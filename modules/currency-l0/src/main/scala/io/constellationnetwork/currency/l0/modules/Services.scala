@@ -47,6 +47,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SharedArtifact
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
 
 import org.http4s.client.Client
@@ -126,7 +127,12 @@ object Services {
         dataApplicationAcceptanceManager,
         cfg.snapshotSize,
         sharedServices.currencyEventsCutter,
-        storages.currencySnapshotEventValidationError
+        storages.currencySnapshotEventValidationError,
+        // blocker-1a: this metagraph's own retained CL0 snapshot store is the in-band source for reconstructing the processed-set `P`.
+        // The producer AND the consensus facilitators both run this currency-l0 creator, so they reconstruct an identical `P` and thus an
+        // identical applied cross-shard SpendAction set (given `P`-window ⊇ `U`-window). Depth = the former node-local cache window.
+        getCurrencySnapshotByHash = Some((h: Hash) => storages.snapshot.get(h)),
+        processedGlobalOrdinalsReconstructionDepth = sharedCfg.lastGlobalSnapshotsSync.maxLastGlobalSnapshotsInMemory.value
       )
 
       validator = CurrencySnapshotValidator.make[F](

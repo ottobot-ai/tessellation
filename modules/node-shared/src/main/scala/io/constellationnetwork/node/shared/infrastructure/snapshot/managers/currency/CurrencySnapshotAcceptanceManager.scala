@@ -59,6 +59,11 @@ trait CurrencySnapshotAcceptanceManager[F[_]] {
     lastGlobalSyncView: Option[GlobalSyncView],
     shouldPerformMetagraphSpecificValidations: Boolean,
     lastArtifactProofs: NonEmptySet[SignatureProof],
+    // blocker-1a — set-valued in-band P. The union of `GlobalSnapshotsProcessed.ordinals` over the metagraph's retained CL0 chain,
+    // reconstructed by the caller (see `GlobalSnapshotOpsManager.reconstructProcessedGlobalOrdinals`). Replaces the former node-local
+    // `globalSnapshotsAlreadyProcessed` mutable cache. Gates which cross-shard `SpendAction`s are (re-)applied:
+    // `A = { o ∈ U : o ≤ view ∧ o ∉ P }`. Because `P` is now a pure input, `accept` no longer depends on manager-instance-local state.
+    alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
     // Validator-only override. When Some, bypass the priority chain that picks
     // which GL0 ordinal to sync to and use this exact value. This lets GL0 re-run
     // acceptance with the same GL0 sync point the producer used, avoiding the race
@@ -140,12 +145,10 @@ object CurrencySnapshotAcceptanceManager {
       // when multiple currency snapshots are being processed concurrently or in sequence.
       lastGlobalSnapshotsCached <- SignallingRef.of[F, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]](Map.empty)
 
-      // Tracks which global snapshot ordinals have already been processed for each metagraph address.
-      // This avoids re-extracting global-layer artifacts such as SpendActions when multiple
-      // currency snapshots are produced before lastGlobalSnapshotInfo is updated.
-      // Not maintaining this state would result in applying the same actions multiple times,
-      // leading to inconsistencies like double deduction and snapshot diff mismatches.
-      globalSnapshotsAlreadyProcessed <- SignallingRef.of[F, Map[Address, Map[SnapshotOrdinal, List[SnapshotOrdinal]]]](Map.empty)
+      // NOTE (blocker-1a): the former node-local `globalSnapshotsAlreadyProcessed` cache (which tracked, per metagraph, which global
+      // snapshot ordinals had already been processed so their SpendActions were not re-applied) has been removed. That set (`P`) is now
+      // reconstructed IN-BAND from the retained CL0 chain (`⋃ GlobalSnapshotsProcessed.ordinals`) and passed into `accept` as
+      // `alreadyProcessedGlobalOrdinals`. This eliminates a mutable, manager-instance-local, node-dependent input to consensus acceptance.
 
       // Initialize operational components
       blockOps = BlockAcceptanceOpsManager.make[F](
@@ -162,8 +165,7 @@ object CurrencySnapshotAcceptanceManager {
 
       globalSnapshotOps = GlobalSnapshotOpsManager.make[F](
         lastGlobalSnapshotsSyncConfig,
-        lastGlobalSnapshotsCached,
-        globalSnapshotsAlreadyProcessed
+        lastGlobalSnapshotsCached
       )
 
       allowSpendOps = AllowSpendOpsManager.make[F]
@@ -225,6 +227,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     maybeLastGlobalSyncView: Option[GlobalSyncView],
     shouldPerformMetagraphSpecificValidations: Boolean,
     lastArtifactProofs: NonEmptySet[SignatureProof],
+    alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
     forcedGlobalSyncView: Option[GlobalSyncView] = None
   )(implicit hasher: Hasher[F]): F[CurrencySnapshotAcceptanceResult] = for {
     initialTxRef <- TransactionReference.emptyCurrency(lastSnapshotContext.address)
@@ -459,7 +462,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       getGlobalSnapshotByOrdinal,
       metagraphId,
       lastUnsyncMetagraphSyncData,
-      snapshotOrdinal,
+      alreadyProcessedGlobalOrdinals,
       lastUnsyncGlobalSnapshot.ordinal,
       updatingCombineFunctionSpendActions
     )

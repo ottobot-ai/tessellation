@@ -7,10 +7,11 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 import scala.concurrent.duration.DurationInt
 
+import io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
 import io.constellationnetwork.node.shared.config.types.LastGlobalSnapshotsSyncConfig
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.artifact.SpendAction
+import io.constellationnetwork.schema.artifact.{GlobalSnapshotsProcessed, SharedArtifact, SpendAction}
 import io.constellationnetwork.security.Hashed
 
 import fs2.concurrent.SignallingRef
@@ -21,8 +22,7 @@ import retry.implicits.retrySyntaxError
 
 class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
   lastGlobalSnapshotsSyncConfig: LastGlobalSnapshotsSyncConfig,
-  lastGlobalSnapshotsCached: SignallingRef[F, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]],
-  globalSnapshotsAlreadyProcessed: SignallingRef[F, Map[Address, Map[SnapshotOrdinal, List[SnapshotOrdinal]]]]
+  lastGlobalSnapshotsCached: SignallingRef[F, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]]
 ) {
   val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F]("GlobalSnapshotOps")
 
@@ -55,13 +55,37 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
       }
   }
 
+  /** Select which cross-shard global-snapshot ordinals to apply for this metagraph and return their combined `SpendAction`s.
+    *
+    * The applied set is `A = { o ∈ U : o ≤ view ∧ o ∉ P }` where:
+    *   - `U` = `syncDataInfo.unappliedGlobalChangeOrdinals` (the gl0-maintained set of global ordinals carrying not-yet-acked cross-shard
+    *     changes for this metagraph),
+    *   - `view` = `globalSnapshotViewOrdinal` (the pinned/recorded global sync view), and
+    *   - `P` = `alreadyProcessedGlobalOrdinals`, the set of global ordinals this metagraph has ALREADY emitted in prior currency snapshots'
+    *     `GlobalSnapshotsProcessed` artifacts (blocker-1a: reconstructed IN-BAND from the retained CL0 chain by the caller — see
+    *     [[GlobalSnapshotOpsManager.reconstructProcessedGlobalOrdinals]] — replacing the former node-local
+    *     `globalSnapshotsAlreadyProcessed` mutable cache).
+    *
+    * `P` is required because gl0 trims `U` (`MetagraphSyncManager.updateFromCurrencySnapshots`:
+    * `U.diff(GlobalSnapshotsProcessed.ordinals)`) only once it has ingested the CL0 snapshot that emitted `GlobalSnapshotsProcessed(A)`.
+    * Between emission and that trim propagating back into the producer's `U`, several currency snapshots can be produced against the same
+    * stale `U`; without `P` they would re-apply the same `SpendAction`s (double-deduction / snapshot-diff mismatch).
+    *
+    * DETERMINISM INVARIANT (`P`-window ⊇ `U`-window): `A` depends only on `P ∩ U`, so as long as the reconstructed `P` covers every ordinal
+    * in `U ∩ (≤ view)` that was already processed, `A` is identical across nodes regardless of how much extra CL0 history any node retains.
+    * If the CL0 snapshot that emitted a still-in-`U` processed-ordinal has been evicted from `P`'s reconstruction window, that ordinal
+    * re-applies — see the retention analysis in the blocker-1a report.
+    *
+    * The second element of the result (`= A`) is what the caller wraps in a `GlobalSnapshotsProcessed` artifact for the snapshot being
+    * built.
+    */
   def getLastGlobalSnapshotsSpendActions(
     globalSnapshotViewOrdinal: SnapshotOrdinal,
     lastGlobalSnapshots: List[Hashed[GlobalIncrementalSnapshot]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     currencyId: Address,
     metagraphSyncData: Option[SortedMap[Address, snapshot.MetagraphSyncDataInfo]],
-    currentCurrencySnapshotOrdinal: SnapshotOrdinal,
+    alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
     lastUnsyncGlobalSnapshotOrdinal: SnapshotOrdinal,
     updatedLastSyncGlobalFromPeersInConsensus: SnapshotOrdinal
   ): F[(SortedMap[Address, List[SpendAction]], SortedSet[SnapshotOrdinal])] = {
@@ -72,68 +96,24 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
       case None => (emptySpendActions, emptyProcessedGlobalSnapshots).pure[F]
       case Some(metagraphSyncData) =>
         metagraphSyncData.get(currencyId) match {
-          case None => (emptySpendActions, emptyProcessedGlobalSnapshots).pure[F]
+          case None               => (emptySpendActions, emptyProcessedGlobalSnapshots).pure[F]
           case Some(syncDataInfo) =>
-            for {
-              allMetagraphsGlobalSnapshotsAlreadyProcessed <- globalSnapshotsAlreadyProcessed.get
+            // A = { o ∈ U : o ≤ view ∧ o ∉ P }. P (`alreadyProcessedGlobalOrdinals`) is reconstructed in-band from the retained CL0
+            // chain by the caller; this replaces the former node-local `globalSnapshotsAlreadyProcessed` cache read.
+            val unappliedGlobalOrdinalsToProcess: SortedSet[SnapshotOrdinal] =
+              syncDataInfo.unappliedGlobalChangeOrdinals
+                .filter(o => o <= globalSnapshotViewOrdinal && !alreadyProcessedGlobalOrdinals.contains(o))
 
-              metagraphOrdinalsByCurrencyOrdinal =
-                allMetagraphsGlobalSnapshotsAlreadyProcessed.getOrElse(currencyId, Map.empty)
-
-              allProcessedOrdinals =
-                metagraphOrdinalsByCurrencyOrdinal.values.flatten.toSet
-
-              alreadyProcessedForCurrentOrdinal =
-                metagraphOrdinalsByCurrencyOrdinal.getOrElse(currentCurrencySnapshotOrdinal, List.empty)
-
-              unappliedGlobalOrdinalsToProcess = syncDataInfo.unappliedGlobalChangeOrdinals
-                .filter(o => o <= globalSnapshotViewOrdinal && !allProcessedOrdinals.contains(o))
-
-              globalOrdinalsToProcess = (alreadyProcessedForCurrentOrdinal ++ unappliedGlobalOrdinalsToProcess).toSet
-
-              result <-
-                if (globalOrdinalsToProcess.isEmpty) {
-                  (emptySpendActions, emptyProcessedGlobalSnapshots).pure[F]
-                } else {
-                  for {
-                    spendActions <- processUnappliedOrdinals(
-                      globalOrdinalsToProcess,
-                      lastGlobalSnapshots,
-                      getGlobalSnapshotByOrdinal,
-                      lastUnsyncGlobalSnapshotOrdinal,
-                      updatedLastSyncGlobalFromPeersInConsensus
-                    )
-                    _ <- globalSnapshotsAlreadyProcessed.update { current =>
-                      val currentMetagraphProcessedOrdinals = current.getOrElse(currencyId, Map.empty)
-
-                      val updatedMetagraphProcessedOrdinals = currentMetagraphProcessedOrdinals
-                        .updated(
-                          currentCurrencySnapshotOrdinal,
-                          currentMetagraphProcessedOrdinals
-                            .getOrElse(currentCurrencySnapshotOrdinal, List.empty)
-                            ++ unappliedGlobalOrdinalsToProcess
-                        )
-                        .view
-                        .mapValues(_.distinct.sorted)
-                        .toSeq
-                        .sortBy(_._1.value.value)
-                        .takeRight(lastGlobalSnapshotsSyncConfig.maxLastGlobalSnapshotsInMemory.value)
-                        .toMap
-
-                      current.updated(currencyId, updatedMetagraphProcessedOrdinals)
-                    }
-
-                    _ <- globalSnapshotsAlreadyProcessed.get.flatMap { processed =>
-                      val totalAddresses = processed.size
-                      val totalEntries = processed.values.map(_.size).sum
-                      val totalOrdinals = processed.values.flatMap(_.values).map(_.size).sum
-                      logger.info(
-                        s"--- [ORDINAL=$globalSnapshotViewOrdinal] globalSnapshotsAlreadyProcessed size: $totalAddresses addresses, $totalEntries entries, $totalOrdinals total ordinals"
-                      )
-                    }
-                  } yield (spendActions, unappliedGlobalOrdinalsToProcess)
-                }
-            } yield result
+            if (unappliedGlobalOrdinalsToProcess.isEmpty)
+              (emptySpendActions, emptyProcessedGlobalSnapshots).pure[F]
+            else
+              processUnappliedOrdinals(
+                unappliedGlobalOrdinalsToProcess,
+                lastGlobalSnapshots,
+                getGlobalSnapshotByOrdinal,
+                lastUnsyncGlobalSnapshotOrdinal,
+                updatedLastSyncGlobalFromPeersInConsensus
+              ).map(spendActions => (spendActions, unappliedGlobalOrdinalsToProcess))
         }
     }
   }
@@ -194,12 +174,25 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
 object GlobalSnapshotOpsManager {
   def make[F[_]: Async: Parallel](
     lastGlobalSnapshotsSyncConfig: LastGlobalSnapshotsSyncConfig,
-    lastGlobalSnapshotsCached: SignallingRef[F, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]],
-    globalSnapshotsAlreadyProcessed: SignallingRef[F, Map[Address, Map[SnapshotOrdinal, List[SnapshotOrdinal]]]]
+    lastGlobalSnapshotsCached: SignallingRef[F, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]]
   ): GlobalSnapshotOpsManager[F] =
     new GlobalSnapshotOpsManager[F](
       lastGlobalSnapshotsSyncConfig,
-      lastGlobalSnapshotsCached,
-      globalSnapshotsAlreadyProcessed
+      lastGlobalSnapshotsCached
     )
+
+  /** In-band reconstruction of `P` (blocker-1a): the union of every `GlobalSnapshotsProcessed.ordinals` carried in the `artifacts` of the
+    * given retained CL0 currency snapshots. This is a PURE fold over consensus-pinned chain data — it replaces the former node-local
+    * `globalSnapshotsAlreadyProcessed` mutable mirror. Callers supply a bounded window of the metagraph's own recent currency snapshots
+    * (walked back from the pinned prior); the window must cover the live `unappliedGlobalChangeOrdinals` (`U`) span (`P`-window ⊇
+    * `U`-window), otherwise an already-processed ordinal that is still in `U` re-applies.
+    */
+  def reconstructProcessedGlobalOrdinals(snapshots: Iterable[CurrencyIncrementalSnapshot]): SortedSet[SnapshotOrdinal] =
+    snapshots.foldLeft(SortedSet.empty[SnapshotOrdinal]) { (acc, snap) =>
+      acc ++ snap.artifacts
+        .getOrElse(SortedSet.empty[SharedArtifact])
+        .toList
+        .collect { case gsp: GlobalSnapshotsProcessed => gsp.ordinals }
+        .flatten
+    }
 }

@@ -30,7 +30,8 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.ValidationEr
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.currency.{
   CurrencySnapshotAcceptanceManager,
-  DataApplicationSnapshotAcceptanceManager
+  DataApplicationSnapshotAcceptanceManager,
+  GlobalSnapshotOpsManager
 }
 import io.constellationnetwork.node.shared.snapshot.currency._
 import io.constellationnetwork.schema._
@@ -41,6 +42,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.swap.AllowSpendBlock
 import io.constellationnetwork.schema.tokenLock.TokenLockBlock
 import io.constellationnetwork.schema.transaction.RewardTransaction
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
@@ -84,7 +86,16 @@ object CurrencySnapshotCreator {
     dataApplicationSnapshotAcceptanceManager: Option[DataApplicationSnapshotAcceptanceManager[F]],
     snapshotSizeConfig: SnapshotSizeConfig,
     currencyEventsCutter: CurrencyEventsCutter[F],
-    currencySnapshotValidationErrorStorage: ValidationErrorStorage[F, CurrencySnapshotEvent, BlockRejectionReason]
+    currencySnapshotValidationErrorStorage: ValidationErrorStorage[F, CurrencySnapshotEvent, BlockRejectionReason],
+    // blocker-1a: fetch a retained CL0 currency snapshot by its hash (from the metagraph's own SnapshotStorage) so the in-band
+    // processed-set `P` can be reconstructed by walking back from `lastArtifact` along `lastSnapshotHash`. `None` (the default) means no
+    // currency snapshot store is available at this construction site, giving window = 1 (only `lastArtifact` itself) — as at the gl0
+    // createContext path, which at numShards=1 sees `metagraphSyncData = None` and never consults `P`.
+    getCurrencySnapshotByHash: Option[Hash => F[Option[Signed[CurrencyIncrementalSnapshot]]]] = None,
+    // How many currency snapshots back (inclusive of `lastArtifact`) to union `GlobalSnapshotsProcessed` over when reconstructing `P`.
+    // Must be ≥ the live `unappliedGlobalChangeOrdinals` (`U`) round-trip lag (`P`-window ⊇ `U`-window) or an already-processed ordinal
+    // still in `U` re-applies. Wired from `lastGlobalSnapshotsSync.maxLastGlobalSnapshotsInMemory` (= the former node-local cache window).
+    processedGlobalOrdinalsReconstructionDepth: Int = 1
   ): CurrencySnapshotCreator[F] = new CurrencySnapshotCreator[F] {
 
     private def maxProposalSizeInBytes(facilitators: Set[PeerId]): PosLong =
@@ -114,6 +125,7 @@ object CurrencySnapshotCreator {
 
       def createProposalWithSizeLimit(
         eventsForAcceptance: Set[CurrencySnapshotEvent],
+        alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
         rejectedEvents: Set[CurrencySnapshotEvent] = Set.empty[CurrencySnapshotEvent],
         awaitedEvents: Set[CurrencySnapshotEvent] = Set.empty[CurrencySnapshotEvent]
       ): F[CurrencySnapshotCreationResult[CurrencySnapshotEvent]] =
@@ -222,6 +234,7 @@ object CurrencySnapshotCreator {
                 lastArtifact.globalSyncView,
                 shouldPerformMetagraphSpecificValidations,
                 lastArtifact.proofs,
+                alreadyProcessedGlobalOrdinals,
                 forcedGlobalSyncView
               )
 
@@ -342,7 +355,12 @@ object CurrencySnapshotCreator {
                 )
                 .flatMap {
                   case Some((remainingAcceptedEvents, sizeAwaitedEvent)) =>
-                    createProposalWithSizeLimit(remainingAcceptedEvents, newRejectedEvents, newAwaitingEvents + sizeAwaitedEvent)
+                    createProposalWithSizeLimit(
+                      remainingAcceptedEvents,
+                      alreadyProcessedGlobalOrdinals,
+                      newRejectedEvents,
+                      newAwaitingEvents + sizeAwaitedEvent
+                    )
                   case None =>
                     UnableToReduceProposalByCutting(currentOrdinal)
                       .raiseError[F, CurrencySnapshotCreationResult[CurrencySnapshotEvent]]
@@ -350,7 +368,44 @@ object CurrencySnapshotCreator {
             }
         } yield result
 
-      createProposalWithSizeLimit(events)
+      // blocker-1a: reconstruct the in-band processed-set `P` ONCE (it depends only on `lastArtifact`, invariant across the size-cutting
+      // recursion) and thread it into acceptance in place of the removed node-local `globalSnapshotsAlreadyProcessed` cache.
+      reconstructAlreadyProcessedGlobalOrdinals(lastArtifact.value).flatMap { alreadyProcessedGlobalOrdinals =>
+        createProposalWithSizeLimit(events, alreadyProcessedGlobalOrdinals)
+      }
+    }
+
+    /** blocker-1a: reconstruct the in-band processed-set `P` = `⋃ GlobalSnapshotsProcessed.ordinals` over the metagraph's own retained CL0
+      * chain, walked back from `lastArtifact` along `lastSnapshotHash` up to `processedGlobalOrdinalsReconstructionDepth` snapshots
+      * (inclusive of `lastArtifact`). The walk stops early when history is exhausted (genesis reached, or a snapshot has been pruned from
+      * the store), which bounds `P`'s window: if the retained depth is shorter than the live `U` round-trip lag, a still-in-`U` processed
+      * ordinal can fall out of `P` and re-apply — see the blocker-1a retention analysis.
+      */
+    private def reconstructAlreadyProcessedGlobalOrdinals(
+      lastArtifactValue: CurrencyIncrementalSnapshot
+    ): F[SortedSet[SnapshotOrdinal]] = {
+      def walkBack(
+        fetch: Hash => F[Option[Signed[CurrencyIncrementalSnapshot]]],
+        current: CurrencyIncrementalSnapshot,
+        remaining: Int,
+        acc: List[CurrencyIncrementalSnapshot]
+      ): F[List[CurrencyIncrementalSnapshot]] = {
+        val collected = current :: acc
+        if (remaining <= 0) collected.pure[F]
+        else
+          fetch(current.lastSnapshotHash).flatMap {
+            case Some(previous) => walkBack(fetch, previous.value, remaining - 1, collected)
+            case None           => collected.pure[F]
+          }
+      }
+
+      val collectSnapshots: F[List[CurrencyIncrementalSnapshot]] =
+        getCurrencySnapshotByHash match {
+          case None        => List(lastArtifactValue).pure[F]
+          case Some(fetch) => walkBack(fetch, lastArtifactValue, (processedGlobalOrdinalsReconstructionDepth - 1).max(0), List.empty)
+        }
+
+      collectSnapshots.map(GlobalSnapshotOpsManager.reconstructProcessedGlobalOrdinals)
     }
 
     protected def getHeightAndSubHeight(
