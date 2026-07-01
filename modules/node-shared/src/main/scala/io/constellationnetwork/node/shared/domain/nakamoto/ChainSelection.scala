@@ -10,10 +10,10 @@ import io.constellationnetwork.schema.nakamoto.slot.VrfOutput
   *
   * **Strict separation of fork choice and finality.** Fork choice picks the best live branch from block-header structure alone (longest
   * chain, density on long forks). Finality (attestation ≥ 2/3 OR depth-k) is computed elsewhere by `TipTracker` and feeds into chain
-  * selection only as a *constraint* via `shouldSwitch`'s "don't revert below the finalized head" check. This matches Polkadot's
-  * BABE/GRANDPA split, Cardano Praos/Genesis, and the original Nakamoto rule. It is deliberately NOT Ethereum's LMD-GHOST blend — which
-  * couples latest-attestation weight into the comparator and has produced a long tail of balancing/bouncing/avalanche attacks (Neu/Tas/Tse
-  * IACR 2022/289; D'Amato/Zanolini IACR 2023/279). For a 50-100 validator chain with depth-k fallback, the dynamic- availability
+  * selection only as a *constraint* via `shouldSwitch`'s "don't revert below the settled floor" check. This matches Polkadot's BABE/GRANDPA
+  * split, Cardano Praos/Genesis, and the original Nakamoto rule. It is deliberately NOT Ethereum's LMD-GHOST blend — which couples
+  * latest-attestation weight into the comparator and has produced a long tail of balancing/bouncing/avalanche attacks (Neu/Tas/Tse IACR
+  * 2022/289; D'Amato/Zanolini IACR 2023/279). For a 50-100 validator chain with depth-k fallback, the dynamic- availability
   * head-convergence properties LMD-GHOST buys aren't worth the attack surface.
   *
   * '''The pre-removal bug.''' An earlier version called `tipTracker.attestationWeight(tipHash)` per-hash and let the heavier tip win if
@@ -31,6 +31,17 @@ import io.constellationnetwork.schema.nakamoto.slot.VrfOutput
   * Finality (orthogonal to this file) is the union of two independent rules:
   *   - attestation ≥ 2/3 weight on a chain-canonical hash (BFT-classic, fast path in healthy network)
   *   - depth-k confirmation (probabilistic, fallback when attestations stall) Whichever fires first marks the tip finalized.
+  *
+  * '''Track-3 S3 — band-density deep-reorg (CONFIG-FLAGGED, default OFF).''' Two distinct finality depths gate fork choice:
+  *   - k₁ (`confirmationDepthK`) = operational finality — the depth `shouldSwitch` FREEZES at in the legacy (flag-OFF) behavior.
+  *   - k₂ (`keepDepthBehindFinalized` = 100·k₁, the "settled" marker) = the ONLY absolute floor.
+  *
+  * With the `nakamoto.band-density-reorg-enabled` flag ON, `shouldSwitch`'s revert floor moves from k₁ to the k₂ "settled" ordinal, so a
+  * fork anywhere in the `(settled, finalized]` band is density-revertable (maxvalid-bg) instead of frozen — and the density comparator is
+  * made COMMUTATIVE (true-MRCA anchored) so nodes on opposite band branches converge. The flag defaults OFF (byte-identical to the
+  * post-`376d09fbc` k₁-freeze baseline — the 2026-06-27 storm backstop) until a deep-fork sim validates cluster-uniformity; this is attempt
+  * #2 of the reverted `86f390130` (which was inert because its archive marker never fired — here the settled marker is the live,
+  * T_depth2-driven `nakamotoSettledOrdinalRef`).
   */
 trait ChainSelection[F[_]] {
 
@@ -50,41 +61,71 @@ trait ChainSelection[F[_]] {
 
   /** Check if we should switch from our current tip to a new candidate.
     *
-    * Returns false if current tip is finalized, because finalized tips cannot be reverted.
+    * Returns false when the switch would revert history below the finality floor (k₁ finalized head in the legacy behavior; the k₂
+    * "settled" ordinal under the band-density flag), because settled/finalized history cannot be reverted.
     *
     * @return
-    *   true if candidate beats current and current is not finalized
+    *   true if candidate beats current and the switch does not revert below the finality floor
     */
   def shouldSwitch(current: ChainTip, candidate: ChainTip): F[Boolean]
 }
 
 object ChainSelection {
 
-  /** Default parameters (tunable per deployment). */
+  /** Default parameters. Retained as fallbacks ONLY for call sites (tests) that don't wire the config-derived values. The production call
+    * site (`GlobalSnapshotConsensus`) now passes `NakamotoConfig.kLookback` (= k₁ + 1) and `NakamotoConfig.sWindow` (= round(R/3)) —
+    * Track-3 S3 killed the hardcoded 50/200 there.
+    */
   val DefaultKLookback: Long = 50L // blocks before switching to density rule
   val DefaultSWindow: Long = 200L // slot window for density comparison
 
   /** Create a ChainSelection that uses purely structural (Bifrost maxvalid-tk + maxvalid-bg) fork choice.
     *
-    * Attestation weight does not enter `compare`. `tipTracker` is retained only so `shouldSwitch` can consult `lastFinalized` to refuse
-    * reverting below a finalized head — a *constraint* on fork choice, not a tiebreaker.
+    * Attestation weight does not enter `compare`. `tipTracker` is retained only so `shouldSwitch` can consult `lastFinalized` (legacy k₁
+    * clamp) to refuse reverting below a finalized head — a *constraint* on fork choice, not a tiebreaker.
     *
     * @param tipTracker
-    *   used by `shouldSwitch` to query the finalized head; not used in `compare`.
+    *   used by `shouldSwitch` (legacy/flag-OFF path) to query the k₁ finalized head; not used in `compare`.
     * @param fetchParent
     *   given a ChainTip, retrieve its parent (for ancestor traversal).
     * @param kLookback
-    *   max blocks to traverse before switching to density rule.
+    *   max fork depth treated as a "short" fork (tip tiebreak); deeper forks use the density rule.
     * @param sWindow
     *   forward-looking slot window for density comparison.
+    * @param maxAncestorDepth
+    *   Track-3 S3: upper bound on the ancestor walk when searching for the TRUE most-recent common ancestor (MRCA). Under the band-density
+    *   flag this is k₂ (the settled floor) so a fork anywhere in the `(settled, finalized]` band resolves against its REAL fork point
+    *   instead of a `kLookback`-truncated pseudo-anchor (the non-commutativity bug). Defaults to `kLookback` so a non-opt-in call site
+    *   keeps the pre-S3 truncating behavior byte-for-byte.
+    * @param settledOrdinalReader
+    *   Track-3 S3: reader for the k₂ "settled" floor ordinal, consulted ONLY on the band-density path (flag ON) by `shouldSwitch`. `None`
+    *   (default) ⇒ floor 0 ⇒ never refuse on the settled floor (tests / non-opt-in). Production wires
+    *   `Some(nakamotoSettledOrdinalRef.get.map(_.value.value))`.
+    * @param bandDensityReorgEnabled
+    *   Track-3 S3 CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`, default false). false = legacy k₁-freeze fork choice (hash-exact
+    *   finalized clamp + `kLookback`-truncated ancestor walk = byte-identical to the post-`376d09fbc` baseline). true = band-density reorg:
+    *   k₂ settled floor + true-MRCA commutative density.
     */
   def make[F[_]: Monad](
     tipTracker: TipTracker[F],
     fetchParent: ChainTip => F[Option[ChainTip]],
     kLookback: Long = DefaultKLookback,
-    sWindow: Long = DefaultSWindow
+    sWindow: Long = DefaultSWindow,
+    maxAncestorDepth: Long = DefaultKLookback,
+    settledOrdinalReader: Option[F[Long]] = None,
+    bandDensityReorgEnabled: Boolean = false
   ): ChainSelection[F] =
     new ChainSelection[F] {
+
+      // Ancestor-walk bound for the true-MRCA search. Flag OFF reproduces the pre-S3 truncation
+      // (`depth > kLookback`) EXACTLY via `kLookback + 1` (so `depth >= bound` ⟺ `depth > kLookback`);
+      // flag ON walks up to k₂ (`maxAncestorDepth`) to find the real common ancestor of a band fork.
+      private val ancestorWalkBound: Long =
+        if (bandDensityReorgEnabled) maxAncestorDepth else kLookback + 1L
+
+      // k₂ "settled" floor reader (band path only). Absent ⇒ 0 ⇒ never refuse on the settled floor.
+      private val settledOrdinalF: F[Long] =
+        settledOrdinalReader.getOrElse(Monad[F].pure(0L))
 
       def compare(tipA: ChainTip, tipB: ChainTip): F[ChainTip] =
         if (tipA.hash === tipB.hash) tipA.pure[F]
@@ -101,7 +142,9 @@ object ChainSelection {
       def shouldSwitch(current: ChainTip, candidate: ChainTip): F[Boolean] =
         if (current.hash === candidate.hash)
           false.pure[F]
-        else
+        else if (!bandDensityReorgEnabled)
+          // FLAG OFF — legacy k₁ hash-exact finalized clamp (byte-identical to pre-S3). Fork choice is
+          // frozen at the k₁ finalized head: refuse to switch away from a tip that IS the finalized head.
           for {
             lastFinalized <- tipTracker.lastFinalized
             winner <- compare(current, candidate)
@@ -110,109 +153,161 @@ object ChainSelection {
             val currentIsFinalized = lastFinalized.exists { case (fh, _) => fh === current.hash }
             candidateWins && !currentIsFinalized
           }
+        else
+          // FLAG ON — k₂ settled floor. The `(settled, finalized]` band is density-revertable, so the ONLY
+          // reorg refusal here is one that would rewrite history at/below the settled (k₂) ordinal: refuse
+          // iff the fork's common ancestor is STRICTLY below settled (its deepest reverted block,
+          // mrca.ordinal + 1, would then be ≤ settled). A fork deeper than the k₂ walk bound (MRCA not
+          // found) is treated as below-settled ⇒ refuse — it cannot be a legitimate band reorg.
+          for {
+            settled <- settledOrdinalF
+            winner <- compare(current, candidate)
+            forkOrdinalOpt <- forkAncestorOrdinal(current, candidate)
+          } yield {
+            val candidateWins = winner.hash === candidate.hash
+            val revertsAtOrBelowSettled = forkOrdinalOpt.fold(true)(_ < settled)
+            candidateWins && !revertsAtOrBelowSettled
+          }
 
-      /** Walk back both tines to find common ancestor, then apply appropriate rule. */
+      /** Walk back both tines to the true common ancestor (bounded by `ancestorWalkBound`), then apply the short/long-fork rule. */
       private def findCommonAncestorAndSelect(tipA: ChainTip, tipB: ChainTip): F[ChainTip] =
-        // Simple case: if one is ancestor of the other (same chain), longer wins
+        // Simple case: if one is the immediate parent of the other (same chain), the descendant wins (longer).
         if (tipA.parentHash === tipB.hash) tipA.pure[F]
         else if (tipB.parentHash === tipA.hash) tipB.pure[F]
-        else {
-          // Build both tines back to common ancestor (or kLookback)
+        else
           buildTines(List(tipA), List(tipB), 0L).map {
-            case (tineA, tineB, exceedsK) =>
-              if (exceedsK) {
-                // Long fork: density comparison within sWindow
-                densityCompare(tineA, tineB, tipA, tipB)
-              } else {
-                // Short fork: standard tiebreakers on tips
+            case (tineA, tineB, mrca, forkDepth) =>
+              if (forkDepth > kLookback)
+                // Long fork: density comparison within sWindow from the (true) fork point.
+                densityCompare(tineA, tineB, tipA, tipB, mrca)
+              else
+                // Short fork: standard tip tiebreakers.
                 standardCompare(tipA, tipB)
-              }
           }
-        }
 
-      /** Recursively build tines back to common ancestor. Returns (tineA, tineB, exceedsKLookback). Each tine is oldest-first (ancestor at
-        * head, tip at end).
+      /** Most-recent common-ancestor ordinal of the two tips (the fork point), or None if the fork is deeper than `ancestorWalkBound` (> k₂
+        * under the flag) or the walk hit an evicted/genesis gap. Reuses the SAME symmetric tine walk as `compare`, so the fork point it
+        * reports is identical to the one the density comparison anchored on.
+        */
+      private def forkAncestorOrdinal(tipA: ChainTip, tipB: ChainTip): F[Option[Long]] =
+        if (tipA.hash === tipB.hash) Option(tipA.ordinal).pure[F]
+        else if (tipA.parentHash === tipB.hash) Option(tipB.ordinal).pure[F]
+        else if (tipB.parentHash === tipA.hash) Option(tipA.ordinal).pure[F]
+        else buildTines(List(tipA), List(tipB), 0L).map { case (_, _, mrca, _) => mrca.map(_.ordinal) }
+
+      /** Recursively build tines back to the true most-recent common ancestor (MRCA), bounded by `ancestorWalkBound`.
+        *
+        * Returns `(tineA, tineB, mrca, forkDepth)`:
+        *   - `tineA`/`tineB` oldest-first (ancestor-or-truncation-head at head, tip at end),
+        *   - `mrca` = Some(commonAncestor) when found within the bound, else None (truncated / parent gap),
+        *   - `forkDepth` = number of walk levels at stop.
+        *
+        * '''Commutativity (Track-3 S3).''' Which tine is walked at each step is decided by ORDINAL comparison (not arg position), and every
+        * stop condition (heads equal, or `depth >= bound`, or a parent gap) is symmetric — so the MRCA and `forkDepth` are IDENTICAL for
+        * `(A, B)` and `(B, A)`. The prior implementation truncated the MRCA search at `kLookback` (before the true fork point for band
+        * forks) and let `densityCompare` anchor on the FIRST argument's truncation head, breaking `compare(A,B) == compare(B,A)`; walking
+        * to the real MRCA is what fixes it.
         */
       private def buildTines(
         tineA: List[ChainTip],
         tineB: List[ChainTip],
         depth: Long
-      ): F[(List[ChainTip], List[ChainTip], Boolean)] = {
+      ): F[(List[ChainTip], List[ChainTip], Option[ChainTip], Long)] = {
         val headA = tineA.head
         val headB = tineB.head
 
-        // Common ancestor found
+        // Common ancestor found.
         if (headA.hash === headB.hash)
-          (tineA, tineB, depth > kLookback).pure[F]
-        // Exceeded k-lookback — switch to density
-        else if (depth > kLookback)
-          (tineA, tineB, true).pure[F]
+          (tineA, tineB, Some(headA): Option[ChainTip], depth).pure[F]
+        // Exceeded the ancestor-walk bound — give up finding the MRCA (flag OFF: reproduces the legacy
+        // `depth > kLookback` truncation; flag ON: fork is deeper than k₂, i.e. below the settled floor).
+        else if (depth >= ancestorWalkBound)
+          (tineA, tineB, Option.empty[ChainTip], depth).pure[F]
         else {
-          // Walk back the taller tine (or both if equal height)
+          // Walk back the taller tine (or both if equal height) — the choice is symmetric in arg order.
           val aOrdinal = headA.ordinal
           val bOrdinal = headB.ordinal
 
           if (aOrdinal > bOrdinal) {
-            // Walk A back
             fetchParent(headA).flatMap {
-              case Some(parentA) => buildTines(parentA :: tineA, tineB, depth + 1)
-              case None          => (tineA, tineB, depth > kLookback).pure[F] // hit genesis
+              case Some(parentA) => buildTines(parentA :: tineA, tineB, depth + 1L)
+              case None          => (tineA, tineB, Option.empty[ChainTip], depth).pure[F] // hit genesis / evicted
             }
           } else if (bOrdinal > aOrdinal) {
-            // Walk B back
             fetchParent(headB).flatMap {
-              case Some(parentB) => buildTines(tineA, parentB :: tineB, depth + 1)
-              case None          => (tineA, tineB, depth > kLookback).pure[F]
+              case Some(parentB) => buildTines(tineA, parentB :: tineB, depth + 1L)
+              case None          => (tineA, tineB, Option.empty[ChainTip], depth).pure[F]
             }
           } else {
-            // Equal height — walk both back
+            // Equal height — walk both back.
             (fetchParent(headA), fetchParent(headB)).tupled.flatMap {
               case (Some(parentA), Some(parentB)) =>
-                buildTines(parentA :: tineA, parentB :: tineB, depth + 1)
+                buildTines(parentA :: tineA, parentB :: tineB, depth + 1L)
               case _ =>
-                (tineA, tineB, depth > kLookback).pure[F]
+                (tineA, tineB, Option.empty[ChainTip], depth).pure[F]
             }
           }
         }
       }
 
-      /** Standard (short fork) comparison: height → slot → VRF tiebreak. */
+      /** Standard (short fork) comparison: height → slot → deterministic (VRF, then hash) tiebreak. */
       private def standardCompare(tipA: ChainTip, tipB: ChainTip): ChainTip =
-        // 1. Higher ordinal (longer chain)
+        // 1. Higher ordinal (longer chain).
         if (tipA.ordinal != tipB.ordinal) {
           if (tipA.ordinal > tipB.ordinal) tipA else tipB
         }
-        // 2. Lower slot (earlier production = harder lottery)
+        // 2. Lower slot (earlier production = harder lottery).
         else if (tipA.slot.value.value != tipB.slot.value.value) {
           if (tipA.slot.value.value < tipB.slot.value.value) tipA else tipB
         }
-        // 3. Lower VRF output (deterministic)
-        else {
-          if (compareVrfOutputs(tipA.vrfOutput, tipB.vrfOutput) <= 0) tipA else tipB
-        }
+        // 3. Fully deterministic tip tiebreak.
+        else deterministicTip(tipA, tipB)
 
-      /** Density comparison: count blocks within sWindow from the fork point. More blocks in the window = denser chain = better. On tie:
-        * fall back to VRF tiebreak on tips.
+      /** Density comparison (maxvalid-bg): more blocks within `sWindow` slots of the fork point = denser chain = better. On tie: the
+        * fully-deterministic tip tiebreak.
+        *
+        * '''Track-3 S3 commutativity fix.''' The fork anchor `forkSlot` is the TRUE MRCA slot when the common ancestor was found (`mrca =
+        * Some`) — which is SYMMETRIC in arg order, replacing the previous `tineA.head` anchor that made `compare(A,B) ≠ compare(B,A)` on
+        * band forks (the tineA-only asymmetry). Because both tines descend from the MRCA, every `slot - forkSlot ≥ 0`, so the prior
+        * "negative `(slot − forkSlot)` always counts" artifact is gone too. The `None` (unfound-MRCA) fallback to the legacy `tineA.head`
+        * anchor is only reachable OFF the band path (flag-OFF deep-fork truncation — preserved byte-for-byte — or a > k₂ fork, which is
+        * below the settled freeze and cannot legitimately reorg).
         */
       private def densityCompare(
         tineA: List[ChainTip],
         tineB: List[ChainTip],
         tipA: ChainTip,
-        tipB: ChainTip
+        tipB: ChainTip,
+        mrca: Option[ChainTip]
       ): ChainTip = {
-        // The fork point is the common ancestor (head of each tine)
-        val forkSlot = tineA.headOption.map(_.slot.value.value).getOrElse(0L)
+        // The fork point is the true common ancestor (symmetric); legacy fallback = tineA head (only off-band).
+        val forkSlot =
+          mrca.map(_.slot.value.value).getOrElse(tineA.headOption.map(_.slot.value.value).getOrElse(0L))
 
-        // Count blocks within sWindow slots from fork point
+        // Count blocks within sWindow slots from the fork point.
         val densityA = tineA.count(t => t.slot.value.value - forkSlot <= sWindow)
         val densityB = tineB.count(t => t.slot.value.value - forkSlot <= sWindow)
 
         if (densityA != densityB) {
           if (densityA > densityB) tipA else tipB
         } else {
-          // Equal density: VRF tiebreak on tips
-          if (compareVrfOutputs(tipA.vrfOutput, tipB.vrfOutput) <= 0) tipA else tipB
+          // Equal density: fully deterministic tip tiebreak.
+          deterministicTip(tipA, tipB)
         }
+      }
+
+      /** Fully deterministic, commutative final tiebreak: lower VRF output wins; on an EXACT VRF tie (cryptographically unreachable for
+        * distinct honest snapshots — only an equivocating same-slot producer) the lexicographically-lower snapshot hash wins. This totality
+        * is what makes `compare` commutative for EVERY input pair (cluster-uniformity): `compare(A,B) == compare(B,A)`. The hash tiebreak
+        * is a strict improvement over the pre-S3 `vrf <= 0 ? tipA : tipB` (which was arg-order-dependent on an exact VRF tie); it changes
+        * NO honest outcome (VRF collisions don't occur) and makes the adversarial equivocation case converge.
+        */
+      private def deterministicTip(tipA: ChainTip, tipB: ChainTip): ChainTip = {
+        val vrfCmp = compareVrfOutputs(tipA.vrfOutput, tipB.vrfOutput)
+        if (vrfCmp < 0) tipA
+        else if (vrfCmp > 0) tipB
+        else if (tipA.hash.value.compareTo(tipB.hash.value) <= 0) tipA
+        else tipB
       }
 
       /** Compare VRF outputs as unsigned BigInts. */

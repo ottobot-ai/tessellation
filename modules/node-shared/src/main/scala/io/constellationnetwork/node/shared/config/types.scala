@@ -122,6 +122,14 @@ object types {
     // data-app-fee reorg storm — gl0-4 self-finalized 857 while peers held 819-822). The refuse-counter trigger is
     // conservative (K sustained different-hash writes at-or-below finalized; no false-positive scenario for the gate).
     rebootstrapEnabled: Boolean,
+    // Track-3 S3 CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`). false (default) = legacy k₁-freeze fork choice: the
+    // `NakamotoChainStore` store-gate + `ChainSelection.shouldSwitch` both key off the k₁ finalized marker (byte-identical to
+    // the post-`376d09fbc` baseline — the 2026-06-27 storm backstop). true = re-key BOTH to the k₂ "settled" marker so forks
+    // in the `(settled, finalized]` band are density-revertable (maxvalid-bg), AND enable the commutative true-MRCA density
+    // comparator. Consensus-critical + cluster-uniform: EVERY node must run the same value (a split would fork the chain), so
+    // this is a single global switch (NOT per-env). Keep OFF until a deep-fork sim validates cluster-uniformity — this is
+    // attempt #2 of the reverted `86f390130`. The production PRODUCTION-floor (`SnapshotLeaderLoop`) stays k₁ regardless.
+    bandDensityReorgEnabled: Boolean,
     // ml0 gl0-follow changeset transport (task #12). `changesetRingDepth` bounds the gl0 producer's SERVED ring of
     // recent finalized per-ordinal accumulators (`GlobalChangeSetService` / `SnapshotLeaderLoop.ringInsertTrimmed`) —
     // a follower more than this many finalized ordinals behind falls back to a heavy full-GSI resync, so widening it
@@ -156,6 +164,17 @@ object types {
     // 100 * confirmationDepthK` in `SnapshotLeaderLoop` is gone — k₂ is threaded from here (`GlobalSnapshotConsensus` → `archivalDepthK`).
     def keepDepthBehindFinalized(env: AppEnvironment): PosLong =
       PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
+    // Track-3 S3 fork-choice lookback = k₁ + 1. Forks shallower than this are resolved by the tip
+    // tiebreak (maxvalid-tk, longest-chain); deeper forks switch to the density rule (maxvalid-bg). At
+    // k₁ + 1 the density rule engages exactly one ordinal past operational finality, so the whole
+    // `(settled, finalized]` band is density-arbitrated. Derived from the per-env k₁, NOT loaded —
+    // replaces the hardcoded `ChainSelection.DefaultKLookback` (50) at the production wiring.
+    def kLookback(env: AppEnvironment): Long = confirmationDepthK(env).value + 1L
+    // Track-3 S3 density window = round(R / 3), R = etaRotationSnapshots (= round(3.1·k₁)), so
+    // sWindow ≈ 1.033·k₁ slots. The density comparison counts blocks within this many slots of the true
+    // fork point — one confirmation-depth's worth of chain growth, matching maxvalid-bg's s-parameter.
+    // Derived from the per-env R, NOT loaded — replaces the hardcoded `ChainSelection.DefaultSWindow` (200).
+    def sWindow(env: AppEnvironment): Long = math.round(etaRotationSnapshots(env).value.toDouble / 3.0d)
   }
 
   /** HOCON shape for the gl0 LDD snowplow (see [[NakamotoConfig.ldd]]). `baseline` (fB) and `amplitude` (fA) are EXACT rationals read

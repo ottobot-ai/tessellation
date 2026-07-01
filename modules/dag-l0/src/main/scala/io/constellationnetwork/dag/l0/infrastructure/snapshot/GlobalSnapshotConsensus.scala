@@ -1032,7 +1032,22 @@ object GlobalSnapshotConsensus {
               case Some(cs) => cs.tipFor(tip.parentHash)
               case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
             }
-          chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](tipTracker, fetchParent)
+          // Track-3 S3: wire the config-DERIVED fork-choice params (kills the hardcoded 50/200) + the k₂
+          // ancestor-walk bound + the settled-floor reader + the band-density flag. Flag OFF (default) ⇒
+          // ChainSelection is byte-identical to the pre-S3 baseline (k₁ hash-exact clamp, kLookback-truncated
+          // ancestor walk). Flag ON ⇒ k₂ settled floor + true-MRCA commutative density (maxvalid-bg).
+          chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](
+            tipTracker,
+            fetchParent,
+            kLookback = sharedCfg.nakamoto.kLookback(sharedCfg.environment),
+            sWindow = sharedCfg.nakamoto.sWindow(sharedCfg.environment),
+            // k₂ (= keepDepthBehindFinalized) bounds the true-MRCA search so a band fork resolves against
+            // its real fork point instead of a kLookback-truncated pseudo-anchor; matches in-memory retention.
+            maxAncestorDepth = sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value,
+            // The settled (k₂) floor: shouldSwitch (flag ON) refuses ONLY reverts at/below this ordinal.
+            settledOrdinalReader = Some(nakamotoSettledOrdinalRef.get.map(_.value.value)),
+            bandDensityReorgEnabled = sharedCfg.nakamoto.bandDensityReorgEnabled
+          )
           // Heap-leak Fix B — `nakamoto.keep-depth-behind-finalized` (default = k₁ = 255). Bounds
           // in-memory canonical-chain retention to a sliding window behind the finalized tip; older
           // lookups fall through to disk-backed `SnapshotStorage` via
@@ -1053,7 +1068,10 @@ object GlobalSnapshotConsensus {
               // store-gate/fork-choice and reset alongside the k₁ ref in `unsafe_clearFinality`. The k₁ store-gate + production
               // floor are UNCHANGED in S1.5 — only the reset uses this ref for now.
               nakamotoSettledOrdinalRef,
-              keepDepthBehindFinalized
+              keepDepthBehindFinalized,
+              // Track-3 S3: the SAME flag ChainSelection reads — selects the store-gate floor (k₁ finalized
+              // vs k₂ settled). Both read `sharedCfg.nakamoto.bandDensityReorgEnabled`, so they never diverge.
+              bandDensityReorgEnabled = sharedCfg.nakamoto.bandDensityReorgEnabled
             )
             .toResource
           _ <- chainStoreRef.set(Some(chainStore)).toResource

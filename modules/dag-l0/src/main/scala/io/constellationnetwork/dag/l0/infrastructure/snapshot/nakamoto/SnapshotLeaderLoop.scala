@@ -1694,6 +1694,16 @@ object SnapshotLeaderLoop {
               // could have silently overwritten finalized content (the gl0-2-divergent-517
               // class of bug). Skip and let the sync daemon catch us up via gossip/chainsync;
               // the next slot win after catch-up produces the correct (above-finalized) ordinal.
+              //
+              // Track-3 S3 — DELIBERATE ASYMMETRY: this PRODUCTION floor stays keyed on the k₁
+              // `nakamotoFinalizedOrdinalRef`, even though S3 re-keys the store-gate + fork-choice
+              // revert floor to the k₂ `nakamotoSettledOrdinalRef` under the band-density flag. Rationale:
+              // production must NOT emit new blocks below OPERATIONAL finality (k₁) — a k₂ floor here would
+              // let a node produce ~100·k₁ ords into already-confirmed history, defeating the purpose of the
+              // finality gate and re-creating the `86f390130` self-contradiction (dragging production to k₂).
+              // Fork choice / storage may REVERT within the (settled, finalized] band (density-arbitrated),
+              // but LOCAL production always extends at-or-above the k₁ tip. So this comparison is intentionally
+              // NOT changed by S3 and is independent of `nakamoto.band-density-reorg-enabled`.
               if (wouldProduceOrdinal <= finalizedOrdinal) {
                 logger.warn(
                   s"⛔ Skipping slot-win production: would-be ordinal=${wouldProduceOrdinal.show} ≤ finalized=${finalizedOrdinal.show}. " +

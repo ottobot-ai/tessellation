@@ -151,7 +151,10 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     * marker — and (c) `unsafe_clearFinality` resets BOTH.
     */
   private def mkChainStoreWithSettled(
-    keepDepthBehindFinalized: Long = NakamotoChainStore.DefaultKeepDepthBehindFinalized
+    keepDepthBehindFinalized: Long = NakamotoChainStore.DefaultKeepDepthBehindFinalized,
+    // Track-3 S3: when true, BOTH the store-gate and ChainSelection.shouldSwitch key off the k₂ settled
+    // ref (band-density reorg). Defaults false (legacy k₁-freeze) so the S1.5 tests keep their behavior.
+    bandDensityReorgEnabled: Boolean = false
   )(
     implicit hs: HasherSelector[IO]
   ): IO[
@@ -163,8 +166,21 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       tipTracker <- TipTracker.make[IO](stakeRegistry)
       finalizedRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
       settledRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
-      chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
-      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef, settledRef, keepDepthBehindFinalized)
+      chainSelection = ChainSelection.make[IO](
+        tipTracker,
+        _ => IO.pure(None),
+        settledOrdinalReader = Some(settledRef.get.map(_.value.value)),
+        bandDensityReorgEnabled = bandDensityReorgEnabled
+      )
+      chainStore <- NakamotoChainStore.make[IO](
+        stubStorage,
+        chainSelection,
+        tipTracker,
+        finalizedRef,
+        settledRef,
+        keepDepthBehindFinalized,
+        bandDensityReorgEnabled = bandDensityReorgEnabled
+      )
     } yield (chainStore, finalizedRef, settledRef)
 
   /** Same as `mkChainStore` but with a `diskBackedStorage` plumbed in. Returns the disk Refs so tests can simulate "this snapshot is on
@@ -477,13 +493,14 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       )
   }
 
-  test("S1.5: store finality-gate keys off finalized (k₁), NOT the deeper settled (k₂) marker") { res =>
+  test("S1.5/S3 (flag OFF/default): store finality-gate keys off finalized (k₁), NOT the deeper settled (k₂) marker") { res =>
     val (_, _, j, h, sp) = res
     implicit val jSer: JsonSerializer[IO] = j
     implicit val hh: Hasher[IO] = h
     implicit val spp: SecurityProvider[IO] = sp
     implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
     for {
+      // Default band-density flag = OFF ⇒ legacy k₁ store-gate (the 2026-06-27 storm backstop preserved).
       r <- mkChainStoreWithSettled()
       (chainStore, finalizedRef, settledRef) = r
       // finalized (k₁) = 5, settled (k₂) = 1 — settled is the DEEPER (smaller) marker.
@@ -493,8 +510,8 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       pairA <- mkGenesis
       (sA, ctxA) = pairA
       storedA <- chainStore.store(sA, ctxA, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
-      // A DIFFERENT-hash write at ordinal 3 must be REFUSED — 3 ≤ finalized(5) with an existing divergent hash. Had the gate
-      // (prematurely, S3) moved to the settled marker, 3 > settled(1) would instead ALLOW this write.
+      // A DIFFERENT-hash write at ordinal 3 must be REFUSED — 3 ≤ finalized(5) with an existing divergent hash. With the S3
+      // flag ON the gate would instead move to the settled marker (3 > settled(1) ⇒ ALLOW) — that is the next test.
       pairB <- mkAltSnapshot
       (sB, ctxB) = pairB
       storedB <- chainStore.store(sB, ctxB, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
@@ -502,9 +519,45 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     } yield
       expect.all(
         storedA, // first write accepted
-        !storedB, // divergent write at 3 REFUSED because 3 ≤ finalized (k₁) — proves the gate is k₁, not settled(1)
+        !storedB, // divergent write at 3 REFUSED because 3 ≤ finalized (k₁) — proves the DEFAULT gate is k₁, not settled(1)
         refuseCount == 1L
       )
+  }
+
+  test("S3 (flag ON): store-gate keyed on settled (k₂) — divergent write in (settled, finalized] is routed to compare, NOT auto-refused") {
+    res =>
+      val (_, _, j, h, sp) = res
+      implicit val jSer: JsonSerializer[IO] = j
+      implicit val hh: Hasher[IO] = h
+      implicit val spp: SecurityProvider[IO] = sp
+      implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+      for {
+        // Band-density flag ON ⇒ the store-gate keys off the k₂ settled marker (S3 floor-move).
+        r <- mkChainStoreWithSettled(bandDensityReorgEnabled = true)
+        (chainStore, finalizedRef, settledRef) = r
+        // finalized (k₁) = 5, settled (k₂) = 1 — the (settled, finalized] band is ordinals 2..5.
+        _ <- finalizedRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(5L)))
+        _ <- settledRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(1L)))
+        // Seed hash A at ordinal 3 — in the band settled(1) < 3 ≤ finalized(5).
+        pairA <- mkGenesis
+        (sA, ctxA) = pairA
+        storedA <- chainStore.store(sA, ctxA, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
+        // A DIFFERENT-hash write at ordinal 3: because 3 > settled(1), the S3 store-gate does NOT auto-refuse it — it
+        // routes through to `tryStore` → `ChainSelection.shouldSwitch` (density-revertable band). It is stored (here as
+        // an alternate branch, since with the stub fetchParent the density comparison can't find the MRCA to switch), and
+        // crucially the P-11 divergent-refuse counter does NOT trip (proving the gate moved to settled, not finalized).
+        pairB <- mkAltSnapshot
+        (sB, ctxB) = pairB
+        storedB <- chainStore.store(sB, ctxB, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
+        refuseCount <- chainStore.divergentRefuseCount
+        sample <- chainStore.divergentRefuseSample
+      } yield
+        expect.all(
+          storedA, // first write accepted
+          storedB, // NOT refused by the k₂ store-gate (3 > settled(1)) — routed to compare and stored
+          refuseCount == 0L, // the finality-safety gate did NOT trip (it keys off settled now, not finalized)
+          sample.isEmpty
+        )
   }
 
   test("S1.5: unsafe_clearFinality resets BOTH finalized (k₁) and settled (k₂) to MinValue") { res =>

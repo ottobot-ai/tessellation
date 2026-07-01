@@ -243,7 +243,20 @@ object NakamotoChainStore {
     //   - `ChainSyncServer.serveSnapshots` answers `NotFound` for hashes not in `byHash`;
     //     historical-query peers can fall back to `serveByRange` (disk-backed) or full
     //     catch-up.
-    keepDepthBehindFinalized: Long = DefaultKeepDepthBehindFinalized
+    keepDepthBehindFinalized: Long = DefaultKeepDepthBehindFinalized,
+    // Track-3 S3 CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`, default false). Selects WHICH
+    // finality marker the store-gate (the `ordinal <= floor` finality-safety refusal in `store`) keys
+    // off:
+    //   - false (default) ⇒ the k₁ `nakamotoFinalizedOrdinalRef` — the legacy write-freeze at operational
+    //     finality (byte-identical to the post-`376d09fbc` baseline; the 2026-06-27 storm backstop).
+    //   - true ⇒ the k₂ `nakamotoSettledOrdinalRef` — a different-hash write in the `(settled, finalized]`
+    //     band is no longer auto-refused here; it is routed to `ChainSelection.shouldSwitch` → `compare`
+    //     (density-revertable). Only at/below the k₂ settled floor does the store-gate freeze.
+    // The different-hash refusal + P-11 `divergentRefuseCounter` semantics are IDENTICAL either way; only
+    // the floor ordinal moves. Kept OFF until a deep-fork sim validates cluster-uniformity (this is
+    // attempt #2 of the reverted `86f390130`, whose store-internal archive marker never fired — here the
+    // settled marker is the live, T_depth2-driven ref shared with `SettledOrdinalTracker`).
+    bandDensityReorgEnabled: Boolean = false
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
 
@@ -393,25 +406,33 @@ object NakamotoChainStore {
                 }
               }.flatten
 
-              nakamotoFinalizedOrdinalRef.get.flatMap { finalized =>
-                // Chain-store API is Long-indexed; compare against the finalized ordinal's Long value.
-                val finalizedLong = finalized.value.value
-                if (ordinal <= finalizedLong) {
+              // Track-3 S3: the store-gate floor. Flag OFF (default) keys off the k₁
+              // `nakamotoFinalizedOrdinalRef` (legacy write-freeze at operational finality — the
+              // 2026-06-27 storm backstop). Flag ON keys off the k₂ `nakamotoSettledOrdinalRef`, so a
+              // different-hash write in the `(settled, finalized]` band is NOT refused here — it falls
+              // through to `tryStore`, where `ChainSelection.shouldSwitch` → `compare` decides the reorg
+              // (density-revertable band). Only at/below the settled floor does the store-gate freeze.
+              val floorRef = if (bandDensityReorgEnabled) nakamotoSettledOrdinalRef else nakamotoFinalizedOrdinalRef
+              floorRef.get.flatMap { floor =>
+                // Chain-store API is Long-indexed; compare against the floor ordinal's Long value.
+                val floorLong = floor.value.value
+                if (ordinal <= floorLong) {
                   stateRef.get.flatMap { state =>
                     state.byHash.values.find(_.ordinal == ordinal).map(_.hash) match {
                       case Some(existingHash) if existingHash =!= snapshotHash =>
-                        // P-11 (#141): the divergent-self-finalize trip-wire. We've already finalized
-                        // a different hash at this ordinal; the incoming write IS the canonical chain
-                        // trying to overwrite our locally-finalized divergent fork. Increment the
-                        // signal counter + record the sample so the RebootstrapOrchestrator can detect
+                        // P-11 (#141): the divergent-self-finalize trip-wire. We've already
+                        // finalized/settled a different hash at this ordinal; the incoming write IS the
+                        // canonical chain trying to overwrite our locally-frozen divergent fork. Increment
+                        // the signal counter + record the sample so the RebootstrapOrchestrator can detect
                         // the lock-out and trigger reset.
                         divergentRefuseCounterRef.update(_ + 1L) >>
                           divergentRefuseSampleRef.set(Some((ordinal, snapshotHash))) >>
                           logger
                             .warn(
-                              s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below finalized=${finalized.show}, " +
+                              s"REFUSED store: finality-safety violation — ordinal=$ordinal is at-or-below " +
+                                s"${if (bandDensityReorgEnabled) "settled(k₂)" else "finalized(k₁)"}=${floor.show}, " +
                                 s"existing=${existingHash.value.take(12)}, new=${snapshotHash.value.take(12)}. " +
-                                s"Dropping write; this node previously finalized the existing snapshot and must not rewrite it. " +
+                                s"Dropping write; this node previously froze the existing snapshot and must not rewrite it. " +
                                 s"[P-11 divergent-refuse counter incremented]"
                             )
                             .as(false)

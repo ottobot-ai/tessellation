@@ -192,4 +192,99 @@ object ChainSelectionSuite extends SimpleIOSuite {
       result <- chainSelection.shouldSwitch(current, candidate)
     } yield expect(!result)
   }
+
+  // ============================================================
+  // Track-3 S3 — band-density deep-reorg (flag ON): the density comparator is COMMUTATIVE (true-MRCA
+  // anchored) and shouldSwitch's revert floor is the k₂ "settled" ordinal (not the k₁ finalized head).
+  // ============================================================
+  //
+  // A band fork off a common ancestor `gAnc` (ordinal 100). Branch A is 4 blocks in a tight slot window
+  // (DENSE); branch B is 2 blocks spread across a wide slot range (SPARSE). Fork depth (4) exceeds the
+  // small kLookback (2), so the density rule (maxvalid-bg) — not the tip tiebreak — decides.
+  private val gAnc = tip("Gband", 100, 100, "rootband", 0x30)
+  private val a1 = tip("a1", 101, 101, "Gband", 0x10)
+  private val a2 = tip("a2", 102, 102, "a1", 0x11)
+  private val a3 = tip("a3", 103, 103, "a2", 0x12)
+  private val a4 = tip("a4", 104, 104, "a3", 0x13)
+  private val b1 = tip("b1", 130, 101, "Gband", 0x20)
+  private val b2 = tip("b2", 160, 102, "b1", 0x21)
+  private val bandGraph: List[ChainTip] = List(gAnc, a1, a2, a3, a4, b1, b2)
+
+  /** ChainSelection over an in-memory chain graph with the band-density flag ON (true-MRCA walk to `maxAncestorDepth`, k₂ settled floor).
+    * `fetchParent` resolves parents from the graph by hash.
+    */
+  private def graphSelection(
+    graph: List[ChainTip],
+    settled: Long = 0L,
+    kLookback: Long = 2L,
+    sWindow: Long = 100L,
+    maxAncestorDepth: Long = 1000L,
+    bandDensityReorgEnabled: Boolean = true
+  ): IO[ChainSelection[IO]] = {
+    val byHash = graph.map(t => t.hash -> t).toMap
+    for {
+      registry <- setupRegistry(Set.empty)
+      tracker <- TipTracker.make[IO](registry)
+    } yield
+      ChainSelection.make[IO](
+        tracker,
+        (t: ChainTip) => IO.pure(byHash.get(t.parentHash)),
+        kLookback = kLookback,
+        sWindow = sWindow,
+        maxAncestorDepth = maxAncestorDepth,
+        settledOrdinalReader = Some(IO.pure(settled)),
+        bandDensityReorgEnabled = bandDensityReorgEnabled
+      )
+  }
+
+  test("S3 densityCompare is COMMUTATIVE on a band fork: compare(A,B) == compare(B,A)") {
+    // The pre-S3 comparator truncated the ancestor walk at kLookback (BEFORE the true fork point for a
+    // band fork) and anchored the density window on the FIRST argument's truncation head, so
+    // compare(A,B) ≠ compare(B,A) — nodes on opposite band branches never converged. With the true-MRCA
+    // (gAnc) anchor the result is identical in both directions (cluster-uniformity).
+    for {
+      cs <- graphSelection(bandGraph)
+      ab <- cs.compare(a4, b2)
+      ba <- cs.compare(b2, a4)
+    } yield expect.same(ab.hash, ba.hash)
+  }
+
+  test("S3 densityCompare: the DENSER branch wins in the band (maxvalid-bg)") {
+    // Branch A packs 5 blocks (gAnc + a1..a4) into the sWindow from the fork point; branch B only 3
+    // (gAnc + b1, b2). Denser wins — regardless of argument order.
+    for {
+      cs <- graphSelection(bandGraph)
+      winnerAB <- cs.compare(a4, b2)
+      winnerBA <- cs.compare(b2, a4)
+    } yield expect.same(a4.hash, winnerAB.hash) && expect.same(a4.hash, winnerBA.hash)
+  }
+
+  test("S3 shouldSwitch: switches onto the denser branch when the fork point is ABOVE the settled floor") {
+    // settled = 50 < fork point (gAnc, ordinal 100): the reorg reverts only b1/b2 (ords 101,102), both
+    // above settled ⇒ the k₂ floor allows it and the denser candidate a4 wins.
+    for {
+      cs <- graphSelection(bandGraph, settled = 50L)
+      switch <- cs.shouldSwitch(b2, a4)
+    } yield expect(switch)
+  }
+
+  test("S3 shouldSwitch: allows the switch when settled == the fork-point ordinal (fork point is preserved)") {
+    // settled = 100 == gAnc.ordinal (the MRCA, common to BOTH branches so it is NOT reverted; the deepest
+    // reverted block is b1 at ord 101 > settled). Refuse iff MRCA < settled ⇒ 100 < 100 is false ⇒ allow.
+    // This boundary is only correct because the walk found the TRUE MRCA (ord 100) — a kLookback-truncated
+    // walk would report no ancestor and wrongly refuse.
+    for {
+      cs <- graphSelection(bandGraph, settled = 100L)
+      switch <- cs.shouldSwitch(b2, a4)
+    } yield expect(switch)
+  }
+
+  test("S3 shouldSwitch: REFUSES the switch when it would revert a block at/below the settled (k₂) floor") {
+    // settled = 101 == b1.ordinal (the deepest block the reorg would revert). MRCA gAnc(100) < settled(101)
+    // ⇒ the switch reverts settled history ⇒ refuse. This is the k₂ absolute floor doing its job.
+    for {
+      cs <- graphSelection(bandGraph, settled = 101L)
+      switch <- cs.shouldSwitch(b2, a4)
+    } yield expect(!switch)
+  }
 }

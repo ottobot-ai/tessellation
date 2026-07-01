@@ -46,6 +46,24 @@ object NakamotoConfigSuite extends SimpleIOSuite {
     )
   }
 
+  pureTest("Track-3 S3: kLookback = k₁+1 and sWindow = round(R/3) derive from per-env k₁; band-density flag defaults OFF") {
+    expect.all(
+      // dev k₁=32 → kLookback=33; R=99 → sWindow=round(33.0)=33
+      nakamoto.kLookback(Dev) == 33L,
+      nakamoto.sWindow(Dev) == 33L,
+      // mainnet k₁=1024 → kLookback=1025; R=3174 → sWindow=round(1058.0)=1058
+      nakamoto.kLookback(Mainnet) == 1025L,
+      nakamoto.sWindow(Mainnet) == 1058L,
+      // testnet/integrationnet k₁=256 → kLookback=257; R=round(793.6)=794 → sWindow=round(264.67)=265
+      nakamoto.kLookback(Testnet) == 257L,
+      nakamoto.sWindow(Testnet) == 265L,
+      nakamoto.kLookback(Integrationnet) == 257L,
+      nakamoto.sWindow(Integrationnet) == 265L,
+      // CONFIG-FLAG defaults OFF (byte-identical k₁-freeze baseline — the 2026-06-27 storm backstop).
+      !nakamoto.bandDensityReorgEnabled
+    )
+  }
+
   pureTest("ldd snowplow parses EXACT fractions from HOCON (baseline=1/20, amplitude=1/2, γ=16) — no Double round-trip") {
     // The whole point of the `fromDoubles` removal: `"1/20"` decodes to EXACTLY `Ratio(1, 20)`, not the garbage
     // 18-digit-denominator rational you get from round-tripping the Double `0.05` through `Ratio(double, 18)`. This
