@@ -628,7 +628,18 @@ object GlobalSnapshotConsensus {
           invaliditySlashingConfig = sharedCfg.nakamoto.invaliditySlashing,
           // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs + surface the bounty slash. SAME instance the
           // leader-produce and `validateArtifact` paths share (this single GSAM). `None` at numShards=1.
-          invalidStateProofValidator = gsamInvalidStateProofValidator
+          invalidStateProofValidator = gsamInvalidStateProofValidator,
+          // Track-1 blocker-2a: the version-retained BY-ORDINAL per-MG `CurrencySnapshotInfo` reader for the gl0 produce + validate rail
+          // (this ONE GSAM serves both). Backed by the CONTIGUOUS `signedBytesStore` (512 finalized ordinals; its bytes reproduce the signed
+          // `stateProof.mptRoot` by construction, so `sidecarFreeMptRoot === mptRoot` holds) + the finalized-chain resolver
+          // `getGlobalSnapshotByOrdinalWithFallback` (carries the pin hash + committed mptRoot). Reachable in `accept()` for the follow-up
+          // I-PIN consumer; not read yet. RETENTION: serves anchors within 512 ordinals of the finalized tip; deeper (toward k₂) hard-rejects
+          // until the §5 disk-backed-k₂ retention lands.
+          pinnedCurrencyInfoReader = Some {
+            implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
+            io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
+              .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback)
+          }
         )
         .toResource
 

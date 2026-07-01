@@ -477,7 +477,15 @@ object GlobalSnapshotAcceptanceManager {
     // `numShards = 1` byte-identical regression bar is preserved independently of this validator.
     invalidStateProofValidator: Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
-    ] = None
+    ] = None,
+    // Track-1 blocker-2a — the version-retained, BY-ORDINAL, per-metagraph `CurrencySnapshotInfo` reader, pinned to
+    // `(ordinal, globalSyncView.hash)` (`PinnedCurrencyInfoReader`). Captured in the `accept()` closure so it is REACHABLE on all three
+    // mptRoot paths: the gl0 produce/validate GSAM (`GlobalSnapshotConsensus.make`, backed by the contiguous `signedBytesStore`) and the
+    // cl0/dl1 `createContext` GSAM (`SharedServices.make`, backed by the `mpt_snapshot_info` store). CONSUMED by the follow-up I-PIN slice,
+    // which reads each metagraph's pinned global prior HERE inside `accept()` instead of the non-deterministic HEAD read
+    // (`lastGlobalSnapshotStorage.getCombined`). `None` (tests / currency-l0) ⇒ the future consumer keeps today's HEAD read ⇒ byte-identical
+    // to pre-2a behavior; this slice only INTRODUCES + wires the reader (it does not yet change `accept()`).
+    pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[F]] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {

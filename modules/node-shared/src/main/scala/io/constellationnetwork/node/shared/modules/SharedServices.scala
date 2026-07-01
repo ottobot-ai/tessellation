@@ -346,6 +346,13 @@ object SharedServices {
         case None =>
           Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
       }
+      // Track-1 blocker-2a: a READ-ONLY per-ordinal state-bytes store over the SAME `mpt_snapshot_info` files this node's finalized-base
+      // producer (`SharedStorages.mptStore`, `FileSystemMerklePatriciaProducer.make(cfg.mptSnapshotInfoPath)`) persists — the follower
+      // `createContext` rail's version-retained byte source for the pinned per-MG reader below. RETENTION CAVEAT: that store prunes with
+      // `LogarithmicOrdinalCutoff` (sparse, gappy below the head), so by-ordinal reads at an arbitrary past ordinal MISS unless it sits on
+      // the logarithmic ladder ⇒ this rail hard-rejects most anchors (surfaced, not worked around — a contiguous/disk-backed follower store
+      // is a later slice). The default cutoff is inert here since this instance only READS (writes/prune go through the producer instance).
+      pinnedByteStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage.make[F](cfg.mptSnapshotInfoPath)
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,
@@ -388,7 +395,16 @@ object SharedServices {
         invaliditySlashingConfig = cfg.nakamoto.invaliditySlashing,
         // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs on the `createContext` path so gl0 followers slash
         // identically and reproduce the signed mptRoot. `None` at numShards=1.
-        invalidStateProofValidator = createContextInvalidStateProofValidator
+        invalidStateProofValidator = createContextInvalidStateProofValidator,
+        // Track-1 blocker-2a: the version-retained BY-ORDINAL per-MG `CurrencySnapshotInfo` reader for the cl0/dl1 `createContext` rail.
+        // Backed by the read-only `pinnedByteStore` (over `mpt_snapshot_info`) + this node's `lastNGlobalSnapshot.getByOrdinal` (carries the
+        // pin hash + committed mptRoot). Reachable in `accept()` for the follow-up I-PIN consumer; not read yet. Delete-override (a later
+        // slice) removes this follower's HEAD fallback, so wiring the by-ordinal reader here is what keeps followers unfrozen then.
+        pinnedCurrencyInfoReader = Some {
+          implicit val h: Hasher[F] = HasherSelector[F].getCurrent
+          io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
+            .make[F](pinnedByteStore, ord => storages.lastNGlobalSnapshot.getByOrdinal(ord))
+        }
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,
