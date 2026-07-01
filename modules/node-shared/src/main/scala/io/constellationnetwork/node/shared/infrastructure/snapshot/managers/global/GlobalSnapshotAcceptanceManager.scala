@@ -1104,42 +1104,17 @@ object GlobalSnapshotAcceptanceManager {
                         case Some(pinnedPrior) =>
                           for {
                             nextInfoRaw <- ChangeSet.reconstructInfoFromDiff[F](mg, pinnedPrior, diff)
-                            // BASE-INDEPENDENT AUTHORITATIVE OVERRIDE (multi-mg per-MG-root determinism). The committee
-                            // `perMetagraphStateDiff` is a DELTA over the PRODUCER's finalized base; when gl0's OWN base S(N)
-                            // lags the producer's (slower catch-up at multi-mg / cross-shard), applying the delta onto gl0's base
-                            // reconstructs the WRONG value for any field with a non-empty base (notably `balances` — the 14 genesis
-                            // keys) → gl0's per-MG root != the committee-attested root → the MG's currency advance is DROPPED in a
-                            // stuck "S(N) lags" deadlock (gl0 can't adopt → its base never catches up → every re-offer mismatches).
-                            // The metagraph PUSHES its authoritative CUMULATIVE balances/active-sets on the signed incremental, so
-                            // OVERRIDE the reconstructed values with them (base-INDEPENDENT) before computing BOTH the per-MG root and
-                            // the committed `nextInfo`. This matches the producer (which commits the same authoritative values via
-                            // `ShardCheckpointWiring`'s `nextAuth`), so the root agrees REGARDLESS of base lag, and the served
-                            // `MgBalances` (built from this committed `nextInfo`) is the authoritative map. The GAP-1 verify below
-                            // still confirms each value hashes to the metagraph's OWN signed proof. Absent (legacy / pre-this-field)
-                            // ⇒ keep the reconstructed value (byte-unchanged). Re-derivable fields (refs, sync-view) stay base+diff.
-                            // `lastTxRefs` is ALSO authoritative-overridden: it is a CUMULATIVE per-source ref map that the base+diff
-                            // reconstruction cannot reproduce when gl0's base lags the producer's (the same base-lag hazard as `balances`),
-                            // so applying the delta onto gl0's base yields the WRONG refs → per-MG root diverges → MG advance dropped, and
-                            // (the symptom) cl1's `/transactions/last-reference` freezes. OVERRIDE with the metagraph's pushed authoritative
-                            // cumulative refs (base-INDEPENDENT, matches the producer's `nextAuth`); the GAP-1 verify below ties it to the
-                            // metagraph's OWN signed `lastTxRefsProof`. Absent (legacy / pre-this-field) ⇒ keep the reconstructed value.
-                            // The OTHER cumulative ref-maps (lastFeeTxRefs / lastAllowSpendRefs / lastTokenLockRefs / lastMessages) are
-                            // authoritative-overridden for the SAME reason as lastTxRefs (base+diff cannot reproduce a cumulative map when gl0's
-                            // base lags the producer's). OVERRIDE each with the metagraph's pushed authoritative map (matches the producer's
-                            // `nextAuth`); the GAP-1 verify below ties each to the metagraph's OWN signed proof. Absent ⇒ keep the reconstructed.
-                            nextInfo = nextInfoRaw.copy(
-                              balances = lastIncremental.value.authoritativeBalances.getOrElse(nextInfoRaw.balances),
-                              activeAllowSpends =
-                                lastIncremental.value.authoritativeActiveAllowSpends.orElse(nextInfoRaw.activeAllowSpends),
-                              activeTokenLocks = lastIncremental.value.authoritativeActiveTokenLocks.orElse(nextInfoRaw.activeTokenLocks),
-                              lastTxRefs = lastIncremental.value.authoritativeLastTxRefs.getOrElse(nextInfoRaw.lastTxRefs),
-                              lastFeeTxRefs = lastIncremental.value.authoritativeLastFeeTxRefs.orElse(nextInfoRaw.lastFeeTxRefs),
-                              lastAllowSpendRefs =
-                                lastIncremental.value.authoritativeLastAllowSpendRefs.orElse(nextInfoRaw.lastAllowSpendRefs),
-                              lastTokenLockRefs =
-                                lastIncremental.value.authoritativeLastTokenLockRefs.orElse(nextInfoRaw.lastTokenLockRefs),
-                              lastMessages = lastIncremental.value.authoritativeLastMessages.orElse(nextInfoRaw.lastMessages)
-                            )
+                            // TRACK-1 DELETE-OVERRIDE (2026-07-01) — the last authoritative override dies here (its producer twin dies in the
+                            // SAME commit at `ShardCheckpointWiring.reExecDerivationWithDiff`). COMMIT THE RECONSTRUCTED `next` VERBATIM.
+                            // Why the override is now redundant: the committee's `perMetagraphStateDiff` is cut over the producer's `infoOf(next)`,
+                            // which `deriveAdoptedCurrencyInfo` (inside `processCurrencySnapshots`) ALREADY populates with the metagraph's
+                            // authoritative CUMULATIVE balances/refs/active-sets — each verified against the signed `stateProof` at derivation time.
+                            // With diff-base-pin (`eb9bf9a5e`) every honest node reads the per-MG prior at the cluster-uniform `diffBaseOrdinal`
+                            // (`pinnedPrior`), the EXACT base the committee diffed over, so applying the diff reconstructs the byte-identical
+                            // `infoOf(next)` — authoritative values included — WITHOUT re-applying them and WITHOUT the S(N)-lags drop-deadlock the
+                            // override was masking. The per-MG root gate (PIN-1, `recomputed === attestedRoot`) + the re-grounded GAP-1 below (bind
+                            // each reconstructed field the tip's `stateProof` actually carries to that signed proof) are the consensus checks now.
+                            nextInfo = nextInfoRaw
                             nextState = Right((lastIncremental, nextInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState
                             // PIN-1: recompute the COMPONENT-ADDRESSABLE per-MG root over the post-apply state via the SAME shared
                             // `currencySnapshotMgRoot` the committee producer used (MG sub-trie rootHash over fieldId-5 + `infoSubFields` `Mg*`
@@ -1148,17 +1123,23 @@ object GlobalSnapshotAcceptanceManager {
                             recomputed <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextState))
                             out <-
                               if (recomputed === attestedRoot)
-                                // GAP-1 verify-by-proof (committee-state-diff / authoritative* fields), gated PER FIELD to the AUTHORITATIVE path:
-                                // when the metagraph PUSHED `authoritativeBalances` / `authoritativeActiveAllowSpends` / `authoritativeActiveTokenLocks`,
-                                // the per-MG root matching the committee attestation only ties the reconstructed value to the PRODUCER's claim, so
-                                // ALSO verify each hashes to the METAGRAPH's OWN signed proof (on the tip incremental's signed `stateProof`) — gl0
-                                // adopts an authoritative value only if it is the one the metagraph itself signed, never a value a Byzantine producer
-                                // fabricated and attested. FAIL-CLOSED on any present-and-mismatched field (drop, do NOT adopt — ALL present fields
-                                // must pass). When a field carries NO authoritative value (legacy / pre-this-field snapshots) it came from the
-                                // re-derived committee diff and has no metagraph-signed map to verify against — `recomputed === attestedRoot` is the
-                                // guarantee, so it is left out of this check (byte-unchanged from before). `balancesProof` is exactly `balances.hash`
-                                // and the active-set proofs are `active*.traverse(_.hash)` (`CurrencySnapshotInfo.stateProof` / `stateProofBuilder`),
-                                // so we hash `nextInfo.{balances,activeAllowSpends,activeTokenLocks}` directly — selector-independent.
+                                // GAP-1 verify-by-proof (Byzantine-producer check), RE-GROUNDED for delete-override (Track-1 3a). The per-MG root
+                                // matching the committee attestation only ties the reconstructed value to the PRODUCER's claim; ALSO bind each
+                                // reconstructed field to the METAGRAPH's OWN signed proof (on the tip incremental's `stateProof`) so gl0 adopts a
+                                // value only if the metagraph itself signed it, never one a Byzantine producer fabricated and attested. FAIL-CLOSED
+                                // on any present-and-mismatched field (drop — ALL present fields must pass).
+                                //
+                                // 3a FIX — gate each Option-valued field on `stateProof.<field>.isDefined`, NOT the removed `authoritative*.isDefined`.
+                                // Reconstruction ALWAYS lifts `.some` on the Option info fields (`reconstructCurrencyInfoFrom` — a partition with no
+                                // entries reconstructs `Some(empty)`), whereas the live metagraph emits genuine `None` (`lastFeeTxRefs` hardcoded None
+                                // in CSAM; `lastMessages` None when message-free) and the signed `stateProof` DISTINGUISHES them (`None -> None`,
+                                // `Some(empty) -> Some(hash(empty))`). A mechanical unconditional compare would then read `Some(hash(empty)) === None`
+                                // = false and fail-close EVERY honest sharded MG every ordinal. So SKIP any field the tip's `stateProof` does not carry
+                                // (its `<field>Proof` is `None`) — the reconstructed `Some(empty)` is MPT-indistinguishable from `None` (both are zero
+                                // partition entries, so `recomputed === attestedRoot` already held) — and COMPARE only the fields the metagraph asserted.
+                                // `balancesProof` / `lastTxRefsProof` are NON-Option `Hash` (always present) ⇒ their compare is UNCONDITIONAL. The
+                                // active-set / ref-map proofs are `Option[Hash]` = `<field>.traverse(_.hash)`, so hash `nextInfo.<field>` directly and
+                                // compare to `stateProof.<field>` (selector-independent).
                                 (
                                   hasher.hash(nextInfo.balances),
                                   nextInfo.activeAllowSpends.traverse(hasher.hash(_)),
@@ -1179,34 +1160,30 @@ object GlobalSnapshotAcceptanceManager {
                                         reconstructedLastTokenLockRefsProof,
                                         reconstructedLastMessagesProof
                                       ) =>
-                                    val balancesOk =
-                                      !lastIncremental.value.authoritativeBalances.isDefined ||
-                                        reconstructedBalancesProof === lastIncremental.value.stateProof.balancesProof
+                                    val sp = lastIncremental.value.stateProof
+                                    // `balancesProof` / `lastTxRefsProof` are NON-Option `Hash` (the metagraph ALWAYS asserts them) ⇒ UNCONDITIONAL
+                                    // compare. On the sharded path `nextInfo.{balances,lastTxRefs}` reconstructs the committee's `infoOf(next)`, whose
+                                    // balances/refs `deriveAdoptedCurrencyInfo` already bound to exactly these signed proofs — so the honest path passes
+                                    // and a Byzantine-fabricated map (hash != signed) fails closed.
+                                    val balancesOk = reconstructedBalancesProof === sp.balancesProof
+                                    val lastTxRefsOk = reconstructedLastTxRefsProof === sp.lastTxRefsProof
+                                    // Option-valued fields: SKIP when the tip's `stateProof` does not carry the field (3a — the reconstructed
+                                    // `Some(empty)` is MPT-indistinguishable from the metagraph's `None`), else bind the reconstructed value to the
+                                    // metagraph's OWN signed proof (fail-closed on mismatch).
                                     val activeAllowSpendsOk =
-                                      !lastIncremental.value.authoritativeActiveAllowSpends.isDefined ||
-                                        reconstructedActiveAllowSpends === lastIncremental.value.stateProof.activeAllowSpends
+                                      !sp.activeAllowSpends.isDefined || reconstructedActiveAllowSpends === sp.activeAllowSpends
                                     val activeTokenLocksOk =
-                                      !lastIncremental.value.authoritativeActiveTokenLocks.isDefined ||
-                                        reconstructedActiveTokenLocks === lastIncremental.value.stateProof.activeTokenLocks
-                                    // `lastTxRefsProof` is a non-Option `Hash` = `lastTxRefs.hash` (`CurrencySnapshotInfo.stateProof`), so hash
-                                    // `nextInfo.lastTxRefs` directly and tie the authoritative map to the metagraph's OWN signed proof.
-                                    val lastTxRefsOk =
-                                      !lastIncremental.value.authoritativeLastTxRefs.isDefined ||
-                                        reconstructedLastTxRefsProof === lastIncremental.value.stateProof.lastTxRefsProof
-                                    // The OTHER ref-map proofs are `Option[Hash]` = `<field>.traverse(_.hash)`; tie each pushed authoritative map
-                                    // to the metagraph's OWN signed proof (same fail-closed gate).
+                                      !sp.activeTokenLocks.isDefined || reconstructedActiveTokenLocks === sp.activeTokenLocks
                                     val lastFeeTxRefsOk =
-                                      !lastIncremental.value.authoritativeLastFeeTxRefs.isDefined ||
-                                        reconstructedLastFeeTxRefsProof === lastIncremental.value.stateProof.lastFeeTxRefsProof
+                                      !sp.lastFeeTxRefsProof.isDefined || reconstructedLastFeeTxRefsProof === sp.lastFeeTxRefsProof
                                     val lastAllowSpendRefsOk =
-                                      !lastIncremental.value.authoritativeLastAllowSpendRefs.isDefined ||
-                                        reconstructedLastAllowSpendRefsProof === lastIncremental.value.stateProof.lastAllowSpendRefsProof
+                                      !sp.lastAllowSpendRefsProof.isDefined ||
+                                        reconstructedLastAllowSpendRefsProof === sp.lastAllowSpendRefsProof
                                     val lastTokenLockRefsOk =
-                                      !lastIncremental.value.authoritativeLastTokenLockRefs.isDefined ||
-                                        reconstructedLastTokenLockRefsProof === lastIncremental.value.stateProof.lastTokenLockRefsProof
+                                      !sp.lastTokenLockRefsProof.isDefined ||
+                                        reconstructedLastTokenLockRefsProof === sp.lastTokenLockRefsProof
                                     val lastMessagesOk =
-                                      !lastIncremental.value.authoritativeLastMessages.isDefined ||
-                                        reconstructedLastMessagesProof === lastIncremental.value.stateProof.lastMessagesProof
+                                      !sp.lastMessagesProof.isDefined || reconstructedLastMessagesProof === sp.lastMessagesProof
                                     if (
                                       balancesOk && activeAllowSpendsOk && activeTokenLocksOk && lastTxRefsOk && lastFeeTxRefsOk &&
                                       lastAllowSpendRefsOk && lastTokenLockRefsOk && lastMessagesOk
@@ -1215,12 +1192,12 @@ object GlobalSnapshotAcceptanceManager {
                                     else
                                       loggerBundle.app
                                         .warn(
-                                          s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} authoritative field != metagraph-signed " +
+                                          s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} reconstructed field != metagraph-signed " +
                                             s"proof — DROP (balancesOk=$balancesOk activeAllowSpendsOk=$activeAllowSpendsOk " +
                                             s"activeTokenLocksOk=$activeTokenLocksOk lastTxRefsOk=$lastTxRefsOk lastFeeTxRefsOk=$lastFeeTxRefsOk " +
                                             s"lastAllowSpendRefsOk=$lastAllowSpendRefsOk lastTokenLockRefsOk=$lastTokenLockRefsOk " +
                                             s"lastMessagesOk=$lastMessagesOk reconstructedBalancesProof=${reconstructedBalancesProof.value
-                                                .take(16)}... metagraphSignedBalancesProof=${lastIncremental.value.stateProof.balancesProof.value
+                                                .take(16)}... metagraphSignedBalancesProof=${sp.balancesProof.value
                                                 .take(16)}...)"
                                         )
                                         .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])

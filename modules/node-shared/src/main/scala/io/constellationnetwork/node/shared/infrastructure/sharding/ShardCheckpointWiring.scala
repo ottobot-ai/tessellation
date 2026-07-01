@@ -5,7 +5,7 @@ import cats.data.NonEmptyList
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
-import scala.collection.immutable.{Map, SortedMap, SortedSet}
+import scala.collection.immutable.{Map, SortedMap}
 
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.json.JsonSerializer
@@ -21,14 +21,10 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageType}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
-import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
-import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
-import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -313,95 +309,49 @@ object ShardCheckpointWiring {
                       accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
                     lastStateOpt match {
                       case Some(next) =>
-                        // CONTIGUITY GATE (I3 / run-27b). The window MUST chain from the FINALIZED base prior. `AdoptFromSignedFields`
-                        // accumulates `next` OVER `priorInfo` (the base, read via `fromMptStore`). The window anchors at the shard chain's
-                        // `bestTip` (`perMgTip`), so for an ACTIVE MG whose adopted checkpoints have not yet finalized (`bestTip > base`),
-                        // the window's binaries chain from `bestTip`, NOT base — folding them onto base silently DROPS the base→bestTip
-                        // events and yields a WRONG `next`. Every gl0 then recomputes the real root over the same base, mismatches the
-                        // attested (wrong) root, and WITHHOLDS the MG ⇒ permanent freeze (run-27b DAG5L1ez). Detect the gap by ordinal: a
-                        // window that chains from base advances `base.ordinal` by EXACTLY `windowSize`. On a gap, OMIT (defer) — base catches
-                        // up when the in-flight checkpoints finalize, then the next checkpoint covers `base→latest` in ONE contiguous burst
-                        // and the MG self-heals (mirror stays current: gl0 adopts the burst to `latest`). Genesis priors (`Left`/`None`) are
-                        // seeded by the window itself, so the gate only constrains an incremental (`Right`) base. Deterministic: base + the
-                        // signed window are identical on every committee member, so the OMIT decision is cluster-uniform.
+                        // TRACK-1 DELETE-OVERRIDE (2026-07-01) — the producer twin of the authoritative override dies here (its GSAM adopter
+                        // twin dies in the SAME commit). EMIT `infoOf(next)` VERBATIM. The override re-applied the metagraph's authoritative
+                        // balances/refs/active-sets onto the re-exec output, but `deriveAdoptedCurrencyInfo` (inside `processCurrencySnapshots`,
+                        // the SAME derivation this closure runs) ALREADY populates `infoOf(next)` with those exact maps — each verified against the
+                        // signed `stateProof` at derivation time — so `infoOf(next).copy(authX.getOrElse(infoOf(next).X))` was byte-for-byte
+                        // `infoOf(next)`. The attested per-MG root + the committee diff are cut over this `infoOf(next)`; every gl0 verifier
+                        // reconstructs it byte-identically from the diff over the SAME `diffBaseOrdinal`-pinned prior, and its GAP-1 (re-grounded on
+                        // `stateProof.<field>.isDefined`) binds the reconstructed value to the metagraph's own signature.
+                        //
+                        // CONTIGUITY (I3 / run-27b) — RELAXED to advisory. The window anchors at `finalizedBasePerMgTip` (S2 §4) and the diff prior
+                        // is read at `diffBaseOrdinal` — the SAME finalized base by construction — so a window chaining from the base advances
+                        // `base.ordinal` by EXACTLY `windowSize`; the old OMIT is now an invariant. Keep the check as a diagnostic only (a violation
+                        // means a base read-skew, caught fail-closed downstream by the adopter's now-unconditional GAP-1 balances/refs compare — a
+                        // drop, never silent corruption) and PROCEED to derive rather than defer (removing a false-defer liveness hazard).
                         val contiguousWithBase: Boolean = (priorOpt, next) match {
                           case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
                             nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
                           case _ => true
                         }
-                        if (!contiguousWithBase)
-                          reExecDiagLogger
-                            .warn(
-                              s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with finalized base " +
-                                s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
-                                    .map(_._1.value.ordinal.value.value)
-                                    .getOrElse(-1L)}) — bestTip>base, OMIT (defer until base finalizes)"
-                            )
-                            .as(None: Option[(Hash, ChangeSet)])
-                        else {
-                          // AUTHORITATIVE BALANCES (committee-state-diff / data-with-fee fix). The metagraph pushes its OWN cumulative
-                          // balance map on the signed incremental (`CurrencyIncrementalSnapshot.authoritativeBalances`) — the exact map its
-                          // `stateProof.balancesProof` is hashed over. gl0's re-exec derivation (`infoOf(next)`) cannot reproduce that map
-                          // for a path-dependent metagraph (fee/token-lock/spend effects over a base gl0 never executed), so for the SHARDED
-                          // adopt path we OVERRIDE the derived `balances` with the metagraph's authoritative map BEFORE computing both the
-                          // attested per-MG root and the committee diff. The DESERIALIZED incremental is in `next` (the `Right._1`); read it
-                          // there, NOT by re-parsing `binaries.head` (those are serialized `StateChannelSnapshotBinary`). Genesis (`Left`)
-                          // carries no `authoritativeBalances` ⇒ `next` is left as-is (its `infoOf` reads the genesis embedded balances).
-                          // gl0's apply side then re-verifies hash(authoritativeBalances) === the metagraph-signed `balancesProof` before
-                          // committing (GAP-1 verify-by-proof in `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`).
-                          val authBal: Option[SortedMap[Address, Balance]] = next.toOption.flatMap(_._1.value.authoritativeBalances)
-                          // Active-allow-spend / active-token-lock authoritative maps (committee-state-diff follow-up): same anchor as balances,
-                          // but Option-shaped, so OVERRIDE only when the metagraph pushed a value (`orElse` falls back to the derived set when
-                          // the metagraph carried `None`). Reduced by cross-shard spends gl0 cannot replay, so the derived set would be stale.
-                          val authAS: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-                            next.toOption.flatMap(_._1.value.authoritativeActiveAllowSpends)
-                          val authTL: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-                            next.toOption.flatMap(_._1.value.authoritativeActiveTokenLocks)
-                          // Authoritative cumulative last-tx-refs (committee-state-diff / cl1-lastRef-freeze fix): same anchor as balances. The
-                          // re-exec `infoOf(next)` rebuilds a per-incremental ref set that diverges from the metagraph's CUMULATIVE map, so OVERRIDE
-                          // it on BOTH the attested root and the diff — keeping the committee producer and the gl0 adopt side byte-identical.
-                          val authTxRefs: Option[SortedMap[Address, TransactionReference]] =
-                            next.toOption.flatMap(_._1.value.authoritativeLastTxRefs)
-                          // The OTHER authoritative cumulative ref-maps (lastFeeTxRefs / lastAllowSpendRefs / lastTokenLockRefs / lastMessages):
-                          // same anchor as lastTxRefs. OVERRIDE each on BOTH the attested root and the diff so the producer and the gl0 adopt side
-                          // commit byte-identical per-MG roots regardless of base lag.
-                          val authFeeTxRefs: Option[SortedMap[Address, TransactionReference]] =
-                            next.toOption.flatMap(_._1.value.authoritativeLastFeeTxRefs)
-                          val authAllowSpendRefs: Option[SortedMap[Address, AllowSpendReference]] =
-                            next.toOption.flatMap(_._1.value.authoritativeLastAllowSpendRefs)
-                          val authTokenLockRefs: Option[SortedMap[Address, TokenLockReference]] =
-                            next.toOption.flatMap(_._1.value.authoritativeLastTokenLockRefs)
-                          val authMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]] =
-                            next.toOption.flatMap(_._1.value.authoritativeLastMessages)
-                          val nextInfo: CurrencySnapshotInfo = infoOf(next).copy(
-                            balances = authBal.getOrElse(infoOf(next).balances),
-                            activeAllowSpends = authAS.orElse(infoOf(next).activeAllowSpends),
-                            activeTokenLocks = authTL.orElse(infoOf(next).activeTokenLocks),
-                            lastTxRefs = authTxRefs.getOrElse(infoOf(next).lastTxRefs),
-                            lastFeeTxRefs = authFeeTxRefs.orElse(infoOf(next).lastFeeTxRefs),
-                            lastAllowSpendRefs = authAllowSpendRefs.orElse(infoOf(next).lastAllowSpendRefs),
-                            lastTokenLockRefs = authTokenLockRefs.orElse(infoOf(next).lastTokenLockRefs),
-                            lastMessages = authMessages.orElse(infoOf(next).lastMessages)
+                        val nextInfo: CurrencySnapshotInfo = infoOf(next)
+                        for {
+                          _ <-
+                            if (contiguousWithBase) Async[F].unit
+                            else
+                              reExecDiagLogger.warn(
+                                s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with pinned diff-base " +
+                                  s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
+                                      .map(_._1.value.ordinal.value.value)
+                                      .getOrElse(-1L)}) — base read-skew; proceeding (GAP-1 is the fail-closed net)"
+                              )
+                          // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
+                          // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. The gl0 follower
+                          // recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state — all three PIN-1 sites route through that
+                          // one helper, so the bytes are identical by construction.
+                          root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> next))
+                          // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
+                          // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
+                          cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
+                          _ <- reExecDiagLogger.info(
+                            s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
                           )
-                          // Carry the authoritative balances on BOTH the attested root and the diff (consistency): build a `next` whose info
-                          // half has `balances = authBal` so the per-MG root commits to the authoritative map, matching the diff.
-                          val nextAuth: CurrencyState = next.map { case (inc, _) => (inc, nextInfo) }
-                          for {
-                            // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
-                            // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. REPLACES the old flat
-                            // `hash((incrementalRoot, infoRoot))` so a single-field/single-account inclusion proof verifies against it
-                            // (ShardSubtreeProofService). The gl0 follower recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply
-                            // state — all three PIN-1 sites route through that one helper, so the bytes are identical by construction.
-                            root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextAuth))
-                            // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
-                            // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
-                            cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextAuth))
-                            _ <- reExecDiagLogger.info(
-                              s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
-                            )
-                            diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, nextInfo)
-                          } yield Some((root, diff)): Option[(Hash, ChangeSet)]
-                        }
+                          diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, nextInfo)
+                        } yield Some((root, diff)): Option[(Hash, ChangeSet)]
                       case None =>
                         // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
                         // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's

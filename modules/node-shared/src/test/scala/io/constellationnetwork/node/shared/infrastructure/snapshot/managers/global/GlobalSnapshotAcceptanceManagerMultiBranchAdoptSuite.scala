@@ -138,7 +138,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   /** A `Signed[CurrencyIncrementalSnapshot]` built with a sentinel proof (no keypair needed — the GSAM only round-trips it through the
     * `LastIncrementalCurrencySnapshots` codec and re-hashes its bytes for the `incrementalRoot`; signature validity is irrelevant here).
     */
-  private def mkSignedIncremental(snapOrdinal: Long): Signed[CurrencyIncrementalSnapshot] = {
+  private def mkSignedIncremental(
+    snapOrdinal: Long,
+    // TRACK-1 delete-override: the tip incremental's SIGNED stateProof is now load-bearing at the GSAM adopt path's re-grounded GAP-1
+    // (the now-unconditional `balances`/`lastTxRefs` compare binds the reconstructed value to THIS proof). Default = the all-empty sentinel
+    // for callers that only need the base-seed incremental (its stateProof is never GAP-1-checked — the base reconstructs from the `Mg*`
+    // partitions). The ADOPT tests (A/B/C) pass `nextInfo.stateProof` so the tip proof is consistent with the committed post-state.
+    stateProof: CurrencySnapshotStateProof = CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None)
+  ): Signed[CurrencyIncrementalSnapshot] = {
     val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("33" * 64)), Signature(Hex("44" * 70)))
     val snap = CurrencyIncrementalSnapshot(
       ordinal = SnapshotOrdinal.unsafeApply(snapOrdinal),
@@ -148,7 +155,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       blocks = SortedSet.empty,
       rewards = SortedSet.empty,
       tips = SnapshotTips(SortedSet.empty, SortedSet.empty),
-      stateProof = CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None),
+      stateProof = stateProof,
       epochProgress = EpochProgress.MinValue,
       dataApplication = None,
       messages = None,
@@ -773,6 +780,10 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     res =>
       implicit val (h, sp, j) = res
       for {
+        // TRACK-1 delete-override: the tip incremental carries `nextInfo`'s signed stateProof so the re-grounded GAP-1 (now-unconditional
+        // balances/lastTxRefs compare) binds the reconstructed value to the metagraph's OWN proof and ADOPTS. Shadows the class `inc`.
+        tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+        inc = mkSignedIncremental(2L, tipProof)
         store <- freshStore
         // Constraint 1 (Right-arm-with-diff): seed the FINALIZED BASE with the MG's prior currency info (`basePriorRT`).
         basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
@@ -816,6 +827,10 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   test("(B) CONTROL: SAME checkpoint/diff/attestedRoot but parentTip == base (branch == base) ⇒ MG IS ADOPTED (currency advances)") { res =>
     implicit val (h, sp, j) = res
     for {
+      // TRACK-1 delete-override: tip incremental carries `nextInfo`'s signed stateProof so the re-grounded GAP-1 balances/lastTxRefs
+      // compare binds to the metagraph's OWN proof and ADOPTS. Shadows the class `inc`.
+      tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      inc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
       truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
@@ -851,6 +866,10 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   ) { res =>
     implicit val (h, sp, j) = res
     for {
+      // TRACK-1 delete-override: tip incremental carries `nextInfo`'s signed stateProof so the re-grounded GAP-1 balances/lastTxRefs
+      // compare binds to the metagraph's OWN proof and ADOPTS. Shadows the class `inc`.
+      tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      inc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
       truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
@@ -862,5 +881,48 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
       gsi <- runAccept(mgr, checkpoint, parentTip = childTip, lastSnapshotInfo = gsiWith(mg, inc, branchPriorRaw))
     } yield expect(advancedTo(gsi, mg, nextInfo)) // GREEN under S1 (base-anchored follower); was RED on HEAD (branch-anchored).
+  }
+
+  // ============================================================================
+  // (D) 3a GATE — genuine-`None` optional fields (lastFeeTxRefs / lastMessages) must ADOPT after the override is gone, NOT fail-closed drop.
+  // ============================================================================
+  //
+  // Delete-override made GAP-1 the load-bearing per-field binding. `reconstructInfoFromDiff` ALWAYS lifts `.some` on the optional info
+  // fields (a partition with no entries reconstructs `Some(empty)`), but the live metagraph emits genuine `None` (`lastFeeTxRefs` hardcoded
+  // None in CSAM; `lastMessages` None when message-free), and the SIGNED stateProof DISTINGUISHES them (`None -> None`, `Some(empty) ->
+  // Some(hash(empty))`). A mechanical unconditional compare would then read `Some(hash(empty)) === None` = false and DROP every honest
+  // sharded MG every ordinal — the 3a fail-close. The re-grounded gate SKIPS any field the tip's stateProof does not carry, so the MG
+  // ADOPTS. This pins BOTH the divergence (reconstruct = Some(empty) where the signed proof = None) AND the ADOPT outcome. `nextInfo`
+  // (`infoWithBalance`) carries `lastFeeTxRefs = None` + `lastMessages = None`, so its stamped tip proof carries `None` for both.
+  test("(D) 3a GATE: reconstruct = Some(empty) for genuine-None fields the metagraph left None ⇒ MG still ADOPTS (no fail-closed drop)") {
+    res =>
+      implicit val (h, sp, j) = res
+      for {
+        tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+        inc = mkSignedIncremental(2L, tipProof)
+        store <- freshStore
+        basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
+        truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
+        (wireDiff, attestedRoot) = truth
+        // The 3a divergence made explicit: the committee cut the diff over `infoOf(next)` whose `lastFeeTxRefs`/`lastMessages` are genuine
+        // `None`, yet the follower's `reconstructInfoFromDiff` lifts them to `Some(empty)`.
+        reconstructed <- ChangeSet.reconstructInfoFromDiff[IO](mg, basePriorRT, ChangeSet.fromWire(wireDiff))
+        checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
+        ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
+        (overlay, baseTip) = ob
+        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
+        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiWith(mg, inc, basePriorRaw))
+      } yield
+        expect.all(
+          // The follower reconstructs `Some(empty)` for the fields the metagraph left `None` — the 3a divergence is real, not hypothetical.
+          reconstructed.lastFeeTxRefs.exists(_.isEmpty),
+          reconstructed.lastMessages.exists(_.isEmpty),
+          // The metagraph's SIGNED tip proof carries genuine `None` for those same fields (a mechanical compare would mismatch → drop).
+          inc.value.stateProof.lastFeeTxRefsProof.isEmpty,
+          inc.value.stateProof.lastMessagesProof.isEmpty,
+          // Yet the MG ADOPTS — the field-presence gate skips the None fields instead of fail-closing on Some(empty)-vs-None.
+          advancedTo(gsi, mg, nextInfo)
+        )
   }
 }
