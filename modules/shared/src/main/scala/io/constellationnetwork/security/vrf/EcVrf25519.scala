@@ -165,9 +165,9 @@ class EcVrf25519 {
 object EcVrf25519 {
 
   /** Shared stateless singleton. `EcVrf25519` carries no per-instance mutable state — all methods read their inputs and write to fresh
-    * arrays — so a single process-wide instance suffices. Callers (`EligibilityChecker`, `CommitteeSortition`, `NakamotoProposer`,
-    * `NakamotoSyncDaemon`) should use this rather than `new EcVrf25519()` to avoid pointless allocation. Tests may still `new EcVrf25519()`
-    * for isolation but typically don't need to.
+    * arrays — so a single process-wide instance suffices. Callers (`EligibilityChecker`, `CommitteeSortition`, `NakamotoSyncDaemon`) should
+    * use this rather than `new EcVrf25519()` to avoid pointless allocation. Tests may still `new EcVrf25519()` for isolation but typically
+    * don't need to.
     */
   val default: EcVrf25519 = new EcVrf25519
 

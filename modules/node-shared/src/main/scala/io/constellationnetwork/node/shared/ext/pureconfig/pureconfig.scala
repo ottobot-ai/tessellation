@@ -8,6 +8,7 @@ import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.ext.http4s.AddressVar
 import io.constellationnetwork.node.shared.config.types.{PriceOracleConfig, RouteRateLimiterConfig}
 import io.constellationnetwork.node.shared.domain.statechannel.FeeCalculatorConfig
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
@@ -20,6 +21,7 @@ import io.constellationnetwork.security.hex.Hex
 
 import _root_.pureconfig.ConvertHelpers.catchReadError
 import _root_.pureconfig.configurable.genericMapReader
+import _root_.pureconfig.error.CannotConvert
 import _root_.pureconfig.generic.auto._
 import _root_.pureconfig.module.cats.nonEmptySetReader
 import _root_.pureconfig.{ConfigReader, ConfigWriter}
@@ -49,6 +51,25 @@ package object pureconfig {
     genericMapReader(catchReadError(AppEnvironment.withName))
   implicit val envToRouteRateLimiterConfigReader: ConfigReader[Map[AppEnvironment, RouteRateLimiterConfig]] =
     genericMapReader(catchReadError(AppEnvironment.withName))
+
+  // Exact rational config values (e.g. the LDD snowplow fB/fA difficulties) written as `"n/d"` or `"n"` in HOCON — parsed
+  // straight into the consensus-deterministic `Ratio`, NEVER through `Double`. This keeps the config value byte-identical to the
+  // intended fraction (`"1/20"` → `Ratio(1,20)`, exactly) instead of round-tripping `0.05` through IEEE-754 into a garbage denominator.
+  implicit val ratioReader: ConfigReader[Ratio] = ConfigReader[String].emap { raw =>
+    raw.trim.split("/").map(_.trim) match {
+      case Array(n) =>
+        scala.util.Try(Ratio(BigInt(n))).toEither.left.map(e => CannotConvert(raw, "Ratio", e.getMessage))
+      case Array(n, d) =>
+        scala.util.Try {
+          val denom = BigInt(d)
+          require(denom.signum != 0, "denominator must be non-zero")
+          Ratio(BigInt(n), denom)
+        }.toEither.left
+          .map(e => CannotConvert(raw, "Ratio", e.getMessage))
+      case _ =>
+        Left(CannotConvert(raw, "Ratio", s"expected an exact fraction 'n/d' or integer 'n', got '$raw'"))
+    }
+  }
 
   implicit val addressReader: ConfigReader[Address] = ConfigReader[String].map(AddressVar.unapply).map(_.get)
   implicit val tokenPairToBigdecimalReader: ConfigReader[Map[TokenPair, BigDecimal]] = genericMapReader(catchReadError {

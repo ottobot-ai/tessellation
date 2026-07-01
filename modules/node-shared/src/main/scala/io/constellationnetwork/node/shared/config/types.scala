@@ -8,6 +8,7 @@ import scala.concurrent.duration.{DurationInt, FiniteDuration}
 
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.node.shared.domain.statechannel.FeeCalculatorConfig
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.epoch.EpochProgress
@@ -89,8 +90,8 @@ object types {
     * resolve the env from the wrapping `SharedConfig.environment` and pass it once (see the call sites in `GlobalSnapshotConsensus` /
     * `CurrencyL0App` / `SharedServices`).
     *
-    * Other `NAKAMOTO_*` env vars (LDD knobs, slots-per-epoch, etc.) are NOT migrated here — Wave 2 of the sys.env-to-HOCON sweep handles
-    * the rest of the namespace in one pass.
+    * Other `NAKAMOTO_*` tunables (the LDD knobs, slot duration) are likewise typed under `nakamoto.*` and resolved via
+    * `SharedConfig.nakamoto`, not `sys.env`.
     */
   case class NakamotoConfig(
     // Confirmation depth k₁ — the single loaded consensus-depth knob, now PER-ENVIRONMENT (`nakamoto.confirmation-depth-k` block:
@@ -101,10 +102,9 @@ object types {
     // Drives the gl0 SnapshotLeaderLoop slot tick AND the per-slot shard-checkpoint lottery. Migrated from the
     // `NAKAMOTO_SLOT_DURATION_MS` sys.env read in SnapshotLeaderLoop (project rule: HOCON over scattered env reads).
     slotDurationMs: PosLong,
-    // gl0 LDD snowplow — consensus-critical; defaults mirror LddConfig.Default. Converted once via
-    // LddConfig.fromDoubles at the wiring site (exact rationals on the consensus path from there on).
+    // gl0 LDD snowplow — consensus-critical; read from HOCON as EXACT rationals (`baseline`/`amplitude` = `"n/d"`),
+    // mapped 1:1 to `LddConfig` at the wiring site. No Double, no source-level default (config is authoritative).
     ldd: GlobalLddConfig,
-    slotsPerEpoch: PosLong,
     // Coordinated genesis time (epoch ms); 0 = unset -> local-clock fallback with WARN (solo dev only).
     genesisTimeMs: NonNegLong,
     genesisEtaSeed: String,
@@ -156,12 +156,14 @@ object types {
       PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
   }
 
-  /** HOCON shape for the gl0 LDD snowplow (see [[NakamotoConfig.ldd]]). */
+  /** HOCON shape for the gl0 LDD snowplow (see [[NakamotoConfig.ldd]]). `baseline` (fB) and `amplitude` (fA) are EXACT rationals read
+    * straight from `"n/d"` strings via the `Ratio` ConfigReader — no `Double`, no embedded defaults (config is authoritative).
+    */
   case class GlobalLddConfig(
-    cutoff: Int = 15,
-    offset: Int = 1,
-    baseline: Double = 0.05,
-    amplitude: Double = 0.5
+    cutoff: Int,
+    offset: Int,
+    baseline: Ratio,
+    amplitude: Ratio
   )
 
   object NakamotoConfig {
@@ -222,11 +224,12 @@ object types {
     *   - `watchtowerEnabled`: master switch for the watchtower approval-check (the per-checkpoint re-execution + fraud-proof gossip).
     *     Default `true` at `numShards > 1`; INERT at `numShards = 1` (no committee checkpoints exist). Turning it off disables fraud-proof
     *     emission (the dispute consumer + slash still run if an envelope arrives, but no node produces one).
-    *   - `slashFraction`: fraction of the offender's combined (delegated + collateral) stake destroyed. Default `1.0` (total loss — the
-    *     `InvalidStateProof` tier is the maximum severity; a single proven wrong derivation = total loss). A value `< 1.0` reduces
-    *     delegated stake proportionally and still fully removes collateral (collateral has no partial-amount slot — conservative).
-    *   - `bountyFraction`: fraction of the slashed pool credited to the fraud-proof submitter; the remainder burns. Default `0.05` (5%) —
-    *     enough to incentivise running a watchtower, not enough for a self-attacker to recover via self-submission (95% burns).
+    *   - `slashFraction`: exact `Ratio` — fraction of the offender's combined (delegated + collateral) stake destroyed. Production `"1/1"`
+    *     (total loss — the `InvalidStateProof` tier is the maximum severity; a single proven wrong derivation = total loss). A value `< 1`
+    *     reduces delegated stake proportionally and still fully removes collateral (collateral has no partial-amount slot).
+    *   - `bountyFraction`: exact `Ratio` — fraction of the slashed pool credited to the fraud-proof submitter; the remainder burns.
+    *     Production `"1/20"` (5%) — enough to incentivise running a watchtower, not enough for a self-attacker to recover via
+    *     self-submission (95% burns).
     *   - `cooldownEpochs`: epochs the slashed operator is excluded from the active set (cannot rejoin a committee / contribute to quorum).
     *     Default `100`, matching the equivocation cooldown in `SLASHING-DESIGN.md` §6.
     *
@@ -238,8 +241,10 @@ object types {
     */
   case class InvalidStateProofSlashingConfig(
     watchtowerEnabled: Boolean,
-    slashFraction: Double,
-    bountyFraction: Double,
+    // slashFraction / bountyFraction are EXACT `Ratio` (HOCON `"n/d"` → Ratio via ConfigReader, never Double): the slash reduces
+    // stake by these fractions and the result seeds the global mptRoot, so the arithmetic MUST be exact + byte-identical cluster-wide.
+    slashFraction: Ratio,
+    bountyFraction: Ratio,
     cooldownEpochs: Long
   )
 

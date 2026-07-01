@@ -21,16 +21,17 @@ import io.constellationnetwork.security.hash.Hash
   *
   * '''Why peek (not drain) on produce.''' A produced snapshot may not finalize (fork). Removing on produce would lose the dispute on a
   * losing fork. Instead the producer peeks; an entry stays until its checkpoint is durably slashed, after which the accept-path validator's
-  * double-slash guard (`InvalidStateProofSlashedReader.wasSlashed` over the `Slashings` MPT partition) returns `AlreadySlashed` ⇒ the carried
-  * evidence is embedded-but-inert (no double slash). Bounded capacity ages out stale/slashed entries so the pool cannot grow unbounded.
+  * double-slash guard (`InvalidStateProofSlashedReader.wasSlashed` over the `Slashings` MPT partition) returns `AlreadySlashed` ⇒ the
+  * carried evidence is embedded-but-inert (no double slash). Bounded capacity ages out stale/slashed entries so the pool cannot grow
+  * unbounded.
   *
   * '''Canonical `SortedSet`''' ordered by `InvalidStateProofEvidence`'s `(shardId, disputedCheckpointHash)` `Order` — the SAME identity the
   * snapshot `fraudProofs` field uses, so the embedded set is byte-deterministic and re-offers of the same dispute coalesce.
   *
   * '''Determinism note.''' The pool's contents are node-local and gossip-timing-dependent (different leaders may hold different disputes),
-  * exactly like the per-shard checkpoint candidate selection. That is fine: the LEADER's embedded set rides into the signed snapshot, and the
-  * follower/peer thread THAT embedded set (never their own pool) into accept(), so the byte-exact `recreatedArtifact === artifact` round-trip
-  * holds — mirroring the `shardCheckpoints` split-safety invariant.
+  * exactly like the per-shard checkpoint candidate selection. That is fine: the LEADER's embedded set rides into the signed snapshot, and
+  * the follower/peer thread THAT embedded set (never their own pool) into accept(), so the byte-exact `recreatedArtifact === artifact`
+  * round-trip holds — mirroring the `shardCheckpoints` split-safety invariant.
   */
 trait WatchtowerFraudProofPool[F[_]] {
 

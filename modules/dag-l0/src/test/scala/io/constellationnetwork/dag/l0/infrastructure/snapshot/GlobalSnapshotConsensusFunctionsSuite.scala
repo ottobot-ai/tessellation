@@ -419,7 +419,14 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           collateral,
           EpochProgress(NonNegLong(136080L)),
           mptOverlay,
-          dbLogger
+          dbLogger,
+          etaRotationSnapshots = 2550L,
+          invaliditySlashingConfig = InvalidStateProofSlashingConfig(
+            watchtowerEnabled = true,
+            slashFraction = io.constellationnetwork.numerics.Ratio.One,
+            bountyFraction = io.constellationnetwork.numerics.Ratio(1, 20),
+            cooldownEpochs = 100L
+          )
         )
       rewardsInfoStorage <- RewardsInfoStorage.make
       // §G5: wire the same MPT-backed state managers used by the production code path. The test's

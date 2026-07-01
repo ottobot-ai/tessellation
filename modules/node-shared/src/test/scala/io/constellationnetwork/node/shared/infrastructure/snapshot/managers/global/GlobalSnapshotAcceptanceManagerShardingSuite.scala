@@ -556,7 +556,14 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
                     // partition this same GSAM writes). `None` for non-watchtower tests.
                     invalidStateProofValidator = mkInvalidStateProofValidator(mptStore),
                     // W3c ACTIVATION — the cross-shard proof client for the per-accept sharded SpendActionValidator.
-                    crossShardSpendProofClient = crossShardSpendProofClient
+                    crossShardSpendProofClient = crossShardSpendProofClient,
+                    etaRotationSnapshots = 2550L,
+                    invaliditySlashingConfig = InvalidStateProofSlashingConfig(
+                      watchtowerEnabled = true,
+                      slashFraction = io.constellationnetwork.numerics.Ratio.One,
+                      bountyFraction = io.constellationnetwork.numerics.Ratio(1, 20),
+                      cooldownEpochs = 100L
+                    )
                   )
               } yield (mgr, mptStore)
             }

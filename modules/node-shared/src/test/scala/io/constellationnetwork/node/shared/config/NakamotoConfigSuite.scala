@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.config
 import io.constellationnetwork.env.AppEnvironment._
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.ext.pureconfig._
+import io.constellationnetwork.numerics.Ratio
 
 import eu.timepit.refined.pureconfig._
 import pureconfig.ConfigSource
@@ -38,6 +39,18 @@ object NakamotoConfigSuite extends SimpleIOSuite {
       // mainnet k₁=1024 → R=round(3174.4)=3174, k₂=102400
       nakamoto.etaRotationSnapshots(Mainnet).value == 3174L,
       nakamoto.keepDepthBehindFinalized(Mainnet).value == 102400L
+    )
+  }
+
+  pureTest("ldd snowplow parses EXACT fractions from HOCON (baseline=1/20, amplitude=1/2, γ=16) — no Double round-trip") {
+    // The whole point of the `fromDoubles` removal: `"1/20"` decodes to EXACTLY `Ratio(1, 20)`, not the garbage
+    // 18-digit-denominator rational you get from round-tripping the Double `0.05` through `Ratio(double, 18)`. This
+    // loads `application.conf`'s `nakamoto.ldd` block through the `ConfigReader[Ratio]`, so it guards the parse end-to-end.
+    expect.all(
+      nakamoto.ldd.cutoff == 16,
+      nakamoto.ldd.offset == 1,
+      nakamoto.ldd.baseline == Ratio(1, 20),
+      nakamoto.ldd.amplitude == Ratio(1, 2)
     )
   }
 }

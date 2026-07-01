@@ -14,8 +14,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** §1 — eta resolver with MPT-cache + chainStore-walk fallback. Path 1 of the heap-leak workstream (Tessellation-Nakamoto).
   *
   * '''Problem statement.''' `vrfOutputsForPeriod` walks back to `periodStart` of period N-1 to recompute eta_N from VRF outputs. Under Fix
-  * B's k₁-bounded `byHash` retention (default 255 ords), that walk hits the eviction floor for any `etaRotationSnapshots > 255` (production
-  * default is 2550 = 10·k₁). Without a disk-immune cache, eta silently degrades to `genesisEta` for every period after the first eviction
+  * B's k₁-bounded `byHash` retention (k₁ ords, per-env), that walk hits the eviction floor for any `etaRotationSnapshots > k₁` (always
+  * true: R = round(3.1·k₁)). Without a disk-immune cache, eta silently degrades to `genesisEta` for every period after the first eviction
   * crosses the rotation boundary — pseudo-predictability defeated cluster-wide. (Findings 1 + 2 from the reviewer.)
   *
   * '''Solution.''' At every eta-period boundary (`ord % R == R - 1` for the closing period N), GSAM persists a

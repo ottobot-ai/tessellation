@@ -35,8 +35,8 @@ import weaver.MutableIOSuite
   * reserves the source `−amount−fee` at creation; `M` autonomously refunds `+amount` on expiry (fee permanently taken); gl0 ADOPTS `M`'s
   * balances into the per-MG `MgBalances` mirror — so after a cross-shard consume `M` never witnessed expires, `M` REFUNDS the source a
   * PHANTOM `+amount`. The settlement closes this two ways:
-  *   - '''W3d nullifier''' (`AllowSpendConsumeHandler` / `ConsumedAllowSpendStateManager.settle`): the consume writes a `ConsumedAllowSpends`
-  *     marker; a replay (the same `hash(AS)`) is REJECTED by the absence check.
+  *   - '''W3d nullifier''' (`AllowSpendConsumeHandler` / `ConsumedAllowSpendStateManager.settle`): the consume writes a
+  *     `ConsumedAllowSpends` marker; a replay (the same `hash(AS)`) is REJECTED by the absence check.
   *   - '''W3e read-side effective-balance overlay''' (`effectiveCurrencyBalances`): at the `SpendActionValidator` read site, `M`'s ATTESTED
   *     balances are overlaid with the committed spent-set so the source's EFFECTIVE balance stays debited — a no-`allowSpendRef` self-spend
   *     of the phantom-refunded amount is REJECTED for insufficient balance.
@@ -85,11 +85,10 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
 
   /** Scan `numShards ∈ [2,64]` for a value placing the two metagraph addresses on DIFFERENT shards. */
   private def findNumShardsSplitting(m: Address, mPrime: Address)(implicit hasher: Hasher[IO]): IO[Int] =
-    (2 to 64).toList
-      .findM { n =>
-        val a = ShardAssignment.make[IO](n)
-        (a.shardIdFor(m), a.shardIdFor(mPrime)).mapN(_ =!= _)
-      }
+    (2 to 64).toList.findM { n =>
+      val a = ShardAssignment.make[IO](n)
+      (a.shardIdFor(m), a.shardIdFor(mPrime)).mapN(_ =!= _)
+    }
       .map(_.getOrElse(throw new AssertionError("could not split the two metagraphs across any numShards in [2,64]")))
 
   private def mkAllowSpend(
@@ -304,13 +303,12 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
       m = mKp.getPublic.toAddress
       mPrimeA = mPrimeAKp.getPublic.toAddress
       mPrimeB = mPrimeBKp.getPublic.toAddress
-      numShards <- (2 to 128).toList
-        .findM { n =>
-          val a = ShardAssignment.make[IO](n)
-          (a.shardIdFor(m), a.shardIdFor(mPrimeA), a.shardIdFor(mPrimeB)).mapN {
-            case (sM, sA, sB) => sM =!= sA && sM =!= sB
-          }
+      numShards <- (2 to 128).toList.findM { n =>
+        val a = ShardAssignment.make[IO](n)
+        (a.shardIdFor(m), a.shardIdFor(mPrimeA), a.shardIdFor(mPrimeB)).mapN {
+          case (sM, sA, sB) => sM =!= sA && sM =!= sB
         }
+      }
         .map(_.getOrElse(throw new AssertionError("could not split both producers from M")))
       assignment = ShardAssignment.make[IO](numShards)
 

@@ -369,9 +369,10 @@ object GlobalSnapshotAcceptanceManager {
     // §3 NIPoPoW S0.4: number of snapshots per eta-rotation period. At every boundary ordinal (`ord % R == R - 1`)
     // accept() captures `NodeStakeAggregator.snapshotFromMpt` (the §G2 MPT-primary path; byte-equivalent to the previous
     // `EpochStakeSnapshotter.snapshot(builtInfo)` GSI walk) into `historicalStakeSnapshots[currentPeriod]` and prunes
-    // entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a reorg-grace). Must match the
-    // producer's `NAKAMOTO_ETA_ROTATION_SNAPSHOTS` for cross-node determinism.
-    etaRotationSnapshots: Long = 2550L,
+    // entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a reorg-grace). REQUIRED (no source-level
+    // default): must match the producer's R = round(3.1·k₁) (`nakamoto.confirmation-depth-k` derived) for cross-node determinism —
+    // a stale literal would silently diverge. Prod + the gl0 path thread the derived R; test callers pass an explicit R fixture.
+    etaRotationSnapshots: Long,
     // Path 1 (heap-leak workstream): callback that returns eta_period for the just-closed eta-period at
     // the boundary write. Eta_period is determined at the 2/3-mark of period (period-1) and used by slot
     // leaders DURING period; by the time the boundary ordinal of period is reached, eta_period has been
@@ -438,31 +439,32 @@ object GlobalSnapshotAcceptanceManager {
     // `spendActionValidator` is used verbatim ⇒ the cross-shard branch is unreachable, the gl0-local client is never constructed
     // ⇒ byte-identical to today.
     crossShardSpendProofClient: Option[ShardSubtreeProofClient[F]] = None,
-    // §3 NIPoPoW historical-commitment SMT. `Some(store)` is wired ONLY at the gl0 produce/verify GSAM
-    // (`GlobalSnapshotConsensus.make`) — that path has the finalized global-snapshot chain (`getGlobalSnapshotByOrdinal`)
-    // needed to derive the per-ordinal commitment for the eligible finalized ordinal `N − confirmationDepthK`. When present,
-    // accept() folds that ordinal's `PerOrdinalCommitment(hypergraphRoot, incrementalSnapshotHash, towerEligibility)` into the
-    // store and overrides `stateProof.smtRoot` with `smtRoot(N)` (= root over commitments ≤ N − k). gl0-leader and gl0-peer
-    // share this single GSAM/store, so they compute byte-identical roots. `None` (cl0/dl1/tests) leaves `smtRoot = None` —
-    // byte-identical to pre-SMT behavior, and excluded from the `StateProofValidator` `===` via `StateProofComparison`.
-    historicalCommitmentSmtStore: Option[
-      io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore[F]
+    // §3 NIPoPoW historical-commitment SMT store COUPLED with its confirmation-depth cutoff k `(store, k)`. k is read ONLY
+    // in the `Some` branch (the cutoff ordinal committed at accept(N) is `N − k`), so binding it to the store makes "wired
+    // the store but forgot k" unrepresentable — and there is NO source-level k default (Option-None is the only default, so
+    // every `None` caller — cl0/dl1/tests/the SharedServices verify-GSAM — stays free of a meaningless k literal). k is our
+    // primary security knob; it must never silently default. `Some((store, k))` is wired ONLY at the gl0 produce/verify GSAM
+    // (`GlobalSnapshotConsensus.make`), which has the finalized global-snapshot chain (`getGlobalSnapshotByOrdinal`) to
+    // derive the per-ordinal commitment for the eligible finalized ordinal `N − k`. accept() folds that ordinal's
+    // `PerOrdinalCommitment(hypergraphRoot, incrementalSnapshotHash, towerEligibility)` into the store and overrides
+    // `stateProof.smtRoot` with `smtRoot(N)` (= root over commitments ≤ N − k). gl0-leader and gl0-peer share this single
+    // GSAM/store, so they compute byte-identical roots. `None` leaves `smtRoot = None` — byte-identical to pre-SMT behavior,
+    // and excluded from the `StateProofValidator` `===` via `StateProofComparison`. (Sibling `GlobalChangeSetService.make`
+    // keeps the separate `store` + required-`k` shape; this GSAM couples them since here the `None` callers are the majority.)
+    historicalCommitmentSmt: Option[
+      (io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore[F], Long)
     ] = None,
-    // The existing confirmation depth k (`ConfirmationDepthK`). The cutoff ordinal committed at accept(N) is `N − k`. Defaults
-    // to 255 (the production default) but the gl0 wiring passes the same value the leader loop / sync daemon read, so producer
-    // and verifier agree. Only consulted when `historicalCommitmentSmtStore` is `Some`.
-    confirmationDepthK: Long = 255L,
     // WATCHTOWER invalid-state-proof slashing config (slashing part 3): slashFraction / bountyFraction / cooldownEpochs / watchtowerEnabled
     // — typed HOCON, NOT a `sys.env` read (project rule). Threaded into the `applyWatchtowerSlashes` fold at the upheld-dispute sink. Default
     // mirrors `application.conf`'s `nakamoto.invalidity-slashing` (100% tier, 5% bounty, 100-epoch cooldown, watchtower ON) so the durable
-    // slash applies at `numShards > 1`. PRODUCTION WIRING threads `SharedConfig.nakamoto.invaliditySlashing` from the single HOCON source
-    // at the sole GSAM construction site (`SharedServices.make`), so the operator-configured, cluster-uniform fraction/cooldown/bounty are
-    // used; this default mirrors `application.conf` and serves only as the test/fallback value.
+    // slash applies at `numShards > 1`. REQUIRED (no source-level default): slashFraction/bountyFraction feed the post-slash stake
+    // maps committed into the global mptRoot, so they must be the operator-configured, cluster-uniform values — never a silent
+    // literal. Prod threads `SharedConfig.nakamoto.invaliditySlashing` (100% tier, 5% bounty, 100-epoch cooldown, watchtower ON)
+    // at BOTH GSAM construction sites; test callers pass an explicit fixture.
     // NOTE: `watchtowerEnabled = false` makes the sink inert (no slash + no `Slashings` write), keeping the mptRoot pre-slash. The slash is
     // ONLY reachable at `numShards > 1` regardless (the adopt path that surfaces the request never runs at `numShards = 1`), so the
     // `numShards = 1` byte-identical regression bar is independent of this config.
-    invaliditySlashingConfig: InvalidStateProofSlashingConfig =
-      InvalidStateProofSlashingConfig(watchtowerEnabled = true, slashFraction = 1.0d, bountyFraction = 0.05d, cooldownEpochs = 100L),
+    invaliditySlashingConfig: InvalidStateProofSlashingConfig,
     // WATCHTOWER fraud-proof DETERMINISTIC dispute verdict (W3a). When `Some`, every fraud-proof artifact carried in `accept(fraudProofs=…)`
     // is re-validated here via the SAME `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed
     // checkpoint's OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger). On UPHELD a `WatchtowerSlashRequest` with
@@ -565,9 +567,9 @@ object GlobalSnapshotAcceptanceManager {
           proof: GlobalSnapshotStateProof,
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
         ): F[GlobalSnapshotStateProof] =
-          historicalCommitmentSmtStore match {
+          historicalCommitmentSmt match {
             case None => proof.pure[F]
-            case Some(store) =>
+            case Some((store, confirmationDepthK)) =>
               val ordValue = ordinal.value.value
               if (ordValue < confirmationDepthK) proof.pure[F]
               else {

@@ -92,11 +92,12 @@ object ProofError {
   *      level-µ density `(chain length) / (level-0 reference length)` must fall within `targetDensity * (1 ± DensityRelativeErrorBound)`.
   *      Uses the L0 suffix length as the reference (this is a coarse approximation for short proofs; acceptable for v1 per the empirical 5%
   *      bound at 10M slots in `paper/main.tex`). 4. L0 suffix VRF — for each suffix header, re-verify
-  *      `EligibilityChecker.verifyEligibility` with the certificate's VRF triple + `LddConfig.Default` + an *approximate* relativeStake =
-  *      1/activePoolSize. The producer-side eligibility used the actual stake; we use uniform stake as a v1 approximation (`activePoolSize`
-  *      is the only stake-related field on the certificate). This is a sanity check, not a security gate. 5. Eta-rotation reconstruction —
-  *      verify that within the L0 suffix, consecutive headers in the same rotation period carry the same eta (eta is a per-period
-  *      invariant). Cross-period eta transitions cannot be verified from suffix alone; we trust the producer's claimed eta in that case.
+  *      `EligibilityChecker.verifyEligibility` with the certificate's VRF triple + the bound consensus `lddConfig` + an *approximate*
+  *      relativeStake = 1/activePoolSize. The producer-side eligibility used the actual stake; we use uniform stake as a v1 approximation
+  *      (`activePoolSize` is the only stake-related field on the certificate). This is a sanity check, not a security gate. 5. Eta-rotation
+  *      reconstruction — verify that within the L0 suffix, consecutive headers in the same rotation period carry the same eta (eta is a
+  *      per-period invariant). Cross-period eta transitions cannot be verified from suffix alone; we trust the producer's claimed eta in
+  *      that case.
   *
   * '''What this does NOT check''' (deferred to S5 + tower-anchored proofs):
   *   - State proof inclusion (no MPT path verification in v1 — that's S5).
@@ -114,13 +115,15 @@ trait TowerVerifier[F[_]] {
     * @param etaRotationSnapshots
     *   the period length in snapshots. Used to bucket headers into eta-rotation periods.
     * @param lddConfig
-    *   LDD config for the L0 eligibility check. Default = [[LddConfig.Default]].
+    *   LDD config for the L0 eligibility check. REQUIRED (no default): the caller (`NipopowProofProvider`) binds the consensus LDD config
+    *   captured at startup, so the light client checks eligibility at the SAME γ the chain runs. A source-level default here would silently
+    *   verify at a stale γ if the chain's config differs — exactly the divergence class this removal prevents.
     */
   def verify(
     proof: TowerProof,
     genesisEta: Array[Byte],
     etaRotationSnapshots: Long,
-    lddConfig: LddConfig = LddConfig.Default
+    lddConfig: LddConfig
   ): F[Either[ProofError, Unit]]
 }
 

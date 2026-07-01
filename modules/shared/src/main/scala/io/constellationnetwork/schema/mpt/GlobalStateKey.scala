@@ -283,8 +283,10 @@ object GlobalStateFieldId {
     * '''Why hypergraph-namespaced (DAG-scoped), not system-namespaced.''' This is consensus-load-bearing single-use state read cross-shard
     * by the spend path — the exact role `ActiveAllowSpends` already plays — so it belongs in the consensus global `mptRoot`
     * ([[consensusRootEntries]] keeps it; it is neither a path-dependent `SystemNamespace` sidecar nor an observation-dependent `Mg*`
-    * sub-field). SCHEMA + KEY PLUMBING ONLY: no producer writes and no consumer reads this partition yet — the acceptance-fold wiring that
-    * populates/checks the spent-set is a separate later task.
+    * sub-field). WIRED at `numShards > 1` (2026-06-29): the producer writes the spent-marker at the gl0 fold
+    * (`CrossShardMessageEngine.write`, `GlobalSnapshotAcceptanceManager` ~:3089) and the consumer reads it via
+    * `ConsumedAllowSpendStateManager.materializeConsumedAllowSpendsFromMpt` — absence-checked and written atomically in the same snapshot.
+    * INERT at `numShards = 1` (never written ⇒ empty ⇒ `mptRoot` byte-identical to the pre-sharding path).
     */
   case object ConsumedAllowSpends extends GlobalStateFieldId { def toInt: Int = 33 }
 
@@ -566,7 +568,8 @@ object GlobalStateKey {
     * `priceStateKey` / `kesRegistrationCertsKey`, which `Hasher[F].hash(...)` a canonical-string identity first. `HashNamespace` serializes
     * its hash verbatim in `serializeNamespace` (no re-hash), so the marker for a given allow-spend is reproducible from its hash alone,
     * with no `F[_]`/`Hasher` needed. Mirrors the `ActiveAllowSpends` (fieldId 7) hypergraph scope but addressed by hash rather than by
-    * source `Address`. SCHEMA/KEY PLUMBING ONLY — no producer/consumer is wired yet (separate later task).
+    * source `Address`. WIRED at `numShards > 1` (2026-06-29) — produced via `CrossShardMessageEngine.write` and consumed via
+    * `ConsumedAllowSpendStateManager`; inert (empty) at `numShards = 1`.
     */
   def consumedAllowSpendKey(allowSpendHash: Hash): GlobalStateKey =
     GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.ConsumedAllowSpends, EmptyNamespace, HashNamespace(allowSpendHash))

@@ -44,8 +44,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Shared epoch state — used by BOTH SnapshotLeaderLoop (production) and NakamotoSyncDaemon (gossip).
   *
-  * VRF outputs from ALL sources (own production + received gossip) are accumulated here. When 2/3 of slotsPerEpoch outputs are collected,
-  * eta rotates — this happens uniformly across all validators, not just producers.
+  * VRF outputs from ALL sources (own production + received gossip) are accumulated here. When 2/3 of the eta-rotation EPOCH
+  * (`etaRotationSnapshots` = R = round(3.1·k₁) SNAPSHOTS) outputs are collected, eta rotates — uniformly across all validators, not just
+  * producers. (This is the eta EPOCH, measured in snapshots — NOT epoch progress, which is a separate slot-based counter.)
   */
 final case class SharedEpochState(
   currentEta: Array[Byte],
@@ -57,9 +58,9 @@ object SharedEpochState {
   def initial(genesisEta: Array[Byte]): SharedEpochState =
     SharedEpochState(currentEta = genesisEta, genesisEta = genesisEta, vrfAccumulator = Nil)
 
-  /** Accumulate a VRF output and rotate eta if threshold reached. Eta rotates every `etaRotationSnapshots` (default 2550 = 10·k₁), not
-    * every epoch. Rotation is keyed on **ordinal** to satisfy the Praos R ≥ 3·k₁ stability bound (slots are LDD-paced and lumpy; ordinals
-    * give a stable R). See `docs/nakamoto/attestation-and-finality.md` §1.
+  /** Accumulate a VRF output and rotate eta if threshold reached. Eta rotates every `etaRotationSnapshots` = R = round(3.1·k₁) (threaded
+    * from config; no source default), not every epoch-progress tick. Rotation is keyed on **ordinal** to satisfy the R ≥ 3·k₁ stability
+    * bound (slots are LDD-paced and lumpy; ordinals give a stable R). See `docs/nakamoto/attestation-and-finality.md` §1.
     */
   def accumulate(
     state: SharedEpochState,
@@ -410,12 +411,10 @@ object SnapshotLeaderLoop {
     *   this node's PeerId
     * @param lddConfig
     *   LDD snowplow parameters
-    * @param slotsPerEpoch
-    *   slots per epoch (default 60, for time labels only)
     * @param etaRotationSnapshots
-    *   snapshots per eta rotation period. Production default 2550 = 10·k₁ (matches Cardano R/k ratio). Eta is long-lived — Cardano uses ~5
-    *   days. Rotation is keyed on **ordinal**, not slot — see `docs/nakamoto/attestation-and-finality.md` §1 for the R ≥ 3·k₁ stability
-    *   bound rationale.
+    *   R — the eta-rotation EPOCH length in SNAPSHOTS, = round(3.1·k₁) (derived from k₁; the last R/3 ≥ k₁ finalizes before the nonce is
+    *   consumed ⇒ R ≥ 3·k₁). Rotation is keyed on **ordinal**, not slot — see `docs/nakamoto/attestation-and-finality.md` §1. (NOT 10·k₁ —
+    *   the old "2550 = 10·k₁" label was stale.)
     */
   def run[F[_]: Async: SecurityProvider: HasherSelector: JsonSerializer: Metrics](
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
@@ -432,18 +431,21 @@ object SnapshotLeaderLoop {
     selfId: PeerId,
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
-    slotsPerEpoch: Long = 60L,
-    // R = eta-rotation period. Threaded from `sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value`
-    // (derived = round(3.1·k₁) from the per-env k₁) at the GlobalSnapshotConsensus.make call site — NOT a config
-    // read here. The `2550L` literal is a dev/test fallback only; production always passes config.
-    etaRotationSnapshots: Long = 2550L,
-    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` at the
-    // call site (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule:
-    // HOCON over scattered sys.env). Drives the depth-k finality gate (`ConfirmationDepthK` below).
-    confirmationDepthK: Long = 255L,
+    // The three consensus-time params below are REQUIRED — no source-level default. The sole runtime caller
+    // (`GlobalSnapshotConsensus.make`) threads each from the per-env HOCON config; a stale literal here would silently
+    // diverge from that config for any future caller (k is our primary security knob — it must never default). Zero
+    // test callers construct `run` (tests exercise the static helpers only), so requiring them is safe.
+    // R = eta-rotation EPOCH length in SNAPSHOTS = round(3.1·k₁), derived in `NakamotoConfig` from the per-env k₁
+    // (the last R/3 ≥ k₁ finalizes before the nonce is consumed ⇒ R ≥ 3·k₁). Threaded from
+    // `sharedCfg.nakamoto.etaRotationSnapshots(env).value`. (NOT 10·k₁ = 2550 — that was a stale pre-2026 label.)
+    etaRotationSnapshots: Long,
+    // Confirmation depth k₁ — threaded from `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value`
+    // (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; HOCON over scattered sys.env). Drives the
+    // depth-k finality gate (`ConfirmationDepthK` below).
+    confirmationDepthK: Long,
     // Slot duration ms — threaded from `sharedCfg.nakamoto.slotDurationMs.value` at the call site (§5.7: the
     // consensus time UNIT; replaces the prior `sys.env.get("NAKAMOTO_SLOT_DURATION_MS")` read here).
-    slotDurationMs: Long = 1000L,
+    slotDurationMs: Long,
     // Shard boot grace (run-17): slots a node must have been Ready before taking ANY shard duty
     // (HOCON nakamoto.sharding.checkpoint.boot-grace-slots at the call site) — intake must drain
     // first or a late-booting rank takes genesis duty blind and seeds a rival lineage.

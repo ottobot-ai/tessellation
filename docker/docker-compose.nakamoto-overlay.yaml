@@ -28,7 +28,6 @@ services:
       # growth — block production is wall-clock bound, not eligibility bound,
       # so doubling fA just changed the fill-rate metric without producing
       # snapshots faster.
-      - NAKAMOTO_SLOTS_PER_EPOCH=${NAKAMOTO_SLOTS_PER_EPOCH:-60}
       # k₁ (confirmation depth) + derived R=round(3.1·k₁) and k₂=100·k₁ come from the per-env
       # `confirmation-depth-k` block in application.conf. All e2e nodes run as Dev (CL_APP_ENV=dev),
       # so they resolve k₁=32 → R=99, exercising the eta rotation many times per run (tests aren't
@@ -63,15 +62,19 @@ services:
       # (token-lock-replacement WithdrawalTimeLimit). See docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md §7.
       # Test-only (overlay); mainnet uses the application.conf `nakamoto.ldd` defaults. amplitude/baseline are the
       # "go faster" knobs (NOT cutoff↓) if throughput is ever wanted; left at defaults here since the goal is sync headroom.
-      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-30}
+      # REVERTED 30→16 (2026-06-30): the fork storm's ROOT cause was smtRoot non-determinism (fixed 376d09fbc), not cutoff.
+      # 16 restores ~7s blocks (design intent) and was clean at 2mg/2shard. Forks recurring at 16 ⇒ the smtRoot fix isn't holding.
+      - NAKAMOTO_LDD_CUTOFF=${NAKAMOTO_LDD_CUTOFF:-16}
       - NAKAMOTO_LDD_OFFSET=${NAKAMOTO_LDD_OFFSET:-1}
-      - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-0.05}
-      - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-0.5}
+      # EXACT fractions "n/d" (fB=1/20, fA=1/2) — parsed straight into Ratio, never Double. Mirror the HOCON
+      # `nakamoto.ldd` defaults (application.conf). Empty-string hazard: a present-but-empty env would fail the
+      # Ratio parse loudly at boot (not silently), which is the desired fail-closed behavior for a consensus knob.
+      - NAKAMOTO_LDD_BASELINE=${NAKAMOTO_LDD_BASELINE:-1/20}
+      - NAKAMOTO_LDD_AMPLITUDE=${NAKAMOTO_LDD_AMPLITUDE:-1/2}
       # Test-only slot duration. Production default is 1000ms (in SnapshotLeaderLoop).
-      # Kept at 1000ms because halving slot duration also halves wall-clock per epoch
-      # (slots-per-epoch is fixed at 60), which made the token-lock-replacement edge
-      # cases flake — the WithdrawalTimeLimit window closes before the L1 syncs the
-      # new lock. If we want faster slots we'd need to scale slots-per-epoch too.
+      # Kept at 1000ms because halving slot duration also halves the wall-clock cadence,
+      # which made the token-lock-replacement edge cases flake — the WithdrawalTimeLimit
+      # window closes before the L1 syncs the new lock.
       - NAKAMOTO_SLOT_DURATION_MS=${NAKAMOTO_SLOT_DURATION_MS:-1000}
       # ⚠ DEAD KNOB — kept only so a present-but-empty env can't crash HOCON NUMBER parse.
       # `NAKAMOTO_COMMITTEE_K_TARGET` (set by `--shards=N` in set-env.sh) is read by NOTHING:

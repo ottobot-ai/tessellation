@@ -623,7 +623,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
           overlay = overlay,
           shardingConfig = Some(mkShardingConfig(4)),
           shardCheckpointAcceptanceManager = Some(checkpointManager),
-          shardAssignment = Some(ShardAssignment.make[IO](numShards = 4))
+          shardAssignment = Some(ShardAssignment.make[IO](numShards = 4)),
+          etaRotationSnapshots = 2550L,
+          invaliditySlashingConfig = InvalidStateProofSlashingConfig(
+            watchtowerEnabled = true,
+            slashFraction = io.constellationnetwork.numerics.Ratio.One,
+            bountyFraction = io.constellationnetwork.numerics.Ratio(1, 20),
+            cooldownEpochs = 100L
+          )
         )
     }
   }

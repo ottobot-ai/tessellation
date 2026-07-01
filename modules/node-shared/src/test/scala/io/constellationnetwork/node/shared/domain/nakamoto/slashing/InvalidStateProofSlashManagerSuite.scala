@@ -4,6 +4,7 @@ import cats.data.NonEmptySet
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
@@ -96,8 +97,8 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
       shardId = shardZero,
       disputedCheckpointHash = cpHash,
       evidenceDigest = evidenceDigest,
-      slashFraction = 1.0d,
-      bountyFraction = 0.05d,
+      slashFraction = Ratio.One,
+      bountyFraction = Ratio(1, 20),
       cooldownEpochs = 100L
     )
     // delegatorA keeps ONLY the honest record; delegatorB had only the offender ⇒ dropped entirely.
@@ -127,8 +128,8 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
       shardZero,
       cpHash,
       evidenceDigest,
-      1.0d,
-      0.05d,
+      Ratio.One,
+      Ratio(1, 20),
       100L
     )
     val a = run
@@ -153,8 +154,8 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
       shardId = shardZero,
       disputedCheckpointHash = cpHash,
       evidenceDigest = evidenceDigest,
-      slashFraction = 0.5d,
-      bountyFraction = 0.0d,
+      slashFraction = Ratio(1, 2),
+      bountyFraction = Ratio.Zero,
       cooldownEpochs = 10L
     )
     // 50% of 2000 = 1000 slashed from stake; 1000 remains. Collateral fully removed (300). total = 1000 + 300.
@@ -178,8 +179,8 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
       shardZero,
       cpHash,
       evidenceDigest,
-      1.0d,
-      0.05d,
+      Ratio.One,
+      Ratio(1, 20),
       100L
     )
     expect.all(
@@ -194,9 +195,9 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
 
   test("bounty/burn split helper: floor semantics") {
     expect.all(
-      InvalidStateProofSlashManager.splitBountyBurn(1000L, 0.05d) == ((50L, 950L)),
-      InvalidStateProofSlashManager.splitBountyBurn(999L, 0.05d) == ((49L, 950L)),
-      InvalidStateProofSlashManager.splitBountyBurn(0L, 0.5d) == ((0L, 0L))
+      InvalidStateProofSlashManager.splitBountyBurn(1000L, Ratio(1, 20)) == ((50L, 950L)),
+      InvalidStateProofSlashManager.splitBountyBurn(999L, Ratio(1, 20)) == ((49L, 950L)),
+      InvalidStateProofSlashManager.splitBountyBurn(0L, Ratio(1, 2)) == ((0L, 0L))
     )
   }
 }

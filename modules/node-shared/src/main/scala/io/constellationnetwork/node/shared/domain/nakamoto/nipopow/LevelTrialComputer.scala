@@ -63,7 +63,7 @@ class LevelTrialComputer[F[_]: Monad](exp: Exp[F]) {
     *   - `level` — the super-level µ (1..L-1); requires [[SuperLevelParams.at]] to be defined
     *   - `gMu` — base-block gap (snapshots since previous level-µ hit, NOT slots)
     *   - `deltaSlot` — L0 slot gap vs parent snapshot
-    *   - `gamma` — `LddConfig.lddCutoff` (default 15)
+    *   - `gamma` — `LddConfig.lddCutoff` (from the bound consensus config; no source-level default)
     */
   def runTrial(
     vrfOutput: Array[Byte],

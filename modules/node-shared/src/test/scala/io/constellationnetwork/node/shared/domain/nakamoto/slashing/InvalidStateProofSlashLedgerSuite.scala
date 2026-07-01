@@ -14,6 +14,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
   WatchtowerSlashRequest,
   applyWatchtowerSlashes
 }
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
@@ -69,7 +70,12 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
   private val submitter: Address = Address.fromBytes("submitter".getBytes("UTF-8"))
 
   private val config: InvalidStateProofSlashingConfig =
-    InvalidStateProofSlashingConfig(watchtowerEnabled = true, slashFraction = 1.0d, bountyFraction = 0.05d, cooldownEpochs = 100L)
+    InvalidStateProofSlashingConfig(
+      watchtowerEnabled = true,
+      slashFraction = Ratio.One,
+      bountyFraction = Ratio(1, 20),
+      cooldownEpochs = 100L
+    )
 
   private def proof: NonEmptySet[SignatureProof] =
     NonEmptySet.of(SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70))))

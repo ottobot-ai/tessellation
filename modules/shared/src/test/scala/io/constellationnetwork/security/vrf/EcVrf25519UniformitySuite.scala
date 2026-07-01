@@ -5,7 +5,7 @@ import java.security.SecureRandom
 import cats.effect.IO
 
 import io.constellationnetwork.numerics.implicits._
-import io.constellationnetwork.schema.nakamoto.LddConfig
+import io.constellationnetwork.schema.nakamoto.{LddConfig, LddConfigFixture}
 
 import weaver.SimpleIOSuite
 
@@ -61,7 +61,7 @@ object EcVrf25519UniformitySuite extends SimpleIOSuite {
     */
   test("VRF — 8-key cluster simulation: per-key win counts within iid Bernoulli envelope") {
     IO {
-      val cfg = LddConfig.Default.copy(lddCutoff = 16) // matches docker-compose default
+      val cfg = LddConfigFixture.production // production-aligned γ=16
       val numNodes = 8
       val numSlots = 6000L
       val etaRotation = 600L

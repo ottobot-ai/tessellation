@@ -22,8 +22,8 @@ import io.constellationnetwork.serde.codecs.instances.ConsumedAllowSpendCodec.{i
   * `settleCrossShardConsumes`) — this handler adapts them into the generic [[CrossShardMessageHandler.settle]] shape (prior-set
   * materialization + classify + settle + encode markers to `GlobalStateKey → bytes`). The allow-spend STATE EFFECT — the read-side
   * effective-CURRENCY-balance overlay ([[ConsumedAllowSpendStateManager.effectiveCurrencyBalances]]) applied at the `SpendActionValidator`
-  * and the `GL0CurrencyBalanceRoutes` read sites — stays DELIBERATELY outside this handler (it is type-specific and safety-critical; a future
-  * message type defines its own effect at its own read sites).
+  * and the `GL0CurrencyBalanceRoutes` read sites — stays DELIBERATELY outside this handler (it is type-specific and safety-critical; a
+  * future message type defines its own effect at its own read sites).
   */
 final case class AllowSpendConsumeHandler[F[_]: Async](
   manager: ConsumedAllowSpendStateManager[F]

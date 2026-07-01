@@ -610,10 +610,13 @@ object GlobalSnapshotConsensus {
           shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
           shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
           shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
-          // §3 NIPoPoW historical-commitment SMT: wire the gl0 store + the confirmation-depth cutoff so accept() anchors
-          // `smtRoot(N)`. Same k the leader loop / sync daemon use (`nakamoto.confirmation-depth-k`, default 255).
-          historicalCommitmentSmtStore = Some(historicalCommitmentSmtStore),
-          confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
+          // §3 NIPoPoW historical-commitment SMT: wire the gl0 store COUPLED with its confirmation-depth cutoff k so accept()
+          // anchors `smtRoot(N)`. Same per-env k the leader loop / sync daemon read (`nakamoto.confirmation-depth-k`, no default).
+          historicalCommitmentSmt =
+            Some((historicalCommitmentSmtStore, sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value)),
+          // WATCHTOWER slashing config — threaded from the single HOCON source (same as the SharedServices GSAM) so both GSAM
+          // sites apply the operator-configured, cluster-uniform slash/bounty fractions (now required — no source-level default).
+          invaliditySlashingConfig = sharedCfg.nakamoto.invaliditySlashing,
           // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs + surface the bounty slash. SAME instance the
           // leader-produce and `validateArtifact` paths share (this single GSAM). `None` at numShards=1.
           invalidStateProofValidator = gsamInvalidStateProofValidator
@@ -814,16 +817,15 @@ object GlobalSnapshotConsensus {
       // Nakamoto GL0: no BFT consensus trigger or loop — slot clock handles production
       triggerEvent = Async[F].unit
 
-      // Nakamoto LDD + VRF config. Env vars are typed Double for backwards-compatible config; we lock
-      // them into Ratio at boot via `Ratio.apply(double, prec)` so the threshold computation is exact
-      // and reproducible across all JVMs/CPUs.
-      lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig.fromDoubles(
+      // Nakamoto LDD + VRF config. `baseline`/`amplitude` arrive from HOCON as exact `Ratio` (parsed from
+      // `"n/d"` strings — never Double), so the threshold computation is exact and reproducible across all
+      // JVMs/CPUs by construction. No fromDoubles round-trip, no source-level default.
+      lddConfig = io.constellationnetwork.schema.nakamoto.LddConfig(
         lddCutoff = sharedCfg.nakamoto.ldd.cutoff,
         offset = sharedCfg.nakamoto.ldd.offset,
         baselineDifficulty = sharedCfg.nakamoto.ldd.baseline,
         amplitude = sharedCfg.nakamoto.ldd.amplitude
       )
-      slotsPerEpoch = sharedCfg.nakamoto.slotsPerEpoch.value
       // R = eta-rotation period, now DERIVED in `NakamotoConfig` as `round(3.03·k₁)` from the single
       // `nakamoto.confirmation-depth-k` knob (Ouroboros: first-2/3 nonce + last-1/3 ≥ k₁ stability; .03 margin).
       // Rotation is keyed on **ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with
@@ -843,7 +845,7 @@ object GlobalSnapshotConsensus {
           nakLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("NakamotoConsensus").pure[F].toResource
           _ <- nakLogger
             .info(
-              s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSnapshots} snapshots, slotsPerEpoch=${slotsPerEpoch}, genesisTime=${pureGenesisTimeMs}"
+              s"🔧 Nakamoto config: LDD(cutoff=${lddConfig.lddCutoff}, offset=${lddConfig.offset}, baseline=${lddConfig.baselineDifficulty}, amplitude=${lddConfig.amplitude}), etaRotation=${etaRotationSnapshots} snapshots, genesisTime=${pureGenesisTimeMs}"
             )
             .toResource
           // §1.1: switch from equal-weight to stake-weighted VRF election.
@@ -1898,7 +1900,6 @@ object GlobalSnapshotConsensus {
                   selfId = selfId,
                   lddConfig = lddConfig,
                   eligibilityChecker = eligibilityChecker,
-                  slotsPerEpoch = slotsPerEpoch,
                   etaRotationSnapshots = etaRotationSnapshots,
                   // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).

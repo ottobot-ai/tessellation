@@ -362,7 +362,13 @@ object Mocks {
                       loggerBundle = loggerBundle,
                       overlay = overlay,
                       etaRotationSnapshots = etaRotationSnapshots,
-                      etaForPeriod = etaForPeriod
+                      etaForPeriod = etaForPeriod,
+                      invaliditySlashingConfig = InvalidStateProofSlashingConfig(
+                        watchtowerEnabled = true,
+                        slashFraction = io.constellationnetwork.numerics.Ratio.One,
+                        bountyFraction = io.constellationnetwork.numerics.Ratio(1, 20),
+                        cooldownEpochs = 100L
+                      )
                     )
                 } yield mgr
               }

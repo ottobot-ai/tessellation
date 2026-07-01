@@ -35,7 +35,6 @@ object KesRegistryLoaderSuite extends SimpleIOSuite {
 
   private val protocolParams = L0GenesisProtocolParams(
     lddCutoff = 1,
-    slotsPerEpoch = 1000L,
     etaRotationSnapshots = 2550L,
     genesisEta = "00" * 32,
     startingEpochProgress = 0L

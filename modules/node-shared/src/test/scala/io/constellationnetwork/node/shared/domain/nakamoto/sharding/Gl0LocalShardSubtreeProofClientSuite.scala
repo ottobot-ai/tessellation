@@ -41,16 +41,16 @@ import weaver.MutableIOSuite
   * The client reads the cross-shard `AllowSpend`/`Balance` value DIRECTLY off gl0's own consensus-pinned finalized state (a real MPT-backed
   * `GlobalStateReader.finalized`), never a peer. These tests prove the four properties from the slice task:
   *
-  *   1. '''Cross-shard CONSUME accepted''' — an allow-spend present in gl0's finalized mirror, referenced by a spend in a DIFFERENT-shard MG,
-  *      is ACCEPTED through `SpendActionValidator` via the gl0-local client (the unsharded validator / `noop` client previously rejected it
-  *      as `CrossShardProofUnavailable`).
-  *   1. '''Cross-shard phantom-refund balance-spend still REJECTED''' — the W3c effective-balance overlay fires on the gl0-LOCAL-read attested
-  *      balance, so a no-`allowSpendRef` self-spend of a phantom expiry-refund is rejected; the same spend is accepted under the raw attested
-  *      balance, proving the overlay is load-bearing over the local read.
-  *   1. '''Determinism''' — two independently-constructed gl0-local clients over the SAME finalized state return the byte-identical value for
-  *      the same key (the cluster-uniformity argument: every gl0 node reads the same finalized state ⇒ same bytes ⇒ same mptRoot).
-  *   1. '''numShards = 1 byte-identity''' — at `numShards = 1` the cross-shard path is unreachable; the gl0-local client is never consulted,
-  *      and the spend is validated off the in-process attested balance exactly as today.
+  *   1. '''Cross-shard CONSUME accepted''' — an allow-spend present in gl0's finalized mirror, referenced by a spend in a DIFFERENT-shard
+  *      MG, is ACCEPTED through `SpendActionValidator` via the gl0-local client (the unsharded validator / `noop` client previously
+  *      rejected it as `CrossShardProofUnavailable`).
+  *   1. '''Cross-shard phantom-refund balance-spend still REJECTED''' — the W3c effective-balance overlay fires on the gl0-LOCAL-read
+  *      attested balance, so a no-`allowSpendRef` self-spend of a phantom expiry-refund is rejected; the same spend is accepted under the
+  *      raw attested balance, proving the overlay is load-bearing over the local read.
+  *   1. '''Determinism''' — two independently-constructed gl0-local clients over the SAME finalized state return the byte-identical value
+  *      for the same key (the cluster-uniformity argument: every gl0 node reads the same finalized state ⇒ same bytes ⇒ same mptRoot).
+  *   1. '''numShards = 1 byte-identity''' — at `numShards = 1` the cross-shard path is unreachable; the gl0-local client is never
+  *      consulted, and the spend is validated off the in-process attested balance exactly as today.
   */
 object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
 

@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.slashing
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
@@ -28,10 +29,10 @@ import eu.timepit.refined.types.numeric.NonNegLong
   *
   * '''What it does''' (per `SLASHING-DESIGN.md` §5, adapted — NOT a new primitive):
   *   1. '''Stake reduction''' — for every `(delegator, record)` whose `record.event.value.nodeId` is a slash target, reduce the staked
-  *      amount by `slashFraction`. At the default `slashFraction = 1.0` (the `InvalidStateProof` tier is total loss) the record is REMOVED
+  *      amount by `slashFraction` (exact `Ratio`). At `slashFraction = 1/1` (the `InvalidStateProof` tier is total loss) the record is REMOVED
   *      (amount → 0). For a partial fraction the `DelegatedStakeRecord.currentAmount` slot is reduced in place; node collaterals carry no
   *      mutable-amount slot, so a partial collateral slash is NOT representable without a schema change (see [[applySlash]] scaladoc) — the
-  *      100% tier removes them outright, which IS representable. The default tier is the supported one.
+  *      100% tier removes them outright, which IS representable. The 100% tier is the supported one.
   *   1. '''Eviction''' — every slashed operator gets a [[SlashedRegistryEntry]] with a `cooldownUntilEpoch`; the registry is read by the
   *      active-set gate so a slashed operator cannot contribute to any committee/quorum until cooldown elapses.
   *   1. '''Bounty + burn''' — `bountyFraction` of the slashed amount is credited to the submitter; the remainder is BURNED (removed from
@@ -101,8 +102,8 @@ object InvalidStateProofSlashManager {
     shardId: ShardId,
     disputedCheckpointHash: Hash,
     evidenceDigest: Hash,
-    slashFraction: Double,
-    bountyFraction: Double,
+    slashFraction: Ratio,
+    bountyFraction: Ratio,
     cooldownEpochs: Long
   ): SlashResult = {
     val isTarget: PeerId => Boolean = slashTargets.contains
@@ -117,13 +118,14 @@ object InvalidStateProofSlashManager {
               if (!isTarget(rec.event.value.nodeId)) (rs + rec, s)
               else {
                 val before: Long = rec.amount.value.value
-                if (slashFraction >= 1.0d)
-                  // Full slash — remove the record (amount → 0).
+                if (slashFraction.numerator >= slashFraction.denominator)
+                  // Full slash (slashFraction ≥ 1) — remove the record (amount → 0).
                   (rs, s + before)
                 else {
-                  // Partial slash — reduce `currentAmount` in place. `floor` is deterministic (identical product floored on every node;
-                  // `slashFraction` is a byte-identical config constant cluster-wide).
-                  val slashed: Long = math.floor(before.toDouble * slashFraction).toLong
+                  // Partial slash — reduce `currentAmount` in place. EXACT: `floor(before × slashFraction)` via BigInt integer
+                  // division (truncates toward zero = floor for non-negative), byte-identical cluster-wide — no Double, no precision
+                  // loss for large stakes (`before.toDouble` would lose precision past 2^53).
+                  val slashed: Long = (BigInt(before) * slashFraction.numerator / slashFraction.denominator).toLong
                   val remaining: Long = math.max(0L, before - slashed)
                   (
                     rs + rec.copy(currentAmount =
@@ -173,9 +175,13 @@ object InvalidStateProofSlashManager {
   /** Deterministic bounty/burn split of a slashed pool. `bounty = floor(total × bountyFraction)` (clamped to `[0, total]`); the remainder
     * burns. Pulled out so the GSAM sink computes it once with the configured `bountyFraction`.
     */
-  def splitBountyBurn(total: Long, bountyFraction: Double): (Long, Long) = {
-    val f = math.max(0.0d, math.min(1.0d, bountyFraction))
-    val bounty = math.max(0L, math.min(total, math.floor(total.toDouble * f).toLong))
+  def splitBountyBurn(total: Long, bountyFraction: Ratio): (Long, Long) = {
+    // Clamp to [0, 1], then EXACT `floor(total × f)` via BigInt division (no Double). Byte-identical cluster-wide.
+    val f =
+      if (bountyFraction.numerator <= 0) Ratio.Zero
+      else if (bountyFraction.numerator >= bountyFraction.denominator) Ratio.One
+      else bountyFraction
+    val bounty = math.max(0L, math.min(total, (BigInt(total) * f.numerator / f.denominator).toLong))
     (bounty, total - bounty)
   }
 

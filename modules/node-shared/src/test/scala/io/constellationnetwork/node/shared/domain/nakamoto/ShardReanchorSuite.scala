@@ -14,11 +14,10 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
-/**
- * Edge-case matrix for the orphaned-tip reanchor classifier (the 2026-06-29 sharded-mirror freeze fix). `classify` is a
- * pure function of (window, tip hash, tip metagraph-ordinal) — the SAME logic the GSAM adopt-guard and the GSCF embed-
- * selection call, so these cases pin the cluster-wide (split-safe) behavior. Genesis-rooted ⇒ binary index == ordinal.
- */
+/** Edge-case matrix for the orphaned-tip reanchor classifier (the 2026-06-29 sharded-mirror freeze fix). `classify` is a pure function of
+  * (window, tip hash, tip metagraph-ordinal) — the SAME logic the GSAM adopt-guard and the GSCF embed- selection call, so these cases pin
+  * the cluster-wide (split-safe) behavior. Genesis-rooted ⇒ binary index == ordinal.
+  */
 object ShardReanchorSuite extends SimpleIOSuite {
 
   private val proof = SignatureProof(ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))

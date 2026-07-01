@@ -6,8 +6,8 @@ import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot._
+import io.constellationnetwork.schema.nakamoto.{LddConfig, LddConfigFixture}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 
@@ -98,7 +98,7 @@ object TowerVerifierSuite extends MutableIOSuite {
   // ============== Empty proof — always accepts ==============
 
   test("empty proof — verifier accepts") { verifier =>
-    verifier.verify(TowerProof.Empty, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(TowerProof.Empty, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       expect(r.isRight)
     }
   }
@@ -116,7 +116,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       ),
       levelChains = Map.empty
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       expect(r == Left(ProofError.NonMonotonicOrdinals(0)))
     }
   }
@@ -134,7 +134,7 @@ object TowerVerifierSuite extends MutableIOSuite {
         )
       )
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       expect(r == Left(ProofError.NonMonotonicOrdinals(1)))
     }
   }
@@ -148,7 +148,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = Vector(header(1L, 5L, 4L, out, subchainLevelCounts = badCounts)),
       levelChains = Map.empty
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(ProofError.SubchainStateShape(o, sz)) => expect(o == ord(1L)).and(expect(sz == 3))
         case other                                      => failure(s"expected SubchainStateShape, got $other")
@@ -161,10 +161,10 @@ object TowerVerifierSuite extends MutableIOSuite {
   test("level-µ trial — header with VRF that ACTUALLY passes the L1 trial → accept") { verifier =>
     // For L1 (params: pMax≈1.131, σ=0.5), threshold = pMax * (1 - e^(-(gMu-1)/σ)) * gating(δ_S, γ).
     // Use gMu=10 (anchor at since=0, header at ord=10): threshold-pre-gating ≈ 1.131 * (1 - e^-18) ≈ 1.131.
-    // Use deltaSlot ≥ γ (=15 by default in LddConfig.Default) so gating = 1. Then threshold = 1.131,
+    // Use deltaSlot ≥ γ (=16 in LddConfigFixture.production) so gating = 1. Then threshold = 1.131,
     // and any tau < 1.0 < 1.131 → passes. Pick a VRF whose tau < 1/2 for safety margin.
     val passingVrf = findPassingVrf(1, Ratio(BigInt(1), BigInt(2)))
-    val l1Header = header(10L, 100L, 80L, passingVrf, eta = etaHash(0)) // deltaSlot = 20 > γ=15 → gating=1
+    val l1Header = header(10L, 100L, 80L, passingVrf, eta = etaHash(0)) // deltaSlot = 20 > γ=16 → gating=1
     val l0SuffixVrf = findPassingVrf(1, Ratio.One)
     val suffix = (96L to 100L).toVector.map(o => header(o, o * 10L, o * 10L - 9L, l0SuffixVrf, eta = etaHash(0)))
     val proof = TowerProof(
@@ -173,7 +173,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map(1 -> Vector(l1Header))
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(_: ProofError.TrialFailed) => failure(s"expected non-TrialFailed error, got TrialFailed")
         case _                               => success
@@ -192,7 +192,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = Vector(header(1L, 10L, 9L, anyVrf)),
       levelChains = Map(1 -> Vector(l1Header))
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(ProofError.TrialFailed(1, o, _, threshold)) =>
           expect(o == ord(1L)).and(expect(threshold == Ratio.Zero))
@@ -220,7 +220,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map(1 -> l1Chain)
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(ProofError.DensityViolation(level, _, _, _)) => expect(level == 1)
         case Left(_: ProofError.TrialFailed)                   =>
@@ -243,7 +243,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map(1 -> l1Chain)
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(_: ProofError.DensityViolation) =>
           failure("density check should be skipped for short proofs")
@@ -264,7 +264,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map.empty
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(_: ProofError.L0VrfFailed) => success
         case other                           => failure(s"expected L0VrfFailed, got $other")
@@ -287,7 +287,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map.empty
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(_: ProofError.EtaChainInconsistent) => success
         case Left(_: ProofError.L0VrfFailed)          =>
@@ -318,7 +318,7 @@ object TowerVerifierSuite extends MutableIOSuite {
         )
       )
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       r match {
         case Left(_: ProofError.TrialFailed) => success
         case Left(_)                         => success // any other rejection is also acceptable here
@@ -337,7 +337,7 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map.empty
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       expect(r.isLeft)
     }
   }
@@ -354,14 +354,14 @@ object TowerVerifierSuite extends MutableIOSuite {
       level0Suffix = suffix,
       levelChains = Map(1 -> l1Chain)
     )
-    verifier.verify(proof, genesisEta, etaRotationSnapshots).map { r =>
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { r =>
       expect(r.isLeft) // exact error type depends on which check fires first
     }
   }
 
-  // ============== Density check uses LddConfig.Default by default ==============
+  // ============== Density check uses the caller-provided LddConfig (no source-level default) ==============
 
-  test("LddConfig parameter accepted (Default + custom)") { verifier =>
+  test("LddConfig parameter accepted (fixture + custom)") { verifier =>
     val customLdd = LddConfig(lddCutoff = 30, offset = 5, baselineDifficulty = Ratio(1, 10), amplitude = Ratio(1, 3))
     verifier.verify(TowerProof.Empty, genesisEta, etaRotationSnapshots, customLdd).map { r =>
       expect(r == Right(()))

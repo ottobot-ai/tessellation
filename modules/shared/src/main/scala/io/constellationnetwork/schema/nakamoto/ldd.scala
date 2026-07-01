@@ -23,6 +23,10 @@ import derevo.derive
   * @param amplitude
   *   fA — peak difficulty at the ramp top
   */
+// NO embedded value default lives here. The LDD parameters are consensus-critical and AUTHORITATIVE in HOCON
+// (`nakamoto.ldd` in application.conf, per-env overridable) — a source-level `Default` silently drifts from that
+// config (γ=15-here vs γ=16-in-config is exactly the class of bug this removal prevents). Production reads the
+// config; tests construct an explicit fixture (see `LddConfigFixture` in `shared` test scope).
 @derive(encoder, decoder, eqv, show)
 case class LddConfig(
   lddCutoff: Int,
@@ -30,30 +34,3 @@ case class LddConfig(
   baselineDifficulty: Ratio,
   amplitude: Ratio
 )
-
-object LddConfig {
-
-  /** Decimal digits of precision used when parsing Double-typed env vars (`NAKAMOTO_LDD_BASELINE`, `NAKAMOTO_LDD_AMPLITUDE`) into `Ratio`.
-    * 18 = limit of Double mantissa. After this point the value is locked in as an exact rational and never touches Double again on the
-    * consensus path.
-    */
-  val DoubleParsePrecision: Int = 18
-
-  /** Default Taktikos parameters from Bifrost production. fA = 1/2, fB = 1/20. */
-  val Default: LddConfig = LddConfig(
-    lddCutoff = 15,
-    offset = 1,
-    baselineDifficulty = Ratio(1, 20),
-    amplitude = Ratio(1, 2)
-  )
-
-  /** Construct from Double-typed inputs (env vars, legacy callers). Locks the value to `DoubleParsePrecision` decimal digits.
-    */
-  def fromDoubles(lddCutoff: Int, offset: Int, baselineDifficulty: Double, amplitude: Double): LddConfig =
-    LddConfig(
-      lddCutoff,
-      offset,
-      Ratio(baselineDifficulty, DoubleParsePrecision),
-      Ratio(amplitude, DoubleParsePrecision)
-    )
-}

@@ -62,7 +62,8 @@ object TowerFinalizer {
     *   pure computer for the L-1 level-µ trials. Same instance the producer can use offline; the trial is deterministic given `(ρ_S, g_µ,
     *   δ_S, γ)`.
     * @param lddCutoff
-    *   `γ` for the L0 slot-gap gating multiplier `min(1, δ_S/γ)`. Sourced from `LddConfig.lddCutoff` at construction (typically 15).
+    *   `γ` for the L0 slot-gap gating multiplier `min(1, δ_S/γ)`. Sourced from `LddConfig.lddCutoff` (the bound consensus config; no
+    *   source-level default).
     */
   def make[F[_]: Async: Metrics](
     tower: TowerStore[F],

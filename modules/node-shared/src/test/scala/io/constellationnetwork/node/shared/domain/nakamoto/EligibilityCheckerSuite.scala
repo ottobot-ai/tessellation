@@ -7,8 +7,8 @@ import cats.effect.IO
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
-import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{LddConfig, LddConfigFixture}
 import io.constellationnetwork.security.vrf.EcVrf25519
 
 import weaver.SimpleIOSuite
@@ -16,7 +16,8 @@ import weaver.SimpleIOSuite
 object EligibilityCheckerSuite extends SimpleIOSuite {
 
   private val vrf = new EcVrf25519()
-  private val defaultConfig = LddConfig.Default
+  // Production-aligned LDD curve (γ=16). Suites that pin γ-specific values below track this.
+  private val defaultConfig = LddConfigFixture.production
   private val random = new SecureRandom()
 
   // Match Bifrost prod precision (log1p=8, exp=38) so test thresholds are byte-identical to runtime.
@@ -69,11 +70,12 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
   test("threshold equals baselineDifficulty in recovery region (δ ≥ γ) at stake=1") {
     for {
       checker <- checkerIO
-      thresh15 <- checker.threshold(Ratio.One, 15, defaultConfig)
+      // δ=20 and δ=100 are both ≥ γ=16, so both sit in the baseline recovery region.
+      thresh20 <- checker.threshold(Ratio.One, 20, defaultConfig)
       thresh100 <- checker.threshold(Ratio.One, 100, defaultConfig)
     } yield
       // At stake=1 the formula 1 - (1-f)^1 = f, so threshold = baselineDifficulty exactly (within Lentz precision).
-      expect((thresh15 - defaultConfig.baselineDifficulty).abs < Tol)
+      expect((thresh20 - defaultConfig.baselineDifficulty).abs < Tol)
         .and(expect((thresh100 - defaultConfig.baselineDifficulty).abs < Tol))
   }
 
@@ -319,8 +321,8 @@ object EligibilityCheckerSuite extends SimpleIOSuite {
       threshDelta0 <- checker.threshold(Ratio.One, 0, defaultConfig)
       threshDelta1 <- checker.threshold(Ratio.One, 1, defaultConfig)
       threshDelta2 <- checker.threshold(Ratio.One, 2, defaultConfig)
-      // δ=2: difficulty = 1/2 × (2-1)/(15-1) = 1/28. At stake=1: threshold = 1 - (27/28)^1 = 1/28.
-      expectedRampStart = Ratio(1, 28)
+      // δ=2 at γ=16: difficulty = 1/2 × (2-1)/(16-1) = 1/30. At stake=1: threshold = 1 - (29/30)^1 = 1/30.
+      expectedRampStart = Ratio(1, 30)
     } yield
       expect(threshDelta0 == Ratio.Zero)
         .and(expect(threshDelta1 == Ratio.Zero))

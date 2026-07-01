@@ -130,7 +130,8 @@ object ShardCheckpointAttestationEmitter {
     *   this operator's stake share within the shard committee (v1 stable-σ rule: `1 / K_S`). Not load-bearing for the proof bytes (the
     *   proof is over `(shardEta, slot)` only) but carried for symmetry / future threshold use.
     * @param lddConfig
-    *   per-shard LDD config (production uses `LddConfig.Default`). Carried for symmetry; unused by `vrfProofForSlot` itself.
+    *   per-shard LDD config (production threads the consensus config from the wiring site). Carried for symmetry; unused by
+    *   `vrfProofForSlot` itself.
     */
   def make[F[_]: Async: SecurityProvider](
     selfPeerId: PeerId,

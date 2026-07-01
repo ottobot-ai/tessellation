@@ -443,7 +443,14 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
           Amount.empty,
           EpochProgress(NonNegLong(136080L)),
           mptOverlay,
-          dbLogger
+          dbLogger,
+          etaRotationSnapshots = 2550L,
+          invaliditySlashingConfig = InvalidStateProofSlashingConfig(
+            watchtowerEnabled = true,
+            slashFraction = io.constellationnetwork.numerics.Ratio.One,
+            bountyFraction = io.constellationnetwork.numerics.Ratio(1, 20),
+            cooldownEpochs = 100L
+          )
         )
       snapshotContextFunctions = GlobalSnapshotContextFunctions.make[IO](
         snapshotAcceptanceManager,

@@ -35,14 +35,14 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
   *   (pre-encoded by the handler via its own codec, so the engine is value-type-agnostic — it stores the bytes verbatim via the
   *   `Array[Byte]` passthrough codec). One marker per ADMITTED cross-shard instance.
   * @param rejected
-  *   the single-use identities (content hashes) REJECTED this ordinal — double-consume / replay (already in the nullifier set) or
-  *   failed the type's include-check. Surfaced for logging / downstream effect handlers.
+  *   the single-use identities (content hashes) REJECTED this ordinal — double-consume / replay (already in the nullifier set) or failed
+  *   the type's include-check. Surfaced for logging / downstream effect handlers.
   *
   * '''Why key-typed (`GlobalStateKey`) rather than raw `Hex`.''' The branch-aware acceptance overlay exposes only a `GlobalStateKey`-keyed
   * `insert` (writing by raw `Hex` would bypass the overlay's branch handle and its MultiBranch pending-write semantics). The engine writes
-  * the pre-encoded bytes through the `Array[Byte]` passthrough `ImmutableCodec` (`byteArrayImmutableCodec`, `ByteVector.view`), so the stored
-  * bytes are byte-identical to a typed `insert[T]` with the type's real codec — uniform for every message type, with no per-type codec in the
-  * engine. The engine derives each marker's `Hex` via `GlobalStateKey.toHex` for the #107 verify-replay fold.
+  * the pre-encoded bytes through the `Array[Byte]` passthrough `ImmutableCodec` (`byteArrayImmutableCodec`, `ByteVector.view`), so the
+  * stored bytes are byte-identical to a typed `insert[T]` with the type's real codec — uniform for every message type, with no per-type
+  * codec in the engine. The engine derives each marker's `Hex` via `GlobalStateKey.toHex` for the #107 verify-replay fold.
   */
 final case class CrossShardSettlementWrite(
   markers: SortedMap[GlobalStateKey, Array[Byte]],
@@ -80,9 +80,9 @@ trait CrossShardMessageHandler[F[_]] {
   def nullifierFieldId: GlobalStateFieldId
 
   /** Self-contained nullifier lifecycle for this ordinal: materialize this type's prior nullifier set, classify the cross-shard instances
-    * out of `acceptedSpendActions` (owner-shard ≠ producing-shard via `ShardAssignment`), REJECT any whose single-use identity is already in
-    * the nullifier set OR fails the type's include-check, and return the markers to write (`GlobalStateKey` → canonical bytes) + the rejected
-    * identities. Deterministic same-snapshot collision order (sorted by single-use identity ⇒ first admits, rest reject).
+    * out of `acceptedSpendActions` (owner-shard ≠ producing-shard via `ShardAssignment`), REJECT any whose single-use identity is already
+    * in the nullifier set OR fails the type's include-check, and return the markers to write (`GlobalStateKey` → canonical bytes) + the
+    * rejected identities. Deterministic same-snapshot collision order (sorted by single-use identity ⇒ first admits, rest reject).
     */
   def settle(
     acceptedSpendActions: SortedMap[Address, List[SpendAction]],
@@ -136,9 +136,9 @@ object CrossShardMessageEngine {
         EngineResult(allMarkers, allRejected)
       }
 
-  /** Write the unioned markers through the ONE branch-aware `mpt.insert` path (the SAME path the watchtower `Slashings` partition uses), and
-    * return the hex-keyed byte view of every written marker for the #107 verify-replay fold. Skips the write when there are no markers (the
-    * common path / always at `numShards = 1`) ⇒ no partition touched ⇒ `mptRoot` byte-identical.
+  /** Write the unioned markers through the ONE branch-aware `mpt.insert` path (the SAME path the watchtower `Slashings` partition uses),
+    * and return the hex-keyed byte view of every written marker for the #107 verify-replay fold. Skips the write when there are no markers
+    * (the common path / always at `numShards = 1`) ⇒ no partition touched ⇒ `mptRoot` byte-identical.
     */
   def write[F[_]: Async](
     markers: SortedMap[GlobalStateKey, Array[Byte]],

@@ -53,7 +53,6 @@ object types {
   /** Protocol-parameter block for L0 genesis. Defaults track the §1.1 Taktikos defaults. */
   case class L0GenesisProtocolParams(
     lddCutoff: Int,
-    slotsPerEpoch: Long,
     etaRotationSnapshots: Long,
     genesisEta: String,
     startingEpochProgress: Long
@@ -63,10 +62,16 @@ object types {
     implicit val encoder: Encoder[L0GenesisProtocolParams] = deriveEncoder[L0GenesisProtocolParams]
     implicit val decoder: Decoder[L0GenesisProtocolParams] = deriveDecoder[L0GenesisProtocolParams]
 
+    // INFORMATIONAL genesis-record defaults — consensus does NOT read these. The live, per-env values are authoritative in
+    // HOCON (`nakamoto.ldd` γ; `nakamoto.confirmation-depth-k` → derived R = round(3.1·k₁)). Kept in lock-step with
+    // `application.conf` so a generated genesis file is not misleading.
+    //   - lddCutoff = 16          — γ, mirrors `nakamoto.ldd.cutoff`.
+    //   - etaRotationSnapshots    — R, the eta-rotation EPOCH in SNAPSHOTS = round(3.1·k₁); 3174 at the mainnet k₁=1024
+    //                               reference (NOT 10·k₁ — the old 2550 label was stale). Consensus derives the real
+    //                               per-env R from k₁; this is a record only.
     val default: L0GenesisProtocolParams = L0GenesisProtocolParams(
-      lddCutoff = 15,
-      slotsPerEpoch = 60L,
-      etaRotationSnapshots = 2550L,
+      lddCutoff = 16,
+      etaRotationSnapshots = 3174L,
       genesisEta = "tessellation-nakamoto-genesis",
       startingEpochProgress = 0L
     )

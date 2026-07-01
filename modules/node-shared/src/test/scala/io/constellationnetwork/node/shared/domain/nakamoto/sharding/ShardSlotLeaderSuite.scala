@@ -12,7 +12,7 @@ import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.implicits._
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfigFixture}
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.vrf.EcVrf25519
@@ -156,12 +156,12 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test("isLeader fire rate over 1000 slots tracks LDD threshold expectation at K_S=4, σ=1/4") {
     case (hasher, ec, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      // 4-member committee at uniform σ. Default LDD config: fA=1/2, fB=1/20, ψ=1, γ=15. We use a fixed slotGap = 100 ⇒ recovery
+      // 4-member committee at uniform σ. Default LDD config: fA=1/2, fB=1/20, ψ=1, γ=16. We use a fixed slotGap = 100 ⇒ recovery
       // region holds (slotGap > γ) ⇒ difficulty = fB = 1/20. At σ=1/4 the per-slot threshold is
       //   t = 1 - (1 - 1/20)^(1/4) = 1 - (19/20)^(1/4) ≈ 1 - 0.987342 = 0.012658
       // Expected fires over 1000 slots ≈ 1000 · 0.012658 ≈ 12.66. With Bernoulli variance σ²_fires ≈ N·t·(1-t) ≈ 12.50 ⇒ sd ≈ 3.54.
       // A ±50% window (≈ ±6.33 ≈ 1.79σ) is the sanity bound (Chernoff-tight is not the goal here).
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val shardId = ShardId.unsafeApply(0)
       val gl0Eta = randomGl0Eta()
       val sigma = Ratio(1, 4)
@@ -200,7 +200,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test("isLeader fires zero times when sigmaInCommittee = 0") {
     case (hasher, _, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val sk = randomSk()
       val gl0Eta = randomGl0Eta()
       // σ=0 ⇒ threshold = 1 - (1-f)^0 = 0 ⇒ nothing ever fires. This is the contract `EligibilityChecker.threshold` provides and
@@ -218,7 +218,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test("isLeader output verifies under verifyLeader for the same (shardEta, slot, σ, ldd)") {
     case (hasher, _, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val sigma = Ratio(1, 2) // higher σ ⇒ more wins per slot, so we find a winning slot faster
       val slotGap = 100L
       val sk = randomSk()
@@ -251,7 +251,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test("verifyLeader rejects a leader's proof when checked against a different shardEta") {
     case (hasher, _, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val sigma = Ratio(1, 2)
       val slotGap = 100L
       val sk = randomSk()
@@ -294,7 +294,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test("verifyLeader rejects a proof signed under a different VK") {
     case (hasher, _, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val sigma = Ratio(1, 2)
       val slotGap = 100L
       val sk1 = randomSk()
@@ -372,7 +372,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   ) {
     case (hasher, _, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val sigma = Ratio(1, 2) // higher σ ⇒ win a slot quickly
       val slotGap = 100L
       val shardId = ShardId.unsafeApply(5)
@@ -413,7 +413,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test("S4 determinism failure mode: a verifier keyed on the WRONG epoch derives a different eta and the leader's proof does NOT verify") {
     case (hasher, _, ssl) =>
       implicit val h: Hasher[IO] = hasher
-      val cfg = LddConfig.Default
+      val cfg = LddConfigFixture.production
       val sigma = Ratio(1, 2)
       val slotGap = 100L
       val shardId = ShardId.unsafeApply(5)
