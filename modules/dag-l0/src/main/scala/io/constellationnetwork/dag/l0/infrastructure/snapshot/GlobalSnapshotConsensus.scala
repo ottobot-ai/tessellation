@@ -203,6 +203,11 @@ object GlobalSnapshotConsensus {
     // -binary pruning on actual finality. Seeded with SnapshotOrdinal.MinIncrementalValue
     // (ordinal 1 = genesis); grows monotonically as finality advances.
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    // Track-3 S1.5 "marker split": the settled (k₂) ref — the SAME ref backing `settledOrdinalTracker` (one settled source),
+    // DISTINCT from the k₁ `nakamotoFinalizedOrdinalRef`. Passed to `NakamotoChainStore.make` (below, in the chain-store wiring
+    // region) so the store can consume it for the S3 store-gate/fork-choice and reset it in `unsafe_clearFinality`. The k₂ marker
+    // is advanced only by the leader loop's `T_depth2` sink (through the tracker); the store just reads/resets it.
+    nakamotoSettledOrdinalRef: Ref[F, SnapshotOrdinal],
     // Observability seam for the chain-quality HTTP route (#138). Populated by SnapshotLeaderLoop
     // once the four FinalityTriggers are constructed; read by `FinalityTriggersRoutes` to answer
     // "which triggers qualified ord N?" without owning trigger references. Empty until the
@@ -1033,6 +1038,10 @@ object GlobalSnapshotConsensus {
               chainSelection,
               tipTracker,
               nakamotoFinalizedOrdinalRef,
+              // Track-3 S1.5: the distinct k₂ settled source (same ref as `settledOrdinalTracker`). Consumed by the store's S3
+              // store-gate/fork-choice and reset alongside the k₁ ref in `unsafe_clearFinality`. The k₁ store-gate + production
+              // floor are UNCHANGED in S1.5 — only the reset uses this ref for now.
+              nakamotoSettledOrdinalRef,
               keepDepthBehindFinalized
             )
             .toResource

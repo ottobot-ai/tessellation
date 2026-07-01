@@ -147,11 +147,16 @@ object Main
       finalityTriggerViewRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[IO]]](None)
         .asResource
-      // Track-3 S1: injected settled (k₂-archival) marker, promoted out of SnapshotLeaderLoop's fiber-local ref so
-      // FinalityTriggersRoutes can serve `GET /global-snapshots/settled`. G1 (critical): a FRESH tracker with its OWN Ref —
-      // NEVER aliased to `nakamotoFinalizedOrdinalRef` (k₁), which would report k₁ as "settled" and let a route corrupt the
-      // k₁ production floor. Same lifetime + Main→Services→HttpApi sharing pattern as `finalityTriggerViewRef`.
-      settledOrdinalTracker <- io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker.make[IO].asResource
+      // Track-3 S1.5 "marker split": the settled (k₂-archival) ordinal is now a first-class injected Ref, DISTINCT from the k₁
+      // `nakamotoFinalizedOrdinalRef` (G1: never alias — aliasing would report k₁ as "settled" and let a route corrupt the k₁
+      // production floor). There is exactly ONE settled (k₂) source: this ref backs BOTH the `SettledOrdinalTracker` (the monotone
+      // advance-and-read surface for SnapshotLeaderLoop's `T_depth2` sink + `GET /global-snapshots/settled`) AND
+      // `NakamotoChainStore`'s `nakamotoSettledOrdinalRef` — available to the store-gate/fork-choice in Track-3 S3, and reset here
+      // in lock-step with `nakamotoFinalizedOrdinalRef` inside `unsafe_clearFinality`. Same lifetime + Main→Services→HttpApi
+      // sharing pattern as `nakamotoFinalizedOrdinalRef`.
+      nakamotoSettledOrdinalRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue).asResource
+      settledOrdinalTracker = io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker
+        .makeFromRef[IO](nakamotoSettledOrdinalRef)
       // §3 NIPoPoW S5 — light-client proof + verify HTTP routes. Populated inside
       // GlobalSnapshotConsensus.make once the tower store and snapshot storage are wired.
       // Shared between Services and HttpApi the same way as `finalityTriggerViewRef`.
@@ -243,6 +248,7 @@ object Main
           Hasher.forKryo[IO],
           nodeShared.loggerBundle,
           nakamotoFinalizedOrdinalRef,
+          nakamotoSettledOrdinalRef,
           finalityTriggerViewRef,
           settledOrdinalTracker,
           nipopowProofProviderRef,

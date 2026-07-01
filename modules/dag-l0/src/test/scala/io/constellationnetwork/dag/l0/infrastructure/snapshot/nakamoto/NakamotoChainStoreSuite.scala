@@ -137,11 +137,35 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       _ <- stakeRegistry.updateValidators(Set(pid("self")))
       tipTracker <- TipTracker.make[IO](stakeRegistry)
       finalizedRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
+      // Track-3 S1.5 "marker split": the DISTINCT k₂ settled ref. These tests don't drive the settled marker, so it's allocated
+      // internally at MinValue and not exposed; `mkChainStoreWithSettled` returns it for the S1.5 gate tests.
+      settledRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
       // ChainSelection wants a fetchParent — for our P-11 surface tests we never trigger fork
       // selection, so a None-returning stub suffices.
       chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
-      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef, keepDepthBehindFinalized)
+      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef, settledRef, keepDepthBehindFinalized)
     } yield (chainStore, finalizedRef, tipTracker, stakeRegistry)
+
+  /** Track-3 S1.5 "marker split": exposes BOTH the k₁ finalized ref AND the DISTINCT k₂ settled ref so tests can drive them independently
+    * and assert (a) they advance independently, (b) the store's finality-safety gate keys off finalized (k₁) — NOT the deeper settled (k₂)
+    * marker — and (c) `unsafe_clearFinality` resets BOTH.
+    */
+  private def mkChainStoreWithSettled(
+    keepDepthBehindFinalized: Long = NakamotoChainStore.DefaultKeepDepthBehindFinalized
+  )(
+    implicit hs: HasherSelector[IO]
+  ): IO[
+    (NakamotoChainStore.NakamotoChainStoreAlgebra[IO], Ref[IO, SnapshotOrdinal], Ref[IO, SnapshotOrdinal])
+  ] =
+    for {
+      stakeRegistry <- StakeRegistry.equalWeight[IO]
+      _ <- stakeRegistry.updateValidators(Set(pid("self")))
+      tipTracker <- TipTracker.make[IO](stakeRegistry)
+      finalizedRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
+      settledRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
+      chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
+      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef, settledRef, keepDepthBehindFinalized)
+    } yield (chainStore, finalizedRef, settledRef)
 
   /** Same as `mkChainStore` but with a `diskBackedStorage` plumbed in. Returns the disk Refs so tests can simulate "this snapshot is on
     * disk but evicted from memory".
@@ -163,11 +187,13 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       _ <- stakeRegistry.updateValidators(Set(pid("self")))
       tipTracker <- TipTracker.make[IO](stakeRegistry)
       finalizedRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
+      // Track-3 S1.5: distinct k₂ settled ref (unused by the disk-fallback tests, allocated internally).
+      settledRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
       diskRef <- Ref.of[IO, Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]]](Map.empty)
       diskByHashRef <- Ref.of[IO, Map[Hash, Signed[GlobalIncrementalSnapshot]]](Map.empty)
       storage = diskBackedStorage(diskRef, diskByHashRef)
       chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
-      chainStore <- NakamotoChainStore.make[IO](storage, chainSelection, tipTracker, finalizedRef, keepDepthBehindFinalized)
+      chainStore <- NakamotoChainStore.make[IO](storage, chainSelection, tipTracker, finalizedRef, settledRef, keepDepthBehindFinalized)
     } yield (chainStore, finalizedRef, diskRef, diskByHashRef)
 
   private def pid(name: String): PeerId =
@@ -417,6 +443,93 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         // The previously-refused canonical is now the bestTip (the core P-11 contract — the
         // reset unblocks the chain).
         postBestTip.contains(h2.hash)
+      )
+  }
+
+  // ============================================================
+  // Track-3 S1.5 "marker split": the settled (k₂) ordinal is a source DISTINCT from the finalized
+  // (k₁) ordinal. These gate the three S1.5 contracts — independent advancement, the store-gate
+  // stays k₁ (NOT the deeper settled marker), and lock-step reset — WITHOUT re-keying the k₁
+  // store-gate or the SnapshotLeaderLoop production floor (those move in S3).
+  // ============================================================
+
+  test("S1.5: settled (k₂) and finalized (k₁) advance independently; invariant settled ≤ finalized holds") { res =>
+    implicit val (_, _, _, h, _) = res
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStoreWithSettled()
+      (_, finalizedRef, settledRef) = r
+      // The settled marker is advanced ONLY through the tracker (the leader loop's T_depth2 sink), which shares this exact ref.
+      settledTracker = SettledOrdinalTracker.makeFromRef[IO](settledRef)
+      // Advance finalized (k₁) to 100 — the settled (k₂) marker must NOT move.
+      _ <- finalizedRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(100L)))
+      settledAfterFinalizedBump <- settledRef.get
+      // Advance settled (k₂) to 40 (deeper, smaller ordinal ≤ finalized) — finalized must NOT move.
+      _ <- settledTracker.markSettled(SnapshotOrdinal(NonNegLong.unsafeFrom(40L)))
+      finalizedAfterSettledBump <- finalizedRef.get
+      settledFinal <- settledRef.get
+    } yield
+      expect.all(
+        settledAfterFinalizedBump == SnapshotOrdinal.MinValue, // finalized advance left settled untouched
+        finalizedAfterSettledBump == SnapshotOrdinal(NonNegLong.unsafeFrom(100L)), // settled advance left finalized untouched
+        settledFinal == SnapshotOrdinal(NonNegLong.unsafeFrom(40L)),
+        settledFinal.value.value <= finalizedAfterSettledBump.value.value // settled ≤ finalized invariant
+      )
+  }
+
+  test("S1.5: store finality-gate keys off finalized (k₁), NOT the deeper settled (k₂) marker") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStoreWithSettled()
+      (chainStore, finalizedRef, settledRef) = r
+      // finalized (k₁) = 5, settled (k₂) = 1 — settled is the DEEPER (smaller) marker.
+      _ <- finalizedRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(5L)))
+      _ <- settledRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(1L)))
+      // Seed hash A at ordinal 3 — in the discriminating window settled(1) < 3 ≤ finalized(5).
+      pairA <- mkGenesis
+      (sA, ctxA) = pairA
+      storedA <- chainStore.store(sA, ctxA, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
+      // A DIFFERENT-hash write at ordinal 3 must be REFUSED — 3 ≤ finalized(5) with an existing divergent hash. Had the gate
+      // (prematurely, S3) moved to the settled marker, 3 > settled(1) would instead ALLOW this write.
+      pairB <- mkAltSnapshot
+      (sB, ctxB) = pairB
+      storedB <- chainStore.store(sB, ctxB, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
+      refuseCount <- chainStore.divergentRefuseCount
+    } yield
+      expect.all(
+        storedA, // first write accepted
+        !storedB, // divergent write at 3 REFUSED because 3 ≤ finalized (k₁) — proves the gate is k₁, not settled(1)
+        refuseCount == 1L
+      )
+  }
+
+  test("S1.5: unsafe_clearFinality resets BOTH finalized (k₁) and settled (k₂) to MinValue") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStoreWithSettled()
+      (chainStore, finalizedRef, settledRef) = r
+      // Seed chain state (so the reset reports work done) and drive both markers high (settled ≤ finalized).
+      pair <- mkGenesis
+      (s1, ctx1) = pair
+      _ <- chainStore.store(s1, ctx1, ordinal = 1L, slot = 1L, parentHash = Hash.empty, vrfOutput = Array.empty)
+      _ <- finalizedRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(100L)))
+      _ <- settledRef.set(SnapshotOrdinal(NonNegLong.unsafeFrom(40L)))
+      cleared <- chainStore.unsafe_clearFinality
+      postFinalized <- finalizedRef.get
+      postSettled <- settledRef.get
+    } yield
+      expect.all(
+        cleared, // state was cleared
+        postFinalized == SnapshotOrdinal.MinValue, // k₁ reset
+        postSettled == SnapshotOrdinal.MinValue // k₂ reset in lock-step (S1.5)
       )
   }
 

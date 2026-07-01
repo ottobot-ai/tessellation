@@ -207,6 +207,18 @@ object NakamotoChainStore {
     // at-or-below finalized with MATCHING hash are no-ops (legitimate re-delivery or
     // download-replay). Only differing-hash writes at-or-below finalized are refused.
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    // Track-3 S1.5 "marker split". The DISTINCT k₂ "settled" ordinal source — the deepest ordinal past the Phase-2→Phase-3
+    // archival gate (k₂ = 100·k₁), advanced ONLY by SnapshotLeaderLoop's `T_depth2` sink (via the `SettledOrdinalTracker` that
+    // shares this exact ref, so there is ONE settled source). This is NOT `nakamotoFinalizedOrdinalRef` (k₁) — the two markers are
+    // separate refs and advance independently, with the invariant `settled ≤ finalized` maintained by construction (k₂ is the
+    // deeper window: T_depth2 always trails T_depth1).
+    //
+    // In S1.5 the store only RESETS this ref (in `unsafe_clearFinality`, in lock-step with the k₁ ref) — it is threaded in now so
+    // it is AVAILABLE to the store-gate + fork-choice, but the store-gate (the `ordinal <= finalized` finality-safety check in
+    // `store`) and the production floor (`SnapshotLeaderLoop`) stay keyed on the k₁ `nakamotoFinalizedOrdinalRef`. Re-keying the
+    // store-gate + `shouldSwitch` onto this settled ref is Track-3 S3; wiring it now (without S3) would either be inert or drag
+    // production to k₂ — the `86f390130` self-contradiction that got reverted.
+    nakamotoSettledOrdinalRef: Ref[F, SnapshotOrdinal],
     // Heap-leak Fix B. Number of ordinals BEHIND the finalized tip to retain in
     // `ChainState.byHash`. Defaults to [[DefaultKeepDepthBehindFinalized]] = 255 (k₁,
     // matching the operational confirmation depth). The production call site overrides via
@@ -791,6 +803,12 @@ object NakamotoChainStore {
             _ <- divergentRefuseCounterRef.set(0L)
             _ <- divergentRefuseSampleRef.set(None)
             _ <- nakamotoFinalizedOrdinalRef.set(SnapshotOrdinal.MinValue)
+            // Track-3 S1.5: reset the DISTINCT k₂ settled marker in lock-step with the k₁ finalized ref. Resetting both together
+            // preserves the `settled ≤ finalized` invariant through a re-bootstrap (leaving settled high while finalized drops to
+            // MinValue would transiently violate it). This ref is shared with `SettledOrdinalTracker`, whose only other writer is
+            // the monotone `T_depth2` sink — so this reset is the one place the settled marker can move backward, and it is gated by
+            // the same `unsafe_` re-bootstrap contract as the finalized reset.
+            _ <- nakamotoSettledOrdinalRef.set(SnapshotOrdinal.MinValue)
             anyCleared = preChainSize > 0 || preFinalized > 0 || preBestTip.isDefined
             _ <-
               if (anyCleared)

@@ -35,15 +35,28 @@ trait SettledOrdinalTracker[F[_]] {
 object SettledOrdinalTracker {
 
   /** Allocate a tracker backed by a FRESH `Ref` initialised to `SnapshotOrdinal.MinValue`. G1: this is a NEW ref, never the k₁
-    * `nakamotoFinalizedOrdinalRef` — see the class doc.
+    * `nakamotoFinalizedOrdinalRef` — see the class doc. Convenience for callers (e.g. tests) that don't need to share the backing ref; the
+    * production wiring uses [[makeFromRef]] instead.
     */
   def make[F[_]: Sync]: F[SettledOrdinalTracker[F]] =
-    Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue).map { ref =>
-      new SettledOrdinalTracker[F] {
-        def markSettled(ordinal: SnapshotOrdinal): F[Unit] =
-          ref.update(prev => if (ordinal.value.value > prev.value.value) ordinal else prev)
+    Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue).map(makeFromRef[F])
 
-        def settledOrdinal: F[SnapshotOrdinal] = ref.get
-      }
+  /** Build a tracker as a write-restricted VIEW over an EXTERNALLY-owned `Ref` (Track-3 S1.5 "marker split"). The same ref is handed to
+    * `NakamotoChainStore` as `nakamotoSettledOrdinalRef`, so there is exactly ONE settled (k₂) source: this tracker is the monotone
+    * advance-and-read surface for the `T_depth2` sink + the `/settled` route, while the store owns the reset (`unsafe_clearFinality` sets
+    * it back to `MinValue`, in lock-step with `nakamotoFinalizedOrdinalRef`).
+    *
+    * '''Still distinct from `nakamotoFinalizedOrdinalRef` (k₁).''' The caller MUST pass a ref that is NOT the k₁ production-floor ref — see
+    * the class doc. This constructor only shares the settled ref with the store/fork-choice (k₂ consumers); it never aliases k₁.
+    *
+    * [[markSettled]] stays internally monotone, so even though the store can now reset the shared ref, the tracker itself never regresses
+    * it.
+    */
+  def makeFromRef[F[_]: Sync](ref: Ref[F, SnapshotOrdinal]): SettledOrdinalTracker[F] =
+    new SettledOrdinalTracker[F] {
+      def markSettled(ordinal: SnapshotOrdinal): F[Unit] =
+        ref.update(prev => if (ordinal.value.value > prev.value.value) ordinal else prev)
+
+      def settledOrdinal: F[SnapshotOrdinal] = ref.get
     }
 }

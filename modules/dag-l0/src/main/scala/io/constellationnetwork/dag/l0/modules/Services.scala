@@ -73,10 +73,15 @@ object Services {
     txHasher: Hasher[F],
     loggerBundle: LoggerBundle[F],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
+    // Track-3 S1.5 "marker split": the settled (k₂) ref — the SAME ref that backs `settledOrdinalTracker` below (one settled source),
+    // DISTINCT from the k₁ `nakamotoFinalizedOrdinalRef`. Threaded straight into GlobalSnapshotConsensus.make → NakamotoChainStore
+    // (which consumes it for the S3 store-gate/fork-choice and resets it in `unsafe_clearFinality`). No Services field — like the k₁
+    // ref, only the store/leader-loop need it; HttpApi reads the settled value through `settledOrdinalTracker` instead.
+    nakamotoSettledOrdinalRef: Ref[F, SnapshotOrdinal],
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
     // Track-3 S1: injected settled (k₂-archival) marker — a NEW instance created in Main (never the k₁ `nakamotoFinalizedOrdinalRef`),
     // threaded into GlobalSnapshotConsensus.make (the leader loop is its only writer) and re-exposed as a field for HttpApi →
-    // FinalityTriggersRoutes (`GET /global-snapshots/settled`).
+    // FinalityTriggersRoutes (`GET /global-snapshots/settled`). Backed by `nakamotoSettledOrdinalRef` above (Track-3 S1.5).
     settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
     // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Mirrors
     // `finalityTriggerViewRef`; populated inside GlobalSnapshotConsensus.make once the tower store
@@ -300,6 +305,7 @@ object Services {
             loggerBundle,
             queues.rumor,
             nakamotoFinalizedOrdinalRef,
+            nakamotoSettledOrdinalRef,
             finalityTriggerViewRef,
             settledOrdinalTracker,
             nipopowProofProviderRef,
