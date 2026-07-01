@@ -55,11 +55,11 @@ trait AllowSpendStateManager[F[_]] {
     *
     * `metagraphPinnedEpochProgresses` maps a metagraph address to the epoch the metagraph itself used when it expired its OWN allow-spends
     * — its pinned `globalSyncView.epochProgress` (the SAME value `CurrencySnapshotAcceptanceManager` reads as
-    * `lastGlobalSnapshotEpochProgress
-    * \= lastSyncGlobalSnapshot.epochProgress`). The METAGRAPH-scoped expiry filter (`processMetagraphAllowSpends`) uses this pinned epoch
-    * per `Some(mg)`, NOT the live global `epochProgress`, so a metagraph trailing the global tip doesn't have its allow-spends over-pruned
-    * (the "m0 frozen" wedge). A metagraph absent from the map (genesis / pre-`globalSyncView` snapshot) falls back to the live
-    * `epochProgress` — the prior behaviour. The DAG-global scope (`None`) is unaffected and keeps the live global `epochProgress`.
+    * `lastGlobalSnapshotEpochProgress \= lastSyncGlobalSnapshot.epochProgress`). The METAGRAPH-scoped expiry filter
+    * (`processMetagraphAllowSpends`) uses this pinned epoch per `Some(mg)`, NOT the live global `epochProgress`, so a metagraph trailing
+    * the global tip doesn't have its allow-spends over-pruned (the "m0 frozen" wedge). A metagraph absent from the map (genesis /
+    * pre-`globalSyncView` snapshot) falls back to the live `epochProgress` — the prior behaviour. The DAG-global scope (`None`) is
+    * unaffected and keeps the live global `epochProgress`.
     */
   def acceptAllowSpendsWithExpired(
     epochProgress: EpochProgress,

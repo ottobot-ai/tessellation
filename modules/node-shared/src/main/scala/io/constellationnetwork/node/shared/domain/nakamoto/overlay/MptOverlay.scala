@@ -214,6 +214,20 @@ trait MptOverlay[F[_], K] {
     */
   def pruneBelow(ord: SnapshotOrdinal): F[Unit]
 
+  /** Current in-memory sizes of the overlay's history accumulators (Track-3 S2 telemetry). Read-only, allocation-light snapshot — NO
+    * `Metrics[F]` dependency is threaded into `make`; instead a caller that already has `Metrics[F]` (`SnapshotLeaderLoop.finalityMonitor`)
+    * reads this each finality tick, emits `dag_nakamoto_overlay_undo_journal_size` from `undoJournal`, and increments an over-bound counter
+    * when `JournalSizes.overBound(k₁)` holds.
+    *
+    * The `undoJournal` count is the load-bearing signal: it is the IN-MEMORY reverse-delta window that MUST stay bounded to the operational
+    * k₁ fast-path (the Heap-leak Fix A prune calls `pruneBelow` at the k₁ watermark). The disk-backed signed-bytes store holds the deep
+    * history to k₂ (Track-3 S2) — RAM does NOT. If `undoJournal` ever climbs past the k₁ window, the RAM journal is leaking toward k₂ (the
+    * regression S2's disk/RAM split exists to prevent), and the over-bound counter fires as the sentinel.
+    *
+    * Multi-branch: live sizes of `undoJournalRef` / `finalizedRef` / `pendingRef`. Passthrough: all-zero (no per-branch in-memory history).
+    */
+  def journalSizes: F[MptOverlay.JournalSizes]
+
   /** Re-bootstrap escape hatch (P-11, task #141). Clear `pendingRef`, `finalizedRef`, `lastCommittedBranchRef`, and `undoJournalRef`
     * unconditionally. The underlying base `MptStore` is NOT touched — the caller (`RebootstrapOrchestrator`) is responsible for resyncing
     * base via `mptStore.syncFromGlobalSnapshotInfo` after this returns. Equivalent to "fresh overlay over the existing base".
@@ -227,6 +241,27 @@ trait MptOverlay[F[_], K] {
 }
 
 object MptOverlay {
+
+  /** Read-only snapshot of the overlay's in-memory history-accumulator sizes (Track-3 S2 memory-budget telemetry). Returned by
+    * `MptOverlay.journalSizes`.
+    *
+    *   - `undoJournal`: entries in `undoJournalRef` — the per-ordinal reverse-delta RAM window (#121). The bounded fast-path that Fix A
+    *     prunes at the operational k₁ watermark. This is the count the `dag_nakamoto_overlay_undo_journal_size` gauge tracks.
+    *   - `finalizedMarkers`: entries in `finalizedRef` (cross-ordinal conflict-detection markers, also k₁-bounded by Fix A).
+    *   - `pendingBranches`: entries in `pendingRef` (live pending branches, bounded by the eviction cap — not by prune).
+    */
+  final case class JournalSizes(undoJournal: Int, finalizedMarkers: Int, pendingBranches: Int) {
+
+    /** True when the RAM undo-journal has grown past its intended fast-path window `windowBound` (the operational k₁). A healthy node sits
+      * far below k₁ (folds happen at depth k₁ and Fix A prunes at the k₁ watermark, so only a thin band survives); exceeding k₁ means the
+      * prune is not keeping the journal bounded and RAM is drifting toward the k₂ disk depth — the leak S2's disk/RAM split prevents.
+      */
+    def overBound(windowBound: Long): Boolean = undoJournal.toLong > windowBound
+  }
+
+  object JournalSizes {
+    val empty: JournalSizes = JournalSizes(0, 0, 0)
+  }
 
   /** Per-branch entry in the overlay's pending-branches map. Lives only in memory — restart wipes pending state and the node resyncs from
     * the finalized base + `ChainSync`.
@@ -355,6 +390,10 @@ object MptOverlay {
         // Passthrough has no in-memory history (no `undoJournalRef`, no `pendingRef`, no `finalizedRef`);
         // writes already landed in `underlying` during the handle's lifetime. Trivially a no-op.
         Async[F].unit
+
+      def journalSizes: F[MptOverlay.JournalSizes] =
+        // Passthrough keeps no per-branch in-memory history — nothing to size.
+        Async[F].pure(MptOverlay.JournalSizes.empty)
 
       def unsafe_reset: F[Unit] =
         // Passthrough has no in-memory state to drop; writes already landed in `underlying`.
@@ -865,6 +904,13 @@ object MptOverlay {
                   s"OVERLAY-PRUNE-BELOW ord=$ordValue no-op (already pruned: $preUndo undoJournal, $preFinalized finalized)"
                 )
           } yield ()
+        }
+
+      def journalSizes: F[MptOverlay.JournalSizes] =
+        // Read-only telemetry snapshot (Track-3 S2). No mutex: each `.get` is atomic and a momentarily-inconsistent
+        // cross-ref view is harmless for a memory-budget gauge (the counts are advisory, not consensus-load-bearing).
+        (undoJournalRef.get, finalizedRef.get, pendingRef.get).mapN {
+          case (uj, fz, pd) => MptOverlay.JournalSizes(uj.size, fz.size, pd.size)
         }
 
       def unsafe_reset: F[Unit] =

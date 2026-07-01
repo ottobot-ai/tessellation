@@ -1756,6 +1756,83 @@ object MptOverlaySuite extends MutableIOSuite {
   }
 
   // ============================================================
+  // Track-3 S2: RAM undo-journal bound telemetry (journalSizes + over-bound sentinel)
+  // ============================================================
+  //
+  // Contract: `journalSizes` exposes the in-memory accumulator sizes so `SnapshotLeaderLoop` can emit
+  // `dag_nakamoto_overlay_undo_journal_size` and fire an over-bound counter (`JournalSizes.overBound(k₁)`)
+  // WITHOUT threading `Metrics[F]` into `make`. The disk `signedBytesStore` holds deep history to k₂; the
+  // RAM `undoJournalRef` must stay bounded to the operational k₁ window (the Fix A prune). These tests pin the
+  // sentinel: it reads > window when unpruned and ≤ window after a k₁-watermark `pruneBelow`.
+
+  test("journalSizes on Passthrough is always empty (no in-memory history), never over-bound") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.Passthrough,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+
+      // Even after a commit + finalize, passthrough keeps no per-branch history.
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](gskBalance(9600), Balance(NonNegLong(1L)))
+      _ <- overlay.commit(handle, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+      sizes <- overlay.journalSizes
+    } yield
+      expect.all(
+        sizes == MptOverlay.JournalSizes.empty,
+        sizes.undoJournal == 0,
+        !sizes.overBound(0L) // 0 > 0 is false — passthrough is never over-bound
+      )
+  }
+
+  test("journalSizes on MultiBranch tracks undoJournal per finalized ordinal; over-bound + pruneBelow bound it (S2)") { res =>
+    implicit val (h, _, js) = res
+
+    val n = 6 // fold at ordinals 1..6
+    val k1Window = 3L // stand-in for the operational k₁ RAM fast-path window
+
+    def branchN(i: Int): BranchId = BranchId(Hash(f"$i%064x"))
+    def ordN(i: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(i))
+
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+
+      // Fold a distinct branch at each ordinal 1..n. Each finalize journals one reverse-delta entry
+      // (`undoJournalRef[ord]`) + one `finalizedRef[ord]` marker.
+      _ <- (1 to n).toList.traverse_ { i =>
+        for {
+          hI <- overlay.checkout(parentP)
+          _ <- hI.insert[Balance](gskBalance(9500 + i), Balance(NonNegLong.unsafeFrom(i.toLong)))
+          _ <- overlay.commit(hI, branchN(i), ordN(i.toLong))
+          _ <- overlay.finalizeBranch(branchN(i), ordN(i.toLong))
+        } yield ()
+      }
+
+      // Unpruned: one RAM journal entry per finalized ordinal — OVER the small k₁ window (the leak shape).
+      sizesUnpruned <- overlay.journalSizes
+
+      // Fix-A-style prune at the k₁ watermark: keep only the last `k1Window` ordinals [n-k1Window+1, n].
+      _ <- overlay.pruneBelow(ordN(n - k1Window + 1L))
+      sizesPruned <- overlay.journalSizes
+    } yield
+      expect.all(
+        sizesUnpruned.undoJournal == n,
+        sizesUnpruned.finalizedMarkers == n,
+        sizesUnpruned.overBound(k1Window), // ← RAM journal exceeded its window → the counter would fire
+        sizesPruned.undoJournal == k1Window.toInt, // ← prune bounded the RAM journal to the window
+        !sizesPruned.overBound(k1Window) // ← within the window → no over-bound
+      )
+  }
+
+  // ============================================================
   // P-11 (task #141): unsafe_reset for re-bootstrap recovery
   // ============================================================
 

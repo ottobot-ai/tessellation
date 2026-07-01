@@ -1469,6 +1469,28 @@ object SnapshotLeaderLoop {
                                 else Async[F].unit
                               }
 
+                              // Track-3 S2: RAM undo-journal bound telemetry. The disk `signedBytesStore` now holds the deep
+                              // signed bytes to k₂ (`ContiguousOrdinalCutoff(keepDepthBehindFinalized)`); the in-memory
+                              // `undoJournalRef` MUST stay bounded to the operational-k₁ fast-path window (the Fix A prune just
+                              // above). Emit its size EVERY tick as a gauge, and fire an over-bound counter if it exceeds the k₁
+                              // window — the sentinel that the RAM journal is NOT silently regressing toward the k₂ disk depth
+                              // (the pre-Fix-A heap leak). Read-only snapshot: no mutex, no consensus effect.
+                              overlayJournalSizes <- mptOverlay.journalSizes
+                              _ <- Metrics[F].updateGauge(
+                                "dag_nakamoto_overlay_undo_journal_size",
+                                overlayJournalSizes.undoJournal.toLong
+                              )
+                              _ <-
+                                if (overlayJournalSizes.overBound(ConfirmationDepthK))
+                                  Metrics[F].incrementCounter("dag_nakamoto_overlay_undo_journal_overbound_total") >>
+                                    logger.warn(
+                                      s"[MptOverlay] undo-journal OVER-BOUND: size=${overlayJournalSizes.undoJournal} > k₁=$ConfirmationDepthK " +
+                                        s"(finalizedMarkers=${overlayJournalSizes.finalizedMarkers}, pendingBranches=${overlayJournalSizes.pendingBranches}). " +
+                                        s"The RAM fast-path window is exceeded — Fix A prune should bound this to k₁; investigate a prune stall " +
+                                        s"before RAM drifts toward the k₂ disk depth."
+                                    )
+                                else Async[F].unit
+
                               // T_depth2 (Phase 2 → Phase 3, ARCHIVAL) observability + scaffolding.
                               //
                               // When `tDepth2.latestQualifyingOrdinal` strictly outruns our local archival

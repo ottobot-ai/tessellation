@@ -34,20 +34,20 @@ import weaver.MutableIOSuite
 /** Determinism + retention unit suite for [[PinnedCurrencyInfoReader]] (Track-1 blocker-2a).
   *
   * Fixture strategy mirrors `ShardSubtreeProofServiceSuite` (real `GlobalStateConverter.currencySnapshotMgEntries` for the per-MG byte map,
-  * so the producer/follower byte path is exercised end-to-end) and `LastNGlobalSnapshotStorageSuite` (a minimal `Hashed[GlobalIncrementalSnapshot]`
-  * carrying a chosen `stateProof.mptRoot`). The ORACLE for the happy path is a DIRECT `getCurrencySnapshotInfo` reconstruction over the SAME
-  * committed bytes — so the assertion is "reader == a live finalized-reader read of the pinned committed bytes", robust to the `.some`-empty
-  * Option shapes `reconstructCurrencyInfoFrom` produces.
+  * so the producer/follower byte path is exercised end-to-end) and `LastNGlobalSnapshotStorageSuite` (a minimal
+  * `Hashed[GlobalIncrementalSnapshot]` carrying a chosen `stateProof.mptRoot`). The ORACLE for the happy path is a DIRECT
+  * `getCurrencySnapshotInfo` reconstruction over the SAME committed bytes — so the assertion is "reader == a live finalized-reader read of
+  * the pinned committed bytes", robust to the `.some`-empty Option shapes `reconstructCurrencyInfoFrom` produces.
   *
   * Coverage (the hard-reject contract):
-  *   1. HAPPY — hash + mptRoot both match, bytes retained ⇒ `Some(info)` == the direct reconstruction (correct hash-verified per-MG Info at a
-  *      past ordinal).
+  *   1. HAPPY — hash + mptRoot both match, bytes retained ⇒ `Some(info)` == the direct reconstruction (correct hash-verified per-MG Info at
+  *      a past ordinal).
   *   1. HASH-MISMATCH — the pinned snapshot resolves but its hash ≠ `expectedGlobalSnapshotHash` ⇒ `None` (a fork's snapshot at the same
   *      ordinal is rejected; no HEAD fallback).
-  *   1. EVICTED/MISSING BYTES — snapshot + hash pin OK, but no retained state bytes at the anchor ⇒ `None` (retention doesn't reach the depth;
-  *      NO head fallback).
-  *   1. ROOT-MISMATCH — snapshot + hash pin OK, bytes retained, but the pinned snapshot's committed `mptRoot` ≠ `sidecarFreeMptRoot(bytes)` ⇒
-  *      `None` (retained bytes don't reproduce the pinned committed root).
+  *   1. EVICTED/MISSING BYTES — snapshot + hash pin OK, but no retained state bytes at the anchor ⇒ `None` (retention doesn't reach the
+  *      depth; NO head fallback).
+  *   1. ROOT-MISMATCH — snapshot + hash pin OK, bytes retained, but the pinned snapshot's committed `mptRoot` ≠ `sidecarFreeMptRoot(bytes)`
+  *      ⇒ `None` (retained bytes don't reproduce the pinned committed root).
   *   1. NO SNAPSHOT — nothing resolvable at the anchor ordinal ⇒ `None`.
   */
 object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
@@ -71,7 +71,9 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
 
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal.unsafeApply(n)
 
-  /** A `Signed[CurrencyIncrementalSnapshot]` — only its bytes feed the fieldId-5 incremental leaf (gates `getCurrencySnapshotInfo` to Some). */
+  /** A `Signed[CurrencyIncrementalSnapshot]` — only its bytes feed the fieldId-5 incremental leaf (gates `getCurrencySnapshotInfo` to
+    * Some).
+    */
   private def mkSignedIncremental(snapOrdinal: Long): Signed[CurrencyIncrementalSnapshot] = {
     val proof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("33" * 64)), Signature(Hex("44" * 70)))
     val snap = CurrencyIncrementalSnapshot(

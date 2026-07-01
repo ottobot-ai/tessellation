@@ -5,6 +5,8 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
+import io.constellationnetwork.cutoff.ContiguousOrdinalCutoff
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotConsensus
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema._
@@ -123,5 +125,45 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
           expect(signedRoot.isDefined) &&
           // the served store's recompute equals the producer's SIGNED mptRoot — the follower verify gate passes BY CONSTRUCTION
           expect.same(recomputed, signedRoot)
+  }
+
+  // Track-3 S2 (disk-backed k₂ retention). Two properties compilation can't pin:
+  //   1. the signed-bytes store retains a CONTIGUOUS window to its configured depth — every ordinal in
+  //      [current-depth+1, current] survives `applyCutoff`, with NO logarithmic gaps (a gap would 404 the
+  //      3c-A serve route + hard-reject a 2a pinned anchor);
+  //   2. `signedBytesRetentionDepth` is now the k₂ depth (`keepDepthBehindFinalized` = 100·k₁), not the old
+  //      stale 512 — so the DISK tier reaches k₂ for the later S4 deep revert.
+  // The depth here is kept small (5) purely so the on-disk write/cutoff round-trip is fast; the derivation
+  // assertions cover the real k₂ magnitudes.
+  test("S2: signed-bytes store retains a contiguous window to the configured depth; depth derives from k₂ (not 512)") { res =>
+    implicit val (_, _, j, _) = res
+
+    val depth = 5 // stand-in for k₂, small for a fast on-disk test
+    val highest = 12L // write ords 0..12 (> 2×depth) so the retained window sits well inside the range
+
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        store <- MptStateStorage.make[IO](
+          dir / "mpt_snapshot_info_signed",
+          ContiguousOrdinalCutoff.make(depth)
+        )
+        // One file per finalized ordinal — exactly how the leader's promote sink writes `signedBytesStore`.
+        _ <- (0L to highest).toList.traverse_(o => store.writeState(ord(o), bytesFor(o.toInt)))
+        _ <- store.applyCutoff(ord(highest))
+        kept <- store.listStoredOrdinals.map(_.map(_.value.value).toSet)
+      } yield {
+        val expectedWindow = ((highest - depth + 1L) to highest).toSet
+        expect.all(
+          // exactly the last `depth` ordinals survive, contiguously — no logarithmic gaps
+          kept == expectedWindow,
+          kept.size == depth,
+          kept == (kept.min to kept.max).toSet,
+          // the raise: derivation returns k₂ verbatim. mainnet k₁=1024 ⇒ k₂=102400; dev k₁=32 ⇒ k₂=3200; both ≫ the stale 512.
+          GlobalSnapshotConsensus.signedBytesRetentionDepth(100L * 1024L) == 102400,
+          GlobalSnapshotConsensus.signedBytesRetentionDepth(100L * 32L) == 3200,
+          GlobalSnapshotConsensus.signedBytesRetentionDepth(100L * 1024L) > 512
+        )
+      }
+    }
   }
 }

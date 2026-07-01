@@ -38,19 +38,25 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * reject by design: the future I-PIN consumer treats every `None` as "no pinned prior — hard reject", never as "read HEAD instead".
   *
   * '''Retention (version depth this reader can serve depends ENTIRELY on the injected `byteStore`):'''
-  *   - gl0 produce/validate rail: `byteStore` = the `signedBytesStore` (`<mptSnapshotInfoPath>_signed`, `ContiguousOrdinalCutoff(512)`) —
-  *     a CONTIGUOUS recent window of 512 finalized ordinals, whose bytes reproduce the signed `mptRoot` by construction. Serves any anchor
-  *     within 512 ordinals of the finalized tip; deeper anchors (toward k₂ = 100·k₁) hard-reject until the §5 disk-backed-k₂ retention lands.
+  *   - gl0 produce/validate rail: `byteStore` = the `signedBytesStore` (`<mptSnapshotInfoPath>_signed`,
+  *     `ContiguousOrdinalCutoff(keepDepthBehindFinalized)`) — a CONTIGUOUS window of k₂ = 100·k₁ finalized ordinals after Track-3 S2
+  *     (raised from the old, stale 512), whose bytes reproduce the signed `mptRoot` by construction. Serves any anchor within k₂ of the
+  *     finalized tip; only anchors deeper than the k₂ absolute floor hard-reject. (S2 raised the DISK depth; the deep-revert EXECUTOR that
+  *     consumes it is S4.)
   *   - follower `createContext` rail (cl0/dl1): `byteStore` = a read-only view over the producer's `mpt_snapshot_info` store, which prunes
-  *     with `LogarithmicOrdinalCutoff` — a SPARSE, gappy retention below the head. By-ordinal reads at an arbitrary past ordinal MISS unless
-  *     that ordinal happens to sit on the logarithmic ladder ⇒ this rail hard-rejects most anchors. Surfaced, NOT worked around: the fix is a
-  *     contiguous/disk-backed per-ordinal store on followers (a later slice), not a silent shallow/HEAD fallback here.
+  *     with `LogarithmicOrdinalCutoff` — a SPARSE, gappy retention below the head. By-ordinal reads at an arbitrary past ordinal MISS
+  *     unless that ordinal happens to sit on the logarithmic ladder ⇒ this rail hard-rejects most anchors. '''Track-3 S2 decision: the
+  *     follower contiguous/disk-backed store is DEFERRED''' — followers do not yet consume deep anchors (that need lands with
+  *     byteDiff-adopt / diff-base-pin), so building it now is scaffolding ahead of the blocker. It is NOT a silent shallow ship: this
+  *     reader HARD-REJECTS a deep follower anchor (returns `None`, never a HEAD fallback), so a follower that cannot serve the anchor
+  *     defers/re-pulls rather than adopting wrong bytes. Surfaced here + at the `SharedServices` `pinnedByteStore` wiring, not worked
+  *     around.
   *
   * The reader is stateless: each `readAt` loads the retained byte map into a throwaway in-memory `MptStore` and reconstructs ONLY the
-  * requested metagraph's `CurrencySnapshotInfo` via the exact same unrolled-partition inverse (`GlobalStateReaderOps.getCurrencySnapshotInfo`)
-  * every other read path uses — so the result is byte-identical to a live finalized-reader read of the same committed bytes. No trie is built
-  * (reads scan the raw byte map), but the whole global byte map is materialized per call; a consumer that reads the same anchor repeatedly
-  * (e.g. once per `accept()`) should cache the result.
+  * requested metagraph's `CurrencySnapshotInfo` via the exact same unrolled-partition inverse
+  * (`GlobalStateReaderOps.getCurrencySnapshotInfo`) every other read path uses — so the result is byte-identical to a live finalized-reader
+  * read of the same committed bytes. No trie is built (reads scan the raw byte map), but the whole global byte map is materialized per
+  * call; a consumer that reads the same anchor repeatedly (e.g. once per `accept()`) should cache the result.
   */
 trait PinnedCurrencyInfoReader[F[_]] {
 
@@ -68,8 +74,9 @@ object PinnedCurrencyInfoReader {
     *   the version-retained, per-ordinal state-bytes store this reader reads at the anchor. Its retention (contiguous depth vs logarithmic
     *   gaps) is exactly the version depth `readAt` can serve — see the class scaladoc's retention section.
     * @param getGlobalSnapshotByOrdinal
-    *   resolves the FINALIZED global snapshot at an ordinal (carries `hash` for the pin + `stateProof.mptRoot` for the byte-verify). gl0 wires
-    *   its finalized-chain lookup (`getGlobalSnapshotByOrdinalWithFallback`); followers wire their `lastNGlobalSnapshot.getByOrdinal`.
+    *   resolves the FINALIZED global snapshot at an ordinal (carries `hash` for the pin + `stateProof.mptRoot` for the byte-verify). gl0
+    *   wires its finalized-chain lookup (`getGlobalSnapshotByOrdinalWithFallback`); followers wire their
+    *   `lastNGlobalSnapshot.getByOrdinal`.
     */
   def make[F[_]: Async: Parallel: Hasher: JsonSerializer](
     byteStore: MptStateStorage[F],

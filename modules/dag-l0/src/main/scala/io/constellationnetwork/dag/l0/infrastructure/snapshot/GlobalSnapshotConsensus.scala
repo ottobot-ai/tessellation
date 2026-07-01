@@ -88,18 +88,27 @@ object GlobalSnapshotConsensus {
   // GL0 is Nakamoto-only. No env var check needed — the run-nakamoto CLI command
   // is the single source of truth. Tunables come from NAKAMOTO_* env vars below.
 
-  /** Contiguous-window retention depth (in ordinals) for the 3c-A SERVED signed-bytes store (`mpt_snapshot_info_signed`).
+  /** Contiguous-window retention DEPTH (in ordinals) for the 3c-A SERVED signed-bytes store (`mpt_snapshot_info_signed`), as a function of
+    * the k₂ archival depth (`NakamotoConfig.keepDepthBehindFinalized` = 100·k₁).
     *
     * The store is written at every finalized ordinal; without a cutoff it grows unbounded. We retain a CONTIGUOUS recent window (not the
     * default logarithmic, which is gappy below the head) so the serve route's resolved ordinal — the latest combined checkpoint at-or-below
     * finalized, hence recent — is always present and the 3c-A fast path never 404s into the legacy GSI re-encode path.
     *
-    * 512 comfortably exceeds the head→finality gap (k₁ = 255 prod / 32 dev) plus one `checkpointIntervalEpochs` (=5) of ordinals (the most
-    * the resolved checkpoint can lag finalized), with margin for several ordinals per epoch. It also covers the combined store's own
-    * `maxCheckpointsStored × checkpointIntervalEpochs` = 320-epoch retention envelope. Byte maps are bounded, so 512 files is cheap. Not a
+    * '''Track-3 S2 (disk-backed k₂ revert — Cardano UTxO-HD analog).''' Raised from the old hardcoded `512` to k₂. The prior "512 > prod k₁
+    * \= 255" rationale was STALE: mainnet k₁ = 1024 > 512, so 512 didn't even cover the operational challenge window, let alone a deep
+    * density reorg. This store is the DISK tier of the retention model — it holds the deep signed per-ordinal bytes to k₂ so a later
+    * density-driven revert in the (k₂, k₁] band (Track-3 S4 disk-revert executor) can `readState` + re-fold from any anchor within k₂, and
+    * the 2a `PinnedCurrencyInfoReader` gl0 rail resolves deep pinned anchors toward k₂ instead of hard-rejecting at 512. Crucially the
+    * IN-MEMORY RAM fast-path window (`MptOverlay.undoJournalRef`) stays bounded to the operational k₁ (Heap-leak Fix A prune) — ONLY the
+    * on-disk bytes reach k₂. k₂-deep byte files are ~GB (k₂ ≈ 102400 on mainnet) — acceptable disk; the point is RAM stays bounded. Not a
     * consensus parameter — a follower past the window falls back to the legacy path, whose verify gate rejects any inconsistent base.
+    *
+    * Clamped to `Int.MaxValue` because `ContiguousOrdinalCutoff.make` takes an `Int` depth; k₂ = 100·k₁ fits comfortably for any realistic
+    * k₁ (mainnet 102400).
     */
-  val signedBytesRetentionDepth: Int = 512
+  def signedBytesRetentionDepth(keepDepthBehindFinalized: Long): Int =
+    math.min(math.max(1L, keepDepthBehindFinalized), Int.MaxValue.toLong).toInt
 
   /** Genesis time of the Nakamoto chain — Unix epoch milliseconds at which slot 0 starts.
     *
@@ -376,16 +385,22 @@ object GlobalSnapshotConsensus {
       // legacy (drift-prone) `syncFromGlobalSnapshotInfo` path. A contiguous window guarantees the resolved ordinal is
       // present so the fast path always fires.
       //
-      // Depth = `signedBytesRetentionDepth` (512). The resolved checkpoint ordinal is at-or-below `finalized` and at-most
-      // one `checkpointIntervalEpochs` (=5) behind it, so the window must cover the head→finality gap (k₁ = 32 dev / 255
-      // prod ordinals) plus a checkpoint interval, with margin. 512 > prod k₁ (255) + several `checkpointIntervalEpochs`
-      // worth of ordinals (ordinals can be multiple per epoch), comfortably covering the combined store's own
-      // `maxCheckpointsStored × checkpointIntervalEpochs` = 320-epoch retention envelope. Byte maps are bounded, so 512
-      // files is cheap. (`LogarithmicOrdinalCutoff` stays the default for all OTHER `MptStateStorage` users.)
+      // Depth = k₂ (`NakamotoConfig.keepDepthBehindFinalized` = 100·k₁). Track-3 S2 (disk-backed k₂ revert): raised from
+      // the old hardcoded 512, which was STALE — mainnet k₁ = 1024 already exceeds 512, so the window didn't even cover
+      // the operational challenge window, let alone a deep density reorg. This is the DISK tier of the retention model —
+      // deep signed per-ordinal bytes are kept to k₂ so a later density-driven revert in the (k₂, k₁] band (S4 disk-revert
+      // executor) can `readState` + re-fold from any anchor within k₂, and the 2a `PinnedCurrencyInfoReader` gl0 rail
+      // resolves deep pinned anchors instead of hard-rejecting. The IN-MEMORY RAM journal (`MptOverlay.undoJournalRef`)
+      // stays bounded to operational k₁ (Heap-leak Fix A prune) — ONLY the on-disk bytes reach k₂; k₂-deep files are ~GB,
+      // acceptable disk. (`LogarithmicOrdinalCutoff` stays the default for all OTHER `MptStateStorage` users.)
       signedBytesStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage
         .make[F](
           fs2.io.file.Path(sharedCfg.mptSnapshotInfoPath.toString + "_signed"),
-          io.constellationnetwork.cutoff.ContiguousOrdinalCutoff.make(GlobalSnapshotConsensus.signedBytesRetentionDepth)
+          io.constellationnetwork.cutoff.ContiguousOrdinalCutoff.make(
+            GlobalSnapshotConsensus.signedBytesRetentionDepth(
+              sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value
+            )
+          )
         )
         .toResource
       // SERVED ring: bounded ordinal-keyed ring of recent FINALIZED per-ordinal accumulators (the ml0-side
@@ -630,11 +645,11 @@ object GlobalSnapshotConsensus {
           // leader-produce and `validateArtifact` paths share (this single GSAM). `None` at numShards=1.
           invalidStateProofValidator = gsamInvalidStateProofValidator,
           // Track-1 blocker-2a: the version-retained BY-ORDINAL per-MG `CurrencySnapshotInfo` reader for the gl0 produce + validate rail
-          // (this ONE GSAM serves both). Backed by the CONTIGUOUS `signedBytesStore` (512 finalized ordinals; its bytes reproduce the signed
-          // `stateProof.mptRoot` by construction, so `sidecarFreeMptRoot === mptRoot` holds) + the finalized-chain resolver
-          // `getGlobalSnapshotByOrdinalWithFallback` (carries the pin hash + committed mptRoot). Reachable in `accept()` for the follow-up
-          // I-PIN consumer; not read yet. RETENTION: serves anchors within 512 ordinals of the finalized tip; deeper (toward k₂) hard-rejects
-          // until the §5 disk-backed-k₂ retention lands.
+          // (this ONE GSAM serves both). Backed by the CONTIGUOUS `signedBytesStore` (k₂ = 100·k₁ finalized ordinals after Track-3 S2; its
+          // bytes reproduce the signed `stateProof.mptRoot` by construction, so `sidecarFreeMptRoot === mptRoot` holds) + the finalized-chain
+          // resolver `getGlobalSnapshotByOrdinalWithFallback` (carries the pin hash + committed mptRoot). Reachable in `accept()` for the
+          // follow-up I-PIN consumer; not read yet. RETENTION: S2 raised the gl0 disk window to k₂, so anchors within k₂ of the finalized tip
+          // resolve; only anchors deeper than k₂ (beyond the absolute floor) hard-reject.
           pinnedCurrencyInfoReader = Some {
             implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
             io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader

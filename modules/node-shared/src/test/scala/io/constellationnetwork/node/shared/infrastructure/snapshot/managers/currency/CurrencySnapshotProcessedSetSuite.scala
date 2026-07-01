@@ -32,13 +32,13 @@ import weaver.MutableIOSuite
   *
   * These tests pin the applied-set semantics `A = { o ∈ U : o ≤ view ∧ o ∉ P }` at the exact site where the former node-local
   * `globalSnapshotsAlreadyProcessed` cache was read (`GlobalSnapshotOpsManager.getLastGlobalSnapshotsSpendActions`), now that `P` is a pure
-  * input (reconstructed in-band from the retained CL0 chain by the caller). Observable = the returned "processed" set (the second element of
-  * the result), which is exactly the `GlobalSnapshotsProcessed(A)` the acceptance manager emits into the snapshot.
+  * input (reconstructed in-band from the retained CL0 chain by the caller). Observable = the returned "processed" set (the second element
+  * of the result), which is exactly the `GlobalSnapshotsProcessed(A)` the acceptance manager emits into the snapshot.
   *
   * Cases: (a) gaps in `U`; (b) same-ordinal retry determinism; (c) below-view injection (the ordinal-below-an-advanced-view case a scalar
-  * interval `(prior_view, view]` drops permanently — the set-valued `P` applies it); and (d) node-local-ness (Step-5b): two sequential calls
-  * on ONE manager vs a fresh manager yield the same applied-set (impossible with the removed mutable cache). A final pure test pins the
-  * reconstruction `P = ⋃ GlobalSnapshotsProcessed.ordinals`.
+  * interval `(prior_view, view]` drops permanently — the set-valued `P` applies it); and (d) node-local-ness (Step-5b): two sequential
+  * calls on ONE manager vs a fresh manager yield the same applied-set (impossible with the removed mutable cache). A final pure test pins
+  * the reconstruction `P = ⋃ GlobalSnapshotsProcessed.ordinals`.
   */
 object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
 
@@ -88,11 +88,13 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       SortedMap.empty
     )
 
-  /** A benign `Hashed[GlobalIncrementalSnapshot]` at `ordinal` with NO spendActions — enough for `processUnappliedOrdinals` to resolve every
-    * applied ordinal from the `lastGlobalSnapshots` cache (so no network fetch / retry), while the applied-set under test is driven purely by
-    * `U`, `view`, and `P`.
+  /** A benign `Hashed[GlobalIncrementalSnapshot]` at `ordinal` with NO spendActions — enough for `processUnappliedOrdinals` to resolve
+    * every applied ordinal from the `lastGlobalSnapshots` cache (so no network fetch / retry), while the applied-set under test is driven
+    * purely by `U`, `view`, and `P`.
     */
-  private def mkGlobalSnapshotAt(ordinal: SnapshotOrdinal)(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[Hashed[GlobalIncrementalSnapshot]] =
+  private def mkGlobalSnapshotAt(
+    ordinal: SnapshotOrdinal
+  )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[Hashed[GlobalIncrementalSnapshot]] =
     mkGlobalInfoEmpty.stateProof[IO](ordinal).flatMap { sp =>
       Signed(
         GlobalIncrementalSnapshot(
@@ -159,16 +161,17 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     } yield expect(a == oset(100L, 105L))
   }
 
-  test("(b) same-ordinal retry: two invocations with identical (U, view, P) return the identical applied-set (no per-ordinal cache state)") {
-    res =>
-      implicit val (h, j, sp) = res
-      for {
-        kp <- KeyPairGenerator.makeKeyPair[IO]
-        mgId = PublicKeyOps(kp.getPublic).toAddress
-        gsom <- mkGsom
-        first <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 103L), p = oset(103L))
-        second <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 103L), p = oset(103L))
-      } yield expect(first == oset(101L)) && expect(first == second)
+  test(
+    "(b) same-ordinal retry: two invocations with identical (U, view, P) return the identical applied-set (no per-ordinal cache state)"
+  ) { res =>
+    implicit val (h, j, sp) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      mgId = PublicKeyOps(kp.getPublic).toAddress
+      gsom <- mkGsom
+      first <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 103L), p = oset(103L))
+      second <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 103L), p = oset(103L))
+    } yield expect(first == oset(101L)) && expect(first == second)
   }
 
   test(

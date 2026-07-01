@@ -350,8 +350,10 @@ object SharedServices {
       // producer (`SharedStorages.mptStore`, `FileSystemMerklePatriciaProducer.make(cfg.mptSnapshotInfoPath)`) persists — the follower
       // `createContext` rail's version-retained byte source for the pinned per-MG reader below. RETENTION CAVEAT: that store prunes with
       // `LogarithmicOrdinalCutoff` (sparse, gappy below the head), so by-ordinal reads at an arbitrary past ordinal MISS unless it sits on
-      // the logarithmic ladder ⇒ this rail hard-rejects most anchors (surfaced, not worked around — a contiguous/disk-backed follower store
-      // is a later slice). The default cutoff is inert here since this instance only READS (writes/prune go through the producer instance).
+      // the logarithmic ladder ⇒ this rail hard-rejects most anchors (surfaced, not worked around). Track-3 S2 raised the gl0 DISK window to
+      // k₂ but DEFERRED the follower contiguous/disk-backed store: followers don't consume deep anchors until byteDiff-adopt / diff-base-pin,
+      // and the reader hard-rejects (never HEAD-fallbacks) a deep follower anchor, so this stays safe. The default cutoff is inert here since
+      // this instance only READS (writes/prune go through the producer instance).
       pinnedByteStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage.make[F](cfg.mptSnapshotInfoPath)
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,

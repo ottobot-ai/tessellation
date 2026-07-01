@@ -29,10 +29,10 @@ import eu.timepit.refined.types.numeric.NonNegLong
   *
   * '''What it does''' (per `SLASHING-DESIGN.md` §5, adapted — NOT a new primitive):
   *   1. '''Stake reduction''' — for every `(delegator, record)` whose `record.event.value.nodeId` is a slash target, reduce the staked
-  *      amount by `slashFraction` (exact `Ratio`). At `slashFraction = 1/1` (the `InvalidStateProof` tier is total loss) the record is REMOVED
-  *      (amount → 0). For a partial fraction the `DelegatedStakeRecord.currentAmount` slot is reduced in place; node collaterals carry no
-  *      mutable-amount slot, so a partial collateral slash is NOT representable without a schema change (see [[applySlash]] scaladoc) — the
-  *      100% tier removes them outright, which IS representable. The 100% tier is the supported one.
+  *      amount by `slashFraction` (exact `Ratio`). At `slashFraction = 1/1` (the `InvalidStateProof` tier is total loss) the record is
+  *      REMOVED (amount → 0). For a partial fraction the `DelegatedStakeRecord.currentAmount` slot is reduced in place; node collaterals
+  *      carry no mutable-amount slot, so a partial collateral slash is NOT representable without a schema change (see [[applySlash]]
+  *      scaladoc) — the 100% tier removes them outright, which IS representable. The 100% tier is the supported one.
   *   1. '''Eviction''' — every slashed operator gets a [[SlashedRegistryEntry]] with a `cooldownUntilEpoch`; the registry is read by the
   *      active-set gate so a slashed operator cannot contribute to any committee/quorum until cooldown elapses.
   *   1. '''Bounty + burn''' — `bountyFraction` of the slashed amount is credited to the submitter; the remainder is BURNED (removed from
