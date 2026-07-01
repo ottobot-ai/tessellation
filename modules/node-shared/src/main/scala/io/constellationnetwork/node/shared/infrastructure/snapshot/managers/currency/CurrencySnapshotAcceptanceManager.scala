@@ -14,6 +14,7 @@ import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.{FieldsAddedOrdinals, LastGlobalSnapshotsSyncConfig}
 import io.constellationnetwork.node.shared.domain.block.processing._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
 import io.constellationnetwork.node.shared.domain.swap.block.AllowSpendBlockAcceptanceManager
 import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlockAcceptanceManager
@@ -27,6 +28,7 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.currencyMessage.CurrencyMessage
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.{RewardTransaction, Transaction, TransactionReference}
@@ -134,7 +136,14 @@ object CurrencySnapshotAcceptanceManager {
     feeTransactionValidator: FeeTransactionValidator[F],
     globalSnapshotSyncValidator: GlobalSnapshotSyncValidator[F],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
-    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]
+    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
+    // Track-1 I-PIN (Step-1 read-at-anchor). The version-retained, BY-ORDINAL per-metagraph pinned reader (blocker-2a). On the
+    // VALIDATOR / re-exec path (`forcedGlobalSyncView` set) `accept` reads the metagraph's gl0-committed cross-shard sync data at the
+    // RECORDED `globalSyncView` through this reader instead of the non-deterministic node-local head. `None` (tests, or a rail with no
+    // per-ordinal global byte store such as the currency-l0 producer) ⇒ the producer path keeps its head read (byte-identical to today)
+    // and the validator path folds no cross-shard sync data (deterministic). Prod wires it in `SharedServices.make` over the same
+    // `mpt_snapshot_info` byte store that backs the GSAM reader.
+    pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[F]] = None
   )(
     implicit currencyStateProofSelector: CurrencyStateProofSelector
   ): F[CurrencySnapshotAcceptanceManager[F]] =
@@ -184,7 +193,8 @@ object CurrencySnapshotAcceptanceManager {
         globalSnapshotOps,
         allowSpendOps,
         tokenLockOps,
-        balanceOps
+        balanceOps,
+        pinnedCurrencyInfoReader
       )
 }
 
@@ -201,7 +211,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
   globalSnapshotOps: GlobalSnapshotOpsManager[F],
   allowSpendOps: AllowSpendOpsManager[F],
   tokenLockOps: TokenLockOpsManager[F],
-  balanceOps: BalanceOpsManager[F]
+  balanceOps: BalanceOpsManager[F],
+  pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[F]]
 )(implicit currencyStateProofSelector: CurrencyStateProofSelector)
     extends CurrencySnapshotAcceptanceManager[F] {
 
@@ -296,6 +307,12 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       .fromOption(maybeUnsyncLastGlobalSnapshot)
       .getOrRaise(new IllegalStateException("Could not get the last global snapshot info"))
 
+    // NOTE (Track-1 I-PIN Step-1 scope): `lastUnsyncBalances` / `lastUnsyncLastCurrencySnapshots` feed ONLY currency-message validation
+    // (`acceptMessages`) and are the GLOBAL cross-metagraph maps (balances of every address; every metagraph's fee/message addresses for the
+    // cross-metagraph address-uniqueness check) — NOT reconstructible from `pinnedCurrencyInfoReader`'s per-metagraph `CurrencySnapshotInfo`.
+    // They are kept on the head read in this slice; a message-bearing snapshot's `lastMessages` field therefore remains head-influenced on
+    // the validator path (a residual purity gap, out of scope here — the forcing test is message-free). `lastUnsyncMetagraphSyncData` is used
+    // ONLY on the PRODUCER path below (`forcedGlobalSyncView` empty); the validator path reads the metagraph's sync data at the pinned anchor.
     lastUnsyncBalances = lastUnsyncGlobalSnapshotInfo.balances
     lastUnsyncLastCurrencySnapshots = lastUnsyncGlobalSnapshotInfo.lastCurrencySnapshots
     lastUnsyncMetagraphSyncData = lastUnsyncGlobalSnapshotInfo.metagraphSyncData
@@ -376,19 +393,25 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       case None        => globalSnapshotOps.getGlobalSnapshotWithRetry(ordinalToFetchGlobalSnapshot, getGlobalSnapshotByOrdinal)
     }
 
+    // Track-1 I-PIN (Step-1) — hash-pin as a CLEAN REJECT, not a fatal raise. On the validator / re-exec path the recorded
+    // `forcedGlobalSyncView` pins the EXACT GL0 snapshot this CL0 snapshot was produced against. If our local snapshot at that ordinal
+    // has a different hash, the recorded view is stale/forked relative to our canonical chain and we must REDO this snapshot against the
+    // new canonical view — NOT crash. We log and PROCEED: the pinned reads below hard-reject on the hash mismatch (fold nothing), so the
+    // recomputed `stateProof` will not match the producer's and the snapshot is rejected downstream by the ordinary stateProof
+    // comparison (a re-propose), never a fatal exception that could wedge the consensus loop.
     _ <- forcedGlobalSyncView.traverse_ { forced =>
-      if (lastSyncGlobalSnapshot.hash === forced.hash) Async[F].unit
-      else
-        Async[F].raiseError[Unit](
-          new IllegalStateException(
-            s"Forced globalSyncView hash mismatch: CL0 snapshot references GL0 ordinal ${forced.ordinal.show} " +
-              s"with hash ${forced.hash.show}, but local GL0 at that ordinal has hash ${lastSyncGlobalSnapshot.hash.show}. " +
-              s"Under finality, this indicates either a bug, data corruption, or a CL0 snapshot from a different chain."
-          )
+      Async[F].whenA(lastSyncGlobalSnapshot.hash =!= forced.hash)(
+        logger.warn(
+          s"Forced globalSyncView hash mismatch (clean reject / redo): CL0 snapshot references GL0 ordinal ${forced.ordinal.show} " +
+            s"with hash ${forced.hash.show}, but local GL0 at that ordinal has hash ${lastSyncGlobalSnapshot.hash.show}. " +
+            s"Recomputing against the local canonical view; the stateProof comparison rejects this snapshot for re-proposal."
         )
+      )
     }
 
-    _ <- globalSnapshotOps.updateGlobalSnapshotCache(lastSyncGlobalSnapshot)
+    // Track-1 I-PIN (Step-1): `updateGlobalSnapshotCache` REMOVED from the consensus path — populating a manager-instance-local cache
+    // from acceptance made `accept()` self-mutating (an impurity). The last-resort cache read in `getGlobalSnapshotWithRetry` still works;
+    // it simply no longer depends on a side effect of a prior `accept()`.
 
     lastGlobalSnapshotEpochProgress = lastSyncGlobalSnapshot.epochProgress
     lastGlobalSnapshotOrdinal = lastSyncGlobalSnapshot.ordinal
@@ -426,7 +449,9 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         snapshotOrdinal,
         tokenLockInitialTxRef,
         shouldPerformMetagraphSpecificValidations,
-        lastUnsyncGlobalSnapshot.ordinal,
+        // Track-1 I-PIN (Step-1): feature-activation gate keyed off the RECORDED `globalSyncView`, not the node-local head, so the
+        // producer and every re-executing validator apply the identical validation rules (producer==validator determinism).
+        globalSyncView.ordinal,
         fixingAllowSpendAndTokenLockValidation,
         lastGlobalSnapshotEpochProgress
       ),
@@ -436,7 +461,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         snapshotOrdinal,
         initialAllowSpendRef,
         shouldPerformMetagraphSpecificValidations,
-        lastUnsyncGlobalSnapshot.ordinal,
+        // Track-1 I-PIN (Step-1): feature-activation gate keyed off the RECORDED `globalSyncView` (see acceptTokenLockBlocks above).
+        globalSyncView.ordinal,
         fixingAllowSpendAndTokenLockValidation,
         lastGlobalSnapshotEpochProgress
       )
@@ -456,14 +482,35 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       acceptanceTokenLockBlocksResult.contextUpdate.lastTokenLocksRefs
     )
 
+    // Track-1 I-PIN (Step-1) READ-AT-ANCHOR: the cross-shard sync data (`U` = the metagraph's unapplied global-change ordinals) that gates
+    // which SpendActions this snapshot folds MUST be read at the RECORDED `globalSyncView`, never the node-local head. Otherwise two
+    // validators whose heads advertise different `metagraphSyncData` (one having advanced past the pinned view) fold different cross-shard
+    // state and compute divergent `balancesProof` — exactly the forcing-test impurity. Rules:
+    //   - PRODUCER path (`forcedGlobalSyncView` empty): keep the head read. The producer DEFINES the view it records, and the currency-l0
+    //     producer has no per-ordinal global byte store to re-read from ⇒ byte-identical to pre-I-PIN, preserving cross-shard on produce.
+    //   - VALIDATOR / re-exec path (`forcedGlobalSyncView` set): read the metagraph's fieldId-18 sync data at the pinned anchor through
+    //     `pinnedCurrencyInfoReader` (hard-reject/`None` on hash-pin miss or retention eviction — NEVER a head fallback). A `None` reader
+    //     (tests, or a rail with no global byte store) folds no cross-shard sync data — deterministic and head-independent.
+    anchorMetagraphSyncData <- forcedGlobalSyncView match {
+      case None => lastUnsyncMetagraphSyncData.pure[F]
+      case Some(_) =>
+        pinnedCurrencyInfoReader match {
+          case Some(reader) =>
+            reader
+              .readMetagraphSyncDataAt(globalSyncView.ordinal, globalSyncView.hash, metagraphId)
+              .map(_.map(info => SortedMap(metagraphId -> info)))
+          case None => none[SortedMap[Address, MetagraphSyncDataInfo]].pure[F]
+        }
+    }
+
     (globalSnapshotsSpendActions, globalSnapshotsProcessed) <- globalSnapshotOps.getLastGlobalSnapshotsSpendActions(
       globalSyncView.ordinal,
       lastGlobalSnapshots,
       getGlobalSnapshotByOrdinal,
       metagraphId,
-      lastUnsyncMetagraphSyncData,
+      anchorMetagraphSyncData,
       alreadyProcessedGlobalOrdinals,
-      lastUnsyncGlobalSnapshot.ordinal,
+      globalSyncView.ordinal,
       updatingCombineFunctionSpendActions
     )
 
@@ -539,7 +586,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       incomingCurrencyAllowSpends,
       lastActiveAllowSpends,
       metagraphIdSpendTransactions,
-      lastUnsyncGlobalSnapshot.ordinal,
+      // Track-1 I-PIN (Step-1): allow-spend expiration feature gate keyed off the RECORDED `globalSyncView`, not the node-local head.
+      globalSyncView.ordinal,
       fixingAllowSpendExpiration
     )
 
@@ -550,7 +598,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         incomingCurrencyAllowSpends,
         lastActiveAllowSpends,
         metagraphIdSpendTransactions,
-        lastUnsyncGlobalSnapshot.ordinal,
+        // Track-1 I-PIN (Step-1): allow-spend expiration feature gate keyed off the RECORDED `globalSyncView` (see above).
+        globalSyncView.ordinal,
         fixingAllowSpendExpiration
       )
       .flatMap {
@@ -577,9 +626,14 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     updatedAllowSpendsCleaned = updatedAllowSpends.filter { case (_, allowSpends) => allowSpends.nonEmpty }
     updatedActiveTokenLocksCleaned = updatedActiveTokenLocks.filter { case (_, tokenLocks) => tokenLocks.nonEmpty }
 
+    // Track-1 I-PIN (Step-1) BLOCKER-1b: the optional-CSI-field emission gate keyed off the RECORDED `globalSyncView`, not the node-local
+    // head — so which fields a snapshot emits at a feature boundary (fields-added-ordinals in application.conf) is a pure function of the
+    // recorded view and identical across nodes with divergent heads. On the validator/re-exec path `globalSyncView.ordinal` == the fetched
+    // `lastGlobalSnapshotOrdinal` (both are the pinned ordinal), so the else-branches (which already read the anchor-derived
+    // `lastGlobalSnapshotOrdinal`) stay head-independent. See `CurrencySnapshotFieldEmissionBoundarySuite` for the per-boundary identity proof.
     snapshotOrdinalToCheckFields =
-      if (lastUnsyncGlobalSnapshot.ordinal > metagraphSyncDataStartingOrdinal) {
-        lastUnsyncGlobalSnapshot.ordinal
+      if (globalSyncView.ordinal > metagraphSyncDataStartingOrdinal) {
+        globalSyncView.ordinal
       } else if (lastGlobalSnapshotOrdinal <= checkSyncGlobalSnapshotField) {
         lastGlobalSnapshotOrdinal
       } else {
@@ -640,7 +694,8 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
           lastActiveAllowSpends,
           lastGlobalSnapshotEpochProgress,
           metagraphIdSpendTransactions,
-          lastUnsyncGlobalSnapshot.ordinal,
+          // Track-1 I-PIN (Step-1): allow-spend expiration feature gate keyed off the RECORDED `globalSyncView`, not the node-local head.
+          globalSyncView.ordinal,
           fixingAllowSpendExpiration
         )
         .flatMap(allowSpendOps.emitAllowSpendsExpired),

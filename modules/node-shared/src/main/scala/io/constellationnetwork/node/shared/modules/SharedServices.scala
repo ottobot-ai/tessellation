@@ -173,6 +173,20 @@ object SharedServices {
 
       localHealthcheck <- LocalHealthcheck.make[F](nodeClient, storages.cluster)
       gossip <- HasherSelector[F].withCurrent(implicit hasher => GossipImpl.make[F](queues.rumor, nodeId, generation, keyPair))
+      // Track-1 blocker-2a / I-PIN (Step-1): a READ-ONLY per-ordinal state-bytes store over this node's `mpt_snapshot_info` global-state
+      // files (the same the finalized-base producer persists), plus the version-retained BY-ORDINAL per-MG pinned reader over it. SHARED by
+      // the CSAM below (currency acceptance re-exec/validate path) and the GSAM `createContext` rail further down, so both read each
+      // metagraph's pinned global prior through one instance. RETENTION CAVEAT: this store prunes with `LogarithmicOrdinalCutoff` (sparse,
+      // gappy below the head) so by-ordinal reads at an arbitrary past ordinal hard-reject unless on the ladder (surfaced — a
+      // contiguous/disk-backed follower store is a later slice). On the currency-l0 producer rail this store holds the metagraph's currency
+      // state (not global), but CSAM reads through it ONLY on the VALIDATOR path (`forcedGlobalSyncView` set); the producer path keeps its
+      // head read, so the mismatched rail is never consulted for global sync data on produce.
+      pinnedByteStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage.make[F](cfg.mptSnapshotInfoPath)
+      sharedPinnedCurrencyInfoReader = {
+        implicit val h: Hasher[F] = HasherSelector[F].getCurrent
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
+          .make[F](pinnedByteStore, ord => storages.lastNGlobalSnapshot.getByOrdinal(ord))
+      }
       currencySnapshotAcceptanceManager <- CurrencySnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.environment,
@@ -185,7 +199,11 @@ object SharedServices {
         validators.feeTransactionValidator,
         validators.globalSnapshotSyncValidator,
         storages.lastNGlobalSnapshot,
-        storages.lastGlobalSnapshot
+        storages.lastGlobalSnapshot,
+        // Track-1 I-PIN (Step-1): on the VALIDATOR / re-exec path (`forcedGlobalSyncView` set) `accept` reads each metagraph's committed
+        // cross-shard sync data at the RECORDED `globalSyncView` through this reader instead of the node-local head. numShards=1: the
+        // metagraph has no fieldId-18 entry ⇒ the read is `None` ⇒ folds nothing ⇒ byte-identical to the pre-I-PIN head read.
+        pinnedCurrencyInfoReader = Some(sharedPinnedCurrencyInfoReader)
       )
 
       currencyEventsCutter = CurrencyEventsCutter.make[F](None)
@@ -346,15 +364,6 @@ object SharedServices {
         case None =>
           Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
       }
-      // Track-1 blocker-2a: a READ-ONLY per-ordinal state-bytes store over the SAME `mpt_snapshot_info` files this node's finalized-base
-      // producer (`SharedStorages.mptStore`, `FileSystemMerklePatriciaProducer.make(cfg.mptSnapshotInfoPath)`) persists — the follower
-      // `createContext` rail's version-retained byte source for the pinned per-MG reader below. RETENTION CAVEAT: that store prunes with
-      // `LogarithmicOrdinalCutoff` (sparse, gappy below the head), so by-ordinal reads at an arbitrary past ordinal MISS unless it sits on
-      // the logarithmic ladder ⇒ this rail hard-rejects most anchors (surfaced, not worked around). Track-3 S2 raised the gl0 DISK window to
-      // k₂ but DEFERRED the follower contiguous/disk-backed store: followers don't consume deep anchors until byteDiff-adopt / diff-base-pin,
-      // and the reader hard-rejects (never HEAD-fallbacks) a deep follower anchor, so this stays safe. The default cutoff is inert here since
-      // this instance only READS (writes/prune go through the producer instance).
-      pinnedByteStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage.make[F](cfg.mptSnapshotInfoPath)
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,
@@ -398,15 +407,10 @@ object SharedServices {
         // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs on the `createContext` path so gl0 followers slash
         // identically and reproduce the signed mptRoot. `None` at numShards=1.
         invalidStateProofValidator = createContextInvalidStateProofValidator,
-        // Track-1 blocker-2a: the version-retained BY-ORDINAL per-MG `CurrencySnapshotInfo` reader for the cl0/dl1 `createContext` rail.
-        // Backed by the read-only `pinnedByteStore` (over `mpt_snapshot_info`) + this node's `lastNGlobalSnapshot.getByOrdinal` (carries the
-        // pin hash + committed mptRoot). Reachable in `accept()` for the follow-up I-PIN consumer; not read yet. Delete-override (a later
-        // slice) removes this follower's HEAD fallback, so wiring the by-ordinal reader here is what keeps followers unfrozen then.
-        pinnedCurrencyInfoReader = Some {
-          implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-          io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
-            .make[F](pinnedByteStore, ord => storages.lastNGlobalSnapshot.getByOrdinal(ord))
-        }
+        // Track-1 blocker-2a: the version-retained BY-ORDINAL per-MG `CurrencySnapshotInfo` reader for the cl0/dl1 `createContext` rail —
+        // the SAME instance wired into the CSAM above (hoisted to `sharedPinnedCurrencyInfoReader`), so the currency re-exec/validate path
+        // and the global createContext path read each metagraph's pinned prior through one reader over one byte store.
+        pinnedCurrencyInfoReader = Some(sharedPinnedCurrencyInfoReader)
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,

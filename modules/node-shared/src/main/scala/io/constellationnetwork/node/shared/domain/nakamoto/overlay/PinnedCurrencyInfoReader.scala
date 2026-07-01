@@ -8,7 +8,9 @@ import io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps.GlobalStateReaderTypedOps
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -66,6 +68,22 @@ trait PinnedCurrencyInfoReader[F[_]] {
     expectedGlobalSnapshotHash: Hash,
     metagraphId: Address
   ): F[Option[CurrencySnapshotInfo]]
+
+  /** Read `metagraphId`'s gl0-maintained cross-shard `MetagraphSyncDataInfo` (the fieldId-18 hypergraph partition — the set of unapplied
+    * global-change ordinals for this metagraph) at the pinned global anchor.
+    *
+    * This is the SIBLING of [[readAt]] used by Track-1 I-PIN: `CurrencySnapshotAcceptanceManager.accept` must gate which cross-shard
+    * `SpendAction`s it folds off the state committed at the RECORDED `globalSyncView`, not off the node-local head. `MetagraphSyncDataInfo`
+    * is NOT part of `CurrencySnapshotInfo` (it lives in `GlobalSnapshotInfo.metagraphSyncData`, MPT fieldId 18, keyed per metagraph
+    * address), so it needs its own accessor rather than a field of [[readAt]]'s result. Same pin+verify+hard-reject contract as [[readAt]]
+    * (returns `None` on any miss — no head fallback); a clean `None` means the metagraph has no unapplied cross-shard state at the verified
+    * anchor.
+    */
+  def readMetagraphSyncDataAt(
+    ordinal: SnapshotOrdinal,
+    expectedGlobalSnapshotHash: Hash,
+    metagraphId: Address
+  ): F[Option[MetagraphSyncDataInfo]]
 }
 
 object PinnedCurrencyInfoReader {
@@ -90,39 +108,62 @@ object PinnedCurrencyInfoReader {
       expectedGlobalSnapshotHash: Hash,
       metagraphId: Address
     ): F[Option[CurrencySnapshotInfo]] =
+      withVerifiedAnchorBytes(ordinal, expectedGlobalSnapshotHash, metagraphId, "CurrencySnapshotInfo")(
+        reconstructPerMgInfo(_, metagraphId)
+      )
+
+    def readMetagraphSyncDataAt(
+      ordinal: SnapshotOrdinal,
+      expectedGlobalSnapshotHash: Hash,
+      metagraphId: Address
+    ): F[Option[MetagraphSyncDataInfo]] =
+      withVerifiedAnchorBytes(ordinal, expectedGlobalSnapshotHash, metagraphId, "MetagraphSyncDataInfo")(
+        reconstructMetagraphSyncData(_, metagraphId)
+      )
+
+    /** Pin to the EXACT canonical snapshot at `ordinal`, verify the retained state bytes reproduce its committed `mptRoot`, and hand them
+      * to `reconstruct`. Returns `None` (NEVER a HEAD fallback) on any miss along the way — no resolvable snapshot at `ordinal`, hash ≠ the
+      * pinned hash (a fork's snapshot, or one this node can't resolve), no committed `mptRoot` (BFT/pre-MPT), retained bytes
+      * evicted/absent, or retained bytes that do not recompute the pinned root. Shared by [[readAt]] and [[readMetagraphSyncDataAt]] so
+      * both honor one pin+verify+hard-reject contract; they differ only in which partition they reconstruct from the verified bytes.
+      */
+    private def withVerifiedAnchorBytes[A](
+      ordinal: SnapshotOrdinal,
+      expectedGlobalSnapshotHash: Hash,
+      metagraphId: Address,
+      what: String
+    )(reconstruct: Map[Hex, Array[Byte]] => F[Option[A]]): F[Option[A]] =
       getGlobalSnapshotByOrdinal(ordinal).flatMap {
-        // Pin to the EXACT canonical snapshot: reject when none is resolvable at `ordinal`, OR its hash ≠ the pinned hash (a fork's
-        // snapshot at the same ordinal, or a snapshot this node hasn't/ can't resolve). NEVER read HEAD instead.
         case Some(snap) if snap.hash === expectedGlobalSnapshotHash =>
           snap.signed.value.stateProof.mptRoot match {
             case None =>
               logger.debug(
-                s"[2a] pinned snapshot ord=${ordinal.show} carries no committed mptRoot (BFT/pre-MPT) — hard-reject for mg=${metagraphId.show}"
-              ) >> none[CurrencySnapshotInfo].pure[F]
+                s"[2a] pinned snapshot ord=${ordinal.show} carries no committed mptRoot (BFT/pre-MPT) — hard-reject $what for mg=${metagraphId.show}"
+              ) >> none[A].pure[F]
             case Some(expectedMptRoot) =>
               byteStore.readState(ordinal).flatMap {
                 case None =>
                   // Retained state bytes evicted/absent at the anchor (store retention doesn't reach this depth) — hard-reject, no fallback.
                   logger.debug(
-                    s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject for mg=${metagraphId.show}"
-                  ) >> none[CurrencySnapshotInfo].pure[F]
+                    s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject $what for mg=${metagraphId.show}"
+                  ) >> none[A].pure[F]
                 case Some(bytes) =>
                   GlobalSnapshotInfo.sidecarFreeMptRoot[F](bytes).flatMap { computedRoot =>
                     if (computedRoot =!= expectedMptRoot)
                       // Retained bytes do NOT reproduce the pinned snapshot's committed root (wrong branch / corrupt) — hard-reject.
                       logger.debug(
                         s"[2a] retained bytes at pinned ord=${ordinal.show} recompute mptRoot=${computedRoot.show} ≠ pinned " +
-                          s"stateProof.mptRoot=${expectedMptRoot.show} — hard-reject for mg=${metagraphId.show}"
-                      ) >> none[CurrencySnapshotInfo].pure[F]
+                          s"stateProof.mptRoot=${expectedMptRoot.show} — hard-reject $what for mg=${metagraphId.show}"
+                      ) >> none[A].pure[F]
                     else
-                      reconstructPerMgInfo(bytes, metagraphId)
+                      reconstruct(bytes)
                   }
               }
           }
         case _ =>
           logger.debug(
-            s"[2a] no canonical snapshot at pinned ord=${ordinal.show} matching hash=${expectedGlobalSnapshotHash.show} — hard-reject for mg=${metagraphId.show}"
-          ) >> none[CurrencySnapshotInfo].pure[F]
+            s"[2a] no canonical snapshot at pinned ord=${ordinal.show} matching hash=${expectedGlobalSnapshotHash.show} — hard-reject $what for mg=${metagraphId.show}"
+          ) >> none[A].pure[F]
       }
 
     /** Load the verified byte map into a throwaway in-memory store and reconstruct ONLY `metagraphId`'s `CurrencySnapshotInfo`. Reuses the
@@ -136,6 +177,20 @@ object PinnedCurrencyInfoReader {
         producer <- InMemoryMerklePatriciaProducer.make[F](bytes)
         store <- MptStore.make[F, GlobalStateKey](producer, GlobalStateKey.toHex[F])
         info <- GlobalStateReader.fromMptStore[F](store).getCurrencySnapshotInfo(metagraphId)
+      } yield info
+
+    /** Load the verified byte map into a throwaway in-memory store and read ONLY `metagraphId`'s fieldId-18 `MetagraphSyncDataInfo`
+      * (`GlobalStateConverter.syntax`'s `getMetagraphSyncData` — the exact hypergraph-partition accessor every finalized reader uses), so
+      * the result is byte-identical to a live read of these bytes.
+      */
+    private def reconstructMetagraphSyncData(
+      bytes: Map[Hex, Array[Byte]],
+      metagraphId: Address
+    ): F[Option[MetagraphSyncDataInfo]] =
+      for {
+        producer <- InMemoryMerklePatriciaProducer.make[F](bytes)
+        store <- MptStore.make[F, GlobalStateKey](producer, GlobalStateKey.toHex[F])
+        info <- store.getMetagraphSyncData(metagraphId)
       } yield info
   }
 }
