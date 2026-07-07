@@ -21,7 +21,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.mpt.GlobalStateConverter
+import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
@@ -135,12 +135,13 @@ object ShardCheckpointWiring {
     * `perMetagraphMptRoots(mg)`. With a fixed sentinel:
     *   - For an empty-window checkpoint (`includedSnapshots` empty — a T_alive liveness ping) there is nothing to compare, so the path
     *     reduces to pre-check + finality and accepts cleanly.
-    *   - For a non-empty-window checkpoint the sentinel will (almost surely) NOT equal the real committed root, so the manager returns
-    *     `RejectedReExecutionMismatch`. The checkpoint is DROPPED (fail-closed) — the binaries do NOT enter the gl0 snapshot. This is the
-    *     conservative outcome: a degraded shard's non-quorum checkpoint is rejected rather than admitted on an unverified derivation. It
-    *     does NOT cause a false slash: `GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` only LOGS the rejected-mismatch signer list
-    *     (the slash penalty is a separate slice, S2.0). So the worst case is "degraded-shard non-quorum checkpoints are not admitted until
-    *     quorum returns", never "honest signers slashed".
+    *   - For a non-empty-window checkpoint the `Hash.empty` sentinel is the manager's CANNOT-RE-DERIVE marker: `reExecPath` buckets it as
+    *     "this node can't check" and returns a plain `Rejected` — the checkpoint is DROPPED (fail-closed; the binaries do NOT enter the gl0
+    *     snapshot) but the signers are NOT slash targets. This matters because `RejectedReExecutionMismatch` now feeds the DURABLE 100%
+    *     `InvalidStateProof` slash (`GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` → `WatchtowerSlashRequest`), which demands an
+    *     AFFIRMATIVE pinned-base re-derivation mismatch as evidence — a sentinel from an unwired closure (or an unresolvable pinned
+    *     diff-base) is not evidence of committee deviation. So the worst case is "degraded-shard non-quorum checkpoints are not admitted
+    *     until quorum returns", never "honest signers slashed".
     */
   def noReExecDerivation[F[_]: Async]
     : (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
@@ -175,6 +176,38 @@ object ShardCheckpointWiring {
     (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal, _: SnapshotOrdinal) =>
       processor.deriveMetagraphRoot(mg, binaries, gl0AnchorOrdinal, noGlobalSnapshotLookup)(Hasher[F])
   }
+
+  /** Track-1 diff-base-pin (FINDING-B1) — THE single reader-resolution recipe for every [[reExecDerivationWithDiff]] caller: resolve the
+    * finalized [[GlobalStateReader]] AT the wire-carried, committee-signed pinned ordinal (`diffBaseOrdinal`), NEVER at this node's live
+    * base when the two differ.
+    *
+    * '''Why one definition.''' The re-derived per-MG root is base-DEPENDENT (`deriveAdoptedCurrencyInfo` folds cumulative
+    * balances/refs/active-sets — and the `lastMessages` carry-forward — onto the seed prior; `currencySnapshotMgRoot` is taken over that
+    * fold). So every rail that recomputes the root for byte-comparison against a committee-attested `perMetagraphMptRoots(mg)` — the gl0
+    * produce/watchtower rail (`GlobalSnapshotConsensus.finalizedReaderAt`), the SharedServices sub-quorum `reExecuteDerivation`, and the
+    * SharedServices `createContext` fraud-proof validator — MUST read the SAME pinned base the producer diffed over, or an honest
+    * committee's root is not reproduced and the mismatch feeds the 100% `InvalidStateProof` slash (the false-slash + split this pin kills).
+    * One shared definition keeps all three rails byte-identical, mirroring [[reExecDerivationWithDiff]] itself.
+    *
+    * '''Resolution.''' FAST PATH = the live finalized reader when `ord` IS the store's current `lastPersistedOrdinal` (the producer's /
+    * in-lockstep follower's common case — no byte-map materialization); otherwise the version-retained
+    * [[PinnedCurrencyInfoReader.pinnedReaderAt]], which verifies the retained bytes reproduce the pinned snapshot's committed `mptRoot`.
+    *
+    * '''Fail-closed.''' `None` when the anchor is unresolvable (evicted below the byte store's retention — logarithmic on the follower
+    * rail, contiguous k₂ on gl0 — or not yet reached). The caller then OMITs (defers) / maps to the `Hash.empty` "cannot re-derive"
+    * sentinel, which the consumers treat as "can't check" (plain reject / dispute-not-upheld) — NEVER a live-base substitute, NEVER a
+    * slash.
+    */
+  def pinnedPriorReaderAt[F[_]: Async](
+    mptStore: MptStore[F, GlobalStateKey],
+    pinnedReader: PinnedCurrencyInfoReader[F]
+  ): SnapshotOrdinal => F[Option[GlobalStateReader[F]]] =
+    (ord: SnapshotOrdinal) =>
+      mptStore.lastPersistedOrdinal.flatMap {
+        case Some(live) if live.value.value == ord.value.value =>
+          Async[F].pure(Some(GlobalStateReader.fromMptStore[F](mptStore)))
+        case _ => pinnedReader.pinnedReaderAt(ord)
+      }
 
   /** The PRODUCER-side per-MG derivation (step 6 of the unroll workstream). Same SHAPE as [[reExecDerivation]] but returns the per-MG MPT
     * root PAIRED with the MINIMAL `CurrencySnapshotInfo` byte-diff against the prior shard-checkpoint's cumulative state `S(N)`. The

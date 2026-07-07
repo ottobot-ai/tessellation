@@ -446,7 +446,6 @@ object GlobalSnapshotStateChannelEventsProcessor {
             .foldLeft(priorLastMessages) { (acc, message) =>
               acc.updated(message.value.messageType, message)
             }
-        val nextLastMessagesOpt = if (nextLastMessages.isEmpty) None else Some(nextLastMessages)
 
         // Accepted events carried in the signed snapshot.
         val acceptedTransactions: List[Signed[Transaction]] =
@@ -728,7 +727,12 @@ object GlobalSnapshotStateChannelEventsProcessor {
           candidateLastTokenLockRefs = authoritativeLastTokenLockRefs.orElse(
             committedProof.lastTokenLockRefsProof.map(_ => nextTokenLockRefs)
           )
-          candidateLastMessages = authoritativeLastMessages.orElse(nextLastMessagesOpt)
+          // Track-1 diff-base-pin follow-up: drive the Option SHAPE off the committed proof like the guarded siblings above
+          // (`None -> None`, `Some -> Some(map)`), replacing the empty-collapses-to-None `nextLastMessagesOpt`. The old shape leaked the
+          // PRIOR's messages into the candidate when the metagraph committed `lastMessagesProof = None`, and produced `None` (never
+          // matching a post-migration `Some(empty)` proof) when the fold was empty — both per-field-gate misses that carried the
+          // base-dependent `lastState.lastMessages` forward into the per-MG root.
+          candidateLastMessages = authoritativeLastMessages.orElse(committedProof.lastMessagesProof.map(_ => nextLastMessages))
           // NOTE: this is a `<-` (not `=`) deliberately — it inserts a flatMap boundary that resets the for-comprehension's batched
           // consecutive-`=` tuple, which otherwise hits Scala 2.13's 22-element TupleN ceiling once these authoritative ref-map bindings
           // are added (the `x$NN` desugar failure). `.pure[F]` is a no-op; behavior is identical to a `=` binding.

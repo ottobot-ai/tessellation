@@ -717,8 +717,11 @@ object GlobalSnapshotAcceptanceManager {
           *        binaries) and collect the cross-shard receipts.
           *      - `PendingMoreAttestations`: skip this checkpoint for this ord; the gl0 leader will retry next ord (§7.2 `gl0AnchorOrdinal`
           *        loose coupling permits a checkpoint to ride into N, N+1, …).
-          *      - `Rejected` / `RejectedReExecutionMismatch`: log + drop. Slashing emission for the re-exec mismatch case (§10.2) is Slice
-          *        16/17 territory; this slice surfaces the rejection but does not yet emit evidence.
+          *      - `Rejected`: log + drop (includes the fail-closed CANNOT-RE-DERIVE case — the verifier could not resolve the checkpoint's
+          *        pinned `diffBaseOrdinal`, so it can't check; no slash on unverifiable evidence).
+          *      - `RejectedReExecutionMismatch`: log + drop + queue a durable `WatchtowerSlashRequest` (§10.2 — the 100%
+          *        `InvalidStateProof` tier; see the match arm below). Only an AFFIRMATIVE pinned-base re-derivation mismatch reaches this
+          *        branch.
           *
           *   1. Merge every accepted checkpoint's `includedSnapshots` into a single adopted map. The map key is the metagraph address; the
           *      static §4 assignment makes one MG belong to exactly one shard, so the per-shard contributions are disjoint and the union is

@@ -574,19 +574,11 @@ object GlobalSnapshotConsensus {
       // Resolve the finalized state reader AT a pinned ordinal: FAST PATH = the live base reader when the ordinal IS the current
       // `lastPersistedOrdinal` (the producer's common case — no byte-map materialization); otherwise a version-retained pinned reader over
       // `signedBytesStore` (the watchtower's historical case). `None` ⇒ the anchor can't be served (evicted below k₂ / not on this chain).
-      finalizedReaderAt = { (ord: io.constellationnetwork.schema.SnapshotOrdinal) =>
-        mptStore.lastPersistedOrdinal.flatMap {
-          case Some(live) if live.value.value == ord.value.value =>
-            Async[F].pure(
-              Some(io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore))
-            )
-          case _ => gl0PinnedReader.pinnedReaderAt(ord)
-        }
-      }: (
-        io.constellationnetwork.schema.SnapshotOrdinal => F[
-          Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F]]
-        ]
-      )
+      // Track-1 diff-base-pin (FINDING-B1): the SINGLE shared recipe (`ShardCheckpointWiring.pinnedPriorReaderAt`) — the SharedServices
+      // follower rails (sub-quorum re-exec + createContext fraud-proof validator) resolve through the SAME definition (over their
+      // logarithmic `mpt_snapshot_info` byte store), so all `reExecDerivationWithDiff` callers read one pin semantics.
+      finalizedReaderAt = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+        .pinnedPriorReaderAt[F](mptStore, gl0PinnedReader)
 
       // ─── WATCHTOWER fraud-proof re-derivation closure (W3a) — hoisted ABOVE the GSAM so the on-chain verdict can use it ───
       // The PIN-1 per-MG re-derivation — IDENTICAL encoding to the sub-quorum re-exec the acceptance manager uses

@@ -537,34 +537,61 @@ object ShardCheckpointGl0AcceptanceManager {
           * empty-window checkpoint (T_alive liveness ping per §6.1) — there's nothing to re-exec, so acceptance reduces to the pre-check +
           * finality phase combination above.
           *
-          * All-match ⇒ `Accepted`. Any-mismatch ⇒ `RejectedReExecutionMismatch` with the entire signer list as the slash target (§10.2 —
-          * every signer attested to the same wrong-derivation result; all of them deviated). The first mismatch carries the reason; we
-          * don't short-circuit at the first mismatch because diagnostic completeness (which MGs diverged) is more valuable than the trivial
-          * CPU saved by early-exit on a path that fires under degraded liveness only.
+          * All-match ⇒ `Accepted`. Any AFFIRMATIVE mismatch (a real re-derived root ≠ the claimed root) ⇒ `RejectedReExecutionMismatch`
+          * with the entire signer list as the slash target (§10.2 — every signer attested to the same wrong-derivation result; all of them
+          * deviated). The first mismatch carries the reason; we don't short-circuit at the first mismatch because diagnostic completeness
+          * (which MGs diverged) is more valuable than the trivial CPU saved by early-exit on a path that fires under degraded liveness
+          * only.
+          *
+          * '''CANNOT-RE-DERIVE fail-closed (Track-1 diff-base-pin, FINDING-B1).''' `Hash.empty` from the closure is the wiring's
+          * fail-closed "cannot re-derive" sentinel (`reExecDerivationWithDiff` OMITted: the pinned `diffBaseOrdinal` is unresolvable below
+          * this node's retention / not yet reached, the derivation deferred/crashed, or no closure is wired) — "THIS NODE can't check", NOT
+          * "the committee deviated". Exactly the reading [[watchtowerReExec]] applies when it filters `Hash.empty`. Such an MG must NOT
+          * feed `RejectedReExecutionMismatch`: that result is consumed by `GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` as a
+          * DURABLE 100% `InvalidStateProof` slash (`WatchtowerSlashRequest`), and slashing demands an affirmative pinned-base re-derivation
+          * mismatch as evidence (`feedback_slashing_safety_bar`). Instead the checkpoint is REJECTED plain (fail-closed — never admitted
+          * unverified, never falsely slashed); it re-offers once the node can serve the pinned base or quorum returns.
           */
         private def reExecPath(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] = {
           val included = checkpoint.derivedStateDelta.includedSnapshots
           val claimedRoots = checkpoint.derivedStateDelta.perMetagraphMptRoots
           val signers = checkpoint.committeeSignatures.toList.map(_.peerId)
 
+          // Per-MG verdict: Right(mg) = root reproduced; Left((mg, reason, slashable)) = not reproduced, where `slashable` is true ONLY
+          // for an affirmative mismatch (a REAL re-derived root that differs from the claim) — never for the can't-check sentinel.
           included.toList.traverse {
             case (mg, snaps) =>
-              // Full per-MG chain + the checkpoint's wire-carried `gl0AnchorOrdinal`. Mirrors `ShardCheckpointProducer.assembleDelta` —
-              // the producer derives the per-MG root off the whole included chain at the same anchor ordinal, and the gl0 verifier re-runs
-              // the SAME derivation off the SAME chain + ordinal. Byte-identical inputs ⇒ byte-identical roots (the S3 no-false-slashing
-              // contract).
+              // Full per-MG chain + the checkpoint's wire-carried `gl0AnchorOrdinal` + pinned `diffBaseOrdinal`. Mirrors
+              // `ShardCheckpointProducer.assembleDelta` — the producer derives the per-MG root off the whole included chain at the same
+              // anchor over the same pinned base, and the gl0 verifier re-runs the SAME derivation off the SAME inputs. Byte-identical
+              // inputs ⇒ byte-identical roots (the S3 no-false-slashing contract).
               reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal, checkpoint.diffBaseOrdinal).map { actual =>
                 claimedRoots.get(mg) match {
+                  // CANNOT-RE-DERIVE sentinel — fail closed, no slash (see scaladoc). Checked FIRST so a sentinel never counts as an
+                  // affirmative mismatch against any claimed value (or a missing claim).
+                  case _ if actual === Hash.empty =>
+                    Left(
+                      (
+                        mg,
+                        s"cannot re-derive MG $mg at pinned diffBase=${checkpoint.diffBaseOrdinal.value.value} " +
+                          s"(re-exec unavailable: pinned base unresolvable/OMIT) — fail-closed drop, NO slash",
+                        false
+                      )
+                    )
                   case Some(claimed) if claimed === actual => Right(mg)
                   case Some(claimed) =>
-                    Left((mg, s"re-exec mismatch for MG $mg: claimed=${claimed.value.take(16)}... actual=${actual.value.take(16)}..."))
+                    Left(
+                      (mg, s"re-exec mismatch for MG $mg: claimed=${claimed.value.take(16)}... actual=${actual.value.take(16)}...", true)
+                    )
                   case None =>
-                    Left((mg, s"re-exec mismatch for MG $mg: claimed=<missing> actual=${actual.value.take(16)}..."))
+                    Left((mg, s"re-exec mismatch for MG $mg: claimed=<missing> actual=${actual.value.take(16)}...", true))
                 }
               }
           }.flatMap { results =>
-            val mismatches = results.collect { case Left(x) => x }
-            if (mismatches.isEmpty) {
+            val failures = results.collect { case Left(x) => x }
+            val mismatches = failures.filter { case (_, _, slashable) => slashable }
+            val uncheckable = failures.filterNot { case (_, _, slashable) => slashable }
+            if (failures.isEmpty) {
               logger
                 .info(
                   s"accept T_depth1_shard re-exec OK: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
@@ -573,7 +600,9 @@ object ShardCheckpointGl0AcceptanceManager {
                 ShardMetrics
                   .incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TDepth1)
                   .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
-            } else {
+            } else if (mismatches.nonEmpty) {
+              // Affirmative deviation evidence on ≥1 MG wins over any uncheckable sibling: the committee signed a root no honest
+              // pinned-base re-execution of its own signed binaries produces.
               val firstReason = mismatches.head._2
               val mismatchedMgs = mismatches.map(_._1).map(_.value.value).mkString(", ")
               logger
@@ -586,6 +615,18 @@ object ShardCheckpointGl0AcceptanceManager {
                   .as(
                     ShardCheckpointAcceptResult.RejectedReExecutionMismatch(firstReason, signers): ShardCheckpointAcceptResult
                   )
+            } else {
+              // ONLY can't-check sentinels — fail closed WITHOUT slash targets: plain Rejected (dropped, re-offered later).
+              val firstReason = uncheckable.head._2
+              val uncheckableMgs = uncheckable.map(_._1).map(_.value.value).mkString(", ")
+              logger
+                .warn(
+                  s"reject T_depth1_shard re-exec CANNOT-RE-DERIVE (fail-closed, no slash): shardId=${checkpoint.shardId} " +
+                    s"shardOrd=${checkpoint.shardOrdinal.value} uncheckableMgs=[$uncheckableMgs] firstReason=$firstReason"
+                ) >>
+                ShardMetrics
+                  .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.ReExecMismatch)
+                  .as(ShardCheckpointAcceptResult.Rejected(firstReason): ShardCheckpointAcceptResult)
             }
           }
         }

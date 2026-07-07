@@ -418,8 +418,14 @@ object CurrencyAdoptRootsOnlyAdvanceSuite extends MutableIOSuite {
       prior: SortedMap[Address, CurrencySnapshotWithState] =
         SortedMap(mgAddr -> priorState)(Address.OrderingInstance)
 
-      // The adopted second incremental carries NO messages — the prior owner must survive.
-      secondIncremental <- signedIncremental(2L, firstHash, None, mgKeyPair)
+      // The adopted second incremental carries NO messages — the prior owner must survive. Stamp the proof a REAL ml0 commits for a
+      // message-free window: its CUMULATIVE lastMessages still holds the owner, so `lastMessagesProof = Some(hash({Owner -> msg}))`
+      // (the same "the fixture must carry the proof its messages imply" doctrine as the stamped test above). Track-1 diff-base-pin
+      // follow-up: `candidateLastMessages` is now shape-driven off the committed proof like its guarded siblings — a `None` proof means
+      // "the metagraph's own info has NO messages" (ml0's stateProof maps None -> None and its acceptMessages fold never removes), so a
+      // prior-owner-with-None-proof fixture modeled a mirror/MG divergence, not the real carry-forward case.
+      carryForwardProof <- info(Some(priorMessages)).stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      secondIncremental <- signedIncremental(2L, firstHash, None, mgKeyPair, stateProof = carryForwardProof)
       secondBinary <- binaryOf(secondIncremental, firstHash, mgKeyPair)
       adopted = SortedMap(mgAddr -> NonEmptyList.of(secondBinary))(Address.OrderingInstance)
 

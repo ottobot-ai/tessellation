@@ -21,18 +21,22 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   * disputed checkpoint's `includedSnapshots` and decides UPHELD iff attested ≠ honest-re-derived. Never trust the challenger's claimed
   * roots — recompute." This validator implements exactly that.
   *
-  * '''The re-derivation primitive (`reDerivePerMgRoot`).''' Injected as the SAME `(metagraphAddress, includedChain, gl0AnchorOrdinal) =>
-  * F[Hash]` closure the [[io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager]]
-  * uses on its sub-quorum re-exec path (production: `ShardCheckpointWiring.reExecDerivationWithDiff(...)._1`, the PIN-1
-  * `Hasher.hash((incrementalRoot, infoRoot))` encoding seeded from this node's FINALIZED base `GlobalStateReader.fromMptStore`). Two facts
-  * make this deterministic cluster-wide:
-  *   1. The closure reads NO live snapshot storage for the derivation itself (`noGlobalSnapshotLookup`) — only the finalized MPT base for
-  *      the `S(N)` prior.
-  *   1. The dispute is gated to land WITHIN the challenge window (`depth-k1`); below depth-k1 the finalized base `S(N)` is cluster-uniform
+  * '''The re-derivation primitive (`reDerivePerMgRoot`).''' Injected as the SAME `(metagraphAddress, includedChain, gl0AnchorOrdinal,
+  * diffBaseOrdinal) => F[Hash]` closure the
+  * [[io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager]] uses on its
+  * sub-quorum re-exec path (production: `ShardCheckpointWiring.reExecDerivationWithDiff(...)._1`, the PIN-1 component-addressable
+  * `currencySnapshotMgRoot` encoding, seeded from the reader `ShardCheckpointWiring.pinnedPriorReaderAt` resolves AT the disputed
+  * checkpoint's own `diffBaseOrdinal` — Track-1 diff-base-pin, FINDING-B1). Two facts make this deterministic cluster-wide:
+  *   1. The closure reads NO live snapshot storage for the derivation itself (`noGlobalSnapshotLookup`), and the `S(N)` prior is read at
+  *      the wire-carried, committee-signed `diffBaseOrdinal` — NEVER this node's live base (a validator whose tip ran ahead of the
+  *      checkpoint's base would otherwise recompute a different root and false-uphold against an honest committee).
+  *   1. The dispute is gated to land WITHIN the challenge window (`depth-k1`); below depth-k1 the pinned base `S(N)` is cluster-uniform
   *      (consensus has finalized it), so every honest node's PIN-1 re-derivation reads the IDENTICAL prior and computes the IDENTICAL root.
   *      Above the window the economic effect is already irreversible, so a late dispute is rejected by the GSAM gate before it reaches this
   *      validator (the validator itself stays pure given its inputs; the window gate is the caller's contract — same shape as
-  *      [[SlashableEvidenceValidator]]'s `currentEpoch`/`eventEpoch` caller contract).
+  *      [[SlashableEvidenceValidator]]'s `currentEpoch`/`eventEpoch` caller contract). A node that cannot RESOLVE the pinned base
+  *      (retention miss / not reached) yields the `Hash.empty` sentinel and the verdict FAILS CLOSED
+  *      ([[io.constellationnetwork.schema.slashing.InvalidStateProofRejection.CannotRederive]]) — an unverifiable dispute never slashes.
   *
   * '''Why re-derive from the checkpoint's OWN signed bytes, not the challenger's claim.''' The committee SIGNED `disputedCheckpoint` (its
   * `committeeSignatures` cover the `ShardCheckpointSigPreimage`, which includes `derivedStateDelta.includedSnapshots` and
@@ -134,23 +138,32 @@ object InvalidStateProofValidator {
         }
 
       // Step 7 — THE VERDICT (load-bearing). Re-derive the honest per-MG root from the checkpoint's OWN signed binaries at its OWN
-      // gl0AnchorOrdinal, using the SAME closure the sub-quorum re-exec uses (PIN-1 encoding, finalized base). Compare against the
-      // committee-attested root read off the signed envelope. UPHELD iff they differ. Never trusts the challenger's carried roots.
+      // gl0AnchorOrdinal over its OWN pinned diffBaseOrdinal, using the SAME closure the sub-quorum re-exec uses (PIN-1 encoding,
+      // diff-base-pinned reader). Compare against the committee-attested root read off the signed envelope. UPHELD iff the re-derivation
+      // AFFIRMATIVELY differs. Never trusts the challenger's carried roots.
       def step7(binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]]): F[Either[InvalidStateProofRejection, Unit]] = {
         val attested: Option[Hash] = cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
         reDerivePerMgRoot(mg, binaries, cp.gl0AnchorOrdinal, cp.diffBaseOrdinal).map { honest =>
-          attested match {
-            case Some(attestedRoot) if attestedRoot === honest =>
-              // Honest re-derivation reproduced the attested root ⇒ committee did NOT deviate ⇒ NOT upheld. The "honest committee" floor.
-              Left(InvalidStateProofRejection.DisputeNotUpheld(honest, attestedRoot))
-            case Some(_) =>
-              // Divergence — the committee signed a root no honest re-execution of its own signed binaries produces. UPHELD.
-              Right(())
-            case None =>
-              // The committee carried NO root for an MG it included binaries for — a structurally invalid derivation. UPHELD (the honest
-              // derivation produced a root; the committee attested none).
-              Right(())
-          }
+          // FAIL-CLOSED (Track-1 diff-base-pin, FINDING-B1): `Hash.empty` is the wiring's "cannot re-derive" sentinel
+          // (`reExecDerivationWithDiff` returned None — the pinned diffBaseOrdinal is unresolvable below this node's retention / not
+          // reached, or the derivation OMITted). An unverifiable dispute is NEVER upheld: "this node can't check" is not evidence of
+          // committee deviation, and upholding here would 100%-slash an honest committee on a local retention miss. Checked FIRST so the
+          // sentinel can neither "differ" from an attested root nor satisfy the None-attested branch below.
+          if (honest === Hash.empty)
+            Left(InvalidStateProofRejection.CannotRederive(mg))
+          else
+            attested match {
+              case Some(attestedRoot) if attestedRoot === honest =>
+                // Honest re-derivation reproduced the attested root ⇒ committee did NOT deviate ⇒ NOT upheld. The "honest committee" floor.
+                Left(InvalidStateProofRejection.DisputeNotUpheld(honest, attestedRoot))
+              case Some(_) =>
+                // Divergence — the committee signed a root no honest re-execution of its own signed binaries produces. UPHELD.
+                Right(())
+              case None =>
+                // The committee carried NO root for an MG it included binaries for — a structurally invalid derivation. UPHELD (the honest
+                // derivation produced a root; the committee attested none).
+                Right(())
+            }
         }
       }
 

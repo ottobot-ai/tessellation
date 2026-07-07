@@ -589,6 +589,140 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   // ============================================================================
+  // Test 5b (diff-base-pin fail-closed): re-exec CANNOT-DERIVE sentinel — plain Rejected, NO slash
+  // ============================================================================
+
+  test("T_depth1-only re-exec CANNOT-DERIVE (Hash.empty sentinel): fail-closed plain Rejected — NEVER RejectedReExecutionMismatch/slash") {
+    res =>
+      implicit val (h, sp, _) = res
+      for {
+        (signerKp, signerPeer) <- mkSigner
+        (_, selfPeer) <- mkSigner
+
+        mg = Address.fromBytes("mg-e2".getBytes("UTF-8"))
+        mptRoot = Hash("11" * 32)
+        binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+        delta = mkDelta(mg, mptRoot, binary)
+        shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+
+        validSig <- mkValidSig(shell, signerKp, signerPeer)
+        checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
+
+        // T_depth1 qualifies; T_count doesn't — forces the re-exec path.
+        (_, triggers) <- mkFinalityTriggers(
+          kQuorum = 1000,
+          k1Shard = 3L,
+          chainLength = 10,
+          selfId = selfPeer
+        )
+        // Re-exec returns Hash.empty — the wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationWithDiff` OMIT: the
+        // pinned diff-base is unresolvable below this node's retention / not yet reached, or the derivation deferred). That is
+        // "THIS NODE can't check", NOT "the committee deviated" (the same reading `watchtowerReExec` applies when it filters
+        // `Hash.empty` mismatches). The checkpoint must be REJECTED (fail-closed: never admitted unverified) but the signers must
+        // NOT be slash targets — `RejectedReExecutionMismatch` feeds the DURABLE 100% `InvalidStateProof` slash
+        // (`GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` → `WatchtowerSlashRequest`), which demands an AFFIRMATIVE
+        // pinned-base re-derivation mismatch as evidence.
+        reExecCb = (
+          (
+            _: Address,
+            _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+            _: SnapshotOrdinal,
+            _: SnapshotOrdinal
+          ) => IO.pure(Hash.empty)
+        ): (
+          Address,
+          NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          SnapshotOrdinal,
+          SnapshotOrdinal
+        ) => IO[Hash]
+
+        mgr <- mkManager(
+          finalityTriggers = Map(shardZero -> triggers),
+          committeeMembership = Set(signerPeer),
+          selfId = selfPeer,
+          reExecuteDerivation = reExecCb
+        )
+        result <- mgr.evaluate(checkpoint)
+      } yield
+        result match {
+          case ShardCheckpointAcceptResult.Rejected(reason) =>
+            expect(reason.contains("cannot re-derive"), s"reason should name the can't-check condition, got: $reason")
+          case other =>
+            failure(
+              s"Expected fail-closed plain Rejected (can't-check ⇒ drop, NO slash targets), got $other — " +
+                s"a Hash.empty sentinel must never mark an honest committee for the 100% InvalidStateProof slash"
+            )
+        }
+  }
+
+  // ============================================================================
+  // Test 5c (diff-base-pin fail-closed): affirmative mismatch on ANOTHER MG still slashes
+  // ============================================================================
+
+  test("mixed window: one MG affirmatively mismatches, another can't-derive → RejectedReExecutionMismatch (affirmative evidence wins)") {
+    res =>
+      implicit val (h, sp, _) = res
+      for {
+        (signerKp, signerPeer) <- mkSigner
+        (_, selfPeer) <- mkSigner
+
+        mgBad = Address.fromBytes("mg-bad".getBytes("UTF-8"))
+        mgUncheckable = Address.fromBytes("mg-uncheckable".getBytes("UTF-8"))
+        claimedRoot = Hash("11" * 32)
+        binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+        delta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(mgBad -> claimedRoot, mgUncheckable -> claimedRoot),
+          perMetagraphStateDiff = SortedMap.empty,
+          includedSnapshots = SortedMap(mgBad -> NonEmptyList.of(binary), mgUncheckable -> NonEmptyList.of(binary)),
+          tokenLockBalancesDelta = SortedMap.empty,
+          perMetagraphArtifacts = SortedMap.empty,
+          perMetagraphSyncDataDelta = SortedMap.empty
+        )
+        shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+
+        validSig <- mkValidSig(shell, signerKp, signerPeer)
+        checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
+
+        (_, triggers) <- mkFinalityTriggers(
+          kQuorum = 1000,
+          k1Shard = 3L,
+          chainLength = 10,
+          selfId = selfPeer
+        )
+        // mgBad re-derives to a REAL root ≠ claimed (affirmative deviation evidence); mgUncheckable yields the can't-check sentinel.
+        // The affirmative mismatch is cryptographic evidence the committee deviated — it must still slash, regardless of the
+        // uncheckable sibling.
+        reExecCb = (
+          (
+            a: Address,
+            _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+            _: SnapshotOrdinal,
+            _: SnapshotOrdinal
+          ) => IO.pure(if (a === mgBad) Hash("ff" * 32) else Hash.empty)
+        ): (
+          Address,
+          NonEmptyList[Signed[StateChannelSnapshotBinary]],
+          SnapshotOrdinal,
+          SnapshotOrdinal
+        ) => IO[Hash]
+
+        mgr <- mkManager(
+          finalityTriggers = Map(shardZero -> triggers),
+          committeeMembership = Set(signerPeer),
+          selfId = selfPeer,
+          reExecuteDerivation = reExecCb
+        )
+        result <- mgr.evaluate(checkpoint)
+      } yield
+        result match {
+          case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
+            expect(reason.contains("re-exec mismatch")) &&
+            expect.same(List(signerPeer), slashSigners)
+          case other => failure(s"Expected RejectedReExecutionMismatch (affirmative mismatch on mgBad), got $other")
+        }
+  }
+
+  // ============================================================================
   // Test 6: Neither qualifies → Pending
   // ============================================================================
 

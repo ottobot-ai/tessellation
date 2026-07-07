@@ -213,6 +213,49 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       } yield expect(res match { case Left(_: InvalidStateProofRejection.CheckpointHashMismatch) => true; case _ => false })
   }
 
+  test("FAIL-CLOSED: reDerive returning the Hash.empty cannot-re-derive sentinel ⇒ dispute NOT upheld (never a slash)") {
+    case (h0, sp0) =>
+      implicit val h: Hasher[IO] = h0
+      implicit val sp: SecurityProvider[IO] = sp0
+      val cp = mkCheckpoint(attested, nSigners = 6)
+      // `Hash.empty` is the production wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationWithDiff` returned
+      // None — the pinned diff-base is unresolvable below this node's retention / not reached, or the derivation OMITted).
+      // "This node can't check" is NOT evidence the committee deviated: upholding here would 100%-slash an honest committee
+      // on a local retention miss. The verdict must fail closed — reject the dispute, never uphold.
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(Hash.empty)
+      val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
+      for {
+        (kp, pid) <- challengerSetup
+        ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
+        res <- validator.validate(ev)
+      } yield
+        expect(
+          res == Left(InvalidStateProofRejection.CannotRederive(mgA)),
+          s"a dispute this node cannot re-derive must NEVER be upheld (fail-closed CannotRederive, no slash) — got $res"
+        )
+  }
+
+  test("FAIL-CLOSED: Hash.empty sentinel with NO attested root for the MG ⇒ still CannotRederive (never the None-attested UPHELD branch)") {
+    case (h0, sp0) =>
+      implicit val h: Hasher[IO] = h0
+      implicit val sp: SecurityProvider[IO] = sp0
+      // A structurally-invalid checkpoint (binaries included, no attested root) would normally be UPHELD — but ONLY on an
+      // affirmative honest re-derivation. With the cannot-re-derive sentinel the verdict must STILL fail closed.
+      val cpNoRoot = {
+        val cp0 = mkCheckpoint(attested, nSigners = 3)
+        cp0.copy(derivedStateDelta = cp0.derivedStateDelta.copy(perMetagraphMptRoots = SortedMap.empty))
+      }
+      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
+        (_, _, _, _) => IO.pure(Hash.empty)
+      val validator = InvalidStateProofValidator.make[IO](reDerive, InvalidStateProofSlashedReader.neverSlashed[IO])
+      for {
+        (kp, pid) <- challengerSetup
+        ev <- mkEvidence(cpNoRoot, kp, pid, claimed = attested, challengerRoot = honestDifferent)
+        res <- validator.validate(ev)
+      } yield expect(res == Left(InvalidStateProofRejection.CannotRederive(mgA)), s"got $res")
+  }
+
   test("reject: already-slashed (double-slash guard) on (shardId, disputedCheckpointHash)") {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0

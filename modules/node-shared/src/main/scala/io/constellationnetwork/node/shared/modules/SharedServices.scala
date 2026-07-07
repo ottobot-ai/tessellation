@@ -320,17 +320,20 @@ object SharedServices {
         // byte-identical.
         reExecuteDerivation = Some {
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-          // Track-1 diff-base-pin: the follower has no CONTIGUOUS k₂ store (its retention is logarithmic), and this degraded-path
-          // sub-quorum re-exec ROOT is base-INDEPENDENT (authoritative-override fields + sync-view excluded from the per-MG root), so read
-          // the LIVE finalized base (ignore the pinned ordinal) — pinning to a historical `diffBaseOrdinal` would MISS on the logarithmic
-          // store and spuriously OMIT/reject. The gl0 rail (contiguous `signedBytesStore`) is the one that pins historically.
-          val liveReaderAt: SnapshotOrdinal => F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F]]] =
-            (_: SnapshotOrdinal) =>
-              Async[F].pure(
-                Some(io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](storages.mptStore))
-              )
+          // Track-1 diff-base-pin (FINDING-B1): resolve the derivation prior AT the wire-carried, committee-signed `diffBaseOrdinal` —
+          // NEVER at this node's live base when the two differ. The re-derived per-MG root is base-DEPENDENT
+          // (`deriveAdoptedCurrencyInfo` folds cumulative balances/refs/active-sets — and the `lastMessages` carry-forward — onto the
+          // seed prior), so a live read on a node whose finalized tip ≠ the checkpoint's base recomputes a DIFFERENT root for the SAME
+          // honest checkpoint → false `RejectedReExecutionMismatch` (a durable 100% slash of the whole committee) + adopt-decision split.
+          // Same shared recipe the gl0 produce/watchtower rail uses (`GlobalSnapshotConsensus.finalizedReaderAt`): fast-path live reader
+          // iff `diffBaseOrdinal` IS the current `lastPersistedOrdinal`, else the version-retained pinned reader over this node's
+          // `mpt_snapshot_info` byte store (`sharedPinnedCurrencyInfoReader`). RETENTION CAVEAT: that store prunes logarithmically
+          // (sparse below the head), so a deep anchor can miss — the pin then FAILS CLOSED (`None` ⇒ OMIT ⇒ `Hash.empty`, which
+          // `reExecPath` treats as "can't check": plain reject, NO slash) rather than substituting a live base.
+          val pinnedReaderAt =
+            ShardCheckpointWiring.pinnedPriorReaderAt[F](storages.mptStore, sharedPinnedCurrencyInfoReader)
           val withDiff =
-            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, liveReaderAt)(
+            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, pinnedReaderAt)(
               Async[F],
               Parallel[F],
               h,
@@ -343,10 +346,11 @@ object SharedServices {
             anchor: SnapshotOrdinal,
             diffBaseOrdinal: SnapshotOrdinal
           ) =>
-            // OMIT-ON-CAN'T-DERIVE: `reExecDerivationWithDiff` now returns `None` when it cannot derive a real state (it OMITS the MG
-            // rather than emit an empty-state sentinel). On the sub-quorum re-exec failover we map that to `Hash.empty` — the same
-            // fail-closed sentinel `noReExecDerivation` uses — so a non-derivable MG yields a deterministic mismatch (the degraded
-            // checkpoint is rejected, never falsely admitted) rather than a spurious empty-state-root match.
+            // OMIT-ON-CAN'T-DERIVE: `reExecDerivationWithDiff` returns `None` when it cannot derive a real state (pinned base
+            // unresolvable, derivation deferred/crashed) — it OMITS the MG rather than emit an empty-state sentinel. Map that to
+            // `Hash.empty`, the fail-closed CANNOT-RE-DERIVE sentinel: `ShardCheckpointGl0AcceptanceManager.reExecPath` buckets it as
+            // "can't check" (plain `Rejected` — dropped, never admitted unverified, NO slash targets) and `watchtowerReExec` filters it —
+            // never a deterministic-mismatch false slash.
             withDiff(mg, binaries, anchor, diffBaseOrdinal).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
         }
       )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
@@ -358,15 +362,16 @@ object SharedServices {
       createContextInvalidStateProofValidator = shardAcceptanceDeps match {
         case Some(_) =>
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-          // Track-1 diff-base-pin: LIVE base reader (same rationale as `reExecuteDerivation` above — follower has no contiguous k₂ store,
-          // and the re-derived root is base-independent).
-          val liveReaderAt: SnapshotOrdinal => F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F]]] =
-            (_: SnapshotOrdinal) =>
-              Async[F].pure(
-                Some(io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](storages.mptStore))
-              )
+          // Track-1 diff-base-pin (FINDING-B1): the SAME pinned reader-resolution as `reExecuteDerivation` above — the honest
+          // re-derivation reads S(N) at the DISPUTED checkpoint's own `diffBaseOrdinal`, never this follower's live base. A follower
+          // whose live tip ran AHEAD of the pinned base would otherwise recompute a different root, false-UPHOLD the fraud proof, and
+          // write a slash (fieldId-34 + stake maps) into its consensus root that the pinned leader didn't → StateProofMismatch
+          // mirror-freeze fork. Unresolvable anchor ⇒ fail-closed `Hash.empty` ⇒ `InvalidStateProofValidator` step 7 rejects the dispute
+          // (`CannotRederive`) — an unverifiable dispute never slashes.
+          val pinnedReaderAt =
+            ShardCheckpointWiring.pinnedPriorReaderAt[F](storages.mptStore, sharedPinnedCurrencyInfoReader)
           val withDiff =
-            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, liveReaderAt)(
+            ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, pinnedReaderAt)(
               Async[F],
               Parallel[F],
               h,
