@@ -426,8 +426,28 @@ object Main
                               _ <- storages.globalSnapshot.setHeadForRecovery(latestSnapshot, latestInfo)
                               _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
                               _ <- sharedStorages.lastNGlobalSnapshot.setForRecovery(hashedSnapshot, latestInfo)
-                              _ <- sharedStorages.mptStore
-                                .syncFromGlobalSnapshotInfo(latestInfo, latestOrdinal)(globalStateProofSelector, withdrawalTimeLimit)
+                              // FINDING-S01 fail-closed cold-restart gate. The persisted `GlobalSnapshotInfo` has NO field for the
+                              // MPT-native consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34), and the in-memory MPT store
+                              // is empty at boot (SharedStorages seeds an empty producer), so a plain from-GSI rebuild would silently
+                              // resurface WITHOUT the cross-shard spent-set — re-opening consumed allow-spends for a double-spend and
+                              // committing a base whose root diverges from the last snapshot's SIGNED `stateProof.mptRoot`.
+                              // `syncFromGlobalSnapshotInfoVerified` rebuilds ONLY when the from-GSI root reproduces the signed root
+                              // (always at `numShards = 1` / empty spent-set — the normal restart), and returns false otherwise.
+                              mptAdopted <- sharedStorages.mptStore
+                                .syncFromGlobalSnapshotInfoVerified(latestInfo, latestOrdinal, latestSnapshot.value.stateProof.mptRoot)(
+                                  globalStateProofSelector,
+                                  withdrawalTimeLimit
+                                )
+                              _ <- IO
+                                .raiseError[Unit](
+                                  new RuntimeException(
+                                    s"Cold restart at ordinal=$latestOrdinal: the persisted GlobalSnapshotInfo cannot reproduce the " +
+                                      s"snapshot's SIGNED stateProof.mptRoot — its MPT-native ConsumedAllowSpends/Slashings partitions are " +
+                                      s"not carried by the GSI. FAILING CLOSED rather than booting with a wiped cross-shard spent-set. " +
+                                      s"Re-bootstrap this node from a healthy peer (byte-faithful MPT adoption) to recover."
+                                  )
+                                )
+                                .whenA(!mptAdopted)
                               _ <- services.consensus.manager
                                 .startFacilitatingAfterRollback(
                                   latestSnapshot.ordinal,
@@ -481,10 +501,30 @@ object Main
                             latestInfo
                           )
                         }
-                        _ <- hasherSelector.withCurrent { implicit hasher =>
+                        // FINDING-S01 fail-closed peer-download gate (see the cold-restart site). The downloaded GSI has no field
+                        // for ConsumedAllowSpends (33) / Slashings (34); rebuild ONLY when the from-GSI root reproduces the
+                        // downloaded snapshot's SIGNED stateProof.mptRoot, else fail closed (byte-faithful MPT adoption is the
+                        // preferred recovery — see the remaining-work note).
+                        mptAdopted <- hasherSelector.withCurrent { implicit hasher =>
                           sharedStorages.mptStore
-                            .syncFromGlobalSnapshotInfo(latestInfo, hashedSnapshot.ordinal)(globalStateProofSelector, withdrawalTimeLimit)
+                            .syncFromGlobalSnapshotInfoVerified(
+                              latestInfo,
+                              hashedSnapshot.ordinal,
+                              latestSnapshot.value.stateProof.mptRoot
+                            )(
+                              globalStateProofSelector,
+                              withdrawalTimeLimit
+                            )
                         }
+                        _ <- IO
+                          .raiseError[Unit](
+                            new RuntimeException(
+                              s"Peer download at ordinal=${hashedSnapshot.ordinal}: the peer's GlobalSnapshotInfo cannot reproduce the " +
+                                s"snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings not carried by the GSI). " +
+                                s"FAILING CLOSED rather than joining with a wiped cross-shard spent-set."
+                            )
+                          )
+                          .whenA(!mptAdopted)
                         _ <- services.consensus.manager
                           .startFacilitatingAfterRollback(
                             latestSnapshot.ordinal,

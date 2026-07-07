@@ -340,6 +340,22 @@ object GlobalStateFieldId {
       MgLastMessages
     )
 
+  /** Consensus-root-load-bearing partitions that are MPT-NATIVE: they are folded into the signed global `mptRoot`
+    * ([[GlobalStateKey.consensusRootEntries]] keeps them) but have NO corresponding `GlobalSnapshotInfo` case-class field — the MPT is
+    * their ONLY carrier. [[ConsumedAllowSpends]] (33, the cross-shard single-use spent-set) and [[Slashings]] (34, the watchtower slash
+    * ledger) are written directly at the gl0 fold (`CrossShardMessageEngine.write` / the upheld-dispute sink), never via a GSI field.
+    *
+    * '''Why this set exists (FINDING-S01).''' Every `syncFromGlobalSnapshotInfo` rebuild reconstructs the store FROM a `GlobalSnapshotInfo`
+    * — so any partition without a GSI field would be silently WIPED by the rebuild (clearing the cross-shard nullifier re-opens the same
+    * allow-spend for a second consume = double-spend, and the rebuilt root diverges from the signed `stateProof.mptRoot` = self-fork).
+    * `GlobalStateConverter.syncFromGlobalSnapshotInfo` therefore PRESERVES these partitions verbatim across the rebuild, and the
+    * root-verified adopt variant reconciles {with, without} the preserved bytes against the SIGNED root. A new MPT-native consensus
+    * partition (one that `consensusRootEntries` keeps but `GlobalSnapshotInfo` does not carry) MUST be added here, or every GSI-rebuild
+    * path will drop it. Both members are structurally EMPTY at `numShards = 1`, so preservation is a byte-identical no-op there.
+    */
+  val mptNativeConsensusFields: Set[GlobalStateFieldId] =
+    Set(ConsumedAllowSpends, Slashings)
+
   implicit val ordering: Ordering[GlobalStateFieldId] = Ordering.by(_.toInt)
   implicit val show: Show[GlobalStateFieldId] = Show.show(_.toInt.toString)
 

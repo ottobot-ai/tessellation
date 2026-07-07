@@ -239,25 +239,22 @@ object NakamotoSyncDaemon {
               .as(false)
         }
       case None =>
-        // LEGACY FALLBACK (byte route 404 at a sparse combined-checkpoint ordinal): re-encode the GSI into the MPT, then gate. This
-        // branch CAN still diverge for the sharded-currency partition (GSI not source of truth); on mismatch we do NOT adopt.
+        // LEGACY FALLBACK (byte route 404 at a sparse combined-checkpoint ordinal): root-verified GSI re-encode. FINDING-S01:
+        // `syncFromGlobalSnapshotInfoVerified` is CHECK-THEN-WRITE — it reconciles {GSI ∪ preserved ConsumedAllowSpends/Slashings,
+        // GSI alone} against the signed root BEFORE any store write (the old write-then-verify clobbered the live MPT on mismatch,
+        // and unconditionally WIPED the MPT-native partitions the GSI has no field for). This branch can still legitimately fail
+        // for the sharded-currency partition (GSI not source of truth); on `false` nothing was written — the caller re-pulls/idles.
         logger.info(
-          s"🔄 CATCH-UP byte-faithful: byte route unavailable at ord=${ordinal.show}, falling back to GSI re-encode (gated)"
+          s"🔄 CATCH-UP byte-faithful: byte route unavailable at ord=${ordinal.show}, falling back to GSI re-encode (root-verified)"
         ) >>
-          mptStore.syncFromGlobalSnapshotInfo(gsi, ordinal) >>
-          mptStore.underlying.entries
-            .flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[F])
-            .flatMap { recomputed =>
-              if (recomputed.some === signedRoot)
-                true.pure[F]
-              else
-                logger
-                  .warn(
-                    s"⛔ CATCH-UP byte-faithful: GSI re-encode root ${recomputed.show.take(12)} ≠ signed mptRoot " +
-                      s"${shortOpt(signedRoot)} at ord=${ordinal.show} (GSI inconsistent with signed root). NOT adopting; will re-pull."
-                  )
-                  .as(false)
-            }
+          mptStore.syncFromGlobalSnapshotInfoVerified(gsi, ordinal, signedRoot).flatTap { adopted =>
+            logger
+              .warn(
+                s"⛔ CATCH-UP byte-faithful: no GSI-rebuild candidate reproduces the signed mptRoot ${shortOpt(signedRoot)} " +
+                  s"at ord=${ordinal.show} (GSI inconsistent with signed root). NOT adopting (store untouched); will re-pull."
+              )
+              .whenA(!adopted)
+          }
     }
   }
 
@@ -2105,53 +2102,67 @@ object NakamotoSyncDaemon {
                 // new canonical tip will go through the normal Valid path (full content validation).
                 // At depth < k1 the chosen rule is Taktikos `maxvalid-tk` (length, then lower
                 // head-slot tiebreaker); the Genesis density rule fires only on deep forks (>=k1).
+                val reorgOrdinal = SnapshotOrdinal.unsafeApply(snap.ordinal)
                 logger.info(
                   s"🔄 Reorg to fork at ordinal=${snap.ordinal} slot=${snap.slot} (ChainSelection.standardCompare picked it: maxvalid-tk for shallow forks, density only fires at depth>=k1). " +
-                    s"prevBestTip=${prevBestTip.map(_.value.take(12)).getOrElse("none")} newBestTip=${newBestTip.map(_.value.take(12)).getOrElse("none")}. Validating via catch-up."
+                    s"prevBestTip=${prevBestTip.map(_.value.take(12)).getOrElse("none")} newBestTip=${newBestTip.map(_.value.take(12)).getOrElse("none")}. Validating via root-verified adopt."
                 ) >>
                   productionGate.pause(ProductionGate.ReorgInProgress) >>
                   HasherSelector[F].withCurrent { implicit hasher =>
                     signedSnapshot.toHashed[F].flatMap { hashed =>
-                      snapshotStorage.setTentativeHead(signedSnapshot, context) >>
-                        lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                        lastNGlobalSnapshotStorage.setForRecovery(hashed, context)
+                      // FINDING-S01 fail-closed gate. The fork's carried GlobalSnapshotInfo has NO field for the MPT-native
+                      // consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34), so the old ungated
+                      // `syncFromGlobalSnapshotInfo` rebuild silently WIPED the cross-shard spent-set on every plain tip reorg
+                      // (re-opening consumed allow-spends for a double-spend) and committed a base whose sidecar-free root
+                      // diverged from the fork's SIGNED `stateProof.mptRoot`. `syncFromGlobalSnapshotInfoVerified` reconciles
+                      // {GSI ∪ preserved 33/34, GSI alone} against the signed root BEFORE any store write and rebuilds only on
+                      // a match; on `false` NOTHING is written and we do NOT adopt the fork's state — the node keeps its
+                      // pre-reorg canonical state and recovers via the byte-faithful catch-up (`seedMptByteFaithful`) once the
+                      // fork finalizes, instead of committing a divergent root.
+                      mptStore
+                        .syncFromGlobalSnapshotInfoVerified(context, reorgOrdinal, signedSnapshot.value.stateProof.mptRoot)
+                        .flatMap {
+                          case true =>
+                            snapshotStorage.setTentativeHead(signedSnapshot, context) >>
+                              lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                              lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
+                              // Overlay cleanup — AFTER the (verified) base rebuild rather than before it, because the
+                              // verified rebuild is check-then-write (nothing to clean up if the gate rejects). The overlay's
+                              // `pendingRef` still holds orphan local-fork branches whose deltas were built against the
+                              // pre-reorg base — those branches show up in `bestTipsFn`, get marked protected by
+                              // `walkAncestorsInPending`, and block `evictIfOverCap` from making progress (pendingRef grows
+                              // unboundedly past cap, see #116 iter14 forensics). The reorg-replace `case None` arm in
+                              // `MptOverlay.finalizeBranch` handles the expected case here ("canonical not in pending,
+                              // locally-rejected fork branches still resident"): it clears `pendingRef`, resets
+                              // `lastCommittedBranchRef`, and emits a WARN that the caller is responsible for base resync
+                              // (already done by the verified rebuild above). Serialized under `snapshotSemaphore`, so no
+                              // reader observes the base-new/overlay-stale interim.
+                              mptOverlay
+                                .finalizeBranch(
+                                  io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(hashed.hash),
+                                  reorgOrdinal
+                                )
+                                .void >>
+                              // Reconcile event mempool — evict stale DAG blocks, keep unconfirmed.
+                              reconcileMempool(eventMempool, context, logger) >>
+                              chainStore.bestTipSlot.flatMap {
+                                case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
+                                case None           => Async[F].unit
+                              } >>
+                              Metrics[F].incrementCounter("dag_nakamoto_reorgs")
+                          case false =>
+                            logger.error(
+                              s"⛔ REORG state adopt REJECTED at ordinal=${snap.ordinal} slot=${snap.slot}: neither {carried GSI ∪ " +
+                                s"local ConsumedAllowSpends/Slashings} nor {carried GSI alone} reproduces the fork snapshot's SIGNED " +
+                                s"stateProof.mptRoot (the fork's MPT-native partitions are not reconstructible from the GSI). " +
+                                s"FAILING CLOSED: no canonical/MPT write — keeping pre-reorg state; byte-faithful catch-up will " +
+                                s"adopt the fork once its signed MPT bytes are served at a finalized ordinal."
+                            ) >>
+                              Metrics[F].incrementCounter("dag_nakamoto_reorg_state_adopt_rejected")
+                        }
                     }
                   } >>
-                  // MPT self-healing: rebuild from the fork's state.
-                  //
-                  // Before re-syncing the underlying base store from the fork's GlobalSnapshotInfo,
-                  // we MUST clean up the overlay's pending/finalized refs. `syncFromGlobalSnapshotInfo`
-                  // operates on the base `MptStore` directly (clears + repopulates) and bypasses the
-                  // overlay entirely. Without this `finalizeBranch` call the overlay's `pendingRef`
-                  // would still hold orphan local-fork branches whose deltas were built against the
-                  // pre-reorg base — those branches show up in `bestTipsFn`, get marked protected by
-                  // `walkAncestorsInPending`, and block `evictIfOverCap` from making progress
-                  // (pendingRef grows unboundedly past cap, see #116 iter14 forensics).
-                  //
-                  // The reorg-replace `case None` arm in `MptOverlay.finalizeBranch` handles the
-                  // expected case here ("canonical not in pending, locally-rejected fork branches
-                  // still resident"): it clears `pendingRef`, resets `lastCommittedBranchRef`, and
-                  // emits a WARN that the caller is responsible for base resync (which is exactly
-                  // what we do next via `syncFromGlobalSnapshotInfo`).
-                  HasherSelector[F].withCurrent { implicit hasher =>
-                    signedSnapshot.toHashed[F].flatMap { hashed =>
-                      mptOverlay
-                        .finalizeBranch(
-                          io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(hashed.hash),
-                          SnapshotOrdinal.unsafeApply(snap.ordinal)
-                        )
-                        .void >>
-                        mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal.unsafeApply(snap.ordinal))
-                    }
-                  } >>
-                  // Reconcile event mempool — evict stale DAG blocks, keep unconfirmed.
-                  reconcileMempool(eventMempool, context, logger) >>
-                  chainStore.bestTipSlot.flatMap {
-                    case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
-                    case None           => Async[F].unit
-                  } >>
-                  productionGate.resume(ProductionGate.ReorgInProgress) >>
-                  Metrics[F].incrementCounter("dag_nakamoto_reorgs")
+                  productionGate.resume(ProductionGate.ReorgInProgress)
               } else if (isNew) {
                 // Fork stored but not canonical — just log
                 Metrics[F].incrementCounter("dag_nakamoto_forks_stored")
@@ -3343,30 +3354,49 @@ object NakamotoSyncDaemon {
   ): F[Boolean] =
     verifyCatchUpSnapshot[F](signedSnapshot, context).flatMap {
       case CatchUpVerdict.Accept(verifiedHashed) =>
-        val adopt =
-          for {
-            _ <- chainStore.store(
-              signedSnapshot,
-              context,
-              snap.ordinal,
-              snap.slot,
-              parentHash,
-              vrfOutputFromProof(snap.vrfProof.toByteArray)
-            )
-            // setHeadForRecovery advances ALL canonical storages to this ordinal so the leader loop's
-            // parent read sees the re-aligned tip (same primitives catch-up uses; here it is a +1 forward step).
-            _ <- HasherSelector[F].withCurrent { implicit hasher =>
-              snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
-                lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
-                lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
-            }
+        // FINDING-S01 fail-closed ordering: re-seed the MPT FIRST via the root-verified rebuild
+        // (`syncFromGlobalSnapshotInfoVerified` reconciles {carried GSI ∪ preserved ConsumedAllowSpends/Slashings,
+        // carried GSI alone} against the snapshot's SIGNED `stateProof.mptRoot` BEFORE any store write), and advance the
+        // canonical storages ONLY on a `true` verdict. On `false` NOTHING — canonical or MPT — has been written and we
+        // return false, falling back to the normal fork/catch-up handling (the existing contract of this method).
+        val adopt: F[Boolean] =
+          HasherSelector[F].withCurrent { implicit hasher =>
             // Re-seed the MPT from the producer's authoritative GSI — its committed reward-sum replaces our
             // diverged re-derivation, so the per-ordinal stateProof re-derives correctly from here on.
-            _ <- HasherSelector[F].withCurrent { implicit hasher =>
-              mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
-            }
-            _ <- reconcileMempool(eventMempool, context, logger)
-          } yield ()
+            mptStore.syncFromGlobalSnapshotInfoVerified(
+              context,
+              SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
+              signedSnapshot.value.stateProof.mptRoot
+            )
+          }.flatMap {
+            case false =>
+              logger
+                .warn(
+                  s"⛔ REWARD-SUM REALIGN REJECTED at ordinal=${snap.ordinal}: no GSI-rebuild candidate reproduces the " +
+                    s"snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings not reconstructible " +
+                    s"from the carried GSI). FAILING CLOSED: nothing written; falling back to normal fork handling."
+                )
+                .as(false)
+            case true =>
+              for {
+                _ <- chainStore.store(
+                  signedSnapshot,
+                  context,
+                  snap.ordinal,
+                  snap.slot,
+                  parentHash,
+                  vrfOutputFromProof(snap.vrfProof.toByteArray)
+                )
+                // setHeadForRecovery advances ALL canonical storages to this ordinal so the leader loop's
+                // parent read sees the re-aligned tip (same primitives catch-up uses; here it is a +1 forward step).
+                _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                  snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                    lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
+                    lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
+                }
+                _ <- reconcileMempool(eventMempool, context, logger)
+              } yield true
+          }
         for {
           _ <- logger.info(
             s"🩹 REWARD-SUM REALIGN: adopting producer's signed-authentic state at ordinal=${snap.ordinal} " +
@@ -3374,9 +3404,10 @@ object NakamotoSyncDaemon {
               s"reproducible fields match; signature + stateProof verified)."
           )
           _ <- productionGate.pause("reward-sum-realign")
-          _ <- cats.effect.MonadCancel[F].guarantee(adopt, productionGate.resume("reward-sum-realign"))
-          _ <- Metrics[F].incrementCounter("dag_nakamoto_reward_sum_realign")
-        } yield true
+          adopted <- cats.effect.MonadCancel[F].guarantee(adopt, productionGate.resume("reward-sum-realign"))
+          _ <- Metrics[F].incrementCounter("dag_nakamoto_reward_sum_realign").whenA(adopted)
+          _ <- Metrics[F].incrementCounter("dag_nakamoto_reward_sum_realign_rejected").whenA(!adopted)
+        } yield adopted
       case CatchUpVerdict.RejectedInvalidSignature =>
         logger
           .warn(
@@ -3471,80 +3502,103 @@ object NakamotoSyncDaemon {
                       )
                       _ <- productionGate.pause("catch-up-sync")
 
-                      // Store in chain store (seed this snapshot as our new starting point)
-                      _ <- chainStore.store(
-                        signedSnapshot,
-                        context,
-                        snap.ordinal,
-                        snap.slot,
-                        parentHash,
-                        vrfOutputFromProof(snap.vrfProof.toByteArray)
-                      )
-
-                      // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
-                      // reads for its parent. Without this, the leader loop produces at the OLD ordinal
-                      // after catch-up, causing the node to fall behind again immediately. Reuse the
-                      // signature-verified `Hashed` from `verifyCatchUpSnapshot` rather than re-hashing
-                      // via the no-signature-check `toHashed` (`setHeadForRecovery` needs the implicit Hasher).
-                      _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                        snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
-                          lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
-                          lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
-                      }
-
-                      // MPT full sync from the context we received — critical for
-                      // the acceptance manager to validate subsequent snapshots
-                      _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context...")
-                      _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                        mptStore.syncFromGlobalSnapshotInfo(context, SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)))
+                      // MPT full sync from the context we received — critical for the acceptance manager to validate
+                      // subsequent snapshots. FINDING-S01 fail-closed ordering: the ROOT-VERIFIED rebuild runs FIRST
+                      // (`syncFromGlobalSnapshotInfoVerified` is check-then-write — it reconciles {carried GSI ∪ preserved
+                      // ConsumedAllowSpends/Slashings, carried GSI alone} against the snapshot's SIGNED stateProof.mptRoot
+                      // BEFORE any store write) and every canonical seeding step below runs ONLY on a `true` verdict. On
+                      // `false` NOTHING was written — the node retries on a later gossip wave (10s cooldown); the
+                      // byte-faithful pull remains the primary deep-recovery route.
+                      _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context (root-verified)...")
+                      mptAdopted <- HasherSelector[F].withCurrent { implicit hasher =>
+                        mptStore.syncFromGlobalSnapshotInfoVerified(
+                          context,
+                          SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
+                          signedSnapshot.value.stateProof.mptRoot
+                        )
                       }
                       // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
                       // ahead of our wall clock, making slotGap negative and blocking VRF
                       // eligibility. Production will update it after its next successful store.
+                      _ <-
+                        if (!mptAdopted)
+                          logger.error(
+                            s"\u26D4 CATCH-UP MPT adopt REJECTED at ordinal=${snap.ordinal}: no GSI-rebuild candidate " +
+                              s"reproduces the snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings " +
+                              s"are not reconstructible from the carried GSI). FAILING CLOSED: no canonical/MPT write; " +
+                              s"retrying on a later gossip wave / byte-faithful pull."
+                          ) >>
+                            Metrics[F].incrementCounter(
+                              "dag_nakamoto_catchup_rejected",
+                              Seq(Metrics.unsafeLabelName("reason") -> "mpt_root_unreconstructible")
+                            )
+                        else
+                          for {
+                            // Store in chain store (seed this snapshot as our new starting point)
+                            _ <- chainStore.store(
+                              signedSnapshot,
+                              context,
+                              snap.ordinal,
+                              snap.slot,
+                              parentHash,
+                              vrfOutputFromProof(snap.vrfProof.toByteArray)
+                            )
 
-                      // Reconcile event mempool — evict DAG blocks whose transactions are
-                      // already consumed in the new context's lastTxRefs (prevents double-spend).
-                      // Keep events whose transactions are still unconfirmed (prevents starvation).
-                      _ <- reconcileMempool(eventMempool, context, logger)
+                            // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
+                            // reads for its parent. Without this, the leader loop produces at the OLD ordinal
+                            // after catch-up, causing the node to fall behind again immediately. Reuse the
+                            // signature-verified `Hashed` from `verifyCatchUpSnapshot` rather than re-hashing
+                            // via the no-signature-check `toHashed` (`setHeadForRecovery` needs the implicit Hasher).
+                            _ <- HasherSelector[F].withCurrent { implicit hasher =>
+                              snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
+                                lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
+                                lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
+                            }
 
-                      _ <- stateRef.update(s =>
-                        s.copy(
-                          networkTipOrdinal = snap.ordinal,
-                          networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
-                          localTipOrdinal = snap.ordinal,
-                          // Same orphan-adopt livelock guard as the byte-faithful path: record the adopted ordinal for the gap-check.
-                          lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, snap.ordinal)
-                        )
-                      )
+                            // Reconcile event mempool — evict DAG blocks whose transactions are
+                            // already consumed in the new context's lastTxRefs (prevents double-spend).
+                            // Keep events whose transactions are still unconfirmed (prevents starvation).
+                            _ <- reconcileMempool(eventMempool, context, logger)
 
+                            _ <- stateRef.update(s =>
+                              s.copy(
+                                networkTipOrdinal = snap.ordinal,
+                                networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
+                                localTipOrdinal = snap.ordinal,
+                                // Same orphan-adopt livelock guard as the byte-faithful path: record the adopted ordinal for the gap-check.
+                                lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, snap.ordinal)
+                              )
+                            )
+
+                            _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
+                            _ <- logger.info(
+                              s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
+                                s"Subsequent gossip should find parents."
+                            )
+
+                            // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
+                            // The parent hash of the caught-up snapshot is the starting point for the walk-back.
+                            _ <- {
+                              val cursor = BackfillDaemon.BackfillCursor(
+                                nextHashToFetch = parentHash.value,
+                                targetOrdinal = 1L,
+                                currentOrdinal = snap.ordinal,
+                                startedAtOrdinal = snap.ordinal,
+                                completedChunks = Set.empty,
+                                createdAtMs = System.currentTimeMillis()
+                              )
+                              // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
+                              // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
+                              supervisor
+                                .supervise(
+                                  BackfillDaemon
+                                    .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
+                                    .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
+                                )
+                                .void
+                            }
+                          } yield ()
                       _ <- productionGate.resume("catch-up-sync")
-                      _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
-                      _ <- logger.info(
-                        s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
-                          s"Subsequent gossip should find parents."
-                      )
-
-                      // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
-                      // The parent hash of the caught-up snapshot is the starting point for the walk-back.
-                      _ <- {
-                        val cursor = BackfillDaemon.BackfillCursor(
-                          nextHashToFetch = parentHash.value,
-                          targetOrdinal = 1L,
-                          currentOrdinal = snap.ordinal,
-                          startedAtOrdinal = snap.ordinal,
-                          completedChunks = Set.empty,
-                          createdAtMs = System.currentTimeMillis()
-                        )
-                        // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
-                        // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
-                        supervisor
-                          .supervise(
-                            BackfillDaemon
-                              .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
-                              .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
-                          )
-                          .void
-                      }
                     } yield ()
                 }
               } yield ()

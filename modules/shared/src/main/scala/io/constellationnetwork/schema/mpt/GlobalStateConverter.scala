@@ -1874,10 +1874,82 @@ object GlobalStateConverter {
         * (`getBalance`, `getActiveTokenLocks`, etc) and the incremental `syncFromStateChanges` writer. Use this for every bootstrap /
         * resync / peer-download path — `allStateEntries → syncFull[Json]` (JSON bytes) must NOT be mixed in, since it produces different
         * bytes for the same logical state and the resulting mptRoot will diverge from peers that bootstrapped via the typed path.
+        *
+        * '''FINDING-S01 — MPT-native consensus partitions are PRESERVED, not wiped.''' `GlobalStateFieldId.mptNativeConsensusFields`
+        * (`ConsumedAllowSpends` 33, `Slashings` 34) are in the signed consensus `mptRoot` but have NO `GlobalSnapshotInfo` field, so a
+        * from-GSI rebuild used to silently DROP them — wiping the cross-shard nullifier (re-opening consumed allow-spends for a
+        * double-spend) and committing a root that diverges from the signed `stateProof.mptRoot`. This method now carries those partitions'
+        * raw bytes verbatim across the clear→rebuild. Both partitions are empty at `numShards = 1` (byte-identical no-op). Consensus adopt
+        * sites that hold the SIGNED root should prefer [[syncFromGlobalSnapshotInfoVerified]], which reconciles {with, without} the
+        * preserved bytes against the signed root BEFORE writing and fails closed on neither matching.
         */
       def syncFromGlobalSnapshotInfo(
         info: GlobalSnapshotInfo,
         snapshotOrdinal: SnapshotOrdinal
+      )(
+        implicit stateProofSelector: StateProofSelector,
+        withdrawalTimeLimitCtx: WithdrawalTimeLimit
+      ): F[Unit] =
+        syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = true)
+
+      /** ROOT-VERIFIED GSI adopt — the fail-closed variant for every consensus adopt site that holds the target snapshot's SIGNED
+        * `stateProof.mptRoot` (reorg self-heal, reward-realign, gossip catch-up fallback, cold restart, peer download). Reconciles, BEFORE
+        * any store write, which rebuild candidate reproduces the signed root:
+        *
+        *   1. '''with-preserve''' — GSI entries ∪ the store's current `mptNativeConsensusFields` (33/34) bytes. Matches whenever the local
+        *      spent-set/slash-ledger equals the target's (the plain-reorg / restart common case: the markers were written at finalized
+        *      ordinals shared by both branches).
+        *   1. '''without-preserve''' — GSI entries alone. Matches when the target's 33/34 partitions are EMPTY (always at `numShards = 1`;
+        *      also the cross-chain adopt case where OUR local markers are stale and must NOT be carried into the adopted state).
+        *   1. '''neither''' — the target's 33/34 content differs from ours and is NOT reconstructible from the GSI (it has no field for
+        *      them). Returns `false` WITHOUT touching the store — the caller must fail closed (do not adopt canonical state; recover via
+        *      the byte-faithful `loadBytes` path, e.g. `NakamotoSyncDaemon.seedMptByteFaithful`).
+        *
+        * The candidate roots are computed over `toAllStateKeyValueBytes(info)` — byte-identical to what the typed-insert rebuild writes for
+        * every user field (the standing rebuild-vs-producer parity contract, `RebuildVsProducerBytesAllPartitionsParitySuite`) — so a
+        * `true` verdict guarantees the post-rebuild store root equals the signed root. `signedMptRoot = None` (pre-MPT legacy snapshot)
+        * returns `false`: there is nothing sound to verify against.
+        *
+        * @return
+        *   `true` iff the store was rebuilt AND its sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ NOTHING was written.
+        */
+      def syncFromGlobalSnapshotInfoVerified(
+        info: GlobalSnapshotInfo,
+        snapshotOrdinal: SnapshotOrdinal,
+        signedMptRoot: Option[Hash]
+      )(
+        implicit stateProofSelector: StateProofSelector,
+        withdrawalTimeLimitCtx: WithdrawalTimeLimit
+      ): F[Boolean] =
+        signedMptRoot match {
+          case None => false.pure[F]
+          case Some(expected) =>
+            for {
+              preserved <- store.underlying.entries.map(_.filter {
+                case (hex, _) => GlobalStateKey.fieldIdFromHex(hex).exists(GlobalStateFieldId.mptNativeConsensusFields.contains)
+              })
+              gsiBytes <- toAllStateKeyValueBytes[F](info)
+              gsiHex <- gsiBytes.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
+              // Key sets are disjoint by construction: `gsiHex` never contains an mptNative fieldId (the GSI has no field for them)
+              // and `preserved` contains ONLY mptNative fieldIds — so `++` is a pure union, no overwrites.
+              rootWith <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](gsiHex ++ preserved)
+              adopted <-
+                if (rootWith === expected)
+                  syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = true).as(true)
+                else
+                  io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](gsiHex).flatMap { rootWithout =>
+                    if (rootWithout === expected)
+                      syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = false).as(true)
+                    else
+                      false.pure[F]
+                  }
+            } yield adopted
+        }
+
+      private def syncFromGlobalSnapshotInfoImpl(
+        info: GlobalSnapshotInfo,
+        snapshotOrdinal: SnapshotOrdinal,
+        preserveMptNative: Boolean
       )(
         implicit stateProofSelector: StateProofSelector,
         withdrawalTimeLimitCtx: WithdrawalTimeLimit
@@ -2131,6 +2203,16 @@ object GlobalStateConverter {
         // and storeForkBranch) run under `snapshotSemaphore`. accept() callers run under
         // `mptStore.withTransaction`'s savepoint scope, also `snapshotSemaphore`-serialized.
         for {
+          // FINDING-S01: capture the MPT-NATIVE consensus partitions (ConsumedAllowSpends 33 / Slashings 34 — in the signed
+          // consensus root but with NO GlobalSnapshotInfo field) BEFORE the clear, and re-insert them verbatim below. Without
+          // this the rebuild silently wipes the cross-shard spent-set (double-spend re-open) and commits a root that diverges
+          // from the signed stateProof.mptRoot. Empty at numShards = 1 ⇒ byte-identical no-op.
+          preservedMptNative <-
+            if (preserveMptNative)
+              store.underlying.entries.map(_.filter {
+                case (hex, _) => GlobalStateKey.fieldIdFromHex(hex).exists(GlobalStateFieldId.mptNativeConsensusFields.contains)
+              })
+            else Map.empty[Hex, Array[Byte]].pure[F]
           _ <- store.clear
           currency <- buildCurrencySnapshotEntries
           updateNodeParametersEntries <- updateNodeParametersEntriesF
@@ -2205,6 +2287,10 @@ object GlobalStateConverter {
                 .activeAddressIndexKey[F](TokenLockBalances)
                 .map(k => Map(k -> tokenLockBalancePairs))
           _ <- store.insert[SortedSet[(Address, Address)]](addressPairIndexEntries)
+          // FINDING-S01: restore the MPT-native consensus partitions captured above — raw bytes, verbatim (no codec round-trip),
+          // exactly as the byte-faithful `loadBytes` path would carry them. Keys cannot collide with any GSI-derived insert
+          // (disjoint fieldIds).
+          _ <- store.underlying.insertBytes(preservedMptNative).flatMap(_.liftTo[F]).whenA(preservedMptNative.nonEmpty)
           _ <- store.build(snapshotOrdinal).void
         } yield ()
       }
