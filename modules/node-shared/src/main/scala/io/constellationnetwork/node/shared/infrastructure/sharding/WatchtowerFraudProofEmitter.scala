@@ -5,6 +5,8 @@ import java.security.KeyPair
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{ShardCheckpointGl0AcceptanceManager, WatchtowerMismatch}
 import io.constellationnetwork.schema.peer.PeerId
@@ -30,8 +32,11 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *     producer's diff base (the in-order chain-hole-guard invariant) ⇒ an honest checkpoint never mismatches.
   *   - '''Signing.''' Ed25519 (long-term key) over the canonical `FraudProofSigPreimage` hash — the same key + Hasher discipline the
   *     attestation emitter uses, so the on-chain verdict recovers the submitter VK from `submitterId` and verifies.
-  *   - '''Failure model.''' Re-exec / publish failures are logged + swallowed; the adopt path MUST NOT block on the watchtower. A
-  *     persistent failure is observable as "no fraud proofs despite a wrong root", not as a crashed receive path.
+  *   - '''Failure model.''' Re-exec failures are logged + swallowed; publish failures are retried a bounded number of times
+  *     (`nakamoto.invalidity-slashing.fraud-proof-publish-*` — a fraud proof is slashing evidence and must survive a transient local
+  *     sidecar hiccup; once the RPC lands, the sidecar's durable outbox owns delivery) and then swallowed. The adopt path MUST NOT block on
+  *     the watchtower: `emit` runs on the daemon's background fiber, so the retries never stall gossip intake. A persistent failure is
+  *     observable as "no fraud proofs despite a wrong root", not as a crashed receive path.
   *
   * '''numShards = 1 no-op / disabled.''' Constructed only on the activated path (`numShards > 1` AND `watchtower-enabled`); the daemon
   * receives `None` otherwise and never emits.
@@ -54,13 +59,23 @@ object WatchtowerFraudProofEmitter {
     *   the SAME [[ShardCheckpointGl0AcceptanceManager]] the adopt path uses — its [[ShardCheckpointGl0AcceptanceManager.watchtowerReExec]]
     *   holds the PIN-1 re-exec closure (finalized base), so the re-derived roots are byte-comparable with the attested ones.
     * @param sidecarClient
-    *   gossip transport — publishes the encoded fraud proof on the gl0-wide `fraud-proof` topic.
+    *   gossip transport — publishes the encoded fraud proof on the gl0-wide `fraud-proof` topic. Once the RPC lands, the sidecar's durable
+    *   outbox republishes until TTL — so the retry below only has to survive the LOCAL hop (a restarting/unreachable sidecar process).
+    * @param publishAttempts
+    *   total publish attempts before giving up (`nakamoto.invalidity-slashing.fraud-proof-publish-attempts`). A fraud proof is slashing
+    *   EVIDENCE — a single warn-and-drop on a transient local gRPC failure silently disarmed the watchtower tooth. Retries run on the
+    *   daemon's background fiber (the adopt path is never blocked); after the last attempt the failure is still swallowed (WARN) so the
+    *   receive path can't crash.
+    * @param publishRetryDelay
+    *   delay between attempts (`nakamoto.invalidity-slashing.fraud-proof-publish-retry-delay`) — sized to ride out a sidecar restart.
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
     selfPeerId: PeerId,
     selfKeyPair: KeyPair,
     acceptanceManager: ShardCheckpointGl0AcceptanceManager[F],
-    sidecarClient: SidecarClient.SidecarClientAlgebra[F]
+    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+    publishAttempts: Int = 3,
+    publishRetryDelay: FiniteDuration = 2.seconds
   ): WatchtowerFraudProofEmitter[F] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("WatchtowerFraudProofEmitter")
 
@@ -106,26 +121,50 @@ object WatchtowerFraudProofEmitter {
           sig <- Signing.signData[F](digest.getBytes)(selfKeyPair.getPrivate)
           signed = unsigned.copy(challengerSignature = Hex.fromBytes(sig))
           wire = FraudProofWireCodecs.toWire(signed)
-          _ <- sidecarClient
-            .publishFraudProof(wire)
-            .flatMap { resp =>
-              if (resp.ok)
-                logger.warn(
-                  s"🛡️ WATCHTOWER fraud proof GOSSIPED: shard=${checkpoint.shardId.value.value} " +
-                    s"shardOrd=${checkpoint.shardOrdinal.value} mg=${mm.metagraphAddress.value.value.take(10)} " +
-                    s"attested=${mm.attestedRoot.value.take(12)} honest=${mm.reDerivedRoot.value.take(12)} " +
-                    s"checkpoint=${checkpointHash.value.take(12)}"
-                )
-              else
-                logger.warn(
-                  s"⚠️ Watchtower fraud-proof publish not-ok: shard=${checkpoint.shardId.value.value} " +
-                    s"checkpoint=${checkpointHash.value.take(12)}: ${resp.error}"
-                )
-            }
-            .handleErrorWith { err =>
-              logger.warn(s"⚠️ Watchtower fraud-proof publish failed: ${err.getMessage}")
-            }
+          _ <- publishWithRetry(wire, checkpoint, checkpointHash, mm, attempt = 1)
         } yield ()
+      }
+
+      /** Bounded-retry publish. Retries BOTH failure shapes — a raised gRPC error (sidecar down) and an `ok = false` response (e.g. the
+        * sidecar's fraud topic not joined) — because either way the evidence has not left the node. Never raises: after the final attempt
+        * the failure is WARN-swallowed (design rule: the adopt/receive path must not crash on watchtower trouble; a persistent failure is
+        * observable as "no fraud proofs despite a wrong root").
+        */
+      private def publishWithRetry(
+        wire: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.FraudProofEnvelopeWire,
+        checkpoint: ShardCheckpoint,
+        checkpointHash: io.constellationnetwork.security.hash.Hash,
+        mm: WatchtowerMismatch,
+        attempt: Int
+      ): F[Unit] = {
+
+        def retryOrGiveUp(reason: String): F[Unit] =
+          if (attempt < publishAttempts)
+            logger.warn(
+              s"⚠️ Watchtower fraud-proof publish failed (attempt $attempt/$publishAttempts, retrying in $publishRetryDelay): " +
+                s"shard=${checkpoint.shardId.value.value} checkpoint=${checkpointHash.value.take(12)}: $reason"
+            ) >> Async[F].sleep(publishRetryDelay) >> publishWithRetry(wire, checkpoint, checkpointHash, mm, attempt + 1)
+          else
+            logger.warn(
+              s"⚠️ Watchtower fraud-proof publish FAILED after $publishAttempts attempt(s) — evidence NOT gossiped: " +
+                s"shard=${checkpoint.shardId.value.value} checkpoint=${checkpointHash.value.take(12)}: $reason"
+            )
+
+        sidecarClient
+          .publishFraudProof(wire)
+          .attempt
+          .flatMap {
+            case Right(resp) if resp.ok =>
+              logger.warn(
+                s"🛡️ WATCHTOWER fraud proof GOSSIPED: shard=${checkpoint.shardId.value.value} " +
+                  s"shardOrd=${checkpoint.shardOrdinal.value} mg=${mm.metagraphAddress.value.value.take(10)} " +
+                  s"attested=${mm.attestedRoot.value.take(12)} honest=${mm.reDerivedRoot.value.take(12)} " +
+                  s"checkpoint=${checkpointHash.value.take(12)}" +
+                  (if (attempt > 1) s" (attempt $attempt/$publishAttempts)" else "")
+              )
+            case Right(resp) => retryOrGiveUp(s"sidecar not-ok: ${resp.error}")
+            case Left(err)   => retryOrGiveUp(err.getMessage)
+          }
       }
     }
   }

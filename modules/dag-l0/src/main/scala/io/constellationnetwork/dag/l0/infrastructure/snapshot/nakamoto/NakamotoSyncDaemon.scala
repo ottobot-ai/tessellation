@@ -908,8 +908,14 @@ object NakamotoSyncDaemon {
 
                         }
 
+                    // FINDING-F1: the daemon declares the exact message families it consumes — every family
+                    // EXCEPT rumor (rumors belong to SidecarRumorBridge). The shard-checkpoint families ride
+                    // the sidecar's SHARED fan-in channels (exactly-one-drainer semantics); before this filter
+                    // the rumor bridge's subscribe-all stream race-drained ~half of them and its `isRumor`
+                    // collect silently discarded the wins. With explicit topic sets on both streams the daemon
+                    // is the shard channels' only drainer by construction.
                     val gossip = GossipStream
-                      .subscribe[F](channel)
+                      .subscribe[F](channel, SidecarClient.SubscribeTopics.daemonTopics)
                       .evalMap { msg =>
                         Clock[F].monotonic.map(_.toMillis).flatMap(lastMsgRef.set) >>
                           (msg.body match {
@@ -1041,6 +1047,8 @@ object NakamotoSyncDaemon {
                                 .void
 
                             case _: pb.GossipMessage.Body.Rumor =>
+                              // Not requested by `daemonTopics` (rumors are the SidecarRumorBridge's family);
+                              // kept as a defensive no-op should the sidecar ever misroute one.
                               Async[F].unit
 
                             case pb.GossipMessage.Body.Empty =>

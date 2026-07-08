@@ -1937,7 +1937,9 @@ object GlobalSnapshotConsensus {
                       selfPeerId = selfId,
                       selfKeyPair = keyPair,
                       acceptanceManager = deps.acceptanceManager,
-                      sidecarClient = sidecarClient
+                      sidecarClient = sidecarClient,
+                      publishAttempts = sharedCfg.nakamoto.invaliditySlashing.fraudProofPublishAttempts,
+                      publishRetryDelay = sharedCfg.nakamoto.invaliditySlashing.fraudProofPublishRetryDelay
                     )
                   ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]]
                 )

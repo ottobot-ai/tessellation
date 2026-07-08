@@ -4,14 +4,18 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/scasplte2/tessellation/p2p/internal/chainsync"
 	"github.com/scasplte2/tessellation/p2p/internal/gossip"
+	"github.com/scasplte2/tessellation/p2p/internal/metrics"
 	"github.com/scasplte2/tessellation/p2p/internal/outbox"
 	pb "github.com/scasplte2/tessellation/p2p/proto"
 )
@@ -36,25 +40,96 @@ const (
 	// config.Config.
 	TopicShardCheckpoint            = "shard-checkpoint"
 	TopicShardCheckpointAttestation = "shard-checkpoint-attestation"
+
+	// WATCHTOWER fraud-proof outbox label (EPIC-9-NET M4). gl0-wide topic —
+	// no shard-id suffix. Matches SidecarClient.OutboxTopic.FraudProof.
+	TopicFraudProof = "fraud-proof"
+
+	// Subscribe-filter labels for the three families that have no outbox
+	// label (they are never outbox-tracked). Together with the Topic*
+	// constants above these form the complete SubscribeRequest.topics
+	// vocabulary — one label per GossipMessage.body arm. The JVM mirror is
+	// SidecarClient.SubscribeTopics; a rename without updating both sides
+	// desyncs the subscribe filter.
+	TopicSnapshot    = "snapshot"
+	TopicAttestation = "attestation"
+	TopicRumor       = "rumor"
 )
+
+// GossipNode is the narrow view of *gossip.Node the gRPC server depends on.
+// An interface seam (consumer-side, Go-idiomatic) so Subscribe-routing
+// behaviour is unit-testable against a fake node without a live libp2p host —
+// the F1 dual-Subscribe race regression test needs exactly that.
+//
+// Channel semantics contract (load-bearing — see Subscribe):
+//   - the *Messages(ctx) methods create a fresh per-call subscription each
+//     call (fan-out: every caller sees every message);
+//   - ShardCheckpointMessages / ShardCheckpointAttestationMessages return the
+//     SINGLE node-lifetime shared fan-in channel (each message is delivered to
+//     exactly ONE reader — concurrent readers race);
+//   - FraudProofMessages returns nil when the topic is not joined (numShards
+//     <= 1); a nil channel never delivers.
+type GossipNode interface {
+	PublishSnapshot(ctx context.Context, data []byte) error
+	PublishAttestation(ctx context.Context, data []byte) error
+	PublishRumor(ctx context.Context, data []byte) error
+	PublishMetagraphBinary(ctx context.Context, data []byte) error
+	PublishMetagraphAttestation(ctx context.Context, data []byte) error
+	PublishAllowSpendBlock(ctx context.Context, data []byte) error
+	PublishDAGBlock(ctx context.Context, data []byte) error
+	PublishTokenLockBlock(ctx context.Context, data []byte) error
+	PublishShardCheckpoint(ctx context.Context, shardID uint32, data []byte) error
+	PublishShardCheckpointAttestation(ctx context.Context, shardID uint32, data []byte) error
+	PublishFraudProof(ctx context.Context, data []byte) error
+
+	SnapshotMessages(ctx context.Context) <-chan []byte
+	AttestationMessages(ctx context.Context) <-chan []byte
+	RumorMessages(ctx context.Context) <-chan []byte
+	MetagraphBinaryMessages(ctx context.Context) <-chan []byte
+	MetagraphAttestationMessages(ctx context.Context) <-chan []byte
+	AllowSpendBlockMessages(ctx context.Context) <-chan []byte
+	DAGBlockMessages(ctx context.Context) <-chan []byte
+	TokenLockBlockMessages(ctx context.Context) <-chan []byte
+	FraudProofMessages(ctx context.Context) <-chan []byte
+	ShardCheckpointMessages() <-chan []byte
+	ShardCheckpointAttestationMessages() <-chan []byte
+
+	ReconnectCh() <-chan struct{}
+	MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries, metagraphAttestations, allowSpendBlocks, dagBlocks, tokenLockBlocks int)
+	ShardMeshPeerCount() (checkpoints, attestations int)
+	ConnectedPeerCount() int
+}
+
+// Compile-time proof that the concrete node satisfies the seam.
+var _ GossipNode = (*gossip.Node)(nil)
 
 // Server implements the SidecarService and ChainSyncOutbound gRPC interfaces.
 type Server struct {
 	pb.UnimplementedSidecarServiceServer
 	pb.UnimplementedChainSyncOutboundServer
 
-	node      *gossip.Node
+	node      GossipNode
 	chainSync *chainsync.Handler
 	outbox    *outbox.Outbox
 	startedAt time.Time
 	grpcSrv   *grpc.Server
+
+	// shardDrainStreams counts live Subscribe streams draining the SHARED
+	// shard fan-in channels. The channels' semantics tolerate exactly one
+	// drainer (two would race and silently split deliveries — FINDING-F1);
+	// after the SubscribeRequest.topics filter, only the NakamotoSyncDaemon
+	// requests the shard families, so this should never exceed 1. Belt-and-
+	// braces observability: >1 logs loudly + sets the
+	// sidecar_shard_drain_streams gauge so a regression is visible, never
+	// silent.
+	shardDrainStreams atomic.Int32
 }
 
 // New creates a gRPC server backed by the gossip node. The outbox is the
 // shared durable-publish ledger (#196); the same instance is also held by
 // the republish goroutine in main.go so confirmed entries disappear from
 // the periodic resend immediately.
-func New(node *gossip.Node, cs *chainsync.Handler, ob *outbox.Outbox) *Server {
+func New(node GossipNode, cs *chainsync.Handler, ob *outbox.Outbox) *Server {
 	return &Server{
 		node:      node,
 		chainSync: cs,
@@ -267,6 +342,32 @@ func (s *Server) PublishShardCheckpointAttestation(ctx context.Context, sca *pb.
 	return &pb.PublishResponse{Ok: true}, nil
 }
 
+// PublishFraudProof broadcasts a watchtower fraud proof on the gl0-WIDE
+// fraud-proof topic (EPIC-9-NET M4 — the transport leg of the watchtower
+// slashing tooth). EVERY gl0 receives it and independently re-runs the
+// deterministic dispute verdict over the disputed checkpoint's own bytes
+// (WATCHTOWER-FRAUD-PROOF-DESIGN.md §10.2). Opaque payload — sidecar only
+// wraps and routes. Outbox-tracked: a fraud proof is slashing EVIDENCE and
+// must not be lossy, so the periodic republisher resends it until the JVM
+// confirms or the TTL lapses (content-derived message IDs make republishes
+// dedupe at peers' seen-caches). Fails ok=false when the fraud topic is not
+// joined (numShards <= 1 — the watchtower is inert there and the JVM emitter
+// is never constructed; an arriving call means JVM/sidecar config split).
+func (s *Server) PublishFraudProof(ctx context.Context, fp *pb.FraudProofEnvelopeWire) (*pb.PublishResponse, error) {
+	data, err := proto.Marshal(fp)
+	if err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	if err := s.node.PublishFraudProof(ctx, data); err != nil {
+		return &pb.PublishResponse{Ok: false, Error: err.Error()}, nil
+	}
+	// Like MetagraphAttestation, the entire structured message IS the payload
+	// — no single inner field — so the outbox id is sha256 of the wire-level
+	// proto bytes. Both sender and receiver compute the id from these bytes.
+	s.outbox.Add(TopicFraudProof, outbox.MsgIDFor(data), data)
+	return &pb.PublishResponse{Ok: true}, nil
+}
+
 // ConfirmFinalized drops outbox entries for the named ids on the named
 // topic. Called by the JVM Phase-3 finality hook after a global snapshot
 // is fully finalized — at that point the entries it includes are durably
@@ -279,26 +380,126 @@ func (s *Server) ConfirmFinalized(ctx context.Context, req *pb.ConfirmFinalizedR
 	return &pb.ConfirmFinalizedResponse{Dropped: int32(dropped)}, nil
 }
 
-// Subscribe streams incoming gossip messages to the JVM.
+// subscribeTopicSet parses SubscribeRequest.topics into a membership set.
+// nil result = subscribe-all (the documented legacy default for an empty
+// list — kept as a debugging aid; both JVM consumers pass explicit lists).
+// Unknown labels fail the stream LOUDLY (InvalidArgument): a typo'd label
+// silently subscribing to nothing would be a liveness hole harder to spot
+// than the race this filter removes.
+func subscribeTopicSet(topics []string) (map[string]bool, error) {
+	if len(topics) == 0 {
+		return nil, nil
+	}
+	known := map[string]bool{
+		TopicSnapshot:                   true,
+		TopicAttestation:                true,
+		TopicRumor:                      true,
+		TopicMetagraphBinary:            true,
+		TopicMetagraphAttestation:       true,
+		TopicAllowSpendBlock:            true,
+		TopicDAGBlock:                   true,
+		TopicTokenLockBlock:             true,
+		TopicShardCheckpoint:            true,
+		TopicShardCheckpointAttestation: true,
+		TopicFraudProof:                 true,
+	}
+	set := make(map[string]bool, len(topics))
+	for _, tp := range topics {
+		if !known[tp] {
+			return nil, status.Errorf(codes.InvalidArgument, "unknown subscribe topic label %q (vocabulary: snapshot, attestation, rumor, metagraph-binary, metagraph-attestation, allow-spend-block, dag-block, token-lock-block, shard-checkpoint, shard-checkpoint-attestation, fraud-proof)", tp)
+		}
+		set[tp] = true
+	}
+	return set, nil
+}
+
+// Subscribe streams incoming gossip messages to the JVM, filtered to the
+// message families named in SubscribeRequest.topics (empty = all).
+//
+// FINDING-F1 fix: the filter exists because the JVM holds TWO concurrent
+// Subscribe streams (the SidecarRumorBridge and the NakamotoSyncDaemon) and
+// the shard-checkpoint families are SHARED node-lifetime fan-in channels —
+// each message is handed to exactly ONE drainer. Two subscribe-all streams
+// race-drained them, and the bridge's `.collect isRumor` silently discarded
+// the shard checkpoints it won (~half). With the filter, the bridge requests
+// rumor-only and the daemon requests the non-rumor families, so the shared
+// channels get exactly one drainer by construction. Universal topics are
+// per-call fan-out subscriptions and were never at risk; unrequested families
+// simply skip the subscription (a nil channel never fires in the select).
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_SubscribeServer) error {
 	ctx := stream.Context()
 
-	snCh := s.node.SnapshotMessages(ctx)
-	atCh := s.node.AttestationMessages(ctx)
-	ruCh := s.node.RumorMessages(ctx)
-	mbCh := s.node.MetagraphBinaryMessages(ctx)
-	maCh := s.node.MetagraphAttestationMessages(ctx)
-	asbCh := s.node.AllowSpendBlockMessages(ctx)
-	dagCh := s.node.DAGBlockMessages(ctx)
-	tlbCh := s.node.TokenLockBlockMessages(ctx)
+	set, terr := subscribeTopicSet(req.GetTopics())
+	if terr != nil {
+		return terr
+	}
+	wants := func(label string) bool { return set == nil || set[label] }
+
+	// Universal topics: fresh per-call fan-out subscriptions, opened only for
+	// requested families (unrequested = nil channel, never fires).
+	var snCh, atCh, ruCh, mbCh, maCh, asbCh, dagCh, tlbCh, fpCh <-chan []byte
+	if wants(TopicSnapshot) {
+		snCh = s.node.SnapshotMessages(ctx)
+	}
+	if wants(TopicAttestation) {
+		atCh = s.node.AttestationMessages(ctx)
+	}
+	if wants(TopicRumor) {
+		ruCh = s.node.RumorMessages(ctx)
+	}
+	if wants(TopicMetagraphBinary) {
+		mbCh = s.node.MetagraphBinaryMessages(ctx)
+	}
+	if wants(TopicMetagraphAttestation) {
+		maCh = s.node.MetagraphAttestationMessages(ctx)
+	}
+	if wants(TopicAllowSpendBlock) {
+		asbCh = s.node.AllowSpendBlockMessages(ctx)
+	}
+	if wants(TopicDAGBlock) {
+		dagCh = s.node.DAGBlockMessages(ctx)
+	}
+	if wants(TopicTokenLockBlock) {
+		tlbCh = s.node.TokenLockBlockMessages(ctx)
+	}
+	// WATCHTOWER fraud proofs (EPIC-9-NET M4): universal-topic class — per-
+	// call fan-out, immune to the shared-channel race by construction. nil at
+	// numShards <= 1 (topic not joined).
+	if wants(TopicFraudProof) {
+		fpCh = s.node.FraudProofMessages(ctx)
+	}
+
 	// Slice 14: shared per-shard fan-in channels. Unlike the universal topics
 	// these are node-lifetime channels (not per-call subscriptions) populated
 	// by relays started when each shard topic is first joined — so a single
 	// Subscribe stream sees envelopes/attestations from every shard this node
-	// has joined. Multiple concurrent Subscribe streams would race to drain
-	// these channels; in practice the JVM holds exactly one stream.
-	scCh := s.node.ShardCheckpointMessages()
-	scaCh := s.node.ShardCheckpointAttestationMessages()
+	// has joined. Each message is delivered to exactly ONE drainer, so at
+	// most one live stream may request these families. The topics filter
+	// guarantees that for the two JVM consumers; the atomic guard below makes
+	// any regression (a second concurrent drainer) loud instead of silently
+	// splitting deliveries — the exact FINDING-F1 failure shape.
+	var scCh, scaCh <-chan []byte
+	drainsShard := wants(TopicShardCheckpoint) || wants(TopicShardCheckpointAttestation)
+	if drainsShard {
+		if wants(TopicShardCheckpoint) {
+			scCh = s.node.ShardCheckpointMessages()
+		}
+		if wants(TopicShardCheckpointAttestation) {
+			scaCh = s.node.ShardCheckpointAttestationMessages()
+		}
+		n := s.shardDrainStreams.Add(1)
+		metrics.ShardDrainStreams.Set(float64(n))
+		defer func() {
+			metrics.ShardDrainStreams.Set(float64(s.shardDrainStreams.Add(-1)))
+		}()
+		if n > 1 {
+			// Loud, not fatal: during a client reconnect the old handler may
+			// linger until its ctx cancels; refusing here would loop the
+			// reconnect. The gauge + log make a SUSTAINED dual-drain visible.
+			fmt.Printf("WARN: Subscribe: %d concurrent streams draining the SHARED shard-checkpoint channels — deliveries will split between them (FINDING-F1 shape). Check the JVM subscribe topology.\n", n)
+		}
+	}
+
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
@@ -457,6 +658,21 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 				return err
 			}
 
+		case data, ok := <-fpCh:
+			if !ok {
+				return nil
+			}
+			var fp pb.FraudProofEnvelopeWire
+			if err := proto.Unmarshal(data, &fp); err != nil {
+				continue
+			}
+			msg := &pb.GossipMessage{
+				Body: &pb.GossipMessage_FraudProof{FraudProof: &fp},
+			}
+			if err := stream.Send(msg); err != nil {
+				return err
+			}
+
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -470,7 +686,7 @@ func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.P
 	// Node.ShardMeshPeerCount for why sum, not max). 0 until the first shard
 	// topic is joined AND has mesh peers — exactly the visibility task #40 needs.
 	scPeers, scaPeers := s.node.ShardMeshPeerCount()
-	total := len(s.node.Host.Network().Peers())
+	total := s.node.ConnectedPeerCount()
 	return &pb.PeerCountResponse{
 		Total:                           int32(total),
 		MeshSnapshots:                   int32(snPeers),
@@ -489,7 +705,7 @@ func (s *Server) PeerCount(ctx context.Context, req *pb.PeerCountRequest) (*pb.P
 // Health returns sidecar health info.
 func (s *Server) Health(ctx context.Context, req *pb.HealthRequest) (*pb.HealthResponse, error) {
 	uptime := int64(time.Since(s.startedAt).Seconds())
-	peerCount := len(s.node.Host.Network().Peers())
+	peerCount := s.node.ConnectedPeerCount()
 	return &pb.HealthResponse{
 		Healthy:       true,
 		UptimeSeconds: uptime,

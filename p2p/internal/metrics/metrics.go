@@ -99,6 +99,19 @@ var (
 			Help: "Total outbox entries dropped without confirmation due to TTL expiry.",
 		},
 	)
+
+	// ShardDrainStreams tracks how many live gRPC Subscribe streams are
+	// draining the SHARED shard-checkpoint fan-in channels. The channels
+	// tolerate exactly ONE drainer (each message is delivered to a single
+	// reader); a sustained value > 1 means concurrent streams are racing and
+	// deliveries are silently splitting between them — the FINDING-F1
+	// failure shape. Alert on > 1.
+	ShardDrainStreams = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "sidecar_shard_drain_streams",
+			Help: "Live Subscribe streams draining the shared shard-checkpoint channels (must be <= 1).",
+		},
+	)
 )
 
 func init() {
@@ -112,6 +125,7 @@ func init() {
 		OutboxSize,
 		OutboxRepublished,
 		OutboxPrunedTTL,
+		ShardDrainStreams,
 	)
 }
 

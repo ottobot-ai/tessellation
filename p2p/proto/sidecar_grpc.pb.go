@@ -29,6 +29,7 @@ const (
 	SidecarService_PublishTokenLockBlock_FullMethodName             = "/nakamoto.p2p.SidecarService/PublishTokenLockBlock"
 	SidecarService_PublishShardCheckpoint_FullMethodName            = "/nakamoto.p2p.SidecarService/PublishShardCheckpoint"
 	SidecarService_PublishShardCheckpointAttestation_FullMethodName = "/nakamoto.p2p.SidecarService/PublishShardCheckpointAttestation"
+	SidecarService_PublishFraudProof_FullMethodName                 = "/nakamoto.p2p.SidecarService/PublishFraudProof"
 	SidecarService_ConfirmFinalized_FullMethodName                  = "/nakamoto.p2p.SidecarService/ConfirmFinalized"
 	SidecarService_Subscribe_FullMethodName                         = "/nakamoto.p2p.SidecarService/Subscribe"
 	SidecarService_PeerCount_FullMethodName                         = "/nakamoto.p2p.SidecarService/PeerCount"
@@ -75,6 +76,10 @@ type SidecarServiceClient interface {
 	// envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
 	// (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
 	PublishShardCheckpointAttestation(ctx context.Context, in *ShardCheckpointAttestationWire, opts ...grpc.CallOption) (*PublishResponse, error)
+	// WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. EVERY
+	// gl0 receives it and independently re-runs the deterministic verdict over the
+	// disputed checkpoint's own bytes (WATCHTOWER-FRAUD-PROOF-DESIGN.md §10.2).
+	PublishFraudProof(ctx context.Context, in *FraudProofEnvelopeWire, opts ...grpc.CallOption) (*PublishResponse, error)
 	// JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
 	// finality. The sidecar drops the corresponding outbox entries; until this
 	// call arrives the outbox keeps republishing them periodically. Idempotent
@@ -197,6 +202,16 @@ func (c *sidecarServiceClient) PublishShardCheckpointAttestation(ctx context.Con
 	return out, nil
 }
 
+func (c *sidecarServiceClient) PublishFraudProof(ctx context.Context, in *FraudProofEnvelopeWire, opts ...grpc.CallOption) (*PublishResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PublishResponse)
+	err := c.cc.Invoke(ctx, SidecarService_PublishFraudProof_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *sidecarServiceClient) ConfirmFinalized(ctx context.Context, in *ConfirmFinalizedRequest, opts ...grpc.CallOption) (*ConfirmFinalizedResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ConfirmFinalizedResponse)
@@ -286,6 +301,10 @@ type SidecarServiceServer interface {
 	// envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
 	// (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
 	PublishShardCheckpointAttestation(context.Context, *ShardCheckpointAttestationWire) (*PublishResponse, error)
+	// WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. EVERY
+	// gl0 receives it and independently re-runs the deterministic verdict over the
+	// disputed checkpoint's own bytes (WATCHTOWER-FRAUD-PROOF-DESIGN.md §10.2).
+	PublishFraudProof(context.Context, *FraudProofEnvelopeWire) (*PublishResponse, error)
 	// JVM tells sidecar that the listed message_ids on `topic` reached Phase-3
 	// finality. The sidecar drops the corresponding outbox entries; until this
 	// call arrives the outbox keeps republishing them periodically. Idempotent
@@ -337,6 +356,9 @@ func (UnimplementedSidecarServiceServer) PublishShardCheckpoint(context.Context,
 }
 func (UnimplementedSidecarServiceServer) PublishShardCheckpointAttestation(context.Context, *ShardCheckpointAttestationWire) (*PublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method PublishShardCheckpointAttestation not implemented")
+}
+func (UnimplementedSidecarServiceServer) PublishFraudProof(context.Context, *FraudProofEnvelopeWire) (*PublishResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PublishFraudProof not implemented")
 }
 func (UnimplementedSidecarServiceServer) ConfirmFinalized(context.Context, *ConfirmFinalizedRequest) (*ConfirmFinalizedResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ConfirmFinalized not implemented")
@@ -551,6 +573,24 @@ func _SidecarService_PublishShardCheckpointAttestation_Handler(srv interface{}, 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _SidecarService_PublishFraudProof_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FraudProofEnvelopeWire)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SidecarServiceServer).PublishFraudProof(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: SidecarService_PublishFraudProof_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SidecarServiceServer).PublishFraudProof(ctx, req.(*FraudProofEnvelopeWire))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _SidecarService_ConfirmFinalized_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ConfirmFinalizedRequest)
 	if err := dec(in); err != nil {
@@ -662,6 +702,10 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "PublishShardCheckpointAttestation",
 			Handler:    _SidecarService_PublishShardCheckpointAttestation_Handler,
+		},
+		{
+			MethodName: "PublishFraudProof",
+			Handler:    _SidecarService_PublishFraudProof_Handler,
 		},
 		{
 			MethodName: "ConfirmFinalized",

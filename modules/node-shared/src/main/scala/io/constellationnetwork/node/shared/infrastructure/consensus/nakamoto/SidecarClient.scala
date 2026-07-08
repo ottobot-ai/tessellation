@@ -124,6 +124,51 @@ object SidecarClient {
     val FraudProof = "fraud-proof"
   }
 
+  /** `SubscribeRequest.topics` labels — the complete message-family vocabulary of the sidecar's Subscribe filter, one label per
+    * `GossipMessage.body` arm. Kept in lockstep with the Go sidecar's `grpcserver.Topic*` constants (the sidecar REJECTS an unknown label,
+    * so a typo fails loudly instead of silently subscribing to nothing).
+    *
+    * '''Why the filter exists (FINDING-F1).''' The JVM holds TWO concurrent Subscribe streams — the [[SidecarRumorBridge]] and the
+    * `NakamotoSyncDaemon` — and the sidecar's shard-checkpoint families are SHARED node-lifetime fan-in channels: each message is handed to
+    * exactly ONE drainer. Two subscribe-all streams race-drained them and the bridge's `isRumor` collect silently discarded the shard
+    * checkpoints it won (~half). Each consumer now declares exactly what it consumes: the bridge takes [[rumorOnly]], the daemon takes
+    * [[daemonTopics]] (everything else) — so the shared channels get exactly one drainer by construction.
+    */
+  object SubscribeTopics {
+    val Snapshot = "snapshot"
+    val Attestation = "attestation"
+    val Rumor = "rumor"
+    // Families that are also outbox-tracked reuse the OutboxTopic literals — one vocabulary, no drift.
+    val MetagraphBinary: String = OutboxTopic.MetagraphBinary
+    val MetagraphAttestation: String = OutboxTopic.MetagraphAttestation
+    val AllowSpendBlock: String = OutboxTopic.AllowSpendBlock
+    val DAGBlock: String = OutboxTopic.DAGBlock
+    val TokenLockBlock: String = OutboxTopic.TokenLockBlock
+    val ShardCheckpoint: String = OutboxTopic.ShardCheckpoint
+    val ShardCheckpointAttestation: String = OutboxTopic.ShardCheckpointAttestation
+    val FraudProof: String = OutboxTopic.FraudProof
+
+    /** The [[SidecarRumorBridge]]'s filter: rumors and nothing else. */
+    val rumorOnly: Seq[String] = Seq(Rumor)
+
+    /** The `NakamotoSyncDaemon`'s filter: every family EXCEPT rumor (rumors belong to the bridge). Includes the shard-checkpoint families
+      * (the daemon must be their ONLY drainer — see the F1 note above) and the watchtower fraud-proof family (the daemon's
+      * `handleFraudProof` is the dispute consumer).
+      */
+    val daemonTopics: Seq[String] = Seq(
+      Snapshot,
+      Attestation,
+      MetagraphBinary,
+      MetagraphAttestation,
+      AllowSpendBlock,
+      DAGBlock,
+      TokenLockBlock,
+      ShardCheckpoint,
+      ShardCheckpointAttestation,
+      FraudProof
+    )
+  }
+
   /** Create a gRPC client Resource that opens a channel and cleans up on release. */
   def makeResource[F[_]: Async](config: SidecarConfig): Resource[F, SidecarClientAlgebra[F]] =
     Resource

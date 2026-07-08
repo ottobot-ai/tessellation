@@ -253,6 +253,10 @@ object types {
     *     self-submission (95% burns).
     *   - `cooldownEpochs`: epochs the slashed operator is excluded from the active set (cannot rejoin a committee / contribute to quorum).
     *     Default `100`, matching the equivocation cooldown in `SLASHING-DESIGN.md` §6.
+    *   - `fraudProofPublishAttempts` / `fraudProofPublishRetryDelay`: bounded retry for the watchtower emitter's fraud-proof publish over
+    *     the LOCAL sidecar gRPC hop (EPIC-9-NET M4 "retry-or-outbox"). A fraud proof is slashing evidence — a single warn-and-drop on a
+    *     transient sidecar restart silently disarmed the tooth. Once the RPC lands, the sidecar's durable outbox owns network delivery.
+    *     Node-local QoS knobs (NOT consensus-critical — divergent values cannot split the cluster).
     *
     * '''Challenge window.''' A checkpoint's economic effects are not irreversible until `confirmationDepthK` (k₁) finalized ordinals after
     * adoption — the window in which a fraud proof can land and revert it. The window is NOT a separate knob: it is the existing
@@ -266,7 +270,10 @@ object types {
     // stake by these fractions and the result seeds the global mptRoot, so the arithmetic MUST be exact + byte-identical cluster-wide.
     slashFraction: Ratio,
     bountyFraction: Ratio,
-    cooldownEpochs: Long
+    cooldownEpochs: Long,
+    // Defaults keep the many existing construction sites source-compatible; production values come from `application.conf`.
+    fraudProofPublishAttempts: Int = 3,
+    fraudProofPublishRetryDelay: FiniteDuration = 2.seconds
   )
 
   /** §3 NIPoPoW historical-commitment SMT tunables. The tree is unbounded; `versionRootRetention` bounds only how many recent historical

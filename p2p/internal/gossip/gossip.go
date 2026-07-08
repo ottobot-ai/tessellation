@@ -42,6 +42,14 @@ type Node struct {
 	dagBlockTopic             *pubsub.Topic
 	tokenLockBlockTopic       *pubsub.Topic
 
+	// fraudProofTopic is the gl0-WIDE watchtower fraud-proof topic. Unlike
+	// the eight universal topics above it is joined only when sharding is
+	// active (NumShards > 1): the watchtower is inert at numShards = 1, and
+	// the single-shard regression bar requires zero extra topic joins. nil
+	// when not joined — PublishFraudProof then fails loudly and
+	// FraudProofMessages returns a nil (never-delivering) channel.
+	fraudProofTopic *pubsub.Topic
+
 	cfg config.Config
 
 	// ── Per-shard checkpoint topics (Slice 14) ──
@@ -325,6 +333,22 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 			cfg.ShardCheckpointTopicPrefix, cfg.NumShards-1,
 			cfg.ShardCheckpointAttestationTopicPrefix, cfg.NumShards-1,
 		)
+
+		// WATCHTOWER fraud-proof topic (gl0-wide, EPIC-9-NET M4). Joined
+		// alongside the shard topics because fraud proofs only exist where
+		// committee checkpoints exist (numShards > 1); at the single-shard
+		// default this branch never runs and the sidecar stays byte-identical
+		// to pre-sharding. Universal-topic class (per-Subscribe-call fan-out
+		// via FraudProofMessages) — NOT the shared fan-in class of the shard
+		// channels — so concurrent Subscribe streams each see every dispute
+		// and can never race-drain each other.
+		fpTopic, jerr := ps.Join(cfg.FraudProofTopic)
+		if jerr != nil {
+			h.Close()
+			return nil, fmt.Errorf("join fraud-proof topic: %w", jerr)
+		}
+		node.fraudProofTopic = fpTopic
+		fmt.Printf("fraud-proofs: joined gl0-wide topic %s (numShards=%d)\n", cfg.FraudProofTopic, cfg.NumShards)
 	}
 
 	// Start mDNS discovery for automatic peer finding on local network / Docker bridge.
@@ -550,6 +574,43 @@ func (n *Node) PublishTokenLockBlock(ctx context.Context, data []byte) error {
 		metrics.MessagesPublished.WithLabelValues("token_lock_block").Inc()
 	}
 	return err
+}
+
+// PublishFraudProof publishes raw bytes to the gl0-wide fraud-proof topic.
+// Carries a proto-marshalled FraudProofEnvelopeWire serialized by the JVM
+// watchtower emitter; the sidecar treats the payload as opaque. Fails loudly
+// when the topic is not joined (numShards <= 1 — the watchtower is inert and
+// the JVM emitter is never constructed, so a call here indicates a config
+// split between the JVM and the sidecar worth surfacing, not swallowing).
+func (n *Node) PublishFraudProof(ctx context.Context, data []byte) error {
+	if n.fraudProofTopic == nil {
+		return fmt.Errorf("fraud-proof topic not joined (numShards=%d <= 1 — sharding inactive)", n.cfg.NumShards)
+	}
+	err := n.fraudProofTopic.Publish(ctx, data)
+	if err == nil {
+		metrics.MessagesPublished.WithLabelValues("fraud_proof").Inc()
+	}
+	return err
+}
+
+// FraudProofMessages returns a channel of incoming fraud-proof messages.
+// Universal-topic semantics: each call creates its own GossipSub subscription
+// so multiple consumers each receive every dispute independently (fan-out —
+// immune to the shared-channel race the shard families had). Returns a nil
+// channel when the topic is not joined (numShards <= 1): a nil channel never
+// delivers, so a Subscribe select arm over it simply never fires.
+func (n *Node) FraudProofMessages(ctx context.Context) <-chan []byte {
+	if n.fraudProofTopic == nil {
+		return nil
+	}
+	ch, err := n.subscribeAndRelay(ctx, n.fraudProofTopic, n.cfg.FraudProofBufferSize, "fraud_proof")
+	if err != nil {
+		fmt.Printf("ERROR: subscribe fraud_proof: %v\n", err)
+		empty := make(chan []byte)
+		close(empty)
+		return empty
+	}
+	return ch
 }
 
 // joinShardCheckpointTopic lazily joins the per-shard checkpoint-envelope
@@ -878,6 +939,13 @@ func (n *Node) ShardMeshPeersByTopic() map[string]int {
 	return out
 }
 
+// ConnectedPeerCount returns the number of connected libp2p peers. Exposed as
+// a method (rather than callers reaching into Host) so the gRPC server can
+// depend on the narrow GossipNode interface seam instead of the concrete Node.
+func (n *Node) ConnectedPeerCount() int {
+	return len(n.Host.Network().Peers())
+}
+
 // TriggerSubscriberReconnect broadcasts to all active Subscribe handlers that
 // they should terminate, forcing JVM clients to re-establish their gRPC streams.
 // Called by the mesh health monitor after recovering from degradation.
@@ -1022,6 +1090,12 @@ func buildPeerScoreParams(cfg config.Config) *pubsub.PeerScoreParams {
 		cfg.AllowSpendBlockTopic:      buildTopicScoreParams(cfg.HeartbeatInterval),
 		cfg.DAGBlockTopic:             buildTopicScoreParams(cfg.HeartbeatInterval),
 		cfg.TokenLockBlockTopic:       buildTopicScoreParams(cfg.HeartbeatInterval),
+	}
+	// Fraud-proof topic scoring: only registered when the topic is joined
+	// (NumShards > 1) so the single-shard score-params map stays byte-identical
+	// to pre-sharding. Same conservative defaults as the universal topics.
+	if cfg.NumShards > 1 {
+		topics[cfg.FraudProofTopic] = buildTopicScoreParams(cfg.HeartbeatInterval)
 	}
 	return &pubsub.PeerScoreParams{
 		Topics:                      topics,

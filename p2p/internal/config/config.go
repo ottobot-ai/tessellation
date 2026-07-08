@@ -27,6 +27,15 @@ type Config struct {
 	DAGBlockTopic             string
 	TokenLockBlockTopic       string
 
+	// FraudProofTopic is the gl0-WIDE watchtower fraud-proof topic (not
+	// per-shard): every gl0 must receive a dispute so each independently
+	// re-runs the deterministic verdict (WATCHTOWER-FRAUD-PROOF-DESIGN.md
+	// §10.2). Joined only when NumShards > 1 — the watchtower is inert at
+	// numShards = 1 (no committee checkpoints exist), and the regression bar
+	// requires the single-shard sidecar to be byte-identical to pre-sharding
+	// (zero extra topic joins).
+	FraudProofTopic string
+
 	// ShardCheckpointTopicPrefix / ShardCheckpointAttestationTopicPrefix are
 	// the GossipSub topic-path prefixes for the per-shard checkpoint topics
 	// (Slice 14). The actual topic joined at publish/receive time is
@@ -85,6 +94,11 @@ type Config struct {
 	// applies to every shard's subscription.
 	ShardCheckpointBufferSize int
 
+	// FraudProofBufferSize sizes the per-subscriber relay channel for
+	// watchtower fraud proofs. Disputes are rare (a Byzantine event), so the
+	// buffer only needs to absorb a burst during a JVM-consumer stall.
+	FraudProofBufferSize int
+
 	// Outbox parameters. The sidecar keeps an in-memory ledger of recently-
 	// published AllowSpendBlock / MetagraphBinary / MetagraphAttestation
 	// messages and re-publishes them on a ticker until the JVM acknowledges
@@ -127,6 +141,7 @@ func DefaultConfig() Config {
 		AllowSpendBlockTopic:      "/tessellation/allow-spend-blocks/1.0.0",
 		DAGBlockTopic:             "/tessellation/dag-blocks/1.0.0",
 		TokenLockBlockTopic:       "/tessellation/token-lock-blocks/1.0.0",
+		FraudProofTopic:           "/tessellation/fraud-proofs/1.0.0",
 		// Per-shard topics are `<prefix><shardId>` — e.g.
 		// /tessellation/shard-checkpoints/1.0.0/0 for shard 0.
 		ShardCheckpointTopicPrefix:            "/tessellation/shard-checkpoints/1.0.0/",
@@ -165,8 +180,10 @@ func DefaultConfig() Config {
 		// (gl0-anchor cadence) plus a committee-sized attestation fan-in;
 		// reuse the 256-slot default shared by the other low-cadence topics.
 		ShardCheckpointBufferSize: 256,
-		OutboxRepublishInterval:   30 * time.Second,
-		OutboxTTL:                 1 * time.Hour,
+		// FraudProof: disputes are rare; 256 comfortably absorbs any burst.
+		FraudProofBufferSize:    256,
+		OutboxRepublishInterval: 30 * time.Second,
+		OutboxTTL:               1 * time.Hour,
 		// M (number of execution shards). Env-driven so the sidecar agrees with the
 		// gl0 JVM (both read NAKAMOTO_NUM_SHARDS). Default 1 = sharding inactive.
 		NumShards: envInt("NAKAMOTO_NUM_SHARDS", 1),

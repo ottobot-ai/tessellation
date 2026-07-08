@@ -402,7 +402,20 @@ message PublishResponse {
 }
 
 message SubscribeRequest {
-  // Which message types to receive. Empty = all.
+  // Which message families to receive — one label per GossipMessage.body arm:
+  //   "snapshot", "attestation", "rumor", "metagraph-binary",
+  //   "metagraph-attestation", "allow-spend-block", "dag-block",
+  //   "token-lock-block", "shard-checkpoint", "shard-checkpoint-attestation",
+  //   "fraud-proof"
+  // Empty = all (legacy default / debugging aid). Unknown labels FAIL the
+  // stream (InvalidArgument) — a typo must not silently subscribe to nothing.
+  //
+  // FINDING-F1: the filter is load-bearing for the shard-checkpoint families,
+  // which ride SHARED node-lifetime fan-in channels tolerating exactly ONE
+  // drainer. The JVM's two streams declare disjoint sets (the rumor bridge
+  // takes "rumor"; the NakamotoSyncDaemon takes everything else) so the shard
+  // channels get exactly one drainer by construction. Labels mirror
+  // SidecarClient.SubscribeTopics (JVM) / grpcserver.Topic* (Go).
   repeated string topics = 1;
 }
 

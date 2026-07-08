@@ -201,6 +201,9 @@ func main() {
 			cfg.ShardCheckpointAttestationTopicPrefix, cfg.NumShards-1,
 			cfg.NumShards,
 		)
+		// WATCHTOWER fraud-proof topic: joined alongside the shard topics
+		// (watchtower is inert at numShards = 1). See gossip.New.
+		fmt.Printf("  Fraud-proof topic: %s (gl0-wide)\n", cfg.FraudProofTopic)
 	}
 	fmt.Printf("  gRPC:   %s\n", cfg.GRPCAddr)
 
@@ -377,6 +380,13 @@ func startOutboxRepublisher(ctx context.Context, node *gossip.Node, ob *outbox.O
 						continue
 					}
 					perr = node.PublishShardCheckpointAttestation(ctx, sca.ShardId, e.Payload)
+				case grpcserver.TopicFraudProof:
+					// WATCHTOWER (EPIC-9-NET M4): gl0-wide topic, no shard-id
+					// derivation needed — republish the stored wire bytes as-is.
+					// Fraud proofs are slashing evidence; the republish loop is
+					// the durability backstop against a transient mesh stall
+					// eating the only copy.
+					perr = node.PublishFraudProof(ctx, e.Payload)
 				default:
 					// Unknown topic in outbox — bug elsewhere; drop the
 					// entry so it doesn't loop forever.
