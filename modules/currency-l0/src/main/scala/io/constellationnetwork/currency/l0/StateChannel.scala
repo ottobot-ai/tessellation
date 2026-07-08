@@ -180,12 +180,40 @@ object StateChannel {
     //
     // BOOTSTRAP-ONLY (`handleInitialSnapshot`): the bootstrap Left tuple carries only `(snapshot, GSI)` — no served byte
     // map — and the bootstrap path has NO verify gate (it adopts the majority-hash-verified snapshot directly, then pulls
-    // forward). So the `syncFromGlobalSnapshotInfo` re-encode here cannot wedge the cluster: the `recomputed ≠ signed`
-    // drift only bites the resync/follow VERIFY gate, and the very next forward tick that resyncs uses the verbatim
-    // `ensureMptFromSignedBytes` path below. Steady-state state advancement is the lossless incremental
-    // `syncFromStateChanges` (accept) path; this is reached only on cold bootstrap.
-    def ensureMptInitialized(ordinal: SnapshotOrdinal, state: GlobalSnapshotInfo): F[Unit] =
-      sharedStorages.mptStore.syncFromGlobalSnapshotInfo(state, ordinal)
+    // forward). Steady-state state advancement is the lossless incremental `syncFromStateChanges` (accept) path; this is
+    // reached only on cold bootstrap.
+    //
+    // FINDING-S01 seed order: the GSI has NO field for the MPT-native consensus partitions (`ConsumedAllowSpends` 33 /
+    // `Slashings` 34 — non-empty at `numShards > 1`), so a bare from-GSI re-encode of the empty boot-time store commits a
+    // base whose root diverges from the snapshot's SIGNED `stateProof.mptRoot`. Order: (1) byte-faithful reload of ml0's
+    // OWN persisted MPT at the bootstrap ordinal (carries 33/34 verbatim — root == signed by construction; a restarting
+    // node does not needlessly diverge-then-resync); (2) root-verified GSI rebuild (always passes at `numShards = 1` /
+    // empty spent-set); (3) DEGRADE to the plain preserving re-encode with a loud WARN — the documented bootstrap contract
+    // (no verify gate here) stays: ml0 does not read 33/34 locally, the divergence only bites the follow verify gate, and
+    // the very next forward tick that resyncs uses the verbatim `ensureMptFromSignedBytes` byte route below, which heals
+    // the base byte-faithfully. Failing closed here instead would retry the SAME GSI bootstrap forever (a hard wedge).
+    def ensureMptInitialized(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
+      sharedStorages.mptStore.syncFromPersistedMptVerified(snapshot.ordinal, snapshot.signed.value.stateProof.mptRoot).flatMap {
+        case true =>
+          logger.info(
+            s"ml0 bootstrap MPT seed: adopted OWN persisted MPT bytes at ord=${snapshot.ordinal.show} " +
+              s"(root == signed stateProof.mptRoot; ConsumedAllowSpends/Slashings preserved verbatim)"
+          )
+        case false =>
+          sharedStorages.mptStore
+            .syncFromGlobalSnapshotInfoVerified(state, snapshot.ordinal, snapshot.signed.value.stateProof.mptRoot)
+            .flatMap {
+              case true => Async[F].unit
+              case false =>
+                logger.warn(
+                  s"ml0 bootstrap MPT seed at ord=${snapshot.ordinal.show}: no persisted-MPT or GSI-rebuild candidate reproduces " +
+                    s"the snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings are not carried by the " +
+                    s"GSI — expected at numShards > 1 with a non-empty spent-set, or on a legacy mptRoot=None snapshot). " +
+                    s"DEGRADING to the plain GSI re-encode; the next follow resync heals the base via the verbatim byte route."
+                ) >>
+                  sharedStorages.mptStore.syncFromGlobalSnapshotInfo(state, snapshot.ordinal)
+            }
+      }
 
     // 3c-A — store gl0's SIGNED MPT byte map VERBATIM at `ordinal` (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A).
     // Unlike `ensureMptInitialized`, which re-encodes a GSI through the per-field codecs (a DIFFERENT byte path than the
@@ -211,7 +239,7 @@ object StateChannel {
         _ <- sharedStorages.lastNGlobalSnapshot.setInitialFetchingGL0(snapshot, state, services.globalL0.asLeft.some, none)
         _ <- sharedStorages.lastGlobalSnapshot.setInitial(snapshot, state)
         _ <- persistGlobalSnapshot(snapshot, state)
-        _ <- ensureMptInitialized(snapshot.ordinal, state)
+        _ <- ensureMptInitialized(snapshot, state)
         _ <- triggerOnGlobalSnapshotPullHook(snapshot, state)
         _ <- logger.info(s"Successfully initialized global snapshot storages with ordinal=${snapshot.ordinal}")
       } yield ()
@@ -278,14 +306,35 @@ object StateChannel {
             // along ONLY for `setForRecovery` (`adoptCanonical`); on the verbatim `Some` branch it is NEVER re-encoded into the
             // MPT — that re-encode was the drift. The bytes are OPTIONAL: gl0's byte route 404s at a sparse combined-checkpoint
             // ordinal, in which case `pullLatestMptEntries` already degraded to the legacy `pullLatestSnapshot` and returns `None`
-            // here. On `None` we fall back to the legacy `ensureMptInitialized` (= `syncFromGlobalSnapshotInfo`); the verify gate
-            // BELOW is unchanged and still gates the legacy recompute (corruption backstop). On `Some` the gate passes by
-            // construction.
+            // here.
+            //
+            // FINDING-S01 (`None` fallback): the GSI has NO field for the MPT-native ConsumedAllowSpends (33) / Slashings (34)
+            // partitions, and the old bare re-encode was WRITE-then-detect — it clobbered the live mirror even when the
+            // rebuilt root could never equal the signed root (leaving the MPT at the canonical ordinal while the storages
+            // stayed at the old one). `syncFromGlobalSnapshotInfoVerified` is CHECK-then-write: it reconciles {GSI ∪ preserved
+            // 33/34, GSI alone} against the snapshot's SIGNED `stateProof.mptRoot` BEFORE any store write; on `false` NOTHING
+            // was written and the verify gate BELOW routes to re-pull/idle over the UNTOUCHED store. On `Some` the gate passes
+            // by construction.
             canonical <- services.globalL0.pullLatestMptEntries
             (canonicalSnapshot, canonicalState, canonicalEntries) = canonical
             _ <- canonicalEntries match {
               case Some(bytes) => ensureMptFromSignedBytes(canonicalSnapshot.ordinal, bytes)
-              case None        => ensureMptInitialized(canonicalSnapshot.ordinal, canonicalState)
+              case None =>
+                sharedStorages.mptStore
+                  .syncFromGlobalSnapshotInfoVerified(
+                    canonicalState,
+                    canonicalSnapshot.ordinal,
+                    canonicalSnapshot.signed.value.stateProof.mptRoot
+                  )
+                  .flatMap { adopted =>
+                    logger
+                      .warn(
+                        s"ml0 resync-to-canonical: GSI fallback at ord=${canonicalSnapshot.ordinal.show} cannot reproduce the " +
+                          s"snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings not carried by the " +
+                          s"GSI). NOT adopting (store untouched); the verify gate below re-pulls."
+                      )
+                      .whenA(!adopted)
+                  }
             }
             // The signed global `mptRoot` excludes path-dependent SystemNamespace sidecars
             // (`GlobalSnapshotInfo.mptStateProofFromBytes`); recompute the rebuilt store's root sidecar-free
@@ -524,7 +573,7 @@ object StateChannel {
       lastSnapshot: Hashed[GlobalIncrementalSnapshot],
       lastState: GlobalSnapshotInfo
     ): F[Unit] =
-      // Don't call `ensureMptInitialized(lastSnapshot.ordinal, lastState)` here. It's lossy:
+      // Don't call `ensureMptInitialized(lastSnapshot, lastState)` here. It's lossy:
       // syncFromGlobalSnapshotInfo clears the MPT and rebuilds from GSI fields only, which
       // can't fully reproduce the MPT — entries that the incremental writer correctly produced
       // (e.g. expiry-index buckets whose source record is no longer active but whose bucket

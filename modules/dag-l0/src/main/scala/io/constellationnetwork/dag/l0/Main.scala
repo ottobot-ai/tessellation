@@ -431,13 +431,27 @@ object Main
                               // is empty at boot (SharedStorages seeds an empty producer), so a plain from-GSI rebuild would silently
                               // resurface WITHOUT the cross-shard spent-set — re-opening consumed allow-spends for a double-spend and
                               // committing a base whose root diverges from the last snapshot's SIGNED `stateProof.mptRoot`.
-                              // `syncFromGlobalSnapshotInfoVerified` rebuilds ONLY when the from-GSI root reproduces the signed root
-                              // (always at `numShards = 1` / empty spent-set — the normal restart), and returns false otherwise.
-                              mptAdopted <- sharedStorages.mptStore
-                                .syncFromGlobalSnapshotInfoVerified(latestInfo, latestOrdinal, latestSnapshot.value.stateProof.mptRoot)(
-                                  globalStateProofSelector,
-                                  withdrawalTimeLimit
+                              // Seed order: (1) `syncFromPersistedMptVerified` — byte-faithful reload of the node's OWN persisted MPT at
+                              // `latestOrdinal` (carries 33/34 verbatim, so it reproduces the signed root by construction — a node with
+                              // a non-empty spent-set restarts WITHOUT re-bootstrapping); (2) `syncFromGlobalSnapshotInfoVerified` —
+                              // rebuilds ONLY when a from-GSI candidate reproduces the signed root (always at `numShards = 1` / empty
+                              // spent-set — the normal restart); (3) fail closed.
+                              persistedAdopted <- sharedStorages.mptStore
+                                .syncFromPersistedMptVerified(latestOrdinal, latestSnapshot.value.stateProof.mptRoot)
+                              _ <- logger
+                                .info(
+                                  s"Cold restart: adopted OWN persisted MPT bytes at ordinal=$latestOrdinal " +
+                                    s"(root == signed stateProof.mptRoot; ConsumedAllowSpends/Slashings preserved verbatim)"
                                 )
+                                .whenA(persistedAdopted)
+                              mptAdopted <-
+                                if (persistedAdopted) IO.pure(true)
+                                else
+                                  sharedStorages.mptStore
+                                    .syncFromGlobalSnapshotInfoVerified(latestInfo, latestOrdinal, latestSnapshot.value.stateProof.mptRoot)(
+                                      globalStateProofSelector,
+                                      withdrawalTimeLimit
+                                    )
                               _ <- IO
                                 .raiseError[Unit](
                                   new RuntimeException(
@@ -502,19 +516,26 @@ object Main
                           )
                         }
                         // FINDING-S01 fail-closed peer-download gate (see the cold-restart site). The downloaded GSI has no field
-                        // for ConsumedAllowSpends (33) / Slashings (34); rebuild ONLY when the from-GSI root reproduces the
-                        // downloaded snapshot's SIGNED stateProof.mptRoot, else fail closed (byte-faithful MPT adoption is the
-                        // preferred recovery — see the remaining-work note).
+                        // for ConsumedAllowSpends (33) / Slashings (34). Seed order: (1) byte-faithful reload of the node's OWN
+                        // persisted MPT at the downloaded ordinal, verified against the downloaded snapshot's SIGNED
+                        // stateProof.mptRoot (a REJOINING node that already held this ordinal restarts without a GSI transit);
+                        // (2) root-verified from-GSI rebuild; (3) fail closed.
                         mptAdopted <- hasherSelector.withCurrent { implicit hasher =>
                           sharedStorages.mptStore
-                            .syncFromGlobalSnapshotInfoVerified(
-                              latestInfo,
-                              hashedSnapshot.ordinal,
-                              latestSnapshot.value.stateProof.mptRoot
-                            )(
-                              globalStateProofSelector,
-                              withdrawalTimeLimit
-                            )
+                            .syncFromPersistedMptVerified(hashedSnapshot.ordinal, latestSnapshot.value.stateProof.mptRoot)
+                            .flatMap {
+                              case true => IO.pure(true)
+                              case false =>
+                                sharedStorages.mptStore
+                                  .syncFromGlobalSnapshotInfoVerified(
+                                    latestInfo,
+                                    hashedSnapshot.ordinal,
+                                    latestSnapshot.value.stateProof.mptRoot
+                                  )(
+                                    globalStateProofSelector,
+                                    withdrawalTimeLimit
+                                  )
+                            }
                         }
                         _ <- IO
                           .raiseError[Unit](

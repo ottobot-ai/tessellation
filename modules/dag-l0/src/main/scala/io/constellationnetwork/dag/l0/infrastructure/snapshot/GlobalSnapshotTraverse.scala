@@ -122,7 +122,42 @@ object GlobalSnapshotTraverse {
                 // Typed-scodec sync — writes per-field `ImmutableCodec[V]` bytes that match
                 // `mptStateProof` (`buildMptFromBytes`) and the typed MPT reads. No JSON blob
                 // intermediate. Idempotent per-ordinal.
-                mptStore.syncFromGlobalSnapshotInfo(firstInfo, firstInc.ordinal) >>
+                //
+                // FINDING-S01 fail-closed rollback seed: the persisted GSI has NO field for the MPT-native consensus
+                // partitions (`ConsumedAllowSpends` 33 / `Slashings` 34), so a plain from-GSI rebuild of the empty boot-time
+                // store would resurface WITHOUT the cross-shard spent-set and with a root diverging from the snapshot's
+                // SIGNED `stateProof.mptRoot`. Seed order: (1) byte-faithful reload of the node's OWN persisted MPT at the
+                // rollback ordinal (carries 33/34 verbatim — reproduces the signed root by construction; no needless
+                // re-bootstrap); (2) root-verified GSI rebuild (always passes at `numShards = 1` / empty spent-set);
+                // (3) FAIL CLOSED — neither source reproduces the signed root, so raise BEFORE any write rather than
+                // replaying atop a divergent base (pre-fix this was write-then-detect: the mismatch was only caught after
+                // the store was clobbered, by the proof validation below — which stays as the outer full-proof gate).
+                {
+                  firstInc.value.stateProof.mptRoot match {
+                    case None =>
+                      // Pre-MPT legacy snapshot: no signed mptRoot to verify against — legacy plain rebuild, unchanged.
+                      mptStore.syncFromGlobalSnapshotInfo(firstInfo, firstInc.ordinal)
+                    case signedRoot @ Some(_) =>
+                      mptStore.syncFromPersistedMptVerified(firstInc.ordinal, signedRoot).flatMap {
+                        case true =>
+                          logger.info(
+                            s"Rollback MPT seed: adopted OWN persisted MPT bytes at ordinal=${firstInc.ordinal.show} " +
+                              s"(root == signed stateProof.mptRoot; ConsumedAllowSpends/Slashings preserved verbatim)"
+                          )
+                        case false =>
+                          mptStore.syncFromGlobalSnapshotInfoVerified(firstInfo, firstInc.ordinal, signedRoot).flatMap {
+                            case true => ().pure[F]
+                            case false =>
+                              (new Exception(
+                                s"Rollback at ordinal=${firstInc.ordinal.show}: neither the persisted MPT nor the persisted " +
+                                  s"GlobalSnapshotInfo reproduces the snapshot's SIGNED stateProof.mptRoot (MPT-native " +
+                                  s"ConsumedAllowSpends/Slashings are not carried by the GSI). FAILING CLOSED rather than " +
+                                  s"rolling back onto a wiped cross-shard spent-set."
+                              )).raiseError[F, Unit]
+                          }
+                      }
+                  }
+                } >>
                   builder.buildProof(firstInfo, firstInc.ordinal)
             }
           }

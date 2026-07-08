@@ -226,11 +226,32 @@ class GlobalSnapshotAlignment[F[
         )
         // The bytes are OPTIONAL: gl0's byte route 404s at a sparse combined-checkpoint ordinal, in which case
         // `pullLatestMptEntries` already degraded to legacy `pullLatestSnapshot` and returns `None`. On `Some` load the SIGNED
-        // bytes VERBATIM; on `None` fall back to legacy `syncFromGlobalSnapshotInfo`. The post-load root recompute BELOW is
-        // DIAG-only on this path — preserved unchanged either way.
+        // bytes VERBATIM. The post-load root recompute BELOW is DIAG-only — preserved unchanged either way.
+        //
+        // FINDING-S01 (`None` fallback): the GSI has NO field for the MPT-native ConsumedAllowSpends (33) / Slashings (34)
+        // partitions, and this recovery previously adopted the bare re-encode UNVERIFIED (the recompute below is DIAG-only) —
+        // silently committing a mirror whose root diverges from the snapshot's SIGNED `stateProof.mptRoot` and then swapping
+        // the follow storages onto it. `syncFromGlobalSnapshotInfoVerified` is CHECK-then-write; on `false` NOTHING was
+        // written and we RAISE so the enclosing `recovery.handleErrorWith` falls back to the legacy log+shouldRedownload
+        // behavior (no unverified adopt, no clobbered mirror). A legacy `mptRoot = None` snapshot keeps the plain rebuild.
         _ <- canonicalEntries match {
           case Some(bytes) => sharedStorages.mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
-          case None        => sharedStorages.mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+          case None =>
+            canonicalSnapshot.signed.value.stateProof.mptRoot match {
+              case None => sharedStorages.mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+              case signedRoot @ Some(_) =>
+                sharedStorages.mptStore
+                  .syncFromGlobalSnapshotInfoVerified(canonicalState, canonicalSnapshot.ordinal, signedRoot)
+                  .flatMap {
+                    case true => Async[F].unit
+                    case false =>
+                      new RuntimeException(
+                        s"DL1 recoverFromOrphan: GSI fallback at ord=${canonicalSnapshot.ordinal.show} cannot reproduce the " +
+                          s"snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings not carried by the " +
+                          s"GSI). NOT adopting (store untouched); falling back to shouldRedownload."
+                      ).raiseError[F, Unit]
+                  }
+            }
         }
         // DIAG: recompute sidecar-free (apples-to-apples with the signed `stateProof.mptRoot`), NOT `getRootHashForOrdinal`
         // (which includes the path-dependent SystemNamespace sidecars). With the verbatim `loadBytes` this equals the

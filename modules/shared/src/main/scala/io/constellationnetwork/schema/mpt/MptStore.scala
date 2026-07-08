@@ -89,6 +89,15 @@ trait MptStore[F[_], K] {
     * [[syncFull]]'s clear→insert→persist→build→bookkeep tail, minus the codec round-trip.
     */
   def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal): F[Unit]
+
+  /** Byte-faithful reload of the node's OWN persisted MPT state at `ordinal` — the boot/download counterpart of [[loadBytes]] (FINDING-S01
+    * completion). The persisted byte map is exactly what the producer held when it persisted at that ordinal — including the MPT-native
+    * consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34) that a from-GSI rebuild cannot reconstruct — so a successful load
+    * reproduces the signed `stateProof.mptRoot` BY CONSTRUCTION on an uncorrupted store. Returns `false` (store untouched) when the
+    * producer has no persistence backend or nothing is persisted at `ordinal`; callers that hold the signed root should verify via
+    * `syncFromPersistedMptVerified` (GlobalStateConverter syntax), which restores the pre-load state on a root mismatch.
+    */
+  def loadPersisted(ordinal: SnapshotOrdinal): F[Boolean]
   def deleteAbove(ordinal: SnapshotOrdinal): F[Unit]
 
   /** Capture a snapshot of all internal state (producer state + last synced ordinal). The returned savepoint can restore the store to this
@@ -350,6 +359,19 @@ object MptStore {
     override def underlying: StatefulMerklePatriciaProducer[F] = producer
 
     override def allEntriesAsBytes: F[Map[Hex, Array[Byte]]] = producer.entries
+
+    override def loadPersisted(ordinal: SnapshotOrdinal): F[Boolean] =
+      producer match {
+        case p: StatefulWithPersistenceMerklePatriciaProducer[F] =>
+          p.load(ordinal).flatTap { loaded =>
+            // Same build + last-synced bookkeeping tail as `loadBytes`, minus `persistAsync` (the bytes just came FROM disk).
+            (logger.info(s"[MptStore] loadPersisted: restored persisted state at ordinal=$ordinal VERBATIM (no re-encode)") >>
+              build(ordinal).void >>
+              lastSyncedOrdinalRef.set(Some(ordinal))).whenA(loaded)
+          }
+        case _ =>
+          false.pure[F]
+      }
 
     override def deleteAbove(ordinal: SnapshotOrdinal): F[Unit] =
       producer match {

@@ -64,6 +64,7 @@ import io.constellationnetwork.schema.tokenLock.TokenLockReference
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.{Hash, ProofsHash}
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
@@ -2181,6 +2182,164 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
               Left(TipsGotMisaligned(Set(parent1.hash), Set.empty)),
               (hashedLastSnapshot, snapshotInfo)
             )
+          )
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────────
+  // FINDING-S01 (EPIC-9-SERDE 9.1) — the follower GSI-rebuild at the DownloadNeeded seed.
+  //
+  // The GSI has NO field for the MPT-native consensus partitions (`ConsumedAllowSpends` fieldId 33 / `Slashings` fieldId
+  // 34 — non-empty at numShards > 1), so the old bare `syncFromGlobalSnapshotInfo` at the bootstrap / forced-re-download
+  // seed committed a mirror whose sidecar-free root diverges from the snapshot's SIGNED `stateProof.mptRoot` whenever the
+  // local 33/34 content differs from the target's — the follower follow-verify wedge (its recomputed proof never equals
+  // the signed root again). The seed now reconciles {GSI ∪ preserved 33/34, GSI alone} against the SIGNED root BEFORE
+  // writing (`syncFromGlobalSnapshotInfoVerified`); legacy snapshots (`mptRoot = None`) keep the plain preserving rebuild
+  // — pinned byte-identical by every other download test in this suite.
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  private def s01Markers(peerId: PeerId)(implicit h: Hasher[IO]): IO[(Hex, Array[Byte], Hex, Array[Byte])] =
+    for {
+      consumedHex <- GlobalStateKey.toHex[IO](GlobalStateKey.consumedAllowSpendKey(Hash("ab" * 32)))
+      slashKey <- GlobalStateKey.slashingsKey[IO](peerId, io.constellationnetwork.schema.sharding.ShardId.unsafeApply(0), Hash("cd" * 32))
+      slashHex <- GlobalStateKey.toHex[IO](slashKey)
+    } yield (consumedHex, Array[Byte](1, 2, 3, 4), slashHex, Array[Byte](9, 9, 9))
+
+  test("FINDING-S01: DownloadNeeded with STALE local 33/34 markers reconciles to the SIGNED root — markers dropped, root == signed") {
+    testResources.use {
+      case (snapshotProcessor, sp, h, _, _, srcKey, _, srcAddress, _, peerId, _, _, _, _, _, _, _, _, mptStore, jhs, _) =>
+        implicit val securityProvider: SecurityProvider[IO] = sp
+        implicit val hasher = h
+        implicit val js = jhs
+        implicit val globalStateProofSelector: GlobalStateProofSelector =
+          GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+
+        val snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty).copy(balances = generateSnapshotBalances(Set(srcAddress)))
+
+        for {
+          (consumedHex, markerBytes, slashHex, slashBytes) <- s01Markers(peerId)
+
+          // The canonical target's SIGNED root is GSI-only: on the canonical chain the 33/34 partitions are EMPTY, so the
+          // markers our mirror still holds are STALE and must NOT be carried into the adopted state.
+          throwawayProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+          throwawayStore <- MptStore.make[IO, GlobalStateKey](throwawayProducer, GlobalStateKey.toHex[IO])
+          _ <- throwawayStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal10)
+          signedRoot <- throwawayStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+
+          // The follower's live mirror BEFORE the forced re-download: it previously followed byte-faithfully, so it holds
+          // 33/34 markers (written at ordinals the canonical chain has since reconciled away).
+          _ <- mptStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal9)
+          _ <- mptStore.underlying.insertBytes(Map(consumedHex -> markerBytes, slashHex -> slashBytes)).flatMap(_.liftTo[IO])
+          _ <- mptStore.commit(snapshotOrdinal9)
+
+          hashedSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId).copy(stateProof = generateSnapshot(peerId).stateProof.copy(mptRoot = signedRoot.some)),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+
+          processingResult <- snapshotProcessor.process((hashedSnapshot, snapshotInfo).asLeft[Hashed[GlobalIncrementalSnapshot]])
+
+          entriesAfter <- mptStore.allEntriesAsBytes
+          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+        } yield
+          expect.all(
+            processingResult == DownloadPerformed(SnapshotReference.fromHashedSnapshot(hashedSnapshot), Set.empty, Set.empty),
+            // RED pre-fix: the bare rebuild PRESERVED the stale markers, so the rebuilt root could never equal the signed
+            // root again (the follow-verify wedge). GREEN: the without-preserve candidate matches -> stale markers dropped.
+            !entriesAfter.contains(consumedHex),
+            !entriesAfter.contains(slashHex),
+            rootAfter === signedRoot
+          )
+    }
+  }
+
+  test(
+    "FINDING-S01: DownloadNeeded with MATCHING local 33/34 markers preserves them — spent-set survives the GSI rebuild, root == signed"
+  ) {
+    testResources.use {
+      case (snapshotProcessor, sp, h, _, _, srcKey, _, srcAddress, _, peerId, _, _, _, _, _, _, _, _, mptStore, jhs, _) =>
+        implicit val securityProvider: SecurityProvider[IO] = sp
+        implicit val hasher = h
+        implicit val js = jhs
+        implicit val globalStateProofSelector: GlobalStateProofSelector =
+          GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+
+        val snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty).copy(balances = generateSnapshotBalances(Set(srcAddress)))
+
+        for {
+          (consumedHex, markerBytes, slashHex, slashBytes) <- s01Markers(peerId)
+
+          // The canonical target's SIGNED root COVERS our markers: {GSI ∪ 33/34} — the common re-download case where the
+          // markers were written at finalized ordinals shared by both.
+          throwawayProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+          throwawayStore <- MptStore.make[IO, GlobalStateKey](throwawayProducer, GlobalStateKey.toHex[IO])
+          _ <- throwawayStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal10)
+          _ <- throwawayStore.underlying.insertBytes(Map(consumedHex -> markerBytes, slashHex -> slashBytes)).flatMap(_.liftTo[IO])
+          _ <- throwawayStore.build(snapshotOrdinal10).void
+          signedRoot <- throwawayStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+
+          _ <- mptStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal9)
+          _ <- mptStore.underlying.insertBytes(Map(consumedHex -> markerBytes, slashHex -> slashBytes)).flatMap(_.liftTo[IO])
+          _ <- mptStore.commit(snapshotOrdinal9)
+
+          hashedSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId).copy(stateProof = generateSnapshot(peerId).stateProof.copy(mptRoot = signedRoot.some)),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+
+          processingResult <- snapshotProcessor.process((hashedSnapshot, snapshotInfo).asLeft[Hashed[GlobalIncrementalSnapshot]])
+
+          entriesAfter <- mptStore.allEntriesAsBytes
+          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+        } yield
+          expect.all(
+            processingResult == DownloadPerformed(SnapshotReference.fromHashedSnapshot(hashedSnapshot), Set.empty, Set.empty),
+            // the cross-shard spent-set + slash ledger SURVIVE the from-GSI rebuild VERBATIM
+            entriesAfter.get(consumedHex).exists(_.sameElements(markerBytes)),
+            entriesAfter.get(slashHex).exists(_.sameElements(slashBytes)),
+            // and the rebuilt mirror root equals the snapshot's SIGNED stateProof.mptRoot — the follow-verify wedge closed
+            rootAfter === signedRoot
+          )
+    }
+  }
+
+  test("FINDING-S01: DownloadNeeded at numShards=1 (empty 33/34) — the verified seed is byte-identical to the plain rebuild") {
+    testResources.use {
+      case (snapshotProcessor, sp, h, _, _, srcKey, _, srcAddress, _, peerId, _, _, _, _, _, _, _, _, mptStore, jhs, _) =>
+        implicit val securityProvider: SecurityProvider[IO] = sp
+        implicit val hasher = h
+        implicit val js = jhs
+        implicit val globalStateProofSelector: GlobalStateProofSelector =
+          GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
+
+        val snapshotInfo = mkGlobalSnapshotInfo(SortedMap.empty).copy(balances = generateSnapshotBalances(Set(srcAddress)))
+
+        for {
+          // The plain-rebuild reference: what the pre-fix seed wrote (and the signed root at numShards = 1, where 33/34 are
+          // structurally empty).
+          throwawayProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+          throwawayStore <- MptStore.make[IO, GlobalStateKey](throwawayProducer, GlobalStateKey.toHex[IO])
+          _ <- throwawayStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal10)
+          referenceEntries <- throwawayStore.allEntriesAsBytes
+          signedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](referenceEntries)
+
+          hashedSnapshot <- forAsyncHasher(
+            generateSnapshot(peerId).copy(stateProof = generateSnapshot(peerId).stateProof.copy(mptRoot = signedRoot.some)),
+            srcKey
+          ).flatMap(_.toHashedWithSignatureCheck.map(_.toOption.get))
+
+          // Cold bootstrap: the processor's mptStore starts EMPTY.
+          processingResult <- snapshotProcessor.process((hashedSnapshot, snapshotInfo).asLeft[Hashed[GlobalIncrementalSnapshot]])
+
+          entriesAfter <- mptStore.allEntriesAsBytes
+          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+        } yield
+          expect.all(
+            processingResult == DownloadPerformed(SnapshotReference.fromHashedSnapshot(hashedSnapshot), Set.empty, Set.empty),
+            rootAfter === signedRoot,
+            // byte-identity with the plain rebuild — preservation/verification is a provable no-op when 33/34 are empty
+            entriesAfter.keySet == referenceEntries.keySet,
+            entriesAfter.forall { case (k, v) => referenceEntries.get(k).exists(_.sameElements(v)) }
           )
     }
   }

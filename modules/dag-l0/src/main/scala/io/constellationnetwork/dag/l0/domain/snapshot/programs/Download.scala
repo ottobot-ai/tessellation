@@ -520,15 +520,20 @@ object Download {
         // with `mptStateProof` and typed reads. No JSON blob intermediate.
         // FINDING-S01 fail-closed: the download context (`GlobalSnapshotInfo`) has no field for the MPT-native consensus
         // partitions (`ConsumedAllowSpends` 33 / `Slashings` 34), so a plain from-GSI seed would start the replay with a wiped
-        // cross-shard spent-set and a base whose root diverges from the signed `stateProof.mptRoot`. Seed ONLY when the from-GSI
-        // root reproduces the starting snapshot's SIGNED root (always at `numShards = 1` / empty spent-set), else raise
+        // cross-shard spent-set and a base whose root diverges from the signed `stateProof.mptRoot`. Seed order: (1)
+        // byte-faithful reload of the node's OWN persisted MPT at the starting ordinal, verified against the starting
+        // snapshot's SIGNED root (carries 33/34 verbatim — a re-downloading node that already held this ordinal seeds without
+        // a GSI transit); (2) root-verified from-GSI rebuild (always passes at `numShards = 1` / empty spent-set); (3) raise
         // `InvalidStateProof` so the download fails closed rather than replaying atop a divergent base.
         def performInitialSync: F[Unit] =
           logger.info("Performing initial sync of MPT") >>
-            hasherSelector
-              .withCurrent(implicit h =>
-                mptStore.syncFromGlobalSnapshotInfoVerified(context, lastSnapshot.ordinal, lastSnapshot.value.stateProof.mptRoot)
-              )
+            hasherSelector.withCurrent { implicit h =>
+              mptStore.syncFromPersistedMptVerified(lastSnapshot.ordinal, lastSnapshot.value.stateProof.mptRoot).flatMap {
+                case true => true.pure[F]
+                case false =>
+                  mptStore.syncFromGlobalSnapshotInfoVerified(context, lastSnapshot.ordinal, lastSnapshot.value.stateProof.mptRoot)
+              }
+            }
               .ifM(Applicative[F].unit, InvalidStateProof(lastSnapshot.ordinal).raiseError[F, Unit])
 
         for {

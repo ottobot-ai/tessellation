@@ -202,12 +202,35 @@ object CurrencySnapshotProcessor {
                             canonicalRef = SnapshotReference.fromHashedSnapshot(canonicalSnapshot)
                             // The bytes are OPTIONAL: gl0's byte route 404s at a sparse combined-checkpoint ordinal, in which
                             // case `pullLatestMptEntries` already degraded to legacy `pullLatestSnapshot` and returns `None`.
-                            // On `Some` load the SIGNED bytes VERBATIM (gate below passes by construction); on `None` fall back
-                            // to legacy `syncFromGlobalSnapshotInfo`. The verify gate BELOW stays unchanged as the corruption
-                            // backstop for the legacy recompute.
+                            // On `Some` load the SIGNED bytes VERBATIM (gate below passes by construction).
+                            //
+                            // FINDING-S01 (`None` fallback): the GSI has NO field for the MPT-native ConsumedAllowSpends (33) /
+                            // Slashings (34) partitions, so the old bare re-encode WROTE-then-detected — it clobbered the live
+                            // mirror (wiping/staling 33/34) even when the rebuilt root could never equal the signed root,
+                            // leaving the MPT at the canonical ordinal while the follow storages stayed at the old one.
+                            // `syncFromGlobalSnapshotInfoVerified` is CHECK-then-write: it reconciles {GSI ∪ preserved 33/34,
+                            // GSI alone} against the snapshot's SIGNED `stateProof.mptRoot` BEFORE any store write; on `false`
+                            // NOTHING was written and the verify gate BELOW routes to re-pull/idle over the UNTOUCHED store.
+                            // The gate stays unchanged as the corruption backstop for both branches.
                             _ <- canonicalEntries match {
                               case Some(bytes) => mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
-                              case None        => mptStore.syncFromGlobalSnapshotInfo(canonicalState, canonicalSnapshot.ordinal)
+                              case None =>
+                                mptStore
+                                  .syncFromGlobalSnapshotInfoVerified(
+                                    canonicalState,
+                                    canonicalSnapshot.ordinal,
+                                    canonicalSnapshot.signed.value.stateProof.mptRoot
+                                  )
+                                  .flatMap { adopted =>
+                                    Slf4jLogger
+                                      .getLogger[F]
+                                      .warn(
+                                        s"cl1 resync-to-canonical: GSI fallback at ord=${canonicalSnapshot.ordinal.show} cannot " +
+                                          s"reproduce the snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/" +
+                                          s"Slashings not carried by the GSI). NOT adopting (store untouched); the gate below re-pulls."
+                                      )
+                                      .whenA(!adopted)
+                                  }
                             }
                             // Track-3 S4: the MPT base was just realigned to gl0's canonical GSI — drop the eta walk
                             // cache so getEta re-derives over the canonical chain (bootstrap-equivalence).

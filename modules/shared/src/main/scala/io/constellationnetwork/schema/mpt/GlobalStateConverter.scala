@@ -1946,6 +1946,43 @@ object GlobalStateConverter {
             } yield adopted
         }
 
+      /** ROOT-VERIFIED byte-faithful reload of the node's OWN persisted MPT at `snapshotOrdinal` — the PREFERRED boot/download seed
+        * (FINDING-S01 completion). The persisted byte map carries the MPT-native consensus partitions (`ConsumedAllowSpends` 33 /
+        * `Slashings` 34) verbatim — the partitions a from-GSI rebuild structurally cannot reconstruct — so a node restarting with its own
+        * persisted MPT reproduces the signed `stateProof.mptRoot` BY CONSTRUCTION and does not need to re-bootstrap from a peer.
+        *
+        * Semantics: load the persisted state (if any), recompute the sidecar-free consensus root, and keep the load ONLY when it equals
+        * `signedMptRoot`. On no-persistence / nothing-persisted / root mismatch (stale or corrupt bytes) the pre-call store state is
+        * restored via savepoint and `false` is returned — callers then fall back to [[syncFromGlobalSnapshotInfoVerified]] (and fail
+        * closed, or degrade per the site's documented contract, when that also cannot reproduce the signed root). `signedMptRoot = None`
+        * (pre-MPT legacy snapshot) returns `false` without touching disk: there is nothing sound to verify against.
+        *
+        * @return
+        *   `true` iff the persisted bytes were adopted AND their sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ the store is
+        *   byte-identical to its pre-call state.
+        */
+      def syncFromPersistedMptVerified(
+        snapshotOrdinal: SnapshotOrdinal,
+        signedMptRoot: Option[Hash]
+      ): F[Boolean] =
+        signedMptRoot match {
+          case None => false.pure[F]
+          case Some(expected) =>
+            for {
+              sp <- store.savepoint
+              loaded <- store.loadPersisted(snapshotOrdinal)
+              adopted <-
+                if (!loaded) false.pure[F]
+                else
+                  store.underlying.entries
+                    .flatMap(io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](_))
+                    .flatMap { loadedRoot =>
+                      if (loadedRoot === expected) true.pure[F]
+                      else sp.restore.as(false)
+                    }
+            } yield adopted
+        }
+
       private def syncFromGlobalSnapshotInfoImpl(
         info: GlobalSnapshotInfo,
         snapshotOrdinal: SnapshotOrdinal,

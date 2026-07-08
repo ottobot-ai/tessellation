@@ -104,10 +104,31 @@ object SnapshotDownloadStorage {
             for {
               // Typed-scodec sync — writes per-field `ImmutableCodec[V]` bytes that match
               // `mptStateProof` and typed MPT reads. No JSON blob intermediate.
+              //
+              // FINDING-S01 fail-closed download-replay seed: the persisted GSI has NO field for the MPT-native consensus
+              // partitions (`ConsumedAllowSpends` 33 / `Slashings` 34), so a plain from-GSI rebuild would silently seed the
+              // replay base WITHOUT the cross-shard spent-set and with a root diverging from the snapshot's SIGNED
+              // `stateProof.mptRoot`. `syncFromGlobalSnapshotInfoVerified` is check-then-write: it rebuilds ONLY when a
+              // {GSI ∪ preserved 33/34, GSI alone} candidate reproduces the signed root (always at `numShards = 1` / empty
+              // spent-set) and otherwise raises BEFORE any store write — previously the same mismatch was caught only AFTER
+              // the store was clobbered, by the proof validation below (which stays as the outer full-proof gate).
+              // A legacy pre-MPT snapshot (`mptRoot = None`) keeps the plain rebuild, unchanged.
               _ <- info match {
                 case Left(value) => ().pure[F]
                 case Right(value) =>
-                  mptStore.syncFromGlobalSnapshotInfo(value, ordinal)
+                  snapshot.signed.value.stateProof.mptRoot match {
+                    case None => mptStore.syncFromGlobalSnapshotInfo(value, ordinal)
+                    case signedRoot @ Some(_) =>
+                      mptStore.syncFromGlobalSnapshotInfoVerified(value, ordinal, signedRoot).flatMap {
+                        case true => ().pure[F]
+                        case false =>
+                          new Exception(
+                            s"Persisted snapshot info at ordinal=${ordinal.show} cannot reproduce the snapshot's SIGNED " +
+                              s"stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings are not carried by the GSI). " +
+                              s"FAILING CLOSED rather than replaying atop a wiped cross-shard spent-set."
+                          ).raiseError[F, Unit]
+                      }
+                  }
               }
               result <- (info match {
                 case Left(infoV2) =>

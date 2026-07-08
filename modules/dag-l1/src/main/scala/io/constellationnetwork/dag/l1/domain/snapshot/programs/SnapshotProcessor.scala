@@ -81,6 +81,58 @@ abstract class SnapshotProcessor[
 
   def setInitialLastNSnapshots(snapshot: Hashed[S], state: SI): F[Unit] = Applicative[F].unit
 
+  /** FINDING-S01 — global-MPT mirror maintenance for `processAlignment` (fires only when `state` is a `GlobalSnapshotInfo`, i.e. the gl1
+    * global-follow instantiation).
+    *
+    * The GSI has NO field for the MPT-native consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34 — non-empty at `numShards >
+    * 1`), so a from-GSI rebuild cannot reconstruct them; the plain `syncFromGlobalSnapshotInfo` PRESERVES the store's current 33/34 bytes
+    * verbatim across the clear→rebuild.
+    *
+    *   - `verifyAgainstSignedRoot = true` — the `DownloadNeeded` seed, whose `state` is the FULL GSI pulled from gl0 at bootstrap /
+    *     forced-re-download: reconcile {GSI ∪ preserved 33/34, GSI alone} against the snapshot's SIGNED `stateProof.mptRoot` BEFORE any
+    *     store write (check-then-write; a stale local spent-set is dropped when the target's root says so, closing the
+    *     recomputed-root-≠-signed follow divergence). On `false` DEGRADE to the plain preserving rebuild with a loud WARN — gl1's mirror is
+    *     deliberately not full-root-gated (its follow verifies per-field slice roots, `DAGSnapshotProcessor.applyGlobalSnapshotFn`), so
+    *     failing closed here would wedge a fresh join at `numShards > 1` over partitions gl1 never reads. A legacy snapshot (`mptRoot =
+    *     None`) skips the gate.
+    *   - `verifyAgainstSignedRoot = false` — `AlignedAtNewOrdinal` / `AlignedAtNewHeight` / `RedownloadNeeded`, whose `state` is the
+    *     PARTIAL 5-field GSI built by gl1's slice follow: a partial GSI can NEVER reproduce the signed full root (it lacks the other fields
+    *     by design), so the verified gate is deliberately NOT used; the plain preserving rebuild keeps 33/34 across every per-tick partial
+    *     resync.
+    */
+  private def updateGlobalMptStorage(
+    mptStore: MptStore[F, GlobalStateKey],
+    snapshot: Hashed[S],
+    state: SI,
+    verifyAgainstSignedRoot: Boolean
+  )(
+    implicit hasher: Hasher[F],
+    stateProofSelector: StateProofSelector,
+    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
+  ): F[Unit] =
+    state match {
+      case info: GlobalSnapshotInfo =>
+        val signedMptRoot = snapshot.signed.value match {
+          case g: GlobalIncrementalSnapshot => g.stateProof.mptRoot
+          case _                            => none[Hash]
+        }
+        if (verifyAgainstSignedRoot && signedMptRoot.isDefined)
+          mptStore.syncFromGlobalSnapshotInfoVerified(info, snapshot.ordinal, signedMptRoot).flatMap {
+            case true => Applicative[F].unit
+            case false =>
+              logger.warn(
+                s"global-MPT seed at ord=${snapshot.ordinal.show}: no GSI-rebuild candidate reproduces the snapshot's SIGNED " +
+                  s"stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings are not carried by the GSI — expected at " +
+                  s"numShards > 1 with a non-empty spent-set). DEGRADING to the plain preserving re-encode (gl1's mirror is " +
+                  s"slice-root-verified, not full-root-gated)."
+              ) >>
+                mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
+          }
+        else
+          mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
+      case _ => Applicative[F].unit
+    }
+
   def processAlignment(
     alignment: Alignment,
     blockStorage: BlockStorage[F],
@@ -124,13 +176,10 @@ abstract class SnapshotProcessor[
         val setSnapshot: F[Unit] =
           lastSnapshotStorage.set(snapshot, state)
 
-        // Use syncFullIfNeeded which atomically checks if already synced at this ordinal.
-        // This avoids redundant full syncs since createContext already synced the trie.
-        val updateMptStorage: F[Unit] = state match {
-          case info: GlobalSnapshotInfo =>
-            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
-          case _ => Async[F].unit
-        }
+        // gl1's Aligned* `state` is the PARTIAL slice-built GSI — plain preserving rebuild (no full-root gate); see
+        // `updateGlobalMptStorage`'s FINDING-S01 note.
+        val updateMptStorage: F[Unit] =
+          updateGlobalMptStorage(mptStore, snapshot, state, verifyAgainstSignedRoot = false)
 
         adjustToMajority >>
           markTxRefsAsMajority >>
@@ -173,11 +222,10 @@ abstract class SnapshotProcessor[
         val setSnapshot: F[Unit] =
           lastSnapshotStorage.set(snapshot, state)
 
-        val updateMptStorage: F[Unit] = state match {
-          case info: GlobalSnapshotInfo =>
-            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
-          case _ => Async[F].unit
-        }
+        // gl1's Aligned* `state` is the PARTIAL slice-built GSI — plain preserving rebuild (no full-root gate); see
+        // `updateGlobalMptStorage`'s FINDING-S01 note.
+        val updateMptStorage: F[Unit] =
+          updateGlobalMptStorage(mptStore, snapshot, state, verifyAgainstSignedRoot = false)
 
         adjustToMajority >>
           markTxRefsAsMajority >>
@@ -213,11 +261,11 @@ abstract class SnapshotProcessor[
             .info(s"Setting initial snapshot: ${snapshot.ordinal.show}") >>
             lastSnapshotStorage.setInitial(snapshot, state)
 
-        val updateMptStorage: F[Unit] = state match {
-          case info: GlobalSnapshotInfo =>
-            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
-          case _ => Async[F].unit
-        }
+        // `DownloadNeeded.state` is the FULL GSI pulled from gl0 (bootstrap / forced re-download) and the snapshot's SIGNED
+        // `stateProof.mptRoot` is in hand — root-verify the rebuild BEFORE writing; see `updateGlobalMptStorage`'s
+        // FINDING-S01 note.
+        val updateMptStorage: F[Unit] =
+          updateGlobalMptStorage(mptStore, snapshot, state, verifyAgainstSignedRoot = true)
 
         adjustToMajority >>
           setBalances >>
@@ -266,11 +314,10 @@ abstract class SnapshotProcessor[
         val setSnapshot: F[Unit] =
           lastSnapshotStorage.set(snapshot, state)
 
-        val updateMptStorage: F[Unit] = state match {
-          case info: GlobalSnapshotInfo =>
-            mptStore.syncFromGlobalSnapshotInfo(info, snapshot.ordinal)
-          case _ => Async[F].unit
-        }
+        // gl1's `RedownloadNeeded.state` is the PARTIAL slice-built GSI (from `applySnapshotFn`) — plain preserving rebuild
+        // (no full-root gate); see `updateGlobalMptStorage`'s FINDING-S01 note.
+        val updateMptStorage: F[Unit] =
+          updateGlobalMptStorage(mptStore, snapshot, state, verifyAgainstSignedRoot = false)
 
         adjustToMajority >>
           setBalances >>
