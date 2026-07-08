@@ -140,7 +140,9 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
       IO.pure(validators),
       reg,
       etaForEpoch,
-      kDraw
+      kDraw,
+      kQuorum = 1,
+      slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
     )
 
   test("committeeFor: result is always a SUBSET of the active validator set") { res =>
@@ -177,7 +179,9 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
         IO.pure(Set.empty[PeerId]),
         vrfReg,
         etaForEpoch,
-        kDraw = 4
+        kDraw = 4,
+        kQuorum = 1,
+        slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
       )
       .map(c => expect(c.isEmpty))
   }
@@ -264,7 +268,9 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
       IO.pure(symmetryValidators),
       symmetryVrfReg,
       resolver,
-      symmetryKTarget
+      symmetryKTarget,
+      kQuorum = 1,
+      slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
     )
 
   test("#261 eta axis — ROOT CAUSE: leader getEta(epoch≥2) ≠ buggy-follower getEta (real walk vs no-op→genesis)") { res =>

@@ -352,7 +352,19 @@ object SharedServices {
             // "can't check" (plain `Rejected` — dropped, never admitted unverified, NO slash targets) and `watchtowerReExec` filters it —
             // never a deterministic-mismatch false slash.
             withDiff(mg, binaries, anchor, diffBaseOrdinal).map(_.map(_._1).getOrElse(io.constellationnetwork.security.hash.Hash.empty))
-        }
+        },
+        // FINDING-002/EPIC-3.1 — slash-cooldown committee exclusion. Reads the `Slashings` (fieldId 34) records off the SAME
+        // finalized-base `storages.mptStore` the committee draw's eta resolver (`sharedEtaForPeriod` → HistoricalStakeReader) reads,
+        // pinned per epoch at the anchor `(epoch−1)·R − 1` (R = the SAME `etaRotationSnapshots` the GSAM boundary writer uses) — a pure
+        // function of the wire-carried `checkpoint.epoch` over append-only consensus records in the k₁ write-frozen prefix, so every
+        // node on every path that runs `verifyEmbedded` (produce + validateArtifact + follower createContext) excludes the identical
+        // set (#261 split-safety; see SlashCooldownReader's scaladoc for the full uniformity argument).
+        slashCooldownReader = Some(
+          io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.fromMptStore[F](
+            storages.mptStore,
+            cfg.nakamoto.etaRotationSnapshots(cfg.environment).value
+          )(Async[F], HasherSelector[F].getCurrent)
+        )
       )(Async[F], HasherSelector[F].getCurrent, implicitly[SecurityProvider[F]], implicitly[Metrics[F]])
       // WATCHTOWER on-chain dispute verdict for the `createContext` GSAM (W3a). gl0 followers re-derive the GSI via `createContext` and must
       // reproduce the signed snapshot's mptRoot — which reflects any watchtower slash — so this GSAM must apply the SAME slash. Built with
