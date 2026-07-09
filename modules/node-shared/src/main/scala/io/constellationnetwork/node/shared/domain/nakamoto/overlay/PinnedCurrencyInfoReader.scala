@@ -37,7 +37,12 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *      committed root).
   *
   * A `None` from a clean verify (the metagraph simply had no reconstructible state at the verified anchor) is indistinguishable from a
-  * reject by design: the future I-PIN consumer treats every `None` as "no pinned prior — hard reject", never as "read HEAD instead".
+  * reject ON THE `Option` METHODS by design: the future I-PIN consumer treats every `None` as "no pinned prior — hard reject", never as
+  * "read HEAD instead". The byteDiff-ADOPT consumer is the exception — it MUST tell the two apart (a genuinely unreadable anchor is
+  * fail-closed, but a VERIFIED anchor at which this metagraph simply has no committed state is the brand-new-MG genesis seam, where the
+  * producer seeds `emptyInfo` via `getOrElse` — see `ShardCheckpointWiring.reExecDerivationWithDiff`). That consumer uses the THREE-VALUED
+  * [[readAtOrdinalVerified]] ([[PinnedCurrencyInfoReader.PinnedAnchorRead]]); every other consumer keeps the collapsed `Option` view
+  * unchanged.
   *
   * '''Retention (version depth this reader can serve depends ENTIRELY on the injected `byteStore`):'''
   *   - gl0 produce/validate rail: `byteStore` = the `signedBytesStore` (`<mptSnapshotInfoPath>_signed`,
@@ -97,6 +102,27 @@ trait PinnedCurrencyInfoReader[F[_]] {
     metagraphId: Address
   ): F[Option[CurrencySnapshotInfo]]
 
+  /** Track-1 diff-base-pin GENESIS SEAM — the THREE-VALUED sibling of [[readAtOrdinal]], for the byteDiff-ADOPT consumer ONLY
+    * (`GlobalSnapshotAcceptanceManager.pinnedPriorInfoOf`). Same self-resolve + verify contract, but the result DISAMBIGUATES the two
+    * outcomes [[readAtOrdinal]] collapses into one `None`:
+    *
+    *   - [[PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorUnreadable]] — the ANCHOR step itself failed (no finalized snapshot resolvable
+    *     at `ordinal`, no committed `stateProof.mptRoot`, retained bytes evicted/absent, or bytes that do not recompute the pinned root).
+    *     The adopter MUST stay FAIL-CLOSED here: never adopt over a wrong/unverifiable prior.
+    *   - `AnchorVerified(None)` — the anchor VERIFIED CLEANLY (retained bytes reproduce the pinned committed root) and this metagraph
+    *     simply has NO committed currency state there. Absence under a verified pinned root is itself a pinned fact (MPT non-inclusion), so
+    *     every honest node derives it identically — the adopter mirrors the producer's `getOrElse(emptyInfo)` genesis seam
+    *     (`ShardCheckpointWiring.reExecDerivationWithDiff`), which is what lets a NEVER-before-adopted metagraph's first checkpoint onboard
+    *     at `numShards >= 2`.
+    *   - `AnchorVerified(Some(info))` — the anchor verified and the pinned per-MG prior reconstructed.
+    *
+    * [[readAtOrdinal]] is exactly this method with `.toOption` applied — existing `Option` consumers are untouched.
+    */
+  def readAtOrdinalVerified(
+    ordinal: SnapshotOrdinal,
+    metagraphId: Address
+  ): F[PinnedCurrencyInfoReader.PinnedAnchorRead[CurrencySnapshotInfo]]
+
   /** Track-1 diff-base-pin — a version-retained, self-resolving WHOLE-GLOBAL [[GlobalStateReader]] pinned at the finalized snapshot at
     * `ordinal`. Where [[readAtOrdinal]] returns one metagraph's `CurrencySnapshotInfo`, this hands back a full reader over the verified
     * retained bytes so the committee/watchtower `reExecDerivationWithDiff` can seed BOTH its derivation prior
@@ -110,6 +136,36 @@ trait PinnedCurrencyInfoReader[F[_]] {
 }
 
 object PinnedCurrencyInfoReader {
+
+  /** The THREE-VALUED pinned-read result for the byteDiff-ADOPT consumer (see [[PinnedCurrencyInfoReader.readAtOrdinalVerified]]).
+    *
+    * The split is made at the ANCHOR-VERIFY seam: every branch of `withVerifiedAnchorBytes` that rejects BEFORE the retained bytes are
+    * proven to reproduce the pinned committed root is [[PinnedAnchorRead.AnchorUnreadable]]; once the bytes verify, the per-partition
+    * reconstruction's own `Option` is carried VERBATIM inside [[PinnedAnchorRead.AnchorVerified]] (`None` = the metagraph has no committed
+    * state under the VERIFIED root — a pinned fact, not a failure).
+    *
+    * `toOption` collapses back to the legacy `Option` view (`AnchorUnreadable → None`, `AnchorVerified(r) → r`), which is how the existing
+    * `Option`-shaped methods are implemented — their observable semantics are byte-identical to before this ADT existed.
+    */
+  sealed trait PinnedAnchorRead[+A] {
+    def toOption: Option[A] = this match {
+      case PinnedAnchorRead.AnchorUnreadable    => None
+      case PinnedAnchorRead.AnchorVerified(res) => res
+    }
+  }
+
+  object PinnedAnchorRead {
+
+    /** The anchor step failed: no snapshot at the ordinal / hash-pin miss / no committed `mptRoot` / bytes evicted / root mismatch. The
+      * consumer must FAIL-CLOSED (drop/defer) — the prior is unverifiable.
+      */
+    case object AnchorUnreadable extends PinnedAnchorRead[Nothing]
+
+    /** The anchor VERIFIED (retained bytes reproduce the pinned committed root); `result` is the per-MG reconstruction over those verified
+      * bytes — `None` iff the metagraph has no committed state at the verified anchor (MPT non-inclusion, cluster-uniform).
+      */
+    final case class AnchorVerified[+A](result: Option[A]) extends PinnedAnchorRead[A]
+  }
 
   /** @param byteStore
     *   the version-retained, per-ordinal state-bytes store this reader reads at the anchor. Its retention (contiguous depth vs logarithmic
@@ -148,18 +204,26 @@ object PinnedCurrencyInfoReader {
       ordinal: SnapshotOrdinal,
       metagraphId: Address
     ): F[Option[CurrencySnapshotInfo]] =
+      // The legacy Option view: exactly the three-valued read, collapsed. `AnchorUnreadable → None` and `AnchorVerified(None) → None`
+      // remain conflated HERE by design (I-PIN-style consumers hard-reject both); only the byteDiff-adopt consumer needs the split.
+      readAtOrdinalVerified(ordinal, metagraphId).map(_.toOption)
+
+    def readAtOrdinalVerified(
+      ordinal: SnapshotOrdinal,
+      metagraphId: Address
+    ): F[PinnedAnchorRead[CurrencySnapshotInfo]] =
       // SELF-RESOLVE the pin: the diff-base pin is THE finalized snapshot at `ordinal` on this node's chain, not an independently-carried
-      // hash. Resolve it once, then run the identical verify+reconstruct as `readAt`. `None` snapshot ⇒ hard-reject (base not on this
-      // chain / not yet reached) — the adopter treats that as defer-or-fail-closed per its own base-vs-diffBaseOrdinal gate.
+      // hash. Resolve it once, then run the identical verify+reconstruct as `readAt`. `None` snapshot ⇒ ANCHOR-UNREADABLE (base not on
+      // this chain / not yet reached) — the adopter treats that as defer-or-fail-closed per its own base-vs-diffBaseOrdinal gate.
       getGlobalSnapshotByOrdinal(ordinal).flatMap {
         case Some(snap) =>
-          withVerifiedAnchorBytes(ordinal, snap.hash, s"mg=${metagraphId.show}", "CurrencySnapshotInfo")(
+          withVerifiedAnchorBytesR(ordinal, snap.hash, s"mg=${metagraphId.show}", "CurrencySnapshotInfo")(
             reconstructPerMgInfo(_, metagraphId)
           )
         case None =>
           logger.debug(
             s"[diff-base-pin] no finalized snapshot resolvable at pinned ord=${ordinal.show} — hard-reject CurrencySnapshotInfo for mg=${metagraphId.show}"
-          ) >> none[CurrencySnapshotInfo].pure[F]
+          ) >> (PinnedAnchorRead.AnchorUnreadable: PinnedAnchorRead[CurrencySnapshotInfo]).pure[F]
       }
 
     def pinnedReaderAt(
@@ -177,11 +241,10 @@ object PinnedCurrencyInfoReader {
       }
 
     /** Pin to the EXACT canonical snapshot at `ordinal`, verify the retained state bytes reproduce its committed `mptRoot`, and hand them
-      * to `reconstruct`. Returns `None` (NEVER a HEAD fallback) on any miss along the way — no resolvable snapshot at `ordinal`, hash ≠ the
-      * pinned hash (a fork's snapshot, or one this node can't resolve), no committed `mptRoot` (BFT/pre-MPT), retained bytes
-      * evicted/absent, or retained bytes that do not recompute the pinned root. Shared by [[readAt]] / [[readMetagraphSyncDataAt]] (I-PIN,
-      * hash carried) and [[readAtOrdinal]] / [[pinnedReaderAt]] (diff-base-pin, hash self-resolved) so all honor one pin+verify+hard-reject
-      * contract; they differ only in which partition they reconstruct from the verified bytes. `ctx` is a human label for the log lines.
+      * to `reconstruct` — the collapsed `Option` view of [[withVerifiedAnchorBytesR]]. Returns `None` (NEVER a HEAD fallback) on any miss
+      * along the way — anchor failures AND a clean-verify-but-absent reconstruction alike. Shared by [[readAt]] /
+      * [[readMetagraphSyncDataAt]] (I-PIN, hash carried) and [[pinnedReaderAt]] (diff-base-pin, hash self-resolved) so all honor one
+      * pin+verify+hard-reject contract; they differ only in which partition they reconstruct from the verified bytes.
       */
     private def withVerifiedAnchorBytes[A](
       ordinal: SnapshotOrdinal,
@@ -189,20 +252,36 @@ object PinnedCurrencyInfoReader {
       ctx: String,
       what: String
     )(reconstruct: Map[Hex, Array[Byte]] => F[Option[A]]): F[Option[A]] =
+      withVerifiedAnchorBytesR(ordinal, expectedGlobalSnapshotHash, ctx, what)(reconstruct).map(_.toOption)
+
+    /** THREE-VALUED core of the pin+verify contract — the anchor-vs-absent split is made HERE. Every reject BEFORE the retained bytes are
+      * proven to reproduce the pinned committed root is `AnchorUnreadable` (no resolvable snapshot at `ordinal`, hash ≠ the pinned hash — a
+      * fork's snapshot or one this node can't resolve, no committed `mptRoot` (BFT/pre-MPT), retained bytes evicted/absent, or retained
+      * bytes that do not recompute the pinned root); once the bytes VERIFY, the reconstruction's own `Option` is carried verbatim as
+      * `AnchorVerified(_)` (`None` = nothing committed for the requested partition under the VERIFIED root — a pinned fact). NEVER a HEAD
+      * fallback on any path. `ctx` is a human label for the log lines.
+      */
+    private def withVerifiedAnchorBytesR[A](
+      ordinal: SnapshotOrdinal,
+      expectedGlobalSnapshotHash: Hash,
+      ctx: String,
+      what: String
+    )(reconstruct: Map[Hex, Array[Byte]] => F[Option[A]]): F[PinnedAnchorRead[A]] = {
+      val unreadable: F[PinnedAnchorRead[A]] = (PinnedAnchorRead.AnchorUnreadable: PinnedAnchorRead[A]).pure[F]
       getGlobalSnapshotByOrdinal(ordinal).flatMap {
         case Some(snap) if snap.hash === expectedGlobalSnapshotHash =>
           snap.signed.value.stateProof.mptRoot match {
             case None =>
               logger.debug(
                 s"[2a] pinned snapshot ord=${ordinal.show} carries no committed mptRoot (BFT/pre-MPT) — hard-reject $what for $ctx"
-              ) >> none[A].pure[F]
+              ) >> unreadable
             case Some(expectedMptRoot) =>
               byteStore.readState(ordinal).flatMap {
                 case None =>
                   // Retained state bytes evicted/absent at the anchor (store retention doesn't reach this depth) — hard-reject, no fallback.
                   logger.debug(
                     s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject $what for $ctx"
-                  ) >> none[A].pure[F]
+                  ) >> unreadable
                 case Some(bytes) =>
                   GlobalSnapshotInfo.sidecarFreeMptRoot[F](bytes).flatMap { computedRoot =>
                     if (computedRoot =!= expectedMptRoot)
@@ -210,17 +289,20 @@ object PinnedCurrencyInfoReader {
                       logger.debug(
                         s"[2a] retained bytes at pinned ord=${ordinal.show} recompute mptRoot=${computedRoot.show} ≠ pinned " +
                           s"stateProof.mptRoot=${expectedMptRoot.show} — hard-reject $what for $ctx"
-                      ) >> none[A].pure[F]
+                      ) >> unreadable
                     else
-                      reconstruct(bytes)
+                      // ANCHOR VERIFIED — the reconstruction's own Option is now a pinned fact (Some = the committed value, None = the
+                      // requested partition has nothing committed under this verified root), NOT a failure.
+                      reconstruct(bytes).map(PinnedAnchorRead.AnchorVerified(_): PinnedAnchorRead[A])
                   }
               }
           }
         case _ =>
           logger.debug(
             s"[2a] no canonical snapshot at pinned ord=${ordinal.show} matching hash=${expectedGlobalSnapshotHash.show} — hard-reject $what for $ctx"
-          ) >> none[A].pure[F]
+          ) >> unreadable
       }
+    }
 
     /** Load the verified byte map into a throwaway in-memory store and expose it as a whole-global [[GlobalStateReader]] — the SAME
       * `fromMptStore` adapter every finalized-reader path uses, so a `reExecDerivationWithDiff` seeded from this reader is byte-identical

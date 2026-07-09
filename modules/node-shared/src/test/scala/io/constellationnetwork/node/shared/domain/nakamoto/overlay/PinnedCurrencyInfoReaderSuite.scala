@@ -340,4 +340,116 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
       } yield expect(wrongRoot =!= root) && expect(got.isEmpty)
     }
   }
+
+  // ===========================================================================
+  // Track-1 diff-base-pin GENESIS SEAM: readAtOrdinalVerified — the THREE-VALUED read for the byteDiff-adopt consumer.
+  // The anchor-vs-absent split: every anchor failure ⇒ AnchorUnreadable (fail-closed); a clean verify carries the per-MG
+  // reconstruction's own Option verbatim (None = the MG has no committed state under the VERIFIED root — a pinned fact,
+  // the brand-new-MG first advance the old Option view conflated with the failures).
+  // ===========================================================================
+
+  import PinnedCurrencyInfoReader.PinnedAnchorRead
+
+  test("readAtOrdinalVerified VERIFIED-PRESENT: clean verify + MG committed at the anchor ⇒ AnchorVerified(Some(oracle))") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, oracle) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtOrdinalVerified(ord(10L), mg)
+      } yield
+        expect(oracle.isDefined) &&
+          expect(got == PinnedAnchorRead.AnchorVerified(oracle))
+    }
+  }
+
+  test("readAtOrdinalVerified VERIFIED-ABSENT: clean verify but the queried MG has NO state at the anchor ⇒ AnchorVerified(None)") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      val mgAbsent = addr("mg-never-seen-at-anchor")
+      for {
+        boe <- buildBytesAndOracle // bytes carry ONLY `mg` — the anchor verifies with real content, `mgAbsent` is not in it
+        (bytes, root, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtOrdinalVerified(ord(10L), mgAbsent)
+        // BLAST-RADIUS GUARD: the legacy Option view still collapses this to None (I-PIN-style consumers unchanged).
+        gotOption <- reader.readAtOrdinal(ord(10L), mgAbsent)
+      } yield
+        expect(got == PinnedAnchorRead.AnchorVerified(none[CurrencySnapshotInfo])) &&
+          expect(gotOption.isEmpty)
+    }
+  }
+
+  test("readAtOrdinalVerified UNREADABLE (no snapshot): nothing resolvable at the anchor ordinal ⇒ AnchorUnreadable") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, _, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        resolver = (_: SnapshotOrdinal) => none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtOrdinalVerified(ord(10L), mg)
+      } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
+    }
+  }
+
+  test("readAtOrdinalVerified UNREADABLE (no mptRoot): pinned snapshot carries no committed root (BFT/pre-MPT) ⇒ AnchorUnreadable") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, _, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, mptRoot = None)
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtOrdinalVerified(ord(10L), mg)
+      } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
+    }
+  }
+
+  test("readAtOrdinalVerified UNREADABLE (evicted bytes): no retained state bytes at the anchor ⇒ AnchorUnreadable, NOT verified-absent") {
+    res =>
+      implicit val (h, _, js) = res
+      Files[IO].tempDirectory.use { dir =>
+        for {
+          boe <- buildBytesAndOracle
+          (_, root, _) = boe
+          byteStore <- MptStateStorage.make[IO](dir) // deliberately EMPTY at the anchor
+          pinned <- mkHashed(20L, Some(root))
+          resolver = (o: SnapshotOrdinal) => (if (o === ord(20L)) pinned.some else none).pure[IO]
+          reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+          got <- reader.readAtOrdinalVerified(ord(20L), mg)
+        } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
+      }
+  }
+
+  test("readAtOrdinalVerified UNREADABLE (root mismatch): retained bytes don't reproduce the pinned root ⇒ AnchorUnreadable") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(30L), bytes)
+        wrongRoot = Hash("00" * 32)
+        pinned <- mkHashed(30L, Some(wrongRoot))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(30L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtOrdinalVerified(ord(30L), mg)
+      } yield expect(wrongRoot =!= root) && expect(got == PinnedAnchorRead.AnchorUnreadable)
+    }
+  }
 }

@@ -40,6 +40,8 @@ import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
+import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
 import io.constellationnetwork.schema.tokenLock._
@@ -47,6 +49,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
@@ -54,6 +57,7 @@ import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSna
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosInt}
+import fs2.io.file.Files
 import weaver.MutableIOSuite
 
 /** S0 of the sharded-currency-mirror endgame (docs/nakamoto/SHARDED-CURRENCY-MIRROR-ENDGAME-PLAN.md).
@@ -208,7 +212,10 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     mg: Address,
     binary: Signed[StateChannelSnapshotBinary],
     diff: ShardCurrencyStateDiff,
-    attestedRoot: Hash
+    attestedRoot: Hash,
+    // Track-1 diff-base-pin: the committee-stamped pinned base. `MinValue` (the schema default) keeps every pre-pin test on the
+    // never-defer arm; the genesis-seam tests (E)/(F)/(G) stamp a REAL base so `pinnedPriorInfoOf` reads through the wired reader.
+    diffBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
   ): ShardCheckpoint =
     ShardCheckpoint(
       shardId = ShardId.unsafeApply(0),
@@ -226,7 +233,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       ),
       emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig),
-      epoch = epochZero
+      epoch = epochZero,
+      diffBaseOrdinal = diffBaseOrdinal
     )
 
   // ============================================================================
@@ -473,7 +481,12 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   private def mkManager(
     overlay: MptOverlay[IO, GlobalStateKey],
     stateChannelEventsProcessor: GlobalSnapshotStateChannelEventsProcessor[IO],
-    checkpointManager: ShardCheckpointGl0AcceptanceManager[IO]
+    checkpointManager: ShardCheckpointGl0AcceptanceManager[IO],
+    // Genesis-seam tests (E)/(F)/(G)/(H): the Track-1 pinned diff-base reader. Production wires it UNCONDITIONALLY at both GSAM
+    // sites (GlobalSnapshotConsensus + SharedServices); the `None` default keeps every pre-existing test on the `priorInfoOf`
+    // fallback arm — byte-identical to the suite before this parameter existed.
+    pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[IO]] = None,
+    numShards: Int = 4
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {
     val mockBlockAcceptanceManager: BlockAcceptanceManager[IO] = new BlockAcceptanceManager[IO] {
       override def acceptBlocksIteratively(
@@ -628,9 +641,10 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
           withdrawalTimeLimit = EpochProgress(4L),
           loggerBundle = loggerBundle,
           overlay = overlay,
-          shardingConfig = Some(mkShardingConfig(4)),
+          shardingConfig = Some(mkShardingConfig(numShards)),
           shardCheckpointAcceptanceManager = Some(checkpointManager),
-          shardAssignment = Some(ShardAssignment.make[IO](numShards = 4)),
+          shardAssignment = Some(ShardAssignment.make[IO](numShards = numShards)),
+          pinnedCurrencyInfoReader = pinnedCurrencyInfoReader,
           etaRotationSnapshots = 2550L,
           invaliditySlashingConfig = InvalidStateProofSlashingConfig(
             watchtowerEnabled = true,
@@ -924,5 +938,375 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
           // Yet the MG ADOPTS — the field-presence gate skips the None fields instead of fail-closing on Some(empty)-vs-None.
           advancedTo(gsi, mg, nextInfo)
         )
+  }
+
+  // ============================================================================
+  // (E)/(F)/(G)/(H) GENESIS-SEAM — the diff-base-pin two-`None` disambiguation (Track-1, eb9bf9a5e follow-up).
+  //
+  // At numShards >= 2 the FIRST checkpoint of a NEVER-before-adopted metagraph pins its diff prior at `diffBaseOrdinal` via the
+  // wired `PinnedCurrencyInfoReader.readAtOrdinal`. The anchor VERIFIES cleanly (it is finalized history every node retains) but
+  // the brand-new MG has no committed currency state there, so the per-MG lookup is `None` — which the adopter conflated with the
+  // genuinely-unreadable-anchor `None` and FAIL-CLOSED DROPPED, total (neither currency state nor SC tip advance ⇒ the MG can
+  // never onboard; `lastStateChannelSnapshotHashes` stays `{}` forever). The producer meanwhile seeds `emptyInfo` for an absent
+  // MG (`ShardCheckpointWiring.reExecDerivationWithDiff`'s `priorInfoOpt.getOrElse(emptyInfo)`), so the checkpoint itself is
+  // honest and verifiable. The fix makes the pinned read THREE-VALUED (`readAtOrdinalVerified`): AnchorUnreadable ⇒ keep the
+  // fail-closed drop; AnchorVerified(None) ⇒ the producer-mirroring `emptyInfo`; AnchorVerified(Some(info)) ⇒ the pinned prior.
+  // ============================================================================
+
+  /** BYTE-IDENTICAL to the producer's `emptyInfo` (`ShardCheckpointWiring`) and the GSAM's `emptyInfo` genesis arm. */
+  private val emptyInfoVal: CurrencySnapshotInfo =
+    CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
+
+  /** The committee-stamped pinned base for the genesis-seam tests — a REAL ordinal (> MinValue) so the bounded-defer gate and the pinned
+    * read both engage exactly as in production.
+    */
+  private val diffBase: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
+
+  /** A minimal `Hashed[GlobalIncrementalSnapshot]` at `ordinal` whose `stateProof.mptRoot` is `mptRoot` — the canonical finalized snapshot
+    * the pinned reader self-resolves the diff-base pin against. Mirrors PinnedCurrencyInfoReaderSuite's fixture.
+    */
+  private def mkHashedGlobal(
+    ordinal: SnapshotOrdinal,
+    mptRoot: Option[Hash]
+  )(implicit h: Hasher[IO]): IO[Hashed[GlobalIncrementalSnapshot]] = {
+    val unsigned = GlobalIncrementalSnapshot(
+      ordinal = ordinal,
+      height = Height(NonNegLong(0L)),
+      subHeight = SubHeight(NonNegLong(0L)),
+      lastSnapshotHash = Hash.empty,
+      blocks = SortedSet.empty,
+      stateChannelSnapshots = SortedMap.empty,
+      shardCheckpoints = SortedMap.empty,
+      rewards = SortedSet.empty,
+      delegateRewards = None,
+      epochProgress = EpochProgress(NonNegLong(0L)),
+      nextFacilitators = NonEmptyList.of(PeerId(Hex("0d" * 64))),
+      tips = SnapshotTips(SortedSet.empty, SortedSet.empty),
+      stateProof = GlobalSnapshotStateProof(
+        Hash.empty,
+        Hash.empty,
+        Hash.empty,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        mptRoot,
+        None,
+        None
+      ),
+      allowSpendBlocks = None,
+      tokenLockBlocks = None,
+      spendActions = None,
+      updateNodeParameters = None,
+      artifacts = None,
+      activeDelegatedStakes = None,
+      delegatedStakesWithdrawals = None,
+      activeNodeCollaterals = None,
+      nodeCollateralWithdrawals = None,
+      version = SnapshotVersion("0.0.1"),
+      slotCertificate = None,
+      eta = None
+    )
+    Signed(unsigned, NonEmptySet.of(SignatureProof(PeerId(Hex("0d" * 64)).toId, Signature(Hex("0e" * 64)))))
+      .toHashed[IO]
+  }
+
+  /** Stand up the cluster-uniform PINNED history at [[diffBase]]: a version-retained byte store holding `state`'s committed bytes plus a
+    * finalized snapshot whose `stateProof.mptRoot` those bytes reproduce (or `mptRootOverride` — pass a wrong root to model the
+    * genuinely-UNREADABLE anchor: retained bytes that do not recompute the pinned committed root, i.e. a fork/corruption). Returns the
+    * wired `PinnedCurrencyInfoReader` the GSAM-under-test consumes.
+    */
+  private def mkPinnedReaderOver(
+    dir: fs2.io.file.Path,
+    state: SortedMap[Address, CurrencySnapshotWithState],
+    mptRootOverride: Option[Hash] = None
+  )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
+    for {
+      bytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](state)
+      root <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](bytes)
+      byteStore <- MptStateStorage.make[IO](dir)
+      _ <- byteStore.writeState(diffBase, bytes)
+      pinnedSnap <- mkHashedGlobal(diffBase, Some(mptRootOverride.getOrElse(root)))
+      resolver = (o: SnapshotOrdinal) => (if (o === diffBase) pinnedSnap.some else none[Hashed[GlobalIncrementalSnapshot]]).pure[IO]
+    } yield PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+
+  /** A `GlobalSnapshotInfo` with NO currency state at all — the "never seen by gl0" prior for the genesis-seam tests. */
+  private val gsiEmpty: GlobalSnapshotInfo =
+    GlobalSnapshotInfo(
+      lastStateChannelSnapshotHashes = SortedMap.empty,
+      lastTxRefs = SortedMap.empty,
+      balances = SortedMap.empty,
+      lastCurrencySnapshots = SortedMap.empty,
+      lastCurrencySnapshotsProofs = SortedMap.empty,
+      activeAllowSpends = None,
+      activeTokenLocks = None,
+      tokenLockBalances = None,
+      lastAllowSpendRefs = None,
+      lastTokenLockRefs = None,
+      updateNodeParameters = None,
+      activeDelegatedStakes = None,
+      delegatedStakesWithdrawals = None,
+      activeNodeCollaterals = Some(SortedMap.empty),
+      nodeCollateralWithdrawals = Some(SortedMap.empty),
+      priceState = Some(SortedMap.empty),
+      metagraphSyncData = Some(SortedMap.empty),
+      historicalStakeSnapshots = SortedMap.empty
+    )
+
+  /** Like [[runAccept]] but also returns the committed state proof's `mptRoot` (tuple element `_10`) — the byte-identity observable for the
+    * numShards=1 regression bar (H).
+    */
+  private def runAcceptWithRoot(
+    mgr: GlobalSnapshotAcceptanceManager[IO],
+    checkpoint: ShardCheckpoint,
+    parentTip: BranchId,
+    lastSnapshotInfo: GlobalSnapshotInfo
+  ): IO[(GlobalSnapshotInfo, Option[Hash])] =
+    mgr
+      .accept(
+        ordinal = acceptOrdinal,
+        epochProgress = EpochProgress(10L),
+        previousEpochProgress = EpochProgress.MinValue,
+        blocksForAcceptance = List.empty,
+        allowSpendBlocksForAcceptance = List.empty,
+        tokenLockBlocksForAcceptance = List.empty,
+        scEvents = List.empty,
+        unpEvents = List.empty,
+        cdsEvents = List.empty,
+        wdsEvents = List.empty,
+        cncEvents = List.empty,
+        wncEvents = List.empty,
+        lastSnapshotContext = lastSnapshotInfo,
+        lastActiveTips = SortedSet.empty,
+        lastDeprecatedTips = SortedSet.empty,
+        calculateRewardsFn = noopRewardsFn,
+        validationType = StateChannelValidationType.Full,
+        getGlobalSnapshotByOrdinal = _ => None.pure[IO],
+        parentTip = parentTip,
+        shardCheckpoints = SortedMap(checkpoint.shardId -> checkpoint)
+      )
+      .map(r => (r._9, r._10.mptRoot))
+
+  // The never-seen metagraph + the unrelated MG that gives the anchor (and the adopter's base) real, verifiable content.
+  private val mgNew: Address = mkAddress("genesis-seam-new-mg")
+  private val mgOther: Address = mkAddress("genesis-seam-other-mg")
+  private val otherHolder: Address = mkAddress("genesis-seam-other-holder")
+
+  /** The anchor's committed currency state at [[diffBase]]: ONLY `mgOther` — so the anchor verifies cleanly with real content while `mgNew`
+    * is genuinely ABSENT there (MPT non-inclusion under a verified pinned root — itself a pinned fact).
+    */
+  private def otherOnlyState: SortedMap[Address, CurrencySnapshotWithState] =
+    SortedMap(mgOther -> (Right((mkSignedIncremental(1L), infoWithBalance(otherHolder, 50L))): CurrencySnapshotWithState))
+
+  /** Seed the GSAM's own finalized base with `mgOther` only and commit it at [[diffBase]] so the bounded-defer gate sees the pinned base as
+    * reached (`lastPersistedOrdinal = Some(diffBase)`), exactly the production shape when the stuck checkpoint re-offers.
+    */
+  private def seedOtherOnlyBase(
+    store: MptStore[IO, GlobalStateKey]
+  )(implicit h: Hasher[IO]): IO[Unit] =
+    seedBaseAndRoundTrip(store, mgOther, mkSignedIncremental(1L), infoWithBalance(otherHolder, 50L)).void >>
+      store.commit(diffBase)
+
+  // ============================================================================
+  // (E) THE GENESIS SEAM — RED (pre-fix): the never-seen MG is FAIL-CLOSED DROPPED because the clean-verify `None` is conflated
+  //     with the unreadable-anchor `None`. GREEN (post-fix): `AnchorVerified(None)` seeds the producer-mirroring `emptyInfo`, the
+  //     diff applies, PIN-1 recomputed === attested, GAP-1 binds, and the MG ONBOARDS (currency state + SC tip both advance).
+  // ============================================================================
+
+  test("(E) GENESIS-SEAM: never-seen MG, wired pinned reader, VERIFIED anchor with no per-MG state ⇒ adopts over emptyInfo") { res =>
+    implicit val (h, sp, j) = res
+    Files[IO].tempDirectory.use { dir =>
+      val nextGenesis = infoWithBalance(holder, 200L)
+      for {
+        tipProof <- nextGenesis.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+        inc = mkSignedIncremental(2L, tipProof)
+        // The pinned history every honest node retains: the anchor at `diffBase` verifies (bytes reproduce the committed root)
+        // and carries ONLY mgOther — mgNew's per-MG lookup at the VERIFIED anchor is None (the brand-new-MG first advance).
+        pinnedReader <- mkPinnedReaderOver(dir, otherOnlyState)
+        // The adopter's own base: same unrelated content, committed at diffBase (bounded-defer gate passes).
+        store <- freshStore
+        _ <- seedOtherOnlyBase(store)
+        // PRODUCER SEMANTICS (ShardCheckpointWiring `priorInfoOpt.getOrElse(emptyInfo)`): the diff is cut over the EMPTY prior;
+        // the attested root is over the post-window state. An adopter that seeds the identical empty prior reproduces it exactly.
+        truth <- producerTruth(mgNew, inc, emptyInfoVal, nextGenesis)
+        (wireDiff, attestedRoot) = truth
+        recomputedOverEmpty <- followerRecomputeRoot(mgNew, inc, emptyInfoVal, wireDiff)
+        checkpoint = mkRightArmCheckpoint(mgNew, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
+        ob <- mkOverlayWithBranch(store, mgNew, inc, emptyInfoVal, branchPrior = None)
+        (overlay, baseTip) = ob
+        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        mgr <- mkManager(
+          overlay,
+          derivingProcessor(inc, emptyInfoVal),
+          StubAcceptanceManager(callsRef),
+          pinnedCurrencyInfoReader = Some(pinnedReader)
+        )
+        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiEmpty)
+        calls <- callsRef.get
+      } yield
+        expect.all(
+          // The checkpoint was verified and the adopt path ran (not deferred on the diff-base axis) ...
+          calls.size == 1,
+          // ... the producer-mirror at the prior level: the EMPTY prior reproduces the committee-attested root exactly
+          // (`AnchorVerified(None) -> emptyInfo` is byte-identical to the producer's `getOrElse(emptyInfo)`) ...
+          recomputedOverEmpty == attestedRoot,
+          // ... and end-to-end the never-seen MG ONBOARDS: its committed currency state advances to the attested `next` ...
+          advancedTo(gsi, mgNew, nextGenesis),
+          // ... AND its SC tip advances (pre-fix the drop was TOTAL: `lastStateChannelSnapshotHashes` stayed {} forever).
+          gsi.lastStateChannelSnapshotHashes.contains(mgNew)
+        )
+    }
+  }
+
+  // ============================================================================
+  // (F) THE SAFETY NET — a genuinely UNREADABLE anchor must STILL fail-closed drop (do not let the genesis-seam fix weaken it).
+  // ============================================================================
+
+  test("(F) SAFETY NET: AnchorUnreadable (retained bytes don't reproduce the pinned root) ⇒ STILL fail-closed DROP, total") { res =>
+    implicit val (h, sp, j) = res
+    Files[IO].tempDirectory.use { dir =>
+      val nextGenesis = infoWithBalance(holder, 200L)
+      for {
+        tipProof <- nextGenesis.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+        inc = mkSignedIncremental(2L, tipProof)
+        // The UNREADABLE anchor: bytes retained, but the pinned snapshot's committed root does NOT match (fork/corruption) —
+        // one of the four hard-reject branches in `withVerifiedAnchorBytes`. This must NEVER be adopted over a guessed prior.
+        pinnedReader <- mkPinnedReaderOver(dir, otherOnlyState, mptRootOverride = Some(Hash("00" * 32)))
+        store <- freshStore
+        _ <- seedOtherOnlyBase(store)
+        truth <- producerTruth(mgNew, inc, emptyInfoVal, nextGenesis)
+        (wireDiff, attestedRoot) = truth
+        checkpoint = mkRightArmCheckpoint(mgNew, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
+        ob <- mkOverlayWithBranch(store, mgNew, inc, emptyInfoVal, branchPrior = None)
+        (overlay, baseTip) = ob
+        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        mgr <- mkManager(
+          overlay,
+          derivingProcessor(inc, emptyInfoVal),
+          StubAcceptanceManager(callsRef),
+          pinnedCurrencyInfoReader = Some(pinnedReader)
+        )
+        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiEmpty)
+        calls <- callsRef.get
+      } yield
+        expect.all(
+          calls.size == 1,
+          // FAIL-CLOSED and TOTAL: neither the currency state nor the SC tip advances over an unreadable/forked anchor.
+          !advancedTo(gsi, mgNew, nextGenesis),
+          !gsi.lastCurrencySnapshots.contains(mgNew),
+          !gsi.lastStateChannelSnapshotHashes.contains(mgNew)
+        )
+    }
+  }
+
+  // ============================================================================
+  // (G) WIRED-READER CONTROL — AnchorVerified(Some(info)): the pinned prior is applied VERBATIM (the fix routes it unchanged).
+  // ============================================================================
+
+  test("(G) WIRED-READER CONTROL: anchor VERIFIES and carries the MG's prior ⇒ pinned prior applied verbatim, MG adopts") { res =>
+    implicit val (h, sp, j) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+        inc = mkSignedIncremental(2L, tipProof)
+        // The anchor carries THIS MG's prior state (the steady-state shape after onboarding).
+        anchorState = SortedMap(mg -> (Right((inc, basePriorRaw)): CurrencySnapshotWithState))
+        pinnedReader <- mkPinnedReaderOver(dir, anchorState)
+        // The diff is cut over EXACTLY what the pinned reader serves at the anchor (the production contract: producer and
+        // adopter read one pinned base).
+        pinnedPrior <- pinnedReader
+          .readAtOrdinal(diffBase, mg)
+          .flatMap(IO.fromOption(_)(new RuntimeException("fixture: pinned prior must be readable")))
+        store <- freshStore
+        basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
+        _ <- store.commit(diffBase)
+        truth <- producerTruth(mg, inc, pinnedPrior, nextInfo)
+        (wireDiff, attestedRoot) = truth
+        checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
+        ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
+        (overlay, baseTip) = ob
+        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        mgr <- mkManager(
+          overlay,
+          derivingProcessor(inc, basePriorRT),
+          StubAcceptanceManager(callsRef),
+          pinnedCurrencyInfoReader = Some(pinnedReader)
+        )
+        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiWith(mg, inc, basePriorRaw))
+        calls <- callsRef.get
+      } yield
+        expect.all(
+          calls.size == 1,
+          // The pinned Some(info) prior flows verbatim: reconstruct(pinnedPrior, diff) === attested ⇒ ADOPT.
+          advancedTo(gsi, mg, nextInfo),
+          gsi.lastStateChannelSnapshotHashes.contains(mg)
+        )
+    }
+  }
+
+  // ============================================================================
+  // (H) numShards=1 BYTE-IDENTITY — the adopt path (and hence the pinned read) is UNREACHABLE at numShards=1, so a wired reader
+  //     changes NOTHING: committed GSI + mptRoot are byte-identical to the reader-less manager, and the reader is never consulted
+  //     (its resolver RAISES — a canary, not a stub).
+  // ============================================================================
+
+  test("(H) numShards=1 BYTE-IDENTITY: wired pinned reader + diff-carrying checkpoint ⇒ adopt path never fires; GSI + mptRoot identical") {
+    res =>
+      implicit val (h, sp, j) = res
+      Files[IO].tempDirectory.use { dir =>
+        def runNode(reader: Option[PinnedCurrencyInfoReader[IO]]): IO[(GlobalSnapshotInfo, Option[Hash])] =
+          for {
+            tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+            inc = mkSignedIncremental(2L, tipProof)
+            store <- freshStore
+            basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
+            _ <- store.commit(diffBase)
+            truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
+            (wireDiff, attestedRoot) = truth
+            checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
+            ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
+            (overlay, baseTip) = ob
+            callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+            mgr <- mkManager(
+              overlay,
+              derivingProcessor(inc, basePriorRT),
+              StubAcceptanceManager(callsRef),
+              pinnedCurrencyInfoReader = reader,
+              numShards = 1
+            )
+            out <- runAcceptWithRoot(mgr, checkpoint, baseTip, gsiWith(mg, inc, basePriorRaw))
+            calls <- callsRef.get
+            _ <- IO.raiseError(new RuntimeException("adopt path fired at numShards=1")).whenA(calls.nonEmpty)
+          } yield out
+        for {
+          byteStore <- MptStateStorage.make[IO](dir)
+          // CANARY reader: any pinned read at numShards=1 RAISES (fails the test loudly) instead of silently answering.
+          poison = PinnedCurrencyInfoReader.make[IO](
+            byteStore,
+            _ => IO.raiseError(new RuntimeException("pinned reader consulted at numShards=1"))
+          )
+          withReader <- runNode(Some(poison))
+          withoutReader <- runNode(None)
+          (gsiA, rootA) = withReader
+          (gsiB, rootB) = withoutReader
+        } yield
+          expect.all(
+            // Byte-identity: the wired reader is inert at numShards=1 (committed GSI AND state-proof mptRoot agree).
+            gsiA == gsiB,
+            rootA == rootB,
+            rootA.isDefined,
+            // And the checkpoint was NOT adopted (no sharding at numShards=1): the MG's currency did not advance to `next`.
+            !advancedTo(gsiA, mg, nextInfo)
+          )
+      }
   }
 }

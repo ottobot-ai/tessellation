@@ -1068,16 +1068,28 @@ object GlobalSnapshotAcceptanceManager {
               // Track-1 diff-base-pin: read the per-MG diff prior AT the checkpoint's cluster-uniform `diffBaseOrdinal` — the exact base the
               // committee cut the diff over — instead of the adopter's own (per-node-lagging) `overlay.base` (`priorInfoOf`). Every honest
               // node then reconstructs the byte-identical `next`, so the drop-deadlock the authoritative-override masking papers over is gone
-              // at the root. `readAtOrdinal` self-resolves the pin (the finalized snapshot at `diffBaseOrdinal`) + hard-rejects on miss:
+              // at the root. `readAtOrdinalVerified` self-resolves the pin (the finalized snapshot at `diffBaseOrdinal`) and is
+              // THREE-VALUED (the eb9bf9a5e genesis-seam fix — the old Option read conflated the two `None`s and permanently dropped
+              // every never-before-adopted MG's first checkpoint at numShards >= 2):
               //   - reader NOT wired (tests / currency-l0) ⇒ fall back to `priorInfoOf` (byte-identical to pre-pin behavior);
-              //   - reader wired, `Some(info)` ⇒ the pinned prior;
-              //   - reader wired, `None` ⇒ FAIL-CLOSED: the base was reached (adoptShardCheckpoints deferred otherwise) but the pinned prior
+              //   - `AnchorVerified(Some(info))` ⇒ the pinned prior, verbatim;
+              //   - `AnchorVerified(None)` ⇒ the anchor VERIFIED but this MG has no committed currency state there — the brand-new-MG
+              //     genesis seam. Seed the SAME `emptyInfo` the producer's `getOrElse(emptyInfo)` seeds
+              //     (`ShardCheckpointWiring.reExecDerivationWithDiff`) and the legacy `priorInfoOf` genesis arms return. Consensus-safe:
+              //     absence under a VERIFIED pinned root is itself a pinned fact (MPT non-inclusion), so every honest node derives the
+              //     byte-identical empty prior; the PIN-1 root gate + GAP-1 proof binding below stay the fail-closed nets over the result.
+              //   - `AnchorUnreadable` ⇒ FAIL-CLOSED: the base was reached (adoptShardCheckpoints deferred otherwise) but the pinned ANCHOR
               //     is unreadable (evicted below retention, or the pinned snapshot is on a fork) ⇒ DROP this MG (never adopt over a wrong
               //     prior); the leader re-offers and it self-heals once the anchor is served.
               def pinnedPriorInfoOf(mg: Address, diffBaseOrdinal: SnapshotOrdinal): F[Option[CurrencySnapshotInfo]] =
                 pinnedCurrencyInfoReader match {
-                  case None         => priorInfoOf(mg).some.pure[F]
-                  case Some(reader) => reader.readAtOrdinal(diffBaseOrdinal, mg)
+                  case None => priorInfoOf(mg).some.pure[F]
+                  case Some(reader) =>
+                    reader.readAtOrdinalVerified(diffBaseOrdinal, mg).map {
+                      case PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorUnreadable          => none[CurrencySnapshotInfo]
+                      case PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorVerified(Some(inf)) => inf.some
+                      case PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorVerified(None)      => emptyInfo.some
+                    }
                 }
 
               // APPLY-AND-VERIFY the committee diff over each adopted MG whose checkpoint carried one, OVERRIDING the final committed info.
@@ -1094,13 +1106,15 @@ object GlobalSnapshotAcceptanceManager {
                       val lastIncremental = derivedState.toOption.get._1 // safe: isLeft handled above (window TIP — newest incremental,
                       //                                                    whose cumulative balances == the producer's authoritativeBalances)
                       val diff = ChangeSet.fromWire(wireDiff)
-                      // Track-1 diff-base-pin: resolve the diff prior AT the checkpoint's `diffBaseOrdinal`. `None` (reader wired but the
-                      // pinned anchor is unreadable) ⇒ FAIL-CLOSED drop; `Some(pinnedPrior)` ⇒ apply the diff over the pinned base.
+                      // Track-1 diff-base-pin: resolve the diff prior AT the checkpoint's `diffBaseOrdinal`. `None` here means EXACTLY
+                      // `AnchorUnreadable` (the wired reader's anchor step failed — evicted/fork/no-root; a verified-but-absent MG already
+                      // became `Some(emptyInfo)` in `pinnedPriorInfoOf`, mirroring the producer's genesis seam) ⇒ FAIL-CLOSED drop;
+                      // `Some(pinnedPrior)` ⇒ apply the diff over the pinned base.
                       pinnedPriorInfoOf(mg, diffBaseOrdinal).flatMap {
                         case None =>
                           loggerBundle.app
                             .warn(
-                              s"[ACCEPTANCE/ADOPT-VERIFY/diff-base-pin] ordinal=$ordinal mg=${mg.value.value.take(8)} pinned prior at " +
+                              s"[ACCEPTANCE/ADOPT-VERIFY/diff-base-pin] ordinal=$ordinal mg=${mg.value.value.take(8)} pinned ANCHOR at " +
                                 s"diffBaseOrdinal=${diffBaseOrdinal.value.value} unreadable (evicted/fork) — FAIL-CLOSED DROP this MG's currency advance"
                             )
                             .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
