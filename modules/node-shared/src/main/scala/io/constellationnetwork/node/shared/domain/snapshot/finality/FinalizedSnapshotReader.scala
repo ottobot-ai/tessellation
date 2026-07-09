@@ -50,6 +50,15 @@ trait FinalizedSnapshotReader[F[_], S <: Snapshot, SI <: SnapshotInfo[_]] {
     */
   def latestMptEntriesResponse: F[Option[Response[F]]]
 
+  /** Signed-byte-store backfill serve side (2026-07-09) — gl0's signed MPT byte map at an EXACT `ordinal`, iff that ordinal is at-or-below
+    * finalized AND the signed store holds bytes there. The by-ordinal sibling of [[latestMptEntriesResponse]] serving ONLY the entries map
+    * (no snapshot/GSI: the puller verifies against its OWN locally-committed `stateProof.mptRoot` at that ordinal — see
+    * `PinnedCurrencyInfoReader.PinnedByteBackfill`). The signed store contains exclusively finalized-branch bytes by construction, and the
+    * additional finality gate here keeps the "only finalized data leaves the node" invariant belt-and-braces. `None` (→ 404) on a hole /
+    * pruned ordinal / non-global layer (BFT + readers without an `MptStateStorage`), leaving those routes byte-identical.
+    */
+  def mptEntriesAt(ordinal: SnapshotOrdinal): F[Option[Response[F]]]
+
   /** Metadata for the latest combined checkpoint servable under finality. BFT derives it from head; Nakamoto returns the tracked on-disk
     * checkpoint info if it's at-or-below finalized.
     */
@@ -88,6 +97,10 @@ object FinalizedSnapshotReader {
     // layers (e.g. currency-l0) have no such store to serve, so this is `None` here and the `mpt-entries` route 404s on those layers —
     // leaving their behavior byte-identical.
     def latestMptEntriesResponse: F[Option[Response[F]]] =
+      Option.empty[Response[F]].pure[F]
+
+    // Same reasoning as `latestMptEntriesResponse`: no signed byte store on BFT / non-global layers ⇒ the by-ordinal route 404s.
+    def mptEntriesAt(ordinal: SnapshotOrdinal): F[Option[Response[F]]] =
       Option.empty[Response[F]].pure[F]
 
     // Checkpoint info / by-ordinal endpoints are about the on-disk checkpoint files (preserved snapshots consumers can pin to). Even in
@@ -211,6 +224,22 @@ object FinalizedSnapshotReader {
                       }
                   }
               }
+          }
+      }
+
+    // Signed-byte-store backfill serve side: the exact-ordinal read. Finality-gated (belt-and-braces — the signed store only ever
+    // holds finalized-branch bytes) and `None` on a hole or a reader without a byte store, so a puller's 404 is indistinguishable
+    // from "this peer can't serve it" and it simply tries the next peer.
+    def mptEntriesAt(ordinal: SnapshotOrdinal): F[Option[Response[F]]] =
+      mptStateStorage match {
+        case None => Option.empty[Response[F]].pure[F]
+        case Some(byteStore) =>
+          finalityGate.isServable(ordinal).flatMap {
+            case false => Option.empty[Response[F]].pure[F]
+            case true =>
+              byteStore
+                .readState(ordinal)
+                .map(_.map(entries => respOf(entries.asJson(MptStateStorage.mptEntriesEncoder))))
           }
       }
 

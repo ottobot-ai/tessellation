@@ -563,13 +563,36 @@ object GlobalSnapshotConsensus {
           .inMemory[F](sharedCfg.nakamoto.commitmentSmt.versionRootRetention.value)
       }.toResource
 
+      // ─── Signed-byte-store read-time BACKFILL (2026-07-09): heals HOLES in the contiguous `signedBytesStore` at the pinned-read miss
+      // seam. Creation-side staging races (fail-closed reorg adopts whose carried GSI can't reproduce the fork's signed root,
+      // same-ordinal proposal-race losses where the winner's bytes were never staged under the finalized hash, catch-up jumps) leave
+      // ordinals permanently missing; when a peer stamps such an ordinal as a shard checkpoint's `diffBaseOrdinal`, the adopt-verify
+      // fail-closes on EVERY subsequent checkpoint and the metagraph mirror freezes (the 2mg/2shard token-lock e2e residual: ord 227
+      // holed on gl0-0/gl0-1 ⇒ `pinned ANCHOR ... unreadable` ×106/×101). The backfill pulls the signed byte map for the EXACT missing
+      // ordinal from up to `nakamoto.pinned-backfill-max-peers` peers via the by-ordinal `/global-snapshots/<ord>/mpt-entries` route
+      // (session-less like the byte-faithful catch-up pull: integrity comes from the root gate, not the transport); the reader then
+      // verifies `sidecarFreeMptRoot(fetched) === the LOCALLY-committed stateProof.mptRoot@ord`, strips to `consensusRootEntries`
+      // (staged map = pure function of the committed root), and persists. Fetch failure / wrong root ⇒ the exact pre-existing
+      // fail-closed defer. In-flight per-ordinal dedup bounds network amplification when many per-MG reads miss the same base.
+      gl0PinnedBackfill <- io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader.PinnedByteBackfill
+        .deduplicated[F](
+          io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon.pullMptEntriesAtOrdinalFromPeer[F](
+            io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient
+              .make[F](client, None, sharedCfg.snapshotTimeoutsConfig),
+            clusterStorage,
+            sharedCfg.nakamoto.pinnedBackfillMaxPeers.value,
+            sharedCfg.nakamoto.pinnedBackfillPerPeerTimeout,
+            org.typelevel.log4cats.slf4j.Slf4jLogger.getLoggerFromName[F]("PinnedByteBackfill")
+          )
+        )
+        .toResource
       // ─── Track-1 diff-base-pin: the shared gl0 PinnedCurrencyInfoReader (over the CONTIGUOUS k₂ `signedBytesStore`) + the by-ordinal
       // finalized-reader FACTORY used by the produce/watchtower `reExecDerivationWithDiff`. Hoisted here so the watchtower (below), the
       // producer (`derivePerMgState`, far below), and the GSAM `pinnedCurrencyInfoReader` param all reuse the SAME instance.
       gl0PinnedReader = {
         implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
-          .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback)
+          .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback, backfill = Some(gl0PinnedBackfill))
       }
       // Resolve the finalized state reader AT a pinned ordinal — ALWAYS the version-retained, root-verified pinned reader over
       // `signedBytesStore`. `None` ⇒ the anchor can't be served (evicted below k₂ / not yet finalize-persisted / not on this chain).

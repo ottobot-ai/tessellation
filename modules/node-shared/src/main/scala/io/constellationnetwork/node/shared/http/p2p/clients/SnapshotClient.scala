@@ -130,6 +130,20 @@ abstract class SnapshotClient[
     PeerResponse[F, Signed[S]](s"$urlPrefix/${ordinal.value.value}")(client, optionalSession)
   }
 
+  /** Signed-byte-store backfill transport (2026-07-09) — fetch the peer's SIGNED MPT byte map at an EXACT finalized `ordinal` (the
+    * by-ordinal sibling of [[getLatestMptEntries]], serving ONLY the entries map: the caller verifies against its OWN locally-committed
+    * `stateProof.mptRoot` at that ordinal, so the peer's snapshot/GSI are not needed). 404 when the peer's signed store has no bytes at
+    * `ordinal` (hole / outside its contiguous window / non-global layer) — the caller tries the next peer or fails closed. Decodes with the
+    * shared `MptStateStorage.mptEntriesDecoder` wire-codec anchor, identical to the latest-entries route.
+    */
+  def getMptEntriesAt(ordinal: SnapshotOrdinal): PeerResponse[F, Map[Hex, Array[Byte]]] = {
+    import org.http4s.circe.CirceEntityCodec.circeEntityDecoder
+
+    implicit val entriesDecoder: Decoder[Map[Hex, Array[Byte]]] = MptStateStorage.mptEntriesDecoder
+
+    PeerResponse[F, Map[Hex, Array[Byte]]](s"$urlPrefix/${ordinal.value.value}/mpt-entries")(client, optionalSession)
+  }
+
   def get(hash: Hash): PeerResponse[F, Signed[S]] = {
     import org.http4s.circe.CirceEntityCodec.circeEntityDecoder
 

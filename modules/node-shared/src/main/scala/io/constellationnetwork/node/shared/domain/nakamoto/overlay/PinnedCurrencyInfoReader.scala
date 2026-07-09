@@ -137,6 +137,66 @@ trait PinnedCurrencyInfoReader[F[_]] {
 
 object PinnedCurrencyInfoReader {
 
+  /** Signed-byte-store BACKFILL transport (2026-07-09) — the read-time healer for HOLES in the version-retained byte store.
+    *
+    * '''Why holes exist at all.''' The signed store's writers are the finalize-sink promote (hash-keyed staging: produce + validate +
+    * `stageAdoptedPostBytes` adopt staging) and the byte-faithful catch-up's direct write. Every one of those is CREATION-side and
+    * hash/race-sensitive: a fail-closed reorg adopt (the fork's carried GSI cannot reproduce its signed root ⇒ correctly stages nothing), a
+    * same-ordinal proposal-race loss where the winning candidate's bytes were never staged under the finalized hash, and a catch-up that
+    * jumps past intermediate ordinals ALL leave a PERMANENT hole at an ordinal this node's canonical chain finalized (2mg/2shard
+    * 2026-07-09, HEAD 4b3ac1cac: gl0-0 holes {41,108,227}, gl0-1 {108,202,227,229}, gl0-2 ≈52 — ord 41 was an explicit `REORG state adopt
+    * REJECTED` fail-close, ord 227 a validated-yet-unpromoted same-ordinal race). When a peer then stamps such an ordinal as a shard
+    * checkpoint's `diffBaseOrdinal` (IT has the bytes — its newest persisted), every holed node fail-closes `pinned ANCHOR ... unreadable`
+    * on EVERY subsequent checkpoint (observed ×106/×101) and that metagraph's per-MG mirror freezes permanently. Closing each creation site
+    * individually is whack-a-mole; the READ-time seam catches all of them by construction.
+    *
+    * '''Determinism contract (why a peer fetch cannot poison the fold).''' The fetch result is ONLY accepted when
+    * `sidecarFreeMptRoot(fetched) === the LOCALLY-resolved pinned snapshot's committed stateProof.mptRoot` — the identical check retained
+    * store bytes must pass at read time. Before staging, the map is STRIPPED to `GlobalStateKey.consensusRootEntries` (exactly the entry
+    * set the root commits), so the staged map is a PURE FUNCTION of the committed root (Merkle-collision-resistance): every honest node
+    * backfilling the same ordinal from ANY peer stages the byte-identical map, and no root-excluded (SystemNamespace / field-32 syncView)
+    * peer byte ever persists or serves. No pinned-reader consumer reads a root-excluded key (`reconstructPerMgInfo` reads the unrolled
+    * `Mg*`/fieldId-5/7 partitions, `reconstructMetagraphSyncData` fieldId-18, `reExecDerivationWithDiff` the currency partitions), so a
+    * stripped map reconstructs identically to a locally-staged one. A fetch failure / wrong-root response / in-flight duplicate stays
+    * FAIL-CLOSED (`AnchorUnreadable` — defer), never a live-base substitute, never a slash — the exact contract the unreadable path already
+    * has; the backfill only makes MORE pinned reads SUCCEED, never bypasses verification.
+    *
+    * '''No self-reference.''' The transport is a plain HTTP by-ordinal pull (`/global-snapshots/<ord>/mpt-entries`); it performs NO pinned
+    * read itself, so backfilling N can never recurse into a pinned miss at N.
+    */
+  trait PinnedByteBackfill[F[_]] {
+
+    /** Fetch a candidate signed byte map for `ordinal` from a peer. Transport-only: the CALLER (the reader) root-verifies against its own
+      * pinned committed root before anything is staged or served. `None` = no peer could serve it this round (fail-closed defer). Must
+      * never raise.
+      */
+    def fetch(ordinal: SnapshotOrdinal): F[Option[Map[Hex, Array[Byte]]]]
+  }
+
+  object PinnedByteBackfill {
+
+    /** Wrap a transport with a per-ordinal IN-FLIGHT guard: while one fiber is fetching ordinal N, concurrent misses at N return `None`
+      * immediately (fail-closed this round — they re-read the store on their next fold, by which time the winner has staged the verified
+      * bytes). Bounds network amplification when many per-MG reads miss the same stamped diff-base simultaneously. Also totalizes the
+      * underlying fetch (any raised error → `None`).
+      */
+    def deduplicated[F[_]: Async](
+      underlying: SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]]
+    ): F[PinnedByteBackfill[F]] =
+      cats.effect.Ref.of[F, Set[SnapshotOrdinal]](Set.empty).map { inFlight =>
+        new PinnedByteBackfill[F] {
+          def fetch(ordinal: SnapshotOrdinal): F[Option[Map[Hex, Array[Byte]]]] =
+            inFlight.modify(s => if (s.contains(ordinal)) (s, false) else (s + ordinal, true)).flatMap {
+              case false => none[Map[Hex, Array[Byte]]].pure[F]
+              case true =>
+                Async[F]
+                  .guarantee(underlying(ordinal), inFlight.update(_ - ordinal))
+                  .handleError(_ => none[Map[Hex, Array[Byte]]])
+            }
+        }
+      }
+  }
+
   /** The THREE-VALUED pinned-read result for the byteDiff-ADOPT consumer (see [[PinnedCurrencyInfoReader.readAtOrdinalVerified]]).
     *
     * The split is made at the ANCHOR-VERIFY seam: every branch of `withVerifiedAnchorBytes` that rejects BEFORE the retained bytes are
@@ -174,10 +234,18 @@ object PinnedCurrencyInfoReader {
     *   resolves the FINALIZED global snapshot at an ordinal (carries `hash` for the pin + `stateProof.mptRoot` for the byte-verify). gl0
     *   wires its finalized-chain lookup (`getGlobalSnapshotByOrdinalWithFallback`); followers wire their
     *   `lastNGlobalSnapshot.getByOrdinal`.
+    * @param backfill
+    *   optional read-time HOLE healer (see [[PinnedByteBackfill]]). When `byteStore.readState(ordinal)` MISSES but the pinned snapshot at
+    *   `ordinal` (and thus its committed `stateProof.mptRoot`) IS locally resolvable, fetch a candidate byte map from a peer, verify
+    *   `sidecarFreeMptRoot(fetched) === the pinned root`, STRIP to `GlobalStateKey.consensusRootEntries`, persist into `byteStore`, and
+    *   serve the read — healing the hole for every subsequent read. Any failure keeps the exact pre-backfill fail-closed behavior
+    *   (`AnchorUnreadable`, store untouched). `None` (the default — all pre-existing wirings) = behavior byte-identical to before this
+    *   parameter existed. gl0 wires it ONLY for the reader over the SIGNED byte store (`GlobalSnapshotConsensus.gl0PinnedReader`).
     */
   def make[F[_]: Async: Parallel: Hasher: JsonSerializer](
     byteStore: MptStateStorage[F],
-    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+    backfill: Option[PinnedByteBackfill[F]] = None
   ): PinnedCurrencyInfoReader[F] = new PinnedCurrencyInfoReader[F] {
 
     private val logger = Slf4jLogger.getLoggerFromName[F]("PinnedCurrencyInfoReader")
@@ -278,10 +346,47 @@ object PinnedCurrencyInfoReader {
             case Some(expectedMptRoot) =>
               byteStore.readState(ordinal).flatMap {
                 case None =>
-                  // Retained state bytes evicted/absent at the anchor (store retention doesn't reach this depth) — hard-reject, no fallback.
-                  logger.debug(
-                    s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject $what for $ctx"
-                  ) >> unreadable
+                  // Retained state bytes evicted/absent at the anchor (store retention doesn't reach this depth, or a creation-side
+                  // staging race left a HOLE at a locally-finalized ordinal). Before hard-rejecting, try the read-time peer BACKFILL —
+                  // the pinned snapshot at `ordinal` DID resolve (we hold `expectedMptRoot`, the local verification anchor), so a
+                  // peer-served byte map is acceptable iff it reproduces that committed root. See [[PinnedByteBackfill]] for the
+                  // determinism contract. No backfill wired / fetch miss / wrong root ⇒ the exact pre-existing fail-closed reject.
+                  backfill match {
+                    case None =>
+                      logger.debug(
+                        s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject $what for $ctx"
+                      ) >> unreadable
+                    case Some(bf) =>
+                      bf.fetch(ordinal).flatMap {
+                        case None =>
+                          logger.debug(
+                            s"[2a] no retained state bytes at pinned ord=${ordinal.show} and peer backfill unavailable — " +
+                              s"hard-reject $what for $ctx (fail-closed defer)"
+                          ) >> unreadable
+                        case Some(fetched) =>
+                          // STRIP to the consensus entry set FIRST: the root is computed exactly over `consensusRootEntries`, so the
+                          // verify below covers every byte we would persist — no root-excluded peer byte can survive.
+                          val stripped = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(fetched)
+                          GlobalSnapshotInfo.sidecarFreeMptRoot[F](stripped).flatMap { fetchedRoot =>
+                            if (fetchedRoot =!= expectedMptRoot)
+                              // Peer bytes do NOT reproduce the locally-pinned committed root (fork / corrupt / stale peer) —
+                              // hard-reject and leave the store UNTOUCHED (never stage unverified bytes).
+                              logger.warn(
+                                s"[2a][backfill] peer bytes at pinned ord=${ordinal.show} recompute mptRoot=${fetchedRoot.show} ≠ " +
+                                  s"pinned stateProof.mptRoot=${expectedMptRoot.show} — REJECTED (store untouched), hard-reject $what for $ctx"
+                              ) >> unreadable
+                            else
+                              // VERIFIED against the local anchor — persist the stripped (root-determined, cluster-uniform) map so
+                              // every subsequent read at this ordinal is a plain store hit, then serve THIS read from it.
+                              byteStore.writeState(ordinal, stripped) >>
+                                logger.info(
+                                  s"[2a][backfill] HEALED hole at pinned ord=${ordinal.show}: peer bytes verified === committed " +
+                                    s"mptRoot=${expectedMptRoot.show.take(12)} (${stripped.size} consensus entries staged) — serving $what for $ctx"
+                                ) >>
+                                reconstruct(stripped).map(PinnedAnchorRead.AnchorVerified(_): PinnedAnchorRead[A])
+                          }
+                      }
+                  }
                 case Some(bytes) =>
                   GlobalSnapshotInfo.sidecarFreeMptRoot[F](bytes).flatMap { computedRoot =>
                     if (computedRoot =!= expectedMptRoot)

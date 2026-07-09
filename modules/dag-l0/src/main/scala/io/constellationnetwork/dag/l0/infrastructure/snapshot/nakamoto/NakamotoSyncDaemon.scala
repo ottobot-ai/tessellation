@@ -326,6 +326,61 @@ object NakamotoSyncDaemon {
       .handleErrorWith(e => logger.warn(e)("byte-faithful catch-up: could not pull MPT entries from any peer").as(None))
   }
 
+  /** Signed-byte-store backfill transport (2026-07-09) — pull a peer's SIGNED MPT byte map at an EXACT finalized `ordinal` over the
+    * by-ordinal `/global-snapshots/<ord>/mpt-entries` route (the sibling of [[pullLatestMptEntriesFromPeer]]'s latest-pull). Consumed by
+    * `PinnedCurrencyInfoReader.PinnedByteBackfill` to heal HOLES in the local signed store at a stamped shard-checkpoint `diffBaseOrdinal`.
+    *
+    * TRANSPORT-ONLY, deliberately UNVERIFIED here: the pinned reader verifies `sidecarFreeMptRoot(fetched) === its OWN locally-committed
+    * `stateProof.mptRoot@ordinal`` before anything is staged or served (the same reason the latest-pull runs session-less: byte integrity
+    * comes from the root gate, not the transport). Tries up to `maxPeers` responsive peers (sorted by peer id for stable behavior — the
+    * VERIFIED outcome is peer-independent, root-determined) with a per-try `perPeerTimeout` so a hung peer cannot stall the accept fold; a
+    * peer without the ordinal 404s and the next is tried. `None` on total miss — the caller stays fail-closed. `maxPeers = 0` disables the
+    * transport outright (config kill-switch). Never raises.
+    */
+  private[snapshot] def pullMptEntriesAtOrdinalFromPeer[F[_]: Async](
+    l0GlobalSnapshotClient: io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient[F],
+    clusterStorage: io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage[F],
+    maxPeers: Int,
+    perPeerTimeout: scala.concurrent.duration.FiniteDuration,
+    logger: org.typelevel.log4cats.Logger[F]
+  )(ordinal: SnapshotOrdinal): F[Option[Map[Hex, Array[Byte]]]] = {
+    def pullFrom(p: io.constellationnetwork.schema.peer.Peer): F[Option[Map[Hex, Array[Byte]]]] =
+      Async[F]
+        .timeoutTo(
+          l0GlobalSnapshotClient
+            .getMptEntriesAt(ordinal)
+            .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
+            .map(_.some),
+          perPeerTimeout,
+          (None: Option[Map[Hex, Array[Byte]]]).pure[F]
+        )
+        .handleErrorWith { e =>
+          logger
+            .debug(
+              s"[backfill] signed-bytes pull ord=${ordinal.show} from peer ${p.id.show.take(16)} failed (${e.getMessage}), trying next"
+            )
+            .as(None: Option[Map[Hex, Array[Byte]]])
+        }
+
+    def tryInOrder(remaining: List[io.constellationnetwork.schema.peer.Peer]): F[Option[Map[Hex, Array[Byte]]]] =
+      remaining match {
+        case Nil => (None: Option[Map[Hex, Array[Byte]]]).pure[F]
+        case p :: tail =>
+          pullFrom(p).flatMap {
+            case some @ Some(_) => (some: Option[Map[Hex, Array[Byte]]]).pure[F]
+            case None           => tryInOrder(tail)
+          }
+      }
+
+    if (maxPeers <= 0) (None: Option[Map[Hex, Array[Byte]]]).pure[F]
+    else
+      clusterStorage.getResponsivePeers
+        .flatMap(peers => tryInOrder(peers.toList.sortBy(_.id.show).take(maxPeers)))
+        .handleErrorWith(e =>
+          logger.warn(e)(s"[backfill] could not pull signed MPT bytes at ord=${ordinal.show} from any peer (fail-closed defer)").as(None)
+        )
+  }
+
   /** Ethereum-style mempool reconciliation after catch-up/reorg.
     *
     * Evicts DAG blocks whose transactions reference a lastTxRef that no longer matches the new context. Keeps events whose transactions are

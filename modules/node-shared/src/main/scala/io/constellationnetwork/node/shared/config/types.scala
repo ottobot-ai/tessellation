@@ -140,6 +140,14 @@ object types {
     // is kept comfortably above `changesetRingDepth` (2×). Pure transport memory bounds — NOT consensus parameters.
     changesetRingDepth: PosInt,
     stagingAccumulatorsCap: PosInt,
+    // Signed-byte-store read-time BACKFILL (2026-07-09) — heals HOLES in gl0's contiguous signed byte store
+    // (`mpt_snapshot_info_signed`) at read time: when a pinned diff-base read misses locally but the snapshot at that ordinal
+    // IS locally finalized, pull the signed byte map from up to `pinnedBackfillMaxPeers` peers (per-try `pinnedBackfillPerPeerTimeout`
+    // so a hung peer can't stall the accept fold), verify `sidecarFreeMptRoot === the LOCAL committed stateProof.mptRoot`, and stage.
+    // Transport tunables ONLY — the verification is unconditional and a total fetch failure stays fail-closed (defer), so these are
+    // NOT consensus parameters. `pinned-backfill-max-peers = 0` disables the transport (kill switch).
+    pinnedBackfillMaxPeers: NonNegInt = NonNegInt.unsafeFrom(3),
+    pinnedBackfillPerPeerTimeout: FiniteDuration = 5.seconds,
     commitmentSmt: CommitmentSmtConfig,
     localEvents: LocalEventsConfig,
     committee: CommitteeConfig,

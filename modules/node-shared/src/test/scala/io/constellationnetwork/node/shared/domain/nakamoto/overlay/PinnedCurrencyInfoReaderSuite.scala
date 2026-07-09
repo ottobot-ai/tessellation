@@ -452,4 +452,193 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
       } yield expect(wrongRoot =!= root) && expect(got == PinnedAnchorRead.AnchorUnreadable)
     }
   }
+
+  // ===========================================================================
+  // Signed-byte-store read-time BACKFILL (2026-07-09) — the hole healer. A creation-side staging race (fail-closed reorg adopt /
+  // same-ordinal proposal-race loss / catch-up jump) leaves an ordinal MISSING from the signed store even though the node's own
+  // canonical chain finalized it; a shard checkpoint stamping that ordinal as `diffBaseOrdinal` then fail-closed forever (the
+  // 2mg/2shard token-lock mirror freeze: hole at ord 227 ⇒ `pinned ANCHOR ... unreadable` ×106). The backfill fetches the byte map
+  // from a peer AT READ TIME, verifies it against the LOCALLY-committed `stateProof.mptRoot`, strips to `consensusRootEntries`,
+  // persists, and serves. Wrong-root / missing peer bytes stay fail-closed with the store UNTOUCHED.
+  // ===========================================================================
+
+  import PinnedCurrencyInfoReader.PinnedByteBackfill
+
+  private def backfillOf(f: SnapshotOrdinal => IO[Option[Map[Hex, Array[Byte]]]]): PinnedByteBackfill[IO] =
+    new PinnedByteBackfill[IO] {
+      def fetch(ordinal: SnapshotOrdinal): IO[Option[Map[Hex, Array[Byte]]]] = f(ordinal)
+    }
+
+  test(
+    "BACKFILL RED→GREEN: hole at a stamped diff-base ⇒ AnchorUnreadable without backfill; WITH backfill serving root-correct " +
+      "bytes the SAME read heals — AnchorVerified(oracle), bytes persisted, subsequent reads need no peer"
+  ) { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, oracle) = boe
+        // The HOLE: the local signed store has NOTHING at the stamped diff-base ordinal (creation-side staging race), but the
+        // node's own finalized chain DOES resolve the snapshot there (root = the local verification anchor).
+        byteStore <- MptStateStorage.make[IO](dir)
+        pinned <- mkHashed(227L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
+
+        // RED — the pre-backfill behavior (exactly what froze the mirror): fail-closed unreadable at the hole.
+        readerNoBackfill = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        red <- readerNoBackfill.readAtOrdinalVerified(ord(227L), mg)
+
+        // GREEN — same store, same resolver, backfill wired: the peer serves the finalized bytes for ord 227.
+        fetches <- IO.ref(0)
+        backfill = backfillOf(o => fetches.update(_ + 1) *> (if (o === ord(227L)) bytes.some else none).pure[IO])
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfill))
+        green <- reader.readAtOrdinalVerified(ord(227L), mg)
+
+        // Healed ON DISK: the store now serves the ordinal, so a later read works with NO backfill at all.
+        persisted <- byteStore.readState(ord(227L))
+        afterHeal <- readerNoBackfill.readAtOrdinalVerified(ord(227L), mg)
+        // And the whole-global pinned reader (the reExecDerivationWithDiff prior) resolves too.
+        pinnedReaderOpt <- reader.pinnedReaderAt(ord(227L))
+        fetchCount <- fetches.get
+      } yield
+        expect(red == PinnedAnchorRead.AnchorUnreadable) &&
+          expect(oracle.isDefined) &&
+          expect(green == PinnedAnchorRead.AnchorVerified(oracle)) &&
+          expect(persisted.isDefined) &&
+          expect(afterHeal == PinnedAnchorRead.AnchorVerified(oracle)) &&
+          expect(pinnedReaderOpt.isDefined) &&
+          // The store hit path serves post-heal reads — the single RED+GREEN read pair cost exactly one fetch.
+          expect.same(1, fetchCount)
+    }
+  }
+
+  test(
+    "BACKFILL NEGATIVE (wrong root): peer bytes that do NOT reproduce the locally-committed root are REJECTED — " +
+      "AnchorUnreadable, store untouched, still fail-closed on the next read"
+  ) { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, _) = boe
+        // Adversarial/stale peer state: OTHER content (different balances ⇒ different consensus root).
+        wrongState = SortedMap(
+          mg -> (Right((mkSignedIncremental(5L), infoWithBalances(account -> 666L))): Either[
+            Signed[CurrencySnapshot],
+            (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+          ])
+        )
+        wrongBytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](wrongState)
+        wrongBytesRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](wrongBytes)
+        byteStore <- MptStateStorage.make[IO](dir) // hole at the anchor
+        pinned <- mkHashed(227L, Some(root)) // the LOCAL committed root pins `bytes`, not `wrongBytes`
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
+        backfill = backfillOf(_ => wrongBytes.some.pure[IO])
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfill))
+        got <- reader.readAtOrdinalVerified(ord(227L), mg)
+        persisted <- byteStore.readState(ord(227L))
+        gotAgain <- reader.readAtOrdinalVerified(ord(227L), mg)
+      } yield
+        expect(wrongBytesRoot =!= root) && // the adversarial map genuinely recomputes a different root
+          expect(got == PinnedAnchorRead.AnchorUnreadable) && // rejected, fail-closed
+          expect(persisted.isEmpty) && // NEVER staged — the store stays untouched by unverified bytes
+          expect(gotAgain == PinnedAnchorRead.AnchorUnreadable) // and stays fail-closed (defer), not poisoned
+    }
+  }
+
+  test(
+    "BACKFILL STRIP: root-excluded peer entries (SystemNamespace sidecars) never persist — the staged map is exactly " +
+      "consensusRootEntries(fetched), a pure function of the committed root"
+  ) { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, oracle) = boe
+        // A malicious/rich peer response: the honest consensus bytes PLUS a SystemNamespace sidecar entry (hex prefix "03" —
+        // excluded from the consensus root, so it would ride along UNVERIFIED if not stripped).
+        poisonKey = Hex("03" + "ab" * 24)
+        fetched = bytes + (poisonKey -> Array[Byte](1, 2, 3))
+        fetchedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](fetched)
+        byteStore <- MptStateStorage.make[IO](dir)
+        pinned <- mkHashed(227L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfillOf(_ => fetched.some.pure[IO])))
+        got <- reader.readAtOrdinalVerified(ord(227L), mg)
+        persisted <- byteStore.readState(ord(227L))
+        expectedStripped = GlobalStateKey.consensusRootEntries(fetched)
+      } yield
+        expect(fetchedRoot === root) && // the sidecar entry is invisible to the root — the heal itself proceeds
+          expect(got == PinnedAnchorRead.AnchorVerified(oracle)) &&
+          expect(persisted.exists(m => !m.contains(poisonKey))) && // the UNVERIFIED sidecar byte never persisted
+          expect(persisted.exists(_.keySet == expectedStripped.keySet)) // staged map == the root-committed entry set
+    }
+  }
+
+  test("BACKFILL absent-peer: fetch returns None ⇒ AnchorUnreadable (fail-closed defer), store untouched") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (_, root, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        pinned <- mkHashed(227L, Some(root))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfillOf(_ => none.pure[IO])))
+        got <- reader.readAtOrdinalVerified(ord(227L), mg)
+        persisted <- byteStore.readState(ord(227L))
+      } yield expect(got == PinnedAnchorRead.AnchorUnreadable) && expect(persisted.isEmpty)
+    }
+  }
+
+  test(
+    "BACKFILL no-local-anchor: an ordinal the node cannot resolve locally NEVER fetches (no root to verify against) ⇒ AnchorUnreadable"
+  ) { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, _, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        resolver = (_: SnapshotOrdinal) => none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
+        fetches <- IO.ref(0)
+        reader = PinnedCurrencyInfoReader.make[IO](
+          byteStore,
+          resolver,
+          backfill = Some(backfillOf(_ => fetches.update(_ + 1) *> bytes.some.pure[IO]))
+        )
+        got <- reader.readAtOrdinalVerified(ord(999L), mg)
+        fetchCount <- fetches.get
+      } yield expect(got == PinnedAnchorRead.AnchorUnreadable) && expect.same(0, fetchCount)
+    }
+  }
+
+  test(
+    "PinnedByteBackfill.deduplicated: one in-flight fetch per ordinal — the concurrent loser fails closed (None) and the " +
+      "underlying runs once; after completion the ordinal is fetchable again; errors totalize to None"
+  ) { _ =>
+    for {
+      started <- cats.effect.Deferred[IO, Unit]
+      gate <- cats.effect.Deferred[IO, Unit]
+      calls <- IO.ref(0)
+      underlying = (_: SnapshotOrdinal) => calls.update(_ + 1) *> started.complete(()) *> gate.get.as(Map.empty[Hex, Array[Byte]].some)
+      bf <- PinnedByteBackfill.deduplicated[IO](underlying)
+      winner <- bf.fetch(ord(50L)).start
+      _ <- started.get // the winner is INSIDE the underlying fetch now
+      loser <- bf.fetch(ord(50L)) // in-flight dedup: immediate None, no second underlying call
+      _ <- gate.complete(())
+      winnerResult <- winner.joinWithNever
+      callsDuringOverlap <- calls.get
+      again <- bf.fetch(ord(50L)) // released: the ordinal is fetchable again
+      callsAfter <- calls.get
+      erroring <- PinnedByteBackfill.deduplicated[IO]((_: SnapshotOrdinal) => IO.raiseError(new RuntimeException("boom")))
+      errFetch <- erroring.fetch(ord(51L))
+    } yield
+      expect(loser.isEmpty) &&
+        expect(winnerResult.isDefined) &&
+        expect.same(1, callsDuringOverlap) &&
+        expect(again.isDefined) &&
+        expect.same(2, callsAfter) &&
+        expect(errFetch.isEmpty)
+  }
 }

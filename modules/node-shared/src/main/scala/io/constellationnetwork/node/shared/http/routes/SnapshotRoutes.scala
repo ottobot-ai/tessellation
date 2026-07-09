@@ -223,6 +223,23 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
             }
           }
 
+        case GET -> Root / SnapshotOrdinalVar(ordinal) / "mpt-entries" =>
+          // Signed-byte-store backfill serve side (2026-07-09) — the by-ordinal sibling of `/latest/combined/mpt-entries`, serving ONLY
+          // the signed MPT byte map at `ordinal` (the puller root-verifies against its OWN committed `stateProof.mptRoot` there, so no
+          // snapshot/GSI ride along). Finality-gated twice (route `isOrdinalServable` + the reader's own gate); 404 on a hole / pruned
+          // ordinal / non-global layer. Consumed by `PinnedCurrencyInfoReader.PinnedByteBackfill` to heal signed-store holes at stamped
+          // shard-checkpoint `diffBaseOrdinal`s (the gap>1 / adopt-race residual of the 2026-07-09 token-lock mirror freeze).
+          whenNodeReady {
+            isOrdinalServable(ordinal).flatMap {
+              case false => NotFound()
+              case true =>
+                finalizedReader.mptEntriesAt(ordinal).flatMap {
+                  case Some(resp) => resp.pure[F]
+                  case None       => NotFound()
+                }
+            }
+          }
+
         case req @ GET -> Root / HashVar(hash) =>
           // Hash-based lookup, gated on finality: fetch the snapshot, then refuse
           // to serve if its ordinal is past the finalized head. Closes a leak
