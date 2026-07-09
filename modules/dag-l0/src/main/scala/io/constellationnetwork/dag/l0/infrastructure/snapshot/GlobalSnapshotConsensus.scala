@@ -2290,6 +2290,12 @@ object GlobalSnapshotConsensus {
                   // stripped->canonical so it promotes on finalize (complete served changeset ring).
                   pendingAccumulatorsRef = pendingAccumulatorsRef,
                   pendingPostBytesRef = pendingPostBytesRef,
+                  // Signed-byte-store FIDELITY (2026-07-09): the SAME served signed-bytes store the finalize sink writes. The daemon's
+                  // byte-faithful catch-up persists its root-verified adopt target here directly (already-finalized ordinal); the
+                  // reorg/realign/legacy-catch-up adopts stage into `pendingPostBytesRef` for the sink to promote — so ADOPTED ordinals
+                  // stop being permanent holes that fail-close `pinnedReaderAt(diffBaseOrdinal)`.
+                  signedBytesStore = signedBytesStore,
+                  stagingAccumulatorsCap = sharedCfg.nakamoto.stagingAccumulatorsCap.value,
                   eventMempool = eventMempool,
                   dataDir = java.nio.file.Paths.get(sys.env.getOrElse("TESSELLATION_DATA_DIR", "/tessellation/data")),
                   enqueueAllowSpendBlock = enqueueAllowSpendBlock,

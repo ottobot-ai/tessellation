@@ -32,12 +32,15 @@ import weaver.MutableIOSuite
 /** Pins the byte-faithful catch-up MPT seeder ([[NakamotoSyncDaemon.seedMptByteFaithful]]) — the gl0 analog of ml0's `resyncToCanonical`
   * verify gate, and the root fix for the catch-up wedge. The contract:
   *
-  *   - '''Some(signed bytes) matching the signed mptRoot → adopt VERBATIM, return true''' — the MPT ends up with exactly the served bytes
-  *     (sidecar-free root === signed). This is the path that, unlike the old GSI rebuild, reproduces the producer's per-MG currency root.
-  *   - '''Some(bytes) whose root ≠ signed mptRoot → return false AND leave the MPT untouched''' — the recompute happens BEFORE any write,
-  *     so a corrupt/truncated transfer never clobbers the live store.
-  *   - '''None (byte route 404) + GSI that rebuilds to the signed root → return true''' (legacy fallback gate passes).
-  *   - '''None + signed mptRoot the GSI rebuild can't reproduce → return false''' (fallback gate rejects rather than adopt-divergent).
+  *   - '''Some(signed bytes) matching the signed mptRoot → adopt VERBATIM, return Some(bytes)''' — the MPT ends up with exactly the served
+  *     bytes (sidecar-free root === signed), and the RETURNED map recomputes to the signed root too (signed-byte-store FIDELITY: it is what
+  *     the caller persists into `mpt_snapshot_info_signed` at the adopted finalized ordinal). This is the path that, unlike the old GSI
+  *     rebuild, reproduces the producer's per-MG currency root.
+  *   - '''Some(bytes) whose root ≠ signed mptRoot → return None AND leave the MPT untouched''' — the recompute happens BEFORE any write, so
+  *     a corrupt/truncated transfer never clobbers the live store.
+  *   - '''None (byte route 404) + GSI that rebuilds to the signed root → return Some(verified rebuild bytes)''' (legacy fallback gate
+  *     passes; the returned candidate map recomputes to the signed root).
+  *   - '''None + signed mptRoot the GSI rebuild can't reproduce → return None''' (fallback gate rejects rather than adopt-divergent).
   */
 object SeedMptByteFaithfulSuite extends MutableIOSuite {
 
@@ -137,20 +140,27 @@ object SeedMptByteFaithfulSuite extends MutableIOSuite {
       root <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entries)
     } yield (entries, root)
 
-  test("Some(signed bytes) matching signed mptRoot → adopts verbatim, returns true, store root === signed") { res =>
+  test("Some(signed bytes) matching signed mptRoot → adopts verbatim, returns the verified bytes, store root === signed") { res =>
     implicit val (j, h, sp) = res
     val logger = NoOpLogger[IO]
     for {
       (entries, root) <- producerTruth
       snapshot <- mkSnapshot(root.some)
       store <- freshStore
-      ok <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, GlobalSnapshotInfo.empty, entries.some, store, logger)
+      adopted <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, GlobalSnapshotInfo.empty, entries.some, store, logger)
       after <- store.allEntriesAsBytes
       afterRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](after)
-    } yield expect(ok).and(expect(afterRoot === root)).and(expect(after.nonEmpty))
+      // Signed-byte-store FIDELITY: the returned map is what the caller persists into `mpt_snapshot_info_signed` at the pulled
+      // FINALIZED ordinal — it MUST itself recompute to the signed root (here it is the served bytes verbatim).
+      adoptedRoot <- adopted.traverse(GlobalSnapshotInfo.sidecarFreeMptRoot[IO])
+    } yield
+      expect(adopted.isDefined)
+        .and(expect(afterRoot === root))
+        .and(expect(after.nonEmpty))
+        .and(expect.same(adoptedRoot, root.some))
   }
 
-  test("Some(bytes) whose root ≠ signed mptRoot → returns false AND does NOT clobber the MPT (verify-before-write)") { res =>
+  test("Some(bytes) whose root ≠ signed mptRoot → returns None AND does NOT clobber the MPT (verify-before-write)") { res =>
     implicit val (j, h, sp) = res
     val logger = NoOpLogger[IO]
     for {
@@ -158,31 +168,35 @@ object SeedMptByteFaithfulSuite extends MutableIOSuite {
       // Snapshot commits to a DIFFERENT mptRoot than the served bytes recompute to ⇒ a corrupt/wrong transfer.
       snapshot <- mkSnapshot(Hash("ff".padTo(64, 'a').take(64)).some)
       store <- freshStore
-      ok <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, GlobalSnapshotInfo.empty, entries.some, store, logger)
+      adopted <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, GlobalSnapshotInfo.empty, entries.some, store, logger)
       after <- store.allEntriesAsBytes
-    } yield expect(!ok).and(expect(after.isEmpty)) // never written — the gate failed before loadBytes
+    } yield expect(adopted.isEmpty).and(expect(after.isEmpty)) // never written — the gate failed before loadBytes
   }
 
-  test("None (byte route 404) + GSI rebuilding to the signed root → legacy fallback gate passes, returns true") { res =>
-    implicit val (j, h, sp) = res
-    val logger = NoOpLogger[IO]
-    val gsi = applyAccumulatorToGSI(GlobalSnapshotInfo.empty, acc)
-    for {
-      (_, root) <- producerTruth
-      snapshot <- mkSnapshot(root.some)
-      store <- freshStore
-      ok <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, gsi, none, store, logger)
-    } yield expect(ok)
+  test("None (byte route 404) + GSI rebuilding to the signed root → legacy fallback gate passes, returns the verified rebuild bytes") {
+    res =>
+      implicit val (j, h, sp) = res
+      val logger = NoOpLogger[IO]
+      val gsi = applyAccumulatorToGSI(GlobalSnapshotInfo.empty, acc)
+      for {
+        (_, root) <- producerTruth
+        snapshot <- mkSnapshot(root.some)
+        store <- freshStore
+        adopted <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, gsi, none, store, logger)
+        // Signed-byte-store FIDELITY: the fallback's returned map (the verified GSI-rebuild candidate) must ALSO recompute to the
+        // signed root — it is what the catch-up persists at the adopted ordinal.
+        adoptedRoot <- adopted.traverse(GlobalSnapshotInfo.sidecarFreeMptRoot[IO])
+      } yield expect(adopted.isDefined).and(expect.same(adoptedRoot, root.some))
   }
 
-  test("None + signed mptRoot the GSI rebuild can't reproduce → fallback gate rejects, returns false") { res =>
+  test("None + signed mptRoot the GSI rebuild can't reproduce → fallback gate rejects, returns None") { res =>
     implicit val (j, h, sp) = res
     val logger = NoOpLogger[IO]
     val gsi = applyAccumulatorToGSI(GlobalSnapshotInfo.empty, acc)
     for {
       snapshot <- mkSnapshot(Hash("ab".padTo(64, 'c').take(64)).some)
       store <- freshStore
-      ok <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, gsi, none, store, logger)
-    } yield expect(!ok)
+      adopted <- NakamotoSyncDaemon.seedMptByteFaithful[IO](snapshot, gsi, none, store, logger)
+    } yield expect(adopted.isEmpty)
   }
 }

@@ -205,8 +205,11 @@ object NakamotoSyncDaemon {
     * branch can still legitimately diverge for the sharded-currency partition, so a mismatch there also returns `false` (do NOT adopt).
     *
     * @return
-    *   `true` iff the MPT now holds state whose sidecar-free root equals the snapshot's SIGNED `mptRoot` (safe to adopt as canonical);
-    *   `false` => the transfer was corrupt or the GSI fallback diverged — the caller must NOT adopt canonical state (re-pull / idle).
+    *   `Some(verifiedBytes)` iff the MPT now holds state whose sidecar-free root equals the snapshot's SIGNED `mptRoot` (safe to adopt as
+    *   canonical) — the exact root-verified byte map that was installed, so the caller can persist/stage it into the signed byte store
+    *   (signed-byte-store FIDELITY: adopted ordinals must not stay permanent holes there, see `SnapshotLeaderLoop.stageAdoptedPostBytes`);
+    *   `None` => the transfer was corrupt or the GSI fallback diverged — the caller must NOT adopt canonical state (re-pull / idle).
+    *   `isDefined` is exactly the old Boolean.
     */
   private[nakamoto] def seedMptByteFaithful[F[_]: Async: cats.Parallel: JsonSerializer: Hasher](
     snapshot: Hashed[GlobalIncrementalSnapshot],
@@ -217,7 +220,7 @@ object NakamotoSyncDaemon {
   )(
     implicit stateProofSelector: io.constellationnetwork.schema.StateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): F[Boolean] = {
+  ): F[Option[Map[Hex, Array[Byte]]]] = {
     val ordinal = snapshot.signed.value.ordinal
     val signedRoot = snapshot.signed.value.stateProof.mptRoot
     def shortOpt(h: Option[Hash]): String = h.map(_.show.take(12)).getOrElse("none")
@@ -229,31 +232,31 @@ object NakamotoSyncDaemon {
             logger.info(
               s"🔄 CATCH-UP byte-faithful: adopting ${bytes.size} SIGNED MPT entries VERBATIM at ord=${ordinal.show} " +
                 s"(sidecar-free root=${recomputed.show.take(12)} === signed mptRoot — verified)"
-            ) >> mptStore.loadBytes(bytes, ordinal).as(true)
+            ) >> mptStore.loadBytes(bytes, ordinal).as(bytes.some)
           else
             logger
               .warn(
                 s"⛔ CATCH-UP byte-faithful: served SIGNED MPT bytes recompute to ${recomputed.show.take(12)} ≠ signed mptRoot " +
                   s"${shortOpt(signedRoot)} at ord=${ordinal.show} (corrupt/truncated transfer). NOT adopting; will re-pull."
               )
-              .as(false)
+              .as(none[Map[Hex, Array[Byte]]])
         }
       case None =>
         // LEGACY FALLBACK (byte route 404 at a sparse combined-checkpoint ordinal): root-verified GSI re-encode. FINDING-S01:
-        // `syncFromGlobalSnapshotInfoVerified` is CHECK-THEN-WRITE — it reconciles {GSI ∪ preserved ConsumedAllowSpends/Slashings,
+        // `syncFromGlobalSnapshotInfoVerifiedBytes` is CHECK-THEN-WRITE — it reconciles {GSI ∪ preserved ConsumedAllowSpends/Slashings,
         // GSI alone} against the signed root BEFORE any store write (the old write-then-verify clobbered the live MPT on mismatch,
         // and unconditionally WIPED the MPT-native partitions the GSI has no field for). This branch can still legitimately fail
-        // for the sharded-currency partition (GSI not source of truth); on `false` nothing was written — the caller re-pulls/idles.
+        // for the sharded-currency partition (GSI not source of truth); on `None` nothing was written — the caller re-pulls/idles.
         logger.info(
           s"🔄 CATCH-UP byte-faithful: byte route unavailable at ord=${ordinal.show}, falling back to GSI re-encode (root-verified)"
         ) >>
-          mptStore.syncFromGlobalSnapshotInfoVerified(gsi, ordinal, signedRoot).flatTap { adopted =>
+          mptStore.syncFromGlobalSnapshotInfoVerifiedBytes(gsi, ordinal, signedRoot).flatTap { adopted =>
             logger
               .warn(
                 s"⛔ CATCH-UP byte-faithful: no GSI-rebuild candidate reproduces the signed mptRoot ${shortOpt(signedRoot)} " +
                   s"at ord=${ordinal.show} (GSI inconsistent with signed root). NOT adopting (store untouched); will re-pull."
               )
-              .whenA(!adopted)
+              .whenA(adopted.isEmpty)
           }
     }
   }
@@ -402,8 +405,16 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
-    // 3c-A enabler — signed-bytes staging map, threaded alongside `pendingAccumulatorsRef` (rides with it; never feeds back into logic).
+    // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
+    // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09 — adopted ordinals must not stay permanent holes in
+    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(diffBaseOrdinal)` fail-closes on every node that adopted that ordinal).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    // Signed-byte-store FIDELITY — the SERVED signed-bytes store (`mpt_snapshot_info_signed`). Written DIRECTLY only by the byte-faithful
+    // catch-up (its target is an already-FINALIZED ordinal the local finalize sink may never re-visit); every other adopt stages via
+    // `pendingPostBytesRef` and lets the finalize sink write.
+    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
+    // Bound for the adopt-staging (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
+    stagingAccumulatorsCap: Int,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -473,6 +484,8 @@ object NakamotoSyncDaemon {
               mptOverlay,
               pendingAccumulatorsRef,
               pendingPostBytesRef,
+              signedBytesStore,
+              stagingAccumulatorsCap,
               eventMempool,
               chainSyncManager,
               channel,
@@ -542,8 +555,13 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
-    // 3c-A enabler — signed-bytes staging map, threaded alongside `pendingAccumulatorsRef` (rides with it; never feeds back into logic).
+    // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
+    // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    // Signed-byte-store FIDELITY — the SERVED signed-bytes store; written directly only by the byte-faithful catch-up (see handleSnapshot).
+    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
+    // Bound for the adopt-staging (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
+    stagingAccumulatorsCap: Int,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
     // (#196) Sink for inbound AllowSpendBlock gossip — same queue
@@ -787,6 +805,8 @@ object NakamotoSyncDaemon {
                                 mptOverlay,
                                 pendingAccumulatorsRef,
                                 pendingPostBytesRef,
+                                signedBytesStore,
+                                stagingAccumulatorsCap,
                                 eventMempool,
                                 csm,
                                 channel,
@@ -888,6 +908,8 @@ object NakamotoSyncDaemon {
                                   mptOverlay,
                                   pendingAccumulatorsRef,
                                   pendingPostBytesRef,
+                                  signedBytesStore,
+                                  stagingAccumulatorsCap,
                                   eventMempool,
                                   chainSyncManager,
                                   channel,
@@ -1286,8 +1308,16 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
-    // 3c-A enabler — signed-bytes staging map, threaded alongside `pendingAccumulatorsRef` (rides with it; never feeds back into logic).
+    // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
+    // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09 — adopted ordinals must not stay permanent holes in
+    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(diffBaseOrdinal)` fail-closes on every node that adopted that ordinal).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    // Signed-byte-store FIDELITY — the SERVED signed-bytes store (`mpt_snapshot_info_signed`). Written DIRECTLY only by the byte-faithful
+    // catch-up (its target is an already-FINALIZED ordinal the local finalize sink may never re-visit); every other adopt stages via
+    // `pendingPostBytesRef` and lets the finalize sink write.
+    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
+    // Bound for the adopt-staging (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
+    stagingAccumulatorsCap: Int,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -1612,6 +1642,8 @@ object NakamotoSyncDaemon {
               mptOverlay,
               pendingAccumulatorsRef,
               pendingPostBytesRef,
+              signedBytesStore,
+              stagingAccumulatorsCap,
               eventMempool,
               chainSyncManager,
               channel,
@@ -1643,6 +1675,9 @@ object NakamotoSyncDaemon {
             productionGate,
             channel,
             dataDir,
+            pendingPostBytesRef,
+            signedBytesStore,
+            stagingAccumulatorsCap,
             logger,
             pullLatestMptEntries
           )
@@ -1680,6 +1715,9 @@ object NakamotoSyncDaemon {
                       productionGate,
                       channel,
                       dataDir,
+                      pendingPostBytesRef,
+                      signedBytesStore,
+                      stagingAccumulatorsCap,
                       logger,
                       pullLatestMptEntries
                     )
@@ -1711,6 +1749,8 @@ object NakamotoSyncDaemon {
                       mptOverlay,
                       eventMempool,
                       productionGate,
+                      pendingPostBytesRef,
+                      stagingAccumulatorsCap,
                       logger
                     )
                 }
@@ -1729,6 +1769,9 @@ object NakamotoSyncDaemon {
                   productionGate,
                   channel,
                   dataDir,
+                  pendingPostBytesRef,
+                  signedBytesStore,
+                  stagingAccumulatorsCap,
                   logger,
                   pullLatestMptEntries
                 )
@@ -1755,6 +1798,8 @@ object NakamotoSyncDaemon {
                       mptStore,
                       eventMempool,
                       productionGate,
+                      pendingPostBytesRef,
+                      stagingAccumulatorsCap,
                       logger
                     )
                   case _ => false.pure[F]
@@ -2065,6 +2110,14 @@ object NakamotoSyncDaemon {
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
+    // Signed-byte-store FIDELITY (2026-07-09) — the SAME staging Ref the produce/validate paths fill. A reorg ADOPT installs the fork's
+    // root-verified state into the live MPT but used to stage NOTHING, so when the adopted hash finalized the sink's promote missed and
+    // `mpt_snapshot_info_signed` was left with a PERMANENT HOLE at that ordinal (the pinnedReaderAt fail-close root cause — every hole in
+    // the 2026-07-09 2mg/2shard run correlated 1:1 with a `Reorg to fork`/`REWARD-SUM REALIGN` adopt). Stage the verified byte map under
+    // the adopted CANONICAL hash so the existing finalize sink persists it exactly like a produced/validated entry.
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    // Bound for the staging map (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
+    stagingAccumulatorsCap: Int,
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -2128,10 +2181,19 @@ object NakamotoSyncDaemon {
                       // pre-reorg canonical state and recovers via the byte-faithful catch-up (`seedMptByteFaithful`) once the
                       // fork finalizes, instead of committing a divergent root.
                       mptStore
-                        .syncFromGlobalSnapshotInfoVerified(context, reorgOrdinal, signedSnapshot.value.stateProof.mptRoot)
+                        .syncFromGlobalSnapshotInfoVerifiedBytes(context, reorgOrdinal, signedSnapshot.value.stateProof.mptRoot)
                         .flatMap {
-                          case true =>
-                            snapshotStorage.setTentativeHead(signedSnapshot, context) >>
+                          case Some(verifiedBytes) =>
+                            // Signed-byte-store FIDELITY: stage the JUST-VERIFIED byte map (sidecar-free root === the fork snapshot's
+                            // SIGNED `stateProof.mptRoot`) under the adopted CANONICAL hash, so the finalize sink persists this ordinal
+                            // into `mpt_snapshot_info_signed` when the adopted branch finalizes. Without this the reorg-adopted ordinal
+                            // is a PERMANENT hole there and every later `pinnedReaderAt(diffBaseOrdinal=thisOrdinal)` fail-closes on
+                            // this node (the 2026-07-09 per-MG mirror freeze). A re-reorged loser is dropped by the sink's watermark
+                            // prune — the "only a FINALIZED branch's bytes reach the store" invariant is untouched.
+                            pendingPostBytesRef.update(
+                              SnapshotLeaderLoop.stageAdoptedPostBytes(_, hashed.hash, reorgOrdinal, verifiedBytes, stagingAccumulatorsCap)
+                            ) >>
+                              snapshotStorage.setTentativeHead(signedSnapshot, context) >>
                               lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                               lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
                               // Overlay cleanup — AFTER the (verified) base rebuild rather than before it, because the
@@ -2158,7 +2220,7 @@ object NakamotoSyncDaemon {
                                 case None           => Async[F].unit
                               } >>
                               Metrics[F].incrementCounter("dag_nakamoto_reorgs")
-                          case false =>
+                          case None =>
                             logger.error(
                               s"⛔ REORG state adopt REJECTED at ordinal=${snap.ordinal} slot=${snap.slot}: neither {carried GSI ∪ " +
                                 s"local ConsumedAllowSpends/Slashings} nor {carried GSI alone} reproduces the fork snapshot's SIGNED " +
@@ -3355,6 +3417,10 @@ object NakamotoSyncDaemon {
     mptStore: MptStore[F, GlobalStateKey],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     productionGate: ProductionGate[F],
+    // Signed-byte-store FIDELITY (2026-07-09) — stage the realign-ADOPTED ordinal's root-verified byte map so the finalize sink persists
+    // it (see `storeForkBranch`'s twin param; the ordinal-18 hole on BOTH healthy nodes in the 2026-07-09 run was exactly this path).
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    stagingAccumulatorsCap: Int,
     logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
@@ -3363,21 +3429,21 @@ object NakamotoSyncDaemon {
     verifyCatchUpSnapshot[F](signedSnapshot, context).flatMap {
       case CatchUpVerdict.Accept(verifiedHashed) =>
         // FINDING-S01 fail-closed ordering: re-seed the MPT FIRST via the root-verified rebuild
-        // (`syncFromGlobalSnapshotInfoVerified` reconciles {carried GSI ∪ preserved ConsumedAllowSpends/Slashings,
+        // (`syncFromGlobalSnapshotInfoVerifiedBytes` reconciles {carried GSI ∪ preserved ConsumedAllowSpends/Slashings,
         // carried GSI alone} against the snapshot's SIGNED `stateProof.mptRoot` BEFORE any store write), and advance the
-        // canonical storages ONLY on a `true` verdict. On `false` NOTHING — canonical or MPT — has been written and we
+        // canonical storages ONLY on a `Some` verdict. On `None` NOTHING — canonical or MPT — has been written and we
         // return false, falling back to the normal fork/catch-up handling (the existing contract of this method).
         val adopt: F[Boolean] =
           HasherSelector[F].withCurrent { implicit hasher =>
             // Re-seed the MPT from the producer's authoritative GSI — its committed reward-sum replaces our
             // diverged re-derivation, so the per-ordinal stateProof re-derives correctly from here on.
-            mptStore.syncFromGlobalSnapshotInfoVerified(
+            mptStore.syncFromGlobalSnapshotInfoVerifiedBytes(
               context,
               SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
               signedSnapshot.value.stateProof.mptRoot
             )
           }.flatMap {
-            case false =>
+            case None =>
               logger
                 .warn(
                   s"⛔ REWARD-SUM REALIGN REJECTED at ordinal=${snap.ordinal}: no GSI-rebuild candidate reproduces the " +
@@ -3385,8 +3451,20 @@ object NakamotoSyncDaemon {
                     s"from the carried GSI). FAILING CLOSED: nothing written; falling back to normal fork handling."
                 )
                 .as(false)
-            case true =>
+            case Some(verifiedBytes) =>
               for {
+                // Signed-byte-store FIDELITY: stage the verified byte map under the adopted CANONICAL hash so the finalize sink
+                // persists this ordinal into `mpt_snapshot_info_signed` (a realign-adopt otherwise leaves a permanent hole there —
+                // the pinnedReaderAt fail-close root cause).
+                _ <- pendingPostBytesRef.update(
+                  SnapshotLeaderLoop.stageAdoptedPostBytes(
+                    _,
+                    verifiedHashed.hash,
+                    SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
+                    verifiedBytes,
+                    stagingAccumulatorsCap
+                  )
+                )
                 _ <- chainStore.store(
                   signedSnapshot,
                   context,
@@ -3446,6 +3524,13 @@ object NakamotoSyncDaemon {
     productionGate: ProductionGate[F],
     channel: ManagedChannel,
     dataDir: java.nio.file.Path,
+    // Signed-byte-store FIDELITY (2026-07-09) — see `storeForkBranch`'s twin params. The LEGACY gossip-adopt arm stages its root-verified
+    // rebuild bytes for finalize-sink promotion (the adopted tip is unfinalized); the BYTE-FAITHFUL arm writes `signedBytesStore` DIRECTLY
+    // (its target is the peer's latest FINALIZED ordinal — strictly ahead of the local tip — so the local finalize sink may never re-visit
+    // it; the bytes already passed the `sidecarFreeMptRoot === signed mptRoot` gate).
+    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
+    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
+    stagingAccumulatorsCap: Int,
     logger: org.typelevel.log4cats.Logger[F],
     pullLatestMptEntries: F[Option[LatestMptEntries]]
   )(
@@ -3512,19 +3597,36 @@ object NakamotoSyncDaemon {
 
                       // MPT full sync from the context we received — critical for the acceptance manager to validate
                       // subsequent snapshots. FINDING-S01 fail-closed ordering: the ROOT-VERIFIED rebuild runs FIRST
-                      // (`syncFromGlobalSnapshotInfoVerified` is check-then-write — it reconciles {carried GSI ∪ preserved
+                      // (`syncFromGlobalSnapshotInfoVerifiedBytes` is check-then-write — it reconciles {carried GSI ∪ preserved
                       // ConsumedAllowSpends/Slashings, carried GSI alone} against the snapshot's SIGNED stateProof.mptRoot
-                      // BEFORE any store write) and every canonical seeding step below runs ONLY on a `true` verdict. On
-                      // `false` NOTHING was written — the node retries on a later gossip wave (10s cooldown); the
+                      // BEFORE any store write) and every canonical seeding step below runs ONLY on a `Some` verdict. On
+                      // `None` NOTHING was written — the node retries on a later gossip wave (10s cooldown); the
                       // byte-faithful pull remains the primary deep-recovery route.
                       _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context (root-verified)...")
-                      mptAdopted <- HasherSelector[F].withCurrent { implicit hasher =>
-                        mptStore.syncFromGlobalSnapshotInfoVerified(
+                      mptAdoptedBytes <- HasherSelector[F].withCurrent { implicit hasher =>
+                        mptStore.syncFromGlobalSnapshotInfoVerifiedBytes(
                           context,
                           SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
                           signedSnapshot.value.stateProof.mptRoot
                         )
                       }
+                      // Signed-byte-store FIDELITY (2026-07-09): stage the verified byte map under the adopted CANONICAL hash so the
+                      // finalize sink persists this ordinal into `mpt_snapshot_info_signed` once finality passes it (the adopted gossip
+                      // tip is UNFINALIZED, so staging — not a direct store write — is the correct sink; a re-reorged loser is dropped by
+                      // the sink's watermark prune). Without this, a legacy-catch-up-adopted ordinal is a permanent hole there and every
+                      // later `pinnedReaderAt(diffBaseOrdinal=thisOrdinal)` fail-closes on this node.
+                      _ <- mptAdoptedBytes.traverse_ { verifiedBytes =>
+                        pendingPostBytesRef.update(
+                          SnapshotLeaderLoop.stageAdoptedPostBytes(
+                            _,
+                            verifiedHashed.hash,
+                            SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
+                            verifiedBytes,
+                            stagingAccumulatorsCap
+                          )
+                        )
+                      }
+                      mptAdopted = mptAdoptedBytes.isDefined
                       // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
                       // ahead of our wall clock, making slotGap negative and blocking VRF
                       // eligibility. Production will update it after its next successful store.
@@ -3634,7 +3736,7 @@ object NakamotoSyncDaemon {
             HasherSelector[F]
               .withCurrent(implicit hasher => seedMptByteFaithful[F](pulledHashed, pulledGsi, pulledBytes, mptStore, logger))
               .flatMap {
-                case false =>
+                case None =>
                   logger.warn(
                     s"\u26d4 CATCH-UP byte-faithful: pulled latest finalized ord=${pOrdinal.show} but sidecarFreeMptRoot \u2260 signed mptRoot " +
                       s"(corrupt transfer / GSI-fallback divergence). Not adopting; will re-pull next wave."
@@ -3643,8 +3745,21 @@ object NakamotoSyncDaemon {
                       "dag_nakamoto_catchup_rejected",
                       Seq(Metrics.unsafeLabelName("reason") -> "byte_faithful_root_mismatch")
                     )
-                case true =>
+                case Some(adoptedBytes) =>
                   for {
+                    // Signed-byte-store FIDELITY (2026-07-09): persist the root-verified byte map DIRECTLY at the pulled ordinal. The
+                    // target is the peer's latest FINALIZED ordinal (strictly ahead of the local tip per the guard below), so the local
+                    // finalize sink may never re-visit it — staging alone could never promote. The bytes already passed
+                    // `sidecarFreeMptRoot === signed mptRoot` inside `seedMptByteFaithful`, so the store keeps its by-construction
+                    // "bytes reproduce the signed root" contract (the pinned reader re-verifies at read time regardless). Cutoff is
+                    // best-effort exactly as at the finalize sink.
+                    _ <- signedBytesStore.writeState(pOrdinal, adoptedBytes) >>
+                      signedBytesStore
+                        .applyCutoff(pOrdinal)
+                        .handleErrorWith(e =>
+                          logger
+                            .warn(e)(s"CATCH-UP byte-faithful: signed-bytes store cutoff failed at ordinal=${pOrdinal.show} (non-fatal)")
+                        )
                     _ <- logger.warn(
                       s"\ud83d\udd04 CATCH-UP byte-faithful: adopting gl0's latest FINALIZED ord=${pOrdinal.show} " +
                         s"(MPT seeded VERBATIM from signed bytes, verified === signed mptRoot). Resetting local state to network tip."

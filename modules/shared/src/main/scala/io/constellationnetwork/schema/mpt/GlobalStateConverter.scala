@@ -1921,8 +1921,29 @@ object GlobalStateConverter {
         implicit stateProofSelector: StateProofSelector,
         withdrawalTimeLimitCtx: WithdrawalTimeLimit
       ): F[Boolean] =
+        syncFromGlobalSnapshotInfoVerifiedBytes(info, snapshotOrdinal, signedMptRoot).map(_.isDefined)
+
+      /** [[syncFromGlobalSnapshotInfoVerified]] that also RETURNS the verified byte map on adopt — `Some(bytes)` iff the store was rebuilt
+        * and `sidecarFreeMptRoot(bytes) === signedMptRoot` (the exact candidate — GSI entries ∪ preserved 33/34, or GSI alone — that
+        * reproduced the signed root); `None` ⇒ NOTHING was written, identical to the Boolean `false`.
+        *
+        * Why the bytes matter (signed-byte-store FIDELITY, 2026-07-09): every consensus ADOPT site (reorg self-heal, reward-realign, gossip
+        * catch-up fallback) already computes this root-verified map internally and discarded it — while the finalize sink can only persist
+        * an ordinal's signed bytes if SOMETHING staged them (`SnapshotLeaderLoop.stageAdoptedPostBytes`). Returning the map lets the adopt
+        * site stage exactly the bytes it verified, closing the permanent per-ordinal HOLES in `mpt_snapshot_info_signed` that made
+        * `PinnedCurrencyInfoReader.pinnedReaderAt(diffBaseOrdinal)` fail-close on every node that had adopted (not produced/validated) that
+        * ordinal. The Boolean variant above delegates here, so its observable behavior is byte-identical to before this method existed.
+        */
+      def syncFromGlobalSnapshotInfoVerifiedBytes(
+        info: GlobalSnapshotInfo,
+        snapshotOrdinal: SnapshotOrdinal,
+        signedMptRoot: Option[Hash]
+      )(
+        implicit stateProofSelector: StateProofSelector,
+        withdrawalTimeLimitCtx: WithdrawalTimeLimit
+      ): F[Option[Map[Hex, Array[Byte]]]] =
         signedMptRoot match {
-          case None => false.pure[F]
+          case None => none[Map[Hex, Array[Byte]]].pure[F]
           case Some(expected) =>
             for {
               preserved <- store.underlying.entries.map(_.filter {
@@ -1932,16 +1953,17 @@ object GlobalStateConverter {
               gsiHex <- gsiBytes.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
               // Key sets are disjoint by construction: `gsiHex` never contains an mptNative fieldId (the GSI has no field for them)
               // and `preserved` contains ONLY mptNative fieldIds — so `++` is a pure union, no overwrites.
-              rootWith <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](gsiHex ++ preserved)
+              withPreserved = gsiHex ++ preserved
+              rootWith <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](withPreserved)
               adopted <-
                 if (rootWith === expected)
-                  syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = true).as(true)
+                  syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = true).as(withPreserved.some)
                 else
                   io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](gsiHex).flatMap { rootWithout =>
                     if (rootWithout === expected)
-                      syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = false).as(true)
+                      syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = false).as(gsiHex.some)
                     else
-                      false.pure[F]
+                      none[Map[Hex, Array[Byte]]].pure[F]
                   }
             } yield adopted
         }

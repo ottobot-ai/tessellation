@@ -166,6 +166,44 @@ object SnapshotLeaderLoop {
   ): Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] =
     staged.filter { case (_, (o, _)) => o.value.value > finalizedOrdinal.value.value }
 
+  /** Signed-byte-store FIDELITY (2026-07-09) — stage an ADOPTED snapshot's ROOT-VERIFIED byte map for finalize-sink promotion.
+    *
+    * The finalize sink (`recordFinalizedAccumulator`) writes `signedBytesStore` at ordinal N ONLY when `pendingPostBytesRef` holds an entry
+    * under N's canonical hash — and until this helper, only the produce path (`createProposalArtifact`) and the validate path
+    * (`validateArtifact` + the stripped→canonical rekey) ever staged one. Every ADOPT path — near-tip reorg (`Reorg to fork … root-verified
+    * adopt`), the Driver-B `REWARD-SUM REALIGN`, and the legacy gossip catch-up — installed the adopted branch's verified state into the
+    * live MPT but staged NOTHING, so when the adopted hash finalized the sink's `staged.get(finalizedHash)` missed and the store was left
+    * with a PERMANENT HOLE at that ordinal (2mg/2shard 2026-07-09: every missing ordinal in each gl0's `mpt_snapshot_info_signed`
+    * correlated 1:1 with that node's adopt events; the wedged gl0-2's store froze at 32, it stamped `diffBaseOrdinal=32` on its shard
+    * checkpoints, and the healthy nodes — which lost the ordinal-32 proposal race and adopted — fail-closed 186× each on
+    * `pinnedReaderAt(32)`; the per-MG mirror froze cluster-wide). Adopt sites call this with the byte map they ALREADY root-verified
+    * against the adopted snapshot's committed `stateProof.mptRoot` (`syncFromGlobalSnapshotInfoVerifiedBytes` / `seedMptByteFaithful`'s
+    * gate), keyed by the adopted CANONICAL hash — the same hash `chainStore.walkBackTo` resolves at finalize — so the existing sink
+    * promotes it exactly like a produced/validated entry. The "only a FINALIZED branch's bytes ever reach the store" invariant is
+    * untouched: a re-reorged loser is dropped by the watermark prune, never written.
+    *
+    * Same lowest-ordinal eviction backstop as the produce-path staging (ties broken by hash for determinism), bounded by the SAME typed
+    * `nakamoto.staging-accumulators-cap` — full-state byte maps are large and a finality stall can adopt every gossip wave, so the cap is
+    * load-bearing (memory), never consensus (an evicted entry only costs that ordinal the 3c-A/pinned-read fallback).
+    */
+  def stageAdoptedPostBytes(
+    staged: Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])],
+    canonicalHash: Hash,
+    ordinal: SnapshotOrdinal,
+    verifiedBytes: Map[Hex, Array[Byte]],
+    cap: Int
+  ): Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] = {
+    val updated = staged.updated(canonicalHash, (ordinal, verifiedBytes))
+    if (updated.size > cap) {
+      val excess = updated.size - cap
+      val toEvict = updated.toList.sortBy { case (h, (o, _)) => (o.value.value, h.value) }
+        .take(excess)
+        .map(_._1)
+        .toSet
+      updated.filterNot { case (h, _) => toEvict.contains(h) }
+    } else updated
+  }
+
   /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last `recentAccumulatorsToKeep`
     * (dropping the lowest ordinals). The cap is the typed `nakamoto.changeset-ring-depth` HOCON value
     * (`SharedConfig.nakamoto.changesetRingDepth`, default 1024), threaded in from `GlobalSnapshotConsensus.make` — a pure transport memory
