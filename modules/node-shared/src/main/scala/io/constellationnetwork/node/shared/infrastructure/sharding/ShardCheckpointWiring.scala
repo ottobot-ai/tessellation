@@ -22,12 +22,13 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.GlobalStateConverter
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
@@ -192,25 +193,46 @@ object ShardCheckpointWiring {
     * committee's root is not reproduced and the mismatch feeds the 100% `InvalidStateProof` slash (the false-slash + split this pin kills).
     * One shared definition keeps all three rails byte-identical, mirroring [[reExecDerivationWithDiff]] itself.
     *
-    * '''Resolution.''' FAST PATH = the live finalized reader when `ord` IS the store's current `lastPersistedOrdinal` (the producer's /
-    * in-lockstep follower's common case — no byte-map materialization); otherwise the version-retained
-    * [[PinnedCurrencyInfoReader.pinnedReaderAt]], which verifies the retained bytes reproduce the pinned snapshot's committed `mptRoot`.
+    * '''Resolution — ALWAYS the version-retained [[PinnedCurrencyInfoReader.pinnedReaderAt]]''' (which verifies the retained bytes
+    * reproduce the pinned snapshot's committed `mptRoot`). There is deliberately NO live-store fast path. The original fast path served
+    * `GlobalStateReader.fromMptStore(mptStore)` whenever `ord == mptStore.lastPersistedOrdinal` — but that equivalence is UNSOUND: the live
+    * store is a MUTABLE VIEW whose content-vs-watermark relationship is unsynchronized. In Passthrough overlay mode the accept-path writes
+    * land in the base store THROUGHOUT an ordinal's processing and `MptStore.commit(ordinal)` bumps `lastPersistedOrdinal` only at the very
+    * end, so `lastPersistedOrdinal == N` holds while the content is anywhere from state@N to a MID-FOLD/POST-FOLD state of N+1+. Live wedge
+    * (2026-07-08, 2mg/2shard token-lock e2e): gl0-1 minted shard-0 `shardOrdinal=8` stamped `diffBaseOrdinal=18` while its live store
+    * already carried the shardOrd-7 adopt (prior read `inc@10,bal=15`; the TRUE committed state@18 was `inc@7,bal=14`) — the diff was cut
+    * over the drifted content, quorum attested it (every committee member's fast path saw the same drifted view), and every honest adopter
+    * — applying the wire diff onto the verified state@18 — recomputed a root that never matched the attested one. The checkpoint re-offered
+    * and dropped at EVERY gl0 ordinal, the per-MG mirror froze, and the metagraph's `activeTokenLocks` never reached gl0. The pinned read
+    * is the only version-pinned source; the fast path's byte-map-materialization saving was never worth an unpinned prior. (Forcing test:
+    * `DiffBasePinReExecutionSuite` "forcing (iii)" — mid-fold watermark skew.)
     *
     * '''Fail-closed.''' `None` when the anchor is unresolvable (evicted below the byte store's retention — logarithmic on the follower
     * rail, contiguous k₂ on gl0 — or not yet reached). The caller then OMITs (defers) / maps to the `Hash.empty` "cannot re-derive"
     * sentinel, which the consumers treat as "can't check" (plain reject / dispute-not-upheld) — NEVER a live-base substitute, NEVER a
     * slash.
     */
-  def pinnedPriorReaderAt[F[_]: Async](
-    mptStore: MptStore[F, GlobalStateKey],
+  def pinnedPriorReaderAt[F[_]](
     pinnedReader: PinnedCurrencyInfoReader[F]
   ): SnapshotOrdinal => F[Option[GlobalStateReader[F]]] =
-    (ord: SnapshotOrdinal) =>
-      mptStore.lastPersistedOrdinal.flatMap {
-        case Some(live) if live.value.value == ord.value.value =>
-          Async[F].pure(Some(GlobalStateReader.fromMptStore[F](mptStore)))
-        case _ => pinnedReader.pinnedReaderAt(ord)
-      }
+    (ord: SnapshotOrdinal) => pinnedReader.pinnedReaderAt(ord)
+
+  /** Track-1 diff-base-pin — the ordinal the producer STAMPS as [[io.constellationnetwork.schema.sharding.ShardCheckpoint.diffBaseOrdinal]]
+    * and cuts every per-MG diff over: the NEWEST ordinal the version-retained signed byte store can actually SERVE (its latest persisted
+    * state), NOT the live `mptStore.lastPersistedOrdinal`.
+    *
+    * '''Why not the live watermark.''' [[pinnedPriorReaderAt]] resolves the diff prior EXCLUSIVELY through the version-retained,
+    * root-verified pinned reader (see its scaladoc for the mid-fold-skew wedge the live fast path caused). The signed byte store is written
+    * at the FINALIZE sink and therefore TRAILS `lastPersistedOrdinal` by a few ordinals — stamping the live watermark would make the pinned
+    * read miss on almost every mint (`cannot resolve pinned diff-base — OMIT (defer)`, the DAG4Bawb producer chase in the 2026-07-08 run)
+    * and stall checkpoint production. Stamping the store's own latest ordinal makes the base resolvable-by-construction on the minting
+    * node; committee re-executors and gl0 adopters resolve it from their own (finalize-synchronized) signed stores.
+    *
+    * `SnapshotOrdinal.MinValue` before the first finalize-sink write — `produceInner` then OMITs (defers) until history exists, which is
+    * exactly the fail-closed contract. `numShards = 1` never builds checkpoints, so this is dead there (regression bar preserved).
+    */
+  def pinnedDiffBaseOrdinal[F[_]: Async](signedBytesStore: MptStateStorage[F]): F[SnapshotOrdinal] =
+    signedBytesStore.findLatestOrdinal.map(_.getOrElse(SnapshotOrdinal.MinValue))
 
   /** The PRODUCER-side per-MG derivation (step 6 of the unroll workstream). Same SHAPE as [[reExecDerivation]] but returns the per-MG MPT
     * root PAIRED with the MINIMAL `CurrencySnapshotInfo` byte-diff against the prior shard-checkpoint's cumulative state `S(N)`. The

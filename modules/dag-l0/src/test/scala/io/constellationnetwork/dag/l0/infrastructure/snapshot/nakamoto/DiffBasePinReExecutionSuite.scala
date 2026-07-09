@@ -13,7 +13,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotStat
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, PinnedCurrencyInfoReader}
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ChangeSet, GlobalStateReader, PinnedCurrencyInfoReader}
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashedReader, InvalidStateProofValidator}
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
 import io.constellationnetwork.schema._
@@ -260,16 +260,20 @@ object DiffBasePinReExecutionSuite extends MutableIOSuite {
 
   /** THE PRODUCTION READER-RESOLUTION UNDER TEST — the SINGLE shared recipe both SharedServices rails (sub-quorum `reExecuteDerivation` +
     * `createContextInvalidStateProofValidator`) AND the gl0 produce/watchtower rail (`GlobalSnapshotConsensus.finalizedReaderAt`) wire:
-    * fast-path live reader iff the pinned ordinal IS the current `lastPersistedOrdinal`, else the version-retained pinned reader; `None`
-    * (fail-closed OMIT — never a live-base substitute) when the anchor is unresolvable. The RED capture of this suite (2026-07-07) ran the
-    * SAME forcing tests against [[preFixLiveReaderAt]] — the pre-fix SharedServices wiring — and they failed with divergent roots / a
-    * false-UPHELD verdict; keeping the call routed through the production helper is what forces the pin.
+    * ALWAYS the version-retained, root-verified pinned reader; `None` (fail-closed OMIT — never a live-base substitute) when the anchor is
+    * unresolvable. The `live` store is taken ONLY to assert the production recipe ignores it: the removed fast path (live reader iff the
+    * pinned ordinal == `lastPersistedOrdinal`) was UNSOUND — the live store's content is not pinned by its watermark (forcing (iii), the
+    * 2026-07-08 mid-fold-skew wedge). The RED capture of this suite (2026-07-07) ran the SAME forcing tests against [[preFixLiveReaderAt]]
+    * — the pre-fix SharedServices wiring — and they failed with divergent roots / a false-UPHELD verdict; keeping the call routed through
+    * the production helper is what forces the pin.
     */
   private def productionPriorReaderAt(
     live: MptStore[IO, GlobalStateKey],
     pinned: PinnedCurrencyInfoReader[IO]
-  ): SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]] =
-    ShardCheckpointWiring.pinnedPriorReaderAt[IO](live, pinned)
+  ): SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]] = {
+    val _ = live // deliberately unused: the production recipe must never consult the live store
+    ShardCheckpointWiring.pinnedPriorReaderAt[IO](pinned)
+  }
 
   /** The production re-derivation closure shape (SharedServices `reExecuteDerivation` / `reDerive`): PIN-1 root half of
     * `reExecDerivationWithDiff`, `Hash.empty` on OMIT.
@@ -286,6 +290,22 @@ object DiffBasePinReExecutionSuite extends MutableIOSuite {
       val withDiff = ShardCheckpointWiring.reExecDerivationWithDiff[IO](processor, readerAt)
       (mgA: Address, bins: NonEmptyList[Signed[StateChannelSnapshotBinary]], anchor: SnapshotOrdinal, base: SnapshotOrdinal) =>
         withDiff(mgA, bins, anchor, base).map(_.map(_._1).getOrElse(Hash.empty))
+    }
+
+  /** Like [[mkReDerive]] but returns BOTH halves of the producer emission — the attested root AND the wire `ChangeSet` — so the
+    * mid-fold-skew forcing test can replay the ADOPTER's apply-and-verify (`ChangeSet.reconstructInfoFromDiff` over the pinned prior,
+    * re-rooted via `currencySnapshotMgRoot`) against exactly what the producer would have stamped on the checkpoint.
+    */
+  private def mkReDeriveWithDiff(
+    readerAt: SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]]
+  )(
+    implicit h: Hasher[IO],
+    js: JsonSerializer[IO],
+    ks: KryoSerializer[IO],
+    sp: SecurityProvider[IO]
+  ): IO[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]]] =
+    GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessor(Map.empty).map { processor =>
+      ShardCheckpointWiring.reExecDerivationWithDiff[IO](processor, readerAt)
     }
 
   /** The message-free checkpoint window: ONE incremental at metagraph-ordinal 6 chaining the base's ordinal-5 incremental. */
@@ -453,6 +473,61 @@ object DiffBasePinReExecutionSuite extends MutableIOSuite {
             rootAtBase === rootAhead,
             s"balances flow through the seed prior — the pinned rail must neutralize a live-tip balance drift " +
               s"(got atBase=${rootAtBase.value.take(16)} ahead=${rootAhead.value.take(16)})"
+          )
+    }
+  }
+
+  // ===========================================================================
+  // FORCING (iii): mid-fold watermark skew — the 2026-07-08 live wedge (token-lock e2e, shard-0 shardOrd=8)
+  // ===========================================================================
+
+  test(
+    "forcing (iii): production rail — live watermark == diffBase but content already drifted (mid-fold skew) still derives the " +
+      "pinned state@diffBase root, and the emitted diff re-applies onto the pinned prior to the attested root"
+  ) { res =>
+    implicit val (ks, h, js, sp) = res
+    // THE 2026-07-08 LIVE WEDGE (2mg/2shard token-lock e2e). In Passthrough overlay mode the accept-path writes land in the live base
+    // store THROUGHOUT an ordinal's processing and `MptStore.commit(ordinal)` bumps `lastPersistedOrdinal` only at the END — so
+    // `lastPersistedOrdinal == N` does NOT imply "content == committed state@N". gl0-1 minted shard-0 shardOrd=8 stamped
+    // `diffBaseOrdinal=18` while its live store already carried the shardOrd-7 adopt (prior read inc@10/bal=15; true state@18 was
+    // inc@7/bal=14): the old fast path (`live == ord ⇒ serve the live store`) handed the derivation that POST-FOLD content, the diff was
+    // cut over it, and every honest adopter — applying the wire diff onto the TRUE pinned state@18 — recomputed a root (4bfe2f1f…) that
+    // never matched the attested one (b9787f2e…): the checkpoint re-offered and dropped EVERY ordinal, the per-MG mirror froze at
+    // mgOrd=10, and the metagraph's later activeTokenLocks never reached gl0. This test models that exact skew: watermark == diffBase,
+    // content = aheadInfoBalances. The production rail must IGNORE the live view and read the version-retained, root-VERIFIED bytes.
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        pinned <- mkPinnedHistory(dir)
+        // Watermark says diffBase; content has ALREADY moved past it (the mid-fold/in-flight-adopt state).
+        skewedLive <- mkLiveStore(mgState(aheadInfoBalances), diffBase)
+        window <- mkWindow
+        reDeriveSkewed <- mkReDeriveWithDiff(productionPriorReaderAt(skewedLive, pinned))
+        emitted <- reDeriveSkewed(mg, window, anchorOrd, diffBase)
+        (attestedRoot, wireDiff) = emitted.getOrElse((Hash.empty, ChangeSet.empty))
+        // The ADOPTER side (GSAM `deriveAdoptedCurrencyState` PIN-1): apply the emitted diff onto the TRUE pinned state@diffBase and
+        // re-root — byte-identical recompute of what every honest gl0 does with this checkpoint.
+        pinnedPriorOpt <- pinned.readAtOrdinal(diffBase, mg)
+        adopterRoot <- pinnedPriorOpt match {
+          case Some(pinnedPrior) =>
+            ChangeSet
+              .reconstructInfoFromDiff[IO](mg, pinnedPrior, wireDiff)
+              .flatMap { reconstructed =>
+                GlobalStateConverter.currencySnapshotMgRoot[IO](
+                  SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]](
+                    mg -> Right((mkSignedIncremental(6L), reconstructed))
+                  )
+                )
+              }
+          case None => IO.pure(Hash.empty)
+        }
+      } yield
+        expect(attestedRoot =!= Hash.empty, "the skewed-watermark node must still derive (not OMIT) — the pinned bytes are servable") &&
+          expect(pinnedPriorOpt.isDefined, "the pinned prior at diffBase must reconstruct (fixture sanity)") &&
+          expect(
+            adopterRoot === attestedRoot,
+            s"a checkpoint minted under mid-fold watermark skew must still be reconstructible by every honest adopter from the " +
+              s"pinned state@diffBase — the live-view fast path poisons the attested root otherwise " +
+              s"(attested=${attestedRoot.value.take(16)} adopterRecomputed=${adopterRoot.value.take(16)})"
           )
     }
   }

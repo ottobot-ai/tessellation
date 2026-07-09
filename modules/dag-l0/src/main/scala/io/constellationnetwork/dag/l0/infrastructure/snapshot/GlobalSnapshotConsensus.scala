@@ -571,14 +571,16 @@ object GlobalSnapshotConsensus {
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
           .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback)
       }
-      // Resolve the finalized state reader AT a pinned ordinal: FAST PATH = the live base reader when the ordinal IS the current
-      // `lastPersistedOrdinal` (the producer's common case — no byte-map materialization); otherwise a version-retained pinned reader over
-      // `signedBytesStore` (the watchtower's historical case). `None` ⇒ the anchor can't be served (evicted below k₂ / not on this chain).
+      // Resolve the finalized state reader AT a pinned ordinal — ALWAYS the version-retained, root-verified pinned reader over
+      // `signedBytesStore`. `None` ⇒ the anchor can't be served (evicted below k₂ / not yet finalize-persisted / not on this chain).
+      // NO live fast path: `lastPersistedOrdinal == ord` does NOT imply the live store's content is state@ord (Passthrough accept
+      // writes land before the watermark bumps), and that skew minted quorum-attested checkpoints whose diff no honest adopter could
+      // re-apply — the 2026-07-08 shard-0 shardOrd=8 wedge (see `ShardCheckpointWiring.pinnedPriorReaderAt` scaladoc).
       // Track-1 diff-base-pin (FINDING-B1): the SINGLE shared recipe (`ShardCheckpointWiring.pinnedPriorReaderAt`) — the SharedServices
       // follower rails (sub-quorum re-exec + createContext fraud-proof validator) resolve through the SAME definition (over their
       // logarithmic `mpt_snapshot_info` byte store), so all `reExecDerivationWithDiff` callers read one pin semantics.
       finalizedReaderAt = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-        .pinnedPriorReaderAt[F](mptStore, gl0PinnedReader)
+        .pinnedPriorReaderAt[F](gl0PinnedReader)
 
       // ─── WATCHTOWER fraud-proof re-derivation closure (W3a) — hoisted ABOVE the GSAM so the on-chain verdict can use it ───
       // The PIN-1 per-MG re-derivation — IDENTICAL encoding to the sub-quorum re-exec the acceptance manager uses
@@ -1833,9 +1835,14 @@ object GlobalSnapshotConsensus {
                           implicitly[io.constellationnetwork.json.JsonSerializer[F]],
                           globalStateProofSelector
                         ),
-                      // Track-1 diff-base-pin ATOMIC SAVEPOINT: the finalized base ordinal the producer stamps + cuts every per-MG diff over.
-                      diffBaseOrdinalF =
-                        mptStore.lastPersistedOrdinal.map(_.getOrElse(io.constellationnetwork.schema.SnapshotOrdinal.MinValue)),
+                      // Track-1 diff-base-pin ATOMIC SAVEPOINT: the base ordinal the producer stamps + cuts every per-MG diff over.
+                      // = the signed byte store's NEWEST persisted ordinal (`pinnedDiffBaseOrdinal`), NOT the live
+                      // `mptStore.lastPersistedOrdinal`: the diff prior is resolved EXCLUSIVELY through the version-retained pinned
+                      // reader now (no live fast path — the 2026-07-08 mid-fold-skew wedge), and the signed store trails the live
+                      // watermark by the finalize lag, so stamping the watermark would OMIT-defer almost every mint while stamping the
+                      // store's own latest is resolvable-by-construction on the minting node and finalize-synchronized on every verifier.
+                      diffBaseOrdinalF = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+                        .pinnedDiffBaseOrdinal[F](signedBytesStore),
                       // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
                       // manager gates new window production so pending batches while embedding catches up.
                       lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),

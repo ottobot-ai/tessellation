@@ -325,13 +325,15 @@ object SharedServices {
           // (`deriveAdoptedCurrencyInfo` folds cumulative balances/refs/active-sets — and the `lastMessages` carry-forward — onto the
           // seed prior), so a live read on a node whose finalized tip ≠ the checkpoint's base recomputes a DIFFERENT root for the SAME
           // honest checkpoint → false `RejectedReExecutionMismatch` (a durable 100% slash of the whole committee) + adopt-decision split.
-          // Same shared recipe the gl0 produce/watchtower rail uses (`GlobalSnapshotConsensus.finalizedReaderAt`): fast-path live reader
-          // iff `diffBaseOrdinal` IS the current `lastPersistedOrdinal`, else the version-retained pinned reader over this node's
-          // `mpt_snapshot_info` byte store (`sharedPinnedCurrencyInfoReader`). RETENTION CAVEAT: that store prunes logarithmically
-          // (sparse below the head), so a deep anchor can miss — the pin then FAILS CLOSED (`None` ⇒ OMIT ⇒ `Hash.empty`, which
-          // `reExecPath` treats as "can't check": plain reject, NO slash) rather than substituting a live base.
+          // Same shared recipe the gl0 produce/watchtower rail uses (`GlobalSnapshotConsensus.finalizedReaderAt`): ALWAYS the
+          // version-retained, root-verified pinned reader over this node's `mpt_snapshot_info` byte store
+          // (`sharedPinnedCurrencyInfoReader`) — NO live fast path (`lastPersistedOrdinal == ord` does not pin the live store's
+          // CONTENT to state@ord; see `ShardCheckpointWiring.pinnedPriorReaderAt` for the 2026-07-08 mid-fold-skew wedge).
+          // RETENTION CAVEAT: that store prunes logarithmically (sparse below the head), so an anchor can miss — the pin then FAILS
+          // CLOSED (`None` ⇒ OMIT ⇒ `Hash.empty`, which `reExecPath` treats as "can't check": plain reject, NO slash) rather than
+          // substituting a live base.
           val pinnedReaderAt =
-            ShardCheckpointWiring.pinnedPriorReaderAt[F](storages.mptStore, sharedPinnedCurrencyInfoReader)
+            ShardCheckpointWiring.pinnedPriorReaderAt[F](sharedPinnedCurrencyInfoReader)
           val withDiff =
             ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, pinnedReaderAt)(
               Async[F],
@@ -381,7 +383,7 @@ object SharedServices {
           // mirror-freeze fork. Unresolvable anchor ⇒ fail-closed `Hash.empty` ⇒ `InvalidStateProofValidator` step 7 rejects the dispute
           // (`CannotRederive`) — an unverifiable dispute never slashes.
           val pinnedReaderAt =
-            ShardCheckpointWiring.pinnedPriorReaderAt[F](storages.mptStore, sharedPinnedCurrencyInfoReader)
+            ShardCheckpointWiring.pinnedPriorReaderAt[F](sharedPinnedCurrencyInfoReader)
           val withDiff =
             ShardCheckpointWiring.reExecDerivationWithDiff[F](shardScEventsProcessor, pinnedReaderAt)(
               Async[F],
