@@ -829,87 +829,122 @@ object GlobalSnapshotAcceptanceManager {
                         // split-safe. No continuation present at all ⇒ defer (true chain hole, the leader re-offers an
                         // older ancestor).
                         val tipFor: Address => Hash = mg => priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty)
-                        // ORPHANED-TIP REANCHOR (2026-06-29): classify each window via the SHARED `ShardReanchor` (byte-identical
-                        // to the embed-selection `pick` in GlobalSnapshotConsensusFunctions — the lockstep guarantee). Continue =
-                        // trim-aware suffix off gl0's tip (existing); Reanchor = gl0's tip orphaned by a same-ordinal shard reorg,
-                        // adopt the canonical suffix past the dead tip's ordinal (heals the freeze); Defer = true chain hole. The
-                        // trailing `Boolean` flags a reanchor for the log line below.
-                        val trimResults: List[Either[
-                          (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
-                          (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
-                        ]] =
-                          cp.derivedStateDelta.includedSnapshots.toList.map {
-                            case (mg, nel) =>
-                              def suffixFrom(idx: Int, isReanchor: Boolean) =
+                        // ORPHANED-TIP REANCHOR (2026-06-29) + FULLY-ADOPTED SKIP (2026-07-08): classify each window via the SHARED
+                        // `ShardReanchor` (byte-identical to the embed-selection `pick` in GlobalSnapshotConsensusFunctions — the
+                        // lockstep guarantee). Continue = trim-aware suffix off gl0's tip (existing); Reanchor = gl0's tip orphaned
+                        // by a same-ordinal shard reorg, adopt the canonical suffix past the dead tip's ordinal (heals the freeze);
+                        // AlreadyAdopted = the window's tail IS gl0's tip (window fully adopted) — adopt NOTHING for this MG (a
+                        // benign no-op, NOT a chain hole: pre-fix this misclassified as Reanchor(lastIdx) and re-committed the tip
+                        // binary every gl0 ordinal — the 3gl0/2shard startup freeze); Defer = true chain hole. The window-tail hash
+                        // comes from the SHARED `ShardReanchor.windowTipHashF` (the same value-hash the SC-tip setter records) —
+                        // deterministic over wire-carried bytes, split-safe. Result shape: Left(mg) = already adopted (skip);
+                        // Right(Left(...)) = deferred; Right(Right((mg, suffix, idx, isReanchor))) = adopted, where the trailing
+                        // `Boolean` flags a reanchor for the log line below.
+                        cp.derivedStateDelta.includedSnapshots.toList.traverse {
+                          case (mg, nel) =>
+                            ShardReanchor.windowTipHashF(nel).map { windowTipHash =>
+                              def suffixFrom(idx: Int, isReanchor: Boolean): Either[
+                                (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                                (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
+                              ] =
                                 NonEmptyList
                                   .fromList(nel.toList.drop(idx))
-                                  .map(suffix => Right((mg, suffix, idx, isReanchor)))
+                                  .map(suffix =>
+                                    Right((mg, suffix, idx, isReanchor)): Either[
+                                      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                                      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
+                                    ]
+                                  )
                                   .getOrElse(Left((mg, nel)))
-                              ShardReanchor.classify(nel, tipFor(mg), ShardReanchor.tipOrdinalFor(priorLastCurrencySnapshots, mg)) match {
-                                case ShardReanchor.Continue(idx) => suffixFrom(idx, isReanchor = false)
-                                case ShardReanchor.Reanchor(idx) => suffixFrom(idx, isReanchor = true)
-                                case ShardReanchor.Defer         => Left((mg, nel))
-                              }
-                          }
-                        val deferred = trimResults.collect { case Left(d) => d }
-                        val adopted = trimResults.collect { case Right(r) => r }
-                        val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
-                          SortedMap.from(adopted.map { case (mg, suffix, _, _) => mg -> suffix })(Address.OrderingInstance)
-                        // STEP 6: the committee's per-MG `(byte-diff, attested per-MG root)` for each adopted MG — fed to
-                        // `deriveAdoptedCurrencyState` to APPLY-and-verify the committed currency info (PIN-1 root, PIN-3 minimal diff). Only
-                        // for MGs that have BOTH a carried diff and a carried root in this checkpoint's `derivedStateDelta`; a pure-genesis
-                        // window (empty diff/root) is simply absent ⇒ `deriveAdoptedCurrencyState` keeps the decoded info verbatim there.
-                        val newDiffs
-                          : SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)] =
-                          SortedMap.from(chainContinuous.keys.toList.flatMap { mg =>
-                            (
-                              cp.derivedStateDelta.perMetagraphStateDiff.get(mg),
-                              cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
-                              // Track-1 diff-base-pin: attach THIS checkpoint's `diffBaseOrdinal` to each adopted MG's diff — the pinned base
-                              // `deriveAdoptedCurrencyState` reads the per-MG prior at (byte-identical to the base the producer diffed over).
-                            ).tupled.map { case (diff, root) => mg -> ((diff, root, cp.diffBaseOrdinal)) }
-                          })(Address.OrderingInstance)
-                        val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
-                        deferred.traverse_ {
-                          case (mg, nel) =>
-                            loggerBundle.app.warn(
+                              val decision: Either[
+                                Address,
+                                Either[
+                                  (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                                  (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
+                                ]
+                              ] =
+                                ShardReanchor.classify(
+                                  nel,
+                                  windowTipHash,
+                                  tipFor(mg),
+                                  ShardReanchor.tipOrdinalFor(priorLastCurrencySnapshots, mg)
+                                ) match {
+                                  case ShardReanchor.Continue(idx)  => Right(suffixFrom(idx, isReanchor = false))
+                                  case ShardReanchor.Reanchor(idx)  => Right(suffixFrom(idx, isReanchor = true))
+                                  case ShardReanchor.AlreadyAdopted => Left(mg)
+                                  case ShardReanchor.Defer          => Right(Left((mg, nel)))
+                                }
+                              decision
+                            }
+                        }.flatMap { trimResults =>
+                          val alreadyAdopted = trimResults.collect { case Left(mg) => mg }
+                          val deferred = trimResults.collect { case Right(Left(d)) => d }
+                          val adopted = trimResults.collect { case Right(Right(r)) => r }
+                          val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
+                            SortedMap.from(adopted.map { case (mg, suffix, _, _) => mg -> suffix })(Address.OrderingInstance)
+                          // STEP 6: the committee's per-MG `(byte-diff, attested per-MG root)` for each adopted MG — fed to
+                          // `deriveAdoptedCurrencyState` to APPLY-and-verify the committed currency info (PIN-1 root, PIN-3 minimal diff). Only
+                          // for MGs that have BOTH a carried diff and a carried root in this checkpoint's `derivedStateDelta`; a pure-genesis
+                          // window (empty diff/root) is simply absent ⇒ `deriveAdoptedCurrencyState` keeps the decoded info verbatim there.
+                          val newDiffs
+                            : SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)] =
+                            SortedMap.from(chainContinuous.keys.toList.flatMap { mg =>
+                              (
+                                cp.derivedStateDelta.perMetagraphStateDiff.get(mg),
+                                cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
+                                // Track-1 diff-base-pin: attach THIS checkpoint's `diffBaseOrdinal` to each adopted MG's diff — the pinned base
+                                // `deriveAdoptedCurrencyState` reads the per-MG prior at (byte-identical to the base the producer diffed over).
+                              ).tupled.map { case (diff, root) => mg -> ((diff, root, cp.diffBaseOrdinal)) }
+                            })(Address.OrderingInstance)
+                          val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
+                          alreadyAdopted.traverse_ { mg =>
+                            loggerBundle.app.info(
                               s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                s"DEFER-ANCHOR mg=$mg windowHeadParent=${nel.head.value.lastSnapshotHash.value.take(12)} " +
-                                s"gl0Tip=${tipFor(mg).value.take(12)} " +
-                                s"— no continuation of gl0's SC tip anywhere in the window (missing ancestor checkpoint); deferring"
+                                s"ALREADY-ADOPTED mg=$mg gl0Tip=${tipFor(mg).value.take(12)} — window tail === gl0's SC tip " +
+                                s"(fully adopted); nothing to adopt for this MG"
                             )
-                        } >>
-                          adopted.traverse_ {
-                            case (mg, _, trimmedCount, isReanchor) =>
-                              if (isReanchor) {
-                                val tipOrd = ShardReanchor.tipOrdinalFor(priorLastCurrencySnapshots, mg).getOrElse(-1L)
+                          } >>
+                            deferred.traverse_ {
+                              case (mg, nel) =>
                                 loggerBundle.app.warn(
                                   s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                    s"REANCHOR mg=$mg gl0Tip=${tipFor(mg).value.take(12)} orphaned by reorg — adopted canonical " +
-                                    s"suffix from index=$trimmedCount (tip metagraph-ordinal=$tipOrd)"
+                                    s"DEFER-ANCHOR mg=$mg windowHeadParent=${nel.head.value.lastSnapshotHash.value.take(12)} " +
+                                    s"gl0Tip=${tipFor(mg).value.take(12)} " +
+                                    s"— no continuation of gl0's SC tip anywhere in the window (missing ancestor checkpoint); deferring"
                                 )
-                              } else
-                                Async[F].whenA(trimmedCount > 0) {
-                                  loggerBundle.app.info(
+                            } >>
+                            adopted.traverse_ {
+                              case (mg, _, trimmedCount, isReanchor) =>
+                                if (isReanchor) {
+                                  val tipOrd = ShardReanchor.tipOrdinalFor(priorLastCurrencySnapshots, mg).getOrElse(-1L)
+                                  loggerBundle.app.warn(
                                     s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                      s"TRIM-ANCHOR mg=$mg trimmed=$trimmedCount already-adopted prefix binaries (post-reorg window overlap)"
+                                      s"REANCHOR mg=$mg gl0Tip=${tipFor(mg).value.take(12)} orphaned by reorg — adopted canonical " +
+                                      s"suffix from index=$trimmedCount (tip metagraph-ordinal=$tipOrd)"
                                   )
-                                }
-                          } >>
-                          loggerBundle.app
-                            .info(
-                              s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                s"ACCEPTED adopt mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
-                                s"deferredMgs=${deferred.size} receipts=${newReceipts.size}"
-                            ) >>
-                          // Bounded-pipeline watermark (2026-06-11) + fork-choice anchor (task #42): record the adopted shard
-                          // ordinal AND the adopted checkpoint's canonical hash. The ordinal gates producer windows (pipeline
-                          // depth); the hash is the anchor the daemon feeds into ShardChainStore.noteAnchor so every node's
-                          // shard fork choice follows gl0's adopted lineage (the run-14/15 heal).
-                          Hasher[F]
-                            .hash(cp.signingPreimage)
-                            .flatMap(cpHash => checkpointManager.noteAdopted(shardId, cp.shardOrdinal, cpHash))
-                            .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts, diffAcc ++ newDiffs, slashAcc))
+                                } else
+                                  Async[F].whenA(trimmedCount > 0) {
+                                    loggerBundle.app.info(
+                                      s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                                        s"TRIM-ANCHOR mg=$mg trimmed=$trimmedCount already-adopted prefix binaries (post-reorg window overlap)"
+                                    )
+                                  }
+                            } >>
+                            loggerBundle.app
+                              .info(
+                                s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                                  s"ACCEPTED adopt mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
+                                  s"deferredMgs=${deferred.size} alreadyAdoptedMgs=${alreadyAdopted.size} receipts=${newReceipts.size}"
+                              ) >>
+                            // Bounded-pipeline watermark (2026-06-11) + fork-choice anchor (task #42): record the adopted shard
+                            // ordinal AND the adopted checkpoint's canonical hash. The ordinal gates producer windows (pipeline
+                            // depth); the hash is the anchor the daemon feeds into ShardChainStore.noteAnchor so every node's
+                            // shard fork choice follows gl0's adopted lineage (the run-14/15 heal).
+                            Hasher[F]
+                              .hash(cp.signingPreimage)
+                              .flatMap(cpHash => checkpointManager.noteAdopted(shardId, cp.shardOrdinal, cpHash))
+                              .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts, diffAcc ++ newDiffs, slashAcc))
+                        } // close trimResults flatMap
                       } // close else (diff-base reached)
 
                     case ShardCheckpointAcceptResult.PendingMoreAttestations =>

@@ -643,23 +643,39 @@ object GlobalSnapshotConsensusFunctions {
                               // window head. Post-reorg, canonical windows OVERLAP the already-adopted orphaned
                               // prefix; head-only matching stalled adoption permanently (run bml994k4d shard 1)
                               // while the chain kept producing. The adoption side trims the overlap.
-                              val pick = chainTipFirst.reverse.find { h =>
+                              chainTipFirst.reverse.findM { h =>
                                 val cp = h.signed.value
-                                cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
-                                cp.derivedStateDelta.includedSnapshots.nonEmpty &&
-                                cp.derivedStateDelta.includedSnapshots.exists {
-                                  case (mg, nel) =>
-                                    // ORPHANED-TIP REANCHOR (2026-06-29): byte-identical to the GSAM adopt-guard via the shared
-                                    // `ShardReanchor` — a checkpoint qualifies if a window continues gl0's SC tip OR (the freeze fix)
-                                    // gl0's tip was orphaned by a same-ordinal reorg and this is the genesis-rooted canonical lineage.
-                                    ShardReanchor.classify(
-                                      nel,
-                                      scTips.getOrElse(mg, Hash.empty),
-                                      ShardReanchor.tipOrdinalFor(snapshotContext.lastCurrencySnapshots, mg)
-                                    ) != ShardReanchor.Defer
-                                }
-                              }
-                              pick match {
+                                if (
+                                  cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
+                                  cp.derivedStateDelta.includedSnapshots.nonEmpty
+                                )
+                                  cp.derivedStateDelta.includedSnapshots.toList.existsM {
+                                    case (mg, nel) =>
+                                      // ORPHANED-TIP REANCHOR (2026-06-29) + FULLY-ADOPTED SKIP (2026-07-08): byte-identical to the
+                                      // GSAM adopt-guard via the shared `ShardReanchor` — a checkpoint qualifies if a window continues
+                                      // gl0's SC tip (Continue) OR gl0's tip was orphaned by a same-ordinal reorg and this is the
+                                      // genesis-rooted canonical lineage (Reanchor). A FULLY-ADOPTED window (AlreadyAdopted — its tail
+                                      // IS gl0's tip) does NOT qualify: pre-fix it misclassified as Reanchor, so this oldest-first
+                                      // `find` re-embedded the fully-adopted genesis checkpoint every gl0 ordinal, shadowing its
+                                      // successor forever (the 3gl0/2shard startup freeze — mirror frozen at currency ord 1 while the
+                                      // producer's awaiting-embed pipeline gate blocked all further minting). A Defer window (true
+                                      // chain hole) does not qualify either. `windowTipHashF` is the SAME deterministic value-hash the
+                                      // SC-tip setter records — wire-carried bytes only, split-safe.
+                                      ShardReanchor.windowTipHashF(nel).map { windowTipHash =>
+                                        ShardReanchor.classify(
+                                          nel,
+                                          windowTipHash,
+                                          scTips.getOrElse(mg, Hash.empty),
+                                          ShardReanchor.tipOrdinalFor(snapshotContext.lastCurrencySnapshots, mg)
+                                        ) match {
+                                          case ShardReanchor.Continue(_) | ShardReanchor.Reanchor(_) => true
+                                          case ShardReanchor.Defer | ShardReanchor.AlreadyAdopted    => false
+                                        }
+                                      }
+                                  }
+                                else
+                                  false.pure[F]
+                              }.flatMap {
                                 case None =>
                                   // embed-none observability (mirrors produce-skip). This fires BOTH when fully
                                   // caught up (normal: every window already adopted, tips == newest tail) AND on an
