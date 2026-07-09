@@ -603,7 +603,7 @@ func (n *Node) FraudProofMessages(ctx context.Context) <-chan []byte {
 	if n.fraudProofTopic == nil {
 		return nil
 	}
-	ch, err := n.subscribeAndRelay(ctx, n.fraudProofTopic, n.cfg.FraudProofBufferSize, "fraud_proof")
+	ch, err := n.subscribeAndRelay(ctx, n.fraudProofTopic, n.cfg.FraudProofBufferSize, "fraud_proof", false)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe fraud_proof: %v\n", err)
 		empty := make(chan []byte)
@@ -759,15 +759,35 @@ func (n *Node) ShardCheckpointAttestationMessages() <-chan []byte {
 }
 
 // subscribeAndRelay creates a per-caller subscription on the given topic and
-// relays incoming messages (excluding self-published) into the returned channel.
-// The subscription is cancelled when ctx is done. The topicLabel is used for
-// Prometheus metrics (e.g. "snapshot", "attestation", "rumor").
+// relays incoming messages into the returned channel. The subscription is
+// cancelled when ctx is done. The topicLabel is used for Prometheus metrics
+// (e.g. "snapshot", "attestation", "rumor").
+//
+// deliverSelf controls whether messages this sidecar itself published are
+// relayed to the local subscriber.
+//
+//   - false (same-client topics): publisher and subscriber are the SAME JVM
+//     (e.g. gl0 publishes rumors and subscribes to rumors on one sidecar) —
+//     relaying our own publish back would echo the client's message to itself.
+//
+//   - true (cross-client topics — the l1-block families): the publisher is the
+//     colocated gl1 JVM and the subscriber is the colocated gl0 JVM, two
+//     DIFFERENT gRPC clients of this one sidecar. Skipping self-published
+//     messages here silently starves the local gl0: all L1 validators co-sign
+//     one block and publish IDENTICAL bytes within milliseconds, the
+//     content-derived message ID (task #40) collapses those copies into ONE
+//     gossipsub message, and each sidecar's own publish poisons its seen-cache
+//     before the remote flood-publish copies arrive — so with the skip in
+//     place NO gl0 ever received the block until an outbox republish landed
+//     after the ~2min gossipsub seen-cache TTL (observed live 2026-07-09:
+//     token-lock block d766560c created 05:54:14.976, first gl0 acceptance
+//     ordinal 86 at 05:57:06 — a 28-ordinal delivery gap; #186 e2e failure).
 //
 // When the relay channel is full (slow JVM consumer), messages are dropped
 // and counted in sidecar_gossip_messages_dropped_total rather than blocking
 // the relay goroutine. Blocking would backpressure libp2p's internal gossipsub
 // queue and stall the whole validator, so we prefer a loud, observable drop.
-func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSize int, topicLabel string) (<-chan []byte, error) {
+func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSize int, topicLabel string, deliverSelf bool) (<-chan []byte, error) {
 	sub, err := topic.Subscribe()
 	if err != nil {
 		return nil, err
@@ -781,7 +801,7 @@ func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSi
 			if err != nil {
 				return
 			}
-			if msg.ReceivedFrom == n.Host.ID() {
+			if !deliverSelf && msg.ReceivedFrom == n.Host.ID() {
 				continue
 			}
 			metrics.MessagesReceived.WithLabelValues(topicLabel).Inc()
@@ -799,7 +819,7 @@ func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSi
 // Each call creates its own GossipSub subscription so multiple consumers
 // each receive every message independently.
 func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.snapshotTopic, n.cfg.SnapshotBufferSize, "snapshot")
+	ch, err := n.subscribeAndRelay(ctx, n.snapshotTopic, n.cfg.SnapshotBufferSize, "snapshot", false)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe snapshot: %v\n", err)
 		empty := make(chan []byte)
@@ -811,7 +831,7 @@ func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
 
 // AttestationMessages returns a channel of incoming attestation messages.
 func (n *Node) AttestationMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.attestationTopic, n.cfg.AttestationBufferSize, "attestation")
+	ch, err := n.subscribeAndRelay(ctx, n.attestationTopic, n.cfg.AttestationBufferSize, "attestation", false)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe attestation: %v\n", err)
 		empty := make(chan []byte)
@@ -823,7 +843,7 @@ func (n *Node) AttestationMessages(ctx context.Context) <-chan []byte {
 
 // RumorMessages returns a channel of incoming rumor messages.
 func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.rumorTopic, n.cfg.RumorBufferSize, "rumor")
+	ch, err := n.subscribeAndRelay(ctx, n.rumorTopic, n.cfg.RumorBufferSize, "rumor", false)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe rumor: %v\n", err)
 		empty := make(chan []byte)
@@ -835,7 +855,7 @@ func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
 
 // MetagraphBinaryMessages returns a channel of incoming metagraph-binary messages.
 func (n *Node) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, n.cfg.MetagraphBinaryBufferSize, "metagraph_binary")
+	ch, err := n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, n.cfg.MetagraphBinaryBufferSize, "metagraph_binary", false)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe metagraph_binary: %v\n", err)
 		empty := make(chan []byte)
@@ -847,7 +867,7 @@ func (n *Node) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
 
 // MetagraphAttestationMessages returns a channel of incoming metagraph-attestation messages.
 func (n *Node) MetagraphAttestationMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.metagraphAttestationTopic, n.cfg.MetagraphAttestationBufferSize, "metagraph_attestation")
+	ch, err := n.subscribeAndRelay(ctx, n.metagraphAttestationTopic, n.cfg.MetagraphAttestationBufferSize, "metagraph_attestation", false)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe metagraph_attestation: %v\n", err)
 		empty := make(chan []byte)
@@ -859,7 +879,7 @@ func (n *Node) MetagraphAttestationMessages(ctx context.Context) <-chan []byte {
 
 // AllowSpendBlockMessages returns a channel of incoming allow-spend-block messages.
 func (n *Node) AllowSpendBlockMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.allowSpendBlockTopic, n.cfg.AllowSpendBlockBufferSize, "allow_spend_block")
+	ch, err := n.subscribeAndRelay(ctx, n.allowSpendBlockTopic, n.cfg.AllowSpendBlockBufferSize, "allow_spend_block", true)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe allow_spend_block: %v\n", err)
 		empty := make(chan []byte)
@@ -871,7 +891,7 @@ func (n *Node) AllowSpendBlockMessages(ctx context.Context) <-chan []byte {
 
 // DAGBlockMessages returns a channel of incoming dag-block messages.
 func (n *Node) DAGBlockMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.dagBlockTopic, n.cfg.DAGBlockBufferSize, "dag_block")
+	ch, err := n.subscribeAndRelay(ctx, n.dagBlockTopic, n.cfg.DAGBlockBufferSize, "dag_block", true)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe dag_block: %v\n", err)
 		empty := make(chan []byte)
@@ -883,7 +903,7 @@ func (n *Node) DAGBlockMessages(ctx context.Context) <-chan []byte {
 
 // TokenLockBlockMessages returns a channel of incoming token-lock-block messages.
 func (n *Node) TokenLockBlockMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.tokenLockBlockTopic, n.cfg.TokenLockBlockBufferSize, "token_lock_block")
+	ch, err := n.subscribeAndRelay(ctx, n.tokenLockBlockTopic, n.cfg.TokenLockBlockBufferSize, "token_lock_block", true)
 	if err != nil {
 		fmt.Printf("ERROR: subscribe token_lock_block: %v\n", err)
 		empty := make(chan []byte)

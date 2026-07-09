@@ -265,43 +265,107 @@ object TokenLockStateManager {
       def acceptReplacementTokenLocks(
         acceptedTokenLocks: List[Signed[TokenLock]],
         lastSnapshotContext: GlobalSnapshotInfo
-      )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]] =
+      )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]] = {
+        // #186 in-round chain fix (2026-07-09): a replacement B whose `replaceTokenLockRef` targets a lock A
+        // accepted EARLIER IN THIS SAME LIST used to be dropped silently — the candidate set was read only from
+        // the parent-state MPT (`ActiveTokenLocks`), which cannot contain A yet. Block-level acceptance
+        // (`TokenLockBlockAcceptanceLogic.processLastTxRefs`) chains same-round blocks through `contextUpdate`
+        // and has already advanced `lastTokenLockRefs` past B, so the drop was PERMANENT: any resubmission of B
+        // rejects with `ParentOrdinalBelowLastTxOrdinal` and the address's replacement chain is wedged.
+        //
+        // The fold now additionally threads:
+        //   - `inRoundBySource`: DAG (currencyId-empty) locks accepted earlier in this fold, so a later tx in
+        //     the same round can replace them exactly as it can replace a parent-state lock;
+        //   - `deltaBySource`: the net spendable-balance effect of the txs accepted earlier in this fold
+        //     (+replaced.amount − tx.amount − tx.fee for replacements; −tx.amount − tx.fee for plain DAG locks),
+        //     so the funding conjunct evaluates against the balance as it will stand AFTER those txs apply,
+        //     not the stale parent-state balance.
+        //
+        // Determinism: this stays a pure fold over the caller-ordered list (GSAM derives it from
+        // `tokenLockBlockAcceptanceResult.accepted`, itself produced from `blocks.sorted`) plus reads through
+        // the same pinned branch-aware reader — every honest node computes the same include/drop set. For any
+        // input without an in-round chain the accepted list is unchanged; the only behavioral deltas are
+        // (a) in-round chains are now included, (b) the funding conjunct also counts earlier same-round,
+        // same-source debits/credits (strictly consistent with the downstream balance fold in
+        // `updateGlobalBalancesByTokenLocksFromMptWithExpired`, which would otherwise be able to fail).
+        final case class FoldSt(
+          result: List[Signed[TokenLock]],
+          seen: Set[Hash],
+          inRoundBySource: Map[Address, List[(TokenLockReference, Signed[TokenLock])]],
+          deltaBySource: Map[Address, BigInt]
+        )
+
+        def recordAccepted(st: FoldSt, tx: Signed[TokenLock], netDelta: BigInt, seenAdd: Option[Hash]): F[FoldSt] =
+          // Only DAG locks are replacement targets; currency locks are never candidates.
+          if (tx.currencyId.isEmpty)
+            TokenLockReference.of(tx).map { txRef =>
+              st.copy(
+                result = st.result :+ tx,
+                seen = st.seen ++ seenAdd,
+                inRoundBySource = st.inRoundBySource.updatedWith(tx.source) {
+                  case Some(list) => Some(list :+ (txRef, tx))
+                  case None       => Some(List((txRef, tx)))
+                },
+                deltaBySource = st.deltaBySource.updated(tx.source, st.deltaBySource.getOrElse(tx.source, BigInt(0)) + netDelta)
+              )
+            }
+          else
+            st.copy(result = st.result :+ tx, seen = st.seen ++ seenAdd).pure[F]
+
         acceptedTokenLocks
-          .foldLeftM((List.empty[Signed[TokenLock]], Set.empty[Hash])) {
-            case ((result, seen), tx) =>
-              tx.replaceTokenLockRef match {
-                case Some(replaceTokenLockRef) =>
-                  if (tx.currencyId.nonEmpty) {
-                    // we can only replace DAG token locks
-                    (result, seen).pure[F]
-                  } else if (seen(replaceTokenLockRef)) {
-                    (result, seen).pure[F]
-                  } else {
-                    for {
-                      activeTokenLocks <- reader
-                        .get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, tx.source))
-                        .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]))
-                      balance <- reader
-                        .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, tx.source))
-                        .map(_.getOrElse(Balance.empty))
-                      existingWithRefs <- activeTokenLocks.toList
-                        .filter(_.currencyId.isEmpty) // we can only replace DAG token locks
-                        .traverse(existing => TokenLockReference.of(existing).map(ref => (ref, existing)))
-                    } yield {
-                      val shouldInclude = existingWithRefs.exists {
-                        case (ref, existing) =>
-                          ref.hash === replaceTokenLockRef &&
-                          existing.source == tx.source &&
-                          existing.amount < tx.amount &&
-                          balance.value.value + existing.amount.value.value >= tx.amount.value.value + tx.fee.value.value
-                      }
-                      if (shouldInclude) (result :+ tx, seen + replaceTokenLockRef) else (result, seen)
+          .foldLeftM(FoldSt(List.empty, Set.empty, Map.empty, Map.empty)) { (st, tx) =>
+            tx.replaceTokenLockRef match {
+              case Some(replaceTokenLockRef) =>
+                if (tx.currencyId.nonEmpty) {
+                  // we can only replace DAG token locks
+                  st.pure[F]
+                } else if (st.seen(replaceTokenLockRef)) {
+                  st.pure[F]
+                } else {
+                  for {
+                    activeTokenLocks <- reader
+                      .get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, tx.source))
+                      .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]))
+                    balance <- reader
+                      .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, tx.source))
+                      .map(_.getOrElse(Balance.empty))
+                    existingWithRefs <- activeTokenLocks.toList
+                      .filter(_.currencyId.isEmpty) // we can only replace DAG token locks
+                      .traverse(existing => TokenLockReference.of(existing).map(ref => (ref, existing)))
+                    // Parent-state candidates ∪ locks accepted earlier in this same round.
+                    candidates = existingWithRefs ++ st.inRoundBySource.getOrElse(tx.source, List.empty)
+                    delta = st.deltaBySource.getOrElse(tx.source, BigInt(0))
+                    matched = candidates.find {
+                      case (ref, existing) =>
+                        ref.hash === replaceTokenLockRef &&
+                        existing.source == tx.source &&
+                        existing.amount < tx.amount &&
+                        BigInt(balance.value.value) + delta + BigInt(existing.amount.value.value) >=
+                          BigInt(tx.amount.value.value) + BigInt(tx.fee.value.value)
                     }
-                  }
-                case None => (result :+ tx, seen).pure[F]
-              }
+                    newSt <- matched match {
+                      case Some((_, replaced)) =>
+                        recordAccepted(
+                          st,
+                          tx,
+                          netDelta = BigInt(replaced.amount.value.value) - BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value),
+                          seenAdd = Some(replaceTokenLockRef)
+                        )
+                      case None => st.pure[F]
+                    }
+                  } yield newSt
+                }
+              case None =>
+                recordAccepted(
+                  st,
+                  tx,
+                  netDelta = -BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value),
+                  seenAdd = None
+                )
+            }
           }
-          .map(_._1)
+          .map(_.result)
+      }
 
       def acceptTokenLockRefs(
         lastTokenLockRefs: SortedMap[Address, TokenLockReference],

@@ -2613,9 +2613,21 @@ object GlobalSnapshotAcceptanceManager {
                 // diverged and `generateTokenUnlocks` failed lookups that `acceptReplacementTokenLocks` had passed.
                 tokenLockLookupAddresses = acceptedGlobalTokenLocks.map(_.value.source).toSet ++
                   initialData.existingStakes.expired.keySet
-                globalActiveTokenLocksByRef <- tokenLockStateManager.buildActiveTokenLocksByRefFromMpt(
+                globalActiveTokenLocksByRefFromState <- tokenLockStateManager.buildActiveTokenLocksByRefFromMpt(
                   tokenLockLookupAddresses
                 )
+                // #186 in-round chain fix: a replacement accepted this round may target a lock ALSO accepted
+                // this round (A→B inside one ordinal — `acceptReplacementTokenLocks` now admits that chain).
+                // `generateTokenUnlocks` must resolve that in-round ref or the whole acceptance raises
+                // ("Token lock not found for replacement ref" → RuntimeException below). Union the parent-state
+                // map with this round's accepted locks. For rounds without an in-round chain none of the added
+                // refs is ever looked up, so outputs stay byte-identical to the prior behavior. Deterministic:
+                // `acceptedGlobalTokenLocks` is itself deterministic (derived from sorted block acceptance) and
+                // the keys are content-addressed hashes.
+                inRoundAcceptedTokenLocksByRef <- acceptedGlobalTokenLocks
+                  .traverse(lock => lock.toHashed.map(hashed => hashed.hash -> lock))
+                  .map(_.toMap)
+                globalActiveTokenLocksByRef = globalActiveTokenLocksByRefFromState ++ inRoundAcceptedTokenLocksByRef
 
                 globalLastAllowSpendRefs <- allowSpendStateManager.materializeLastAllowSpendRefsFromMpt
                 globalLastTokenLockRefs <- tokenLockStateManager.materializeLastTokenLockRefsFromMpt

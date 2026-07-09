@@ -593,6 +593,291 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
     } yield expect(result.isEmpty) // Both should be rejected due to amount requirements
   }
 
+  // ─── #186 in-round chain-linked replacements ─────────────────────────────────────────────────────
+  // A replacement B whose replaceTokenLockRef targets a lock A accepted earlier in the SAME accepted
+  // list must be included: the parent-state MPT cannot contain A yet, and block-level acceptance has
+  // already advanced lastTokenLockRefs past B, so a drop here is a PERMANENT silent loss (any
+  // resubmission of B rejects with ParentOrdinalBelowLastTxOrdinal).
+
+  test("acceptReplacementTokenLocks - #186 should accept a replacement whose target was accepted earlier in the same round") { res =>
+    implicit val (jsonHasher, sp, _, js) = res
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      testAddress <- kp.getPublic.toId.toAddress
+
+      priorLock = TokenLock(
+        testAddress,
+        TokenLockAmount(100L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("prior")),
+        none,
+        none,
+        none
+      )
+      signedPriorLock <- Signed.forAsyncHasher(priorLock, kp)
+      hashedPriorLock <- signedPriorLock.toHashed
+
+      replacementA = TokenLock(
+        testAddress,
+        TokenLockAmount(200L),
+        TokenLockFee(10L),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("refA")),
+        none,
+        none,
+        hashedPriorLock.hash.some
+      )
+      signedA <- Signed.forAsyncHasher(replacementA, kp)
+      hashedA <- signedA.toHashed
+
+      replacementB = TokenLock(
+        testAddress,
+        TokenLockAmount(300L),
+        TokenLockFee(10L),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("refB")),
+        none,
+        none,
+        hashedA.hash.some // chains off A, which is NOT in parent state — only in this round's list
+      )
+      signedB <- Signed.forAsyncHasher(replacementB, kp)
+
+      snapshotInfo = GlobalSnapshotInfo.empty.copy(
+        activeTokenLocks = SortedMap(testAddress -> SortedSet(signedPriorLock)).some,
+        balances = SortedMap(testAddress -> Balance(5000L))
+      )
+      localMptStore <- mkMptStore(snapshotInfo)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
+
+      result <- acceptanceManager.acceptReplacementTokenLocks(List(signedA, signedB), snapshotInfo)
+    } yield expect.same(List(signedA, signedB), result)
+  }
+
+  test("acceptReplacementTokenLocks - #186 should accept a full three-link in-round chain") { res =>
+    implicit val (jsonHasher, sp, _, js) = res
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      testAddress <- kp.getPublic.toId.toAddress
+
+      priorLock = TokenLock(
+        testAddress,
+        TokenLockAmount(100L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("prior3")),
+        none,
+        none,
+        none
+      )
+      signedPriorLock <- Signed.forAsyncHasher(priorLock, kp)
+      hashedPriorLock <- signedPriorLock.toHashed
+
+      replacementA = TokenLock(
+        testAddress,
+        TokenLockAmount(200L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("refA3")),
+        none,
+        none,
+        hashedPriorLock.hash.some
+      )
+      signedA <- Signed.forAsyncHasher(replacementA, kp)
+      hashedA <- signedA.toHashed
+
+      replacementB = TokenLock(
+        testAddress,
+        TokenLockAmount(300L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("refB3")),
+        none,
+        none,
+        hashedA.hash.some
+      )
+      signedB <- Signed.forAsyncHasher(replacementB, kp)
+      hashedB <- signedB.toHashed
+
+      replacementC = TokenLock(
+        testAddress,
+        TokenLockAmount(400L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(4L), testHash("refC3")),
+        none,
+        none,
+        hashedB.hash.some
+      )
+      signedC <- Signed.forAsyncHasher(replacementC, kp)
+
+      snapshotInfo = GlobalSnapshotInfo.empty.copy(
+        activeTokenLocks = SortedMap(testAddress -> SortedSet(signedPriorLock)).some,
+        balances = SortedMap(testAddress -> Balance(5000L))
+      )
+      localMptStore <- mkMptStore(snapshotInfo)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
+
+      result <- acceptanceManager.acceptReplacementTokenLocks(List(signedA, signedB, signedC), snapshotInfo)
+    } yield expect.same(List(signedA, signedB, signedC), result)
+  }
+
+  test("acceptReplacementTokenLocks - #186 should accept an in-round replacement of a plain lock accepted in the same round") { res =>
+    implicit val (jsonHasher, sp, _, js) = res
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      testAddress <- kp.getPublic.toId.toAddress
+
+      // Plain new lock (no replacement reference) — accepted unconditionally.
+      plainLock = TokenLock(
+        testAddress,
+        TokenLockAmount(100L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("plainP")),
+        none,
+        none,
+        none
+      )
+      signedPlain <- Signed.forAsyncHasher(plainLock, kp)
+      hashedPlain <- signedPlain.toHashed
+
+      replacementB = TokenLock(
+        testAddress,
+        TokenLockAmount(200L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("refBP")),
+        none,
+        none,
+        hashedPlain.hash.some // replaces the plain lock accepted earlier in this same round
+      )
+      signedB <- Signed.forAsyncHasher(replacementB, kp)
+
+      snapshotInfo = GlobalSnapshotInfo.empty.copy(
+        balances = SortedMap(testAddress -> Balance(5000L))
+      )
+      localMptStore <- mkMptStore(snapshotInfo)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
+
+      result <- acceptanceManager.acceptReplacementTokenLocks(List(signedPlain, signedB), snapshotInfo)
+    } yield expect.same(List(signedPlain, signedB), result)
+  }
+
+  test("acceptReplacementTokenLocks - #186 in-round funding conjunct counts earlier same-round debits") { res =>
+    implicit val (jsonHasher, sp, _, js) = res
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      testAddress <- kp.getPublic.toId.toAddress
+
+      priorLock = TokenLock(
+        testAddress,
+        TokenLockAmount(100L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("priorF")),
+        none,
+        none,
+        none
+      )
+      signedPriorLock <- Signed.forAsyncHasher(priorLock, kp)
+      hashedPriorLock <- signedPriorLock.toHashed
+
+      // A replaces prior: funded (250 + 100 >= 200 + 10). Net spendable delta: +100 − 200 − 10 = −110.
+      replacementA = TokenLock(
+        testAddress,
+        TokenLockAmount(200L),
+        TokenLockFee(10L),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("refAF")),
+        none,
+        none,
+        hashedPriorLock.hash.some
+      )
+      signedA <- Signed.forAsyncHasher(replacementA, kp)
+      hashedA <- signedA.toHashed
+
+      // B replaces A: post-A spendable is 250 − 110 = 140; 140 + 200 = 340 < 400 + 10 → NOT funded → dropped.
+      replacementB = TokenLock(
+        testAddress,
+        TokenLockAmount(400L),
+        TokenLockFee(10L),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("refBF")),
+        none,
+        none,
+        hashedA.hash.some
+      )
+      signedB <- Signed.forAsyncHasher(replacementB, kp)
+
+      snapshotInfo = GlobalSnapshotInfo.empty.copy(
+        activeTokenLocks = SortedMap(testAddress -> SortedSet(signedPriorLock)).some,
+        balances = SortedMap(testAddress -> Balance(250L))
+      )
+      localMptStore <- mkMptStore(snapshotInfo)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
+
+      result <- acceptanceManager.acceptReplacementTokenLocks(List(signedA, signedB), snapshotInfo)
+    } yield expect.same(List(signedA), result)
+  }
+
+  test("acceptReplacementTokenLocks - #186 second in-round replacement of the same target is still dropped (seen guard)") { res =>
+    implicit val (jsonHasher, sp, _, js) = res
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      testAddress <- kp.getPublic.toId.toAddress
+
+      priorLock = TokenLock(
+        testAddress,
+        TokenLockAmount(100L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(1L), testHash("priorS")),
+        none,
+        none,
+        none
+      )
+      signedPriorLock <- Signed.forAsyncHasher(priorLock, kp)
+      hashedPriorLock <- signedPriorLock.toHashed
+
+      replacementA = TokenLock(
+        testAddress,
+        TokenLockAmount(200L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(2L), testHash("refAS")),
+        none,
+        none,
+        hashedPriorLock.hash.some
+      )
+      signedA <- Signed.forAsyncHasher(replacementA, kp)
+      hashedA <- signedA.toHashed
+
+      replacementB = TokenLock(
+        testAddress,
+        TokenLockAmount(300L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("refBS")),
+        none,
+        none,
+        hashedA.hash.some
+      )
+      signedB <- Signed.forAsyncHasher(replacementB, kp)
+
+      // C also claims to replace A — the seen-set must drop it (A is already consumed by B this round).
+      replacementC = TokenLock(
+        testAddress,
+        TokenLockAmount(500L),
+        TokenLockFee(0L),
+        TokenLockReference(TokenLockOrdinal(3L), testHash("refCS")),
+        none,
+        none,
+        hashedA.hash.some
+      )
+      signedC <- Signed.forAsyncHasher(replacementC, kp)
+
+      snapshotInfo = GlobalSnapshotInfo.empty.copy(
+        activeTokenLocks = SortedMap(testAddress -> SortedSet(signedPriorLock)).some,
+        balances = SortedMap(testAddress -> Balance(5000L))
+      )
+      localMptStore <- mkMptStore(snapshotInfo)
+      acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
+
+      result <- acceptanceManager.acceptReplacementTokenLocks(List(signedA, signedB, signedC), snapshotInfo)
+    } yield expect.same(List(signedA, signedB), result)
+  }
+
   test("generateTokenUnlocks - should handle empty inputs") { res =>
     val (_, _, mptStore, _) = res
     val acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(mptStore))
