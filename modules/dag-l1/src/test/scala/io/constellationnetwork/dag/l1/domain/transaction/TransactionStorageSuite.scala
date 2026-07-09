@@ -216,4 +216,198 @@ object TransactionStorageSuite extends SimpleIOSuite with TransactionGenerator {
         } yield expect.same(NonEmptyList.fromList(txsA.toList ::: txsB.toList), pulled)
     }
   }
+
+  // --- adoptForwardByRefs (cl1 routine forward-adopt; monotone — the 2026-07-08 L0-token double-spend strand fix) ---
+
+  test("adoptForwardByRefs must NOT roll back a locally-ahead consistent chain (the cl1 adopt-rollback regression)") {
+    testResources.use {
+      case (transactionStorage, _, key1, address1, _, address2, sp, h, txHasher, _, _) =>
+        implicit val securityProvider = sp
+        implicit val hasher = h
+
+        for {
+          txs <- generateTransactions(address1, key1, address2, 5, kHasher = txHasher, jHasher = h)
+          // Local mempool-accepted chain is at ordinal 5...
+          _ <- txs.toList.traverse(transactionStorage.accept)
+          // ...and the (lagging) finalized mirror adopt carries ordinal 2 — an ancestor of the local chain.
+          _ <- transactionStorage.adoptForwardByRefs(
+            Map(address1 -> TransactionReference.of(txs.toList(1))),
+            SnapshotOrdinal.MinValue
+          )
+          lastProcessed <- transactionStorage.getLastProcessedTransaction(address1)
+          state <- transactionStorage.getState
+          stored = state(address1)
+        } yield
+          // The rolled-forward chain survives: last processed stays at ordinal 5, txs ≤ 2 compacted into the majority marker.
+          expect.same(TransactionReference.of(txs.last), lastProcessed.ref) &&
+            expect.same(
+              SortedMap[TransactionOrdinal, StoredTransaction](
+                txs.toList(1).ordinal -> MajorityTx(TransactionReference.of(txs.toList(1)), SnapshotOrdinal.MinValue),
+                txs.toList(2).ordinal -> AcceptedTx(txs.toList(2)),
+                txs.toList(3).ordinal -> AcceptedTx(txs.toList(3)),
+                txs.toList(4).ordinal -> AcceptedTx(txs.toList(4))
+              ),
+              stored
+            )
+    }
+  }
+
+  test("adoptForwardByRefs adopts a finalized ref AHEAD of the local chain and re-attaches still-chaining local txs") {
+    testResources.use {
+      case (transactionStorage, transactionR, key1, address1, _, address2, sp, h, txHasher, _, _) =>
+        implicit val securityProvider = sp
+        implicit val hasher = h
+
+        for {
+          txs <- generateTransactions(address1, key1, address2, 4, kHasher = txHasher, jHasher = h)
+          // Local state: majority base at ordinal 1, waiting txs at ordinals 3 and 4 (2 not yet seen locally).
+          _ <- transactionR(address1).set(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.head.ordinal -> MajorityTx(TransactionReference.of(txs.head), SnapshotOrdinal.MinValue),
+              txs.toList(2).ordinal -> WaitingTx(txs.toList(2)),
+              txs.toList(3).ordinal -> WaitingTx(txs.toList(3))
+            ).some
+          )
+          // Finalized mirror advanced past us to ordinal 2.
+          _ <- transactionStorage.adoptForwardByRefs(
+            Map(address1 -> TransactionReference.of(txs.toList(1))),
+            SnapshotOrdinal.MinValue
+          )
+          state <- transactionStorage.getState
+          stored = state(address1)
+        } yield
+          // New majority base at ordinal 2; waiting 3 and 4 still chain onto it and survive; entry at 1 is compacted away.
+          expect.same(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.toList(1).ordinal -> MajorityTx(TransactionReference.of(txs.toList(1)), SnapshotOrdinal.MinValue),
+              txs.toList(2).ordinal -> WaitingTx(txs.toList(2)),
+              txs.toList(3).ordinal -> WaitingTx(txs.toList(3))
+            ),
+            stored
+          )
+    }
+  }
+
+  test("adoptForwardByRefs drops local txs that no longer chain onto the adopted finalized ref") {
+    testResources.use {
+      case (transactionStorage, transactionR, key1, address1, _, address2, sp, h, txHasher, key3, address3) =>
+        implicit val securityProvider = sp
+        implicit val hasher = h
+
+        for {
+          txs <- generateTransactions(address1, key1, address2, 3, kHasher = txHasher, jHasher = h)
+          // A conflicting local chain: same source, same starting parent, DIFFERENT destination ⇒ different hashes.
+          conflicting <- generateTransactions(address1, key1, address3, 3, kHasher = txHasher, jHasher = h)
+          // Local state: majority base at ordinal 1 plus a waiting tx at ordinal 3 from the CONFLICTING branch.
+          _ <- transactionR(address1).set(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.head.ordinal -> MajorityTx(TransactionReference.of(txs.head), SnapshotOrdinal.MinValue),
+              conflicting.toList(2).ordinal -> WaitingTx(conflicting.toList(2))
+            ).some
+          )
+          // Finalized mirror advanced to ordinal 2 on the txs branch.
+          _ <- transactionStorage.adoptForwardByRefs(
+            Map(address1 -> TransactionReference.of(txs.toList(1))),
+            SnapshotOrdinal.MinValue
+          )
+          state <- transactionStorage.getState
+          stored = state(address1)
+        } yield
+          // conflicting(2) at ordinal 3 does NOT chain onto the adopted ref (parent = conflicting(1) ≠ txs(1)) ⇒ dropped.
+          expect.same(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.toList(1).ordinal -> MajorityTx(TransactionReference.of(txs.toList(1)), SnapshotOrdinal.MinValue)
+            ),
+            stored
+          )
+    }
+  }
+
+  test("adoptForwardByRefs resets destructively when the local chain DIVERGED at the finalized ordinal") {
+    testResources.use {
+      case (transactionStorage, transactionR, key1, address1, _, address2, sp, h, txHasher, key3, address3) =>
+        implicit val securityProvider = sp
+        implicit val hasher = h
+
+        for {
+          txs <- generateTransactions(address1, key1, address2, 3, kHasher = txHasher, jHasher = h)
+          conflicting <- generateTransactions(address1, key1, address3, 3, kHasher = txHasher, jHasher = h)
+          // Local chain accepted the CONFLICTING branch up to ordinal 3.
+          _ <- transactionR(address1).set(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              conflicting.head.ordinal -> AcceptedTx(conflicting.head),
+              conflicting.toList(1).ordinal -> AcceptedTx(conflicting.toList(1)),
+              conflicting.toList(2).ordinal -> AcceptedTx(conflicting.toList(2))
+            ).some
+          )
+          // Finalized mirror carries the OTHER branch's ordinal-2 tx — the local branch lost.
+          _ <- transactionStorage.adoptForwardByRefs(
+            Map(address1 -> TransactionReference.of(txs.toList(1))),
+            SnapshotOrdinal.MinValue
+          )
+          state <- transactionStorage.getState
+          stored = state(address1)
+        } yield
+          expect.same(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.toList(1).ordinal -> MajorityTx(TransactionReference.of(txs.toList(1)), SnapshotOrdinal.MinValue)
+            ),
+            stored
+          )
+    }
+  }
+
+  test("adoptForwardByRefs is a no-op for a finalized ref behind the local majority base (append-only source)") {
+    testResources.use {
+      case (transactionStorage, transactionR, key1, address1, _, address2, sp, h, txHasher, _, _) =>
+        implicit val securityProvider = sp
+        implicit val hasher = h
+
+        for {
+          txs <- generateTransactions(address1, key1, address2, 5, kHasher = txHasher, jHasher = h)
+          // Post-compaction local state: single majority marker at ordinal 5 (no entry at ordinal 2 anymore).
+          _ <- transactionR(address1).set(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.last.ordinal -> MajorityTx(TransactionReference.of(txs.last), SnapshotOrdinal.MinValue)
+            ).some
+          )
+          _ <- transactionStorage.adoptForwardByRefs(
+            Map(address1 -> TransactionReference.of(txs.toList(1))),
+            SnapshotOrdinal.MinValue
+          )
+          state <- transactionStorage.getState
+          stored = state(address1)
+        } yield
+          expect.same(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.last.ordinal -> MajorityTx(TransactionReference.of(txs.last), SnapshotOrdinal.MinValue)
+            ),
+            stored
+          )
+    }
+  }
+
+  test("adoptForwardByRefs behaves like replaceByRefs on an empty address slot (cold bootstrap unchanged)") {
+    testResources.use {
+      case (transactionStorage, _, key1, address1, _, address2, sp, h, txHasher, _, _) =>
+        implicit val securityProvider = sp
+        implicit val hasher = h
+
+        for {
+          txs <- generateTransactions(address1, key1, address2, 1, kHasher = txHasher, jHasher = h)
+          _ <- transactionStorage.adoptForwardByRefs(
+            Map(address1 -> TransactionReference.of(txs.head)),
+            SnapshotOrdinal.MinValue
+          )
+          state <- transactionStorage.getState
+          stored = state(address1)
+        } yield
+          expect.same(
+            SortedMap[TransactionOrdinal, StoredTransaction](
+              txs.head.ordinal -> MajorityTx(TransactionReference.of(txs.head), SnapshotOrdinal.MinValue)
+            ),
+            stored
+          )
+    }
+  }
 }

@@ -419,6 +419,21 @@ object CurrencySnapshotProcessor {
             s"${snapshot.value.ordinal.show}; currency state is adopted authoritatively in processCurrencySnapshots — investigate"
         ).raiseError[F, CurrencySnapshotInfo]
 
+      // CUTOVER + ROLLBACK FIX: every routine forward-adopt funnels through the DownloadNeeded path, whose default
+      // commits the adopted lastTxRefs DESTRUCTIVELY (`replaceByRefs`). The adopted state is gl0's depth-k-finalized
+      // mirror, which structurally LAGS this cl1's own mempool-accepted chain — a destructive replace ROLLS BACK
+      // per-address last-accepted refs on every adopt (observed 2026-07-08: adopt ord=85 rolled W1 101→1; the
+      // L0-token double-spend tx built on the rolled-back ref was admitted, then permanently stranded when the next
+      // adopt re-advanced the refs — the e2e "Double spend occurred" strand). Adopt MONOTONICALLY instead: never move
+      // a consistent address chain backwards; a genuinely diverged chain (different hash at the finalized ordinal)
+      // still resets destructively, and `RedownloadNeeded` (fork recovery) keeps the destructive replace.
+      override def setTransactionRefsOnDownload(
+        transactionStorage: TransactionStorage[F],
+        refs: Map[Address, TransactionReference],
+        snapshotOrdinal: SnapshotOrdinal
+      ): F[Unit] =
+        transactionStorage.adoptForwardByRefs(refs, snapshotOrdinal)
+
       override def onDownload(snapshot: Hashed[CurrencyIncrementalSnapshot], state: CurrencySnapshotInfo): F[Unit] =
         // CUTOVER: processCurrencySnapshots routes EVERY forward adopt through the download path (onDownload),
         // not just a one-time cold sync. So the consumed-field storages must be FULLY RESET to the adopted

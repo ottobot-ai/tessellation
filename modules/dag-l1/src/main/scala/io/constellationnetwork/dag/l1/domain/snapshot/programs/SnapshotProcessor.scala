@@ -81,6 +81,24 @@ abstract class SnapshotProcessor[
 
   def setInitialLastNSnapshots(snapshot: Hashed[S], state: SI): F[Unit] = Applicative[F].unit
 
+  /** How the `DownloadNeeded` branch of `processAlignment` commits the adopted state's `lastTxRefs` into `TransactionStorage`. Default (gl1
+    * / true cold bootstrap / forced re-download): destructive `replaceByRefs` — the local chain is absent or presumed wrong, the downloaded
+    * state wins wholesale.
+    *
+    * The cl1/dl1 cutover OVERRIDES this with the monotone `adoptForwardByRefs`: post-cutover, EVERY routine finalized currency adopt
+    * funnels through `DownloadNeeded` (CurrencySnapshotProcessor.adoptForwardTo), and the adopted state is gl0's depth-k-finalized mirror
+    * which structurally lags the L1's own mempool-accepted chain. A destructive replace there ROLLS BACK per-address last-accepted refs on
+    * every adopt, opening windows where `/transactions/last-reference` serves stale refs and admission accepts txs chained on stale parents
+    * that can never be included once the refs re-advance (the 2026-07-08 L0-token double-spend e2e strand). `RedownloadNeeded` (genuine
+    * fork recovery) keeps the destructive replace unconditionally.
+    */
+  def setTransactionRefsOnDownload(
+    transactionStorage: TransactionStorage[F],
+    refs: Map[Address, TransactionReference],
+    snapshotOrdinal: SnapshotOrdinal
+  ): F[Unit] =
+    transactionStorage.replaceByRefs(refs, snapshotOrdinal)
+
   /** FINDING-S01 — global-MPT mirror maintenance for `processAlignment` (fires only when `state` is a `GlobalSnapshotInfo`, i.e. the gl1
     * global-follow instantiation).
     *
@@ -253,7 +271,7 @@ abstract class SnapshotProcessor[
             addressStorage.updateBalances(state.balances)
 
         val setTransactionRefs: F[Unit] =
-          transactionStorage.replaceByRefs(state.lastTxRefs, snapshot.ordinal)
+          setTransactionRefsOnDownload(transactionStorage, state.lastTxRefs, snapshot.ordinal)
 
         val setInitialSnapshot: F[Unit] =
           Slf4jLogger

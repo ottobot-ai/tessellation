@@ -72,6 +72,76 @@ class TransactionStorage[F[_]: Async](
         transactionsR(address).set(initial.some)
     }
 
+  /** Monotone, per-address variant of `replaceByRefs` for the cl1/dl1 ROUTINE forward-adopt (the sharding cutover funnels every finalized
+    * currency adopt through the `DownloadNeeded` path, not just cold bootstrap).
+    *
+    * `replaceByRefs` wholesale-resets each address to the adopted snapshot's ref. The adopted state is gl0's depth-k-FINALIZED mirror,
+    * which structurally LAGS both ml0's tip and this L1's own mempool-accepted chain — so a wholesale reset ROLLS BACK per-address
+    * last-accepted refs. During the rollback window the `/transactions/last-reference` endpoint serves stale refs and admission accepts txs
+    * chained on stale parents; once the next adopt re-advances the refs, those txs are permanently unincludable (accepted-then-stranded, no
+    * error to the client). Observed live 2026-07-08: cl1 adopt ord=85 rolled W1 101→1; the L0-token double-spend tx (5756f86e, parent ord
+    * 1) was admitted into the rolled-back window and stranded forever.
+    *
+    * Semantics per (address, incoming finalized ref):
+    *   - no locally processed chain (empty / waiting-only) → cold-download behavior (same as `replaceByRefs`);
+    *   - incoming AHEAD of local last processed → adopt incoming as the majority base, re-attaching stored txs above it that still chain
+    *     onto it (same walk as `accept`);
+    *   - local chain AHEAD and CONSISTENT (contains the incoming ref) → compact ≤ incoming into the majority marker, KEEP the locally-ahead
+    *     chain (this is the rollback fix);
+    *   - local chain AHEAD but DIVERGED at the incoming ordinal (different hash at same ordinal) → the local chain lost against the
+    *     finalized one: destructive reset to incoming (old `replaceByRefs` behavior);
+    *   - incoming BEHIND the local majority base (no entry at the incoming ordinal) → no-op: the finalized source is append-only per
+    *     address, so an older finalized ref is an ancestor of what we already adopted.
+    */
+  def adoptForwardByRefs(refs: Map[Address, TransactionReference], snapshotOrdinal: SnapshotOrdinal): F[Unit] =
+    refs.toList.traverse_ {
+      case (address, incoming) =>
+        transactionsR(address).update { maybeStored =>
+          val stored = maybeStored.getOrElse(SortedMap.empty[TransactionOrdinal, StoredTransaction])
+          val incomingBase: SortedMap[TransactionOrdinal, StoredTransaction] =
+            SortedMap(incoming.ordinal -> MajorityTx(incoming, snapshotOrdinal))
+
+          def compactUpToIncoming: SortedMap[TransactionOrdinal, StoredTransaction] =
+            stored.filter {
+              case (ordinal, _) => ordinal > incoming.ordinal
+            } +
+              (incoming.ordinal -> MajorityTx(incoming, snapshotOrdinal))
+
+          getLastProcessedTransaction(stored) match {
+            case None =>
+              incomingBase.some
+            case Some(lastProcessed) =>
+              if (lastProcessed.ref === incoming)
+                compactUpToIncoming.some
+              else if (lastProcessed.ref.ordinal < incoming.ordinal) {
+                // Finalized state is ahead: adopt it and re-attach still-chaining local txs above it.
+                val above = stored.filter { case (ordinal, _) => ordinal > incoming.ordinal }
+                above.values.toList
+                  .foldLeft(incomingBase) {
+                    case (acc, tx) =>
+                      val last = acc.last._2
+                      tx match {
+                        case nm: NonMajorityTx if nm.transaction.parent === last.ref => acc + (nm.ref.ordinal -> nm)
+                        case _                                                       => acc
+                      }
+                  }
+                  .some
+              } else
+                stored.get(incoming.ordinal) match {
+                  case Some(entryAtIncoming) if entryAtIncoming.ref === incoming =>
+                    // Locally ahead and consistent with the finalized chain — keep the ahead chain.
+                    compactUpToIncoming.some
+                  case Some(_) =>
+                    // Diverged from the finalized chain at this ordinal — finalized wins, destructive reset.
+                    incomingBase.some
+                  case None =>
+                    // Incoming is behind our majority base — stale (finalized source is append-only): no-op.
+                    maybeStored
+                }
+          }
+        }
+    }
+
   def advanceMajorityRefs(refs: Map[Address, TransactionReference], snapshotOrdinal: SnapshotOrdinal): F[Unit] =
     refs.toList.traverse_ {
       case (source, majorityTxRef) =>
