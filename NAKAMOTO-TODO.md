@@ -21,6 +21,13 @@
 > Avalanche cascade is absent. The source-cited status authority is
 > `docs/review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`; any checkmark below
 > contradicted by that report is withdrawn.
+>
+> **Active implementation order:**
+> `docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`. The historical priority
+> buckets and numbered items below are a status inventory, not the sequence for
+> economic deployment. Finality, authorization, conservation, exact-once
+> inter-metagraph settlement, recovery, and network gates in the active roadmap
+> take precedence over the older testnet labels.
 
 ---
 
@@ -65,7 +72,7 @@
 - ⚠ **Shard committee draw** — public deterministic VK-hash selection per `(shard, eta period)`, uniform `1/N` over eligible GL0 operators. This deliberately replaced the failed secret stake-weighted VRF design; the attached VRF proves registered-key possession, not hidden membership.
 - ⚠ **Committee pre-execution -> checkpoint root; universal GL0 recreation** — every adopter recreates from `includedSnapshots`; abandoned diff and receipt fields have been removed. This is a path invariant, not an economic-safety certification; see ECO-02..ECO-06.
 - ⚠ **Watchtower InvalidStateProof slash — durable ledger** (Slashings fieldId 34) (`ed8928b81`); durably slash a full-quorum colluding committee on one honest fraud proof (`68246cffe`, W3a). **Wired-vs-shelfware being verified in handoff.**
-- ⚠ **Slash-cooldown committee exclusion** — FINDING-002 loop closed (`893ed5351`, EPIC-3.1/3.4).
+- ⚠ **Slash-cooldown committee exclusion** — the cooldown reader is wired, but the loop is not closed: SHARD-03 permits wire-epoch grinding around the intended selection and ECO-06 leaves bonded principal undebited.
 - ✅ **Cross-shard framework reads = Option A (finality-first)** — the GL0 accept path wires `gl0Local` over the finalized MPT base;
   an owner value present only on an unfinalized parent branch is not usable by a consuming shard.
 - ⚠ **Atomic cross-shard allow-spend settlement (I-ONCE)** via generic cross-shard-message seam (`f368e064e`); W3c cross-shard proof-path effective-balance overlay (`4081ef0d4`).
@@ -74,13 +81,16 @@
 - ⚠ **Shard-checkpoint chain-sync (pull-based recovery)** (`df5b7b0e0`, `d47a4403f`); FINALIZED-anchored shard checkpoints (`eb15e19c0`).
 - ⚠ **ml0 unified chain-based consensus engine** — rotation + solo-extension + gl0-anchor under one seam (`add65b620` design; decision recorded).
 - ⚠ **Go↔JVM gossip transport for shard-checkpoint + fraud-proof legs** (`72f39d652`, F1/F2/F8); sidecar carries l1-block topics + self-delivery (`b0ca67908`).
-- 🔴 **RECURRING WEDGE / current frontier — metagraph committee-gate parent-ordinal resolution.** `MetagraphCommitteeGate` / `MetagraphParentOrdinalResolver` / `MetagraphOrphanBuffer`; resolver→None on GSI-tip-lag → orphan re-buffer loop. Prior fix "walk-finalized-not-bestTip" (`40d546761`) recurred; blocks the 2mg/2shard token-lock e2e. **Must be fixed WITHIN the re-exec model.**
+- 🔴 **RECURRING WEDGE / current e2e operational frontier (not the security dependency head) — metagraph committee-gate parent-ordinal resolution.** `MetagraphCommitteeGate` / `MetagraphParentOrdinalResolver` / `MetagraphOrphanBuffer`; resolver→None on GSI-tip-lag → orphan re-buffer loop. Prior fix "walk-finalized-not-bestTip" (`40d546761`) recurred; blocks the 2mg/2shard token-lock e2e. **Must be fixed WITHIN the re-exec model, after the active roadmap's security ordering is respected.**
 - ⚠ **CL1 re-exec before sign/adopt** — `evaluate` and `verifyEmbedded` re-execute regardless of quorum/depth; ancestor attestations are
   gated by the same verifier. Watchtower checking is defense in depth, not the economic-validity gate.
 
 ---
 
 ## 🔧 Implementation Still Needed (original items, re-annotated 2026-07-10)
+
+The priority headings in this inherited list are historical. Use the active
+consensus-economic roadmap for dependencies and release gates.
 
 ### High Priority — Before Testnet
 

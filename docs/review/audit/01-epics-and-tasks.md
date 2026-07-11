@@ -1,5 +1,13 @@
 # 01 — Execution Roadmap (epics → tasks → DAG)
 
+> **HISTORICAL PRE-FIX ROADMAP.** This plan was written against `21933559c`
+> before universal GL0 replay replaced committee-root/diff adoption and before
+> the 2026-07-11 audit expanded the production blockers. Its priority order,
+> cutover gates, roots-only work, bounded-history replay proposal, finality patch,
+> and `smtRootBlind` test are not active instructions. The current finding-owned
+> sequence is
+> [`../CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`](../CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md).
+
 **Branch** `feature/committee-state-diff` · **HEAD** `21933559c` · **Date** 2026-07-07
 **Inputs:** `00-audit-findings.md` (2 Critical · 10 High · 8 Medium · 2 Low · 2 test-gaps), the
 invariant→test coverage matrix, and the four confirmed stakeholder directives (fraud-proofs

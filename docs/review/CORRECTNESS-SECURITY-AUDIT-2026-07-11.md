@@ -277,6 +277,8 @@ The finality repair must center a durable atomic
 `(ordinal, hash, fixed validator set, quorum certificate)` and descendant-only fork
 choice. The economic repair must make every accepted balance change a checked,
 authorized, replay-protected transition over one deterministic reservation accumulator.
+The finding-owned implementation order and acceptance gates are maintained in
+`CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`.
 
 ## 10. Verification limits
 

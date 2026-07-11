@@ -54,6 +54,10 @@ authorization, conservation, stake-backing, replay, and finality violations.
 Repeating an invalid transition on every GL0 node is deterministic invalidity,
 not economic enforcement.
 
+The active dependency order for closing these blockers is
+`docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`. Historical roots-only,
+bounded-history, or committee-authority task lists are not implementation plans.
+
 ## Committee Identity
 
 - ML0 operators run metagraph snapshot consensus and sign the binary submitted to
