@@ -23,8 +23,8 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
-/** Tests for [[ShardBinaryBuffer]] — the per-shard raw-binary accumulator (EXECUTION-SHARDING R-1, the inversion intake), incl. the S3
-  * finalize-keyed pruning + occupancy gauge + evict-finalized-first contract (`docs/nakamoto/SHARDED-CURRENCY-MIRROR-ENDGAME-PLAN.md` §S3).
+/** Tests for [[ShardBinaryBuffer]] — the per-shard raw-binary accumulator, including finalize-keyed pruning, occupancy gauges, and the
+  * evict-finalized-first contract.
   *
   * Coverage:
   *   - buffer then snapshot round-trips per MG in insertion order.

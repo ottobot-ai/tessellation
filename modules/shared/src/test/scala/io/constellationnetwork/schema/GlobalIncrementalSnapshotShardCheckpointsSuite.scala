@@ -14,7 +14,6 @@ import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
-import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
@@ -31,22 +30,17 @@ import weaver.FunSuite
 /** Circe round-trip suite for the `GlobalIncrementalSnapshot.shardCheckpoints` field landed by Slice 4 of
   * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4.
   *
-  * '''What this suite proves.''' Three contracts on the new field:
+  * '''What this suite proves.''' Three contracts on the field:
   *
   *   1. '''Round-trip with non-empty content.''' A snapshot constructed with N `ShardId`-keyed `ShardCheckpoint` entries encodes via Circe
   *      and decodes back equal (including ordered iteration: `SortedMap` keys come out in `Ordering[ShardId]` order; per-checkpoint
   *      `NonEmptyList` element order preserved).
-  *   1. '''Default-empty path.''' Since the case-class default for the field is `SortedMap.empty`, a snapshot whose JSON omits the
-  *      `shardCheckpoints` key (the pre-Slice-4 wire shape) still decodes — because the project keeps `SlotCertificate`-style "forgiving
-  *      decoder" precedent (`schema.nakamoto.slot.SlotCertificate.decoder`) and `GlobalIncrementalSnapshot.decoder` mirrors it for this
-  *      field.
+  *   1. '''Required wire shape.''' Omitting `shardCheckpoints` or `fraudProofs` is rejected; this greenfield fork has no deployed
+  *      predecessor shape to support.
   *   1. '''Mixed with existing fields.''' Encoding/decoding does not regress any of the existing field round-trips — the encoder still
   *      emits a `shardCheckpoints` key, the decoder still requires the other 24 fields, and equality holds.
   *
-  * '''What this suite does NOT exercise.''' No state-application semantics (acceptance into MPT, fork-choice, etc.) — those land in later
-  * slices (9, 13). No scodec wire-format coverage — `JsonScodecParitySuite` proves scodec parity on pre-Slice-4 fixtures continues to work,
-  * and a dedicated `ShardingScodecCodecs` package (for non-empty `ShardCheckpoint` scodec encoding) is deferred to a follow-up slice (see
-  * scaladoc in `GlobalSnapshotCodecs.globalIncrementalSnapshotCodec`).
+  * '''What this suite does NOT exercise.''' State-application semantics (acceptance into MPT and fork choice) are covered elsewhere.
   *
   * '''Why `FunSuite`, not `MutableIOSuite`.''' Circe codecs are pure functions; no `IO` is needed. Matches `ShardingCodecsSuite` (Slice 1)
   * and `GlobalSnapshotCodecsSuite` (the existing top-level snapshot round-trip suite).
@@ -63,8 +57,6 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
 
   private val mgAddrA: Address = addr("mg-aaa")
   private val mgAddrB: Address = addr("mg-bbb")
-  private val holderA: Address = addr("holder-1")
-  private val holderB: Address = addr("holder-2")
 
   private def peerIdN(n: Int): PeerId =
     PeerId(Hex(n.toHexString.padTo(2, '0') * 64))
@@ -104,36 +96,20 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
       NonEmptySet.of(mkProof("11" * 64, "22" * 70))
     )
 
-  private def mkDelta(mgAddr: Address, lockHolderAmount: Long): ShardDerivedStateDelta =
+  private def mkDelta(mgAddr: Address): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mgAddr -> hash('a')),
-      perMetagraphStateDiff = SortedMap.empty,
-      includedSnapshots = SortedMap(mgAddr -> NonEmptyList.of(mkSignedBinary('s'))),
-      tokenLockBalancesDelta = SortedMap(
-        mgAddr -> SortedMap(
-          holderA -> io.constellationnetwork.schema.balance.Balance(NonNegLong.unsafeFrom(lockHolderAmount)),
-          holderB -> io.constellationnetwork.schema.balance.Balance(NonNegLong.unsafeFrom(lockHolderAmount * 2L))
-        )
-      ),
-      perMetagraphArtifacts = SortedMap.empty,
-      perMetagraphSyncDataDelta = SortedMap(
-        mgAddr -> MetagraphSyncDataInfo(
-          globalOrdinalLastAcceptedOn = SnapshotOrdinal(NonNegLong.unsafeFrom(7L)),
-          globalEpochProgressLastAcceptedOn = EpochProgress(NonNegLong.unsafeFrom(3L)),
-          unappliedGlobalChangeOrdinals = SortedSet.empty
-        )
-      )
+      includedSnapshots = SortedMap(mgAddr -> NonEmptyList.of(mkSignedBinary('s')))
     )
 
-  private def mkCheckpoint(shard: ShardId, mgAddr: Address, lockHolderAmount: Long): ShardCheckpoint =
+  private def mkCheckpoint(shard: ShardId, mgAddr: Address): ShardCheckpoint =
     ShardCheckpoint(
       shardId = shard,
       parentCheckpointHash = hash('p'),
       shardOrdinal = ShardOrdinal(42L),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(99L)),
       slot = SlotT.unsafeApply(99L),
-      derivedStateDelta = mkDelta(mgAddr, lockHolderAmount),
-      emittedReceipts = List.empty,
+      derivedStateDelta = mkDelta(mgAddr),
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(1, 7), mkCommitteeSig(2, 8)),
       epoch = EtaPeriod(5L)
     )
@@ -204,9 +180,9 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
 
   test("GlobalIncrementalSnapshot.shardCheckpoints — non-empty SortedMap round-trips through Circe (3 shards)") {
     val checkpoints = SortedMap(
-      shardZero -> mkCheckpoint(shardZero, mgAddrA, 100L),
-      shardOne -> mkCheckpoint(shardOne, mgAddrB, 200L),
-      shardTwo -> mkCheckpoint(shardTwo, mgAddrA, 300L)
+      shardZero -> mkCheckpoint(shardZero, mgAddrA),
+      shardOne -> mkCheckpoint(shardOne, mgAddrB),
+      shardTwo -> mkCheckpoint(shardTwo, mgAddrA)
     )
     val snapshot = mkSnapshot(checkpoints)
     val jsonStr = snapshot.asJson.noSpaces
@@ -238,15 +214,12 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
   }
 
   // ===========================================================================
-  // Test 3 — forgiving decoder: missing `shardCheckpoints` key in JSON (pre-Slice-4 fixtures) decodes to empty map
+  // Current greenfield schema rejects a missing checkpoint field.
   //
-  // This is the load-bearing test for the `SlotCertificate`-style forgiving decoder in `GlobalIncrementalSnapshot.decoder`. Pre-Slice-4
-  // brotli fixtures in `JsonScodecParitySuite` (e.g. `incremental_snapshot_ordinal_700.brotli`) lack the field; the suite-wide contract
-  // is "missing key → default empty map" via the project precedent in `schema.nakamoto.slot.SlotCertificate.decoder`.
+  // Fork-only consensus fields have no compatibility default.
   // ===========================================================================
 
-  test("GlobalIncrementalSnapshot.shardCheckpoints — missing key in JSON decodes to SortedMap.empty (pre-Slice-4 wire compat)") {
-    // Build a snapshot and serialize, then strip out the `shardCheckpoints` field from the JSON object — emulating a pre-Slice-4 fixture.
+  test("GlobalIncrementalSnapshot.shardCheckpoints — missing key is rejected") {
     val snapshotWithEmpty = mkSnapshot(SortedMap.empty[ShardId, ShardCheckpoint])
     val jsonStr = snapshotWithEmpty.asJson.noSpaces
     val parsedJson = parse(jsonStr).fold(err => throw new AssertionError(s"parse failed: ${err.getMessage}"), identity)
@@ -259,8 +232,7 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
     val strippedStr = strippedJson.noSpaces
     expect.all(
       !strippedStr.contains("shardCheckpoints"), // guard: confirm we actually stripped the key
-      // The forgiving decoder fills in `SortedMap.empty` for the missing field.
-      decode[GlobalIncrementalSnapshot](strippedStr).map(_.shardCheckpoints.isEmpty) == Right(true)
+      decode[GlobalIncrementalSnapshot](strippedStr).isLeft
     )
   }
 
@@ -284,9 +256,9 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
 
   test("GlobalIncrementalSnapshot.shardCheckpoints — SortedMap key order preserved across encode/decode regardless of insertion order") {
     val reverseInsertion: SortedMap[ShardId, ShardCheckpoint] = SortedMap(
-      shardTwo -> mkCheckpoint(shardTwo, mgAddrA, 1L),
-      shardZero -> mkCheckpoint(shardZero, mgAddrA, 2L),
-      shardOne -> mkCheckpoint(shardOne, mgAddrA, 3L)
+      shardTwo -> mkCheckpoint(shardTwo, mgAddrA),
+      shardZero -> mkCheckpoint(shardZero, mgAddrA),
+      shardOne -> mkCheckpoint(shardOne, mgAddrA)
     )
     val snapshot = mkSnapshot(reverseInsertion)
     val jsonStr = snapshot.asJson.noSpaces
@@ -321,7 +293,7 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
     mgAddr: Address,
     cpHashSeed: Char
   ): io.constellationnetwork.schema.slashing.InvalidStateProofEvidence = {
-    val cp = mkCheckpoint(shard, mgAddr, 100L)
+    val cp = mkCheckpoint(shard, mgAddr)
     io.constellationnetwork.schema.slashing.InvalidStateProofEvidence(
       shardId = shard,
       disputedCheckpoint = cp,
@@ -343,7 +315,7 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
     )
   }
 
-  test("GlobalIncrementalSnapshot.fraudProofs — missing key in JSON decodes to SortedSet.empty (pre-watchtower wire compat)") {
+  test("GlobalIncrementalSnapshot.fraudProofs — missing key is rejected") {
     val snapshot = mkSnapshot(SortedMap.empty) // fraudProofs defaults to empty
     val jsonStr = snapshot.asJson.noSpaces
     val parsedJson = parse(jsonStr).fold(err => throw new AssertionError(s"parse failed: ${err.getMessage}"), identity)
@@ -355,7 +327,7 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
     val strippedStr = strippedJson.noSpaces
     expect.all(
       !strippedStr.contains("fraudProofs"),
-      decode[GlobalIncrementalSnapshot](strippedStr).map(_.fraudProofs.isEmpty) == Right(true)
+      decode[GlobalIncrementalSnapshot](strippedStr).isLeft
     )
   }
 

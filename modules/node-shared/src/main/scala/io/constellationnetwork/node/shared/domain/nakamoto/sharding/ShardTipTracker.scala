@@ -20,8 +20,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * '''Why a separate tracker per shard.''' Two independent reasons:
   *   - '''Scope.''' A shard committee is a sortitioned subset of the gl0 operator set (per the `sharding-direction-clarified` memory note —
   *     execution sharded, not data sharded). Mixing attestations from different shards' committees in one tracker would lose the
-  *     per-committee threshold accounting that's load-bearing for `T_count_shard` (`design doc §5.4` row 2). Each shard's `K_S`
-  *     committee-size value drives its own `⌈2·K_S/3⌉` threshold.
+  *     per-committee accounting used by `T_count_shard`. The cluster-uniform configured `kQuorum` is compared directly.
   *   - '''Pruning floor.''' Each shard advances its `lastFinalizedOrdinal` independently. Pruning needs to know "what's below the shard's
   *     own floor" — a single mixed tracker would have to track per-(shardId) floors anyway, which is just this per-shard tracker
   *     constructor-fed a `ShardId` for diagnostic logging plus a per-shard `Map[Hash, Map[PeerId, CommitteeMemberSignature]]`.
@@ -37,17 +36,16 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - Fresh per-shard tracker. The gl0 `TipTracker` stays as-is for the universal global chain.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`):
-  *   - No env reads. `selfPeerId` and `shardId` are constructor params; `K_S` (committee size for threshold math) lives on
-  *     [[ShardFinalityTriggers]] (the per-shard composite), not here.
+  *   - No env reads. `selfPeerId` and `shardId` are constructor params; `kQuorum` lives on [[ShardFinalityTriggers]].
   *
   * '''Why `Map[Hash, Map[PeerId, CommitteeMemberSignature]]`.''' The shard committee membership is bounded (`K_S` ≈ small) and each
   * committee member produces at most one signature per checkpoint, so the inverted shape — keyed by `Hash`, value a per-signer `Map[PeerId,
-  * CommitteeMemberSignature]` — is simple for the `⌈2·K_S/3⌉` count comparison (`= keySet.size`) and for the `pruneBelow` predicate (drop
-  * hashes whose shard-ord falls below the floor). Retaining the FULL signature (not just the `PeerId`, the original Slice-6 shape) is what
-  * slice 14 needs: the gl0 consensus leader reads [[signaturesFor]] and splices the ≥`kQuorum` collected signatures back into a candidate
-  * checkpoint's `committeeSignatures` before the DETERMINISTIC `verifyEmbedded` adopt gate — turning a sub-quorum re-exec failover into a
-  * fast count-verified adopt. (The gl0 `TipTracker` is keyed by `PeerId` instead because there each peer's latest attestation supersedes
-  * its previous — P-11b NID; the shard's one-sig-per-checkpoint invariant makes the `Hash`-keyed shape sound here.)
+  * CommitteeMemberSignature]` — is simple for the direct `kQuorum` count comparison and for the `pruneBelow` predicate (drop hashes whose
+  * shard-ord falls below the floor). Retaining the FULL signature (not just the `PeerId`, the original Slice-6 shape) is what slice 14
+  * needs: the gl0 consensus leader reads [[signaturesFor]] and splices the ≥`kQuorum` collected signatures back into a candidate
+  * checkpoint's `committeeSignatures` before the deterministic `verifyEmbedded` replay gate. Signature enrichment never bypasses replay.
+  * (The gl0 `TipTracker` is keyed by `PeerId` instead because there each peer's latest attestation supersedes its previous — P-11b NID; the
+  * shard's one-sig-per-checkpoint invariant makes the `Hash`-keyed shape sound here.)
   */
 trait ShardTipTracker[F[_]] {
 
@@ -81,8 +79,7 @@ trait ShardTipTracker[F[_]] {
     * gl0 consensus leader uses to enrich a candidate checkpoint's `committeeSignatures` to ≥`kQuorum` before the deterministic
     * `verifyEmbedded` adopt gate. NO self-exclusion here (unlike [[attestationCountFor]]): the leader needs every distinct signer it has
     * observed to reach quorum, and dedup-by-`peerId` in the merge keeps the producer's already-embedded signature from being
-    * double-counted. Empty map ⇒ no attestations collected for this hash yet (the leader falls back to the re-exec failover until gossip
-    * catches up).
+    * double-counted. Empty map means no additional attestations have been collected for this hash.
     */
   def signaturesFor(checkpointHash: Hash): F[Map[PeerId, CommitteeMemberSignature]]
 

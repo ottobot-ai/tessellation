@@ -75,26 +75,28 @@ class BalanceOpsManager[F[_]: Async](
       case None => (balances, maybeTxs).pure[F]
       case Some(txs) =>
         val feeReferredAddresses = txs.flatMap(tx => Set(tx.value.source, tx.value.destination))
-        val feeReferredBalances = feeReferredAddresses.foldLeft(SortedMap.empty[Address, Long]) {
+        val feeReferredBalances = feeReferredAddresses.foldLeft(SortedMap.empty[Address, BigInt]) {
           case (acc, address) =>
-            acc.updated(address, balances.getOrElse(address, Balance.empty).value.value)
+            acc.updated(address, BigInt(balances.getOrElse(address, Balance.empty).value.value))
         }
         val updatedFeeReferredBalances = txs
           .foldLeft(feeReferredBalances) {
             case (balances, tx) =>
+              val amount = BigInt(tx.amount.value.value)
               balances
-                .updatedWith(tx.source)(existing => (existing.getOrElse(Balance.empty.value.value) - tx.amount.value.value).some)
-                .updatedWith(tx.destination)(existing => (existing.getOrElse(Balance.empty.value.value) + tx.amount.value.value).some)
+                .updatedWith(tx.source)(existing => (existing.getOrElse(BigInt(0L)) - amount).some)
+                .updatedWith(tx.destination)(existing => (existing.getOrElse(BigInt(0L)) + amount).some)
           }
 
         updatedFeeReferredBalances.toList
           .foldLeftM(SortedMap.empty[Address, Balance]) {
             case (acc, (address, balance)) =>
-              NonNegLong
-                .from(balance)
-                .map(Balance(_))
-                .map(acc.updated(address, _))
-                .leftMap(e => new ArithmeticException(s"Unexpected state when applying fee transactions: $e"))
+              Either
+                .cond(
+                  balance >= 0 && balance <= Long.MaxValue,
+                  acc.updated(address, Balance(NonNegLong.unsafeFrom(balance.longValue))),
+                  new ArithmeticException(s"Unexpected state when applying fee transactions: balance out of range for $address")
+                )
                 .liftTo[F]
           }
           .map { updates =>

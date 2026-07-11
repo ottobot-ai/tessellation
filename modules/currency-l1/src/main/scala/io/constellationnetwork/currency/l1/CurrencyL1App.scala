@@ -230,7 +230,7 @@ abstract class CurrencyL1App(
 
       // (#196 follow-up) cl1 → cl0 send-block hop: the upstream `StateChannel`
       // + `TokenLock` were refactored to take a per-call-site lambda so the
-      // dl1 → gl0 hop can publish via the gl0 sidecar's durable outbox
+      // gl1 -> gl0 hop can publish via the gl0 sidecar's durable outbox
       // (replaces the brittle single-peer HTTP POST lottery). cl0 has no
       // sidecar wiring, so the cl1 → cl0 path keeps the previous semantics:
       // pick a random gl0-cl0 alignment peer with collateral, HTTP-POST to

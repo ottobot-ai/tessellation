@@ -22,13 +22,13 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   * roots — recompute." This validator implements exactly that.
   *
   * '''The re-derivation primitive (`reDerivePerMgRoot`).''' Injected as the SAME `(metagraphAddress, includedChain, gl0AnchorOrdinal,
-  * diffBaseOrdinal) => F[Hash]` closure the
-  * [[io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager]] uses on its
-  * sub-quorum re-exec path (production: `ShardCheckpointWiring.reExecDerivationWithDiff(...)._1`, the PIN-1 component-addressable
+  * executionBaseOrdinal) => F[Hash]` closure the
+  * [[io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager]] uses for every
+  * checkpoint replay (production: `ShardCheckpointWiring.reExecDerivationAtPinnedBase`, the PIN-1 component-addressable
   * `currencySnapshotMgRoot` encoding, seeded from the reader `ShardCheckpointWiring.pinnedPriorReaderAt` resolves AT the disputed
-  * checkpoint's own `diffBaseOrdinal` — Track-1 diff-base-pin, FINDING-B1). Two facts make this deterministic cluster-wide:
+  * checkpoint's own `executionBaseOrdinal` — Track-1 execution-base-pin, FINDING-B1). Two facts make this deterministic cluster-wide:
   *   1. The closure reads NO live snapshot storage for the derivation itself (`noGlobalSnapshotLookup`), and the `S(N)` prior is read at
-  *      the wire-carried, committee-signed `diffBaseOrdinal` — NEVER this node's live base (a validator whose tip ran ahead of the
+  *      the wire-carried, committee-signed `executionBaseOrdinal` — NEVER this node's live base (a validator whose tip ran ahead of the
   *      checkpoint's base would otherwise recompute a different root and false-uphold against an honest committee).
   *   1. The dispute is gated to land WITHIN the challenge window (`depth-k1`); below depth-k1 the pinned base `S(N)` is cluster-uniform
   *      (consensus has finalized it), so every honest node's PIN-1 re-derivation reads the IDENTICAL prior and computes the IDENTICAL root.
@@ -71,17 +71,17 @@ object InvalidStateProofValidator {
   /** Construct the validator.
     *
     * @param reDerivePerMgRoot
-    *   the canonical per-MG root re-derivation — MUST be the SAME closure the shard acceptance manager's sub-quorum re-exec uses
-    *   (`ShardCheckpointWiring.reExecDerivationWithDiff(...)._1` seeded from the FINALIZED base reader), so the recomputed root is in the
-    *   exact `perMetagraphMptRoots` (PIN-1) encoding and byte-comparable against the committee-attested value. Production wiring passes the
+    *   the canonical per-MG root re-derivation — MUST be the SAME closure the shard acceptance manager's unconditional replay uses
+    *   (`ShardCheckpointWiring.reExecDerivationAtPinnedBase` seeded from the finalized base reader), so the recomputed root is in the exact
+    *   `perMetagraphMptRoots` (PIN-1) encoding and byte-comparable against the committee-attested value. Production wiring passes the
     *   identical instance constructed in `SharedServices`/`GlobalSnapshotConsensus`.
     * @param slashedReader
     *   the double-slash MPT guard, keyed on `(shardId, disputedCheckpointHash)`. `InvalidStateProofSlashedReader.neverSlashed` for tests /
     *   pre-MPT-partition wiring.
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
-    // Track-1 diff-base-pin: the 4th arg is the disputed checkpoint's `diffBaseOrdinal`, so the honest re-derivation reads S(N) at the
-    // SAME pinned base the committee diffed over (call site passes `cp.diffBaseOrdinal`) — a watchtower that read its own live base would
+    // Track-1 execution-base-pin: the 4th arg is the disputed checkpoint's `executionBaseOrdinal`, so the honest re-derivation reads S(N) at the
+    // SAME pinned base the committee executed over (call site passes `cp.executionBaseOrdinal`) — a watchtower that read its own live base would
     // recompute a different root and false-slash an honest checkpoint whose base lags the watchtower's.
     reDerivePerMgRoot: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash],
     slashedReader: InvalidStateProofSlashedReader[F]
@@ -138,14 +138,14 @@ object InvalidStateProofValidator {
         }
 
       // Step 7 — THE VERDICT (load-bearing). Re-derive the honest per-MG root from the checkpoint's OWN signed binaries at its OWN
-      // gl0AnchorOrdinal over its OWN pinned diffBaseOrdinal, using the SAME closure the sub-quorum re-exec uses (PIN-1 encoding,
-      // diff-base-pinned reader). Compare against the committee-attested root read off the signed envelope. UPHELD iff the re-derivation
+      // gl0AnchorOrdinal over its OWN pinned executionBaseOrdinal, using the SAME closure the checkpoint replay uses (PIN-1 encoding,
+      // execution-base-pinned reader). Compare against the committee-attested root read off the signed envelope. UPHELD iff the re-derivation
       // AFFIRMATIVELY differs. Never trusts the challenger's carried roots.
       def step7(binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]]): F[Either[InvalidStateProofRejection, Unit]] = {
         val attested: Option[Hash] = cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
-        reDerivePerMgRoot(mg, binaries, cp.gl0AnchorOrdinal, cp.diffBaseOrdinal).map { honest =>
-          // FAIL-CLOSED (Track-1 diff-base-pin, FINDING-B1): `Hash.empty` is the wiring's "cannot re-derive" sentinel
-          // (`reExecDerivationWithDiff` returned None — the pinned diffBaseOrdinal is unresolvable below this node's retention / not
+        reDerivePerMgRoot(mg, binaries, cp.gl0AnchorOrdinal, cp.executionBaseOrdinal).map { honest =>
+          // FAIL-CLOSED (Track-1 execution-base-pin, FINDING-B1): `Hash.empty` is the wiring's "cannot re-derive" sentinel
+          // (`reExecDerivationAtPinnedBase` returned None — the pinned executionBaseOrdinal is unresolvable below this node's retention / not
           // reached, or the derivation OMITted). An unverifiable dispute is NEVER upheld: "this node can't check" is not evidence of
           // committee deviation, and upholding here would 100%-slash an honest committee on a local retention miss. Checked FIRST so the
           // sentinel can neither "differ" from an attested root nor satisfy the None-attested branch below.

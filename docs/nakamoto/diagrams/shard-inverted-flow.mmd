@@ -1,27 +1,25 @@
 flowchart TB
-    B["Metagraph ml0<br/>SC binaries (BFT, unchanged)"]
-    B -->|"gossip to shard topic<br/>shard-checkpoint-id"| ADM
-    subgraph COMM["SHARD COMMITTEE · re-executes (VRF-sortitioned gl0 subset)"]
-        direction TB
-        ADM["chain-link admission<br/>shard-internal, vs prior checkpoint tip"]
-        EXE["re-execute per-MG slice<br/>currency · token-lock · artifacts · sync · MPT root"]
-        BUILD["build ShardCheckpoint<br/>includedSnapshots + derivedStateDelta"]
-        SIGN["KES + Ed25519 sign<br/>committee attest to quorum"]
-        ADM --> EXE --> BUILD --> SIGN
+    B["ML0 signed state-channel binaries"]
+    B --> ADM
+    subgraph ADMISSION["GL0 BINARY ADMISSION COMMITTEE"]
+        ADM["per-binary secret VRF draw<br/>authenticate and buffer"]
     end
-    SIGN -->|"fully-signed envelope<br/>(gl0-wide topic)"| VER
-    subgraph GL0["EVERYONE ELSE · verify-only + trust (all other gl0 nodes + consumers)"]
-        direction TB
-        VER{"verify committee-sig threshold<br/>(deterministic, no re-exec)"}
-        TRUST["adopt claimed state"]
-        EMBED["embed full checkpoint in<br/>global snapshot (execution-sharded)"]
-        VER -->|pass| TRUST --> EMBED
+    ADM --> EXEC
+    subgraph COMMITTEE["GL0 EXECUTION COMMITTEE"]
+        EXEC["chain-link window<br/>pin finalized execution base"]
+        REPLAY["recreate every included CL1 transition"]
+        BUILD["claim per-metagraph roots<br/>carry all replay inputs"]
+        SIGN["validate, recreate, then sign"]
+        EXEC --> REPLAY --> BUILD --> SIGN
     end
-    EMBED -.->|"full data in gl0 ⇒ shard bootstrap is free<br/>(reconstructed from gl0 sync)"| BOOT["new committee member<br/>(eligible only after N-2)"]
-    SIGN -.->|"divergence / equivocation evidence"| SLASH["slashing backstop (later)"]
-    classDef good fill:#e0f7e0,stroke:#27ae60,color:#145a32;
-    classDef neu fill:#eef2f7,stroke:#5d6d7e,color:#1b2631;
-    classDef future fill:#fff3d6,stroke:#b9770e,color:#7e5109;
-    class COMM,ADM,EXE,BUILD,SIGN,VER,TRUST,EMBED good;
-    class B,BOOT neu;
-    class SLASH future;
+    SIGN --> VERIFY
+    subgraph GLOBAL["EVERY GL0 ADOPTER"]
+        VERIFY["verify identity, keys, KES, duty,<br/>assignment, ancestry, and schema"]
+        AGAIN["recreate every CL1 transition<br/>at signed finalized base"]
+        COMPARE{"local roots equal claims?"}
+        EMBED["store, attest, select, and embed"]
+        VERIFY --> AGAIN --> COMPARE
+        COMPARE -->|yes| EMBED
+        COMPARE -->|no| REJECT["reject; optional fraud evidence"]
+    end
+    EMBED --> RETURN["finalized GL0 state returns downstream"]

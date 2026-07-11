@@ -35,16 +35,6 @@ object CurrencyAtomCodecsSuite extends FunSuite {
       .and(expect(o.immutableBytes != s.immutableBytes))
   }
 
-  test("BalanceAdjustmentReason all variants round-trip") {
-    val samples: Seq[BalanceAdjustmentReason] = Seq(
-      SpendTransactionNotApplied,
-      SpendTransactionSourceNotApplied,
-      SpendTransactionDestinationNotApplied
-    )
-    val decoded = samples.map(_.immutableBytes.fromImmutableBytes[BalanceAdjustmentReason])
-    expect(decoded == samples.map(Right(_)))
-  }
-
   test("SessionToken round-trips (wraps Generation = PosLong)") {
     val tk = SessionToken(Generation(PosLong.unsafeFrom(123L)))
     expect(tk.immutableBytes.fromImmutableBytes[SessionToken] == Right(tk))

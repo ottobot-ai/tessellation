@@ -61,6 +61,12 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
 
   type Res = (KryoSerializer[IO], Hasher[IO], JsonSerializer[IO], SecurityProvider[IO])
 
+  final case class ProcessorHarness(
+    processor: GlobalSnapshotStateChannelEventsProcessor[IO],
+    creator: CurrencySnapshotCreator[IO],
+    initialGlobalSnapshot: Hashed[GlobalIncrementalSnapshot]
+  )
+
   def sharedResource: Resource[IO, Res] = for {
     implicit0(ks: KryoSerializer[IO]) <- KryoSerializer.forAsync[IO](sharedKryoRegistrar)
     sp <- SecurityProvider.forAsync[IO]
@@ -68,7 +74,7 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
     h = Hasher.forJson[IO]
   } yield (ks, h, j, sp)
 
-  def mkProcessor(
+  def mkProcessorHarness(
     stateChannelAllowanceLists: Map[Address, NonEmptySet[PeerId]],
     failed: Option[(Address, StateChannelValidator.StateChannelValidationError)] = None
   )(implicit H: Hasher[IO], S: SecurityProvider[IO], J: JsonSerializer[IO], K: KryoSerializer[IO]) = {
@@ -120,6 +126,9 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
       lastNSnapshotStorage =
         LastNGlobalSnapshotStorage.make[IO](lastGlobalSnapshotsSyncConfig, lastNSnapR, incLastNSnapR)
       lastGlobalSnapshotStorage = LastSnapshotStorage.make[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo](lastSnapR)
+      initialGlobalInfo = mkGlobalSnapshotInfo()
+      initialGlobalSnapshot <- mkGlobalIncrementalSnapshot[IO](initialGlobalInfo)
+      _ <- lastGlobalSnapshotStorage.setInitial(initialGlobalSnapshot, initialGlobalInfo)
 
       currencySnapshotAcceptanceManager <- CurrencySnapshotAcceptanceManager.make(
         FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty),
@@ -142,12 +151,12 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
           SnapshotOrdinal.MinValue,
           currencySnapshotAcceptanceManager,
           None,
-          SnapshotSizeConfig(Long.MaxValue, Long.MaxValue),
+          SnapshotSizeConfig(1L, Long.MaxValue),
           currencyEventsCutter,
           validationErrorStorage
         )
       currencySnapshotValidator = CurrencySnapshotValidator
-        .make[IO](SnapshotOrdinal.MinValue, creator, validators.signedValidator, None, None)
+        .make[IO](creator, validators.signedValidator, None, None)
       mptProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       mptStore <- MptStore.make[IO, GlobalStateKey](
         mptProducer,
@@ -178,8 +187,14 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
           feeCalculator,
           io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore(mptStore)
         )
-    } yield processor
+    } yield ProcessorHarness(processor, creator, initialGlobalSnapshot)
   }
+
+  def mkProcessor(
+    stateChannelAllowanceLists: Map[Address, NonEmptySet[PeerId]],
+    failed: Option[(Address, StateChannelValidator.StateChannelValidationError)] = None
+  )(implicit H: Hasher[IO], S: SecurityProvider[IO], J: JsonSerializer[IO], K: KryoSerializer[IO]) =
+    mkProcessorHarness(stateChannelAllowanceLists, failed).map(_.processor)
 
   test("return new sc event") { res =>
     implicit val (ks, h, j, sp) = res
@@ -280,6 +295,68 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
       )
     } yield expect.eql(expected, result)
 
+  }
+
+  test("direct currency processing cannot bypass full state-channel validation") { res =>
+    implicit val (ks, h, j, sp) = res
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      address = keyPair.getPublic.toAddress
+      genesis = CurrencySnapshot.mkGenesis(Map.empty, None, None)
+      signedGenesis <- forAsyncHasher(genesis, keyPair)
+      content <- j.serialize(signedGenesis)
+      binary <- forAsyncHasher(StateChannelSnapshotBinary(Hash.empty, content, SnapshotFee.MinValue), keyPair)
+      events = SortedMap(address -> NonEmptyList.one(binary))
+      validProcessor <- mkProcessor(Map(address -> binary.proofs.map(_.id.toPeerId)))
+      rejectingProcessor <- mkProcessor(
+        Map(address -> binary.proofs.map(_.id.toPeerId)),
+        Some(address -> StateChannelValidator.BinaryFeeNotSufficient(SnapshotFee.MinValue, SnapshotFee(1L), 1, SnapshotOrdinal(1L)))
+      )
+      accepted <- validProcessor.processCurrencySnapshots(
+        SnapshotOrdinal(1L),
+        SortedMap.empty,
+        SortedMap.empty,
+        events,
+        _ => none.pure[IO]
+      )
+      rejected <- rejectingProcessor.processCurrencySnapshots(
+        SnapshotOrdinal(1L),
+        SortedMap.empty,
+        SortedMap.empty,
+        events,
+        _ => none.pure[IO]
+      )
+    } yield expect(accepted.contains(address)).and(expect(rejected.isEmpty))
+  }
+
+  test("an unseeded currency incremental is rejected instead of advancing as opaque state") { res =>
+    implicit val (ks, h, j, sp) = res
+    implicit val currencySelector: CurrencyStateProofSelector = CurrencyStateProofSelector.instance
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      address = keyPair.getPublic.toAddress
+      genesis = CurrencySnapshot.mkGenesis(Map.empty, None, None)
+      incremental <- CurrencyIncrementalSnapshot.fromCurrencySnapshot[IO](genesis)(
+        implicitly[Parallel[IO]],
+        implicitly[Async[IO]],
+        h,
+        j,
+        currencySelector
+      )
+      signedIncremental <- forAsyncHasher(incremental, keyPair)
+      content <- j.serialize(signedIncremental)
+      binary <- forAsyncHasher(StateChannelSnapshotBinary(Hash.empty, content, SnapshotFee.MinValue), keyPair)
+      processor <- mkProcessor(Map(address -> binary.proofs.map(_.id.toPeerId)))
+      result <- processor.processCurrencySnapshots(
+        SnapshotOrdinal(1L),
+        SortedMap.empty,
+        SortedMap.empty,
+        SortedMap(address -> NonEmptyList.one(binary)),
+        _ => none.pure[IO]
+      )
+    } yield expect(result.isEmpty)
   }
 
   def mkStateChannelOutput(keyPair: KeyPair, hash: Option[Hash] = None)(

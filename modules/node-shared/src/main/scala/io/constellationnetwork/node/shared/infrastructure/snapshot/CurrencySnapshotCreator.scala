@@ -72,9 +72,9 @@ trait CurrencySnapshotCreator[F[_]] {
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     shouldPerformMetagraphSpecificValidations: Boolean,
     maybeCustomArtifacts: Option[Signed[CurrencyIncrementalSnapshot] => Option[SortedSet[SharedArtifact]]],
-    // Validator-only override: force the acceptance manager to use this GL0 sync
-    // point (matching what the producer used). None means default priority chain.
-    forcedGlobalSyncView: Option[GlobalSyncView] = None
+    // Validator-only execution pin. GL0 re-execution resolves this ordinal from
+    // finalized history and verifies the committed hash and epoch before use.
+    pinnedGlobalSyncView: Option[GlobalSyncView] = None
   )(implicit hasher: Hasher[F]): F[CurrencySnapshotCreationResult[CurrencySnapshotEvent]]
 }
 
@@ -119,7 +119,7 @@ object CurrencySnapshotCreator {
       getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
       shouldPerformMetagraphSpecificValidations: Boolean,
       maybeCustomArtifacts: Option[Signed[CurrencyIncrementalSnapshot] => Option[SortedSet[SharedArtifact]]],
-      forcedGlobalSyncView: Option[GlobalSyncView] = None
+      pinnedGlobalSyncView: Option[GlobalSyncView] = None
     )(implicit hasher: Hasher[F]): F[CurrencySnapshotCreationResult[CurrencySnapshotEvent]] = {
       val maxArtifactSize = maxProposalSizeInBytes(facilitators)
 
@@ -235,7 +235,7 @@ object CurrencySnapshotCreator {
                 shouldPerformMetagraphSpecificValidations,
                 lastArtifact.proofs,
                 alreadyProcessedGlobalOrdinals,
-                forcedGlobalSyncView
+                pinnedGlobalSyncView
               )
 
           rejectedBlockEvents = currencySnapshotAcceptanceResult.block.notAccepted.collect {
@@ -306,32 +306,7 @@ object CurrencySnapshotCreator {
             if (currencySnapshotAcceptanceResult.lastGlobalSnapshotToCheckFields < tessellation3MigrationStartingOrdinal) none
             else currencySnapshotAcceptanceResult.tokenLockBlock.accepted.toSortedSet.some,
             if (currencySnapshotAcceptanceResult.lastGlobalSnapshotToCheckFields < tessellation3MigrationStartingOrdinal) none
-            else currencySnapshotAcceptanceResult.globalSyncView.some,
-            // authoritativeBalances — the metagraph's OWN cumulative balance map. This is the EXACT `info.balances` that
-            // `currencySnapshotAcceptanceResult.stateProof.balancesProof` (committed above) is hashed over (`csi.stateProof` in
-            // `CurrencySnapshotAcceptanceManager`), so the field and the proof are byte-consistent — the security anchor gl0 verifies
-            // before adopting it under roots-only sharding (no balance re-derive carry-forward).
-            currencySnapshotAcceptanceResult.info.balances.some,
-            // authoritativeActiveAllowSpends / authoritativeActiveTokenLocks — the metagraph's OWN active-set maps. These are the EXACT
-            // `info.activeAllowSpends` / `info.activeTokenLocks` that `stateProof.activeAllowSpends` / `stateProof.activeTokenLocks`
-            // (committed above) are hashed over (`csi.stateProof`), so the field and the proof are byte-consistent — the security anchor gl0
-            // verifies before adopting them under roots-only sharding (these are reduced by cross-shard spends gl0 cannot replay). Already
-            // Option-shaped (`None` pre-migration, `Some(map)` post-migration) — pass through as-is.
-            currencySnapshotAcceptanceResult.info.activeAllowSpends,
-            currencySnapshotAcceptanceResult.info.activeTokenLocks,
-            // authoritativeLastTxRefs — the metagraph's OWN cumulative last-tx-reference map. This is the EXACT `info.lastTxRefs` that
-            // `currencySnapshotAcceptanceResult.stateProof.lastTxRefsProof` (committed above) is hashed over (`csi.stateProof`), so the field
-            // and the proof are byte-consistent — the security anchor gl0 verifies before adopting it under roots-only sharding. gl0's
-            // per-incremental `AdoptFromSignedFields` replay cannot reproduce the cumulative ref map onto its path-dependent prior, so ml0
-            // PUSHES it here (no re-derive carry-forward for lastTxRefs in the sharded path).
-            currencySnapshotAcceptanceResult.info.lastTxRefs.some,
-            // authoritativeLast{FeeTxRefs,AllowSpendRefs,TokenLockRefs,Messages} — same anchor as lastTxRefs, for the OTHER cumulative
-            // ref-maps that gl0's per-incremental replay also cannot reproduce. These `info` fields are already Option-shaped, so push as-is
-            // (the field and its `stateProof.*Proof` are byte-consistent); gl0 verifies each against the metagraph-signed proof before adopting.
-            currencySnapshotAcceptanceResult.info.lastFeeTxRefs,
-            currencySnapshotAcceptanceResult.info.lastAllowSpendRefs,
-            currencySnapshotAcceptanceResult.info.lastTokenLockRefs,
-            currencySnapshotAcceptanceResult.info.lastMessages
+            else currencySnapshotAcceptanceResult.globalSyncView.some
           )
 
           artifactSize: Int <- JsonSerializer[F].serialize(artifact).map(_.length)

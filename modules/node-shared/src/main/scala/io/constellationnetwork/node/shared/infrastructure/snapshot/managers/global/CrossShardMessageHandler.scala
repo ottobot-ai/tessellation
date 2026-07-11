@@ -54,10 +54,9 @@ object CrossShardSettlementWrite {
     CrossShardSettlementWrite(SortedMap.empty[GlobalStateKey, Array[Byte]], scala.collection.immutable.SortedSet.empty[Hash])
 }
 
-/** A thin GENERIC seam for cross-shard message settlement at gl0 (`docs/nakamoto/ECONOMIC-TRUST-SHARDED-SECURITY-ARCHITECTURE.md` §5,
-  * I-ONCE). gl0 is the shared sequencer: it sees every shard checkpoint in one total-ordered global snapshot, so it settles a cross-shard
-  * message ATOMICALLY at its fold — verify the message's single-use identity is ABSENT from this type's nullifier set, write the nullifier,
-  * and (type-specifically, OUTSIDE this seam) apply the message's effect.
+/** A thin generic seam for cross-shard message settlement at GL0 (ADR-0016). GL0 is the shared sequencer: it sees every shard checkpoint in
+  * one total-ordered global snapshot, so it settles a cross-shard message ATOMICALLY at its fold — verify the message's single-use identity
+  * is ABSENT from this type's nullifier set, write the nullifier, and (type-specifically, OUTSIDE this seam) apply the message's effect.
   *
   * This trait owns ONLY the NULLIFIER lifecycle (the part that is uniform across every message type: classify cross-shard, reject
   * double-spend/replay, emit markers). Instance 1 is [[AllowSpendConsumeHandler]] over the `ConsumedAllowSpends` partition (fieldId 33). A
@@ -82,7 +81,8 @@ trait CrossShardMessageHandler[F[_]] {
   /** Self-contained nullifier lifecycle for this ordinal: materialize this type's prior nullifier set, classify the cross-shard instances
     * out of `acceptedSpendActions` (owner-shard ≠ producing-shard via `ShardAssignment`), REJECT any whose single-use identity is already
     * in the nullifier set OR fails the type's include-check, and return the markers to write (`GlobalStateKey` → canonical bytes) + the
-    * rejected identities. Deterministic same-snapshot collision order (sorted by single-use identity ⇒ first admits, rest reject).
+    * rejected identities. Same-snapshot collisions reject every candidate sharing the identity, because a hash-only rejection result cannot
+    * safely identify one downstream winner.
     */
   def settle(
     acceptedSpendActions: SortedMap[Address, List[SpendAction]],

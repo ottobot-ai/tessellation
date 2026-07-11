@@ -49,12 +49,13 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *      last-finalized marker. 3. Reset `mptOverlay.unsafe_reset` — drop pending branches, finalized markers, undo journal. 4. Reset
   *      `chainStore.unsafe_clearFinality` — drop byHash, bestTip, lastFinalizedOrdinal, refuse counter, refuse sample.
   *
-  * After reset, normal gossip + ChainSync re-seeds the chain store with canonical snapshots. Production resumes once the divergent-refuse
-  * counter stays at 0 across the cooldown window (`RebootstrapCooldown`) — preventing flap if the bug recurs immediately.
+  * After reset, normal gossip buffers parentless snapshots and ChainSync fetches their ancestry. Each transition must pass ordinary global
+  * replay before it can re-enter the chain store. Production resumes once the divergent-refuse counter stays at 0 across the cooldown
+  * window (`RebootstrapCooldown`) — preventing flap if the bug recurs immediately.
   *
-  * NOTE: the orchestrator does NOT itself touch `lastGlobalSnapshotStorage`, `snapshotStorage`, or the `MptStore` base. The follow-on
-  * `NakamotoSyncDaemon.handleSnapshot` catch-up path is responsible for those once a canonical snapshot is delivered. Resetting them here
-  * would race the daemon's own canonical-rewrite path.
+  * NOTE: the orchestrator does NOT itself touch `lastGlobalSnapshotStorage`, `snapshotStorage`, or the `MptStore` base. Follow-on recovery
+  * must fetch ancestry and pass each transition through `NakamotoSyncDaemon.handleSnapshot`'s normal global replay path. A delivered peer
+  * tip or self-consistent root is not authority to rewrite those stores.
   *
   * ==Enablement (currently ON; target OFF once density-past-k₁ (S3) lands + is e2e-validated)==
   *
@@ -155,8 +156,8 @@ object RebootstrapOrchestrator {
     *      already refuses to produce at-or-below finalized, and after the reset finalized=0 with chainStore empty, so production cannot
     *      mint anything until gossip / ChainSync delivers genesis-like state.
     *
-    * The post-reset chain re-seed is the responsibility of `NakamotoSyncDaemon.handleSnapshot`: the next gossip snapshot will trigger its
-    * catch-up path (parent-not-found → Tier 3 → `catchUpFromGossip` → full state resync).
+    * The post-reset chain re-seed is the responsibility of `NakamotoSyncDaemon.handleSnapshot`: the next parentless gossip snapshot is
+    * buffered, ChainSync fetches missing ancestry, and the daemon globally replays each transition before storage.
     *
     * When `enabled == false`, returns an empty Stream — the orchestrator is wired but dormant. NOTE: `false` is NOT the current default
     * (live default is `true`; see the enablement note above) — dormant-mode is the TARGET state once density-past-k₁ (Track-3 S3)
@@ -245,11 +246,11 @@ object RebootstrapOrchestrator {
     *   1. WARN log surfaces the divergent self-finalize event (ord + canonical hash). 2. INFO log marks the reset start. 3. Production gate
     *      paused (other components may already be reading this; the pause is idempotent so re-entrant pauses don't break anything). 4.
     *      `tipTracker.unsafe_reset` first — stops further attestations from polluting the tracker before we've cleared chain state. 5.
-    *      `mptOverlay.unsafe_reset` next — drops in-memory pending state. Base MptStore is NOT touched; the post-reset gossip catch-up will
-    *      resync base. 6. `chainStore.unsafe_clearFinality` last — clears the refuse counter so a future different-hash store doesn't
-    *      immediately re-trip the trigger; also resets `nakamotoFinalizedOrdinalRef` to MinValue so production's "at-or-below finalized"
-    *      guard treats any post-catch-up ordinal as fresh. 7. INFO log marks the reset complete. 8. Production gate resumed — the slot-win
-    *      guard handles the rest.
+    *      `mptOverlay.unsafe_reset` next — drops in-memory pending state. Base MptStore is NOT touched; later replayed transitions must
+    *      reconcile it through the ordinary validator. 6. `chainStore.unsafe_clearFinality` last — clears the refuse counter so a future
+    *      different-hash store doesn't immediately re-trip the trigger; also resets `nakamotoFinalizedOrdinalRef` to MinValue so
+    *      production's "at-or-below finalized" guard treats any post-recovery ordinal as fresh. 7. INFO log marks the reset complete. 8.
+    *      Production gate resumed — the slot-win guard handles the rest.
     *
     * If any step throws, the gate is left paused (the orchestrator's resume() is in the happy path). Operators will see production stalled
     * and can intervene; that's safer than auto-resuming with half-reset state.

@@ -99,9 +99,9 @@ object GlobalStateConverter {
     * `GlobalSnapshotAcceptanceManager.accept()` would have built for that ordinal. PURE data logic — no codec, no auto-derivation, no MPT.
     *
     * This is the typed mirror of `MptStore.syncFromStateChanges` (which applies the SAME accumulator to the MPT byte store). The two stay
-    * in lockstep: for every field, the merge rule here is byte-for-byte the same shape the MPT writer applies, so a follower that adopts
-    * this GSI and recomputes the MPT root over its bytes lands on the producer's signed `mptRoot` (the verify-before-adopt anchor). 1:1 GSI
-    * ↔ accumulator field correspondence (~18 per-field merges):
+    * in lockstep: for every field, the merge rule here is byte-for-byte the same shape the MPT writer applies, so a follower replaying a
+    * globally validated accumulator recomputes the same MPT root. Root parity checks deterministic execution bytes; a producer-signed root
+    * alone does not authorize the accumulator. 1:1 GSI ↔ accumulator field correspondence (~18 per-field merges):
     *
     *   - '''Always-present overwrite''' (`prior.field ++ delta.field` — the delta carries the COMPLETE new value per touched key): the five
     *     mandatory maps (`lastStateChannelSnapshotHashes`, `lastTxRefs`, `balances`, `lastCurrencySnapshots`,
@@ -231,7 +231,7 @@ object GlobalStateConverter {
     *
     * Keep in lockstep with `toAccumulatorHexDelta` — every key it `preSyncBytes.get(_)`s for must appear here, or the replayed bucket/index
     * bytes silently diverge from the in-store sync and the recomputed root mismatches (which the verify gate then rejects, falling back to
-    * the full path — safe, but defeats the adopt fast-path).
+    * full replay — safe, but defeats the incremental replay fast-path).
     */
   def changeSetPreSyncHexKeys[F[_]: Async: Hasher](acc: StateChangesAccumulator): F[Set[Hex]] = {
     import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
@@ -272,8 +272,8 @@ object GlobalStateConverter {
     } yield hexKeys.toSet
   }
 
-  /** ml0 (currency-l0) global-FOLLOW adopt-and-verify decision for ONE ordinal `N` (task #12). The verify-before-adopt safety gate,
-    * isolated from `StateChannel` so it is unit-testable without the full snapshot-processing loop.
+  /** ml0 (currency-l0) global-FOLLOW incremental replay check for ONE ordinal `N` (task #12), isolated from `StateChannel` so it is
+    * unit-testable without the full snapshot-processing loop. The method name is retained for API compatibility.
     *
     * Given the prior GSI (ml0's `lastState`), the per-ordinal `delta`, the signed snapshot's claimed `signedMptRoot` for `N`, and `N`:
     *
@@ -283,13 +283,13 @@ object GlobalStateConverter {
     *      `mptStore.withTransaction`: applies `hexRem` then `hexUp` to the producer incrementally, builds at `N` to get `newRoot`, and — if
     *      `Some(newRoot) === signedMptRoot` — yields `(Some(candidateGSI), Commit)`; otherwise `(None, Rollback)`.
     *
-    * The `withTransaction` Commit/Rollback bracket is THE enforcement: on any mismatch (wrong/tampered delta, incomplete preSyncBytes,
-    * evicted base) the MPT mutations are rolled back and `None` is returned — the caller MUST then fall back to the full path and never
-    * advance ml0 state. `Some(gsi)` is returned ONLY when the recomputed root equals the signed root, so adoption is correct by
-    * construction.
+    * The `withTransaction` Commit/Rollback bracket enforces byte parity: on any mismatch (wrong/tampered delta, incomplete preSyncBytes,
+    * evicted base) the MPT mutations are rolled back and `None` is returned — the caller MUST then fall back to full replay and never
+    * advance ml0 state. `Some(gsi)` means only that an already globally re-executed delta reproduced the committed root; it is not a
+    * substitute for deriving and validating that delta.
     *
-    * Returns `None` (caller falls back) on: root mismatch, OR `signedMptRoot = None` (legacy-format ordinal — no MPT anchor to verify
-    * against, so the cheap adopt path is not safe; defer to createContext).
+    * Returns `None` (caller falls back) on: root mismatch, OR `signedMptRoot = None` (legacy-format ordinal — no MPT anchor for the
+    * incremental replay check; defer to createContext).
     */
   def adoptAndVerifyChangeSetDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
     mptStore: MptStore[F, GlobalStateKey],
@@ -300,7 +300,7 @@ object GlobalStateConverter {
   )(implicit stateProofSelector: StateProofSelector): F[Option[GlobalSnapshotInfo]] =
     signedMptRoot match {
       case None =>
-        // Legacy-format ordinal: no signed mptRoot to anchor verification → adopt path unsafe, fall back.
+        // Legacy-format ordinal: no signed mptRoot to anchor the incremental replay check, so fall back.
         none[GlobalSnapshotInfo].pure[F]
       case Some(expectedRoot) =>
         val candidateGSI = applyAccumulatorToGSI(prior, delta)
@@ -317,8 +317,8 @@ object GlobalStateConverter {
               _ <- mptStore.underlying.buildForOrdinal(ordinal)
               // `expectedRoot` (the signed `mptRoot`) excludes path-dependent SystemNamespace sidecars
               // (`GlobalSnapshotInfo.mptStateProofFromBytes`); `getRootHashForOrdinal` is the producer's root over
-              // ALL stored bytes (sidecars included). Recompute sidecar-free so this adopt-verify gate compares
-              // apples-to-apples — otherwise EVERY ChangeSet delta adoption would mismatch and fall back.
+              // ALL stored bytes (sidecars included). Recompute sidecar-free so this replay-parity gate compares
+              // apples-to-apples — otherwise every ChangeSet replay would mismatch and fall back.
               afterBytes <- mptStore.underlying.entries
               newRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes)
               matches = newRoot === expectedRoot
@@ -923,12 +923,7 @@ object GlobalStateConverter {
     */
   def toAccumulatorHexDelta[F[_]: Async: Parallel: Hasher: JsonSerializer](
     acc: StateChangesAccumulator,
-    preSyncBytes: Map[Hex, Array[Byte]],
-    // S1 BASE-ANCHORING for the `Mg*` removal set — MUST mirror the writer's `AcceptanceMptStateChanges.applyStateChanges`
-    // `currencyInfoRemovalPrior` (GSAM passes `Some(overlay.base.allEntriesAsBytes)` in `shardedInfoMode`, else `None`). The per-MG
-    // `Mg*` removals are computed against THIS prior (the FINALIZED BASE), not `preSyncBytes` (the branch tip). `None` ⇒ branch==base
-    // (pipelineDepth=1 / numShards=1, the production regime), where it equals `preSyncBytes`.
-    mgRemovalPriorBytes: Option[Map[Hex, Array[Byte]]] = None
+    preSyncBytes: Map[Hex, Array[Byte]]
   )(implicit stateProofSelector: StateProofSelector): F[(Map[Hex, Array[Byte]], Set[Hex])] =
     for {
       typedUpserts <- toAccumulatorBytesDelta[F](acc)
@@ -1002,6 +997,7 @@ object GlobalStateConverter {
       // `divergedFields=[MgActiveTokenLocks:1]`). Computed as a pure HEX-KEY-SET DIFF (no decode / reconstruction — robust): for each MG,
       // its `Mg*` keys present in `preSyncBytes` but ABSENT from the new upserts (`upsertsHex`, written via the single `infoEntryBytes`
       // encoder) are exactly the dropped sub-entries — the same set `infoRemovalKeys` computes, without re-decoding the prior bytes.
+      // Both writer and replay use the checked-out parent branch: `preSyncBytes` is that branch's exact pre-write byte view.
       // `activeAllowSpends` (fieldId-7) is intentionally excluded — its removals are the top-level `removedAllowSpendKeys` path, matching
       // `infoRemovalKeys`'s exclusion. Verify-side only — no consensus bytes move (the writer / `postBytes` were always correct).
       infoRemovalsHex <- acc.lastCurrencySnapshots.keys.toList.parTraverse { mgAddr =>
@@ -1016,8 +1012,7 @@ object GlobalStateConverter {
           GlobalStateFieldId.MgGlobalSnapshotSyncView
         ).traverse(sub => GlobalStateKey.metagraphFieldPrefix[F](mgAddr, sub)).map { prefixes =>
           val isMgEntry = (k: Hex) => prefixes.exists(p => k.value.startsWith(p.value))
-          // Anchor the prior `Mg*` key set on the SAME prior the writer used (base in shardedInfoMode, else branch==preSyncBytes).
-          mgRemovalPriorBytes.getOrElse(preSyncBytes).keySet.filter(isMgEntry) -- upsertsHex.keySet.filter(isMgEntry)
+          preSyncBytes.keySet.filter(isMgEntry) -- upsertsHex.keySet.filter(isMgEntry)
         }
       }.map(_.flatten.toSet)
     } yield
@@ -1374,9 +1369,9 @@ object GlobalStateConverter {
     * '''Determinism (the byte-identity contract).''' Routes through [[fieldRootFromBytes]] — the SAME
     * `MerklePatriciaTrie.makeParallelFromBytes` build + `Hash.empty`-on-empty convention every other per-field / global root uses — over
     * [[currencySnapshotMgEntries]] (gl0's exact producer bytes, field-32-filtered). No node-local state enters, so producer + every
-    * verifier compute the byte-identical root. The THREE PIN-1 sites (producer `ShardCheckpointWiring.reExecDerivationWithDiff`, follower
-    * `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`, proof verifier/generator `ShardSubtreeProofService`) MUST all call THIS
-    * method so they stay byte-identical.
+    * verifier compute the byte-identical root. The three PIN-1 sites (producer `ShardCheckpointWiring.reExecDerivationAtPinnedBase`,
+    * follower `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState`, proof verifier/generator `ShardSubtreeProofService`) MUST all
+    * call THIS method so they stay byte-identical.
     *
     * '''numShards = 1 is untouched.''' At the production default `numShards = 1` gl0 re-executes and never builds `perMetagraphMptRoots`
     * (`ShardCheckpointWiring.acceptanceDeps` returns `None`); this method is on the sharded path only.
@@ -1871,17 +1866,17 @@ object GlobalStateConverter {
       /** Seed / reset the MptStore from a `GlobalSnapshotInfo`.
         *
         * Writes each typed field via its canonical scodec `ImmutableCodec`, matching the encoding used by the typed read methods
-        * (`getBalance`, `getActiveTokenLocks`, etc) and the incremental `syncFromStateChanges` writer. Use this for every bootstrap /
-        * resync / peer-download path — `allStateEntries → syncFull[Json]` (JSON bytes) must NOT be mixed in, since it produces different
-        * bytes for the same logical state and the resulting mptRoot will diverge from peers that bootstrapped via the typed path.
+        * (`getBalance`, `getActiveTokenLocks`, etc) and the incremental `syncFromStateChanges` writer. This is a local reconstruction
+        * primitive, not a peer/bootstrap authorization path: remote state must be derived by global replay. `allStateEntries →
+        * syncFull[Json]` (JSON bytes) must NOT be mixed in, since it produces different bytes for the same logical state.
         *
         * '''FINDING-S01 — MPT-native consensus partitions are PRESERVED, not wiped.''' `GlobalStateFieldId.mptNativeConsensusFields`
         * (`ConsumedAllowSpends` 33, `Slashings` 34) are in the signed consensus `mptRoot` but have NO `GlobalSnapshotInfo` field, so a
         * from-GSI rebuild used to silently DROP them — wiping the cross-shard nullifier (re-opening consumed allow-spends for a
         * double-spend) and committing a root that diverges from the signed `stateProof.mptRoot`. This method now carries those partitions'
-        * raw bytes verbatim across the clear→rebuild. Both partitions are empty at `numShards = 1` (byte-identical no-op). Consensus adopt
-        * sites that hold the SIGNED root should prefer [[syncFromGlobalSnapshotInfoVerified]], which reconciles {with, without} the
-        * preserved bytes against the signed root BEFORE writing and fails closed on neither matching.
+        * raw bytes verbatim across the clear→rebuild. Both partitions are empty at `numShards = 1` (byte-identical no-op). Local persisted
+        * recovery with this node's previously validated SIGNED root should use [[syncFromGlobalSnapshotInfoVerified]], which reconciles
+        * {with, without} the preserved bytes BEFORE writing and fails closed on neither matching.
         */
       def syncFromGlobalSnapshotInfo(
         info: GlobalSnapshotInfo,
@@ -1892,18 +1887,17 @@ object GlobalStateConverter {
       ): F[Unit] =
         syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = true)
 
-      /** ROOT-VERIFIED GSI adopt — the fail-closed variant for every consensus adopt site that holds the target snapshot's SIGNED
-        * `stateProof.mptRoot` (reorg self-heal, reward-realign, gossip catch-up fallback, cold restart, peer download). Reconciles, BEFORE
-        * any store write, which rebuild candidate reproduces the signed root:
+      /** ROOT-VERIFIED LOCAL GSI reconstruction for this node's previously validated, persisted snapshot. Reconciles, BEFORE any store
+        * write, which rebuild candidate reproduces that local snapshot's SIGNED `stateProof.mptRoot`. A remote self-consistent GSI/root
+        * tuple is not authority; peer recovery must fetch ancestry and globally replay every transition.
         *
         *   1. '''with-preserve''' — GSI entries ∪ the store's current `mptNativeConsensusFields` (33/34) bytes. Matches whenever the local
-        *      spent-set/slash-ledger equals the target's (the plain-reorg / restart common case: the markers were written at finalized
-        *      ordinals shared by both branches).
+        *      spent-set/slash-ledger equals the persisted target's (the normal local-restart case).
         *   1. '''without-preserve''' — GSI entries alone. Matches when the target's 33/34 partitions are EMPTY (always at `numShards = 1`;
-        *      also the cross-chain adopt case where OUR local markers are stale and must NOT be carried into the adopted state).
+        *      also a local rollback target whose persisted state predates the current store's stale markers).
         *   1. '''neither''' — the target's 33/34 content differs from ours and is NOT reconstructible from the GSI (it has no field for
-        *      them). Returns `false` WITHOUT touching the store — the caller must fail closed (do not adopt canonical state; recover via
-        *      the byte-faithful `loadBytes` path, e.g. `NakamotoSyncDaemon.seedMptByteFaithful`).
+        *      them). Returns `false` WITHOUT touching the store — the caller must fail closed and use this node's own root-verified
+        *      persisted bytes, or fetch ancestry and globally replay transitions.
         *
         * The candidate roots are computed over `toAllStateKeyValueBytes(info)` — byte-identical to what the typed-insert rebuild writes for
         * every user field (the standing rebuild-vs-producer parity contract, `RebuildVsProducerBytesAllPartitionsParitySuite`) — so a
@@ -1911,7 +1905,7 @@ object GlobalStateConverter {
         * returns `false`: there is nothing sound to verify against.
         *
         * @return
-        *   `true` iff the store was rebuilt AND its sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ NOTHING was written.
+        *   `true` iff local state was rebuilt AND its sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ NOTHING was written.
         */
       def syncFromGlobalSnapshotInfoVerified(
         info: GlobalSnapshotInfo,
@@ -1923,18 +1917,14 @@ object GlobalStateConverter {
       ): F[Boolean] =
         syncFromGlobalSnapshotInfoVerifiedBytes(info, snapshotOrdinal, signedMptRoot).map(_.isDefined)
 
-      /** [[syncFromGlobalSnapshotInfoVerified]] that also RETURNS the verified byte map on adopt — `Some(bytes)` iff the store was rebuilt
-        * and `sidecarFreeMptRoot(bytes) === signedMptRoot` (the exact candidate — GSI entries ∪ preserved 33/34, or GSI alone — that
-        * reproduced the signed root); `None` ⇒ NOTHING was written, identical to the Boolean `false`.
+      /** Internal implementation of [[syncFromGlobalSnapshotInfoVerified]]. Returns the verified byte map only so the Boolean wrapper can
+        * distinguish a successful local persisted-state reconstruction from a fail-closed no-write result. It is deliberately private: a
+        * consensus or peer-recovery caller must replay transitions and cannot use a self-consistent GSI/root tuple as authority.
         *
-        * Why the bytes matter (signed-byte-store FIDELITY, 2026-07-09): every consensus ADOPT site (reorg self-heal, reward-realign, gossip
-        * catch-up fallback) already computes this root-verified map internally and discarded it — while the finalize sink can only persist
-        * an ordinal's signed bytes if SOMETHING staged them (`SnapshotLeaderLoop.stageAdoptedPostBytes`). Returning the map lets the adopt
-        * site stage exactly the bytes it verified, closing the permanent per-ordinal HOLES in `mpt_snapshot_info_signed` that made
-        * `PinnedCurrencyInfoReader.pinnedReaderAt(diffBaseOrdinal)` fail-close on every node that had adopted (not produced/validated) that
-        * ordinal. The Boolean variant above delegates here, so its observable behavior is byte-identical to before this method existed.
+        * `Some(bytes)` iff the store was rebuilt and `sidecarFreeMptRoot(bytes) === signedMptRoot` (the exact candidate — GSI entries ∪
+        * preserved 33/34, or GSI alone — that reproduced the signed root); `None` ⇒ NOTHING was written, identical to the Boolean `false`.
         */
-      def syncFromGlobalSnapshotInfoVerifiedBytes(
+      private def syncFromGlobalSnapshotInfoVerifiedBytes(
         info: GlobalSnapshotInfo,
         snapshotOrdinal: SnapshotOrdinal,
         signedMptRoot: Option[Hash]
@@ -1968,7 +1958,7 @@ object GlobalStateConverter {
             } yield adopted
         }
 
-      /** ROOT-VERIFIED byte-faithful reload of the node's OWN persisted MPT at `snapshotOrdinal` — the PREFERRED boot/download seed
+      /** ROOT-VERIFIED byte-faithful reload of the node's OWN persisted MPT at `snapshotOrdinal` — the preferred local restart seed
         * (FINDING-S01 completion). The persisted byte map carries the MPT-native consensus partitions (`ConsumedAllowSpends` 33 /
         * `Slashings` 34) verbatim — the partitions a from-GSI rebuild structurally cannot reconstruct — so a node restarting with its own
         * persisted MPT reproduces the signed `stateProof.mptRoot` BY CONSTRUCTION and does not need to re-bootstrap from a peer.
@@ -1980,7 +1970,7 @@ object GlobalStateConverter {
         * (pre-MPT legacy snapshot) returns `false` without touching disk: there is nothing sound to verify against.
         *
         * @return
-        *   `true` iff the persisted bytes were adopted AND their sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ the store is
+        *   `true` iff the persisted bytes were loaded AND their sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ the store is
         *   byte-identical to its pre-call state.
         */
       def syncFromPersistedMptVerified(
@@ -2257,10 +2247,8 @@ object GlobalStateConverter {
 
         // We avoid per-field `sync` (each would trigger its own trie build). Instead: clear,
         // insert each typed batch, then build once at the end.
-        // Caller-serialized — see MptStore.withTransaction. Bootstrap/download paths are
-        // single-fiber; production-time reorg-adoption callers (NakamotoSyncDaemon catch-up
-        // and storeForkBranch) run under `snapshotSemaphore`. accept() callers run under
-        // `mptStore.withTransaction`'s savepoint scope, also `snapshotSemaphore`-serialized.
+        // Caller-serialized — see MptStore.withTransaction. Local bootstrap/restart reconstruction is single-fiber; accept() callers run
+        // under `mptStore.withTransaction`'s savepoint scope, also `snapshotSemaphore`-serialized.
         for {
           // FINDING-S01: capture the MPT-NATIVE consensus partitions (ConsumedAllowSpends 33 / Slashings 34 — in the signed
           // consensus root but with NO GlobalSnapshotInfo field) BEFORE the clear, and re-insert them verbatim below. Without

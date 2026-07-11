@@ -63,6 +63,12 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
   private def mkBinaryHash(tag: String): Hash =
     Hash((tag + "0" * 64).take(64))
 
+  private def vrfVkFor(vrfSk: Array[Byte]): Array[Byte] =
+    new io.constellationnetwork.security.vrf.EcVrf25519().getVerificationKey(vrfSk)
+
+  private def vrfRegistry(entries: (PeerId, Array[Byte])*): VrfRegistry[IO] =
+    VrfRegistry.make[IO](entries.toMap)
+
   /** Stub publisher — captures every published attestation in a Ref so the test can assert on them. */
   private def stubPublisher: IO[(Publisher[IO], Ref[IO, List[StubPublished]])] =
     Ref.of[IO, List[StubPublished]](Nil).map { ref =>
@@ -157,14 +163,16 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
       vrfSk = Array.fill[Byte](32)(0x55.toByte)
+      selfVrfVk = vrfVkFor(vrfSk)
       (sortition, agg) <- buildSortition
       (publisher, publishedRef) <- stubPublisher
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
-        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
+        selfVrfVk = selfVrfVk,
         keyPair = kp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(selfId -> selfVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
@@ -205,14 +213,16 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
       vrfSk = Array.fill[Byte](32)(0x66.toByte)
+      selfVrfVk = vrfVkFor(vrfSk)
       (sortition, agg) <- buildSortition
       (publisher, publishedRef) <- stubPublisher
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
-        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
+        selfVrfVk = selfVrfVk,
         keyPair = kp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(selfId -> selfVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
@@ -248,6 +258,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
       vrfSk = Array.fill[Byte](32)(0x77.toByte)
+      selfVrfVk = vrfVkFor(vrfSk)
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
       // Pre-seed 3 attestations from peers (below quorum). We use σ=0 so the sender path skips, then
@@ -258,9 +269,10 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
-        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
+        selfVrfVk = selfVrfVk,
         keyPair = kp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(selfId -> selfVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
@@ -294,6 +306,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(kp.getPublic)
       vrfSk = Array.fill[Byte](32)(0x88.toByte)
+      selfVrfVk = vrfVkFor(vrfSk)
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
       _ <- agg.record(mg, parent, binary, PeerId(Hex("aa" * 64)))
@@ -301,9 +314,10 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
-        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
+        selfVrfVk = selfVrfVk,
         keyPair = kp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(selfId -> selfVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
@@ -338,6 +352,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       selfId = PeerId.fromPublic(selfKp.getPublic)
       senderId = PeerId.fromPublic(senderKp.getPublic)
       vrfSk = Array.fill[Byte](32)(0x99.toByte)
+      senderVrfVk = Array.fill[Byte](32)(0xaa.toByte)
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
       // KES verifier rejects everything — simulates an adversary forging a committee attestation
@@ -348,6 +363,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = selfKp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(senderId -> senderVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => false), // <-- KES rejects
@@ -364,7 +380,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       edSig <- io.constellationnetwork.security.signature.Signing.signData[IO](msgBytes)(senderKp.getPrivate)
       incoming = IncomingAttestation(
         senderPeerId = senderId,
-        senderVrfVk = Array.fill[Byte](32)(0xaa.toByte), // VRF would also fail since the proof is fake — we tag KES-fail first
+        senderVrfVk = senderVrfVk, // VRF would also fail since the proof is fake — we tag KES-fail first
         metagraphAddress = mg,
         parentHash = parent,
         binaryHash = binary,
@@ -403,14 +419,16 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       selfKp <- KeyPairGenerator.makeKeyPair[IO]
       selfId = PeerId.fromPublic(selfKp.getPublic)
       vrfSk = Array.fill[Byte](32)(0xa1.toByte)
+      selfVrfVk = vrfVkFor(vrfSk)
       (sortition, agg) <- buildSortition
       (publisher, publishedRef) <- stubPublisher
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
-        selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
+        selfVrfVk = selfVrfVk,
         keyPair = selfKp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(selfId -> selfVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),
@@ -464,6 +482,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = selfKp,
         sortition = sortition,
+        vrfRegistry = vrfRegistry(senderId -> senderVrfVk),
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_.nonEmpty),
@@ -489,6 +508,153 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
     } yield expect(count == 1)
   }
 
+  test("receiver rejects a valid proof under an unregistered in-band VRF key") { res =>
+    implicit val (h, sp, _) = res
+    val mg = mkAddress("mg-unregistered-vrf")
+    val parent = mkParent("p-unregistered-vrf")
+    val binary = mkBinaryHash("bin-unregistered-vrf")
+    val eta = Array.fill[Byte](32)(0x21.toByte)
+    val kDraw = 100
+    for {
+      selfKp <- KeyPairGenerator.makeKeyPair[IO]
+      senderKp <- KeyPairGenerator.makeKeyPair[IO]
+      selfId = PeerId.fromPublic(selfKp.getPublic)
+      senderId = PeerId.fromPublic(senderKp.getPublic)
+      (sortition, agg) <- buildSortition
+      (publisher, _) <- stubPublisher
+      senderVrfSk = Array.fill[Byte](32)(0x22.toByte)
+      senderVrfVk = vrfVkFor(senderVrfSk)
+      draw <- sortition.isInCommittee(senderVrfSk, eta, mg, parent, Ratio(1, 1), kDraw)
+      proof = draw.map(_._1).getOrElse(Array.emptyByteArray)
+      msgBytes <- MetagraphCommitteeGate.messageBytes[IO](senderId, mg, parent, binary)
+      edSig <- io.constellationnetwork.security.signature.Signing.signData[IO](msgBytes)(senderKp.getPrivate)
+      gate = MetagraphCommitteeGate.make[IO](
+        selfPeerId = selfId,
+        selfVrfSk = Array.fill[Byte](32)(0x23.toByte),
+        selfVrfVk = Array.fill[Byte](32)(0x24.toByte),
+        keyPair = selfKp,
+        sortition = sortition,
+        vrfRegistry = VrfRegistry.empty[IO],
+        aggregator = agg,
+        kesSigner = stubKesSigner,
+        kesVerifier = stubKesVerifier(_ => true),
+        publisher = publisher,
+        kDraw = kDraw,
+        kQuorum = 1,
+        gateTimeoutMs = 100L,
+        pollIntervalMs = 25L
+      )
+      _ <- gate.recordReceivedAttestation(
+        IncomingAttestation(
+          senderPeerId = senderId,
+          senderVrfVk = senderVrfVk,
+          metagraphAddress = mg,
+          parentHash = parent,
+          binaryHash = binary,
+          committeeVrfProof = proof,
+          longTermSignature = edSig,
+          kesSignature = Array[Byte](1),
+          senderTreeStep = 0
+        ),
+        eta,
+        _ => IO.pure(Ratio(1, 1))
+      )
+      count <- agg.countFor(mg, parent, binary)
+    } yield expect(count == 0)
+  }
+
+  test("receiver rejects key grinding when the in-band VRF key differs from registration") { res =>
+    implicit val (h, sp, _) = res
+    val mg = mkAddress("mg-mismatched-vrf")
+    val parent = mkParent("p-mismatched-vrf")
+    val binary = mkBinaryHash("bin-mismatched-vrf")
+    val eta = Array.fill[Byte](32)(0x31.toByte)
+    val kDraw = 100
+    for {
+      selfKp <- KeyPairGenerator.makeKeyPair[IO]
+      senderKp <- KeyPairGenerator.makeKeyPair[IO]
+      selfId = PeerId.fromPublic(selfKp.getPublic)
+      senderId = PeerId.fromPublic(senderKp.getPublic)
+      (sortition, agg) <- buildSortition
+      (publisher, _) <- stubPublisher
+      attackerVrfSk = Array.fill[Byte](32)(0x32.toByte)
+      attackerVrfVk = vrfVkFor(attackerVrfSk)
+      registeredVrfVk = vrfVkFor(Array.fill[Byte](32)(0x33.toByte))
+      draw <- sortition.isInCommittee(attackerVrfSk, eta, mg, parent, Ratio(1, 1), kDraw)
+      proof = draw.map(_._1).getOrElse(Array.emptyByteArray)
+      msgBytes <- MetagraphCommitteeGate.messageBytes[IO](senderId, mg, parent, binary)
+      edSig <- io.constellationnetwork.security.signature.Signing.signData[IO](msgBytes)(senderKp.getPrivate)
+      gate = MetagraphCommitteeGate.make[IO](
+        selfPeerId = selfId,
+        selfVrfSk = Array.fill[Byte](32)(0x34.toByte),
+        selfVrfVk = Array.fill[Byte](32)(0x35.toByte),
+        keyPair = selfKp,
+        sortition = sortition,
+        vrfRegistry = vrfRegistry(senderId -> registeredVrfVk),
+        aggregator = agg,
+        kesSigner = stubKesSigner,
+        kesVerifier = stubKesVerifier(_ => true),
+        publisher = publisher,
+        kDraw = kDraw,
+        kQuorum = 1,
+        gateTimeoutMs = 100L,
+        pollIntervalMs = 25L
+      )
+      _ <- gate.recordReceivedAttestation(
+        IncomingAttestation(
+          senderPeerId = senderId,
+          senderVrfVk = attackerVrfVk,
+          metagraphAddress = mg,
+          parentHash = parent,
+          binaryHash = binary,
+          committeeVrfProof = proof,
+          longTermSignature = edSig,
+          kesSignature = Array[Byte](1),
+          senderTreeStep = 0
+        ),
+        eta,
+        _ => IO.pure(Ratio(1, 1))
+      )
+      count <- agg.countFor(mg, parent, binary)
+    } yield expect(count == 0)
+  }
+
+  test("sender does not self-count when its local VRF key differs from registration") { res =>
+    implicit val (h, sp, _) = res
+    val mg = mkAddress("mg-self-mismatched-vrf")
+    val parent = mkParent("p-self-mismatched-vrf")
+    val binary = mkBinaryHash("bin-self-mismatched-vrf")
+    val eta = Array.fill[Byte](32)(0x41.toByte)
+    for {
+      selfKp <- KeyPairGenerator.makeKeyPair[IO]
+      selfId = PeerId.fromPublic(selfKp.getPublic)
+      (sortition, agg) <- buildSortition
+      (publisher, publishedRef) <- stubPublisher
+      selfVrfSk = Array.fill[Byte](32)(0x42.toByte)
+      selfVrfVk = vrfVkFor(selfVrfSk)
+      registeredVrfVk = vrfVkFor(Array.fill[Byte](32)(0x43.toByte))
+      gate = MetagraphCommitteeGate.make[IO](
+        selfPeerId = selfId,
+        selfVrfSk = selfVrfSk,
+        selfVrfVk = selfVrfVk,
+        keyPair = selfKp,
+        sortition = sortition,
+        vrfRegistry = vrfRegistry(selfId -> registeredVrfVk),
+        aggregator = agg,
+        kesSigner = stubKesSigner,
+        kesVerifier = stubKesVerifier(_ => true),
+        publisher = publisher,
+        kDraw = 1,
+        kQuorum = 1,
+        gateTimeoutMs = 100L,
+        pollIntervalMs = 25L
+      )
+      admitted <- gate.attestAndAdmit(mg, parent, binary, eta, Ratio(1, 1))
+      count <- agg.countFor(mg, parent, binary)
+      published <- publishedRef.get
+    } yield expect(!admitted).and(expect(count == 0)).and(expect(published.isEmpty))
+  }
+
   // ===== pruneParents passthrough =====
 
   test("pruneParents forwards to aggregator") { res =>
@@ -508,6 +674,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         selfVrfVk = Array.fill[Byte](32)(0xab.toByte),
         keyPair = kp,
         sortition = sortition,
+        vrfRegistry = VrfRegistry.empty[IO],
         aggregator = agg,
         kesSigner = stubKesSigner,
         kesVerifier = stubKesVerifier(_ => true),

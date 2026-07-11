@@ -64,8 +64,9 @@ final case class StateChannelRoutes[F[_]: Async: Hasher: JsonSerializer](
   // NakamotoSyncDaemon's `MetagraphBinary` intake) for gl0 to seed `lastCurrencySnapshots[mg]` and unblock cl1's
   // first-currency-snapshot bootstrap. A single best-effort GossipSub publish can miss the (rotating) shard leader, after
   // which the slow ChainSync stuck-detection fallback loses the race against cl1's 90s timeout. So we re-publish the
-  // genesis a few times: the sidecar uses GossipSub's DEFAULT seqno-based message-id, so each re-publish is a DISTINCT
-  // message (NOT seen-cache-deduped) and re-propagates, reliably reaching every gl0 node's shard buffer within seconds.
+  // genesis a few times. The sidecar uses a topic-domain content message-id, so identical retries inside GossipSub's
+  // seen-cache window are deduplicated. These copies only hedge a local RPC/publish failure; they do not repair a message
+  // lost after GossipSub accepts it. The memory-only outbox/seen-TTL mismatch remains a transport hardening blocker.
   // Fired in the BACKGROUND so the inbound POST still returns promptly. Idempotent downstream (dedup by binary hash in the
   // shard buffer + orphan buffer), so the extra publishes are harmless. Only the genesis is amplified — incrementals are
   // frequent + each is already broadcast, so they need no help.
@@ -82,7 +83,7 @@ final case class StateChannelRoutes[F[_]: Async: Hasher: JsonSerializer](
   // DO NOT finality-gate this path: in Nakamoto mode, head is ~always ahead
   // of finalized during active production, so gating here would reject every
   // incoming binary. The validator re-runs acceptance with the CL0-baked
-  // globalSyncView via forcedGlobalSyncView when snapshot production includes
+  // globalSyncView via pinnedGlobalSyncView when snapshot production includes
   // the binary — that's where the race is handled. FinalityGate is retained
   // at the outbound-retrieval routes (SnapshotRoutes), not here.
   protected val public: HttpRoutes[F] = Timeout(snapshotBinarySenderTimeoutsConfig.routes)(HttpRoutes.of[F] {

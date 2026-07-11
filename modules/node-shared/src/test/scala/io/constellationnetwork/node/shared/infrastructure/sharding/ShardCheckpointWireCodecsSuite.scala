@@ -4,7 +4,7 @@ import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.{IO, Resource}
 import cats.kernel.Eq
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -14,15 +14,10 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpoi
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.artifact.{SharedArtifact, SpendAction, SpendTransaction}
-import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
-import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
-import io.constellationnetwork.schema.swap.{CurrencyId, SwapAmount}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -31,7 +26,7 @@ import io.constellationnetwork.security.signature.signature.{Signature, Signatur
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import com.google.protobuf.ByteString
-import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
+import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
 /** Wire-format round-trip suite for [[ShardCheckpointWireCodecs]] — Slice 14 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
@@ -87,9 +82,6 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
 
   private val mgAddrA: Address = addr("mg-aaa")
   private val mgAddrB: Address = addr("mg-bbb")
-  private val mgAddrC: Address = addr("mg-ccc")
-  private val holderA: Address = addr("holder-1")
-  private val holderB: Address = addr("holder-2")
 
   private def peerIdN(n: Int): PeerId =
     PeerId(Hex(n.toHexString.padTo(2, '0') * 64))
@@ -121,63 +113,16 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
   private def mkSignedBinary(seed: Char, contentByte: Byte, fee: Long): Signed[StateChannelSnapshotBinary] =
     mkSigned(mkScsb(seed, contentByte, fee))
 
-  // A multi-element delta that exercises every nested field of `ShardDerivedStateDelta`. The outer SortedMap iteration order is
-  // Address-defined so encode/decode roundtrip preserves order regardless of insertion sequence.
+  // A multi-element delta that exercises both replay-authorized fields of `ShardDerivedStateDelta`.
   private def sampleDelta: ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(
         mgAddrA -> hash('a'),
         mgAddrB -> hash('b')
       ),
-      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap(
         mgAddrA -> NonEmptyList.of(mkSignedBinary('1', 0x01, 10L), mkSignedBinary('2', 0x02, 20L)),
         mgAddrB -> NonEmptyList.of(mkSignedBinary('3', 0x03, 30L))
-      ),
-      tokenLockBalancesDelta = SortedMap(
-        mgAddrA -> SortedMap(
-          holderA -> Balance(NonNegLong(100L)),
-          holderB -> Balance(NonNegLong(200L))
-        )
-      ),
-      perMetagraphArtifacts = SortedMap(
-        mgAddrA -> List[SharedArtifact](
-          SpendAction(
-            spendTransactions = NonEmptyList.of(
-              SpendTransaction(
-                allowSpendRef = Some(hash('s')),
-                currencyId = Some(CurrencyId(mgAddrB)),
-                amount = SwapAmount(PosLong(50L)),
-                source = holderA,
-                destination = holderB
-              )
-            )
-          )
-        )
-      ),
-      perMetagraphSyncDataDelta = SortedMap(
-        mgAddrA -> MetagraphSyncDataInfo(
-          globalOrdinalLastAcceptedOn = SnapshotOrdinal(NonNegLong(7L)),
-          globalEpochProgressLastAcceptedOn = EpochProgress(NonNegLong(3L)),
-          unappliedGlobalChangeOrdinals = SortedSet(
-            SnapshotOrdinal(NonNegLong(1L)),
-            SnapshotOrdinal(NonNegLong(2L))
-          )
-        )
-      )
-    )
-
-  private def sampleReceipt: CrossShardReceipt =
-    CrossShardReceipt.MetagraphSyncDataWrite(
-      sourceShardId = shardZero,
-      sourceMetagraph = mgAddrA,
-      sourceCheckpointHash = hash('p'),
-      targetShardId = shardOne,
-      targetMetagraph = mgAddrB,
-      increment = MetagraphSyncDataInfo(
-        globalOrdinalLastAcceptedOn = SnapshotOrdinal(NonNegLong(10L)),
-        globalEpochProgressLastAcceptedOn = EpochProgress(NonNegLong(4L)),
-        unappliedGlobalChangeOrdinals = SortedSet.empty
       )
     )
 
@@ -189,7 +134,6 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong(99L)),
       slot = SlotT.unsafeApply(99L),
       derivedStateDelta = sampleDelta,
-      emittedReceipts = List(sampleReceipt),
       committeeSignatures = NonEmptyList.of(mkSig(1, 7), mkSig(2, 8), mkSig(3, 9)),
       epoch = EtaPeriod(5L)
     )
@@ -227,97 +171,6 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       reparsed = viaProtoBytes(wire, pb.ShardCheckpointWire)
       decoded <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](reparsed)
     } yield assertEq("ShardCheckpoint", cp, decoded)
-  }
-
-  // ===========================================================================
-  // Test 2 — NonEmptyList preservation: single-element NEL
-  //
-  // The wire shape is `repeated bytes signed_snapshots_json` (per the proto's `PerMetagraphSnapshots` message). A single-element NEL must
-  // round-trip without inadvertently collapsing to an empty repeated field — proto3 distinguishes empty `repeated` from absent only by
-  // semantics, not by wire bytes, but the codec must construct the NEL with the single element on decode.
-  // ===========================================================================
-
-  test("PerMetagraphSnapshots: single-element NEL preserved across round-trip") { res =>
-    implicit val (_, j) = res
-    val singletonMap = SortedMap(
-      mgAddrA -> NonEmptyList.of(mkSignedBinary('s', 0x42, 1L))
-    )
-    for {
-      wires <- ShardCheckpointWireCodecs.includedSnapshotsToWire[IO](singletonMap)
-      reparsed = wires.map(w => viaProtoBytes(w, pb.PerMetagraphSnapshots))
-      decoded <- ShardCheckpointWireCodecs.includedSnapshotsFromWire[IO](reparsed)
-    } yield
-      expect.all(
-        decoded.size == 1,
-        decoded.contains(mgAddrA),
-        decoded(mgAddrA).size == 1L, // NEL size == 1
-        Eq[Signed[StateChannelSnapshotBinary]].eqv(decoded(mgAddrA).head, singletonMap(mgAddrA).head)
-      )
-  }
-
-  // ===========================================================================
-  // Test 3 — NonEmptyList preservation: multi-element NEL + multi-key SortedMap
-  //
-  // Three MGs (A, B, C) each with 1, 3, 2 SC binaries respectively. After round-trip:
-  //   - SortedMap key set + key ordering matches (Address ordering is well-defined)
-  //   - per-MG NEL element count matches
-  //   - per-MG NEL element order matches (the proto `repeated` field preserves order)
-  // ===========================================================================
-
-  test("PerMetagraphSnapshots: multi-element NEL + multi-key SortedMap preserved across round-trip") { res =>
-    implicit val (_, j) = res
-    val multi = SortedMap(
-      mgAddrA -> NonEmptyList.of(mkSignedBinary('a', 0x11, 1L)),
-      mgAddrB -> NonEmptyList.of(
-        mkSignedBinary('b', 0x21, 2L),
-        mkSignedBinary('c', 0x22, 3L),
-        mkSignedBinary('d', 0x23, 4L)
-      ),
-      mgAddrC -> NonEmptyList.of(
-        mkSignedBinary('e', 0x31, 5L),
-        mkSignedBinary('f', 0x32, 6L)
-      )
-    )
-    for {
-      wires <- ShardCheckpointWireCodecs.includedSnapshotsToWire[IO](multi)
-      reparsed = wires.map(w => viaProtoBytes(w, pb.PerMetagraphSnapshots))
-      decoded <- ShardCheckpointWireCodecs.includedSnapshotsFromWire[IO](reparsed)
-    } yield {
-      val keyOrderingPreserved = decoded.keys.toList == multi.keys.toList
-      val perMgSizesMatch = multi.forall { case (k, v) => decoded.get(k).exists(_.size == v.size) }
-      val perMgOrderMatches = multi.forall {
-        case (k, v) =>
-          decoded.get(k).exists { decodedNel =>
-            Eq[List[Signed[StateChannelSnapshotBinary]]].eqv(decodedNel.toList, v.toList)
-          }
-      }
-      expect.all(
-        decoded.size == multi.size,
-        keyOrderingPreserved,
-        perMgSizesMatch,
-        perMgOrderMatches
-      )
-    }
-  }
-
-  // ===========================================================================
-  // Test 4 — empty `signed_snapshots_json` on decode is rejected (NonEmptyList contract)
-  //
-  // Schema requires `NonEmptyList`; an empty repeated field on decode is a wire-level protocol violation. Encoder never produces an empty
-  // repeated field (the input is `NonEmptyList`), but a malicious / buggy sender could. We assert the decode path raises rather than
-  // silently producing a malformed value.
-  // ===========================================================================
-
-  test("PerMetagraphSnapshots: empty signed_snapshots_json on decode raises") { res =>
-    implicit val (_, j) = res
-    val bogus = pb.PerMetagraphSnapshots(
-      metagraphAddress = mgAddrA.value.value,
-      signedSnapshotsJson = Seq.empty
-    )
-    ShardCheckpointWireCodecs
-      .includedSnapshotsFromWire[IO](Seq(bogus))
-      .attempt
-      .map(res => expect(res.isLeft))
   }
 
   // ===========================================================================
@@ -405,12 +258,10 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       parentCheckpointHash = ByteString.EMPTY,
       gl0AnchorOrdinal = 0L,
       epoch = 0L,
-      includedSnapshots = Seq.empty,
       derivedStateDelta = None,
       committeeSignatures = Seq(
         ShardCheckpointWireCodecs.committeeSignatureToWire(mkSig(0, 0))
-      ),
-      emittedReceiptsJson = ByteString.EMPTY
+      )
     )
     ShardCheckpointWireCodecs
       .shardCheckpointFromWire[IO](bogus)
@@ -428,42 +279,11 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
         parentCheckpointHash = ByteString.EMPTY,
         gl0AnchorOrdinal = 0L,
         epoch = 0L,
-        includedSnapshots = Seq.empty,
         derivedStateDelta = Some(delta),
-        committeeSignatures = Seq.empty, // <-- intentional violation
-        emittedReceiptsJson = ByteString.EMPTY
+        committeeSignatures = Seq.empty // <-- intentional violation
       )
       attempted <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](bogus).attempt
     } yield expect(attempted.isLeft)
-  }
-
-  // ===========================================================================
-  // Test 8 — empty emittedReceipts ↔ empty bytes round-trip
-  //
-  // `emittedReceipts: List[CrossShardReceipt]` is allowed to be empty (most checkpoints have no cross-shard SpendActions). The codec must
-  // map empty list ↔ empty ByteString deterministically, NOT carry a JSON-encoded `[]` (the byte form differs from "no payload" if a
-  // future change introduces a length-prefix discriminator). Asserting the bytes-side is empty pins the contract.
-  // ===========================================================================
-
-  test("emittedReceipts: empty list ↔ empty bytes (no JSON envelope wrapping)") { res =>
-    implicit val (_, j) = res
-    for {
-      encoded <- ShardCheckpointWireCodecs.emittedReceiptsToWire[IO](List.empty[CrossShardReceipt])
-      decoded <- ShardCheckpointWireCodecs.emittedReceiptsFromWire[IO](encoded)
-    } yield
-      expect.all(
-        encoded.isEmpty,
-        decoded.isEmpty
-      )
-  }
-
-  test("emittedReceipts: non-empty list round-trips via opaque JSON bytes") { res =>
-    implicit val (_, j) = res
-    val list = List(sampleReceipt)
-    for {
-      encoded <- ShardCheckpointWireCodecs.emittedReceiptsToWire[IO](list)
-      decoded <- ShardCheckpointWireCodecs.emittedReceiptsFromWire[IO](encoded)
-    } yield expect(Eq[List[CrossShardReceipt]].eqv(decoded, list))
   }
 
   // ===========================================================================

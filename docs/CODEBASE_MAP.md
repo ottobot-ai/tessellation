@@ -10,35 +10,23 @@ total_tokens: 1230430
 
 ## System Overview
 
-Tessellation is the Constellation Network Node Software - a DAG-based distributed ledger with Layer 0 (L0) and Layer 1 (L1) validators. The system uses a hierarchical consensus model where L1 metagraphs create blocks that are aggregated into global snapshots by L0.
+Tessellation is the Constellation Network Node Software - a DAG-based distributed ledger with global and metagraph execution paths. The layer names are not interchangeable: DAG L1 is GL1, while metagraph L1 is the conceptual CL1/DL1 pair that feeds ML0.
 
 ```mermaid
-graph TB
-    subgraph "Layer 1 - Metagraphs"
-        ML1A[Metagraph L1 Node A]
-        ML1B[Metagraph L1 Node B]
-        CL0[Currency L0]
-    end
+flowchart LR
+    Client[Native DAG client] --> GL1[GL1 / DAG L1]
+    GL1 -->|native DAG-token blocks| GL0[GL0 / DAG L0]
 
-    subgraph "Layer 0 - Global Consensus"
-        GL0A[Global L0 Node A]
-        GL0B[Global L0 Node B]
-        GL0C[Global L0 Node C]
-    end
+    Econ[Metagraph economic client] --> CL1[CL1 / Currency L1]
+    Data[Custom data client] --> DL1[DL1 / CurrencyL1App + data service]
+    CL1 -->|framework economic blocks| ML0[ML0 / CL0 / Currency L0]
+    DL1 -->|custom data blocks| ML0
+    ML0 -->|signed state-channel binary| GL0
 
-    subgraph "Storage"
-        GS[(Global Snapshots)]
-        CS[(Currency Snapshots)]
-    end
-
-    ML1A -->|L1 Blocks| CL0
-    ML1B -->|L1 Blocks| CL0
-    CL0 -->|Currency Snapshot| GL0A
-    CL0 -->|Currency Snapshot| GL0B
-    GL0A <-->|Gossip/Consensus| GL0B
-    GL0B <-->|Gossip/Consensus| GL0C
-    GL0A --> GS
-    CL0 --> CS
+    GL0 -->|finalized canonical state| GL1
+    GL0 -->|finalized canonical state| ML0
+    GL0 -->|finalized canonical state| CL1
+    GL0 -->|finalized canonical state| DL1
 ```
 
 ## Directory Structure
@@ -51,10 +39,10 @@ tessellation/
 │   ├── keytool/          # Key management, PKCS12 keystores (4k tokens)
 │   ├── wallet/           # CLI wallet operations (6k tokens)
 │   ├── node-shared/      # P2P networking, consensus, gossip (419k tokens)
-│   ├── dag-l0/           # Layer 0 validator - global consensus (157k tokens)
-│   ├── dag-l1/           # Layer 1 validator - metagraph consensus (83k tokens)
-│   ├── currency-l0/      # Currency metagraph L0 logic (59k tokens)
-│   ├── currency-l1/      # Currency metagraph L1 logic (41k tokens)
+│   ├── dag-l0/           # GL0 global consensus, settlement, canonical MPT, finality
+│   ├── dag-l1/           # GL1 native DAG-token edge application
+│   ├── currency-l0/      # ML0/CL0 metagraph snapshot consensus
+│   ├── currency-l1/      # CL1 framework economics or DL1 with an injected data app
 │   ├── rosetta/          # Blockchain data standardization API (17k tokens)
 │   ├── sdk/              # SDK for metagraph development (0.5k tokens)
 │   ├── tools/            # CLI utilities for testing (4k tokens)
@@ -181,9 +169,9 @@ graph LR
 
 ---
 
-### dag-l1 (L1 Validator)
+### dag-l1 (GL1 / Global L1 Validator)
 
-**Purpose**: Metagraph-specific block creation and consensus.
+**Purpose**: Native DAG-token block creation and consensus. GL1 submits directly to GL0; it is not DL1 and does not route through ML0.
 
 **Entry point**: `Main.scala` (Cluster ID: `17e78993-...`)
 
@@ -212,7 +200,7 @@ graph LR
 
 ### currency-l0 / currency-l1
 
-**Purpose**: Currency-specific metagraph logic extending dag-l0/l1.
+**Purpose**: ML0/CL0 runs metagraph snapshot consensus. Currency L1 runs either CL1 framework economics or, when a custom data-application service is injected, DL1 application logic. ML1 is only an umbrella term for CL1 and DL1.
 
 **Entry points**: `CurrencyL0App.scala`, `CurrencyL1App.scala`
 

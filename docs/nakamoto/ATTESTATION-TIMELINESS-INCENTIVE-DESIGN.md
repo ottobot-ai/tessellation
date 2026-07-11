@@ -25,9 +25,9 @@ Today a committee member that never sends a `MetagraphAttestation` for a binary 
 - It shrinks the **effective committee** below `K_target`, raising the slots-to-threshold latency
   for every binary that member was drawn for.
 - It contributes nothing to liveness yet continues to be eligible for the next committee draw.
-- The existing non-participation accumulator (`ShardNonParticipationCounter`, fieldId 24,
-  `evaluateEpochBoundary`) was built and tested but has **zero production callers** — it measures
-  nothing at runtime (see `EPOCH-PARTICIPATION-AND-DEMOTION-DESIGN.md §2`).
+- No consensus-carried participation accumulator or epoch-boundary demotion evaluator exists today.
+  The previously prototyped field-24 shard counter was unwired fork-only code and has been removed;
+  this proposal must define a fresh global participation schema before implementation.
 
 Two goals:
 
@@ -266,9 +266,9 @@ silence is not that.
 The promptness ratio computed in §2.4 is the natural input to the participating-set demotion logic
 in `EPOCH-PARTICIPATION-AND-DEMOTION-DESIGN.md §3.5`. The relationship:
 
-- `ShardNonParticipationSlasher.evaluateEpochBoundary` (generalized to gl0 scope) decides whether
-  a peer's period-level binary-absence rate exceeds `ShardSlashingConfig.maxMissedPctPerEpoch`.
-  This is the coarse binary-present/absent signal.
+- A future deterministic epoch-boundary evaluator must decide whether a peer's period-level
+  binary-absence rate exceeds a consensus-configured threshold. Neither that evaluator nor its
+  consensus-carried input exists today. This would be the coarse binary-present/absent signal.
 - The timeliness promptness ratio adds a **granularity layer** on top: a peer may be "present" (not
   demoted) yet consistently late, earning reduced rewards without reaching the demotion threshold.
 
@@ -360,8 +360,8 @@ production-validated. Neither creates a new slashable surface.
   `promptnessRatioAt(peerId, period)`.
 
 **Design docs to align with:**
-- `EPOCH-PARTICIPATION-AND-DEMOTION-DESIGN.md` — load-bearing prerequisite; participating set,
-  Slice-17 counters, `HistoricalStakeSnapshot` extension pattern.
+- `EPOCH-PARTICIPATION-AND-DEMOTION-DESIGN.md` — load-bearing prerequisite; proposed participating
+  set, new participation records, and the `HistoricalStakeSnapshot` extension pattern.
 - `SLASHING-DESIGN.md` — canonical equivocation slash path; the **only** path that results in a
   slash. This doc does NOT add to it.
 - `COMMITTEE-SORTITION-DESIGN.md §8` — committee safety argument; slashing + N-2 staging

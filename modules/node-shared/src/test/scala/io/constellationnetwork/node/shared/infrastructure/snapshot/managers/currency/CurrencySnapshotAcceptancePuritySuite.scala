@@ -45,7 +45,7 @@ import weaver.MutableIOSuite
 /** Track-1 I-PIN determinism forcing-test (TDD target-lock).
   *
   * THE PROPERTY under test: two invocations of `CurrencySnapshotAcceptanceManager.accept` that differ ONLY in the node-local GL0 head
-  * (`lastGlobalSnapshotStorage`) but carry the SAME recorded/pinned `globalSyncView` (validator path, `forcedGlobalSyncView`) must produce
+  * (`lastGlobalSnapshotStorage`) but carry the SAME recorded/pinned `globalSyncView` (validator path, `pinnedGlobalSyncView`) must produce
   * a BYTE-IDENTICAL `stateProof`. `CurrencySnapshotStateProof` has a derevo-derived `Eq` over its all-`Hash` fields, so structural `Eq` ==
   * byte identity; `expect.eql(rA.stateProof, rB.stateProof)` is therefore an exact byte-equality assertion.
   *
@@ -64,13 +64,14 @@ import weaver.MutableIOSuite
   *
   * LOAD-BEARING PRECONDITIONS honored below:
   *   1. The SpendAction moves a REAL balance and `source` is FUNDED (`ctx.snapshotInfo.balances(source) >= amount`) so `Balance.minus`
-  *      (CSAM:571 path) does not underflow-and-raise — the test asserts RED, it must not ERROR. 2. `forcedGlobalSyncView` hash-pins the
+  *      (CSAM:571 path) does not underflow-and-raise — the test asserts RED, it must not ERROR. 2. `pinnedGlobalSyncView` hash-pins the
   *      anchor that `getGlobalSnapshotByOrdinal` resolves, so the forced-view hash guard (CSAM:376-386) passes instead of raising. 3.
   *      `getGlobalSnapshotByOrdinal` (and the empty `getLastN`) are IDENTICAL across both managers — ONLY `lastGlobalSnapshotStorage`
   *      differs. 4. The SAME `Hasher` instance is threaded to both snapshot builders and both `accept` calls. 5. `FieldsAddedOrdinals` is
   *      all-empty ⇒ every threshold is `SnapshotOrdinal.MinValue`, so both head ordinals (150, 120) clear the tessellation-3 migration
-  *      boundary and BOTH emit the extended `csi` fields — the field-gating head-leak (`snapshotOrdinalToCheckFields
-  * \= lastUnsyncGlobalSnapshot.ordinal`, CSAM:577) is INERT and cannot spuriously flip a field. The ONLY effective difference is balances.
+  *      boundary and BOTH emit the extended `csi` fields — the field-gating head-leak (`snapshotOrdinalToCheckFields \=
+  *      lastUnsyncGlobalSnapshot.ordinal`, CSAM:577) is INERT and cannot spuriously flip a field. The ONLY effective difference is
+  *      balances.
   *
   * TWO SEPARATE managers: the head-storage `set()` guard forbids swapping divergent heads on one storage, and separate managers keep the
   * `globalSnapshotsAlreadyProcessed` cache from contaminating call 2.
@@ -279,7 +280,7 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
         // processed history, so `P = ∅` — head A's `metagraphSyncData` still names ord=100 as unapplied (100 ∉ ∅), which is exactly why the
         // pre-I-PIN head read diverges. Added when copying the suite forward from the pre-1a worktree that authored it.
         alreadyProcessedGlobalOrdinals = SortedSet.empty,
-        forcedGlobalSyncView = anchorView.some
+        pinnedGlobalSyncView = anchorView.some
       )
       .map(_.stateProof)
 

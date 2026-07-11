@@ -30,8 +30,8 @@ case class ShardOrdinal(value: Long) {
 
 object ShardOrdinal {
 
-  /** Genesis ordinal — the very first checkpoint a shard emits. Mirrors `SnapshotOrdinal.MinValue` for the gl0 chain. */
-  val Genesis: ShardOrdinal = ShardOrdinal(0L)
+  /** Synthetic chain-root ordinal. No checkpoint is emitted at zero; the first checkpoint is `Root.next` (ordinal 1). */
+  val Root: ShardOrdinal = ShardOrdinal(0L)
 
   // ---- JSON value codecs ---------------------------------------------------
   // Manual rather than `@derive(encoder, decoder)` for the same rationale as `ShardId`: keep the JSON shape a plain number.

@@ -25,10 +25,11 @@ import io.circe.parser
 import io.grpc.ManagedChannel
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Background daemon that fills historical chain gaps after catch-up.
+/** Background daemon that fills historical chain gaps after replay-based recovery.
   *
-  * When a node teleports to the network tip via catchUpFromGossip, ordinals between its old tip and the new tip are missing from disk. This
-  * daemon fetches the missing range via ChainSync, validates structurally (hash + signature + VRF), and persists to disk.
+  * This daemon fetches an already-identified historical range via ChainSync, validates transport structure (hash/signature continuity), and
+  * persists archival snapshots. It does not establish a canonical tip, install an MPT/GSI, attest, or authorize economic state;
+  * startup/recovery must fetch authenticated ancestry and globally replay every transition through the normal validator first.
   *
   * Features:
   *   - Parallel chunk-based fetching (max 4 concurrent, 256 ordinals per chunk)
@@ -50,7 +51,7 @@ object BackfillDaemon {
     nextHashToFetch: String, // hex hash of the next snapshot to walk back from (sequential fallback)
     targetOrdinal: Long, // stop when we reach this ordinal (1 = genesis)
     currentOrdinal: Long, // ordinal of the most recently processed snapshot
-    startedAtOrdinal: Long, // ordinal where backfill started (the caught-up tip)
+    startedAtOrdinal: Long, // ordinal where archival backfill started
     completedChunks: Set[String], // "startOrd-endOrd" keys of completed chunks
     createdAtMs: Long
   )
@@ -118,12 +119,9 @@ object BackfillDaemon {
           // corrupts any byte >= 0x80).
           val payloadStr = new String(snap.payload.toByteArray, java.nio.charset.StandardCharsets.UTF_8)
           io.circe.parser.parse(payloadStr).toOption.flatMap { json =>
-            // In-memory hits serve the `{"snapshot":…, "context":…}` envelope (ChainSyncServer ~L78);
-            // the disk/evicted fallback (~L126) and serveByRange serve the BARE
-            // `Signed[GlobalIncrementalSnapshot]`. Backfill walks into evicted history, which is
-            // disk-served slim — so we MUST tolerate both, or the cursor stalls at the first evicted
-            // snapshot and the node can never catch up (3-3 finalized fork via stalled backfill).
-            val wrapped = for {
+            // Greenfield ChainSync payload: required snapshot plus optional context. The context is
+            // archival transport metadata and is never installed as canonical state here.
+            for {
               snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot").toOption
               snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]].toOption
             } yield {
@@ -133,9 +131,6 @@ object BackfillDaemon {
               } yield ctx
               (snapshot, contextOpt)
             }
-            wrapped.orElse(
-              json.as[Signed[GlobalIncrementalSnapshot]].toOption.map(s => (s, None: Option[GlobalSnapshotInfo]))
-            )
           }
         } else None
       }

@@ -13,10 +13,10 @@ import io.circe.{Encoder, Json}
 trait AddressService[F[_], S <: Snapshot] {
   def getBalance(address: Address): F[Option[(Balance, SnapshotOrdinal)]]
 
-  /** Per-address balance plus a Merkle-Patricia inclusion proof against the metagraph's committed balance root, for the roots-only sharding
-    * light client (`docs/nakamoto/ROOTS-ONLY-SHARDING-ARCHITECTURE.md`). The tree's node digests are computed with the brotli-free,
-    * RFC-8785-canonical [[io.constellationnetwork.security.Hasher.forCanonicalJson]] hasher so a stock TypeScript verifier
-    * (`mptVerifier.ts`) can recompute the root and accept the proof with no custom code. Returns `None` when no snapshot is available yet.
+  /** Per-address balance plus a Merkle-Patricia inclusion proof against the root derived from globally re-executed metagraph state. The
+    * tree's node digests are computed with the brotli-free, RFC-8785-canonical [[io.constellationnetwork.security.Hasher.forCanonicalJson]]
+    * hasher so a stock TypeScript verifier (`mptVerifier.ts`) can recompute the root and accept the proof with no custom code. Returns
+    * `None` when no snapshot is available yet.
     */
   def getBalanceProof(address: Address): F[Option[BalanceProof]]
 

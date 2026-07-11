@@ -73,12 +73,9 @@ class TokenLockOpsManager[F[_]: Async] {
   def acceptTokenUnlocks(
     expiredTokenLockHashes: List[Hash],
     incomingTokenUnlocks: SortedSet[TokenUnlock],
-    activeTokenLocksRefs: List[Hash]
+    activeTokenLocksByRef: Map[Hash, TokenLock]
   ): SortedSet[TokenUnlock] =
-    incomingTokenUnlocks.filter { itu =>
-      activeTokenLocksRefs.contains(itu.tokenLockRef) &&
-      !expiredTokenLockHashes.contains(itu.tokenLockRef)
-    }
+    TokenLockOpsManager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksByRef)
 
   def updateBalancesByTokenLocks(
     epochProgress: EpochProgress,
@@ -161,6 +158,20 @@ class TokenLockOpsManager[F[_]: Async] {
 }
 
 object TokenLockOpsManager {
+  def acceptTokenUnlocks(
+    expiredTokenLockHashes: List[Hash],
+    incomingTokenUnlocks: SortedSet[TokenUnlock],
+    activeTokenLocksByRef: Map[Hash, TokenLock]
+  ): SortedSet[TokenUnlock] =
+    incomingTokenUnlocks.filter { tokenUnlock =>
+      !expiredTokenLockHashes.contains(tokenUnlock.tokenLockRef) &&
+      activeTokenLocksByRef.get(tokenUnlock.tokenLockRef).exists { tokenLock =>
+        tokenUnlock.amount == tokenLock.amount &&
+        tokenUnlock.currencyId == tokenLock.currencyId &&
+        tokenUnlock.source == tokenLock.source
+      }
+    }
+
   def make[F[_]: Async]: TokenLockOpsManager[F] =
     new TokenLockOpsManager[F]
 }

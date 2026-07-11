@@ -14,9 +14,8 @@ import eu.timepit.refined.types.all.NonNegLong
 import weaver.SimpleIOSuite
 
 /** Slice 14 — unit tests for [[GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures]]: the pure helper the gl0 consensus LEADER uses
-  * to enrich a candidate checkpoint's `committeeSignatures` with the committee attestations collected in the per-shard `ShardTipTracker`,
-  * so `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` counts `>= kQuorum` distinct signers and adopts via the FAST verify path instead
-  * of the slow re-exec failover.
+  * to enrich a candidate checkpoint's `committeeSignatures` with the committee attestations collected in the per-shard `ShardTipTracker`.
+  * The count affects selection only; `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` still replays every included transition.
   *
   * Determinism is the load-bearing property: every follower threads the leader's enriched set unchanged and re-verifies it, so the splice
   * must (a) leave the canonical signing-preimage UNTOUCHED (`committeeSignatures` is excluded from `ShardCheckpointSigPreimage`), (b) dedup
@@ -51,7 +50,6 @@ object SpliceCommitteeSignaturesSuite extends SimpleIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(5L)),
       slot = SlotT.unsafeApply(5L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(sig(producer)),
       epoch = EtaPeriod(0L)
     )

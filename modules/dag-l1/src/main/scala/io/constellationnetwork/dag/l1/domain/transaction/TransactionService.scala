@@ -64,7 +64,7 @@ object TransactionService {
             //
             // Bound the wait with a timeout: when an upstream issue prevents currency
             // snapshots from ever being processed at this node (e.g. gl0 chain-link
-            // rejection on all metagraph SC binaries due to a forcedGlobalSyncView
+            // rejection on all metagraph SC binaries due to a pinnedGlobalSyncView
             // mismatch — see 2026-05-18 4-mg e2e diagnosis), `lastSnapshotStorage`
             // stays empty forever and `head` blocks forever. That manifests as a
             // hung HTTP POST /transactions request that holds the test client open
@@ -93,7 +93,7 @@ object TransactionService {
                   s"Timed out after ${firstSnapshotTimeout.toSeconds}s waiting for the first currency snapshot — " +
                     s"the node has no currency snapshot to validate against (lastSnapshotStorage empty). " +
                     s"Upstream cause is typically gl0 rejecting all metagraph SC binaries (chain-link rejection or " +
-                    s"forcedGlobalSyncView mismatch); inspect gl0 logs for [SCAcceptance] warnings or " +
+                    s"pinnedGlobalSyncView mismatch); inspect gl0 logs for [SCAcceptance] warnings or " +
                     s"GlobalSnapshotStateChannelEventsProcessor errors."
                 ).raiseError[F, Option[Either[NonEmptyList[ContextualTransactionValidationError], Hash]]]
               )

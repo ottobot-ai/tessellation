@@ -42,7 +42,7 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for the currency-snapshot family:
   *   - `CurrencyIncrementalSnapshotV1` (11 fields, legacy).
-  *   - `CurrencyIncrementalSnapshot` (17 fields, current).
+  *   - `CurrencyIncrementalSnapshot` (18 fields, current).
   *   - `CurrencySnapshot` (12 fields, full-snapshot variant).
   *
   * Closing the last big dependency before `GlobalSnapshotInfo`.
@@ -115,42 +115,6 @@ object CurrencySnapshotCodecs {
   private val optArtifactsCodec = option(sortedSet(sharedArtifactCodec))
   private val optAllowSpendBlocksCodec = option(sortedSet(signedAllowSpendBlockCodec))
   private val optTokenLockBlocksCodec = option(sortedSet(signedTokenLockBlockCodec))
-  // The metagraph's authoritative cumulative balance map (the roots-only sharding security anchor — see
-  // `CurrencyIncrementalSnapshot.authoritativeBalances`). Reuses the same `SortedMap[Address, Balance]` encoding as
-  // `CurrencySnapshotInfo.balances` so the on-disk/scodec form stays byte-consistent with the Circe form.
-  private val authoritativeBalancesMapCodec: Codec[SortedMap[Address, Balance]] = sortedMap(addressCodec, Codec[Balance])
-  private val optAuthoritativeBalancesCodec = option(authoritativeBalancesMapCodec)
-  // The metagraph's authoritative active-allow-spend / active-token-lock maps (the roots-only sharding security anchor — see
-  // `CurrencyIncrementalSnapshot.authoritativeActiveAllowSpends` / `authoritativeActiveTokenLocks`). Reuse the SAME element codecs
-  // (`Signed[AllowSpend]` / `Signed[TokenLock]`) and `SortedMap[Address, SortedSet[...]]` encoding as `CurrencySnapshotInfo`'s
-  // `activeAllowSpends` / `activeTokenLocks` so the on-disk/scodec form stays byte-consistent with the Circe form.
-  private val signedAllowSpendCodec: Codec[Signed[AllowSpend]] = signedCodecFor(allowSpendCodec)
-  private val signedTokenLockCodec: Codec[Signed[TokenLock]] = signedCodecFor(tokenLockCodec)
-  private val authoritativeActiveAllowSpendsMapCodec: Codec[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-    sortedMap(addressCodec, sortedSet(signedAllowSpendCodec))
-  private val authoritativeActiveTokenLocksMapCodec: Codec[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-    sortedMap(addressCodec, sortedSet(signedTokenLockCodec))
-  private val optAuthoritativeActiveAllowSpendsCodec = option(authoritativeActiveAllowSpendsMapCodec)
-  private val optAuthoritativeActiveTokenLocksCodec = option(authoritativeActiveTokenLocksMapCodec)
-  // The metagraph's authoritative cumulative last-tx-ref map (`CurrencyIncrementalSnapshot.authoritativeLastTxRefs`). Reuse the SAME
-  // `SortedMap[Address, TransactionReference]` encoding as `CurrencySnapshotInfo.lastTxRefs` so the scodec form stays byte-consistent.
-  private val authoritativeLastTxRefsMapCodec: Codec[SortedMap[Address, TransactionReference]] =
-    sortedMap(addressCodec, transactionReferenceCodec)
-  private val optAuthoritativeLastTxRefsCodec = option(authoritativeLastTxRefsMapCodec)
-  // The metagraph's authoritative cumulative last-fee-tx-ref / last-allow-spend-ref / last-token-lock-ref / last-message maps
-  // (`CurrencyIncrementalSnapshot.authoritativeLast{FeeTxRefs,AllowSpendRefs,TokenLockRefs,Messages}`). Reuse the SAME element codecs and
-  // `SortedMap[...]` encoding as the matching `CurrencySnapshotInfo` fields so the scodec form stays byte-consistent with the Circe form.
-  private val authoritativeLastFeeTxRefsMapCodec: Codec[SortedMap[Address, TransactionReference]] = authoritativeLastTxRefsMapCodec
-  private val authoritativeLastAllowSpendRefsMapCodec: Codec[SortedMap[Address, AllowSpendReference]] =
-    sortedMap(addressCodec, allowSpendRefCodec)
-  private val authoritativeLastTokenLockRefsMapCodec: Codec[SortedMap[Address, TokenLockReference]] =
-    sortedMap(addressCodec, tokenLockRefCodec)
-  private val authoritativeLastMessagesMapCodec: Codec[SortedMap[MessageType, Signed[CurrencyMessage]]] =
-    sortedMap(messageTypeCodec, signedCurrencyMessageCodec)
-  private val optAuthoritativeLastFeeTxRefsCodec = option(authoritativeLastFeeTxRefsMapCodec)
-  private val optAuthoritativeLastAllowSpendRefsCodec = option(authoritativeLastAllowSpendRefsMapCodec)
-  private val optAuthoritativeLastTokenLockRefsCodec = option(authoritativeLastTokenLockRefsMapCodec)
-  private val optAuthoritativeLastMessagesCodec = option(authoritativeLastMessagesMapCodec)
 
   implicit val currencyIncrementalSnapshotCodec: Codec[CurrencyIncrementalSnapshot] =
     (ordinalCodec ::
@@ -170,21 +134,12 @@ object CurrencySnapshotCodecs {
       optAllowSpendBlocksCodec ::
       optTokenLockBlocksCodec ::
       optGlobalSyncViewCodec ::
-      optAuthoritativeBalancesCodec ::
-      optAuthoritativeActiveAllowSpendsCodec ::
-      optAuthoritativeActiveTokenLocksCodec ::
-      optAuthoritativeLastTxRefsCodec ::
-      optAuthoritativeLastFeeTxRefsCodec ::
-      optAuthoritativeLastAllowSpendRefsCodec ::
-      optAuthoritativeLastTokenLockRefsCodec ::
-      optAuthoritativeLastMessagesCodec ::
       versionCodec)
       .xmap[CurrencyIncrementalSnapshot](
         {
           case o :: h :: sh :: lsh :: blks :: rws :: tp :: sp :: ep ::
               da :: msgs :: syncs :: fees :: artifacts :: asb :: tlb ::
-              gsv :: authBal :: authAS :: authTL :: authTxRefs ::
-              authFeeTxRefs :: authAllowSpendRefs :: authTokenLockRefs :: authMessages :: v :: HNil =>
+              gsv :: v :: HNil =>
             CurrencyIncrementalSnapshot(
               o,
               h,
@@ -203,14 +158,6 @@ object CurrencySnapshotCodecs {
               asb,
               tlb,
               gsv,
-              authBal,
-              authAS,
-              authTL,
-              authTxRefs,
-              authFeeTxRefs,
-              authAllowSpendRefs,
-              authTokenLockRefs,
-              authMessages,
               v
             )
         },
@@ -232,14 +179,6 @@ object CurrencySnapshotCodecs {
             s.allowSpendBlocks ::
             s.tokenLockBlocks ::
             s.globalSyncView ::
-            s.authoritativeBalances ::
-            s.authoritativeActiveAllowSpends ::
-            s.authoritativeActiveTokenLocks ::
-            s.authoritativeLastTxRefs ::
-            s.authoritativeLastFeeTxRefs ::
-            s.authoritativeLastAllowSpendRefs ::
-            s.authoritativeLastTokenLockRefs ::
-            s.authoritativeLastMessages ::
             s.version ::
             HNil
       )

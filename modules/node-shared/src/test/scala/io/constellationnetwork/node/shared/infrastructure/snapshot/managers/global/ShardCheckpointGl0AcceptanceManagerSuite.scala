@@ -11,10 +11,10 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
-import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, KesRegistry, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
-import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
+import io.constellationnetwork.node.shared.infrastructure.sharding.RegisteredCheckpointSigner
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
@@ -24,8 +24,8 @@ import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
-import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
@@ -37,7 +37,7 @@ import weaver.MutableIOSuite
   * '''Required coverage''' (per slice spec):
   *   1. '''Pre-check fail: signer not in committee''' — checkpoint signed by a peerId not in `committeeMembership(...)` → `Rejected`
   *   1. '''Pre-check fail: bad Ed25519 sig''' — signature doesn't verify → `Rejected`
-  *   1. '''T_count path accept''' — triggers report T_count qualifies → `Accepted` without invoking re-exec
+  *   1. '''T_count path accept''' — triggers report T_count qualifies and re-exec matches → `Accepted`
   *   1. '''T_depth1-only re-exec accept''' — T_count doesn't qualify, T_depth1 does, re-exec matches → `Accepted`
   *   1. '''T_depth1-only re-exec mismatch''' — T_count doesn't qualify, T_depth1 does, re-exec returns DIFFERENT hash for one MG →
   *      `RejectedReExecutionMismatch` with slash list = checkpoint signers
@@ -45,19 +45,14 @@ import weaver.MutableIOSuite
   *   1. '''Unknown shard''' — checkpoint's shardId not in `finalityTriggers` map → `Rejected`
   *
   * '''Test fixture pattern''':
-  *   - Build the `Signed[ShardCheckpoint]` envelopes with REAL `KeyPair`s for the committee signers so the Ed25519 pre-check verifies
-  *     against the recovered public key from each `PeerId`. The KES sig is structurally valid (8-byte placeholder); the manager's KES
-  *     verify reads from the injected `KesRegistry` and uses the "no registry entry → accept" carve-out for tests.
-  *   - The LEGACY pre-check tests use 80-byte structural VRF proof bytes + the default empty `VrfRegistry` / `None` shardEta, which drives
-  *     the manager's registry-/eta-absent bootstrap carve-out (structural length check) — so their accept/reject outcomes are unchanged.
-  *     The dedicated "real VRF verify" tests below register a real VRF VK + a real shardEta and exercise the REAL `EcVrf25519` verify
-  *     (accept a valid member's proof; reject forged / wrong-epoch / impersonated proofs).
+  *   - Build checkpoint envelopes with real Ed25519, KES, and VRF signatures, and inject registries containing the corresponding public
+  *     keys. Missing KES/VRF registrations fail closed exactly as they do in production.
   *   - `ShardFinalityTriggers` is built fresh per test off a `ShardChainStore` + `ShardTipTracker` pair so we control which trigger
   *     qualifies which ordinal exactly.
   */
 object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], RegisteredCheckpointSigner)
 
   // Slice 19: ShardChainStore, ShardTipTracker, and ShardCheckpointGl0AcceptanceManager constructors now all require
   // Metrics[F]. No-op interpreter — slice-19 metric semantics are covered by ShardMetricsSuite.
@@ -68,7 +63,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       sp <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
-    } yield (h, sp, j)
+      checkpointSigner <- RegisteredCheckpointSigner.make.asResource
+    } yield (h, sp, j, checkpointSigner)
 
   // ============================================================================
   // Fixtures
@@ -86,41 +82,19 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       (kp, PeerId.fromPublic(kp.getPublic))
     }
 
-  /** Build a committee-member sig that PASSES every pre-check predicate for the given peer:
-    *   - peerId is in the test's expected committee
-    *   - Ed25519 sig verifies under the peer's recovered VK
-    *   - KES sig is non-empty (registry-absent carve-out kicks in)
-    *   - VRF proof is 80 bytes (structural check passes)
-    */
+  /** Build a committee-member signature that passes every cryptographic pre-check for the given registered peer. */
   private def mkValidSig(
     checkpoint: ShardCheckpoint,
     kp: KeyPair,
     peerId: PeerId
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[CommitteeMemberSignature] =
-    for {
-      preimageHash <- Hasher[IO].hash(checkpoint.signingPreimage)
-      edSig <- Signing.signData[IO](preimageHash.getBytes)(kp.getPrivate)
-    } yield
-      CommitteeMemberSignature(
-        peerId = peerId,
-        vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)), // structural-min length passes the slice-9 VRF check
-        ed25519Sig = Hex.fromBytes(edSig),
-        kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // non-empty; registry-absent carve-out → accept
-        kesTreeStep = 0
-      )
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], checkpointSigner: RegisteredCheckpointSigner): IO[CommitteeMemberSignature] =
+    checkpointSigner.sign(checkpoint, kp, peerId, realShardEta)
 
   // ── Real-VRF fixtures (committee-VRF verify tests) ─────────────────────────────────────────────────────────────────
   // A deterministic 32-byte stand-in for the per-shard leader-VRF eta (`ShardSlotLeader.computeShardEta` output). The
   // acceptance manager only needs the SAME bytes the producer used; the tests inject this both into the manager's
   // `shardEtaFor` AND into the proof-construction message, so producer + verifier agree by construction.
   private val realShardEta: Array[Byte] = Array.tabulate[Byte](32)(i => (i * 7 + 1).toByte)
-
-  /** Build a `ShardSlotLeader[IO]` (for `vrfProofForSlot`) over a real LDD-arithmetic `EligibilityChecker`. */
-  private def mkSlotLeader: IO[ShardSlotLeader[IO]] =
-    for {
-      log1p <- Log1pInterpreter.make[IO](maxIterations = 10000, precision = 8)
-      exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38)
-    } yield ShardSlotLeader.make[IO](EligibilityChecker.make[IO](log1p, exp))
 
   /** Build a committee-member sig whose VRF proof is a REAL `EcVrf25519` proof of `(shardEta, checkpoint.slot)` under the operator's VRF SK
     * (derived from its long-term keypair via the SAME `VrfKeyDeriver` the runtime + genesis use). The Ed25519 sig also really verifies. The
@@ -130,26 +104,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     checkpoint: ShardCheckpoint,
     kp: KeyPair,
     peerId: PeerId,
-    slotLeader: ShardSlotLeader[IO],
     shardEta: Array[Byte]
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[(CommitteeMemberSignature, Array[Byte])] = {
-    val (vrfSeed, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(kp)
-    for {
-      preimageHash <- Hasher[IO].hash(checkpoint.signingPreimage)
-      edSig <- Signing.signData[IO](preimageHash.getBytes)(kp.getPrivate)
-      vrfProof <- slotLeader.membershipProof(vrfSeed, shardEta, checkpoint.slot)
-    } yield
-      (
-        CommitteeMemberSignature(
-          peerId = peerId,
-          vrfProof = Hex.fromBytes(vrfProof),
-          ed25519Sig = Hex.fromBytes(edSig),
-          kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // non-empty; registry-absent KES carve-out → accept
-          kesTreeStep = 0
-        ),
-        vrfVk
-      )
-  }
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    checkpointSigner: RegisteredCheckpointSigner
+  ): IO[(CommitteeMemberSignature, Array[Byte])] =
+    checkpointSigner.sign(checkpoint, kp, peerId, shardEta).map(_ -> VrfKeyDeriver.deriveVrfKeyPair(kp)._2)
 
   /** Dummy `CommitteeMemberSignature` used to satisfy the 3-arg `recordAttestation` signature in tests that only care about peerId-based
     * counting. The tracker stores/counts by the explicit `peerId` argument, not by the sig's internal peerId.
@@ -196,7 +157,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = delta,
-      emittedReceipts = List.empty,
       // Placeholder — overwritten downstream once the real signature is computed.
       committeeSignatures = NonEmptyList.of(
         CommitteeMemberSignature(
@@ -216,11 +176,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   private def mkDelta(mg: Address, root: Hash, binary: Signed[StateChannelSnapshotBinary]): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mg -> root),
-      perMetagraphStateDiff = SortedMap.empty,
-      includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary)),
-      tokenLockBalancesDelta = SortedMap.empty,
-      perMetagraphArtifacts = SortedMap.empty,
-      perMetagraphSyncDataDelta = SortedMap.empty
+      includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary))
     )
 
   /** Build a fake `Signed[StateChannelSnapshotBinary]` for the included-snapshots field. The manager doesn't validate the binary's inner
@@ -258,7 +214,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       _ <- triggers.advance
     } yield (store, triggers)
 
-  /** Seed a linear chain of `n` checkpoints (ords 0..n-1) into the store. Used by the depth-finality + tip-tracker tests so the `bestTip`
+  /** Seed a linear chain of `n` checkpoints (ords 1..n) into the store. Used by the depth-finality + tip-tracker tests so the `bestTip`
     * resolves at the highest ord. Returns the canonical hash list in chain order. The `Hasher[IO]` consumed by `store.store` is captured at
     * store construction time (via `ShardChainStore.make[F: Hasher]`), so seedChain doesn't need an implicit param of its own.
     */
@@ -266,8 +222,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     store: ShardChainStore[IO],
     n: Int
   ): IO[List[Hash]] =
-    (0L until n.toLong).toList
-      .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash("0" * 64))) {
+    (1L to n.toLong).toList
+      .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
         case ((acc, parent), ord) =>
           val cp = ShardCheckpoint(
             shardId = shardZero,
@@ -276,7 +232,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
             gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L + ord)),
             slot = SlotT.unsafeApply(100L + ord),
             derivedStateDelta = ShardDerivedStateDelta.empty,
-            emittedReceipts = List.empty,
             committeeSignatures = NonEmptyList.of(
               CommitteeMemberSignature(
                 peerId = PeerId(Hex(f"${ord.toInt + 1}%02x" * 64)),
@@ -295,7 +250,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
               signed,
               parentHash = parent,
               shardOrdinal = ShardOrdinal(ord),
-              slot = ord + 1L,
+              slot = 100L + ord,
               vrfOutput = Array.fill[Byte](32)(ord.toByte)
             )
             .flatMap { _ =>
@@ -309,32 +264,23 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     */
   private def mkManager(
     finalityTriggers: Map[ShardId, ShardFinalityTriggers[IO]],
-    chainStore: Map[ShardId, ShardChainStore[IO]] = Map.empty,
     committeeMembership: Set[PeerId],
-    // Draw/quorum decouple: `kDraw` sizes the committee draw (reserved for the future VRF check; no test outcome depends on it here);
-    // `kQuorum` is the admit count `verifyEmbedded` requires DIRECTLY (default 4 ≈ the old `ceil(2·committeeSize/3)` at committeeSize=4).
-    kDraw: Int = 4,
-    kQuorum: Int = 4,
-    selfId: PeerId,
-    kesRegistry: KesRegistry[IO] = KesRegistry.empty[IO],
-    // Committee-VRF verify seam. The DEFAULTS (empty VRF registry + None shardEta) drive the registry-/eta-absent
-    // bootstrap carve-out, so the legacy tests' 80-byte structural proofs still pass — preserving their accept/reject
-    // outcomes. The dedicated VRF tests below override these with a real registry + a real shardEta to exercise the REAL
-    // EcVrf25519 verify (accept a valid member's proof; reject a non-member / forged / wrong-epoch proof).
-    vrfRegistry: VrfRegistry[IO] = VrfRegistry.empty[IO],
-    shardEtaFor: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]] = (_, _) => IO.pure(none[Array[Byte]]),
+    kesRegistryOverride: Option[KesRegistry[IO]] = None,
+    vrfRegistryOverride: Option[VrfRegistry[IO]] = None,
+    shardEtaFor: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]] = (_, _) => IO.pure(realShardEta.some),
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-      (_, _, _, _) => IO.pure(Hash("0" * 64))
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
+      (_, _, _, _) => IO.pure(Hash("11" * 32))
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    checkpointSigner: RegisteredCheckpointSigner
+  ): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
     ShardCheckpointGl0AcceptanceManager.make[IO](
       finalityTriggers = sid => IO.pure(finalityTriggers.get(sid)),
-      chainStore = sid => IO.pure(chainStore.get(sid)),
       committeeMembership = (_, _) => IO.pure(committeeMembership),
-      kDraw = kDraw,
-      kQuorum = kQuorum,
-      selfPeerId = selfId,
-      kesRegistry = kesRegistry,
-      vrfRegistry = vrfRegistry,
+      kesRegistry = kesRegistryOverride.getOrElse(checkpointSigner.kesRegistry),
+      vrfRegistry = vrfRegistryOverride.getOrElse(checkpointSigner.vrfRegistry),
+      shardAssignment = ShardAssignment.make[IO](numShards = 1),
       shardEtaFor = shardEtaFor,
       reExecuteDerivation = reExecuteDerivation
     )
@@ -344,7 +290,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("pre-check fail: signer peerId not in committeeMembership → Rejected") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -363,8 +309,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // committeeMembership is EMPTY — signer is not in committee → pre-check membership predicate fails.
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
-        committeeMembership = Set.empty[PeerId],
-        selfId = selfPeer
+        committeeMembership = Set.empty[PeerId]
       )
       result <- mgr.evaluate(checkpoint)
     } yield
@@ -380,7 +325,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("pre-check fail: Ed25519 sig doesn't verify under signer's VK → Rejected") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (_, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -399,8 +344,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // committeeMembership includes our signer so the membership pre-check passes — Ed25519 must be the one that fails.
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
-        committeeMembership = Set(signerPeer),
-        selfId = selfPeer
+        committeeMembership = Set(signerPeer)
       )
       result <- mgr.evaluate(checkpoint)
     } yield
@@ -411,16 +355,81 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       }
   }
 
+  test("pre-check fail: missing registered KES key rejects a cryptographically valid signer") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      mg = Address.fromBytes("mg-missing-kes".getBytes("UTF-8"))
+      delta = mkDelta(mg, Hash("11" * 32), mkSignedBinary("content".getBytes("UTF-8")))
+      shell = mkCheckpointShell(1L, 100L, delta, signerPeer)
+      sig <- mkValidSig(shell, signerKp, signerPeer)
+      manager <- mkManager(
+        finalityTriggers = Map.empty,
+        committeeMembership = Set(signerPeer),
+        kesRegistryOverride = KesRegistry.empty[IO].some
+      )
+      result <- manager.verifyEmbedded(shell.copy(committeeSignatures = NonEmptyList.of(sig)))
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("KES sig verify failed"))
+        case other                                        => failure(s"Expected fail-closed KES rejection, got $other")
+      }
+  }
+
+  test("pre-check fail: missing registered VRF key rejects a cryptographically valid signer") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      mg = Address.fromBytes("mg-missing-vrf".getBytes("UTF-8"))
+      delta = mkDelta(mg, Hash("11" * 32), mkSignedBinary("content".getBytes("UTF-8")))
+      shell = mkCheckpointShell(1L, 100L, delta, signerPeer)
+      sig <- mkValidSig(shell, signerKp, signerPeer)
+      manager <- mkManager(
+        finalityTriggers = Map.empty,
+        committeeMembership = Set(signerPeer),
+        vrfRegistryOverride = VrfRegistry.empty[IO].some
+      )
+      result <- manager.verifyEmbedded(shell.copy(committeeSignatures = NonEmptyList.of(sig)))
+    } yield
+      result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => expect(reason.contains("committee-VRF proof verify failed"))
+        case other                                        => failure(s"Expected fail-closed VRF rejection, got $other")
+      }
+  }
+
+  test("standalone attestation: Ed25519-valid outsider is rejected before tracker insertion") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+    for {
+      (outsiderKp, outsiderPeer) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      shell = mkCheckpointShell(
+        shardOrd = 1L,
+        gl0Anchor = 100L,
+        delta = ShardDerivedStateDelta.empty,
+        placeholderPeerId = outsiderPeer
+      )
+      outsiderSig <- mkValidSig(shell, outsiderKp, outsiderPeer)
+      manager <- mkManager(
+        finalityTriggers = Map.empty,
+        committeeMembership = Set.empty
+      )
+      tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
+      checkpointHash <- Hasher[IO].hash(shell.signingPreimage)
+      validation <- manager.verifyCommitteeSignature(shell, outsiderSig)
+      _ <- validation.fold(_ => IO.unit, _ => tracker.recordAttestation(checkpointHash, outsiderPeer, outsiderSig))
+      retained <- tracker.signaturesFor(checkpointHash)
+    } yield
+      expect(validation.left.exists(_.contains("not in committee"))) &&
+        expect(retained.isEmpty)
+  }
+
   // ============================================================================
   // Test 3: T_count path accept
   // ============================================================================
 
-  test("T_count path: triggers report T_count qualifies → Accepted without invoking re-exec") { res =>
-    implicit val (h, sp, _) = res
+  test("T_count path: triggers report T_count qualifies and re-exec matches → Accepted") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
 
-    // The re-exec callback is wired to ALWAYS RETURN A WRONG HASH so we can prove it was never called (if it were called, the
-    // mismatch would surface as RejectedReExecutionMismatch). Sentinel-hash trick: re-exec returns 0xff but the delta carries 0x11
-    // — if the test reaches the re-exec path, we'd see a Rejected; we expect plain Accepted.
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -446,7 +455,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
       _ <- triggers.advance
 
-      // Re-exec returns a HASH THAT DOES NOT MATCH — proves the manager never enters the re-exec path on the T_count fast path.
       reExecCalledRef <- cats.effect.Ref.of[IO, Boolean](false)
       reExecCb = (
         (
@@ -454,7 +462,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
           _: SnapshotOrdinal
-        ) => reExecCalledRef.set(true).as(Hash("ff" * 32))
+        ) => reExecCalledRef.set(true).as(mptRoot)
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
@@ -465,14 +473,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
         committeeMembership = Set(signerPeer),
-        selfId = selfPeer,
         reExecuteDerivation = reExecCb
       )
       result <- mgr.evaluate(checkpoint)
       reExecCalled <- reExecCalledRef.get
     } yield
       expect.same(ShardCheckpointAcceptResult.Accepted, result) &&
-        expect(!reExecCalled) // T_count fast path must NOT invoke re-exec
+        expect(reExecCalled)
   }
 
   // ============================================================================
@@ -480,7 +487,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("T_depth1-only re-exec: T_count doesn't qualify, T_depth1 does, re-exec matches → Accepted") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -520,7 +527,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
         committeeMembership = Set(signerPeer),
-        selfId = selfPeer,
         reExecuteDerivation = reExecCb
       )
       result <- mgr.evaluate(checkpoint)
@@ -532,7 +538,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("T_depth1-only re-exec mismatch: re-exec returns DIFFERENT hash → RejectedReExecutionMismatch with slash list = signers") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp1, signerPeer1) <- mkSigner
       (signerKp2, signerPeer2) <- mkSigner
@@ -575,7 +581,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
         committeeMembership = Set(signerPeer1, signerPeer2),
-        selfId = selfPeer,
         reExecuteDerivation = reExecCb
       )
       result <- mgr.evaluate(checkpoint)
@@ -589,12 +594,12 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 5b (diff-base-pin fail-closed): re-exec CANNOT-DERIVE sentinel — plain Rejected, NO slash
+  // Test 5b (execution-base-pin fail-closed): re-exec CANNOT-DERIVE sentinel — plain Rejected, NO slash
   // ============================================================================
 
   test("T_depth1-only re-exec CANNOT-DERIVE (Hash.empty sentinel): fail-closed plain Rejected — NEVER RejectedReExecutionMismatch/slash") {
     res =>
-      implicit val (h, sp, _) = res
+      implicit val (h, sp, _, checkpointSigner) = res
       for {
         (signerKp, signerPeer) <- mkSigner
         (_, selfPeer) <- mkSigner
@@ -615,8 +620,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           chainLength = 10,
           selfId = selfPeer
         )
-        // Re-exec returns Hash.empty — the wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationWithDiff` OMIT: the
-        // pinned diff-base is unresolvable below this node's retention / not yet reached, or the derivation deferred). That is
+        // Re-exec returns Hash.empty — the wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationAtPinnedBase` omitted: the
+        // pinned execution-base is unresolvable below this node's retention / not yet reached, or the derivation deferred). That is
         // "THIS NODE can't check", NOT "the committee deviated" (the same reading `watchtowerReExec` applies when it filters
         // `Hash.empty` mismatches). The checkpoint must be REJECTED (fail-closed: never admitted unverified) but the signers must
         // NOT be slash targets — `RejectedReExecutionMismatch` feeds the DURABLE 100% `InvalidStateProof` slash
@@ -639,7 +644,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         mgr <- mkManager(
           finalityTriggers = Map(shardZero -> triggers),
           committeeMembership = Set(signerPeer),
-          selfId = selfPeer,
           reExecuteDerivation = reExecCb
         )
         result <- mgr.evaluate(checkpoint)
@@ -656,12 +660,12 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 5c (diff-base-pin fail-closed): affirmative mismatch on ANOTHER MG still slashes
+  // Test 5c (execution-base-pin fail-closed): affirmative mismatch on ANOTHER MG still slashes
   // ============================================================================
 
   test("mixed window: one MG affirmatively mismatches, another can't-derive → RejectedReExecutionMismatch (affirmative evidence wins)") {
     res =>
-      implicit val (h, sp, _) = res
+      implicit val (h, sp, _, checkpointSigner) = res
       for {
         (signerKp, signerPeer) <- mkSigner
         (_, selfPeer) <- mkSigner
@@ -672,11 +676,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
         delta = ShardDerivedStateDelta(
           perMetagraphMptRoots = SortedMap(mgBad -> claimedRoot, mgUncheckable -> claimedRoot),
-          perMetagraphStateDiff = SortedMap.empty,
-          includedSnapshots = SortedMap(mgBad -> NonEmptyList.of(binary), mgUncheckable -> NonEmptyList.of(binary)),
-          tokenLockBalancesDelta = SortedMap.empty,
-          perMetagraphArtifacts = SortedMap.empty,
-          perMetagraphSyncDataDelta = SortedMap.empty
+          includedSnapshots = SortedMap(mgBad -> NonEmptyList.of(binary), mgUncheckable -> NonEmptyList.of(binary))
         )
         shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
 
@@ -709,7 +709,6 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         mgr <- mkManager(
           finalityTriggers = Map(shardZero -> triggers),
           committeeMembership = Set(signerPeer),
-          selfId = selfPeer,
           reExecuteDerivation = reExecCb
         )
         result <- mgr.evaluate(checkpoint)
@@ -727,7 +726,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("neither trigger qualifies → PendingMoreAttestations") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -752,11 +751,34 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       )
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
-        committeeMembership = Set(signerPeer),
-        selfId = selfPeer
+        committeeMembership = Set(signerPeer)
       )
       result <- mgr.evaluate(checkpoint)
     } yield expect.same(ShardCheckpointAcceptResult.PendingMoreAttestations, result)
+  }
+
+  test("neither trigger qualifies but re-execution mismatches → RejectedReExecutionMismatch") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      (_, selfPeer) <- mkSigner
+      calls <- cats.effect.Ref.of[IO, Int](0)
+      mg = Address.fromBytes("mg-pending-mismatch".getBytes("UTF-8"))
+      claimedRoot = Hash("11" * 32)
+      binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+      delta = mkDelta(mg, claimedRoot, binary)
+      shell = mkCheckpointShell(shardOrd = 50L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+      validSig <- mkValidSig(shell, signerKp, signerPeer)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
+      (_, triggers) <- mkFinalityTriggers(kQuorum = 100, k1Shard = 10L, chainLength = 3, selfId = selfPeer)
+      mgr <- mkManager(
+        finalityTriggers = Map(shardZero -> triggers),
+        committeeMembership = Set(signerPeer),
+        reExecuteDerivation = (_, _, _, _) => calls.updateAndGet(_ + 1).as(Hash("22" * 32))
+      )
+      result <- mgr.evaluate(checkpoint)
+      callCount <- calls.get
+    } yield expect.all(result.isInstanceOf[ShardCheckpointAcceptResult.RejectedReExecutionMismatch], callCount == 1)
   }
 
   // ============================================================================
@@ -764,10 +786,9 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("unknown shard: checkpoint's shardId not in finalityTriggers map → Rejected") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
-      (_, selfPeer) <- mkSigner
 
       mg = Address.fromBytes("mg-g".getBytes("UTF-8"))
       mptRoot = Hash("11" * 32)
@@ -781,8 +802,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // finalityTriggers map is EMPTY for shardZero — the manager's `finalityTriggers(shardZero)` callback returns None.
       mgr <- mkManager(
         finalityTriggers = Map.empty[ShardId, ShardFinalityTriggers[IO]],
-        committeeMembership = Set(signerPeer),
-        selfId = selfPeer
+        committeeMembership = Set(signerPeer)
       )
       result <- mgr.evaluate(checkpoint)
     } yield
@@ -800,10 +820,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   /** The load-bearing determinism test: `verifyEmbedded` MUST return the SAME result under TWO DIFFERENT node-local `finalityTriggers`
     * states. This proves it reads NO node-local input (no triggers, no shard tip) — the property the whole symmetric-adopt design rests on.
     * Node A's triggers qualify the checkpoint's ord (T_count fires); node B's triggers never qualify (short chain, huge kTarget, zero
-    * attestations). `verifyEmbedded` ignores both and decides purely from the committee-quorum count, so both nodes return `Accepted`.
+    * attestations). `verifyEmbedded` ignores both and decides from deterministic re-execution, so both nodes return `Accepted`.
     */
   test("verifyEmbedded determinism: SAME result under two DIFFERENT finalityTriggers states (no node-local dependency)") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeerA) <- mkSigner
@@ -817,7 +837,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      // kQuorum = 1 ⇒ the single valid signer meets the admit quorum ⇒ Accepted, regardless of triggers (committee size = 1 here).
+      // The matching re-execution result is accepted regardless of trigger state.
 
       // Node A: triggers FULLY qualify the checkpoint ord (T_count fires, deep chain).
       (storeA, _) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
@@ -832,15 +852,11 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
 
       mgrA <- mkManager(
         finalityTriggers = Map(shardZero -> triggersA),
-        committeeMembership = Set(signerPeer),
-        kQuorum = 1,
-        selfId = selfPeerA
+        committeeMembership = Set(signerPeer)
       )
       mgrB <- mkManager(
         finalityTriggers = Map(shardZero -> triggersB),
-        committeeMembership = Set(signerPeer),
-        kQuorum = 1,
-        selfId = selfPeerB
+        committeeMembership = Set(signerPeer)
       )
       resultA <- mgrA.verifyEmbedded(checkpoint)
       resultB <- mgrB.verifyEmbedded(checkpoint)
@@ -850,8 +866,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         expect.same(resultA, resultB) // the determinism assertion: byte-identical outcome on two different-trigger nodes
   }
 
-  test("verifyEmbedded: quorum met (distinctSigners >= kQuorum) → Accepted") { res =>
-    implicit val (h, sp, _) = res
+  test("verifyEmbedded: multiple valid signatures still require matching re-execution") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (kp1, p1) <- mkSigner
       (kp2, p2) <- mkSigner
@@ -865,8 +881,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       sig1 <- mkValidSig(shell, kp1, p1)
       sig2 <- mkValidSig(shell, kp2, p2)
       sig3 <- mkValidSig(shell, kp3, p3)
-      // kQuorum = 3; 3 distinct valid signers meet the admit quorum ⇒ Accepted (re-exec never runs). committee size is 4 here but the
-      // quorum is the DECOUPLED `kQuorum`, not `ceil(2·committeeSize/3)`.
+      // Signature count is not an economic-validity shortcut; the callback must still run and match.
       (_, anyTriggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 3, selfId = selfPeer)
       reExecCalledRef <- cats.effect.Ref.of[IO, Boolean](false)
       reExecCb = (
@@ -875,7 +890,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
           _: SnapshotOrdinal
-        ) => reExecCalledRef.set(true).as(Hash("ff" * 32))
+        ) => reExecCalledRef.set(true).as(Hash("11" * 32))
       ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[
         Hash
       ]
@@ -883,29 +898,26 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> anyTriggers),
         committeeMembership = Set(p1, p2, p3, selfPeer),
-        kQuorum = 3,
-        selfId = selfPeer,
         reExecuteDerivation = reExecCb
       )
       result <- mgr.verifyEmbedded(checkpoint)
       reExecCalled <- reExecCalledRef.get
-    } yield expect.same(ShardCheckpointAcceptResult.Accepted, result) && expect(!reExecCalled)
+    } yield expect.same(ShardCheckpointAcceptResult.Accepted, result) && expect(reExecCalled)
   }
 
-  test("verifyEmbedded: sub-quorum → deterministic re-exec failover (fail-closed stub → mismatch), trigger-independent") { res =>
-    implicit val (h, sp, _) = res
+  test("verifyEmbedded: one valid signer plus a wrong root deterministically rejects, trigger-independent") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (kp1, p1) <- mkSigner
       (_, selfPeerA) <- mkSigner
       (_, selfPeerB) <- mkSigner
 
-      mg = Address.fromBytes("mg-subquorum".getBytes("UTF-8"))
+      mg = Address.fromBytes("mg-single-signer".getBytes("UTF-8"))
       mptRoot = Hash("11" * 32)
       binary = mkSignedBinary("c".getBytes("UTF-8"))
       delta = mkDelta(mg, mptRoot, binary)
       shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = p1)
       sig1 <- mkValidSig(shell, kp1, p1)
-      // kQuorum = 3; only 1 valid signer ⇒ sub-quorum ⇒ re-exec failover (committee size 4, but the quorum is the decoupled kQuorum).
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1))
 
       // re-exec returns a WRONG root vs the delta's claimed root ⇒ RejectedReExecutionMismatch, deterministically.
@@ -923,21 +935,17 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         SnapshotOrdinal
       ) => IO[Hash]
 
-      // Two different trigger states again — the re-exec failover must also be node-local-independent.
+      // Two different trigger states again — consensus replay must be node-local-independent.
       (_, triggersA) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeerA)
       (_, triggersB) <- mkFinalityTriggers(kQuorum = 1000, k1Shard = 1000L, chainLength = 2, selfId = selfPeerB)
       mgrA <- mkManager(
         finalityTriggers = Map(shardZero -> triggersA),
         committeeMembership = Set(p1) ++ (1 to 3).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet,
-        kQuorum = 3,
-        selfId = selfPeerA,
         reExecuteDerivation = reExecWrong
       )
       mgrB <- mkManager(
         finalityTriggers = Map(shardZero -> triggersB),
         committeeMembership = Set(p1) ++ (1 to 3).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet,
-        kQuorum = 3,
-        selfId = selfPeerB,
         reExecuteDerivation = reExecWrong
       )
       resultA <- mgrA.verifyEmbedded(checkpoint)
@@ -952,7 +960,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   test("verifyEmbedded: pre-check fail (signer not in committee) → Rejected (deterministic)") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (kp, p) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -964,8 +972,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       (_, triggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 1L, chainLength = 10, selfId = selfPeer)
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
-        committeeMembership = Set.empty[PeerId], // signer not in committee ⇒ pre-check rejects before quorum
-        selfId = selfPeer
+        committeeMembership = Set.empty[PeerId] // signer not in committee ⇒ deterministic pre-check rejection
       )
       result <- mgr.verifyEmbedded(checkpoint)
     } yield
@@ -980,45 +987,43 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   /** Build a fully-wired checkpoint + a manager whose `shardEtaFor` resolves to `realShardEta` and whose `vrfRegistry` maps the signer to
-    * the supplied VK, then run the DETERMINISTIC `verifyEmbedded` adopt-verifier with `kQuorum = 1` — so the single signer meets quorum and
-    * the ONLY thing that can flip Accepted→Rejected is the per-signer pre-check (where the committee-VRF verify lives). This isolates the
-    * VRF verify as the decision under test (a valid proof ⇒ Accepted; a forged/wrong-epoch/impersonated proof ⇒ Rejected at pre-check).
+    * the supplied VK, then run the DETERMINISTIC `verifyEmbedded` adopt-verifier. The only thing that can flip Accepted→Rejected is the
+    * per-signer pre-check (where the committee-VRF verify lives). This isolates the VRF verify as the decision under test (a valid proof ⇒
+    * Accepted; a forged/wrong-epoch/impersonated proof ⇒ Rejected at pre-check).
     */
   private def mkVrfScenario(
-    sigForCheckpoint: (ShardCheckpoint, ShardSlotLeader[IO]) => IO[(CommitteeMemberSignature, Array[Byte])],
+    sigForCheckpoint: ShardCheckpoint => IO[(CommitteeMemberSignature, Array[Byte])],
     registryVkFor: (PeerId, Array[Byte]) => Map[PeerId, Array[Byte]],
     managerShardEta: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]],
     signerPeer: PeerId,
     selfPeer: PeerId
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointAcceptResult] =
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], checkpointSigner: RegisteredCheckpointSigner): IO[ShardCheckpointAcceptResult] = {
+    val mg = Address.fromBytes("mg-vrf".getBytes("UTF-8"))
+    val binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
+    val delta = mkDelta(mg, Hash("11" * 32), binary)
+    val shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
     for {
-      slotLeader <- mkSlotLeader
-      mg = Address.fromBytes("mg-vrf".getBytes("UTF-8"))
-      binary = mkSignedBinary("binary-content".getBytes("UTF-8"))
-      delta = mkDelta(mg, Hash("11" * 32), binary)
-      shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
-      (sig, vrfVk) <- sigForCheckpoint(shell, slotLeader)
+      (sig, vrfVk) <- sigForCheckpoint(shell)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig))
       (_, triggers) <- mkFinalityTriggers(kQuorum = 1, k1Shard = 100L, chainLength = 5, selfId = selfPeer)
       mgr <- mkManager(
         finalityTriggers = Map(shardZero -> triggers),
         committeeMembership = Set(signerPeer),
-        kQuorum = 1,
-        selfId = selfPeer,
-        vrfRegistry = VrfRegistry.make[IO](registryVkFor(signerPeer, vrfVk)),
+        vrfRegistryOverride = VrfRegistry.make[IO](registryVkFor(signerPeer, vrfVk)).some,
         shardEtaFor = managerShardEta
       )
       result <- mgr.verifyEmbedded(checkpoint)
     } yield result
+  }
 
   test("real VRF verify: valid committee member's proof (registered VK, correct (shardEta, slot)) → Accepted") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
       result <- mkVrfScenario(
         // Real proof over the SAME `realShardEta` the manager resolves; signer's real VK registered.
-        sigForCheckpoint = (shell, slotLeader) => mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, realShardEta),
+        sigForCheckpoint = shell => mkRealVrfSig(shell, signerKp, signerPeer, realShardEta),
         registryVkFor = (peer, vk) => Map(peer -> vk),
         managerShardEta = (_, _) => IO.pure(realShardEta.some),
         signerPeer = signerPeer,
@@ -1028,7 +1033,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   test("real VRF verify: forged (garbage) VRF proof under a registered VK → Rejected") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
@@ -1036,20 +1041,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         // Registered VK, but the 80-byte proof is garbage (structurally length-valid so it passes the old placeholder, but the REAL
         // EcVrf25519 verify must reject it). Use the signer's real VK so membership + the registry lookup both pass and only the
         // cryptographic verify can fail.
-        sigForCheckpoint = (shell, _) =>
+        sigForCheckpoint = shell =>
           for {
-            preimageHash <- Hasher[IO].hash(shell.signingPreimage)
-            edSig <- Signing.signData[IO](preimageHash.getBytes)(signerKp.getPrivate)
+            validSig <- checkpointSigner.sign(shell, signerKp, signerPeer, realShardEta)
             (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(signerKp)
           } yield
             (
-              CommitteeMemberSignature(
-                peerId = signerPeer,
-                vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)), // 80 bytes (passes structural) but NOT a valid proof
-                ed25519Sig = Hex.fromBytes(edSig),
-                kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)),
-                kesTreeStep = 0
-              ),
+              validSig.copy(vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte))),
               vrfVk
             ),
         registryVkFor = (peer, vk) => Map(peer -> vk),
@@ -1065,7 +1063,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   test("real VRF verify: wrong-epoch eta (proof over a DIFFERENT shardEta than the manager resolves) → Rejected") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     // Producer signed under one epoch's eta; the manager resolves a DIFFERENT epoch's eta (a wrong-epoch replay). The VRF message
     // differs ⇒ the cryptographic verify fails. This is the load-bearing cross-epoch-replay guard.
     val otherEta: Array[Byte] = Array.tabulate[Byte](32)(i => (i * 13 + 5).toByte)
@@ -1073,7 +1071,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       (signerKp, signerPeer) <- mkSigner
       (_, selfPeer) <- mkSigner
       result <- mkVrfScenario(
-        sigForCheckpoint = (shell, slotLeader) => mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, otherEta), // proof over otherEta
+        sigForCheckpoint = shell => mkRealVrfSig(shell, signerKp, signerPeer, otherEta), // proof over otherEta
         registryVkFor = (peer, vk) => Map(peer -> vk),
         managerShardEta = (_, _) => IO.pure(realShardEta.some), // manager resolves realShardEta ≠ otherEta
         signerPeer = signerPeer,
@@ -1087,7 +1085,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   test("real VRF verify: impersonation — registry maps the signer to a DIFFERENT VK than signed the proof → Rejected") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       (otherKp, _) <- mkSigner
@@ -1096,7 +1094,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // registered (wrong) VK fails — a peer cannot pass off another operator's committee slot.
       (otherVrfVk: Array[Byte]) = VrfKeyDeriver.deriveVrfKeyPair(otherKp)._2
       result <- mkVrfScenario(
-        sigForCheckpoint = (shell, slotLeader) => mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, realShardEta),
+        sigForCheckpoint = shell => mkRealVrfSig(shell, signerKp, signerPeer, realShardEta),
         registryVkFor = (peer, _) => Map(peer -> otherVrfVk), // wrong VK for this peer
         managerShardEta = (_, _) => IO.pure(realShardEta.some),
         signerPeer = signerPeer,
@@ -1110,18 +1108,17 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   test("real VRF verify: determinism — two managers (same registry + eta) reach the SAME verdict for the same checkpoint") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     // The verify is a pure function of (vrfRegistry, shardEtaFor, proof bytes). Two managers built with byte-identical registry + eta
     // resolve identically — the #261 split-safety property for the consensus-gating pre-check.
     for {
       (signerKp, signerPeer) <- mkSigner
       (_, selfA) <- mkSigner
       (_, selfB) <- mkSigner
-      slotLeader <- mkSlotLeader
       mg = Address.fromBytes("mg-vrf-det".getBytes("UTF-8"))
       delta = mkDelta(mg, Hash("11" * 32), mkSignedBinary("c".getBytes("UTF-8")))
       shell = mkCheckpointShell(shardOrd = 1L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
-      (sig, vrfVk) <- mkRealVrfSig(shell, signerKp, signerPeer, slotLeader, realShardEta)
+      (sig, vrfVk) <- mkRealVrfSig(shell, signerKp, signerPeer, realShardEta)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig))
       registry = VrfRegistry.make[IO](Map(signerPeer -> vrfVk))
       etaFor = (_: ShardId, _: EtaPeriod) => IO.pure(realShardEta.some)
@@ -1130,17 +1127,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       mgrA <- mkManager(
         finalityTriggers = Map(shardZero -> triggersA),
         committeeMembership = Set(signerPeer),
-        kQuorum = 1,
-        selfId = selfA,
-        vrfRegistry = registry,
+        vrfRegistryOverride = registry.some,
         shardEtaFor = etaFor
       )
       mgrB <- mkManager(
         finalityTriggers = Map(shardZero -> triggersB),
         committeeMembership = Set(signerPeer),
-        kQuorum = 1,
-        selfId = selfB,
-        vrfRegistry = registry,
+        vrfRegistryOverride = registry.some,
         shardEtaFor = etaFor
       )
       rA <- mgrA.verifyEmbedded(checkpoint)
@@ -1153,7 +1146,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   // ============================================================================
 
   test("fixture sanity: mkSignedCheckpoint produces a Signed envelope") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp, signerPeer) <- mkSigner
       mg = Address.fromBytes("mg-sanity".getBytes("UTF-8"))

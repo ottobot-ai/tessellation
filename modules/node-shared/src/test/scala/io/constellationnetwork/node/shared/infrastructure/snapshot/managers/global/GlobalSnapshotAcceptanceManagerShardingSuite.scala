@@ -35,7 +35,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.{PricingUpdate, SpendAction}
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
@@ -82,8 +82,8 @@ import weaver.MutableIOSuite
   *   - The `ShardCheckpointGl0AcceptanceManager` is fully stubbed (returns a configurable result per call) — no real KES/Ed25519/VRF
   *     fixture is needed; the GSAM contract under test is "adopt accepted checkpoint outputs into the currency pipeline", not "verify
   *     checkpoint crypto" (which is [[ShardCheckpointGl0AcceptanceManagerSuite]]'s job).
-  *   - `MetagraphSyncManager` is real (constructed from production `make`), so `consumeReceipts` actually drains into its internal
-  *     accumulator.
+  *   - `MetagraphSyncManager` is real (constructed from production `make`), so acknowledgement/pending-ordinal state uses the production
+  *     transition rather than a receipt accumulator.
   *
   * The byte-exactness equivalence between the adopt path and re-execution (the load-bearing #259 claim) is proven separately in
   * [[GlobalSnapshotAcceptanceManagerAdoptParitySuite]] with a real processor.
@@ -101,6 +101,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
 
   // Reused metrics — see Mocks.scala scaladoc for why NoOpMetrics is the test-time choice.
   implicit val metrics: Metrics[IO] = NoOpMetrics.make
+  implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
 
   // ============================================================================
   // Fixtures
@@ -132,11 +133,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private def mkDelta(mg: Address, binary: Signed[StateChannelSnapshotBinary]): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mg -> Hash("11" * 32)),
-      perMetagraphStateDiff = SortedMap.empty,
-      includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary)),
-      tokenLockBalancesDelta = SortedMap.empty,
-      perMetagraphArtifacts = SortedMap.empty,
-      perMetagraphSyncDataDelta = SortedMap.empty
+      includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary))
     )
 
   /** Build a minimal checkpoint shell. The signatures field is a placeholder — the stubbed manager doesn't verify it. */
@@ -144,8 +141,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     shardId: ShardId,
     shardOrd: Long,
     gl0Anchor: Long,
-    delta: ShardDerivedStateDelta,
-    receipts: List[CrossShardReceipt] = List.empty
+    delta: ShardDerivedStateDelta
   ): ShardCheckpoint = {
     val placeholderPeerId = io.constellationnetwork.schema.peer.PeerId(Hex("ab" * 64))
     val placeholderSig = CommitteeMemberSignature(
@@ -162,7 +158,6 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = delta,
-      emittedReceipts = receipts,
       committeeSignatures = NonEmptyList.of(placeholderSig),
       epoch = epochZero
     )
@@ -212,8 +207,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
           CurrencySnapshot
         ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
-        adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(
         implicit hasher: Hasher[IO]
       ): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
@@ -236,12 +230,61 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
           incomingCurrencySnapshotsWithState = SortedMap.empty[Address, List[CurrencySnapshotWithState]]
         )
 
-      override def deriveMetagraphRoot(
-        metagraphAddress: Address,
-        binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
+    }
+
+  /** Deterministic processor fixture that reports a supplied recreated currency state for every replayed binary. */
+  private def mkSuccessfulReplayProcessor(
+    recreatedState: CurrencySnapshotWithState
+  ): GlobalSnapshotStateChannelEventsProcessor[IO] =
+    new GlobalSnapshotStateChannelEventsProcessor[IO] {
+      override def process(
         snapshotOrdinal: SnapshotOrdinal,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        events: List[StateChannelOutput],
+        validationType: StateChannelValidationType,
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
-      )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
+      )(implicit hasher: Hasher[IO]): IO[StateChannelAcceptanceResult] =
+        IO.pure(
+          StateChannelAcceptanceResult(
+            SortedMap.empty,
+            priorLastCurrencySnapshots,
+            Set.empty,
+            SortedMap.empty,
+            SortedMap.empty
+          )
+        )
+
+      override def processCurrencySnapshots(
+        snapshotOrdinal: SnapshotOrdinal,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
+        IO.pure(events.map { case (mg, binaries) => mg -> (binaries.map(_ -> recreatedState.some), SortedMap.empty[Address, Balance]) })
+
+      override def assembleAcceptanceResult(
+        processed: SortedMap[Address, MetagraphAcceptanceResult],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        returned: Set[StateChannelOutput]
+      ): StateChannelAcceptanceResult = {
+        val recreated = SortedMap.from(processed.toList.flatMap { case (mg, (pairs, _)) => pairs.last._2.map(mg -> _) })
+        StateChannelAcceptanceResult(
+          accepted = processed.map { case (mg, (pairs, _)) => mg -> pairs.map(_._1) },
+          calculatedCurrencyState = priorLastCurrencySnapshots ++ recreated,
+          returned = returned,
+          balanceUpdate = SortedMap.empty,
+          incomingCurrencySnapshotsWithState = SortedMap.empty
+        )
+      }
     }
 
   /** Stubbed `ShardCheckpointGl0AcceptanceManager` — returns the configured result per checkpoint and records every call.
@@ -252,18 +295,23 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     */
   private final case class StubAcceptanceManager(
     callsRef: Ref[IO, List[ShardCheckpoint]],
-    decision: ShardCheckpoint => ShardCheckpointAcceptResult
+    decision: ShardCheckpoint => ShardCheckpointAcceptResult,
+    adoptedRef: Option[Ref[IO, List[(ShardId, ShardOrdinal, Hash)]]] = None
   ) extends ShardCheckpointGl0AcceptanceManager[IO] {
     override def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
+    override def verifyCommitteeSignature(
+      checkpoint: ShardCheckpoint,
+      signature: CommitteeMemberSignature
+    ): IO[Either[String, Unit]] = IO.pure(Right(()))
     override def noteAdopted(
       shardId: io.constellationnetwork.schema.sharding.ShardId,
       shardOrdinal: ShardOrdinal,
       checkpointHash: io.constellationnetwork.security.hash.Hash
     ): IO[Unit] =
-      IO.unit
+      adoptedRef.traverse_(_.update(_ :+ (shardId, shardOrdinal, checkpointHash)))
     override def lastAdoptedOrd(shardId: io.constellationnetwork.schema.sharding.ShardId): IO[Option[ShardOrdinal]] =
       IO.pure(None)
     override def lastAdoptedAnchor(
@@ -579,9 +627,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     ShardingConfig(
       numShards = numShards,
       finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
-      slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
+      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
     )
 
   /** Shared no-op rewards function — none of the suite tests exercise the rewards path. */
@@ -816,6 +863,70 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       )
   }
 
+  test("checkpoint watermark advances only after its selected MG replay matches the claimed root") { res =>
+    implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("31" * 64)), Signature(Hex("32" * 70)))
+      val recreatedState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(stateProof)))
+
+      for {
+        mg <- IO.pure(mkAddress("ack-after-replay"))
+        binary = mkSignedBinary("ack-after-replay-content".getBytes("UTF-8"))
+        root <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> recreatedState))
+        delta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(mg -> root),
+          includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary))
+        )
+        cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, delta)
+        calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+        adoptions <- Ref.of[IO, List[(ShardId, ShardOrdinal, Hash)]](Nil)
+        stub = StubAcceptanceManager(calls, _ => ShardCheckpointAcceptResult.Accepted, Some(adoptions))
+        mgr <- mkSuiteManagerWithProcessor(
+          Some(mkShardingConfig(numShards = 4)),
+          Some(stub),
+          mkSuccessfulReplayProcessor(recreatedState)
+        )
+        _ <- invokeAccept(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+        recorded <- adoptions.get
+      } yield expect(recorded.map { case (shard, ord, _) => shard -> ord } == List(cp.shardId -> cp.shardOrdinal))
+    }
+  }
+
+  test("one failed MG root suppresses the whole checkpoint watermark and fork anchor") { res =>
+    implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("41" * 64)), Signature(Hex("42" * 70)))
+      val recreatedState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(stateProof)))
+
+      for {
+        goodMg <- IO.pure(mkAddress("ack-partial-good"))
+        badMg <- IO.pure(mkAddress("ack-partial-bad"))
+        goodBinary = mkSignedBinary("ack-partial-good-content".getBytes("UTF-8"))
+        badBinary = mkSignedBinary("ack-partial-bad-content".getBytes("UTF-8"))
+        goodRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(goodMg -> recreatedState))
+        badRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(badMg -> recreatedState))
+        wrongBadRoot = if (badRoot === Hash("ff" * 32)) Hash("ee" * 32) else Hash("ff" * 32)
+        delta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(goodMg -> goodRoot, badMg -> wrongBadRoot),
+          includedSnapshots = SortedMap(goodMg -> NonEmptyList.of(goodBinary), badMg -> NonEmptyList.of(badBinary))
+        )
+        cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, delta)
+        calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+        adoptions <- Ref.of[IO, List[(ShardId, ShardOrdinal, Hash)]](Nil)
+        stub = StubAcceptanceManager(calls, _ => ShardCheckpointAcceptResult.Accepted, Some(adoptions))
+        mgr <- mkSuiteManagerWithProcessor(
+          Some(mkShardingConfig(numShards = 4)),
+          Some(stub),
+          mkSuccessfulReplayProcessor(recreatedState)
+        )
+        _ <- invokeAccept(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+        recorded <- adoptions.get
+      } yield expect(recorded.isEmpty)
+    }
+  }
+
   // ============================================================================
   // Test 4b (W3c ACTIVATION): at numShards>1 the GSAM builds + uses the PER-ACCEPT sharded SpendActionValidator
   //   (cross-shard-capable, overlay bound to this accept's spent-set/epochs) — so the INJECTED unsharded validator
@@ -1028,128 +1139,69 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 8: three-paths byte-identity — produce / createContext / validateArtifact all funnel through accept()
-  //         with the SAME embedded checkpoints + prior state ⇒ byte-identical accepted state + state proof.
+  // Test 8: independent-node accept byte-identity — the same embedded checkpoints + prior state produce
+  //         byte-identical accepted state + state proof on independent manager instances.
   // ============================================================================
 
-  /** The central-invariant GSAM-level test. Produce embeds the `verifyEmbedded`-accepted checkpoints into the artifact; `createContext` and
-    * `validateArtifact` read them back from `artifact.shardCheckpoints` and thread them into accept(). So all three paths invoke `accept()`
-    * with the SAME `(shardCheckpoints, scEvents, lastSnapshotContext)`. Because the adopt path is a pure function of those inputs
-    * (deterministic `verifyEmbedded` + the deterministic CHANGE-3 filter + the shared assembly), three INDEPENDENT GSAM instances (three
-    * nodes) produce byte-identical accepted `scSnapshots` and state-proof `mptRoot`. This is the byte-identity the symmetric-adopt design
-    * guarantees. The CHANGE-3 filter is also exercised: a raw `scEvent` for a sharded MG is excluded from the base path (it would otherwise
-    * diverge per node), leaving the adopt path as the sole source for sharded MGs.
+  /** GSAM accept-level determinism test. Three independent manager instances receive the same `(shardCheckpoints, scEvents,
+    * lastSnapshotContext)` and must produce byte-identical accepted `scSnapshots` and state-proof `mptRoot`. This test does not exercise
+    * the outer `produce`, `createContext`, or `validateArtifact` wiring. The CHANGE-3 filter is also exercised: a raw `scEvent` for a
+    * sharded MG is excluded from the base path, leaving independently replayed checkpoint inputs as the sole source for sharded MGs.
     */
-  test("three paths byte-identical: accept() over the same embedded checkpoints + prior state is node-independent") { res =>
+  test("three independent managers produce byte-identical accept results from the same checkpoint inputs") { res =>
     implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val replayProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("51" * 64)), Signature(Hex("52" * 70)))
+      val recreatedState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(replayProof)))
 
-    // A processor that DERIVES a deterministic non-empty result from the adopted snapshots, so the comparison is meaningful
-    // (not trivially-empty). `processCurrencySnapshots` echoes each adopted binary as a `(binary, None)` pair with an empty
-    // balance update; `assembleAcceptanceResult` inlines the SAME pure projection production uses (deterministic by inputs).
-    val derivingProcessor: GlobalSnapshotStateChannelEventsProcessor[IO] =
-      new GlobalSnapshotStateChannelEventsProcessor[IO] {
-        override def process(
-          snapshotOrdinal: SnapshotOrdinal,
-          currentBalances: SortedMap[Address, Balance],
-          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
-          priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
-            CurrencySnapshot
-          ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
-          events: List[StateChannelOutput],
-          validationType: StateChannelValidationType,
-          getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
-        )(implicit hasher: Hasher[IO]): IO[StateChannelAcceptanceResult] =
-          // Base path only ever sees the (filtered) non-sharded events; with a total assignment that's empty. Echo whatever
-          // (non-sharded) events arrive as accepted so the base result is faithful; CHANGE 3 means this is empty in this test.
-          StateChannelAcceptanceResult(
-            accepted =
-              SortedMap.from(events.groupBy(_.address).map { case (a, es) => a -> NonEmptyList.fromListUnsafe(es.map(_.snapshotBinary)) }),
-            calculatedCurrencyState = SortedMap.empty[Address, CurrencySnapshotWithState],
-            returned = Set.empty[StateChannelOutput],
-            balanceUpdate = SortedMap.empty[Address, Balance],
-            incomingCurrencySnapshotsWithState = SortedMap.empty[Address, List[CurrencySnapshotWithState]]
-          ).pure[IO]
+      // A processor that derives the same deterministic currency state from every adopted binary, so GL0 can independently
+      // recreate and compare a non-empty state claim before including the metagraph in the accepted result.
+      val derivingProcessor = mkSuccessfulReplayProcessor(recreatedState)
 
-        override def processCurrencySnapshots(
-          snapshotOrdinal: SnapshotOrdinal,
-          currentBalances: SortedMap[Address, Balance],
-          priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
-            CurrencySnapshot
-          ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
-          events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-          getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
-          adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
-        )(implicit hasher: Hasher[IO]): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
-          events.map {
-            case (addr, bins) => addr -> ((bins.map(b => (b, none[CurrencySnapshotWithState])), SortedMap.empty[Address, Balance]))
-          }.pure[IO]
+      // Build a fresh GSAM instance whose processor is the deriving processor — represents one node. Each call is independent;
+      // the verifyEmbedded-Accepted stub + the wired shardAssignment make this an end-to-end adopt path.
+      def mkNodeManager(): IO[GlobalSnapshotAcceptanceManager[IO]] =
+        for {
+          checkpointCallsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+          stubMgr = StubAcceptanceManager(checkpointCallsRef, _ => ShardCheckpointAcceptResult.Accepted)
+          mgr <- mkSuiteManagerWithProcessor(Some(mkShardingConfig(numShards = 4)), Some(stubMgr), derivingProcessor)
+        } yield mgr
 
-        override def assembleAcceptanceResult(
-          processed: SortedMap[Address, MetagraphAcceptanceResult],
-          priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
-            CurrencySnapshot
-          ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
-          returned: Set[StateChannelOutput]
-        ): StateChannelAcceptanceResult = {
-          // Inlined production projection (pure ⇒ deterministic by inputs); identical across all three node instances.
-          val lastStatePerAddress: SortedMap[Address, CurrencySnapshotWithState] =
-            processed.map { case (k, (v, _)) => k -> v.toList.flatMap(_._2).lastOption }.collect { case (key, Some(s)) => key -> s }
-          val incoming: SortedMap[Address, List[CurrencySnapshotWithState]] =
-            processed.map { case (k, (v, _)) => k -> v.toList.flatMap(_._2) }.filterNot { case (_, list) => list.isEmpty }
-          StateChannelAcceptanceResult(
-            accepted = processed.map { case (k, (v, _)) => k -> v.map(_._1) },
-            calculatedCurrencyState = priorLastCurrencySnapshots.concat(lastStatePerAddress),
-            returned = returned,
-            balanceUpdate = processed.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _),
-            incomingCurrencySnapshotsWithState = incoming
-          )
-        }
-
-        override def deriveMetagraphRoot(
-          metagraphAddress: Address,
-          binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-          snapshotOrdinal: SnapshotOrdinal,
-          getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
-        )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
-      }
-
-    // Build a fresh GSAM instance whose processor is the deriving processor — represents one node. Each call is independent;
-    // the verifyEmbedded-Accepted stub + the wired shardAssignment make this an end-to-end adopt path.
-    def mkNodeManager(): IO[GlobalSnapshotAcceptanceManager[IO]] =
       for {
-        checkpointCallsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-        stubMgr = StubAcceptanceManager(checkpointCallsRef, _ => ShardCheckpointAcceptResult.Accepted)
-        mgr <- mkSuiteManagerWithProcessor(Some(mkShardingConfig(numShards = 4)), Some(stubMgr), derivingProcessor)
-      } yield mgr
+        mgSharded <- IO.pure(mkAddress("three-paths-sharded-mg"))
+        binarySharded = mkSignedBinary("three-paths-content".getBytes("UTF-8"))
+        recreatedRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mgSharded -> recreatedState))
+        delta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(mgSharded -> recreatedRoot),
+          includedSnapshots = SortedMap(mgSharded -> NonEmptyList.of(binarySharded))
+        )
+        cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, delta)
+        embedded = SortedMap[ShardId, ShardCheckpoint](cp.shardId -> cp)
+        // A raw scEvent for a (sharded) MG — CHANGE 3 must exclude it from the base path on every node.
+        rawShardedEvent = StateChannelOutput(mkAddress("three-paths-raw-sharded"), mkSignedBinary("raw".getBytes("UTF-8")))
 
-    for {
-      mgSharded <- IO.pure(mkAddress("three-paths-sharded-mg"))
-      binarySharded = mkSignedBinary("three-paths-content".getBytes("UTF-8"))
-      cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, mkDelta(mgSharded, binarySharded))
-      embedded = SortedMap[ShardId, ShardCheckpoint](cp.shardId -> cp)
-      // A raw scEvent for a (sharded) MG — CHANGE 3 must exclude it from the base path on every node.
-      rawShardedEvent = StateChannelOutput(mkAddress("three-paths-raw-sharded"), mkSignedBinary("raw".getBytes("UTF-8")))
-
-      // Three independent node instances all run accept() with the SAME embedded checkpoints + scEvents + prior state.
-      mgrProduce <- mkNodeManager()
-      mgrCreateContext <- mkNodeManager()
-      mgrValidate <- mkNodeManager()
-      produce <- invokeAcceptCapturing(mgrProduce, List(rawShardedEvent), embedded, emptyGsi)
-      createCtx <- invokeAcceptCapturing(mgrCreateContext, List(rawShardedEvent), embedded, emptyGsi)
-      validate <- invokeAcceptCapturing(mgrValidate, List(rawShardedEvent), embedded, emptyGsi)
-    } yield
-      expect.all(
-        // The adopted sharded MG is in the accepted scSnapshots (adopt path produced it) ...
-        produce._1.keySet.contains(mgSharded),
-        // ... and the raw sharded event was EXCLUDED from the base path (CHANGE 3) — its address is not present.
-        !produce._1.keySet.contains(rawShardedEvent.address),
-        // All three paths: byte-identical accepted scSnapshots ...
-        produce._1 == createCtx._1,
-        produce._1 == validate._1,
-        // ... and byte-identical state-proof mptRoot.
-        produce._2 == createCtx._2,
-        produce._2 == validate._2
-      )
+        // Three independent node instances all run accept() with the SAME embedded checkpoints + scEvents + prior state.
+        mgrProduce <- mkNodeManager()
+        mgrCreateContext <- mkNodeManager()
+        mgrValidate <- mkNodeManager()
+        produce <- invokeAcceptCapturing(mgrProduce, List(rawShardedEvent), embedded, emptyGsi)
+        createCtx <- invokeAcceptCapturing(mgrCreateContext, List(rawShardedEvent), embedded, emptyGsi)
+        validate <- invokeAcceptCapturing(mgrValidate, List(rawShardedEvent), embedded, emptyGsi)
+      } yield
+        expect.all(
+          // The adopted sharded MG is in the accepted scSnapshots only after recreated state matched the claimed root.
+          produce._1.keySet.contains(mgSharded),
+          // The raw sharded event was EXCLUDED from the base path (CHANGE 3) — its address is not present.
+          !produce._1.keySet.contains(rawShardedEvent.address),
+          // All three independent managers: byte-identical accepted scSnapshots ...
+          produce._1 == createCtx._1,
+          produce._1 == validate._1,
+          // ... and byte-identical state-proof mptRoot.
+          produce._2 == createCtx._2,
+          produce._2 == validate._2
+        )
+    }
   }
 
   // ============================================================================
@@ -1172,11 +1224,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private def wtCheckpoint(mg: Address, attestedRoot: Hash): ShardCheckpoint = {
     val delta = ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
-      perMetagraphStateDiff = SortedMap.empty,
-      includedSnapshots = SortedMap(mg -> NonEmptyList.of(mkSignedBinary("wt-content".getBytes("UTF-8")))),
-      tokenLockBalancesDelta = SortedMap.empty,
-      perMetagraphArtifacts = SortedMap.empty,
-      perMetagraphSyncDataDelta = SortedMap.empty
+      includedSnapshots = SortedMap(mg -> NonEmptyList.of(mkSignedBinary("wt-content".getBytes("UTF-8"))))
     )
     mkCheckpoint(ShardId.unsafeApply(0), shardOrd = 1L, gl0Anchor = 2L, delta = delta)
   }

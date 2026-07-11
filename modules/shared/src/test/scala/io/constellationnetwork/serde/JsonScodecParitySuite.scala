@@ -8,11 +8,10 @@ import scala.io.Source
 import scala.util.Using
 
 import io.constellationnetwork.currency.schema.currency.CurrencySnapshotInfo
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot, GlobalSnapshotInfo}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
 import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotCodecs._
-import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotInfoCodec._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec._
 import io.constellationnetwork.serde.implicits._
 
@@ -31,6 +30,9 @@ import weaver.MutableIOSuite
   *
   * A mismatch means our scodec codec for `T` doesn't faithfully round-trip the Scala representation of live on-disk data. This is the
   * validation layer that catches field-order / Option / sum-type mistakes the unit-level round-trip tests would miss.
+  *
+  * The upstream-v4 incremental fixtures predate this greenfield fork's mandatory shard fields. They are rejection fixtures, not a reason to
+  * default absent fork-only fields; current non-empty incremental coverage lives in `ShardingScodecCodecsSuite`.
   */
 object JsonScodecParitySuite extends MutableIOSuite {
 
@@ -64,61 +66,23 @@ object JsonScodecParitySuite extends MutableIOSuite {
     scodecDecoded == circeDecoded
   }
 
+  private def currentSchemaRejects[T: Decoder](fixtureName: String): Boolean = {
+    val json = brotliToJson(readFixture(fixtureName))
+    decode[T](json).isLeft
+  }
+
   // ---- Tests --------------------------------------------------------------
 
-  test("incremental_snapshot ordinal=1 round-trips through scodec") { _ =>
-    IO(
-      expect(
-        parityCheck[Signed[GlobalIncrementalSnapshot]](
-          "incremental_snapshot_ordinal_1.brotli",
-          signedImmutableCodec(globalIncrementalSnapshotCodec)
-        )
-      )
+  test("upstream-v4 incremental fixtures are rejected by the strict greenfield schema") { _ =>
+    val preGreenfieldFixtures = List(
+      "incremental_snapshot_ordinal_1.brotli",
+      "incremental_snapshot_ordinal_10.brotli",
+      "incremental_snapshot_ordinal_100.brotli",
+      "incremental_snapshot_ordinal_500.brotli",
+      "incremental_snapshot_ordinal_700.brotli"
     )
-  }
 
-  test("incremental_snapshot ordinal=10 round-trips through scodec") { _ =>
-    IO(
-      expect(
-        parityCheck[Signed[GlobalIncrementalSnapshot]](
-          "incremental_snapshot_ordinal_10.brotli",
-          signedImmutableCodec(globalIncrementalSnapshotCodec)
-        )
-      )
-    )
-  }
-
-  test("incremental_snapshot ordinal=100 round-trips through scodec") { _ =>
-    IO(
-      expect(
-        parityCheck[Signed[GlobalIncrementalSnapshot]](
-          "incremental_snapshot_ordinal_100.brotli",
-          signedImmutableCodec(globalIncrementalSnapshotCodec)
-        )
-      )
-    )
-  }
-
-  test("incremental_snapshot ordinal=500 round-trips through scodec") { _ =>
-    IO(
-      expect(
-        parityCheck[Signed[GlobalIncrementalSnapshot]](
-          "incremental_snapshot_ordinal_500.brotli",
-          signedImmutableCodec(globalIncrementalSnapshotCodec)
-        )
-      )
-    )
-  }
-
-  test("incremental_snapshot ordinal=700 round-trips through scodec") { _ =>
-    IO(
-      expect(
-        parityCheck[Signed[GlobalIncrementalSnapshot]](
-          "incremental_snapshot_ordinal_700.brotli",
-          signedImmutableCodec(globalIncrementalSnapshotCodec)
-        )
-      )
-    )
+    IO(expect(preGreenfieldFixtures.forall(currentSchemaRejects[Signed[GlobalIncrementalSnapshot]])))
   }
 
   test("full_snapshot genesis round-trips through scodec") { _ =>

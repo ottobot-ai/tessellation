@@ -63,9 +63,8 @@ trait ShardChainStore[F[_]] {
     * Note: `shardOrdinal`, `slot`, and `vrfOutput` are passed explicitly (rather than read off the `ShardCheckpoint`) because:
     *   - `shardOrdinal` is part of the checkpoint envelope already; passing it again is a redundant sanity check that callers and the
     *     envelope agree, matching the gl0 chain-store API shape (where `ordinal` is also passed alongside the snapshot).
-    *   - `slot` and `vrfOutput` are NOT carried on the checkpoint envelope itself — they come from the slot-leader VRF outcome at the
-    *     producer (§5.3), and the verifier reproduces them by running the VRF. The chain-store needs them for fork-choice (`maxvalid-tk`
-    *     reads slot + vrfOutput), so they ride the API alongside the checkpoint.
+    *   - `slot` is carried on the checkpoint and is repeated here for the same sanity-check/API-shape reason. `vrfOutput` is derived from
+    *     the registered-key possession proof and cached for the current fork-choice tiebreak.
     */
   def store(
     checkpoint: Signed[ShardCheckpoint],
@@ -137,7 +136,7 @@ trait ShardChainStore[F[_]] {
     */
   def getByOrdinal(shardOrdinal: ShardOrdinal): F[Option[Hashed[ShardCheckpoint]]]
 
-  /** Highest shard-ordinal that has been finalized via `finalize`. Defaults to `ShardOrdinal.Genesis` (0) at construction. */
+  /** Highest shard-ordinal that has been finalized via `finalize`. Defaults to `ShardOrdinal.Root` (0) at construction. */
   def lastFinalizedOrdinal: F[ShardOrdinal]
 
   /** Number of entries currently in `byHash`. Diagnostic; production callers should not depend on this for control flow. */
@@ -166,11 +165,11 @@ object ShardChainStore {
     * @param shardOrdinal
     *   the chain height within this shard (also carried on the envelope; replicated here for fast access)
     * @param slot
-    *   the gl0-wide slot at which the producer was leader (used by `maxvalid-tk` for tiebreaks)
+    *   the signed GL0-wide slot in which staircase duty authorized the producer
     * @param parentHash
     *   the parent checkpoint hash, used for chain-walking
     * @param vrfOutput
-    *   raw VRF bytes from the slot-leader proof; used as the final `maxvalid-tk` tiebreak (lower BigInt wins)
+    *   raw output derived from the registered-key possession proof; currently used as the final `maxvalid-tk` tiebreak
     */
   case class StoredShardCheckpoint(
     signedCheckpoint: Signed[ShardCheckpoint],
@@ -210,7 +209,7 @@ object ShardChainStore {
   )
 
   object ChainState {
-    val empty: ChainState = ChainState(Map.empty, None, ShardOrdinal.Genesis, Set.empty, Map.empty, None)
+    val empty: ChainState = ChainState(Map.empty, None, ShardOrdinal.Root, Set.empty, Map.empty, None)
   }
 
   /** Construct a per-shard chain store.
@@ -245,117 +244,154 @@ object ShardChainStore {
           slot: Long,
           vrfOutput: Array[Byte]
         ): F[Boolean] =
-          // Compute both hashes:
-          //   - `snapshotHash` = `Hasher[F]` over `ShardCheckpointSigPreimage` (design doc §3.3). This is the bytes every committee
-          //     member signed. The store keys its `byHash` map by this so lookups by canonical-hash work everywhere.
-          //   - `proofsHash` = `Hasher[F]` over the outer Signed envelope's proofs set — carried on the `Hashed` wrapper for parity with
-          //     the standard contract (no synthesized placeholder).
-          (deriveHash(checkpoint), checkpoint.proofsHash[F]).tupled.flatMap {
-            case (snapshotHash, sigProofsHash) =>
-              val stored = StoredShardCheckpoint(
-                signedCheckpoint = checkpoint,
-                hash = snapshotHash,
-                proofsHash = sigProofsHash,
-                shardOrdinal = shardOrdinal,
-                slot = slot,
-                parentHash = parentHash,
-                vrfOutput = vrfOutput
+          if (
+            checkpoint.value.shardId =!= outerShardId ||
+            checkpoint.value.parentCheckpointHash =!= parentHash ||
+            checkpoint.value.shardOrdinal =!= shardOrdinal ||
+            checkpoint.value.slot.value.value =!= slot
+          )
+            logger
+              .warn(
+                s"store: rejected envelope/argument mismatch shard=${checkpoint.value.shardId} expected=$outerShardId " +
+                  s"ordinal=${checkpoint.value.shardOrdinal.value}/$shardOrdinal slot=${checkpoint.value.slot.value.value}/$slot"
               )
+              .as(false)
+          else
+            // Compute both hashes:
+            //   - `snapshotHash` = `Hasher[F]` over `ShardCheckpointSigPreimage` (design doc §3.3). This is the bytes every committee
+            //     member signed. The store keys its `byHash` map by this so lookups by canonical-hash work everywhere.
+            //   - `proofsHash` = `Hasher[F]` over the outer Signed envelope's proofs set — carried on the `Hashed` wrapper for parity with
+            //     the standard contract (no synthesized placeholder).
+            (deriveHash(checkpoint), checkpoint.proofsHash[F]).tupled.flatMap {
+              case (snapshotHash, sigProofsHash) =>
+                val stored = StoredShardCheckpoint(
+                  signedCheckpoint = checkpoint,
+                  hash = snapshotHash,
+                  proofsHash = sigProofsHash,
+                  shardOrdinal = shardOrdinal,
+                  slot = slot,
+                  parentHash = parentHash,
+                  vrfOutput = vrfOutput
+                )
 
-              stateRef.modify { state =>
-                if (state.byHash.contains(snapshotHash)) {
-                  // Duplicate — already stored. Idempotent no-op.
-                  (state, logger.debug(s"store: duplicate hash=${snapshotHash.value.take(12)}; ignoring").as(false))
-                } else {
-                  val newByHash = state.byHash + (snapshotHash -> stored)
-                  val newByParent = state.byParent.updatedWith(parentHash)(c => Some(c.getOrElse(Set.empty) + snapshotHash))
+                stateRef.modify { state =>
+                  if (state.byHash.contains(snapshotHash)) {
+                    // Duplicate — already stored. Idempotent no-op.
+                    (state, logger.debug(s"store: duplicate hash=${snapshotHash.value.take(12)}; ignoring").as(false))
+                  } else {
+                    val parentOrdinalValid =
+                      if (parentHash === Hash.empty) shardOrdinal === ShardOrdinal.Root.next
+                      else state.byHash.get(parentHash).forall(parent => shardOrdinal === parent.shardOrdinal.next)
 
-                  // CONNECTIVITY: the incoming entry is connected iff its parent is genesis, a connected entry, or evicted below the
-                  // finality keep-floor (a catch-up node whose retained chain starts at the boundary). Connected entries CASCADE to any
-                  // previously-orphaned descendants waiting in `byParent`.
-                  val parentConnected: Boolean =
-                    parentHash === Hash.empty ||
-                      state.connected.contains(parentHash) ||
-                      (!state.byHash.contains(parentHash) && shardOrdinal.value <= state.lastFinalizedOrdinal.value + 1L)
-
-                  val newlyConnected: Set[Hash] =
-                    if (!parentConnected) Set.empty
+                    if (!parentOrdinalValid)
+                      (
+                        state,
+                        logger
+                          .warn(
+                            s"store: rejected non-contiguous ordinal=${shardOrdinal.value} parent=${parentHash.value.take(12)}"
+                          )
+                          .as(false)
+                      )
                     else {
-                      val acc = scala.collection.mutable.Set.empty[Hash]
-                      val queue = scala.collection.mutable.Queue(snapshotHash)
-                      while (queue.nonEmpty) {
-                        val h = queue.dequeue()
-                        if (!acc.contains(h)) {
-                          acc += h
-                          newByParent.getOrElse(h, Set.empty).foreach(queue.enqueue(_))
+                      val newByHash = state.byHash + (snapshotHash -> stored)
+                      val newByParent = state.byParent.updatedWith(parentHash)(c => Some(c.getOrElse(Set.empty) + snapshotHash))
+
+                      // CONNECTIVITY: the incoming entry is connected iff its parent is genesis, a connected entry, or evicted below the
+                      // finality keep-floor (a catch-up node whose retained chain starts at the boundary). Connected entries CASCADE to any
+                      // previously-orphaned descendants waiting in `byParent`.
+                      val parentConnected: Boolean =
+                        parentHash === Hash.empty ||
+                          state.connected.contains(parentHash) ||
+                          (!state.byHash.contains(parentHash) && shardOrdinal.value <= state.lastFinalizedOrdinal.value + 1L)
+
+                      val newlyConnected: Set[Hash] =
+                        if (!parentConnected) Set.empty
+                        else {
+                          val acc = scala.collection.mutable.Set.empty[Hash]
+                          val queue = scala.collection.mutable.Queue(snapshotHash)
+                          while (queue.nonEmpty) {
+                            val h = queue.dequeue()
+                            if (!acc.contains(h)) {
+                              acc += h
+                              val parentOrdinal = newByHash.get(h).map(_.shardOrdinal)
+                              newByParent
+                                .getOrElse(h, Set.empty)
+                                .filter(child =>
+                                  (parentOrdinal, newByHash.get(child).map(_.shardOrdinal)) match {
+                                    case (Some(parent), Some(childOrdinal)) => childOrdinal === parent.next
+                                    case _                                  => false
+                                  }
+                                )
+                                .foreach(queue.enqueue(_))
+                            }
+                          }
+                          acc.toSet
+                        }
+                      val newConnected = state.connected ++ newlyConnected
+
+                      // Resolve current tip defensively — if `bestTipHash` points at a hash no longer in `byHash` (eviction race), treat as no
+                      // best tip. Mirrors the `resolvedBest = state.bestTipHash.flatMap(...)` pattern in `NakamotoChainStore.store`.
+                      val resolvedBest: Option[StoredShardCheckpoint] =
+                        state.bestTipHash.flatMap(state.byHash.get)
+
+                      // Best tip = anchor-compatibility FIRST (task #42), then maxvalid-tk — over CONNECTED entries only. Fold every
+                      // newly-connected entry (the incoming one plus any reconnected descendants) against the current best; an orphan
+                      // store leaves the tip untouched.
+                      val newBestTipHash: Hash = {
+                        val candidates = newlyConnected.toList.flatMap(newByHash.get)
+                        val seed = resolvedBest
+                        candidates.foldLeft(seed) {
+                          case (None, cand) => Some(cand)
+                          case (Some(best), cand) =>
+                            if (compareAnchoredMaxvalid(newByHash, state.anchorHash, cand, best) > 0) Some(cand) else Some(best)
+                        } match {
+                          case Some(best) => best.hash
+                          case None       => snapshotHash // unreachable in practice: first store is genesis-connected
                         }
                       }
-                      acc.toSet
-                    }
-                  val newConnected = state.connected ++ newlyConnected
 
-                  // Resolve current tip defensively — if `bestTipHash` points at a hash no longer in `byHash` (eviction race), treat as no
-                  // best tip. Mirrors the `resolvedBest = state.bestTipHash.flatMap(...)` pattern in `NakamotoChainStore.store`.
-                  val resolvedBest: Option[StoredShardCheckpoint] =
-                    state.bestTipHash.flatMap(state.byHash.get)
+                      val newState =
+                        state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash), connected = newConnected, byParent = newByParent)
+                      // Slice 19: emit per-shard `dag_nakamoto_shard_chain_height{shard_id}` gauge whenever the bestTip moves.
+                      // The gauge follows the highest-stored-tip ord, so we only emit on the three branches where the bestTip
+                      // ACTUALLY advanced (bootstrap, linear-extension, reorg). The alternate-branch case keeps the prior tip.
+                      val newTipOrd: ShardOrdinal = ShardOrdinal(
+                        newState.byHash.get(newBestTipHash).map(_.shardOrdinal.value).getOrElse(0L)
+                      )
+                      val effect: F[Boolean] = (newBestTipHash === snapshotHash, resolvedBest) match {
+                        case (true, None) =>
+                          logger
+                            .info(s"store: chain bootstrapped at shardOrdinal=${shardOrdinal.value} slot=$slot")
+                            .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
+                            .as(true)
+                        case (true, Some(prior)) if stored.parentHash === prior.hash =>
+                          logger
+                            .debug(s"store: linear extension shardOrdinal=${shardOrdinal.value} slot=$slot")
+                            .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
+                            .as(true)
+                        case (true, Some(prior)) =>
+                          logger
+                            .info(
+                              s"store: reorg — new tip shardOrdinal=${shardOrdinal.value} slot=$slot beats " +
+                                s"prior shardOrdinal=${prior.shardOrdinal.value} slot=${prior.slot}"
+                            )
+                            .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
+                            .as(true)
+                        case (false, _) =>
+                          logger
+                            .debug(
+                              s"store: ${if (parentConnected) "alternate branch" else "ORPHAN (parent unknown — awaiting reconnect)"} " +
+                                s"shardOrdinal=${shardOrdinal.value} slot=$slot " +
+                                s"(parent=${parentHash.value.take(8)}, not switching from currentBest)"
+                            )
+                            .as(true)
+                      }
 
-                  // Best tip = anchor-compatibility FIRST (task #42), then maxvalid-tk — over CONNECTED entries only. Fold every
-                  // newly-connected entry (the incoming one plus any reconnected descendants) against the current best; an orphan
-                  // store leaves the tip untouched.
-                  val newBestTipHash: Hash = {
-                    val candidates = newlyConnected.toList.flatMap(newByHash.get)
-                    val seed = resolvedBest
-                    candidates.foldLeft(seed) {
-                      case (None, cand) => Some(cand)
-                      case (Some(best), cand) =>
-                        if (compareAnchoredMaxvalid(newByHash, state.anchorHash, cand, best) > 0) Some(cand) else Some(best)
-                    } match {
-                      case Some(best) => best.hash
-                      case None       => snapshotHash // unreachable in practice: first store is genesis-connected
+                      (newState, effect)
                     }
                   }
-
-                  val newState =
-                    state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash), connected = newConnected, byParent = newByParent)
-                  // Slice 19: emit per-shard `dag_nakamoto_shard_chain_height{shard_id}` gauge whenever the bestTip moves.
-                  // The gauge follows the highest-stored-tip ord, so we only emit on the three branches where the bestTip
-                  // ACTUALLY advanced (bootstrap, linear-extension, reorg). The alternate-branch case keeps the prior tip.
-                  val newTipOrd: ShardOrdinal = ShardOrdinal(
-                    newState.byHash.get(newBestTipHash).map(_.shardOrdinal.value).getOrElse(0L)
-                  )
-                  val effect: F[Boolean] = (newBestTipHash === snapshotHash, resolvedBest) match {
-                    case (true, None) =>
-                      logger
-                        .info(s"store: chain bootstrapped at shardOrdinal=${shardOrdinal.value} slot=$slot")
-                        .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
-                        .as(true)
-                    case (true, Some(prior)) if stored.parentHash === prior.hash =>
-                      logger
-                        .debug(s"store: linear extension shardOrdinal=${shardOrdinal.value} slot=$slot")
-                        .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
-                        .as(true)
-                    case (true, Some(prior)) =>
-                      logger
-                        .info(
-                          s"store: reorg — new tip shardOrdinal=${shardOrdinal.value} slot=$slot beats " +
-                            s"prior shardOrdinal=${prior.shardOrdinal.value} slot=${prior.slot}"
-                        )
-                        .productR(ShardMetrics.setChainHeight[F](outerShardId, newTipOrd))
-                        .as(true)
-                    case (false, _) =>
-                      logger
-                        .debug(
-                          s"store: ${if (parentConnected) "alternate branch" else "ORPHAN (parent unknown — awaiting reconnect)"} " +
-                            s"shardOrdinal=${shardOrdinal.value} slot=$slot " +
-                            s"(parent=${parentHash.value.take(8)}, not switching from currentBest)"
-                        )
-                        .as(true)
-                  }
-
-                  (newState, effect)
-                }
-              }.flatten
-          }
+                }.flatten
+            }
 
         def noteAnchor(anchorHash: Hash): F[Unit] =
           stateRef.modify { state =>

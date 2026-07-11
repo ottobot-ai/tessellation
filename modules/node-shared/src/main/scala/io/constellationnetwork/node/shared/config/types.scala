@@ -99,7 +99,7 @@ object types {
     // active env via the `confirmationDepthK(env)` accessor below — R and k₂ DERIVE from the resolved value (see the `def`s in the body).
     confirmationDepthKByEnv: Map[AppEnvironment, PosLong],
     // Slot duration in ms — the consensus time unit (§5.7: a PARAMETER, not a constant; 1000 prod / 500 fast-test).
-    // Drives the gl0 SnapshotLeaderLoop slot tick AND the per-slot shard-checkpoint lottery. Migrated from the
+    // Drives the GL0 SnapshotLeaderLoop slot tick and execution-shard staircase duty windows. Migrated from the
     // `NAKAMOTO_SLOT_DURATION_MS` sys.env read in SnapshotLeaderLoop (project rule: HOCON over scattered env reads).
     slotDurationMs: PosLong,
     // gl0 LDD snowplow — consensus-critical; read from HOCON as EXACT rationals (`baseline`/`amplitude` = `"n/d"`),
@@ -141,7 +141,7 @@ object types {
     changesetRingDepth: PosInt,
     stagingAccumulatorsCap: PosInt,
     // Signed-byte-store read-time BACKFILL (2026-07-09) — heals HOLES in gl0's contiguous signed byte store
-    // (`mpt_snapshot_info_signed`) at read time: when a pinned diff-base read misses locally but the snapshot at that ordinal
+    // (`mpt_snapshot_info_signed`) at read time: when a pinned execution-base read misses locally but the snapshot at that ordinal
     // IS locally finalized, pull the signed byte map from up to `pinnedBackfillMaxPeers` peers (per-try `pinnedBackfillPerPeerTimeout`
     // so a hung peer can't stall the accept fold), verify `sidecarFreeMptRoot === the LOCAL committed stateProof.mptRoot`, and stage.
     // Transport tunables ONLY — the verification is unconditional and a total fetch failure stays fail-closed (defer), so these are
@@ -209,16 +209,16 @@ object types {
       })
   }
 
-  /** Committee draw/quorum decouple — the two cluster-uniform knobs that size the per-metagraph committee gate AND (reused) the per-shard
-    * committee. Both MUST be byte-identical on every node: `kDraw` keys the VRF/VK-seeded DRAW so the elected committee is the SAME
-    * sender↔receiver and node↔node, and `kQuorum` is the admit count every node waits for, so they all admit at the same threshold.
+  /** Committee draw/quorum decouple — the two cluster-uniform knobs shared by the per-metagraph admission committee and the execution-shard
+    * committee. Both are GL0-operator committees, but admission uses a true secret-key VRF per binary while shard membership uses a public,
+    * enumerable VK-hash draw per `(shard, eta period)`. Both currently use uniform `1/N` weight.
     *
     *   - `kDraw` — committee DRAW target. Used in `CommitteeSortition.threshold(kDraw, σ) = min(kDraw·σ, 1)`, so the expected committee
     *     size is `≈ kDraw·σ·N`. With uniform σ = 1/N this is `≈ kDraw`; setting `kDraw = N` makes `kDraw·σ = 1` saturate ⇒ committee =
     *     everyone.
     *   - `kQuorum` — admit quorum. The number of distinct committee attestations the metagraph gate waits for
-    *     (`MetagraphAttestationAggregator.thresholdReached`) and the per-shard acceptance count (`ShardCheckpointGl0AcceptanceManager` /
-    *     `ShardFinalityTriggers.tCountShard`). This is the count DIRECTLY (no further 2/3 multiplier).
+    *     (`MetagraphAttestationAggregator.thresholdReached`) and the shard selection-finality count (`ShardFinalityTriggers.tCountShard`).
+    *     Economic validity never depends on this count: GL0 re-executes every included CL1 transition.
     *
     * '''Invariant (validated fail-fast at config load via [[validated]]): `0 < kQuorum <= kDraw`.''' Decoupling the two fixes the
     * throughput lag where expected-committee == admit-quorum: a binomial committee draw around `kDraw` left ~36% of binaries with a
@@ -246,9 +246,8 @@ object types {
   }
 
   /** WATCHTOWER invalid-state-proof slashing — the 100% `InvalidStateProof` tier (`docs/nakamoto/SLASHING-DESIGN.md` §6;
-    * `docs/nakamoto/WATCHTOWER-FRAUD-PROOF-DESIGN.md`). Distinct from the per-shard NON-participation slashing in [[ShardSlashingConfig]]
-    * (`nakamoto.sharding.slashing`): that is a soft, rate-based, least-severe tier; THIS is the hard, evidence-based total-loss tier for a
-    * committee that signed a checkpoint with a wrong per-MG derivation.
+    * `docs/nakamoto/WATCHTOWER-FRAUD-PROOF-DESIGN.md`). This is the evidence-based total-loss tier for a committee that signed a checkpoint
+    * with a wrong per-MG derivation.
     *
     *   - `watchtowerEnabled`: master switch for the watchtower approval-check (the per-checkpoint re-execution + fraud-proof gossip).
     *     Default `true` at `numShards > 1`; INERT at `numShards = 1` (no committee checkpoints exist). Turning it off disables fraud-proof
@@ -308,8 +307,7 @@ object types {
     numShards: Int,
     finality: ShardFinalityConfig,
     checkpoint: ShardCheckpointConfig,
-    observability: ShardObservabilityConfig,
-    slashing: ShardSlashingConfig
+    observability: ShardObservabilityConfig
   )
 
   /** `k1Shard` maps to HOCON key `k1-shard` (the digit binds tight to the preceding letter — same convention as `k₁` in the design doc). A
@@ -326,8 +324,6 @@ object types {
   }
 
   case class ShardCheckpointConfig(
-    tAliveMs: Long,
-    tBurst: Int,
     binaryBufferCap: Int,
     /** Bounded checkpoint pipeline (2026-06-11): max unadopted windows in flight before the producer holds production so pending binaries
       * batch into one bigger window (catch-up margin — see ShardCheckpointProducer). MUST be 1 (run-27): the producer diffs each window
@@ -365,22 +361,9 @@ object types {
     *   - `tPartitionHardMs`: if a shard goes longer than this without ANY `T_count_shard` attestation reaching threshold (only the
     *     `T_depth1_shard` fallback fires), the gl0 leader logs a `SHARD-PARTITION-SUSPECT` WARN and increments
     *     `dag_nakamoto_shard_partition_hard_total{shard_id}`. Operator intervention is expected; per design-doc §9.4, v1 does not perform
-    *     automatic rotation. Default `600000` ms = 10 minutes (≥ `5 × t-alive-ms` in any realistic deploy).
+    *     automatic rotation. Default `600000` ms = 10 minutes.
     */
   case class ShardObservabilityConfig(tPartitionHardMs: Long)
-
-  /** Slice 17 (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.3) — per-epoch non-participation slashing.
-    *
-    *   - `maxMissedPctPerEpoch`: percentage threshold (0..100) — a committee member whose `missedSlotsAsLeader / totalSlotsAsLeader` or
-    *     `missedAttestationWindows / totalCheckpointsReceived` exceeds this fraction in the just-closed epoch is added to the slash list at
-    *     the epoch boundary. Default `33` ⇒ slash when more than ~one-third of duties are missed.
-    *   - `minDenominatorPerEpoch`: minimum number of duties (slot-leader elections OR checkpoints received) that must have occurred before
-    *     the rate is evaluated for that obligation. Without this floor, a peer elected leader once and missing that single slot would
-    *     register 100% missed and be slashed — a single sample is noise, not evidence of non-participation. Default `5` ⇒ ignore rates when
-    *     fewer than 5 duties were attempted; matches the slashing-safety bar (evidence + determinism + standard patterns —
-    *     `feedback_slashing_safety_bar`) which favours false-negatives over false-positives.
-    */
-  case class ShardSlashingConfig(maxMissedPctPerEpoch: Int, minDenominatorPerEpoch: Long)
 
   /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
     * the gRPC server that publishes consensus events to local subscribers (e2e tests, operator GUI).

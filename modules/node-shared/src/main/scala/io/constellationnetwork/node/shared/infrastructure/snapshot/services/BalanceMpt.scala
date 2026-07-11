@@ -18,8 +18,8 @@ import io.constellationnetwork.security.mpt.producer.StatelessMerklePatriciaProd
 import io.circe.Json
 import io.circe.syntax.EncoderOps
 
-/** Builds the per-address balance Merkle-Patricia trie that backs the roots-only-sharding light-client commitment, and produces the
-  * inclusion proof a stock TypeScript verifier (`mptVerifier.ts`) consumes.
+/** Builds the per-address balance Merkle-Patricia trie over globally re-executed balance state and produces the inclusion proof a stock
+  * TypeScript verifier (`mptVerifier.ts`) consumes.
   *
   * ==Cross-language contract (must stay byte-identical to `mptVerifier.ts`)==
   *   - '''Path''' (`= SHA-256(address)` hex): [[path]] = `SHA-256(utf8(address.value))` lowercase-hex. A light client derives the same path

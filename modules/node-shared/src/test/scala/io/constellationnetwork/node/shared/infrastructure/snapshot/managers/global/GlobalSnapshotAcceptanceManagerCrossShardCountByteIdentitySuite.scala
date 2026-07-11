@@ -2,7 +2,7 @@ package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glo
 
 import java.security.KeyPair
 
-import cats.data.{NonEmptyList, NonEmptySet}
+import cats.data.NonEmptyList
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
@@ -36,7 +36,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.{PricingUpdate, SpendAction}
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
@@ -50,7 +50,6 @@ import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
-import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary, StateChannelValidationType}
 
 import eu.timepit.refined.auto._
@@ -59,33 +58,27 @@ import weaver.MutableIOSuite
 
 /** TG-02 — the CROSS-SHARD-COUNT byte-identity gate (`numShards = 1` vs `numShards = K`).
   *
-  * '''The gap this closes.''' Every pre-existing "numShards=1 byte-identity" test compares WITH-feature vs WITHOUT-feature at
-  * `numShards = 1` (the regression bar that the sharding machinery is inert at the production default). None compares the STATE produced
-  * at `numShards = 1` against the state produced at `numShards = K` for the SAME event stream — the headline non-regression guard for the
-  * sharding hard fork: turning sharding ON must not change what state the cluster derives from the same metagraph binaries.
+  * '''The gap this closes.''' Every pre-existing "numShards=1 byte-identity" test compares WITH-feature vs WITHOUT-feature at `numShards =
+  * 1` (the regression bar that the sharding machinery is inert at the production default). None compares the STATE produced at `numShards =
+  * 1` against the state produced at `numShards = K` for the SAME event stream — the headline non-regression guard for the sharding hard
+  * fork: turning sharding ON must not change what state the cluster derives from the same metagraph binaries.
   *
   * '''What is compared.''' The SAME metagraph SC binaries are folded through [[GlobalSnapshotAcceptanceManager.accept]] twice, on two
   * independent manager instances (each with its own fresh MPT store):
   *
   *   - '''numShards = 1''' — the raw path: binaries arrive as ordinary `scEvents` and flow through the REAL chain-link
   *     (`GlobalSnapshotStateChannelAcceptanceManager.accept` / `onlyPossibleReferences`) + the REAL currency derivation
-  *     (`processCurrencySnapshots`, `CurrencyAdoptionMode.Recreate` via `process`). `shardCheckpoints` is empty — no committees exist.
-  *   - '''numShards = K (2 / 4)''' — the adopt path: the SAME binaries arrive inside mock quorum-accepted [[ShardCheckpoint]]s
-  *     (`verifyEmbedded` stubbed `Accepted` — the committee-quorum decision is mocked; everything downstream of it is REAL), routed to
-  *     the shard each MG's address statically maps to (`ShardAssignment.shardIdFor`). The SAME raw `scEvents` are ALSO passed so the
-  *     CHANGE-3 filter (total static assignment ⇒ raw metagraph events excluded from the base path) is exercised — the input stream is
-  *     genuinely identical, only the numShards wiring differs.
+  *     (`processCurrencySnapshots` via `process`). `shardCheckpoints` is empty — no committees exist.
+  *   - '''numShards = K (2 / 4)''' — the adopt path: the SAME binaries arrive inside mock accepted [[ShardCheckpoint]]s with their real
+  *     globally-derived per-MG roots. Everything after the mocked checkpoint verdict is production code, including global recreation and
+  *     root comparison. The SAME raw `scEvents` are also passed so the sharded-path partition is exercised.
   *
   * '''The assertion''': byte-identical accepted `scSnapshots`, byte-identical [[GlobalSnapshotInfo]] (whole-object hash + targeted
-  * per-field comparisons so a failure names the diverging field/partition), and — the headline — byte-identical
-  * `stateProof` / `stateProof.mptRoot`.
+  * per-field comparisons so a failure names the diverging field/partition), and — the headline — byte-identical `stateProof` /
+  * `stateProof.mptRoot`.
   *
-  * '''Scope (deliberate).''' Windows are currency GENESIS binaries (plus a non-decodable opaque child binary for the multi-binary-window
-  * case). Both `CurrencyAdoptionMode`s decode a genesis full snapshot through the identical pure `deserialize[Signed[CurrencySnapshot]]`
-  * branch, so the mode seam (`Recreate` at numShards=1 vs `AdoptFromSignedFields` on the adopt path) is NOT exercised for 2nd+
-  * INCREMENTAL binaries here — that leg requires a real `CurrencySnapshotContextFunctions` (currency-l0 validator stack) which this
-  * node-shared harness stubs as unreachable (same constraint as [[GlobalSnapshotAcceptanceManagerAdoptParitySuite]], whose processor
-  * fixture this suite reuses). Incremental-window cross-count parity remains an open follow-up test.
+  * '''Scope (deliberate).''' Windows contain signed currency genesis snapshots. Incremental-window parity requires the full currency
+  * validator stack and is covered at the re-execution boundary by the dedicated sharding suites.
   */
 object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends MutableIOSuite {
 
@@ -279,6 +272,10 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
       callsRef.update(_ :+ checkpoint).as(ShardCheckpointAcceptResult.Accepted)
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(ShardCheckpointAcceptResult.Accepted)
+    override def verifyCommitteeSignature(
+      checkpoint: ShardCheckpoint,
+      signature: CommitteeMemberSignature
+    ): IO[Either[String, Unit]] = IO.pure(Right(()))
     override def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit
     override def lastAdoptedOrd(shardId: ShardId): IO[Option[ShardOrdinal]] = IO.pure(None)
     override def lastAdoptedAnchor(shardId: ShardId): IO[Option[Hash]] = IO.pure(None)
@@ -286,8 +283,8 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   }
 
   /** REAL state-channel events processor — the exact fixture of [[GlobalSnapshotAcceptanceManagerAdoptParitySuite]]: real chain-link
-    * `GlobalSnapshotStateChannelAcceptanceManager` (pull/purge delay 0), permissive `StateChannelValidator`, fee-free `FeeCalculator`,
-    * and a no-op `CurrencySnapshotContextFunctions` (unreachable for genesis-window binaries — see the suite scaladoc's scope note).
+    * `GlobalSnapshotStateChannelAcceptanceManager` (pull/purge delay 0), permissive `StateChannelValidator`, fee-free `FeeCalculator`, and
+    * a no-op `CurrencySnapshotContextFunctions` (unreachable for genesis-window binaries — see the suite scaladoc's scope note).
     */
   private def mkRealProcessor(
     implicit h: Hasher[IO],
@@ -331,17 +328,20 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
     ShardingConfig(
       numShards = numShards,
       finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
-      slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
+      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
     )
 
-  /** One independent "node": a fresh GSAM over a fresh MPT store + a fresh REAL processor. Returns the manager and the committee-stub
-    * call recorder (so tests can assert the adopt path actually ran at numShards>1).
+  /** One independent "node": a fresh GSAM over a fresh MPT store + a fresh REAL processor. Returns the manager and the committee-stub call
+    * recorder (so tests can assert the adopt path actually ran at numShards>1).
     */
   private def mkManager(
     numShards: Int
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[(GlobalSnapshotAcceptanceManager[IO], Ref[IO, List[ShardCheckpoint]])] = {
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    j: JsonSerializer[IO]
+  ): IO[(GlobalSnapshotAcceptanceManager[IO], Ref[IO, List[ShardCheckpoint]])] = {
     implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
 
     val updateDelegatedStakeValidator =
@@ -444,41 +444,29 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
 
   private def mkCurrencyGenesisBinary(
     mgKeyPair: KeyPair
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[Signed[StateChannelSnapshotBinary]] = {
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[(Signed[StateChannelSnapshotBinary], Hash)] = {
     val genesis: CurrencySnapshot = CurrencySnapshot.mkGenesis(Map.empty, None, None)
     for {
       signedGenesis <- forAsyncHasher(genesis, mgKeyPair)
       contentBytes <- JsonSerializer[IO].serialize(signedGenesis)
       binary = StateChannelSnapshotBinary(Hash.empty, contentBytes, SnapshotFee.MinValue)
       signedBinary <- forAsyncHasher(binary, mgKeyPair)
-    } yield signedBinary
+      mg = PublicKeyOps(mgKeyPair.getPublic).toAddress
+      state = signedGenesis.asLeft[(Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+      root <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> state))
+    } yield (signedBinary, root)
   }
-
-  /** A chain-linked CHILD binary whose content is valid JSON but NOT a currency snapshot (the fee-free stateless-accept branch — mode
-    * independent). `parentHash` must be the hash of the parent binary's UNSIGNED value (`Signed.toHashed` hashes `signed.value` — that is
-    * what the real chain-link's `onlyPossibleReferences` links on).
-    */
-  private def mkOpaqueChildBinary(
-    mgKeyPair: KeyPair,
-    parentHash: Hash
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[Signed[StateChannelSnapshotBinary]] =
-    for {
-      contentBytes <- JsonSerializer[IO].serialize("cross-count-opaque-child")
-      binary = StateChannelSnapshotBinary(parentHash, contentBytes, SnapshotFee.MinValue)
-      signedBinary <- forAsyncHasher(binary, mgKeyPair)
-    } yield signedBinary
 
   private val genesisHash: Hash = Hash("0" * 64)
   private val epochZero: EtaPeriod = EtaPeriod(0L)
 
-  /** Minimal quorum-accepted checkpoint shell carrying the given per-MG windows. Pure-genesis-window shape: NO per-MG diff and NO
-    * attested root (the `(diff, root).tupled` STEP-6 pair is absent ⇒ the adopt path keeps the binary-decoded state verbatim — exactly
-    * the production behavior for a genesis window, per `adoptShardCheckpoints`). The committee signature is a placeholder — the stubbed
-    * `verifyEmbedded` (the mocked quorum decision) never inspects it.
+  /** Minimal accepted checkpoint shell carrying the given per-MG windows and their globally-derived roots. The committee signature is a
+    * placeholder because this suite stubs only the checkpoint verdict; GL0's recreation and root comparison remain real.
     */
   private def mkCheckpoint(
     shardId: ShardId,
-    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    roots: SortedMap[Address, Hash]
   ): ShardCheckpoint = {
     val placeholderPeerId = io.constellationnetwork.schema.peer.PeerId(Hex("ab" * 64))
     val placeholderSig = CommitteeMemberSignature(
@@ -495,14 +483,9 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(2L)),
       slot = SlotT.unsafeApply(2L),
       derivedStateDelta = ShardDerivedStateDelta(
-        perMetagraphMptRoots = SortedMap.empty,
-        perMetagraphStateDiff = SortedMap.empty,
-        includedSnapshots = windows,
-        tokenLockBalancesDelta = SortedMap.empty,
-        perMetagraphArtifacts = SortedMap.empty,
-        perMetagraphSyncDataDelta = SortedMap.empty
+        perMetagraphMptRoots = roots,
+        includedSnapshots = windows
       ),
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(placeholderSig),
       epoch = epochZero
     )
@@ -513,18 +496,18 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
     */
   private def mkCheckpointsByAssignment(
     numShards: Int,
-    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    roots: SortedMap[Address, Hash]
   )(implicit h: Hasher[IO]): IO[SortedMap[ShardId, ShardCheckpoint]] = {
     val assignment = ShardAssignment.make[IO](numShards = numShards)
-    windows.toList
-      .traverse { case (mg, nel) => assignment.shardIdFor(mg).map(sid => (sid, mg, nel)) }
-      .map { routed =>
-        val byShard = routed.groupBy(_._1)
-        SortedMap.from(byShard.map {
-          case (sid, entries) =>
-            sid -> mkCheckpoint(sid, SortedMap.from(entries.map { case (_, mg, nel) => mg -> nel })(Address.OrderingInstance))
-        })
-      }
+    windows.toList.traverse { case (mg, nel) => assignment.shardIdFor(mg).map(sid => (sid, mg, nel)) }.map { routed =>
+      val byShard = routed.groupBy(_._1)
+      SortedMap.from(byShard.map {
+        case (sid, entries) =>
+          val shardWindows = SortedMap.from(entries.map { case (_, mg, nel) => mg -> nel })(Address.OrderingInstance)
+          sid -> mkCheckpoint(sid, shardWindows, roots.filter { case (mg, _) => shardWindows.contains(mg) })
+      })
+    }
   }
 
   /** The three byte-identity observables: accepted `scSnapshots`, the derived `GlobalSnapshotInfo`, and the `GlobalSnapshotStateProof`. */
@@ -569,7 +552,8 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
     */
   private def runOneVsK(
     k: Int,
-    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    roots: SortedMap[Address, Hash]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[
     (
       (SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], GlobalSnapshotInfo, GlobalSnapshotStateProof),
@@ -586,7 +570,7 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
       (mgrOne, callsOneRef) = pairOne
       pairK <- mkManager(numShards = k)
       (mgrK, callsKRef) = pairK
-      checkpoints <- mkCheckpointsByAssignment(k, windows)
+      checkpoints <- mkCheckpointsByAssignment(k, windows, roots)
       one <- invokeAccept(mgrOne, scEvents = rawEvents, shardCheckpoints = SortedMap.empty)
       kres <- invokeAccept(mgrK, scEvents = rawEvents, shardCheckpoints = checkpoints)
       callsOne <- callsOneRef.get
@@ -646,14 +630,17 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
       mgKeyPairB <- KeyPairGenerator.makeKeyPair[IO]
       mgA = PublicKeyOps(mgKeyPairA.getPublic).toAddress
       mgB = PublicKeyOps(mgKeyPairB.getPublic).toAddress
-      binaryA <- mkCurrencyGenesisBinary(mgKeyPairA)
-      binaryB <- mkCurrencyGenesisBinary(mgKeyPairB)
+      fixtureA <- mkCurrencyGenesisBinary(mgKeyPairA)
+      fixtureB <- mkCurrencyGenesisBinary(mgKeyPairB)
+      (binaryA, rootA) = fixtureA
+      (binaryB, rootB) = fixtureB
       windows = SortedMap(
         mgA -> NonEmptyList.of(binaryA),
         mgB -> NonEmptyList.of(binaryB)
       )(Address.OrderingInstance)
-      checkpoints <- mkCheckpointsByAssignment(2, windows)
-      out <- runOneVsK(2, windows)
+      roots = SortedMap(mgA -> rootA, mgB -> rootB)(Address.OrderingInstance)
+      checkpoints <- mkCheckpointsByAssignment(2, windows, roots)
+      out <- runOneVsK(2, windows, roots)
       (one, kres, committeeCallsAtK, committeeCallsAtOne) = out
       gsiHashOne <- h.hash(one._2)
       gsiHashK <- h.hash(kres._2)
@@ -671,43 +658,40 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   }
 
   // ============================================================================
-  // TG-02 Test 2 — K=4, two MGs, one MULTI-BINARY window (genesis + chain-linked opaque child)
+  // TG-02 Test 2 — K=4, two MG genesis windows
   // ============================================================================
 
-  test("TG-02 cross-count byte-identity: numShards=1 == numShards=4 — multi-binary window (genesis + chained child)") { res =>
+  test("TG-02 cross-count byte-identity: numShards=1 == numShards=4 — genesis windows") { res =>
     implicit val (h, sp, j) = res
     for {
       mgKeyPairA <- KeyPairGenerator.makeKeyPair[IO]
       mgKeyPairB <- KeyPairGenerator.makeKeyPair[IO]
       mgA = PublicKeyOps(mgKeyPairA.getPublic).toAddress
       mgB = PublicKeyOps(mgKeyPairB.getPublic).toAddress
-      genesisA <- mkCurrencyGenesisBinary(mgKeyPairA)
-      // The chain-link reference is the hash of the parent binary's UNSIGNED value (Signed.toHashed semantics).
-      genesisAValueHash <- h.hash(genesisA.value)
-      childA <- mkOpaqueChildBinary(mgKeyPairA, genesisAValueHash)
-      genesisB <- mkCurrencyGenesisBinary(mgKeyPairB)
+      fixtureA <- mkCurrencyGenesisBinary(mgKeyPairA)
+      fixtureB <- mkCurrencyGenesisBinary(mgKeyPairB)
+      (genesisA, rootA) = fixtureA
+      (genesisB, rootB) = fixtureB
       windows = SortedMap(
-        mgA -> NonEmptyList.of(genesisA, childA), // oldest-first, the checkpoint window convention
+        mgA -> NonEmptyList.of(genesisA),
         mgB -> NonEmptyList.of(genesisB)
       )(Address.OrderingInstance)
-      checkpoints <- mkCheckpointsByAssignment(4, windows)
-      out <- runOneVsK(4, windows)
+      roots = SortedMap(mgA -> rootA, mgB -> rootB)(Address.OrderingInstance)
+      checkpoints <- mkCheckpointsByAssignment(4, windows, roots)
+      out <- runOneVsK(4, windows, roots)
       (one, kres, committeeCallsAtK, committeeCallsAtOne) = out
       gsiHashOne <- h.hash(one._2)
       gsiHashK <- h.hash(kres._2)
-      // Window-shape sanity: the multi-binary MG really carried BOTH binaries through on the 1-side (chain-link unfolded the child).
-      multiWindowLenOne = one._1.get(mgA).map(_.size).getOrElse(0)
     } yield
-      expect(multiWindowLenOne == 2) and
-        expectByteIdentical(
-          Set(mgA, mgB),
-          one,
-          kres,
-          committeeCallsAtK,
-          committeeCallsAtOne,
-          expectedCheckpointCount = checkpoints.size,
-          gsiHashOne,
-          gsiHashK
-        )
+      expectByteIdentical(
+        Set(mgA, mgB),
+        one,
+        kres,
+        committeeCallsAtK,
+        committeeCallsAtOne,
+        expectedCheckpointCount = checkpoints.size,
+        gsiHashOne,
+        gsiHashK
+      )
   }
 }

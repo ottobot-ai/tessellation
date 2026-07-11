@@ -7,9 +7,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, StakeRegistry}
-import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
-import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger}
-import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
 import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.peer.PeerId
@@ -39,17 +37,12 @@ object NakamotoSnapshotValidator {
   case object ParentBuffered extends Invalid
   final case class VrfFailed(slot: Long, detail: String) extends Invalid
   final case class SignatureInvalid(ordinal: Long) extends Invalid
-  // `selfHealable` (Driver B): the mismatch's ONLY divergence is in consensus-derived / path-dependent
-  // partitions that a node with a transiently fork-diverged base cannot reproduce — the delegated-stake
-  // reward-accrual partitions (`DelegatedStakeRecord.rewards` is a running sum) and/or the rolled-up
-  // mptRoot — while EVERY reproducible field (balances/txRefs/currSnapshots/...) matches. The daemon then
-  // adopts the producer's signed-authentic state to re-align the base instead of churning a fork.
-  final case class ContentMismatch(detail: String, selfHealable: Boolean = false) extends Invalid
-  final case class VrfOnlyFailed(slot: Long) extends Invalid
+  final case class KesInvalid(ordinal: Long) extends Invalid
+  final case class ContentMismatch(detail: String) extends Invalid
+  final case class PayloadMissing(ordinal: Long) extends Invalid
 
   def validate[F[_]: Async: SecurityProvider: HasherSelector](
     signedSnapshot: Signed[GlobalIncrementalSnapshot],
-    context: GlobalSnapshotInfo,
     slot: Long,
     vrfProof: Array[Byte],
     vrfPublicKey: Array[Byte],
@@ -123,8 +116,7 @@ object NakamotoSnapshotValidator {
                 // ── Step 3: SlotCertificate verification ──
                 val certResult = signedSnapshot.value.slotCertificate match {
                   case None =>
-                    // Pre-activation snapshots don't have certs — accept for now
-                    Right(())
+                    Left("missing required slot certificate")
                   case Some(cert) =>
                     // §3 NIPoPoW S2 phase 2b-2: subchainLevelCounts must carry forward parent's
                     // vector verbatim. Until S3 lands and trials start producing real passes,
@@ -217,33 +209,31 @@ object NakamotoSnapshotValidator {
                                 diffs += s"lastHash(recv=${leader.lastSnapshotHash.show.take(12)},own=${own.lastSnapshotHash.show.take(12)})"
                               if (leader.epochProgress =!= own.epochProgress)
                                 diffs += s"epoch(recv=${leader.epochProgress},own=${own.epochProgress})"
-                              val spDiffList: List[String] =
-                                if (leader.stateProof =!= own.stateProof) {
-                                  val lp = leader.stateProof
-                                  val op = own.stateProof
-                                  val spDiffs = List.newBuilder[String]
-                                  if (lp.lastStateChannelSnapshotHashesProof =!= op.lastStateChannelSnapshotHashesProof)
-                                    spDiffs += "scHashes"
-                                  if (lp.lastTxRefsProof =!= op.lastTxRefsProof) spDiffs += "txRefs"
-                                  if (lp.balancesProof =!= op.balancesProof) spDiffs += "balances"
-                                  if (lp.lastCurrencySnapshotsProof =!= op.lastCurrencySnapshotsProof) spDiffs += "currSnapshots"
-                                  if (lp.activeAllowSpends =!= op.activeAllowSpends) spDiffs += "allowSpends"
-                                  if (lp.activeTokenLocks =!= op.activeTokenLocks) spDiffs += "tokenLocks"
-                                  if (lp.tokenLockBalances =!= op.tokenLockBalances) spDiffs += "tokenLockBal"
-                                  if (lp.lastAllowSpendRefs =!= op.lastAllowSpendRefs) spDiffs += "allowSpendRefs"
-                                  if (lp.lastTokenLockRefs =!= op.lastTokenLockRefs) spDiffs += "tokenLockRefs"
-                                  if (lp.updateNodeParameters =!= op.updateNodeParameters) spDiffs += "nodeParams"
-                                  if (lp.activeDelegatedStakes =!= op.activeDelegatedStakes) spDiffs += "delegStakes"
-                                  if (lp.delegatedStakesWithdrawals =!= op.delegatedStakesWithdrawals) spDiffs += "delegWithdraw"
-                                  if (lp.activeNodeCollaterals =!= op.activeNodeCollaterals) spDiffs += "nodeCollat"
-                                  if (lp.nodeCollateralWithdrawals =!= op.nodeCollateralWithdrawals) spDiffs += "collatWithdraw"
-                                  if (lp.priceState =!= op.priceState) spDiffs += "priceState"
-                                  if (lp.lastGlobalSnapshotsWithCurrency =!= op.lastGlobalSnapshotsWithCurrency) spDiffs += "globalWithCurr"
-                                  if (lp.mptRoot =!= op.mptRoot) spDiffs += "mptRoot"
-                                  val result = spDiffs.result()
-                                  diffs += s"stateProof[${result.mkString(",")}]"
-                                  result
-                                } else List.empty[String]
+                              if (leader.stateProof =!= own.stateProof) {
+                                val lp = leader.stateProof
+                                val op = own.stateProof
+                                val spDiffs = List.newBuilder[String]
+                                if (lp.lastStateChannelSnapshotHashesProof =!= op.lastStateChannelSnapshotHashesProof)
+                                  spDiffs += "scHashes"
+                                if (lp.lastTxRefsProof =!= op.lastTxRefsProof) spDiffs += "txRefs"
+                                if (lp.balancesProof =!= op.balancesProof) spDiffs += "balances"
+                                if (lp.lastCurrencySnapshotsProof =!= op.lastCurrencySnapshotsProof) spDiffs += "currSnapshots"
+                                if (lp.activeAllowSpends =!= op.activeAllowSpends) spDiffs += "allowSpends"
+                                if (lp.activeTokenLocks =!= op.activeTokenLocks) spDiffs += "tokenLocks"
+                                if (lp.tokenLockBalances =!= op.tokenLockBalances) spDiffs += "tokenLockBal"
+                                if (lp.lastAllowSpendRefs =!= op.lastAllowSpendRefs) spDiffs += "allowSpendRefs"
+                                if (lp.lastTokenLockRefs =!= op.lastTokenLockRefs) spDiffs += "tokenLockRefs"
+                                if (lp.updateNodeParameters =!= op.updateNodeParameters) spDiffs += "nodeParams"
+                                if (lp.activeDelegatedStakes =!= op.activeDelegatedStakes) spDiffs += "delegStakes"
+                                if (lp.delegatedStakesWithdrawals =!= op.delegatedStakesWithdrawals) spDiffs += "delegWithdraw"
+                                if (lp.activeNodeCollaterals =!= op.activeNodeCollaterals) spDiffs += "nodeCollat"
+                                if (lp.nodeCollateralWithdrawals =!= op.nodeCollateralWithdrawals) spDiffs += "collatWithdraw"
+                                if (lp.priceState =!= op.priceState) spDiffs += "priceState"
+                                if (lp.lastGlobalSnapshotsWithCurrency =!= op.lastGlobalSnapshotsWithCurrency) spDiffs += "globalWithCurr"
+                                if (lp.mptRoot =!= op.mptRoot) spDiffs += "mptRoot"
+                                val result = spDiffs.result()
+                                diffs += s"stateProof[${result.mkString(",")}]"
+                              }
                               if (leader.rewards =!= own.rewards) diffs += s"rewards(recv=${leader.rewards.size},own=${own.rewards.size})"
                               if (leader.tips =!= own.tips) diffs += "tips"
                               val diffList = diffs.result()
@@ -253,22 +243,11 @@ object NakamotoSnapshotValidator {
                               // Per-field MPT-derived hashes are deterministic from MPT entries; the global
                               // mptRoot is deterministic from the same MPT producer state. If undo-journal
                               // fork rollback ever produces a transient mptRoot diff, ContentMismatch will
-                              // surface it as a catch-up signal — which is the correct response.
-                              // Driver B self-heal signal: the ONLY divergence is the consensus-derived
-                              // delegated-stake reward-accrual partition(s) (`DelegatedStakeRecord.rewards` is a
-                              // running sum a node with a transiently fork-diverged base cannot reproduce) and/or
-                              // the rolled-up mptRoot, while every reproducible field matches. Conservative — any
-                              // non-accrual stateProof diff (balances/currSnapshots/…) or any top-level diff
-                              // (ordinal/epoch/rewards/tips) disqualifies, so a genuine fork takes the normal path.
-                              val rewardAccrualFields = Set("delegStakes", "delegWithdraw")
-                              val selfHealable =
-                                spDiffList.nonEmpty &&
-                                  spDiffList.toSet.subsetOf(rewardAccrualFields + "mptRoot") &&
-                                  diffList.size == 1
-                              val msg = s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
-                              (msg, false, selfHealable)
+                              // surface it as a replay failure. No subset of state-proof fields is eligible for
+                              // producer-authoritative realignment.
+                              s"❌ Content REJECTED: slot=$slot diffs=[$diffStr]"
                             case _ =>
-                              (s"❌ Content validation fail: slot=$slot err=$err", false, false)
+                              s"❌ Content validation fail: slot=$slot err=$err"
                           }
                           // Discard the orphan branch left behind by `validateArtifact`'s internal
                           // call to `createProposalArtifact(strippedReceived)` (#113). On the Right
@@ -288,11 +267,7 @@ object NakamotoSnapshotValidator {
                             _ <- pendingAccumulatorsRef.update(_ - strippedHash)
                             // 3c-A enabler — symmetric drop of the rejected candidate's staged signed bytes.
                             _ <- pendingPostBytesRef.update(_ - strippedHash)
-                            result <-
-                              if (logMsg._2)
-                                logger.info(logMsg._1).as(Valid(signedSnapshot, context): ValidationResult)
-                              else
-                                logger.warn(logMsg._1).as(ContentMismatch(logMsg._1, logMsg._3): ValidationResult)
+                            result <- logger.warn(logMsg).as(ContentMismatch(logMsg): ValidationResult)
                           } yield result
                       }
                 }

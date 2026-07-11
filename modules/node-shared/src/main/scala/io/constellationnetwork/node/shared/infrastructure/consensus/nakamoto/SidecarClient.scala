@@ -64,13 +64,13 @@ object SidecarClient {
 
     /** Slice 14: publish a shard checkpoint on the per-shard topic `shard-checkpoint-<shardId>`. The wire payload is already a
       * proto-encoded `ShardCheckpointWire` produced via `ShardCheckpointWireCodecs.shardCheckpointToWire`; the sidecar treats it as opaque
-      * and gossips on the per-shard topic indicated by `msg.shardId`. The fully-signed (post-threshold) checkpoint envelope flow rides on
-      * top of this primitive; the gossip topic name routing is the sidecar's responsibility.
+      * and gossips on the per-shard topic indicated by `msg.shardId`. Signature enrichment rides on top of this primitive; the gossip topic
+      * routing is the sidecar's responsibility.
       */
     def publishShardCheckpoint(msg: ShardCheckpointWire): F[PublishResponse]
 
     /** Slice 14: publish a shard-checkpoint attestation (non-producing committee member's attestation, post-envelope-observation). Same
-      * per-shard topic as `publishShardCheckpoint`. Receivers tally toward the `≥ ⌈2/3 K_S⌉` quorum (Slice 9).
+      * per-shard topic as `publishShardCheckpoint`. Receivers tally distinct valid signers against configured `kQuorum`.
       */
     def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire): F[PublishResponse]
 

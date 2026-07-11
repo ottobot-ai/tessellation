@@ -158,9 +158,9 @@ object GossipStreamTopologySuite extends MutableIOSuite {
         .lastOrError
         .timeout(15.seconds)
         .map { msg =>
-          expect(msg.body.isShardCheckpoint) and
-            expect.same(42L, msg.getShardCheckpoint.shardOrdinal) and
-            expect.same(List(SubscribeTopics.daemonTopics), h.captured.asScala.toList)
+          expect(msg.body.isShardCheckpoint)
+            .and(expect.same(42L, msg.getShardCheckpoint.shardOrdinal))
+            .and(expect.same(List(SubscribeTopics.daemonTopics), h.captured.asScala.toList))
         }
     }
   }
@@ -198,10 +198,11 @@ object GossipStreamTopologySuite extends MutableIOSuite {
     // Lockstep check: these literals MUST match grpcserver.Topic* in the Go
     // sidecar (which REJECTS unknown labels). One label per GossipMessage.body
     // arm; rumor belongs to the bridge.
-    expect.same(expected, SubscribeTopics.daemonTopics.toSet) and
-      expect.same(SubscribeTopics.daemonTopics.size, SubscribeTopics.daemonTopics.distinct.size) and
-      expect(!SubscribeTopics.daemonTopics.contains(SubscribeTopics.Rumor)) and
-      expect.same(Seq("rumor"), SubscribeTopics.rumorOnly)
+    expect
+      .same(expected, SubscribeTopics.daemonTopics.toSet)
+      .and(expect.same(SubscribeTopics.daemonTopics.size, SubscribeTopics.daemonTopics.distinct.size))
+      .and(expect(!SubscribeTopics.daemonTopics.contains(SubscribeTopics.Rumor)))
+      .and(expect.same(Seq("rumor"), SubscribeTopics.rumorOnly))
   }
 
   // ─── the zombie-stream guard ───────────────────────────────────────

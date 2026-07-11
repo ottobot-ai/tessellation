@@ -23,20 +23,20 @@ import weaver.MutableIOSuite
   * `smtRootBlind(recreatedArtifact) === smtRootBlind(artifact)` at GlobalSnapshotConsensusFunctions.scala:286-295).
   *
   * The §3 NIPoPoW `stateProof.smtRoot` is gl0-maintained and PATH-DEPENDENT (folded from a separately-maintained accumulating SMT), so
-  * honest nodes provably cannot reproduce it in lockstep — including it in the consensus `===` made ~97% of freshly-won blocks fail
-  * content validation (the fork storm). The fix compares smtRoot-BLIND: both sides are copied with `smtRoot = None` before `===`.
+  * honest nodes provably cannot reproduce it in lockstep — including it in the consensus `===` made ~97% of freshly-won blocks fail content
+  * validation (the fork storm). The fix compares smtRoot-BLIND: both sides are copied with `smtRoot = None` before `===`.
   *
-  * This suite pins both directions of that contract THROUGH the production `validateArtifact` path (no re-implementation of the blind
-  * copy in test code):
+  * This suite pins both directions of that contract THROUGH the production `validateArtifact` path (no re-implementation of the blind copy
+  * in test code):
   *
   *   1. two artifacts differing ONLY in `stateProof.smtRoot` ARE consensus-equal — `validateArtifact` returns `Right` for an incoming
-  *      artifact whose `smtRoot` the local re-derivation cannot reproduce (the local unit harness re-derives `smtRoot = None`; the
-  *      incoming carries `Some`). Removing the `smtRootBlind` copy makes this test fail — the exact fork-storm regression shape.
+  *      artifact whose `smtRoot` the local re-derivation cannot reproduce (the local unit harness re-derives `smtRoot = None`; the incoming
+  *      carries `Some`). Removing the `smtRootBlind` copy makes this test fail — the exact fork-storm regression shape.
   *   1. the blind compare blinds ONLY `smtRoot`: an artifact differing in `stateProof.mptRoot` (the ledger root) is still REJECTED
   *      (`Left(GlobalArtifactMismatch)`) — the fix must not have widened into a general state-proof blindness.
   *
-  * Harness: reuses [[GlobalSnapshotConsensusFunctionsSuite]]'s public fixtures (`getTestData` / `mkGlobalSnapshotConsensusFunctions`),
-  * one fresh consensus-functions instance per `validateArtifact` call (each owns its MptStore — `createProposalArtifact` mutates it).
+  * Harness: reuses [[GlobalSnapshotConsensusFunctionsSuite]]'s public fixtures (`getTestData` / `mkGlobalSnapshotConsensusFunctions`), one
+  * fresh consensus-functions instance per `validateArtifact` call (each owns its MptStore — `createProposalArtifact` mutates it).
   */
 object SmtRootBlindValidateArtifactSuite extends MutableIOSuite {
 

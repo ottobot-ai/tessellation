@@ -4,27 +4,22 @@ import cats.Eq
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.syntax.eq._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.artifact.{SharedArtifact, SpendAction, SpendTransaction}
-import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
-import io.constellationnetwork.schema.swap.{CurrencyId, SwapAmount}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
-import eu.timepit.refined.types.numeric.{NonNegInt, NonNegLong, PosLong}
+import eu.timepit.refined.types.numeric.{NonNegInt, NonNegLong}
 import io.circe.parser.decode
 import io.circe.syntax._
 import weaver.FunSuite
@@ -66,8 +61,6 @@ object ShardingCodecsSuite extends FunSuite {
 
   private val mgAddrA: Address = addr("mg-aaa")
   private val mgAddrB: Address = addr("mg-bbb")
-  private val holderA: Address = addr("holder-1")
-  private val holderB: Address = addr("holder-2")
 
   private def peerIdN(n: Int): PeerId =
     PeerId(Hex((n.toHexString.padTo(2, '0')) * 64)) // 128 hex chars
@@ -116,57 +109,9 @@ object ShardingCodecsSuite extends FunSuite {
         mgAddrA -> hash('a'),
         mgAddrB -> hash('b')
       ),
-      perMetagraphStateDiff = SortedMap.empty,
       includedSnapshots = SortedMap(
         mgAddrA -> NonEmptyList.of(mkSignedBinary('1', 0x01, 10L), mkSignedBinary('2', 0x02, 20L)),
         mgAddrB -> NonEmptyList.of(mkSignedBinary('3', 0x03, 30L))
-      ),
-      tokenLockBalancesDelta = SortedMap(
-        mgAddrA -> SortedMap(
-          holderA -> Balance(NonNegLong(100L)),
-          holderB -> Balance(NonNegLong(200L))
-        )
-      ),
-      perMetagraphArtifacts = SortedMap(
-        mgAddrA -> List[SharedArtifact](
-          SpendAction(
-            spendTransactions = NonEmptyList.of(
-              SpendTransaction(
-                allowSpendRef = Some(hash('s')),
-                currencyId = Some(CurrencyId(mgAddrB)),
-                amount = SwapAmount(PosLong(50L)),
-                source = holderA,
-                destination = holderB
-              )
-            )
-          )
-        )
-      ),
-      perMetagraphSyncDataDelta = SortedMap(
-        mgAddrA -> MetagraphSyncDataInfo(
-          globalOrdinalLastAcceptedOn = SnapshotOrdinal(NonNegLong(7L)),
-          globalEpochProgressLastAcceptedOn = EpochProgress(NonNegLong(3L)),
-          unappliedGlobalChangeOrdinals = SortedSet(
-            SnapshotOrdinal(NonNegLong(1L)),
-            SnapshotOrdinal(NonNegLong(2L))
-          )
-        )
-      )
-    )
-
-  // ---- CrossShardReceipt ---------------------------------------------------
-
-  private def sampleReceipt: CrossShardReceipt =
-    CrossShardReceipt.MetagraphSyncDataWrite(
-      sourceShardId = shardZero,
-      sourceMetagraph = mgAddrA,
-      sourceCheckpointHash = hash('p'),
-      targetShardId = shardOne,
-      targetMetagraph = mgAddrB,
-      increment = MetagraphSyncDataInfo(
-        globalOrdinalLastAcceptedOn = SnapshotOrdinal(NonNegLong(10L)),
-        globalEpochProgressLastAcceptedOn = EpochProgress(NonNegLong(4L)),
-        unappliedGlobalChangeOrdinals = SortedSet.empty
       )
     )
 
@@ -180,7 +125,6 @@ object ShardingCodecsSuite extends FunSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong(99L)),
       slot = SlotT.unsafeApply(99L),
       derivedStateDelta = sampleDelta,
-      emittedReceipts = List(sampleReceipt),
       committeeSignatures = NonEmptyList.of(mkSig(1, 7), mkSig(2, 8), mkSig(3, 9)),
       epoch = EtaPeriod(5L)
     )
@@ -233,7 +177,7 @@ object ShardingCodecsSuite extends FunSuite {
   }
 
   test("ShardOrdinal: round-trips through Circe")(roundtrip("ShardOrdinal", sampleShardOrdinal))
-  test("ShardOrdinal: round-trips at Genesis")(roundtrip("Genesis", ShardOrdinal.Genesis))
+  test("ShardOrdinal: round-trips at synthetic Root")(roundtrip("Root", ShardOrdinal.Root))
 
   test("ShardOrdinal.next increments by 1") {
     expect(ShardOrdinal(7L).next == ShardOrdinal(8L))
@@ -243,10 +187,6 @@ object ShardingCodecsSuite extends FunSuite {
 
   test("ShardDerivedStateDelta: round-trips through Circe")(roundtrip("ShardDerivedStateDelta", sampleDelta))
   test("ShardDerivedStateDelta.empty: round-trips through Circe")(roundtrip("empty", ShardDerivedStateDelta.empty))
-
-  test("CrossShardReceipt: round-trips through Circe (MetagraphSyncDataWrite variant)")(
-    roundtrip("CrossShardReceipt", sampleReceipt)
-  )
 
   test("ShardCheckpoint: round-trips through Circe")(roundtrip("ShardCheckpoint", sampleCheckpoint))
 
@@ -290,14 +230,6 @@ object ShardingCodecsSuite extends FunSuite {
     expect(originalA === decodedA)
   }
 
-  test("ShardDerivedStateDelta.tokenLockBalancesDelta nested SortedMap preserves key order") {
-    val jsonStr = sampleDelta.asJson.noSpaces
-    val decoded = decode[ShardDerivedStateDelta](jsonStr).fold(e => throw new AssertionError(s"decode failed: ${e.getMessage}"), identity)
-    val originalInner = sampleDelta.tokenLockBalancesDelta(mgAddrA).keys.toList
-    val decodedInner = decoded.tokenLockBalancesDelta(mgAddrA).keys.toList
-    expect.same(originalInner, decodedInner)
-  }
-
   // ===========================================================================
   // Determinism — encoding the same value twice produces identical bytes
   // ===========================================================================
@@ -335,11 +267,11 @@ object ShardingCodecsSuite extends FunSuite {
       preimage.parentCheckpointHash === sampleCheckpoint.parentCheckpointHash,
       preimage.shardOrdinal === sampleCheckpoint.shardOrdinal,
       preimage.gl0AnchorOrdinal === sampleCheckpoint.gl0AnchorOrdinal,
+      preimage.slot === sampleCheckpoint.slot,
       preimage.derivedStateDelta === sampleCheckpoint.derivedStateDelta,
-      preimage.emittedReceipts === sampleCheckpoint.emittedReceipts,
       preimage.epoch === sampleCheckpoint.epoch,
-      // Track-1 diff-base-pin: the V2 preimage carries `diffBaseOrdinal` (the base the diff was cut over) so it is signed + verified.
-      preimage.diffBaseOrdinal === sampleCheckpoint.diffBaseOrdinal
+      // The pinned execution base is signed and verified as part of the canonical preimage.
+      preimage.executionBaseOrdinal === sampleCheckpoint.executionBaseOrdinal
     )
   }
 

@@ -17,15 +17,15 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Per-shard raw-binary accumulator — the intake side of the execution-sharding inversion
-  * (`docs/nakamoto/EXECUTION-SHARDING-COMMITTEE-VERIFY-DESIGN.md` §2/§6.1, R-1).
+/** Per-shard admission-approved binary accumulator — the intake side of execution sharding
+  * (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6).
   *
   * '''Why this exists (the inversion).''' Before R-1 the shard checkpoint producer read its input from gl0's own post-chain-link committed
   * `signed.value.stateChannelSnapshots` map. With the `CHANGE-3` Axis-1a filter that map is empty at `numShards > 1`, so the producer
   * starved and no checkpoint could ever be produced (circular starvation), AND it inherited gl0's #259 chain-link freeze. The fix is to
-  * invert the producer's input: the shard committee buffers the RAW metagraph binaries for ITS shard here, and the producer
-  * ([[ShardCheckpointProducer]]) reads from this buffer + chain-links them off the shard's own prior-checkpoint tip
-  * ([[ShardChainStore.perMgTip]]) — fully decoupled from gl0's chain-link admission.
+  * invert the producer's input: after the separate metagraph admission committee approves a signed binary, the execution-shard intake
+  * buffers the complete binary for its shard here, and the producer ([[ShardCheckpointProducer]]) reads from this buffer + chain-links them
+  * off the shard's own prior-checkpoint tip ([[ShardChainStore.perMgTip]]) — fully decoupled from gl0's chain-link admission.
   *
   * '''Determinism model — leader-proposes / members-attest (Polkadot backing-group).''' This buffer is intentionally NODE-LOCAL and is NOT
   * required to converge across committee members. Only the shard's SLOT LEADER builds a checkpoint from ITS OWN buffer; the other committee
@@ -38,15 +38,15 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * idempotent no-op (dedup by binary hash), and `ShardChainStore.store` is idempotent by checkpoint hash, so re-reading a still-pending
   * window across successive gl0 ords does not double-include.
   *
-  * '''Finalize-keyed pruning (S3, `docs/nakamoto/SHARDED-CURRENCY-MIRROR-ENDGAME-PLAN.md` §S3).''' [[pruneFinalized]] drops the STRICT
-  * ANCESTORS of each MG's per-MG finalize floor. The floor MUST be the gl0 DEPTH-K-FINALIZED per-MG SC tip (the finalized global snapshot's
-  * `lastStateChannelSnapshotHashes`, read at the gl0 `onFinalize` / on-disk-base-advance seam) — NEVER the adopted-but-unfinalized tip.
-  * (`lastAdoptedAnchor` is the node-local ADOPTED watermark set on the accept/proposal path — reorg-able; sound as a fork-choice BIAS but
-  * NOT as an irreversible prune floor, since a reorg can un-adopt it.) The floor binary and every binary AT or ABOVE it are retained: those
-  * are S2's base->latest re-inclusion set (adopted-but-not-yet-finalized binaries an optimistic reorg may still need to rebuild the window)
-  * plus any fork siblings. Pruning strictly below an UN-finalized tip would be unsafe — a reorg could drop the adopted binary, and if it
-  * had been pruned it could not be re-included. The caller passes `MIN(finalizedTip, bestTip)` per MG (the §5 reorg-safety guard) so a
-  * backward `noteAnchor` reorg that pushes bestTip below the finalized tip never drops a binary the post-reorg window needs. Idempotent.
+  * '''Finalize-keyed pruning.''' [[pruneFinalized]] drops the STRICT ANCESTORS of each MG's per-MG finalize floor. The floor MUST be the
+  * gl0 DEPTH-K-FINALIZED per-MG SC tip (the finalized global snapshot's `lastStateChannelSnapshotHashes`, read at the gl0 `onFinalize` /
+  * on-disk-base-advance seam) — NEVER the adopted-but-unfinalized tip. (`lastAdoptedAnchor` is the node-local ADOPTED watermark set on the
+  * accept/proposal path — reorg-able; sound as a fork-choice BIAS but NOT as an irreversible prune floor, since a reorg can un-adopt it.)
+  * The floor binary and every binary AT or ABOVE it are retained: those are S2's base->latest re-inclusion set
+  * (adopted-but-not-yet-finalized binaries an optimistic reorg may still need to rebuild the window) plus any fork siblings. Pruning
+  * strictly below an UN-finalized tip would be unsafe — a reorg could drop the adopted binary, and if it had been pruned it could not be
+  * re-included. The caller passes `MIN(finalizedTip, bestTip)` per MG (the §5 reorg-safety guard) so a backward `noteAnchor` reorg that
+  * pushes bestTip below the finalized tip never drops a binary the post-reorg window needs. Idempotent.
   *
   * '''Live drive deferred to S2.''' This slice ships the prune CONTRACT only (this API + at-cap reclaim + the occupancy gauge + the
   * `ShardBinaryBufferSuite` cases). The live call is wired in S2, keyed on the SAME depth-k finalized-base per-MG tip S2 establishes as the
@@ -72,7 +72,7 @@ trait ShardBinaryBuffer[F[_]] {
   /** Which shard this buffer is scoped to. Set at construction; immutable. */
   def shardId: ShardId
 
-  /** Buffer a received raw metagraph binary for the in-shard metagraph `mgAddr`.
+  /** Buffer an admission-approved metagraph binary for the in-shard metagraph `mgAddr`.
     *
     * Idempotent: a binary whose `Hasher[F]` hash is already buffered (for any MG in this shard) is dropped silently. At the per-shard cap,
     * the buffer FIRST reclaims by pruning strict ancestors of the retained per-MG finalize floor; if that frees a slot the new binary is

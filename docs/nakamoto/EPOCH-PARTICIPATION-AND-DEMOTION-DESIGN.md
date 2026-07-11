@@ -28,13 +28,14 @@ verify cannot reproduce it (it uses an interim `relativeStakeAt` = 2/3-of-total 
 | Piece | Exists? | Wired? |
 |---|---|---|
 | Equivocation evidence + validator (Family A `SlashableEvidence`; Family B shard-checkpoint) | ✅ types+validators+tests, in HEAD | ❌ no consumer; no L0-tx/event ADT admits them |
-| Non-participation accumulator (Slice 17): `ShardNonParticipationCounter`, `ShardNonParticipationStateManager` (record* + `materializeAllForEpoch`), MPT partition **fieldId 24**, `ShardNonParticipationSlasher.evaluateEpochBoundary → List[PeerId]`, `ShardSlashingConfig` | ✅ built+tested, in HEAD | ❌ **zero production call sites** (counters never written, slash-list never read) |
-| Consequence: stake penalty / eviction / validator-set or participating-set mutation / `slashedRegistry` | ❌ does not exist | — |
+| Consensus-carried participation records + epoch evaluator | ❌ no current schema, writer, reader, or evaluator | — |
+| Consequence: participation-based eviction or participating-set mutation | ❌ does not exist | — |
 
 `updateValidators` is called **once at boot** (`GlobalSnapshotConsensus.scala:793`), sourced from the
 **seedlist** (minus `metagraph-op` aliases); validator *membership* is static post-genesis (only
 stake *weight* evolves). `SLASHING-DESIGN §8` / `HIERARCHICAL-SHARD-CHECKPOINTS §10` mark the
-consequence (§5 ledger-effect) as the deferred half. **This refactor builds that missing sink.**
+consequence (§5 ledger-effect) as the deferred half. **This proposal designs that missing sink; it is
+not implemented.**
 
 ## 3. Design
 
@@ -51,14 +52,13 @@ quorum, and (optionally) committee eligibility read the **participating set**, n
 This makes demotion epoch-anchored, deterministic, reproducible, and reversible (re-promotion) —
 without touching the boot-only `updateValidators`.
 
-### 3.2 Measure within an epoch — extend Slice 17
+### 3.2 Measure within an epoch — define a new consensus record
 
-Per-`(peerId, epoch)` participation counters (generalize Slice-17's per-shard counters by dropping
-the `shardId` dimension for the gl0-global set): slots-eligible-as-leader vs missed, attestation
-windows total vs missed, checkpoints/tips seen. **The integration gap is invocation** — the Slice-17
-`record*` writers have no callers. Wire them from the same paths that drive consensus today: the
-election/eligibility path (`recordSlotEligibility`) and the attestation/tip-accept path (the site
-that currently calls the ad-hoc `markActive`, `TipTracker:197`).
+Define per-`(peerId, epoch)` participation records for the gl0-global set: slots eligible as leader
+vs missed, attestation windows total vs missed, and checkpoints/tips seen. The record must have a
+versioned byte contract, a consensus-root-bearing storage location, and deterministic writers from
+the election/eligibility and attestation/tip-accept paths. None of those components exists today.
+The retired field-24 shard counter is not a base to extend.
 
 ### 3.3 Record at the eta boundary — extend the `HistoricalStakeSnapshot` pattern
 
@@ -68,14 +68,15 @@ The exact template exists: `GlobalSnapshotAcceptanceManager.computeHistoricalSta
 `AcceptanceMptStateChanges` (fieldId 20). Two options, lowest-friction first:
 1. **Fold into `HistoricalStakeSnapshot`** → `{stakes, eta, participating}` (a `Set[PeerId]` or a
    `SortedMap[PeerId, ParticipationRatio]`), computed in the *same* boundary function from the §3.2
-   counters via a generalized `ShardNonParticipationSlasher.shouldSlash` predicate. The boundary
-   hook, retention, MPT-delta plumbing, and GSI↔MPT parity test already exist.
-2. Or a new `GlobalStateFieldId` (next free int = **25**) + `participatingSetKey[F](period)` mirroring
-   `historicalStakeSnapshotsKey`, written in the same boundary branch.
+   records via a new deterministic threshold predicate. The boundary hook, retention, MPT-delta
+   plumbing, and GSI↔MPT parity test already exist.
+2. Or allocate a new, explicitly versioned `GlobalStateFieldId` plus
+   `participatingSetKey[F](period)` mirroring `historicalStakeSnapshotsKey`, written in the same
+   boundary branch. Field 24 is retired; active IDs 25 through 34 must remain unchanged.
 
 The **participation ratio** is integer-arithmetic from the counters (e.g. `1 - missed/total`),
-config-thresholded (`ShardSlashingConfig.maxMissedPctPerEpoch`, `minDenominatorPerEpoch`) — fully
-deterministic.
+using newly specified, consensus-validated thresholds and minimum denominators. Those parameters
+must be cluster-uniform and fail-fast validated. No current `ShardingConfig` fields supply them.
 
 ### 3.4 Read deterministically — extend the `relativeStakeAt` pattern
 
@@ -85,13 +86,13 @@ This is the deterministic, MPT-backed, **offline-reproducible** read.
 
 ### 3.5 Demotion over a series of epochs
 
-- **Decision** (exists, generalize): `ShardNonParticipationSlasher.evaluateEpochBoundary(closedEpoch)
-  → List[PeerId]` — deterministic, sorted, integer-arithmetic, config-thresholded. Generalize to the
-  gl0-global set. Demote on **sustained** non-participation across K consecutive epochs (hysteresis,
+- **Decision** (new): implement an epoch-boundary evaluator that returns a sorted, deduplicated
+  list of peers using only consensus-carried records, integer arithmetic, and cluster-uniform
+  thresholds. Demote on **sustained** non-participation across K consecutive epochs (hysteresis,
   to survive transient partitions), and immediately on **accepted equivocation evidence** (Family A/B).
 - **Effect** (the missing sink): the boundary writes the demoted peers *out* of the next period's
   participating set (§3.3). **Re-promotion** on sustained participation (symmetric hysteresis).
-- **One consequence sink for both inputs:** non-participation (Slice 17) *and* accepted equivocation
+- **One consequence sink for both inputs:** sustained non-participation *and* accepted equivocation
   evidence feed the same epoch-boundary participating-set update. This is the first half of
   `SLASHING-DESIGN §5`; the stake-reduction / bounty / burn effects compose on top later.
 
@@ -108,10 +109,9 @@ This is the deterministic, MPT-backed, **offline-reproducible** read.
 ## 4. Extend vs net-new
 
 - **Extend (already in HEAD):** the eta-boundary hook + retention + MPT-delta plumbing + parity test;
-  `HistoricalStakeSnapshot` + `HistoricalStakeReader` + `relativeStakeAt`; Slice-17 counter schema +
-  state manager + `evaluateEpochBoundary` + `ShardSlashingConfig`; the `GlobalStateFieldId` pattern.
-- **Net-new:** invocation of the participation counters from the gl0 election/attestation paths; the
-  gl0-global (vs shard-scoped) counter; the persisted per-period participating/demoted set; the
+  `HistoricalStakeSnapshot` + `HistoricalStakeReader` + `relativeStakeAt`; the `GlobalStateFieldId` pattern.
+- **Net-new:** the participation-record byte contract and consensus storage; deterministic writers
+  from the gl0 election/attestation paths; the persisted per-period participating/demoted set; the
   `participatingSetAt`/`participationRatioAt` reads; **the consequence sink** that excludes demoted
   peers from consensus weight (shared with slashing).
 
@@ -119,7 +119,7 @@ This is the deterministic, MPT-backed, **offline-reproducible** read.
 
 1. **Record** the epoch participating set at the boundary (extend `HistoricalStakeSnapshot`) + the
    deterministic `participatingSetAt` read. (No behavior change; observability.)
-2. **Wire** the Slice-17 participation counters from the election + attestation paths.
+2. **Write** the new participation records from the election + attestation paths.
 3. **Swap** `TipTracker` finality + the S5 cert verify to read the participating set; delete the
    ad-hoc `activeRef`/`markActive`/`markInactive`.
 4. **Demote:** generalize `evaluateEpochBoundary`; exclusion effect at the boundary; hysteresis +
@@ -130,8 +130,8 @@ This is the deterministic, MPT-backed, **offline-reproducible** read.
 ## 6. Safety / open questions
 
 - **Honest-node protection:** demotion must require *sustained* (K-epoch) non-participation with a
-  minimum denominator, so a transient partition or a slow node isn't demoted — `ShardSlashingConfig`
-  already has `minDenominatorPerEpoch`; add the K-epoch hysteresis. Re-promotion symmetric.
+  consensus-configured minimum denominator, so a transient partition or a slow node isn't demoted.
+  Add K-epoch hysteresis and symmetric re-promotion.
 - **Determinism (hard requirement):** all counters + thresholds integer-arithmetic, config-pinned;
   the participating set is computed identically on every node at the boundary (GSI↔MPT parity test
   extended). This is what makes it reproducible offline and consensus-safe.
@@ -152,9 +152,9 @@ This is the deterministic, MPT-backed, **offline-reproducible** read.
 - `GlobalSnapshotConsensus.scala:790-793` (boot-only validator-set source = seedlist)
 - `GlobalSnapshotAcceptanceManager.scala:954-1019` (eta-boundary recording hook)
 - `AcceptanceMptStateChanges.scala` (boundary MPT write)
-- `ShardNonParticipationStateManager.scala` (Slice-17 counters + Slasher — unwired)
 - `StakeDistribution.scala` (`HistoricalStakeSnapshot`, `EtaPeriod`, `EpochStakeSnapshotter`)
-- `GlobalStateKey.scala:249/:368` (fieldId 24 non-participation), `:280` (fieldId 20 historical stake)
+- `GlobalStateKey.scala` (fieldId 20 historical stake and the explicit field-ID allocation pattern;
+  field 24 is intentionally unassigned)
 - slashing: `slashing/{SlashableEvidence,ShardCheckpointEquivocation}Validator.scala`;
   `docs/nakamoto/SLASHING-DESIGN.md §5/§8`; `HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md §10`
 - consumer to swap: `LightClientCertVerifier.scala` (S5 interim quorum basis)

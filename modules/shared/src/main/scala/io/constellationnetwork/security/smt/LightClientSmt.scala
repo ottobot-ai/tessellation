@@ -13,8 +13,7 @@ import io.circe.{Decoder, Encoder}
   *
   * ==Why this exists (and why it does NOT use `Hasher`)==
   * The Tessellation `Hasher[F]` typeclass hashes `SHA-256(0x?? ++ Brotli(circeJSON(...)))` — a Brotli-inside-the-preimage scheme that no
-  * off-the-shelf TS verifier can reproduce. The whole point of the roots-only sharding light-client model
-  * (`docs/nakamoto/ROOTS-ONLY-SHARDING-ARCHITECTURE.md` §2) is that a TS light client verifies a Scala-produced root with the stock
+  * off-the-shelf TS verifier can reproduce. A TS light client verifies a root derived from globally re-executed state with the stock
   * `@zk-kit/smt` `verifyProof` and ZERO custom code. That requires reproducing `@zk-kit/smt`'s hashing EXACTLY, which means bypassing
   * `Hasher` entirely and calling `java.security.MessageDigest.getInstance("SHA-256")` directly. This class is a deliberate sibling of
   * `SparseMerkleTree[F]` (which is Brotli-bound) — they do not and must not share the hash seam.

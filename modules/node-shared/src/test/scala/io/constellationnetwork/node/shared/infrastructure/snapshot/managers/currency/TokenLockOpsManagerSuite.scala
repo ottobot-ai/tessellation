@@ -12,6 +12,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.TokenUnlock
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.swap.CurrencyId
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -30,6 +31,21 @@ object TokenLockOpsManagerSuite extends MutableIOSuite {
   val testSignature = signature.Signature(Hex(""))
   val testSignatureProof = signature.SignatureProof(Id(Hex("")), testSignature)
 
+  private def activeTokenLock(
+    source: Address,
+    amount: TokenLockAmount,
+    currencyId: Option[CurrencyId] = None
+  ): TokenLock =
+    TokenLock(
+      source,
+      amount,
+      TokenLockFee(0L),
+      TokenLockReference(TokenLockOrdinal(1L), Hash("parent")),
+      currencyId,
+      EpochProgress(2000L).some,
+      none
+    )
+
   override def sharedResource: Resource[IO, Res] =
     for {
       sp <- SecurityProvider.forAsync[IO]
@@ -42,15 +58,22 @@ object TokenLockOpsManagerSuite extends MutableIOSuite {
     val manager = TokenLockOpsManager.make[IO]
 
     val expiredTokenLockHashes = List(Hash("expired1"), Hash("expired2"))
-    val activeTokenLocksRefs = List(Hash("active1"), Hash("active2"))
-
-    val incomingTokenUnlocks = SortedSet(
-      TokenUnlock(Hash("active1"), TokenLockAmount(100L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")),
-      TokenUnlock(Hash("nonExistent"), TokenLockAmount(200L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")),
-      TokenUnlock(Hash("expired1"), TokenLockAmount(300L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV"))
+    val source1 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")
+    val source2 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")
+    val source3 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV")
+    val activeTokenLocksByRef = Map(
+      Hash("active1") -> activeTokenLock(source1, TokenLockAmount(100L)),
+      Hash("active2") -> activeTokenLock(source2, TokenLockAmount(200L)),
+      Hash("expired1") -> activeTokenLock(source3, TokenLockAmount(300L))
     )
 
-    val result = manager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksRefs)
+    val incomingTokenUnlocks = SortedSet(
+      TokenUnlock(Hash("active1"), TokenLockAmount(100L), none, source1),
+      TokenUnlock(Hash("nonExistent"), TokenLockAmount(200L), none, source2),
+      TokenUnlock(Hash("expired1"), TokenLockAmount(300L), none, source3)
+    )
+
+    val result = manager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksByRef)
 
     (expect(result.size == 1) &&
       expect(result.head.tokenLockRef == Hash("active1"))).pure[IO]
@@ -61,15 +84,22 @@ object TokenLockOpsManagerSuite extends MutableIOSuite {
     val manager = TokenLockOpsManager.make[IO]
 
     val expiredTokenLockHashes = List(Hash("expired1"), Hash("expired2"))
-    val activeTokenLocksRefs = List(Hash("active1"), Hash("expired1"), Hash("expired2"))
-
-    val incomingTokenUnlocks = SortedSet(
-      TokenUnlock(Hash("active1"), TokenLockAmount(100L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")),
-      TokenUnlock(Hash("expired1"), TokenLockAmount(200L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")),
-      TokenUnlock(Hash("expired2"), TokenLockAmount(300L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV"))
+    val source1 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")
+    val source2 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")
+    val source3 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV")
+    val activeTokenLocksByRef = Map(
+      Hash("active1") -> activeTokenLock(source1, TokenLockAmount(100L)),
+      Hash("expired1") -> activeTokenLock(source2, TokenLockAmount(200L)),
+      Hash("expired2") -> activeTokenLock(source3, TokenLockAmount(300L))
     )
 
-    val result = manager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksRefs)
+    val incomingTokenUnlocks = SortedSet(
+      TokenUnlock(Hash("active1"), TokenLockAmount(100L), none, source1),
+      TokenUnlock(Hash("expired1"), TokenLockAmount(200L), none, source2),
+      TokenUnlock(Hash("expired2"), TokenLockAmount(300L), none, source3)
+    )
+
+    val result = manager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksByRef)
 
     (expect(result.size == 1) &&
       expect(result.head.tokenLockRef == Hash("active1"))).pure[IO]
@@ -80,18 +110,84 @@ object TokenLockOpsManagerSuite extends MutableIOSuite {
     val manager = TokenLockOpsManager.make[IO]
 
     val expiredTokenLockHashes = List.empty[Hash]
-    val activeTokenLocksRefs = List(Hash("active1"), Hash("active2"), Hash("active3"))
-
-    val incomingTokenUnlocks = SortedSet(
-      TokenUnlock(Hash("active1"), TokenLockAmount(100L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")),
-      TokenUnlock(Hash("active2"), TokenLockAmount(200L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")),
-      TokenUnlock(Hash("active3"), TokenLockAmount(300L), none, Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV"))
+    val source1 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")
+    val source2 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")
+    val source3 = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV")
+    val activeTokenLocksByRef = Map(
+      Hash("active1") -> activeTokenLock(source1, TokenLockAmount(100L)),
+      Hash("active2") -> activeTokenLock(source2, TokenLockAmount(200L)),
+      Hash("active3") -> activeTokenLock(source3, TokenLockAmount(300L))
     )
 
-    val result = manager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksRefs)
+    val incomingTokenUnlocks = SortedSet(
+      TokenUnlock(Hash("active1"), TokenLockAmount(100L), none, source1),
+      TokenUnlock(Hash("active2"), TokenLockAmount(200L), none, source2),
+      TokenUnlock(Hash("active3"), TokenLockAmount(300L), none, source3)
+    )
+
+    val result = manager.acceptTokenUnlocks(expiredTokenLockHashes, incomingTokenUnlocks, activeTokenLocksByRef)
 
     (expect(result.size == 3) &&
       expect(result.map(_.tokenLockRef).toSet == Set(Hash("active1"), Hash("active2"), Hash("active3")))).pure[IO]
+  }
+
+  test("acceptTokenUnlocks - should authenticate amount, currency, and source against the referenced lock") { res =>
+    implicit val (hasher, sp) = res
+    val manager = TokenLockOpsManager.make[IO]
+
+    val source = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebU")
+    val attacker = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")
+    val otherCurrency = CurrencyId(Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebV"))
+    val tokenLockRef = Hash("active1")
+    val tokenLock = activeTokenLock(source, TokenLockAmount(100L))
+    val validUnlock = TokenUnlock(tokenLockRef, tokenLock.amount, tokenLock.currencyId, tokenLock.source)
+    val incomingTokenUnlocks = SortedSet(
+      validUnlock,
+      validUnlock.copy(amount = TokenLockAmount(200L)),
+      validUnlock.copy(currencyId = otherCurrency.some),
+      validUnlock.copy(source = attacker)
+    )
+
+    val result = manager.acceptTokenUnlocks(List.empty, incomingTokenUnlocks, Map(tokenLockRef -> tokenLock))
+
+    expect(result == SortedSet(validUnlock)).pure[IO]
+  }
+
+  test("acceptTokenUnlocks - forged fields cannot refund or remove the referenced lock") { res =>
+    implicit val (hasher, sp) = res
+    val manager = TokenLockOpsManager.make[IO]
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      source <- kp.getPublic.toId.toAddress
+      attacker = Address("DAG53ho9ssY8KYQdjxsWPYgNbDJ1YqM2RaPDZebT")
+      signedTokenLock <- Signed.forAsyncHasher(activeTokenLock(source, TokenLockAmount(100L)), kp)
+      hashedTokenLock <- signedTokenLock.toHashed
+      activeTokenLocks = SortedMap(source -> SortedSet(signedTokenLock))
+      currentBalances = SortedMap(source -> Balance.empty, attacker -> Balance.empty)
+      forgedUnlock = TokenUnlock(hashedTokenLock.hash, TokenLockAmount(200L), none, attacker)
+      acceptedUnlocks = manager.acceptTokenUnlocks(
+        List.empty,
+        SortedSet(forgedUnlock),
+        Map(hashedTokenLock.hash -> signedTokenLock.value)
+      )
+      (updatedActiveTokenLocks, _) <- manager.acceptTokenLocks(
+        EpochProgress(1000L),
+        SortedMap.empty,
+        activeTokenLocks,
+        acceptedUnlocks
+      )
+      updatedBalances = manager.updateBalancesByTokenLocks(
+        EpochProgress(1000L),
+        currentBalances,
+        SortedMap.empty,
+        activeTokenLocks,
+        acceptedUnlocks
+      )
+    } yield
+      expect(acceptedUnlocks.isEmpty) &&
+        expect(updatedActiveTokenLocks == activeTokenLocks) &&
+        expect(updatedBalances == Right(currentBalances))
   }
 
   test("filterExpiredTokenLocks - should filter out token locks with past unlock epoch") { res =>
@@ -308,7 +404,7 @@ object TokenLockOpsManagerSuite extends MutableIOSuite {
       acceptedTokenLocks = SortedMap(signedAcceptedTokenLock.source -> SortedSet(signedAcceptedTokenLock))
       lastActiveTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]]
 
-      tokenUnlock = TokenUnlock(Hash("ref1"), TokenLockAmount(200L), none, address)
+      tokenUnlock = TokenUnlock(Hash("ref1"), TokenLockAmount(100L), none, address)
       acceptedTokenUnlocks = SortedSet(tokenUnlock)
 
       result = manager.updateBalancesByTokenLocks(
@@ -319,7 +415,7 @@ object TokenLockOpsManagerSuite extends MutableIOSuite {
         acceptedTokenUnlocks
       )
 
-      expectedBalance = Balance(600L) // 500 - 100 + 200
+      expectedBalance = Balance(500L) // 500 - 100 + 100
     } yield
       expect(result.isRight) &&
         expect(result.toOption.get(address) == expectedBalance)

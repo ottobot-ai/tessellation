@@ -220,22 +220,13 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         CurrencySnapshot
       ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
       events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
-      adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode =
-        GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.Recreate
+      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
     )(implicit hasher: Hasher[F]): IO[
       SortedMap[
         Address,
         (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])
       ]
     ] = ???
-
-    def deriveMetagraphRoot(
-      metagraphAddress: Address,
-      binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-      snapshotOrdinal: SnapshotOrdinal,
-      getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
-    )(implicit hasher: Hasher[F]): IO[Hash] = ???
 
     def assembleAcceptanceResult(
       processed: SortedMap[
@@ -581,9 +572,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       ShardingConfig(
         numShards = 4,
         finality = ShardFinalityConfig(k1Shard = 8L),
-        checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
-        observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
-        slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+        checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
+        observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
       )
 
     for {

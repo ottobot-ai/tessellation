@@ -41,11 +41,10 @@ import eu.timepit.refined.types.numeric.NonNegLong
   *     `peerIdBytes.map("%02x".format(_)).mkString` → `Hex` → `PeerId`).
   *   - `Hex` (sig fields) ⇄ `bytes`: `.toBytes` on encode, `Hex.fromBytes` on decode. The raw bytes form is the cheap wire representation,
   *     the `Hex` newtype is the schema-side representation.
-  *   - Heavy structural payloads (`Signed[StateChannelSnapshotBinary]`, the entire `ShardDerivedStateDelta`, `List[CrossShardReceipt]`) are
-  *     opaque JSON bytes via the project `JsonSerializer`. This mirrors how `MetagraphBinary.binary` carries `Signed[SCSB]` JSON and how
-  *     `AllowSpendBlock.payload` carries `Signed[AllowSpendBlock]` JSON. Because `JsonSerializer.forAsync` uses a `Printer` with `sortKeys
-  *     \= true` + `dropNullValues = true`, repeated encodes are byte-identical — the canonical-preimage hash signers compute is stable
-  *     across encode/decode round-trips.
+  *   - The `ShardDerivedStateDelta` is opaque JSON via the project `JsonSerializer`. This mirrors how `MetagraphBinary.binary` carries
+  *     `Signed[SCSB]` JSON and how `AllowSpendBlock.payload` carries `Signed[AllowSpendBlock]` JSON. Because `JsonSerializer.forAsync` uses
+  *     a `Printer` with `sortKeys \= true` + `dropNullValues = true`, repeated encodes are byte-identical — the canonical-preimage hash
+  *     signers compute is stable across encode/decode round-trips.
   *
   * '''Why `Async[F]` and `JsonSerializer[F]` constraints''' — JSON ser/de is the existing `JsonSerializer[F]` typeclass, which surfaces an
   * `F[Either[Throwable, A]]` on deserialize. Codec functions return `F[A]` (with `fromWire` lifting the deserialize failure into
@@ -139,97 +138,6 @@ object ShardCheckpointWireCodecs {
     }
 
   // ===========================================================================
-  // PerMetagraphSnapshots ⇄ SortedMap<Address, NonEmptyList<Signed<SCSB>>>
-  //
-  // Each per-MG entry: address + repeated JSON-encoded Signed[SCSB] bytes.
-  // Order across the repeated field == NonEmptyList order. SortedMap key order
-  // is preserved by emitting `toList` (SortedMap iteration is deterministic
-  // under `Ordering[Address]`).
-  //
-  // Decode contract: an empty `signed_snapshots_json` for a given entry is a
-  // protocol violation because the schema-side value is `NonEmptyList`. We
-  // surface this as `F.raiseError` so the caller can drop the message and
-  // log; we do NOT silently fall back to a stub.
-  // ===========================================================================
-
-  def includedSnapshotsToWire[F[_]: Async: JsonSerializer](
-    snaps: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
-  ): F[Seq[pb.PerMetagraphSnapshots]] =
-    snaps.toList.traverse {
-      case (mg, nel) =>
-        nel.toList
-          .traverse(s => JsonSerializer[F].serialize(s).map(ByteString.copyFrom))
-          .map { jsonList =>
-            pb.PerMetagraphSnapshots(
-              metagraphAddress = mg.value.value,
-              signedSnapshotsJson = jsonList
-            )
-          }
-    }.map(_.toSeq)
-
-  def includedSnapshotsFromWire[F[_]: Async: JsonSerializer](
-    wires: Seq[pb.PerMetagraphSnapshots]
-  ): F[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]] =
-    wires.toList.traverse { w =>
-      addressFromString(w.metagraphAddress) match {
-        case Left(err) =>
-          Async[F].raiseError[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]])](
-            new RuntimeException(s"PerMetagraphSnapshots: invalid metagraph address '${w.metagraphAddress}' ($err)")
-          )
-        case Right(addr) =>
-          w.signedSnapshotsJson.toList match {
-            case Nil =>
-              Async[F].raiseError[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]])](
-                new RuntimeException(
-                  s"PerMetagraphSnapshots: empty signed_snapshots_json for $addr — schema requires NonEmptyList"
-                )
-              )
-            case head :: tail =>
-              (head :: tail).traverse { bytes =>
-                JsonSerializer[F].deserialize[Signed[StateChannelSnapshotBinary]](bytes.toByteArray).flatMap {
-                  case Right(s) => Async[F].pure(s)
-                  case Left(e) =>
-                    Async[F].raiseError[Signed[StateChannelSnapshotBinary]](
-                      new RuntimeException(s"Signed[SCSB] JSON decode failed for $addr: ${e.getMessage}", e)
-                    )
-                }
-              }.map { case h :: t => (addr, NonEmptyList(h, t)); case _ => throw new IllegalStateException("unreachable") }
-          }
-      }
-    }
-      .map(entries => SortedMap.from(entries)(address.Address.OrderingInstance))
-
-  // ===========================================================================
-  // emittedReceipts: List[CrossShardReceipt] ⇄ bytes (opaque JSON)
-  //
-  // Empty bytes ⇒ empty list. Round-trip: List[CrossShardReceipt] → JSON →
-  // ByteString → JSON → List[CrossShardReceipt]. Determinism via
-  // `JsonSerializer.forAsync`'s sortKeys printer.
-  // ===========================================================================
-
-  def emittedReceiptsToWire[F[_]: Async: JsonSerializer](
-    receipts: List[CrossShardReceipt]
-  ): F[ByteString] =
-    if (receipts.isEmpty)
-      Async[F].pure(ByteString.EMPTY)
-    else
-      JsonSerializer[F].serialize(receipts).map(ByteString.copyFrom)
-
-  def emittedReceiptsFromWire[F[_]: Async: JsonSerializer](
-    b: ByteString
-  ): F[List[CrossShardReceipt]] =
-    if (b.isEmpty)
-      Async[F].pure(List.empty[CrossShardReceipt])
-    else
-      JsonSerializer[F].deserialize[List[CrossShardReceipt]](b.toByteArray).flatMap {
-        case Right(l) => Async[F].pure(l)
-        case Left(e) =>
-          Async[F].raiseError[List[CrossShardReceipt]](
-            new RuntimeException(s"List[CrossShardReceipt] JSON decode failed: ${e.getMessage}", e)
-          )
-      }
-
-  // ===========================================================================
   // ShardCheckpoint ⇄ ShardCheckpointWire
   //
   // The outer `Signed[ShardCheckpoint]` envelope is NOT carried on the gossip wire by
@@ -246,9 +154,7 @@ object ShardCheckpointWireCodecs {
     cp: ShardCheckpoint
   ): F[pb.ShardCheckpointWire] =
     for {
-      included <- includedSnapshotsToWire[F](cp.derivedStateDelta.includedSnapshots)
       derivedDelta <- derivedStateDeltaToWire[F](cp.derivedStateDelta)
-      receiptsJson <- emittedReceiptsToWire[F](cp.emittedReceipts)
     } yield
       pb.ShardCheckpointWire(
         shardId = cp.shardId.value.value,
@@ -256,36 +162,50 @@ object ShardCheckpointWireCodecs {
         parentCheckpointHash = hashToBytes(cp.parentCheckpointHash),
         gl0AnchorOrdinal = cp.gl0AnchorOrdinal.value.value,
         epoch = cp.epoch.value,
-        includedSnapshots = included,
         derivedStateDelta = Some(derivedDelta),
         committeeSignatures = cp.committeeSignatures.toList.map(committeeSignatureToWire),
-        emittedReceiptsJson = receiptsJson,
         slot = cp.slot.value.value,
-        // Track-1 diff-base-pin: the finalized ordinal the committee cut the byte-diff over. In the V2 signing preimage, so it MUST
-        // round-trip byte-faithfully or the receiver's `signingPreimage` hash (and every committee-sig verify) diverges.
-        diffBaseOrdinal = cp.diffBaseOrdinal.value.value
+        // Finalized execution base used by producer and every verifier. It is signed and must round-trip exactly.
+        executionBaseOrdinal = cp.executionBaseOrdinal.value.value
       )
 
   def shardCheckpointFromWire[F[_]: Async: JsonSerializer](
     w: pb.ShardCheckpointWire
   ): F[ShardCheckpoint] = {
     val shardIdOpt = ShardId(w.shardId)
+    val shardOrdinalOpt = Option.when(w.shardOrdinal >= 0L)(ShardOrdinal(w.shardOrdinal))
     val gl0OrdOpt = NonNegLong.from(w.gl0AnchorOrdinal).toOption.map(SnapshotOrdinal(_))
     val slotOpt = Slot(w.slot)
-    (shardIdOpt, gl0OrdOpt, slotOpt) match {
-      case (None, _, _) =>
+    val epochOpt = Option.when(w.epoch >= 0L)(EtaPeriod(w.epoch))
+    val executionBaseOpt = NonNegLong.from(w.executionBaseOrdinal).toOption.map(SnapshotOrdinal(_))
+    (shardIdOpt, shardOrdinalOpt, gl0OrdOpt, slotOpt, epochOpt, executionBaseOpt) match {
+      case (None, _, _, _, _, _) =>
         Async[F].raiseError[ShardCheckpoint](
           new RuntimeException(s"ShardCheckpointWire: invalid shard_id ${w.shardId} (must be non-negative)")
         )
-      case (_, None, _) =>
+      case (_, None, _, _, _, _) =>
+        Async[F].raiseError[ShardCheckpoint](
+          new RuntimeException(s"ShardCheckpointWire: invalid shard_ordinal ${w.shardOrdinal} (must be non-negative)")
+        )
+      case (_, _, None, _, _, _) =>
         Async[F].raiseError[ShardCheckpoint](
           new RuntimeException(s"ShardCheckpointWire: invalid gl0_anchor_ordinal ${w.gl0AnchorOrdinal} (must be non-negative)")
         )
-      case (_, _, None) =>
+      case (_, _, _, None, _, _) =>
         Async[F].raiseError[ShardCheckpoint](
           new RuntimeException(s"ShardCheckpointWire: invalid slot ${w.slot} (must be non-negative)")
         )
-      case (Some(sid), Some(gl0Ord), Some(slotV)) =>
+      case (_, _, _, _, None, _) =>
+        Async[F].raiseError[ShardCheckpoint](
+          new RuntimeException(s"ShardCheckpointWire: invalid epoch ${w.epoch} (must be non-negative)")
+        )
+      case (_, _, _, _, _, None) =>
+        Async[F].raiseError[ShardCheckpoint](
+          new RuntimeException(
+            s"ShardCheckpointWire: invalid execution_base_ordinal ${w.executionBaseOrdinal} (must be non-negative)"
+          )
+        )
+      case (Some(sid), Some(shardOrdinal), Some(gl0Ord), Some(slotV), Some(epoch), Some(executionBase)) =>
         for {
           // The derived-state-delta wire is required; a None is wire-shape-level invalid.
           deltaWire <- w.derivedStateDelta
@@ -293,12 +213,6 @@ object ShardCheckpointWireCodecs {
               new RuntimeException("ShardCheckpointWire: missing required derived_state_delta")
             )
           delta <- derivedStateDeltaFromWire[F](deltaWire)
-          // Validate cross-consistency: the wire-side derived delta carries its own includedSnapshots; the wire-side
-          // includedSnapshots message field is the per-MG repeated decomposition. The two must agree. We treat the
-          // delta-internal one as authoritative (it's the field that hashes into the signed preimage) but also re-decode
-          // the structural one to catch a sender that forgot to keep them in sync.
-          _ <- includedSnapshotsFromWire[F](w.includedSnapshots).void
-          receipts <- emittedReceiptsFromWire[F](w.emittedReceiptsJson)
           sigsList = w.committeeSignatures.toList.map(committeeSignatureFromWire)
           sigsNel <- sigsList match {
             case Nil =>
@@ -313,16 +227,13 @@ object ShardCheckpointWireCodecs {
           ShardCheckpoint(
             shardId = sid,
             parentCheckpointHash = bytesToHash(w.parentCheckpointHash),
-            shardOrdinal = ShardOrdinal(w.shardOrdinal),
+            shardOrdinal = shardOrdinal,
             gl0AnchorOrdinal = gl0Ord,
             slot = slotV,
             derivedStateDelta = delta,
-            emittedReceipts = receipts,
             committeeSignatures = sigsNel,
-            epoch = EtaPeriod(w.epoch),
-            // Track-1 diff-base-pin (wire field 11). A negative uint64 (> Long.MAX) is not a valid ordinal ⇒ fall back to MinValue (the
-            // pre-sharding regression-bar default); the signing-preimage hash verify downstream rejects any genuinely wrong value.
-            diffBaseOrdinal = NonNegLong.from(w.diffBaseOrdinal).toOption.map(SnapshotOrdinal(_)).getOrElse(SnapshotOrdinal.MinValue)
+            epoch = epoch,
+            executionBaseOrdinal = executionBase
           )
     }
   }

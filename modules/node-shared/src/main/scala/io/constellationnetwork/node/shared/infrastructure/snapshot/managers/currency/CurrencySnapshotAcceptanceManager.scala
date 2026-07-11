@@ -19,7 +19,6 @@ import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalS
 import io.constellationnetwork.node.shared.domain.swap.block.AllowSpendBlockAcceptanceManager
 import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlockAcceptanceManager
 import io.constellationnetwork.node.shared.domain.transaction.FeeTransactionValidator
-import io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencyBalanceAdjustments.metagraphsBalancesAdjustments
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{CurrencyMessageValidator, GlobalSnapshotSyncValidator}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -66,12 +65,10 @@ trait CurrencySnapshotAcceptanceManager[F[_]] {
     // `globalSnapshotsAlreadyProcessed` mutable cache. Gates which cross-shard `SpendAction`s are (re-)applied:
     // `A = { o ∈ U : o ≤ view ∧ o ∉ P }`. Because `P` is now a pure input, `accept` no longer depends on manager-instance-local state.
     alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
-    // Validator-only override. When Some, bypass the priority chain that picks
-    // which GL0 ordinal to sync to and use this exact value. This lets GL0 re-run
-    // acceptance with the same GL0 sync point the producer used, avoiding the race
-    // where GL0's local head has advanced past what CL0 saw when producing.
-    // Producers should always pass None; only the validator supplies a value.
-    forcedGlobalSyncView: Option[GlobalSyncView] = None
+    // Validator-only execution pin. The submitted view selects an ordinal, but its
+    // hash and epoch must match finalized GL0 before any transition is recreated.
+    // Producers pass None; GL0 validators supply the view committed by the binary.
+    pinnedGlobalSyncView: Option[GlobalSyncView] = None
   )(implicit hasher: Hasher[F]): F[CurrencySnapshotAcceptanceResult]
 
   def acceptRewardTxs(
@@ -83,9 +80,16 @@ trait CurrencySnapshotAcceptanceManager[F[_]] {
 
 object CurrencySnapshotAcceptanceManager {
 
+  private[currency] def filterFrameworkGeneratedArtifacts(
+    supplied: SortedSet[SharedArtifact]
+  ): SortedSet[SharedArtifact] = supplied.filter {
+    case _: GlobalSnapshotsProcessed => false
+    case _                           => true
+  }
+
   /** Select the GL0 ordinal the CL0 producer will sync to when stamping the next CL0 snapshot.
     *
-    * Priority (producer path, when `forcedGlobalSyncView=None`): (A) peer `GlobalSnapshotSync` quorum (`maybeSnapshotOrdinalSync`) — when
+    * Priority (producer path, when `pinnedGlobalSyncView=None`): (A) peer `GlobalSnapshotSync` quorum (`maybeSnapshotOrdinalSync`) — when
     * present, it is the consensus-derived sync point and wins outright (committee-of-peers can legitimately be ahead of the local follower
     * at small CL0 cohort sizes). (B) prior CL0 snapshot's `globalSyncView.ordinal` (`maybeLastGlobalSyncView`) — a monotonic lower bound
     * that protects against local-follower regression on reorg. (C) the producer's actual GL0 head (`fallbackOrdinal =
@@ -104,13 +108,13 @@ object CurrencySnapshotAcceptanceManager {
     * avoid using the `Ord.MinValue` sentinel as a real ordinal.
     */
   private[currency] def selectOrdinalToFetchGlobalSnapshot(
-    forcedGlobalSyncView: Option[GlobalSyncView],
+    pinnedGlobalSyncView: Option[GlobalSyncView],
     maybeSnapshotOrdinalSync: Option[SnapshotOrdinal],
     maybeLastGlobalSyncView: Option[GlobalSyncView],
     fallbackOrdinal: SnapshotOrdinal
   ): SnapshotOrdinal =
-    forcedGlobalSyncView.map(_.ordinal) match {
-      case Some(forced) => forced
+    pinnedGlobalSyncView.map(_.ordinal) match {
+      case Some(pinned) => pinned
       case None =>
         maybeSnapshotOrdinalSync match {
           case Some(peerSync) => peerSync
@@ -138,7 +142,7 @@ object CurrencySnapshotAcceptanceManager {
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     // Track-1 I-PIN (Step-1 read-at-anchor). The version-retained, BY-ORDINAL per-metagraph pinned reader (blocker-2a). On the
-    // VALIDATOR / re-exec path (`forcedGlobalSyncView` set) `accept` reads the metagraph's gl0-committed cross-shard sync data at the
+    // VALIDATOR / re-exec path (`pinnedGlobalSyncView` set) `accept` reads the metagraph's gl0-committed cross-shard sync data at the
     // RECORDED `globalSyncView` through this reader instead of the non-deterministic node-local head. `None` (tests, or a rail with no
     // per-ordinal global byte store such as the currency-l0 producer) ⇒ the producer path keeps its head read (byte-identical to today)
     // and the validator path folds no cross-shard sync data (deterministic). Prod wires it in `SharedServices.make` over the same
@@ -239,7 +243,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     shouldPerformMetagraphSpecificValidations: Boolean,
     lastArtifactProofs: NonEmptySet[SignatureProof],
     alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
-    forcedGlobalSyncView: Option[GlobalSyncView] = None
+    pinnedGlobalSyncView: Option[GlobalSyncView] = None
   )(implicit hasher: Hasher[F]): F[CurrencySnapshotAcceptanceResult] = for {
     initialTxRef <- TransactionReference.emptyCurrency(lastSnapshotContext.address)
     tokenLockInitialTxRef <- TokenLockReference.emptyCurrency(lastSnapshotContext.address)
@@ -255,8 +259,6 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     updatedLastSyncGlobalOrder = fieldsAddedOrdinals.updatedLastSyncGlobalOrder
       .getOrElse(environment, SnapshotOrdinal.MinValue)
     updatedLastSyncGlobalFromPeersInConsensus = fieldsAddedOrdinals.updatedLastSyncGlobalFromPeersInConsensus
-      .getOrElse(environment, SnapshotOrdinal.MinValue)
-    updatingCombineFunctionSpendActions = fieldsAddedOrdinals.updatingCombineFunctionSpendActions
       .getOrElse(environment, SnapshotOrdinal.MinValue)
     fixingAllowSpendExpiration = fieldsAddedOrdinals.fixingAllowSpendExpiration
       .getOrElse(environment, SnapshotOrdinal.MinValue)
@@ -300,7 +302,10 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       feeTransactionsForAcceptance
     )
 
-    acceptedSharedArtifacts = sharedArtifactsForAcceptance
+    // GlobalSnapshotsProcessed is a framework acknowledgement, not DL1-provided application data. Recompute it below from the exact
+    // consensus-pinned GL0 ordinals this acceptance actually folds. Accepting a supplied value verbatim would let a producer acknowledge an
+    // ordinal without applying its SpendActions, causing GL0 to retire the cross-shard balance overlay against stale raw currency state.
+    acceptedSharedArtifacts = CurrencySnapshotAcceptanceManager.filterFrameworkGeneratedArtifacts(sharedArtifactsForAcceptance)
     maybeUnsyncLastGlobalSnapshot <- lastGlobalSnapshotStorage.getCombined
 
     (lastUnsyncGlobalSnapshot, lastUnsyncGlobalSnapshotInfo) <- OptionT
@@ -312,7 +317,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     // cross-metagraph address-uniqueness check) — NOT reconstructible from `pinnedCurrencyInfoReader`'s per-metagraph `CurrencySnapshotInfo`.
     // They are kept on the head read in this slice; a message-bearing snapshot's `lastMessages` field therefore remains head-influenced on
     // the validator path (a residual purity gap, out of scope here — the forcing test is message-free). `lastUnsyncMetagraphSyncData` is used
-    // ONLY on the PRODUCER path below (`forcedGlobalSyncView` empty); the validator path reads the metagraph's sync data at the pinned anchor.
+    // ONLY on the PRODUCER path below (`pinnedGlobalSyncView` empty); the validator path reads the metagraph's sync data at the pinned anchor.
     lastUnsyncBalances = lastUnsyncGlobalSnapshotInfo.balances
     lastUnsyncLastCurrencySnapshots = lastUnsyncGlobalSnapshotInfo.lastCurrencySnapshots
     lastUnsyncMetagraphSyncData = lastUnsyncGlobalSnapshotInfo.metagraphSyncData
@@ -331,13 +336,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         lastSnapshotContext.snapshotInfo.globalSnapshotSyncView,
         globalSnapshotSyncsForAcceptance,
         lastSnapshotContext.address,
-        facilitators,
-        // FORCED-OVERRIDE (#259 currency-consensus determinism): `forcedGlobalSyncView` is set ONLY on the follower/validator
-        // RECOMPUTE path (CurrencySnapshotValidator passes `expected.globalSyncView`), never on produce. On that path the
-        // available `facilitators` is `artifact.proofs` (2/3 signers) — too narrow to reproduce the producer's committed
-        // `globalSnapshotSyncView` (accepted under the full committee), so trust the committed syncs instead of re-gating
-        // membership. Verified single-ml0 (committee={ml0}, no asymmetry) wedges 0× vs 837× multi-ml0.
-        trustCommitted = forcedGlobalSyncView.isDefined
+        facilitators
       )
     ).parMapN((messages, syncs) => (messages, syncs))
 
@@ -371,18 +370,15 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
 
     lastGlobalSnapshots <- lastNGlobalSnapshotStorage.getLastN
 
-    // Validator path: when forcedGlobalSyncView is Some, the validator is re-running
-    // acceptance to check a CL0 snapshot that was produced against a specific GL0
-    // sync point. Bypass the priority chain (maybeSnapshotOrdinalSync → last view →
-    // local head) and use the exact ordinal the producer used. Under GL0 finality,
-    // this ordinal is guaranteed reachable on our chain; hash is verified as a
-    // sanity check.
+    // Validator path: re-run acceptance against the exact GL0 input committed by the
+    // submitted snapshot. The ordinal is only a lookup key; finalized hash and epoch
+    // equality below are mandatory execution-input checks.
     //
     // Producer path: see CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot
     // for the priority semantics (peer-sync > max(prior-view, local-head)). Mode-2 bug fix
     // documented in docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md.
     ordinalToFetchGlobalSnapshot = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView,
+      pinnedGlobalSyncView,
       maybeSnapshotOrdinalSync,
       maybeLastGlobalSyncView,
       fallbackOrdinal
@@ -393,18 +389,16 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       case None        => globalSnapshotOps.getGlobalSnapshotWithRetry(ordinalToFetchGlobalSnapshot, getGlobalSnapshotByOrdinal)
     }
 
-    // Track-1 I-PIN (Step-1) — hash-pin as a CLEAN REJECT, not a fatal raise. On the validator / re-exec path the recorded
-    // `forcedGlobalSyncView` pins the EXACT GL0 snapshot this CL0 snapshot was produced against. If our local snapshot at that ordinal
-    // has a different hash, the recorded view is stale/forked relative to our canonical chain and we must REDO this snapshot against the
-    // new canonical view — NOT crash. We log and PROCEED: the pinned reads below hard-reject on the hash mismatch (fold nothing), so the
-    // recomputed `stateProof` will not match the producer's and the snapshot is rejected downstream by the ordinary stateProof
-    // comparison (a re-propose), never a fatal exception that could wedge the consensus loop.
-    _ <- forcedGlobalSyncView.traverse_ { forced =>
-      Async[F].whenA(lastSyncGlobalSnapshot.hash =!= forced.hash)(
-        logger.warn(
-          s"Forced globalSyncView hash mismatch (clean reject / redo): CL0 snapshot references GL0 ordinal ${forced.ordinal.show} " +
-            s"with hash ${forced.hash.show}, but local GL0 at that ordinal has hash ${lastSyncGlobalSnapshot.hash.show}. " +
-            s"Recomputing against the local canonical view; the stateProof comparison rejects this snapshot for re-proposal."
+    // The committed view is only an execution-input locator. The located snapshot must exactly match finalized GL0 history; submitted hash
+    // and epoch values are never copied into recreated state.
+    _ <- pinnedGlobalSyncView.traverse_ { pinned =>
+      Async[F].raiseWhen(
+        lastSyncGlobalSnapshot.hash =!= pinned.hash || lastSyncGlobalSnapshot.epochProgress =!= pinned.epochProgress
+      )(
+        new IllegalArgumentException(
+          s"Pinned globalSyncView does not match finalized GL0 history at ordinal ${pinned.ordinal.show}: " +
+            s"pinnedHash=${pinned.hash.show} finalizedHash=${lastSyncGlobalSnapshot.hash.show} " +
+            s"pinnedEpoch=${pinned.epochProgress.show} finalizedEpoch=${lastSyncGlobalSnapshot.epochProgress.show}"
         )
       )
     }
@@ -416,17 +410,16 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     lastGlobalSnapshotEpochProgress = lastSyncGlobalSnapshot.epochProgress
     lastGlobalSnapshotOrdinal = lastSyncGlobalSnapshot.ordinal
 
-    globalSyncView = forcedGlobalSyncView.getOrElse(
+    finalizedFetchedView = GlobalSyncView(
+      lastSyncGlobalSnapshot.ordinal,
+      lastSyncGlobalSnapshot.hash,
+      lastSyncGlobalSnapshot.epochProgress
+    )
+    globalSyncView = pinnedGlobalSyncView.fold(
       maybeLastGlobalSyncView
         .filter(_.ordinal >= lastSyncGlobalSnapshot.ordinal)
-        .getOrElse(
-          GlobalSyncView(
-            lastSyncGlobalSnapshot.ordinal,
-            lastSyncGlobalSnapshot.hash,
-            lastSyncGlobalSnapshot.epochProgress
-          )
-        )
-    )
+        .getOrElse(finalizedFetchedView)
+    )(_ => finalizedFetchedView)
 
     // [OVERPRUNE-DIAG/ml0] (2026-06-13, REMOVE after e2e): the smoking gun for run-26 divergence #1. ml0 EXPIRES allow-spends/
     // token-locks with `lastGlobalSnapshotEpochProgress` (the synced snapshot's epoch at `ordinalToFetch`), but ADVERTISES
@@ -486,12 +479,12 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     // which SpendActions this snapshot folds MUST be read at the RECORDED `globalSyncView`, never the node-local head. Otherwise two
     // validators whose heads advertise different `metagraphSyncData` (one having advanced past the pinned view) fold different cross-shard
     // state and compute divergent `balancesProof` — exactly the forcing-test impurity. Rules:
-    //   - PRODUCER path (`forcedGlobalSyncView` empty): keep the head read. The producer DEFINES the view it records, and the currency-l0
+    //   - PRODUCER path (`pinnedGlobalSyncView` empty): keep the head read. The producer DEFINES the view it records, and the currency-l0
     //     producer has no per-ordinal global byte store to re-read from ⇒ byte-identical to pre-I-PIN, preserving cross-shard on produce.
-    //   - VALIDATOR / re-exec path (`forcedGlobalSyncView` set): read the metagraph's fieldId-18 sync data at the pinned anchor through
+    //   - VALIDATOR / re-exec path (`pinnedGlobalSyncView` set): read the metagraph's fieldId-18 sync data at the pinned anchor through
     //     `pinnedCurrencyInfoReader` (hard-reject/`None` on hash-pin miss or retention eviction — NEVER a head fallback). A `None` reader
     //     (tests, or a rail with no global byte store) folds no cross-shard sync data — deterministic and head-independent.
-    anchorMetagraphSyncData <- forcedGlobalSyncView match {
+    anchorMetagraphSyncData <- pinnedGlobalSyncView match {
       case None => lastUnsyncMetagraphSyncData.pure[F]
       case Some(_) =>
         pinnedCurrencyInfoReader match {
@@ -509,9 +502,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       getGlobalSnapshotByOrdinal,
       metagraphId,
       anchorMetagraphSyncData,
-      alreadyProcessedGlobalOrdinals,
-      globalSyncView.ordinal,
-      updatingCombineFunctionSpendActions
+      alreadyProcessedGlobalOrdinals
     )
 
     metagraphIdSpendTransactions = globalSnapshotsSpendActions.flatMap {
@@ -527,9 +518,10 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
 
     activeTokenLocks = lastSnapshotContext.snapshotInfo.activeTokenLocks.getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
 
-    tokenLocksRefs <-
+    tokenLocksByRef <-
       (incomingTokenLocks.toList ++ activeTokenLocks.values.flatten)
-        .traverse(_.toHashed.map(_.hash))
+        .traverse(tokenLock => tokenLock.toHashed.map(hashed => hashed.hash -> tokenLock.value))
+        .map(_.toMap)
 
     tokenUnlocks = acceptedSharedArtifacts.collect {
       case tokenUnlock: TokenUnlock => tokenUnlock
@@ -544,7 +536,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     acceptedTokenUnlocks = tokenLockOps.acceptTokenUnlocks(
       expiredTokenLocksHashes,
       tokenUnlocks,
-      tokenLocksRefs
+      tokenLocksByRef
     )
 
     acceptedTokenLocks = incomingTokenLocks
@@ -644,38 +636,11 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         else lastGlobalSnapshotOrdinal
       }
 
-    balanceAdjustments = acceptedSharedArtifacts.collect {
-      case balanceAdjustment: io.constellationnetwork.schema.artifact.BalanceAdjustment => balanceAdjustment
-    }
-
-    updatedBalancesByInvalidAddressChecks <-
-      metagraphsBalancesAdjustments
-        .get(lastSnapshotContext.address)
-        .fold[F[SortedMap[Address, Balance]]] {
-          if (balanceAdjustments.nonEmpty) {
-            val unauthorizedError = new RuntimeException(
-              s"Metagraph $metagraphId not authorized to perform balance updates on ordinal $snapshotOrdinal"
-            )
-            Async[F].raiseError(unauthorizedError)
-          } else {
-            updatedBalancesBySpendTransactions.pure[F]
-          }
-        } { info =>
-          if (info.snapshotOrdinal === snapshotOrdinal && info.environment === environment) {
-            info.balanceAdjustFunction(updatedBalancesBySpendTransactions, balanceAdjustments) match {
-              case Right(balances) => balances.pure[F]
-              case Left(error)     => Async[F].raiseError(new RuntimeException(s"Balance adjustment failed: $error"))
-            }
-          } else {
-            updatedBalancesBySpendTransactions.pure[F]
-          }
-        }
-
     csi = CurrencySnapshotInfo(
       if (snapshotOrdinalToCheckFields < tessellation3MigrationStartingOrdinal)
         lastSnapshotContext.snapshotInfo.lastTxRefs ++ acceptanceBlocksResult.contextUpdate.lastTxRefs
       else transactionsRefs,
-      updatedBalancesByInvalidAddressChecks,
+      updatedBalancesBySpendTransactions,
       Option.when(messagesAcceptanceResult.contextUpdate.nonEmpty)(messagesAcceptanceResult.contextUpdate),
       None,
       if (snapshotOrdinalToCheckFields < tessellation3MigrationStartingOrdinal) none else updatedAllowSpendRefs.some,

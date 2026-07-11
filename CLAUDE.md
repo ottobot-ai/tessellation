@@ -46,6 +46,15 @@ Conventional commits required (enforced by commitlint). Format: `type: descripti
 
 ## Architecture
 
+`AGENTS.md` is the normative layer/topology and economic-authority map. In
+particular, `dag-l1` is GL1, not a metagraph layer, and all CL1 framework economics
+must be re-executed on the way into canonical GL0 state.
+
+Both metagraph-binary admission and execution-shard committees are GL0 operator
+committees. Admission uses a real per-binary VRF with uniform `1/N` weight;
+execution membership uses a separate public, enumerable VK-hash draw with uniform
+`1/N` weight. ML0 signs the binary but is not either committee.
+
 ```
 modules/
 ├── shared        # Core data structures, crypto, serialization
@@ -53,10 +62,10 @@ modules/
 ├── keytool       # Key management and cryptography
 ├── wallet        # Wallet operations
 ├── node-shared   # P2P networking, consensus, metrics, gossip
-├── dag-l0        # Layer 0 validator - global DAG consensus
-├── dag-l1        # Layer 1 validator - metagraph consensus
-├── currency-l0   # Currency logic for L0
-├── currency-l1   # Currency logic for L1
+├── dag-l0        # GL0: global consensus, settlement, canonical MPT, finality
+├── dag-l1        # GL1: native DAG-token edge application; sends directly to GL0
+├── currency-l0   # ML0/CL0: metagraph snapshot consensus; submits binaries to GL0
+├── currency-l1   # CL1 or DL1 runtime: framework economics and optional custom data app
 ├── sdk           # SDK for custom metagraph extensions
 ├── rosetta       # Blockchain data standardization
 ├── tools         # CLI utilities
@@ -129,6 +138,10 @@ This is a project-wide rule. Sub-agents and humans alike — encapsulate config,
 
 Tessellation implements a hierarchical DAG consensus with L0 (global) aggregating L1 (metagraph) blocks. The largest module is `node-shared` (419k tokens) providing consensus FSM, anti-entropy gossip, and cluster management. Core data structures (transactions, blocks, snapshots, Merkle Patricia Tries) live in `shared`. Currency modules extend dag-l0/l1 with metagraph-specific logic and extension points for custom data applications.
 
-**Consensus flow**: L1 creates blocks → Currency-L0 creates snapshots → Global-L0 creates global snapshots with all metagraph state.
+**Native DAG flow**: client -> GL1 -> GL0.
+
+**Metagraph flow**: CL1 framework-economic blocks and DL1 custom-data blocks ->
+ML0 snapshot consensus -> state-channel binary -> GL0. Finalized GL0 state then
+flows back to GL1, ML0, CL1, and DL1 as the canonical follower state.
 
 For detailed architecture, file purposes, and navigation guides, see [docs/CODEBASE_MAP.md](docs/CODEBASE_MAP.md).

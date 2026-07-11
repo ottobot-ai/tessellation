@@ -46,6 +46,7 @@ trait StateChannelValidator[F[_]] {
   )(
     implicit hasher: Hasher[F]
   ): F[StateChannelValidationErrorOr[StateChannelOutput]]
+
 }
 
 object StateChannelValidator {

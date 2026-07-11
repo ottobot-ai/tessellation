@@ -13,7 +13,7 @@ import weaver.SimpleIOSuite
 /** Tests for [[MetagraphAttestationAggregator]] — the per-metagraph committee attestation tally (Slice S2.5).
   *
   * The aggregator is verification-agnostic by contract (callers pre-verify); these tests assert the bookkeeping: idempotent record,
-  * per-binary isolation, threshold semantics that match `TipTracker.FinalityThreshold`, and `pruneParents` correctness.
+  * per-binary isolation, direct configured-quorum checks, and `pruneParents` correctness.
   */
 object MetagraphAttestationAggregatorSuite extends SimpleIOSuite {
 
@@ -28,29 +28,6 @@ object MetagraphAttestationAggregatorSuite extends SimpleIOSuite {
 
   private def hash(tag: String): Hash =
     Hash((tag + "0" * 64).take(64))
-
-  // ============ requiredCount semantics ============
-
-  test("requiredCount uses ceil(2/3 · K) — matches TipTracker.FinalityThreshold parity") {
-    // Default threshold = 2/3. K=3 → ceil(2) = 2; K=6 → ceil(4) = 4; K=7 → ceil(14/3) = 5;
-    // K=100 → ceil(200/3) = 67; K=400 → ceil(800/3) = 267.
-    IO.pure {
-      expect(MetagraphAttestationAggregator.requiredCount(3) == 2)
-        .and(expect(MetagraphAttestationAggregator.requiredCount(6) == 4))
-        .and(expect(MetagraphAttestationAggregator.requiredCount(7) == 5))
-        .and(expect(MetagraphAttestationAggregator.requiredCount(100) == 67))
-        .and(expect(MetagraphAttestationAggregator.requiredCount(400) == 267))
-    }
-  }
-
-  test("requiredCount rejects kTarget=0") {
-    IO.delay {
-      val caught =
-        try { MetagraphAttestationAggregator.requiredCount(0); false }
-        catch { case _: IllegalArgumentException => true }
-      expect(caught)
-    }
-  }
 
   // ============ record + idempotency ============
 

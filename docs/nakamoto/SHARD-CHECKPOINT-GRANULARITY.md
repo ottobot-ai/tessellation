@@ -1,5 +1,11 @@
 # Shard checkpoint granularity — recommendation
 
+> **HISTORICAL, SUPERSEDED RECOMMENDATION.** This document assumes an abandoned
+> shard topology and proof/adoption model; it does not describe the current v1
+> assignment, committee lifecycle, or GL0 economic-validity gate. Do not use it
+> to drive implementation. It is retained only as decision history; see
+> [`../../AGENTS.md`](../../AGENTS.md), ADR-0016, and ADR-0017.
+
 **Status:** research recommendation. No code commitment. Written 2026-05-22
 against `feature/serde-typeclass-shim`.
 **Scope:** how often a shard committee should publish a "shard sub-snapshot"

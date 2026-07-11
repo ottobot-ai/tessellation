@@ -3,7 +3,7 @@ package io.constellationnetwork.dag.l0.http.routes
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedMap
+import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.http4s.AddressVar
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
@@ -29,14 +29,12 @@ import org.http4s.dsl.Http4sDsl
   * [[io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps.getCurrencySnapshotInfo]]), the per-metagraph state
   * gl0 mirrors and commits to via the shard checkpoint `perMetagraphMptRoot`.
   *
-  * '''Why this route exists.''' Under roots-only sharding the per-MG currency state lives in the MPT, NOT in the
-  * `GlobalSnapshotInfo.lastCurrencySnapshots` blob (which is being eliminated — `info` is no longer the source of truth and is empty in the
-  * combined view). So a metagraph-token balance — e.g. a data-application fee that lands in the metagraph token — is held by gl0 but had no
-  * read surface. This is that surface: "whatever touches CL1 is tessellation-level, so the global layer knows it." This serves the value
-  * (the "known" half); the VERIFIABLE half — an MPT inclusion proof of the `MgBalances` key against the shard checkpoint root — is what
-  * [[ShardProofRoutes]] (`POST /shard/{shardId}/proof`) is built for. That route + its `ShardSubtreeProofService` are now wired into the
-  * gl0 server on the sharding-active path (`numShards > 1`); at `numShards = 1` the proof route serves 503 (no shard committees to prove
-  * against).
+  * '''Why this route exists.''' GL0 recreates every CL1 transition and commits the resulting per-MG currency state in the MPT; it does not
+  * adopt producer-carried cumulative state. A metagraph-token balance — e.g. a data-application fee that lands in the metagraph token — is
+  * therefore held by GL0 but needs a read surface. This serves the value (the "known" half); the VERIFIABLE half — an MPT inclusion proof
+  * of the `MgBalances` key against the shard checkpoint root — is what [[ShardProofRoutes]] (`POST /shard/{shardId}/proof`) is built for.
+  * That route + its `ShardSubtreeProofService` are now wired into the gl0 server on the sharding-active path (`numShards > 1`); at
+  * `numShards = 1` the proof route serves 503.
   *
   * '''Endpoint''': `GET /currency/{metagraphId}/balance/{address}` → `{ "metagraphId", "address", "balance": <long> }`. Balance is `0` when
   * the metagraph or address is absent (no proof-of-absence in v1 — `0` is the read default). `503` before the snapshot head exists
@@ -74,15 +72,20 @@ final case class GL0CurrencyBalanceRoutes[F[_]: Async: HasherSelector](
           HasherSelector[F].withCurrent { implicit hasher =>
             (
               reader.getCurrencySnapshotInfo(metagraphId),
+              reader.getMetagraphSyncData(metagraphId),
               consumedAllowSpendStateManager.materializeConsumedAllowSpendsFromMpt
             ).tupled
           }.map {
-            case (maybeInfo, spentSet) =>
+            case (maybeInfo, metagraphSyncData, spentSet) =>
               val attested: SortedMap[Address, Balance] = maybeInfo.map(_.balances).getOrElse(SortedMap.empty[Address, Balance])
+              val pendingGlobalChangeOrdinals = metagraphSyncData.fold(Map.empty[Address, SortedSet[SnapshotOrdinal]]) { syncData =>
+                Map(metagraphId -> syncData.unappliedGlobalChangeOrdinals)
+              }
               val effective = consumedAllowSpendStateManager.effectiveCurrencyBalances(
                 attested,
                 metagraphId.some,
                 spentSet,
+                pendingGlobalChangeOrdinals,
                 Map.empty[Address, EpochProgress],
                 liveEpoch
               )

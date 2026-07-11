@@ -1,131 +1,67 @@
-# Shard-checkpoint flow — metagraph → hypergraph walkthrough
+# Shard Checkpoint Flow
 
-Traces, step by step: how two metagraphs on two different shards produce snapshots and get
-integrated into the hypergraph (gl0); how the hypergraph advancing feeds back into metagraph
-state; and how a hypergraph reorg is (and isn't) absorbed. Grounded in
-`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` (the design) + the current code, and flags where the
-**current Slice-13 implementation diverges from the design** (the #259 root + fix target).
+**Status:** current flow. ADR-0016 and ADR-0017 are normative.
 
-Cast:
-- **metagraph_A** — currency metagraph, address `A`. `shardIdFor(A) = hash(A) mod 4 = 0`.
-- **metagraph_B** — currency metagraph, address `B`. `shardIdFor(B) = 1`.
-- **Shard-0 / Shard-1 committees** — *different* VRF-sortitioned subsets of the 8 gl0 operators.
-- Each metagraph runs its **own BFT consensus internally** (ml0/cl1/dl1), unchanged (`§2.3`).
+## Layer Topology
 
-Layer terms: a **metagraph snapshot** = `Signed[StateChannelSnapshotBinary]` (wraps a
-`CurrencyIncrementalSnapshot` + a tiny `globalSyncView` = `(ordinal, hash, epochProgress)`,
-`globalSnapshotSync.scala:38`). A **shard checkpoint** = `Signed[ShardCheckpoint]` (committee-signed;
-carries `ShardDerivedStateDelta`). A **global snapshot** = `Signed[GlobalIncrementalSnapshot]`
-(carries `SortedMap[ShardId, Signed[ShardCheckpoint]]`).
+```text
+native DAG client -> GL1 -------------------------------> GL0
 
----
+economic client -> CL1 --+
+                          +-> ML0 -> state-channel binary -> GL0 admission -> execution shard -> GL0
+custom data client -> DL1-+
 
-## 0. Current-vs-design gap (why this matters)
+finalized GL0 state -> GL1, ML0, CL1, DL1
+```
 
-The design (`§2.2`, `§7.3`): the shard committee re-executes a metagraph's transitions, signs a
-checkpoint, and **gl0 accepts the checkpoint by signature threshold and applies its
-`derivedStateDelta` directly** — gl0 does *not* re-run chain-link or re-execute.
+GL1 is the native DAG-token edge application and sends blocks directly to GL0. CL1 and DL1 send blocks to ML0. ML0 runs metagraph
+snapshot consensus and submits the resulting signed state-channel binary to GL0. ML0 operators produce and sign that binary; they are not
+the GL0 admission or execution committee by virtue of operating ML0.
 
-The current **Slice-13** wiring (`GlobalSnapshotAcceptanceManager.scala:450-489`, commit
-`cfca30cfb`/`1b27e0a7f`) is an explicit *minimal* "regression bar": it verifies the committee
-signatures, takes only `derivedStateDelta.includedSnapshots`, **re-feeds them through the legacy
-`processStateChannelEvents` pipeline** (re-execute + `onlyPossibleReferences` chain-link against
-gl0's own tip), and **discards** the committee's `tokenLockBalancesDelta` / `perMetagraphMptRoots`.
-The legacy admission path (`MetagraphCommitteeGate`, `stateChannelSnapshots`) was not removed
-(Slice 15 / #280 deferred). So gl0 still re-executes + re-chain-links, and a frozen gl0 tip stalls.
-The commit message confirms it: *"reExecuteDerivation is the noReExecDerivation stub … Producer
-side (priority 2) deferred."* **Deferred completion, not a bug hit.** The ⚠️ branch in the diagram
-below marks the deviation.
+## Binary Admission
 
----
+For each `(eta, metagraphAddress, parentHash)`, eligible GL0 operators independently run the secret-key admission VRF. The draw is uniform
+`1/N` today. A successful admission authenticates and buffers the binary for its statically assigned execution shard. It does not prove the
+binary's framework-economic state transition.
 
-## 1. Steady state — two metagraphs, two shards, into one gl0 ord
+## Execution Checkpoint
 
-![Steady-state shard-checkpoint sequence](diagrams/shard-flow-steadystate.png)
+Execution membership is a separate public deterministic registered-VRF-key hash draw for `(eta, shardId, period)`. Members are eligible
+GL0 operators. Honest producers derive membership once per finalized-anchor eta period; within the claimed period, hash-shuffled staircase
+duty selects one producer window for each next shard ordinal. Current adopters do not bind the wire-carried period back to the anchor, so
+the rotation is grindable until SHARD-03 is fixed.
 
-What this buys (design):
-- **Per-MG re-execution happens once per shard** (the committee), not on every gl0 op (`§2.2`).
-- **gl0 accepts a checkpoint as a unit** by signature — no per-binary admission race, so
-  `MetagraphCommitteeGate` / `MetagraphOrphanBuffer` / chain-link admission disappear (`§2.2`).
-- metagraph_A and metagraph_B never touch each other's shard: different topics, committees,
-  mini-chains. That is the execution segmentation.
+The scheduled producer:
 
----
+1. selects a chain-linked binary window from the shard buffer;
+2. pins a finalized GL0 `executionBaseOrdinal`;
+3. recreates every included CL1 transition against that exact prior and finalized GL0 references;
+4. computes each metagraph MPT root;
+5. signs the checkpoint containing the roots and all replay inputs.
 
-## 2. How the hypergraph advancing influences metagraph state
+Other committee signatures authenticate participation and availability. They never authorize a root. An attester must pass the same
+checkpoint validation and recreation gate before vouching for the checkpoint.
 
-The metagraph does **not** mutate gl0 state; it **consumes a thin, finality-gated slice of it**
-(G1, task #122; `[[project-two-tier-finality-model]]`).
+## GL0 Inclusion
 
-![Hypergraph to metagraph influence](diagrams/shard-flow-influence.png)
+Every GL0 node verifies the envelope, registered keys, KES evidence, committee membership, shard assignment, ancestry, and exact schema.
+It then independently recreates every included CL1 transition at the signed execution base and compares the local roots with the claims.
+Only a replay-valid checkpoint may be stored, attested, selected, embedded, or used to update canonical state.
 
-- ml0 embeds `globalSyncView = (ordinal, hash, epochProgress)` pointing at a **finalized** gl0 ord.
-- It reads **epochProgress** (the token-lock `unlockEpoch` clock — *this is the
-  token-lock-expiration test's clock*), plus **balances / allow-spends** for cross-layer validation.
-- gl0 advances + finalizes → ml0's pinned finalized ord advances → its epoch/balance view
-  advances → time-based + cross-layer logic progresses. One-directional, gated on *finalized* state.
+Committee quorum and shard depth choose among replay-valid checkpoints. Watchtower fraud proofs and slashing are defense in depth. Neither
+is a substitute for validity-before-use.
 
-⚠️ **Implementation caveat (and the subject of the open design question):** the `globalSyncView`
-*field* is tiny, but to *read* balances/allow-spends locally, ml0 today **replays gl0's entire
-~800K-entry GSI** via `createContext` (`GlobalSnapshotContextFunctions.scala:60-63` notes the full
-sync is "~2 min for 800K entries"). That full replay is what forces ml0 to reproduce
-`historicalStakeSnapshots` (gl0 leader-election state it cannot reproduce) → the #259 mismatch. It
-reads a handful of fields but replays everything. See the consumption-options discussion (separate
-note) — the fix is to fetch only consumed fields with MPT inclusion proofs against gl0's committed
-finalized root, not replay the GSI.
+DL1 custom application semantics are different: GL0 cannot execute arbitrary metagraph code, so DL1 remains proof-carried. Framework
+economics inside the same ML0 binary remain universally executable and must pass GL0 recreation.
 
----
+## Finality And Return
 
-## 3. Hypergraph reorg — how a metagraph keeps growing
+A checkpoint inherits the finality of the GL0 snapshot that embeds it. Downstream services follow finalized GL0 state. CL1 does not
+override or independently reinterpret that canonical return state; it verifies the signed global snapshot and advances its local follower
+view.
 
-### 3a. Phase-1 reorg (common, safe)
+Cross-shard framework operations settle only at GL0. A consuming transition executes against an owner value from the finalized GL0 MPT
+base and writes a permanent canonical nullifier. An owner value visible only on an unfinalized parent branch is unavailable until a later
+finalized snapshot.
 
-gl0 Phases: 0 PENDING → **1 PROVISIONAL (best-tip, reorg-able)** → **2 SETTLED (attestation-2/3 or
-depth-k)** → 3 ARCHIVAL. A Phase-1 reorg switches best-tip between competing branches *above* the
-finalized point.
-
-![Phase-1 hypergraph reorg with metagraph continuity](diagrams/shard-flow-reorg.png)
-
-Why the metagraph is unaffected:
-1. **ml0_A's chain is its own BFT chain** (`§2.3`) — gl0's fork choice has no vote in it.
-2. **ml0_A pinned a *finalized* gl0 ord** (`F_100`); the reorg is above it, so nothing ml0
-   consumed changed (this is why consumption is finality-gated — #122).
-3. **The Shard-0 committee chain is independent** of gl0's fork (its own mini-Taktikos, `§5`).
-4. **`gl0AnchorOrdinal` loose coupling (`§7.2`)**: cpA was produced with `anchor=N`; gl0 accepts it
-   at *any* ord `≥ N`, so the winning branch re-includes the **same** committee-signed cpA. The
-   binaries ride forward unchanged.
-
-Contrast — the legacy/#259 path tied each binary to a *specific* gl0 predecessor hash; a reorg
-orphaned it forever (`§1.1`). The checkpoint design admits a *re-includable checkpoint*, not a
-*parent-pinned binary*.
-
-### 3b. Phase-2 reorg (the hard case)
-
-A Phase-2 reorg rolls back already-finalized state — a **safety violation** outside the
-honest-majority + Taktikos depth-k bounds (`[[project-taktikos-protocol]]`; depth-k set so this is
-~10⁻¹²-rare). Even then: ml0_A's chain and the Shard-0 chain still exist (BFT + re-anchorable
-checkpoint). The damage is to *consumption* — if `F_100` itself is reorged away, ml0's
-`globalSyncView=F_100` references state that no longer exists, so ml0 must re-sync its globalSyncView
-and re-derive any snapshot whose consumed gl0 state changed. That is precisely why Phase-2 finality
-is the safety boundary and is set deep.
-
----
-
-## 4. The fix this implies
-
-On `countQualified` acceptance, `processShardCheckpoints` must **apply `derivedStateDelta` directly
-to the MPT** (the `§7.3` `verifyAllAndApply` path) instead of re-feeding `includedSnapshots` through
-`processStateChannelEvents`; and the legacy `MetagraphCommitteeGate` / `stateChannelSnapshots`
-admission must stop sourcing `lastCurrencySnapshots` when `numShards > 1` (Slice 15 / #280). gl0
-trusts the committee quorum — it does not re-execute or re-chain-link. That makes the chain-link
-stall structurally impossible.
-
-The **consumption side** (metagraph reading gl0 state) is the orthogonal half: replace ml0's full
-GSI replay with selective field reads + MPT inclusion proofs against gl0's committed finalized root
-(`259-FOLLOWER-TRUST-REDESIGN.md`; same Option-I pattern the design already uses for cross-shard
-reads). Both halves are one principle: **trust the attested commitment + prove the slice you read;
-never re-execute another layer's work.**
-
----
-
-Diagram sources: `diagrams/*.mmd` (Mermaid), rendered via `mmdc` to `diagrams/*.png`.
+See `HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` for schema, rotation, recovery, and operational gates.

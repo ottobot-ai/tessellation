@@ -31,7 +31,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
       "quorum -> chosen ordinal is 100 (not 1)"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = None,
       maybeLastGlobalSyncView = Some(viewAt(1L, 1L)),
       fallbackOrdinal = ord(100L)
@@ -44,7 +44,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
       "even when its ordinal is lower than the local head"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = Some(ord(50L)),
       maybeLastGlobalSyncView = Some(viewAt(60L, 60L)),
       fallbackOrdinal = ord(100L)
@@ -56,7 +56,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
     "Peer-sync quorum (path A) takes priority even when above the local head (committee can be ahead)"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = Some(ord(120L)),
       maybeLastGlobalSyncView = Some(viewAt(60L, 60L)),
       fallbackOrdinal = ord(100L)
@@ -68,7 +68,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
     "Forced sync view (validator path) bypasses producer priority chain entirely"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = Some(viewAt(42L, 42L)),
+      pinnedGlobalSyncView = Some(viewAt(42L, 42L)),
       maybeSnapshotOrdinalSync = Some(ord(999L)),
       maybeLastGlobalSyncView = Some(viewAt(60L, 60L)),
       fallbackOrdinal = ord(100L)
@@ -80,7 +80,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
     "No peer-sync, no prior view -> falls back to local head"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = None,
       maybeLastGlobalSyncView = None,
       fallbackOrdinal = ord(100L)
@@ -92,7 +92,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
     "No peer-sync, prior view at MinValue (sentinel = no real prior) -> falls back to local head"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = None,
       maybeLastGlobalSyncView = Some(viewAt(SnapshotOrdinal.MinValue.value.value, 0L)),
       fallbackOrdinal = ord(100L)
@@ -104,7 +104,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
     "No peer-sync, prior view ahead of local head -> prior view wins (lower-bound preserved)"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = None,
       maybeLastGlobalSyncView = Some(viewAt(150L, 150L)),
       fallbackOrdinal = ord(100L)
@@ -116,7 +116,7 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
     "No peer-sync, prior view equal to local head -> either is fine (idempotent at equality)"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
-      forcedGlobalSyncView = None,
+      pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = None,
       maybeLastGlobalSyncView = Some(viewAt(100L, 100L)),
       fallbackOrdinal = ord(100L)

@@ -166,44 +166,6 @@ object SnapshotLeaderLoop {
   ): Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] =
     staged.filter { case (_, (o, _)) => o.value.value > finalizedOrdinal.value.value }
 
-  /** Signed-byte-store FIDELITY (2026-07-09) — stage an ADOPTED snapshot's ROOT-VERIFIED byte map for finalize-sink promotion.
-    *
-    * The finalize sink (`recordFinalizedAccumulator`) writes `signedBytesStore` at ordinal N ONLY when `pendingPostBytesRef` holds an entry
-    * under N's canonical hash — and until this helper, only the produce path (`createProposalArtifact`) and the validate path
-    * (`validateArtifact` + the stripped→canonical rekey) ever staged one. Every ADOPT path — near-tip reorg (`Reorg to fork … root-verified
-    * adopt`), the Driver-B `REWARD-SUM REALIGN`, and the legacy gossip catch-up — installed the adopted branch's verified state into the
-    * live MPT but staged NOTHING, so when the adopted hash finalized the sink's `staged.get(finalizedHash)` missed and the store was left
-    * with a PERMANENT HOLE at that ordinal (2mg/2shard 2026-07-09: every missing ordinal in each gl0's `mpt_snapshot_info_signed`
-    * correlated 1:1 with that node's adopt events; the wedged gl0-2's store froze at 32, it stamped `diffBaseOrdinal=32` on its shard
-    * checkpoints, and the healthy nodes — which lost the ordinal-32 proposal race and adopted — fail-closed 186× each on
-    * `pinnedReaderAt(32)`; the per-MG mirror froze cluster-wide). Adopt sites call this with the byte map they ALREADY root-verified
-    * against the adopted snapshot's committed `stateProof.mptRoot` (`syncFromGlobalSnapshotInfoVerifiedBytes` / `seedMptByteFaithful`'s
-    * gate), keyed by the adopted CANONICAL hash — the same hash `chainStore.walkBackTo` resolves at finalize — so the existing sink
-    * promotes it exactly like a produced/validated entry. The "only a FINALIZED branch's bytes ever reach the store" invariant is
-    * untouched: a re-reorged loser is dropped by the watermark prune, never written.
-    *
-    * Same lowest-ordinal eviction backstop as the produce-path staging (ties broken by hash for determinism), bounded by the SAME typed
-    * `nakamoto.staging-accumulators-cap` — full-state byte maps are large and a finality stall can adopt every gossip wave, so the cap is
-    * load-bearing (memory), never consensus (an evicted entry only costs that ordinal the 3c-A/pinned-read fallback).
-    */
-  def stageAdoptedPostBytes(
-    staged: Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])],
-    canonicalHash: Hash,
-    ordinal: SnapshotOrdinal,
-    verifiedBytes: Map[Hex, Array[Byte]],
-    cap: Int
-  ): Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] = {
-    val updated = staged.updated(canonicalHash, (ordinal, verifiedBytes))
-    if (updated.size > cap) {
-      val excess = updated.size - cap
-      val toEvict = updated.toList.sortBy { case (h, (o, _)) => (o.value.value, h.value) }
-        .take(excess)
-        .map(_._1)
-        .toSet
-      updated.filterNot { case (h, _) => toEvict.contains(h) }
-    } else updated
-  }
-
   /** Finalize-sink ring insert: put `acc` at `ordinal` into the served ordinal-keyed ring, trimmed to the last `recentAccumulatorsToKeep`
     * (dropping the lowest ordinals). The cap is the typed `nakamoto.changeset-ring-depth` HOCON value
     * (`SharedConfig.nakamoto.changesetRingDepth`, default 1024), threaded in from `GlobalSnapshotConsensus.make` — a pure transport memory
@@ -221,6 +183,15 @@ object SnapshotLeaderLoop {
       withNew.drop(withNew.size - recentAccumulatorsToKeep)
     else withNew
   }
+
+  /** Execution-shard committee epoch for a checkpoint anchored at `finalizedAnchor`. Keeping this pure and separate from the global
+    * best-tip period prevents a reorgable tip from rotating membership ahead of the replay base.
+    */
+  private[nakamoto] def executionShardEpoch(
+    finalizedAnchor: SnapshotOrdinal,
+    etaRotationSnapshots: Long
+  ): EtaPeriod =
+    EtaPeriod(EtaCalculation.rotationPeriod(finalizedAnchor.value.value, etaRotationSnapshots))
 
   /** Emit the chain-quality gauge + per-kind "fired" counters for task #138.
     *
@@ -274,8 +245,8 @@ object SnapshotLeaderLoop {
     *
     * Visibility widened to `private[snapshot]` (Gap A, shard-checkpoint producer wiring) so `GlobalSnapshotConsensus.make` (in the parent
     * `...infrastructure.snapshot` package) can derive the SAME (vrfSeed, vrfPk) pair this loop uses, to seed each per-shard
-    * `ShardCheckpointProducer`'s slot-leader VRF. v1 reuses the gl0 leader VRF identity for the shard slot lottery (per-operator-key VRF
-    * lands later, #180) — so the seed must be derived identically on both sides.
+    * `ShardCheckpointProducer`'s registered-key possession proof. Public execution membership and staircase duty do not use this secret as
+    * a lottery input.
     */
   private[snapshot] def deriveVrfKeys(keyPair: KeyPair): (Array[Byte], Array[Byte]) =
     // Delegates to the single canonical derivation (normalize EC scalar → deriveVrfSeed → getVerificationKey)
@@ -597,6 +568,8 @@ object SnapshotLeaderLoop {
     // Receivers (NakamotoSyncDaemon) re-derive the same period from the wire ordinal and
     // verify with the master VK looked up in the registry — warn-only this slice.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    // Public KES evidence is persisted beside snapshot storage so an evicted ancestor remains fully verifiable over ChainSync.
+    dataDir: java.nio.file.Path,
     // Slice S3: invoked at finalize sinks (depth-k AND attestation-2/3) with the canonical
     // GlobalIncrementalSnapshot. Iterates `stateChannelSnapshots` to drop `(metagraphAddress,
     // parentHash)` tally entries from the committee-attestation aggregator once their binary
@@ -622,8 +595,8 @@ object SnapshotLeaderLoop {
         F
       ]
     ] = Map.empty,
-    // Per-shard chain stores (the SAME instances `shardProducers` write into). After a producer wins
-    // its shard slot lottery and returns `Some(checkpoint)`, the producing node stores its own
+    // Per-shard chain stores (the same instances `shardProducers` write into). After a producer owns
+    // the active staircase duty and returns `Some(checkpoint)`, the producing node stores its own
     // checkpoint here (it has the full `Signed[ShardCheckpoint]` + can recompute slot/vrfOutput
     // locally) so the local chain advances toward finality without waiting for its own gossip echo.
     // Empty at `numShards = 1`.
@@ -633,7 +606,7 @@ object SnapshotLeaderLoop {
         F
       ]
     ] = Map.empty,
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers (the producer fan-out input — the inversion). The SAME
+    // Per-shard admission-approved binary buffers (the producer fan-out input). The SAME
     // instances the daemon's gossip-intake writes into, projected off `shardAcceptanceDeps.registry`. Empty at
     // `numShards = 1` ⇒ the fan-out stays a no-op `traverse_`.
     shardBinaryBuffers: Map[
@@ -918,6 +891,7 @@ object SnapshotLeaderLoop {
                                 mptStore,
                                 mptOverlay,
                                 operationalKeyMaker,
+                                dataDir,
                                 shardProducers,
                                 shardChainStores,
                                 shardBinaryBuffers,
@@ -938,15 +912,13 @@ object SnapshotLeaderLoop {
                         }
 
                         // ─── §5.7 per-SLOT shard-checkpoint fan-out (owner-corrected 2026-06-11) ─────────────
-                        // The shard-leader lottery draws EVERY slot on the shared wall-clock grid — independent of
-                        // gl0 snapshot production (each slot is a chance at a shard checkpoint or a global snapshot;
-                        // independent draws). This replaces the anchor-driven triggers (gl0-leader onSlotWon self-call
-                        // + daemon becameBestTip hook), which sampled the lottery once per gl0 SNAPSHOT (~6.5 slots
+                        // Execution-shard staircase duty advances every slot on the shared wall-clock grid, independently of
+                        // GL0 snapshot production. This replaces the anchor-driven triggers, which advanced duty once per GL0 snapshot (~6.5 slots
                         // observed mean) — the run-10 Gap-A cadence inversion: shards ticked ~6.5× slower than the
                         // layer they feed. Anchoring data: `producedOrd` = current canonical tip ord (the checkpoint
-                        // rides into this or any later gl0 ord per §7.2); the lottery clock is `slotRefined`, carried
+                        // rides into this or any later GL0 ord); the duty clock is `slotRefined`, carried
                         // on the envelope's `slot` field. Supervised + gated: heavy on a WIN only (derivePerMgState);
-                        // the skip paths (not-leader / awaiting-embed / empty) are cheap Ref reads + one VRF eval.
+                        // the skip paths (not-on-duty / awaiting-embed / empty) are cheap deterministic checks.
                         // Boot grace (run-17): record the first Ready slot (this branch only runs when Ready);
                         // take NO shard duty until intake has had `shardBootGraceSlots` to drain — a late-booting
                         // rank otherwise takes genesis duty blind and seeds a rival lineage (second ord-1 at
@@ -965,12 +937,13 @@ object SnapshotLeaderLoop {
                         // finalized RESTORES the phase-2-only invariant (design §7.2) and aligns the anchor with the
                         // binaries it derives over. The §7.2 acceptance window is upper-bounded only (checkpoint rides
                         // into anchor-or-later), so an older finalized anchor is never rejected as stale. Regression
-                        // introduced by 86ee3dbef (per-slot best-tip fan-out); `lastChainOrdinal`/best-tip is retained
-                        // above only for the eta rotation-period (VRF), which is intentionally tip-paced.
+                        // introduced by 86ee3dbef (per-slot best-tip fan-out). Execution-shard membership is derived from
+                        // this same finalized anchor: using the reorgable best-tip period here can rotate two honest nodes
+                        // at different times and make them compute different committees for the same checkpoint window.
                         nakamotoFinalizedAnchor <- nakamotoFinalizedOrdinalRef.get
                         _ <- Async[F].whenA(shardProducers.nonEmpty && shardAssignment.isDefined && bootGraceElapsed) {
                           val anchorOrd = nakamotoFinalizedAnchor
-                          val shardEpoch = EtaPeriod(currentPeriod)
+                          val shardEpoch = executionShardEpoch(anchorOrd, etaRotationSnapshots)
                           supervisor
                             .supervise(
                               shardFanOutGate.tryAcquire.flatMap {
@@ -1647,6 +1620,7 @@ object SnapshotLeaderLoop {
     mptOverlay: MptOverlay[F, GlobalStateKey],
     // §1.2 Slice 6: KES parallel-signing for the published snapshot's `kes_signature` field.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    dataDir: java.nio.file.Path,
     // Gap A — per-shard checkpoint producers + the SAME chain stores they write into + the static
     // metagraph→shard assignment. Empty / None at numShards=1 (regression bar) ⇒ the fan-out below is
     // a no-op `traverse_` over the empty map. Passed through from `run`'s same-named params.
@@ -1658,7 +1632,7 @@ object SnapshotLeaderLoop {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers (the producer fan-out input — the inversion).
+    // Per-shard admission-approved binary buffers (the producer fan-out input).
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
@@ -1842,9 +1816,40 @@ object SnapshotLeaderLoop {
                       artifact = rawArtifact.copy(slotCertificate = Some(certWithSubchain), eta = Some(etaHash))
                       signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
                       snapshotHashedForStorage <- signed.toHashed[F]
+                      producedOrdinal = lastKey.value.value + 1
+                      kesPeriodSnap = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots).toInt
+                      snapshotHashBytes = snapshotHashedForStorage.hash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                      kesSnapAttempt <-
+                        if (gateOpenPreSign) operationalKeyMaker.signAt(kesPeriodSnap, snapshotHashBytes)
+                        else
+                          Async[F].pure[
+                            Either[io.constellationnetwork.security.kes.KesError, io.constellationnetwork.security.kes.SignatureKesProduct]
+                          ](Left(io.constellationnetwork.security.kes.KesError.MalformedTree("skipped - gate closed")))
+                      kesSnapSigBytes <- kesSnapAttempt match {
+                        case Right(kSig) =>
+                          val bytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
+                          Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_signed_total") >>
+                            logger
+                              .info(
+                                s"KES-SNAP ord=$producedOrdinal period=$kesPeriodSnap sub-sig=${bytes.take(8).map("%02x".format(_)).mkString} (${bytes.length}B)"
+                              )
+                              .as(bytes)
+                        case Left(err) if gateOpenPreSign =>
+                          Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_sign_failed_total") >>
+                            logger
+                              .warn(
+                                s"KES-SNAP sign failed for ord=$producedOrdinal period=$kesPeriodSnap: ${err.message}; refusing chain-store write"
+                              )
+                              .as(Array.empty[Byte])
+                        case Left(_) => Async[F].pure(Array.empty[Byte])
+                      }
+                      kesReady = kesSnapAttempt.isRight
                       parentHashValue = lastHashed.hash
+                      _ <- Async[F].whenA(gateOpenPreSign && kesReady) {
+                        SnapshotKesStorage.put[F](dataDir, snapshotHashedForStorage.hash, kesSnapSigBytes)
+                      }
                       stored <-
-                        if (gateOpenPreSign)
+                        if (gateOpenPreSign && kesReady)
                           chainStore.store(
                             signed,
                             context,
@@ -1878,9 +1883,13 @@ object SnapshotLeaderLoop {
                           mptOverlay.discardBranch(BranchId(rawArtifactHash)) >>
                             pendingAccumulatorsRef.update(_ - rawArtifactHash)
                       action: MptTxAction = if (stored) MptTxAction.Commit else MptTxAction.Rollback
-                    } yield ((signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue), action)
+                    } yield
+                      (
+                        (signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes),
+                        action
+                      )
                   }
-                  (signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue) = txOutcome
+                  (signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes) = txOutcome
 
                   // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
                   // reads on the next slot to determine the parent ordinal. Without this, the
@@ -1903,9 +1912,10 @@ object SnapshotLeaderLoop {
 
                   // Check gate before publishing — a better gossip snapshot may have arrived
                   // during proposal creation. If gate is closed, abandon this production.
-                  stillOpen <- productionGate.isOpen
+                  gateOpenBeforePublish <- productionGate.isOpen
+                  stillOpen = stored && gateOpenBeforePublish
                   _ <-
-                    if (!stillOpen)
+                    if (stored && !gateOpenBeforePublish)
                       productionGate.pauseReasons.flatMap(reasons =>
                         logger
                           .info(s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})")
@@ -1915,46 +1925,6 @@ object SnapshotLeaderLoop {
                   // Publish + self-attest only if gate is still open
                   snapshotHash = snapshotHashedForStorage.hash
                   producedOrdinal = lastKey.value.value + 1
-                  // §1.2 Slice 6: parallel-sign the snapshot's hash bytes with KES BEFORE we
-                  // publish, then embed the resulting bytes in the pb.Snapshot's `kes_signature`
-                  // field. Period is derived from the produced ordinal (`lastKey + 1`) — receivers
-                  // re-derive the same period from `snap.ordinal` so verification stays self-
-                  // consistent. Sender failure → empty wire field, receiver treats as no-sig.
-                  //
-                  // The message bytes ARE the snapshot hash as a UTF-8 string (matching the
-                  // sidecar's existing `hash` byte representation and the receiver's
-                  // `snap.hash.toByteArray` extraction in NakamotoSyncDaemon.verifyKesSnapshot).
-                  kesPeriodSnap = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots).toInt
-                  snapshotHashBytes = snapshotHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                  kesSnapAttempt <-
-                    if (stillOpen) operationalKeyMaker.signAt(kesPeriodSnap, snapshotHashBytes)
-                    else
-                      Async[F]
-                        .pure[
-                          Either[io.constellationnetwork.security.kes.KesError, io.constellationnetwork.security.kes.SignatureKesProduct]
-                        ](
-                          Left(io.constellationnetwork.security.kes.KesError.MalformedTree("skipped — gate closed"))
-                        )
-                  kesSnapSigBytes <- kesSnapAttempt match {
-                    case Right(kSig) =>
-                      val bytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
-                      Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_signed_total") >>
-                        logger
-                          .info(
-                            s"🔐 KES-SNAP ord=$producedOrdinal period=$kesPeriodSnap sub-sig=${bytes.take(8).map("%02x".format(_)).mkString} (${bytes.length}B)"
-                          )
-                          .as(bytes)
-                    case Left(err) if stillOpen =>
-                      Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_sign_failed_total") >>
-                        logger
-                          .warn(
-                            s"⚠️ KES-SNAP sign failed for ord=$producedOrdinal period=$kesPeriodSnap: ${err.message} — emitting unsigned wire field"
-                          )
-                          .as(Array.empty[Byte])
-                    case Left(_) =>
-                      // gate closed → no publish, sig not needed; return empty for path uniformity
-                      Async[F].pure(Array.empty[Byte])
-                  }
                   _ <- Async[F].whenA(stillOpen) {
                     sidecarClient
                       .publishSnapshot(
@@ -2023,7 +1993,7 @@ object SnapshotLeaderLoop {
                   }
 
                   // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick (design §5.7, 2026-06-12) ───
-                  // The gl0-leader self-call that lived here sampled the shard lottery once per PRODUCED gl0 ord —
+                  // The GL0-leader self-call that lived here advanced shard duty once per produced GL0 ordinal;
                   // half of the run-10 Gap-A cadence inversion (the daemon's becameBestTip hook was the other
                   // half). The lottery now draws every wall-clock slot in the slot-tick loop above, on every node,
                   // gated by committee membership + the pipeline-depth watermark. Nothing to do here.

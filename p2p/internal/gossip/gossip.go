@@ -202,15 +202,14 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		// facto delivery path (task #40). Cost is O(subscribers) per publish —
 		// negligible at our N.
 		pubsub.WithFloodPublish(true),
-		// Content-derived message IDs: the default ID is (from, seqno), so an
-		// outbox REPUBLISH of identical bytes counts as a brand-new message and
-		// is re-delivered to every peer. Deriving the ID from a SHA-256 of the
-		// payload makes republishes hit peers' seen-caches and dedupe instead
-		// (task #40). All sidecars redeploy together (greenfield), so the
+		// Content-derived message IDs: include the topic in the hash domain.
+		// Several protobuf wrappers have the same one-field wire shape, so a
+		// payload-only ID lets a wrong-topic publish poison the seen cache for
+		// the later correct-topic message. Same-topic outbox republishes still
+		// dedupe. All sidecars redeploy together (greenfield), so the
 		// network-wide ID function stays consistent.
 		pubsub.WithMessageIdFn(func(pmsg *pubsub_pb.Message) string {
-			digest := sha256.Sum256(pmsg.GetData())
-			return string(digest[:])
+			return contentMessageID(pmsg.GetTopic(), pmsg.GetData())
 		}),
 	)
 	if err != nil {
@@ -366,6 +365,14 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 	}
 
 	return node, nil
+}
+
+func contentMessageID(topic string, data []byte) string {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(topic))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(data)
+	return string(digest.Sum(nil))
 }
 
 // mdnsNotifee handles mDNS peer discovery events.

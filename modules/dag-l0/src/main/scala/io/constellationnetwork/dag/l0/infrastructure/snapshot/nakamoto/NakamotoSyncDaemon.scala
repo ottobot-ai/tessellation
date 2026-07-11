@@ -20,13 +20,11 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.pro
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointAcceptResult
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig, TipAttestation => DomainTipAttestation}
+import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security._
@@ -35,8 +33,6 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.signature.Signature
 import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.EcVrf25519
-import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-import io.constellationnetwork.validator.StateProofValidator
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -52,11 +48,10 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 object NakamotoSyncDaemon {
 
   private val CatchUpThreshold = 6L
-  private val CatchUpCooldownMs = 10000L // Don't retry catch-up more often than every 10s
 
   // #259 metagraph-binary active-recovery (stuck-detection tick) tuning. Fixed internal cadence —
   // NOT a consensus-critical value (recovery is additive + re-gated), so kept as plain constants
-  // rather than HOCON config (mirrors CatchUpThreshold/CatchUpCooldownMs above).
+  // rather than HOCON config (mirrors CatchUpThreshold above).
   //   - Tick every 20s: the orphan-buffer pending-parents poll cadence.
   //   - A parent must persist across ≥2 ticks (≥~20s genuinely stuck, not a mid-drain blip) before
   //     we fetch — encoded as `consecutiveTicks >= 2` at the call site.
@@ -79,6 +74,92 @@ object NakamotoSyncDaemon {
 
   private val vrf = EcVrf25519.default
 
+  /** Decode the greenfield ChainSync payload shape. `snapshot` is required and `context` is optional; the latter is transport metadata
+    * only. The caller requires a validated parent context and runs full replay before any chain or MPT write.
+    */
+  private[nakamoto] def decodeFetchedSnapshotPayload(
+    payload: Array[Byte]
+  ): Option[Signed[GlobalIncrementalSnapshot]] =
+    if (payload.isEmpty) None
+    else
+      io.circe.parser
+        .parse(new String(payload, java.nio.charset.StandardCharsets.UTF_8))
+        .toOption
+        .flatMap(_.hcursor.get[Signed[GlobalIncrementalSnapshot]]("snapshot").toOption)
+
+  /** Bind every routing/eligibility field in the protobuf envelope to the signed snapshot body before the envelope can select a parent,
+    * borrow a producer's stake, pass KES, or provide chain-store metadata. The sidecar treats protobuf fields as opaque and
+    * unauthenticated; the signed body and its slot certificate are the only source of truth.
+    */
+  private[nakamoto] def validateSnapshotEnvelope[F[_]: Async: HasherSelector](
+    snap: pb.Snapshot,
+    signedSnapshot: Signed[GlobalIncrementalSnapshot]
+  ): F[Either[String, Unit]] =
+    HasherSelector[F].withCurrent { implicit hasher =>
+      signedSnapshot.toHashed[F].map { hashed =>
+        val body = signedSnapshot.value
+        val transportHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+        val transportParent = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+        val producerBytes = snap.producerId.toByteArray
+        val signerMatches = signedSnapshot.proofs.toNonEmptyList.exists { proof =>
+          java.util.Arrays.equals(proof.id.hex.toBytes, producerBytes)
+        }
+
+        def sameBytes(left: Array[Byte], right: Array[Byte]): Boolean =
+          java.util.Arrays.equals(left, right)
+
+        val commonChecks = List(
+          Either.cond(transportHash === hashed.hash, (), s"transport hash ${transportHash.value} != signed body hash ${hashed.hash.value}"),
+          Either.cond(
+            snap.ordinal == body.ordinal.value.value,
+            (),
+            s"transport ordinal ${snap.ordinal} != signed ordinal ${body.ordinal.value.value}"
+          ),
+          Either.cond(
+            transportParent === body.lastSnapshotHash,
+            (),
+            s"transport parent ${transportParent.value} != signed parent ${body.lastSnapshotHash.value}"
+          ),
+          Either.cond(signerMatches, (), "transport producer_id is not a signer of the snapshot body")
+        )
+
+        val certificateChecks = body.slotCertificate match {
+          case None =>
+            List(Left("signed snapshot is missing its required slot certificate"))
+          case Some(cert) =>
+            val derivedVrfOutput = vrf.vrfProofToHash(snap.vrfProof.toByteArray)
+            List(
+              Either
+                .cond(cert.slot.value.value == snap.slot, (), s"certificate slot ${cert.slot.value.value} != transport slot ${snap.slot}"),
+              Either.cond(
+                cert.parentSlot.value.value == snap.parentSlot,
+                (),
+                s"certificate parentSlot ${cert.parentSlot.value.value} != transport parentSlot ${snap.parentSlot}"
+              ),
+              Either.cond(sameBytes(cert.vrfProof.toBytes, snap.vrfProof.toByteArray), (), "certificate VRF proof != transport proof"),
+              Either.cond(
+                sameBytes(cert.vrfPublicKey.toBytes, snap.vrfPublicKey.toByteArray),
+                (),
+                "certificate VRF public key != transport key"
+              ),
+              Either.cond(
+                Hex.fromBytes(snap.eta.toByteArray).value == cert.eta.value,
+                (),
+                "certificate eta != transport eta"
+              ),
+              Either.cond(body.eta.contains(cert.eta), (), "snapshot eta != slot-certificate eta"),
+              Either.cond(
+                derivedVrfOutput.exists(sameBytes(_, cert.vrfOutput.toBytes)),
+                (),
+                "certificate VRF output is not derived from its proof"
+              )
+            )
+        }
+
+        (commonChecks ++ certificateChecks).collectFirst { case Left(reason) => reason }.toLeft(())
+      }
+    }
+
   /** Derive VRF output from proof bytes. The chain store needs the output (not the proof) for eta computation. The producer stores
     * vrfOutput directly, but gossip only carries the proof — we must derive the output here to match what the producer stored.
     *
@@ -91,10 +172,10 @@ object NakamotoSyncDaemon {
   /** S3 attestation-inversion gate: decides whether a re-exec/validated `ShardCheckpoint` may be adopted as best-tip and attested.
     *
     * Mirrors the global chain's validate-by-replay → adopt → attest discipline: a node adopts (+ counts the signers' attestations + emits
-    * its own attestation) ONLY for a checkpoint that passed `ShardCheckpointGl0AcceptanceManager.evaluate`'s pre-checks AND
-    * (quorum-attested OR re-exec matched). A `Rejected` (pre-check fail) or `RejectedReExecutionMismatch` (wrong-derivation) checkpoint is
-    * NOT admissible — never adopted, signers never counted toward quorum, no attestation emitted. `PendingMoreAttestations` is admissible
-    * (valid-so-far; the chain must advance toward quorum/depth, and re-exec — if it ever fires on the degraded path — gates a later eval).
+    * its own attestation) ONLY for a checkpoint that passed `ShardCheckpointGl0AcceptanceManager.evaluate`'s signer checks and mandatory
+    * replay. A `Rejected` (pre-check/unavailable-replay failure) or `RejectedReExecutionMismatch` (wrong derivation) checkpoint is NOT
+    * admissible — never adopted, signers never counted toward quorum, no attestation emitted. `PendingMoreAttestations` is admissible
+    * (replay-valid but still waiting for quorum/depth selection finality).
     *
     * Pure + package-visible so the inversion gate is unit-testable without standing up the full gossip handler.
     */
@@ -106,236 +187,16 @@ object NakamotoSyncDaemon {
       case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, _) => false
     }
 
-  /** Verdict of the parent-missing catch-up admission check ([[verifyCatchUpSnapshot]]). The deep-catch-up path adopts a gossiped
-    * `(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)` as the node's ENTIRE canonical gl0 state (balances/txRefs/stakes/locks +
-    * MPT), so — unlike the happy path — the carried snapshot's parent is not in the local chain store and the full
-    * `NakamotoSnapshotValidator.validate` (VRF + slot-cert) is unreachable. Without a gate, a single peer gossiping a forged tuple at
-    * `ordinal > k` would unilaterally reset the victim's state. The two gates below are each a PURE function of the gossiped bytes + the
-    * carried context (identical verdict on every honest node), and BOTH must pass before any canonical write.
-    */
-  sealed private[nakamoto] trait CatchUpVerdict
-  private[nakamoto] object CatchUpVerdict {
-
-    /** Both gates passed: envelope signature is valid AND the carried `GlobalSnapshotInfo` rebuilds to the exact `stateProof` the snapshot
-      * commits to. Safe to adopt. Carries the verified `Hashed` (sig-checked) so the caller reuses it for canonical storage instead of
-      * re-hashing via the no-check `toHashed`.
-      */
-    case class Accept(hashed: Hashed[GlobalIncrementalSnapshot]) extends CatchUpVerdict
-
-    /** Gate 1 failed: the envelope signature does not verify against the snapshot hash. Forged / unauthorized signer. Do NOT adopt. */
-    case object RejectedInvalidSignature extends CatchUpVerdict
-
-    /** Gate 2 failed: the carried `GlobalSnapshotInfo` does NOT rebuild to the `stateProof` baked into the (validly-signed) snapshot — the
-      * attacker (or a corrupt/mis-paired payload) supplied a context inconsistent with what was signed. Do NOT adopt the context into the
-      * MPT. Carries the verified `Hashed` for logging the ordinal/hash.
-      */
-    case class RejectedStateProofMismatch(hashed: Hashed[GlobalIncrementalSnapshot]) extends CatchUpVerdict
-  }
-
-  /** Parent-missing catch-up admission gate. Verifies a gossiped catch-up snapshot WITHOUT needing its parent (which the node lacks during
-    * deep catch-up), so the unilateral-state-reset attack is closed even though `NakamotoSnapshotValidator.validate` can't run here.
-    *
-    * Gate 1 — '''envelope signature''' (`toHashedWithSignatureCheck`, the SAME callable the normal pull path uses at
-    * `GlobalL0Service.pullLatestSnapshotFromPeer` / `pullSnapshots`): rejects a tuple whose `Signed[GlobalIncrementalSnapshot]` proofs
-    * don't verify against the snapshot hash. A forged snapshot from an unauthorized signer cannot pass.
-    *
-    * Gate 2 — '''stateProof consistency''': rebuilds the `GlobalSnapshotStateProof` from the carried `GlobalSnapshotInfo` alone (via
-    * `StateProofValidator.forGlobal(producer = None)` → `GlobalSnapshotInfo.mptStateProof`, a PURE function of the GSI bytes — it does NOT
-    * read or mutate the live `MptStore`) and requires it `equivalent` to the `stateProof` the signed snapshot commits to, using the EXACT
-    * symmetric `StateProofComparison` the producer/follower already use (`StateProofValidator.validateProof`). This binds the
-    * MPT-to-be-written GSI to the signed snapshot: an attacker cannot pair a validly-signed snapshot with an attacker-chosen state.
-    *
-    * Both gates are deterministic and side-effect-free w.r.t. canonical storage / MPT, so an honest snapshot (valid sig, GSI matching its
-    * own committed stateProof) ALWAYS yields `Accept` and legitimate catch-up still recovers.
-    *
-    * '''Why gates 1+2 suffice to close the unilateral-state-reset attack.''' The attack adopts an attacker-chosen `GlobalSnapshotInfo` as
-    * canonical state. Gate 1 forces the carried snapshot to be signed by a key whose proof verifies the snapshot hash; gate 2 forces the
-    * carried GSI to be EXACTLY the state that snapshot committed to (`stateProof` incl. `mptRoot`). So the only state an attacker can
-    * install is one already bound to a validly-signed snapshot — i.e. real consensus output, not a fabrication.
-    *
-    * '''Gate 3 (majority-hash) — DEFERRED, follow-up.''' The normal BFT pull path cross-checks a snapshot's hash against majority peers
-    * (`GlobalL0Service.getMajorityHash`). That machinery lives in node-shared's pull-mode `GlobalL0Service` and is NOT wired into this
-    * push-based sidecar-gossip daemon (`catchUpFromGossip` receives no `L0ClusterStorage` / snapshot client). Adding it means threading new
-    * peer-query infrastructure through the daemon constructor; out of scope here. Impact of omission: a validly-signed-but-MINORITY-fork
-    * snapshot could still be adopted during catch-up. That is bounded — it must be real signed consensus output, and on the next local
-    * production / gossip wave normal fork-choice (ChainSelection) reorgs to the denser chain — whereas the closed hole allowed adopting a
-    * fabrication with NO signer at all.
-    *
-    * '''Gate 4 (VRF / slot-cert) — DEFERRED, sound reason.''' Eligibility verification needs the period `eta` (and active-set/stake) at the
-    * snapshot's period; during deep catch-up (gap > k) the node lacks the chain history to derive that eta deterministically.
-    * `handleSnapshot` already falls back to the snapshot's OWN self-reported `eta` when the parent chain is absent — using that
-    * attacker-supplied eta to verify the attacker's own VRF is circular and adds no security. So VRF/slot-cert is not soundly checkable in
-    * the parent-missing case and is intentionally not attempted here; gates 1+2 carry the safety.
-    */
-  private[nakamoto] def verifyCatchUpSnapshot[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector](
-    signedSnapshot: Signed[GlobalIncrementalSnapshot],
-    context: GlobalSnapshotInfo
-  )(
-    implicit globalStateProofSelector: GlobalStateProofSelector,
-    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): F[CatchUpVerdict] =
-    HasherSelector[F].withCurrent { implicit hasher =>
-      // Gate 1: envelope signature. `toHashedWithSignatureCheck` returns Left(InvalidSignatureForHash) when any proof fails.
-      signedSnapshot.toHashedWithSignatureCheck.flatMap {
-        case Left(_) =>
-          (CatchUpVerdict.RejectedInvalidSignature: CatchUpVerdict).pure[F]
-        case Right(hashed) =>
-          // Gate 2: rebuild the state proof from the carried GSI (no producer ⇒ pure, no live-store access) and compare against the
-          // snapshot's committed `stateProof` via the shared symmetric comparison.
-          StateProofValidator
-            .forGlobal[F](None)
-            .validate(hashed, context)
-            .map {
-              case cats.data.Validated.Valid(_)   => CatchUpVerdict.Accept(hashed)
-              case cats.data.Validated.Invalid(_) => CatchUpVerdict.RejectedStateProofMismatch(hashed)
-            }
-      }
-    }
-
-  /** Byte-faithful MPT seeding for deep catch-up — the gl0 analog of `currency-l0 StateChannel.resyncToCanonical`'s verify gate, and the
-    * root fix for the recurring catch-up wedge (the rebuild-from-GSI path structurally cannot reproduce the producer's per-MG currency
-    * `infoRoot`/`mptRoot` under roots-only sharding, because the producer commits those from its live MPT — populated by shard-checkpoint
-    * adoption — while the carried GSI's `lastCurrencySnapshots` is empty; the GSI is no longer the source of truth).
-    *
-    * Adopts the producer's SIGNED MPT byte map directly (`MptStore.loadBytes`, verbatim, no codec round-trip) and gates on
-    * `sidecarFreeMptRoot(store) === snapshot.stateProof.mptRoot` (the SAME sidecar-/observation-free root the producer signs over). On the
-    * fast (`Some(bytes)`) path the root is recomputed from the bytes BEFORE any store write, so a corrupt/truncated transfer can never
-    * clobber the live MPT — it just returns `false` and the caller re-pulls/idles. On a byte-route 404 (`None`, only at a sparse
-    * combined-checkpoint ordinal) it falls back to the legacy `syncFromGlobalSnapshotInfo` re-encode and gates write-then-verify; that
-    * branch can still legitimately diverge for the sharded-currency partition, so a mismatch there also returns `false` (do NOT adopt).
-    *
-    * @return
-    *   `Some(verifiedBytes)` iff the MPT now holds state whose sidecar-free root equals the snapshot's SIGNED `mptRoot` (safe to adopt as
-    *   canonical) — the exact root-verified byte map that was installed, so the caller can persist/stage it into the signed byte store
-    *   (signed-byte-store FIDELITY: adopted ordinals must not stay permanent holes there, see `SnapshotLeaderLoop.stageAdoptedPostBytes`);
-    *   `None` => the transfer was corrupt or the GSI fallback diverged — the caller must NOT adopt canonical state (re-pull / idle).
-    *   `isDefined` is exactly the old Boolean.
-    */
-  private[nakamoto] def seedMptByteFaithful[F[_]: Async: cats.Parallel: JsonSerializer: Hasher](
-    snapshot: Hashed[GlobalIncrementalSnapshot],
-    gsi: GlobalSnapshotInfo,
-    signedBytes: Option[Map[Hex, Array[Byte]]],
-    mptStore: MptStore[F, GlobalStateKey],
-    logger: org.typelevel.log4cats.Logger[F]
-  )(
-    implicit stateProofSelector: io.constellationnetwork.schema.StateProofSelector,
-    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): F[Option[Map[Hex, Array[Byte]]]] = {
-    val ordinal = snapshot.signed.value.ordinal
-    val signedRoot = snapshot.signed.value.stateProof.mptRoot
-    def shortOpt(h: Option[Hash]): String = h.map(_.show.take(12)).getOrElse("none")
-    signedBytes match {
-      case Some(bytes) =>
-        // FAST PATH: recompute the sidecar-free root from the SIGNED bytes (pure — no store write) and adopt VERBATIM only on match.
-        GlobalSnapshotInfo.sidecarFreeMptRoot[F](bytes).flatMap { recomputed =>
-          if (recomputed.some === signedRoot)
-            logger.info(
-              s"🔄 CATCH-UP byte-faithful: adopting ${bytes.size} SIGNED MPT entries VERBATIM at ord=${ordinal.show} " +
-                s"(sidecar-free root=${recomputed.show.take(12)} === signed mptRoot — verified)"
-            ) >> mptStore.loadBytes(bytes, ordinal).as(bytes.some)
-          else
-            logger
-              .warn(
-                s"⛔ CATCH-UP byte-faithful: served SIGNED MPT bytes recompute to ${recomputed.show.take(12)} ≠ signed mptRoot " +
-                  s"${shortOpt(signedRoot)} at ord=${ordinal.show} (corrupt/truncated transfer). NOT adopting; will re-pull."
-              )
-              .as(none[Map[Hex, Array[Byte]]])
-        }
-      case None =>
-        // LEGACY FALLBACK (byte route 404 at a sparse combined-checkpoint ordinal): root-verified GSI re-encode. FINDING-S01:
-        // `syncFromGlobalSnapshotInfoVerifiedBytes` is CHECK-THEN-WRITE — it reconciles {GSI ∪ preserved ConsumedAllowSpends/Slashings,
-        // GSI alone} against the signed root BEFORE any store write (the old write-then-verify clobbered the live MPT on mismatch,
-        // and unconditionally WIPED the MPT-native partitions the GSI has no field for). This branch can still legitimately fail
-        // for the sharded-currency partition (GSI not source of truth); on `None` nothing was written — the caller re-pulls/idles.
-        logger.info(
-          s"🔄 CATCH-UP byte-faithful: byte route unavailable at ord=${ordinal.show}, falling back to GSI re-encode (root-verified)"
-        ) >>
-          mptStore.syncFromGlobalSnapshotInfoVerifiedBytes(gsi, ordinal, signedRoot).flatTap { adopted =>
-            logger
-              .warn(
-                s"⛔ CATCH-UP byte-faithful: no GSI-rebuild candidate reproduces the signed mptRoot ${shortOpt(signedRoot)} " +
-                  s"at ord=${ordinal.show} (GSI inconsistent with signed root). NOT adopting (store untouched); will re-pull."
-              )
-              .whenA(adopted.isEmpty)
-          }
-    }
-  }
-
-  /** The latest-finalized triple a catching-up gl0 node pulls from a peer for byte-faithful adoption: the signed snapshot (hashed +
-    * signature-checked), its `GlobalSnapshotInfo`, and the producer's SIGNED MPT byte map (`Some` when `/latest/combined/mpt-entries`
-    * served, `None` on a sparse-ordinal 404 → `seedMptByteFaithful` uses its GSI fallback).
-    */
-  private[snapshot] type LatestMptEntries =
-    (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo, Option[Map[Hex, Array[Byte]]])
-
-  /** Pull gl0's latest FINALIZED [[LatestMptEntries]] from a responsive peer over the HTTP `/latest/combined/mpt-entries` route gl0 already
-    * serves — the gl0↔gl0 analog of node-shared `GlobalL0Service.pullLatestMptEntries` (gl0 has its own `ClusterStorage`, not the
-    * follower-side `L0ClusterStorage`). The pulled snapshot's envelope signature is verified (`toHashedWithSignatureCheck`) before return;
-    * the byte-faithful root gate (`sidecarFreeMptRoot === signed mptRoot`) is applied by the caller (`seedMptByteFaithful`). Tries
-    * responsive peers in turn; returns `None` on total failure (no peers / transport error / bad signature) so deep catch-up idles +
-    * re-pulls next wave rather than crashing the loop.
-    *
-    * Why a PULL, not the gossiped tuple: the signed byte store holds only FINALIZED ordinals (bytes are produced at finalize), whereas the
-    * gossiped catch-up tip is unfinalized — so the signed bytes must come from a peer's latest-finalized HTTP response, not the push
-    * payload.
-    */
-  private[snapshot] def pullLatestMptEntriesFromPeer[F[_]: Async: SecurityProvider: HasherSelector: JsonSerializer](
-    l0GlobalSnapshotClient: io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient[F],
-    clusterStorage: io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage[F],
-    logger: org.typelevel.log4cats.Logger[F]
-  ): F[Option[LatestMptEntries]] = {
-    def pullFrom(p: io.constellationnetwork.schema.peer.Peer): F[Option[LatestMptEntries]] =
-      l0GlobalSnapshotClient.getLatestMptEntries
-        .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
-        .flatMap {
-          case (snapshot, state, entries) =>
-            HasherSelector[F]
-              .withCurrent(implicit hasher => snapshot.toHashedWithSignatureCheck)
-              .flatMap(_.liftTo[F])
-              .map(hashed => Some((hashed, state, entries.some)): Option[LatestMptEntries])
-        }
-        .handleErrorWith { e =>
-          logger.warn(e)(s"byte-faithful catch-up: MPT-entries pull from peer ${p.id.show} failed, trying next") >>
-            (None: Option[LatestMptEntries]).pure[F]
-        }
-
-    def tryInOrder(remaining: List[io.constellationnetwork.schema.peer.Peer]): F[Option[LatestMptEntries]] =
-      remaining match {
-        case Nil => (None: Option[LatestMptEntries]).pure[F]
-        case p :: tail =>
-          pullFrom(p).flatMap {
-            case some @ Some(_) => (some: Option[LatestMptEntries]).pure[F]
-            case None           => tryInOrder(tail)
-          }
-      }
-
-    // D2 fix: do NOT pull from the first responsive peer — a single lagging peer strands the whole catch-up (the gl0-4 wedge,
-    // where the first peer served ord 375 while others held 674+). Rank responsive peers by their advertised latest FINALIZED
-    // ordinal (cheap probe) and pull the MPT from the FRESHEST first, falling back down the ranking on failure. (A peer that
-    // can't answer the probe sorts last via ordinal 0.) The strictly-ahead guard in byteFaithfulAdopt is the backstop.
-    clusterStorage.getResponsivePeers.flatMap { peers =>
-      peers.toList.traverse { p =>
-        l0GlobalSnapshotClient.getLatestFinalizedOrdinal
-          .run(io.constellationnetwork.schema.peer.L0Peer.fromPeer(p))
-          .map(ord => (p, ord.value.value))
-          .handleError(_ => (p, 0L))
-      }.flatMap { ranked =>
-        tryInOrder(ranked.sortBy { case (_, ord) => -ord }.map { case (p, _) => p })
-      }
-    }
-      .handleErrorWith(e => logger.warn(e)("byte-faithful catch-up: could not pull MPT entries from any peer").as(None))
-  }
-
   /** Signed-byte-store backfill transport (2026-07-09) — pull a peer's SIGNED MPT byte map at an EXACT finalized `ordinal` over the
-    * by-ordinal `/global-snapshots/<ord>/mpt-entries` route (the sibling of [[pullLatestMptEntriesFromPeer]]'s latest-pull). Consumed by
-    * `PinnedCurrencyInfoReader.PinnedByteBackfill` to heal HOLES in the local signed store at a stamped shard-checkpoint `diffBaseOrdinal`.
+    * by-ordinal `/global-snapshots/<ord>/mpt-entries` route. Consumed by `PinnedCurrencyInfoReader.PinnedByteBackfill` to heal HOLES in the
+    * local signed store at a stamped shard-checkpoint `executionBaseOrdinal`.
     *
     * TRANSPORT-ONLY, deliberately UNVERIFIED here: the pinned reader verifies `sidecarFreeMptRoot(fetched) === its OWN locally-committed
-    * `stateProof.mptRoot@ordinal`` before anything is staged or served (the same reason the latest-pull runs session-less: byte integrity
-    * comes from the root gate, not the transport). Tries up to `maxPeers` responsive peers (sorted by peer id for stable behavior — the
-    * VERIFIED outcome is peer-independent, root-determined) with a per-try `perPeerTimeout` so a hung peer cannot stall the accept fold; a
-    * peer without the ordinal 404s and the next is tried. `None` on total miss — the caller stays fail-closed. `maxPeers = 0` disables the
-    * transport outright (config kill-switch). Never raises.
+    * `stateProof.mptRoot@ordinal`` before anything is staged or served. Byte integrity comes from that root gate, not the transport. Tries
+    * up to `maxPeers` responsive peers (sorted by peer id for stable behavior — the VERIFIED outcome is peer-independent, root-determined)
+    * with a per-try `perPeerTimeout` so a hung peer cannot stall the accept fold; a peer without the ordinal 404s and the next is tried.
+    * `None` on total miss — the caller stays fail-closed. `maxPeers = 0` disables the transport outright (config kill-switch). Never
+    * raises.
     */
   private[snapshot] def pullMptEntriesAtOrdinalFromPeer[F[_]: Async](
     l0GlobalSnapshotClient: io.constellationnetwork.node.shared.http.p2p.clients.L0GlobalSnapshotClient[F],
@@ -381,47 +242,49 @@ object NakamotoSyncDaemon {
         )
   }
 
-  /** Ethereum-style mempool reconciliation after catch-up/reorg.
-    *
-    * Evicts DAG blocks whose transactions reference a lastTxRef that no longer matches the new context. Keeps events whose transactions are
-    * still unconfirmed in the new state — they should be included in the next snapshot.
-    *
-    * Non-DAG events (state channel, allow spend, etc.) are preserved since they have separate validation semantics handled by the
-    * acceptance manager.
+  /** Append a parent-missing item to the orphan buffer without authorizing any state transition. The only production consumer of the
+    * buffered value is [[drainBufferedChildren]], which re-enters the normal validation path after its parent has been stored.
     */
-  private def reconcileMempool[F[_]: Async](
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    context: GlobalSnapshotInfo,
-    logger: org.typelevel.log4cats.Logger[F]
+  private[nakamoto] def bufferPendingChild[F[_], A](
+    missingParent: Hash,
+    child: A,
+    pendingParentRef: Ref[F, Map[Hash, List[A]]]
   ): F[Unit] =
-    for {
-      hashes <- eventMempool.getEventHashes
-      events <- eventMempool.getMultiple(hashes)
-      staleHashes = events.collect {
-        case (hash, hashed) =>
-          hashed.signed.value match {
-            case DAGEvent(signedBlock) =>
-              val isStale = signedBlock.value.transactions.exists { signedTx =>
-                val tx = signedTx.value
-                val contextRef = context.lastTxRefs.getOrElse(tx.source, TransactionReference.empty)
-                // Block is stale if the context's lastTxRef for this source
-                // differs from the transaction's parent ref — meaning the context
-                // has already processed a different transaction chain for this address.
-                contextRef =!= TransactionReference.empty && contextRef =!= tx.parent
-              }
-              if (isStale) Some(hash) else None
-            case _ => None // keep non-DAG events
-          }
-      }.flatten.toSet
-      poolSize <- eventMempool.size
-      _ <-
-        if (staleHashes.nonEmpty)
-          logger.info(
-            s"🧹 Mempool reconciliation: evicting ${staleHashes.size} stale DAG blocks, keeping ${poolSize - staleHashes.size} events"
-          ) >> eventMempool.remove(staleHashes)
-        else
-          logger.info(s"🧹 Mempool reconciliation: all $poolSize events valid for new context, keeping all")
-    } yield ()
+    pendingParentRef.update { pending =>
+      pending.updated(missingParent, pending.getOrElse(missingParent, List.empty) :+ child)
+    }
+
+  /** Run storage, canonical writes, and attestation effects only after full replay validation returned [[NakamotoSnapshotValidator.Valid]].
+    * Non-valid results have no callback and therefore cannot reach those effects. Returns whether the callback ran so the caller can emit
+    * result-specific diagnostics without duplicating the validity gate.
+    */
+  private[nakamoto] def commitReplayValidated[F[_]: cats.Monad](
+    result: NakamotoSnapshotValidator.ValidationResult
+  )(
+    commit: NakamotoSnapshotValidator.Valid => F[Unit]
+  ): F[Boolean] =
+    result match {
+      case valid: NakamotoSnapshotValidator.Valid => commit(valid).as(true)
+      case _                                      => false.pure[F]
+    }
+
+  /** Atomically remove children waiting on `storedHash`, then process them sequentially in insertion order. `processChild` is the normal
+    * snapshot handler in production; a child that fails replay never stores and therefore never invokes another drain, leaving its
+    * descendants buffered behind the invalid hash.
+    */
+  private[nakamoto] def drainBufferedChildren[F[_]: cats.Monad, A](
+    storedHash: Hash,
+    pendingParentRef: Ref[F, Map[Hash, List[A]]]
+  )(
+    onDrain: List[A] => F[Unit],
+    processChild: A => F[Unit]
+  ): F[Unit] =
+    pendingParentRef.modify { pending =>
+      val children = pending.getOrElse(storedHash, List.empty)
+      (pending - storedHash, children)
+    }.flatMap { children =>
+      onDrain(children) >> children.traverse_(processChild)
+    }
 
   /** After storing a snapshot, check if any buffered gossip snapshots were waiting for it as their parent. If so, process them via
     * handleSnapshot (which will now find the parent in the chain store and validate successfully). This creates a validation cascade from
@@ -462,14 +325,8 @@ object NakamotoSyncDaemon {
     ],
     // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
     // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09 — adopted ordinals must not stay permanent holes in
-    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(diffBaseOrdinal)` fail-closes on every node that adopted that ordinal).
+    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(executionBaseOrdinal)` fail-closes on every node that adopted that ordinal).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
-    // Signed-byte-store FIDELITY — the SERVED signed-bytes store (`mpt_snapshot_info_signed`). Written DIRECTLY only by the byte-faithful
-    // catch-up (its target is an already-FINALIZED ordinal the local finalize sink may never re-visit); every other adopt stages via
-    // `pendingPostBytesRef` and lets the finalize sink write.
-    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
-    // Bound for the adopt-staging (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
-    stagingAccumulatorsCap: Int,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -487,7 +344,7 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    // EXECUTION-SHARDING: per-shard admission-gated binary buffers — the producer fan-out input.
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
@@ -498,65 +355,90 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.schema.nakamoto.EtaPeriod
     ) => F[Set[peer.PeerId]],
-    logger: org.typelevel.log4cats.Logger[F],
-    pullLatestMptEntries: F[Option[LatestMptEntries]]
+    logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
     supervisor: Supervisor[F]
   ): F[Unit] =
-    pendingParentRef.modify { m =>
-      val children = m.getOrElse(storedHash, List.empty)
-      (m - storedHash, children)
-    }.flatMap { children =>
-      if (children.isEmpty) Async[F].unit
-      else
-        logger.info(s"🔗 Draining ${children.size} buffered snapshot(s) whose parent ${storedHash.value.take(12)} is now available") >>
-          children.traverse_ { childSnap =>
-            handleSnapshot(
-              childSnap,
-              stateRef,
-              pendingParentRef,
-              chainStore,
-              nodeStorage,
-              tipTracker,
-              stakeRegistry,
-              sidecarClient,
-              selfId,
-              keyPair,
-              lddConfig,
-              eligibilityChecker,
-              lastKnownSlotRef,
-              epochStateRef,
-              etaRotationSnapshots,
-              confirmationDepthK,
-              consensusFns,
-              snapshotStorage,
-              lastGlobalSnapshotStorage,
-              lastNGlobalSnapshotStorage,
-              productionGate,
-              mptStore,
-              mptOverlay,
-              pendingAccumulatorsRef,
-              pendingPostBytesRef,
-              signedBytesStore,
-              stagingAccumulatorsCap,
-              eventMempool,
-              chainSyncManager,
-              channel,
-              dataDir,
-              operationalKeyMaker,
-              kesRegistry,
-              shardProducers,
-              shardChainStores,
-              shardBinaryBuffers,
-              shardAssignment,
-              shardCommitteeMembership,
-              logger,
-              pullLatestMptEntries
-            )
+    drainBufferedChildren(storedHash, pendingParentRef)(
+      children =>
+        if (children.isEmpty) Async[F].unit
+        else
+          logger.info(
+            s"🔗 Draining ${children.size} buffered snapshot(s) whose parent ${storedHash.value.take(12)} is now available"
+          ),
+      childSnap =>
+        handleSnapshot(
+          childSnap,
+          stateRef,
+          pendingParentRef,
+          chainStore,
+          nodeStorage,
+          tipTracker,
+          stakeRegistry,
+          sidecarClient,
+          selfId,
+          keyPair,
+          lddConfig,
+          eligibilityChecker,
+          lastKnownSlotRef,
+          epochStateRef,
+          etaRotationSnapshots,
+          confirmationDepthK,
+          consensusFns,
+          snapshotStorage,
+          lastGlobalSnapshotStorage,
+          lastNGlobalSnapshotStorage,
+          productionGate,
+          mptStore,
+          mptOverlay,
+          pendingAccumulatorsRef,
+          pendingPostBytesRef,
+          eventMempool,
+          chainSyncManager,
+          channel,
+          dataDir,
+          operationalKeyMaker,
+          kesRegistry,
+          shardProducers,
+          shardChainStores,
+          shardBinaryBuffers,
+          shardAssignment,
+          shardCommitteeMembership,
+          logger
+        )
+    )
+
+  /** Reconcile DAG events after a replay-validated snapshot becomes the canonical tip.
+    *
+    * Transactions whose parent no longer matches canonical GL0 state cannot become valid on the selected branch. Other event types remain
+    * queued for their own validation paths.
+    */
+  private def reconcileMempool[F[_]: Async](
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
+    context: GlobalSnapshotInfo,
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Unit] =
+    for {
+      hashes <- eventMempool.getEventHashes
+      events <- eventMempool.getMultiple(hashes)
+      staleHashes = events.collect {
+        case (hash, hashed) =>
+          hashed.signed.value match {
+            case DAGEvent(signedBlock) =>
+              val isStale = signedBlock.value.transactions.exists { signedTx =>
+                val transaction = signedTx.value
+                val canonicalRef = context.lastTxRefs.getOrElse(transaction.source, TransactionReference.empty)
+                canonicalRef =!= TransactionReference.empty && canonicalRef =!= transaction.parent
+              }
+              Option.when(isStale)(hash)
+            case _ => None
           }
-    }
+      }.flatten.toSet
+      _ <- eventMempool.remove(staleHashes).whenA(staleHashes.nonEmpty)
+      _ <- logger.info(s"Mempool reconciliation evicted ${staleHashes.size} stale DAG event(s)")
+    } yield ()
 
   final case class SyncState(
     networkTipOrdinal: Long,
@@ -610,13 +492,8 @@ object NakamotoSyncDaemon {
       F,
       Map[Hash, (SnapshotOrdinal, io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator)]
     ],
-    // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
-    // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09).
+    // 3c-A enabler — signed-bytes staging map used by replay validation. Authoritative recovery paths do not write it.
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
-    // Signed-byte-store FIDELITY — the SERVED signed-bytes store; written directly only by the byte-faithful catch-up (see handleSnapshot).
-    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
-    // Bound for the adopt-staging (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
-    stagingAccumulatorsCap: Int,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     dataDir: java.nio.file.Path,
     // (#196) Sink for inbound AllowSpendBlock gossip — same queue
@@ -743,10 +620,6 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
     ] = Map.empty,
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]] = None,
-    // Byte-faithful deep-catch-up source: pulls gl0's latest FINALIZED signed MPT bytes from a peer (built from `client` + `clusterStorage`
-    // at the GlobalSnapshotConsensus call site via `pullLatestMptEntriesFromPeer`). Threaded into `catchUpFromGossip` so a >k-behind node
-    // adopts the producer's signed MPT VERBATIM (gated on `sidecarFreeMptRoot === signed mptRoot`) instead of the doomed GSI re-encode.
-    pullLatestMptEntries: F[Option[LatestMptEntries]],
     // WATCHTOWER fraud-proof POOL (W3a): `handleFraudProof` OFFERS a locally-UPHELD inbound dispute here so the gl0 leader producer embeds it
     // in the next snapshot's `fraudProofs` consensus field (where EVERY node re-validates + slashes it deterministically). The sole
     // production wiring passes the shared instance; at `numShards = 1` it passes `WatchtowerFraudProofPool.noop[F]` ⇒ offers discard ⇒ no
@@ -771,8 +644,8 @@ object NakamotoSyncDaemon {
         .map(_.registry.map { case (sid, entry) => sid -> entry.chainStore })
         .getOrElse(Map.empty)
 
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers, also projected off the SAME registry. The
-    // gossip-intake (`MetagraphBinary` handler) writes into these; the producer fan-out reads them. This
+    // Per-shard admission-approved binary buffers, projected off the SAME registry. The metagraph gate
+    // writes into these only after quorum admission; the producer fan-out reads them. This
     // shared instance is the inversion — the producer's input comes from buffered binaries, not gl0's
     // post-chain-link `stateChannelSnapshots`. Empty at numShards=1.
     val shardBinaryBuffers: Map[
@@ -860,8 +733,6 @@ object NakamotoSyncDaemon {
                                 mptOverlay,
                                 pendingAccumulatorsRef,
                                 pendingPostBytesRef,
-                                signedBytesStore,
-                                stagingAccumulatorsCap,
                                 eventMempool,
                                 csm,
                                 channel,
@@ -873,8 +744,7 @@ object NakamotoSyncDaemon {
                                 shardBinaryBuffers,
                                 shardAssignment,
                                 shardCommitteeMembership,
-                                logger,
-                                pullLatestMptEntries
+                                logger
                               )
                             }
                           case None => Async[F].unit
@@ -963,8 +833,6 @@ object NakamotoSyncDaemon {
                                   mptOverlay,
                                   pendingAccumulatorsRef,
                                   pendingPostBytesRef,
-                                  signedBytesStore,
-                                  stagingAccumulatorsCap,
                                   eventMempool,
                                   chainSyncManager,
                                   channel,
@@ -976,8 +844,7 @@ object NakamotoSyncDaemon {
                                   shardBinaryBuffers,
                                   shardAssignment,
                                   shardCommitteeMembership,
-                                  logger,
-                                  pullLatestMptEntries
+                                  logger
                                 )
                               } >>
                               productionGate.resume(ProductionGate.BetterGossipReceived)
@@ -1025,35 +892,20 @@ object NakamotoSyncDaemon {
 
                             case pb.GossipMessage.Body.MetagraphBinary(mb) =>
                               // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
-                              // (30s default) waiting for ⌈2K/3⌉ committee attestations. Running it on
+                              // (30s default) waiting for configured `kQuorum` committee attestations. Running it on
                               // the gossip stream's `evalMap` thread serializes EVERY message behind
                               // every pending gate — gl0 TipAttestations from peers then arrive past
                               // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
                               // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
                               // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
                               // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
-                              //
-                              // EXECUTION-SHARDING R-1 (additive — the inversion intake): when sharding is active
-                              // (`numShards > 1` ⇒ `shardBinaryBuffers.nonEmpty`), ALSO buffer this raw binary into
-                              // the buffer for its shard, off the EXISTING global binaries gossip topic (no Go
-                              // per-shard topic — that's a later load-shedding optimization). The shard producer
-                              // reads `snapshotPending` from this SAME buffer. The legacy `handleMetagraphBinary`
-                              // chain-link admission path is kept UNCHANGED — this is purely additive (R-3 retires
-                              // legacy later). At `numShards = 1` the buffer map is empty ⇒ this is a no-op, the
-                              // legacy path is the sole path, byte-identical.
+                              // The gate-aware processor is also the sole writer to execution-shard buffers. A raw
+                              // gossip receipt is never enough to make a binary eligible for a shard checkpoint.
                               Async[F]
                                 .start(
                                   handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger)
                                 )
-                                .void *>
-                                Async[F]
-                                  .whenA(shardBinaryBuffers.nonEmpty)(
-                                    Async[F]
-                                      .start(
-                                        bufferReceivedBinaryForShard(mb, shardBinaryBuffers, shardAssignment, logger)
-                                      )
-                                      .void
-                                  )
+                                .void
 
                             case pb.GossipMessage.Body.MetagraphAttestation(att) =>
                               // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
@@ -1218,27 +1070,7 @@ object NakamotoSyncDaemon {
                                           mb,
                                           processOrphanedMetagraphBinary,
                                           logger
-                                        ) *>
-                                          // GENESIS-BRIDGE (#28): ALSO feed the shard buffer, mirroring the gossip
-                                          // intake (the `MetagraphBinary` handler buffers for the shard right after
-                                          // `handleMetagraphBinary`). ChainSync recovers binaries whose gossip
-                                          // broadcast raced gl0 readiness — notably a FRESH metagraph's genesis-full
-                                          // `CurrencySnapshot` (sent once, un-retried, before gl0's head was ready, so
-                                          // `StateChannelRoutes` returned ServiceUnavailable and never re-broadcast it
-                                          // onto the topic that feeds the shard buffer). Without this the shard
-                                          // checkpoint's `includedSnapshots` is incremental-only → the gl0 adopt path
-                                          // `deriveAdoptedCurrencyState` cannot seed a fresh MG's currency (the
-                                          // genesis-FULL is mandatory as the chain head) → `lastCurrencySnapshots`
-                                          // freezes at genesis → cl1's first-currency-snapshot bootstrap 90s-times-out
-                                          // → L0-token transfers fail. Buffering the ChainSync-fetched genesis here
-                                          // lands it in the LEADER's checkpoint candidate (the leader ChainSyncs it via
-                                          // its own orphan stuck-detection); followers verify+attest the candidate.
-                                          // Split-safe: the genesis rides in the committee-SIGNED checkpoint, never a
-                                          // node-local read. Dynamic: fires for any metagraph onboarding (e2e-genesis
-                                          // OR a new metagraph joining a running gl0), keyed on "genesis binary fetched".
-                                          Async[F].whenA(shardBinaryBuffers.nonEmpty)(
-                                            bufferReceivedBinaryForShard(mb, shardBinaryBuffers, shardAssignment, logger)
-                                          )
+                                        )
                                       }
                                   }
                               }
@@ -1365,14 +1197,8 @@ object NakamotoSyncDaemon {
     ],
     // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
     // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09 — adopted ordinals must not stay permanent holes in
-    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(diffBaseOrdinal)` fail-closes on every node that adopted that ordinal).
+    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(executionBaseOrdinal)` fail-closes on every node that adopted that ordinal).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
-    // Signed-byte-store FIDELITY — the SERVED signed-bytes store (`mpt_snapshot_info_signed`). Written DIRECTLY only by the byte-faithful
-    // catch-up (its target is an already-FINALIZED ordinal the local finalize sink may never re-visit); every other adopt stages via
-    // `pendingPostBytesRef` and lets the finalize sink write.
-    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
-    // Bound for the adopt-staging (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
-    stagingAccumulatorsCap: Int,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
     channel: ManagedChannel,
@@ -1390,7 +1216,7 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    // Per-shard admission-approved binary buffers — the producer fan-out input.
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
@@ -1401,8 +1227,7 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.schema.nakamoto.EtaPeriod
     ) => F[Set[peer.PeerId]],
-    logger: org.typelevel.log4cats.Logger[F],
-    pullLatestMptEntries: F[Option[LatestMptEntries]]
+    logger: org.typelevel.log4cats.Logger[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
@@ -1423,17 +1248,14 @@ object NakamotoSyncDaemon {
       )
 
       // Deserialize payload
-      parsed =
-        if (snap.payload.size() > 0) {
-          val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
-          (for {
-            json <- io.circe.parser.parse(payloadStr)
-            snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot")
-            contextJson <- json.hcursor.get[io.circe.Json]("context")
-            snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]]
-            context <- contextJson.as[GlobalSnapshotInfo]
-          } yield (snapshot, context)).toOption
-        } else None
+      parsed = decodeFetchedSnapshotPayload(snap.payload.toByteArray)
+      envelopeError <- parsed match {
+        case Some(signedSnapshot) =>
+          validateSnapshotEnvelope[F](snap, signedSnapshot).map(_.left.toOption)
+        case None =>
+          Async[F].pure(Option.empty[String])
+      }
+      metadataBound = parsed.nonEmpty && envelopeError.isEmpty
 
       genesisEta <- epochStateRef.get.map(_.genesisEta)
       // Use parentSlot from gossip message for gap (same inputs as producer used)
@@ -1461,7 +1283,9 @@ object NakamotoSyncDaemon {
       // at all. See `docs/nakamoto/attestation-and-finality.md` §1.
       currentPeriod = EtaCalculation.rotationPeriod(math.max(0L, snap.ordinal - 1), etaRotationSnapshots)
       eta <-
-        if (currentPeriod <= 1) {
+        if (!metadataBound) {
+          Async[F].pure(Array.emptyByteArray)
+        } else if (currentPeriod <= 1) {
           // Cardano/Praos bootstrap: periods 0 and 1 are genesis-derivable (distinct, no VRF dependency).
           // Every honest verifier computes the identical value with no chain-walk, so the period 0→1
           // boundary can't fork on disagreement about period 0's VRF outputs (the ord≈R / iter35 wedge).
@@ -1476,7 +1300,7 @@ object NakamotoSyncDaemon {
               // This is safe: VRF proof verification ensures the producer
               // was eligible under THIS eta, and content validation later
               // ensures the snapshot's state transitions are correct.
-              parsed.flatMap(_._1.value.eta) match {
+              parsed.flatMap(_.value.eta) match {
                 case Some(etaHash) =>
                   // Hash wraps a hex string — decode to 32 bytes
                   val hexStr = etaHash.value
@@ -1494,6 +1318,22 @@ object NakamotoSyncDaemon {
           }
         }
 
+      // KES is a store-boundary validity condition. Verify it before global replay and before `chainStore.store`; otherwise an invalid-KES
+      // candidate can become bestTip and later receive attestations even though `processValidSnapshot` declines its state update.
+      kesOk <-
+        if (!metadataBound) Async[F].pure(false)
+        else
+          KesGossipVerification.verifySnapshot(
+            messageBytes = snap.hash.toByteArray,
+            kesSigBytes = snap.kesSignature.toByteArray,
+            producerId = peer.PeerId(Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)),
+            producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString),
+            ordinal = snap.ordinal,
+            kesRegistry = kesRegistry,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+
       // Validation pipeline + chainStore.store. Pre-Phase E this body ran inside
       // `mptStore.withTransaction` so `accept()`'s mid-flight MPT mutations could be
       // rolled back when the snapshot didn't become the new bestTip. Phase D
@@ -1507,144 +1347,119 @@ object NakamotoSyncDaemon {
       // semantics — that's intentional migration scaffolding, byte-equivalent to the
       // legacy path under #107's parity gate. The proper isolation arrives when
       // Phase J flips production wiring to `MultiBranch`.
-      validationResult <- parsed match {
-        case Some((signedSnapshot, context)) =>
-          chainStore.get(parentHash).flatMap {
-            case Some(parentStored) =>
-              NakamotoSnapshotValidator.validate[F](
-                signedSnapshot = signedSnapshot,
-                context = context,
-                slot = snap.slot,
-                vrfProof = snap.vrfProof.toByteArray,
-                vrfPublicKey = snap.vrfPublicKey.toByteArray,
-                producerIdBytes = snap.producerId.toByteArray,
-                eta = eta,
-                slotGap = slotGap,
-                stakeRegistry = stakeRegistry,
-                lddConfig = lddConfig,
-                eligibilityChecker = eligibilityChecker,
-                consensusFns = consensusFns,
-                lastSignedArtifact = parentStored.signedSnapshot,
-                lastContext = parentStored.context,
-                getByOrdinal = { (ordinal: SnapshotOrdinal) =>
-                  snapshotStorage.get(ordinal).flatMap {
-                    case Some(s) => HasherSelector[F].withCurrent(implicit h => s.toHashed[F].map(_.some))
-                    case None =>
-                      chainStore.getByOrdinal(ordinal.value.value).flatMap {
-                        case Some(stored) =>
-                          HasherSelector[F].withCurrent(implicit h => stored.signedSnapshot.toHashed[F].map(_.some))
-                        case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+      validationResult <-
+        if (parsed.isEmpty)
+          Async[F].pure(NakamotoSnapshotValidator.PayloadMissing(snap.ordinal): NakamotoSnapshotValidator.ValidationResult)
+        else if (envelopeError.nonEmpty)
+          logger
+            .warn(s"Rejecting snapshot with unbound transport metadata: ${envelopeError.get}")
+            .as(NakamotoSnapshotValidator.ContentMismatch(s"transport: ${envelopeError.get}"): NakamotoSnapshotValidator.ValidationResult)
+        else if (!kesOk)
+          Async[F].pure(NakamotoSnapshotValidator.KesInvalid(snap.ordinal): NakamotoSnapshotValidator.ValidationResult)
+        else
+          parsed match {
+            case Some(signedSnapshot) =>
+              chainStore.get(parentHash).flatMap {
+                case Some(parentStored) =>
+                  NakamotoSnapshotValidator.validate[F](
+                    signedSnapshot = signedSnapshot,
+                    slot = snap.slot,
+                    vrfProof = snap.vrfProof.toByteArray,
+                    vrfPublicKey = snap.vrfPublicKey.toByteArray,
+                    producerIdBytes = snap.producerId.toByteArray,
+                    eta = eta,
+                    slotGap = slotGap,
+                    stakeRegistry = stakeRegistry,
+                    lddConfig = lddConfig,
+                    eligibilityChecker = eligibilityChecker,
+                    consensusFns = consensusFns,
+                    lastSignedArtifact = parentStored.signedSnapshot,
+                    lastContext = parentStored.context,
+                    getByOrdinal = { (ordinal: SnapshotOrdinal) =>
+                      snapshotStorage.get(ordinal).flatMap {
+                        case Some(s) => HasherSelector[F].withCurrent(implicit h => s.toHashed[F].map(_.some))
+                        case None =>
+                          chainStore.getByOrdinal(ordinal.value.value).flatMap {
+                            case Some(stored) =>
+                              HasherSelector[F].withCurrent(implicit h => stored.signedSnapshot.toHashed[F].map(_.some))
+                            case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
+                          }
                       }
+                    },
+                    mptOverlay = mptOverlay,
+                    pendingAccumulatorsRef = pendingAccumulatorsRef,
+                    pendingPostBytesRef = pendingPostBytesRef
+                  )
+                case None =>
+                  // Parent not in chain store. Three-tier gap handling:
+                  // Tier 1 (<=6): buffer + ChainSync parent fetch (normal gossip latency)
+                  // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
+                  // Tier 3 (>k): full catch-up — network finalized past us
+                  (chainStore.bestTipOrdinal, stateRef.get).flatMapN { (localBestOrdinal, syncSt) =>
+                    // Orphan-adopt livelock guard: a Tier-3 catch-up stores the pulled snapshot as an ORPHAN, so `bestTipOrdinal` keeps
+                    // reporting the OLD connected tip until the BackfillDaemon links the ancestors. Max it with the highest ordinal a
+                    // catch-up has already adopted so we DON'T re-teleport over the same window every gossip (the livelock observed under a
+                    // gossip flood); once a catch-up has adopted ord M, the residual gap to the tip is closed by Tier-2 walk-back instead.
+                    val localOrd = math.max(localBestOrdinal.getOrElse(0L), syncSt.lastCatchUpAdoptedOrdinal)
+                    val gap = snap.ordinal - localOrd
+                    if (gap > confirmationDepthK) {
+                      logger.warn(
+                        s"Tier 3: gap=$gap > k=$confirmationDepthK for ordinal=${snap.ordinal}. " +
+                          s"Buffering until ancestry is available for full global replay; producer-carried state is not authoritative."
+                      ) >>
+                        bufferPendingChild(parentHash, snap, pendingParentRef) >>
+                        chainSyncManager.requestMissing(parentHash) >>
+                        Async[F].pure(
+                          NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
+                        )
+                    } else if (gap > CatchUpThreshold) {
+                      logger.info(
+                        s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$confirmationDepthK) for ordinal=${snap.ordinal}. " +
+                          s"Sequential walk-back from parent ${parentHash.value.take(12)}."
+                      ) >>
+                        bufferPendingChild(parentHash, snap, pendingParentRef) >>
+                        chainSyncManager.requestMissing(parentHash) >>
+                        Async[F].pure(
+                          NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
+                        )
+                    } else {
+                      logger.info(
+                        s"⏳ Tier 1: Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} (gap=$gap). Buffering."
+                      ) >>
+                        bufferPendingChild(parentHash, snap, pendingParentRef) >>
+                        chainSyncManager.requestMissing(parentHash) >>
+                        Async[F].pure(
+                          NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
+                        )
+                    }
                   }
-                },
-                mptOverlay = mptOverlay,
-                pendingAccumulatorsRef = pendingAccumulatorsRef,
-                pendingPostBytesRef = pendingPostBytesRef
-              )
-            case None =>
-              // Parent not in chain store. Three-tier gap handling:
-              // Tier 1 (<=6): buffer + ChainSync parent fetch (normal gossip latency)
-              // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
-              // Tier 3 (>k): full catch-up — network finalized past us
-              (chainStore.bestTipOrdinal, stateRef.get).flatMapN { (localBestOrdinal, syncSt) =>
-                // Orphan-adopt livelock guard: a Tier-3 catch-up stores the pulled snapshot as an ORPHAN, so `bestTipOrdinal` keeps
-                // reporting the OLD connected tip until the BackfillDaemon links the ancestors. Max it with the highest ordinal a
-                // catch-up has already adopted so we DON'T re-teleport over the same window every gossip (the livelock observed under a
-                // gossip flood); once a catch-up has adopted ord M, the residual gap to the tip is closed by Tier-2 walk-back instead.
-                val localOrd = math.max(localBestOrdinal.getOrElse(0L), syncSt.lastCatchUpAdoptedOrdinal)
-                val gap = snap.ordinal - localOrd
-                if (gap > confirmationDepthK) {
-                  logger.warn(
-                    s"🔄 Tier 3: gap=$gap > k=$confirmationDepthK for ordinal=${snap.ordinal}. Triggering full catch-up."
-                  ) >>
-                    Async[F].pure(
-                      NakamotoSnapshotValidator.ParentNotFound: NakamotoSnapshotValidator.ValidationResult
-                    )
-                } else if (gap > CatchUpThreshold) {
-                  logger.info(
-                    s"⏳ Tier 2: gap=$gap (>$CatchUpThreshold, <=$confirmationDepthK) for ordinal=${snap.ordinal}. " +
-                      s"Sequential walk-back from parent ${parentHash.value.take(12)}."
-                  ) >>
-                    pendingParentRef.update { m =>
-                      val existing = m.getOrElse(parentHash, List.empty)
-                      m.updated(parentHash, existing :+ snap)
-                    } >>
-                    chainSyncManager.requestMissing(parentHash) >>
-                    Async[F].pure(
-                      NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
-                    )
-                } else {
-                  logger.info(
-                    s"⏳ Tier 1: Parent ${parentHash.value.take(12)} not in chain store for ordinal=${snap.ordinal} (gap=$gap). Buffering."
-                  ) >>
-                    pendingParentRef.update { m =>
-                      val existing = m.getOrElse(parentHash, List.empty)
-                      m.updated(parentHash, existing :+ snap)
-                    } >>
-                    chainSyncManager.requestMissing(parentHash) >>
-                    Async[F].pure(
-                      NakamotoSnapshotValidator.ParentBuffered: NakamotoSnapshotValidator.ValidationResult
-                    )
-                }
               }
+            case None =>
+              Async[F].pure(NakamotoSnapshotValidator.PayloadMissing(snap.ordinal): NakamotoSnapshotValidator.ValidationResult)
           }
-        case None =>
-          // No payload — fall back to VRF-only validation (legacy/PoC). No accept() and
-          // therefore no MPT mutation.
-          val vrfVK = snap.vrfPublicKey.toByteArray
-          val proof = snap.vrfProof.toByteArray
-          val producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
-          val producerId = peer.PeerId(producerHex)
-          stakeRegistry.relativeStake(producerId).flatMap { producerStake =>
-            val vrfValidF =
-              if (vrfVK.isEmpty || proof.isEmpty) false.pure[F]
-              else
-                eligibilityChecker.verifyEligibility(
-                  vrfVK = vrfVK,
-                  slot = Slot(NonNegLong.unsafeFrom(snap.slot)),
-                  slotGap = slotGap,
-                  eta = eta,
-                  relativeStake = producerStake,
-                  config = lddConfig,
-                  proof = proof
-                )
-            vrfValidF.map { vrfValid =>
-              if (vrfValid) NakamotoSnapshotValidator.Valid(null, null) // VRF-only, no snapshot data
-              else NakamotoSnapshotValidator.VrfOnlyFailed(snap.slot)
-            }
-          }
-      }
-      storeOutcome <- validationResult match {
-        case v: NakamotoSnapshotValidator.Valid if v.snapshot != null && v.context != null =>
-          for {
-            isNew <- chainStore.store(
-              v.snapshot,
-              v.context,
-              snap.ordinal,
-              snap.slot,
-              parentHash,
-              vrfOutputFromProof(snap.vrfProof.toByteArray)
+      replayCommitted <- commitReplayValidated(validationResult) { valid =>
+        for {
+          validHash <- HasherSelector[F].withCurrent(implicit h => valid.snapshot.toHashed[F].map(_.hash))
+          _ <- SnapshotKesStorage.put[F](dataDir, validHash, snap.kesSignature.toByteArray)
+          isNew <- chainStore.store(
+            valid.snapshot,
+            valid.context,
+            snap.ordinal,
+            snap.slot,
+            parentHash,
+            vrfOutputFromProof(snap.vrfProof.toByteArray)
+          )
+          bestTipOpt <- chainStore.bestTip
+          becameBest = isNew && bestTipOpt.exists(_.hash === validHash)
+          _ <- Async[F].whenA(isNew && !becameBest) {
+            logger.info(
+              s"🔀 Stored Nakamoto snapshot at ordinal=${snap.ordinal} as fork branch (not bestTip) — overlay isolates pending branches from canonical."
             )
-            bestTipOpt <- chainStore.bestTip
-            thisHash <- HasherSelector[F].withCurrent(implicit h => v.snapshot.toHashed[F].map(_.hash))
-            becameBest = isNew && bestTipOpt.exists(_.hash === thisHash)
-            _ <- Async[F].whenA(isNew && !becameBest) {
-              logger.info(
-                s"🔀 Stored Nakamoto snapshot at ordinal=${snap.ordinal} as fork branch (not bestTip) — overlay isolates pending branches from canonical."
-              )
-            }
-          } yield (becameBest, v.snapshot.some, v.context.some)
-        case _ =>
-          (false, none[Signed[GlobalIncrementalSnapshot]], none[GlobalSnapshotInfo]).pure[F]
-      }
-      (becameBest, signedOpt, ctxOpt) = storeOutcome
-
-      _ <- (validationResult: NakamotoSnapshotValidator.ValidationResult) match {
-        case NakamotoSnapshotValidator.Valid(_, _) =>
-          processValidSnapshot(
+          }
+          _ <- processValidSnapshot(
             snap,
-            signedOpt,
-            ctxOpt,
+            valid.snapshot.some,
+            valid.context.some,
             becameBest,
             stateRef,
             chainStore,
@@ -1660,6 +1475,7 @@ object NakamotoSyncDaemon {
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
             productionGate,
+            eventMempool,
             operationalKeyMaker,
             kesRegistry,
             shardProducers,
@@ -1668,207 +1484,74 @@ object NakamotoSyncDaemon {
             shardAssignment,
             shardCommitteeMembership,
             logger
-          ) >> {
-            // This snapshot is now stored — drain any children that were waiting for it.
-            val storedHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-            drainPendingChildren(
-              storedHash,
-              stateRef,
-              pendingParentRef,
-              chainStore,
-              nodeStorage,
-              tipTracker,
-              stakeRegistry,
-              sidecarClient,
-              selfId,
-              keyPair,
-              lddConfig,
-              eligibilityChecker,
-              lastKnownSlotRef,
-              epochStateRef,
-              etaRotationSnapshots,
-              confirmationDepthK,
-              consensusFns,
-              snapshotStorage,
-              lastGlobalSnapshotStorage,
-              lastNGlobalSnapshotStorage,
-              productionGate,
-              mptStore,
-              mptOverlay,
-              pendingAccumulatorsRef,
-              pendingPostBytesRef,
-              signedBytesStore,
-              stagingAccumulatorsCap,
-              eventMempool,
-              chainSyncManager,
-              channel,
-              dataDir,
-              operationalKeyMaker,
-              kesRegistry,
-              shardProducers,
-              shardChainStores,
-              shardBinaryBuffers,
-              shardAssignment,
-              shardCommitteeMembership,
-              logger,
-              pullLatestMptEntries
-            )
-          }
-        case NakamotoSnapshotValidator.ParentNotFound =>
-          // Parent not found — network is ahead of us (restart scenario).
-          catchUpFromGossip(
-            snap,
-            parsed,
+          )
+          // A replay-valid snapshot has passed the same store/processing boundary as live gossip. Re-enter every waiting child through
+          // `handleSnapshot`; a rejected child cannot invoke this drain for its own descendants.
+          storedHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
+          _ <- drainPendingChildren(
+            storedHash,
             stateRef,
+            pendingParentRef,
             chainStore,
+            nodeStorage,
+            tipTracker,
+            stakeRegistry,
+            sidecarClient,
+            selfId,
+            keyPair,
+            lddConfig,
+            eligibilityChecker,
+            lastKnownSlotRef,
+            epochStateRef,
+            etaRotationSnapshots,
+            confirmationDepthK,
+            consensusFns,
             snapshotStorage,
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
-            lastKnownSlotRef,
-            mptStore,
-            eventMempool,
             productionGate,
+            mptStore,
+            mptOverlay,
+            pendingAccumulatorsRef,
+            pendingPostBytesRef,
+            eventMempool,
+            chainSyncManager,
             channel,
             dataDir,
-            pendingPostBytesRef,
-            signedBytesStore,
-            stagingAccumulatorsCap,
-            logger,
-            pullLatestMptEntries
+            operationalKeyMaker,
+            kesRegistry,
+            shardProducers,
+            shardChainStores,
+            shardBinaryBuffers,
+            shardAssignment,
+            shardCommitteeMembership,
+            logger
           )
-        case cm: NakamotoSnapshotValidator.ContentMismatch =>
-          // Content mismatch — could be normal fork, restart, or (Driver B) a self-healable consensus-derived
-          // reward-sum/root drift our fork-diverged base can't reproduce. Try the self-heal adopt first; on any
-          // verification failure or non-self-healable mismatch, fall back to the normal fork/catch-up handling.
-          val normalMismatchHandling: F[Unit] =
-            (snapshotStorage.head, stateRef.get).flatMapN {
-              case (Some((localTip, _)), syncSt) =>
-                // Residual orphan-adopt livelock guard (companion to the Tier-3 gap-check fix). During/after a catch-up, the head
-                // (snapshotStorage) advances but a stream of forward gossip arrives content-mismatched at SMALL gap. Re-adopting on each
-                // (old `gap >= CatchUpThreshold=6`) resets setHeadForRecovery and starves the concurrent Tier-2 walk-back, so the chain
-                // never connects and FINALIZED stays pinned while head advances (observed: gl0-5 head\u2192121, finalized frozen@50, 6\u00D7
-                // re-adopt at gap=6). Fix: max the local ordinal with what a catch-up already adopted, and gate full resync on the SAME
-                // k threshold as Tier-3 \u2014 a small-gap mismatch is a normal fork, stored as a tentative branch (chain-selection resolves),
-                // NOT a reason to re-teleport. Only a genuinely-large (>k) divergence warrants a fresh catch-up.
-                val localOrd = math.max(localTip.ordinal.value.value, syncSt.lastCatchUpAdoptedOrdinal)
-                val gap = snap.ordinal - localOrd
-                if (gap > confirmationDepthK) {
-                  logger.warn(
-                    s"\uD83D\uDD04 Content mismatch with ordinal gap=$gap (local=$localOrd, incoming=${snap.ordinal}). Triggering catch-up."
-                  ) >>
-                    catchUpFromGossip(
-                      snap,
-                      parsed,
-                      stateRef,
-                      chainStore,
-                      snapshotStorage,
-                      lastGlobalSnapshotStorage,
-                      lastNGlobalSnapshotStorage,
-                      lastKnownSlotRef,
-                      mptStore,
-                      eventMempool,
-                      productionGate,
-                      channel,
-                      dataDir,
-                      pendingPostBytesRef,
-                      signedBytesStore,
-                      stagingAccumulatorsCap,
-                      logger,
-                      pullLatestMptEntries
-                    )
-                } else {
-                  // Normal Nakamoto fork — store the snapshot as an alternative branch in
-                  // chainStore WITHOUT updating canonical state (snapshotStorage,
-                  // lastGlobalSnapshotStorage, MPT). Content hasn't been validated against
-                  // this fork's parent state yet — validation is deferred to reorg time.
-                  //
-                  // VRF + signature + slot-cert are already validated (proof of eligibility).
-                  // Content validation (state proof match) requires the fork's parent context
-                  // which we don't have locally. If ChainSelection later picks this fork as
-                  // denser (reorg), we validate by triggering catch-up which resets state to
-                  // the fork's context + MPT self-healing.
-                  logger.info(
-                    s"🔀 Fork at ordinal=${snap.ordinal} slot=${snap.slot} (gap=$gap). Storing as tentative branch (deferred validation)."
-                  ) >>
-                    Metrics[F].incrementCounter("dag_nakamoto_forks_stored") >>
-                    storeForkBranch(
-                      snap,
-                      stateRef,
-                      chainStore,
-                      tipTracker,
-                      snapshotStorage,
-                      lastGlobalSnapshotStorage,
-                      lastNGlobalSnapshotStorage,
-                      lastKnownSlotRef,
-                      mptStore,
-                      mptOverlay,
-                      eventMempool,
-                      productionGate,
-                      pendingPostBytesRef,
-                      stagingAccumulatorsCap,
-                      logger
-                    )
-                }
-              case (None, _) =>
-                catchUpFromGossip(
-                  snap,
-                  parsed,
-                  stateRef,
-                  chainStore,
-                  snapshotStorage,
-                  lastGlobalSnapshotStorage,
-                  lastNGlobalSnapshotStorage,
-                  lastKnownSlotRef,
-                  mptStore,
-                  eventMempool,
-                  productionGate,
-                  channel,
-                  dataDir,
-                  pendingPostBytesRef,
-                  signedBytesStore,
-                  stagingAccumulatorsCap,
-                  logger,
-                  pullLatestMptEntries
-                )
-            }
-
-          // Driver B self-heal: only when the validator flagged the mismatch as `selfHealable` (consensus-derived
-          // reward-sum/root drift, every reproducible field matching), we hold the producer's gossiped GSI, AND the
-          // snapshot is a direct forward extension of our canonical tip (gap == 1). Otherwise fall through to the
-          // normal fork/catch-up handling.
-          val realignAttempt: F[Boolean] =
-            (cm.selfHealable, parsed) match {
-              case (true, Some((signedSnapshot, context))) =>
-                snapshotStorage.head.flatMap {
-                  case Some((localTip, _)) if snap.ordinal == localTip.ordinal.value.value + 1 =>
-                    realignFromAuthoritativeContext(
-                      snap,
-                      signedSnapshot,
-                      context,
-                      parentHash,
-                      chainStore,
-                      snapshotStorage,
-                      lastGlobalSnapshotStorage,
-                      lastNGlobalSnapshotStorage,
-                      mptStore,
-                      eventMempool,
-                      productionGate,
-                      pendingPostBytesRef,
-                      stagingAccumulatorsCap,
-                      logger
-                    )
-                  case _ => false.pure[F]
-                }
-              case _ => false.pure[F]
-            }
-
-          realignAttempt.ifM(Async[F].unit, normalMismatchHandling)
-        case NakamotoSnapshotValidator.ParentBuffered =>
-          // Already buffered for validation when parent arrives — nothing more to do
-          Async[F].unit
-        case invalid: NakamotoSnapshotValidator.Invalid =>
-          Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
-            logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $invalid")
+        } yield ()
+      }
+      _ <- Async[F].unlessA(replayCommitted) {
+        (validationResult: NakamotoSnapshotValidator.ValidationResult) match {
+          case NakamotoSnapshotValidator.ParentNotFound =>
+            // Fail closed. Parentless state cannot be authorized by the producer's signature or by reproducing its self-claimed root.
+            Metrics[F].incrementCounter("dag_nakamoto_parentless_snapshots_rejected") >>
+              logger.warn(
+                s"Rejecting parentless snapshot ordinal=${snap.ordinal} slot=${snap.slot}; ancestry must be fetched and the transition replayed"
+              )
+          case cm: NakamotoSnapshotValidator.ContentMismatch =>
+            Metrics[F].incrementCounter("dag_nakamoto_content_mismatch_rejected") >>
+              logger.warn(
+                s"Rejecting globally replay-invalid snapshot ordinal=${snap.ordinal} slot=${snap.slot}: ${cm.detail}"
+              )
+          case NakamotoSnapshotValidator.ParentBuffered =>
+            // Already buffered for validation when parent arrives — nothing more to do.
+            Async[F].unit
+          case invalid: NakamotoSnapshotValidator.Invalid =>
+            Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
+              logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $invalid")
+          case _: NakamotoSnapshotValidator.Valid =>
+            // `commitReplayValidated` returns true for every Valid result unless its effect raises.
+            Async[F].unit
+        }
       }
     } yield ()
 
@@ -1898,6 +1581,7 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     // Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (becameBestTip-gated). EMPTY / `None`
@@ -1910,7 +1594,7 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    // Per-shard admission-approved binary buffers — the producer fan-out input.
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
@@ -1928,56 +1612,36 @@ object NakamotoSyncDaemon {
     // not run inline under `snapshotSemaphore.permit`). Implicit so the existing positional call
     // site needs no change — it resolves from `run`'s implicit `Supervisor[F]`.
     implicit supervisor: Supervisor[F]
-  ): F[Unit] = {
-    // §1.2 Slice 9: snapshot KES gate runs BEFORE any state mutation. On no-sig /
-    // decode-fail / verify-fail / step-out-of-range, drop the snapshot entirely — no
-    // networkTip update, no canonical-storage write, no self-attestation emit. The
-    // no-registry-entry carve-out accepts so Ed25519-authenticated peers awaiting
-    // their Slice 10 (#179) reg-cert finality aren't silently dropped.
-    val kesGate: F[Boolean] = KesGossipVerification.verifySnapshot(
-      messageBytes = snap.hash.toByteArray,
-      kesSigBytes = snap.kesSignature.toByteArray,
-      producerId = peer.PeerId(Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)),
-      producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString),
-      ordinal = snap.ordinal,
-      kesRegistry = kesRegistry,
-      etaRotationSnapshots = etaRotationSnapshots,
-      logger = logger
+  ): F[Unit] =
+    processValidSnapshotInner(
+      snap,
+      signedSnapshot,
+      context,
+      becameBestTip,
+      stateRef,
+      chainStore,
+      nodeStorage,
+      tipTracker,
+      sidecarClient,
+      selfId,
+      keyPair,
+      lastKnownSlotRef,
+      epochStateRef,
+      etaRotationSnapshots,
+      snapshotStorage,
+      lastGlobalSnapshotStorage,
+      lastNGlobalSnapshotStorage,
+      productionGate,
+      eventMempool,
+      operationalKeyMaker,
+      kesRegistry,
+      shardProducers,
+      shardChainStores,
+      shardBinaryBuffers,
+      shardAssignment,
+      shardCommitteeMembership,
+      logger
     )
-    kesGate.flatMap { kesOk =>
-      if (!kesOk)
-        logger.warn(s"⚠️ KES gate dropped snapshot ord=${snap.ordinal} — no state mutation").as(())
-      else
-        processValidSnapshotInner(
-          snap,
-          signedSnapshot,
-          context,
-          becameBestTip,
-          stateRef,
-          chainStore,
-          nodeStorage,
-          tipTracker,
-          sidecarClient,
-          selfId,
-          keyPair,
-          lastKnownSlotRef,
-          epochStateRef,
-          etaRotationSnapshots,
-          snapshotStorage,
-          lastGlobalSnapshotStorage,
-          lastNGlobalSnapshotStorage,
-          productionGate,
-          operationalKeyMaker,
-          kesRegistry,
-          shardProducers,
-          shardChainStores,
-          shardBinaryBuffers,
-          shardAssignment,
-          shardCommitteeMembership,
-          logger
-        )
-    }
-  }
 
   private def processValidSnapshotInner[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     snap: pb.Snapshot,
@@ -1998,6 +1662,7 @@ object NakamotoSyncDaemon {
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
+    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
     kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
     shardProducers: Map[
@@ -2008,7 +1673,7 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
     ],
-    // EXECUTION-SHARDING R-1: per-shard raw-binary buffers — the producer fan-out input (the inversion).
+    // Per-shard admission-approved binary buffers — the producer fan-out input.
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
@@ -2054,7 +1719,8 @@ object NakamotoSyncDaemon {
                   logger.debug(s"Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
                   Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
                   Metrics[F].updateGauge("dag_nakamoto_ordinal", snap.ordinal) >>
-                  Metrics[F].recordDistribution("dag_nakamoto_slot_gap", (snap.slot - snap.parentSlot).toInt)
+                  Metrics[F].recordDistribution("dag_nakamoto_slot_gap", (snap.slot - snap.parentSlot).toInt) >>
+                  reconcileMempool(eventMempool, ctx, logger)
               }
             } >>
             chainStore.bestTipSlot.flatMap {
@@ -2067,7 +1733,7 @@ object NakamotoSyncDaemon {
 
       // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick in SnapshotLeaderLoop (design §5.7,
       // 2026-06-12). The becameBestTip hook that lived here was the second half of the run-10 Gap-A
-      // cadence inversion: it sampled the shard-leader lottery once per canonical gl0 ORD (the gl0-leader
+      // cadence inversion: it advanced shard producer duty only once per canonical GL0 ordinal (the GL0 leader
       // onSlotWon self-call was the first half), so shards drew ~6.5× slower than gl0's slot grid. The
       // lottery now draws every wall-clock slot on every node, with the envelope carrying its production
       // `slot` (signed). Nothing to do on the snapshot-receive path.
@@ -2141,175 +1807,6 @@ object NakamotoSyncDaemon {
       // this code is unreachable).
 
     } yield ()
-
-  /** Store a fork-branch snapshot WITHOUT updating canonical state.
-    *
-    * The snapshot has valid VRF + signature + slot-cert but its content doesn't match our local state (it was built on a different fork).
-    * We store it tentatively in the chain store. If ChainSelection picks this fork as denser (reorg), we trigger catch-up to adopt the new
-    * state — this resets our canonical view to the fork's context and performs MPT self-healing, which is the deferred validation step.
-    *
-    * Stale fork branches are pruned when finality advances past them (chainStore.finalize).
-    */
-  private def storeForkBranch[F[
-    _
-  ]: Async: cats.Parallel: HasherSelector: io.constellationnetwork.json.JsonSerializer: Metrics: SecurityProvider](
-    snap: pb.Snapshot,
-    stateRef: Ref[F, SyncState],
-    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
-    tipTracker: TipTracker[F],
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
-    lastKnownSlotRef: Ref[F, Option[Long]],
-    mptStore: MptStore[F, GlobalStateKey],
-    mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    productionGate: ProductionGate[F],
-    // Signed-byte-store FIDELITY (2026-07-09) — the SAME staging Ref the produce/validate paths fill. A reorg ADOPT installs the fork's
-    // root-verified state into the live MPT but used to stage NOTHING, so when the adopted hash finalized the sink's promote missed and
-    // `mpt_snapshot_info_signed` was left with a PERMANENT HOLE at that ordinal (the pinnedReaderAt fail-close root cause — every hole in
-    // the 2026-07-09 2mg/2shard run correlated 1:1 with a `Reorg to fork`/`REWARD-SUM REALIGN` adopt). Stage the verified byte map under
-    // the adopted CANONICAL hash so the existing finalize sink persists it exactly like a produced/validated entry.
-    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
-    // Bound for the staging map (typed `nakamoto.staging-accumulators-cap`, same value the produce-path staging uses).
-    stagingAccumulatorsCap: Int,
-    logger: org.typelevel.log4cats.Logger[F]
-  )(
-    implicit globalStateProofSelector: GlobalStateProofSelector,
-    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): F[Unit] =
-    if (snap.payload.size() == 0) Async[F].unit
-    else {
-      val payloadStr = snap.payload.toByteArray.map(_.toChar).mkString
-      val result = for {
-        json <- io.circe.parser.parse(payloadStr)
-        snapshotJson <- json.hcursor.get[io.circe.Json]("snapshot")
-        contextJson <- json.hcursor.get[io.circe.Json]("context")
-        snapshot <- snapshotJson.as[Signed[GlobalIncrementalSnapshot]]
-        context <- contextJson.as[GlobalSnapshotInfo]
-      } yield (snapshot, context)
-
-      result match {
-        case Right((signedSnapshot, context)) =>
-          val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-          for {
-            // Record the previous best tip so we can detect reorgs
-            prevBestTip <- chainStore.bestTip.map(_.map(_.hash))
-
-            // Store in chainStore — ChainSelection may switch bestTip if this fork is denser
-            isNew <- chainStore.store(
-              signedSnapshot,
-              context,
-              snap.ordinal,
-              snap.slot,
-              parentHash,
-              vrfOutputFromProof(snap.vrfProof.toByteArray)
-            )
-
-            // Check if a reorg happened (bestTip changed to a different chain)
-            newBestTip <- chainStore.bestTip.map(_.map(_.hash))
-            reorgHappened = isNew && prevBestTip =!= newBestTip
-
-            _ <-
-              if (reorgHappened) {
-                // ChainSelection picked this fork — adopt its state via catch-up.
-                // This is the deferred validation: catch-up resets canonical state to the fork's
-                // context and performs MPT self-healing. Subsequent snapshots that build on the
-                // new canonical tip will go through the normal Valid path (full content validation).
-                // At depth < k1 the chosen rule is Taktikos `maxvalid-tk` (length, then lower
-                // head-slot tiebreaker); the Genesis density rule fires only on deep forks (>=k1).
-                val reorgOrdinal = SnapshotOrdinal.unsafeApply(snap.ordinal)
-                logger.info(
-                  s"🔄 Reorg to fork at ordinal=${snap.ordinal} slot=${snap.slot} (ChainSelection.standardCompare picked it: maxvalid-tk for shallow forks, density only fires at depth>=k1). " +
-                    s"prevBestTip=${prevBestTip.map(_.value.take(12)).getOrElse("none")} newBestTip=${newBestTip.map(_.value.take(12)).getOrElse("none")}. Validating via root-verified adopt."
-                ) >>
-                  productionGate.pause(ProductionGate.ReorgInProgress) >>
-                  HasherSelector[F].withCurrent { implicit hasher =>
-                    signedSnapshot.toHashed[F].flatMap { hashed =>
-                      // FINDING-S01 fail-closed gate. The fork's carried GlobalSnapshotInfo has NO field for the MPT-native
-                      // consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34), so the old ungated
-                      // `syncFromGlobalSnapshotInfo` rebuild silently WIPED the cross-shard spent-set on every plain tip reorg
-                      // (re-opening consumed allow-spends for a double-spend) and committed a base whose sidecar-free root
-                      // diverged from the fork's SIGNED `stateProof.mptRoot`. `syncFromGlobalSnapshotInfoVerified` reconciles
-                      // {GSI ∪ preserved 33/34, GSI alone} against the signed root BEFORE any store write and rebuilds only on
-                      // a match; on `false` NOTHING is written and we do NOT adopt the fork's state — the node keeps its
-                      // pre-reorg canonical state and recovers via the byte-faithful catch-up (`seedMptByteFaithful`) once the
-                      // fork finalizes, instead of committing a divergent root.
-                      mptStore
-                        .syncFromGlobalSnapshotInfoVerifiedBytes(context, reorgOrdinal, signedSnapshot.value.stateProof.mptRoot)
-                        .flatMap {
-                          case Some(verifiedBytes) =>
-                            // Signed-byte-store FIDELITY: stage the JUST-VERIFIED byte map (sidecar-free root === the fork snapshot's
-                            // SIGNED `stateProof.mptRoot`) under the adopted CANONICAL hash, so the finalize sink persists this ordinal
-                            // into `mpt_snapshot_info_signed` when the adopted branch finalizes. Without this the reorg-adopted ordinal
-                            // is a PERMANENT hole there and every later `pinnedReaderAt(diffBaseOrdinal=thisOrdinal)` fail-closes on
-                            // this node (the 2026-07-09 per-MG mirror freeze). A re-reorged loser is dropped by the sink's watermark
-                            // prune — the "only a FINALIZED branch's bytes reach the store" invariant is untouched.
-                            pendingPostBytesRef.update(
-                              SnapshotLeaderLoop.stageAdoptedPostBytes(_, hashed.hash, reorgOrdinal, verifiedBytes, stagingAccumulatorsCap)
-                            ) >>
-                              snapshotStorage.setTentativeHead(signedSnapshot, context) >>
-                              lastGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                              lastNGlobalSnapshotStorage.setForRecovery(hashed, context) >>
-                              // Overlay cleanup — AFTER the (verified) base rebuild rather than before it, because the
-                              // verified rebuild is check-then-write (nothing to clean up if the gate rejects). The overlay's
-                              // `pendingRef` still holds orphan local-fork branches whose deltas were built against the
-                              // pre-reorg base — those branches show up in `bestTipsFn`, get marked protected by
-                              // `walkAncestorsInPending`, and block `evictIfOverCap` from making progress (pendingRef grows
-                              // unboundedly past cap, see #116 iter14 forensics). The reorg-replace `case None` arm in
-                              // `MptOverlay.finalizeBranch` handles the expected case here ("canonical not in pending,
-                              // locally-rejected fork branches still resident"): it clears `pendingRef`, resets
-                              // `lastCommittedBranchRef`, and emits a WARN that the caller is responsible for base resync
-                              // (already done by the verified rebuild above). Serialized under `snapshotSemaphore`, so no
-                              // reader observes the base-new/overlay-stale interim.
-                              mptOverlay
-                                .finalizeBranch(
-                                  io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(hashed.hash),
-                                  reorgOrdinal
-                                )
-                                .void >>
-                              // Reconcile event mempool — evict stale DAG blocks, keep unconfirmed.
-                              reconcileMempool(eventMempool, context, logger) >>
-                              chainStore.bestTipSlot.flatMap {
-                                case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
-                                case None           => Async[F].unit
-                              } >>
-                              Metrics[F].incrementCounter("dag_nakamoto_reorgs")
-                          case None =>
-                            logger.error(
-                              s"⛔ REORG state adopt REJECTED at ordinal=${snap.ordinal} slot=${snap.slot}: neither {carried GSI ∪ " +
-                                s"local ConsumedAllowSpends/Slashings} nor {carried GSI alone} reproduces the fork snapshot's SIGNED " +
-                                s"stateProof.mptRoot (the fork's MPT-native partitions are not reconstructible from the GSI). " +
-                                s"FAILING CLOSED: no canonical/MPT write — keeping pre-reorg state; byte-faithful catch-up will " +
-                                s"adopt the fork once its signed MPT bytes are served at a finalized ordinal."
-                            ) >>
-                              Metrics[F].incrementCounter("dag_nakamoto_reorg_state_adopt_rejected")
-                        }
-                    }
-                  } >>
-                  productionGate.resume(ProductionGate.ReorgInProgress)
-              } else if (isNew) {
-                // Fork stored but not canonical — just log
-                Metrics[F].incrementCounter("dag_nakamoto_forks_stored")
-              } else Async[F].unit
-
-            // Record attestation regardless (producer attests their own tip). `attestedAt`
-            // is OUR wall-clock receive time via Clock[F].realTime — same Chronos-prep
-            // semantics as the becameBestTip-branch site above. Skew gate trivially
-            // passes since `attestedAt` and `now` are both this node's local clock.
-            tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-            tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
-            producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
-            producerId = peer.PeerId(producerHex)
-            nowMs <- Clock[F].realTime.map(_.toMillis)
-            att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, nowMs)
-            _ <- tipTracker.recordAttestation(producerId, att, nowMs)
-          } yield ()
-
-        case Left(err) =>
-          logger.warn(s"⚠️ Failed to deserialize fork-branch payload: ${err.getMessage}")
-      }
-    }
 
   private def handleAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     att: pb.TipAttestation,
@@ -2650,9 +2147,8 @@ object NakamotoSyncDaemon {
                 }
                 val proofSet = cats.data.NonEmptySet.of(proofs.head, proofs.tail: _*)
                 val signedCheckpoint = Signed(checkpoint, proofSet)
-                // Slot = the envelope's WIRE slot (design §5.7) — the signed lottery clock, byte-identical on every
-                // node (the old anchor-derived reconstruction downsampled the lottery to gl0-snapshot cadence).
-                // vrfOutput is still reconstructed from the producer's committee VRF proof (the wire drops it).
+                // Slot is the signed wire clock used by deterministic staircase duty and the registered-key possession proof.
+                // `vrfOutput` is reconstructed only as a chain-selection input from that proof.
                 val localSlot = checkpoint.slot.value.value
                 val vrfOut = vrfOutputFromProof(checkpoint.committeeSignatures.head.vrfProof.toBytes)
                 HasherSelector[F].withCurrent { implicit hasher =>
@@ -2661,7 +2157,7 @@ object NakamotoSyncDaemon {
                     // known; orphans are bounded retroactively when the parent connects via the chain-store's
                     // connectivity gate). Deflating the slot is the only profitable direction (maxvalid-tk prefers
                     // LOWER slot on ties) and this check closes it; inflating is self-defeating. The wall-clock skew
-                    // bound (`slot <= now + eps`) lands with the Slice-13 cryptographic verifyLeader.
+                    // bound (`slot <= now + eps`) is enforced during cryptographic checkpoint validation.
                     // T1 orphan-by-hash chain-sync (task #A, run-22 cross-node convergence stall): if this checkpoint's
                     // parent is absent locally (and it's not genesis), background-PULL the missing parent from a peer and
                     // re-feed it through this same accept path. This is what converges a node sitting on a divergent
@@ -2711,9 +2207,8 @@ object NakamotoSyncDaemon {
                           // (validate-by-replay → adopt as best-tip → emitAttestation): re-exec/validate the checkpoint FIRST, and
                           // only adopt it into the fork DAG + count its signers' attestations + emit OUR own attestation if the
                           // derivation matched. Previously the emit fired on `becameBestTip` BEFORE `evaluate`, so a node could attest
-                          // (and adopt) a checkpoint whose derivation it had not re-run. `evaluate` runs the committee re-execution
-                          // (`reExecuteDerivation`) on the degraded `T_depth1_shard` path; on the `T_count_shard` fast path it is
-                          // quorum-attested (already cryptographically pre-checked). A `Rejected`/`RejectedReExecutionMismatch` result
+                          // (and adopt) a checkpoint whose derivation it had not re-run. `evaluate` now runs `reExecuteDerivation`
+                          // unconditionally, before either quorum or depth can qualify selection. A `Rejected`/`RejectedReExecutionMismatch` result
                           // is DROPPED — not stored as adoptable, signers NOT counted, NO attestation emitted (a re-exec deviator must
                           // not have its checkpoint adopted nor be rewarded with our attestation). Per Q4 the handler stays
                           // `Async.start`-ed off the gossip thread (see the caller), but WITHIN it the emit is gated on re-exec success.
@@ -2791,8 +2286,8 @@ object NakamotoSyncDaemon {
                                         // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
                                         checkpoint.committeeSignatures.toList
                                           .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
-                                        // T_count_shard quorum closure: sign + gossip OUR attestations so every OTHER node's tracker
-                                        // crosses ⌈2·K_S/3⌉. Self-exclusion (P-11b) keeps them out of our own threshold count. `None`
+                                        // T_count_shard closure: sign + gossip our attestations so every other node's tracker
+                                        // can reach configured `kQuorum`. `None`
                                         // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
                                         // never blocks this handler (the handler is already inside an `Async.start`).
                                         //
@@ -2844,12 +2339,23 @@ object NakamotoSyncDaemon {
                                                                 deps.committeeMembership(ancCp.shardId, ancCp.epoch).flatMap {
                                                                   ancCommittee =>
                                                                     Async[F].whenA(ancCommittee.contains(selfId)) {
-                                                                      logger.info(
-                                                                        s"🧩 ShardCheckpoint attest-ancestor: shard=${ancCp.shardId.value.value} " +
-                                                                          s"shardOrd=${ancCp.shardOrdinal.value} slot=${ancCp.slot.value.value} " +
-                                                                          s"— retroactive attestation (chain-not-tip)"
-                                                                      ) >>
-                                                                        emitter.emit(ancCp.shardId, anc.hash, ancCp.slot, ancCp.epoch)
+                                                                      // Ancestors are subject to the same execution gate as the received tip. A stored/best-chain
+                                                                      // position is not evidence that its currency transition is valid.
+                                                                      deps.acceptanceManager.verifyEmbedded(ancCp).flatMap {
+                                                                        case ShardCheckpointAcceptResult.Accepted =>
+                                                                          logger.info(
+                                                                            s"ShardCheckpoint attest-ancestor after re-exec: " +
+                                                                              s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value} " +
+                                                                              s"slot=${ancCp.slot.value.value}"
+                                                                          ) >> emitter
+                                                                            .emit(ancCp.shardId, anc.hash, ancCp.slot, ancCp.epoch)
+                                                                        case result =>
+                                                                          logger.warn(
+                                                                            s"ShardCheckpoint skip ancestor attestation: " +
+                                                                              s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value} " +
+                                                                              s"executionResult=$result"
+                                                                          )
+                                                                      }
                                                                     }
                                                                 }
                                                               } >> attestMissingAncestors(ancCp.parentCheckpointHash, remaining - 1)
@@ -2898,16 +2404,15 @@ object NakamotoSyncDaemon {
           }
     }
 
-  /** Gap B — handle an incoming `ShardCheckpointAttestationWire` from gossip. Decode, '''verify the attester's Ed25519 signature over the
-    * checkpoint hash''', then record the attester into the per-shard tip tracker so `T_count_shard` can reach quorum from after-the-fact
-    * (non-producing) committee attestations. `None` deps (numShards=1) ⇒ drop with a debug log.
+  /** Gap B — handle an incoming `ShardCheckpointAttestationWire` from gossip. Decode, resolve the referenced checkpoint from the local
+    * shard store, then run the SAME full per-signer pre-check as checkpoint admission (committee membership + Ed25519 + KES + VRF) before
+    * recording the attester into the per-shard tip tracker. `None` deps (numShards=1) ⇒ drop with a debug log.
     *
-    * '''Why verify before recording (mirrors the gl0 `handleAttestation` path).''' `T_count_shard` counts DISTINCT attester peerIds;
-    * without a signature check any peer could forge an attestation under another operator's `peerId` and inflate the count toward false
-    * quorum (a cluster-split risk). The emitter signs the canonical checkpoint hash's UTF-8 bytes with the operator's long-term Ed25519 key
-    * (the SAME bytes + key the producer's committee sig uses), so we recover the VK from `attesterSignature.peerId` and verify exactly as
-    * `handleAttestation` does (`Signing.verifySignature`). Unsigned / invalid-sig attestations are dropped (WARN) and never reach the
-    * tracker — matching the slashing safety bar (only cryptographically verifiable evidence counts).
+    * '''Why every predicate runs before recording.''' The gl0 leader splices every tracker signature into a candidate checkpoint, and
+    * `verifyEmbedded` rejects the whole checkpoint if any signer fails any pre-check. Recording an Ed25519-valid outsider (or a committee
+    * member's first-seen signature with invalid KES/VRF bytes) would therefore poison that checkpoint indefinitely. Unknown hashes are
+    * dropped rather than cached: without the checkpoint bytes there is no shard/epoch/slot context in which committee, KES, or VRF can be
+    * verified. Only a signature accepted by `verifyCommitteeSignature` reaches the tracker.
     */
   private def handleShardCheckpointAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     att: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar.ShardCheckpointAttestationWire,
@@ -2930,32 +2435,35 @@ object NakamotoSyncDaemon {
                 )
               case Some(entry) =>
                 val attesterId = attestation.attesterSignature.peerId
-                val sigBytes = attestation.attesterSignature.ed25519Sig.toBytes
-                // The attester signed the canonical checkpoint hash's UTF-8 bytes (design doc §3.3) — the same bytes the producer's
-                // committee `ed25519Sig` covers. Recover the VK from the peerId and verify; mirrors `handleAttestation`.
-                val msgBytes = attestation.checkpointHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                if (sigBytes.isEmpty)
-                  logger.warn(
-                    s"⚠️ Rejecting unsigned ShardCheckpointAttestation shard=${attestation.shardId.value.value} " +
-                      s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}..."
-                  )
-                else
-                  (for {
-                    pubKey <- attesterId.value.toPublicKey[F]
-                    valid <- Signing.verifySignature[F](msgBytes, sigBytes)(pubKey)
-                  } yield valid).handleError(_ => false).flatMap {
-                    case false =>
-                      logger.warn(
-                        s"⚠️ Rejecting ShardCheckpointAttestation with invalid signature shard=${attestation.shardId.value.value} " +
-                          s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}..."
-                      )
-                    case true =>
-                      entry.tipTracker.recordAttestation(attestation.checkpointHash, attesterId, attestation.attesterSignature) >>
-                        logger.debug(
-                          s"🧩 ShardCheckpointAttestation rx shard=${attestation.shardId.value.value} " +
-                            s"checkpoint=${attestation.checkpointHash.value.take(12)} attester=${attesterId.value.value.take(12)}"
-                        )
-                  }
+                entry.chainStore.getByHash(attestation.checkpointHash).flatMap {
+                  case None =>
+                    logger.warn(
+                      s"Rejecting ShardCheckpointAttestation for unknown checkpoint shard=${attestation.shardId.value.value} " +
+                        s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}..."
+                    )
+                  case Some(stored) if stored.signed.value.shardId =!= attestation.shardId =>
+                    logger.warn(
+                      s"Rejecting ShardCheckpointAttestation with shard mismatch wire=${attestation.shardId.value.value} " +
+                        s"checkpoint=${stored.signed.value.shardId.value.value} hash=${attestation.checkpointHash.value.take(12)}"
+                    )
+                  case Some(stored) =>
+                    deps.acceptanceManager
+                      .verifyCommitteeSignature(stored.signed.value, attestation.attesterSignature)
+                      .flatMap {
+                        case Left(reason) =>
+                          logger.warn(
+                            s"Rejecting invalid ShardCheckpointAttestation shard=${attestation.shardId.value.value} " +
+                              s"checkpoint=${attestation.checkpointHash.value.take(12)} from=${attesterId.value.value.take(16)}... " +
+                              s"reason=$reason"
+                          )
+                        case Right(()) =>
+                          entry.tipTracker.recordAttestation(attestation.checkpointHash, attesterId, attestation.attesterSignature) >>
+                            logger.debug(
+                              s"ShardCheckpointAttestation rx shard=${attestation.shardId.value.value} " +
+                                s"checkpoint=${attestation.checkpointHash.value.take(12)} attester=${attesterId.value.value.take(12)}"
+                            )
+                      }
+                }
             }
           }
           .handleErrorWith { err =>
@@ -3050,9 +2558,9 @@ object NakamotoSyncDaemon {
         logger.debug("Received FraudProof but sharding/watchtower inactive (numShards=1); dropping")
     }
 
-  /** Route an incoming state channel binary from gossip into the [[MetagraphCommitteeGate]] (Slice S3, load-bearing) — the gate computes
-    * the committee sortition for THIS node, emits an attestation if we're in the committee, and waits for ≥ ⌈2 K_target / 3⌉ attestations
-    * to land in the aggregator before admitting the binary into the local acceptance pipeline.
+  /** Route an incoming state channel binary from gossip into the [[MetagraphCommitteeGate]] — the gate computes the committee sortition for
+    * this node, emits an attestation if selected, and waits for configured `kQuorum` attestations to land in the aggregator before
+    * admitting the binary into the local acceptance pipeline.
     *
     * The sender serialized Signed[StateChannelSnapshotBinary] via the project's JsonSerializer (JSON + Brotli); we use the same typeclass
     * to deserialize. Decode failures and gate timeouts both result in the binary being dropped (WARN-logged with enough detail for an
@@ -3105,6 +2613,14 @@ object NakamotoSyncDaemon {
     // inbound-attestation receiver uses — `stakeRegistry.committeeStake`.
     senderStakeLookup: io.constellationnetwork.schema.peer.PeerId => F[io.constellationnetwork.numerics.Ratio],
     orphanBuffer: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer[F],
+    shardBinaryBuffers: Map[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ] = Map.empty[
+      io.constellationnetwork.schema.sharding.ShardId,
+      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
+    ],
+    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]] = None,
     logger: org.typelevel.log4cats.Logger[F]
   ): (io.constellationnetwork.schema.address.Address, Array[Byte]) => F[Unit] = {
     import io.constellationnetwork.schema.address.Address
@@ -3225,7 +2741,10 @@ object NakamotoSyncDaemon {
                       admitted <- committeeGate.attestAndAdmit(address, parentHash, binaryHash, eta, sigma)
                       _ <-
                         if (admitted)
-                          processMetagraphBinary(output)
+                          (processMetagraphBinary(output) *>
+                            Async[F].whenA(shardBinaryBuffers.nonEmpty)(
+                              bufferAdmittedBinaryForShard(output, shardBinaryBuffers, shardAssignment, logger)
+                            ))
                             .handleErrorWith(e => logger.warn(s"⚠️ processMetagraphBinary failed for $address: ${e.getMessage}"))
                             .flatMap(_ => orphanBuffer.drainChildren(address, valueHash))
                             .flatMap(_.traverse_(child => processBytes(address, child)))
@@ -3257,73 +2776,51 @@ object NakamotoSyncDaemon {
     }
   }
 
-  /** EXECUTION-SHARDING R-1 (additive intake): buffer a received raw metagraph binary into the buffer for ITS shard, off the EXISTING
-    * global binaries gossip topic. Runs ALONGSIDE the legacy `handleMetagraphBinary` chain-link admission path (which is unchanged) — the
-    * producer fan-out reads `snapshotPending` from the SAME buffer instances projected from `shardAcceptanceDeps.registry`.
+  /** Buffer an admission-approved metagraph binary into the buffer for its execution shard. This function is called only after
+    * `MetagraphCommitteeGate.attestAndAdmit` returns true; raw gossip receipt and ChainSync fetch are not admission conditions.
     *
     * '''Determinism model.''' Leader-proposes / members-attest: the buffer is node-local and need NOT converge across committee members —
     * only the shard slot leader builds the checkpoint from its own buffer; others attest the gossiped envelope (see
     * [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer]]). So we just deserialize, resolve the shard via the
     * SAME deterministic `ShardAssignment.shardIdFor` mapping, and `bufferBinary` (idempotent by hash) — no multi-proposer machinery.
     *
-    * Only invoked when `shardBinaryBuffers.nonEmpty` (`numShards > 1`); at `numShards = 1` the caller's `whenA` gate makes this a no-op.
+    * Only invoked when `shardBinaryBuffers.nonEmpty` (`numShards > 1`).
     */
-  private def bufferReceivedBinaryForShard[F[_]: Async: io.constellationnetwork.json.JsonSerializer: HasherSelector: Metrics](
-    mb: pb.MetagraphBinary,
+  private def bufferAdmittedBinaryForShard[F[_]: Async: HasherSelector: Metrics](
+    output: io.constellationnetwork.statechannel.StateChannelOutput,
     shardBinaryBuffers: Map[
       io.constellationnetwork.schema.sharding.ShardId,
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
     ],
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
     logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] = {
-    import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
-    import io.constellationnetwork.security.signature.Signed
-    import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
-    import eu.timepit.refined.refineV
-
-    (refineV[DAGAddressRefined](mb.address), shardAssignment) match {
-      case (Right(refined), Some(assignment)) =>
-        val address = Address(refined)
-        val bytes = mb.binary.toByteArray
-        // Deserialize with the SAME typeclass + wire format the legacy `processMetagraphBinary` path uses
-        // (`JsonSerializer` = JSON + Brotli). On decode failure, log + drop — the legacy path logs the same.
-        io.constellationnetwork.json
-          .JsonSerializer[F]
-          .deserialize[Signed[StateChannelSnapshotBinary]](bytes)
-          .flatMap {
-            case Left(err) =>
-              logger.debug(s"R-1 shard-buffer: decode failed for $address (${err.getMessage}); not buffering")
-            case Right(signed) =>
-              HasherSelector[F].withCurrent { implicit hasher =>
-                assignment.shardIdFor(address).flatMap { sid =>
-                  // Metagraph→shard mapping gauge (eval-instrumentation): emit one series per (mg, shard) so
-                  // `count by (shard_id) (dag_nakamoto_metagraph_shard_assignment)` shows the per-shard
-                  // metagraph load at a glance — a shard carrying >1 mg while another sits idle is the
-                  // imbalance that overloads one committee (the data-with-fee wedge). Idempotent (value 1).
-                  Metrics[F].updateGauge(
-                    "dag_nakamoto_metagraph_shard_assignment",
-                    1,
-                    Seq(
-                      Metrics.unsafeLabelName("shard_id") -> sid.value.value.toString,
-                      Metrics.unsafeLabelName("metagraph") -> address.value.value
-                    )
-                  ) >>
-                    (shardBinaryBuffers.get(sid) match {
-                      case Some(buffer) => buffer.bufferBinary(address, signed)
-                      case None         =>
-                        // Address maps to a shard this operator doesn't track a buffer for — drop quietly (the
-                        // legacy admission path still ran). Expected only if numShards/registry disagree.
-                        logger.debug(s"R-1 shard-buffer: no buffer for shard=${sid.value.value} (mg=$address); skipping")
-                    })
-                }
-              }
+  ): F[Unit] =
+    shardAssignment match {
+      case Some(assignment) =>
+        val address = output.address
+        HasherSelector[F].withCurrent { implicit hasher =>
+          assignment.shardIdFor(address).flatMap { sid =>
+            // Metagraph→shard mapping gauge (eval-instrumentation): emit one series per (mg, shard) so
+            // `count by (shard_id) (dag_nakamoto_metagraph_shard_assignment)` shows the per-shard
+            // metagraph load at a glance — a shard carrying >1 mg while another sits idle is the
+            // imbalance that overloads one committee (the data-with-fee wedge). Idempotent (value 1).
+            Metrics[F].updateGauge(
+              "dag_nakamoto_metagraph_shard_assignment",
+              1,
+              Seq(
+                Metrics.unsafeLabelName("shard_id") -> sid.value.value.toString,
+                Metrics.unsafeLabelName("metagraph") -> address.value.value
+              )
+            ) >>
+              (shardBinaryBuffers.get(sid) match {
+                case Some(buffer) => buffer.bufferBinary(address, output.snapshotBinary)
+                case None =>
+                  logger.debug(s"Shard buffer missing for shard=${sid.value.value} (mg=$address); skipping admitted binary")
+              })
           }
-      case _ =>
-        // Invalid address (legacy path already warned) or no assignment (numShards=1) — nothing to buffer.
-        Async[F].unit
+        }
+      case None => Async[F].unit
     }
-  }
 
   // Package-visible so SnapshotLeaderLoop can route producer-self-attestation through the
   // same code path peer-received snapshots use. Unifies the two attestation sites: any future
@@ -3434,457 +2931,4 @@ object NakamotoSyncDaemon {
       }
   }
 
-  /** Catch up from a gossip payload when parent is missing (restart scenario).
-    *
-    * Instead of rejecting the snapshot, use it to reset local state to the network tip. The gossip message already contains the full
-    * Signed[GlobalIncrementalSnapshot] + GlobalSnapshotInfo. The parent is absent so the full `NakamotoSnapshotValidator.validate` (VRF +
-    * slot-cert) can't run, but the two parent-free, deterministic gates in [[verifyCatchUpSnapshot]] (envelope signature +
-    * stateProof-vs-GSI consistency) DO run BEFORE any canonical/MPT write — an unsigned/forged or GSI-inconsistent tuple is rejected and
-    * nothing is written (the node retries on a later gossip wave; the 10s cooldown rate-limits). An honest snapshot passes both gates by
-    * construction, so we reset our canonical storage + MPT and subsequent gossip messages WILL have parents we recognize. See
-    * [[verifyCatchUpSnapshot]] for why majority-hash (gate 3) and VRF/slot-cert (gate 4) are NOT enforced on this path.
-    */
-  /** Driver B reward-sum self-heal — adopt a producer's signed-authentic state for a single forward ordinal.
-    *
-    * When `NakamotoSnapshotValidator` flags a `ContentMismatch` as `selfHealable` (the ONLY divergence is the consensus-derived
-    * delegated-stake reward-accrual partition(s) — `DelegatedStakeRecord.rewards` is a running sum a node with a transiently fork-diverged
-    * base cannot reproduce — and/or the rolled-up mptRoot, while every reproducible field matches), our local re-derivation is wrong but
-    * the producer's signed snapshot carries the correct state. Storing a fork (the small-gap default) never re-aligns the base, so the next
-    * ordinal mismatches again — the fork storm. Instead we adopt the producer's gossiped GSI for THIS ordinal, re-aligning the base so
-    * subsequent ordinals validate.
-    *
-    * Safety is identical to deep catch-up: gate adoption on the two parent-free deterministic checks (`verifyCatchUpSnapshot` — envelope
-    * signature + carried GSI === committed `stateProof` incl. mptRoot), so the only state we can install is real, validly-signed consensus
-    * output (not a fabrication). Reuses catch-up's audited adopt primitives but WITHOUT the cooldown or backfill: the parent is present and
-    * this is a 1-ordinal forward adopt, not a deep resync. Returns true on adopt; false on verification failure (caller falls back to the
-    * normal fork/catch-up handling).
-    */
-  private def realignFromAuthoritativeContext[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
-    snap: pb.Snapshot,
-    signedSnapshot: Signed[GlobalIncrementalSnapshot],
-    context: GlobalSnapshotInfo,
-    // The already-decoded parent hash from `handleSnapshot` (single canonical decode of `snap.parentHash`).
-    parentHash: Hash,
-    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
-    mptStore: MptStore[F, GlobalStateKey],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    productionGate: ProductionGate[F],
-    // Signed-byte-store FIDELITY (2026-07-09) — stage the realign-ADOPTED ordinal's root-verified byte map so the finalize sink persists
-    // it (see `storeForkBranch`'s twin param; the ordinal-18 hole on BOTH healthy nodes in the 2026-07-09 run was exactly this path).
-    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
-    stagingAccumulatorsCap: Int,
-    logger: org.typelevel.log4cats.Logger[F]
-  )(
-    implicit globalStateProofSelector: GlobalStateProofSelector,
-    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): F[Boolean] =
-    verifyCatchUpSnapshot[F](signedSnapshot, context).flatMap {
-      case CatchUpVerdict.Accept(verifiedHashed) =>
-        // FINDING-S01 fail-closed ordering: re-seed the MPT FIRST via the root-verified rebuild
-        // (`syncFromGlobalSnapshotInfoVerifiedBytes` reconciles {carried GSI ∪ preserved ConsumedAllowSpends/Slashings,
-        // carried GSI alone} against the snapshot's SIGNED `stateProof.mptRoot` BEFORE any store write), and advance the
-        // canonical storages ONLY on a `Some` verdict. On `None` NOTHING — canonical or MPT — has been written and we
-        // return false, falling back to the normal fork/catch-up handling (the existing contract of this method).
-        val adopt: F[Boolean] =
-          HasherSelector[F].withCurrent { implicit hasher =>
-            // Re-seed the MPT from the producer's authoritative GSI — its committed reward-sum replaces our
-            // diverged re-derivation, so the per-ordinal stateProof re-derives correctly from here on.
-            mptStore.syncFromGlobalSnapshotInfoVerifiedBytes(
-              context,
-              SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
-              signedSnapshot.value.stateProof.mptRoot
-            )
-          }.flatMap {
-            case None =>
-              logger
-                .warn(
-                  s"⛔ REWARD-SUM REALIGN REJECTED at ordinal=${snap.ordinal}: no GSI-rebuild candidate reproduces the " +
-                    s"snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings not reconstructible " +
-                    s"from the carried GSI). FAILING CLOSED: nothing written; falling back to normal fork handling."
-                )
-                .as(false)
-            case Some(verifiedBytes) =>
-              for {
-                // Signed-byte-store FIDELITY: stage the verified byte map under the adopted CANONICAL hash so the finalize sink
-                // persists this ordinal into `mpt_snapshot_info_signed` (a realign-adopt otherwise leaves a permanent hole there —
-                // the pinnedReaderAt fail-close root cause).
-                _ <- pendingPostBytesRef.update(
-                  SnapshotLeaderLoop.stageAdoptedPostBytes(
-                    _,
-                    verifiedHashed.hash,
-                    SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
-                    verifiedBytes,
-                    stagingAccumulatorsCap
-                  )
-                )
-                _ <- chainStore.store(
-                  signedSnapshot,
-                  context,
-                  snap.ordinal,
-                  snap.slot,
-                  parentHash,
-                  vrfOutputFromProof(snap.vrfProof.toByteArray)
-                )
-                // setHeadForRecovery advances ALL canonical storages to this ordinal so the leader loop's
-                // parent read sees the re-aligned tip (same primitives catch-up uses; here it is a +1 forward step).
-                _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                  snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
-                    lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
-                    lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
-                }
-                _ <- reconcileMempool(eventMempool, context, logger)
-              } yield true
-          }
-        for {
-          _ <- logger.info(
-            s"🩹 REWARD-SUM REALIGN: adopting producer's signed-authentic state at ordinal=${snap.ordinal} " +
-              s"slot=${snap.slot} (consensus-derived reward-sum/root diverged from a fork-diverged base; all " +
-              s"reproducible fields match; signature + stateProof verified)."
-          )
-          _ <- productionGate.pause("reward-sum-realign")
-          adopted <- cats.effect.MonadCancel[F].guarantee(adopt, productionGate.resume("reward-sum-realign"))
-          _ <- Metrics[F].incrementCounter("dag_nakamoto_reward_sum_realign").whenA(adopted)
-          _ <- Metrics[F].incrementCounter("dag_nakamoto_reward_sum_realign_rejected").whenA(!adopted)
-        } yield adopted
-      case CatchUpVerdict.RejectedInvalidSignature =>
-        logger
-          .warn(
-            s"⛔ Reward-sum realign REJECTED ordinal=${snap.ordinal}: invalid envelope signature. " +
-              s"Falling back to normal fork handling."
-          )
-          .as(false)
-      case CatchUpVerdict.RejectedStateProofMismatch(_) =>
-        logger
-          .warn(
-            s"⛔ Reward-sum realign REJECTED ordinal=${snap.ordinal}: gossiped GlobalSnapshotInfo does not " +
-              s"match the snapshot's committed stateProof. Falling back to normal fork handling."
-          )
-          .as(false)
-    }
-
-  private def catchUpFromGossip[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
-    snap: pb.Snapshot,
-    parsed: Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)],
-    stateRef: Ref[F, SyncState],
-    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
-    lastKnownSlotRef: Ref[F, Option[Long]],
-    mptStore: MptStore[F, GlobalStateKey],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    productionGate: ProductionGate[F],
-    channel: ManagedChannel,
-    dataDir: java.nio.file.Path,
-    // Signed-byte-store FIDELITY (2026-07-09) — see `storeForkBranch`'s twin params. The LEGACY gossip-adopt arm stages its root-verified
-    // rebuild bytes for finalize-sink promotion (the adopted tip is unfinalized); the BYTE-FAITHFUL arm writes `signedBytesStore` DIRECTLY
-    // (its target is the peer's latest FINALIZED ordinal — strictly ahead of the local tip — so the local finalize sink may never re-visit
-    // it; the bytes already passed the `sidecarFreeMptRoot === signed mptRoot` gate).
-    pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
-    signedBytesStore: io.constellationnetwork.security.mpt.storages.MptStateStorage[F],
-    stagingAccumulatorsCap: Int,
-    logger: org.typelevel.log4cats.Logger[F],
-    pullLatestMptEntries: F[Option[LatestMptEntries]]
-  )(
-    implicit globalStateProofSelector: GlobalStateProofSelector,
-    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit,
-    supervisor: Supervisor[F]
-  ): F[Unit] = {
-    val now = System.currentTimeMillis()
-    stateRef.get.flatMap { state =>
-      if (now - state.lastCatchUpAttemptMs < CatchUpCooldownMs) {
-        // Cooldown — don't spam catch-up attempts
-        logger.debug(
-          s"⏳ Catch-up cooldown (${(CatchUpCooldownMs - (now - state.lastCatchUpAttemptMs)) / 1000}s remaining), " +
-            s"skipping ordinal=${snap.ordinal}"
-        )
-      } else {
-        // BYTE-FAITHFUL DEEP CATCH-UP (root fix #116): rebuilding the snapshot's state from the gossiped GSI structurally CANNOT reproduce
-        // the producer's per-MG currency `infoRoot`/`mptRoot` under roots-only sharding (the producer commits those from its live MPT —
-        // populated by shard-checkpoint adoption — while the carried GSI's `lastCurrencySnapshots` is empty; the GSI is no longer the source
-        // of truth). PRIMARY path: pull gl0's latest FINALIZED signed MPT byte map from a peer and adopt it VERBATIM, gated on
-        // `sidecarFreeMptRoot === signed mptRoot` (`seedMptByteFaithful`); the gossiped `snap` is only the trigger. FALLBACK (no peer / pull
-        // failed): the legacy gossip-tuple adoption, behaviorally unchanged.
-        val legacyGossipAdopt: F[Unit] =
-          parsed match {
-            case Some((signedSnapshot, context)) =>
-              val parentHash = Hash(new String(snap.parentHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-              for {
-                _ <- stateRef.update(_.copy(lastCatchUpAttemptMs = now))
-                // SECURITY: the parent is missing here, so `NakamotoSnapshotValidator.validate` (VRF + slot-cert) cannot run. Adopting an
-                // UNVERIFIED gossiped tuple as the entire canonical gl0 state would let any single peer reset our balances/txRefs/stakes/
-                // locks. Gate adoption on the two parent-free, deterministic checks (`verifyCatchUpSnapshot`) BEFORE touching any canonical
-                // storage or the MPT: a forged-signature tuple (gate 1) or a GSI inconsistent with the signed `stateProof` (gate 2) is
-                // rejected and nothing is written; the node retries on a later gossip wave (the 10s cooldown rate-limits). An HONEST
-                // snapshot (valid sig + GSI matching its committed stateProof) passes both gates by construction, so legitimate catch-up
-                // still recovers.
-                verdict <- verifyCatchUpSnapshot[F](signedSnapshot, context)
-                _ <- verdict match {
-                  case CatchUpVerdict.RejectedInvalidSignature =>
-                    logger.warn(
-                      s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot}: INVALID envelope signature. " +
-                        s"Not adopting (no canonical/MPT write). Will retry on next gossip wave."
-                    ) >>
-                      Metrics[F].incrementCounter(
-                        "dag_nakamoto_catchup_rejected",
-                        Seq(Metrics.unsafeLabelName("reason") -> "invalid_signature")
-                      )
-                  case CatchUpVerdict.RejectedStateProofMismatch(rejectedHashed) =>
-                    logger.warn(
-                      s"⛔ Rejecting catch-up snapshot ordinal=${snap.ordinal} slot=${snap.slot} " +
-                        s"hash=${rejectedHashed.hash.value.take(12)}: carried GlobalSnapshotInfo does NOT match the snapshot's " +
-                        s"committed stateProof (state-proof mismatch). Not adopting (no canonical/MPT write). Retrying on next gossip wave."
-                    ) >>
-                      Metrics[F].incrementCounter(
-                        "dag_nakamoto_catchup_rejected",
-                        Seq(Metrics.unsafeLabelName("reason") -> "state_proof_mismatch")
-                      )
-                  case CatchUpVerdict.Accept(verifiedHashed) =>
-                    for {
-                      _ <- logger.warn(
-                        s"\uD83D\uDD04 CATCH-UP: No parent found for ordinal=${snap.ordinal} slot=${snap.slot} " +
-                          s"(verified: signature OK, stateProof matches). Resetting local state to network tip."
-                      )
-                      _ <- productionGate.pause("catch-up-sync")
-
-                      // MPT full sync from the context we received — critical for the acceptance manager to validate
-                      // subsequent snapshots. FINDING-S01 fail-closed ordering: the ROOT-VERIFIED rebuild runs FIRST
-                      // (`syncFromGlobalSnapshotInfoVerifiedBytes` is check-then-write — it reconciles {carried GSI ∪ preserved
-                      // ConsumedAllowSpends/Slashings, carried GSI alone} against the snapshot's SIGNED stateProof.mptRoot
-                      // BEFORE any store write) and every canonical seeding step below runs ONLY on a `Some` verdict. On
-                      // `None` NOTHING was written — the node retries on a later gossip wave (10s cooldown); the
-                      // byte-faithful pull remains the primary deep-recovery route.
-                      _ <- logger.info(s"\uD83D\uDD04 CATCH-UP: Syncing MPT from received context (root-verified)...")
-                      mptAdoptedBytes <- HasherSelector[F].withCurrent { implicit hasher =>
-                        mptStore.syncFromGlobalSnapshotInfoVerifiedBytes(
-                          context,
-                          SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
-                          signedSnapshot.value.stateProof.mptRoot
-                        )
-                      }
-                      // Signed-byte-store FIDELITY (2026-07-09): stage the verified byte map under the adopted CANONICAL hash so the
-                      // finalize sink persists this ordinal into `mpt_snapshot_info_signed` once finality passes it (the adopted gossip
-                      // tip is UNFINALIZED, so staging — not a direct store write — is the correct sink; a re-reorged loser is dropped by
-                      // the sink's watermark prune). Without this, a legacy-catch-up-adopted ordinal is a permanent hole there and every
-                      // later `pinnedReaderAt(diffBaseOrdinal=thisOrdinal)` fail-closes on this node.
-                      _ <- mptAdoptedBytes.traverse_ { verifiedBytes =>
-                        pendingPostBytesRef.update(
-                          SnapshotLeaderLoop.stageAdoptedPostBytes(
-                            _,
-                            verifiedHashed.hash,
-                            SnapshotOrdinal(NonNegLong.unsafeFrom(snap.ordinal)),
-                            verifiedBytes,
-                            stagingAccumulatorsCap
-                          )
-                        )
-                      }
-                      mptAdopted = mptAdoptedBytes.isDefined
-                      // Don't overwrite lastKnownSlotRef with the gossip slot — it may be
-                      // ahead of our wall clock, making slotGap negative and blocking VRF
-                      // eligibility. Production will update it after its next successful store.
-                      _ <-
-                        if (!mptAdopted)
-                          logger.error(
-                            s"\u26D4 CATCH-UP MPT adopt REJECTED at ordinal=${snap.ordinal}: no GSI-rebuild candidate " +
-                              s"reproduces the snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings " +
-                              s"are not reconstructible from the carried GSI). FAILING CLOSED: no canonical/MPT write; " +
-                              s"retrying on a later gossip wave / byte-faithful pull."
-                          ) >>
-                            Metrics[F].incrementCounter(
-                              "dag_nakamoto_catchup_rejected",
-                              Seq(Metrics.unsafeLabelName("reason") -> "mpt_root_unreconstructible")
-                            )
-                        else
-                          for {
-                            // Store in chain store (seed this snapshot as our new starting point)
-                            _ <- chainStore.store(
-                              signedSnapshot,
-                              context,
-                              snap.ordinal,
-                              snap.slot,
-                              parentHash,
-                              vrfOutputFromProof(snap.vrfProof.toByteArray)
-                            )
-
-                            // Update ALL canonical storages — snapshotStorage is what SnapshotLeaderLoop
-                            // reads for its parent. Without this, the leader loop produces at the OLD ordinal
-                            // after catch-up, causing the node to fall behind again immediately. Reuse the
-                            // signature-verified `Hashed` from `verifyCatchUpSnapshot` rather than re-hashing
-                            // via the no-signature-check `toHashed` (`setHeadForRecovery` needs the implicit Hasher).
-                            _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                              snapshotStorage.setHeadForRecovery(signedSnapshot, context) >>
-                                lastGlobalSnapshotStorage.setForRecovery(verifiedHashed, context) >>
-                                lastNGlobalSnapshotStorage.setForRecovery(verifiedHashed, context)
-                            }
-
-                            // Reconcile event mempool — evict DAG blocks whose transactions are
-                            // already consumed in the new context's lastTxRefs (prevents double-spend).
-                            // Keep events whose transactions are still unconfirmed (prevents starvation).
-                            _ <- reconcileMempool(eventMempool, context, logger)
-
-                            _ <- stateRef.update(s =>
-                              s.copy(
-                                networkTipOrdinal = snap.ordinal,
-                                networkTipHash = Some(Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))),
-                                localTipOrdinal = snap.ordinal,
-                                // Same orphan-adopt livelock guard as the byte-faithful path: record the adopted ordinal for the gap-check.
-                                lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, snap.ordinal)
-                              )
-                            )
-
-                            _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
-                            _ <- logger.info(
-                              s"\u2705 CATCH-UP complete: now at ordinal=${snap.ordinal} slot=${snap.slot}. " +
-                                s"Subsequent gossip should find parents."
-                            )
-
-                            // Start backfill daemon in background to fill the gap from caught-up tip down to genesis.
-                            // The parent hash of the caught-up snapshot is the starting point for the walk-back.
-                            _ <- {
-                              val cursor = BackfillDaemon.BackfillCursor(
-                                nextHashToFetch = parentHash.value,
-                                targetOrdinal = 1L,
-                                currentOrdinal = snap.ordinal,
-                                startedAtOrdinal = snap.ordinal,
-                                completedChunks = Set.empty,
-                                createdAtMs = System.currentTimeMillis()
-                              )
-                              // Scope the backfill fiber to the app Supervisor so shutdown cancels cleanly.
-                              // Previously a raw Async.start leaked a fiber that outlived the owning daemon.
-                              supervisor
-                                .supervise(
-                                  BackfillDaemon
-                                    .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
-                                    .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
-                                )
-                                .void
-                            }
-                          } yield ()
-                      _ <- productionGate.resume("catch-up-sync")
-                    } yield ()
-                }
-              } yield ()
-            case None =>
-              logger.warn(
-                s"\u274c No parent found for ordinal=${snap.ordinal} and no payload to catch up from"
-              )
-          }
-
-        // Adopt gl0's latest FINALIZED state byte-faithfully: seed the MPT from the SIGNED bytes (verified === signed mptRoot) and swap all
-        // canonical refs to the PULLED snapshot (the gossiped tip is only the trigger). On a root-gate failure (corrupt transfer / GSI-
-        // fallback divergence) we adopt NOTHING and re-pull next wave.
-        def byteFaithfulAdopt(triple: LatestMptEntries): F[Unit] = {
-          val (pulledHashed, pulledGsi, pulledBytes) = triple
-          val pOrdinal = pulledHashed.signed.value.ordinal
-          val pOrdinalL = pOrdinal.value.value
-          val pSlot = pulledHashed.signed.value.slotCertificate.map(_.slot.value.value).getOrElse(0L)
-          val pParentHash = pulledHashed.signed.value.lastSnapshotHash
-          val pVrfOutput =
-            vrfOutputFromProof(pulledHashed.signed.value.slotCertificate.map(_.vrfProof.toBytes).getOrElse(Array.empty[Byte]))
-          // GUARD (D1/D4): never adopt a pulled state at-or-below our own tip. A lagging/holed peer can serve a STALE finalized
-          // snapshot; chain-selection would then refuse to switch to the older snapshot, pinning the canonical tip while Tier-3
-          // re-fires every gossip forever (the gl0-4 ord-375-below-409 livelock). `performAdopt` runs only when strictly ahead.
-          def performAdopt: F[Unit] =
-            HasherSelector[F]
-              .withCurrent(implicit hasher => seedMptByteFaithful[F](pulledHashed, pulledGsi, pulledBytes, mptStore, logger))
-              .flatMap {
-                case None =>
-                  logger.warn(
-                    s"\u26d4 CATCH-UP byte-faithful: pulled latest finalized ord=${pOrdinal.show} but sidecarFreeMptRoot \u2260 signed mptRoot " +
-                      s"(corrupt transfer / GSI-fallback divergence). Not adopting; will re-pull next wave."
-                  ) >>
-                    Metrics[F].incrementCounter(
-                      "dag_nakamoto_catchup_rejected",
-                      Seq(Metrics.unsafeLabelName("reason") -> "byte_faithful_root_mismatch")
-                    )
-                case Some(adoptedBytes) =>
-                  for {
-                    // Signed-byte-store FIDELITY (2026-07-09): persist the root-verified byte map DIRECTLY at the pulled ordinal. The
-                    // target is the peer's latest FINALIZED ordinal (strictly ahead of the local tip per the guard below), so the local
-                    // finalize sink may never re-visit it — staging alone could never promote. The bytes already passed
-                    // `sidecarFreeMptRoot === signed mptRoot` inside `seedMptByteFaithful`, so the store keeps its by-construction
-                    // "bytes reproduce the signed root" contract (the pinned reader re-verifies at read time regardless). Cutoff is
-                    // best-effort exactly as at the finalize sink.
-                    _ <- signedBytesStore.writeState(pOrdinal, adoptedBytes) >>
-                      signedBytesStore
-                        .applyCutoff(pOrdinal)
-                        .handleErrorWith(e =>
-                          logger
-                            .warn(e)(s"CATCH-UP byte-faithful: signed-bytes store cutoff failed at ordinal=${pOrdinal.show} (non-fatal)")
-                        )
-                    _ <- logger.warn(
-                      s"\ud83d\udd04 CATCH-UP byte-faithful: adopting gl0's latest FINALIZED ord=${pOrdinal.show} " +
-                        s"(MPT seeded VERBATIM from signed bytes, verified === signed mptRoot). Resetting local state to network tip."
-                    )
-                    _ <- productionGate.pause("catch-up-sync")
-                    _ <- chainStore.store(pulledHashed.signed, pulledGsi, pOrdinalL, pSlot, pParentHash, pVrfOutput)
-                    _ <- HasherSelector[F].withCurrent { implicit hasher =>
-                      snapshotStorage.setHeadForRecovery(pulledHashed.signed, pulledGsi) >>
-                        lastGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi) >>
-                        lastNGlobalSnapshotStorage.setForRecovery(pulledHashed, pulledGsi)
-                    }
-                    // MPT already seeded byte-faithfully above \u2014 do NOT re-seed from the GSI (that re-encode was the wedge).
-                    _ <- reconcileMempool(eventMempool, pulledGsi, logger)
-                    _ <- stateRef.update(s =>
-                      s.copy(
-                        networkTipOrdinal = pOrdinalL,
-                        networkTipHash = Some(pulledHashed.hash),
-                        localTipOrdinal = pOrdinalL,
-                        // Record what we adopted so the Tier-3 gap-check won't re-teleport over this window while the orphan connects.
-                        lastCatchUpAdoptedOrdinal = math.max(s.lastCatchUpAdoptedOrdinal, pOrdinalL)
-                      )
-                    )
-                    _ <- productionGate.resume("catch-up-sync")
-                    _ <- Metrics[F].incrementCounter("dag_nakamoto_catchups")
-                    _ <- logger.info(
-                      s"\u2705 CATCH-UP byte-faithful complete: now at ordinal=${pOrdinal.show}. Subsequent gossip should find parents."
-                    )
-                    _ <- {
-                      val cursor = BackfillDaemon.BackfillCursor(
-                        nextHashToFetch = pParentHash.value,
-                        targetOrdinal = 1L,
-                        currentOrdinal = pOrdinalL,
-                        startedAtOrdinal = pOrdinalL,
-                        completedChunks = Set.empty,
-                        createdAtMs = System.currentTimeMillis()
-                      )
-                      supervisor
-                        .supervise(
-                          BackfillDaemon
-                            .run[F](cursor, channel, snapshotStorage, productionGate, dataDir)
-                            .handleErrorWith(e => logger.warn(s"Backfill daemon failed: ${e.getMessage}"))
-                        )
-                        .void
-                    }
-                  } yield ()
-              }
-
-          (chainStore.bestTipOrdinal, stateRef.get).flatMapN { (bestTipOpt, syncSt) =>
-            val localOrd = math.max(bestTipOpt.getOrElse(0L), syncSt.lastCatchUpAdoptedOrdinal)
-            if (pOrdinalL <= localOrd)
-              logger.warn(
-                s"⛔ CATCH-UP byte-faithful: pulled finalized ord=$pOrdinalL is NOT ahead of local tip=$localOrd " +
-                  s"(a peer served a STALE finalized state); refusing to teleport the canonical tip backward. Re-pulling a fresher peer next wave."
-              ) >>
-                Metrics[F].incrementCounter(
-                  "dag_nakamoto_catchup_rejected",
-                  Seq(Metrics.unsafeLabelName("reason") -> "stale_pull_at_or_below_tip")
-                )
-            else
-              performAdopt
-          }
-        }
-
-        pullLatestMptEntries.flatMap {
-          case Some(triple) =>
-            stateRef.update(_.copy(lastCatchUpAttemptMs = now)) >> byteFaithfulAdopt(triple)
-          case None =>
-            legacyGossipAdopt
-        }
-      }
-    }
-  }
 }

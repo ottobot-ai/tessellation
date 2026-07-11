@@ -236,7 +236,7 @@ object UpdateNodeCollateralValidator {
               .getOrElse(SortedSet.empty[NodeCollateralRecord])
               .find(_.event.tokenLockRef === signed.tokenLockRef)
               .map(_.event)
-            maybeExistingStake.isEmpty && maybeExistingCollateral.forall(_.nodeId != signed.nodeId)
+            maybeExistingStake.isEmpty && maybeExistingCollateral.isEmpty
           }
 
         // Verify the token lock belongs to the signing address (address === tokenLock.source),
@@ -513,6 +513,13 @@ object UpdateNodeCollateralValidator {
   case class AlreadyWithdrawn(collateralRef: Hash) extends UpdateNodeCollateralValidationError
 
   case class InvalidParent(parent: NodeCollateralReference) extends UpdateNodeCollateralValidationError
+
+  case class DuplicatedCreate(
+    source: Address,
+    nodeId: PeerId,
+    tokenLockReference: Hash,
+    parent: NodeCollateralReference
+  ) extends UpdateNodeCollateralValidationError
 
   case object Rejected extends UpdateNodeCollateralValidationError
 

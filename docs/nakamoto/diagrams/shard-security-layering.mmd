@@ -1,29 +1,12 @@
 flowchart TB
-    CP["Committee checkpoint<br/>pre+post state-root · data commitment · committee VRF-sigs"]
-    subgraph V1["v1 — committee sig-threshold trust (ships first; unblocks #259)"]
-        direction TB
-        T1["gl0 + consumers verify<br/>more than 2/3 committee VRF-sigs over checkpoint bytes"]
-        T2["deterministic admit then trust claimed state<br/>(NO re-execution by non-committee)"]
-        T1 --> T2
-    end
-    CP --> T1
-    NOTE1["SAFE ONLY IF per-bucket honest-majority holds.<br/>Without the v2 backstop, v1 needs Algorand-sized committees;<br/>a small per-bucket committee is unsafe (cross-shard CQ-collapse)."]
-    V1 -.-> NOTE1
-    subgraph V2["v2 — availability + fraud-proof + slashing (hardens trust; lets committees shrink)"]
-        direction TB
-        DA["DA gate (Polkadot): erasure-code data,<br/>block finality until at least 1/3+1 hold a chunk"]
-        AP["approval-checkers (ELVES): VRF-sampled AFTER signing,<br/>re-execute a random subset, escalate on no-show"]
-        DIS["disputes to 2/3 supermajority +<br/>asymmetric slashing: ~100% false-valid, ~0% honest dissent + rollback"]
-        DA --> AP --> DIS
-    end
-    T2 --> DA
-    ALT["ALTERNATIVE end-state (NEAR): ship a STATE WITNESS with the checkpoint<br/>so verifiers re-execute over the witness = validity-before-inclusion.<br/>No challenge window, no rollback. Fits MPT-primary subtree-stub."]
-    V2 -.->|or| ALT
-    classDef v1 fill:#e0f0ff,stroke:#2471a3,color:#1a5276;
-    classDef v2 fill:#e8e0ff,stroke:#6c3483,color:#4a235a;
-    classDef warn fill:#ffe9cc,stroke:#b9770e,color:#7e5109;
-    classDef alt fill:#e0f7e0,stroke:#27ae60,color:#145a32;
-    class T1,T2 v1;
-    class DA,AP,DIS v2;
-    class NOTE1 warn;
-    class ALT alt;
+    CP["Shard checkpoint<br/>root claims plus complete replay inputs"]
+    CP --> AUTH["verify signatures, registered VRF keys,<br/>KES, committee membership, duty, and ancestry"]
+    AUTH --> REPLAY["every GL0 adopter recreates every CL1 transition<br/>at the signed finalized execution base"]
+    REPLAY --> MATCH{"all recreated roots match?"}
+    MATCH -->|yes| USE["eligible for store, attest, selection,<br/>embedding, and canonical use"]
+    MATCH -->|no| DROP["reject before value is usable"]
+    DROP -.-> EVIDENCE["self-contained fraud or equivocation evidence"]
+    EVIDENCE --> SLASH["deterministic slash folded into canonical GL0 state"]
+    WATCH["Watchtowers re-execute independently"] -.-> EVIDENCE
+    NOTE["Quorum and depth select among replay-valid checkpoints.<br/>They are not validity gates."]
+    USE -.-> NOTE

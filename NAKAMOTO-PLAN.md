@@ -1,11 +1,15 @@
 # Nakamoto — Active Work Plan
 
-**Branch:** `feature/serde-typeclass-shim`
+**Historical branch at time of writing:** `feature/serde-typeclass-shim`
 **Last updated:** 2026-05-16 (post-validation roadmap split out to companion doc — see Forward roadmap below)
 
-Companion to `NAKAMOTO-TODO.md` (full backlog) and `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` (forward roadmap — stake-weighted VRF + KES + Avalanche + NIPoPoW + cross-shard mitigation, sequenced by dependency). This file tracks the in-flight workstream toward metagraph end-to-end on Nakamoto GL0; the companion file sequences the post-empirical-validation implementation phases.
+> **HISTORICAL PLAN.** ADR-0017 and the 2026-07-10 universal-reexecution changes supersede every committee/diff-adoption and direct peer-state-recovery assumption in this file. Current CL1 validity requires every GL0 adopter to recreate the transition; current GL0 recovery obtains ancestry and exact-replays it.
+>
+> **Committee correction.** Both committees are GL0-operator committees, not ML0 committees. Per-binary admission uses a real secret-key VRF keyed by `(eta, metagraph, parentHash)` but currently weights operators uniformly (`1/N`). Execution-shard membership is a separate public deterministic VK-hash draw keyed by `(eta, shard, epoch)`, also uniform `1/N`, followed by hash-shuffled staircase duty. The abandoned design was secret, stake-weighted shard membership with per-slot LDD leadership. Historical roadmap text below is not the live shard design.
 
-## Forward roadmap (2026-05-16)
+Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
+
+## Historical roadmap (2026-05-16, superseded)
 
 The implementation work that remains after the finality-trigger stack + GKL composition doc + empirical sim validation lives in **`docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md`**. Phases:
 
@@ -13,9 +17,9 @@ The implementation work that remains after the finality-trigger stack + GKL comp
 2. **§1.2 KES port from Bifrost** (parallel track, 15-25 d) — forward-secure signatures; prerequisite for §3, §4.C.
 3. **§2 Avalanche-attestation cascade** (independent, 12-18 d) — Snowball `(K=8, α=5, β=10, Δ=slot/2)`; production parameters empirically validated.
 4. **§3 NIPoPoW level-µ chains** (needs §1.1+§1.2, 20-30 d) — `L = 10` domain-separated VRF trials per slot; tower anchored at `T_depth2`.
-5. **§4.A Cross-shard Option A** (needs §1.1, 12-18 d) — VRF-sortition of operator keys to shards; gates `StateChannelValidator.validateAllowedSignatures`.
+5. **§4.A Cross-shard Option A** (superseded mechanism) — proposed secret VRF assignment of operator keys to shards. Live v1 uses public VK-hash execution membership and GL0 re-execution.
 6. **§4.C Cross-shard Option C** (needs §1.2+§4.A, 15-25 d) — slashing of `nodeCollateral` on detected equivocation; KES-anchored evidence non-repudiation.
-7. **§5 Sharding proper** — out of scope; strictly gated on §4.A+§4.C in production (per `GKL-COMPOSITION.md` §5.2, `α_total > 1/(2S)` collapse threshold).
+7. **§5 Sharding proper** — historical scope statement; execution sharding now exists behind `numShards > 1`, while economic validity remains universal at GL0.
 
 Critical path: §1.2 → §3 → §4.C ≈ 50-80 person-days. Whole-roadmap sequential: 79-124 person-days. Process rule introduced: empirical validation must precede doc commitment (§0.4 / §6.3 of the companion).
 
@@ -96,7 +100,7 @@ Env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (defau
 - **`T_count`** added (commit `7003be21`) — 1-validator-1-vote canonical-hash-filtered count finality, self-excluded (#133), denominator = `StakeRegistry.validatorCount` (full seedlist). Reuses `TipTracker.FinalityThreshold` so it ties with `T_weight` under equal stake and is strictly stronger evidence once stake-weighted VRF lands.
 - **`T_depth2`** added (commit `06455f98`) — Phase 2 → Phase 3 archival depth gate. Identical structure to `T_depth1`, only the constant differs (k₂ default 65536). Drives `MptOverlay.pruneBelow` (commit `173e6a7d`) so long-running nodes don't leak undo-journal / finalizedRef entries past the archival boundary.
 - **`T_weight`** got self-exclusion via #133 (commit `95471c7f`) — `TipTracker.highestFinalizedOrdinal` now takes a `selfId: PeerId` parameter and drops the self-entry before the canonical-hash filter. Partial mitigation of #119 fork-recovery deadlock.
-- **Re-bootstrap orchestrator landed** (commit `01ebcca6`, task #141) — full node-level recovery for divergent self-finalize lock-out. `RebootstrapOrchestrator` ticks at 30s, observes `chainStore.divergentRefuseCount`, fires `unsafe_reset` on TipTracker/Overlay + `unsafe_clearFinality` on chainStore when sustained refuses cross the threshold. Default-OFF via `NAKAMOTO_REBOOTSTRAP_ENABLED` until iter-level e2e proves no spurious fires; 5-min cooldown prevents flap. Pure `decide` function for unit testing.
+- **Re-bootstrap reset machinery landed** (commit `01ebcca6`, task #141) — `RebootstrapOrchestrator` observes sustained `chainStore.divergentRefuseCount`, then resets TipTracker/Overlay/finality state. The typed-HOCON setting is live-default `true`. Reset is not itself recovery: completion now depends on ordinary verified ancestry replay because direct peer-context/state installers were removed. Fresh end-to-end validation is required.
 - **`attestedAt` skew bound** (commit `422e1a6b`) — receive-side defense-in-depth for `T_count`. Drops attestations outside ±`NAKAMOTO_MAX_ATTESTATION_SKEW_MS` of `Clock[F].realTime`; counter `dag_nakamoto_attestations_rejected_skew_total`. Tightenable post-Chronos.
 - **Chain-quality observable** (commit `866cd598`, task #138) — `FinalityTrigger.triggersFor(ord)` lookup answers "which triggers qualified ord N?" at both finalize sites (gauge `dag_nakamoto_chain_quality` ∈ {1, 2, 3}; per-kind counters) and via HTTP route `GET /global-snapshots/{ord}/finality-triggers`. Pure observability — never feeds back into consensus.
 - **`SlotCertificate.parentSlot` wiring** (commit `bec9de6b`) — `NakamotoProposer` was passing `parentSlot = Slot.MinValue` (TODO placeholder); now threaded through correctly so verifier-side `slotGap = cert.slot - cert.parentSlot` reconstruction matches the producer's LDD lottery threshold.
@@ -114,7 +118,7 @@ See `docs/nakamoto/attestation-and-finality.md` §0 / §5 for the formal four-ph
 **Validated live:** in the metagraph e2e (#7 below), `GET /global-snapshots/latest/finalized-ordinal` returns a real value (`{"value":159}`) at end-of-test, proving the route is reachable, the Ref is being updated, and CL0 is consuming it.
 
 ### 7. Metagraph end-to-end via `just`  *(✅ done)*
-Updated `just test` to launch CL0 + DL1 against a Nakamoto GL0 cluster (`--use-test-metagraph --num-gl0=3 --nakamoto-gl0`). Currency e2e test suite (DAG transfers + L0 token transfers + double-spend prevention for both) runs to completion in **622s** test time / **720s** total against 3-node Nakamoto GL0 + sidecars + 3 GL1 + 2 ML0 + 3 CL1 + 3 DL1.
+Updated `just test` to launch CL0 + DL1 against a Nakamoto GL0 cluster (`--use-test-metagraph --num-gl0=3 --nakamoto-gl0`). Currency e2e test suite (DAG transfers + L0 token transfers + double-spend prevention for both) ran to completion in **622s** test time / **720s** total against 3-node Nakamoto GL0 + sidecars + 3 GL1 + 2 ML0 + 3 CL1 + 3 DL1. This is historical evidence only; it does not validate the later ADR-0017 universal-recreation path or replay-only recovery.
 
 **Also validated:**
 - Sidecar gossip migration end-to-end: BFT consensus rumors and Tessellation events both flow through Go libp2p GossipSub (no legacy HTTP gossip) and CL0 BFT consensus still reaches finality.

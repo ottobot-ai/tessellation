@@ -139,14 +139,13 @@ object Hasher {
     * `Printer(dropNullValues = true, indent = "", sortKeys = true)` — the SAME printer `JsonSerializer.forAsync` feeds into Brotli, but
     * WITHOUT the Brotli compression step in the pre-image.
     *
-    * Why this exists: the roots-only sharding light client (`docs/nakamoto/ROOTS-ONLY-SHARDING-ARCHITECTURE.md`) needs a TypeScript
-    * verifier to recompute a Scala-produced Merkle-Patricia-Trie node digest with stock Web Crypto + an inline RFC 8785 canonicalizer and
-    * ZERO custom code. The default [[forJson]] / [[forKryo]] hashers fold Brotli (resp. Kryo) into the pre-image, which no off-the-shelf JS
-    * verifier can reproduce. This hasher's `prefixedHash` is byte-identical to that verifier's `SHA-256(prefixByte ++
-    * canonicalize(commitmentJSON))` for the MPT commitment shapes (`Leaf{remaining,dataDigest}` / `Branch{pathsDigest}` /
-    * `Extension{shared,childDigest}`), which `MerklePatriciaCommitment` already encodes — so building/proving a trie under this hasher
-    * yields a TS-verifiable root + inclusion proof. (Proven by the `mpt-crosslang-balance` cross-language KAT, which has the
-    * `digital-evidence-app` `mptVerifier.ts` accept a balance proof produced here.)
+    * Why this exists: a TypeScript light client needs to recompute a globally re-executed Merkle-Patricia-Trie node digest with stock Web
+    * Crypto + an inline RFC 8785 canonicalizer and ZERO custom code. The default [[forJson]] / [[forKryo]] hashers fold Brotli (resp. Kryo)
+    * into the pre-image, which no off-the-shelf JS verifier can reproduce. This hasher's `prefixedHash` is byte-identical to that
+    * verifier's `SHA-256(prefixByte ++ canonicalize(commitmentJSON))` for the MPT commitment shapes (`Leaf{remaining,dataDigest}` /
+    * `Branch{pathsDigest}` / `Extension{shared,childDigest}`), which `MerklePatriciaCommitment` already encodes — so building/proving a
+    * trie under this hasher yields a root + inclusion proof whose byte contract is implementable in TypeScript. The Scala KAT verifies the
+    * canonical proof path; release gating still requires an external-client parity vector.
     *
     * Use this ONLY for the light-client commitment trees (e.g. the per-address balance MPT served at `/currency/{address}/balance/proof`).
     * It is a deliberate sibling of [[forJson]] — they hash differently and MUST NOT be mixed within one tree. Consensus-bytes hashing stays

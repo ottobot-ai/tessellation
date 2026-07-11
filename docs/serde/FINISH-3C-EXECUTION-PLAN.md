@@ -317,22 +317,12 @@ Two safe options, pick one:
 
 ## 8. Dependencies / conflicts with adjacent in-flight work
 
-### `docs/nakamoto/COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md` (DESIGN, 2026-06-13)
-Replaces `AdoptFromSignedFields` per-field re-derive in the sharded **currency mirror** with an MPT
-**byte-diff** apply: committee emits `perMetagraphStateDiff`; followers `ChangeSet.withChanges(base, diff)`
-and require `perMetagraphMptRoot(state') === attested root` (its §4). Depends on the unroll (now landed).
+### Execution-shard checkpoints
 
-- **Strong alignment, no conflict.** Both move from "re-derive a typed view and compare" to "apply
-  the signed bytes and verify the root by construction." 3c-A is the **global-snapshot** analogue of
-  COMMITTEE-STATE-DIFF's **per-metagraph** byte-diff. They share the same primitive
-  (`ChangeSet.withChanges` / `insertBytes` over a finalized base).
-- **Sequencing:** land **3c-A first** (heals the global follow/resync fork that wedges the whole
-  cluster), then COMMITTEE-STATE-DIFF for the per-MG mirror. 3c-A's `loadBytes` + `mpt-entries` serve
-  route is reusable infrastructure for the committee diff's base hydration. **Overlap to avoid:**
-  both touch `ShardCheckpointWiring` (3c-C migrates its `info.<field>` reads; COMMITTEE-STATE-DIFF
-  rewrites its `deriveMetagraphRoot`/`deriveAdoptedCurrencyInfo` — `ShardCheckpointWiring:165`). Do
-  the COMMITTEE-STATE-DIFF rewrite of those two functions BEFORE 3c-C touches the same file, or merge
-  the `ShardCheckpointWiring` edits in one PR.
+The abandoned committee state-diff adoption design has been removed. A checkpoint carries root claims and complete replay inputs, and
+every GL0 adopter recreates all framework-economic CL1 transitions at the signed finalized execution base before use. MPT-primary storage
+work may optimize how canonical bytes are persisted or served downstream, but it must never reintroduce committee-provided economic bytes
+as an adoption authority.
 
 ### `docs/nakamoto/259-FOLLOWER-TRUST-REDESIGN.md` (slices 1–2 built)
 Follower trusts the finalized `stateProof.mptRoot` and cross-checks only `followerConsumedFieldIds`

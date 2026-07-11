@@ -1,7 +1,6 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot
 
-import cats.data.Validated.Valid
-import cats.data.{NonEmptyChain, Validated, ValidatedNec}
+import cats.data.{Validated, ValidatedNec}
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
@@ -17,7 +16,6 @@ import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.snapshot.currency._
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.artifact.SharedArtifact
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.signature.SignedValidator.SignedValidationError
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
@@ -50,7 +48,6 @@ trait CurrencySnapshotValidator[F[_]] {
 object CurrencySnapshotValidator {
 
   def make[F[_]: Async: KryoSerializer: JsonSerializer](
-    globalSyncViewStartingOrdinal: SnapshotOrdinal,
     currencySnapshotCreator: CurrencySnapshotCreator[F],
     signedValidator: SignedValidator[F],
     maybeRewards: Option[Rewards[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotEvent]],
@@ -141,7 +138,8 @@ object CurrencySnapshotValidator {
       } yield
         dataApplicationEvents ++ blockEvents ++ messageEvents ++ globalSnapshotSyncEvents ++ tokenLockBlockEvents ++ allowSpendsBlockEvents
 
-      // Rewrite if implementation not provided
+      // GL0 must never trust a metagraph-provided reward set. A deployment without a registered deterministic reward implementation
+      // accepts only the empty set; any non-empty claimed rewards then fail the exact artifact recreation below.
       val rewards = maybeRewards.orElse(Some {
         new Rewards[F, CurrencySnapshotStateProof, CurrencyIncrementalSnapshot, CurrencySnapshotEvent] {
           def distribute(
@@ -151,7 +149,7 @@ object CurrencySnapshotValidator {
             trigger: ConsensusTrigger,
             events: Set[CurrencySnapshotEvent],
             maybeCalculatedState: Option[DataCalculatedState] = None
-          ): F[SortedSet[transaction.RewardTransaction]] = expected.rewards.pure[F]
+          ): F[SortedSet[transaction.RewardTransaction]] = SortedSet.empty[transaction.RewardTransaction].pure[F]
         }
       })
 
@@ -172,7 +170,7 @@ object CurrencySnapshotValidator {
                 expected.artifacts.map(() => _),
                 getGlobalSnapshotByOrdinal,
                 shouldPerformMetagraphSpecificValidations = false,
-                Some((_: Signed[CurrencyIncrementalSnapshot]) => expected.artifacts),
+                None,
                 // Force acceptance to use the exact GL0 sync point the producer used.
                 // Without this, the recompute would fetch GL0's current head, which has
                 // advanced past what CL0 saw when producing → SnapshotDifferentThanExpected
@@ -182,7 +180,8 @@ object CurrencySnapshotValidator {
               )
 
           def check(result: F[CurrencySnapshotCreationResult[CurrencySnapshotEvent]]) =
-            // Rewrite if implementation not provided
+            // Only arbitrary DL1 calculated state is unavailable to GL0. Framework messages and SharedArtifacts must survive the
+            // acceptance managers unchanged; replacing them from `expected` would turn validation into self-consistency.
             result.map { creationResult =>
               maybeDataApplication match {
                 case Some(_) => creationResult
@@ -190,19 +189,8 @@ object CurrencySnapshotValidator {
                   creationResult
                     .focus(_.artifact.dataApplication)
                     .replace(expected.dataApplication)
-                    .focus(_.artifact.artifacts)
-                    .replace(expected.artifacts)
 
               }
-            }.map { creationResult =>
-              if (creationResult.artifact.messages.forall(_.isEmpty))
-                creationResult.focus(_.artifact.messages).replace(expected.messages)
-              else creationResult
-            }.map { creationResult =>
-              if (lastArtifact.ordinal.next < globalSyncViewStartingOrdinal)
-                creationResult.focus(_.artifact.globalSyncView).replace(expected.globalSyncView)
-              else
-                creationResult
             }.map { creationResult =>
               if (creationResult.artifact =!= expected)
                 SnapshotDifferentThanExpected(expected, creationResult.artifact).invalidNec

@@ -1,83 +1,114 @@
-# 17. Committee re-execution is the primary economic-validity gate
+# 17. Universal GL0 re-execution is the CL1 economic-validity gate
 
 Date: 2026-07-10
 
 ## Status
 
-Accepted
+Accepted (amended 2026-07-10)
 
-Extends ADR-0016 (execution-sharding re-execution model) and the two-tier finality model. Supersedes the *implemented* behavior in which a shard-checkpoint reaches quorum on committee signatures that do not attest a re-execution.
+**Implementation safety status (2026-07-11): BLOCKED.** This ADR defines the
+required authority boundary. Source audit confirms that the roots/diff/quorum
+bypass is removed, but does not certify the global transition function itself.
+Unsigned token unlocks and no-reference spends, bounded processed-history replay,
+unbacked stake records, and unsafe finality still violate the broader economic
+invariant. See `docs/review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`.
+
+Supersedes the earlier revision of this ADR that allowed non-committee GL0 nodes to adopt on committee signatures and a verified byte-diff.
+That was not sufficient under the stated threat model: a colluding quorum can sign the same invalid computation, and a root or proof only
+binds a claim; it does not establish that the framework transition was executed.
 
 ## Context
 
-**The core principle this ADR restates as binding: a node adds its signature only to something it has verified itself. You never sign state you did not re-execute.** A committee signature must mean *"I independently re-ran this metagraph's derivation and got this exact root."* The re-execution test suite already states this intent (`ShardCommitteeReExecutionSuite` §"an attestation must mean 'I independently re-ran…and got result R'").
+CL1 transfer, fee, reward, allow-spend, spend, token-lock, balance, reference, and supply effects are framework-defined. Every GL0 binary
+contains the same Scala implementation needed to execute them. Before this decision, three shortcuts bypassed that implementation:
 
-The implementation does not do this on the happy path. Verified at source (HEAD `5557ee084`):
+1. Currency snapshots carried cumulative `authoritative*` fields that could replace balances, active sets, and reference maps.
+2. A shard committee byte-diff replaced the result produced by the GL0 currency processor.
+3. `kQuorum` signatures allowed `verifyEmbedded` to return `Accepted` without re-execution; committee members also signed best-tip
+   checkpoints and stored ancestors without first recomputing their roots.
 
-- **Committee members sign on best-tip, without re-executing.** `ShardCheckpointAttestationEmitter` emits an attestation when a received checkpoint *becomes the node's best tip* (chain selection), signing Ed25519+KES over the checkpoint **hash**. There is no re-execution in the emit path; the attestation-receive handler (`NakamotoSyncDaemon.scala:2933-2953`) only verifies the hash-signature and records it. So the quorum encodes **chain agreement, not economic re-validation**.
-- **gl0 adopts on signature count, without re-executing.** `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` admits on `distinctSigners >= kQuorum` (`:388-396`, default 6-of-8). Its own scaladoc (`:156-158`) states the exposure: *"admits on `kQuorum` distinct committee signatures WITHOUT re-execution … a corrupt committee that reaches quorum can attest a WRONG root and have it adopted."*
-- **The only happy-path re-execution is the producer's** (one node). Re-execution DOES run, and with a real base-pinned closure, in exactly two places — **neither gates the happy path**: the sub-quorum failover `reExecPath` (`:397-406`, reachable only when `distinctSigners < kQuorum`) and `watchtowerReExec` (`:411-441`), which runs **after adoption**, fire-and-forget (`NakamotoSyncDaemon.scala:2784-2787`), producing a fraud proof for *later* slashing.
-
-The re-execution machinery is real and already wired: production `SharedServices.scala:321` injects `reExecuteDerivation = Some { reExecDerivationWithDiff(…, pinnedReaderAt) }` — the same base-pinned derivation the producer runs. (`noReExecDerivation` is only the `None` default for tests/legacy, `ShardCheckpointWiring.scala:503`.) So both the sub-quorum failover and the watchtower re-execute for real; the gap is only that the **happy-path attestation and adoption skip it**.
-
-**How this happened (git trace, not a designed decision).** `6c7746aec feat(shard): emit ShardCheckpointAttestation on best-tip (T_count quorum)` built the emitter as a chain-attestation/quorum-liveness seam. `8a9d54836` (2026-05-29) introduced the `distinctSigners >= quorum → Accepted` adoption. `396ca81b0` (2026-06-04) "decouple kDraw from kQuorum — throughput" tuned the quorum during the committee-gate throughput fight. `8ac7ce04f` (2026-06-29) *documented* the hole and added the watchtower as a **post-hoc** check rather than fixing the source. Net: re-exec-before-sign was never wired into the attestation path; the gap was patched with an after-the-fact watchtower.
-
-**Why post-hoc slashing is insufficient.** On the happy path the economic guarantee reduces to *producer honesty + slash-after-the-fact*. A malicious slot-leader can get a wrong root adopted and optimistically attestation-finalized before any watchtower dispute lands; if extractable value in that window exceeds the slashable stake, slashing does not deter it. That violates the project's #1 rule (CL1 economic ops MUST be re-executed) — accountability is not prevention.
+Hash equality, a metagraph signature, committee agreement, and post-adoption slashing are not substitutes for executing CL1 before value is
+usable.
 
 ## Decision
 
-**1. The committee quorum IS the re-execution consensus. A committee member MUST re-execute and MUST sign only its own verified root.**
+### 1. One CL1 transition function
 
-On receiving a shard checkpoint that would become its best tip, each committee member re-runs the SAME base-pinned derivation the producer ran (`ShardCheckpointWiring.reExecDerivationWithDiff` at the wire-carried `diffBaseOrdinal`) over the checkpoint's `includedSnapshots`, and:
-- **Full match** of every recomputed `perMetagraphMptRoots(mg)` against the checkpoint's → sign + emit the attestation (as today).
-- **Mismatch** → **do NOT sign**, and **emit a `FraudProofEnvelope`** (reuse the existing watchtower emit path). The honest committee becomes the *first* line of fraud detection, at sign-time, not the watchtower post-adoption.
-- **Cannot-derive sentinel** (`Hash.empty` — pinned base unresolvable / contiguity gap) → **defer** (do not sign yet, do not fraud-proof; retry when the base catches up), exactly as `reExecPath`/`watchtowerReExec` already bucket it.
+`CurrencySnapshotValidator` artifact recreation, reached through `CurrencySnapshotContextFunctions.createContext`, is the only accepted
+CL1 transition function. Producer, committee signer, global-snapshot producer, and every GL0 follower must run it over the checkpoint's full
+included snapshot bytes.
 
-A quorum of `kQuorum` signatures then means `kQuorum` independent re-executions that agree. gl0 `verifyEmbedded` adopting on quorum is then adopting on `kQuorum` re-executions — economic validity established **at quorum formation**, before adoption, before finality.
+Re-execution uses:
 
-**2. Corrected finality tiers.**
+- the checkpoint's signed `executionBaseOrdinal` for the prior currency state;
+- the currency snapshot's signed `globalSyncView`, resolved through a finalized ordinal lookup and checked by hash;
+- deterministic framework code only.
 
-| Tier | Mechanism | Establishes |
-|---|---|---|
-| **Economic validity — PRIMARY** | Each of `kQuorum` committee members re-executes; signs only its own verified root; refuses + fraud-proofs on mismatch | A checkpoint is not adoptable until `kQuorum` members independently re-executed **and agree** (honest-majority BFT). |
-| Attestation finality (unchanged) | Avalanche `T_count` over the global snapshot | chain growth / provisional reads — fast; safe because embedded checkpoints carry a re-exec quorum. |
-| Nakamoto depth-k (unchanged) | chain depth | reorg / chain-safety fallback. |
-| **Watchtower — BACKSTOP (demoted)** | non-committee re-exec → fraud proof → slash | catches a **fully-colluding committee** (≥`kQuorum` Byzantine members, i.e. honest-majority already broken); may additionally gate value-out. |
+An unavailable pinned input means defer/reject. It never means use a live head, use a local best tip, or trust a claimed cumulative field.
 
-The watchtower is no longer the primary (or only) re-execution check — it is defense-in-depth for the case the honest-majority assumption itself fails.
+### 2. Signatures do not establish execution
 
-**3. Determinism of the re-execution is now LIVENESS-critical, not only safety-critical.**
+Committee signatures retain their authentication, availability, and finality roles. Their count never establishes economic validity.
 
-Because a committee member refuses to sign on any root mismatch, ANY non-determinism across honest members means they compute different roots, refuse to sign, and **quorum never forms → the checkpoint stalls**. The `producer-root == verifier-root` property and the base-pinning (diff-base-pin, PIN-1 component roots, and the empty-prior boundary — see ADR-0016 / handoff Q4) become the **liveness bar**. This must be airtight before enabling the sign-gate.
+- A committee member re-executes before signing a received tip.
+- Retroactive ancestor signing runs the same verifier.
+- `evaluate` re-executes even when `T_count` qualifies.
+- `verifyEmbedded` re-executes even when `distinctSigners >= kQuorum`.
+
+A real mismatch is rejected and may form slash evidence. `Hash.empty` means cannot verify and is rejected without slashing.
+
+### 3. No fork-only authority schema
+
+This repository is a greenfield fork of upstream Tessellation v4.0.0. No fork-added authority schema has been deployed, so there is no
+compatibility exception:
+
+- `CurrencyIncrementalSnapshot.authoritative*` fields and codec slots do not exist;
+- checkpoint state-diff, receipt, artifact-delta, balance-delta, and sync-delta fields do not exist;
+- the checkpoint carries signed state-channel binaries, locally reproducible per-metagraph root claims, and a signed
+  `executionBaseOrdinal`;
+- decoders require the current fork schema rather than silently defaulting missing fork consensus fields.
+
+### 4. DL1 remains proof-carried
+
+This decision applies to framework CL1 economics. Arbitrary DL1 application state remains metagraph-defined because GL0 does not have its
+code. A proof may authenticate that custom state, but DL1 state cannot authorize or override a CL1 economic transition.
+
+### 5. GL0 recovery cannot install producer-carried state
+
+A GL0 snapshot enters fork choice only after exact replay against its stored parent. The receiver ignores the producer-carried
+`GlobalSnapshotInfo` and stores the context returned by local replay. A missing parent is fetched and buffered; a content mismatch is
+rejected. Signature/root self-consistency, peer-served MPT bytes, and reward-only mismatch classification cannot authorize a canonical
+state install. Recovery must obtain ancestry and replay each transition.
+
+KES verification is a pre-storage condition. A producer must also obtain its KES signature before writing its own candidate to the chain
+store; signing failure aborts the proposal and rolls back its state transaction.
 
 ## Consequences
 
-- **Latency: ≈ one re-execution window, incurred in parallel.** Committee members re-execute concurrently on their own nodes, so added time-to-quorum ≈ the slowest member's single re-exec (a diff over a pinned base bounded by the included-chain window), not `kQuorum`× serial. Chain growth (soft attestation) can still proceed on the chain-agreement signal; only economic adoption waits for the re-exec quorum.
-- **Aggregate CPU:** `kQuorum` committee nodes re-execute each checkpoint (plus a few watchtowers). This is the intended cost of a committee, not a cost to avoid.
-- **Sequencing (mandatory):** (a) the re-execution must be deterministic across honest members — close the empty-prior boundary and keep the base-pin airtight; (b) the current committee-gate parent-ordinal wedge (a liveness bug) must be fixed first. Enabling the sign-gate before (a)/(b) re-introduces the committee-gate freeze the throughput campaign fought. The base-pin discipline is already documented as slash-safety-critical (`SharedServices.scala:323-334`); it now also gates liveness.
-- **False-stall vs false-slash:** the same base-skew that would have caused a false 100% committee slash on the sub-quorum path now causes a false *stall* on the sign path. Both are prevented by the identical fix (pin the derivation at the wire-carried `diffBaseOrdinal`); the `Hash.empty` defer path prevents a can't-derive from becoming either.
-- **Watchtower stays.** Keep the fraud-proof + `InvalidStateProof` slash (consensus-load-bearing, `GlobalSnapshotAcceptanceManager.scala:3183-3184`) as the backstop for ≥`kQuorum` collusion. The slash now also punishes any member who signs a root the committee/watchtower refutes.
-- **`numShards = 1`:** none of this exists at the default single-shard config (no committees, no watchtowers). That posture is out of scope here and needs its own decision.
+- Every GL0 node pays the CL1 execution cost before adoption. Execution sharding may reduce proposal work and transport, but does not remove
+  universal economic verification.
+- A Byzantine committee at or beyond `kQuorum` cannot bypass recreation merely by colluding on signatures or a root claim. This does not
+  prevent invalid state that the recreated global transition rules themselves accept.
+- Determinism and pinned-input availability are now both safety and liveness requirements. Missing history fails closed and can halt the
+  affected metagraph until the pinned input is recovered.
+- Non-empty rewards are rejected when GL0 has no registered deterministic framework reward implementation; echoing the metagraph's claimed
+  reward set is forbidden.
+- Watchtower disputes remain defense in depth. They are not the pre-adoption validity gate.
 
-## Implementation scope (the concrete change)
+## Enforcement sites
 
-Primary change — wire re-exec into the attestation sign path:
-- **`ShardCheckpointAttestationEmitter`** (and its caller `NakamotoSyncDaemon.handleShardCheckpoint`, ~`:2607`, the became-best-tip seam): inject the base-pinned re-exec closure already built at `SharedServices.scala:321` (or a derived `verifyCheckpointRoots(checkpoint): F[VerifyResult]`). Before signing, re-exec every `mg` in `checkpoint.derivedStateDelta.includedSnapshots` via `reExecDerivationWithDiff` at `checkpoint.diffBaseOrdinal`; compare to `checkpoint.derivedStateDelta.perMetagraphMptRoots`.
-  - all-match → sign + emit (unchanged emit).
-  - any mismatch → do NOT emit; call the existing `WatchtowerFraudProofEmitter.emit` (or its `InvalidStateProofEvidence` builder) to raise the dispute.
-  - any `Hash.empty` (can't-derive) → defer + retry (do not sign, do not dispute).
-- **`ShardCheckpointGl0AcceptanceManager.verifyEmbedded`**: the quorum branch (`:388-396`) may remain as-is *once* attestation ⇒ re-exec (quorum now means `kQuorum` re-execs). Optionally add a `reExec-on-adopt` belt-and-suspenders, but it is redundant with committee re-exec + watchtower; do not add if it costs adoption latency.
-- **Fraud-proof-at-sign** reuses `InvalidStateProofValidator` / `FraudProofEnvelope` / the pool→embed→`applySlash`→`Slashings` chain unchanged.
+- `CurrencySnapshotValidator.scala`: signature verification plus exact artifact recreation; unregistered rewards default to empty.
+- `GlobalSnapshotStateChannelEventsProcessor.scala`: every CL1 adoption mode calls `createContext`.
+- `ShardCheckpointWiring.scala`: producer/verifier root derivation uses full recreation with pinned prior and global snapshot lookups.
+- `GlobalSnapshotAcceptanceManager.scala`: adopted state is the recreation result.
+- `ShardCheckpointGl0AcceptanceManager.scala`: `evaluate` and `verifyEmbedded` unconditionally re-execute.
+- `NakamotoSyncDaemon.scala`: stored ancestors are verified before retroactive signing.
+- `NakamotoSyncDaemon.scala`: parentless and replay-invalid snapshots never reach `chainStore.store`; producer-carried GSI/MPT recovery
+  installers are removed.
+- `SnapshotLeaderLoop.scala`: KES signing succeeds before a locally produced snapshot reaches `chainStore.store`.
 
-Tests:
-- Extend `ShardCommitteeReExecutionSuite`: a committee member handed a checkpoint with a tampered `perMetagraphMptRoots` **refuses to sign** and **emits a fraud proof**; an honest checkpoint is signed.
-- Determinism regression: producer-root == every-member-verifier-root over the same wire-carried `diffBaseOrdinal` (the liveness bar), including an incremental-only-window case (empty-prior boundary).
-- e2e: with the sign-gate on, (i) quorum still forms for honest producers (liveness), (ii) a malicious producer's checkpoint fails to reach quorum and is disputed.
+## Out of scope
 
-## References
-
-- `ShardCheckpointAttestationEmitter.scala` (best-tip sign, no re-exec) — the defect site.
-- `ShardCheckpointGl0AcceptanceManager.scala:156-158,388-396,397-406,411-441` — quorum-adopt, sub-quorum re-exec, watchtower re-exec.
-- `ShardCheckpointWiring.scala:268,355-363,404,411,503,561` + `SharedServices.scala:321-357` — the real base-pinned re-exec closure and its production wiring.
-- `NakamotoSyncDaemon.scala:2784-2787,2933-2953` — watchtower fire-and-forget; attestation-receive hash-verify.
-- ADR-0016; `docs/review/NAKAMOTO-ECONOMIC-SECURITY-HANDOFF.md`.
+This ADR does not certify transition authorization/conservation, stake backing, replay protection, optimistic/depth finality, KES/VRF
+fail-open behavior, cross-shard atomic settlement, or slashing-evidence authorization. Those are separate safety requirements and currently
+block production.

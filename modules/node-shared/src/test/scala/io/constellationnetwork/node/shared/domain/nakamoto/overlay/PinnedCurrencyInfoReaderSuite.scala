@@ -267,10 +267,10 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
   }
 
   // ===========================================================================
-  // Track-1 diff-base-pin: readAtOrdinal + pinnedReaderAt (SELF-RESOLVING — no independently-carried pin hash)
+  // Track-1 execution-base-pin: readAtOrdinal + pinnedReaderAt (SELF-RESOLVING — no independently-carried pin hash)
   // ===========================================================================
 
-  test("diff-base-pin readAtOrdinal HAPPY: self-resolves the pin (no expected hash) ⇒ == readAt(pinned.hash) == oracle") { res =>
+  test("execution-base-pin readAtOrdinal HAPPY: self-resolves the pin (no expected hash) ⇒ == readAt(pinned.hash) == oracle") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -289,7 +289,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
   }
 
-  test("diff-base-pin readAtOrdinal NO-SNAPSHOT: base not resolvable on this chain ⇒ None (never a head fallback)") { res =>
+  test("execution-base-pin readAtOrdinal NO-SNAPSHOT: base not resolvable on this chain ⇒ None (never a head fallback)") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -304,7 +304,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
   }
 
-  test("diff-base-pin pinnedReaderAt HAPPY: whole-global reader over the pinned bytes reconstructs mg's Info == oracle") { res =>
+  test("execution-base-pin pinnedReaderAt HAPPY: whole-global reader over the pinned bytes reconstructs mg's Info == oracle") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -315,7 +315,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         pinned <- mkHashed(10L, Some(root))
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        // The committee/watchtower `reExecDerivationWithDiff` prior reader — a full GlobalStateReader pinned at the diff base.
+        // The committee/watchtower `reExecDerivationAtPinnedBase` prior reader — a full GlobalStateReader pinned at the execution base.
         pinnedReaderOpt <- reader.pinnedReaderAt(ord(10L))
         gotInfo <- pinnedReaderOpt.traverse(_.getCurrencySnapshotInfo(mg))
       } yield
@@ -324,7 +324,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
   }
 
-  test("diff-base-pin pinnedReaderAt ROOT-MISMATCH: retained bytes don't reproduce the pinned committed root ⇒ None") { res =>
+  test("execution-base-pin pinnedReaderAt ROOT-MISMATCH: retained bytes don't reproduce the pinned committed root ⇒ None") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -342,7 +342,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
   }
 
   // ===========================================================================
-  // Track-1 diff-base-pin GENESIS SEAM: readAtOrdinalVerified — the THREE-VALUED read for the byteDiff-adopt consumer.
+  // Track-1 execution-base-pin GENESIS SEAM: readAtOrdinalVerified — the THREE-VALUED read for the byteDiff-adopt consumer.
   // The anchor-vs-absent split: every anchor failure ⇒ AnchorUnreadable (fail-closed); a clean verify carries the per-MG
   // reconstruction's own Option verbatim (None = the MG has no committed state under the VERIFIED root — a pinned fact,
   // the brand-new-MG first advance the old Option view conflated with the failures).
@@ -456,7 +456,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
   // ===========================================================================
   // Signed-byte-store read-time BACKFILL (2026-07-09) — the hole healer. A creation-side staging race (fail-closed reorg adopt /
   // same-ordinal proposal-race loss / catch-up jump) leaves an ordinal MISSING from the signed store even though the node's own
-  // canonical chain finalized it; a shard checkpoint stamping that ordinal as `diffBaseOrdinal` then fail-closed forever (the
+  // canonical chain finalized it; a shard checkpoint stamping that ordinal as `executionBaseOrdinal` then fail-closed forever (the
   // 2mg/2shard token-lock mirror freeze: hole at ord 227 ⇒ `pinned ANCHOR ... unreadable` ×106). The backfill fetches the byte map
   // from a peer AT READ TIME, verifies it against the LOCALLY-committed `stateProof.mptRoot`, strips to `consensusRootEntries`,
   // persists, and serves. Wrong-root / missing peer bytes stay fail-closed with the store UNTOUCHED.
@@ -470,7 +470,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
 
   test(
-    "BACKFILL RED→GREEN: hole at a stamped diff-base ⇒ AnchorUnreadable without backfill; WITH backfill serving root-correct " +
+    "BACKFILL RED→GREEN: hole at a stamped execution-base ⇒ AnchorUnreadable without backfill; WITH backfill serving root-correct " +
       "bytes the SAME read heals — AnchorVerified(oracle), bytes persisted, subsequent reads need no peer"
   ) { res =>
     implicit val (h, _, js) = res
@@ -478,7 +478,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
       for {
         boe <- buildBytesAndOracle
         (bytes, root, oracle) = boe
-        // The HOLE: the local signed store has NOTHING at the stamped diff-base ordinal (creation-side staging race), but the
+        // The HOLE: the local signed store has NOTHING at the stamped execution-base ordinal (creation-side staging race), but the
         // node's own finalized chain DOES resolve the snapshot there (root = the local verification anchor).
         byteStore <- MptStateStorage.make[IO](dir)
         pinned <- mkHashed(227L, Some(root))
@@ -497,7 +497,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         // Healed ON DISK: the store now serves the ordinal, so a later read works with NO backfill at all.
         persisted <- byteStore.readState(ord(227L))
         afterHeal <- readerNoBackfill.readAtOrdinalVerified(ord(227L), mg)
-        // And the whole-global pinned reader (the reExecDerivationWithDiff prior) resolves too.
+        // And the whole-global pinned replay reader resolves too.
         pinnedReaderOpt <- reader.pinnedReaderAt(ord(227L))
         fetchCount <- fetches.get
       } yield

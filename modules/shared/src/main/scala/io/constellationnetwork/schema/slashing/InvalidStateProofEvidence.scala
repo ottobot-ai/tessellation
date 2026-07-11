@@ -19,10 +19,10 @@ import derevo.derive
   * disputed [[ShardCheckpoint]] envelope and the verdict RE-DERIVES from its own signed bytes (`InvalidStateProofValidator`), never
   * trusting the challenger.
   *
-  * '''Why the full envelope, not just a hash.''' The deterministic verdict must re-run `deriveMetagraphRoot` over the checkpoint's
-  * `includedSnapshots(metagraphAddress)`; those bytes live inside the envelope. Carrying the full `ShardCheckpoint` makes the evidence
-  * SELF-CONTAINED — any gl0 node validates it without needing the checkpoint in its local store (it may have pruned it). The committee
-  * signatures inside the envelope are the cryptographic binding that "this committee signed THIS derivation".
+  * '''Why the full envelope, not just a hash.''' The deterministic verdict must re-run pinned-base currency recreation over the
+  * checkpoint's `includedSnapshots(metagraphAddress)`; those bytes live inside the envelope. Carrying the full `ShardCheckpoint` makes the
+  * evidence SELF-CONTAINED — any gl0 node validates it without needing the checkpoint in its local store (it may have pruned it). The
+  * committee signatures inside the envelope are the cryptographic binding that "this committee signed THIS derivation".
   *
   * '''Slash identity (double-slash key).''' `(shardId, disputedCheckpointHash)` — every committee member who signed THIS checkpoint is a
   * slash target (all of them attested the same wrong derivation; §10.2 "every committee signer deviated"). The MPT double-slash guard keys
@@ -33,8 +33,8 @@ import derevo.derive
   * binds the submitter). The GSAM accept-path credits the bounty to `fraudProof.submitterId`.
   *
   * '''Determinism contract.''' Same as [[SlashableEvidenceValidator]]: every honest node computing `InvalidStateProofValidator` over the
-  * same `(evidence)` returns byte-equivalent accept/reject — the re-derivation is pure (`noGlobalSnapshotLookup`, empty prior). No clock,
-  * no env reads, no node-local consensus state.
+  * same evidence and retained signed execution base returns byte-equivalent accept/reject. No clock, env read, peer response, or mutable
+  * best-tip input participates; an unavailable base rejects without slashing.
   *
   * '''Frozen wire shape.''' Fields are consensus-load-bearing (they are the bytes a gl0 snapshot serializes when it slashes). Adding /
   * reordering / wrapping a field silently changes the encoding; bump explicitly (`InvalidStateProofEvidenceV2`) and version the validator
@@ -50,7 +50,7 @@ import derevo.derive
   *   the metagraph inside the checkpoint whose derivation is wrong. MUST equal `fraudProof.metagraphAddress`.
   * @param attestedRoot
   *   the committee-attested per-MG root (`disputedCheckpoint.derivedStateDelta.perMetagraphMptRoots(metagraphAddress)`) carried redundantly
-  *   for the MPT slash record; the validator reads the authoritative value off the envelope, not this field.
+  *   for the MPT slash record; the validator reads the signed value off the envelope, not this field.
   * @param fraudProof
   *   the watchtower's [[FraudProofEnvelope]] — carries the submitter identity (`submitterId`) + the replay-binding `challengerSignature`
   *   the validator verifies, plus the challenger's (untrusted) reference roots for triage.
@@ -114,7 +114,7 @@ object InvalidStateProofRejection {
   final case class CheckpointHashMismatch(computed: Hash, claimed: Hash) extends InvalidStateProofRejection
 
   /** The disputed MG is not present in the checkpoint's `includedSnapshots` — there is no derivation to re-execute, so no wrong-derivation
-    * to prove. (An empty-window / liveness-ping checkpoint or a wrong MG name.)
+    * to prove.
     */
   @derive(eqv, show)
   final case class MetagraphNotInCheckpoint(metagraphAddress: Address) extends InvalidStateProofRejection
@@ -139,8 +139,8 @@ object InvalidStateProofRejection {
   @derive(eqv, show)
   final case class DisputeNotUpheld(honestReDerivedRoot: Hash, attestedRoot: Hash) extends InvalidStateProofRejection
 
-  /** FAIL-CLOSED (Track-1 diff-base-pin, FINDING-B1): the honest re-derivation is UNAVAILABLE on this node — the injected
-    * `reDerivePerMgRoot` returned the `Hash.empty` "cannot re-derive" sentinel (the disputed checkpoint's pinned `diffBaseOrdinal` is
+  /** FAIL-CLOSED (Track-1 execution-base-pin, FINDING-B1): the honest re-derivation is UNAVAILABLE on this node — the injected
+    * `reDerivePerMgRoot` returned the `Hash.empty` "cannot re-derive" sentinel (the disputed checkpoint's pinned `executionBaseOrdinal` is
     * unresolvable below this node's byte-store retention / not yet reached, or the derivation OMITted/deferred). "This node can't check" is
     * NOT evidence the committee deviated, so an unverifiable dispute is NEVER upheld — upholding demands an affirmative pinned-base
     * re-derivation that mismatches the attested root. Mirrors the node-local watchtower trigger

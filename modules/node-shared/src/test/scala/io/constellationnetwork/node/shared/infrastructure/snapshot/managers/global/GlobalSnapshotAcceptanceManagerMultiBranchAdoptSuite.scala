@@ -40,8 +40,6 @@ import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
-import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
 import io.constellationnetwork.schema.tokenLock._
@@ -49,7 +47,6 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
-import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
@@ -57,48 +54,13 @@ import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSna
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosInt}
-import fs2.io.file.Files
 import weaver.MutableIOSuite
 
-/** S0 of the sharded-currency-mirror endgame (docs/nakamoto/SHARDED-CURRENCY-MIRROR-ENDGAME-PLAN.md).
+/** Boundary tests for sharded currency adoption over a multi-branch global MPT.
   *
-  * '''What this pins (VERSION-MODEL §4).''' The three references to "the prior S(N)" — producer window-anchor, producer diff-prior, and the
-  * gl0 follower APPLY-prior — must all read the SAME finalized base. On HEAD the follower apply-prior reads the BRANCH-aware reader
-  * (`GlobalSnapshotAcceptanceManager.accept` builds `priorLastCurrencySnapshots` through the branch-aware `mpt` reader, and
-  * `deriveAdoptedCurrencyState`'s `priorInfoOf` reads from that map), while the committee cuts its diff over the FINALIZED BASE. When the
-  * branch carries an intervening committed incremental ahead of the base (`branch != base`), the HEAD follower reconstructed
-  * `reconstructInfoFromDiff(branchPrior, diff_over_base)` whose per-MG root did NOT equal the committee-attested root, and the MG was
-  * '''DROPPED''' (`[ACCEPTANCE/ADOPT-VERIFY] ... MISMATCH ... DROPPING`). That asymmetry — drop at `branch != base`, adopt at `branch ==
-  * base`, '''with the identical checkpoint''' — IS the run-24→27 disease.
-  *
-  * '''S1 STATE (this revision).''' The follower now base-anchors BOTH halves for sharded MGs: (i) its apply-prior info reads the finalized
-  * base (`GlobalSnapshotAcceptanceManager.accept`'s `shardedInfoMode`), and (ii) its per-MG currency-WRITE removal-prior reads that same
-  * base (`AcceptanceMptStateChanges.applyStateChanges(currencyInfoRemovalPrior = Some(baseReader))`) so the `Mg*` removal set matches the
-  * accumulator-delta verify-replay (which carries no `Mg*` info removals) and the #107 writer self-check still holds. With both halves on
-  * base, a `branch != base` MG now ADOPTS. Tests (A) and (C) are the GREEN guards (both assert adopt); (A) additionally keeps the
-  * prior-level §4-mechanism asserts (recompute-over-base === attested, recompute-over-branch != attested) proving the follower reads base
-  * despite the branch diverging. (B) is the unchanged branch==base control. These pass at pipelineDepth=1; deeper windows are S2's job.
-  *
-  * '''Two make-or-break construction constraints''' (each verified against HEAD; miss either ⇒ a false-green that proves nothing):
-  *
-  *   1. '''The MG MUST be in the Right (incremental) arm WITH a carried diff.''' The Left(genesis)/None arms return `emptyInfo` regardless
-  *      of branch depth, so `branchPrior == basePrior == emptyInfo`, recompute === attested, NO drop — GREEN-on-HEAD (the trap). Here the
-  *      finalized base already holds the MG's `CurrencySnapshotInfo` (the unrolled `Mg*` entries + the `LastIncrementalCurrencySnapshots`
-  *      key + the `LastCurrencySnapshots` active-address index), so `priorLastCurrencySnapshots(mg)` resolves to a `Right((inc, info))`,
-  *      and the checkpoint carries a NON-EMPTY diff over that base prior. (See `seedBaseAndRoundTrip` + `writeRightArm` +
-  *      `mkRightArmCheckpoint`.)
-  *
-  * 2. '''The harness drives the PRODUCTION MultiBranch overlay with a NON-passthrough child `BranchId` threaded as `accept(parentTip =
-  * ...)`.''' `GlobalSnapshotAcceptanceManagerShardingSuite` builds `MptOverlay.passthrough` and passes `parentTip = BranchId.passthrough`
-  * (== base == `BranchId(Hash.empty)`) — structurally incapable of `branch > base`. Here the overlay is
-  * `MptOverlay.make(OverlayMode.MultiBranch(...))`; an INTERVENING per-MG incremental+info is written into a checked-out child branch
-  * (`childTip`) so its branch reader returns a DIFFERENT prior than the base `MptStore`; that `childTip` is threaded as `parentTip`. (See
-  * `mkOverlayWithBranch`.)
-  *
-  * '''Producer-truth.''' The carried diff and the committee-attested per-MG root are computed with the EXACT production functions the
-  * follower recomputes against (`ChangeSet.currencyInfoChangeSet`, `ChangeSet.reconstructInfoFromDiff`, the PIN-1
-  * `GlobalStateConverter.currencySnapshotMgRoot` — the component-addressable per-MG sub-trie root), so producer and verifier agree by
-  * construction and the only thing that flips drop↔adopt is which prior the follower reads (branch vs base).
+  * Checkpoints carry only included snapshot binaries and claimed roots. The only candidate state is the output of
+  * `processCurrencySnapshots`, representing GL0 recreation. Adoption requires its per-MG root to match the checkpoint claim; missing or
+  * mismatched roots fail closed. Branch/base fixtures prove local overlay position cannot replace replay with committee-carried state.
   */
 object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSuite {
 
@@ -173,9 +135,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     Signed(snap, NonEmptySet.of(sentinelProof))
   }
 
-  /** A `CurrencySnapshotInfo` carrying exactly one balance entry — used as both base prior and branch prior (same key, different value), so
-    * the branch's `MgBalances` upsert cleanly OVERRIDES the base entry and `reconstructCurrencyInfoFrom` yields a different prior at the
-    * branch than at the base. The other sub-maps stay empty (mirrors the `reconstructCurrencyInfoFrom` always-`.some` shape).
+  /** A `CurrencySnapshotInfo` carrying exactly one balance entry. It is used as both base and branch fixture state so the overlay readers
+    * can prove they expose different priors for the same metagraph.
     */
   private def infoWithBalance(holder: Address, amount: Long): CurrencySnapshotInfo =
     CurrencySnapshotInfo(
@@ -203,19 +164,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       kesTreeStep = 0
     )
 
-  /** Build a checkpoint whose `derivedStateDelta` carries, for `mg`: the head binary (`includedSnapshots`), the committee byte-diff
-    * (`perMetagraphStateDiff`), and the committee-attested per-MG root (`perMetagraphMptRoots`). The diff + root are PRODUCER-TRUTH:
-    * computed over `basePriorRT` (the round-tripped base prior) so that `reconstructInfoFromDiff(basePriorRT, diff) === nextInfo` and the
-    * attested root === `currencySnapshotMgRoot(mg -> Right((inc, nextInfo)))`.
+  /** Build a checkpoint carrying one replayable binary plus the committee's claimed per-MG root. The execution base is signed metadata
+    * consumed by `ShardCheckpointGl0AcceptanceManager`; GSAM receives only its accept/reject verdict and never applies committee state.
     */
   private def mkRightArmCheckpoint(
     mg: Address,
     binary: Signed[StateChannelSnapshotBinary],
-    diff: ShardCurrencyStateDiff,
     attestedRoot: Hash,
-    // Track-1 diff-base-pin: the committee-stamped pinned base. `MinValue` (the schema default) keeps every pre-pin test on the
-    // never-defer arm; the genesis-seam tests (E)/(F)/(G) stamp a REAL base so `pinnedPriorInfoOf` reads through the wired reader.
-    diffBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
+    executionBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
   ): ShardCheckpoint =
     ShardCheckpoint(
       shardId = ShardId.unsafeApply(0),
@@ -225,57 +181,25 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       slot = io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(2L),
       derivedStateDelta = ShardDerivedStateDelta(
         perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
-        perMetagraphStateDiff = SortedMap(mg -> diff),
-        includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary)),
-        tokenLockBalancesDelta = SortedMap.empty,
-        perMetagraphArtifacts = SortedMap.empty,
-        perMetagraphSyncDataDelta = SortedMap.empty
+        includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary))
       ),
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig),
       epoch = epochZero,
-      diffBaseOrdinal = diffBaseOrdinal
+      executionBaseOrdinal = executionBaseOrdinal
     )
 
   // ============================================================================
-  // Producer-truth diff + attested root (the EXACT functions the follower recomputes against)
+  // GL0-recreated root (the exact value compared with the checkpoint claim)
   // ============================================================================
 
-  /** Compute the committee byte-diff over `basePrior` and the PIN-1 attested per-MG root over `next`, using the production functions. By
-    * the `reconstructInfoFromDiff` round-trip invariant, every gl0 follower whose APPLY-prior equals `basePrior` recomputes `next` and
-    * matches the root (ADOPT); a follower whose prior differs (the branch) reconstructs a different info and mismatches (DROP).
-    */
-  private def producerTruth(
+  private def recreatedRoot(
     mg: Address,
     inc: Signed[CurrencyIncrementalSnapshot],
-    basePrior: CurrencySnapshotInfo,
     next: CurrencySnapshotInfo
-  )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[(ShardCurrencyStateDiff, Hash)] =
-    for {
-      changeSet <- ChangeSet.currencyInfoChangeSet[IO](mg, basePrior, next)
-      wireDiff = ChangeSet.toWire(changeSet)
-      nextState = Right((inc, next)): CurrencySnapshotWithState
-      // PIN-1: the attested per-MG root is the COMPONENT-ADDRESSABLE `currencySnapshotMgRoot` (MG-sub-trie rootHash), the exact root the
-      // GSAM follower recomputes in `deriveAdoptedCurrencyState`.
-      attestedRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> nextState))
-    } yield (wireDiff, attestedRoot)
-
-  /** Recompute the per-MG PIN-1 root EXACTLY as the GSAM follower does (`reconstructInfoFromDiff(prior, diff)` → `currencySnapshotMgRoot` —
-    * the component-addressable per-MG sub-trie root), for an arbitrary `prior`. Lets a test assert, at the prior level, that the recompute
-    * \=== attested over the BASE prior but != attested over the BRANCH prior — i.e. the drop is exactly the §4 mechanism.
-    */
-  private def followerRecomputeRoot(
-    mg: Address,
-    inc: Signed[CurrencyIncrementalSnapshot],
-    prior: CurrencySnapshotInfo,
-    wireDiff: ShardCurrencyStateDiff
-  )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[Hash] =
-    for {
-      nextInfo <- ChangeSet.reconstructInfoFromDiff[IO](mg, prior, ChangeSet.fromWire(wireDiff))
-      nextState = Right((inc, nextInfo)): CurrencySnapshotWithState
-      // PIN-1: recompute the component-addressable per-MG root EXACTLY as the GSAM follower does.
-      recomputed <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> nextState))
-    } yield recomputed
+  )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[Hash] = {
+    val nextState = Right((inc, next)): CurrencySnapshotWithState
+    GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> nextState))
+  }
 
   // ============================================================================
   // Seeding the finalized base / a branch with Right-arm per-MG state
@@ -306,9 +230,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
     } yield store
 
-  /** Seed the BASE store directly with: the Right-arm info (`basePrior`) for `mg`, the fieldId-5 incremental, and the
-    * `LastCurrencySnapshots` active-address index marking `mg` (so `accept()`'s `priorLastCurrencySnapshots` keyset includes it). Returns
-    * the round-tripped base prior the GSAM will actually read back, so the producer diff is cut over the BYTE-IDENTICAL prior.
+  /** Seed the BASE store directly with the Right-arm info, fieldId-5 incremental, and active-address index for `mg`. Returns the
+    * round-tripped prior GSAM will actually read during replay.
     */
   private def seedBaseAndRoundTrip(
     store: MptStore[IO, GlobalStateKey],
@@ -368,15 +291,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // The deriving processor — puts the MG in the RIGHT arm of calculatedCurrencyState
   // ============================================================================
 
-  /** A processor whose `processCurrencySnapshots` emits, per adopted MG, a single `(binary, Some(Right((inc, seedInfo))))` pair. The GSAM
-    * adopt path then sees `calculatedCurrencyState(mg) = Right((inc, seedInfo))` (so `derivedState.isLeft == false` and the
-    * apply-and-verify runs with `lastIncremental = inc`), and OVERRIDES `seedInfo` with the verified
-    * `reconstructInfoFromDiff(priorInfoOf(mg), diff)`. The base-path `process` is never load-bearing here (sharded MGs are filtered out by
-    * CHANGE-3; we pass no raw scEvents).
+  /** A processor boundary fixture whose output stands for GL0's recreated state. The adopter must use it verbatim and only compare its root
+    * with the checkpoint claim.
     */
   private def derivingProcessor(
     inc: Signed[CurrencyIncrementalSnapshot],
-    seedInfo: CurrencySnapshotInfo
+    seedInfo: CurrencySnapshotInfo,
+    balanceUpdate: SortedMap[Address, Balance] = SortedMap.empty,
+    onReplay: IO[Unit] = IO.unit
   ): GlobalSnapshotStateChannelEventsProcessor[IO] =
     new GlobalSnapshotStateChannelEventsProcessor[IO] {
       override def process(
@@ -401,15 +323,16 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
         currentBalances: SortedMap[Address, Balance],
         priorLastCurrencySnapshots: SortedMap[Address, CurrencySnapshotWithState],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
-        adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[IO]): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
-        events.map {
-          case (addr, bins) =>
-            val pairs: NonEmptyList[BinaryCurrencyPair] =
-              bins.map(b => (b, (Right((inc, seedInfo)): CurrencySnapshotWithState).some))
-            addr -> ((pairs, SortedMap.empty[Address, Balance]))
-        }.pure[IO]
+        onReplay.as {
+          events.map {
+            case (addr, bins) =>
+              val pairs: NonEmptyList[BinaryCurrencyPair] =
+                bins.map(b => (b, (Right((inc, seedInfo)): CurrencySnapshotWithState).some))
+              addr -> ((pairs, balanceUpdate))
+          }
+        }
 
       override def assembleAcceptanceResult(
         processed: SortedMap[Address, MetagraphAcceptanceResult],
@@ -420,32 +343,34 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
           processed.map { case (k, (v, _)) => k -> v.toList.flatMap(_._2).lastOption }.collect { case (key, Some(s)) => key -> s }
         val incoming: SortedMap[Address, List[CurrencySnapshotWithState]] =
           processed.map { case (k, (v, _)) => k -> v.toList.flatMap(_._2) }.filterNot { case (_, list) => list.isEmpty }
+        val combinedBalanceUpdate = processed.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
         StateChannelAcceptanceResult(
           accepted = processed.map { case (k, (v, _)) => k -> v.map(_._1) },
           calculatedCurrencyState = priorLastCurrencySnapshots.concat(lastStatePerAddress),
           returned = returned,
-          balanceUpdate = SortedMap.empty[Address, Balance],
+          balanceUpdate = combinedBalanceUpdate,
           incomingCurrencySnapshotsWithState = incoming
         )
       }
 
-      override def deriveMetagraphRoot(
-        metagraphAddress: Address,
-        binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-        snapshotOrdinal: SnapshotOrdinal,
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
-      )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
     }
 
   // ============================================================================
-  // Stub checkpoint manager — always Accepted (verifyEmbedded is the GSAM adopt-decision call)
+  // Stub checkpoint manager — captures the GSAM verifier boundary and can model a rejected execution base.
   // ============================================================================
 
-  private final case class StubAcceptanceManager(callsRef: Ref[IO, List[ShardCheckpoint]]) extends ShardCheckpointGl0AcceptanceManager[IO] {
+  private final case class StubAcceptanceManager(
+    callsRef: Ref[IO, List[ShardCheckpoint]],
+    verdict: ShardCheckpoint => ShardCheckpointAcceptResult = (_: ShardCheckpoint) => ShardCheckpointAcceptResult.Accepted
+  ) extends ShardCheckpointGl0AcceptanceManager[IO] {
     override def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
-      callsRef.update(_ :+ checkpoint).as(ShardCheckpointAcceptResult.Accepted)
+      callsRef.update(_ :+ checkpoint).as(verdict(checkpoint))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
-      callsRef.update(_ :+ checkpoint).as(ShardCheckpointAcceptResult.Accepted)
+      callsRef.update(_ :+ checkpoint).as(verdict(checkpoint))
+    override def verifyCommitteeSignature(
+      checkpoint: ShardCheckpoint,
+      signature: CommitteeMemberSignature
+    ): IO[Either[String, Unit]] = IO.pure(Right(()))
     override def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit
     override def lastAdoptedOrd(shardId: ShardId): IO[Option[ShardOrdinal]] = IO.pure(None)
     override def lastAdoptedAnchor(shardId: ShardId): IO[Option[Hash]] = IO.pure(None)
@@ -461,9 +386,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     ShardingConfig(
       numShards = numShards,
       finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
-      slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
+      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
     )
 
   private val noopRewardsFn: io.constellationnetwork.node.shared.infrastructure.snapshot.RewardsInput => IO[DelegatedRewardsResult] =
@@ -482,10 +406,6 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     overlay: MptOverlay[IO, GlobalStateKey],
     stateChannelEventsProcessor: GlobalSnapshotStateChannelEventsProcessor[IO],
     checkpointManager: ShardCheckpointGl0AcceptanceManager[IO],
-    // Genesis-seam tests (E)/(F)/(G)/(H): the Track-1 pinned diff-base reader. Production wires it UNCONDITIONALLY at both GSAM
-    // sites (GlobalSnapshotConsensus + SharedServices); the `None` default keeps every pre-existing test on the `priorInfoOf`
-    // fallback arm — byte-identical to the suite before this parameter existed.
-    pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[IO]] = None,
     numShards: Int = 4
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {
     val mockBlockAcceptanceManager: BlockAcceptanceManager[IO] = new BlockAcceptanceManager[IO] {
@@ -644,7 +564,6 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
           shardingConfig = Some(mkShardingConfig(numShards)),
           shardCheckpointAcceptanceManager = Some(checkpointManager),
           shardAssignment = Some(ShardAssignment.make[IO](numShards = numShards)),
-          pinnedCurrencyInfoReader = pinnedCurrencyInfoReader,
           etaRotationSnapshots = 2550L,
           invaliditySlashingConfig = InvalidStateProofSlashingConfig(
             watchtowerEnabled = true,
@@ -736,29 +655,22 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   private val holderBranchExtra: Address = mkAddress("s0-spine-holder-branch-extra")
   private val inc: Signed[CurrencyIncrementalSnapshot] = mkSignedIncremental(snapOrdinal = 2L)
 
-  // S(N) the committee diffs OVER (the finalized base): one holder.
+  // Finalized-base currency state: one holder.
   private val basePriorRaw: CurrencySnapshotInfo = infoWithBalance(holder, 100L)
 
-  // S(N+1) the committee re-exec produced: that SAME holder, advanced. The minimal diff `changeSet(basePrior, next)` therefore upserts ONLY
-  // `holder`'s balance — it carries NO entry for `holderBranchExtra`. That is the load-bearing asymmetry: the diff overwrites the prior's
-  // `holder` value regardless of prior (so a divergence in `holder`'s value alone would be MASKED by the upsert — the original false-green),
-  // but it leaves any branch-only key UNTOUCHED.
+  // State GL0 recreates by executing the included snapshot binary.
   private val nextInfo: CurrencySnapshotInfo = infoWithBalance(holder, 200L)
 
-  // The intervening BRANCH prior (`branch != base`): the same `holder` PLUS an EXTRA holder the base/next never mention. Applying the
-  // base-cut diff to this prior leaves `holderBranchExtra` in place ⇒ `reconstructInfoFromDiff(branchPrior, diff)` differs from `next` ⇒ the
-  // recomputed per-MG root != attested ⇒ DROP. Applying it to the base prior yields exactly `next` ⇒ ADOPT.
+  // Intervening branch state. The extra holder proves the test is genuinely running above a divergent pending branch while checkpoint
+  // adoption still derives its candidate exclusively from replayed binaries.
   private val branchPriorRaw: CurrencySnapshotInfo =
     basePriorRaw.copy(balances = basePriorRaw.balances + (holderBranchExtra -> Balance(NonNegLong.unsafeFrom(999L))))
 
   private val headBinary: Signed[StateChannelSnapshotBinary] = mkSignedBinary("s0-head-binary".getBytes("UTF-8"))
 
   // ============================================================================
-  // HARNESS PRECONDITION — make-or-break constraint #2, asserted at the reader level.
-  // Proves the MultiBranch overlay genuinely expresses `branch != base`: the SAME MG reconstructs a DIFFERENT prior at the child branch
-  // (`branchPrior`, with the extra holder) than at the finalized base (`basePrior`). If this ever collapses to base==branch the spine (A)
-  // would be a false-green (it would assert a drop the code makes for an unrelated reason). This is the structural guard the existing
-  // Sharding suite cannot provide (it is passthrough-only, where every read collapses to base).
+  // HARNESS PRECONDITION: prove the MultiBranch overlay genuinely expresses branch != base. The same MG reconstructs a different prior at
+  // the child branch than at the finalized base, so the replay-adoption test cannot pass on a passthrough-only fixture by accident.
   // ============================================================================
 
   test("HARNESS: branch reader reconstructs branchPrior, base reader reconstructs basePrior (branch != base is real)") { res =>
@@ -781,290 +693,229 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   // ============================================================================
-  // (A) THE SPINE — S1 GREEN guard: branch > base, the follower base-anchors its apply-prior AND its currency write ⇒ MG ADOPTED.
+  // Replay-only checkpoint adoption
   // ============================================================================
 
-  // Was RED-on-HEAD-by-design (it asserted the run-24→27 DROP); after S1 the follower reads BOTH its apply-prior info and its currency-write
-  // removal-prior from the FINALIZED BASE, so an MG whose branch runs ahead of base now reconstructs `reconstructInfoFromDiff(basePrior,
-  // diff_over_base)` === attested and ADOPTS. The prior-level §4-MECHANISM asserts are KEPT verbatim — they prove the follower reads the
-  // base DESPITE the branch diverging: recompute-over-BASE === attested (adopt) while recompute-over-BRANCH != attested (the drop the HEAD
-  // code made). The end-to-end assert FLIPS from `!advancedTo` to `advancedTo`: this is now the permanent S1 regression guard that the
-  // base-anchored follower converges where the branch-anchored follower forked.
-  test("(A) SPINE [S1 GREEN]: MG past first-incremental, branch != base, follower base-anchors apply-prior + currency write ⇒ MG ADOPTS") {
-    res =>
-      implicit val (h, sp, j) = res
-      for {
-        // TRACK-1 delete-override: the tip incremental carries `nextInfo`'s signed stateProof so the re-grounded GAP-1 (now-unconditional
-        // balances/lastTxRefs compare) binds the reconstructed value to the metagraph's OWN proof and ADOPTS. Shadows the class `inc`.
-        tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-        inc = mkSignedIncremental(2L, tipProof)
-        store <- freshStore
-        // Constraint 1 (Right-arm-with-diff): seed the FINALIZED BASE with the MG's prior currency info (`basePriorRT`).
-        basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-        // Producer-truth: diff cut over the BASE prior; attested root over `nextInfo`. (reconstructInfoFromDiff(basePriorRT, diff) === next.)
-        truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
-        (wireDiff, attestedRoot) = truth
-        checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
-        // Constraint 2 (branch > base): commit an INTERVENING incremental+info into a child branch so its reader returns `branchPrior`.
-        ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = Some(branchPriorRaw))
-        (overlay, childTip) = ob
-        // The round-tripped branch prior the follower's `priorInfoOf` WOULD read at `parentTip = childTip` if it anchored on the branch.
-        branchPriorRT <- GlobalStateConverter
-          .reconstructCurrencyInfoFrom[IO](mg, CurrencyInfoMptAdapters.readerFor(GlobalStateReader.fromOverlay[IO](overlay, childTip)))
-        // Producer-truth at the PRIOR level (the §4 mechanism in isolation): recompute the PIN-1 root the GSAM follower would, over each prior.
-        recomputedOverBase <- followerRecomputeRoot(mg, inc, basePriorRT, wireDiff)
-        recomputedOverBranch <- followerRecomputeRoot(mg, inc, branchPriorRT, wireDiff)
-        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-        mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
-        // The follower runs at `parentTip = childTip` (branch > base); S1 makes its apply-prior + write read the BASE despite that.
-        gsi <- runAccept(mgr, checkpoint, parentTip = childTip, lastSnapshotInfo = gsiWith(mg, inc, branchPriorRaw))
-        calls <- callsRef.get
-      } yield
-        expect.all(
-          // The checkpoint was verified (the adopt path ran) ...
-          calls.size == 1,
-          // §4 mechanism, in isolation (KEPT from the RED spine): the committee cut the diff over BASE, so recompute-over-base === attested
-          // (adopt), but recompute-over-BRANCH != attested (the drop the HEAD follower made). This proves the asymmetry is branch-vs-base.
-          recomputedOverBase == attestedRoot,
-          recomputedOverBranch != attestedRoot,
-          // ... and end-to-end the MG ADOPTED — its committed currency ADVANCED to `nextInfo`. The follower base-anchored its apply-prior
-          // (reconstruct over BASE === attested) AND its currency write (the `Mg*` removal set anchored at base, so `postBytes ==`
-          // verify-replay `expectedBytes`, no #107 writer divergence). This is the S1 fix: diff-prior == apply-prior == write, all on base.
-          advancedTo(gsi, mg, nextInfo)
-        )
-  }
-
-  // ============================================================================
-  // (B) THE CONTROL — same checkpoint, branch == base ⇒ MG ADOPTED. Proves it's the §4 bug, not a fake root.
-  // ============================================================================
-
-  test("(B) CONTROL: SAME checkpoint/diff/attestedRoot but parentTip == base (branch == base) ⇒ MG IS ADOPTED (currency advances)") { res =>
+  test("globally recreated state is adopted on a divergent pending branch") { res =>
     implicit val (h, sp, j) = res
     for {
-      // TRACK-1 delete-override: tip incremental carries `nextInfo`'s signed stateProof so the re-grounded GAP-1 balances/lastTxRefs
-      // compare binds to the metagraph's OWN proof and ADOPTS. Shadows the class `inc`.
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-      inc = mkSignedIncremental(2L, tipProof)
+      localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
-      basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-      truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
-      (wireDiff, attestedRoot) = truth
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
-      // NO intervening branch — branchPrior = None ⇒ parentTip == base ⇒ the follower APPLY-prior reads the BASE (`basePriorRT`).
-      ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
-      (overlay, baseTip) = ob
+      basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+      claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
+      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+      ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = Some(branchPriorRaw))
+      (overlay, childTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-      mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
-      gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiWith(mg, inc, basePriorRaw))
+      replayCalls <- Ref.of[IO, Int](0)
+      mgr <- mkManager(
+        overlay,
+        derivingProcessor(localInc, nextInfo, onReplay = replayCalls.update(_ + 1)),
+        StubAcceptanceManager(callsRef)
+      )
+      gsi <- runAccept(mgr, checkpoint, childTip, gsiWith(mg, localInc, branchPriorRaw))
       calls <- callsRef.get
+      replayCount <- replayCalls.get
     } yield
       expect.all(
-        calls.size == 1,
-        // branch == base ⇒ reconstruct(basePrior, diff_over_base) === next === attested ⇒ ADOPT. The MG's currency ADVANCES to `nextInfo`.
-        // (A) drops and (B) adopts with the IDENTICAL checkpoint ⇒ the only difference is branch-vs-base ⇒ proves the §4 violation specifically.
-        advancedTo(gsi, mg, nextInfo)
+        calls == List(checkpoint),
+        replayCount == 1,
+        checkpoint.derivedStateDelta.includedSnapshots.keySet == Set(mg),
+        checkpoint.derivedStateDelta.perMetagraphMptRoots == SortedMap(mg -> claimedRoot),
+        advancedTo(gsi, mg, nextInfo),
+        gsi.lastStateChannelSnapshotHashes.contains(mg)
+      )
+  }
+
+  test("currency replay removes branch-only prior entries and converges to the same canonical MPT root") { res =>
+    implicit val (h, sp, j) = res
+
+    def runFrom(priorOnBranch: Option[CurrencySnapshotInfo]): IO[(GlobalSnapshotInfo, Option[Hash])] =
+      for {
+        tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+        localInc = mkSignedIncremental(2L, tipProof)
+        store <- freshStore
+        basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+        claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
+        checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+        ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, priorOnBranch)
+        (overlay, parentTip) = ob
+        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        mgr <- mkManager(overlay, derivingProcessor(localInc, nextInfo), StubAcceptanceManager(callsRef))
+        lastInfo = gsiWith(mg, localInc, priorOnBranch.getOrElse(basePriorRaw))
+        out <- runAcceptWithRoot(mgr, checkpoint, parentTip, lastInfo)
+      } yield out
+
+    for {
+      fromBase <- runFrom(None)
+      fromBranch <- runFrom(Some(branchPriorRaw))
+      (baseGsi, baseRoot) = fromBase
+      (branchGsi, branchRoot) = fromBranch
+    } yield
+      expect.all(
+        advancedTo(baseGsi, mg, nextInfo),
+        advancedTo(branchGsi, mg, nextInfo),
+        baseGsi.lastCurrencySnapshots == branchGsi.lastCurrencySnapshots,
+        baseRoot.isDefined,
+        branchRoot == baseRoot
+      )
+  }
+
+  test("matching globally recreated root adopts at branch == base") { res =>
+    implicit val (h, sp, j) = res
+    for {
+      tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      localInc = mkSignedIncremental(2L, tipProof)
+      store <- freshStore
+      basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+      claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
+      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+      ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
+      (overlay, baseTip) = ob
+      callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+      mgr <- mkManager(overlay, derivingProcessor(localInc, nextInfo), StubAcceptanceManager(callsRef))
+      gsi <- runAccept(mgr, checkpoint, baseTip, gsiWith(mg, localInc, basePriorRaw))
+    } yield expect(advancedTo(gsi, mg, nextInfo))
+  }
+
+  test("mismatched claimed root drops globally recreated state and its balance update") { res =>
+    implicit val (h, sp, j) = res
+    for {
+      tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      localInc = mkSignedIncremental(2L, tipProof)
+      store <- freshStore
+      basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+      checkpoint = mkRightArmCheckpoint(mg, headBinary, Hash("ff" * 32))
+      ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = Some(branchPriorRaw))
+      (overlay, childTip) = ob
+      callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+      replayCalls <- Ref.of[IO, Int](0)
+      rejectedBalance = Balance(NonNegLong.unsafeFrom(999999L))
+      mgr <- mkManager(
+        overlay,
+        derivingProcessor(
+          localInc,
+          nextInfo,
+          balanceUpdate = SortedMap(holder -> rejectedBalance),
+          onReplay = replayCalls.update(_ + 1)
+        ),
+        StubAcceptanceManager(callsRef)
+      )
+      gsi <- runAccept(mgr, checkpoint, childTip, gsiWith(mg, localInc, branchPriorRaw))
+      replayCount <- replayCalls.get
+    } yield
+      expect.all(
+        replayCount == 1,
+        !advancedTo(gsi, mg, nextInfo),
+        !gsi.lastStateChannelSnapshotHashes.contains(mg),
+        !gsi.balances.get(holder).contains(rejectedBalance)
+      )
+  }
+
+  test("missing claimed root drops globally recreated state") { res =>
+    implicit val (h, sp, j) = res
+    for {
+      tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      localInc = mkSignedIncremental(2L, tipProof)
+      store <- freshStore
+      basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+      claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
+      checkpoint0 = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+      checkpoint = checkpoint0.copy(
+        derivedStateDelta = checkpoint0.derivedStateDelta.copy(perMetagraphMptRoots = SortedMap.empty)
+      )
+      ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
+      (overlay, baseTip) = ob
+      callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+      mgr <- mkManager(overlay, derivingProcessor(localInc, nextInfo), StubAcceptanceManager(callsRef))
+      gsi <- runAccept(mgr, checkpoint, baseTip, gsiWith(mg, localInc, basePriorRaw))
+    } yield
+      expect.all(
+        !advancedTo(gsi, mg, nextInfo),
+        !gsi.lastStateChannelSnapshotHashes.contains(mg)
       )
   }
 
   // ============================================================================
-  // (C) THE CONVERGENCE TARGET — now GREEN under S1: a minimal branch > base adopt, asserted purely end-to-end.
+  // Execution-base verifier boundary
   // ============================================================================
 
-  // Same construction as (A) (branch > base, diff cut over base), asserting the POST-S1 outcome: the MG ADOPTS. On HEAD this FAILED (the
-  // apply-prior read the branch ⇒ mismatch ⇒ drop), so it was `.ignore`d as a forward-looking placeholder. After S1 — the follower reads
-  // BOTH its apply-prior info AND its currency-write removal-prior from the finalized base for sharded MGs — the follower reconstructs
-  // `reconstructInfoFromDiff(basePrior, diff)` === attested at any branch depth (at pipelineDepth=1; deeper windows are S2's producer job)
-  // ⇒ recompute === attested ⇒ ADOPT, with no #107 writer divergence. Un-ignored as the S1 green gate (a leaner end-to-end twin of (A)).
-  test(
-    "(C) CONVERGENCE [S1 GREEN]: branch != base ADOPTS now that the follower apply-prior + currency write read the finalized base"
-  ) { res =>
+  private val executionBase: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
+
+  test("execution-base pin reaches the verifier unchanged before replay adoption") { res =>
     implicit val (h, sp, j) = res
     for {
-      // TRACK-1 delete-override: tip incremental carries `nextInfo`'s signed stateProof so the re-grounded GAP-1 balances/lastTxRefs
-      // compare binds to the metagraph's OWN proof and ADOPTS. Shadows the class `inc`.
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-      inc = mkSignedIncremental(2L, tipProof)
+      localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
-      basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-      truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
-      (wireDiff, attestedRoot) = truth
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
-      ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = Some(branchPriorRaw))
-      (overlay, childTip) = ob
+      basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+      _ <- store.commit(executionBase)
+      claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
+      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
+      ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
+      (overlay, baseTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-      mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
-      gsi <- runAccept(mgr, checkpoint, parentTip = childTip, lastSnapshotInfo = gsiWith(mg, inc, branchPriorRaw))
-    } yield expect(advancedTo(gsi, mg, nextInfo)) // GREEN under S1 (base-anchored follower); was RED on HEAD (branch-anchored).
+      replayCalls <- Ref.of[IO, Int](0)
+      verifier = StubAcceptanceManager(
+        callsRef,
+        cp =>
+          if (cp.executionBaseOrdinal === executionBase) ShardCheckpointAcceptResult.Accepted
+          else ShardCheckpointAcceptResult.Rejected("wrong execution base")
+      )
+      mgr <- mkManager(
+        overlay,
+        derivingProcessor(localInc, nextInfo, onReplay = replayCalls.update(_ + 1)),
+        verifier
+      )
+      gsi <- runAccept(mgr, checkpoint, baseTip, gsiWith(mg, localInc, basePriorRaw))
+      calls <- callsRef.get
+      replayCount <- replayCalls.get
+    } yield
+      expect.all(
+        calls.map(_.executionBaseOrdinal) == List(executionBase),
+        replayCount == 1,
+        advancedTo(gsi, mg, nextInfo)
+      )
   }
 
-  // ============================================================================
-  // (D) 3a GATE — genuine-`None` optional fields (lastFeeTxRefs / lastMessages) must ADOPT after the override is gone, NOT fail-closed drop.
-  // ============================================================================
-  //
-  // Delete-override made GAP-1 the load-bearing per-field binding. `reconstructInfoFromDiff` ALWAYS lifts `.some` on the optional info
-  // fields (a partition with no entries reconstructs `Some(empty)`), but the live metagraph emits genuine `None` (`lastFeeTxRefs` hardcoded
-  // None in CSAM; `lastMessages` None when message-free), and the SIGNED stateProof DISTINGUISHES them (`None -> None`, `Some(empty) ->
-  // Some(hash(empty))`). A mechanical unconditional compare would then read `Some(hash(empty)) === None` = false and DROP every honest
-  // sharded MG every ordinal — the 3a fail-close. The re-grounded gate SKIPS any field the tip's stateProof does not carry, so the MG
-  // ADOPTS. This pins BOTH the divergence (reconstruct = Some(empty) where the signed proof = None) AND the ADOPT outcome. `nextInfo`
-  // (`infoWithBalance`) carries `lastFeeTxRefs = None` + `lastMessages = None`, so its stamped tip proof carries `None` for both.
-  test("(D) 3a GATE: reconstruct = Some(empty) for genuine-None fields the metagraph left None ⇒ MG still ADOPTS (no fail-closed drop)") {
-    res =>
-      implicit val (h, sp, j) = res
-      for {
-        tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-        inc = mkSignedIncremental(2L, tipProof)
-        store <- freshStore
-        basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-        truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
-        (wireDiff, attestedRoot) = truth
-        // The 3a divergence made explicit: the committee cut the diff over `infoOf(next)` whose `lastFeeTxRefs`/`lastMessages` are genuine
-        // `None`, yet the follower's `reconstructInfoFromDiff` lifts them to `Some(empty)`.
-        reconstructed <- ChangeSet.reconstructInfoFromDiff[IO](mg, basePriorRT, ChangeSet.fromWire(wireDiff))
-        checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot)
-        ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
-        (overlay, baseTip) = ob
-        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-        mgr <- mkManager(overlay, derivingProcessor(inc, basePriorRT), StubAcceptanceManager(callsRef))
-        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiWith(mg, inc, basePriorRaw))
-      } yield
-        expect.all(
-          // The follower reconstructs `Some(empty)` for the fields the metagraph left `None` — the 3a divergence is real, not hypothetical.
-          reconstructed.lastFeeTxRefs.exists(_.isEmpty),
-          reconstructed.lastMessages.exists(_.isEmpty),
-          // The metagraph's SIGNED tip proof carries genuine `None` for those same fields (a mechanical compare would mismatch → drop).
-          inc.value.stateProof.lastFeeTxRefsProof.isEmpty,
-          inc.value.stateProof.lastMessagesProof.isEmpty,
-          // Yet the MG ADOPTS — the field-presence gate skips the None fields instead of fail-closing on Some(empty)-vs-None.
-          advancedTo(gsi, mg, nextInfo)
-        )
-  }
-
-  // ============================================================================
-  // (E)/(F)/(G)/(H) GENESIS-SEAM — the diff-base-pin two-`None` disambiguation (Track-1, eb9bf9a5e follow-up).
-  //
-  // At numShards >= 2 the FIRST checkpoint of a NEVER-before-adopted metagraph pins its diff prior at `diffBaseOrdinal` via the
-  // wired `PinnedCurrencyInfoReader.readAtOrdinal`. The anchor VERIFIES cleanly (it is finalized history every node retains) but
-  // the brand-new MG has no committed currency state there, so the per-MG lookup is `None` — which the adopter conflated with the
-  // genuinely-unreadable-anchor `None` and FAIL-CLOSED DROPPED, total (neither currency state nor SC tip advance ⇒ the MG can
-  // never onboard; `lastStateChannelSnapshotHashes` stays `{}` forever). The producer meanwhile seeds `emptyInfo` for an absent
-  // MG (`ShardCheckpointWiring.reExecDerivationWithDiff`'s `priorInfoOpt.getOrElse(emptyInfo)`), so the checkpoint itself is
-  // honest and verifiable. The fix makes the pinned read THREE-VALUED (`readAtOrdinalVerified`): AnchorUnreadable ⇒ keep the
-  // fail-closed drop; AnchorVerified(None) ⇒ the producer-mirroring `emptyInfo`; AnchorVerified(Some(info)) ⇒ the pinned prior.
-  // ============================================================================
-
-  /** BYTE-IDENTICAL to the producer's `emptyInfo` (`ShardCheckpointWiring`) and the GSAM's `emptyInfo` genesis arm. */
-  private val emptyInfoVal: CurrencySnapshotInfo =
-    CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
-
-  /** The committee-stamped pinned base for the genesis-seam tests — a REAL ordinal (> MinValue) so the bounded-defer gate and the pinned
-    * read both engage exactly as in production.
-    */
-  private val diffBase: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
-
-  /** A minimal `Hashed[GlobalIncrementalSnapshot]` at `ordinal` whose `stateProof.mptRoot` is `mptRoot` — the canonical finalized snapshot
-    * the pinned reader self-resolves the diff-base pin against. Mirrors PinnedCurrencyInfoReaderSuite's fixture.
-    */
-  private def mkHashedGlobal(
-    ordinal: SnapshotOrdinal,
-    mptRoot: Option[Hash]
-  )(implicit h: Hasher[IO]): IO[Hashed[GlobalIncrementalSnapshot]] = {
-    val unsigned = GlobalIncrementalSnapshot(
-      ordinal = ordinal,
-      height = Height(NonNegLong(0L)),
-      subHeight = SubHeight(NonNegLong(0L)),
-      lastSnapshotHash = Hash.empty,
-      blocks = SortedSet.empty,
-      stateChannelSnapshots = SortedMap.empty,
-      shardCheckpoints = SortedMap.empty,
-      rewards = SortedSet.empty,
-      delegateRewards = None,
-      epochProgress = EpochProgress(NonNegLong(0L)),
-      nextFacilitators = NonEmptyList.of(PeerId(Hex("0d" * 64))),
-      tips = SnapshotTips(SortedSet.empty, SortedSet.empty),
-      stateProof = GlobalSnapshotStateProof(
-        Hash.empty,
-        Hash.empty,
-        Hash.empty,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        mptRoot,
-        None,
-        None
-      ),
-      allowSpendBlocks = None,
-      tokenLockBlocks = None,
-      spendActions = None,
-      updateNodeParameters = None,
-      artifacts = None,
-      activeDelegatedStakes = None,
-      delegatedStakesWithdrawals = None,
-      activeNodeCollaterals = None,
-      nodeCollateralWithdrawals = None,
-      version = SnapshotVersion("0.0.1"),
-      slotCertificate = None,
-      eta = None
-    )
-    Signed(unsigned, NonEmptySet.of(SignatureProof(PeerId(Hex("0d" * 64)).toId, Signature(Hex("0e" * 64)))))
-      .toHashed[IO]
-  }
-
-  /** Stand up the cluster-uniform PINNED history at [[diffBase]]: a version-retained byte store holding `state`'s committed bytes plus a
-    * finalized snapshot whose `stateProof.mptRoot` those bytes reproduce (or `mptRootOverride` — pass a wrong root to model the
-    * genuinely-UNREADABLE anchor: retained bytes that do not recompute the pinned committed root, i.e. a fork/corruption). Returns the
-    * wired `PinnedCurrencyInfoReader` the GSAM-under-test consumes.
-    */
-  private def mkPinnedReaderOver(
-    dir: fs2.io.file.Path,
-    state: SortedMap[Address, CurrencySnapshotWithState],
-    mptRootOverride: Option[Hash] = None
-  )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
+  test("unavailable execution base rejects before replay and performs no metagraph write") { res =>
+    implicit val (h, sp, j) = res
     for {
-      bytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](state)
-      root <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](bytes)
-      byteStore <- MptStateStorage.make[IO](dir)
-      _ <- byteStore.writeState(diffBase, bytes)
-      pinnedSnap <- mkHashedGlobal(diffBase, Some(mptRootOverride.getOrElse(root)))
-      resolver = (o: SnapshotOrdinal) => (if (o === diffBase) pinnedSnap.some else none[Hashed[GlobalIncrementalSnapshot]]).pure[IO]
-    } yield PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+      tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
+      localInc = mkSignedIncremental(2L, tipProof)
+      store <- freshStore
+      basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+      claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
+      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
+      ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
+      (overlay, baseTip) = ob
+      callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+      verifier = StubAcceptanceManager(
+        callsRef,
+        _ => ShardCheckpointAcceptResult.Rejected("execution base unavailable")
+      )
+      failIfReplayed = IO.raiseError[Unit](new AssertionError("replay ran despite unavailable execution base"))
+      mgr <- mkManager(
+        overlay,
+        derivingProcessor(localInc, nextInfo, onReplay = failIfReplayed),
+        verifier
+      )
+      gsi <- runAccept(mgr, checkpoint, baseTip, gsiWith(mg, localInc, basePriorRaw))
+      afterInfo <- GlobalStateConverter.reconstructCurrencyInfoFrom[IO](
+        mg,
+        CurrencyInfoMptAdapters.readerFor(GlobalStateReader.fromOverlay[IO](overlay, BranchId.base))
+      )
+      calls <- callsRef.get
+    } yield
+      expect.all(
+        calls.map(_.executionBaseOrdinal) == List(executionBase),
+        !advancedTo(gsi, mg, nextInfo),
+        !gsi.lastStateChannelSnapshotHashes.contains(mg),
+        afterInfo.balances == basePrior.balances
+      )
+  }
 
-  /** A `GlobalSnapshotInfo` with NO currency state at all — the "never seen by gl0" prior for the genesis-seam tests. */
-  private val gsiEmpty: GlobalSnapshotInfo =
-    GlobalSnapshotInfo(
-      lastStateChannelSnapshotHashes = SortedMap.empty,
-      lastTxRefs = SortedMap.empty,
-      balances = SortedMap.empty,
-      lastCurrencySnapshots = SortedMap.empty,
-      lastCurrencySnapshotsProofs = SortedMap.empty,
-      activeAllowSpends = None,
-      activeTokenLocks = None,
-      tokenLockBalances = None,
-      lastAllowSpendRefs = None,
-      lastTokenLockRefs = None,
-      updateNodeParameters = None,
-      activeDelegatedStakes = None,
-      delegatedStakesWithdrawals = None,
-      activeNodeCollaterals = Some(SortedMap.empty),
-      nodeCollateralWithdrawals = Some(SortedMap.empty),
-      priceState = Some(SortedMap.empty),
-      metagraphSyncData = Some(SortedMap.empty),
-      historicalStakeSnapshots = SortedMap.empty
-    )
-
-  /** Like [[runAccept]] but also returns the committed state proof's `mptRoot` (tuple element `_10`) — the byte-identity observable for the
-    * numShards=1 regression bar (H).
-    */
   private def runAcceptWithRoot(
     mgr: GlobalSnapshotAcceptanceManager[IO],
     checkpoint: ShardCheckpoint,
@@ -1094,219 +945,46 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
         parentTip = parentTip,
         shardCheckpoints = SortedMap(checkpoint.shardId -> checkpoint)
       )
-      .map(r => (r._9, r._10.mptRoot))
+      .map(result => (result._9, result._10.mptRoot))
 
-  // The never-seen metagraph + the unrelated MG that gives the anchor (and the adopter's base) real, verifiable content.
-  private val mgNew: Address = mkAddress("genesis-seam-new-mg")
-  private val mgOther: Address = mkAddress("genesis-seam-other-mg")
-  private val otherHolder: Address = mkAddress("genesis-seam-other-holder")
-
-  /** The anchor's committed currency state at [[diffBase]]: ONLY `mgOther` — so the anchor verifies cleanly with real content while `mgNew`
-    * is genuinely ABSENT there (MPT non-inclusion under a verified pinned root — itself a pinned fact).
-    */
-  private def otherOnlyState: SortedMap[Address, CurrencySnapshotWithState] =
-    SortedMap(mgOther -> (Right((mkSignedIncremental(1L), infoWithBalance(otherHolder, 50L))): CurrencySnapshotWithState))
-
-  /** Seed the GSAM's own finalized base with `mgOther` only and commit it at [[diffBase]] so the bounded-defer gate sees the pinned base as
-    * reached (`lastPersistedOrdinal = Some(diffBase)`), exactly the production shape when the stuck checkpoint re-offers.
-    */
-  private def seedOtherOnlyBase(
-    store: MptStore[IO, GlobalStateKey]
-  )(implicit h: Hasher[IO]): IO[Unit] =
-    seedBaseAndRoundTrip(store, mgOther, mkSignedIncremental(1L), infoWithBalance(otherHolder, 50L)).void >>
-      store.commit(diffBase)
-
-  // ============================================================================
-  // (E) THE GENESIS SEAM — RED (pre-fix): the never-seen MG is FAIL-CLOSED DROPPED because the clean-verify `None` is conflated
-  //     with the unreadable-anchor `None`. GREEN (post-fix): `AnchorVerified(None)` seeds the producer-mirroring `emptyInfo`, the
-  //     diff applies, PIN-1 recomputed === attested, GAP-1 binds, and the MG ONBOARDS (currency state + SC tip both advance).
-  // ============================================================================
-
-  test("(E) GENESIS-SEAM: never-seen MG, wired pinned reader, VERIFIED anchor with no per-MG state ⇒ adopts over emptyInfo") { res =>
+  test("numShards=1 ignores checkpoint roots and never enters replay adoption") { res =>
     implicit val (h, sp, j) = res
-    Files[IO].tempDirectory.use { dir =>
-      val nextGenesis = infoWithBalance(holder, 200L)
-      for {
-        tipProof <- nextGenesis.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-        inc = mkSignedIncremental(2L, tipProof)
-        // The pinned history every honest node retains: the anchor at `diffBase` verifies (bytes reproduce the committed root)
-        // and carries ONLY mgOther — mgNew's per-MG lookup at the VERIFIED anchor is None (the brand-new-MG first advance).
-        pinnedReader <- mkPinnedReaderOver(dir, otherOnlyState)
-        // The adopter's own base: same unrelated content, committed at diffBase (bounded-defer gate passes).
-        store <- freshStore
-        _ <- seedOtherOnlyBase(store)
-        // PRODUCER SEMANTICS (ShardCheckpointWiring `priorInfoOpt.getOrElse(emptyInfo)`): the diff is cut over the EMPTY prior;
-        // the attested root is over the post-window state. An adopter that seeds the identical empty prior reproduces it exactly.
-        truth <- producerTruth(mgNew, inc, emptyInfoVal, nextGenesis)
-        (wireDiff, attestedRoot) = truth
-        recomputedOverEmpty <- followerRecomputeRoot(mgNew, inc, emptyInfoVal, wireDiff)
-        checkpoint = mkRightArmCheckpoint(mgNew, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
-        ob <- mkOverlayWithBranch(store, mgNew, inc, emptyInfoVal, branchPrior = None)
-        (overlay, baseTip) = ob
-        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-        mgr <- mkManager(
-          overlay,
-          derivingProcessor(inc, emptyInfoVal),
-          StubAcceptanceManager(callsRef),
-          pinnedCurrencyInfoReader = Some(pinnedReader)
-        )
-        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiEmpty)
-        calls <- callsRef.get
-      } yield
-        expect.all(
-          // The checkpoint was verified and the adopt path ran (not deferred on the diff-base axis) ...
-          calls.size == 1,
-          // ... the producer-mirror at the prior level: the EMPTY prior reproduces the committee-attested root exactly
-          // (`AnchorVerified(None) -> emptyInfo` is byte-identical to the producer's `getOrElse(emptyInfo)`) ...
-          recomputedOverEmpty == attestedRoot,
-          // ... and end-to-end the never-seen MG ONBOARDS: its committed currency state advances to the attested `next` ...
-          advancedTo(gsi, mgNew, nextGenesis),
-          // ... AND its SC tip advances (pre-fix the drop was TOTAL: `lastStateChannelSnapshotHashes` stayed {} forever).
-          gsi.lastStateChannelSnapshotHashes.contains(mgNew)
-        )
-    }
-  }
 
-  // ============================================================================
-  // (F) THE SAFETY NET — a genuinely UNREADABLE anchor must STILL fail-closed drop (do not let the genesis-seam fix weaken it).
-  // ============================================================================
-
-  test("(F) SAFETY NET: AnchorUnreadable (retained bytes don't reproduce the pinned root) ⇒ STILL fail-closed DROP, total") { res =>
-    implicit val (h, sp, j) = res
-    Files[IO].tempDirectory.use { dir =>
-      val nextGenesis = infoWithBalance(holder, 200L)
-      for {
-        tipProof <- nextGenesis.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-        inc = mkSignedIncremental(2L, tipProof)
-        // The UNREADABLE anchor: bytes retained, but the pinned snapshot's committed root does NOT match (fork/corruption) —
-        // one of the four hard-reject branches in `withVerifiedAnchorBytes`. This must NEVER be adopted over a guessed prior.
-        pinnedReader <- mkPinnedReaderOver(dir, otherOnlyState, mptRootOverride = Some(Hash("00" * 32)))
-        store <- freshStore
-        _ <- seedOtherOnlyBase(store)
-        truth <- producerTruth(mgNew, inc, emptyInfoVal, nextGenesis)
-        (wireDiff, attestedRoot) = truth
-        checkpoint = mkRightArmCheckpoint(mgNew, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
-        ob <- mkOverlayWithBranch(store, mgNew, inc, emptyInfoVal, branchPrior = None)
-        (overlay, baseTip) = ob
-        callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-        mgr <- mkManager(
-          overlay,
-          derivingProcessor(inc, emptyInfoVal),
-          StubAcceptanceManager(callsRef),
-          pinnedCurrencyInfoReader = Some(pinnedReader)
-        )
-        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiEmpty)
-        calls <- callsRef.get
-      } yield
-        expect.all(
-          calls.size == 1,
-          // FAIL-CLOSED and TOTAL: neither the currency state nor the SC tip advances over an unreadable/forked anchor.
-          !advancedTo(gsi, mgNew, nextGenesis),
-          !gsi.lastCurrencySnapshots.contains(mgNew),
-          !gsi.lastStateChannelSnapshotHashes.contains(mgNew)
-        )
-    }
-  }
-
-  // ============================================================================
-  // (G) WIRED-READER CONTROL — AnchorVerified(Some(info)): the pinned prior is applied VERBATIM (the fix routes it unchanged).
-  // ============================================================================
-
-  test("(G) WIRED-READER CONTROL: anchor VERIFIES and carries the MG's prior ⇒ pinned prior applied verbatim, MG adopts") { res =>
-    implicit val (h, sp, j) = res
-    Files[IO].tempDirectory.use { dir =>
+    def runNode(claimedRoot: Hash): IO[(GlobalSnapshotInfo, Option[Hash], List[ShardCheckpoint])] =
       for {
         tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-        inc = mkSignedIncremental(2L, tipProof)
-        // The anchor carries THIS MG's prior state (the steady-state shape after onboarding).
-        anchorState = SortedMap(mg -> (Right((inc, basePriorRaw)): CurrencySnapshotWithState))
-        pinnedReader <- mkPinnedReaderOver(dir, anchorState)
-        // The diff is cut over EXACTLY what the pinned reader serves at the anchor (the production contract: producer and
-        // adopter read one pinned base).
-        pinnedPrior <- pinnedReader
-          .readAtOrdinal(diffBase, mg)
-          .flatMap(IO.fromOption(_)(new RuntimeException("fixture: pinned prior must be readable")))
+        localInc = mkSignedIncremental(2L, tipProof)
         store <- freshStore
-        basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-        _ <- store.commit(diffBase)
-        truth <- producerTruth(mg, inc, pinnedPrior, nextInfo)
-        (wireDiff, attestedRoot) = truth
-        checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
-        ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
+        basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
+        checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
+        ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
         (overlay, baseTip) = ob
         callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
+        failIfReplayed = IO.raiseError[Unit](new AssertionError("replay adoption ran at numShards=1"))
         mgr <- mkManager(
           overlay,
-          derivingProcessor(inc, basePriorRT),
+          derivingProcessor(localInc, nextInfo, onReplay = failIfReplayed),
           StubAcceptanceManager(callsRef),
-          pinnedCurrencyInfoReader = Some(pinnedReader)
+          numShards = 1
         )
-        gsi <- runAccept(mgr, checkpoint, parentTip = baseTip, lastSnapshotInfo = gsiWith(mg, inc, basePriorRaw))
+        out <- runAcceptWithRoot(mgr, checkpoint, baseTip, gsiWith(mg, localInc, basePriorRaw))
         calls <- callsRef.get
-      } yield
-        expect.all(
-          calls.size == 1,
-          // The pinned Some(info) prior flows verbatim: reconstruct(pinnedPrior, diff) === attested ⇒ ADOPT.
-          advancedTo(gsi, mg, nextInfo),
-          gsi.lastStateChannelSnapshotHashes.contains(mg)
-        )
-    }
+      } yield (out._1, out._2, calls)
+
+    for {
+      a <- runNode(Hash("11" * 32))
+      b <- runNode(Hash("22" * 32))
+      (gsiA, rootA, callsA) = a
+      (gsiB, rootB, callsB) = b
+    } yield
+      expect.all(
+        callsA.isEmpty,
+        callsB.isEmpty,
+        gsiA == gsiB,
+        rootA == rootB,
+        rootA.isDefined,
+        !advancedTo(gsiA, mg, nextInfo)
+      )
   }
 
-  // ============================================================================
-  // (H) numShards=1 BYTE-IDENTITY — the adopt path (and hence the pinned read) is UNREACHABLE at numShards=1, so a wired reader
-  //     changes NOTHING: committed GSI + mptRoot are byte-identical to the reader-less manager, and the reader is never consulted
-  //     (its resolver RAISES — a canary, not a stub).
-  // ============================================================================
-
-  test("(H) numShards=1 BYTE-IDENTITY: wired pinned reader + diff-carrying checkpoint ⇒ adopt path never fires; GSI + mptRoot identical") {
-    res =>
-      implicit val (h, sp, j) = res
-      Files[IO].tempDirectory.use { dir =>
-        def runNode(reader: Option[PinnedCurrencyInfoReader[IO]]): IO[(GlobalSnapshotInfo, Option[Hash])] =
-          for {
-            tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
-            inc = mkSignedIncremental(2L, tipProof)
-            store <- freshStore
-            basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
-            _ <- store.commit(diffBase)
-            truth <- producerTruth(mg, inc, basePriorRT, nextInfo)
-            (wireDiff, attestedRoot) = truth
-            checkpoint = mkRightArmCheckpoint(mg, headBinary, wireDiff, attestedRoot, diffBaseOrdinal = diffBase)
-            ob <- mkOverlayWithBranch(store, mg, inc, basePriorRT, branchPrior = None)
-            (overlay, baseTip) = ob
-            callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-            mgr <- mkManager(
-              overlay,
-              derivingProcessor(inc, basePriorRT),
-              StubAcceptanceManager(callsRef),
-              pinnedCurrencyInfoReader = reader,
-              numShards = 1
-            )
-            out <- runAcceptWithRoot(mgr, checkpoint, baseTip, gsiWith(mg, inc, basePriorRaw))
-            calls <- callsRef.get
-            _ <- IO.raiseError(new RuntimeException("adopt path fired at numShards=1")).whenA(calls.nonEmpty)
-          } yield out
-        for {
-          byteStore <- MptStateStorage.make[IO](dir)
-          // CANARY reader: any pinned read at numShards=1 RAISES (fails the test loudly) instead of silently answering.
-          poison = PinnedCurrencyInfoReader.make[IO](
-            byteStore,
-            _ => IO.raiseError(new RuntimeException("pinned reader consulted at numShards=1"))
-          )
-          withReader <- runNode(Some(poison))
-          withoutReader <- runNode(None)
-          (gsiA, rootA) = withReader
-          (gsiB, rootB) = withoutReader
-        } yield
-          expect.all(
-            // Byte-identity: the wired reader is inert at numShards=1 (committed GSI AND state-proof mptRoot agree).
-            gsiA == gsiB,
-            rootA == rootB,
-            rootA.isDefined,
-            // And the checkpoint was NOT adopted (no sharding at numShards=1): the MG's currency did not advance to `next`.
-            !advancedTo(gsiA, mg, nextInfo)
-          )
-      }
-  }
 }

@@ -15,11 +15,10 @@ import io.constellationnetwork.schema.peer.PeerId
   * (`L0GenesisData.operators[].vrfPublicKey` at genesis; `KesRegistrationCert.vrfVK` for mid-life joiners). One operator-registration event
   * carries both the KES master VK and the VRF VK, so they cannot drift out of sync.
   *
-  * '''What this is FOR (Slice S2, not yet wired).''' A later slice swaps the full-set committee-membership predicate
-  * (`ShardCheckpointWiring.committeeFor`) for a real per-signer `CommitteeSortition.verifyShardMembership(vrfVk, eta, shardId, epoch, σ,
-  * kTarget, proof)`. That verification needs the signer's VRF VK, which is exactly what this registry provides. As of Slice S1 the registry
-  * is built + threaded as an AVAILABLE dependency but is NOT consumed — `committeeFor` still returns the full active validator set, so
-  * behavior is unchanged at any `numShards`.
+  * '''Consensus uses.''' The metagraph-binary admission gate requires an attester's wire key to byte-match this registry and verifies the
+  * secret-sortition proof under the registered key. Execution-shard membership separately hashes each registered VK into the public,
+  * deterministic committee draw, and checkpoint verification uses the same registration to validate key-possession proofs. Missing keys
+  * fail those committee checks closed; sender-provided replacement keys are never authoritative.
   *
   * '''Read-only.''' This trait does not expose mutators — the v1 registry is loaded once from `L0GenesisData.operators` at startup and
   * frozen for the lifetime of the node. Runtime joiners (via `KesRegistrationCert.vrfVK`) are a follow-up; when wired they will overlay

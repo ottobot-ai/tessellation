@@ -23,7 +23,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
-import io.constellationnetwork.security.mpt.verifier.MerklePatriciaRangeVerifier
+import io.constellationnetwork.security.mpt.verifier.{InvalidWitness, MerklePatriciaRangeVerifier}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.ImmutableCodec
@@ -222,7 +222,7 @@ object GlobalFollowProofServiceSuite extends MutableIOSuite {
       }
   }
 
-  test("omitted leaf (completeness): dropping an inclusion proof but keeping its value → ValueBindingFailed") { res =>
+  test("omitted leaf (completeness): dropping an inclusion proof is rejected by the range proof") { res =>
     implicit val (h, _, js) = res
     for {
       setup <- mkSetup
@@ -232,21 +232,9 @@ object GlobalFollowProofServiceSuite extends MutableIOSuite {
       proofE <- svc.proveConsumedFields(parentP, ordinal)
       proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
 
-      // Drop one inclusion proof from the Balances range proof but KEEP its value in `values`. This is the
-      // omission the design's binding step is the backstop for: the retained value now references a key
-      // with no committed leaf, so value-binding fails (no `dataDigest` to bind against) →
-      // `ValueBindingFailed`.
-      //
-      // DOCUMENTED FINDING (see report): the range verifier (`confirmRange`) does NOT detect an omitted
-      // leaf that is dropped TOGETHER WITH its value when that leaf is interior or at the open end of a
-      // full-field range — it only checks left-boundary↔first and last↔right-boundary gaps, not gaps
-      // between consecutive inclusion proofs. The cryptographic completeness this design relies on is
-      // therefore: (a) exclusion boundaries pin the field's extent (no key can exist below the first or
-      // above the last reported leaf), and (b) mandatory value-binding means no value can be presented
-      // without a committed leaf. A prover that drops BOTH a value and its leaf hides that key; the
-      // follower then provably reads `Balance.empty` for it — acceptable only because gl1 never needs a
-      // value the prover chose not to send. If S3 needs "every committed leaf is reported", tighten the
-      // verifier with a between-consecutive no-gap proof; flagged as out of S1 scope.
+      // Drop one inclusion proof from the Balances range proof but keep its value. The completeness walk
+      // authenticates every in-range subtree before value binding, so the missing commitment is rejected
+      // as an incomplete range proof rather than reaching the later ValueBindingFailed guard.
       balancesRange = proof.fields(GlobalStateFieldId.Balances)
       droppedPath = balancesRange.inclusionProofs.head.path
       truncatedRange = balancesRange.copy(inclusionProofs = balancesRange.inclusionProofs.filterNot(_.path == droppedPath))
@@ -255,9 +243,9 @@ object GlobalFollowProofServiceSuite extends MutableIOSuite {
       verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](omittedProof.committedRoot, omittedProof)
     } yield
       verifiedE match {
-        case Left(FollowVerificationError.ValueBindingFailed(GlobalStateFieldId.Balances, k)) =>
-          expect(k == droppedPath)
-        case other => failure(s"expected Left(ValueBindingFailed(Balances, $droppedPath)), got $other")
+        case Left(FollowVerificationError.RangeProofInvalid(GlobalStateFieldId.Balances, InvalidWitness(message))) =>
+          expect(message.contains("Incomplete range proof"))
+        case other => failure(s"expected Left(RangeProofInvalid(Balances, Incomplete range proof)), got $other")
       }
   }
 

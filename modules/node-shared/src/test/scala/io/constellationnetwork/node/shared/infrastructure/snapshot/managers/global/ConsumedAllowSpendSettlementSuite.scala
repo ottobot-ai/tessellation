@@ -14,7 +14,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator
 import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.NotEnoughCurrencyIdBalance
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.artifact.{SpendAction, SpendTransaction}
+import io.constellationnetwork.schema.artifact.{GlobalSnapshotsProcessed, SpendAction, SpendTransaction}
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt._
@@ -25,7 +25,6 @@ import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProdu
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 
-import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
@@ -67,6 +66,7 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
   private def feeOf(v: Long): AllowSpendFee = AllowSpendFee(NonNegLong.unsafeFrom(v))
   private def epoch(v: Long): EpochProgress = EpochProgress(NonNegLong.unsafeFrom(v))
   private def bal(v: Long): Balance = Balance(NonNegLong.unsafeFrom(v))
+  private def pending(owner: Address): Map[Address, SortedSet[SnapshotOrdinal]] = Map(owner -> SortedSet(ord1))
 
   /** A `ConsumedAllowSpendStateManager` backed by a fresh in-memory MPT store (empty spent-set unless seeded). */
   private def mkManager(
@@ -158,11 +158,11 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
       bigB = 1000L
       d0 = 10L
       attestedPre = SortedMap(source -> bal(bigB - x), dest -> bal(d0)): SortedMap[Address, Balance]
-      effPre = mgr.effectiveCurrencyBalances(attestedPre, m.some, spentSet, Map(m -> epoch(150L)), epoch(150L))
+      effPre = mgr.effectiveCurrencyBalances(attestedPre, m.some, spentSet, pending(m), Map(m -> epoch(150L)), epoch(150L))
 
       // AFTER expiry M REFUNDS source +X ⇒ attested source = B (phantom). The overlay must re-debit.
       attestedPost = SortedMap(source -> bal(bigB), dest -> bal(d0)): SortedMap[Address, Balance]
-      effPost = mgr.effectiveCurrencyBalances(attestedPost, m.some, spentSet, Map(m -> epoch(250L)), epoch(250L))
+      effPost = mgr.effectiveCurrencyBalances(attestedPost, m.some, spentSet, pending(m), Map(m -> epoch(250L)), epoch(250L))
     } yield
       expect.all(
         // BEFORE expiry: source still −X (attested already debited; no correction), dest credited +X.
@@ -171,6 +171,117 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
         // AFTER expiry: source STILL B−X (NOT the phantom B), dest still credited once.
         effPost.getOrElse(source, Balance.empty).value.value == bigB - x,
         effPost.getOrElse(dest, Balance.empty).value.value == d0 + x
+      )
+  }
+
+  test("owner acknowledgement retires only the balance overlay; post-owner raw state is not credited twice") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mKp <- KeyPairGenerator.makeKeyPair[IO]
+      m = mKp.getPublic.toAddress
+      sourceKp <- KeyPairGenerator.makeKeyPair[IO]
+      destKp <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKp.getPublic.toAddress
+      dest = destKp.getPublic.toAddress
+      mgr <- mkManager()
+
+      x = 100L
+      asHash = Hash("ad".padTo(64, '0').take(64))
+      spentSet = SortedMap(asHash -> marker(asHash, source, dest, m, x, 200L))
+
+      // Before the owner processes GL0 ordinal 1, raw state still lacks the destination credit. The pending ordinal keeps the overlay live.
+      preOwnerRaw = SortedMap(source -> bal(900L), dest -> bal(10L)): SortedMap[Address, Balance]
+      preOwnerEffective =
+        mgr.effectiveCurrencyBalances(preOwnerRaw, m.some, spentSet, pending(m), Map(m -> epoch(150L)), epoch(150L))
+
+      // The owner snapshot re-executes ordinal 1 and carries the canonical acknowledgement. Its raw state now includes the credit, while
+      // the permanent spent marker remains for replay protection. Absence from the owner's lossless pending set retires only the overlay.
+      postOwnerRaw = SortedMap(source -> bal(900L), dest -> bal(110L)): SortedMap[Address, Balance]
+      postOwnerEffective = mgr.effectiveCurrencyBalances(
+        postOwnerRaw,
+        m.some,
+        spentSet,
+        Map(m -> SortedSet.empty[SnapshotOrdinal]),
+        Map(m -> epoch(150L)),
+        epoch(150L)
+      )
+    } yield
+      expect.all(
+        preOwnerEffective.getOrElse(dest, Balance.empty).value.value == 110L,
+        postOwnerEffective.getOrElse(dest, Balance.empty).value.value == 110L,
+        postOwnerEffective == postOwnerRaw,
+        spentSet.contains(asHash)
+      )
+  }
+
+  test("pending acknowledgement removes only the exact GL0 ordinals carried by GlobalSnapshotsProcessed") { _ =>
+    val ord2 = SnapshotOrdinal(NonNegLong(2L))
+    val ord3 = SnapshotOrdinal(NonNegLong(3L))
+    val current = SortedSet(ord1, ord2)
+
+    val unrelated = MetagraphSyncManager.pendingAfterAcknowledgements(current, List(GlobalSnapshotsProcessed(SortedSet(ord3))))
+    val acknowledged = MetagraphSyncManager.pendingAfterAcknowledgements(current, List(GlobalSnapshotsProcessed(SortedSet(ord1))))
+
+    expect
+      .all(
+        unrelated == current,
+        acknowledged == SortedSet(ord2)
+      )
+      .pure[IO]
+  }
+
+  test("pending acknowledgement queue does not discard unacknowledged ordinals at the former configured cap") { _ =>
+    val existing = SortedSet.from((1L to 100L).map(v => SnapshotOrdinal(NonNegLong.unsafeFrom(v))))
+    val next = SnapshotOrdinal(NonNegLong(101L))
+    val appended = MetagraphSyncManager.appendPendingOrdinal(existing, next)
+
+    expect
+      .all(
+        appended.size == 101,
+        existing.subsetOf(appended),
+        appended.contains(next)
+      )
+      .pure[IO]
+  }
+
+  test("full owner acknowledgement queue backpressures only new ordinals and never evicts pending evidence") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      producerKp <- KeyPairGenerator.makeKeyPair[IO]
+      ownerKp <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKp <- KeyPairGenerator.makeKeyPair[IO]
+      producer = producerKp.getPublic.toAddress
+      owner = ownerKp.getPublic.toAddress
+      destination = destinationKp.getPublic.toAddress
+      full = SortedSet.from((1L to 100L).map(v => SnapshotOrdinal(NonNegLong.unsafeFrom(v))))
+      next = SnapshotOrdinal(NonNegLong(101L))
+      transaction = SpendTransaction(none[Hash], CurrencyId(owner).some, swap(1L), owner, destination)
+      accepted = SortedMap(producer -> List(SpendAction(NonEmptyList.of(transaction))))
+      rejectedAtCapacity = GlobalSnapshotAcceptanceManager.pruneSpendActionsAtPendingCapacity(
+        accepted,
+        Map(owner -> full),
+        next,
+        maxPendingPerMetagraph = 100
+      )
+      sameOrdinalRetained = GlobalSnapshotAcceptanceManager.pruneSpendActionsAtPendingCapacity(
+        accepted,
+        Map(owner -> full),
+        SnapshotOrdinal(NonNegLong(100L)),
+        maxPendingPerMetagraph = 100
+      )
+      afterAcknowledgementRetained = GlobalSnapshotAcceptanceManager.pruneSpendActionsAtPendingCapacity(
+        accepted,
+        Map(owner -> full.tail),
+        next,
+        maxPendingPerMetagraph = 100
+      )
+    } yield
+      expect.all(
+        rejectedAtCapacity.isEmpty,
+        sameOrdinalRetained == accepted,
+        afterAcknowledgementRetained == accepted,
+        full.size == 100,
+        full.contains(SnapshotOrdinal(NonNegLong(1L)))
       )
   }
 
@@ -199,7 +310,7 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
       // M's ATTESTED currency balance AFTER refund = B (phantom: the X came back). Real spendable = B − X.
       bigB = 100L // exactly X, so the phantom refund is the ONLY thing that could fund the self-spend
       attested = SortedMap(m -> bal(bigB)): SortedMap[Address, Balance]
-      effective = mgr.effectiveCurrencyBalances(attested, m.some, spentSet, Map(m -> epoch(250L)), epoch(250L))
+      effective = mgr.effectiveCurrencyBalances(attested, m.some, spentSet, pending(m), Map(m -> epoch(250L)), epoch(250L))
 
       // A no-allowSpendRef self-spend by M of X against currency M.
       selfSpend = SpendTransaction(none[Hash], CurrencyId(m).some, swap(x), m, dest)
@@ -241,8 +352,8 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
       emptySpentSet = SortedMap.empty[Hash, ConsumedAllowSpend]
       attestedN = SortedMap(m -> bal(1000L)): SortedMap[Address, Balance]
       attestedNk = SortedMap(m -> bal(950L)): SortedMap[Address, Balance]
-      effN = mgr.effectiveCurrencyBalances(attestedN, m.some, emptySpentSet, Map.empty, epoch(100L))
-      effNk = mgr.effectiveCurrencyBalances(attestedNk, m.some, emptySpentSet, Map.empty, epoch(250L))
+      effN = mgr.effectiveCurrencyBalances(attestedN, m.some, emptySpentSet, Map.empty, Map.empty, epoch(100L))
+      effNk = mgr.effectiveCurrencyBalances(attestedNk, m.some, emptySpentSet, Map.empty, Map.empty, epoch(250L))
 
       selfSpend = SpendTransaction(none[Hash], CurrencyId(m).some, swap(x), m, dest)
       action = SpendAction(NonEmptyList.of(selfSpend))
@@ -280,7 +391,7 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
       asHash = Hash("cc".padTo(64, '0').take(64))
       spentSet = SortedMap(asHash -> marker(asHash, source, dest, m, x, 200L))
       attested = SortedMap(source -> bal(30L)): SortedMap[Address, Balance]
-      effective = mgr.effectiveCurrencyBalances(attested, m.some, spentSet, Map(m -> epoch(250L)), epoch(250L))
+      effective = mgr.effectiveCurrencyBalances(attested, m.some, spentSet, pending(m), Map(m -> epoch(250L)), epoch(250L))
     } yield
       expect.all(
         // Saturating subtraction: 30 + 0(credit to source) − 100(debit) clamps to 0, no exception thrown.
@@ -294,7 +405,7 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
   // Test 5 — W3d DOUBLE-CONSUME (two cross-shard spends, one AS, same ordinal)
   // ───────────────────────────────────────────────────────────────────────────
 
-  test("W3d DOUBLE-CONSUME: two cross-shard spends consume the same AS ⇒ first settles, second rejected") { res =>
+  test("W3d DOUBLE-CONSUME: two cross-shard spends consume the same AS ⇒ both rejected") { res =>
     implicit val (h, sp, js) = res
     for {
       mKp <- KeyPairGenerator.makeKeyPair[IO]
@@ -335,12 +446,13 @@ object ConsumedAllowSpendSettlementSuite extends MutableIOSuite {
       mgr <- mkManager()
       candidates <- mgr.classifyCrossShardConsumes(acceptedSpendActions, assignment)
       settlement <- mgr.settleCrossShardConsumes(candidates, SortedMap.empty, lastActiveAllowSpends, ord1)
+      pruned = GlobalSnapshotAcceptanceManager.pruneRejectedSpendActions(acceptedSpendActions, settlement.rejected.toSet)
     } yield
       expect.all(
         candidates.size == 2,
-        settlement.newMarkers.size == 1,
-        settlement.newMarkers.contains(asHash),
-        settlement.rejected.contains(asHash)
+        settlement.newMarkers.isEmpty,
+        settlement.rejected.contains(asHash),
+        pruned.isEmpty
       )
   }
 

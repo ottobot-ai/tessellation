@@ -27,8 +27,7 @@ import shapeless.{::, HNil}
 
 /** Canonical scodec codecs for a batch of simple currency-path atoms.
   *
-  * Covers: `MessageType`, `SessionToken`, `RoundId`, `SnapshotVersion`, `CurrencyMessage`, `FeeTransaction`, `SpendTransaction`,
-  * `BalanceAdjustmentReason`.
+  * Covers: `MessageType`, `SessionToken`, `RoundId`, `SnapshotVersion`, `CurrencyMessage`, `FeeTransaction`, and `SpendTransaction`.
   *
   * All are leaf atoms with no further-unbuilt dependencies.
   */
@@ -47,21 +46,6 @@ object CurrencyAtomCodecs {
 
   implicit val messageTypeImmutableCodec: ImmutableCodec[MessageType] =
     ImmutableCodec.fromScodecCodec(messageTypeCodec)
-
-  // ---- BalanceAdjustmentReason ADT ---------------------------------------
-  //   0x00: SpendTransactionNotApplied
-  //   0x01: SpendTransactionSourceNotApplied
-  //   0x02: SpendTransactionDestinationNotApplied
-
-  implicit val balanceAdjustmentReasonCodec: Codec[BalanceAdjustmentReason] =
-    discriminated[BalanceAdjustmentReason]
-      .by(uint8)
-      .typecase(0, provide(SpendTransactionNotApplied))
-      .typecase(1, provide(SpendTransactionSourceNotApplied))
-      .typecase(2, provide(SpendTransactionDestinationNotApplied))
-
-  implicit val balanceAdjustmentReasonImmutableCodec: ImmutableCodec[BalanceAdjustmentReason] =
-    ImmutableCodec.fromScodecCodec(balanceAdjustmentReasonCodec)
 
   // ---- Generation (PosLong) via shape typeclass -------------------------
   private val generationCodec: Codec[Generation] = Codec[Generation]

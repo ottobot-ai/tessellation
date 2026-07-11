@@ -146,23 +146,22 @@ object SlashCooldownReaderSuite extends MutableIOSuite {
       )
   }
 
-  test("fromMptStore: anchorSettled=false while the base has not reached the epoch's anchor (early/adversarial future-epoch draw)") {
-    res =>
-      implicit val (h, sp, js) = res
-      for {
-        store <- mkStore
-        _ <- insertEntry(store, entry(peer(1), eventOrd = 10L, cooldownUntil = 5000L))
-        _ <- store.commit(SnapshotOrdinal(NonNegLong.unsafeFrom(50L))) // base 50 < anchor(5)=399
-        view <- SlashCooldownReader.fromMptStore[IO](store, R).excludedForEpoch(EtaPeriod(5L))
-        // bootstrap epochs: anchor < 0 ⇒ final without any base requirement
-        bootstrap <- SlashCooldownReader.fromMptStore[IO](store, R).excludedForEpoch(EtaPeriod(1L))
-      } yield
-        expect.all(
-          view.candidates == List((peer(1), 10L)), // visible so far — but NOT final
-          !view.anchorSettled,
-          bootstrap.candidates.isEmpty,
-          bootstrap.anchorSettled
-        )
+  test("fromMptStore: anchorSettled=false while the base has not reached the epoch's anchor (early/adversarial future-epoch draw)") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      store <- mkStore
+      _ <- insertEntry(store, entry(peer(1), eventOrd = 10L, cooldownUntil = 5000L))
+      _ <- store.commit(SnapshotOrdinal(NonNegLong.unsafeFrom(50L))) // base 50 < anchor(5)=399
+      view <- SlashCooldownReader.fromMptStore[IO](store, R).excludedForEpoch(EtaPeriod(5L))
+      // bootstrap epochs: anchor < 0 ⇒ final without any base requirement
+      bootstrap <- SlashCooldownReader.fromMptStore[IO](store, R).excludedForEpoch(EtaPeriod(1L))
+    } yield
+      expect.all(
+        view.candidates == List((peer(1), 10L)), // visible so far — but NOT final
+        !view.anchorSettled,
+        bootstrap.candidates.isEmpty,
+        bootstrap.anchorSettled
+      )
   }
 
   // ── WRITE→READ consistency: the applySlash-written entry under the Nakamoto epoch≡ordinal advance ────────────────

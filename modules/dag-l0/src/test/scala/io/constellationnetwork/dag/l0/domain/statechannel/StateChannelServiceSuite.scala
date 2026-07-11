@@ -90,6 +90,7 @@ object StateChannelServiceSuite extends MutableIOSuite {
         implicit hasher: Hasher[IO]
       ) =
         validate(output, globalOrdinal, snapshotFeesInfo)
+
     }
 
     for {

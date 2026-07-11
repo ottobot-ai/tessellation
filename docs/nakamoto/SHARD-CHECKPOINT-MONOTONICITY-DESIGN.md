@@ -19,8 +19,8 @@ and anything at `numShards = 1` (the regression bar — this whole path is inert
 
 Cross-references (read in conjunction):
 
-- [`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`](./HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md) — the v1 architecture (committee sig-threshold trust, the checkpoint envelope).
-- [`EXECUTION-SHARDING-COMMITTEE-VERIFY-DESIGN.md`](./EXECUTION-SHARDING-COMMITTEE-VERIFY-DESIGN.md) — the inversion (raw-intake production) + the #261 determinism contract.
+- [`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`](./HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md) — the current checkpoint schema, operator duties, and universal GL0 replay contract.
+- [`../adr/0017-committee-reexecution-is-the-primary-economic-validity-gate.md`](../adr/0017-committee-reexecution-is-the-primary-economic-validity-gate.md) — committee quorum never authorizes framework-economic state.
 - [`SHARD-CHECKPOINT-FLOW-WALKTHROUGH.md`](./SHARD-CHECKPOINT-FLOW-WALKTHROUGH.md) — the produce → gossip → attest → adopt → embed pipeline.
 - [`attestation-and-finality.md`](./attestation-and-finality.md) — `kQuorum` / `tCountShard` / the Phase-0/1/2 finality model.
 - Memory: `[[per-slot-rewire-runs12-13]]` (runs 12–19, the staircase + anchor-compat + demux + boot-grace + #44 chain; the run-19 forensics that produced this doc), `[[taktikos]]` (LDD / `maxvalid-tk` are clock-denominated), `[[feedback-greenfield-no-wire-compat]]`, `[[feedback-prefer-hocon-over-sysenv]]`.

@@ -1,12 +1,19 @@
 # Attestation flow and finality in Tessellation-Nakamoto GL0
 
-**Status:** living document. Last updated 2026-05-15 — finality-trigger stack
-landed: `FinalityTrigger[F]` typeclass refactor, `T_count` (1-validator-1-vote)
-and `T_depth2` (archival) triggers wired, attestation skew-rejection,
-chain-quality observable + HTTP route, and `MptOverlay.pruneBelow` Phase-3
-sink. Builds on the 4-phase formalization, GKL property mapping, eta-rotation
-R ≥ 3k₁ bound, chain-selection-scope-per-phase from 2026-05-14. Supersedes
-the prior single-tier finality framing.
+> **HISTORICAL AND UNSAFE - NOT A CURRENT PROTOCOL CLAIM.** The 2026-07-11
+> source audit disproved this document's max-of/Avalanche/common-prefix model.
+> The full K/alpha sampling cascade is absent; `T_count` is diagnostic; the
+> state-changing optimistic rail is the legacy latest-vote weight path; its
+> locally observed active stake is renormalized; and the depth rail can finalize
+> both sides of a long partition. Finality is also not durably restored after
+> restart. Do not use any probability, "first wins", phase, or common-prefix
+> statement below as a guarantee. See
+> [`../review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`](../review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md),
+> findings FIN-01 through FIN-12. The text below is preserved only as design
+> history until it is replaced by a proved certificate protocol.
+
+**Status:** historical design record; implementation and safety claims rejected
+by source audit on 2026-07-11.
 
 This document formalizes the chain-growth model for Tessellation-Nakamoto and
 describes how the operational components (attestation, chain selection,

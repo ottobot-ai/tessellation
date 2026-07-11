@@ -3,7 +3,7 @@
 **Status:** DRAFT — owner review required before any surgery (hard-fork-scale for metagraphs).
 **Date:** 2026-06-11.
 **Supersedes:** the 2026-05-20 "metagraphs stay BFT" direction, with owner approval pending.
-**Companion evidence:** `PRODUCTION-READINESS-AUDIT.md`, the 2026-06-11 e2e campaign post-mortems (runs `bimn7o09f`, `bmnnfnao7`), and the upstream comparison (mainnet BFT 1,859 LOC / testnet 12,666 / this branch 6,245 in the consensus engine).
+**Companion evidence:** the 2026-06-11 e2e campaign post-mortems (runs `bimn7o09f`, `bmnnfnao7`) and the upstream comparison (mainnet BFT 1,859 LOC / testnet 12,666 / this branch 6,245 in the consensus engine).
 
 ---
 
@@ -141,7 +141,7 @@ Solo extension remains the N=1 normal case and the N>1 degraded case (all higher
 
 - **Join:** operator follows the chain (download — exists), submits `RegisterValidator` (collateral pattern), is in the registry at epoch E+1, starts winning slots. No candidacy gossip, no observation keys, no admission certificates. The 2026-06-11 `OutcomeAdmission` work is the conceptual ancestor: "membership changes only through finalized outcomes" — here the finalized outcome IS the chain.
 - **Leave:** `ExitValidator` tx, or
-- **Demotion:** the epoch-participating-set accumulator (designed, fieldId 24) records non-participation *on chain*; exclusion at the epoch boundary is computed identically by everyone. This finally gives that design its consequence sink at ml0.
+- **Demotion:** remains a design item. It requires a new, explicitly specified consensus-carried participation record and deterministic epoch-boundary exclusion rule. No field-24 accumulator or production demotion sink exists today.
 - **Equivocation:** two signed artifacts for the same slot = slashing evidence carried in a tx (slashing safety bar memory: cryptographically verifiable evidence, byte-equivalent outcomes).
 
 ### 5.4 What gets deleted (ml0/BFT engine path)
@@ -169,19 +169,15 @@ Solo extension remains the N=1 normal case and the N>1 degraded case (all higher
 8. **Genesis edge.** Window 0 anchors on the genesis timestamp; initial registry ships in metagraph genesis (balance-CSV pattern).
 9. **Observability is part of the engine.** Ship with: expected-producer gauge, rank-window countdown, countersign coverage, anchor lag, per-interval production source (rank). Every 2026-06 failure hid in unlogged state; the engine must not be able to fail silently.
 
-### 5.7 Shard-checkpoint leadership runs per SLOT, not per global snapshot (owner-corrected 2026-06-11; run-10 "Gap A")
+### 5.7 Current shard-checkpoint duty runs on the shared slot grid
 
-**The clock taxonomy (owner, 2026-06-11).** One wall-clock slot grid (genesis-anchored — `SnapshotLeaderLoop`'s
-existing grid) drives ALL production lotteries. **The slot is a parametrized unit of time, NOT a fixed constant** —
-`slotDuration` (today `NAKAMOTO_SLOT_DURATION_MS`, default 1000 ms; 500 ms for fast-cadence testing; migrate to HOCON
-`nakamoto.slot-duration` per standing rule). 1 s is a *choice*; nothing below may assume it. Every slot is a chance to make a shard checkpoint or a global
-snapshot — independent draws on the same grid. The ONLY snapshot-keyed evaluation in the protocol is the **NIPoPoW
-tower election** (level-µ, evaluated once per snapshot). Everything else — gl0 snapshot eligibility, shard-checkpoint
-eligibility — is slot-keyed.
+One genesis-anchored wall-clock slot grid drives production. GL0 snapshot production uses the Taktikos/LDD lottery. Execution-shard
+checkpoint production does not: a public deterministic committee draw plus `ShardSlotLeader.dutyOrder` assigns one member to each
+staircase window. `slotDuration` is configuration, not a consensus constant.
 
-**The defect this corrects.** The current implementation maps the shard-local "slot" to the **gl0 anchor ordinal**
+**Historical defect corrected by the current implementation.** The earlier implementation mapped the shard-local "slot" to the **gl0 anchor ordinal**
 (`GlobalSnapshotConsensus.scala`: "the gl0 anchor ordinal IS the shard-local slot index"), and the producer is
-triggered once per anchor. That was a determinism shortcut from the sharding slices (anchor is on-wire ⇒ `verifyLeader`
+triggered once per anchor. That was a determinism shortcut from the sharding slices
 needs no wall-clock trust), NOT a discussed design decision — and it inverted the intended cadence: the shard lottery
 gets one draw per global snapshot (~6.5 slot-durations observed mean inter-snapshot time) while gl0 draws every slot,
 so shards tick ~6.5× SLOWER than the layer they feed. Run-10's "Gap A" (51 anchor-draws ≈ 3.3 min without a shard
@@ -201,27 +197,20 @@ verifiable. Shard chain growth stays structurally ≤ gl0 growth (the 1-checkpoi
 pipeline gate are the throughput governors); the staircase's job is mint LATENCY — rank-0 produces within ~1 slot of
 the lane opening. Client-facing finality speed lives in the ml0 countersign rail (5.2), not in shard cadence.
 
-**Mechanics of the correction:**
-  - The `ShardCheckpoint` envelope carries its production **`slot`** explicitly (greenfield schema change; today the
-    slot is derived from `gl0AnchorOrdinal`). `verifyLeader` verifies the VRF against the wire-carried slot under the
-    same validity bounds gl0 snapshots use: slot strictly monotone vs parent, `≤ now + ε` (skew bound). Determinism
-    is preserved — verification reads only on-wire data plus the shared slot grid.
+**Current mechanics:**
+  - The `ShardCheckpoint` envelope carries its production **`slot`** explicitly. Validation checks monotonicity, skew, deterministic
+    staircase duty, and a registered-key possession proof over `(shardEta, slot)`.
   - `gl0AnchorOrdinal` REMAINS on the envelope as chain-link data (epoch/eta resolution, adoption anchoring) — it is
     no longer the lottery clock.
-  - The producer trigger moves from the anchor-update path (`ShardCheckpointFanOut` per gl0 ord) onto the slot
-    tick. `slotGap` = slots since the parent checkpoint's wire slot; under rev 2 it indexes the staircase window
+  - The producer runs from the slot tick. `slotGap` = slots since the parent checkpoint's wire slot and indexes the staircase window
     (`(slotGap − 1) / δ mod K`), not an LDD threshold.
-  - Every gl0 node has the slot clock — moving the shard lottery onto it costs nothing (owner: "all the gl0 will
-    have the clock available"). Production remains throughput-governed by the existing pipeline gate
-    (`awaiting-embed`, depth 2) and the 1-checkpoint/shard/gl0-ord embed rule — per-slot eligibility means a winner
-    is FOUND within a few slots whenever the pipeline has room; it does not flood gl0. Shard cadence is naturally ≥ global cadence, restoring the intended
+  - Every GL0 node has the slot clock. Production remains throughput-governed by the existing pipeline gate
+    (`awaiting-embed`, depth 2) and the one-checkpoint-per-shard-per-GL0-ordinal embed rule. Shard cadence is naturally at least global cadence, restoring the intended
     frequency ordering (shards fast, global aggregates).
 
-**Safety**: unchanged from today — the lottery still keys on `shardEta` (frozen at the prior period's 2/3-mark; no
-grinding), and the safety bars (kQuorum committee signatures, deterministic `verifyEmbedded`, ancestor-first embed,
-TRIM-ANCHOR adoption guard) are untouched. The new wire `slot` adds the same skew-bound trust gl0 snapshots already
-carry. Same-ord siblings from near-simultaneous wins resolve via maxvalid-tk + canonical-chain attestation (the
-attestation-split mode is closed).
+**Safety:** committee membership and duty restrict who may propose, but neither signatures nor depth authorize economic state. Every GL0
+adopter must recreate each included CL1 transition at the signed finalized execution base before storing, attesting, selecting, or embedding
+the checkpoint. Watchtower slashing is defense in depth.
 
 ### 5.8 High-traffic metagraphs — spreading levers (owner-reviewed 2026-06-12)
 

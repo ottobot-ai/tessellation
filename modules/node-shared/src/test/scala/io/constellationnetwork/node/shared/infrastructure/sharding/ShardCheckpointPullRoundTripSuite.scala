@@ -68,7 +68,6 @@ object ShardCheckpointPullRoundTripSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(7), mkCommitteeSig(9)),
       epoch = EtaPeriod(0L)
     )

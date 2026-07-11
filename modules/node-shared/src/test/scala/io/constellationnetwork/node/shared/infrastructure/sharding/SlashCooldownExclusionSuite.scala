@@ -13,12 +13,9 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.{SlashReason, SlashedRegistryEntry}
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashedReader, SlashCooldownReader}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, VrfRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, ShardAssignment, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
-  ShardCheckpointAcceptResult,
-  ShardCheckpointGl0AcceptanceManager
-}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalTimeLimit}
@@ -31,7 +28,6 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
-import io.constellationnetwork.security.signature.Signing
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
@@ -40,29 +36,28 @@ import weaver.MutableIOSuite
   *
   * RED at HEAD `72f39d652` (captured before the fix): an operator with an unexpired `SlashedRegistryEntry` cooldown in the `Slashings`
   * (fieldId 34) partition was (1) still drawn into `committeeFor(shardId, epoch)` with unchanged probability — the draw never read the
-  * partition — and (2) its checkpoint signature still counted toward the `kQuorum` admit count in `verifyEmbedded`. GREEN with the
+  * partition — and (2) its checkpoint attestation could enter local tracking. GREEN with the
   * [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader]] gate wired through
   * [[ShardCheckpointWiring.committeeFor]]:
   *
   *   1. the slashed operator is ABSENT from the committee draw for every epoch whose anchor its record precedes (until cooldown expiry);
-  *   1. its signature can no longer count toward `kQuorum` — the committee-membership pre-check rejects it (quorum non-counting is
-  *      enforced at the SAME single gate as the draw);
-  *   1. exclusion ≡ shrinking the active set: the post-exclusion draw is BYTE-IDENTICAL to a draw whose `activeValidators` never
-  *      contained the slashed peer (σ recomputed over the post-exclusion pool);
+  *   1. its signature fails the committee-membership pre-check before it can enter the attestation tracker;
+  *   1. exclusion ≡ shrinking the active set: the post-exclusion draw is BYTE-IDENTICAL to a draw whose `activeValidators` never contained
+  *      the slashed peer (σ recomputed over the post-exclusion pool);
   *   1. cluster-uniformity: two independent nodes over the same pinned records — different insertion order, different base ordinals,
-  *      different unrelated state — compute the identical excluded set, committee, and quorum verdicts;
+  *      different unrelated state — compute the identical excluded set, committee, and attestation-admission verdicts;
   *   1. epoch staggering + expiry: a record younger than the epoch's anchor does not bite yet (it bites the NEXT epoch); an expired
   *      cooldown restores eligibility;
   *   1. the Polkadot `UpToLimit` floor: exclusion never drops the eligible pool below `kQuorum`;
   *   1. cache discipline: an anchor-unsettled (future-epoch) draw is NOT memoized by `acceptanceDeps`' committee cache;
-  *   1. no-op equivalence: an EMPTY `Slashings` partition draws byte-identically to the pre-fix code (`noExclusion`) — the
-  *      `numShards = 1` regression bar (where nothing is constructed at all) plus the numShards>1 empty-partition bar;
+  *   1. no-op equivalence: an EMPTY `Slashings` partition draws byte-identically to the pre-fix code (`noExclusion`) — the `numShards = 1`
+  *      regression bar (where nothing is constructed at all) plus the numShards>1 empty-partition bar;
   *   1. (EPIC-3.4) REORG DURABILITY: the exclusion survives a `syncFromGlobalSnapshotInfo` base rebuild — the S01/S02 preservation
   *      (`fc90f687e` / `fe6d837b1`) keeps the fieldId-34 bytes, and the SAME committee is drawn after the rebuild.
   */
 object SlashCooldownExclusionSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], RegisteredCheckpointSigner)
 
   implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
@@ -75,7 +70,8 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
       sp <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
-    } yield (h, sp, j)
+      checkpointSigner <- RegisteredCheckpointSigner.make.asResource
+    } yield (h, sp, j, checkpointSigner)
 
   // ── Common fixtures ───────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -137,7 +133,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
   // ═══ 1+3. THE EXCLUSION (RED→GREEN core) + σ-recompute ══════════════════════════════════════════════════════════
 
   test("GREEN (was RED): an operator with an unexpired cooldown is ABSENT from the committee draw") { res =>
-    implicit val (h, sp, js) = res
+    implicit val (h, sp, js, _) = res
     for {
       (_, reader) <- storeReader(List(entry(slashedPeer, eventOrd = 350L, cooldownUntil = 10000L)), baseOrdinal = 450L)
       committee <- committeeWith(reader)
@@ -152,7 +148,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
 
   test("σ recompute: exclusion ≡ shrinking the active set — post-exclusion draw byte-identical to a draw over validators-minus-slashed") {
     res =>
-      implicit val (h, sp, js) = res
+      implicit val (h, sp, js, _) = res
       // Threshold-sensitive regime (mirrors the #261 suite): 20 validators, kDraw=6 ⇒ threshold 6/20=0.30 vs 6/19≈0.3158 — the draw
       // genuinely depends on the σ denominator, so this catches a fix that excludes AFTER drawing with the old σ = 1/N.
       val many: Set[PeerId] = (0 until 20).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet
@@ -170,26 +166,17 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
         )
   }
 
-  // ═══ 2. QUORUM NON-COUNTING through the production manager (RED→GREEN half 2) ═══════════════════════════════════
+  // ═══ 2. ATTESTATION ADMISSION through the production manager ══════════════════════════════════════════════════
 
   private def mkSigner(implicit sp: SecurityProvider[IO]): IO[(KeyPair, PeerId)] =
     KeyPairGenerator.makeKeyPair[IO].map(kp => (kp, PeerId.fromPublic(kp.getPublic)))
 
   private def mkValidSig(cp: ShardCheckpoint, kp: KeyPair, peerId: PeerId)(
     implicit h: Hasher[IO],
-    sp: SecurityProvider[IO]
+    sp: SecurityProvider[IO],
+    checkpointSigner: RegisteredCheckpointSigner
   ): IO[CommitteeMemberSignature] =
-    for {
-      preimageHash <- Hasher[IO].hash(cp.signingPreimage)
-      edSig <- Signing.signData[IO](preimageHash.getBytes)(kp.getPrivate)
-    } yield
-      CommitteeMemberSignature(
-        peerId = peerId,
-        vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)), // structural carve-out (empty VRF registry)
-        ed25519Sig = Hex.fromBytes(edSig),
-        kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)), // registry-absent KES carve-out
-        kesTreeStep = 0
-      )
+    checkpointSigner.sign(cp, kp, peerId)
 
   private def mkShell(placeholder: PeerId): ShardCheckpoint =
     ShardCheckpoint(
@@ -199,124 +186,114 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
       gl0AnchorOrdinal = ord(100L),
       slot = SlotT.unsafeApply(100L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(CommitteeMemberSignature(placeholder, Hex(""), Hex(""), Hex(""), 0)),
       epoch = epoch5
     )
 
-  private def mkManager(membership: (ShardId, EtaPeriod) => IO[Set[PeerId]], kQuorum: Int, self: PeerId)(
+  private def mkManager(membership: (ShardId, EtaPeriod) => IO[Set[PeerId]])(
     implicit h: Hasher[IO],
-    sp: SecurityProvider[IO]
+    sp: SecurityProvider[IO],
+    checkpointSigner: RegisteredCheckpointSigner
   ): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
     ShardCheckpointGl0AcceptanceManager.make[IO](
       finalityTriggers = _ => IO.pure(None),
-      chainStore = _ => IO.pure(None),
       committeeMembership = membership,
-      kDraw = 8,
-      kQuorum = kQuorum,
-      selfPeerId = self,
-      kesRegistry = KesRegistry.empty[IO],
-      vrfRegistry = VrfRegistry.empty[IO],
-      shardEtaFor = (_, _) => IO.pure(none[Array[Byte]]),
+      kesRegistry = checkpointSigner.kesRegistry,
+      vrfRegistry = checkpointSigner.vrfRegistry,
+      shardAssignment = ShardAssignment.make[IO](numShards = 1),
+      shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
       reExecuteDerivation = (_, _, _, _) => IO.pure(Hash.empty)
     )
 
-  test("GREEN (was RED): a slashed signer's signature no longer counts toward kQuorum — the SAME envelope flips Accepted→Rejected") {
-    res =>
-      implicit val (h, sp, js) = res
-      for {
-        (kpSlashed, pSlashed) <- mkSigner
-        (kpHonest1, pHonest1) <- mkSigner
-        (kpHonest2, pHonest2) <- mkSigner
-        signers = Set(pSlashed, pHonest1, pHonest2)
-        signerReg = VrfRegistry.make[IO](signers.toList.zipWithIndex.map {
-          case (p, i) => p -> Array.fill[Byte](32)((0x50 + i).toByte)
-        }.toMap)
-        // The committee the manager's pre-check gates on = the REAL post-exclusion draw over the signer set.
-        (_, reader) <- storeReader(List(entry(pSlashed, eventOrd = 350L, cooldownUntil = 10000L)), baseOrdinal = 450L)
-        membership = (_: ShardId, epoch: EtaPeriod) =>
-          committeeWith(reader, active = signers, epoch = epoch, kDraw = signers.size, reg = signerReg)
-        manager <- mkManager(membership, kQuorum = 2, self = pHonest1)
+  test("a slashed signer's checkpoint attestation is rejected before it can enter the tracker") { res =>
+    implicit val (h, sp, js, checkpointSigner) = res
+    for {
+      (kpSlashed, pSlashed) <- mkSigner
+      (kpHonest1, pHonest1) <- mkSigner
+      (_, pHonest2) <- mkSigner
+      signers = Set(pSlashed, pHonest1, pHonest2)
+      signerReg = VrfRegistry.make[IO](signers.toList.zipWithIndex.map {
+        case (p, i) => p -> Array.fill[Byte](32)((0x50 + i).toByte)
+      }.toMap)
+      // The committee the manager's pre-check gates on = the REAL post-exclusion draw over the signer set.
+      (_, reader) <- storeReader(List(entry(pSlashed, eventOrd = 350L, cooldownUntil = 10000L)), baseOrdinal = 450L)
+      membership = (_: ShardId, epoch: EtaPeriod) =>
+        committeeWith(reader, active = signers, epoch = epoch, kDraw = signers.size, reg = signerReg)
+      manager <- mkManager(membership)
 
-        shell = mkShell(pSlashed)
-        sigSlashed <- mkValidSig(shell, kpSlashed, pSlashed)
-        sigHonest1 <- mkValidSig(shell, kpHonest1, pHonest1)
-        sigHonest2 <- mkValidSig(shell, kpHonest2, pHonest2)
+      shell = mkShell(pSlashed)
+      sigSlashed <- mkValidSig(shell, kpSlashed, pSlashed)
+      sigHonest1 <- mkValidSig(shell, kpHonest1, pHonest1)
 
-        // Envelope A: (slashed + honest) — 2 distinct valid signatures, kQuorum=2 — Accepted at HEAD (the RED capture);
-        // now the slashed signer fails the committee-membership pre-check ⇒ the signature cannot count ⇒ NOT Accepted.
-        resultWithSlashed <- manager.verifyEmbedded(shell.copy(committeeSignatures = NonEmptyList.of(sigSlashed, sigHonest1)))
-        // Envelope B: two ELIGIBLE signers — quorum met from eligible signatures only ⇒ Accepted (liveness preserved).
-        resultEligible <- manager.verifyEmbedded(shell.copy(committeeSignatures = NonEmptyList.of(sigHonest1, sigHonest2)))
-      } yield
-        expect.all(
-          resultWithSlashed match {
-            case ShardCheckpointAcceptResult.Rejected(_) => true
-            case _                                       => false
-          },
-          resultEligible == ShardCheckpointAcceptResult.Accepted
-        )
+      slashedValidation <- manager.verifyCommitteeSignature(shell, sigSlashed)
+      honestValidation <- manager.verifyCommitteeSignature(shell, sigHonest1)
+    } yield
+      expect.all(
+        slashedValidation.left.exists(_.contains("not in committee")),
+        honestValidation.isRight
+      )
   }
 
   // ═══ 4. CLUSTER-UNIFORMITY (the anti-fork invariant) ════════════════════════════════════════════════════════════
 
-  test("cluster-uniformity: two nodes, same pinned records — different insert order / base ordinal / unrelated state ⇒ same excluded set, same committee, same quorum verdict") {
-    res =>
-      implicit val (h, sp, js) = res
-      val e1 = entry(slashedPeer, eventOrd = 350L, cooldownUntil = 10000L, cpHash = Hash("aa" * 32))
-      val e2 = entry(PeerId(Hex("01" * 64)), eventOrd = 360L, cooldownUntil = 10000L, cpHash = Hash("bb" * 32))
-      for {
-        // Node A: [e1, e2] at base 450. Node B: [e2, e1] at base 480 + unrelated fieldId-33 bytes (different local store content
-        // outside the Slashings partition must not leak into the exclusion).
-        (storeA, readerA) <- storeReader(List(e1, e2), baseOrdinal = 450L)
-        (storeB0, _) <- storeReader(List(e2, e1), baseOrdinal = 479L)
-        _ <- storeB0.insert[String](GlobalStateKey.consumedAllowSpendKey(Hash("cc" * 32)), "unrelated")(
-          new io.constellationnetwork.serde.ImmutableCodec[String] {
-            def immutableBytes(v: String) = scodec.bits.ByteVector.view(v.getBytes)
-            def fromImmutableBytes(b: scodec.bits.ByteVector) = Right(new String(b.toArray))
-          }
-        )
-        _ <- storeB0.commit(ord(480L))
-        readerB = SlashCooldownReader.fromMptStore[IO](storeB0, R)
+  test(
+    "cluster-uniformity: two nodes, same pinned records — different insert order / base ordinal / unrelated state ⇒ same excluded set, committee, and admission verdict"
+  ) { res =>
+    implicit val (h, sp, js, checkpointSigner) = res
+    val e1 = entry(slashedPeer, eventOrd = 350L, cooldownUntil = 10000L, cpHash = Hash("aa" * 32))
+    val e2 = entry(PeerId(Hex("01" * 64)), eventOrd = 360L, cooldownUntil = 10000L, cpHash = Hash("bb" * 32))
+    for {
+      // Node A: [e1, e2] at base 450. Node B: [e2, e1] at base 480 + unrelated fieldId-33 bytes (different local store content
+      // outside the Slashings partition must not leak into the exclusion).
+      (storeA, readerA) <- storeReader(List(e1, e2), baseOrdinal = 450L)
+      (storeB0, _) <- storeReader(List(e2, e1), baseOrdinal = 479L)
+      _ <- storeB0.insert[String](GlobalStateKey.consumedAllowSpendKey(Hash("cc" * 32)), "unrelated")(
+        new io.constellationnetwork.serde.ImmutableCodec[String] {
+          def immutableBytes(v: String) = scodec.bits.ByteVector.view(v.getBytes)
+          def fromImmutableBytes(b: scodec.bits.ByteVector) = Right(new String(b.toArray))
+        }
+      )
+      _ <- storeB0.commit(ord(480L))
+      readerB = SlashCooldownReader.fromMptStore[IO](storeB0, R)
 
-        exclusionA <- readerA.excludedForEpoch(epoch5)
-        exclusionB <- readerB.excludedForEpoch(epoch5)
-        committeeA <- committeeWith(readerA)
-        committeeB <- committeeWith(readerB)
+      exclusionA <- readerA.excludedForEpoch(epoch5)
+      exclusionB <- readerB.excludedForEpoch(epoch5)
+      committeeA <- committeeWith(readerA)
+      committeeB <- committeeWith(readerB)
 
-        // Same embedded envelope through both nodes' managers → identical verdicts.
-        (kpX, pX) <- mkSigner
-        signerSet = validators + pX
-        // pX needs a registered VRF VK — a VK-less operator is never sortitionable (committeeFor excludes it regardless of slashing).
-        signerReg = VrfRegistry.make[IO](
-          signerSet.toList.zipWithIndex.map { case (p, i) => p -> Array.fill[Byte](32)((0x60 + i).toByte) }.toMap
-        )
-        membershipA = (_: ShardId, ep: EtaPeriod) =>
-          committeeWith(readerA, active = signerSet, epoch = ep, kDraw = signerSet.size, reg = signerReg)
-        membershipB = (_: ShardId, ep: EtaPeriod) =>
-          committeeWith(readerB, active = signerSet, epoch = ep, kDraw = signerSet.size, reg = signerReg)
-        managerA <- mkManager(membershipA, kQuorum = 1, self = pX)
-        managerB <- mkManager(membershipB, kQuorum = 1, self = pX)
-        shell = mkShell(pX)
-        sigX <- mkValidSig(shell, kpX, pX)
-        cp = shell.copy(committeeSignatures = NonEmptyList.of(sigX))
-        verdictA <- managerA.verifyEmbedded(cp)
-        verdictB <- managerB.verifyEmbedded(cp)
-      } yield
-        expect.all(
-          exclusionA.candidates == exclusionB.candidates,
-          exclusionA.anchorSettled && exclusionB.anchorSettled,
-          committeeA == committeeB,
-          verdictA == verdictB,
-          verdictA == ShardCheckpointAcceptResult.Accepted // pX is eligible on both — sanity that the envelope is decidable at all
-        )
+      // Same embedded envelope through both nodes' managers → identical verdicts.
+      (kpX, pX) <- mkSigner
+      signerSet = validators + pX
+      // pX needs a registered VRF VK — a VK-less operator is never sortitionable (committeeFor excludes it regardless of slashing).
+      signerReg = VrfRegistry.make[IO](
+        signerSet.toList.zipWithIndex.map { case (p, i) => p -> Array.fill[Byte](32)((0x60 + i).toByte) }.toMap
+      )
+      membershipA = (_: ShardId, ep: EtaPeriod) =>
+        committeeWith(readerA, active = signerSet, epoch = ep, kDraw = signerSet.size, reg = signerReg)
+      membershipB = (_: ShardId, ep: EtaPeriod) =>
+        committeeWith(readerB, active = signerSet, epoch = ep, kDraw = signerSet.size, reg = signerReg)
+      managerA <- mkManager(membershipA)
+      managerB <- mkManager(membershipB)
+      shell = mkShell(pX)
+      sigX <- mkValidSig(shell, kpX, pX)
+      cp = shell.copy(committeeSignatures = NonEmptyList.of(sigX))
+      verdictA <- managerA.verifyCommitteeSignature(cp, sigX)
+      verdictB <- managerB.verifyCommitteeSignature(cp, sigX)
+    } yield
+      expect.all(
+        exclusionA.candidates == exclusionB.candidates,
+        exclusionA.anchorSettled && exclusionB.anchorSettled,
+        committeeA == committeeB,
+        verdictA == verdictB,
+        verdictA.isRight // pX is eligible on both — sanity that the attestation is admissible at both nodes
+      )
   }
 
   // ═══ 5. EPOCH STAGGERING + EXPIRY ═══════════════════════════════════════════════════════════════════════════════
 
   test("epoch staggering: a record YOUNGER than the epoch's anchor does not bite that epoch — it bites the next one (Cardano N-2 rule)") {
     res =>
-      implicit val (h, sp, js) = res
+      implicit val (h, sp, js, _) = res
       // anchor(5) = 399, anchor(6) = 499. eventOrdinal 420 ∈ (399, 499] ⇒ eligible at epoch 5, excluded at epoch 6.
       for {
         (_, reader) <- storeReader(List(entry(slashedPeer, eventOrd = 420L, cooldownUntil = 10000L)), baseOrdinal = 550L)
@@ -330,7 +307,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
   }
 
   test("cooldown expiry: once cooldownUntilEpoch is at-or-below the epoch's anchor the operator is drawn again") { res =>
-    implicit val (h, sp, js) = res
+    implicit val (h, sp, js, _) = res
     // cooldownUntilEpoch = 399 = anchor(5) ⇒ NOT active at epoch 5 (strict >); was active at epoch 4 (anchor 299).
     for {
       (_, reader) <- storeReader(List(entry(slashedPeer, eventOrd = 250L, cooldownUntil = 399L)), baseOrdinal = 450L)
@@ -347,7 +324,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
 
   test("degenerate: exclusion never drops the eligible pool below kQuorum — everyone-slashed at |active| <= kQuorum excludes nobody") {
     res =>
-      implicit val (h, sp, js) = res
+      implicit val (h, sp, js, _) = res
       val four: Set[PeerId] = (0 until 4).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet
       val fourReg: VrfRegistry[IO] =
         VrfRegistry.make[IO](four.toList.zipWithIndex.map { case (p, i) => p -> Array.fill[Byte](32)((0x30 + i).toByte) }.toMap)
@@ -374,9 +351,8 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
     ShardingConfig(
       numShards = numShards,
       finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
-      slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
+      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
     )
 
   /** Mutable stub reader: exclusion + settledness read from a Ref, so the test can change what the store "contains" between calls. */
@@ -384,7 +360,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
     (_: EtaPeriod) => ref.get.map { case (cands, settled) => SlashCooldownReader.EpochExclusion(cands, settled) }
 
   test("cache discipline: an anchor-UNSETTLED draw is not memoized (recomputed later, exact); a SETTLED draw is memoized") { res =>
-    implicit val (h, sp, js) = res
+    implicit val (h, sp, js, _) = res
     for {
       unsettledRef <- Ref.of[IO, (List[(PeerId, Long)], Boolean)]((List.empty, false))
       settledRef <- Ref.of[IO, (List[(PeerId, Long)], Boolean)]((List.empty, true))
@@ -434,7 +410,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
   // ═══ 8. NO-OP EQUIVALENCE (byte-identity bars) ══════════════════════════════════════════════════════════════════
 
   test("no-op: an EMPTY Slashings partition draws byte-identically to the pre-fix code (noExclusion) — the numShards>1 empty bar") { res =>
-    implicit val (h, sp, js) = res
+    implicit val (h, sp, js, _) = res
     for {
       (_, reader) <- storeReader(List.empty, baseOrdinal = 450L)
       withEmptyPartition <- committeeWith(reader)
@@ -443,7 +419,7 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
   }
 
   test("numShards=1 regression bar: acceptanceDeps stays None — the exclusion gate (like everything else) is never constructed") { res =>
-    implicit val (h, sp, js) = res
+    implicit val (h, sp, js, _) = res
     for {
       store <- mkStore
       deps <- ShardCheckpointWiring.acceptanceDeps[IO](
@@ -462,48 +438,47 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
 
   // ═══ 9. EPIC-3.4 — REORG DURABILITY (leverages the landed S01/S02 preservation) ═════════════════════════════════
 
-  test("EPIC-3.4: a slashed-then-reorged peer STAYS excluded — the fieldId-34 record and the exclusion survive a GSI base rebuild") {
-    res =>
-      implicit val (h, sp, js) = res
-      for {
-        // A base with ordinary GSI-native state (a balance) + the slash record committed at a finalized ordinal ≥ anchor(5).
-        srcKp <- KeyPairGenerator.makeKeyPair[IO]
-        srcAddr = {
-          import io.constellationnetwork.security.key.ops.PublicKeyOps
-          srcKp.getPublic.toAddress
-        }
-        gsi = GlobalSnapshotInfo.empty.copy(
-          balances = SortedMap(srcAddr -> io.constellationnetwork.schema.balance.Balance(NonNegLong.unsafeFrom(1000L)))
-        )
-        store <- mkStore
-        _ <- store.syncFromGlobalSnapshotInfo(gsi, ord(430L))
-        slashEntry = entry(slashedPeer, eventOrd = 350L, cooldownUntil = 10000L)
-        _ <- insertEntry(store, slashEntry)
-        _ <- store.commit(ord(450L))
-        reader = SlashCooldownReader.fromMptStore[IO](store, R)
-        slashKeyHex <- GlobalStateKey
-          .slashingsKey[IO](slashEntry.peerId, slashEntry.shardId, slashEntry.disputedCheckpointHash)
-          .flatMap(GlobalStateKey.toHex[IO])
+  test("EPIC-3.4: a slashed-then-reorged peer STAYS excluded — the fieldId-34 record and the exclusion survive a GSI base rebuild") { res =>
+    implicit val (h, sp, js, _) = res
+    for {
+      // A base with ordinary GSI-native state (a balance) + the slash record committed at a finalized ordinal ≥ anchor(5).
+      srcKp <- KeyPairGenerator.makeKeyPair[IO]
+      srcAddr = {
+        import io.constellationnetwork.security.key.ops.PublicKeyOps
+        srcKp.getPublic.toAddress
+      }
+      gsi = GlobalSnapshotInfo.empty.copy(
+        balances = SortedMap(srcAddr -> io.constellationnetwork.schema.balance.Balance(NonNegLong.unsafeFrom(1000L)))
+      )
+      store <- mkStore
+      _ <- store.syncFromGlobalSnapshotInfo(gsi, ord(430L))
+      slashEntry = entry(slashedPeer, eventOrd = 350L, cooldownUntil = 10000L)
+      _ <- insertEntry(store, slashEntry)
+      _ <- store.commit(ord(450L))
+      reader = SlashCooldownReader.fromMptStore[IO](store, R)
+      slashKeyHex <- GlobalStateKey
+        .slashingsKey[IO](slashEntry.peerId, slashEntry.shardId, slashEntry.disputedCheckpointHash)
+        .flatMap(GlobalStateKey.toHex[IO])
 
-        committeeBefore <- committeeWith(reader)
-        exclusionBefore <- reader.excludedForEpoch(epoch5)
+      committeeBefore <- committeeWith(reader)
+      exclusionBefore <- reader.excludedForEpoch(epoch5)
 
-        // ===== THE REORG: a `(k₁, head]` fork-switch self-heal rebuilds the base from the carried GSI (the S01 wipe path,
-        // now preservation-fixed by fc90f687e/fe6d837b1 — fieldId 33/34 survive the rebuild verbatim).
-        _ <- store.syncFromGlobalSnapshotInfo(gsi, ord(460L))
+      // ===== THE REORG: a `(k₁, head]` fork-switch self-heal rebuilds the base from the carried GSI (the S01 wipe path,
+      // now preservation-fixed by fc90f687e/fe6d837b1 — fieldId 33/34 survive the rebuild verbatim).
+      _ <- store.syncFromGlobalSnapshotInfo(gsi, ord(460L))
 
-        entriesAfter <- store.allEntriesAsBytes
-        committeeAfter <- committeeWith(reader)
-        exclusionAfter <- reader.excludedForEpoch(epoch5)
-      } yield
-        expect.all(
-          !committeeBefore.contains(slashedPeer),
-          // (1) the raw fieldId-34 record survived the rebuild (the EPIC-1/S02 preservation this task leverages)
-          entriesAfter.contains(slashKeyHex),
-          // (2) the EXCLUSION still applies after the rebuild — the slash keeps biting across the reorg (EPIC-3.4)
-          exclusionAfter.candidates == exclusionBefore.candidates,
-          !committeeAfter.contains(slashedPeer),
-          committeeAfter == committeeBefore
-        )
+      entriesAfter <- store.allEntriesAsBytes
+      committeeAfter <- committeeWith(reader)
+      exclusionAfter <- reader.excludedForEpoch(epoch5)
+    } yield
+      expect.all(
+        !committeeBefore.contains(slashedPeer),
+        // (1) the raw fieldId-34 record survived the rebuild (the EPIC-1/S02 preservation this task leverages)
+        entriesAfter.contains(slashKeyHex),
+        // (2) the EXCLUSION still applies after the rebuild — the slash keeps biting across the reorg (EPIC-3.4)
+        exclusionAfter.candidates == exclusionBefore.candidates,
+        !committeeAfter.contains(slashedPeer),
+        committeeAfter == committeeBefore
+      )
   }
 }

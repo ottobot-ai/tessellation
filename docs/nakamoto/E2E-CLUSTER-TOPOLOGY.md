@@ -263,7 +263,6 @@ correlate node logs — never logs alone.
 
 - Monitoring/metrics detail: `docs/nakamoto/E2E-MONITORING-RUNBOOK.md`.
 - LocalEvents gRPC contract: `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`.
-- Sharding model: `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`,
-  `ROOTS-ONLY-SHARDING-ARCHITECTURE.md`.
+- Sharding model: `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` and ADR-0016/ADR-0017.
 - Dev commands: `docker/README.md`. Codebase map: `docs/CODEBASE_MAP.md` (Build & Deploy).
 - Within-node consensus architecture: `docs/nakamoto-architecture.dot`.

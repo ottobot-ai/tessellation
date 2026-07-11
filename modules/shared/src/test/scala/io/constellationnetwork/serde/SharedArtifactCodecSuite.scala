@@ -5,7 +5,6 @@ import cats.data.NonEmptyList
 import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.schema.artifact._
-import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.priceOracle._
 import io.constellationnetwork.schema.swap.SwapAmount
 import io.constellationnetwork.schema.tokenLock.TokenLockAmount
@@ -41,31 +40,24 @@ object SharedArtifactCodecSuite extends FunSuite {
   private val tokenUnlock: SharedArtifact = TokenUnlock(Hash("b" * 64), TokenLockAmount(PosLong.unsafeFrom(5L)), None, addr)
   private val allowExp: SharedArtifact = AllowSpendExpiration(Hash("c" * 64))
   private val pricing: SharedArtifact = PricingUpdate(PriceFraction(TokenPair.DAG_USD, fraction))
-  private val balanceAdj: SharedArtifact = BalanceAdjustment(
-    addr,
-    SpendTransactionNotApplied,
-    SortedSet(Hash("d" * 64)),
-    Some(Amount(NonNegLong.unsafeFrom(100L))),
-    None
-  )
   private val globalProc: SharedArtifact = GlobalSnapshotsProcessed(
     SortedSet(SnapshotOrdinal(NonNegLong.unsafeFrom(10L)), SnapshotOrdinal(NonNegLong.unsafeFrom(11L)))
   )
 
-  private val all: List[SharedArtifact] = List(spendAction, tokenUnlock, allowExp, pricing, balanceAdj, globalProc)
+  private val all: List[SharedArtifact] = List(spendAction, tokenUnlock, allowExp, pricing, globalProc)
 
   test("Every SharedArtifact variant round-trips through the sum-type codec") {
     val decoded = all.map(_.immutableBytes.fromImmutableBytes[SharedArtifact])
     expect(decoded == all.map(Right(_)))
   }
 
-  test("Each variant's discriminator byte is distinct (6 distinct prefixes)") {
+  test("Each variant's discriminator byte is distinct (5 distinct prefixes)") {
     val prefixes = all.map(_.immutableBytes.take(1)).toSet
-    expect(prefixes.size == 6)
+    expect(prefixes.size == 5)
   }
 
-  test("Variant discriminator bytes match the FROZEN spec (0x00..0x05)") {
+  test("Variant discriminator bytes preserve the unused 0x04 slot") {
     val prefixes = all.map(_.immutableBytes.head)
-    expect(prefixes == List[Byte](0x00, 0x01, 0x02, 0x03, 0x04, 0x05))
+    expect(prefixes == List[Byte](0x00, 0x01, 0x02, 0x03, 0x05))
   }
 }

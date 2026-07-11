@@ -57,9 +57,8 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
     ShardingConfig(
       numShards = numShards,
       finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(tAliveMs = 10000L, tBurst = 100, binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L),
-      slashing = ShardSlashingConfig(maxMissedPctPerEpoch = 33, minDenominatorPerEpoch = 5L)
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
+      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
     )
 
   // Fixed 32-byte eta resolver for the committee draw (deterministic across calls — what `committeeFor` consumes).
@@ -371,13 +370,13 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
       }
   }
 
-  // ─── Track-1 diff-base-pin: pinnedDiffBaseOrdinal (the producer's stamped savepoint source) ─────────────────────
+  // ─── Track-1 execution-base-pin: pinnedExecutionBaseOrdinal (the producer's stamped savepoint source) ─────────────────────
   // The stamp MUST name an ordinal the version-retained signed byte store can SERVE (resolvable-by-construction for the
   // always-pinned `pinnedPriorReaderAt`), NOT the live `mptStore.lastPersistedOrdinal` — the live watermark does not pin
   // the live store's content (the 2026-07-08 mid-fold-skew wedge) and runs AHEAD of the finalize-sink-written signed
   // store, which OMIT-deferred nearly every mint once the fast path was removed.
 
-  test("pinnedDiffBaseOrdinal: returns the signed byte store's NEWEST persisted ordinal") { res =>
+  test("pinnedExecutionBaseOrdinal: returns the signed byte store's NEWEST persisted ordinal") { res =>
     implicit val (h, _sp) = res
     val _ = h
     JsonSerializer.forAsync[IO].flatMap { implicit js =>
@@ -387,20 +386,20 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
           _ <- store.writeState(SnapshotOrdinal.unsafeApply(2L), Map.empty)
           _ <- store.writeState(SnapshotOrdinal.unsafeApply(9L), Map.empty)
           _ <- store.writeState(SnapshotOrdinal.unsafeApply(5L), Map.empty)
-          stamped <- ShardCheckpointWiring.pinnedDiffBaseOrdinal[IO](store)
+          stamped <- ShardCheckpointWiring.pinnedExecutionBaseOrdinal[IO](store)
         } yield expect(stamped === SnapshotOrdinal.unsafeApply(9L), s"must stamp the newest persisted ordinal (got ${stamped.show})")
       }
     }
   }
 
-  test("pinnedDiffBaseOrdinal: EMPTY store (pre-first-finalize) ⇒ SnapshotOrdinal.MinValue (produce defers, fail-closed)") { res =>
+  test("pinnedExecutionBaseOrdinal: EMPTY store (pre-first-finalize) ⇒ SnapshotOrdinal.MinValue (produce defers, fail-closed)") { res =>
     implicit val (h, _sp) = res
     val _ = h
     JsonSerializer.forAsync[IO].flatMap { implicit js =>
       fs2.io.file.Files[IO].tempDirectory.use { dir =>
         for {
           store <- io.constellationnetwork.security.mpt.storages.MptStateStorage.make[IO](dir)
-          stamped <- ShardCheckpointWiring.pinnedDiffBaseOrdinal[IO](store)
+          stamped <- ShardCheckpointWiring.pinnedExecutionBaseOrdinal[IO](store)
         } yield expect(stamped === SnapshotOrdinal.MinValue, s"empty store must stamp MinValue (got ${stamped.show})")
       }
     }

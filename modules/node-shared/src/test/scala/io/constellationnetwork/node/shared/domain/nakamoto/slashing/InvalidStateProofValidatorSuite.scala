@@ -78,7 +78,6 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       gl0AnchorOrdinal = anchor,
       slot = Slot.unsafeApply(1L),
       derivedStateDelta = delta,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.fromListUnsafe((1 to nSigners).toList.map(committeeSig)),
       epoch = epochZero
     )
@@ -218,8 +217,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
       val cp = mkCheckpoint(attested, nSigners = 6)
-      // `Hash.empty` is the production wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationWithDiff` returned
-      // None — the pinned diff-base is unresolvable below this node's retention / not reached, or the derivation OMITted).
+      // `Hash.empty` is the production wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationAtPinnedBase` returned
+      // None — the pinned execution-base is unresolvable below this node's retention / not reached, or the derivation OMITted).
       // "This node can't check" is NOT evidence the committee deviated: upholding here would 100%-slash an honest committee
       // on a local retention miss. The verdict must fail closed — reject the dispute, never uphold.
       val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =

@@ -1,5 +1,11 @@
 # Cross-shard interaction protocols — production-blockchain survey + Tessellation recommendation
 
+> **HISTORICAL, SUPERSEDED RESEARCH.** The survey is retained as background, but
+> its Tessellation recommendation is not the current protocol and must not be
+> implemented as authority. Current cross-shard economics settle through
+> consensus-pinned GL0 state, GL0 re-execution, and canonical single-use state as
+> specified by [`../../AGENTS.md`](../../AGENTS.md) and ADR-0016/ADR-0017.
+
 **Status:** research document. Survey + recommendation. No code commitment.
 Written 2026-05-22 against `feature/serde-typeclass-shim`.
 

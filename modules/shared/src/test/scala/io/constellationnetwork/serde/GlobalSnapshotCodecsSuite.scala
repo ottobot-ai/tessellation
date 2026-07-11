@@ -63,7 +63,7 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
     expect(sample.immutableBytes.fromImmutableBytes[GlobalIncrementalSnapshotV1] == Right(sample))
   }
 
-  test("GlobalIncrementalSnapshot (current, 24 fields) round-trips with all options absent") {
+  test("GlobalIncrementalSnapshot (current, 26 fields) round-trips with all options absent") {
     val stateProof = GlobalSnapshotStateProof(
       Hash("a" * 64),
       Hash("b" * 64),
@@ -110,7 +110,8 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
       nodeCollateralWithdrawals = None,
       version = v0,
       slotCertificate = None,
-      eta = None
+      eta = None,
+      fraudProofs = SortedSet.empty
     )
     expect(sample.immutableBytes.fromImmutableBytes[GlobalIncrementalSnapshot] == Right(sample))
   }

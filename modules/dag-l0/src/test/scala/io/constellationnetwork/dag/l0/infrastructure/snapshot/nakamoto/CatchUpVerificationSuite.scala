@@ -1,7 +1,7 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
-import cats.data.{NonEmptyList, NonEmptySet}
-import cats.effect.{IO, Resource}
+import cats.data.NonEmptyList
+import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
@@ -9,38 +9,39 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
+import io.constellationnetwork.security.vrf.EcVrf25519
 
+import com.google.protobuf.ByteString
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
+import io.circe.syntax._
 import weaver.MutableIOSuite
 
-/** Security regression for the parent-missing catch-up admission gate ([[NakamotoSyncDaemon.verifyCatchUpSnapshot]]).
+/** Regression tests for authenticated parent-first ChainSync recovery.
   *
-  * THE VULNERABILITY this guards: the deep-catch-up path adopts a gossiped `(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)` as the
-  * node's ENTIRE canonical gl0 state (balances/txRefs/stakes/locks + MPT) WITHOUT the snapshot's parent — so the full
-  * `NakamotoSnapshotValidator.validate` (VRF + slot-cert) can't run. Before the fix, that adoption was UNVERIFIED: a single peer gossiping
-  * a forged tuple could unilaterally reset the victim's state. `verifyCatchUpSnapshot` closes this with two parent-free, deterministic
-  * gates — envelope signature (gate 1) and stateProof-vs-GSI consistency (gate 2) — that BOTH pass for an honest snapshot and BOTH
-  * fail-closed for a forged / inconsistent one.
+  * Signature plus GSI/root self-consistency is not transition validity. A successful result may be cached or logged, but runtime recovery
+  * must fetch ancestry and replay before chain storage, MPT writes, attestation, or finality.
   *
-  *   1. '''honest tuple → Accept''' — a correctly-signed snapshot whose `stateProof` was built from the carried GSI is adopted (legitimate
-  *      catch-up still recovers).
-  *   1. '''forged signature → RejectedInvalidSignature''' — a snapshot whose body was tampered after signing (signature no longer matches
-  *      the hash) is rejected by gate 1.
-  *   1. '''mismatched GSI → RejectedStateProofMismatch''' — a validly-signed snapshot paired with a DIFFERENT GlobalSnapshotInfo (attacker-
-  *      chosen state) is rejected by gate 2.
+  *   1. '''one payload shape''' — wrapped snapshots decode with or without optional context; fork-only bare payloads are rejected.
+  *   1. '''transport binding''' — hash, ordinal, parent, producer, slot, VRF, and eta must equal the signed body/certificate.
+  *   1. '''missing parent → buffer only''' — no MPT write, chain-store write, or attestation callback can run until fetched ancestry has
+  *      replayed parent-first through the normal validation gate.
+  *   1. '''invalid middle ancestor → descendants blocked''' — an invalid fetched ancestor is not committed and cannot trigger the drain for
+  *      children waiting on its hash.
   */
 object CatchUpVerificationSuite extends MutableIOSuite {
 
@@ -114,62 +115,244 @@ object CatchUpVerificationSuite extends MutableIOSuite {
 
   // Two distinct valid DAG addresses (concrete values irrelevant; only their presence in `balances` matters for the rebuilt proof).
   private val addrA: Address = Address("DAG2FGeUYivtEo9EjvpELY4ZS7zDQWvJzQYVzXkX")
-  private val addrB: Address = Address("DAG3wbdB4HtqeSumsA8hDFBBvVXxexAtQXJMrbmt")
+  private val vrf = new EcVrf25519()
 
-  test("honest catch-up tuple (valid signature + GSI matching its committed stateProof) is Accepted") { res =>
+  private def mkCertifiedEnvelope(
+    info: GlobalSnapshotInfo,
+    keyPair: java.security.KeyPair
+  )(
+    implicit h: Hasher[IO],
+    j: JsonSerializer[IO],
+    sp: SecurityProvider[IO]
+  ): IO[(Signed[GlobalIncrementalSnapshot], pb.Snapshot)] = {
+    val vrfSk = Array.tabulate[Byte](32)(i => (i + 1).toByte)
+    val vrfPk = vrf.getVerificationKey(vrfSk)
+    val proof = vrf.vrfProof(vrfSk, "snapshot-envelope".getBytes(java.nio.charset.StandardCharsets.UTF_8))
+    val output = vrf.vrfProofToHash(proof).getOrElse(throw new IllegalStateException("test VRF proof did not derive output"))
+    val etaBytes = Array.fill[Byte](32)(0x5a.toByte)
+    val etaHash = Hash(Hex.fromBytes(etaBytes).value)
+    val slot = Slot.unsafeApply(10L)
+    val parentSlot = Slot.unsafeApply(9L)
+
+    for {
+      base <- mkSnapshot(info)
+      certified = base.copy(
+        slotCertificate = Some(
+          SlotCertificate(
+            slot,
+            parentSlot,
+            VrfProof.fromBytes(proof),
+            VrfOutput.fromBytes(output),
+            VrfPublicKey.fromBytes(vrfPk),
+            etaHash,
+            activePoolSize = 1,
+            activePoolHash = Hash.empty,
+            subchainLevelCounts = SlotCertificate.ZeroSubchainLevelCounts
+          )
+        ),
+        eta = Some(etaHash)
+      )
+      signed <- forAsyncHasher(certified, keyPair)
+      hashed <- signed.toHashed[IO]
+      payload = io.circe.Json
+        .obj("snapshot" -> signed.asJson, "context" -> info.asJson)
+        .noSpaces
+        .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+    } yield {
+      val envelope = pb.Snapshot(
+        hash = ByteString.copyFrom(hashed.hash.value.getBytes),
+        slot = slot.value.value,
+        ordinal = certified.ordinal.value.value,
+        parentHash = ByteString.copyFrom(certified.lastSnapshotHash.value.getBytes),
+        vrfProof = ByteString.copyFrom(proof),
+        vrfPublicKey = ByteString.copyFrom(vrfPk),
+        eta = ByteString.copyFrom(etaBytes),
+        payload = ByteString.copyFrom(payload),
+        producerId = ByteString.copyFrom(signed.proofs.head.id.hex.toBytes),
+        parentSlot = parentSlot.value.value,
+        kesSignature = ByteString.copyFrom(Array[Byte](1, 2, 3))
+      )
+      (signed, envelope)
+    }
+  }
+
+  test("chain-sync decoder accepts the single wrapped shape and rejects bare snapshots") { res =>
+    implicit val (_, j, h, sp, _) = res
+    val info = mkInfo(SortedMap(addrA -> Balance.empty))
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      snapshot <- mkSnapshot(info)
+      signed <- forAsyncHasher(snapshot, keyPair)
+      bare = signed.asJson.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      wrapped = io.circe.Json
+        .obj("snapshot" -> signed.asJson, "context" -> info.asJson)
+        .noSpaces
+        .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      wrappedWithoutContext = io.circe.Json
+        .obj("snapshot" -> signed.asJson)
+        .noSpaces
+        .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+      decodedWrapped = NakamotoSyncDaemon.decodeFetchedSnapshotPayload(wrapped)
+      decodedWithoutContext = NakamotoSyncDaemon.decodeFetchedSnapshotPayload(wrappedWithoutContext)
+    } yield
+      expect.all(
+        NakamotoSyncDaemon.decodeFetchedSnapshotPayload(bare).isEmpty,
+        decodedWrapped.exists(_.value === snapshot),
+        decodedWithoutContext.exists(_.value === snapshot),
+        NakamotoSyncDaemon.decodeFetchedSnapshotPayload("not-json".getBytes).isEmpty
+      )
+  }
+
+  private final case class ReplayNode(
+    name: String,
+    hash: Hash,
+    validation: NakamotoSnapshotValidator.ValidationResult
+  )
+
+  test("snapshot transport metadata is bound to the signed body and certificate") { res =>
+    implicit val (_, j, h, sp, hs) = res
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      tuple <- mkCertifiedEnvelope(mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L)))), keyPair)
+      (signed, envelope) = tuple
+      valid <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](envelope, signed)
+      wrongOrdinal <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](envelope.copy(ordinal = envelope.ordinal + 1L), signed)
+      wrongParent <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
+        envelope.copy(parentHash = ByteString.copyFromUtf8("f" * 64)),
+        signed
+      )
+      wrongProducer <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
+        envelope.copy(producerId = ByteString.copyFrom(Array.fill[Byte](32)(9))),
+        signed
+      )
+      wrongEta <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
+        envelope.copy(eta = ByteString.copyFrom(Array.fill[Byte](32)(7))),
+        signed
+      )
+    } yield expect.all(valid.isRight, wrongOrdinal.isLeft, wrongParent.isLeft, wrongProducer.isLeft, wrongEta.isLeft)
+  }
+
+  test("parent-missing snapshot is inert; fetched ancestry replays parent-first before write/store/attest") { res =>
     implicit val (ks, j, h, sp, hs) = res
+
+    val ancestorHash = Hash("a" * 64)
+    val middleHash = Hash("b" * 64)
+    val tipHash = Hash("c" * 64)
 
     for {
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       info = mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L))))
       snapshot <- mkSnapshot(info)
       signed <- forAsyncHasher(snapshot, keyPair)
-      verdict <- NakamotoSyncDaemon.verifyCatchUpSnapshot[IO](signed, info)
-    } yield
-      verdict match {
-        case NakamotoSyncDaemon.CatchUpVerdict.Accept(hashed) =>
-          expect(hashed.signed.value.ordinal === SnapshotOrdinal(NonNegLong(1L)))
-        case other => failure(s"expected Accept, got $other")
+      valid = NakamotoSnapshotValidator.Valid(signed, info): NakamotoSnapshotValidator.ValidationResult
+      ancestor = ReplayNode("ancestor", ancestorHash, valid)
+      middle = ReplayNode("middle", middleHash, valid)
+      tip = ReplayNode("tip", tipHash, valid)
+      pending <- Ref.of[IO, Map[Hash, List[ReplayNode]]](Map.empty)
+      events <- Ref.of[IO, List[String]](List.empty)
+
+      // The tip arrives first. Production buffers it before returning ParentBuffered; the Valid-only callback contains every economic
+      // side effect and must be unreachable for this result.
+      _ <- NakamotoSyncDaemon.bufferPendingChild(middleHash, tip, pending)
+      parentlessCommitted <- NakamotoSyncDaemon.commitReplayValidated[IO](NakamotoSnapshotValidator.ParentBuffered) { _ =>
+        events.update(_ ++ List("write:tip", "store:tip", "attest:tip"))
       }
+      beforeAncestor <- events.get
+      pendingBeforeAncestor <- pending.get
+
+      // The middle is also waiting. Once the ancestor is fetched, each successful replay drains only children keyed by its own hash.
+      _ <- NakamotoSyncDaemon.bufferPendingChild(ancestorHash, middle, pending)
+      _ <- {
+        def replay(node: ReplayNode): IO[Unit] =
+          for {
+            _ <- events.update(_ :+ s"validate:${node.name}")
+            committed <- NakamotoSyncDaemon.commitReplayValidated[IO](node.validation) { _ =>
+              events.update(_ :+ s"write:${node.name}") >>
+                events.update(_ :+ s"store:${node.name}") >>
+                events.update(_ :+ s"attest:${node.name}") >>
+                NakamotoSyncDaemon.drainBufferedChildren(node.hash, pending)(_ => IO.unit, replay)
+            }
+            _ <- events.update(_ :+ s"reject:${node.name}").unlessA(committed)
+          } yield ()
+
+        replay(ancestor)
+      }
+      afterReplay <- events.get
+      pendingAfterReplay <- pending.get
+    } yield
+      expect.all(
+        !parentlessCommitted,
+        beforeAncestor.isEmpty,
+        pendingBeforeAncestor.get(middleHash).contains(List(tip)),
+        afterReplay == List(
+          "validate:ancestor",
+          "write:ancestor",
+          "store:ancestor",
+          "attest:ancestor",
+          "validate:middle",
+          "write:middle",
+          "store:middle",
+          "attest:middle",
+          "validate:tip",
+          "write:tip",
+          "store:tip",
+          "attest:tip"
+        ),
+        pendingAfterReplay.isEmpty
+      )
   }
 
-  test("forged snapshot (body tampered after signing → invalid signature) is RejectedInvalidSignature") { res =>
+  test("invalid middle ancestor is not written/stored/attested and prevents descendant replay") { res =>
     implicit val (ks, j, h, sp, hs) = res
+
+    val ancestorHash = Hash("d" * 64)
+    val middleHash = Hash("e" * 64)
+    val tipHash = Hash("f" * 64)
 
     for {
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       info = mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L))))
       snapshot <- mkSnapshot(info)
       signed <- forAsyncHasher(snapshot, keyPair)
-      // Tamper the signed body AFTER signing: the proof is still bound to the original hash, so the recomputed hash
-      // over the mutated value no longer verifies. (Mutating `height` leaves the stateProof field untouched, isolating
-      // the failure to gate 1.)
-      forged = Signed(signed.value.copy(height = Height(NonNegLong(999L))), signed.proofs)
-      verdict <- NakamotoSyncDaemon.verifyCatchUpSnapshot[IO](forged, info)
-    } yield
-      verdict match {
-        case NakamotoSyncDaemon.CatchUpVerdict.RejectedInvalidSignature => success
-        case other                                                      => failure(s"expected RejectedInvalidSignature, got $other")
-      }
-  }
+      valid = NakamotoSnapshotValidator.Valid(signed, info): NakamotoSnapshotValidator.ValidationResult
+      ancestor = ReplayNode("ancestor", ancestorHash, valid)
+      middle = ReplayNode("middle", middleHash, NakamotoSnapshotValidator.ContentMismatch("invalid transition"))
+      tip = ReplayNode("tip", tipHash, valid)
+      pending <- Ref.of[IO, Map[Hash, List[ReplayNode]]](Map.empty)
+      events <- Ref.of[IO, List[String]](List.empty)
+      _ <- NakamotoSyncDaemon.bufferPendingChild(middleHash, tip, pending)
+      _ <- NakamotoSyncDaemon.bufferPendingChild(ancestorHash, middle, pending)
+      _ <- {
+        def replay(node: ReplayNode): IO[Unit] =
+          for {
+            _ <- events.update(_ :+ s"validate:${node.name}")
+            committed <- NakamotoSyncDaemon.commitReplayValidated[IO](node.validation) { _ =>
+              events.update(_ :+ s"write:${node.name}") >>
+                events.update(_ :+ s"store:${node.name}") >>
+                events.update(_ :+ s"attest:${node.name}") >>
+                NakamotoSyncDaemon.drainBufferedChildren(node.hash, pending)(_ => IO.unit, replay)
+            }
+            _ <- events.update(_ :+ s"reject:${node.name}").unlessA(committed)
+          } yield ()
 
-  test("validly-signed snapshot paired with a different GlobalSnapshotInfo is RejectedStateProofMismatch") { res =>
-    implicit val (ks, j, h, sp, hs) = res
-
-    for {
-      keyPair <- KeyPairGenerator.makeKeyPair[IO]
-      honestInfo = mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L))))
-      snapshot <- mkSnapshot(honestInfo)
-      signed <- forAsyncHasher(snapshot, keyPair)
-      // Attacker-chosen state: an extra balance entry ⇒ rebuilt stateProof ≠ the snapshot's committed stateProof.
-      // The signature is still valid (snapshot body untouched), so gate 1 passes and gate 2 must catch it.
-      tamperedInfo = mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L)), addrB -> Balance(NonNegLong(1L))))
-      verdict <- NakamotoSyncDaemon.verifyCatchUpSnapshot[IO](signed, tamperedInfo)
-    } yield
-      verdict match {
-        case NakamotoSyncDaemon.CatchUpVerdict.RejectedStateProofMismatch(hashed) =>
-          expect(hashed.signed.value.ordinal === SnapshotOrdinal(NonNegLong(1L)))
-        case other => failure(s"expected RejectedStateProofMismatch, got $other")
+        replay(ancestor)
       }
+      afterReplay <- events.get
+      pendingAfterReplay <- pending.get
+    } yield
+      expect.all(
+        afterReplay == List(
+          "validate:ancestor",
+          "write:ancestor",
+          "store:ancestor",
+          "attest:ancestor",
+          "validate:middle",
+          "reject:middle"
+        ),
+        !afterReplay.exists(_.endsWith(":tip")),
+        !afterReplay.exists(event => event == "write:middle" || event == "store:middle" || event == "attest:middle"),
+        pendingAfterReplay == Map(middleHash -> List(tip))
+      )
   }
 }

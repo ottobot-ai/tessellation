@@ -12,11 +12,10 @@ import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardTipTrac
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
-import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfigFixture}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.hash.Hash
@@ -119,9 +118,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         tipTrackerFor = sid => if (sid == shardZero) Some(tracker) else None,
         // Slice S4: epoch-keyed eta resolver. Fixed precomputed eta for shardZero regardless of epoch — the emitter
         // threads the resolved eta into its VRF membership proof; rotation correctness is covered in ShardSlotLeaderSuite.
-        shardEtaFor = (sid, _) => IO.pure(if (sid == shardZero) Some(shardEta) else None),
-        sigmaInCommittee = Ratio(1, 4),
-        lddConfig = LddConfigFixture.production
+        shardEtaFor = (sid, _) => IO.pure(if (sid == shardZero) Some(shardEta) else None)
       )
       _ <- emitter.emit(shardZero, checkpointHash, Slot.unsafeApply(5L), EtaPeriod(0L))
       wires <- published.get
@@ -160,9 +157,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         eligibilityChecker = ec,
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = _ => Some(tracker),
-        shardEtaFor = (_, _) => IO.pure(Option.empty[Array[Byte]]), // no eta for any shard ⇒ skip
-        sigmaInCommittee = Ratio(1, 4),
-        lddConfig = LddConfigFixture.production
+        shardEtaFor = (_, _) => IO.pure(Option.empty[Array[Byte]]) // no eta for any shard ⇒ skip
       )
       _ <- emitter.emit(shardZero, checkpointHash, Slot.unsafeApply(5L), EtaPeriod(0L))
       wires <- published.get

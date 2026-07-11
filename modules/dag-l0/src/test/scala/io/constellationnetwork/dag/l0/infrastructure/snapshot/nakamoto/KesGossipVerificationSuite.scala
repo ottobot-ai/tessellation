@@ -15,7 +15,8 @@ import weaver.SimpleIOSuite
 
 /** §1.2 Slice 5/6 verify-path round-trip tests.
   *
-  * Asserts the warn-only behavior matrix for both [[KesGossipVerification.verifyAttestation]] and [[KesGossipVerification.verifySnapshot]]:
+  * Asserts the fail-closed behavior matrix for both [[KesGossipVerification.verifyAttestation]] and
+  * [[KesGossipVerification.verifySnapshot]]:
   *
   *   - sender's signature + receiver's verification round-trip cleanly when the kesRegistry has the sender's master VK (hard correctness
   *     claim from the slice spec)
@@ -82,7 +83,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       sigResult <- signer.signAt(0, testMessageBytes)
       sigBytes = sigResult.toOption.get
       wireBytes = OperationalKeyMaker.encodeSignature(sigBytes)
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
           messageBytes = testMessageBytes,
@@ -97,7 +98,8 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
+      expect(accepted, "a valid registered attestation must be accepted") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
@@ -108,7 +110,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     for {
       (counters, metrics) <- setup
       registry = KesRegistry.empty[IO]
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
           messageBytes = testMessageBytes,
@@ -123,7 +125,8 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
+      expect(!accepted, "a missing attestation KES signature must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total"))
   }
@@ -137,7 +140,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       registry = KesRegistry.make[IO](Map(peerId('z') -> KesRegistryEntry(otherVk, 0L)))
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
           messageBytes = testMessageBytes,
@@ -152,12 +155,13 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total")) &&
+      expect(!accepted, "an unregistered attester must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total"))
   }
 
-  test("attestation: present sig + wrong VK in registry → invalid counter (warn-only)") {
+  test("attestation: present sig + wrong VK in registry → reject and increment invalid counter") {
     for {
       (counters, metrics) <- setup
       (signerA, _) <- buildSigner(0x44.toByte) // signs the actual message
@@ -165,7 +169,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(wrongVk, 0L)))
       sigResult <- signerA.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
           messageBytes = testMessageBytes,
@@ -180,7 +184,8 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
+      expect(!accepted, "an attestation signed by a key other than the registered KES key must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total"))
   }
@@ -190,7 +195,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       (counters, metrics) <- setup
       garbage = Array.fill[Byte](16)(0xff.toByte) // 4-byte length prefix = -1 → MalformedTree
       registry = KesRegistry.empty[IO]
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifyAttestation[IO](
           messageBytes = testMessageBytes,
@@ -205,7 +210,8 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
+      expect(!accepted, "a malformed attestation KES signature must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total"))
   }
 
@@ -220,7 +226,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(vk, 0L)))
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifySnapshot[IO](
           messageBytes = testMessageBytes,
@@ -235,7 +241,8 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_verified_total")) &&
+      expect(accepted, "a valid registered snapshot must be accepted") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_verified_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total"))
   }
 
@@ -243,7 +250,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     for {
       (counters, metrics) <- setup
       registry = KesRegistry.empty[IO]
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifySnapshot[IO](
           messageBytes = testMessageBytes,
@@ -257,7 +264,9 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
         )
       }
       finalCounters <- counters.get
-    } yield expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_sig_total"))
+    } yield
+      expect(!accepted, "a snapshot without a KES signature must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_sig_total"))
   }
 
   test("snapshot: present sig + missing registry entry → no-registry-entry counter") {
@@ -267,32 +276,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       sigResult <- signer.signAt(0, testMessageBytes)
       wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
       registry = KesRegistry.empty[IO]
-      _ <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifySnapshot[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          producerId = peerId('p'),
-          producerHex = peerHex('p'),
-          ordinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_registry_entry_total"))
-  }
-
-  test("snapshot: present sig + wrong VK in registry → invalid counter (warn-only)") {
-    for {
-      (counters, metrics) <- setup
-      (signer, _) <- buildSigner(0x88.toByte)
-      (_, wrongVk) <- buildSigner(0x99.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(wrongVk, 0L)))
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      _ <- {
+      accepted <- {
         implicit val m: Metrics[IO] = metrics
         KesGossipVerification.verifySnapshot[IO](
           messageBytes = testMessageBytes,
@@ -307,7 +291,35 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
       }
       finalCounters <- counters.get
     } yield
-      expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total")) &&
+      expect(!accepted, "an unregistered snapshot producer must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_registry_entry_total"))
+  }
+
+  test("snapshot: present sig + wrong VK in registry → reject and increment invalid counter") {
+    for {
+      (counters, metrics) <- setup
+      (signer, _) <- buildSigner(0x88.toByte)
+      (_, wrongVk) <- buildSigner(0x99.toByte)
+      registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(wrongVk, 0L)))
+      sigResult <- signer.signAt(0, testMessageBytes)
+      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+      accepted <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifySnapshot[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          producerId = peerId('p'),
+          producerHex = peerHex('p'),
+          ordinal = testOrdinal,
+          kesRegistry = registry,
+          etaRotationSnapshots = etaRotationSnapshots,
+          logger = logger
+        )
+      }
+      finalCounters <- counters.get
+    } yield
+      expect(!accepted, "a snapshot signed by a key other than the registered KES key must be rejected") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total")) &&
         expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_verified_total"))
   }
 
@@ -318,7 +330,7 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   // Verification is unconditional now (no warn-only fallback). These tests pin the return-
   // value mapping so the daemon's drop-on-false behavior can't silently flip.
 
-  test("return-value matrix: valid→true, wrong/missing/decode-fail→false, no-registry→true (carve-out)") {
+  test("return-value matrix: only a valid registered KES signature returns true") {
     for {
       (_, metrics) <- setup
       (signer, vk) <- buildSigner(0xaa.toByte)
@@ -397,9 +409,48 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     } yield
       expect(okGood, "valid sig + valid registry must return true") &&
         expect(!okWrong, "wrong VK in registry must return false") &&
-        expect(okEmpty, "no registry entry must return true (Ed25519 already authenticated; Slice 10 carve-out)") &&
+        expect(!okEmpty, "no registry entry must return false") &&
         expect(!okNoSig, "missing wire field must return false") &&
         expect(!okDecodeFail, "decode failure must return false")
+  }
+
+  test("metagraph admission KES-by-step is fail-closed when the operator is not registered") {
+    for {
+      (counters, metrics) <- setup
+      (signer, vk) <- buildSigner(0x6a.toByte)
+      sigResult <- signer.signAt(0, testMessageBytes)
+      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+      registered = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, 0L)))
+      valid <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestationByStep[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          kesStep = 0,
+          kesRegistry = registered,
+          logger = logger
+        )
+      }
+      unregistered <- {
+        implicit val m: Metrics[IO] = metrics
+        KesGossipVerification.verifyAttestationByStep[IO](
+          messageBytes = testMessageBytes,
+          kesSigBytes = wireBytes,
+          attesterId = peerId('a'),
+          attesterHex = peerHex('a'),
+          kesStep = 0,
+          kesRegistry = KesRegistry.empty[IO],
+          logger = logger
+        )
+      }
+      finalCounters <- counters.get
+    } yield
+      expect(valid, "registered KES identity must verify") &&
+        expect(!unregistered, "missing KES registration must reject admission attestation") &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_verified_total")) &&
+        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_no_registry_entry_total"))
   }
 
   // ============================================================

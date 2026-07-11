@@ -58,21 +58,12 @@ object AcceptanceMptStateChanges {
     * Does NOT call `mptStore.commit(snapshotOrdinal)`; the per-ordinal trie checkpoint is the overlay's responsibility (Passthrough's
     * `commit` checkpoints inline; MultiBranch's `finalizeBranch.foldIntoBase` checkpoints at finalize time).
     *
-    * '''S1 follower base-anchoring''' (`currencyInfoRemovalPrior`). The per-MG `writeCurrencyInfo` issues `Mg*` REMOVAL keys for entries
-    * present in its removal-prior but absent from `newInfo` (the I5 stale-key invariant). By default the removal-prior is reconstructed
-    * from the branch-aware `mpt` (the prior on the branch being extended). For SHARDED MGs the follower's apply-prior reads the FINALIZED
-    * BASE (VERSION-MODEL §4 — `GlobalSnapshotAcceptanceManager.accept`'s `shardedInfoMode`), so the WRITE's removal-prior must read the
-    * SAME finalized base, or the two diverge on a branch-only key (one the branch carries but base+diff never mention): `writeCurrencyInfo`
-    * would remove it from `postBytes` while the accumulator-delta verify-replay — which carries NO `Mg*` info removals — retains it in
-    * `expectedBytes`, raising the #107 writer-divergence self-check. Passing `Some(baseReader)` here makes both anchor the `Mg*` removal
-    * set at the base: `infoRemovalKeys(baseReconstructed, newInfo)` drops only keys the base prior held, none of which the verify-replay
-    * sees as branch-only. At branch==base (pipelineDepth=1 / numShards=1, the production regime) `baseReader` reconstructs the same bytes
-    * as the branch `mpt`, so the issued removal set — and therefore every byte written — is identical to the default branch-prior path.
+    * Currency-info removals are derived from this same branch-aware `mpt` before writes are applied. The read prior, removal prior, and
+    * write target therefore always describe one checked-out parent branch.
     */
   def applyStateChanges[F[_]: Async: Parallel: Hasher: JsonSerializer](
     mpt: AcceptanceMpt[F],
-    acc: StateChangesAccumulator,
-    currencyInfoRemovalPrior: Option[GlobalStateConverter.CurrencyInfoReader[F]] = None
+    acc: StateChangesAccumulator
   )(implicit stateProofSelector: StateProofSelector): F[Unit] = {
     import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
 
@@ -216,11 +207,8 @@ object AcceptanceMptStateChanges {
       _ <- currency._2.traverse_ {
         case (metagraphAddr, newInfo) =>
           val infoMpt = CurrencyInfoMptAdapters.mptFor[F](mpt)
-          // S1: reconstruct the removal-prior from the FINALIZED BASE when supplied (sharded MGs), else the branch-aware `mpt`. The WRITE
-          // itself (upserts + removals) still routes through the branch-aware `infoMpt`; only WHICH prior decides the removal keys changes.
-          val removalPriorReader: GlobalStateConverter.CurrencyInfoReader[F] = currencyInfoRemovalPrior.getOrElse(infoMpt)
           GlobalStateConverter
-            .reconstructCurrencyInfoFrom[F](metagraphAddr, removalPriorReader)
+            .reconstructCurrencyInfoFrom[F](metagraphAddr, infoMpt)
             .flatMap(priorInfo => GlobalStateConverter.writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, infoMpt))
       }
       _ <- mpt.insert[Proof](currencyProofs)

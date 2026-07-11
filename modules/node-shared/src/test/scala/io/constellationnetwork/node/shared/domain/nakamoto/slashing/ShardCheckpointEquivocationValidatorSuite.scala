@@ -102,7 +102,6 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
         gl0AnchorOrdinal = gl0AnchorOrdinal,
         slot = SlotT.unsafeApply(gl0AnchorOrdinal.value.value),
         derivedStateDelta = ShardDerivedStateDelta.empty,
-        emittedReceipts = List.empty,
         committeeSignatures = NonEmptyList.of(placeholderSig),
         epoch = epoch
       )

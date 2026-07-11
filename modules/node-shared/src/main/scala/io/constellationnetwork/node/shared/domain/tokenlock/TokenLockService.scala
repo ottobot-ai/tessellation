@@ -101,7 +101,7 @@ object TokenLockService {
                     s"Timed out after ${firstSnapshotTimeout.toSeconds}s waiting for the first currency snapshot — " +
                       s"the node has no currency snapshot to validate the token lock against (lastSnapshotStorage empty). " +
                       s"Upstream cause is typically gl0 rejecting all metagraph SC binaries (chain-link rejection or " +
-                      s"forcedGlobalSyncView mismatch); inspect gl0 logs for [SCAcceptance] warnings or " +
+                      s"pinnedGlobalSyncView mismatch); inspect gl0 logs for [SCAcceptance] warnings or " +
                       s"GlobalSnapshotStateChannelEventsProcessor errors."
                   ).raiseError[F, Option[Either[NonEmptyList[ContextualTokenLockValidationError], Hash]]]
                 )

@@ -5,6 +5,12 @@
 is delivered, essentially for free, by the **participation-set rotation** work tracked as task #22.
 No timer, no extra wire state, no per-round VRF dimension needed.
 
+> **2026-07-11 scope correction.** This note analyzes the secret-VRF metagraph-binary
+> admission draw only. Execution-shard membership is a separate public VK-hash draw.
+> `sigmaOperatorKey` is a uniform selection weight, not economic stake. The adaptivity
+> argument below matters only in the non-saturated regime `kTarget < N`; the threshold
+> clamps to one when `kTarget/N >= 1`.
+
 ---
 
 ## 1. How committee membership works today
@@ -26,9 +32,9 @@ def threshold(kTarget: Int, sigmaOperatorKey: Ratio): Ratio = {
 }
 ```
 
-`σ` (sigma, `sigmaOperatorKey`) is the per-operator stake fraction supplied by the call site.
-Today that fraction is `committeeStake`, defined at `StakeRegistry.scala:66` and implemented at
-`StakeRegistry.scala:172-176` (equalWeight path) and `:326-330` (stakeWeightedMpt path) as:
+`σ` (sigma, `sigmaOperatorKey`) is the per-operator admission-draw weight supplied by the call site.
+Today that weight is `committeeStake`, which is uniform `1/N` even when the global leader registry
+uses economic stake:
 
 ```scala
 def committeeStake(peerId: PeerId): F[Ratio] =
@@ -47,8 +53,8 @@ The `validatorsRef` is populated from the seedlist once at boot
 `updateValidators` calls (currently boot-only). It does **not** track liveness.
 
 Concretely: with 8 registered validators, σ = 1/8 for every peer, and
-`threshold = kTarget * (1/8)`. With `kTarget = 200` that threshold is 25, meaning each operator
-has an independent 25-in-256 chance of landing in the committee per binary.
+`threshold = min(1, kTarget/8)`. With `kTarget = 200` the threshold saturates at one, so every
+eligible operator is selected. A probabilistic example must use `kTarget < 8`.
 
 ---
 
@@ -77,17 +83,17 @@ instead of:
 Suppose 8 registered validators, 3 of which are partitioned / offline at the time the N-2
 participating set was computed:
 
-| State | Denominator | σ per live operator | threshold at kTarget=40 |
+| State | Denominator | σ per live operator | threshold at kTarget=4 |
 |---|---|---|---|
-| Today (full seedlist) | 8 | 1/8 = 0.125 | 40 × 0.125 = **5.0** |
-| After #22 (live 5) | 5 | 1/5 = 0.200 | 40 × 0.200 = **8.0** |
+| Today (full seedlist) | 8 | 1/8 = 0.125 | 4 × 0.125 = **0.5** |
+| After #22 (live 5) | 5 | 1/5 = 0.200 | 4 × 0.200 = **0.8** |
 
-With kTarget = 40 and 5 live validators:
+With kTarget = 4 and 5 live validators:
 
-- Today's threshold is 5.0 out of [0, 256): expected committee = 40 × 5 (live) × 0.125 = **25** members — undershoots kTarget because 3 offline nodes are included in the denominator but contribute zero VRF proofs.
-- After #22: threshold = 8.0; expected committee = 40 × 5 (live) × 0.200 = **40** — matches kTarget exactly, drawn entirely from the live set.
+- Today's threshold is 0.5: expected live committee size = 4 × 5 × 0.125 = **2.5** — below the target because three offline nodes remain in the denominator.
+- After #22 the threshold is 0.8: expected live committee size = 4 × 5 × 0.200 = **4** — the target, drawn entirely from the live set.
 
-The self-rebalancing is algebraic and instantaneous. No timer fires, no round counter advances,
+In a non-saturated configuration, the self-rebalancing is algebraic once #22 is implemented. No timer fires, no round counter advances,
 no extra gossip occurs. The cluster reconverges on the correct committee size simply by having
 computed `σ` against the right denominator at the prior epoch boundary.
 
@@ -174,14 +180,14 @@ state and compose at call sites only through the `threshold` expression.
 
 Per `EPOCH-PARTICIPATION-AND-DEMOTION-DESIGN.md §3.2–3.3`:
 
-- **Within-epoch measurement**: per-`(peerId, epoch)` participation counters (Slice 17,
-  `ShardNonParticipationStateManager`) are wired from the election path
-  (`recordSlotEligibility`) and the attestation path (the site currently calling the ad-hoc
-  `markActive` at `TipTracker:197`).
+- **Within-epoch measurement**: define new per-`(peerId, epoch)` consensus-carried participation
+  records, then write them from the election path and attestation path. No such production record
+  or writer exists today.
 - **Boundary computation**: at the eta boundary (`GlobalSnapshotAcceptanceManager.scala:954`,
-  predicate `ord % R == R-1`) the participating set is computed from those counters via a
-  generalized `ShardNonParticipationSlasher.evaluateEpochBoundary` predicate and folded into
-  `HistoricalStakeSnapshot` (or a new `GlobalStateFieldId` entry, fieldId 25).
+  predicate `ord % R == R-1`) compute the participating set from those records via a new,
+  deterministic predicate and fold it into `HistoricalStakeSnapshot` (or allocate a new,
+  explicitly versioned `GlobalStateFieldId`). Field 24 is retired and active IDs 25 through 34
+  must not be renumbered.
 - **Retention**: three-period retention, same as the existing historical stake snapshots, so
   the N-2 lookback window is always populated.
 
@@ -233,26 +239,25 @@ not just an optimization.
 
 ## 6. Summary
 
-| Property | Today (full seedlist σ) | After #22 (participating-set σ) |
+| Property | Today (full seedlist σ) | Proposed after #22 (participating-set σ) |
 |---|---|---|
 | σ under partition (3/8 offline) | 1/8 (fixed; offline nodes dilute) | 1/5 (auto-corrects to live set) |
-| Expected committee size | kDraw × 5 × (1/8) = 0.625 × kDraw | kDraw × 5 × (1/5) = kDraw |
+| Expected live committee size | `min(1,kDraw/8) × 5` | `min(1,kDraw/5) × 5` |
 | Wire overhead vs dynamic expansion | — | None (no round field, no timer) |
-| Determinism | ❌ (static seedlist, correct; but tied to boot-only update) | ✅ (N-2 boundary, MPT-backed, parity-tested) |
+| Determinism | ✅ static boot validator set | PLANNED: requires a consensus-pinned N-2 set |
 | Interaction with kDraw/kQuorum split | orthogonal | orthogonal |
 
-**Conclusion.** The participation set replaces the static `|validatorsRef|` denominator in
-`committeeStake` with a deterministic, epoch-anchored, liveness-aware denominator. This delivers
-automatic committee rebalancing under partition — the core value proposition of dynamic committee
-expansion — at zero additional latency, zero additional wire state, and with stronger determinism
-guarantees than the existing `optimisticRelativeStake` path.
+**Conditional conclusion.** If #22 is implemented and the draw is non-saturated, replacing the
+static denominator with a consensus-pinned participating set would rebalance admission under a
+partition without new per-binary wire state. This is not current behavior, and saturated
+`kDraw >= N` configurations already select every eligible operator.
 
 ---
 
 ## References
 
 - `StakeRegistry.scala:66` — `committeeStake` docstring and signature
-- `StakeRegistry.scala:172` / `:326` — `committeeStake` impls (equalWeight / stakeWeightedMpt); denominator is `validators.size`
+- `StakeRegistry.scala:172,326,474` — every `committeeStake` implementation uses uniform `1/validators.size`
 - `CommitteeSortition.scala:139` — `threshold(kTarget, sigmaOperatorKey): Ratio`
 - `CommitteeSortition.scala:220–239` — `make[F]` impl: `isInCommittee` and `verifyMembershipDetailed`
 - `MetagraphAttestationAggregator.scala:83` — `requiredCount(kTarget)`: `ceil(2/3 × kTarget)`

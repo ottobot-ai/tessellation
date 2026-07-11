@@ -85,9 +85,7 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     currencyId: Address,
     metagraphSyncData: Option[SortedMap[Address, snapshot.MetagraphSyncDataInfo]],
-    alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal],
-    lastUnsyncGlobalSnapshotOrdinal: SnapshotOrdinal,
-    updatedLastSyncGlobalFromPeersInConsensus: SnapshotOrdinal
+    alreadyProcessedGlobalOrdinals: SortedSet[SnapshotOrdinal]
   ): F[(SortedMap[Address, List[SpendAction]], SortedSet[SnapshotOrdinal])] = {
     val emptySpendActions = SortedMap.empty[Address, List[SpendAction]]
     val emptyProcessedGlobalSnapshots = SortedSet.empty[SnapshotOrdinal]
@@ -110,51 +108,45 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
               processUnappliedOrdinals(
                 unappliedGlobalOrdinalsToProcess,
                 lastGlobalSnapshots,
-                getGlobalSnapshotByOrdinal,
-                lastUnsyncGlobalSnapshotOrdinal,
-                updatedLastSyncGlobalFromPeersInConsensus
-              ).map(spendActions => (spendActions, unappliedGlobalOrdinalsToProcess))
+                getGlobalSnapshotByOrdinal
+              ).flatMap(spendActions => (spendActions, unappliedGlobalOrdinalsToProcess).pure[F])
         }
     }
   }
 
   private def processUnappliedOrdinals(
-    unappliedOrdinals: Set[SnapshotOrdinal],
+    unappliedOrdinals: SortedSet[SnapshotOrdinal],
     lastGlobalSnapshots: List[Hashed[GlobalIncrementalSnapshot]],
-    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
-    lastUnsyncGlobalSnapshotOrdinal: SnapshotOrdinal,
-    updatedLastSyncGlobalFromPeersInConsensus: SnapshotOrdinal
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   ): F[SortedMap[Address, List[SpendAction]]] = {
     val snapshotCache = lastGlobalSnapshots.map(s => s.ordinal -> s).toMap
     val (cached, missing) = unappliedOrdinals.partition(snapshotCache.contains)
 
-    val fromCache = cached.toList.flatMap { ordinal =>
-      snapshotCache.get(ordinal).flatMap(_.spendActions).toList
+    val fromCache = cached.toList.map { ordinal =>
+      ordinal -> snapshotCache(ordinal).spendActions.getOrElse(SortedMap.empty[Address, List[SpendAction]])
     }
 
     val fetchMissing = missing.toList.parTraverse { ordinal =>
       getGlobalSnapshotWithRetry(ordinal, getGlobalSnapshotByOrdinal)
-        .map(_.spendActions.getOrElse(SortedMap.empty[Address, List[SpendAction]]))
+        .map(snapshot => ordinal -> snapshot.spendActions.getOrElse(SortedMap.empty[Address, List[SpendAction]]))
     }
 
-    fetchMissing.map(fromFetched =>
-      combineSpendActions(fromCache ++ fromFetched, lastUnsyncGlobalSnapshotOrdinal, updatedLastSyncGlobalFromPeersInConsensus)
-    )
+    fetchMissing.map(fromFetched => combineSpendActions(fromCache.concat(fromFetched)))
   }
 
-  private def combineSpendActions(
-    spendActionsList: List[SortedMap[Address, List[SpendAction]]],
-    lastUnsyncGlobalSnapshotOrdinal: SnapshotOrdinal,
-    updatedLastSyncGlobalFromPeersInConsensus: SnapshotOrdinal
+  /** Every ordinal returned in `GlobalSnapshotsProcessed` must have every one of its actions replayed. Merge in ordinal order and
+    * concatenate producer collisions explicitly; right-biased `Map.++` would acknowledge an earlier ordinal while silently dropping its
+    * actions.
+    */
+  private[currency] def combineSpendActions(
+    spendActionsByOrdinal: List[(SnapshotOrdinal, SortedMap[Address, List[SpendAction]])]
   ): SortedMap[Address, List[SpendAction]] =
-    if (lastUnsyncGlobalSnapshotOrdinal > updatedLastSyncGlobalFromPeersInConsensus) {
-      spendActionsList
-        .reduceOption(_ |+| _)
-        .getOrElse(SortedMap.empty)
-    } else {
-      spendActionsList
-        .reduceOption(_ ++ _)
-        .getOrElse(SortedMap.empty)
+    spendActionsByOrdinal.sortBy(_._1).foldLeft(SortedMap.empty[Address, List[SpendAction]]) {
+      case (combined, (_, actionsByProducer)) =>
+        actionsByProducer.foldLeft(combined) {
+          case (acc, (producer, actions)) =>
+            acc.updated(producer, acc.getOrElse(producer, List.empty).appendedAll(actions))
+        }
     }
 
   def updateGlobalSnapshotCache(

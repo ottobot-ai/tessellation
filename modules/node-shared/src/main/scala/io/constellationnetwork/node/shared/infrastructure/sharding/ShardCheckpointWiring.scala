@@ -63,31 +63,31 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * manager's `finalityTriggers` / `chainStore` callbacks are simple `Map.get` lookups against this registry — `None` ⇒ "shard not tracked
   * locally" ⇒ reject, exactly as the manager's scaladoc specifies.
   *
-  * '''committeeMembership(shardId, epoch) — real VRF-VK sortition.''' The acceptance manager's pre-check confirms each checkpoint signer is
-  * in `committeeMembership(shardId, epoch)`; the admit quorum `verifyEmbedded` requires is the DECOUPLED cluster-uniform `kQuorum`
-  * (`nakamoto.committee.kQuorum`), NOT `|committeeMembership(shardId, epoch)|` (the enumerated draw size is logged for diagnostics only).
-  * [[committeeFor]] materializes that committee as a DETERMINISTIC VRF-VK-sortitioned SUBSET of the active operator set — MINUS every
-  * operator with an unexpired `Slashings` (fieldId 34) cooldown at the epoch's anchor (FINDING-002/EPIC-3.1, see
-  * [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader]]; the exclusion is floored so ≥ `kQuorum` eligible
-  * validators always remain) — sized by the DRAW target `kDraw` (size `≈ kDraw`, NOT the full `N` — though the testnet default `kDraw = N`
-  * saturates the threshold so it IS everyone) — so only a metagraph's shard committee re-executes it (genuine execution segmentation). The
-  * draw is a deterministic pseudo-random sortition keyed on each operator's registered VRF *VK* + the epoch eta + the shardId (see
-  * [[committeeFor]] scaladoc for the determinism argument and `CommitteeSortition.isInShardCommittee` for why a VK-seeded PRF, not a true
-  * per-operator VRF eval, is the only enumerable-by-a-non-member option). The per-signer predicates then authenticate "did this specific
-  * peer sign": Ed25519 + KES product sig over the checkpoint hash, AND a REAL `EcVrf25519` verify of each
-  * `CommitteeMemberSignature.vrfProof` under the signer's registered VRF VK (`vrfRegistry`) over the canonical `(shardEta(shardId, epoch),
-  * checkpoint.slot)` message — the SAME proof the producer's `ShardCheckpointAttestationEmitter`/`ShardSlotLeader.membershipProof`
-  * computes; the sortitioned `committeeFor` set gates "is this peer even in shard S's committee". v1 trade-off (acceptable per design §10 —
-  * honest-testnet, slashing is the v2 backstop): the committee SET is PREDICTABLE because VKs are public (the per-signer VRF proof binds
-  * each signature to its drawn member, but does not hide the draw); Algorand player-replaceability (a per-`(shard, epoch)` membership VRF
-  * whose output is unknowable from the VK alone, verified with `CommitteeSortition.verifyMembership`) is a v2 hardening.
+  * '''committeeMembership(shardId, epoch) — public deterministic VK-hash draw.''' This is the execution committee, distinct from the true
+  * per-binary VRF admission committee. The acceptance manager confirms each checkpoint signer is in `committeeMembership(shardId, epoch)`.
+  * `kQuorum` drives shard selection finality, but it never authorizes economic state: `verifyEmbedded` re-executes every included CL1
+  * transition regardless of signature count. [[committeeFor]] materializes the execution committee as a deterministic VK-hash-selected
+  * subset of the active operator set — minus every operator with an unexpired `Slashings` (fieldId 34) cooldown at the epoch's anchor
+  * (FINDING-002/EPIC-3.1, see [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader]]; the exclusion is
+  * floored so ≥ `kQuorum` eligible validators always remain) — sized by the DRAW target `kDraw` (size `≈ kDraw`, NOT the full `N` — though
+  * the testnet default `kDraw = N` saturates the threshold so it IS everyone). The committee pre-executes and attests; every GL0 adopter
+  * still re-executes the included CL1 transitions before canonical state changes. The draw is a deterministic pseudo-random sortition keyed
+  * on each operator's registered VRF *VK* + the epoch eta + the shardId (see [[committeeFor]] scaladoc for the determinism argument and
+  * `CommitteeSortition.isInShardCommittee` for why a VK-seeded public hash, not a true per-operator VRF eval, is the only
+  * enumerable-by-a-non-member option). The per-signer predicates then authenticate "did this specific peer sign": Ed25519 + KES product sig
+  * over the checkpoint hash, AND a REAL `EcVrf25519` verify of each `CommitteeMemberSignature.vrfProof` under the signer's registered VRF
+  * VK (`vrfRegistry`) over the canonical `(shardEta(shardId, epoch), checkpoint.slot)` message — the SAME proof the producer's
+  * `ShardCheckpointAttestationEmitter`/`ShardSlotLeader.membershipProof` computes; the enumerated `committeeFor` set gates "is this peer
+  * even in shard S's committee". v1 trade-off (acceptable per design §10 — honest-testnet, slashing is the v2 backstop): the committee SET
+  * is PREDICTABLE because VKs are public (the per-signer VRF proof binds each signature to its drawn member, but does not hide the draw);
+  * Algorand player-replaceability (a per-`(shard, epoch)` membership VRF whose output is unknowable from the VK alone, verified with
+  * `CommitteeSortition.verifyMembership`) is a v2 hardening.
   *
-  * '''reExecuteDerivation — caller-supplied (S3: real committee re-execution).''' The `T_depth1_shard` degraded path re-runs each MG's
-  * derivation and compares the recomputed `mptRoot` byte-for-byte against the committee-signed value. The closure is supplied as a
-  * parameter so each call site passes the SAME [[reExecDerivation]] closure built from its own
-  * [[GlobalSnapshotStateChannelEventsProcessor]] (the SAME processor gl0 uses for metagraph snapshots) — that is what makes the producer's
-  * `perMetagraphMptRoots` and every verifier's recomputed roots byte-identical. The `None`/[[noReExecDerivation]] fallback (fail-closed
-  * `Hash.empty`) remains for callers that have not wired a processor.
+  * '''reExecuteDerivation — caller-supplied replay.''' Every receive and GL0-adoption path re-runs each MG's derivation and compares the
+  * recomputed `mptRoot` byte-for-byte against the committee-signed value. The closure is supplied as a parameter so each call site passes
+  * the SAME [[reExecDerivationAtPinnedBase]] closure built from its own [[GlobalSnapshotStateChannelEventsProcessor]] and a reader for the
+  * signed finalized execution base. That is what makes the producer's roots and every verifier's recomputed roots byte-identical. The
+  * `None`/[[noReExecDerivation]] fallback (fail-closed `Hash.empty`) remains for callers that have not wired a processor.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`): every tunable is read off the typed [[ShardingConfig]] passed in by the
   * caller from `cfg.nakamoto.sharding`. No `sys.env.get` anywhere in this helper.
@@ -96,9 +96,9 @@ object ShardCheckpointWiring {
 
   /** The per-shard consumer-side state bundle for one shard. Held in the registry the acceptance manager's lookups close over.
     *
-    * '''binaryBuffer (EXECUTION-SHARDING R-1 — the inversion intake).''' The per-shard raw-binary accumulator. The daemon's gossip-handler
-    * buffers each received metagraph binary for ITS shard here; the producer-fan-out reads `binaryBuffer.snapshotPending` from the SAME
-    * instance. This is what decouples shard-checkpoint production from gl0's post-chain-link `stateChannelSnapshots` map (see
+    * '''binaryBuffer.''' The per-shard admission-approved binary accumulator. The metagraph gate buffers each approved binary for its shard
+    * here; the producer fan-out reads `binaryBuffer.snapshotPending` from the SAME instance. This is what decouples shard-checkpoint
+    * production from gl0's post-chain-link `stateChannelSnapshots` map (see
     * [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer]] for the determinism model — leader-proposes /
     * members-attest, so node-local selection is fine).
     */
@@ -131,67 +131,35 @@ object ShardCheckpointWiring {
   )
 
   /** Fail-closed fallback for the `T_depth1_shard` re-exec derivation. Returns a fixed sentinel hash for every `(metagraphAddress,
-    * includedChain, gl0AnchorOrdinal)`. Used only by callers that have NOT wired a real [[reExecDerivation]] closure; both production sites
-    * now pass the real one.
+    * includedChain, gl0AnchorOrdinal)`. Used only by callers that have not wired a real [[reExecDerivationAtPinnedBase]] closure; both
+    * production sites now pass the real one.
     *
     * '''Safety analysis.''' The re-exec path fires ONLY when a shard is degraded (no committee quorum — `T_count_shard` did not qualify —
     * but the chain advanced past `k1Shard`). On that path the manager compares this derivation's output against the committee-signed
     * `perMetagraphMptRoots(mg)`. With a fixed sentinel:
-    *   - For an empty-window checkpoint (`includedSnapshots` empty — a T_alive liveness ping) there is nothing to compare, so the path
-    *     reduces to pre-check + finality and accepts cleanly.
-    *   - For a non-empty-window checkpoint the `Hash.empty` sentinel is the manager's CANNOT-RE-DERIVE marker: `reExecPath` buckets it as
+    *   - Empty checkpoints are rejected before this fallback can authorize anything.
+    *   - For a content-bearing checkpoint the `Hash.empty` sentinel is the manager's CANNOT-RE-DERIVE marker: `reExecPath` buckets it as
     *     "this node can't check" and returns a plain `Rejected` — the checkpoint is DROPPED (fail-closed; the binaries do NOT enter the gl0
     *     snapshot) but the signers are NOT slash targets. This matters because `RejectedReExecutionMismatch` now feeds the DURABLE 100%
     *     `InvalidStateProof` slash (`GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` → `WatchtowerSlashRequest`), which demands an
     *     AFFIRMATIVE pinned-base re-derivation mismatch as evidence — a sentinel from an unwired closure (or an unresolvable pinned
-    *     diff-base) is not evidence of committee deviation. So the worst case is "degraded-shard non-quorum checkpoints are not admitted
-    *     until quorum returns", never "honest signers slashed".
+    *     execution-base) is not evidence of committee deviation. So the worst case is "degraded-shard non-quorum checkpoints are not
+    *     admitted until quorum returns", never "honest signers slashed".
     */
   def noReExecDerivation[F[_]: Async]
     : (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
     (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) => Async[F].pure(Hash.empty)
 
-  /** S3 committee re-execution closure — the SINGLE definition of "re-run this metagraph's derivation and compute its per-MG root", shared
-    * by the producer (`ShardCheckpointProducer.derivePerMgState`) and the gl0 verifier
-    * (`ShardCheckpointGl0AcceptanceManager.reExecuteDerivation`). Defining it once here is what guarantees both sides run the IDENTICAL
-    * function over the same inputs — the byte-identity contract that prevents false-slashing (see
-    * [[GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot]]'s determinism scaladoc).
+  /** The single reader-resolution recipe for every [[reExecDerivationAtPinnedBase]] caller: resolve the finalized [[GlobalStateReader]] AT
+    * the wire-carried, committee-signed pinned ordinal (`executionBaseOrdinal`), NEVER at this node's live base when the two differ.
     *
-    * Delegates to `processor.deriveMetagraphRoot`, passing the checkpoint's wire-carried `gl0AnchorOrdinal` as the derivation ordinal (so
-    * the fee-required cutover is computed identically on producer + verifier) and a CONSTANT `_ => None` global-snapshot lookup. The no-op
-    * lookup makes the root a pure function of `(metagraphAddress, includedChain, gl0AnchorOrdinal)` — zero reads of the live `MptStore` or
-    * snapshot storage, so every node (producer + every committee verifier) computes byte-identical roots regardless of its local chain
-    * height. `processCurrencySnapshots` swallows any per-snapshot apply failure (its `handleErrorWith` keeps the prior state), so a `None`
-    * lookup degrades deterministically rather than diverging.
-    *
-    * @param processor
-    *   the same `GlobalSnapshotStateChannelEventsProcessor` instance gl0 uses for metagraph-snapshot acceptance (its
-    *   `processCurrencySnapshots` IS the canonical derivation).
-    */
-  def reExecDerivation[F[_]: Async: Hasher](
-    processor: GlobalSnapshotStateChannelEventsProcessor[F]
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] = {
-    // Pure-by-construction global-snapshot lookup: NEVER reads storage, so the derivation cannot pick up a node-local view.
-    val noGlobalSnapshotLookup: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]] =
-      (_: SnapshotOrdinal) => Async[F].pure(Option.empty[Hashed[GlobalIncrementalSnapshot]])
-
-    // `deriveMetagraphRoot` seeds from an EMPTY prior (not S(N)), so this root is base-INDEPENDENT — the wire-carried `diffBaseOrdinal`
-    // (4th arg) is accepted for signature parity with `reExecDerivationWithDiff` but not read here.
-    (mg: Address, binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]], gl0AnchorOrdinal: SnapshotOrdinal, _: SnapshotOrdinal) =>
-      processor.deriveMetagraphRoot(mg, binaries, gl0AnchorOrdinal, noGlobalSnapshotLookup)(Hasher[F])
-  }
-
-  /** Track-1 diff-base-pin (FINDING-B1) — THE single reader-resolution recipe for every [[reExecDerivationWithDiff]] caller: resolve the
-    * finalized [[GlobalStateReader]] AT the wire-carried, committee-signed pinned ordinal (`diffBaseOrdinal`), NEVER at this node's live
-    * base when the two differ.
-    *
-    * '''Why one definition.''' The re-derived per-MG root is base-DEPENDENT (`deriveAdoptedCurrencyInfo` folds cumulative
-    * balances/refs/active-sets — and the `lastMessages` carry-forward — onto the seed prior; `currencySnapshotMgRoot` is taken over that
-    * fold). So every rail that recomputes the root for byte-comparison against a committee-attested `perMetagraphMptRoots(mg)` — the gl0
-    * produce/watchtower rail (`GlobalSnapshotConsensus.finalizedReaderAt`), the SharedServices sub-quorum `reExecuteDerivation`, and the
-    * SharedServices `createContext` fraud-proof validator — MUST read the SAME pinned base the producer diffed over, or an honest
-    * committee's root is not reproduced and the mismatch feeds the 100% `InvalidStateProof` slash (the false-slash + split this pin kills).
-    * One shared definition keeps all three rails byte-identical, mirroring [[reExecDerivationWithDiff]] itself.
+    * '''Why one definition.''' Full currency recreation is base-dependent: balances, references, active sets, and messages all begin at the
+    * pinned prior, and `currencySnapshotMgRoot` commits the recreated result. So every rail that recomputes the root for comparison against
+    * `perMetagraphMptRoots(mg)` — the gl0 produce/watchtower rail (`GlobalSnapshotConsensus.finalizedReaderAt`), the SharedServices
+    * unconditional `reExecuteDerivation`, and the SharedServices `createContext` fraud-proof validator — MUST read the SAME pinned base the
+    * producer executed over, or an honest committee's root is not reproduced and the mismatch feeds the 100% `InvalidStateProof` slash (the
+    * false-slash + split this pin kills). One shared definition keeps all three rails byte-identical, mirroring
+    * [[reExecDerivationAtPinnedBase]] itself.
     *
     * '''Resolution — ALWAYS the version-retained [[PinnedCurrencyInfoReader.pinnedReaderAt]]''' (which verifies the retained bytes
     * reproduce the pinned snapshot's committed `mptRoot`). There is deliberately NO live-store fast path. The original fast path served
@@ -199,13 +167,13 @@ object ShardCheckpointWiring {
     * store is a MUTABLE VIEW whose content-vs-watermark relationship is unsynchronized. In Passthrough overlay mode the accept-path writes
     * land in the base store THROUGHOUT an ordinal's processing and `MptStore.commit(ordinal)` bumps `lastPersistedOrdinal` only at the very
     * end, so `lastPersistedOrdinal == N` holds while the content is anywhere from state@N to a MID-FOLD/POST-FOLD state of N+1+. Live wedge
-    * (2026-07-08, 2mg/2shard token-lock e2e): gl0-1 minted shard-0 `shardOrdinal=8` stamped `diffBaseOrdinal=18` while its live store
+    * (2026-07-08, 2mg/2shard token-lock e2e): gl0-1 minted shard-0 `shardOrdinal=8` stamped `executionBaseOrdinal=18` while its live store
     * already carried the shardOrd-7 adopt (prior read `inc@10,bal=15`; the TRUE committed state@18 was `inc@7,bal=14`) — the diff was cut
     * over the drifted content, quorum attested it (every committee member's fast path saw the same drifted view), and every honest adopter
     * — applying the wire diff onto the verified state@18 — recomputed a root that never matched the attested one. The checkpoint re-offered
     * and dropped at EVERY gl0 ordinal, the per-MG mirror froze, and the metagraph's `activeTokenLocks` never reached gl0. The pinned read
     * is the only version-pinned source; the fast path's byte-map-materialization saving was never worth an unpinned prior. (Forcing test:
-    * `DiffBasePinReExecutionSuite` "forcing (iii)" — mid-fold watermark skew.)
+    * `ExecutionBasePinReExecutionSuite` "forcing (iii)" — mid-fold watermark skew.)
     *
     * '''Fail-closed.''' `None` when the anchor is unresolvable (evicted below the byte store's retention — logarithmic on the follower
     * rail, contiguous k₂ on gl0 — or not yet reached). The caller then OMITs (defers) / maps to the `Hash.empty` "cannot re-derive"
@@ -217,39 +185,34 @@ object ShardCheckpointWiring {
   ): SnapshotOrdinal => F[Option[GlobalStateReader[F]]] =
     (ord: SnapshotOrdinal) => pinnedReader.pinnedReaderAt(ord)
 
-  /** Track-1 diff-base-pin — the ordinal the producer STAMPS as [[io.constellationnetwork.schema.sharding.ShardCheckpoint.diffBaseOrdinal]]
-    * and cuts every per-MG diff over: the NEWEST ordinal the version-retained signed byte store can actually SERVE (its latest persisted
-    * state), NOT the live `mptStore.lastPersistedOrdinal`.
+  /** Track-1 execution-base-pin — the ordinal the producer STAMPS as
+    * [[io.constellationnetwork.schema.sharding.ShardCheckpoint.executionBaseOrdinal]] and cuts every per-MG diff over: the NEWEST ordinal
+    * the version-retained signed byte store can actually SERVE (its latest persisted state), NOT the live `mptStore.lastPersistedOrdinal`.
     *
     * '''Why not the live watermark.''' [[pinnedPriorReaderAt]] resolves the diff prior EXCLUSIVELY through the version-retained,
     * root-verified pinned reader (see its scaladoc for the mid-fold-skew wedge the live fast path caused). The signed byte store is written
     * at the FINALIZE sink and therefore TRAILS `lastPersistedOrdinal` by a few ordinals — stamping the live watermark would make the pinned
-    * read miss on almost every mint (`cannot resolve pinned diff-base — OMIT (defer)`, the DAG4Bawb producer chase in the 2026-07-08 run)
-    * and stall checkpoint production. Stamping the store's own latest ordinal makes the base resolvable-by-construction on the minting
+    * read miss on almost every mint (`cannot resolve pinned execution-base — OMIT (defer)`, the DAG4Bawb producer chase in the 2026-07-08
+    * run) and stall checkpoint production. Stamping the store's own latest ordinal makes the base resolvable-by-construction on the minting
     * node; committee re-executors and gl0 adopters resolve it from their own (finalize-synchronized) signed stores.
     *
     * `SnapshotOrdinal.MinValue` before the first finalize-sink write — `produceInner` then OMITs (defers) until history exists, which is
     * exactly the fail-closed contract. `numShards = 1` never builds checkpoints, so this is dead there (regression bar preserved).
     */
-  def pinnedDiffBaseOrdinal[F[_]: Async](signedBytesStore: MptStateStorage[F]): F[SnapshotOrdinal] =
+  def pinnedExecutionBaseOrdinal[F[_]: Async](signedBytesStore: MptStateStorage[F]): F[SnapshotOrdinal] =
     signedBytesStore.findLatestOrdinal.map(_.getOrElse(SnapshotOrdinal.MinValue))
 
-  /** The PRODUCER-side per-MG derivation (step 6 of the unroll workstream). Same SHAPE as [[reExecDerivation]] but returns the per-MG MPT
-    * root PAIRED with the MINIMAL `CurrencySnapshotInfo` byte-diff against the prior shard-checkpoint's cumulative state `S(N)`. The
-    * producer carries the diff in `ShardCheckpoint.derivedStateDelta.perMetagraphStateDiff` and gl0 verifiers APPLY-and-verify it (no
-    * re-exec) — the fix for the run-24/26 allow-spends accumulation bug (`docs/nakamoto/COMMITTEE-STATE-DIFF-ADOPTION-DESIGN.md` +
-    * `docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`).
+  /** The pinned per-MG derivation shared by producer and verifier. It returns only the recreated per-MG MPT root. Every GL0 verifier
+    * independently recreates the state.
     *
     * '''Diff base = `S(N)` from the adopted, chain-linked best-tip (PIN-4 — NOT empty-prior, NOT the undo journal).''' The committee +
     * every verifier are gl0 nodes that ALREADY adopted checkpoint N (the chain-link guard enforces in-order adoption), so `S(N)` — the
     * prior checkpoint's cumulative per-MG currency state — is already in their overlay best-tip. `priorStateReader` is exactly that
     * best-tip `GlobalStateReader`; `S(N)` is reconstructed from it via [[GlobalStateConverter.reconstructCurrencyInfoFrom]] (8 `Mg*` +
-    * fieldId-7 allow-spends) and the fieldId-5 incremental. Diffs apply IN ORDER (chain-link) ⇒ cumulative state ⇒ allow-spends/token-locks
-    * accumulate. The per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only — never the diff base.
+    * fieldId-7 allow-spends) and the fieldId-5 incremental. Snapshots execute IN ORDER (chain-link), so cumulative state, allow-spends, and
+    * token-locks accumulate. The per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only.
     *
-    * '''Derivation (the empty→S(N) swap is the core fix).''' Runs the SAME
-    * [[GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots]] derivation [[reExecDerivation]] uses — identical
-    * `noGlobalSnapshotLookup` (pure `None`, split-safe) and identical `AdoptFromSignedFields` adoption mode — but seeds
+    * '''Derivation.''' Runs the SAME full recreation as the global adopter, with finalized global-snapshot lookup, and seeds
     * `priorLastCurrencySnapshots` with `S(N)` (`Right((priorInc, S(N)))`, or `Left(genesis)` at the metagraph's genesis window, or absent
     * for a never-seen MG) INSTEAD of `SortedMap.empty`. The LAST resulting per-MG `CurrencySnapshotWithState` is `next` (mirrors
     * `calculateLastCurrencySnapshots`).
@@ -257,32 +220,26 @@ object ShardCheckpointWiring {
     * '''Root (PIN-1).''' `root = GlobalStateConverter.currencySnapshotMgRoot(SortedMap(mg -> next))` — the COMPONENT-ADDRESSABLE per-MG MPT
     * root (the `rootHash` of the standalone trie over the MG's fieldId-5 incremental + `infoSubFields` `Mg*` entries, one leaf per
     * account), NOT the old flat `Hasher.hash((incrementalRoot, infoRoot))` (which could not back a single-leaf inclusion proof) and NOT the
-    * Some/None-SENSITIVE `hash((mg, state))` that [[reExecDerivation]] emits. This `Hash` is what `perMetagraphMptRoots(mg)` carries (that
-    * field is `SortedMap[Address, Hash]`); the gl0 verifier recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state,
-    * and `ShardSubtreeProofService` witnesses a single `(field, account)` leaf against it. '''All three PIN-1 sites + TaskB must route
-    * through `currencySnapshotMgRoot`.'''
-    *
-    * '''Diff (PIN-2 + PIN-3).''' `ChangeSet.currencyInfoChangeSet(mg, priorInfo, next.info)` — the 8 `Mg*` ⊕ fieldId-7 allow-spends,
-    * minimal (changed/new upserts + removed keys). `priorInfo` is the info half of `S(N)` (empty when absent).
+    * an empty-prior or Some/None-sensitive hash. This `Hash` is what `perMetagraphMptRoots(mg)` carries (that field is `SortedMap[Address,
+    * Hash]`); the gl0 verifier recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state, and `ShardSubtreeProofService`
+    * witnesses a single `(field, account)` leaf against it. '''All three PIN-1 sites + TaskB must route through
+    * `currencySnapshotMgRoot`.'''
     */
-  def reExecDerivationWithDiff[F[_]: Async: Parallel: Hasher: JsonSerializer](
+  def reExecDerivationAtPinnedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
     processor: GlobalSnapshotStateChannelEventsProcessor[F],
-    // Track-1 diff-base-pin: the prior reader is resolved PER CALL at the checkpoint's `diffBaseOrdinal` (the 4th closure arg), NOT fixed
+    // Track-1 execution-base-pin: the prior reader is resolved PER CALL at the checkpoint's `executionBaseOrdinal` (the 4th closure arg), NOT fixed
     // at construction to the node-local live base. This is what makes the producer's diff-prior + derivation-prior and every re-executor's
     // (committee/watchtower) read the SAME pinned base `S(N)`. `None` ⇒ this node cannot resolve the pinned base (evicted below retention,
-    // or not reached) ⇒ OMIT (defer) rather than derive over a WRONG base. Callers wire the fast-path (live reader when the ordinal is the
-    // current `lastPersistedOrdinal`) + version-retained fallback.
-    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]]
+    // or not reached) ⇒ OMIT (defer) rather than derive over a WRONG base. Callers wire only the version-retained pinned reader.
+    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
+    // Currency recreation resolves the snapshot's signed `globalSyncView` through this finalized, hash-checked lookup. Supplying a
+    // node-local head or `None` would either fork the transition inputs or make the verifier fall back to trusting claimed fields.
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
     implicit stateProofSelector: StateProofSelector
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Option[(Hash, ChangeSet)]] = {
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Option[Hash]] = {
     import GlobalStateReaderOps._
     type CurrencyState = Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
-
-    // Pure-by-construction global-snapshot lookup — identical to `reExecDerivation`'s (NEVER reads storage; the split-safety contract
-    // forbids node-local global reads in the derivation, so producer + every verifier derive byte-identical results).
-    val noGlobalSnapshotLookup: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]] =
-      (_: SnapshotOrdinal) => Async[F].pure(Option.empty[Hashed[GlobalIncrementalSnapshot]])
 
     val emptyInfo: CurrencySnapshotInfo =
       CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
@@ -313,127 +270,108 @@ object ShardCheckpointWiring {
           priorStateReader.getLastCurrencySnapshot(mg).map(_.map(g => Left(g): CurrencyState))
       }
 
-    def infoOf(state: CurrencyState): CurrencySnapshotInfo =
-      state.fold(_.value.info.toCurrencySnapshotInfo, _._2)
-
     (
       mg: Address,
       binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
       gl0AnchorOrdinal: SnapshotOrdinal,
-      diffBaseOrdinal: SnapshotOrdinal
+      executionBaseOrdinal: SnapshotOrdinal
     ) =>
-      // Track-1 diff-base-pin: resolve the prior reader AT `diffBaseOrdinal` (the producer's stamped base, cluster-uniform). A `None`
+      // Track-1 execution-base-pin: resolve the prior reader AT `executionBaseOrdinal` (the producer's stamped base, cluster-uniform). A `None`
       // means this node cannot serve the pinned base (below retention, or not yet reached) — OMIT (defer) rather than seed the derivation
       // from a WRONG base and attest a root no honest verifier reproduces.
-      priorReaderAt(diffBaseOrdinal).flatMap {
+      priorReaderAt(executionBaseOrdinal).flatMap {
         case None =>
           reExecDiagLogger
             .warn(
-              s"[diff-base-pin] mg=${mg.value.value.take(10)} cannot resolve pinned diff-base ord=${diffBaseOrdinal.value.value} " +
+              s"[execution-base-pin] mg=${mg.value.value.take(10)} cannot resolve pinned execution-base ord=${executionBaseOrdinal.value.value} " +
                 s"(evicted/not-reached) — OMIT (defer)"
             )
-            .as(None: Option[(Hash, ChangeSet)])
+            .as(None: Option[Hash])
         case Some(priorStateReader) =>
-          // The DERIVATION prior is the full S(N) CurrencyState (the genesis `Left` is needed to seed the state fold). The DIFF prior, by
-          // contrast, MUST be what is actually RECONSTRUCTIBLE from the unrolled MPT base the apply side (TaskB) diffs against — i.e.
-          // `getCurrencySnapshotInfo` (gated on the fieldId-5 incremental: `None` at a not-yet-unrolled genesis ⇒ `emptyInfo`). Using the
-          // genesis snapshot's embedded info as the diff prior would desync the apply (the genesis info is NOT in the unrolled `Mg*`
-          // partitions until the first incremental writes it), so the two priors are deliberately resolved by different reads.
-          (priorState(priorStateReader, mg), priorStateReader.getCurrencySnapshotInfo(mg)).tupled.flatMap {
-            case (priorOpt, priorInfoOpt) =>
-              val priorInfo: CurrencySnapshotInfo = priorInfoOpt.getOrElse(emptyInfo)
-              val priorMap: SortedMap[Address, CurrencyState] =
-                priorOpt.fold(SortedMap.empty[Address, CurrencyState])(p => SortedMap(mg -> p))
+          // The derivation prior is the full pinned S(N) CurrencyState; the genesis `Left` is needed to seed the state fold.
+          priorState(priorStateReader, mg).flatMap { priorOpt =>
+            val priorMap: SortedMap[Address, CurrencyState] =
+              priorOpt.fold(SortedMap.empty[Address, CurrencyState])(p => SortedMap(mg -> p))
 
-              reExecDiagLogger.info(
-                s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
-                  s"priorOpt=${descPrior(priorOpt)} priorInfoOpt=${priorInfoOpt.fold("None")(i => s"Some(bal=${i.balances.size})")}"
-              ) >>
-                // SAME derivation as reExecDerivation (AdoptFromSignedFields, noGlobalSnapshotLookup), but with the S(N) prior instead of empty.
-                // ORDER CONTRACT (mirrors deriveMetagraphRoot): processCurrencySnapshots expects NEWEST-FIRST; checkpoint windows arrive
-                // OLDEST-FIRST (chainLinkOrder unfolds anchor→tip), so reverse here.
-                processor
-                  .processCurrencySnapshots(
-                    gl0AnchorOrdinal,
-                    SortedMap.empty[Address, Balance],
-                    priorMap,
-                    SortedMap(mg -> binaries.reverse),
-                    noGlobalSnapshotLookup,
-                    GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
-                  )(Hasher[F])
-                  .flatMap { accepted =>
-                    // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the re-executed chain is `next`.
-                    val lastStateOpt: Option[CurrencyState] =
-                      accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
-                    lastStateOpt match {
-                      case Some(next) =>
-                        // TRACK-1 DELETE-OVERRIDE (2026-07-01) — the producer twin of the authoritative override dies here (its GSAM adopter
-                        // twin dies in the SAME commit). EMIT `infoOf(next)` VERBATIM. The override re-applied the metagraph's authoritative
-                        // balances/refs/active-sets onto the re-exec output, but `deriveAdoptedCurrencyInfo` (inside `processCurrencySnapshots`,
-                        // the SAME derivation this closure runs) ALREADY populates `infoOf(next)` with those exact maps — each verified against the
-                        // signed `stateProof` at derivation time — so `infoOf(next).copy(authX.getOrElse(infoOf(next).X))` was byte-for-byte
-                        // `infoOf(next)`. The attested per-MG root + the committee diff are cut over this `infoOf(next)`; every gl0 verifier
-                        // reconstructs it byte-identically from the diff over the SAME `diffBaseOrdinal`-pinned prior, and its GAP-1 (re-grounded on
-                        // `stateProof.<field>.isDefined`) binds the reconstructed value to the metagraph's own signature.
-                        //
-                        // CONTIGUITY (I3 / run-27b) — RELAXED to advisory. The window anchors at `finalizedBasePerMgTip` (S2 §4) and the diff prior
-                        // is read at `diffBaseOrdinal` — the SAME finalized base by construction — so a window chaining from the base advances
-                        // `base.ordinal` by EXACTLY `windowSize`; the old OMIT is now an invariant. Keep the check as a diagnostic only (a violation
-                        // means a base read-skew, caught fail-closed downstream by the adopter's now-unconditional GAP-1 balances/refs compare — a
-                        // drop, never silent corruption) and PROCEED to derive rather than defer (removing a false-defer liveness hazard).
-                        val contiguousWithBase: Boolean = (priorOpt, next) match {
-                          case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
-                            nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
-                          case _ => true
-                        }
-                        val nextInfo: CurrencySnapshotInfo = infoOf(next)
-                        for {
-                          _ <-
-                            if (contiguousWithBase) Async[F].unit
-                            else
-                              reExecDiagLogger.warn(
-                                s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with pinned diff-base " +
-                                  s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
-                                      .map(_._1.value.ordinal.value.value)
-                                      .getOrElse(-1L)}) — base read-skew; proceeding (GAP-1 is the fail-closed net)"
-                              )
-                          // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
-                          // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. The gl0 follower
-                          // recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state — all three PIN-1 sites route through that
-                          // one helper, so the bytes are identical by construction.
-                          root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> next))
-                          // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
-                          // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
-                          cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
-                          _ <- reExecDiagLogger.info(
-                            s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
-                          )
-                          diff <- ChangeSet.currencyInfoChangeSet[F](mg, priorInfo, nextInfo)
-                        } yield Some((root, diff)): Option[(Hash, ChangeSet)]
-                      case None =>
-                        // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
-                        // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
-                        // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
-                        // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s AdoptFromSignedFields genesis-window
-                        // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
-                        // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
-                        // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
-                        // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
-                        // on a later checkpoint once the prior is adopted (the pipeline self-heals).
-                        reExecDiagLogger
-                          .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
-                          .as(None: Option[(Hash, ChangeSet)])
-                    }
+            reExecDiagLogger.info(
+              s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
+                s"priorOpt=${descPrior(priorOpt)}"
+            ) >>
+              // Full currency recreation against the checkpoint's pinned prior and the snapshot's pinned finalized GL0 view.
+              // ORDER CONTRACT: processCurrencySnapshots expects NEWEST-FIRST; checkpoint windows arrive
+              // OLDEST-FIRST (chainLinkOrder unfolds anchor→tip), so reverse here.
+              processor
+                .processCurrencySnapshots(
+                  gl0AnchorOrdinal,
+                  SortedMap.empty[Address, Balance],
+                  priorMap,
+                  SortedMap(mg -> binaries.reverse),
+                  getGlobalSnapshotByOrdinal
+                )(Hasher[F])
+                .flatMap { accepted =>
+                  // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the re-executed chain is `next`.
+                  val lastStateOpt: Option[CurrencyState] =
+                    accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
+                  lastStateOpt match {
+                    case Some(next) =>
+                      // The root and optional transport diff are cut over the full recreation output. No metagraph or committee field
+                      // replaces `infoOf(next)`.
+                      // CONTIGUITY (I3 / run-27b) — RELAXED to advisory. The window anchors at `finalizedBasePerMgTip` (S2 §4) and the diff prior
+                      // is read at `executionBaseOrdinal` — the SAME finalized base by construction — so a window chaining from the base advances
+                      // `base.ordinal` by EXACTLY `windowSize`; the old OMIT is now an invariant. Keep the check as a diagnostic only (a violation
+                      // means a base read-skew, caught fail-closed downstream by the adopter's now-unconditional GAP-1 balances/refs compare — a
+                      // drop, never silent corruption) and PROCEED to derive rather than defer (removing a false-defer liveness hazard).
+                      val contiguousWithBase: Boolean = (priorOpt, next) match {
+                        case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
+                          nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
+                        case _ => true
+                      }
+                      for {
+                        _ <-
+                          if (contiguousWithBase) Async[F].unit
+                          else
+                            reExecDiagLogger.warn(
+                              s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with pinned execution-base " +
+                                s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
+                                    .map(_._1.value.ordinal.value.value)
+                                    .getOrElse(-1L)}) — base read-skew; proceeding (the adopter's full re-exec root check is fail-closed)"
+                            )
+                        // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
+                        // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. The gl0 follower
+                        // recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state — all three PIN-1 sites route through that
+                        // one helper, so the bytes are identical by construction.
+                        root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> next))
+                        // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
+                        // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
+                        cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
+                        _ <- reExecDiagLogger.info(
+                          s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
+                        )
+                      } yield Some(root): Option[Hash]
+                    case None =>
+                      // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
+                      // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
+                      // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
+                      // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s genesis-window
+                      // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
+                      // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
+                      // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
+                      // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
+                      // on a later checkpoint once the prior is adopted (the pipeline self-heals).
+                      reExecDiagLogger
+                        .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
+                        .as(None: Option[Hash])
                   }
-                  .handleErrorWith { e =>
-                    // A derivation crash is likewise NOT a committable state — OMIT this MG (defer) rather than attest an empty-state root
-                    // every verifier would mismatch. The MG re-derives cleanly on a later checkpoint over the same chain.
-                    reExecDiagLogger
-                      .warn(e)(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} DERIVATION CRASH → OMIT (defer)")
-                      .as(None: Option[(Hash, ChangeSet)])
-                  }
+                }
+                .handleErrorWith { e =>
+                  // A derivation crash is likewise NOT a committable state — OMIT this MG (defer) rather than attest an empty-state root
+                  // every verifier would mismatch. The MG re-derives cleanly on a later checkpoint over the same chain.
+                  reExecDiagLogger
+                    .warn(e)(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} DERIVATION CRASH → OMIT (defer)")
+                    .as(None: Option[Hash])
+                }
           }
-      } // close priorReaderAt(diffBaseOrdinal).flatMap
+      } // close priorReaderAt(executionBaseOrdinal).flatMap
   }
 
   /** Build the acceptance-side sharding dependencies, gated on `cfg.numShards > 1`.
@@ -441,17 +379,16 @@ object ShardCheckpointWiring {
     * @param cfg
     *   the typed [[ShardingConfig]] from `cfg.nakamoto.sharding`. `numShards <= 1` ⇒ returns `None` (regression bar; nothing constructed).
     * @param kDraw
-    *   committee DRAW target (cluster-uniform `cfg.nakamoto.committee.kDraw`). Threaded into [[committeeFor]]'s `isInShardCommittee` draw —
-    *   sizes the enumerated shard committee (`≈ kDraw`; `= N` saturates ⇒ everyone). Decoupled from the admit quorum.
+    *   committee DRAW target (cluster-uniform `cfg.nakamoto.committee.kDraw`). Threaded into [[committeeFor]]'s public VK-hash draw — sizes
+    *   the enumerated shard committee (`≈ kDraw`; `= N` saturates ⇒ everyone). Decoupled from the admit quorum.
     * @param kQuorum
-    *   committee ADMIT quorum (cluster-uniform `cfg.nakamoto.committee.kQuorum`). The distinct-attester count `verifyEmbedded` /
-    *   `ShardFinalityTriggers.tCountShard` require — DIRECTLY (no 2/3 of the draw). Invariant `0 < kQuorum <= kDraw` enforced at load.
+    *   shard selection-finality quorum (cluster-uniform `cfg.nakamoto.committee.kQuorum`). `ShardFinalityTriggers.tCountShard` compares the
+    *   distinct-attester count directly (no second 2/3 conversion). `verifyEmbedded` does not use quorum as an economic-validity shortcut.
     * @param selfPeerId
     *   this gl0 operator's PeerId. Threaded into each per-shard [[ShardTipTracker]] (self-exclusion for `T_count_shard`) and the acceptance
     *   manager (diagnostic logging of which op spotted a deviation).
     * @param kesRegistry
-    *   registered KES master VKs. Used by the acceptance manager's per-signer KES product-sig verification (registry-absent carve-out for
-    *   the bootstrap window).
+    *   registered KES master VKs. Used by the acceptance manager's per-signer KES product-sig verification. Missing entries fail closed.
     * @param vrfRegistry
     *   registered per-operator VRF verification keys. CONSUMED by [[committeeFor]] — each operator's registered VK is the per-operator seed
     *   for the deterministic shard-committee draw. MUST be the genesis/seedlist-loaded registry (identical cluster-wide) on EVERY path that
@@ -470,19 +407,18 @@ object ShardCheckpointWiring {
     *   committee-VRF verify consumes — so the eta the committee was DRAWN under and the eta each signer's VRF proof is VERIFIED under share
     *   one source.
     * @param reExecuteDerivation
-    *   the `T_depth1_shard` re-exec derivation closure `(metagraphAddress, includedChain) => F[Hash]`. `Some(...)` (S3 wiring) ⇒ the real
-    *   `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` closure — committee re-execution that recomputes the per-MG root and
-    *   rejects (+ flags slash signers) on a byte-mismatch. `None` (the default) ⇒ [[noReExecDerivation]] (fail-closed: degraded-path
-    *   non-empty checkpoints are rejected on the `Hash.empty` sentinel, never falsely admitted). Modelled as `Option` rather than a
-    *   defaulted closure because Scala can't resolve `Async[F]` for `noReExecDerivation[F]` at the default-arg site (the context bound is
-    *   on the method, not on the default expression) — the same constraint the GSAM `localEventsPublisher` param hits.
+    *   the `T_depth1_shard` pinned-base re-exec derivation closure. `Some(...)` recomputes the canonical per-MG root and rejects (+ flags
+    *   slash signers) on a byte-mismatch. `None` (the default) ⇒ [[noReExecDerivation]] (fail-closed: degraded-path non-empty checkpoints
+    *   are rejected on the `Hash.empty` sentinel, never falsely admitted). Modelled as `Option` rather than a defaulted closure because
+    *   Scala can't resolve `Async[F]` for `noReExecDerivation[F]` at the default-arg site (the context bound is on the method, not on the
+    *   default expression) — the same constraint the GSAM `localEventsPublisher` param hits.
     * @param slashCooldownReader
     *   FINDING-002/EPIC-3.1 — the per-operator cooldown gate over the `Slashings` (fieldId 34) partition [[committeeFor]] excludes on.
     *   Production (`SharedServices`) passes `Some(SlashCooldownReader.fromMptStore(storages.mptStore, R))` — the SAME store + eta-period
     *   length the committee's `etaForEpoch` resolver reads, so the exclusion is a pure function of the wire-carried epoch (see the reader's
     *   scaladoc for the anchor/uniformity contract). MUST be identical cluster-wide on every path that runs `verifyEmbedded`, or the
     *   committee — and thus the adopt decision — diverges (#261). `None` ⇒ [[SlashCooldownReader.noExclusion]] (draw byte-identical to the
-    *   pre-exclusion code; the legacy-fixture default, same modelling constraint as `reExecuteDerivation`).
+    *   no-exclusion path; primarily useful for focused tests, with the same modelling constraint as `reExecuteDerivation`).
     */
   def acceptanceDeps[F[_]: Async: Hasher: SecurityProvider: Metrics](
     cfg: ShardingConfig,
@@ -540,31 +476,28 @@ object ShardCheckpointWiring {
                 }
             }
           }
-        // Per-shard leader-VRF eta resolver for the acceptance manager's REAL committee-VRF verify. Same `etaForEpoch` source the committee
-        // DRAW (`committeeFor`) reads, fed through the SAME `ShardSlotLeader.computeShardEta(shardId, gl0Eta)` derivation the producer's
+        // Per-shard registered-key proof eta resolver. Same `etaForEpoch` source the public committee draw reads, fed through the same
+        // `ShardSlotLeader.computeShardEta(shardId, gl0Eta)` derivation the producer's
         // `ShardCheckpointAttestationEmitter` uses — so the eta a signer's `vrfProof` is VERIFIED under byte-matches the eta the producer
         // SIGNED under, across an eta boundary (keyed on the wire-carried `checkpoint.epoch`). `computeShardEta` is Hasher-only (no
         // EligibilityChecker needed here). MPT-committed eta ⇒ cluster-uniform. Returns `Some(_)` always on the active path (the eta is
-        // always resolvable once the boundary is written); the manager's `None` branch is the bootstrap carve-out for layers without it.
+        // always resolvable once the boundary is written); `None` fails verification closed.
         shardEtaFor = (sid: ShardId, epoch: EtaPeriod) =>
           etaForEpoch(epoch).flatMap(gl0Eta => ShardSlotLeader.computeShardEta[F](sid, gl0Eta)).map(_.some)
+        shardAssignment = ShardAssignment.make[F](cfg.numShards)
         acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[F](
           finalityTriggers = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.finalityTriggers)),
-          chainStore = (sid: ShardId) => Async[F].pure(registry.get(sid).map(_.chainStore)),
           committeeMembership = committeeMembership,
-          kDraw = kDraw,
-          kQuorum = kQuorum,
-          selfPeerId = selfPeerId,
           kesRegistry = kesRegistry,
           vrfRegistry = vrfRegistry,
+          shardAssignment = shardAssignment,
           shardEtaFor = shardEtaFor,
           reExecuteDerivation = reExec
         )
-        shardAssignment = ShardAssignment.make[F](cfg.numShards)
         _ <- logger.info(
           s"sharding ACTIVE: numShards=${cfg.numShards} kDraw=$kDraw kQuorum=$kQuorum " +
             s"k1Shard=${cfg.finality.k1Shard} — built per-shard registry (${registry.size} shards) + gl0 acceptance manager " +
-            s"(real VRF-VK committee sortition)"
+            s"(public deterministic VK-hash committee draw)"
         )
       } yield Some(AcceptanceDeps(cfg, acceptanceManager, shardAssignment, registry, committeeMembership))
   }
@@ -593,14 +526,14 @@ object ShardCheckpointWiring {
           chainStore = chainStore,
           tipTracker = tipTracker
         )
-        // R-1: the per-shard raw-binary accumulator. The SAME instance feeds the gossip-intake (daemon) and the producer-fan-out — that
+        // Per-shard admission-approved binary accumulator. The SAME instance feeds the gate output and producer fan-out, so
         // shared instance IS the inversion: the producer reads buffered binaries here instead of gl0's post-chain-link map.
         binaryBuffer <- ShardBinaryBuffer.make[F](shardId, cap = cfg.checkpoint.binaryBufferCap)
       } yield shardId -> ShardRegistryEntry(chainStore, tipTracker, triggers, binaryBuffer)
     }
       .map(_.toMap)
 
-  /** Real VRF-VK-sortitioned `committeeFor(shardId, epoch)` — the deterministic committee SET for one `(shard, epoch)`.
+  /** Public deterministic VK-hash `committeeFor(shardId, epoch)` — the committee set for one `(shard, epoch)`.
     *
     * '''Algorithm.''' Resolve the epoch's SLASH-COOLDOWN exclusion first (`slashCooldown.excludedForEpoch(epoch)` — FINDING-002/EPIC-3.1,
     * see [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader]] for the epoch-anchored uniformity contract)
@@ -608,8 +541,8 @@ object ShardCheckpointWiring {
     * `SlashCooldownReader.effectiveExclusion`). Then enumerate the POST-EXCLUSION pool in a STABLE order (sorted by `PeerId`, so iteration
     * is order-independent); for each operator look up its registered VRF VK in `vrfRegistry` and keep it iff
     * `CommitteeSortition.isInShardCommittee(vrfVk, eta, shardId, epoch, σ, kDraw)` — i.e. its `H(eta, shardId, epoch, vrfVk)` draw value
-    * falls below `threshold(kDraw, σ)`. An operator with NO registered VK cannot be sortitioned (no seed) ⇒ excluded. `σ` (per-operator
-    * stake share) is the uniform `1/N` rule (`committeeStake`, `[[project-216-committee-stake-drift-fix]]`), computed from `N = |pool|`
+    * falls below `threshold(kDraw, σ)`. An operator with NO registered VK cannot be sortitioned (no seed) ⇒ excluded. `σ` is an independent
+    * uniform `1/N` execution-draw weight, computed from `N = |pool|`
     * (the POST-exclusion size — the draw threshold's denominator shrinks with the eligible set) so `threshold = kDraw/N` and the expected
     * committee size stays `≈ kDraw` over the eligible operators (and `kDraw >= N` saturates to every eligible one). The admit quorum is the
     * SEPARATE `kQuorum`, applied in `verifyEmbedded` / `ShardFinalityTriggers`, NOT this draw — but because every checkpoint signer must
@@ -670,7 +603,7 @@ object ShardCheckpointWiring {
         val n = pool.size
         if (n <= 0) Async[F].pure((Set.empty[PeerId], exclusion.anchorSettled))
         else {
-          val sigma = Ratio(1, n) // uniform per-operator stake share over the ELIGIBLE pool: threshold = kDraw/N ⇒ E[|committee|] ≈ kDraw
+          val sigma = Ratio(1, n) // uniform draw weight over the ELIGIBLE pool: threshold = kDraw/N ⇒ E[|committee|] ≈ kDraw
           // Stable iteration order (sorted by PeerId) so the fold is order-independent; the result is a Set so order is moot anyway.
           pool.toList
             .sortBy(_.value.value)

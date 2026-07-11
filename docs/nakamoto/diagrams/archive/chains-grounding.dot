@@ -1,0 +1,192 @@
+// Hypergraph / Shard / Metagraph chains — finality-tiered grounding
+// ==================================================================
+//
+// Render:
+//   dot -Tpng -Gdpi=150 chains-grounding.dot -o chains-grounding.png
+//   dot -Tsvg          chains-grounding.dot -o chains-grounding.svg
+//
+// WHAT THIS SHOWS
+//   A single wall-clock "now" snapshot of the hypergraph. The gl0 (hypergraph)
+//   chain is the master time-grid: left = older/buried, right = tip/now,
+//   snapshot ordinal increases left->right. Each gl0 snapshot is colored by the
+//   FINALITY TIER it has reached at "now" — so one snapshot matures
+//   A0 (red) -> A1 (orange) -> A2 (green) -> A3 (blue) as it is buried deeper.
+//
+//   FOUR finality-assurance tiers a gl0 snapshot passes through as it ages:
+//     A0  proposed         in-consensus, pre-attestation; throwaway        RED
+//     A1  attestation-final >=2/3 stake attested; ~seconds; churn-reorgs   ORANGE
+//     A2  depth-stable      A1 + delta-slot density confirmation;          GREEN
+//                           ~10s s..min; only a deep density reorg (negligible)
+//     A3  archival          depth-k2; ~hours; irreversible                 BLUE
+//
+//   Three producer chains (swim-lanes) each GROUND themselves on the gl0 tier
+//   appropriate to their trust need, and therefore TRAIL the gl0 tip by that
+//   tier's lag:
+//     - shard committee checkpoints STRADDLE A1 (cheap "ride") + A2 (econ base)
+//     - metagraph (ml0) currency snapshots ground on A2 (globalSyncView)
+//     - external consumers (light clients / cross-shard I-ONCE) settle on A3
+//
+//   delta = the A2 density-confirmation depth (in slots): the metagraph
+//   latency-vs-stability knob. Larger delta => deeper A2 => more stable
+//   economic base, but the metagraph trails the gl0 tip by more.
+//
+// MODELING NOTE (read before over-interpreting the trailing edges)
+//   This is a "now" snapshot. The bold, labeled grounding edges are the LIVE
+//   bindings of each lane's TIP. Trailing nodes (C(k-1), C(k-2), M(j-1) ...)
+//   grounded the same way against the tier that was current at THEIR creation;
+//   those anchors have since matured downward as the gl0 chain grew. They are
+//   drawn thin/unlabeled into their original tier band.
+//
+// Refs:
+//   - docs/nakamoto/ECONOMIC-TRUST-SHARDED-SECURITY-ARCHITECTURE.md
+//   - docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md
+//   - docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md
+//   - docs/nakamoto/finality-monitor.dot   (A1 attestation-2/3 + A2/A3 depth gates)
+//   - docs/nakamoto/layered-anchor-dataflow.dot  (sibling swim-lane diagram)
+
+digraph chains_grounding {
+  rankdir=TB;
+  nodesep=0.70;
+  ranksep=1.25;
+  splines=spline;
+  graph [fontname="Helvetica", fontsize=12, labelloc=t,
+         label=<<B>Hypergraph / Shard / Metagraph chains &mdash; finality-tiered grounding</B><BR/><FONT POINT-SIZE="11">(A0 tip &rarr; A1 ride &rarr; A2 economic &rarr; A3 settlement)</FONT><BR/><FONT POINT-SIZE="10">&delta; = the A2 density-confirmation depth (slots) &mdash; the metagraph latency-vs-stability knob.&nbsp;&nbsp;Left = older / buried&nbsp;&middot;&nbsp;Right = tip / now.</FONT><BR/> >];
+  node  [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.18,0.10"];
+  edge  [fontname="Helvetica", fontsize=9, arrowsize=0.8];
+
+  // =====================================================================
+  // LANE 1 — HYPERGRAPH (gl0) chain : the master time-grid + tier gradient
+  //   columns G0..G6 = S(n-6) .. S(n);  S(n) is the tip = now.
+  //   colored by tier REACHED at now:  A3 A3 A3 | A2 A2 | A1 | A0
+  // =====================================================================
+  S_n6 [label=<<B>S(n&minus;6)</B><BR/><FONT POINT-SIZE="9">A3 &middot; archival</FONT>>,        fillcolor="#E8F4FD", color="#0b5394"];
+  S_n5 [label=<<B>S(n&minus;5)</B><BR/><FONT POINT-SIZE="9">A3 &middot; archival</FONT>>,        fillcolor="#E8F4FD", color="#0b5394"];
+  S_n4 [label=<<B>S(n&minus;4)</B><BR/><FONT POINT-SIZE="9">A3 &middot; archival</FONT>>,        fillcolor="#E8F4FD", color="#0b5394"];
+  S_n3 [label=<<B>S(n&minus;3)</B><BR/><FONT POINT-SIZE="9">A2 &middot; depth-stable</FONT>>,    fillcolor="#D4EDDA", color="#1a7f37"];
+  S_n2 [label=<<B>S(n&minus;2)</B><BR/><FONT POINT-SIZE="9">A2 &middot; depth-stable</FONT>>,    fillcolor="#D4EDDA", color="#1a7f37"];
+  S_n1 [label=<<B>S(n&minus;1)</B><BR/><FONT POINT-SIZE="9">A1 &middot; attest-final</FONT>>,     fillcolor="#FFF3CD", color="#E67E00"];
+  S_n0 [label=<<B>S(n) = tip</B><BR/><FONT POINT-SIZE="9">A0 &middot; proposed (now)</FONT>>,    fillcolor="#F8D7DA", color="#721c24", penwidth=2.2];
+
+  // gl0 lane tag (left margin) — kept IN the gl0 rank so it stays on this row
+  gl0_tag [shape=plaintext, fontsize=11, fontcolor="#333333",
+           label=<<B>HYPERGRAPH</B><BR/><FONT POINT-SIZE="9">gl0 snapshots</FONT>>];
+  { rank=same; gl0_tag; S_n6; S_n5; S_n4; S_n3; S_n2; S_n1; S_n0; }
+  // bold chain-link "next" edges (left->right = increasing ordinal)
+  gl0_tag -> S_n6 [style=invis];
+  S_n6 -> S_n5 -> S_n4 -> S_n3 -> S_n2 -> S_n1 -> S_n0
+        [color="#555555", penwidth=2.2, arrowsize=0.7];
+
+  // =====================================================================
+  // LANE 2 — SHARD COMMITTEE checkpoints : straddle A1 (ride) + A2 (base)
+  //   C(k-2)@G4  C(k-1)@G5  C(k)@G6(tip,now)
+  // =====================================================================
+  C_km2 [label=<<B>C(k&minus;2)</B>>,                          fillcolor="#EDE7F6", color="#6A3D9A"];
+  C_km1 [label=<<B>C(k&minus;1)</B>>,                          fillcolor="#EDE7F6", color="#6A3D9A"];
+  C_k   [label=<<B>C(k)</B><BR/><FONT POINT-SIZE="9">active checkpoint</FONT>>, fillcolor="#EDE7F6", color="#6A3D9A", penwidth=2.2];
+
+  com_tag [shape=plaintext, fontsize=11, fontcolor="#333333",
+           label=<<B>SHARD COMMITTEE</B><BR/><FONT POINT-SIZE="9">checkpoints</FONT>>];
+  { rank=same; com_tag; C_km2; C_km1; C_k; }
+  com_tag -> C_km2 [style=invis];
+  C_km2 -> C_km1 -> C_k [color="#555555", penwidth=2.2, arrowsize=0.7];
+
+  // =====================================================================
+  // LANE 3 — METAGRAPH (ml0) currency snapshots : ground on A2
+  //   M(j-2)@G4  M(j-1)@G5  M(j)@G6(tip,now)
+  // =====================================================================
+  M_jm2 [label=<<B>M(j&minus;2)</B>>,                          fillcolor="#E0F2F1", color="#00796B"];
+  M_jm1 [label=<<B>M(j&minus;1)</B>>,                          fillcolor="#E0F2F1", color="#00796B"];
+  M_j   [label=<<B>M(j)</B><BR/><FONT POINT-SIZE="9">currency tip</FONT>>, fillcolor="#E0F2F1", color="#00796B", penwidth=2.2];
+
+  mg_tag [shape=plaintext, fontsize=11, fontcolor="#333333",
+          label=<<B>METAGRAPH</B><BR/><FONT POINT-SIZE="9">ml0 currency</FONT>>];
+  { rank=same; mg_tag; M_jm2; M_jm1; M_j; }
+  mg_tag -> M_jm2 [style=invis];
+  M_jm2 -> M_jm1 -> M_j [color="#555555", penwidth=2.2, arrowsize=0.7];
+
+  // =====================================================================
+  // LANE 4 — CONSUMERS : light clients / cross-shard I-ONCE settle on A3
+  //   Cons_A@G5  Cons_B@G6
+  // =====================================================================
+  Cons_A [label=<<B>light client</B><BR/><FONT POINT-SIZE="9">inclusion proof</FONT>>,  fillcolor="#F0F0F0", color="#666666"];
+  Cons_B [label=<<B>cross-shard</B><BR/><FONT POINT-SIZE="9">I-ONCE single-use</FONT>>, fillcolor="#F0F0F0", color="#666666"];
+
+  con_tag [shape=plaintext, fontsize=11, fontcolor="#333333",
+           label=<<B>CONSUMERS</B><BR/><FONT POINT-SIZE="9">light client /<BR/>cross-shard</FONT>>];
+  { rank=same; con_tag; Cons_A; Cons_B; }
+  con_tag -> Cons_A [style=invis];
+
+  // =====================================================================
+  // COLUMN ALIGNMENT — invisible TB chains pin each lane under a gl0 column
+  //   G4: S(n-2) | G5: S(n-1) | G6: S(n)=tip
+  // =====================================================================
+  S_n2 -> C_km2 -> M_jm2          [style=invis];
+  S_n1 -> C_km1 -> M_jm1 -> Cons_A [style=invis];
+  S_n0 -> C_k   -> M_j   -> Cons_B [style=invis];
+  // keep the lane tags column aligned on the left
+  gl0_tag -> com_tag -> mg_tag -> con_tag [style=invis];
+
+  // =====================================================================
+  // GROUNDING EDGES (constraint=false so they never disturb the time-grid)
+  //   the bold+labeled edge of each lane = the LIVE binding of its TIP;
+  //   thin unlabeled edges = trailing nodes' (since-matured) anchors.
+  // =====================================================================
+
+  // --- committee TIP: straddles A1 ride + A2 economic base ---
+  C_k -> S_n1 [constraint=false, style=dashed, penwidth=1.8,
+               color="#E67E00", fontcolor="#E67E00", labelfontsize=9,
+               headlabel="rides-into @A1\n(gl0Anchor · 1 back)", labeldistance=4.5, labelangle=18];
+  C_k -> S_n2 [constraint=false, penwidth=2.0,
+               color="#1a7f37", fontcolor="#1a7f37",
+               label="re-exec base @A2\n(2 back)"];
+  // committee trailers — base anchors (1 back), since matured into the green band
+  C_km1 -> S_n2 [constraint=false, style=dashed, penwidth=1.0, color="#1a7f37", arrowsize=0.6];
+  C_km2 -> S_n3 [constraint=false, style=dashed, penwidth=1.0, color="#1a7f37", arrowsize=0.6];
+
+  // --- metagraph TIP: grounds on A2 (globalSyncView), trails by the delta lag ---
+  M_j -> S_n3 [constraint=false, penwidth=2.0,
+               color="#1a7f37", fontcolor="#1a7f37",
+               label="globalSyncView grounds-on @A2\n3 behind tip (~&delta; trail)"];
+  // metagraph trailers
+  M_jm1 -> S_n2 [constraint=false, style=dashed, penwidth=1.0, color="#1a7f37", arrowsize=0.6];
+  M_jm2 -> S_n3 [constraint=false, style=dashed, penwidth=1.0, color="#1a7f37", arrowsize=0.6];
+
+  // --- consumers: settle only on A3 (archival, irreversible) ---
+  //   taillabels (near the well-separated source nodes) so the two long
+  //   blue sweeps don't collide in the middle corridor.
+  Cons_A -> S_n4 [constraint=false, penwidth=2.0,
+                  color="#0b5394", fontcolor="#0b5394",
+                  taillabel="inclusion proof @A3\n(4 back)", labeldistance=4.0, labelangle=-28];
+  Cons_B -> S_n6 [constraint=false, penwidth=2.0,
+                  color="#0b5394", fontcolor="#0b5394",
+                  taillabel="I-ONCE settle @A3\n(6 back)", labeldistance=9.0, labelangle=14];
+
+  // =====================================================================
+  // LEGEND (HTML table, anchored below the consumer lane)
+  // =====================================================================
+  Legend [shape=plaintext, label=<
+    <TABLE BORDER="0" CELLBORDER="1" CELLSPACING="0" CELLPADDING="5">
+      <TR><TD COLSPAN="3" BGCOLOR="#F7F7F7"><B>Finality tier of a gl0 snapshot (color = tier reached at "now")</B></TD></TR>
+      <TR><TD BGCOLOR="#F8D7DA"><B>A0</B></TD><TD ALIGN="LEFT">proposed &mdash; in-consensus, pre-attestation (throwaway)</TD><TD ALIGN="LEFT">tip</TD></TR>
+      <TR><TD BGCOLOR="#FFF3CD"><B>A1</B></TD><TD ALIGN="LEFT">attestation-final &mdash; &ge;2/3 stake attested; reorgs under churn</TD><TD ALIGN="LEFT">~seconds</TD></TR>
+      <TR><TD BGCOLOR="#D4EDDA"><B>A2</B></TD><TD ALIGN="LEFT">depth-stable &mdash; A1 + &delta;-slot density confirmation (deep density reorg only, negligible)</TD><TD ALIGN="LEFT">~10s s&ndash;min</TD></TR>
+      <TR><TD BGCOLOR="#E8F4FD"><B>A3</B></TD><TD ALIGN="LEFT">archival &mdash; depth-k2; irreversible</TD><TD ALIGN="LEFT">~hours</TD></TR>
+      <TR><TD COLSPAN="3" BGCOLOR="#F7F7F7"><B>Edges</B></TD></TR>
+      <TR><TD ALIGN="CENTER"><FONT COLOR="#555555"><B>&rarr;</B></FONT></TD><TD COLSPAN="2" ALIGN="LEFT">next / chain-link (bold)</TD></TR>
+      <TR><TD ALIGN="CENTER"><FONT COLOR="#E67E00"><B>&#10509;</B></FONT></TD><TD COLSPAN="2" ALIGN="LEFT">rides-into (gl0AnchorOrdinal) @A1 &mdash; dashed orange (cheap, churn-exposed)</TD></TR>
+      <TR><TD ALIGN="CENTER"><FONT COLOR="#1a7f37"><B>&rarr;</B></FONT></TD><TD COLSPAN="2" ALIGN="LEFT">grounds-on / re-exec base @A2 &mdash; solid green (economic base)</TD></TR>
+      <TR><TD ALIGN="CENTER"><FONT COLOR="#0b5394"><B>&rarr;</B></FONT></TD><TD COLSPAN="2" ALIGN="LEFT">settles (inclusion / I-ONCE) @A3 &mdash; solid blue (irreversible)</TD></TR>
+      <TR><TD ALIGN="CENTER"><FONT POINT-SIZE="9">bold</FONT> / <FONT POINT-SIZE="9">thin</FONT></TD><TD COLSPAN="2" ALIGN="LEFT">bold = each lane's LIVE tip binding &middot; thin dashed = a trailing node's anchor, since matured deeper (same grounding type)</TD></TR>
+      <TR><TD COLSPAN="3" BGCOLOR="#F7F7F7"><B>Producer lanes</B></TD></TR>
+      <TR><TD BGCOLOR="#EDE7F6"> </TD><TD COLSPAN="2" ALIGN="LEFT">shard committee checkpoint &mdash; straddles A1 ride + A2 base</TD></TR>
+      <TR><TD BGCOLOR="#E0F2F1"> </TD><TD COLSPAN="2" ALIGN="LEFT">metagraph (ml0) currency snapshot &mdash; grounds on A2</TD></TR>
+      <TR><TD BGCOLOR="#F0F0F0"> </TD><TD COLSPAN="2" ALIGN="LEFT">external consumer &mdash; light client / cross-shard, settles on A3</TD></TR>
+    </TABLE>
+  >];
+  Cons_A -> Legend [style=invis];
+
+  // explanatory note (the trailing-edge / maturation caveat)
+  Note [shape=note, style=filled, fillcolor="#FFFFFF", color="#999999", fontsize=9, fontname="Helvetica",
+        label=<<B>Reading the lag</B><BR ALIGN="LEFT"/><FONT POINT-SIZE="9">&bull; Producers sit at the tip (now) and reach BACK by their trust need:<BR ALIGN="LEFT"/>&nbsp;&nbsp;ride @A1 = 1 back &middot; economic @A2 = 2&ndash;3 back &middot; settle @A3 = 4&ndash;6 back.<BR ALIGN="LEFT"/>&bull; The metagraph tip M(j) trails the gl0 tip by the A2 (&delta;) lag &mdash; that is the<BR ALIGN="LEFT"/>&nbsp;&nbsp;latency it pays for a density-stable economic base.<BR ALIGN="LEFT"/>&bull; Bold labeled edges = each lane's LIVE tip binding. Thin edges = trailing<BR ALIGN="LEFT"/>&nbsp;&nbsp;nodes, whose anchors grounded the same way and have since matured deeper.</FONT>>];
+  Cons_B -> Note [style=invis];
+}

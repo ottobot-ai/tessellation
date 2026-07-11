@@ -11,12 +11,14 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutableCodec}
+import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncDataImmutableCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 /** Typed read accessors over `GlobalStateReader[F]`, mirroring the `MptStoreReadOps` extension defined in `GlobalStateConverter` for
@@ -34,6 +36,9 @@ object GlobalStateReaderOps {
 
     def getBalance(address: Address): F[Option[Balance]] =
       reader.get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, address))
+
+    def getMetagraphSyncData(metagraphAddress: Address): F[Option[MetagraphSyncDataInfo]] =
+      reader.get[MetagraphSyncDataInfo](GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, metagraphAddress))
 
     def getDelegatedStakes(address: Address): F[Option[SortedSet[DelegatedStakeRecord]]] =
       reader.get[SortedSet[DelegatedStakeRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveDelegatedStakes, address))

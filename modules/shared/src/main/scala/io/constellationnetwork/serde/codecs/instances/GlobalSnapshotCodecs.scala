@@ -17,6 +17,8 @@ import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
+import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
+import io.constellationnetwork.schema.slashing.InvalidStateProofEvidence
 import io.constellationnetwork.schema.swap.AllowSpendBlock
 import io.constellationnetwork.schema.tokenLock.TokenLockBlock
 import io.constellationnetwork.schema.transaction.RewardTransaction
@@ -41,6 +43,11 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs.updateNodeCollateralCodec
 import io.constellationnetwork.serde.codecs.instances.PeerIdCodec.{codec => peerIdCodec}
 import io.constellationnetwork.serde.codecs.instances.RewardTransactionCodec.{codec => rewardTransactionCodec}
+import io.constellationnetwork.serde.codecs.instances.ShardingScodecCodecs.{
+  invalidStateProofEvidenceCodec,
+  shardCheckpointCodec,
+  shardIdCodec
+}
 import io.constellationnetwork.serde.codecs.instances.SharedArtifactCodec.{sharedArtifactCodec, spendActionCodec}
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
 import io.constellationnetwork.serde.codecs.instances.StateChannelSnapshotBinaryCodec.{codec => scsbCodec}
@@ -53,7 +60,7 @@ import shapeless.{::, HNil}
 /** Canonical scodec codecs for the top-level snapshot capstones:
   *   - `GlobalSnapshot` (full, 11 fields, legacy pre-incremental).
   *   - `GlobalIncrementalSnapshotV1` (12 fields, legacy incremental shape).
-  *   - `GlobalIncrementalSnapshot` (24 fields, current shape with Nakamoto fields).
+  *   - `GlobalIncrementalSnapshot` (26 fields, current shape with Nakamoto sharding and fraud-proof fields).
   *
   * Final commit of the scodec codec library for the snapshot data path.
   */
@@ -152,7 +159,11 @@ object GlobalSnapshotCodecs {
   implicit val globalIncrementalSnapshotV1ImmutableCodec: ImmutableCodec[GlobalIncrementalSnapshotV1] =
     ImmutableCodec.fromScodecCodec(globalIncrementalSnapshotV1Codec)
 
-  // ---- GlobalIncrementalSnapshot (current, 24 fields) ---------------------
+  // ---- GlobalIncrementalSnapshot (current, 26 fields) ---------------------
+
+  // Field 7: every checkpoint carries its replayable CL1 inputs. This field is mandatory in the greenfield schema.
+  private val shardCheckpointsCodec: Codec[SortedMap[ShardId, ShardCheckpoint]] =
+    sortedMap(shardIdCodec, shardCheckpointCodec)
 
   // Field 8: Option[SortedMap[PeerId, Map[Address, Amount]]]
   private val amountCodec: Codec[Amount] = Codec[Amount]
@@ -208,9 +219,12 @@ object GlobalSnapshotCodecs {
   private val activeNodeCollateralsOptCodec = option(activeNodeCollateralsMapCodec)
   private val nodeCollateralWithdrawalsOptCodec = option(nodeCollateralWithdrawalsMapCodec)
 
-  // Field 22..24: version, slotCertificate, eta
+  // Fields 23..25: version, slotCertificate, eta
   private val slotCertificateOptCodec: Codec[Option[SlotCertificate]] = option(slotCertificateCodec)
   private val etaOptCodec: Codec[Option[Hash]] = option(hashCodec)
+
+  // Field 26: self-contained invalid-state-proof evidence. This field is mandatory in the greenfield schema.
+  private val fraudProofsCodec: Codec[SortedSet[InvalidStateProofEvidence]] = sortedSet(invalidStateProofEvidenceCodec)
 
   // Keep the parent ADT codecs referenced so their imports survive scalafix.
   private val _udsADT = updateDelegatedStakeCodec
@@ -224,6 +238,7 @@ object GlobalSnapshotCodecs {
       hashCodec ::
       blocksCodec ::
       stateChannelSnapshotsCodec ::
+      shardCheckpointsCodec ::
       rewardsCodec ::
       delegateRewardsOptCodec ::
       epochCodec ::
@@ -241,18 +256,13 @@ object GlobalSnapshotCodecs {
       nodeCollateralWithdrawalsOptCodec ::
       versionCodec ::
       slotCertificateOptCodec ::
-      etaOptCodec)
+      etaOptCodec ::
+      fraudProofsCodec)
       .xmap[GlobalIncrementalSnapshot](
         {
-          case ord :: h :: sh :: lsh :: blks :: scs :: rws :: dr ::
+          case ord :: h :: sh :: lsh :: blks :: scs :: shardCheckpoints :: rws :: dr ::
               ep :: nf :: tips :: sp :: asb :: tlb :: sa :: unp ::
-              art :: ads :: dsw :: anc :: ncw :: v :: slot :: eta :: HNil =>
-            // `shardCheckpoints` (`GlobalIncrementalSnapshot.scala:108`, added by Slice 4 of
-            // `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4) is intentionally NOT on the scodec wire yet — a
-            // dedicated `ShardingScodecCodecs` package (for `ShardCheckpoint` + sub-types) is deferred to a follow-up slice
-            // alongside scodec parity tests with non-empty checkpoints. Constructing with `SortedMap.empty` here keeps the
-            // existing pre-sharding Brotli-JSON parity fixtures (`JsonScodecParitySuite`) green: Circe-decoded values use the
-            // case-class default (empty), scodec-roundtripped values are explicitly empty, both compare equal under `Eq`.
+              art :: ads :: dsw :: anc :: ncw :: v :: slot :: eta :: fraudProofs :: HNil =>
             GlobalIncrementalSnapshot(
               ord,
               h,
@@ -260,7 +270,7 @@ object GlobalSnapshotCodecs {
               lsh,
               blks,
               scs,
-              SortedMap.empty[io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint],
+              shardCheckpoints,
               rws,
               dr,
               ep,
@@ -278,7 +288,8 @@ object GlobalSnapshotCodecs {
               ncw,
               v,
               slot,
-              eta
+              eta,
+              fraudProofs
             )
         },
         s =>
@@ -288,6 +299,7 @@ object GlobalSnapshotCodecs {
             s.lastSnapshotHash ::
             s.blocks ::
             s.stateChannelSnapshots ::
+            s.shardCheckpoints ::
             s.rewards ::
             s.delegateRewards ::
             s.epochProgress ::
@@ -306,6 +318,7 @@ object GlobalSnapshotCodecs {
             s.version ::
             s.slotCertificate ::
             s.eta ::
+            s.fraudProofs ::
             HNil
       )
 

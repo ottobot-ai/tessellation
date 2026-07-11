@@ -33,8 +33,8 @@ import weaver.MutableIOSuite
   * restarting node boot without a needless re-bootstrap.
   *
   * Under test: `MptStore.loadPersisted` (trait surface over the persistence producer's `load`) and the root-verified wrapper
-  * `syncFromPersistedMptVerified` (adopt-on-match, savepoint-restore on mismatch, `false` on no-persistence / nothing-persisted /
-  * legacy `signedMptRoot = None`).
+  * `syncFromPersistedMptVerified` (adopt-on-match, savepoint-restore on mismatch, `false` on no-persistence / nothing-persisted / legacy
+  * `signedMptRoot = None`).
   */
 object GsiRebuildPersistedLoadSuite extends MutableIOSuite {
 

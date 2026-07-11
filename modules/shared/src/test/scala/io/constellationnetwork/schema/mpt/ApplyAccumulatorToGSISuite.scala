@@ -306,8 +306,9 @@ object ApplyAccumulatorToGSISuite extends MutableIOSuite {
       sigStore <- MptStore.make[IO, GlobalStateKey](sigProducer, GlobalStateKey.toHex[IO])
       _ <- sigStore.syncFromGlobalSnapshotInfo(prior, priorOrd)
       _ <- sigStore.syncFromStateChanges(delta, ord)
-      sigTrie <- sigStore.build(ord)
-      signedRoot = sigTrie.toOption.get.rootHash.value
+      _ <- sigStore.build(ord)
+      sigBytes <- sigStore.allEntriesAsBytes
+      signedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](sigBytes)
 
       // ml0's store, seeded at the prior state.
       ml0Producer <- InMemoryMerklePatriciaProducer.make[IO]()
@@ -317,8 +318,9 @@ object ApplyAccumulatorToGSISuite extends MutableIOSuite {
       result <- GlobalStateConverter.adoptAndVerifyChangeSetDelta[IO](ml0Store, prior, delta, signedRoot.some, ord)
 
       // After Commit, ml0's store root must equal the signed root.
-      ml0Trie <- ml0Store.build(ord)
-      ml0Root = ml0Trie.toOption.get.rootHash.value
+      _ <- ml0Store.build(ord)
+      ml0Bytes <- ml0Store.allEntriesAsBytes
+      ml0Root <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](ml0Bytes)
     } yield
       expect.all(
         result.isDefined,

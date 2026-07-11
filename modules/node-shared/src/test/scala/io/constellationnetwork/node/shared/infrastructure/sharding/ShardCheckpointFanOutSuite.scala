@@ -13,7 +13,6 @@ import scala.concurrent.duration._
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinaryBuffer, ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, ShardAssignment}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
@@ -129,10 +128,10 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
     anchor: SnapshotOrdinal,
-    diffBase: SnapshotOrdinal
-  ): IO[Option[(Hash, ChangeSet)]] = {
-    val _ = (anchor, diffBase)
-    IO.pure(Some((hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"), ChangeSet.empty)))
+    executionBase: SnapshotOrdinal
+  ): IO[Option[Hash]] = {
+    val _ = (anchor, executionBase)
+    IO.pure(Some(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}")))
   }
 
   private def mkOrd(value: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(value))
@@ -155,16 +154,12 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     chainStore: ShardChainStore[IO],
     keyPair: KeyPair,
     sigma: Ratio,
-    shardEta: Array[Byte],
-    assignment: ShardAssignment[IO]
+    shardEta: Array[Byte]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       ShardCheckpointProducer.make[IO](
         shardId = shardId,
         chainStore = chainStore,
-        // The SAME cluster-wide assignment the fan-out / buffers use, so the producer classifies cross-shard SpendAction targets
-        // identically. The stub binaries don't decode as currency snapshots ⇒ no artifacts ⇒ no cross-shard receipts here regardless.
-        shardAssignment = assignment,
         finalizedBasePerMgTip = chainStore.perMgTip, // fan-out tests assert perMgTip-anchored chain-linking (pre-S2 parity)
         adoptedPerMgTip = chainStore.perMgTip, // == window anchor ⇒ newness gate is a no-op here (S2-deadlock fix, 2026-06-15)
         slotLeader = ssl,
@@ -179,7 +174,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         slotGapFor = slotGapFor,
         staircaseDeltaSlots = 5,
         derivePerMgState = deterministicDerive,
-        diffBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
+        executionBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
         lastAdoptedOrd = cats.effect.IO.pure(None),
         pipelineDepth = Int.MaxValue,
         republishEveryTicks = 1
@@ -209,7 +204,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
           store <- ShardChainStore.make[IO](sid)
           buffer <- ShardBinaryBuffer.make[IO](sid, cap = 4096)
           shardEta <- ssl.computeShardEta(sid, gl0Eta)
-          producer <- makeProducer(ssl, sid, store, keyPair, sigma, shardEta, assignment)
+          producer <- makeProducer(ssl, sid, store, keyPair, sigma, shardEta)
         } yield (sid, producer, store, buffer)
       }
     } yield

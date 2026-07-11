@@ -11,6 +11,7 @@ import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.security.hash.Hash
 
 import weaver.MutableIOSuite
 
@@ -58,6 +59,21 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
   }
 
   private val eta: Array[Byte] = Array.tabulate[Byte](32)(i => (i * 7 + 1).toByte)
+
+  test("hashDigestAsRatio: decodes the hex rendering to the actual 32 SHA-256 bytes") { _ =>
+    val denominator = BigInt(2).pow(256)
+    val zero = CommitteeSortition.hashDigestAsRatio(Hash("00" * 32))
+    val midpoint = CommitteeSortition.hashDigestAsRatio(Hash("80" + "00" * 31))
+    val maximum = CommitteeSortition.hashDigestAsRatio(Hash("ff" * 32))
+
+    IO.pure(
+      expect.all(
+        zero == Ratio(0, 1),
+        midpoint == Ratio(1, 2),
+        maximum == Ratio(denominator - 1, denominator)
+      )
+    )
+  }
 
   test("shardDrawValue: deterministic across two independent Hasher instances") { res =>
     val (h1, h2) = res

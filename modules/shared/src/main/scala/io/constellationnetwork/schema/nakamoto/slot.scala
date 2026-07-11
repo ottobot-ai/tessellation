@@ -127,7 +127,7 @@ object slot {
     * field through schema + codec with a zero default; Phase 2b-2 wires the producer to populate it via `SubchainStateUpdater` and adds a
     * verifier parity check. Header observation only — does NOT influence finality.
     */
-  @derive(encoder, eqv, show)
+  @derive(encoder, decoder, eqv, show)
   case class SlotCertificate(
     slot: Slot,
     parentSlot: Slot, // slot of parent snapshot — verifier uses this to compute slot gap
@@ -148,35 +148,5 @@ object slot {
       */
     val ZeroSubchainLevelCounts: Vector[Long] = Vector.fill(9)(0L)
 
-    /** Forgiving Circe decoder — defaults `subchainLevelCounts` to [[ZeroSubchainLevelCounts]] when the field is absent.
-      *
-      * Replaces the derevo-derived decoder so that pre-S2-phase-2b-1 brotli fixtures still round-trip through `JsonScodecParitySuite`
-      * (those fixtures were captured before this field existed). New encodings always include the field via the derived encoder, so
-      * round-trips on current snapshots are unaffected.
-      */
-    implicit val decoder: Decoder[SlotCertificate] = Decoder.instance { c =>
-      for {
-        slot <- c.downField("slot").as[Slot]
-        parentSlot <- c.downField("parentSlot").as[Slot]
-        vrfProof <- c.downField("vrfProof").as[VrfProof]
-        vrfOutput <- c.downField("vrfOutput").as[VrfOutput]
-        vrfPublicKey <- c.downField("vrfPublicKey").as[VrfPublicKey]
-        eta <- c.downField("eta").as[Hash]
-        activePoolSize <- c.downField("activePoolSize").as[Int]
-        activePoolHash <- c.downField("activePoolHash").as[Hash]
-        subchainLevelCounts <- c.downField("subchainLevelCounts").as[Option[Vector[Long]]].map(_.getOrElse(ZeroSubchainLevelCounts))
-      } yield
-        SlotCertificate(
-          slot,
-          parentSlot,
-          vrfProof,
-          vrfOutput,
-          vrfPublicKey,
-          eta,
-          activePoolSize,
-          activePoolHash,
-          subchainLevelCounts
-        )
-    }
   }
 }

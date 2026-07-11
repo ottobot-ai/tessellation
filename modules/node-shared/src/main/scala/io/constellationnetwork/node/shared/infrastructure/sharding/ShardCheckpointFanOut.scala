@@ -20,22 +20,12 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import org.typelevel.log4cats.Logger
 
-/** Shared shard-checkpoint producer fan-out — the seam that drives each per-shard [[ShardCheckpointProducer]] for ONE canonical gl0
-  * ordinal, decoupled from the gl0-leader win.
+/** Shared shard-checkpoint producer fan-out — the per-slot seam that drives each per-shard [[ShardCheckpointProducer]], decoupled from the
+  * global GL0 leader win.
   *
-  * '''Why this exists (decoupling per `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.1).''' Production used to live only
-  * inside `SnapshotLeaderLoop.onSlotWon`, which runs only on the node that won the gl0 slot. That made checkpoint production require a
-  * triple-coincidence (win gl0 slot + win shard slot + content present), so most shards stayed silent. The design intent is one checkpoint
-  * per shard per gl0 ord, produced by the shard committee's slot leader — independent of who produced the gl0 snapshot. This helper is the
-  * shared body invoked from BOTH seams:
-  *   - `SnapshotLeaderLoop.onSlotWon` — the gl0 leader fans out for its OWN produced ord (GossipSub does not echo a publisher its own
-  *     message, so the leader never sees its own ord on the gossip path — this self-call is required, not redundant).
-  *   - `NakamotoSyncDaemon.processValidSnapshotInner` (inside the `becameBestTip` branch) — every node fans out for each canonical
-  *     gossip-received ord.
-  *
-  * Together these fire the fan-out '''exactly once per canonical ord per node''' (leader via onSlotWon for its own ord; everyone else via
-  * the daemon for gossip-received ords). `ShardChainStore.store` is idempotent by hash, so an accidental double on the same checkpoint
-  * dedups — but the design is exactly-once.
+  * Production is called from the ready branch of `SnapshotLeaderLoop` on every slot. Each eligible GL0 operator checks public execution
+  * membership and the producer's staircase duty; a shard with no content emits nothing. The GL0 anchor is the latest finalized ordinal, so
+  * several slots may attempt against the same anchor while the one-checkpoint pipeline and chain store prevent duplicate advancement.
   *
   * '''numShards = 1 regression bar.''' Both call sites gate this on `shardProducers.nonEmpty && shardAssignment.isDefined`. At numShards=1
   * those are `Map.empty` / `None` ⇒ the call site is `whenA(false)` ⇒ this helper is never entered (no allocation, no log). Even if entered
@@ -47,11 +37,11 @@ import org.typelevel.log4cats.Logger
   *
   * '''EXECUTION-SHARDING R-1 — the inversion (input source).''' The fan-out NO LONGER partitions gl0's post-chain-link
   * `stateChannelSnapshots` map (which the `CHANGE-3` Axis-1a filter empties at `numShards > 1`, and which inherits gl0's #259 freeze).
-  * Instead each producer is fed `shardBinaryBuffers(sid).snapshotPending` — the RAW metagraph binaries the committee buffered for ITS shard
-  * off the global binaries gossip topic. The producer then chain-link-orders them off the SHARD's own prior-checkpoint tip
-  * (`ShardChainStore.perMgTip`). This is the centerpiece of the inversion: production is driven by what the shard has buffered, fully
-  * decoupled from gl0's chain-link admission. The buffer is already shard-scoped (the daemon buffers by `ShardAssignment.shardIdFor`), so
-  * no partition step is needed here.
+  * Instead each producer is fed `shardBinaryBuffers(sid).snapshotPending` — the complete signed binaries that passed metagraph admission
+  * and were buffered for this shard off the global binaries gossip topic. The producer then chain-link-orders them off the SHARD's own
+  * prior-checkpoint tip (`ShardChainStore.perMgTip`). This is the centerpiece of the inversion: production is driven by what the shard has
+  * buffered, fully decoupled from gl0's chain-link admission. The buffer is already shard-scoped (the daemon buffers by
+  * `ShardAssignment.shardIdFor`), so no partition step is needed here.
   */
 object ShardCheckpointFanOut {
 
@@ -70,12 +60,12 @@ object ShardCheckpointFanOut {
   /** Drive every per-shard producer for the single gl0 ord `producedOrd`.
     *
     * @param shardBinaryBuffers
-    *   per-shard raw-binary accumulators keyed by `ShardId` (EXECUTION-SHARDING R-1). For each producer, `snapshotPending` on its shard's
-    *   buffer is the input — the RAW metagraph binaries the committee buffered for that shard, NOT gl0's post-chain-link map. A shard with
-    *   an absent / empty buffer feeds the producer an empty map ⇒ `produce` returns `None`. SAME instances the daemon's gossip-intake
-    *   writes into.
+    *   per-shard admission-approved binary accumulators keyed by `ShardId`. For each producer, `snapshotPending` on its shard's buffer is
+    *   the input, not GL0's post-chain-link map. A shard with an absent / empty buffer feeds the producer an empty map ⇒ `produce` returns
+    *   `None`. SAME instances the daemon's gossip-intake writes into.
     * @param producedOrd
-    *   the gl0 ordinal this fan-out is for. Passed to each producer as `gl0AnchorOrdinal` and used to recompute the shard-local slot.
+    *   the finalized GL0 ordinal used as `gl0AnchorOrdinal` and as the pinned replay context. The independent `currentSlot` parameter
+    *   drives staircase duty.
     * @param epoch
     *   eta-rotation period for `producedOrd` (`EtaPeriod(EtaCalculation.rotationPeriod(producedOrd, etaRotationSnapshots))`). Threaded onto
     *   the produced checkpoint's `epoch` field so verifiers look up the right active set.
@@ -85,7 +75,7 @@ object ShardCheckpointFanOut {
     *   the SAME per-shard chain stores the producers + the acceptance side share. On `Some(checkpoint)` the producing node stores its own
     *   checkpoint here so the local chain advances toward finality without waiting for its own gossip echo.
     * @param selfPeerId
-    *   this gl0 operator's PeerId. With real VRF-VK committees a producer runs for shard `s` only when `selfPeerId` is in
+    *   this GL0 operator's PeerId. A producer runs for shard `s` only when `selfPeerId` is in the public deterministic
     *   `committeeMembership(s, epoch)` (Task 2 membership gate) — a non-member's checkpoint can never reach committee quorum at any
     *   verifier's `verifyEmbedded`, so producing it is wasted work / liveness drag.
     * @param committeeMembership
@@ -107,10 +97,10 @@ object ShardCheckpointFanOut {
     // `shardProducers` map is a no-op — the regression-bar short-circuit.
     shardProducers.toList.traverse_ {
       case (sid, producer) =>
-        // EXECUTION-SHARDING committee gate (Task 2): with real VRF-VK-sortitioned committees, only run the producer for shard
+        // EXECUTION-SHARDING committee gate: only run the producer for shard
         // `sid` if THIS node is in `committeeMembership(sid, epoch)`. A non-member's checkpoint can never reach committee quorum at
         // any verifier's `verifyEmbedded` (its signer fails the membership pre-check), so producing it is pure wasted work (and a
-        // non-member winning the LEADER lottery would emit a checkpoint no quorum can attest → liveness drag). Gate the whole
+        // non-member taking a producer duty would emit a checkpoint no quorum can attest → liveness drag). Gate the whole
         // produce path on membership; `committeeMembership` is the SAME deterministic draw the acceptance manager uses, so the gate
         // is consistent with admission cluster-wide.
         committeeMembership(sid, epoch).flatMap { committee =>

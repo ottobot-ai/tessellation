@@ -17,7 +17,7 @@ import io.circe.Json
 import io.circe.syntax._
 import org.http4s.Method._
 import org.http4s._
-import org.http4s.circe.CirceEntityCodec.circeEntityEncoder
+import org.http4s.circe.CirceEntityCodec.{circeEntityDecoder, circeEntityEncoder}
 import org.http4s.client.dsl.io._
 import org.http4s.syntax.literals._
 import suite.HttpSuite
@@ -91,17 +91,16 @@ object ShardProofRoutesSuite extends HttpSuite {
   private def mkRoutes(s: Option[ShardSubtreeProofService[IO]]): IO[HttpRoutes[IO]] =
     Ref.of[IO, Option[ShardSubtreeProofService[IO]]](s).map(ShardProofRoutes[IO](_).publicRoutes)
 
-  // A valid metagraph address parseable by `AddressVar` — checksummed DAG address from the wallet
-  // tests. Hard-coded so the URL parser succeeds; the route then forwards to the stubbed service
-  // which accepts any address.
-  private val validMetagraph: String = "DAG6Yp9hSWZD4TFiNJ7HmrPRWPYjwgVxVD89uvY8"
+  // Address.fromBytes applies the same length, Base58, and parity constraints as AddressVar.
+  private val validMetagraph: String = cannedProof.metagraphAddress.value.value
+  private val validProofUri: Uri = uri"/shard/0/proof".withQueryParam("metagraph", validMetagraph)
 
   // ===========================================================================
   // Tests
   // ===========================================================================
 
   test("POST /shard/0/proof returns 503 when service is not yet initialized") {
-    val req = POST(cannedKey.asJson, uri"/shard/0/proof?metagraph=DAG6Yp9hSWZD4TFiNJ7HmrPRWPYjwgVxVD89uvY8")
+    val req = POST(cannedKey.asJson, validProofUri)
     for {
       routes <- mkRoutes(None)
       r <- expectHttpStatus(routes, req)(Status.ServiceUnavailable)
@@ -109,7 +108,7 @@ object ShardProofRoutesSuite extends HttpSuite {
   }
 
   test("POST /shard/{bad}/proof returns 400 when shardId is not a non-negative integer") {
-    val req = POST(cannedKey.asJson, uri"/shard/abc/proof?metagraph=DAG6Yp9hSWZD4TFiNJ7HmrPRWPYjwgVxVD89uvY8")
+    val req = POST(cannedKey.asJson, uri"/shard/abc/proof".withQueryParam("metagraph", validMetagraph))
     for {
       routes <- mkRoutes(Some(stubService()))
       r <- expectHttpStatus(routes, req)(Status.BadRequest)
@@ -125,15 +124,23 @@ object ShardProofRoutesSuite extends HttpSuite {
   }
 
   test("POST /shard/0/proof returns 400 when body is not a valid GlobalStateKey JSON") {
-    val req = POST(Json.obj("garbage" -> Json.fromInt(1)), uri"/shard/0/proof?metagraph=DAG6Yp9hSWZD4TFiNJ7HmrPRWPYjwgVxVD89uvY8")
+    val req = POST(Json.obj("garbage" -> Json.fromInt(1)), validProofUri)
     for {
       routes <- mkRoutes(Some(stubService()))
-      r <- expectHttpStatus(routes, req)(Status.BadRequest)
-    } yield r
+      result <- routes.run(req).value.flatMap {
+        case Some(response) =>
+          response.as[Json].map { body =>
+            val message = body.hcursor.get[String]("message")
+            expect.same(response.status, Status.BadRequest) |+|
+              expect(message.exists(_.startsWith("could not decode GlobalStateKey body:")))
+          }
+        case None => IO.pure(failure("route not found"))
+      }
+    } yield result
   }
 
   test("POST /shard/0/proof returns 200 with ShardSubtreeProof JSON on success") {
-    val req = POST(cannedKey.asJson, Uri.unsafeFromString(s"/shard/0/proof?metagraph=$validMetagraph"))
+    val req = POST(cannedKey.asJson, validProofUri)
     for {
       routes <- mkRoutes(Some(stubService(cannedProof.some)))
       r <- expectHttpBodyAndStatus(routes, req)(cannedProof, Status.Ok)
@@ -141,7 +148,7 @@ object ShardProofRoutesSuite extends HttpSuite {
   }
 
   test("POST /shard/0/proof returns 404 when service returns None (no proof available)") {
-    val req = POST(cannedKey.asJson, Uri.unsafeFromString(s"/shard/0/proof?metagraph=$validMetagraph"))
+    val req = POST(cannedKey.asJson, validProofUri)
     for {
       routes <- mkRoutes(Some(stubService(None)))
       r <- expectHttpStatus(routes, req)(Status.NotFound)

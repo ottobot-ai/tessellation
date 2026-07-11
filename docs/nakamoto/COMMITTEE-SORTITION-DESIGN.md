@@ -1,7 +1,13 @@
 # Committee Sortition Primitive — Design
 
-**Status:** draft, 2026-05-17
+**Status:** HISTORICAL SUPERSEDED DRAFT, 2026-05-17
 **Scope:** the per-metagraph committee sortition function (§4 cross-shard sharding, Option A from `project_cross_shard_cq_collapse_bound`). Slashing (Option C, #181-ish) and N-2 staggering (#180) are downstream of this doc and treated as out-of-scope here.
+
+> **Do not implement this stake-weighted design.** Live metagraph-binary admission
+> retains the secret VRF input but uses uniform `1/N` selection weight. Live
+> execution-shard membership is a different public deterministic VK-hash draw over
+> the post-cooldown eligible GL0 pool. `SHARD-SORTITION-WORKSTREAM-PLAN.md`,
+> ADR-0016, ADR-0017, and current source supersede the stake/Chernoff claims below.
 
 ---
 

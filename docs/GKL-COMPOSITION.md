@@ -1,5 +1,12 @@
 # GKL composition for the integrated Tessellation-Nakamoto stack
 
+> **HISTORICAL, SUPERSEDED ANALYSIS.** This scaffold predates the current
+> execution-sharding and economic-authority architecture. Its bounds,
+> assumptions, parameter values, and cross-shard composition claims have not been
+> established for the current implementation and must not be cited as current
+> guarantees without a fresh proof. Preserve it as research history; use
+> [`../AGENTS.md`](../AGENTS.md) and current source for the implemented model.
+
 **Status:** scaffolding (2026-05-15). Empirical bounds are tagged for mechanical update by sister sims (Snowball / event-stream / NIPoPoW / cross-shard) currently in flight.
 
 This note characterises the safety and liveness of the integrated stack

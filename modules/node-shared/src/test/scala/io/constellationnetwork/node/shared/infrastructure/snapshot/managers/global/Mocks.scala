@@ -190,21 +190,13 @@ object Mocks {
           CurrencySnapshot
         ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]],
-        adoptionMode: GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(
         implicit hasher: Hasher[IO]
       ): IO[SortedMap[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], BalanceUpdate)]] =
         SortedMap
           .empty[Address, (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], BalanceUpdate)]
           .pure[IO]
-
-      override def deriveMetagraphRoot(
-        metagraphAddress: Address,
-        binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-        snapshotOrdinal: SnapshotOrdinal,
-        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
-      )(implicit hasher: Hasher[IO]): IO[Hash] = Hash.empty.pure[IO]
 
       override def assembleAcceptanceResult(
         processed: SortedMap[

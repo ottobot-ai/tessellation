@@ -237,7 +237,7 @@ object Services {
       // is fire-and-forget, no sender to reply to. DO NOT finality-gate this
       // path: in Nakamoto mode head is ~always ahead of finalized during
       // active production, so gating here would reject every incoming binary.
-      // The validator handles the race via forcedGlobalSyncView at snapshot
+      // The validator handles the race via pinnedGlobalSyncView at snapshot
       // production time.
       processMetagraphBinary = (output: StateChannelOutput) =>
         storages.globalSnapshot.head.flatMap {

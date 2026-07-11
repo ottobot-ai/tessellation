@@ -1,7 +1,12 @@
 # Slashing — Design
 
-**Status:** draft, 2026-05-17
+**Status:** HISTORICAL SUPERSEDED DRAFT, 2026-05-17
 **Scope:** the ledger-side deterrent that makes per-epoch committees safe. Detection in S4 of the committee-sortition sequencing; this doc is the burn-side ledger logic referenced by `COMMITTEE-SORTITION-DESIGN.md` §8 Q#2.
+
+> This draft assumes the superseded stake-weighted admission design and describes
+> schemas/effects that are not the current InvalidStateProof implementation. It is
+> historical rationale, not a safety claim or implementation specification. See the
+> 2026-07-11 correctness audit before relying on any slashing guarantee.
 
 Greenfield rollout — no production migration constraint. Defaults can be aggressive.
 

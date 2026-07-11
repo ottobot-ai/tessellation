@@ -46,10 +46,9 @@ final case class CrossShardSettlementResult(
 /** gl0-side ATOMIC cross-shard allow-spend settlement ("I-ONCE", Option 2: read-side effective-balance overlay).
   *
   * An allow-spend `AS` on currency `M` reserves its source's funds at creation (`M` debits source `−amount −fee` in M's own currency
-  * ledger) and `M` autonomously REFUNDS `+amount` on expiry (fee permanently taken). gl0 ADOPTS `M`'s authoritative pushed balances into
-  * the per-MG `MgBalances` mirror — it does NOT re-derive them (the data-with-fee fix) and MUST NOT mutate them (the committee-attested
-  * per-MG root / PIN-1 adopt-verify would fail). When a CROSS-shard spend (processed in metagraph `M′` on a different shard) consumes `AS`,
-  * `M` never witnesses the consume and refunds anyway → the source's ATTESTED `MgBalances` value gets a PHANTOM `+amount` it could
+  * ledger) and `M` autonomously REFUNDS `+amount` on expiry (fee permanently taken). GL0 independently recreates that CL1 transition and
+  * stores the resulting per-MG `MgBalances` state. When a CROSS-shard spend (processed in metagraph `M′` on a different shard) consumes
+  * `AS`, `M` never witnesses the consume and refunds anyway → the source's recreated `MgBalances` value gets a PHANTOM `+amount` it could
   * double-spend (INFLATION). This manager prevents that with two uncoupled pieces:
   *
   *   1. ['''W3d''' — nullifier / I-ONCE] recording each accepted cross-shard consume in the global `ConsumedAllowSpends` spent-set (fieldId
@@ -57,11 +56,12 @@ final case class CrossShardSettlementResult(
   *      / cross-snapshot replay) or whose `AS` is absent from `M`'s active-allow-spend mirror (no such reservation). This is the WRITE
   *      side, driven through the generic [[CrossShardMessageHandler]] seam by [[AllowSpendConsumeHandler]]. 2. ['''W3e''' — read-side
   *      EFFECTIVE-balance overlay, [[effectiveCurrencyBalances]]] at every gl0 site that reads `M`'s currency balances for ECONOMIC value
-  *      (the `SpendActionValidator`'s same-shard balance check + the `GL0CurrencyBalanceRoutes` serving route), the ATTESTED balances are
-  *      overlaid with the already-committed spent-set: credit each consume's destination `+amount`, and once the allow-spend's expiry
-  *      passes (so `M` has refunded) re-subtract `−amount` from the source (SATURATING). So a no-`allowSpendRef` self-spend of the
-  *      phantom-refunded amount is REJECTED for insufficient balance. The attested `MgBalances` partition is NEVER written — the correction
-  *      is a pure read-time view derived from committed consensus state. NO inflation.
+  *      (the `SpendActionValidator`'s same-shard balance check + the `GL0CurrencyBalanceRoutes` serving route), the recreated balances are
+  *      overlaid with the already-committed spent-set while the consuming GL0 ordinal remains in M's consensus acknowledgement queue:
+  *      credit each consume's destination `+amount`, and once the allow-spend's expiry passes (so `M` has refunded) re-subtract `−amount`
+  *      from the source (SATURATING). After M re-executes and acknowledges that exact ordinal, M's GL0-verified raw state already carries
+  *      the transition and the balance projection retires. The permanent nullifier does not. So a no-`allowSpendRef` self-spend of the
+  *      phantom-refunded amount is REJECTED for insufficient balance without double-projecting state M has already applied.
   *
   * '''Scalability (v1 cost).''' The overlay reads the spent-set (`materializeConsumedAllowSpendsFromMpt`) and folds it per
   * source/destination for the queried scope — an O(|spent-set|) prefix scan + fold. The spent-set holds ONLY cross-shard consumes (it is
@@ -75,7 +75,7 @@ final case class CrossShardSettlementResult(
   *
   * '''`numShards = 1` byte-identity.''' At `numShards = 1` every metagraph maps to shard 0, so `shardIdFor(M) == shardIdFor(M′)` for every
   * consume ⇒ [[classifyCrossShardConsumes]] returns `Nil` ⇒ no marker is ever written, the spent-set stays empty, and
-  * [[effectiveCurrencyBalances]] returns the attested map unchanged (the identity) ⇒ the validator input + the served balance + the
+  * [[effectiveCurrencyBalances]] returns the recreated map unchanged (the identity) ⇒ the validator input + the served balance + the
   * `mptRoot` are byte-identical to the pre-change path. The GSAM caller additionally gates the spent-set read behind `numShards > 1`.
   */
 trait ConsumedAllowSpendStateManager[F[_]] {
@@ -120,9 +120,8 @@ trait ConsumedAllowSpendStateManager[F[_]] {
   )(implicit hasher: Hasher[F]): F[CrossShardSettlementResult]
 
   /** W3e read-side EFFECTIVE-balance overlay for ONE metagraph-currency scope (`currencyId` = owner metagraph `M`, or `None` for the
-    * DAG-global scope which is never cross-shard). Given `M`'s ATTESTED currency balances (the value gl0 mirrors + verifies against the
-    * committee-attested per-MG root — NEVER mutated), returns the ECONOMICALLY-EFFECTIVE balances that reflect the already-committed
-    * cross-shard spent-set:
+    * DAG-global scope which is never cross-shard). Given `M`'s globally recreated currency balances, returns the ECONOMICALLY-EFFECTIVE
+    * balances that reflect the already-committed cross-shard spent-set:
     *   - CREDIT each marker's destination `+amount` for `markers whose currencyId == this scope` (the cross-shard consume moved `M`'s
     *     reserved funds to the destination — neither `M` nor `M′` re-pushes this credit, so it is overlaid at read time), and
     *   - once `epochFor(M) > marker.lastValidEpochProgress` (so `M` has autonomously refunded the source `+amount`), re-subtract `−amount`
@@ -130,13 +129,17 @@ trait ConsumedAllowSpendStateManager[F[_]] {
     *     balance stays debited (`B−amount−fee`) and a replayed cross-shard consume sees insufficient funds.
     *
     * `epochFor(M)` = `metagraphPinnedEpochProgresses(M)` (the owner metagraph's pinned `globalSyncView.epochProgress`, consistent with the
-    * R1 fix) else `liveEpochProgress`. Pure, total, DERIVED from the committed spent-set — it is NOT stored and NOT in any consensus root.
-    * Empty spent-set (always at `numShards = 1`) ⇒ effective == attested ⇒ the validator/read sees byte-identical input.
+    * R1 fix) else `liveEpochProgress`. The overlay applies only while the marker's `consumedAtOrdinal` remains in the owner metagraph's
+    * lossless `pendingGlobalChangeOrdinals` set. Once GL0 accepts the owner's canonical `GlobalSnapshotsProcessed` acknowledgement, the
+    * owner's re-executed raw balance already contains the transition and the overlay retires; the spent marker remains permanently as the
+    * replay nullifier. A missing owner entry is conservative and keeps the overlay active. Pure, total, and derived only from committed
+    * consensus state. Empty spent-set (always at `numShards = 1`) ⇒ effective == recreated ⇒ byte-identical input.
     */
   def effectiveCurrencyBalances(
-    attested: SortedMap[Address, Balance],
+    recreated: SortedMap[Address, Balance],
     currencyId: Option[Address],
     spentSet: SortedMap[Hash, ConsumedAllowSpend],
+    pendingGlobalChangeOrdinals: Map[Address, SortedSet[SnapshotOrdinal]],
     metagraphPinnedEpochProgresses: Map[Address, EpochProgress],
     liveEpochProgress: EpochProgress
   ): SortedMap[Address, Balance]
@@ -224,8 +227,8 @@ object ConsumedAllowSpendStateManager {
       consumedAtOrdinal: SnapshotOrdinal
     )(implicit hasher: Hasher[F]): F[CrossShardSettlementResult] = {
       // Resolve, per candidate, whether its allow-spend is present in M's active-allow-spend mirror (matched by hash(AS)) AND fetch the
-      // authoritative AS fields (lastValidEpochProgress) from that mirror. The mirror is keyed by Option[metagraph] → source → set; for an
-      // owner metagraph M the scope key is Some(M). We hash each candidate-scope's active set ONCE and look the hash up.
+      // globally recreated AS fields (lastValidEpochProgress) from that mirror. The mirror is keyed by Option[metagraph] → source → set;
+      // for an owner metagraph M the scope key is Some(M). We hash each candidate-scope's active set ONCE and look the hash up.
       def activeSetFor(currencyId: Option[CurrencyId]): SortedMap[Address, SortedSet[Signed[AllowSpend]]] =
         lastActiveAllowSpends.getOrElse(currencyId.map(_.value), SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
 
@@ -240,12 +243,16 @@ object ConsumedAllowSpendStateManager {
       }
         .map(_.toMap)
         .map { scopeIndex =>
-          // Single deterministic left-fold over the sorted candidates: accumulate accepted markers + rejected hashes; an in-fold
-          // "seen" set lets the sorted-first consumer of a colliding hash win and the rest fail absence.
+          // Reject every member of a same-snapshot collision. Returning only a rejected Hash cannot identify a winning producer, so
+          // first-wins would let downstream pruning either apply both candidates or remove the winner while still writing its marker.
+          val duplicateHashes =
+            candidates.groupBy(_.allowSpendHash).collect { case (hash, occurrences) if occurrences.sizeCompare(1) > 0 => hash }.toSet
           val seenSpent: Set[Hash] = existingSpentSet.keySet
           candidates.foldLeft(CrossShardSettlementResult(SortedMap.empty[Hash, ConsumedAllowSpend], SortedSet.empty[Hash])) {
             case (acc, c) =>
-              val alreadyConsumed = seenSpent.contains(c.allowSpendHash) || acc.newMarkers.contains(c.allowSpendHash)
+              val alreadyConsumed =
+                seenSpent.contains(c.allowSpendHash) || duplicateHashes
+                  .contains(c.allowSpendHash) || acc.newMarkers.contains(c.allowSpendHash)
               val includedAs: Option[Signed[AllowSpend]] = scopeIndex.getOrElse(c.currencyId, Map.empty).get(c.allowSpendHash)
               (alreadyConsumed, includedAs) match {
                 case (false, Some(as)) =>
@@ -269,9 +276,10 @@ object ConsumedAllowSpendStateManager {
     }
 
     def effectiveCurrencyBalances(
-      attested: SortedMap[Address, Balance],
+      recreated: SortedMap[Address, Balance],
       currencyId: Option[Address],
       spentSet: SortedMap[Hash, ConsumedAllowSpend],
+      pendingGlobalChangeOrdinals: Map[Address, SortedSet[SnapshotOrdinal]],
       metagraphPinnedEpochProgresses: Map[Address, EpochProgress],
       liveEpochProgress: EpochProgress
     ): SortedMap[Address, Balance] = {
@@ -294,6 +302,16 @@ object ConsumedAllowSpendStateManager {
         spentSet.toList.foldLeft((empty, empty)) {
           case (acc @ (cr, db), (_, marker)) =>
             if (marker.currencyId.map(_.value) =!= currencyId) acc
+            else if (
+              marker.currencyId
+                .map(_.value)
+                .flatMap(pendingGlobalChangeOrdinals.get)
+                .exists(!_.contains(marker.consumedAtOrdinal))
+            )
+              // The owner metagraph has acknowledged this exact GL0 ordinal. Its globally re-executed raw balance now includes the
+              // destination credit and reservation settlement, so applying the derived overlay again would double the economic effect.
+              // Keep the marker permanently as the replay nullifier; retire only its read-side balance projection.
+              acc
             else {
               val markerAmount: Amount = SwapAmount.toAmount(marker.amount)
               val crNext = addAmountSat(cr, marker.destination, markerAmount)
@@ -307,10 +325,10 @@ object ConsumedAllowSpendStateManager {
             }
         }
 
-      if (credits.isEmpty && debits.isEmpty) attested
+      if (credits.isEmpty && debits.isEmpty) recreated
       else {
         val affected: SortedSet[Address] = (credits.keySet ++ debits.keySet).to(SortedSet)
-        affected.foldLeft(attested) { (acc, addr) =>
+        affected.foldLeft(recreated) { (acc, addr) =>
           val base: Balance = acc.getOrElse(addr, Balance.empty)
           val credit: Amount = credits.getOrElse(addr, Amount.empty)
           val debit: Amount = debits.getOrElse(addr, Amount.empty)

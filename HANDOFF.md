@@ -1,5 +1,12 @@
 # Nakamoto Consensus Refactor — Agent Handoff
 
+> **HISTORICAL, NON-NORMATIVE HANDOFF (2026-04-08).** This document records an
+> earlier implementation state and contains architecture, parameter, branch, and
+> deployment claims that have since been superseded. Preserve it as project
+> history only. Do not use it to infer current behavior or compatibility
+> requirements. Current invariants are in [`AGENTS.md`](./AGENTS.md); current
+> execution-sharding decisions are in ADR-0016 and ADR-0017.
+
 **For the next agent picking this up** (human or LLM, OpenClaw or otherwise).
 
 **Last updated:** 2026-04-08 by OttoBot

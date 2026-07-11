@@ -1,60 +1,55 @@
-# Shard Sortition Workstream — Sequenced Slice Plan
+# Shard Sortition And Duty
 
-**Goal:** make hierarchical shard checkpoints production-shippable — real committee sortition + committee re-execution (committee members independently re-run metagraph derivations and attest only on a state match), replacing the v1 full-set-membership / sign-only-attestation / fixed-eta simplifications.
+**Status:** current v1 behavior. The prior secret, stake-weighted shard-VRF proposal was abandoned.
 
-**Corrected scale model:** tens of thousands of operators · thousands of metagraphs · a few dozen shards. Each shard = a committee hosting many metagraphs; each operator sortitioned into ~1 shard and does only that shard's work.
+## Two Independent GL0 Committees
 
-> **CORRECTION (2026-06-30):** the "stub" status below is STALE. **S2** (real per-signer committee-VRF verify — `verifyVrf` / `CommitteeSortition.verifyShardMembership`; `verifyVrfStructural` is now only the registry-absent fallback) and **S3** (committee re-execution) are BUILT (`8ac7ce04f..0b7902d69`; S3 already carries an "IMPLEMENTED 2026-05-26" note inline). Re-execution is further hardened by an ALWAYS-RUN `watchtowerReExec` that re-derives every MG's per-MG root, disputes via a real `FraudProofEnvelope`, and triggers a durable slash (`Slashings` fieldId 34). See CURRENCY-APP-TOKEN-ENFORCEMENT.md + SHARDING-PRODUCTION-READINESS-PLAN.md.
+ML0 operators produce and sign metagraph binaries. They are not the admission or execution committee.
 
-## Core finding — the attestation INVERSION
+1. **Binary admission:** each eligible GL0 operator privately evaluates a real VRF for
+   `(eta, metagraphAddress, parentHash)`. Advancing the metagraph parent or eta redraws membership.
+2. **Execution shard:** every GL0 node publicly enumerates membership from
+   `H(eta, shardId, etaPeriod, registeredVrfVk) < threshold`. Honest producers select the eta period from the finalized GL0 anchor.
 
-The global chain does **validate-by-replay → adopt (becameBestTip) → emitAttestation** (`NakamotoSnapshotValidator.validate` re-runs `createProposalArtifact` + compares `stateProof`; `NakamotoSyncDaemon.scala:1298`). The shard receiver **inverts** this: `handleShardCheckpoint` emits the attestation (`NakamotoSyncDaemon.scala:1761`, on `becameBestTip`) **before** `acceptanceManager.evaluate` (`:1778`), and `evaluate`'s re-exec ~~is a stub~~ **was a stub — now BUILT (S3 IMPLEMENTED 2026-05-26; further hardened by the always-run watchtower re-exec + durable slash, `8ac7ce04f..0b7902d69`)**. Fixing this inversion + making re-exec real is the heart of the workstream (slice 3).
+Current adopters validate membership against the checkpoint's wire-carried eta period but do not bind that period back to the finalized
+anchor. A Byzantine producer can therefore grind resolvable periods for a favorable public committee. Rotation is intended once per eta
+period but is not adversarially enforced until audit finding SHARD-03 is fixed.
 
-## Dependency sequence
+The two committees may share `kDraw` and `kQuorum` configuration, but one committee's work never substitutes for the other's.
 
-`1 → {2, 3, 4 parallel} → validate via 7 → 5`. Slice 6 orthogonal (land anytime). Slice 7 built early (it's the eval harness for 2+3).
+## Weight
 
-## Slices
+Both live draws use uniform `1/N` weights, but not the same denominator or implementation. Admission calls
+`StakeRegistry.committeeStake` over the full eligible GL0 validator set. Execution computes `1/N` independently over the post-cooldown
+eligible pool in `ShardCheckpointWiring`. Neither is stake weighted. `StakeRegistry.relativeStake` is used by global Nakamoto slot
+leadership and is a different mechanism.
 
-**S1 — VRF-VK registry piggybacked on KES.** Fill-in-the-blank, not schema surgery: `L0GenesisOperator.vrfPublicKey: Option[String]` already exists (set to `None`, `GenesisGenerator.scala:194`); VRF keys derive deterministically from the operator Ed25519 keypair via `VrfKeyDeriver` (modules/shared, reachable from genesis tool + node-shared). Populate it in `GenesisGenerator` (same loop that builds KES material), add a `VrfRegistry` mirroring `KesRegistry` + a `buildVrfRegistry` loader, and add a `vrfVK` field to `KesRegistrationCert` for runtime joiners. **Determinism contract:** generator + runtime MUST call the same `VrfKeyDeriver.deriveVrfSeed` + identical 32-byte normalization (`SnapshotLeaderLoop.deriveVrfKeys:166-174`).
+The execution draw is not a secret VRF: registered verification keys and eta are public, so future committees are enumerable and
+predictable. A checkpoint VRF proof demonstrates possession of the registered key over `(shardEta, slot)`; it does not hide membership.
 
-**S2 — Sortitioned committee membership.** **[BUILT 2026-06 (`8ac7ce04f..0b7902d69`) — real per-signer `CommitteeSortition.verifyShardMembership` / `verifyVrf` is wired; `verifyVrfStructural` survives only as the registry-absent fallback. The "swap the structural-VRF stub" task below is DONE.]** Swap the full-set `committeeFor` (`ShardCheckpointWiring.scala:191-203`) + structural-VRF stub (`ShardCheckpointGl0AcceptanceManager.verifyVrfStructural:440-444`) for a real per-signer `CommitteeSortition.verifyShardMembership(vrfVk, eta, shardId, epoch, σ, kTarget, proof)`. New `shardMessage(eta, shardId, epoch)` + `CommitteeShardVrfInput` (sibling of the per-metagraph `CommitteeSortition.message:127-131`); reuse `threshold(kTarget, σ)`. `kTarget` (`:111-114`, currently unused) becomes load-bearing. **σ source:** `Ratio(1, max(1, committeeKTarget))` already at `GlobalSnapshotConsensus.scala:1204`. Epoch is wire-carried (`checkpoint.epoch`) so verifiers agree.
+## Rotation Cadence
 
-**S3 — Committee re-execution (the core).**
-- The derivation to re-run = `GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots` (what gl0 already uses for metagraph snapshots).
-- Real per-MG roots: `ShardDerivedStateDelta.perMetagraphMptRoots` — producer computes from `processCurrencySnapshots` output (canonical per-MG root = whatever feeds `stateProof.lastCurrencySnapshotsProof`); replace `derivePerMgState = noReExecDerivation` (`GlobalSnapshotConsensus.scala:1226`).
-- Verifier: replace `reExecuteDerivation = None` (`GlobalSnapshotConsensus.scala:364-374`, `SharedServices.scala:245`) with the same closure; the acceptance manager's `reExecPath` (`ShardCheckpointGl0AcceptanceManager.scala:328-373`) already compares + emits `RejectedReExecutionMismatch(reason, slashSigners)` — only the closure is stubbed.
-- **Fix the inversion:** in `handleShardCheckpoint` (`NakamotoSyncDaemon.scala:1744-1784`) run re-exec/validate **before** adopt + emit, mirroring the global gate.
+An eta period contains `R = round(3.1 * k1)` GL0 snapshot ordinals under the current typed configuration:
 
-**S3 — IMPLEMENTED (2026-05-26, commits 0f526276a + 6673e2035).** Committee re-execution wired (shared `reExecDerivation` closure on producer + verifier → roots match by construction, no false slashing), attestation inversion fixed (validate→adopt→emit), slash penalty left for S2.0. 39 node-shared + 4 new dag-l0 tests pass; numShards=1 no-op. **OPEN BOUNDARY → S3.1:** re-exec uses an EMPTY prior (live-MPT read rejected — diverges producer-post-apply vs verifier-pre-apply → would false-slash). Full-snapshot windows self-seed → true root; INCREMENTAL-only windows (common) yield a deterministic but prior-AGNOSTIC root (not a true accumulated-state commitment). Safe now (additive path = GSAM re-processes included snapshots with true prior on all nodes = authoritative; #259 unaffected) but blocks non-committee work-skip. **S3.1 fix:** read gl0-FINALIZED metagraph prior at `gl0AnchorOrdinal` (finalized+wire-carried → byte-identical, the SAFE read) + chain-prefix replay for intermediate checkpoints → true commitment. AWAITING USER: do S3.1 now (before S2) or defer as tracked follow-up.
+- mainnet: 3174
+- testnet/integrationnet: 794
+- dev: 99
 
-**S4 — shardEta per-period rotation.** `ShardSlotLeader.computeShardEta` is correct; the bug is callers pass `nakamotoGenesisEta` once (`GlobalSnapshotConsensus.scala:1208,1277`, TODO `:1161`). The rotated per-period eta already exists: `etaForPeriodCallback`/`EtaStateManager.getEta` (`:288-307`). Make producer + emitter compute `shardEta` per-call keyed on `checkpoint.epoch` → `etaForPeriod(epoch)`. Confirm anchor-ord→epoch lag is within the eta lookahead window (`EtaCalculation` knows period N at 2/3 of N-1).
+Execution membership is cached per `(shardId, etaPeriod)` only after the epoch's slash-exclusion anchor is settled. Honest production does
+not redraw it per checkpoint; SHARD-03 tracks the missing verifier-side epoch binding.
 
-**S5 — FULL replacement (hard requirement, no dead code).** Delete `MetagraphCommitteeGate` + `MetagraphOrphanBuffer` entirely once S1-4 validate. Call sites: `GlobalSnapshotConsensus.scala:946-1107,1355-1373`, `NakamotoSyncDaemon.scala:283,530-561,1633,1894`. **Coupling:** `SlashableEvidenceValidator.scala:153` uses `MetagraphCommitteeGate.messageBytes` (per-metagraph slashing preimage) → relocate or subsume. Highest-risk slice (see Open Q3).
+## Producer Duty
 
-**S6 — Fan-out off critical path (orthogonal).** Receiver `handleShardCheckpoint` is already `Async.start`-ed; the **producer** fan-out (`ShardCheckpointFanOut.run`) runs **inline inside `snapshotSemaphore.permit`** (`NakamotoSyncDaemon.scala:1231-1249`, `SnapshotLeaderLoop.scala:1554-1569`). After S3's real re-exec this is heavyweight → straggler-node lag. Wrap in `supervisor.supervise` (capture `stateChannelSnapshots` by value). Idempotent-by-hash store keeps it safe.
+Committee members are hash-ordered for the next shard ordinal. One rank owns each five-slot window by default, wrapping through the
+committee; the genesis window is widened by 12x. This deterministic staircase replaced per-slot LDD shard leadership.
 
-**S7 — Test topology (N ≫ K_S).** Knobs exist: `--num-gl0`, `--num-shards`→`NAKAMOTO_NUM_SHARDS`, `--shards`→`NAKAMOTO_COMMITTEE_K_TARGET` (`set-env.sh`). Target ~**32 gl0 / 4 shards** (8 eligible/shard, draw K_S=4, quorum ⌈8/3⌉=3). Even metagraph distribution: **grind per-metagraph genesis keypairs** so `ShardAssignment.shardIdFor(addr)` hits distinct shards (`compose-runner.sh:~148/509`). RAM (150GB free; gl0≈1.5GB, mg≈4.5GB): 32 gl0 + 8 mg ≈ 84GB. **Run AFTER S6** (heavy inline re-exec trips the ±3 cluster-sync tolerance).
+Duty determines who may propose. It never determines validity. The producer and every attester replay the included CL1 window before
+signing, and every GL0 adopter replays it again before inclusion can affect canonical state.
 
-### S7 — IMPLEMENTED (harness/config; 2026-05-26)
+## Enforcement Sites
 
-Invocation: `just test --num-gl0=32 --metagraphs=8 --num-shards=4 --shards=4 --grind-metagraph-shards` (extends existing args — no new just recipe). Bash/docker only; no consensus-code changes.
-
-**1. gl0 node-count cap raised 9→32 (dial-able).** The legacy harness hard-capped hypergraph nodes at 9 because IPs/ports were built by *string concat* (`${NET_PREFIX}.1${i}`, `${DAG_L0_PORT_PREFIX}${i}0`), which overflows the 65535 port ceiling and collides IP octets at i≥10. Switched gl0/gl1 to **arithmetic** allocation (`set-env.sh`, `docker-env-setup.sh`, `docker-compose.test.yaml`, seedlist in `compose-runner.sh`):
-- gl0 host+internal port = `9000 + i*10` (+1/+2); gl0 IP = `${NET_PREFIX}.(10+i)`. **Byte-identical to the legacy scheme for i<10** (gl0-0=9000/.10, gl0-9=9090/.19), extends to 32 (ports 9000..9312, IPs .10..41).
-- gl1 IP = `${NET_PREFIX}.(30+i)` — `GL1_IP_BASE=30` (moved off the legacy `.20` so gl0/gl1 octet ranges stay disjoint at scale; `.60+` is now reserved for snapshot-streaming). gl1 **internal** port stays the legacy 9100 band (preserves the `gl1-0:9100` container alias used by `tx-sender.conf`); gl1 **host** port base = `GL1_EXT_PORT_BASE` = **9600** (a constant lifted above the gl0 host band 9000.. and the m0 metagraph band 9200.., so the two layers never share a host port).
-- Cap knob: `NAKAMOTO_MAX_HG_NODES` (default **20**, IP-safe ceiling derived in `set-env.sh`); the e2e harness additionally hard-caps `--num-gl0 ≤ 16` and `--metagraphs ≤ 5` (`set-env.sh:361-372`). Metagraph operators stay single-digit (cap 9) — each metagraph runs 2-3 nodes on its own `/24` + port prefix (m0=92xx, m1=82xx, …). **fork-recovery (needs ≥5 gl0) is satisfied at N≥5.**
-
-> **As-built note (2026-06-25):** this plan originally targeted 32 gl0 / 8 metagraphs; the realized harness caps are **16 gl0 / 5 metagraphs**. The authoritative current IP/port/topology reference is **[`docs/nakamoto/E2E-CLUSTER-TOPOLOGY.md`](./E2E-CLUSTER-TOPOLOGY.md)** — defer to it over the numbers in this plan.
-
-**2. Metagraph shard-grinding.** Gated by `--grind-metagraph-shards` (sets `NAKAMOTO_GRIND_METAGRAPH_SHARDS=true`; requires `--num-shards>1`). In `compose-runner.sh`'s metagraph genesis phase, for metagraph `k` it regenerates `m${k}-0`'s keypair and re-runs the ML0 genesis container until `tools.jar shard-id --address <genesis.address> --num-shards M` returns `k mod M`. The shardId **oracle** is a new read-only `tools` CLI subcommand (`shard-id`) that calls the *production* `ShardAssignment.make[F](M).shardIdFor(addr)` verbatim — the exact mapping is `BigInt(1, SHA256(brotli(circeJson(addr)))) mod M` (`modules/.../domain/nakamoto/ShardAssignment.scala`), which is *not* reproducible in pure bash, hence the JVM oracle. After a grind changes `m${k}-0`'s peerId, the gl0 seedlist is rebuilt + gl0 restarted (`StateChannelValidator` only accepts SC binaries signed by a seedlisted peer).
-- **Caveat (genesis vs operator address):** the runtime fan-out keys on the metagraph *genesis* address = `Address.fromBytes(serialize(signedGenesisSnapshot))`, a function of the `m${k}-0` *signing key* **and** gl0's embedded `GlobalSyncView` — so it is non-deterministic offline and **must** be checked live (gl0 up), which is why the grind lives in the genesis loop, not in pre-boot keygen. The dry-run validates the routine on operator addresses (see below).
-- **Dry-run (no cluster):** `docker/bin/grind-metagraph-shards-dryrun.sh [K] [M] [pool]` exercises the identical grind loop + oracle via a fast batch `tools.jar shard-scan` (mints N keypairs + their shardIds in one JVM). **Result: 8 mgs / 4 shards → exactly 2 per shard (shards 0-3), avg ≈2 draws/mg.** Non-multiple cases distribute per `k mod M` (e.g. 6/4 → 2,2,1,1).
-
-**3. RAM budget (~150 GB free).** 32 gl0 × ~1.5 GB ≈ 48 GB + 32 sidecars (light) + 8 metagraphs × (ml0+cl1+dl1 ~4.5 GB) ≈ 36 GB + prometheus/grafana/snapshot-streaming/tx-sender ≈ 95-100 GB — within budget. If tight, dial down with `--num-gl0=24` (or `28`) / `NAKAMOTO_MAX_HG_NODES`; K_S≤N validation accepts any N≥K_S.
-
-## OPEN DESIGN QUESTIONS (need decision before S2/S3/S5 impl)
-1. **Sortition model — DECIDED (2026-05-26): per-(shard, epoch) Algorand sortition, committee FIXED per eta, rotating each epoch.** Keyed on `(eta, shardId, epoch)` — reuse `CommitteeSortition` (Algorand Option A), the design doc already specifies this (`:304` checkpoint carries `epoch: EtaPeriod`, `:579` per-(shard,epoch) membership). NOT coarse-pool (that was a wrong lean). N-2 frozen stake + eta from 2/3-mark of N-1 (consensus-epoch-staggering). **PREREQUISITE: per-epoch is safe only with equivocation slashing LOAD-BEARING** (`COMMITTEE-SORTITION-DESIGN.md:276` adaptive-corruption attack). Shard equivocation slashing = Slice 16 (built) — **CONFIRMED 2026-05-26: NOT load-bearing** (`ShardCheckpointEquivocationValidator` has zero non-test call sites; not consumed in the accept pipeline). ⇒ **S2.0 prerequisite (recommended): wire shard equivocation slashing load-bearing** (consume validator + apply slash effect; machinery built in Slices 16/17, needs accept-pipeline consumption) BEFORE S2 per-epoch. Alternative: per-(shard, parentCheckpointHash) interim committee (safe w/o slashing, throwaway).
-2. **Prior-state for re-exec (false-slashing crux):** where does each member get the byte-identical prior metagraph state? Recommended: parent shard checkpoint's re-executed result (held because adoption is re-exec-gated), base case = gl0 MPT at `gl0AnchorOrdinal` via `GlobalStateReader`. Consistent by induction.
-3. **numShards=1 after S5 deletion:** does numShards=1 become a single global shard (committee = whole cluster), replacing the "byte-identical no-op" constraint? And does the per-metagraph slashing path get subsumed by shard equivocation slashing?
-4. **Re-exec sync/async:** emit gated on re-exec success inside the (backgrounded) handler — confirm receiver-side re-exec-before-emit is the authoritative ordering.
+- `CommitteeSortition.scala`: admission VRF and public execution draw.
+- `StakeRegistry.scala`: uniform `committeeStake` versus global-leadership `relativeStake`.
+- `ShardCheckpointWiring.scala`: eligible GL0 pool, sorted VK registry, per-period committee cache.
+- `ShardCheckpointProducer.scala`: deterministic duty order and window.
+- `ShardCheckpointGl0AcceptanceManager.scala`: membership, key-possession, signature, and mandatory replay checks.

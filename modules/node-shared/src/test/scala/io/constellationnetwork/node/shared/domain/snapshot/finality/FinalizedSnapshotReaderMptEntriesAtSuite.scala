@@ -42,9 +42,13 @@ object FinalizedSnapshotReaderMptEntriesAtSuite extends MutableIOSuite {
     dir: fs2.io.file.Path,
     finalized: Long,
     withByteStore: Boolean
-  )(implicit js: JsonSerializer[IO]): IO[(FinalizedSnapshotReader[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo], MptStateStorage[IO])] =
+  )(
+    implicit js: JsonSerializer[IO]
+  ): IO[(FinalizedSnapshotReader[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo], MptStateStorage[IO])] =
     for {
-      fileStorage <- CombinedSnapshotCheckpointFileSystemStorage.make[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo](dir / "checkpoints")
+      fileStorage <- CombinedSnapshotCheckpointFileSystemStorage.make[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
+        dir / "checkpoints"
+      )
       byteStore <- MptStateStorage.make[IO](dir / "signed")
       gateRef <- Ref.of[IO, SnapshotOrdinal](ord(finalized))
       reader = FinalizedSnapshotReader.nakamoto[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo](

@@ -201,6 +201,7 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
             attested,
             scope,
             spentSet,
+            Map(m -> SortedSet(SnapshotOrdinal(NonNegLong.unsafeFrom(1L)))),
             Map.empty[Address, EpochProgress],
             EpochProgress(NonNegLong.unsafeFrom(250L))
           )

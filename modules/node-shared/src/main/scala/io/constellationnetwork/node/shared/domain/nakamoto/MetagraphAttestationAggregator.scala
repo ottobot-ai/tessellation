@@ -3,7 +3,6 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.{Ref, Sync}
 import cats.syntax.all._
 
-import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
@@ -86,28 +85,6 @@ trait MetagraphAttestationAggregator[F[_]] {
 }
 
 object MetagraphAttestationAggregator {
-
-  /** Quorum fraction parallel to `TipTracker.FinalityThreshold` (2/3 by default, env override). Same env knob to keep one finality surface:
-    * equivocation in the committee threshold against chain finality would be a footgun if the two ever drifted out of sync.
-    */
-  val FinalityThreshold: Ratio = TipTracker.FinalityThreshold
-
-  /** Compute the count required to reach `FinalityThreshold` of `kTarget`. `ceil(threshold · K)` computed in exact-Ratio so we stay
-    * byte-identical across observers.
-    *
-    * '''Standalone helper after the draw/quorum decouple.''' [[thresholdReached]] no longer routes through this — the gate now passes the
-    * cluster-uniform `nakamoto.committee.kQuorum` count DIRECTLY. This 2/3-of-K conversion remains exported for the parallel finality
-    * semantics + its own tests; production no longer derives the metagraph admit quorum from it.
-    */
-  def requiredCount(kTarget: Int): Int = {
-    require(kTarget > 0, s"kTarget must be positive, got $kTarget")
-    val num = FinalityThreshold.numerator
-    val den = FinalityThreshold.denominator
-    val product = num * BigInt(kTarget)
-    val (quot, rem) = (product / den, product % den)
-    val ceil = if (rem == 0) quot else quot + 1
-    ceil.toInt
-  }
 
   /** Composite key for the per-binary tally state. Keeping `Address` separate (not folded into the hash) gives
     * `pruneParents(metagraphAddress, parents)` a cheap O(per-metagraph) prune via the outer-map filter rather than walking every entry.

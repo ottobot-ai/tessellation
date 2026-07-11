@@ -8,7 +8,8 @@ import scala.collection.immutable.SortedSet
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.{MetagraphCommitteeGate, MetagraphOrphanBuffer, MetagraphParentOrdinalResolver}
+import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
@@ -140,6 +141,23 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       def pruneParents(metagraphAddress: Address, parents: Set[Hash]): IO[Unit] = IO.unit
     }
 
+  private def admitGate: MetagraphCommitteeGate[IO] =
+    new MetagraphCommitteeGate[IO] {
+      def attestAndAdmit(
+        metagraphAddress: Address,
+        parentHash: Hash,
+        binaryHash: Hash,
+        eta: Array[Byte],
+        sigmaOperatorKey: Ratio
+      ): IO[Boolean] = IO.pure(true)
+      def recordReceivedAttestation(
+        att: MetagraphCommitteeGate.IncomingAttestation,
+        eta: Array[Byte],
+        lookupSenderStake: PeerId => IO[Ratio]
+      ): IO[Unit] = IO.unit
+      def pruneParents(metagraphAddress: Address, parents: Set[Hash]): IO[Unit] = IO.unit
+    }
+
   /** A `parentOrdinalFor` that models `resolveFromBinary`'s tip-identity guard: resolves (via the real content decode) ONLY when `parent`
     * is a known recorded tip; else `None`. The known-tip set is seeded with the genesis tip and NEVER advances — exactly gl0's GSI lag.
     */
@@ -243,5 +261,49 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       reachedGate <- attempted.get.map(_.nonEmpty)
       buffered <- buf.size
     } yield expect(!reachedGate).and(expect.eql(1, buffered))
+  }
+
+  test("execution-shard buffer is written only after metagraph admission succeeds") { res =>
+    implicit val (h, sp, json, hs) = res
+    val assignment = ShardAssignment.make[IO](numShards = 2)
+    for {
+      sid <- assignment.shardIdFor(mgAddr)
+      shardBuffer <- ShardBinaryBuffer.make[IO](sid, cap = 16)
+      buffers = Map(sid -> shardBuffer)
+      binaryBytes <- mkBinaryBytes(1L, genesisTip)
+
+      timeoutOrphans <- MetagraphOrphanBuffer.make[IO](logger)
+      attempted <- Ref.of[IO, List[Hash]](Nil)
+      timeoutProcess = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
+        processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
+        committeeGate = timeoutGate(attempted),
+        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
+        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        selfStake = IO.pure(Ratio(1, 8)),
+        senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
+        orphanBuffer = timeoutOrphans,
+        shardBinaryBuffers = buffers,
+        shardAssignment = assignment.some,
+        logger = logger
+      )
+      _ <- timeoutProcess(mgAddr, binaryBytes)
+      afterTimeout <- shardBuffer.snapshotPending
+
+      admittedOrphans <- MetagraphOrphanBuffer.make[IO](logger)
+      admittedProcess = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
+        processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
+        committeeGate = admitGate,
+        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
+        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        selfStake = IO.pure(Ratio(1, 8)),
+        senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
+        orphanBuffer = admittedOrphans,
+        shardBinaryBuffers = buffers,
+        shardAssignment = assignment.some,
+        logger = logger
+      )
+      _ <- admittedProcess(mgAddr, binaryBytes)
+      afterAdmission <- shardBuffer.snapshotPending
+    } yield expect(afterTimeout.isEmpty).and(expect(afterAdmission.get(mgAddr).exists(_.size == 1)))
   }
 }

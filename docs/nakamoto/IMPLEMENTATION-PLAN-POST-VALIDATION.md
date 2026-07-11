@@ -1,5 +1,11 @@
 # Implementation Plan — Post-Validation Roadmap (2026-05-16)
 
+> **HISTORICAL, SUPERSEDED IMPLEMENTATION PLAN.** This roadmap describes an
+> earlier branch, parameter set, finality model, and sequencing plan. It is not a
+> current task list or authorization to restore removed fork-only paths. Retain it
+> as planning history only; current work must be derived from source,
+> [`../../AGENTS.md`](../../AGENTS.md), and accepted ADRs.
+
 **Branch:** `feature/serde-typeclass-shim` (HEAD `a1f703d0` at time of writing).
 **Status:** sequenced implementation plan after empirical validation closed.
 Companion to [`NAKAMOTO-PLAN.md`](../../NAKAMOTO-PLAN.md) (in-flight workstream)

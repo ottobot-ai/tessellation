@@ -38,15 +38,10 @@ object ShardingConfigSuite extends SimpleIOSuite {
     expect.all(
       cfg.numShards == 1,
       cfg.finality.k1Shard == 8L,
-      cfg.checkpoint.tAliveMs == 30000L,
-      cfg.checkpoint.tBurst == 64,
       // EXECUTION-SHARDING R-1: default per-shard raw-binary buffer cap.
       cfg.checkpoint.binaryBufferCap == 4096,
       // Slice 19: default partition-hard threshold is 10 minutes.
-      cfg.observability.tPartitionHardMs == 600000L,
-      // Slice 17: default non-participation slashing — 33% missed-rate ceiling, min 5 duties before evaluating.
-      cfg.slashing.maxMissedPctPerEpoch == 33,
-      cfg.slashing.minDenominatorPerEpoch == 5L
+      cfg.observability.tPartitionHardMs == 600000L
     )
   }
 
@@ -56,21 +51,16 @@ object ShardingConfigSuite extends SimpleIOSuite {
         |nakamoto.sharding {
         |  num-shards = 4
         |  finality { k1-shard = 16 }
-        |  checkpoint { t-alive-ms = 45000, t-burst = 128, binary-buffer-cap = 8192 }
+        |  checkpoint { binary-buffer-cap = 8192 }
         |  observability { t-partition-hard-ms = 90000 }
-        |  slashing { max-missed-pct-per-epoch = 50, min-denominator-per-epoch = 10 }
         |}
       """.stripMargin
     )
     expect.all(
       cfg.numShards == 4,
       cfg.finality.k1Shard == 16L,
-      cfg.checkpoint.tAliveMs == 45000L,
-      cfg.checkpoint.tBurst == 128,
       cfg.checkpoint.binaryBufferCap == 8192,
-      cfg.observability.tPartitionHardMs == 90000L,
-      cfg.slashing.maxMissedPctPerEpoch == 50,
-      cfg.slashing.minDenominatorPerEpoch == 10L
+      cfg.observability.tPartitionHardMs == 90000L
     )
   }
 
@@ -85,12 +75,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
     expect.all(
       cfg.numShards == 2,
       cfg.finality.k1Shard == 8L,
-      cfg.checkpoint.tAliveMs == 30000L,
-      cfg.checkpoint.tBurst == 64,
       cfg.checkpoint.binaryBufferCap == 4096,
-      cfg.observability.tPartitionHardMs == 600000L,
-      cfg.slashing.maxMissedPctPerEpoch == 33,
-      cfg.slashing.minDenominatorPerEpoch == 5L
+      cfg.observability.tPartitionHardMs == 600000L
     )
   }
 }

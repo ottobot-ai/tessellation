@@ -14,25 +14,19 @@ import derevo.derive
   * derivation it could not reproduce by re-executing the SAME committee derivation
   * (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.2 "wrong-derivation"; `docs/nakamoto/WATCHTOWER-FRAUD-PROOF-DESIGN.md`).
   *
-  * '''The threat this closes.''' `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` admits a checkpoint on `kQuorum` distinct committee
-  * signatures WITHOUT re-execution (the common path). A corrupt committee that reaches quorum can therefore attest a WRONG
-  * `perMetagraphMptRoots` and have every gl0 adopt it. The watchtower is the approval-check that runs the per-MG re-derivation even when
-  * quorum was met — so a SINGLE honest re-executing node catches the wrong root, gossips this envelope, and every gl0 INDEPENDENTLY re-runs
-  * the deterministic verdict (never trusting the challenger's claimed roots — they recompute). Upheld ⇒ revert + slash the committee.
+  * '''The threat this closes.''' A committee may sign a root that GL0 replay does not reproduce. Signatures never authorize that state:
+  * `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` re-executes every included CL1 transition and rejects the mismatch before adoption.
+  * This envelope makes the already-detected, affirmative mismatch self-contained so every GL0 node can independently verify the evidence
+  * and slash the signers without trusting the challenger.
   *
-  * '''Determinism of the verdict (the load-bearing invariant).''' The dispute consumer recomputes the honest derivation from the disputed
-  * checkpoint's OWN signed bytes ([[disputedCheckpointHash]] resolves the cached envelope whose `includedSnapshots(metagraphAddress)` are
-  * the inputs) via the PURE, prior-independent `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot` — `noGlobalSnapshotLookup`,
-  * empty prior, so the result is a pure function of `(metagraphAddress, includedSnapshots(mg), gl0AnchorOrdinal)` and byte-identical on
-  * every node regardless of its local MPT height. The challenger's [[challengerDerivation]] / [[claimedDerivation]] are carried as a HINT
-  * for logging / fast-path triage only; the verdict NEVER trusts them — it recomputes (see `InvalidStateProofValidator`). This is why the
-  * verdict keys on the PURE derivation rather than the node-local-`S(N)`-dependent PIN-1 `perMetagraphMptRoots` encoding: PIN-1 carries
-  * carry-forward fields folded over the producer's `S(N)`, which a lagging-but-honest node does not share, so a PIN-1 verdict could
-  * false-slash an honest committee on a node whose `S(N)` differs. The pure derivation has no such dependency.
+  * '''Determinism of the verdict (the load-bearing invariant).''' The dispute consumer recomputes from the checkpoint's signed binaries at
+  * its signed execution-base ordinal, using the same retained finalized GL0 prior as producer and adopter. The challenger's
+  * [[challengerDerivation]] and [[claimedDerivation]] are diagnostic hints only; the verdict never trusts them. If the pinned base is not
+  * locally available, verification fails closed without slashing.
   *
   * '''Why `Hex` for [[reexecutionWitness]].''' Project convention for "opaque variable-length bytes carried in a Circe-serialized case
   * class" (same choice as `MetagraphAttestation.kesSignature`, `CommitteeMemberSignature.vrfProof`). Here it carries the canonical
-  * `deriveMetagraphRoot` PURE reference root the challenger computed — the value the verdict reproduces. It is a hint, NOT trusted.
+  * independently recreated per-metagraph MPT root. It is a hint, not trusted.
   *
   * '''Frozen wire shape (consensus-load-bearing once a wrapping evidence tx exists).''' Field set + order participate in
   * [[InvalidStateProofEvidence]]'s canonical bytes. Adding/reordering/wrapping a field silently changes the digest. Bump explicitly
@@ -48,16 +42,16 @@ import derevo.derive
   *   `includedSnapshots(metagraphAddress)` — a checkpoint can carry many MGs but a fraud proof targets one wrong derivation.
   * @param gl0AnchorOrdinal
   *   the disputed checkpoint's wire-carried `gl0AnchorOrdinal` — the derivation context (fee-cutover ordinal) the verdict MUST pass to
-  *   `deriveMetagraphRoot` to reproduce the producer's root. Read off the signed checkpoint; carried here so the verdict can sanity-check.
+  *   pinned-base replay to reproduce the producer's root. Read off the signed checkpoint; carried here so the verdict can sanity-check.
   * @param claimedDerivation
   *   the per-MG root the shard committee SIGNED (`perMetagraphMptRoots(metagraphAddress)`) — the committee's claim. UNTRUSTED on the wire
   *   (the verdict reads the committee's claim from the signed checkpoint, not from this field); carried for diagnostics.
   * @param challengerDerivation
-  *   the canonical PURE reference root (`deriveMetagraphRoot`) the challenger computed from independent re-execution — the alleged correct
-  *   value. UNTRUSTED: the verdict RECOMPUTES it. Carried so a node can fast-triage before the full re-derivation.
+  *   the canonical per-metagraph MPT root the challenger computed from independent pinned-base re-execution — the alleged correct value.
+  *   UNTRUSTED: the verdict recomputes it. Carried so a node can fast-triage before the full re-derivation.
   * @param reexecutionWitness
-  *   opaque bytes — currently the challenger's PURE reference root bytes (== `challengerDerivation`), reserved for a future
-  *   per-derivation-kind witness schema (§11.3). Hint only; the verdict reproduces it.
+  *   opaque bytes — currently the challenger's reference-root bytes (== `challengerDerivation`), reserved for a future per-derivation-kind
+  *   witness schema (§11.3). Hint only; the verdict reproduces it.
   * @param challengerSignature
   *   Ed25519 (long-term key, recovered from the submitter `PeerId`) over the `Hasher[F]` of the rest of the envelope. Binds the dispute to
   *   its submitter so a replay attacker cannot lift any bounty; the verdict verifies it before recomputing.

@@ -8,6 +8,7 @@ import io.constellationnetwork.currency.dataApplication.FeeTransaction
 import io.constellationnetwork.ext.cats.syntax.validated._
 import io.constellationnetwork.node.shared.domain.transaction.FeeTransactionValidator.FeeTransactionValidationErrorOr
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.SignedValidator.SignedValidationError
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
 
@@ -22,7 +23,7 @@ trait FeeTransactionValidator[F[_]] {
 }
 
 object FeeTransactionValidator {
-  def make[F[_]: Async](
+  def make[F[_]: Async: Hasher](
     signedValidator: SignedValidator[F]
   ): FeeTransactionValidator[F] =
     new FeeTransactionValidator[F] {
@@ -30,10 +31,14 @@ object FeeTransactionValidator {
         signedTransaction: Signed[FeeTransaction]
       ): F[FeeTransactionValidationErrorOr[Signed[FeeTransaction]]] =
         for {
+          signaturesV <- signedValidator
+            .validateSignatures(signedTransaction)
+            .map(_.errorMap[FeeTransactionValidationError](InvalidSigned))
           srcAddressSignatureV <- validateSourceAddressSignature(signedTransaction)
           differentSrcAndDstV = validateDifferentSourceAndDestinationAddress(signedTransaction)
         } yield
-          srcAddressSignatureV
+          signaturesV
+            .productR(srcAddressSignatureV)
             .productR(differentSrcAndDstV)
 
       def validate(

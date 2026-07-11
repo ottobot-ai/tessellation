@@ -4,7 +4,7 @@ Date: 2026-07-10
 
 ## Status
 
-Accepted
+Accepted (amended 2026-07-10 by ADR-0017)
 
 ## Context
 
@@ -49,10 +49,10 @@ See the sequence and analysis in
 **1. Re-execution split — the economic guarantee is RE-EXECUTION.**
 
 - Global DAG-token movement (dag-l1 / GL1): re-executed by **every GL0 node**.
-- Metagraph economic ops (CL1): re-executed by the assigned **shard committee**,
-  which produces the re-executed state (byteDiff) and ships **both** the
-  checkpoint and the state. **Watchtowers re-exec-check** → mismatch ⇒
-  `InvalidStateProof` slash. Other GL0 nodes adopt + verify the stateProof.
+- Metagraph economic ops (CL1): re-executed by the assigned **shard committee**
+  before it signs and re-executed again by **every GL0 adopter** before state is
+  usable. A committee root is a claim, never an economic authority.
+  Watchtowers are a slashing backstop, not the validity gate.
 - Metagraph data-app logic (DL1): **proof-carried** — authoritative at the
   metagraph, adopted-and-verified by GL0 against a proof/root. Re-execution is
   *impossible* here, so a proof is the only mechanism and is correct **for DL1
@@ -60,9 +60,8 @@ See the sequence and analysis in
 
 "Roots-only" / "proof-carrying" describes the **storage commitment** and the
 **DL1** path. It is **never** a licence to skip re-executing a CL1-processed
-economic operation. Relocating CL1 re-execution to the committee (from a
-hypothetical every-GL0 re-exec) **moves** the re-execution; it does not
-eliminate it.
+economic operation. Execution sharding may reduce proposal work and organize
+data availability; it does not remove universal GL0 economic verification.
 
 **2. Cross-shard framework reads are finality-first (Option A).**
 
@@ -70,11 +69,9 @@ Shard committees do not share state through a direct channel — they share it
 **through the global snapshot** every shard embeds into. A cross-shard CL1 read
 resolves against gl0's **consensus-pinned, finalized** global mirror:
 
-- On the gl0 consensus accept path, the cross-shard read source is
-  `ShardSubtreeProofClient.gl0Local(branchAwareReader)`, where `branchAwareReader`
-  is the same accept-`parentTip`-bound, cluster-uniform finalized reader every
-  per-manager prior-state read uses. Every gl0 node reads the byte-identical
-  value ⇒ no fork.
+- On the gl0 consensus accept path, the cross-shard read source resolves through
+  `gl0Local` over `MptOverlay.base`, the finalized MPT store. It does not read the
+  candidate's `parentTip` branch.
 - If the needed cross-shard value is not yet embedded in gl0's finalized mirror,
   the read returns absent → the consuming op is rejected this round and retried
   on the next gl0 ord (it **waits** for finality; bounded ~one global cadence).
@@ -88,7 +85,7 @@ consensus path.
 re-execution.**
 
 In every cross-shard case the consuming CL1 op is **still re-executed** by the
-committee / gl0 accept. The cross-shard read (or, on the committee-to-committee
+committee and every gl0 adopter. The cross-shard read (or, on the committee-to-committee
 P2P path, an inclusion proof) supplies only the *input value* the local shard
 cannot compute — it never replaces executing the op.
 
@@ -115,12 +112,10 @@ cannot compute — it never replaces executing the op.
   consensus `mptRoot` non-deterministically and forks the cluster. The accept
   path must always use `gl0Local` off the consensus-pinned finalized reader.
 
-- **Anti-drift rule (load-bearing).** Do not propose roots-only / proof-carrying
-  / attestation-only as a *replacement* for re-executing a CL1 economic op, do
-  not call the mirror/fold "settled and deletable," and do not frame the
-  store-fidelity / byteDiff work as legacy. That work is how GL0 carries and
-  adopts the committee's re-executed state; it stays. Fix sharding/mirror bugs
-  **within** the re-execution model.
+- **Anti-drift rule (load-bearing).** Do not propose roots-only, proof-carrying,
+  state-diff, or attestation-only validation as a replacement for every GL0 node
+  re-executing a CL1 economic op. Storage commitments and transport formats may
+  change; universal economic execution does not.
 
 - **Revisiting Option B** (attestation-first cross-shard admission) requires a
   new ADR that supersedes this one, with an explicit analysis of the CQ-collapse
@@ -134,6 +129,6 @@ cannot compute — it never replaces executing the op.
   — `gl0Local` (deterministic consensus read source) and `http` (finality-anchored
   committee P2P path).
 - `modules/node-shared/.../infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala`
-  (~L2507–2548) — the gl0 accept wiring that defaults to `gl0Local(branchAwareReader)`.
-- `docs/nakamoto/CROSS-SHARD-PROTOCOL-RESEARCH.md`,
-  `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8.
+  — the gl0 accept wiring that defaults to `gl0Local` over the finalized MPT base.
+- `docs/nakamoto/CROSS-SHARD-PROTOCOL-RESEARCH.md`
+- `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8

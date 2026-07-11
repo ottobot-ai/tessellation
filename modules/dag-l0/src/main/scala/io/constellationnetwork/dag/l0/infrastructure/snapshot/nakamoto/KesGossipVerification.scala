@@ -18,15 +18,14 @@ import eu.timepit.refined.auto._
   *
   *   - empty wire field → `*_no_sig_total` + WARN, return false (reject)
   *   - decode failure → `*_decode_failed_total` + WARN, return false
-  *   - sig + no registry → `*_no_registry_entry_total` + DEBUG, return true (Ed25519 already authenticated; carve-out for Slice 10 runtime
-  *     registration where a newly-joined operator's reg-cert tx may not yet have finalized when their first sigs arrive)
+  *   - sig + no registry → `*_no_registry_entry_total` + WARN, return false
   *   - sig + verify OK → `*_verified_total` + INFO, return true
   *   - sig + verify fail → `*_invalid_total` + WARN, return false
   */
 // Slice S3: the access modifier was relaxed from `private[nakamoto]` so the
 // `MetagraphCommitteeGate` adapter constructed in `GlobalSnapshotConsensus` can
 // reuse this verify path. The KES accept/reject matrix (no-sig → reject, decode-fail →
-// reject, no-registry → accept, verify-fail → reject) is unchanged.
+// reject, no-registry → reject, verify-fail → reject) is shared by every path.
 object KesGossipVerification {
 
   /** Verify a KES signature attached to an attestation. `messageBytes` is the Ed25519-signed attestation-hash bytes (the same bytes the
@@ -59,10 +58,10 @@ object KesGossipVerification {
             case None =>
               Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_no_registry_entry_total") >>
                 logger
-                  .debug(
-                    s"$tag no registry entry for ord=$tipOrdinal from=${attesterHex.value.take(16)}... — accepting (Ed25519 already authenticated)"
+                  .warn(
+                    s"⚠️ $tag no registry entry for ord=$tipOrdinal from=${attesterHex.value.take(16)}... — rejecting"
                   )
-                  .as(true)
+                  .as(false)
             case Some(entry) =>
               // Registry holds the master VK captured at registration (step=0 in the tree) plus the
               // operator's eta-period offset. Sender signs at the *current* product step (=
@@ -111,7 +110,7 @@ object KesGossipVerification {
     *
     *   - empty sig → reject
     *   - decode fail → reject
-    *   - no registry entry → accept (Ed25519 already authenticated; Slice 10 mid-life join carve-out)
+    *   - no registry entry → reject (admission committee membership requires a registered operator identity)
     *   - registry entry + `kesStep < 0` → reject (impossible by construction; nonetheless guarded)
     *   - registry entry + verify ok → accept
     *   - registry entry + verify fail → reject
@@ -144,10 +143,10 @@ object KesGossipVerification {
             case None =>
               Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_no_registry_entry_total") >>
                 logger
-                  .debug(
-                    s"$tag no registry entry step=$kesStep from=${attesterHex.value.take(16)}... — accepting (Ed25519 already authenticated)"
+                  .warn(
+                    s"⚠️ $tag no registry entry step=$kesStep from=${attesterHex.value.take(16)}... — rejecting"
                   )
-                  .as(true)
+                  .as(false)
             case Some(entry) =>
               if (kesStep < 0)
                 Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_invalid_total") >>
@@ -200,10 +199,10 @@ object KesGossipVerification {
             case None =>
               Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_no_registry_entry_total") >>
                 logger
-                  .debug(
-                    s"$tag no registry entry for ord=$ordinal from=${producerHex.value.take(16)}... — accepting (Ed25519 already authenticated)"
+                  .warn(
+                    s"⚠️ $tag no registry entry for ord=$ordinal from=${producerHex.value.take(16)}... — rejecting"
                   )
-                  .as(true)
+                  .as(false)
             case Some(entry) =>
               val globalPeriod = EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots).toInt
               val treeInternalStep = globalPeriod - entry.offset.toInt

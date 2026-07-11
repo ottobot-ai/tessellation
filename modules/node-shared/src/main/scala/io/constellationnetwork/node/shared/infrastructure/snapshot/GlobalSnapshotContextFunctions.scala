@@ -232,18 +232,11 @@ object GlobalSnapshotContextFunctions {
               // the sharded MGs' binaries (extracted from `stateChannelSnapshots`) and diverge. Empty at numShards=1
               // (the artifact carries an empty map) ⇒ byte-identical to today.
               shardCheckpoints = signedArtifact.shardCheckpoints,
-              // #259 — verifier-replay eta adoption. This is the follower/verifier path: adopt gl0's
-              // authoritative per-period eta from the incoming artifact's `eta` wire field for the
-              // `historicalStakeSnapshots` boundary entry, instead of recomputing it (which the follower
-              // cannot do — it lacks gl0's VRF-output chain, so its `etaForPeriod` chain-walk degrades to
-              // `genesisEta` and diverges from gl0's committed value, failing the boundary mptRoot check
-              // every period). gl0 PRODUCERS go through `GlobalSnapshotConsensusFunctions` (not this path)
-              // and keep `adoptedBoundaryEta = None` ⇒ recompute via `etaForPeriod`, untouched. The wire
-              // `eta` equals gl0's boundary eta byte-for-byte at boundary ordinals (same `%02x` hex
-              // encoding, same period = closingOrdinal / R). Pre-boundary / pre-S0.4 artifacts carry
-              // `eta = None`, which only matters at boundary ordinals — at a boundary the producer always
-              // populated it (`SnapshotLeaderLoop` sets `eta = Some(etaHash)` on every produced snapshot).
-              adoptedBoundaryEta = signedArtifact.eta,
+              // A downstream follower validates finalized GL0 artifacts but does not retain GL0's VRF-output ancestry. At an eta-period
+              // boundary, pin the signed artifact's eta into the historical-stake entry so replay reproduces GL0's exact committed bytes.
+              // The subsequent mptRoot comparison authenticates the whole result. This is canonical GL0 metadata on the return path, not
+              // an ML0/CL1 economic-state override.
+              pinnedBoundaryEta = signedArtifact.eta,
               // WATCHTOWER fraud proofs (W3a) — thread the signed snapshot's `fraudProofs` consensus field so this `createContext` GSAM
               // re-validates each carried dispute and applies the SAME slash the producer did, reproducing the signed mptRoot. Empty at
               // numShards=1 (the artifact carries an empty map) ⇒ byte-identical regression bar.

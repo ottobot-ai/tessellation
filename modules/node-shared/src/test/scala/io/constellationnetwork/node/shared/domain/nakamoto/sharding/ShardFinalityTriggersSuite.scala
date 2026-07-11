@@ -24,12 +24,11 @@ import weaver.MutableIOSuite
 
 /** Tests for [[ShardTipTracker]] and [[ShardFinalityTriggers]] — Slice 6 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §5.4.
   *
-  * '''Required coverage''' (per slice spec):
-  *   1. `T_count_shard` qualifies at threshold — `K_S=4`, 3 attesters → ceil(2·4/3) = 3 → qualifies; 2 attesters → does not.
-  *   1. `T_count_shard` self-exclusion — `K_S=4`, local node attests + 2 others attest → only 2 count → does not qualify (`#133/P-11b`
-  *      mirror).
-  *   1. `T_depth1_shard` qualifies at depth — 10 checkpoints, `k1Shard=5`; ords 0..4 qualify (depth > 5).
-  *   1. Composite max-of — T_count fires for ord 7, T_depth1 fires for ord 4 → composite latestQualifying = 7.
+  * '''Required coverage''':
+  *   1. `T_count_shard` qualifies at the configured `kQuorum` count and not below it.
+  *   1. tracker self-exclusion remains available for diagnostics, while the selection trigger counts all distinct embedded signers.
+  *   1. `T_depth1_shard` qualifies at depth — 10 checkpoints, `k1Shard=5`; the highest qualifying ordinal is 5.
+  *   1. Composite max-of — T_count fires for ord 8, T_depth1 fires for ord 3 → composite latestQualifying = 8.
   *   1. Monotone — `latestQualifying` Ref never goes backwards even if eval regresses.
   *   1. Pruning — after `pruneBelow(ord)`, attestations for checkpoints with shardOrd < ord are gone.
   */
@@ -56,9 +55,6 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   /** Build a deterministic PeerId from a name string (mirrors the `pid` helper in `FinalityTriggerSuite`). */
   private def pid(name: String): PeerId =
     PeerId(Hex(name.getBytes("UTF-8").map(b => f"$b%02x".toString).mkString.padTo(128, '0')))
-
-  /** Deterministic 64-char hex string from a seed character — used for `Hash` and sentinel signature bytes. */
-  private def hashStr(seed: Char): Hash = Hash(seed.toString * 64)
 
   private def hex(s: String): Hex = Hex(s)
 
@@ -104,7 +100,6 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(peerByte)),
       epoch = EtaPeriod(0L)
     )
@@ -112,26 +107,32 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   private def mkSignedCheckpoint(
     ord: Long,
     parent: Hash,
-    peerByte: Int = 1,
-    gl0Anchor: Long = 100L
+    peerByte: Int,
+    gl0Anchor: Long
   ): Signed[ShardCheckpoint] =
     mkSigned(mkCheckpoint(ord, parent, peerByte, gl0Anchor))
 
   private def vrf(seed: Int): Array[Byte] = Array.fill[Byte](32)(seed.toByte)
 
-  /** Seed a chain of `n` checkpoints (ords 0..n-1) into the store; return the list of canonical hashes in order. Used by the depth +
+  /** Seed a chain of `n` checkpoints (ords 1..n) into the store; return the list of canonical hashes in order. Used by the depth +
     * composite tests.
     */
   private def seedChain(
     store: ShardChainStore[IO],
     n: Int
-  )(implicit hasher: Hasher[IO]): IO[List[Hash]] =
-    (0L until n.toLong).toList
+  ): IO[List[Hash]] =
+    (1L to n.toLong).toList
       .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
         case ((acc, parent), ord) =>
           val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = ord.toInt + 1, gl0Anchor = 100L + ord)
           store
-            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1L, vrfOutput = vrf(ord.toInt + 1))
+            .store(
+              signed,
+              parentHash = parent,
+              shardOrdinal = ShardOrdinal(ord),
+              slot = signed.value.slot.value.value,
+              vrfOutput = vrf(ord.toInt + 1)
+            )
             .flatMap { _ =>
               store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
             }
@@ -161,7 +162,10 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       )
       _ <- triggers.advance
       result <- triggers.tCountShard.latestQualifyingOrdinal
-    } yield expect.same(SnapshotOrdinal.unsafeApply(tip.signed.value.shardOrdinal.value), result)
+      current <- triggers.currentQualifyingCheckpoint
+    } yield
+      expect.same(SnapshotOrdinal.unsafeApply(tip.signed.value.shardOrdinal.value), result) &&
+        expect.same(tip.hash.some, current.map(_.hash))
   }
 
   test("T_count_shard: kQuorum=3, only 2 non-self attesters → below threshold → MinValue") { implicit hasher =>
@@ -246,7 +250,7 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   // Test 3: T_depth1_shard qualifies at depth
   // ============================================================================
 
-  test("T_depth1_shard: 10 checkpoints (ords 0..9), k1Shard=5 → qualifies ord (9 - 5) = 4") { implicit hasher =>
+  test("T_depth1_shard: 10 checkpoints (ords 1..10), k1Shard=5 → qualifies ord (10 - 5) = 5") { implicit hasher =>
     val self = pid("self")
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -261,12 +265,14 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       )
       _ <- triggers.advance
       result <- triggers.tDepth1Shard.latestQualifyingOrdinal
+      current <- triggers.currentQualifyingCheckpoint
     } yield
-      // bestTip is ord=9 (10 checkpoints, 0..9), k1Shard=5 → highest ord with depth > 5 is 9 - 5 = 4.
-      // Per design doc §5.4 row 3 — "depth > k1Shard" (strict). At ord 4 the chain extends to ord 9, depth = 9 - 4 = 5,
+      // bestTip is ord=10 (10 checkpoints, 1..10), k1Shard=5 → the implementation's depth candidate is 10 - 5 = 5.
+      // Per design doc §5.4 row 3 — "depth > k1Shard" (strict). At ord 5 the chain extends to ord 10, depth = 10 - 5 = 5,
       // depth > 5 is false. Match the gl0 TDepth1Trigger semantics which uses `bestOrd - k` (subtraction; result becomes the
-      // qualifying ord). With bestOrd=9 and k=5 the qualifying ord is 4.
-      expect.same(SnapshotOrdinal.unsafeApply(4L), result)
+      // qualifying ord). With bestOrd=10 and k=5 the qualifying ord is 5.
+      expect.same(SnapshotOrdinal.unsafeApply(5L), result) &&
+        expect.same(5L.some, current.map(_.signed.value.shardOrdinal.value))
   }
 
   test("T_depth1_shard: chain shorter than k1Shard → MinValue") { implicit hasher =>
@@ -288,21 +294,16 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 4: composite max-of — T_count fires for ord 7, T_depth1 fires for ord 4 → max = 7
+  // Test 4: composite max-of — T_count fires for ord 8, T_depth1 fires for ord 3 → max = 8
   // ============================================================================
 
-  test("composite max-of: T_count_shard=7 + T_depth1_shard=4 → latestQualifyingOrdinal = 7") { implicit hasher =>
+  test("composite max-of: T_count_shard=8 + T_depth1_shard=3 → latestQualifyingOrdinal = 8") { implicit hasher =>
     val self = pid("self")
     for {
-      store <- ShardChainStore.make[IO](shardZero)
-      // Seed 10 checkpoints (ords 0..9). k1Shard=5 ⇒ T_depth1 qualifies ord 9 - 5 = 4.
-      hashes <- seedChain(store, 10)
-      tracker <- ShardTipTracker.make[IO](shardZero, self)
-      // To make T_count qualify at ord 7 (not 9 which is the actual bestTip), we'd need an attestation set at the canonical hash at
-      // ord 7. The composite reads via bestTip — so the scenario is: bestTip is at ord 7 (not 9), T_count threshold met for that
-      // bestTip, T_depth1 sees a 7-ord chain with k1Shard=5 → qualifies ord 2.
+      // To make T_count qualify at ord 8 (not 10 which is the actual bestTip), use a fresh eight-checkpoint store. T_count observes
+      // bestTip ord 8 while T_depth1 sees the same chain with k1Shard=5 and qualifies ord 3.
       //
-      // Re-seed cleanly: build a fresh store of length 8 (ords 0..7) so bestTip = ord 7. k1Shard=5 ⇒ T_depth1 = 2. kQuorum=2 ⇒ required
+      // Re-seed cleanly: build a fresh store of length 8 (ords 1..8) so bestTip = ord 8. k1Shard=5 ⇒ T_depth1 = 3. kQuorum=2 ⇒ required
       // = 2 attesters (DIRECTLY); 2 non-self attesters meet it.
       store2 <- ShardChainStore.make[IO](shardZero)
       hashes2 <- seedChain(store2, 8)
@@ -321,14 +322,16 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       countQualifying <- triggers.tCountShard.latestQualifyingOrdinal
       depthQualifying <- triggers.tDepth1Shard.latestQualifyingOrdinal
       composite <- triggers.latestQualifyingOrdinal
+      current <- triggers.currentQualifyingCheckpoint
     } yield
-      // ord 7 = bestTip, kQuorum=2 ⇒ required = 2 ⇒ T_count qualifies ord 7.
-      expect.same(SnapshotOrdinal.unsafeApply(7L), countQualifying) &&
-        // bestOrd = 7, k1Shard = 5 ⇒ T_depth1 qualifies ord 2.
-        expect.same(SnapshotOrdinal.unsafeApply(2L), depthQualifying) &&
-        // composite max-of ⇒ 7.
-        expect.same(ShardOrdinal(7L), composite) &&
-        expect(hashes.nonEmpty) && expect(hashes2.nonEmpty) // sanity to keep `hashes` from being flagged unused
+      // ord 8 = bestTip, kQuorum=2 ⇒ required = 2 ⇒ T_count qualifies ord 8.
+      expect.same(SnapshotOrdinal.unsafeApply(8L), countQualifying) &&
+        // bestOrd = 8, k1Shard = 5 ⇒ T_depth1 qualifies ord 3.
+        expect.same(SnapshotOrdinal.unsafeApply(3L), depthQualifying) &&
+        // composite max-of ⇒ 8, and the hash-bearing selection chooses the count-qualified tip.
+        expect.same(ShardOrdinal(8L), composite) &&
+        expect.same(tip2.hash.some, current.map(_.hash)) &&
+        expect(hashes2.nonEmpty)
   }
 
   // ============================================================================
@@ -378,11 +381,62 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
         expect.same(qualifyingAfter, qualifyingAfterPrune)
   }
 
+  test("same-ordinal reorg: branch A quorum does not qualify the canonical branch B checkpoint") { implicit hasher =>
+    val self = pid("self")
+    val branchA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty, peerByte = 1, gl0Anchor = 20L)
+    val branchB = mkSignedCheckpoint(ord = 1L, parent = Hash.empty, peerByte = 2, gl0Anchor = 10L)
+
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      storedA <- store.store(
+        branchA,
+        parentHash = Hash.empty,
+        shardOrdinal = ShardOrdinal(1L),
+        slot = branchA.value.slot.value.value,
+        vrfOutput = vrf(1)
+      )
+      tipA <- store.bestTip.map(_.get)
+      tracker <- ShardTipTracker.make[IO](shardZero, self)
+      _ <- tracker.recordAttestation(tipA.hash, pid("attester-1"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tipA.hash, pid("attester-2"), dummyCommitteeSig)
+      _ <- tracker.recordAttestation(tipA.hash, pid("attester-3"), dummyCommitteeSig)
+      triggers <- ShardFinalityTriggers.make[IO](
+        shardId = shardZero,
+        kQuorum = 3,
+        k1Shard = 100L,
+        chainStore = store,
+        tipTracker = tracker
+      )
+      _ <- triggers.advance
+      historicalOrdinal <- triggers.latestQualifyingOrdinal
+
+      // Same height, lower slot: maxvalid-tk switches the canonical entry at ordinal 1 from A to B.
+      storedB <- store.store(
+        branchB,
+        parentHash = Hash.empty,
+        shardOrdinal = ShardOrdinal(1L),
+        slot = branchB.value.slot.value.value,
+        vrfOutput = vrf(2)
+      )
+      tipB <- store.bestTip.map(_.get)
+      ordinalLookup <- store.getByOrdinal(historicalOrdinal)
+      branchBound <- triggers.currentQualifyingCheckpoint
+    } yield
+      expect(storedA) &&
+        expect(storedB) &&
+        expect.same(ShardOrdinal(1L), historicalOrdinal) &&
+        expect(tipA.hash =!= tipB.hash) &&
+        // This is the pre-fix exploit primitive: resolving the monotone ordinal now returns un-attested branch B.
+        expect.same(tipB.hash.some, ordinalLookup.map(_.hash)) &&
+        // The embedding selector must fail closed because no hash on B's ancestry has count or depth qualification.
+        expect.same(none[Hash], branchBound.map(_.hash))
+  }
+
   // ============================================================================
   // Test 6: pruning — pruneBelow(ord) drops attestations for checkpoints with shardOrd < ord
   // ============================================================================
 
-  test("pruning: after pruneBelow(5), attestations for ord 0..4 are gone; attestations for ord 5..9 retained") { implicit hasher =>
+  test("pruning: after pruneBelow(5), attestations for ord 1..4 are gone; attestations for ord 5..10 retained") { implicit hasher =>
     val self = pid("self")
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -397,18 +451,18 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
         h => store.getByHash(h).map(_.map(_.signed.value.shardOrdinal))
       )
       attsAfter <- tracker.allAttestations
-      // Per-hash post-prune counts: ords 0..4 → 0 (dropped), ords 5..9 → 1 each (retained).
-      countOrd0 <- tracker.attestationCountFor(hashes(0), excludeSelf = false)
-      countOrd4 <- tracker.attestationCountFor(hashes(4), excludeSelf = false)
-      countOrd5 <- tracker.attestationCountFor(hashes(5), excludeSelf = false)
-      countOrd9 <- tracker.attestationCountFor(hashes(9), excludeSelf = false)
+      // Per-hash post-prune counts: ords 1..4 → 0 (dropped), ords 5..10 → 1 each (retained).
+      countOrd1 <- tracker.attestationCountFor(hashes(0), excludeSelf = false)
+      countOrd4 <- tracker.attestationCountFor(hashes(3), excludeSelf = false)
+      countOrd5 <- tracker.attestationCountFor(hashes(4), excludeSelf = false)
+      countOrd10 <- tracker.attestationCountFor(hashes(9), excludeSelf = false)
     } yield
       expect.same(10, attsBefore.size) &&
-        expect.same(5, attsAfter.size) && // ords 5..9 retained
-        expect.same(0, countOrd0) &&
+        expect.same(6, attsAfter.size) && // ords 5..10 retained
+        expect.same(0, countOrd1) &&
         expect.same(0, countOrd4) &&
         expect.same(1, countOrd5) &&
-        expect.same(1, countOrd9)
+        expect.same(1, countOrd10)
   }
 
   // ============================================================================
@@ -429,29 +483,4 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
     } yield expect.same(1, count)
   }
 
-  // ============================================================================
-  // Bonus: ceilTwoThirds helper — byte-determinism check across boundary values
-  // ============================================================================
-
-  pureTest("ceilTwoThirds: matches the design doc threshold table (K_S → required)") {
-    // K_S → ceil(2·K_S/3) — design doc §5.4 row 2 threshold.
-    // K_S=1 → ceil(2/3) = 1
-    // K_S=3 → ceil(6/3) = 2
-    // K_S=4 → ceil(8/3) = 3
-    // K_S=6 → ceil(12/3) = 4
-    // K_S=10 → ceil(20/3) = 7
-    // K_S=100 → ceil(200/3) = 67
-    val cases = List(
-      (1, BigInt(1)),
-      (3, BigInt(2)),
-      (4, BigInt(3)),
-      (6, BigInt(4)),
-      (10, BigInt(7)),
-      (100, BigInt(67))
-    )
-    cases.foldLeft(success) {
-      case (acc, (ks, expected)) =>
-        acc && expect.same(expected, ShardFinalityTriggers.ceilTwoThirds(BigInt(ks)))
-    }
-  }
 }

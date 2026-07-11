@@ -12,11 +12,12 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.LastGlobalSnapshotsSyncConfig
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.artifact.{GlobalSnapshotsProcessed, SharedArtifact}
+import io.constellationnetwork.schema.artifact._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
+import io.constellationnetwork.schema.swap.{CurrencyId, SwapAmount}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -24,7 +25,7 @@ import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 
-import eu.timepit.refined.types.numeric.{NonNegLong, PosInt}
+import eu.timepit.refined.types.numeric.{NonNegLong, PosInt, PosLong}
 import fs2.concurrent.SignallingRef
 import weaver.MutableIOSuite
 
@@ -88,12 +89,13 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       SortedMap.empty
     )
 
-  /** A benign `Hashed[GlobalIncrementalSnapshot]` at `ordinal` with NO spendActions — enough for `processUnappliedOrdinals` to resolve
-    * every applied ordinal from the `lastGlobalSnapshots` cache (so no network fetch / retry), while the applied-set under test is driven
-    * purely by `U`, `view`, and `P`.
+  /** A benign `Hashed[GlobalIncrementalSnapshot]` at `ordinal` — enough for `processUnappliedOrdinals` to resolve every applied ordinal
+    * from the `lastGlobalSnapshots` cache (so no network fetch / retry). Most tests leave `spendActions` empty; the lossless-ack regression
+    * supplies them explicitly.
     */
   private def mkGlobalSnapshotAt(
-    ordinal: SnapshotOrdinal
+    ordinal: SnapshotOrdinal,
+    spendActions: SortedMap[Address, List[SpendAction]] = SortedMap.empty
   )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[Hashed[GlobalIncrementalSnapshot]] =
     mkGlobalInfoEmpty.stateProof[IO](ordinal).flatMap { sp =>
       Signed(
@@ -113,7 +115,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
           stateProof = sp,
           Some(SortedSet.empty),
           Some(SortedSet.empty),
-          None,
+          Option.when(spendActions.nonEmpty)(spendActions),
           Some(SortedMap.empty),
           Some(SortedSet.empty),
           Some(SortedMap.empty),
@@ -135,7 +137,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     u: SortedSet[SnapshotOrdinal],
     p: SortedSet[SnapshotOrdinal]
   )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[SortedSet[SnapshotOrdinal]] =
-    u.toList.traverse(mkGlobalSnapshotAt).flatMap { seeded =>
+    u.toList.traverse(mkGlobalSnapshotAt(_)).flatMap { seeded =>
       gsom
         .getLastGlobalSnapshotsSpendActions(
           globalSnapshotViewOrdinal = view,
@@ -143,9 +145,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
           getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
           currencyId = metagraphId,
           metagraphSyncData = Some(SortedMap(metagraphId -> MetagraphSyncDataInfo(ord(0L), EpochProgress.MinValue, u))),
-          alreadyProcessedGlobalOrdinals = p,
-          lastUnsyncGlobalSnapshotOrdinal = view,
-          updatedLastSyncGlobalFromPeersInConsensus = view
+          alreadyProcessedGlobalOrdinals = p
         )
         .map { case (_, processed) => processed }
     }
@@ -201,6 +201,41 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       fresh <- mkGsom
       freshA <- appliedSet(fresh, mgId, view = ord(200L), u = oset(150L, 175L), p = oset(150L))
     } yield expect(seq1 == oset(175L)) && expect(seq1 == seq2) && expect(seq2 == freshA)
+  }
+
+  test("acknowledging multiple ordinals replays every same-producer SpendAction in ordinal order") { res =>
+    implicit val (h, j, sp) = res
+    for {
+      ownerKp <- KeyPairGenerator.makeKeyPair[IO]
+      producerKp <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKp <- KeyPairGenerator.makeKeyPair[IO]
+      owner = PublicKeyOps(ownerKp.getPublic).toAddress
+      producer = PublicKeyOps(producerKp.getPublic).toAddress
+      destination = PublicKeyOps(destinationKp.getPublic).toAddress
+      first = SpendAction(
+        NonEmptyList.one(SpendTransaction(None, Some(CurrencyId(owner)), SwapAmount(PosLong.unsafeFrom(1L)), producer, destination))
+      )
+      second = SpendAction(
+        NonEmptyList.one(SpendTransaction(None, Some(CurrencyId(owner)), SwapAmount(PosLong.unsafeFrom(2L)), producer, destination))
+      )
+      firstSnapshot <- mkGlobalSnapshotAt(ord(10L), SortedMap(producer -> List(first)))
+      secondSnapshot <- mkGlobalSnapshotAt(ord(11L), SortedMap(producer -> List(second)))
+      gsom <- mkGsom
+      result <- gsom.getLastGlobalSnapshotsSpendActions(
+        globalSnapshotViewOrdinal = ord(11L),
+        // Deliberately reverse the cache input: replay order is the consensus ordinal, not local list order.
+        lastGlobalSnapshots = List(secondSnapshot, firstSnapshot),
+        getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+        currencyId = owner,
+        metagraphSyncData = Some(SortedMap(owner -> MetagraphSyncDataInfo(ord(0L), EpochProgress.MinValue, oset(10L, 11L)))),
+        alreadyProcessedGlobalOrdinals = SortedSet.empty
+      )
+      (actions, processed) = result
+    } yield
+      expect.all(
+        processed == oset(10L, 11L),
+        actions.getOrElse(producer, Nil) == List(first, second)
+      )
   }
 
   private def mkCurrencySnapshotWithProcessed(

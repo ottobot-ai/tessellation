@@ -135,18 +135,8 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
   //      stale 512 — so the DISK tier reaches k₂ for the later S4 deep revert.
   // The depth here is kept small (5) purely so the on-disk write/cutoff round-trip is fast; the derivation
   // assertions cover the real k₂ magnitudes.
-  // ── Signed-byte-store FIDELITY (2026-07-09) ────────────────────────────────────────────────────────────────────
-  // Root cause of the 2mg/2shard per-MG mirror freeze: the finalize sink writes `signedBytesStore` at ordinal N ONLY
-  // when `pendingPostBytesRef` holds N's canonical hash — and every ADOPT path (near-tip reorg, REWARD-SUM REALIGN,
-  // legacy gossip catch-up) staged NOTHING, so an adopted ordinal became a PERMANENT HOLE (every hole in each gl0's
-  // `mpt_snapshot_info_signed` correlated 1:1 with that node's adopt events; checkpoints pinned at such an ordinal
-  // — e.g. the wedged gl0-2's `diffBaseOrdinal=32` stamp — fail-closed 186× per healthy node on `pinnedReaderAt`).
-  // The three tests below drive the EXACT production pieces end-to-end:
-  //   1. the defect repro — adopt-without-stage ⇒ hole ⇒ `pinnedReaderAt(N)` = None at a RETAINED ordinal whose
-  //      neighbors read fine (assertion-inverted, this is the pre-fix failing expectation);
-  //   2. the fix pipeline — the reorg-adopt shape (`syncFromGlobalSnapshotInfoVerifiedBytes` → `stageAdoptedPostBytes`
-  //      → the finalize-sink promote) makes `pinnedReaderAt(N)` succeed and serve the verified adopted state;
-  //   3. `stageAdoptedPostBytes` bounds (same lowest-ordinal eviction as the produce-path staging).
+  // Signed-byte history can contain a hole when the canonical proposal's produce/validate bytes were not staged under its final hash. The
+  // retained regression below proves `pinnedReaderAt` fails closed at that ordinal while neighboring retained states remain readable.
 
   /** A distinct GSI (one balance keyed off `seed`) + the EXACT hex byte map `syncFromGlobalSnapshotInfoVerifiedBytes` verifies/returns
     * (`toAllStateKeyValueBytes`), + its sidecar-free consensus root (what the snapshot at that ordinal commits as `stateProof.mptRoot`).
@@ -285,74 +275,9 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
       } yield
         expect.same(stored, Set(31L, 33L)) && // the hole: 32 was finalized but never written (adopt skipped staging)
           expect(at31.isDefined) && expect(at33.isDefined) && // neighbors read fine — 32 is WITHIN retention, not evicted
-          // the e2e failure verbatim: `pinned ANCHOR at diffBaseOrdinal=32 unreadable (evicted/fork) — FAIL-CLOSED DROP`
+          // the e2e failure verbatim: `pinned ANCHOR at executionBaseOrdinal=32 unreadable (evicted/fork) — FAIL-CLOSED DROP`
           expect(at32.isEmpty)
     }
-  }
-
-  test(
-    "FIDELITY fix: the reorg-adopt shape (sync-verified bytes → stageAdoptedPostBytes → finalize-sink promote) makes pinnedReaderAt succeed and serve the verified adopted state"
-  ) { res =>
-    implicit val (h, _, j, _) = res
-    import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps.GlobalStateReaderTypedOps
-    import io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
-    import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-    import io.constellationnetwork.schema.mpt.MptStore
-    import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
-    Files[IO].tempDirectory.use { dir =>
-      for {
-        store <- MptStateStorage.make[IO](dir / "signed", ContiguousOrdinalCutoff.make(100))
-        f32 <- gsiFixture(32L)
-        (gsi32, bytes32, root32) = f32
-        snap32 <- mkFinalizedSnapshot(32L, root32)
-        // The reorg handler's live-MPT rebuild: check-then-write against the fork's SIGNED root, RETURNING the verified map (the fix's
-        // new converter seam). On a fresh store there are no preserved 33/34 bytes, so the candidate is the GSI map itself.
-        producer <- InMemoryMerklePatriciaProducer.make[IO]()
-        liveMpt <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
-        verified <- liveMpt.syncFromGlobalSnapshotInfoVerifiedBytes(gsi32, ord(32L), root32.some)
-        verifiedRoot <- verified.traverse(GlobalSnapshotInfo.sidecarFreeMptRoot[IO])
-        // WRONG root ⇒ None AND nothing written (the fail-closed contract is unchanged by the bytes-returning variant).
-        producer2 <- InMemoryMerklePatriciaProducer.make[IO]()
-        liveMpt2 <- MptStore.make[IO, GlobalStateKey](producer2, GlobalStateKey.toHex[IO])
-        rejected <- liveMpt2.syncFromGlobalSnapshotInfoVerifiedBytes(gsi32, ord(32L), Hash("ff" * 32).some)
-        after2 <- liveMpt2.allEntriesAsBytes
-        // The fix: stage the verified map under the adopted CANONICAL hash; the finalize sink then persists it.
-        stagedRef <- cats.effect.Ref.of[IO, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]](Map.empty)
-        _ <- verified.traverse_ { vb =>
-          stagedRef.update(SnapshotLeaderLoop.stageAdoptedPostBytes(_, snap32.hash, ord(32L), vb, cap = 2048))
-        }
-        _ <- finalizeSinkPostBytes(stagedRef, store, ord(32L), snap32.hash)
-        resolver = (o: SnapshotOrdinal) => (if (o === ord(32L)) snap32.some else none[Hashed[GlobalIncrementalSnapshot]]).pure[IO]
-        reader = PinnedCurrencyInfoReader.make[IO](store, resolver)
-        at32 <- reader.pinnedReaderAt(ord(32L))
-        // Read the adopted state BACK through the pinned reader — the exact read the diff-base rail performs.
-        acct = io.constellationnetwork.schema.address.Address.fromBytes(s"fidelity-acct-32".getBytes("UTF-8"))
-        balance <- at32.traverse(_.getBalance(acct)).map(_.flatten)
-      } yield
-        expect(verified.isDefined) &&
-          expect.same(verifiedRoot, Some(root32)) && // the returned map IS root-verified against the committed root
-          expect(rejected.isEmpty) && expect(after2.isEmpty) && // wrong root: nothing returned, nothing written
-          expect(at32.isDefined) && // the 2026-07-09 fail-close is gone: the adopted ordinal reads back
-          expect.same(balance, Some(Balance(NonNegLong(1032L)))) // and serves the verified adopted state (1000 + seed)
-    }
-  }
-
-  test(
-    "stageAdoptedPostBytes: stages under the canonical hash; cap evicts lowest-ordinal first (hash tiebreak) — same policy as produce staging"
-  ) { _ =>
-    val h1 = Hash("01" * 32)
-    val h2 = Hash("02" * 32)
-    val h3 = Hash("03" * 32)
-    val base: Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])] =
-      Map(h1 -> ((ord(5L), bytesFor(1))), h2 -> ((ord(6L), bytesFor(2))))
-    val staged = SnapshotLeaderLoop.stageAdoptedPostBytes(base, h3, ord(7L), bytesFor(3), cap = 2048)
-    val capped = SnapshotLeaderLoop.stageAdoptedPostBytes(base, h3, ord(7L), bytesFor(3), cap = 2)
-    IO.pure(
-      expect.same(staged.get(h3).map(_._1), Some(ord(7L))) && // staged under the adopted canonical hash
-        expect.same(staged.size, 3) &&
-        expect.same(capped.keySet, Set(h2, h3)) && // over cap: the LOWEST ordinal (h1@5) evicts first — never the newest adopt
-        expect.same(capped.get(h3).map(_._1), Some(ord(7L)))
-    )
   }
 
   test("S2: signed-bytes store retains a contiguous window to the configured depth; depth derives from k₂ (not 512)") { res =>

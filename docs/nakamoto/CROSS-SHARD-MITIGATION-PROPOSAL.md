@@ -1,5 +1,12 @@
 # Cross-shard stake-concentration mitigation — proposal
 
+> **HISTORICAL, SUPERSEDED RESEARCH PROPOSAL.** Do not implement this document's
+> VRF-sortition/slashing authority model or treat it as current behavior. The
+> current design makes GL0 re-execution authoritative for framework economics;
+> committees partition work but do not confer economic validity. Preserve the
+> analysis below only as decision history. See [`../../AGENTS.md`](../../AGENTS.md)
+> and ADR-0016/ADR-0017.
+
 **Status:** research proposal. Decision input. No code commitment in this
 document. Written 2026-05-15 against `feature/serde-typeclass-shim`
 HEAD `c6528548`.

@@ -180,9 +180,8 @@ message MetagraphAttestation {
 //   - `parent_checkpoint_hash` / `checkpoint_hash`: UTF-8 of the canonical
 //     `Hash` hex string — matches `MetagraphAttestation.parent_hash` /
 //     `Snapshot.hash` and the JVM-side `Hash.getBytes` (UTF-8) decode form.
-//   - Heavy structural payloads (`ShardDerivedStateDeltaWire.payload_json`,
-//     `PerMetagraphSnapshots.signed_snapshots_json`, `emitted_receipts_json`)
-//     are opaque JSON bytes serialized via the project `JsonSerializer`
+//   - `ShardDerivedStateDeltaWire.payload_json` is opaque JSON serialized via
+//     the project `JsonSerializer`
 //     (deterministic — sortKeys + dropNullValues per `JsonSerializer.forAsync`).
 //     Mirrors `MetagraphBinary.binary` / `AllowSpendBlock.payload` pattern:
 //     the sidecar treats these as opaque bytes; only the JVM serializes /
@@ -204,35 +203,16 @@ message ShardCheckpointWire {
   bytes parent_checkpoint_hash = 3;      // UTF-8 of canonical Hash hex
   uint64 gl0_anchor_ordinal = 4;
   uint64 epoch = 5;
-  repeated PerMetagraphSnapshots included_snapshots = 6;  // NonEmptyList<Signed[SCSB]> per MG, key-ordered
-  ShardDerivedStateDeltaWire derived_state_delta = 7;
-  repeated CommitteeMemberSignatureWire committee_signatures = 8;
-  bytes emitted_receipts_json = 9;       // JSON bytes for List[CrossShardReceipt]; empty == empty list
-  uint64 slot = 10;                      // wall-clock slot of the leader-lottery win (design §5.7); gl0_anchor_ordinal is chain-link data only
-  uint64 diff_base_ordinal = 11;         // Track-1 diff-base-pin: gl0 finalized ordinal the perMetagraphStateDiff was cut over (in the V2 sig preimage)
-}
-
-// Per-metagraph slice of `ShardDerivedStateDelta.includedSnapshots`. The
-// SortedMap ordering is preserved by emitting entries in key order on encode;
-// the decode path re-sorts on the JVM side (cats `Address.OrderingInstance`).
-//
-// `signed_snapshots_json` is a repeated bytes field — each element is a JSON-
-// encoded `Signed[StateChannelSnapshotBinary]` via the project `JsonSerializer`.
-// Order is preserved across the wire (mirrors `NonEmptyList` semantics).
-// A NonEmptyList contract: this list MUST contain ≥ 1 element; an empty list
-// is a protocol violation (Slice 1's `includedSnapshots` value type is
-// `NonEmptyList`). Codecs enforce this on decode.
-message PerMetagraphSnapshots {
-  string metagraph_address = 1;          // DAG base58 string
-  repeated bytes signed_snapshots_json = 2;  // each = Signed[StateChannelSnapshotBinary] JSON bytes
+  ShardDerivedStateDeltaWire derived_state_delta = 6;
+  repeated CommitteeMemberSignatureWire committee_signatures = 7;
+  uint64 slot = 8;                       // wall-clock slot of the scheduled producer duty
+  uint64 execution_base_ordinal = 9;     // finalized GL0 state used by producer and every verifier for CL1 replay
 }
 
 // `ShardDerivedStateDelta` carried as opaque JSON bytes. The inner type has
-// heterogeneous nested structure (`SortedMap[Address, List[SharedArtifact]]`
-// with `SharedArtifact` a sealed trait — SpendAction/PricingUpdate/etc., each
-// with its own discriminator), and the per-MG MPT subtree roots, token-lock
-// balance deltas, sync-data deltas, etc. Field-by-field re-implementation in
-// proto would double the schema surface for zero gain — the bytes that
+// nested signed state-channel binaries and per-MG MPT subtree roots.
+// Field-by-field re-implementation in proto would double the schema surface for
+// zero gain — the bytes that
 // committee members signed are the JSON-encoded `ShardCheckpointSigPreimage`
 // (`Hasher[F].hash` of the Circe-encoded case class), so JSON IS the
 // authoritative encoding regardless. The wire just transports the bytes.

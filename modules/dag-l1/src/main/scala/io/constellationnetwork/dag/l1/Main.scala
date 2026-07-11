@@ -187,7 +187,7 @@ object Main
       _ <- MkHttpServer[IO].newEmber(ServerName("p2p"), cfg.http.p2pHttp, api.p2pApp)
       _ <- MkHttpServer[IO].newEmber(ServerName("cli"), cfg.http.cliHttp, api.cliApp)
 
-      // (#196 follow-up) dl1 → gl0 send-block hop: publish through the sidecar
+      // (#196 follow-up) gl1 -> gl0 send-block hop: publish through the sidecar
       // durable outbox instead of the prior single-peer HTTP POST lottery.
       // Serialization mirrors the AllowSpendBlock path — JsonSerializer[F]
       // produces the canonical JSON+Brotli bytes that gl0 receivers
@@ -215,7 +215,7 @@ object Main
           }
           .handleErrorWith(e => logger.warn(e)("Error publishing TokenLockBlock to sidecar"))
 
-      // (#196) AllowSpendBlock dl1 → gl0 send hop: lift the (still-current) #196
+      // (#196) AllowSpendBlock gl1 -> gl0 send hop: lift the (still-current) #196
       // sidecar-publish path into a lambda so `dag.l1.Swap` can be parameterised the
       // same way as `dag.l1.StateChannel` and `dag.l1.TokenLock`. The cl1 → cl0
       // call site supplies an HTTP-POST lambda instead (cl0 has no sidecar).

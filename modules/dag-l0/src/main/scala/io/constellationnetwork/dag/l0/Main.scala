@@ -1,6 +1,5 @@
 package io.constellationnetwork.dag.l0
 
-import cats.Parallel
 import cats.effect._
 import cats.syntax.all._
 
@@ -14,7 +13,6 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapsh
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{Finished, GlobalConsensusOutcome}
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.cats.effect._
-import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
@@ -29,7 +27,6 @@ import io.constellationnetwork.node.shared.resources.MkHttpServer
 import io.constellationnetwork.node.shared.resources.MkHttpServer.ServerName
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.cluster.{ClusterId, ClusterSessionToken, SessionToken}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.generation.Generation
@@ -40,9 +37,7 @@ import io.constellationnetwork.schema.peer.{Peer, Responsive}
 import io.constellationnetwork.schema.semver.TessellationVersion
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 
 import com.monovore.decline.Opts
 import eu.timepit.refined.auto._
@@ -73,8 +68,8 @@ object Main
   /** Split-safety (#261): give the createContext / follower GSAM (built inside `SharedServices.make`) the SAME genesis-derived KES + VRF
     * registries the gl0 produce + validateArtifact paths use, so `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` draws the IDENTICAL
     * VRF-VK-sortitioned committee and verifies KES identically on every gl0 path. Loaded from the SAME L0 genesis JSON `run` reads for
-    * `GlobalSnapshotConsensus.make`; empty for non-JSON bootstrap paths (rollback / join / CSV-genesis) where the verify path likewise has
-    * no registry.
+    * `GlobalSnapshotConsensus.make`; empty for non-JSON bootstrap paths (rollback / CSV-genesis) where the verify path likewise has no
+    * registry.
     */
   override protected def nakamotoShardRegistries(method: RunNakamoto)(
     implicit jsonSerializer: io.constellationnetwork.json.JsonSerializer[IO]
@@ -210,9 +205,10 @@ object Main
       // §1.2 Slice 3c: pre-load the L0 genesis JSON (if any) ONLY to extract the KES registry
       // — the full load (with delegated-stake + collateral signing) happens later in PATH 4
       // below. Reading the file twice is fine: it's a few KB and parsed once at startup. For
-      // bootstrap paths that don't take PATH 4 (rollback / join / CSV-genesis), the registry
-      // is empty and Slice 5 verification treats every KES sig as "no registry entry" (warn-
-      // only-skip — the receiver doesn't reject, just doesn't validate).
+      // bootstrap paths that don't take PATH 4 (rollback / CSV-genesis), the registry is
+      // empty. Legacy tip/snapshot KES verification retains its bootstrap carve-out, but the
+      // metagraph admission committee is fail-closed: an unregistered attester cannot count
+      // toward admission quorum.
       kesRegistry <- (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
         case (Some(gPath), true) =>
           GenesisLoader
@@ -365,7 +361,7 @@ object Main
       // Precedence:
       //   1. --rollback-hash  → load a specific snapshot (from disk or peer) as trust anchor
       //   2. Local data on disk → cold restart from the latest ordinal
-      //   3. --nakamoto-peer  → HTTP-download latest snapshot from a running peer
+      //   3. --nakamoto-peer  → fail closed until ancestry replay or an audited finality certificate is implemented
       //   4. --genesis-csv    → fresh start from a genesis CSV
       //   5. None             → startup error
       _ <- ({
@@ -458,7 +454,8 @@ object Main
                                     s"Cold restart at ordinal=$latestOrdinal: the persisted GlobalSnapshotInfo cannot reproduce the " +
                                       s"snapshot's SIGNED stateProof.mptRoot — its MPT-native ConsumedAllowSpends/Slashings partitions are " +
                                       s"not carried by the GSI. FAILING CLOSED rather than booting with a wiped cross-shard spent-set. " +
-                                      s"Re-bootstrap this node from a healthy peer (byte-faithful MPT adoption) to recover."
+                                      s"Restore this node's own root-verified persisted bytes, or recover through authenticated ancestry " +
+                                      s"fetch and global replay (or a separately audited finality certificate)."
                                   )
                                 )
                                 .whenA(!mptAdopted)
@@ -486,81 +483,16 @@ object Main
                       }
 
                   } else if (method.peerToJoin.isDefined) {
-                    // === PATH 3: PEER DOWNLOAD — join an existing chain ===
-                    import org.http4s.ember.client.EmberClientBuilder
-                    import org.http4s.circe.CirceEntityDecoder._
-                    import org.http4s.Uri
-
+                    // === PATH 3: PEER DOWNLOAD DISABLED — a peer tip is not an economic-validity proof ===
                     val peerUrl = method.peerToJoin.get
-                    val peerUri = Uri.unsafeFromString(peerUrl)
-
-                    EmberClientBuilder.default[IO].build.use { client =>
-                      for {
-                        _ <- logger.info(s"Downloading latest snapshot from $peerUrl...")
-                        latestSnapshot <- client.expect[Signed[GlobalIncrementalSnapshot]](
-                          peerUri / "global-snapshots" / "latest"
-                        )
-                        latestInfo <- client.expect[GlobalSnapshotInfo](
-                          peerUri / "global-snapshots" / "latest" / "info"
-                        )
-                        _ <- logger.info(s"Got snapshot ordinal=${latestSnapshot.ordinal}")
-                        hashedSnapshot <- hasherSelector.withCurrent(implicit hasher => latestSnapshot.toHashed[IO])
-                        _ <- hasherSelector.withCurrent { implicit hasher =>
-                          initializeStorages[IO](
-                            storages.globalSnapshot,
-                            sharedStorages.lastNGlobalSnapshot,
-                            sharedStorages.lastGlobalSnapshot,
-                            programs.download,
-                            hashedSnapshot,
-                            latestInfo
-                          )
-                        }
-                        // FINDING-S01 fail-closed peer-download gate (see the cold-restart site). The downloaded GSI has no field
-                        // for ConsumedAllowSpends (33) / Slashings (34). Seed order: (1) byte-faithful reload of the node's OWN
-                        // persisted MPT at the downloaded ordinal, verified against the downloaded snapshot's SIGNED
-                        // stateProof.mptRoot (a REJOINING node that already held this ordinal restarts without a GSI transit);
-                        // (2) root-verified from-GSI rebuild; (3) fail closed.
-                        mptAdopted <- hasherSelector.withCurrent { implicit hasher =>
-                          sharedStorages.mptStore
-                            .syncFromPersistedMptVerified(hashedSnapshot.ordinal, latestSnapshot.value.stateProof.mptRoot)
-                            .flatMap {
-                              case true => IO.pure(true)
-                              case false =>
-                                sharedStorages.mptStore
-                                  .syncFromGlobalSnapshotInfoVerified(
-                                    latestInfo,
-                                    hashedSnapshot.ordinal,
-                                    latestSnapshot.value.stateProof.mptRoot
-                                  )(
-                                    globalStateProofSelector,
-                                    withdrawalTimeLimit
-                                  )
-                            }
-                        }
-                        _ <- IO
-                          .raiseError[Unit](
-                            new RuntimeException(
-                              s"Peer download at ordinal=${hashedSnapshot.ordinal}: the peer's GlobalSnapshotInfo cannot reproduce the " +
-                                s"snapshot's SIGNED stateProof.mptRoot (MPT-native ConsumedAllowSpends/Slashings not carried by the GSI). " +
-                                s"FAILING CLOSED rather than joining with a wiped cross-shard spent-set."
-                            )
-                          )
-                          .whenA(!mptAdopted)
-                        _ <- services.consensus.manager
-                          .startFacilitatingAfterRollback(
-                            latestSnapshot.ordinal,
-                            GlobalConsensusOutcome(
-                              latestSnapshot.ordinal,
-                              Facilitators(List(nodeId)),
-                              RemovedFacilitators.empty,
-                              WithdrawnFacilitators.empty,
-                              EligibleFacilitators.empty,
-                              Finished(latestSnapshot, latestInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
-                            )
-                          )
-                        _ <- logger.info(s"Initialized from peer at ordinal=${latestSnapshot.ordinal}. Starting VRF production.")
-                      } yield ()
-                    }
+                    IO.raiseError(
+                      new RuntimeException(
+                        s"Cannot bootstrap from --nakamoto-peer $peerUrl: single-peer latest-state adoption is disabled. " +
+                          "Startup must fetch authenticated ancestry and globally replay every transition before installing economic state, " +
+                          "or verify a separately audited finality certificate. Use this node's own persisted root-verified state or genesis " +
+                          "until one of those bootstrap protocols is implemented."
+                      )
+                    )
 
                   } else if (method.genesisPath.isDefined) {
                     // === PATH 4: FRESH GENESIS — start from genesis CSV OR Tier-1 l0-genesis.json ===
@@ -688,9 +620,9 @@ object Main
                     // === PATH 5: ERROR — no bootstrap source ===
                     IO.raiseError(
                       new RuntimeException(
-                        "Cannot start: no local snapshot data, no --nakamoto-peer, and no --genesis-csv provided. " +
-                          "Provide one of: --genesis-csv <path> (fresh start), --nakamoto-peer <url> (join chain), " +
-                          "or --rollback-hash <hash> (anchored recovery)."
+                        "Cannot start: no local snapshot data, --genesis-csv, or --rollback-hash was provided. " +
+                          "Single-peer latest-state bootstrap via --nakamoto-peer is disabled until ancestry is globally replayed " +
+                          "or a separately audited finality certificate is available."
                       )
                     )
                   }

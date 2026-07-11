@@ -9,14 +9,18 @@ import scala.collection.MapView
 
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator.{
+  DuplicatedCreate,
   UpdateNodeCollateralValidationError,
   UpdateNodeCollateralValidationErrorOr
 }
 import io.constellationnetwork.schema._
+import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
+import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralReference, UpdateNodeCollateral}
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.SecurityProvider
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
@@ -25,8 +29,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Accepts or rejects node collateral create/withdraw events for inclusion in a global snapshot.
   *
-  * '''Determinism''': Uses `traverse` for validation (order-independent) and `foldLeft` for partitioning accepted/rejected results. Input
-  * lists should be in canonical order for deterministic partition ordering. Callers sort events before passing them.
+  * '''Determinism''': Creates are sorted and processed with a first-wins acceptance context. Withdrawals use `traverse` for validation and
+  * `foldLeft` for partitioning accepted/rejected results.
   */
 trait UpdateNodeCollateralAcceptanceManager[F[_]] {
 
@@ -42,9 +46,68 @@ trait UpdateNodeCollateralAcceptanceManager[F[_]] {
 }
 
 object UpdateNodeCollateralAcceptanceManager {
+
+  private case class CreateAcceptanceResult(
+    accepted: List[Signed[UpdateNodeCollateral.Create]],
+    rejected: List[(Signed[UpdateNodeCollateral.Create], NonEmptyChain[UpdateNodeCollateralValidationError])],
+    acceptedSources: Set[Address],
+    acceptedTokenLockRefs: Set[Hash],
+    acceptedParents: Set[(Address, NodeCollateralReference)],
+    acceptedNodes: Set[(Address, PeerId)]
+  )
+
+  private object CreateAcceptanceResult {
+    val empty: CreateAcceptanceResult = CreateAcceptanceResult(List.empty, List.empty, Set.empty, Set.empty, Set.empty, Set.empty)
+  }
+
   def make[F[_]: Async: SecurityProvider](validator: UpdateNodeCollateralValidator[F]) =
     new UpdateNodeCollateralAcceptanceManager[F] {
       private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
+
+      private def processCreateValidation(
+        acc: CreateAcceptanceResult,
+        signed: Signed[UpdateNodeCollateral.Create],
+        validated: UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Create]]
+      ): CreateAcceptanceResult = {
+        val duplicatesAcceptedContext =
+          acc.acceptedSources(signed.source) ||
+            acc.acceptedTokenLockRefs(signed.tokenLockRef) ||
+            acc.acceptedParents((signed.source, signed.parent)) ||
+            acc.acceptedNodes((signed.source, signed.nodeId))
+
+        validated match {
+          case Valid(_) if duplicatesAcceptedContext =>
+            CreateAcceptanceResult(
+              acc.accepted,
+              (
+                signed,
+                NonEmptyChain.of(DuplicatedCreate(signed.source, signed.nodeId, signed.tokenLockRef, signed.parent))
+              ) :: acc.rejected,
+              acc.acceptedSources,
+              acc.acceptedTokenLockRefs,
+              acc.acceptedParents,
+              acc.acceptedNodes
+            )
+          case Valid(accepted) =>
+            CreateAcceptanceResult(
+              accepted :: acc.accepted,
+              acc.rejected,
+              acc.acceptedSources + accepted.source,
+              acc.acceptedTokenLockRefs + accepted.tokenLockRef,
+              acc.acceptedParents + ((accepted.source, accepted.parent)),
+              acc.acceptedNodes + ((accepted.source, accepted.nodeId))
+            )
+          case Invalid(errors) =>
+            CreateAcceptanceResult(
+              acc.accepted,
+              (signed, errors) :: acc.rejected,
+              acc.acceptedSources,
+              acc.acceptedTokenLockRefs,
+              acc.acceptedParents,
+              acc.acceptedNodes
+            )
+        }
+      }
 
       def accept(
         creates: List[Signed[UpdateNodeCollateral.Create]],
@@ -75,11 +138,14 @@ object UpdateNodeCollateralAcceptanceManager {
         val sortedCreates = creates.sortBy(_.show)
         val sortedWithdrawals = withdrawals.sortBy(_.show)
         for {
-          validatedCreates <- sortedCreates.traverse(signed => validator.validateCreateNodeCollateral(signed, lastSnapshotContext))
+          createResult <- sortedCreates.foldLeftM(CreateAcceptanceResult.empty) { (acc, signed) =>
+            validator.validateCreateNodeCollateral(signed, lastSnapshotContext).map(processCreateValidation(acc, signed, _))
+          }
           validatedWithdrawals <- sortedWithdrawals.traverse(signed =>
             validator.validateWithdrawNodeCollateral(signed, lastSnapshotContext)
           )
-          (acceptedCreates, notAcceptedCreates) = partitionAccepted(validatedCreates, sortedCreates)
+          acceptedCreates = createResult.accepted
+          notAcceptedCreates = createResult.rejected
           (acceptedWithdrawals, notAcceptedWithdrawals) = partitionAccepted(validatedWithdrawals, sortedWithdrawals)
 
           delegatedStakeTokenLockReferences = updateDelegatedStakeAcceptanceResult.acceptedCreates.values

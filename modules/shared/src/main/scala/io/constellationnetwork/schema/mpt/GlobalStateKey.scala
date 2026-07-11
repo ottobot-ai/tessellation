@@ -235,19 +235,6 @@ object GlobalStateFieldId {
     */
   case object LastKesRegistrationRefs extends GlobalStateFieldId { def toInt: Int = 23 }
 
-  /** Slice 17 — per-(shard, peer, epoch) non-participation accumulator (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`
-    * §10.3). One MPT entry per `(shardId, peerId, epoch)` triple carrying a
-    * [[io.constellationnetwork.schema.sharding.ShardNonParticipationCounter]] — the running tally of missed slot-leader and missed
-    * attestation duties. Written by `ShardNonParticipationStateManager` during the shard's `accept`/attestation paths; read at gl0 epoch
-    * boundary by `ShardNonParticipationSlasher` to produce the slash list for the just-closed epoch.
-    *
-    * '''Why a hypergraph-namespaced field, not system-namespaced.''' The counter is user-addressable in the sense that operator tooling
-    * needs to query it (operators want to know "am I close to being slashed for non-participation?"). System-namespaced partitions are
-    * reserved for derived/internal indices; a per-peer ledger-relevant counter is closer to `ActiveDelegatedStakes` (per-peer state) than
-    * to `ExpiryIndexTokenLocks` (derived index). Following the pattern lets the standard hypergraph key constructors apply.
-    */
-  case object ShardNonParticipation extends GlobalStateFieldId { def toInt: Int = 24 }
-
   /** Per-metagraph UNROLLED `CurrencySnapshotInfo` sub-fields (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). These REPLACE the
     * monolithic `LastCurrencySnapshotInfo` blob (fieldId 6): instead of one `metagraph(mgAddr, LastCurrencySnapshotInfo) ->
     * CurrencySnapshotInfo` key per MG (O(N) rewrite on any change), each `CurrencySnapshotInfo` field becomes per-ENTRY keys under the MG's
@@ -299,19 +286,18 @@ object GlobalStateFieldId {
     * wrongly) claimed "fieldId 33" — corrected to 34 in tandem with this allocation.
     *
     * '''Why one composite-hash key per record (not per `(shard,checkpoint)`).''' `InvalidStateProofSlashManager.applySlash` emits ONE
-    * `SlashedRegistryEntry` per `(operator, shard, checkpoint)`. Folding the full triple into the key (mirroring
-    * `shardNonParticipationKey`) gives each slashed operator its own durable slot — so a per-operator cooldown gate can recover every
-    * operator's record — while the double-slash dedup (`InvalidStateProofSlashedReader.wasSlashed(shardId, checkpointHash)`) is answered by
-    * a single prefix-scan filtering `entry.shardId === shardId && entry.disputedCheckpointHash === checkpointHash`. The partition is tiny
-    * (≤ `numShards × committeeSize` per slashed checkpoint, and slashes are rare), so one scannable partition serves BOTH lookups without a
-    * second index — the simplest correct option.
+    * `SlashedRegistryEntry` per `(operator, shard, checkpoint)`. Folding the full triple into the key (mirroring `slashingsKey`) gives each
+    * slashed operator its own durable slot — so a per-operator cooldown gate can recover every operator's record — while the double-slash
+    * dedup (`InvalidStateProofSlashedReader.wasSlashed(shardId, checkpointHash)`) is answered by a single prefix-scan filtering
+    * `entry.shardId === shardId && entry.disputedCheckpointHash === checkpointHash`. The partition is tiny (≤ `numShards × committeeSize`
+    * per slashed checkpoint, and slashes are rare), so one scannable partition serves BOTH lookups without a second index — the simplest
+    * correct option.
     *
     * '''Why hypergraph-namespaced (DAG-scoped), not system-namespaced.''' This is consensus-load-bearing slash state read by the active-set
-    * cooldown gate + the double-slash guard — the exact ledger role `ActiveDelegatedStakes` / `ShardNonParticipation` play — so it belongs
-    * in the consensus global `mptRoot` ([[consensusRootEntries]] keeps it; it is neither a path-dependent `SystemNamespace` sidecar nor an
-    * observation-dependent `Mg*` sub-field). It is written ONLY on the upheld-dispute sink in `GlobalSnapshotAcceptanceManager`, which is
-    * reachable only at `numShards > 1`; at `numShards = 1` the partition stays empty, so the `mptRoot` is byte-identical to the pre-slash
-    * path.
+    * cooldown gate + the double-slash guard — the same consensus role as `ActiveDelegatedStakes` — so it belongs in the consensus global
+    * `mptRoot` ([[consensusRootEntries]] keeps it; it is neither a path-dependent `SystemNamespace` sidecar nor an observation-dependent
+    * `Mg*` sub-field). It is written ONLY on the upheld-dispute sink in `GlobalSnapshotAcceptanceManager`, which is reachable only at
+    * `numShards > 1`; at `numShards = 1` the partition stays empty, so the `mptRoot` is byte-identical to the pre-slash path.
     */
   case object Slashings extends GlobalStateFieldId { def toInt: Int = 34 }
 
@@ -322,12 +308,10 @@ object GlobalStateFieldId {
     * '''`MgGlobalSnapshotSyncView` (field 32) is DELIBERATELY EXCLUDED''' (cause-2, the sharded-mirror m1 freeze). The per-peer
     * `globalSnapshotSyncView` is OBSERVATION-DEPENDENT: the metagraph producer accumulates it under the FULL consensus committee, a
     * re-deriving gl0 verifier (and the currency-layer follower) under only the 2/3 signers (#259), so honest nodes hold DIFFERENT per-peer
-    * maps. In the shard-checkpoint diff/apply that drift is UNRECONCILABLE — a removals-free minimal diff cannot evict a peer present only
-    * in the follower's prior, so the verifier's recomputed `infoRoot` mismatches the committee-attested root EVERY ordinal and the MG
-    * freezes out of gl0 adoption forever (run-2x: gl0 ord 465+, `diff(upserts=1,removals=0)`, attested≠recomputed). gl0 does NOT consume a
-    * metagraph's view of gl0-syncs, so the field is excluded from the consensus root (the #116 pattern: path-dependent state stays STORED +
-    * diffed + reconstructed, but leaves the root). The metagraph's OWN `CurrencySnapshotInfo.stateProof` still commits to it independently.
-    * See `CurrencyDiffRoundTripSuite` (freeze-repro + fix guard) and `ShardCheckpointWiring.reExecDerivationWithDiff`.
+    * maps. That observation-dependent drift cannot participate in the globally recreated per-MG root: honest nodes could otherwise derive
+    * different roots from identical economic inputs and freeze the MG out of GL0 adoption. GL0 does NOT consume a metagraph's view of
+    * gl0-syncs, so the field is excluded from this root. The metagraph's OWN `CurrencySnapshotInfo.stateProof` still commits to it
+    * independently. See `ShardCheckpointWiring.reExecDerivationAtPinnedBase`.
     */
   val infoSubFields: Set[GlobalStateFieldId] =
     Set(
@@ -389,7 +373,6 @@ object GlobalStateFieldId {
     case 21 => Some(TowerEntries)
     case 22 => Some(KesRegistrationCerts)
     case 23 => Some(LastKesRegistrationRefs)
-    case 24 => Some(ShardNonParticipation)
     case 25 => Some(MgBalances)
     case 26 => Some(MgLastTxRefs)
     case 27 => Some(MgLastFeeTxRefs)
@@ -550,27 +533,6 @@ object GlobalStateKey {
       case (hex, _) => fieldIdFromHex(hex).contains(GlobalStateFieldId.MgGlobalSnapshotSyncView)
     }
 
-  /** Slice 17 — key into the per-(shard, peer, epoch) [[GlobalStateFieldId.ShardNonParticipation]] partition. The composite tuple is folded
-    * into a single hash so each `(shardId, peerId, epoch)` triple maps to one MPT entry under the hypergraph namespace.
-    *
-    * '''Why one composite hash rather than three nested namespaces.''' `GlobalStateKey` has exactly four slots (network, field, contract,
-    * user); the natural layout for this partition would be three keyed slots (shard, peer, epoch) plus the field. Folding to one composite
-    * hash keeps the field's MPT root scannable with a single prefix (`hypergraphFieldPrefix(ShardNonParticipation)`) for the slasher's
-    * `materializeAllForEpoch` and avoids forcing structural changes to `GlobalStateKey`.
-    *
-    * '''Per-epoch filtering at materialize-time.''' Because all `(shardId, peerId, epoch)` triples share one prefix, the slasher's
-    * per-epoch scan filters the prefix-scan results by `counter.epoch === closedEpoch` rather than narrowing the prefix. This is fine for
-    * the expected partition size (at most `numShards * |operators| * retentionEpochs` entries ≈ 4 × 100 × 4 = 1600 in v1).
-    */
-  def shardNonParticipationKey[F[_]: Sync: Hasher](
-    shardId: ShardId,
-    peerId: PeerId,
-    epoch: EtaPeriod
-  ): F[GlobalStateKey] =
-    Hasher[F].hash(s"${shardId.value.value}|${peerId.value.value}|${epoch.value}").map { h =>
-      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.ShardNonParticipation, EmptyNamespace, HashNamespace(h))
-    }
-
   /** Key into the §3 NIPoPoW historical-stake-snapshots partition. `userNamespace` carries a hash of the eta-period's canonical string
     * form. One MPT entry per stored period (last 4 under retention).
     */
@@ -591,12 +553,11 @@ object GlobalStateKey {
     GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.ConsumedAllowSpends, EmptyNamespace, HashNamespace(allowSpendHash))
 
   /** Key into the [[GlobalStateFieldId.Slashings]] watchtower-slash ledger, keyed by the `(peerId, shardId, disputedCheckpointHash)` triple
-    * folded into a single composite hash (mirrors [[shardNonParticipationKey]]). Each slashed-operator audit record gets its own MPT slot —
-    * so the per-operator cooldown gate can recover every operator's record — while the value (`SlashedRegistryEntry`) carries the
-    * `(shardId, disputedCheckpointHash)` double-slash identity, recovered by a single prefix-scan for
-    * `InvalidStateProofSlashedReader.wasSlashed`. `Hasher[F].hash` routes the composite-string identity through the project hasher (per
-    * `feedback_use_hasher_no_manual_serialize`) so every honest node derives the byte-identical key. One MPT entry per `(peerId, shardId,
-    * disputedCheckpointHash)`.
+    * folded into a single composite hash. Each slashed-operator audit record gets its own MPT slot — so the per-operator cooldown gate can
+    * recover every operator's record — while the value (`SlashedRegistryEntry`) carries the `(shardId, disputedCheckpointHash)`
+    * double-slash identity, recovered by a single prefix-scan for `InvalidStateProofSlashedReader.wasSlashed`. `Hasher[F].hash` routes the
+    * composite-string identity through the project hasher (per `feedback_use_hasher_no_manual_serialize`) so every honest node derives the
+    * byte-identical key. One MPT entry per `(peerId, shardId, disputedCheckpointHash)`.
     */
   def slashingsKey[F[_]: Sync: Hasher](
     peerId: PeerId,

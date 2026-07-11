@@ -27,7 +27,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofClient
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.SlashedRegistryEntry
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashManager, InvalidStateProofSlashedReader}
-import io.constellationnetwork.node.shared.domain.nakamoto.{NodeStakeAggregator, ShardAssignment, ShardReanchor}
+import io.constellationnetwork.node.shared.domain.nakamoto.{NodeStakeAggregator, ShardAssignment, ShardWindowContinuation}
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersAcceptanceManager
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
   UpdateNodeCollateralAcceptanceManager,
@@ -159,47 +159,14 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     validationType: StateChannelValidationType,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     parentTip: BranchId,
-    // Axis 1a (#259 token-lock stall fix). When non-empty AND the manager is wired with a
-    // `shardCheckpointAcceptanceManager` AND `shardingConfig.numShards > 1`, the shard-checkpoint ADOPT path runs:
-    // each checkpoint is verified via `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` — the DETERMINISTIC
-    // adopt-verifier. The COMMON acceptance path is committee QUORUM SIGNATURE (preCheck proves every signer is a
-    // valid distinct committee member via Ed25519 + KES + VRF-structural; a count gate proves ≥ ⌈2·kS/3⌉ attested),
-    // NOT a per-MptRoot recomputation. The `perMetagraphMptRoots` are byte-compared only on the sub-quorum re-exec
-    // failover. Crucially `verifyEmbedded` reads NO node-local state (no finalityTriggers / shard tip), so the
-    // leader, follower (`createContext`), and gl0 peer (`validateArtifact`) all compute the same decision. Each
-    // accepted checkpoint's `derivedStateDelta.includedSnapshots` is ADOPTED DIRECTLY as the accepted per-metagraph
-    // SC-snapshot chain — BYPASSING the `onlyPossibleReferences` chain-link check in
-    // `GlobalSnapshotStateChannelAcceptanceManager`.
-    //
-    // Why bypass chain-link: gl0's own `lastStateChannelSnapshotHashes` tip can freeze under early divergence; the
-    // standard processor then rejects every checkpoint binary forever (`lastSnapshotHash` ≠ gl0's tip) so the
-    // metagraph's currency tip stalls and token locks never reach Global L0 (#259). The shard committee already
-    // chain-link-validated and signed these binaries, so gl0 re-running the chain-link is both redundant and the
-    // stall.
-    //
-    // What is preserved (byte-exact): the adopted `includedSnapshots` are fed through the SAME currency-snapshot
-    // derivation the standard path uses (`GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots` +
-    // `calculateLastCurrencySnapshots`), so the resulting `currencySnapshots`/`tokenLockBalances`/Merkle proofs/
-    // syncData are byte-identical to what re-execution of the same binaries produces (the committee re-executed
-    // deterministically; gl0 re-derives the same). Only the SOURCE of the accepted `scSnapshots` changes for sharded
-    // MGs (adopt vs chain-link unfold); everything downstream is unchanged. `emittedReceipts` are drained into
-    // [[MetagraphSyncManager.consumeReceipts]] for the cross-MG sync-data write effect (§8.4).
-    //
-    // Default `SortedMap.empty` preserves byte-identical behavior at `numShards = 1` (today's production default) —
-    // the adopt branch never fires; raw `scEvents` flow through the unchanged chain-link path.
+    // At numShards > 1, checkpoint windows are admitted only after `verifyEmbedded` globally re-executes every included CL1 chain and
+    // matches every claimed per-MG root. The windows then run through the same full state-channel validation and currency transition again
+    // inside this acceptance pass. Committee diffs, receipts, artifacts, and signature counts cannot supply economic state.
     shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
-    // #259 — verifier-replay eta adoption. On the follower/verifier path
-    // (`GlobalSnapshotContextFunctions.createContext`) this carries gl0's authoritative per-period eta, taken
-    // verbatim from the incoming signed artifact's `eta` wire field, and is used as the eta half of the
-    // `historicalStakeSnapshots[currentPeriod]` boundary entry instead of recomputing it via `etaForPeriod`.
-    // Followers cannot reproduce gl0's eta (no gl0 VRF-output chain ⇒ `etaForPeriod` degrades to `genesisEta`),
-    // so recomputing diverges from gl0's committed value and fails the boundary `mptRoot` check every period
-    // (#259). Adopting gl0's value makes the recomputed root match by construction; the metagraph never reads
-    // `historicalStakeSnapshots` (it is gl0 leader-election state), so nothing is lost. `None` (the default) on
-    // the gl0-producer path (`GlobalSnapshotConsensusFunctions`) keeps the recompute-via-`etaForPeriod` behavior
-    // unchanged — producers MUST keep computing it. Only consulted at boundary ordinals (`ord % R == R - 1`);
-    // ignored otherwise.
-    adoptedBoundaryEta: Option[Hash] = None,
+    // Downstream replay of a finalized GL0 artifact cannot reconstruct period-N eta without GL0's VRF ancestry. At an eta boundary, use the
+    // signed artifact's consensus-pinned eta so the follower recreates the producer's HistoricalStakeSnapshot bytes. GL0 production leaves
+    // this None and derives eta locally. This is finalized GL0 metadata flowing downstream, not a CL1 economic-state override.
+    pinnedBoundaryEta: Option[Hash] = None,
     // WATCHTOWER fraud-proof CONSENSUS ARTIFACT (W3a). The canonical `SortedSet` of UPHELD fraud proofs the gl0 leader embedded in the
     // produced snapshot's `fraudProofs` field, threaded back here on EVERY path (leader-produce, follower-`createContext`,
     // peer-`validateArtifact`) so the slash is folded identically. Each entry is re-validated via the `invalidStateProofValidator`
@@ -243,13 +210,55 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
 
 object GlobalSnapshotAcceptanceManager {
 
+  private final case class PendingCheckpointAdoption(
+    shardId: ShardId,
+    shardOrdinal: io.constellationnetwork.schema.sharding.ShardOrdinal,
+    checkpointHash: Hash,
+    replayedMetagraphs: Set[Address]
+  )
+
+  private[global] def pruneRejectedSpendActions(
+    accepted: SortedMap[Address, List[SpendAction]],
+    rejectedAllowSpendRefs: Set[Hash]
+  ): SortedMap[Address, List[SpendAction]] =
+    accepted.flatMap {
+      case (producer, actions) =>
+        val retained = actions.flatMap { action =>
+          NonEmptyList
+            .fromList(action.spendTransactions.toList.filterNot(tx => tx.allowSpendRef.exists(rejectedAllowSpendRefs.contains)))
+            .map(SpendAction(_))
+        }
+        Option.when(retained.nonEmpty)(producer -> retained)
+    }
+
+  private[global] def pruneSpendActionsAtPendingCapacity(
+    accepted: SortedMap[Address, List[SpendAction]],
+    pendingGlobalChangeOrdinals: Map[Address, SortedSet[SnapshotOrdinal]],
+    currentOrdinal: SnapshotOrdinal,
+    maxPendingPerMetagraph: Int
+  ): SortedMap[Address, List[SpendAction]] =
+    accepted.flatMap {
+      case (producer, actions) =>
+        val retained = actions.flatMap { action =>
+          NonEmptyList
+            .fromList(action.spendTransactions.toList.filter { transaction =>
+              transaction.currencyId.forall { currencyId =>
+                val pending = pendingGlobalChangeOrdinals.getOrElse(currencyId.value, SortedSet.empty[SnapshotOrdinal])
+                pending.contains(currentOrdinal) || pending.size < maxPendingPerMetagraph
+              }
+            })
+            .map(SpendAction(_))
+        }
+        Option.when(retained.nonEmpty)(producer -> retained)
+    }
+
   private case object InvalidMerkleTree extends NoStackTrace
 
   /** One upheld invalid-state-proof dispute surfaced from `adoptShardCheckpoints` — the durable-slash request the accept path applies. The
-    * reachable producer is the gl0-deterministic sub-quorum re-exec mismatch (`ShardCheckpointAcceptResult.RejectedReExecutionMismatch`),
-    * which carries no fraud-proof submitter ⇒ `submitter = None` ⇒ the full slashed amount BURNS (no bounty recipient). The `submitter`
-    * slot is `Option` so the watchtower-quorum dispute path (an `InvalidStateProofEvidence` carrying `fraudProof.submitterId`), when later
-    * wired into accept, credits the bounty by passing `Some(submitterAddress)`.
+    * reachable producer is the GL0-deterministic replay mismatch (`ShardCheckpointAcceptResult.RejectedReExecutionMismatch`), which carries
+    * no fraud-proof submitter ⇒ `submitter = None` ⇒ the full slashed amount BURNS (no bounty recipient). The `submitter` slot is `Option`
+    * so the watchtower-quorum dispute path (an `InvalidStateProofEvidence` carrying `fraudProof.submitterId`), when later wired into
+    * accept, credits the bounty by passing `Some(submitterAddress)`.
     *
     * @param shardId
     *   the shard whose committee signed the wrong derivation (double-slash key half + registry-entry field).
@@ -477,15 +486,7 @@ object GlobalSnapshotAcceptanceManager {
     // `numShards = 1` byte-identical regression bar is preserved independently of this validator.
     invalidStateProofValidator: Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
-    ] = None,
-    // Track-1 blocker-2a — the version-retained, BY-ORDINAL, per-metagraph `CurrencySnapshotInfo` reader, pinned to
-    // `(ordinal, globalSyncView.hash)` (`PinnedCurrencyInfoReader`). Captured in the `accept()` closure so it is REACHABLE on all three
-    // mptRoot paths: the gl0 produce/validate GSAM (`GlobalSnapshotConsensus.make`, backed by the contiguous `signedBytesStore`) and the
-    // cl0/dl1 `createContext` GSAM (`SharedServices.make`, backed by the `mpt_snapshot_info` store). CONSUMED by the follow-up I-PIN slice,
-    // which reads each metagraph's pinned global prior HERE inside `accept()` instead of the non-deterministic HEAD read
-    // (`lastGlobalSnapshotStorage.getCombined`). `None` (tests / currency-l0) ⇒ the future consumer keeps today's HEAD read ⇒ byte-identical
-    // to pre-2a behavior; this slice only INTRODUCES + wires the reader (it does not yet change `accept()`).
-    pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[F]] = None
+    ] = None
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
@@ -504,18 +505,20 @@ object GlobalSnapshotAcceptanceManager {
     // a dynamic branch-aware reader (`branchTipRef` set at accept() top) so under MultiBranch a
     // child sees its parent branch's pending writes (#56.10 Phase J).
     val mptStore: MptStore[F, GlobalStateKey] = overlay.base
-    // Slice 12: `MetagraphSyncManager.make` is now effectful (allocates internal `Ref`s for the cross-shard receipt consumer's
-    // pending accumulator + seen-set). Threaded into the `mapN` alongside the existing `Ref.of`/`Semaphore.apply` allocations
-    // so the construction stays a single `F` action with no nested `flatMap` ceremony.
+    // Construct the consensus sync manager alongside the branch tip and acceptance mutex in one effect.
     (
       cats.effect.Ref.of[F, BranchId](BranchId.base),
       cats.effect.std.Semaphore[F](1),
-      MetagraphSyncManager.make[F](metagraphsSyncConfig)
+      MetagraphSyncManager.make[F]
     ).mapN { (branchTipRef, acceptMutex, metagraphSyncManager) =>
       val branchAwareReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.dynamic[F](
         overlay,
         branchTipRef.get
       )
+      // Cross-shard framework inputs are finality-first. This reader never sees pending branch deltas; only `finalizeBranch` folds state
+      // into `overlay.base`, so an owner authorization is unavailable to another shard until GL0 finalizes it.
+      val finalizedBaseReader =
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore)
       val artifactEmissionManager = ArtifactEmissionManager.make[F]()
       val tipUsageManager = TipUsageManager.make[F]()
       val rewardAcceptanceManager = RewardAcceptanceManager.make[F](branchAwareReader)
@@ -700,47 +703,9 @@ object GlobalSnapshotAcceptanceManager {
             getGlobalSnapshotByOrdinal
           )
 
-        /** Axis 1a (#259 token-lock stall fix, §7 admission flow). Pre-process the per-shard checkpoint envelopes supplied by the gl0
-          * leader (`shardCheckpoints` parameter on `accept()`) into the ADOPTED per-metagraph SC-snapshot chains, BEFORE the standard
-          * SC-event pipeline runs on the (DAG-layer / non-sharded) raw `scEvents`.
-          *
-          * For each (shardId, checkpoint) tuple:
-          *
-          *   1. Run [[ShardCheckpointGl0AcceptanceManager.verifyEmbedded]] — the DETERMINISTIC adopt-verifier (NOT node-local `evaluate`).
-          *      It runs the SAME pre-checks (committee membership, Ed25519, KES, VRF structural) and then a deterministic count-based
-          *      quorum decision (`distinctSigners >= ceil(2·kS/3)`, `kS = |committee(shardId, epoch)|`) — with NO `finalityTriggers` /
-          *      node-local depth read, so the leader, follower (`createContext`), and gl0 peer (`validateArtifact`) reach a byte-identical
-          *      adopt decision and committed state. The common-path acceptance evidence is the committee QUORUM SIGNATURE (pre-check proves
-          *      every signer is a valid distinct committee member; the count gate proves ≥ 2/3 attested). The per-MG `perMetagraphMptRoots`
-          *      are byte-compared ONLY on the sub-quorum re-exec failover (`reExecPath`), not on the common quorum path. Result branches:
-          *      - `Accepted`: ADOPT the checkpoint's `derivedStateDelta.includedSnapshots` directly (per-MG `NonEmptyList` of chain-linked
-          *        binaries) and collect the cross-shard receipts.
-          *      - `PendingMoreAttestations`: skip this checkpoint for this ord; the gl0 leader will retry next ord (§7.2 `gl0AnchorOrdinal`
-          *        loose coupling permits a checkpoint to ride into N, N+1, …).
-          *      - `Rejected`: log + drop (includes the fail-closed CANNOT-RE-DERIVE case — the verifier could not resolve the checkpoint's
-          *        pinned `diffBaseOrdinal`, so it can't check; no slash on unverifiable evidence).
-          *      - `RejectedReExecutionMismatch`: log + drop + queue a durable `WatchtowerSlashRequest` (§10.2 — the 100%
-          *        `InvalidStateProof` tier; see the match arm below). Only an AFFIRMATIVE pinned-base re-derivation mismatch reaches this
-          *        branch.
-          *
-          *   1. Merge every accepted checkpoint's `includedSnapshots` into a single adopted map. The map key is the metagraph address; the
-          *      static §4 assignment makes one MG belong to exactly one shard, so the per-shard contributions are disjoint and the union is
-          *      unambiguous. The adopted NEL is taken VERBATIM — gl0 does NOT re-run `onlyPossibleReferences` (the chain-link check that
-          *      would reject these binaries forever once gl0's own tip freezes, the #259 stall). gl0 trusts the committee's chain-link,
-          *      which `evaluate` already verified.
-          *
-          *   1. Drain the union of `emittedReceipts` from accepted checkpoints into [[MetagraphSyncManager.consumeReceipts]]. The cross-MG
-          *      `MetagraphSyncDataWrite` effect (§8.4) is folded into the manager's pending accumulator; the cumulative state is read later
-          *      by `acceptMetagraphSyncData`. Idempotent per the consumer's seen-set gate.
-          *
-          * '''Returns''' the adopted per-metagraph SC-snapshot chains (`SortedMap[Address,
-          * NonEmptyList[Signed[StateChannelSnapshotBinary]]]`) — the SAME shape `GlobalSnapshotStateChannelAcceptanceManager.accept`
-          * produces, ready to feed `GlobalSnapshotStateChannelEventsProcessor.processCurrencySnapshots` (the unchanged currency-snapshot
-          * derivation). The cross-shard receipt drain is a side-effect on the [[MetagraphSyncManager]] instance.
-          *
-          * '''Gating contract''': this method is only invoked when the sharding gate (`numShards > 1` AND non-empty `shardCheckpoints` AND
-          * a wired `shardCheckpointAcceptanceManager`) holds. The gate check lives at the single call site below to keep the no-op
-          * fast-path obvious — at `numShards = 1` this method never runs and `accept()` is byte-identical to the pre-shard path.
+        /** Verify checkpoint envelopes and select chain-continuous binary windows for global recreation. `verifyEmbedded` always
+          * re-executes all included CL1 snapshots and compares their roots. Carried diffs and receipts are ignored. This method is
+          * unreachable when `numShards == 1`.
           */
         private def adoptShardCheckpoints(
           ordinal: SnapshotOrdinal,
@@ -751,201 +716,157 @@ object GlobalSnapshotAcceptanceManager {
           // parent was never adopted silently skips the genesis window, advances the SC tip past it, and permanently
           // wedges the MG (the seeding flake's root cause). Pure function of (embedded checkpoint, prior GSI) — every
           // node reaches the same adopt/defer decision.
-          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
-          // ORPHANED-TIP REANCHOR (2026-06-29): gl0's per-MG currency mirror, used only for the tip's metagraph ordinal
-          // so `ShardReanchor.classify` can heal a tip orphaned by a same-ordinal shard reorg (the freeze) instead of
-          // deferring forever. Pure read of the prior GSI — no opaque-content decode.
-          priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
-            CurrencySnapshot
-          ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash]
         )(implicit hasher: Hasher[F]): F[
           (
             SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-            // Track-1 diff-base-pin: the 3rd tuple element is the checkpoint's `diffBaseOrdinal` — the pinned base the committee cut this
-            // MG's diff over. `deriveAdoptedCurrencyState` reads the per-MG prior AT this ordinal (not the adopter's own overlay.base).
-            SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)],
+            // The claimed roots remain comparison values only. GL0 recreates every accepted window and rejects any root mismatch.
+            SortedMap[Address, Hash],
             // WATCHTOWER durable-slash requests (slashing part 3): one per upheld invalid-state-proof dispute surfaced this ordinal — the
-            // gl0-deterministic sub-quorum re-exec mismatch (`RejectedReExecutionMismatch`). Consumed by the accept path's pure
+            // GL0-deterministic replay mismatch (`RejectedReExecutionMismatch`). Consumed by the accept path's pure
             // `applyWatchtowerSlashes` fold (post-slash stake maps + `Slashings` MPT records + burn). Empty on the common all-accept path
             // and ALWAYS empty at `numShards = 1` (this method never runs there) ⇒ the regression bar is preserved.
-            List[WatchtowerSlashRequest]
+            List[WatchtowerSlashRequest],
+            // Local pipeline/fork-choice acknowledgements. They are applied only after the selected MG suffixes have passed the
+            // independent GSAM replay and root comparison later in this accept pass.
+            List[PendingCheckpointAdoption]
           )
         ] =
-          // Track-1 diff-base-pin BOUNDED-DEFER: read this node's finalized base ONCE. A checkpoint whose `diffBaseOrdinal` is AHEAD of the
-          // base (this node hasn't folded that far forward yet) cannot resolve the pinned per-MG prior, so it is DEFERRED whole (adopt
-          // nothing this ord) — self-heals as the base advances. `None` (no persistence yet) ⇒ treat as below every diff base ⇒ defer.
-          mptStore.lastPersistedOrdinal.flatMap { basePersistedOpt =>
-            shardCheckpoints.toList
-              .foldM(
-                (
-                  SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-                  List.empty[io.constellationnetwork.schema.sharding.CrossShardReceipt],
-                  // Per-adopted-MG committee `(byte-diff, attested per-MG root, diffBaseOrdinal)` — STEP 6 ADOPT-AND-VERIFY input to
-                  // `deriveAdoptedCurrencyState`. Only populated for MGs whose accepted checkpoint carried a diff for them.
-                  SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)],
-                  List.empty[WatchtowerSlashRequest]
-                )
-              ) {
-                case ((adoptedAcc, receiptsAcc, diffAcc, slashAcc), (shardId, cp)) =>
-                  // DETERMINISTIC adopt-verifier — NOT node-local `evaluate`. `verifyEmbedded` decides purely from the checkpoint bytes +
-                  // the committee membership for `(shardId, epoch)`, so the leader (produce), the follower (`createContext`), and every gl0
-                  // peer (`validateArtifact`) reach a byte-identical adopt decision + committed state. Using `evaluate` here (which reads the
-                  // node-local `ShardFinalityTriggers`) would split the cluster — the prior-pass bug this change fixes.
+          shardCheckpoints.toList
+            .foldM(
+              (
+                SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+                SortedMap.empty[Address, Hash],
+                List.empty[WatchtowerSlashRequest],
+                List.empty[PendingCheckpointAdoption]
+              )
+            ) {
+              case ((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions), (shardId, cp)) =>
+                // DETERMINISTIC adopt-verifier — NOT node-local `evaluate`. `verifyEmbedded` decides purely from the checkpoint bytes +
+                // the committee membership for `(shardId, epoch)`, so the leader (produce), the follower (`createContext`), and every gl0
+                // peer (`validateArtifact`) reach a byte-identical adopt decision + committed state. Using `evaluate` here (which reads the
+                // node-local `ShardFinalityTriggers`) would split the cluster — the prior-pass bug this change fixes.
+                if (shardId =!= cp.shardId)
+                  loggerBundle.app
+                    .warn(
+                      s"[ACCEPTANCE/SHARDING] ordinal=$ordinal mapShard=$shardId checkpointShard=${cp.shardId} " +
+                        s"shardOrd=${cp.shardOrdinal.value} REJECTED outer shard key mismatch"
+                    )
+                    .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
+                else
                   checkpointManager.verifyEmbedded(cp).flatMap {
                     case ShardCheckpointAcceptResult.Accepted =>
-                      // Track-1 diff-base-pin BOUNDED-DEFER: if this checkpoint carries diffs whose pinned base is AHEAD of this node's
-                      // finalized base, the per-MG prior at `diffBaseOrdinal` is not yet resolvable ⇒ DEFER the WHOLE checkpoint (adopt
-                      // nothing, advance nothing) — self-heals as the base folds forward and the leader re-offers. A checkpoint with no diffs
-                      // (pure genesis / liveness) has no pinned read, so it is never deferred on this axis.
-                      // Only a REAL pinned base (> MinValue) can be "not reached"; the MinValue default (pre-sharding regression bar /
-                      // fixtures) is trivially satisfied by any base, so it never defers. `None` base defers only vs a real (> MinValue) base.
-                      val diffBaseNotReached =
-                        cp.derivedStateDelta.perMetagraphStateDiff.nonEmpty &&
-                          cp.diffBaseOrdinal.value.value > SnapshotOrdinal.MinValue.value.value &&
-                          basePersistedOpt.forall(_.value.value < cp.diffBaseOrdinal.value.value)
-                      if (diffBaseNotReached)
-                        loggerBundle.app
-                          .info(
-                            s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                              s"DEFER-DIFF-BASE base=${basePersistedOpt.map(_.value.value).getOrElse(-1L)} < " +
-                              s"diffBaseOrdinal=${cp.diffBaseOrdinal.value.value} — pinned prior not yet resolvable; deferring whole checkpoint"
-                          )
-                          .as((adoptedAcc, receiptsAcc, diffAcc, slashAcc))
-                      else {
-                        // ADOPT — no `onlyPossibleReferences` chain-link unfold, but with the CHAIN-HOLE GUARD: each per-MG
-                        // window must chain off gl0's recorded SC tip (`Hash.empty` for an unseeded MG). The committee
-                        // chain-link-validated these binaries against the SHARD chain; the guard ensures gl0 consumes that
-                        // chain IN ORDER (no child window adopted while its parent window was never adopted — the genesis
-                        // wedge). A non-continuous window is DEFERRED loudly; the leader re-offers the missing ancestor
-                        // checkpoint at a later ord (ancestor-first selection in GlobalSnapshotConsensusFunctions).
-                        // TRIM-AWARE anchoring (2026-06-10): all checkpoint windows partition the SAME linear ml0
-                        // binary chain, so after a shard-chain reorg gl0's recorded tip (an orphaned branch's window
-                        // tail) still lies ON that linear chain — the canonical window containing its continuation
-                        // OVERLAPS the already-adopted prefix rather than chaining exactly off it. Requiring exact
-                        // head==tip (the first guard shape) turned that overlap into a permanent adoption stall (run
-                        // bml994k4d, shard 1 frozen 30+ min while its chain advanced). Instead: find the binary INSIDE
-                        // the window whose lastSnapshotHash === tip (binaries carry their parent hash — no
-                        // recomputation) and adopt the suffix from there. Pure function of (window, prior GSI) —
-                        // split-safe. No continuation present at all ⇒ defer (true chain hole, the leader re-offers an
-                        // older ancestor).
-                        val tipFor: Address => Hash = mg => priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty)
-                        // ORPHANED-TIP REANCHOR (2026-06-29) + FULLY-ADOPTED SKIP (2026-07-08): classify each window via the SHARED
-                        // `ShardReanchor` (byte-identical to the embed-selection `pick` in GlobalSnapshotConsensusFunctions — the
-                        // lockstep guarantee). Continue = trim-aware suffix off gl0's tip (existing); Reanchor = gl0's tip orphaned
-                        // by a same-ordinal shard reorg, adopt the canonical suffix past the dead tip's ordinal (heals the freeze);
-                        // AlreadyAdopted = the window's tail IS gl0's tip (window fully adopted) — adopt NOTHING for this MG (a
-                        // benign no-op, NOT a chain hole: pre-fix this misclassified as Reanchor(lastIdx) and re-committed the tip
-                        // binary every gl0 ordinal — the 3gl0/2shard startup freeze); Defer = true chain hole. The window-tail hash
-                        // comes from the SHARED `ShardReanchor.windowTipHashF` (the same value-hash the SC-tip setter records) —
-                        // deterministic over wire-carried bytes, split-safe. Result shape: Left(mg) = already adopted (skip);
-                        // Right(Left(...)) = deferred; Right(Right((mg, suffix, idx, isReanchor))) = adopted, where the trailing
-                        // `Boolean` flags a reanchor for the log line below.
-                        cp.derivedStateDelta.includedSnapshots.toList.traverse {
-                          case (mg, nel) =>
-                            ShardReanchor.windowTipHashF(nel).map { windowTipHash =>
-                              def suffixFrom(idx: Int, isReanchor: Boolean): Either[
-                                (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
-                                (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
-                              ] =
-                                NonEmptyList
-                                  .fromList(nel.toList.drop(idx))
-                                  .map(suffix =>
-                                    Right((mg, suffix, idx, isReanchor)): Either[
-                                      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
-                                      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
-                                    ]
-                                  )
-                                  .getOrElse(Left((mg, nel)))
-                              val decision: Either[
-                                Address,
-                                Either[
-                                  (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
-                                  (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int, Boolean)
-                                ]
-                              ] =
-                                ShardReanchor.classify(
-                                  nel,
-                                  windowTipHash,
-                                  tipFor(mg),
-                                  ShardReanchor.tipOrdinalFor(priorLastCurrencySnapshots, mg)
-                                ) match {
-                                  case ShardReanchor.Continue(idx)  => Right(suffixFrom(idx, isReanchor = false))
-                                  case ShardReanchor.Reanchor(idx)  => Right(suffixFrom(idx, isReanchor = true))
-                                  case ShardReanchor.AlreadyAdopted => Left(mg)
-                                  case ShardReanchor.Defer          => Right(Left((mg, nel)))
-                                }
-                              decision
-                            }
-                        }.flatMap { trimResults =>
-                          val alreadyAdopted = trimResults.collect { case Left(mg) => mg }
-                          val deferred = trimResults.collect { case Right(Left(d)) => d }
-                          val adopted = trimResults.collect { case Right(Right(r)) => r }
-                          val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
-                            SortedMap.from(adopted.map { case (mg, suffix, _, _) => mg -> suffix })(Address.OrderingInstance)
-                          // STEP 6: the committee's per-MG `(byte-diff, attested per-MG root)` for each adopted MG — fed to
-                          // `deriveAdoptedCurrencyState` to APPLY-and-verify the committed currency info (PIN-1 root, PIN-3 minimal diff). Only
-                          // for MGs that have BOTH a carried diff and a carried root in this checkpoint's `derivedStateDelta`; a pure-genesis
-                          // window (empty diff/root) is simply absent ⇒ `deriveAdoptedCurrencyState` keeps the decoded info verbatim there.
-                          val newDiffs
-                            : SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)] =
-                            SortedMap.from(chainContinuous.keys.toList.flatMap { mg =>
-                              (
-                                cp.derivedStateDelta.perMetagraphStateDiff.get(mg),
-                                cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
-                                // Track-1 diff-base-pin: attach THIS checkpoint's `diffBaseOrdinal` to each adopted MG's diff — the pinned base
-                                // `deriveAdoptedCurrencyState` reads the per-MG prior at (byte-identical to the base the producer diffed over).
-                              ).tupled.map { case (diff, root) => mg -> ((diff, root, cp.diffBaseOrdinal)) }
-                            })(Address.OrderingInstance)
-                          val newReceipts: List[io.constellationnetwork.schema.sharding.CrossShardReceipt] = cp.emittedReceipts
-                          alreadyAdopted.traverse_ { mg =>
-                            loggerBundle.app.info(
-                              s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                s"ALREADY-ADOPTED mg=$mg gl0Tip=${tipFor(mg).value.take(12)} — window tail === gl0's SC tip " +
-                                s"(fully adopted); nothing to adopt for this MG"
-                            )
-                          } >>
-                            deferred.traverse_ {
-                              case (mg, nel) =>
-                                loggerBundle.app.warn(
-                                  s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                    s"DEFER-ANCHOR mg=$mg windowHeadParent=${nel.head.value.lastSnapshotHash.value.take(12)} " +
-                                    s"gl0Tip=${tipFor(mg).value.take(12)} " +
-                                    s"— no continuation of gl0's SC tip anywhere in the window (missing ancestor checkpoint); deferring"
+                      // ADOPT — no `onlyPossibleReferences` chain-link unfold, but with the CHAIN-HOLE GUARD: each per-MG
+                      // window must chain off gl0's recorded SC tip (`Hash.empty` for an unseeded MG). The committee
+                      // chain-link-validated these binaries against the SHARD chain; the guard ensures gl0 consumes that
+                      // chain IN ORDER (no child window adopted while its parent window was never adopted — the genesis
+                      // wedge). A non-continuous window is DEFERRED loudly; the leader re-offers the missing ancestor
+                      // checkpoint at a later ord (ancestor-first selection in GlobalSnapshotConsensusFunctions).
+                      // TRIM-AWARE anchoring (2026-06-10): all checkpoint windows partition the SAME linear ml0
+                      // binary chain, so after a shard-chain reorg gl0's recorded tip (an orphaned branch's window
+                      // tail) still lies ON that linear chain — the canonical window containing its continuation
+                      // OVERLAPS the already-adopted prefix rather than chaining exactly off it. Requiring exact
+                      // head==tip (the first guard shape) turned that overlap into a permanent adoption stall (run
+                      // bml994k4d, shard 1 frozen 30+ min while its chain advanced). Instead: find the binary INSIDE
+                      // the window whose lastSnapshotHash === tip (binaries carry their parent hash — no
+                      // recomputation) and adopt the suffix from there. Pure function of (window, prior GSI) —
+                      // split-safe. No continuation present at all ⇒ defer (true chain hole, the leader re-offers an
+                      // older ancestor).
+                      val tipFor: Address => Hash = mg => priorLastStateChannelSnapshotHashes.getOrElse(mg, Hash.empty)
+                      // Classify via the same helper used by embed selection. Continue selects an exact suffix off GL0's committed
+                      // tip; AlreadyAdopted is a no-op; every sibling or missing-parent lineage is deferred. Reconstructing a sibling
+                      // by ordinal is invalid without authoritative prior state, and committee-carried state is never authoritative.
+                      cp.derivedStateDelta.includedSnapshots.toList.traverse {
+                        case (mg, nel) =>
+                          ShardWindowContinuation.windowTipHashF(nel).map { windowTipHash =>
+                            def suffixFrom(idx: Int): Either[
+                              (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                              (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int)
+                            ] =
+                              NonEmptyList
+                                .fromList(nel.toList.drop(idx))
+                                .map(suffix =>
+                                  Right((mg, suffix, idx)): Either[
+                                    (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                                    (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int)
+                                  ]
                                 )
-                            } >>
-                            adopted.traverse_ {
-                              case (mg, _, trimmedCount, isReanchor) =>
-                                if (isReanchor) {
-                                  val tipOrd = ShardReanchor.tipOrdinalFor(priorLastCurrencySnapshots, mg).getOrElse(-1L)
-                                  loggerBundle.app.warn(
-                                    s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                      s"REANCHOR mg=$mg gl0Tip=${tipFor(mg).value.take(12)} orphaned by reorg — adopted canonical " +
-                                      s"suffix from index=$trimmedCount (tip metagraph-ordinal=$tipOrd)"
-                                  )
-                                } else
-                                  Async[F].whenA(trimmedCount > 0) {
-                                    loggerBundle.app.info(
-                                      s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                        s"TRIM-ANCHOR mg=$mg trimmed=$trimmedCount already-adopted prefix binaries (post-reorg window overlap)"
-                                    )
-                                  }
-                            } >>
-                            loggerBundle.app
-                              .info(
+                                .getOrElse(Left((mg, nel)))
+                            val decision: Either[
+                              Address,
+                              Either[
+                                (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]),
+                                (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], Int)
+                              ]
+                            ] =
+                              ShardWindowContinuation.classify(
+                                nel,
+                                windowTipHash,
+                                tipFor(mg)
+                              ) match {
+                                case ShardWindowContinuation.Continue(idx)  => Right(suffixFrom(idx))
+                                case ShardWindowContinuation.AlreadyAdopted => Left(mg)
+                                case ShardWindowContinuation.Defer          => Right(Left((mg, nel)))
+                              }
+                            decision
+                          }
+                      }.flatMap { trimResults =>
+                        val alreadyAdopted = trimResults.collect { case Left(mg) => mg }
+                        val deferred = trimResults.collect { case Right(Left(d)) => d }
+                        val adopted = trimResults.collect { case Right(Right(r)) => r }
+                        val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
+                          SortedMap.from(adopted.map { case (mg, suffix, _) => mg -> suffix })(Address.OrderingInstance)
+                        // A carried root is only a claim to compare with GL0's recreated result. State diffs are ignored.
+                        val newRoots: SortedMap[Address, Hash] =
+                          SortedMap.from(chainContinuous.keys.toList.flatMap { mg =>
+                            cp.derivedStateDelta.perMetagraphMptRoots.get(mg).map(mg -> _)
+                          })(Address.OrderingInstance)
+                        alreadyAdopted.traverse_ { mg =>
+                          loggerBundle.app.info(
+                            s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                              s"ALREADY-ADOPTED mg=$mg gl0Tip=${tipFor(mg).value.take(12)} — window tail === gl0's SC tip " +
+                              s"(fully adopted); nothing to adopt for this MG"
+                          )
+                        } >>
+                          deferred.traverse_ {
+                            case (mg, nel) =>
+                              loggerBundle.app.warn(
                                 s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                                  s"ACCEPTED adopt mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
-                                  s"deferredMgs=${deferred.size} alreadyAdoptedMgs=${alreadyAdopted.size} receipts=${newReceipts.size}"
-                              ) >>
-                            // Bounded-pipeline watermark (2026-06-11) + fork-choice anchor (task #42): record the adopted shard
-                            // ordinal AND the adopted checkpoint's canonical hash. The ordinal gates producer windows (pipeline
-                            // depth); the hash is the anchor the daemon feeds into ShardChainStore.noteAnchor so every node's
-                            // shard fork choice follows gl0's adopted lineage (the run-14/15 heal).
-                            Hasher[F]
-                              .hash(cp.signingPreimage)
-                              .flatMap(cpHash => checkpointManager.noteAdopted(shardId, cp.shardOrdinal, cpHash))
-                              .as((adoptedAcc ++ chainContinuous, receiptsAcc ++ newReceipts, diffAcc ++ newDiffs, slashAcc))
-                        } // close trimResults flatMap
-                      } // close else (diff-base reached)
+                                  s"DEFER-ANCHOR mg=$mg windowHeadParent=${nel.head.value.lastSnapshotHash.value.take(12)} " +
+                                  s"gl0Tip=${tipFor(mg).value.take(12)} " +
+                                  s"— no continuation of gl0's SC tip anywhere in the window (missing ancestor checkpoint); deferring"
+                              )
+                          } >>
+                          adopted.traverse_ {
+                            case (mg, _, trimmedCount) =>
+                              Async[F].whenA(trimmedCount > 0) {
+                                loggerBundle.app.info(
+                                  s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                                    s"TRIM-ANCHOR mg=$mg trimmed=$trimmedCount already-adopted prefix binaries (window overlap)"
+                                )
+                              }
+                          } >>
+                          loggerBundle.app
+                            .info(
+                              s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                                s"SELECTED-FOR-REPLAY mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
+                                s"deferredMgs=${deferred.size} alreadyAdoptedMgs=${alreadyAdopted.size}"
+                            ) >>
+                          Hasher[F]
+                            .hash(cp.signingPreimage)
+                            .map { cpHash =>
+                              val nextPending =
+                                if (deferred.isEmpty)
+                                  pendingAdoptions :+ PendingCheckpointAdoption(
+                                    shardId,
+                                    cp.shardOrdinal,
+                                    cpHash,
+                                    chainContinuous.keySet
+                                  )
+                                else pendingAdoptions
+                              (adoptedAcc ++ chainContinuous, rootsAcc ++ newRoots, slashAcc, nextPending)
+                            }
+                      } // close trimResults flatMap
 
                     case ShardCheckpointAcceptResult.PendingMoreAttestations =>
                       loggerBundle.app
@@ -953,7 +874,7 @@ object GlobalSnapshotAcceptanceManager {
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                             s"PENDING — will retry next gl0 ord"
                         )
-                        .as((adoptedAcc, receiptsAcc, diffAcc, slashAcc))
+                        .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
 
                     case ShardCheckpointAcceptResult.Rejected(reason) =>
                       // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient
@@ -964,10 +885,10 @@ object GlobalSnapshotAcceptanceManager {
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                             s"REJECTED reason=$reason"
                         )
-                        .as((adoptedAcc, receiptsAcc, diffAcc, slashAcc))
+                        .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
 
                     case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
-                      // Wrong-derivation result (sub-quorum re-exec path). The committee signers deviated from determinism and are the
+                      // Wrong-derivation result from unconditional GL0 replay. The committee signers deviated from determinism and are the
                       // 100% `InvalidStateProof` slash targets (§10.2). The deterministic LEDGER EFFECT is
                       // `InvalidStateProofSlashManager.applySlash` (stake reduction ×(1−slashFraction) + cooldown registry entry +
                       // bounty/burn), the SAME sink the WATCHTOWER quorum-path dispute feeds via an on-chain `InvalidStateProofEvidence`.
@@ -991,55 +912,21 @@ object GlobalSnapshotAcceptanceManager {
                           .as(
                             (
                               adoptedAcc,
-                              receiptsAcc,
-                              diffAcc,
-                              slashAcc :+ WatchtowerSlashRequest(shardId, cpHash, slashTargets, submitter = None)
+                              rootsAcc,
+                              slashAcc :+ WatchtowerSlashRequest(shardId, cpHash, slashTargets, submitter = None),
+                              pendingAdoptions
                             )
                           )
                       }
                   }
-              }
-              .flatMap {
-                case (adopted, receipts, diffs, slashRequests) =>
-                  // Side-effect: drain the union of cross-shard receipts into the shared MetagraphSyncManager accumulator.
-                  // The manager's internal seen-set gate makes the apply idempotent — duplicate receipts (operator replay,
-                  // gossip duplication, or repeat-evaluation in a re-acceptance turn) are silently dropped after first sight.
-                  metagraphSyncManager.consumeReceipts(receipts).as((adopted, diffs, slashRequests))
-              }
-          } // close mptStore.lastPersistedOrdinal.flatMap (diff-base-pin bounded-defer)
+            }
+            .map {
+              case (adopted, roots, slashRequests, pendingAdoptions) =>
+                (adopted, roots, slashRequests, pendingAdoptions)
+            }
 
-        /** Axis 1a (#259) + STEP 6 committee-state-diff ADOPT-AND-VERIFY. Derive the per-metagraph accepted-currency-snapshot view from
-          * ADOPTED shard-checkpoint SC-snapshot chains, BYPASSING `onlyPossibleReferences` (the chain-link unfold inside
-          * `GlobalSnapshotStateChannelAcceptanceManager.accept`).
-          *
-          * '''The committed per-MG `CurrencySnapshotInfo` is APPLIED, not re-derived (the run-24/26 fix).''' Every gl0 node previously
-          * re-ran `processCurrencySnapshots(AdoptFromSignedFields)` and independently DERIVED each MG's info via the per-field
-          * economic-security gate — which diverged across nodes (a field gl0 couldn't reproduce, e.g. `balances`/`activeAllowSpends`,
-          * carried EMPTY prior on one node and the real value on another) and froze `lastCurrencySnapshots` while silently dropping
-          * allow-spends. Now the SHARD COMMITTEE re-execs ONCE and carries the MINIMAL per-MG byte-diff
-          * (`cp.derivedStateDelta.perMetagraphStateDiff(mg)`); EVERY gl0 node here APPLIES that diff onto its OWN copy of the prior
-          * cumulative state `S(N)` (= `priorLastCurrencySnapshots(mg)`, the adopted chain-linked best-tip — PIN-4) via
-          * [[ChangeSet.reconstructInfoFromDiff]], recomputes the per-MG root, and REQUIRES it `===` the committee-attested
-          * `perMetagraphMptRoots(mg)` (PIN-1, `GlobalStateConverter.currencySnapshotMgRoot` — the component-addressable MG-sub-trie root —
-          * over the post-apply state). On match it ADOPTS the reconstructed `next` info; on mismatch (its `S(N)` lags the producer's —
-          * trim/reorg) it DROPS that MG's currency advance (never adopt unverified) and the leader re-offers later. Because the diff is the
-          * producer's authoritative output, every node lands on the byte-identical `next` — no per-node gate divergence,
-          * allow-spends/token-locks ACCUMULATE.
-          *
-          * '''Why `processCurrencySnapshots` still runs.''' It decodes the adopted binaries to produce the structural shell of the result
-          * the rest of `accept()` consumes: the accepted SC-binary `NonEmptyList` (SC-tip advance), the per-binary `incomingCurrencyState`
-          * list (each binary's `SharedArtifact`s — SpendActions / PricingUpdates — read off the Signed incremental, NOT the info), and the
-          * fee `balanceUpdate`. ONLY the FINAL committed per-MG `CurrencySnapshotInfo` (`calculatedCurrencyState[mg]`, the value written to
-          * the MPT + read by `currencyBalances` / `updateTokenLockBalances` / `activeAllowSpendsFromCurrencySnapshots` / cl1 bootstrap) is
-          * OVERRIDDEN by the verified diff-apply — the intermediate infos are consensus-irrelevant. The
-          * `Signed[CurrencyIncrementalSnapshot]` half of the overridden `Right` tuple is the one `processCurrencySnapshots` derived (the
-          * last binary's incremental — byte-identical to the producer's), so the recomputed `incrementalRoot` matches.
-          *
-          * @param perMgDiffAndRoot
-          *   per-adopted-MG `(committee byte-diff, committee-attested per-MG root)` extracted from the accepted checkpoints by
-          *   `adoptShardCheckpoints`. An MG present in `adoptedScSnapshots` but ABSENT here (no diff carried — e.g. a pure genesis window
-          *   or a legacy empty-diff checkpoint) keeps the binary-decoded info verbatim (no override). PIN-1 root + PIN-3 minimal diff are
-          *   the producer's; this method only applies + verifies.
+        /** Recreate every adopted CL1 snapshot with the global currency transition function. Checkpoint diffs are deliberately absent from
+          * this interface: no committee-carried state can replace the result of global execution.
           */
         private def deriveAdoptedCurrencyState(
           ordinal: SnapshotOrdinal,
@@ -1048,7 +935,7 @@ object GlobalSnapshotAcceptanceManager {
             CurrencySnapshot
           ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
           adoptedScSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-          perMgDiffAndRoot: SortedMap[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)],
+          attestedRoots: SortedMap[Address, Hash],
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
         )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] =
           stateChannelEventsProcessor
@@ -1065,232 +952,28 @@ object GlobalSnapshotAcceptanceManager {
               // size), the state fold ran in reverse, and the resulting NEL's `.last` (the SC-tip setter) was the
               // OLDEST hash.
               adoptedScSnapshots.map { case (mg, nel) => mg -> nel.reverse },
-              getGlobalSnapshotByOrdinal,
-              // Decode the adopted binaries to build the result shell (accepted NEL + per-binary artifacts + fee balanceUpdate). The
-              // FINAL per-MG info this derivation produces is OVERRIDDEN below by the verified committee diff-apply, so the choice of
-              // adoption mode does not affect the committed currency state — `AdoptFromSignedFields` is kept because it replays the
-              // signed binary's events with ZERO global-snapshot lookups (no `createContext` 31s-retry stall), matching the producer's
-              // own re-exec (`ShardCheckpointWiring.reExecDerivationWithDiff`).
-              GlobalSnapshotStateChannelEventsProcessor.CurrencyAdoptionMode.AdoptFromSignedFields
+              getGlobalSnapshotByOrdinal
             )
             .flatMap { accepted =>
-              // `returned = Set.empty` — adopted snapshots are committee-accepted, never gl0-returned.
-              val baseResult =
+              // The accepted map is the output of full CurrencySnapshotValidator recreation. Checkpoints carry execution inputs and root
+              // claims only; they cannot replace balances, references, active sets, or any other economic state.
+              val unverifiedResult =
                 stateChannelEventsProcessor.assembleAcceptanceResult(accepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
 
-              // S(N) info for an MG — the prior cumulative currency state the committee diffed against (PIN-4). This MUST be
-              // byte-for-byte the SAME prior the producer diffed against (`ShardCheckpointWiring.reExecDerivationWithDiff`), or the
-              // apply-and-verify root diverges and that MG freezes. The producer's DIFF prior is `getCurrencySnapshotInfo` — gated on the
-              // fieldId-5 incremental, so at a post-genesis pre-first-incremental window it returns `emptyInfo` (the genesis info is NOT
-              // yet in the unrolled `Mg*` partitions; the first incremental writes it). We therefore mirror that EXACTLY here:
-              //   - `Right((_, info))` — the reconstructed cumulative info: producer reads the identical bytes back via the same gate.
-              //   - `Left(genesis)`  — post-genesis pre-incremental: producer's diff prior is `emptyInfo`, NOT `genesis.info`. Using the
-              //                        genesis embedded info (which carries the non-empty genesis `balances`) here would desync the apply:
-              //                        a genesis-funded address fully drained in window-0 (key dropped in `next`) would survive in this
-              //                        prior but be absent from the producer's diff (which has no removal for it, since the producer's
-              //                        prior is empty), so the recomputed infoRoot would carry the stale key and never match the attested
-              //                        root — a permanent per-MG genesis-seam freeze. So this arm returns `emptyInfo`.
-              //   - `None`           — never seen by gl0: empty prior (the window's binaries seed it). Matches producer's `getOrElse`.
-              val emptyInfo: CurrencySnapshotInfo =
-                CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
-              def priorInfoOf(mg: Address): CurrencySnapshotInfo =
-                priorLastCurrencySnapshots.get(mg) match {
-                  case Some(Right((_, info))) => info
-                  case Some(Left(_))          => emptyInfo
-                  case None                   => emptyInfo
+              adoptedScSnapshots.keys.toList.traverse { mg =>
+                (unverifiedResult.calculatedCurrencyState.get(mg), attestedRoots.get(mg)) match {
+                  case (Some(state), Some(attestedRoot)) =>
+                    GlobalStateConverter
+                      .currencySnapshotMgRoot[F](SortedMap(mg -> state))
+                      .map(recreatedRoot => Option.when(recreatedRoot === attestedRoot)(mg))
+                  case _ => none[Address].pure[F]
                 }
-
-              // Track-1 diff-base-pin: read the per-MG diff prior AT the checkpoint's cluster-uniform `diffBaseOrdinal` — the exact base the
-              // committee cut the diff over — instead of the adopter's own (per-node-lagging) `overlay.base` (`priorInfoOf`). Every honest
-              // node then reconstructs the byte-identical `next`, so the drop-deadlock the authoritative-override masking papers over is gone
-              // at the root. `readAtOrdinalVerified` self-resolves the pin (the finalized snapshot at `diffBaseOrdinal`) and is
-              // THREE-VALUED (the eb9bf9a5e genesis-seam fix — the old Option read conflated the two `None`s and permanently dropped
-              // every never-before-adopted MG's first checkpoint at numShards >= 2):
-              //   - reader NOT wired (tests / currency-l0) ⇒ fall back to `priorInfoOf` (byte-identical to pre-pin behavior);
-              //   - `AnchorVerified(Some(info))` ⇒ the pinned prior, verbatim;
-              //   - `AnchorVerified(None)` ⇒ the anchor VERIFIED but this MG has no committed currency state there — the brand-new-MG
-              //     genesis seam. Seed the SAME `emptyInfo` the producer's `getOrElse(emptyInfo)` seeds
-              //     (`ShardCheckpointWiring.reExecDerivationWithDiff`) and the legacy `priorInfoOf` genesis arms return. Consensus-safe:
-              //     absence under a VERIFIED pinned root is itself a pinned fact (MPT non-inclusion), so every honest node derives the
-              //     byte-identical empty prior; the PIN-1 root gate + GAP-1 proof binding below stay the fail-closed nets over the result.
-              //   - `AnchorUnreadable` ⇒ FAIL-CLOSED: the base was reached (adoptShardCheckpoints deferred otherwise) but the pinned ANCHOR
-              //     is unreadable (evicted below retention, or the pinned snapshot is on a fork) ⇒ DROP this MG (never adopt over a wrong
-              //     prior); the leader re-offers and it self-heals once the anchor is served.
-              def pinnedPriorInfoOf(mg: Address, diffBaseOrdinal: SnapshotOrdinal): F[Option[CurrencySnapshotInfo]] =
-                pinnedCurrencyInfoReader match {
-                  case None => priorInfoOf(mg).some.pure[F]
-                  case Some(reader) =>
-                    reader.readAtOrdinalVerified(diffBaseOrdinal, mg).map {
-                      case PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorUnreadable          => none[CurrencySnapshotInfo]
-                      case PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorVerified(Some(inf)) => inf.some
-                      case PinnedCurrencyInfoReader.PinnedAnchorRead.AnchorVerified(None)      => emptyInfo.some
-                    }
-                }
-
-              // APPLY-AND-VERIFY the committee diff over each adopted MG whose checkpoint carried one, OVERRIDING the final committed info.
-              // The incremental half stays as `processCurrencySnapshots` decoded it (the last binary's incremental — matches the producer).
-              baseResult.calculatedCurrencyState.toList.traverse {
-                case (mg, derivedState) =>
-                  perMgDiffAndRoot.get(mg) match {
-                    // No carried diff (genesis / legacy empty) — keep the decoded state verbatim; nothing to apply or verify.
-                    case None => Async[F].pure((mg -> derivedState).some)
-                    // A carried diff applies only to the `Right` (incremental) arm — a `Left` (still-genesis) MG has no info-diff
-                    // semantics; keep it verbatim (the producer emits an empty diff for a pure-genesis window).
-                    case Some(_) if derivedState.isLeft => Async[F].pure((mg -> derivedState).some)
-                    case Some((wireDiff, attestedRoot, diffBaseOrdinal)) =>
-                      val lastIncremental = derivedState.toOption.get._1 // safe: isLeft handled above (window TIP — newest incremental,
-                      //                                                    whose cumulative balances == the producer's authoritativeBalances)
-                      val diff = ChangeSet.fromWire(wireDiff)
-                      // Track-1 diff-base-pin: resolve the diff prior AT the checkpoint's `diffBaseOrdinal`. `None` here means EXACTLY
-                      // `AnchorUnreadable` (the wired reader's anchor step failed — evicted/fork/no-root; a verified-but-absent MG already
-                      // became `Some(emptyInfo)` in `pinnedPriorInfoOf`, mirroring the producer's genesis seam) ⇒ FAIL-CLOSED drop;
-                      // `Some(pinnedPrior)` ⇒ apply the diff over the pinned base.
-                      pinnedPriorInfoOf(mg, diffBaseOrdinal).flatMap {
-                        case None =>
-                          loggerBundle.app
-                            .warn(
-                              s"[ACCEPTANCE/ADOPT-VERIFY/diff-base-pin] ordinal=$ordinal mg=${mg.value.value.take(8)} pinned ANCHOR at " +
-                                s"diffBaseOrdinal=${diffBaseOrdinal.value.value} unreadable (evicted/fork) — FAIL-CLOSED DROP this MG's currency advance"
-                            )
-                            .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
-                        case Some(pinnedPrior) =>
-                          for {
-                            nextInfoRaw <- ChangeSet.reconstructInfoFromDiff[F](mg, pinnedPrior, diff)
-                            // TRACK-1 DELETE-OVERRIDE (2026-07-01) — the last authoritative override dies here (its producer twin dies in the
-                            // SAME commit at `ShardCheckpointWiring.reExecDerivationWithDiff`). COMMIT THE RECONSTRUCTED `next` VERBATIM.
-                            // Why the override is now redundant: the committee's `perMetagraphStateDiff` is cut over the producer's `infoOf(next)`,
-                            // which `deriveAdoptedCurrencyInfo` (inside `processCurrencySnapshots`) ALREADY populates with the metagraph's
-                            // authoritative CUMULATIVE balances/refs/active-sets — each verified against the signed `stateProof` at derivation time.
-                            // With diff-base-pin (`eb9bf9a5e`) every honest node reads the per-MG prior at the cluster-uniform `diffBaseOrdinal`
-                            // (`pinnedPrior`), the EXACT base the committee diffed over, so applying the diff reconstructs the byte-identical
-                            // `infoOf(next)` — authoritative values included — WITHOUT re-applying them and WITHOUT the S(N)-lags drop-deadlock the
-                            // override was masking. The per-MG root gate (PIN-1, `recomputed === attestedRoot`) + the re-grounded GAP-1 below (bind
-                            // each reconstructed field the tip's `stateProof` actually carries to that signed proof) are the consensus checks now.
-                            nextInfo = nextInfoRaw
-                            nextState = Right((lastIncremental, nextInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState
-                            // PIN-1: recompute the COMPONENT-ADDRESSABLE per-MG root over the post-apply state via the SAME shared
-                            // `currencySnapshotMgRoot` the committee producer used (MG sub-trie rootHash over fieldId-5 + `infoSubFields` `Mg*`
-                            // entries) and REQUIRE it === the attested `perMetagraphMptRoots(mg)`. Byte-identical to the producer by construction
-                            // (one helper, same field-32-filtered bytes). Replaces the old flat `hash((incrementalRoot, infoRoot))`.
-                            recomputed <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> nextState))
-                            out <-
-                              if (recomputed === attestedRoot)
-                                // GAP-1 verify-by-proof (Byzantine-producer check), RE-GROUNDED for delete-override (Track-1 3a). The per-MG root
-                                // matching the committee attestation only ties the reconstructed value to the PRODUCER's claim; ALSO bind each
-                                // reconstructed field to the METAGRAPH's OWN signed proof (on the tip incremental's `stateProof`) so gl0 adopts a
-                                // value only if the metagraph itself signed it, never one a Byzantine producer fabricated and attested. FAIL-CLOSED
-                                // on any present-and-mismatched field (drop — ALL present fields must pass).
-                                //
-                                // 3a FIX — gate each Option-valued field on `stateProof.<field>.isDefined`, NOT the removed `authoritative*.isDefined`.
-                                // Reconstruction ALWAYS lifts `.some` on the Option info fields (`reconstructCurrencyInfoFrom` — a partition with no
-                                // entries reconstructs `Some(empty)`), whereas the live metagraph emits genuine `None` (`lastFeeTxRefs` hardcoded None
-                                // in CSAM; `lastMessages` None when message-free) and the signed `stateProof` DISTINGUISHES them (`None -> None`,
-                                // `Some(empty) -> Some(hash(empty))`). A mechanical unconditional compare would then read `Some(hash(empty)) === None`
-                                // = false and fail-close EVERY honest sharded MG every ordinal. So SKIP any field the tip's `stateProof` does not carry
-                                // (its `<field>Proof` is `None`) — the reconstructed `Some(empty)` is MPT-indistinguishable from `None` (both are zero
-                                // partition entries, so `recomputed === attestedRoot` already held) — and COMPARE only the fields the metagraph asserted.
-                                // `balancesProof` / `lastTxRefsProof` are NON-Option `Hash` (always present) ⇒ their compare is UNCONDITIONAL. The
-                                // active-set / ref-map proofs are `Option[Hash]` = `<field>.traverse(_.hash)`, so hash `nextInfo.<field>` directly and
-                                // compare to `stateProof.<field>` (selector-independent).
-                                (
-                                  hasher.hash(nextInfo.balances),
-                                  nextInfo.activeAllowSpends.traverse(hasher.hash(_)),
-                                  nextInfo.activeTokenLocks.traverse(hasher.hash(_)),
-                                  hasher.hash(nextInfo.lastTxRefs),
-                                  nextInfo.lastFeeTxRefs.traverse(hasher.hash(_)),
-                                  nextInfo.lastAllowSpendRefs.traverse(hasher.hash(_)),
-                                  nextInfo.lastTokenLockRefs.traverse(hasher.hash(_)),
-                                  nextInfo.lastMessages.traverse(hasher.hash(_))
-                                ).tupled.flatMap {
-                                  case (
-                                        reconstructedBalancesProof,
-                                        reconstructedActiveAllowSpends,
-                                        reconstructedActiveTokenLocks,
-                                        reconstructedLastTxRefsProof,
-                                        reconstructedLastFeeTxRefsProof,
-                                        reconstructedLastAllowSpendRefsProof,
-                                        reconstructedLastTokenLockRefsProof,
-                                        reconstructedLastMessagesProof
-                                      ) =>
-                                    val sp = lastIncremental.value.stateProof
-                                    // `balancesProof` / `lastTxRefsProof` are NON-Option `Hash` (the metagraph ALWAYS asserts them) ⇒ UNCONDITIONAL
-                                    // compare. On the sharded path `nextInfo.{balances,lastTxRefs}` reconstructs the committee's `infoOf(next)`, whose
-                                    // balances/refs `deriveAdoptedCurrencyInfo` already bound to exactly these signed proofs — so the honest path passes
-                                    // and a Byzantine-fabricated map (hash != signed) fails closed.
-                                    val balancesOk = reconstructedBalancesProof === sp.balancesProof
-                                    val lastTxRefsOk = reconstructedLastTxRefsProof === sp.lastTxRefsProof
-                                    // Option-valued fields: SKIP when the tip's `stateProof` does not carry the field (3a — the reconstructed
-                                    // `Some(empty)` is MPT-indistinguishable from the metagraph's `None`), else bind the reconstructed value to the
-                                    // metagraph's OWN signed proof (fail-closed on mismatch).
-                                    val activeAllowSpendsOk =
-                                      !sp.activeAllowSpends.isDefined || reconstructedActiveAllowSpends === sp.activeAllowSpends
-                                    val activeTokenLocksOk =
-                                      !sp.activeTokenLocks.isDefined || reconstructedActiveTokenLocks === sp.activeTokenLocks
-                                    val lastFeeTxRefsOk =
-                                      !sp.lastFeeTxRefsProof.isDefined || reconstructedLastFeeTxRefsProof === sp.lastFeeTxRefsProof
-                                    val lastAllowSpendRefsOk =
-                                      !sp.lastAllowSpendRefsProof.isDefined ||
-                                        reconstructedLastAllowSpendRefsProof === sp.lastAllowSpendRefsProof
-                                    val lastTokenLockRefsOk =
-                                      !sp.lastTokenLockRefsProof.isDefined ||
-                                        reconstructedLastTokenLockRefsProof === sp.lastTokenLockRefsProof
-                                    val lastMessagesOk =
-                                      !sp.lastMessagesProof.isDefined || reconstructedLastMessagesProof === sp.lastMessagesProof
-                                    if (
-                                      balancesOk && activeAllowSpendsOk && activeTokenLocksOk && lastTxRefsOk && lastFeeTxRefsOk &&
-                                      lastAllowSpendRefsOk && lastTokenLockRefsOk && lastMessagesOk
-                                    )
-                                      (mg -> nextState).some.pure[F]
-                                    else
-                                      loggerBundle.app
-                                        .warn(
-                                          s"[ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} reconstructed field != metagraph-signed " +
-                                            s"proof — DROP (balancesOk=$balancesOk activeAllowSpendsOk=$activeAllowSpendsOk " +
-                                            s"activeTokenLocksOk=$activeTokenLocksOk lastTxRefsOk=$lastTxRefsOk lastFeeTxRefsOk=$lastFeeTxRefsOk " +
-                                            s"lastAllowSpendRefsOk=$lastAllowSpendRefsOk lastTokenLockRefsOk=$lastTokenLockRefsOk " +
-                                            s"lastMessagesOk=$lastMessagesOk reconstructedBalancesProof=${reconstructedBalancesProof.value
-                                                .take(16)}... metagraphSignedBalancesProof=${sp.balancesProof.value
-                                                .take(16)}...)"
-                                        )
-                                        .as(none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
-                                }
-                              else
-                                for {
-                                  // DIAG: gl0's reconstructed per-sub-field root breakdown — match `attested=` here to the committee's
-                                  // `[REEXEC-FIELDS] root=` line to pin the exact diverging half (inc vs info) + `Mg*` sub-field.
-                                  gl0Diag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> nextState))
-                                  _ <- loggerBundle.app.warn(
-                                    s"[ACCEPTANCE/ADOPT-VERIFY] ordinal=$ordinal mg=${mg.value.value.take(8)} per-MG root MISMATCH: " +
-                                      s"attested=${attestedRoot.value.take(16)}... recomputed=${recomputed.value.take(16)}... — " +
-                                      s"DROPPING this MG's currency advance (S(N) lags the committee producer's; leader re-offers). " +
-                                      s"diff(upserts=${diff.upserts.size},removals=${diff.removals.size}) gl0Fields[$gl0Diag]"
-                                  )
-                                } yield none[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)]
-                          } yield out
-                      } // close pinnedPriorInfoOf(...).flatMap Some(pinnedPrior) branch
-                  }
-              }.map { verifiedPerMg =>
-                // `keptStates` already spans EVERY MG in `calculatedCurrencyState` (prior-only pass-throughs + adopted) minus the
-                // mismatched ones (which became `none`), with each adopted-with-diff MG OVERRIDDEN by its verified `next` — so it is the
-                // complete rebuilt map; no union with the base needed.
-                val keptStates = verifiedPerMg.flatten
-                // An MG whose per-MG root MISMATCHED is fully DEFERRED: also dropped from `incomingCurrencySnapshotsWithState` AND
-                // `accepted`, so neither its currency state NOR its SC tip advances this ordinal (the downstream
-                // `updatedLastCurrencySnapshots = priorLastCurrencySnapshots ++ currencySnapshots` merge then holds the prior verified
-                // state; the SC tip stays at prior). This is the only edge where a checkpoint that passed `verifyEmbedded` is partially
-                // withheld — under chain-linked in-order adoption every honest verifier shares the producer's S(N), so a mismatch flags a
-                // Byzantine producer (drop, safe) or a transient lag (defer + re-pull, safe).
-                val mismatchedMgs: Set[Address] = perMgDiffAndRoot.keySet -- keptStates.map(_._1).toSet
-                val rebuiltCalculated: SortedMap[Address, StateChannelAcceptanceResult.CurrencySnapshotWithState] =
-                  SortedMap.from(keptStates)(Address.OrderingInstance)
-                val rebuiltIncoming = baseResult.incomingCurrencySnapshotsWithState.filterNot {
-                  case (mg, _) => mismatchedMgs.contains(mg)
-                }
-                val rebuiltAccepted = baseResult.accepted.filterNot { case (mg, _) => mismatchedMgs.contains(mg) }
-                baseResult.copy(
-                  accepted = rebuiltAccepted,
-                  calculatedCurrencyState = rebuiltCalculated,
-                  incomingCurrencySnapshotsWithState = rebuiltIncoming
+              }.map { verified =>
+                val rejected = adoptedScSnapshots.keySet -- verified.flatten.toSet
+                stateChannelEventsProcessor.assembleAcceptanceResult(
+                  accepted -- rejected,
+                  priorLastCurrencySnapshots,
+                  Set.empty[StateChannelOutput]
                 )
               }
             }
@@ -1581,12 +1264,7 @@ object GlobalSnapshotAcceptanceManager {
         private def computeHistoricalStakeBoundaryDelta(
           ordinal: SnapshotOrdinal,
           baseInfo: GlobalSnapshotInfo,
-          // #259 — verifier-replay eta adoption. `Some(eta)` ONLY on the follower/verifier path
-          // (`GlobalSnapshotContextFunctions.createContext`), carrying gl0's authoritative per-period eta
-          // taken verbatim from the incoming signed artifact's `eta` wire field. `None` on the gl0-producer
-          // path (`GlobalSnapshotConsensusFunctions`), which recomputes via `etaForPeriod` as before. See the
-          // adoption rationale on the `adoptedBoundaryEta` param of `accept` below.
-          adoptedBoundaryEta: Option[Hash]
+          pinnedBoundaryEta: Option[Hash]
         )(
           implicit hasher: Hasher[F]
         ): F[(SortedMap[EtaPeriod, HistoricalStakeSnapshot], Set[EtaPeriod], SortedMap[EtaPeriod, HistoricalStakeSnapshot])] = {
@@ -1602,19 +1280,8 @@ object GlobalSnapshotAcceptanceManager {
             // the `HistoricalStakeSnapshot` boundary entry. Eta is deterministic from the canonical chain at this point
             // (derived from period (currentPeriod-1)'s first 2/3 VRF outputs, fully knowable before currentPeriod even starts).
             //
-            // #259: a metagraph follower (cl0/cl1/dl1) replaying a gl0 snapshot CANNOT reproduce eta_currentPeriod — it has no
-            // gl0 VRF-output chain, so its `etaForPeriod` chain-walk fallback degrades to `genesisEta`, diverging from gl0's
-            // committed value and breaking the `mptRoot` check every boundary. Instead the follower ADOPTS gl0's authoritative
-            // eta verbatim from the artifact's `eta` wire field (set by the leader at `SnapshotLeaderLoop.scala`'s
-            // `eta = Some(etaHash)`; same `%02x` hex encoding as `SharedServices.etaBytesToHash`, same period at a boundary
-            // ordinal since both reduce to `closingOrdinal / R`). The metagraph never reads `historicalStakeSnapshots` (every
-            // consumer is gl0 leader-election state), so adopting gl0's value loses no guarantee while making the recomputed
-            // root match gl0's by construction.
             val etaF: F[Hash] =
-              adoptedBoundaryEta match {
-                case Some(eta) => Async[F].pure(eta)
-                case None      => etaForPeriod.map(_(currentPeriod)).getOrElse(Async[F].pure(Hash.empty))
-              }
+              pinnedBoundaryEta.fold(etaForPeriod.map(_(currentPeriod)).getOrElse(Async[F].pure(Hash.empty)))(Async[F].pure)
             (NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator), etaF).mapN { (newStakeSnapshot, eta) =>
               val newSnapshot = HistoricalStakeSnapshot(newStakeSnapshot, eta)
               val retentionMinPeriod = currentPeriod.value - 3L
@@ -1679,9 +1346,7 @@ object GlobalSnapshotAcceptanceManager {
           updatedWithdrawNodeCollateralsCleaned: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
           updatedPriceState: SortedMap[TokenPair, PriceRecord],
           updatedAcceptedMetagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo],
-          // #259 — gl0's authoritative per-period eta on the verifier-replay path; `None` for gl0 producers.
-          // Threaded verbatim into `computeHistoricalStakeBoundaryDelta`.
-          adoptedBoundaryEta: Option[Hash]
+          pinnedBoundaryEta: Option[Hash]
         )(
           implicit hasher: Hasher[F]
         ): F[BuildGlobalSnapshotInfoResult] = {
@@ -1724,7 +1389,7 @@ object GlobalSnapshotAcceptanceManager {
           //
           // §G2 — `computeHistoricalStakeBoundaryDelta` is now `F[]` (reads the boundary `StakeDistribution` from MPT via
           // `NodeStakeAggregator.snapshotFromMpt`). `buildGlobalSnapshotInfo` lifts into `F[]` here.
-          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo, adoptedBoundaryEta).map {
+          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo, pinnedBoundaryEta).map {
             case (adds, removes, nextHistorical) =>
               BuildGlobalSnapshotInfoResult(
                 gsi = baseInfo.copy(historicalStakeSnapshots = nextHistorical),
@@ -1928,8 +1593,7 @@ object GlobalSnapshotAcceptanceManager {
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
           parentTip: BranchId,
           shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
-          // #259 — see the trait scaladoc on this param. `Some` on verifier-replay (adopt gl0's eta), `None` on producers.
-          adoptedBoundaryEta: Option[Hash] = None,
+          pinnedBoundaryEta: Option[Hash] = None,
           // WATCHTOWER fraud-proof artifact (W3a) — see the trait scaladoc. Threaded identically on every path; folded into the slash sink.
           fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
         ): F[
@@ -1997,15 +1661,6 @@ object GlobalSnapshotAcceptanceManager {
                 // is shared across accept() calls but `acceptMutex` (above) ensures only one
                 // accept() reads/writes it at a time.
                 _ <- branchTipRef.set(parentTip)
-
-                // S1 (VERSION-MODEL §4): the sharded-MG follower reads BOTH its apply-prior INFO and its currency-WRITE removal-prior from
-                // the FINALIZED BASE (`mptStore = overlay.base`), not the branch-aware `mpt`, so `diff-prior == apply-prior == write` all
-                // anchor at the same finalized base the committee cut the diff over. Hoisted here (depends only on the constructor
-                // `shardingConfig`/`shardAssignment` + the base store) so the SAME predicate + base reader feed the apply-prior split
-                // (`priorLastCurrencySnapshots`) AND the write (`applyStateChanges`). At numShards=1 / pipelineDepth=1, base==branch, so
-                // every read+write is byte-identical to the branch path (production-safety).
-                shardedInfoMode = shardingConfig.exists(_.numShards > 1) && shardAssignment.isDefined
-                baseCurrencyInfoReader = GlobalStateConverter.CurrencyInfoMpt.fromMptStore[F](mptStore)
 
                 (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
                   acceptAllowSpendAndTokenLockBlocks(
@@ -2188,15 +1843,6 @@ object GlobalSnapshotAcceptanceManager {
                     // metagraph with no fieldId-5 incremental has no currency state → emit nothing and let the GSI fallback below cover
                     // it. Reconstruction is `F`, so the per-address build is a `flatTraverse`.
                     infoReader = CurrencyInfoMptAdapters.mptFor(mpt)
-                    // S1 (VERSION-MODEL §4): for sharded MGs the apply-prior INFO must read the FINALIZED BASE — mirroring the
-                    // producer's diff-prior `getCurrencySnapshotInfo` over `fromMptStore` (ShardCheckpointWiring) — NOT the branch
-                    // (`mpt`). The committee cuts the per-MG diff over the finalized base; reconstructing the apply-prior over the
-                    // branch makes `reconstructInfoFromDiff(branchPrior, diff_over_base)` diverge from the committee-attested root
-                    // for an MG whose branch is ahead of base, wrongly DROPPING it (the §4 violation pinned by
-                    // GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite). At numShards=1 / pipelineDepth=1 base==branch ⇒ no-op.
-                    // Structural diff-prior==apply-prior alignment; sound at pipelineDepth=1 until S2 base-anchors the window.
-                    // `shardedInfoMode` + `baseCurrencyInfoReader` are hoisted at the accept() top (after the parentTip checkout).
-                    baseInfoReader = baseCurrencyInfoReader
                     mptEntries <- addrList.flatTraverse { addr =>
                       val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
                       val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
@@ -2207,7 +1853,7 @@ object GlobalSnapshotAcceptanceManager {
                           incs.get(incKey) match {
                             case Some(inc) =>
                               GlobalStateConverter
-                                .reconstructCurrencyInfoFrom[F](addr, if (shardedInfoMode) baseInfoReader else infoReader)
+                                .reconstructCurrencyInfoFrom[F](addr, infoReader)
                                 .map(info => List(addr -> (Right((inc, info)): StateChannelAcceptanceResult.CurrencySnapshotWithState)))
                             case None =>
                               Async[F].pure(List.empty[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
@@ -2228,8 +1874,7 @@ object GlobalSnapshotAcceptanceManager {
                 // AND (b) the caller actually supplied a non-empty `shardCheckpoints` map for this ord. All three conditions
                 // must hold; otherwise `adoptedScSnapshots` is empty, the standard chain-link path runs on the raw `scEvents`
                 // verbatim, and the rest of `accept()` is byte-identical to today (the regression bar — see make()'s
-                // shardingConfig scaladoc). `adoptedDiffs` carries the committee per-MG `(byte-diff, attested root)` consumed by
-                // `deriveAdoptedCurrencyState` for STEP 6 apply-and-verify (empty on the no-op fast-path).
+                // shardingConfig scaladoc). Every adopted CL1 snapshot is recreated below.
                 adoptedResult <-
                   (shardingConfig, shardCheckpointAcceptanceManager) match {
                     case (Some(cfg), Some(scMgr)) if cfg.numShards > 1 && shardCheckpoints.nonEmpty =>
@@ -2237,20 +1882,20 @@ object GlobalSnapshotAcceptanceManager {
                         ordinal,
                         shardCheckpoints,
                         scMgr,
-                        priorLastStateChannelSnapshotHashes,
-                        priorLastCurrencySnapshots
+                        priorLastStateChannelSnapshotHashes
                       )
                     case _ =>
                       Async[F].pure(
                         (
                           SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-                          SortedMap.empty[Address, (io.constellationnetwork.schema.sharding.ShardCurrencyStateDiff, Hash, SnapshotOrdinal)],
-                          List.empty[WatchtowerSlashRequest]
+                          SortedMap.empty[Address, Hash],
+                          List.empty[WatchtowerSlashRequest],
+                          List.empty[PendingCheckpointAdoption]
                         )
                       )
                   }
                 adoptedScSnapshots = adoptedResult._1
-                adoptedDiffs = adoptedResult._2
+                adoptedRoots = adoptedResult._2
 
                 // WATCHTOWER fraud-proof CONSENSUS ARTIFACT → durable slash (W3a). Re-validate EVERY carried fraud proof here via the SAME
                 // deterministic `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed checkpoint's
@@ -2300,7 +1945,7 @@ object GlobalSnapshotAcceptanceManager {
                     case _ => Async[F].pure(List.empty[WatchtowerSlashRequest])
                   }
 
-                // WATCHTOWER durable-slash requests = the gl0 self-detected sub-quorum re-exec mismatches (`submitter = None` ⇒ burn) UNION the
+                // WATCHTOWER durable-slash requests = the GL0 self-detected replay mismatches (`submitter = None` ⇒ burn) UNION the
                 // upheld watchtower fraud-proof disputes (`submitter = Some` ⇒ bounty). Both are applied to the stake maps below, before
                 // cleaning, via the SAME pure `applyWatchtowerSlashes` fold. ALWAYS empty at numShards=1 (neither source produces a request
                 // there). The `watchtowerEnabled` config gate makes the durable slash inert when off (drop the requests ⇒ `applyWatchtowerSlashes`
@@ -2344,43 +1989,51 @@ object GlobalSnapshotAcceptanceManager {
                   getGlobalSnapshotByOrdinal
                 )
 
-                // Merge the committee-adopted SC snapshots (chain-link bypassed; currency derivation re-run identically via
+                // Merge committee-selected SC snapshot bytes after currency derivation is rerun via
                 // `deriveAdoptedCurrencyState`) with the standard chain-link result. The two MG sets are disjoint in normal
                 // operation (a sharded MG flows only via its committee; a non-sharded/bootstrap MG only via raw scEvents), but
-                // on the rare mixed-bootstrap overlap the ADOPTED entry wins (`++` right-biased) — committee acceptance is the
-                // authoritative source for a sharded MG. When `adoptedScSnapshots` is empty (numShards=1 OR no checkpoints
+                // on the rare mixed-bootstrap overlap the globally recreated adopted entry wins (`++` right-biased). When
+                // `adoptedScSnapshots` is empty (numShards=1 OR no checkpoints
                 // this ord) the result IS `baseAcceptance` verbatim — no `deriveAdoptedCurrencyState` call, no merge.
-                StateChannelAcceptanceResult(
-                  scSnapshots,
-                  currencySnapshots,
-                  returnedSCEvents,
-                  currencyAcceptanceBalanceUpdate,
-                  incomingCurrencySnapshots
-                ) <-
-                  if (adoptedScSnapshots.isEmpty) Async[F].pure(baseAcceptance)
+                acceptanceAndVerifiedMetagraphs <-
+                  if (adoptedScSnapshots.isEmpty)
+                    Async[F].pure((baseAcceptance, Set.empty[Address]))
                   else
                     deriveAdoptedCurrencyState(
                       ordinal,
                       updatedGlobalBalances,
                       priorLastCurrencySnapshots,
                       adoptedScSnapshots,
-                      adoptedDiffs,
+                      adoptedRoots,
                       getGlobalSnapshotByOrdinal
                     ).map { adoptedAcceptance =>
-                      StateChannelAcceptanceResult(
-                        accepted = baseAcceptance.accepted ++ adoptedAcceptance.accepted,
-                        // Both base + adopt return `priorLastCurrencySnapshots.concat(<states>)`. Merging them right-biased
-                        // yields `prior ++ baseStates ++ adoptedStates` — the prior keys are overwritten with identical
-                        // values, so this is exactly what a single combined `calculateLastCurrencySnapshots` would produce.
-                        calculatedCurrencyState = baseAcceptance.calculatedCurrencyState ++ adoptedAcceptance.calculatedCurrencyState,
-                        // Adopted snapshots are never "returned" (committee-accepted, not gl0-rejected); only the raw-event
-                        // chain-link path can return events to a metagraph.
-                        returned = baseAcceptance.returned ++ adoptedAcceptance.returned,
-                        balanceUpdate = baseAcceptance.balanceUpdate ++ adoptedAcceptance.balanceUpdate,
-                        incomingCurrencySnapshotsWithState =
-                          baseAcceptance.incomingCurrencySnapshotsWithState ++ adoptedAcceptance.incomingCurrencySnapshotsWithState
+                      (
+                        StateChannelAcceptanceResult(
+                          accepted = baseAcceptance.accepted ++ adoptedAcceptance.accepted,
+                          // Both base + adopt return `priorLastCurrencySnapshots.concat(<states>)`. Merging them right-biased
+                          // yields `prior ++ baseStates ++ adoptedStates` — the prior keys are overwritten with identical
+                          // values, so this is exactly what a single combined `calculateLastCurrencySnapshots` would produce.
+                          calculatedCurrencyState = baseAcceptance.calculatedCurrencyState ++ adoptedAcceptance.calculatedCurrencyState,
+                          // Adopted snapshots are never "returned" (committee-accepted, not gl0-rejected); only the raw-event
+                          // chain-link path can return events to a metagraph.
+                          returned = baseAcceptance.returned ++ adoptedAcceptance.returned,
+                          balanceUpdate = baseAcceptance.balanceUpdate ++ adoptedAcceptance.balanceUpdate,
+                          incomingCurrencySnapshotsWithState =
+                            baseAcceptance.incomingCurrencySnapshotsWithState ++ adoptedAcceptance.incomingCurrencySnapshotsWithState
+                        ),
+                        adoptedAcceptance.accepted.keySet
                       )
                     }
+                (
+                  StateChannelAcceptanceResult(
+                    scSnapshots,
+                    currencySnapshots,
+                    returnedSCEvents,
+                    currencyAcceptanceBalanceUpdate,
+                    incomingCurrencySnapshots
+                  ),
+                  verifiedAdoptedMetagraphs
+                ) = acceptanceAndVerifiedMetagraphs
 
                 transactionsRefsDeltas <- transactionReferenceManager.acceptTransactionRefs(
                   initialData.blockResult.contextUpdate.lastTxRefs,
@@ -2467,6 +2120,21 @@ object GlobalSnapshotAcceptanceManager {
                   .filter { case (_, updates) => updates.nonEmpty }
                   .toSortedMap
 
+                // Prospective pending set for this exact acceptance. `currencySnapshots` already contains the globally re-executed owner
+                // state, while `lastSnapshotContext.metagraphSyncData` still contains ordinals acknowledged by an owner snapshot accepted in
+                // this same round. Remove only those canonical in-band acknowledgements before deriving effective balances, so the overlay
+                // applies while the owner has not processed a SpendAction and retires atomically when the owner's recreated raw balance does.
+                pendingGlobalChangeOrdinals =
+                  lastSnapshotContext.metagraphSyncData.fold(Map.empty[Address, SortedSet[SnapshotOrdinal]]) { syncDataByMetagraph =>
+                    syncDataByMetagraph.iterator.map {
+                      case (metagraphId, syncData) =>
+                        metagraphId -> MetagraphSyncManager.pendingAfterAcknowledgements(
+                          syncData.unappliedGlobalChangeOrdinals,
+                          globalSnapshotsProcessed.getOrElse(metagraphId, List.empty)
+                        )
+                    }.toMap
+                  }
+
                 lastActiveAllowSpends <- allowSpendStateManager.materializeActiveAllowSpendsFromMpt
 
                 // Per-metagraph PINNED global epoch (the epoch each MG used to expire its OWN allow-spends — its `globalSyncView.epochProgress`).
@@ -2499,6 +2167,7 @@ object GlobalSnapshotAcceptanceManager {
                           attested,
                           scope,
                           consumedSpentSetForValidation,
+                          pendingGlobalChangeOrdinals,
                           metagraphPinnedEpochProgresses,
                           epochProgress
                         )
@@ -2514,8 +2183,8 @@ object GlobalSnapshotAcceptanceManager {
                 // cross-shard phantom-refund self-spend is rejected exactly as same-shard). The overlay's `(att, scope)` shape
                 // closes over the per-accept spent-set/epochs; `effectiveCurrencyBalances` is pure+saturating and the spent-set is
                 // gl0-finalized (cluster-uniform), so every honest node computes byte-identical effective balances. The proof
-                // client defaults to the DETERMINISTIC `gl0Local` reader (cross-shard value read off gl0's own consensus-pinned
-                // finalized mirror, built from `branchAwareReader` below) — every gl0 node reads the byte-identical value ⇒ no
+                // client defaults to the DETERMINISTIC `gl0Local` reader over the finalized MPT base — every gl0 node reads the
+                // byte-identical value and an authorization created only on an unfinalized parent branch is not yet usable ⇒ no
                 // fork; see the `crossShardSpendProofClient` param scaladoc for why a peer-fetch HTTP client is NOT used here.
                 // At `numShards = 1` / `shardAssignment = None` we reuse the injected unsharded `spendActionValidator` verbatim ⇒
                 // the cross-shard branch is unreachable, the gl0-local client is never constructed ⇒ byte-identical to the pre-W3c path.
@@ -2527,19 +2196,19 @@ object GlobalSnapshotAcceptanceManager {
                           attestedScopeBalances,
                           ownerScope,
                           consumedSpentSetForValidation,
+                          pendingGlobalChangeOrdinals,
                           metagraphPinnedEpochProgresses,
                           epochProgress
                         )
                     // GL0-LOCAL cross-shard read source (W3c read-source activation). gl0 is the GLOBAL mirror — it holds the
                     // finalized state of EVERY shard's metagraphs — so a cross-shard `AllowSpend`/`Balance` the validator needs is
-                    // read DIRECTLY off gl0's own consensus-pinned reader (`branchAwareReader`, the SAME accept-`parentTip`-bound
-                    // reader every per-manager prior-state read uses this accept), NOT via a peer round-trip. DETERMINISM: the
-                    // accept's prior state is the cluster-uniform finalized snapshot, so every gl0 node's reader returns the
+                    // read DIRECTLY off gl0's finalized MPT base, NOT from the candidate's `parentTip` branch and NOT via a peer
+                    // round-trip. DETERMINISM: the finalized base is cluster-uniform, so every gl0 node's reader returns the
                     // byte-identical value for the same key ⇒ the cross-shard spend-action result feeds the consensus mptRoot
                     // identically on every node (a live `ShardSubtreeProofClient.http` here would be node-local ⇒ fork). An explicit
                     // `crossShardSpendProofClient` (e.g. a test mock) still overrides; production leaves it `None` ⇒ gl0-local.
                     val crossShardClient: ShardSubtreeProofClient[F] =
-                      crossShardSpendProofClient.getOrElse(ShardSubtreeProofClient.gl0Local[F](branchAwareReader))
+                      crossShardSpendProofClient.getOrElse(ShardSubtreeProofClient.gl0Local[F](finalizedBaseReader))
                     SpendActionValidator.make[F](
                       crossShardClient,
                       assignment,
@@ -2597,7 +2266,46 @@ object GlobalSnapshotAcceptanceManager {
                   .mapValues(SortedSet.from(_))
                   .to(SortedMap)
 
-                allAcceptedSpendTxns = acceptedSpendActions.toSortedMap.values.flatten
+                // `unappliedGlobalChangeOrdinals` is a lossless consensus acknowledgement queue. Never evict an unacknowledged ordinal to
+                // satisfy its configured bound: doing so makes absence indistinguishable from owner application and can retire an economic
+                // overlay early. Instead, deterministically backpressure only new currency-targeted transactions for an owner whose queue is
+                // full. Transactions for the current already-tracked ordinal remain admissible because they do not grow the set.
+                capacityCheckedSpendActions = pruneSpendActionsAtPendingCapacity(
+                  acceptedSpendActions.toSortedMap,
+                  pendingGlobalChangeOrdinals,
+                  ordinal,
+                  metagraphsSyncConfig.maxUnappliedGlobalChangeOrdinals.value
+                )
+                capacityRejectedSpendTransactionCount = acceptedSpendActions.values.flatten.map(_.spendTransactions.size).sum -
+                  capacityCheckedSpendActions.values.flatten.map(_.spendTransactions.size).sum
+
+                // Nullifier settlement is part of SpendAction acceptance, not advisory bookkeeping. Prune rejected references before
+                // allow-spend removal, balance effects, sync emission, and the acceptance result are computed.
+                crossShardEngineResult <-
+                  (shardingConfig, shardAssignment) match {
+                    case (Some(cfg), Some(assignment)) if cfg.numShards > 1 =>
+                      CrossShardMessageEngine.settle[F](
+                        crossShardMessageHandlers,
+                        capacityCheckedSpendActions,
+                        assignment,
+                        ordinal
+                      )
+                    case _ => CrossShardMessageEngine.EngineResult.empty.pure[F]
+                  }
+                crossShardMarkers = crossShardEngineResult.markers
+                settledSpendActions: SortedMap[Address, List[SpendAction]] =
+                  pruneRejectedSpendActions(capacityCheckedSpendActions, crossShardEngineResult.rejected.toSet)
+                _ <- Async[F].whenA(
+                  capacityRejectedSpendTransactionCount > 0 || crossShardMarkers.nonEmpty || crossShardEngineResult.rejected.nonEmpty
+                )(
+                  loggerBundle.app.info(
+                    s"[ACCEPTANCE/X-SHARD] ordinal=$ordinal cross-shard message settlement: " +
+                      s"newMarkers=${crossShardMarkers.size} rejected=${crossShardEngineResult.rejected.size} " +
+                      s"pendingCapacityRejected=$capacityRejectedSpendTransactionCount"
+                  )
+                )
+
+                allAcceptedSpendTxns = settledSpendActions.values.flatten
                   .flatMap(spendAction => spendAction.spendTransactions.toList)
                   .toList
 
@@ -2660,35 +2368,6 @@ object GlobalSnapshotAcceptanceManager {
                 (updatedBalancesByAllowSpends, updatedBalancesByAllowSpendsDeltas) <- Async[F].fromEither(
                   allowSpendBalancesResult
                     .leftMap(ex => new RuntimeException(s"Balance arithmetic error updating balances by allow spends: $ex"))
-                )
-
-                // ── ATOMIC CROSS-SHARD MESSAGE SETTLEMENT — W3d (generic nullifier engine) ─────────────────────────────────────────────────
-                // Run the registered `CrossShardMessageHandler`s (instance 1 = allow-spend consume over `ConsumedAllowSpends` fieldId 33).
-                // Each handler classifies its cross-shard instances (owner-shard ≠ producing-shard), rejects double-consume/replay/admit
-                // failures, and emits its nullifier markers. The engine UNIONS them; the markers are WRITTEN later (after `applyStateChanges`)
-                // through the same `mpt.insert` path as the watchtower `Slashings` partition, and folded into the #107 verify-replay. The
-                // allow-spend STATE EFFECT (the read-side effective-balance overlay) was already applied at the validator above; this region
-                // is purely the nullifier bookkeeping.
-                //
-                // GATING: only `numShards > 1 ∧ shardAssignment.isDefined`. At `numShards = 1` every MG maps to shard 0 ⇒ no instance is
-                // cross-shard ⇒ EMPTY markers ⇒ no partition written ⇒ mptRoot byte-identical to the pre-change path.
-                crossShardEngineResult <-
-                  (shardingConfig, shardAssignment) match {
-                    case (Some(cfg), Some(assignment)) if cfg.numShards > 1 =>
-                      CrossShardMessageEngine.settle[F](
-                        crossShardMessageHandlers,
-                        acceptedSpendActions.toSortedMap,
-                        assignment,
-                        ordinal
-                      )
-                    case _ => CrossShardMessageEngine.EngineResult.empty.pure[F]
-                  }
-                crossShardMarkers = crossShardEngineResult.markers
-                _ <- Async[F].whenA(crossShardMarkers.nonEmpty || crossShardEngineResult.rejected.nonEmpty)(
-                  loggerBundle.app.info(
-                    s"[ACCEPTANCE/X-SHARD] ordinal=$ordinal cross-shard message settlement: " +
-                      s"newMarkers=${crossShardMarkers.size} rejected=${crossShardEngineResult.rejected.size}"
-                  )
                 )
 
                 unexpiredNodeCollateralsRaw <- nodeCollateralStateManager.acceptNodeCollaterals(
@@ -2823,7 +2502,7 @@ object GlobalSnapshotAcceptanceManager {
                       }
                   }
 
-                globalSpendTransactions = acceptedSpendActions.toSortedMap.flatMap {
+                globalSpendTransactions = settledSpendActions.flatMap {
                   case (_, spendActions) =>
                     spendActions
                       .flatMap(_.spendTransactions.toList)
@@ -2917,7 +2596,7 @@ object GlobalSnapshotAcceptanceManager {
                     lastSnapshotContext,
                     incomingCurrencySnapshots,
                     globalSnapshotsProcessed,
-                    acceptedSpendActions,
+                    settledSpendActions,
                     ordinal,
                     epochProgress
                   )
@@ -2946,7 +2625,7 @@ object GlobalSnapshotAcceptanceManager {
                   updatedWithdrawNodeCollateralsCleaned,
                   updatedPriceState,
                   updatedAcceptedMetagraphSyncData,
-                  adoptedBoundaryEta
+                  pinnedBoundaryEta
                 )
                 gsi = gsiResult.gsi
 
@@ -3157,13 +2836,7 @@ object GlobalSnapshotAcceptanceManager {
                 // per-branch ChangeSet). Field/insert order, sidecar maintenance and removal-key
                 // derivation mirror legacy `mptStore.syncFromStateChanges` byte-for-byte —
                 // `GsamWritePathParitySuite` (#107) is the regression contract.
-                // S1: for sharded MGs, anchor the per-MG currency-WRITE removal-prior at the FINALIZED BASE (the same base the apply-prior
-                // above read), so `writeCurrencyInfo`'s `Mg*` removal set matches what the accumulator-delta verify-replay expects (which
-                // carries NO `Mg*` info removals). Without this, a branch-only `Mg*` key would be removed from `postBytes` by the write but
-                // retained in the replay's `expectedBytes`, tripping the #107 writer self-check at branch>base. At branch==base (numShards=1 /
-                // pipelineDepth=1) base==branch, so the removal set — and every written byte — is identical to the default branch path.
-                currencyWriteRemovalPrior = if (shardedInfoMode) Some(baseCurrencyInfoReader) else None
-                _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator, currencyWriteRemovalPrior)
+                _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator)
 
                 // WATCHTOWER slash ledger MPT write (slashing part 3). The `Slashings` partition (fieldId 34) is NOT carried by
                 // `StateChangesAccumulator` (whose shape lives in `GlobalStateConverter`, out of this change's scope), so write it DIRECTLY
@@ -3264,20 +2937,8 @@ object GlobalSnapshotAcceptanceManager {
                       // Independent byte derivation: take pre-sync bytes, apply the accumulator's
                       // upserts + removes via `toAccumulatorHexDelta` (scodec per-field encoding,
                       // no `GlobalSnapshotInfo` involved). This is the MPT-as-primary verify path.
-                      // S1 base-anchoring (mirror the writer's `currencyWriteRemovalPrior` above): in shardedInfoMode the writer computes
-                      // per-MG `Mg*` removals against the FINALIZED BASE (`overlay.base`), so the verify-replay MUST anchor them there too
-                      // — otherwise branch!=base re-trips the #107 `mptConsistency=DIVERGED` self-check on a CORRECT writer. Else
-                      // (branch==base, the pipelineDepth=1/numShards=1 production regime) the default (`preSyncBytes`) is exact.
-                      // PERF: the base read is needed ONLY when a currency snapshot actually changes this ordinal (no
-                      // `lastCurrencySnapshots` delta ⇒ no `Mg*` removals possible ⇒ the prior is unused). Gating on `nonEmpty` keeps the
-                      // full `overlay.base.allEntriesAsBytes` off the common (no-currency-change) accept path, where it otherwise slowed
-                      // consensus and worsened the gl0-tip-lag committee-gate fail-close.
-                      mgRemovalPrior <-
-                        if (shardedInfoMode && stateChangesAccumulator.lastCurrencySnapshots.nonEmpty)
-                          overlay.base.allEntriesAsBytes.map(_.some)
-                        else Option.empty[Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]].pure[F]
                       deltaPair <- io.constellationnetwork.schema.mpt.GlobalStateConverter
-                        .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes, mgRemovalPrior)
+                        .toAccumulatorHexDelta[F](stateChangesAccumulator, preSyncBytes)
                       (deltaUpserts, deltaRemoves) = deltaPair
                       // Fold the directly-written `Slashings` entries into the replay set: they are written via `mpt.insert` (not the
                       // accumulator), so `toAccumulatorHexDelta` does not see them — without this fold the writer-path `postBytes` would carry
@@ -3415,6 +3076,27 @@ object GlobalSnapshotAcceptanceManager {
                     ).attempt.void
                   )
                   .void
+
+                // Advance the node-local shard pipeline watermark and fork-choice anchor only after the whole GL0 acceptance pass
+                // succeeded and every newly selected MG suffix for that checkpoint survived independent replay plus root comparison.
+                // A deferred lineage never creates a pending acknowledgement; one failed MG root suppresses the checkpoint as a whole.
+                _ <- shardCheckpointAcceptanceManager.traverse_ { checkpointManager =>
+                  adoptedResult._4.traverse_ { pending =>
+                    val failedMetagraphs = pending.replayedMetagraphs -- verifiedAdoptedMetagraphs
+                    if (failedMetagraphs.isEmpty)
+                      checkpointManager.noteAdopted(
+                        pending.shardId,
+                        pending.shardOrdinal,
+                        pending.checkpointHash
+                      )
+                    else
+                      loggerBundle.app.warn(
+                        s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=${pending.shardId} " +
+                          s"shardOrd=${pending.shardOrdinal.value} NOT-ACKNOWLEDGED replay/root mismatch " +
+                          s"metagraphs=${failedMetagraphs.toList.sorted.mkString(",")}"
+                      )
+                  }
+                }
               } yield
                 (
                   initialData.blockResult,
@@ -3427,7 +3109,7 @@ object GlobalSnapshotAcceptanceManager {
                   acceptedRewardTxs,
                   gsi,
                   stateProof,
-                  acceptedSpendActions,
+                  settledSpendActions,
                   updatedUpdateNodeParameters.view.mapValues(_._1).toSortedMap,
                   (allowSpendsExpiredEvents ++ tokenUnlocksEvents ++ generatedTokenUnlockArtifacts).toSortedSet,
                   delegatorRewardsMap,

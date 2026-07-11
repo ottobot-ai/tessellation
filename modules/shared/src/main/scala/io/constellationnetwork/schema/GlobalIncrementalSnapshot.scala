@@ -143,16 +143,8 @@ case class GlobalIncrementalSnapshot(
 
 object GlobalIncrementalSnapshot {
 
-  /** Forgiving Circe decoder — defaults `shardCheckpoints` to [[SortedMap.empty]] when the field is absent.
-    *
-    * Replaces the derevo-derived decoder so that pre-Slice-4 (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §3.4) brotli
-    * fixtures still round-trip through `JsonScodecParitySuite` (those fixtures were captured before this field existed). New encodings
-    * always include the field via the derived encoder, so round-trips on current snapshots are unaffected. Mirrors the same pattern as
-    * `SlotCertificate.decoder` in `schema.nakamoto.slot` for the `subchainLevelCounts` field.
-    *
-    * '''Why hand-rolled instead of `circe-magnolia.configured.withDefaults`.''' The rest of the schema package uses derevo's standard
-    * (non-configured) magnolia derivation; introducing a per-type `Configuration` here would diverge from the project-wide convention.
-    * Hand-rolling one decoder mirrors the existing precedent in `slot.scala:157` and keeps the customization narrow and explicit.
+  /** Current-schema decoder. Fork-added consensus fields are required because this greenfield fork has no deployed pre-sharding wire
+    * format. Upstream v4 optional/defaulted fields retain their existing decoding behavior.
     */
   implicit val decoder: io.circe.Decoder[GlobalIncrementalSnapshot] = io.circe.Decoder.instance { c =>
     for {
@@ -166,8 +158,7 @@ object GlobalIncrementalSnapshot {
         .as[SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]]
       shardCheckpoints <- c
         .downField("shardCheckpoints")
-        .as[Option[SortedMap[ShardId, ShardCheckpoint]]]
-        .map(_.getOrElse(SortedMap.empty[ShardId, ShardCheckpoint]))
+        .as[SortedMap[ShardId, ShardCheckpoint]]
       rewards <- c.downField("rewards").as[SortedSet[RewardTransaction]]
       delegateRewards <- c.downField("delegateRewards").as[Option[SortedMap[PeerId, Map[Address, Amount]]]]
       epochProgress <- c.downField("epochProgress").as[EpochProgress]
@@ -194,11 +185,9 @@ object GlobalIncrementalSnapshot {
       version <- c.downField("version").as[Option[SnapshotVersion]].map(_.getOrElse(SnapshotVersion("0.0.1")))
       slotCertificate <- c.downField("slotCertificate").as[Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate]]
       eta <- c.downField("eta").as[Option[io.constellationnetwork.security.hash.Hash]]
-      // WATCHTOWER fraud proofs (W3a) — forgiving like `shardCheckpoints`: absent in pre-watchtower fixtures ⇒ empty set.
       fraudProofs <- c
         .downField("fraudProofs")
-        .as[Option[SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]]]
-        .map(_.getOrElse(SortedSet.empty[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]))
+        .as[SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]]
     } yield
       GlobalIncrementalSnapshot(
         ordinal,

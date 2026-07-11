@@ -6,38 +6,32 @@ import cats.data.NonEmptyList
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedMap
 
-import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshotStateProof, SnapshotFee}
+import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ChangeSet
+import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
-import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, ShardAssignment}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.artifact.{SharedArtifact, SpendAction, SpendTransaction}
-import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
-import io.constellationnetwork.schema.swap.{CurrencyId, SwapAmount}
-import io.constellationnetwork.schema.{SnapshotOrdinal, SnapshotTips}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.signature.signature.verifySignatureProof
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
-import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
+import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
 /** Tests for [[ShardCheckpointProducer]] — slice 8 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §6.
@@ -144,52 +138,6 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       }
     )
 
-  /** Build a `Signed[StateChannelSnapshotBinary]` whose `content` is a REAL JSON-serialized `Signed[CurrencyIncrementalSnapshot]` carrying
-    * a single `SpendAction` with one `SpendTransaction` targeting `targetCurrencyId` (`None` ⇒ DAG-hypergraph scope, never cross-shard).
-    * This is the SAME `content` shape the production cross-shard detection decodes (`JsonSerializer.deserialize[Signed[
-    * CurrencyIncrementalSnapshot]]` over `binary.value.content`). `parent` is the binary's `lastSnapshotHash` (genesis = `Hash.empty`) so
-    * it chain-links off the producer's window anchor.
-    */
-  private def mkCurrencyBinaryWithSpend(
-    mgKeyPair: KeyPair,
-    targetCurrencyId: Option[CurrencyId],
-    parent: Hash = Hash.empty
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], json: JsonSerializer[IO]): IO[Signed[StateChannelSnapshotBinary]] = {
-    val spendTx = SpendTransaction(
-      allowSpendRef = None,
-      currencyId = targetCurrencyId,
-      amount = SwapAmount(PosLong.unsafeFrom(1L)),
-      source = mkAddress("spend-src"),
-      destination = mkAddress("spend-dst")
-    )
-    val artifacts: SortedSet[SharedArtifact] = SortedSet(SpendAction(NonEmptyList.of(spendTx)): SharedArtifact)
-    val incremental = CurrencyIncrementalSnapshot(
-      ordinal = SnapshotOrdinal.unsafeApply(1L),
-      height = Height.MinValue,
-      subHeight = SubHeight.MinValue,
-      lastSnapshotHash = Hash.empty,
-      blocks = SortedSet.empty,
-      rewards = SortedSet.empty,
-      tips = SnapshotTips(SortedSet.empty, SortedSet.empty),
-      stateProof = CurrencySnapshotStateProof(Hash.empty, Hash.empty, None, None, None, None, None, None, None),
-      epochProgress = EpochProgress.MinValue,
-      dataApplication = None,
-      messages = None,
-      globalSnapshotSyncs = None,
-      feeTransactions = None,
-      artifacts = Some(artifacts),
-      allowSpendBlocks = None,
-      tokenLockBlocks = None,
-      globalSyncView = None
-    )
-    for {
-      signedInc <- forAsyncHasher(incremental, mgKeyPair)
-      contentBytes <- JsonSerializer[IO].serialize(signedInc)
-      binary = StateChannelSnapshotBinary(lastSnapshotHash = parent, content = contentBytes, fee = SnapshotFee(NonNegLong.unsafeFrom(0L)))
-      signedBinary <- forAsyncHasher(binary, mgKeyPair)
-    } yield signedBinary
-  }
-
   /** EXECUTION-SHARDING R-2: build the next-round pending set chained off the shard's current `perMgTip`. For each MG present in
     * `perMgTip`, the new binary references that tip (so it's admissible to the producer's `chainLinkOrder`); for MGs absent from `perMgTip`
     * (none, in the sequential-produce tests) it anchors at genesis. Keeps the producer's chain-link gate satisfied across successive
@@ -207,18 +155,15 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       }
     )
 
-  /** Deterministic `derivePerMgState` that returns a `Hash` derived from `(mg, headBinary.lastSnapshotHash)` paired with an empty
-    * `ChangeSet` (step-6 signature). The diff content is exercised by the ChangeSet/wiring suites; here the tests only assert on the per-MG
-    * hash values present in the produced `derivedStateDelta.perMetagraphMptRoots`, so an empty diff is sufficient.
-    */
+  /** Deterministic `derivePerMgState` that returns a root claim derived from `(mg, headBinary.lastSnapshotHash)`. */
   private def deterministicDerive(
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
     anchor: SnapshotOrdinal,
-    diffBase: SnapshotOrdinal
-  ): IO[Option[(Hash, ChangeSet)]] = {
-    val _ = (anchor, diffBase)
-    IO.pure(Some((hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}"), ChangeSet.empty)))
+    executionBase: SnapshotOrdinal
+  ): IO[Option[Hash]] = {
+    val _ = (anchor, executionBase)
+    IO.pure(Some(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}")))
   }
 
   /** A `derivePerMgState` callback that records which MGs it was invoked for. The test uses this to assert callback invocation count and
@@ -226,13 +171,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     */
   private def recordingDerive(
     seen: cats.effect.kernel.Ref[IO, List[Address]]
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
-    (mg, snaps, anchor, diffBase) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor, diffBase)
-
-  // Simple slot mapping: 1 slot per gl0 ord. Matches the e2e default cadence in spirit (slot-cadence is per-shard config; for tests,
-  // identity-ish keeps the slot value bounded so the LDD ramp parameters are predictable).
-  private val slotForGl0Anchor: SnapshotOrdinal => Slot =
-    ord => Slot.unsafeApply(ord.value.value)
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
+    (mg, snaps, anchor, executionBase) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor, executionBase)
 
   // slotGap: simple subtraction in slot-space; genesis treats the parent as slot=0 (caller-supplied default).
   private val slotGapFor: (Slot, Option[Slot]) => Long =
@@ -270,7 +210,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     rig: TestRig,
     sigma: Ratio,
     shardEta: Array[Byte],
-    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[(Hash, ChangeSet)]] =
+    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
       deterministicDerive,
     republishEveryTicks: Int = 1,
     // S2: the finalized-base per-MG window anchor. `None` ⇒ the shard's `perMgTip` (so the pre-S2 cases keep their perMgTip-anchored
@@ -278,16 +218,12 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     finalizedBaseTip: Option[IO[SortedMap[Address, Hash]]] = None,
     // Newness-gate (S2-deadlock fix): gl0's ADOPT tip. `None` ⇒ == the window anchor, so the gate is a NO-OP (every existing test
     // sees identical behavior). The dedicated newness-gate case passes a DISTINCT (higher) adopt tip to exercise stale-re-include omit.
-    adoptedTip: Option[IO[SortedMap[Address, Hash]]] = None,
-    // Cluster-wide shard count for the producer's `ShardAssignment`. Default 1 ⇒ every MG maps to shard 0 == this producer's shard ⇒ no
-    // cross-shard receipt is ever emitted (the `emittedReceipts` regression bar). The cross-shard emission case passes a SPLITTING value.
-    numShards: Int = 1
+    adoptedTip: Option[IO[SortedMap[Address, Hash]]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       ShardCheckpointProducer.make[IO](
         shardId = shardZero,
         chainStore = rig.chainStore,
-        shardAssignment = ShardAssignment.make[IO](numShards),
         finalizedBasePerMgTip = finalizedBaseTip.getOrElse(rig.chainStore.perMgTip),
         adoptedPerMgTip = adoptedTip.getOrElse(finalizedBaseTip.getOrElse(rig.chainStore.perMgTip)),
         slotLeader = ssl,
@@ -303,7 +239,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         slotGapFor = slotGapFor,
         staircaseDeltaSlots = 5,
         derivePerMgState = derive,
-        diffBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
+        executionBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
         lastAdoptedOrd = cats.effect.IO.pure(None),
         pipelineDepth = Int.MaxValue,
         republishEveryTicks = republishEveryTicks
@@ -402,7 +338,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         pending = mkPendingChainedOff(SortedMap.empty, round = 0)
       )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
-      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty, slot = 1L)
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
       tipAfterFirst <- rig.chainStore.bestTip
       firstHash = tipAfterFirst.get.hash
       // R-2: the second round's pending binaries must now chain off the SHARD's advanced perMgTip (the first round's included-binary
@@ -461,7 +397,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         pending = SortedMap(mg -> NonEmptyList.of(b0))(Address.OrderingInstance)
       )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
-      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty, slot = 1L)
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
       perMgTipAfter <- rig.chainStore.perMgTip
       // Round 1: the buffer RE-INCLUDES b0 (already at perMgTip) plus the new b1. A perMgTip-anchored producer (anchor = hash(b0)) would
       // unfold ONLY [b1]; the base-anchored producer (anchor = genesis Hash.empty) unfolds [b0, b1] — re-including b0.
@@ -577,7 +513,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
                 pending = mkPendingChainedOff(perMgTip, round = i)
               )
               cp <- IO.fromOption(produced)(new RuntimeException(s"produce-${i + 1} should win at σ=1 within 100 attempts"))
-              _ <- insertIntoStore(rig.chainStore, cp, parentHash = parentHash, slot = i.toLong + 1L)
+              _ <- insertIntoStore(rig.chainStore, cp, parentHash = parentHash)
               tip <- rig.chainStore.bestTip
               tipHash = tip.get.hash
             } yield (acc :+ cp.value.shardOrdinal.value, tipHash)
@@ -615,13 +551,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         seenList.toSet == pending.keys.toSet,
         cp.value.derivedStateDelta.perMetagraphMptRoots.size == pending.keys.size,
         cp.value.derivedStateDelta.perMetagraphMptRoots.keys.toSet == pending.keys.toSet,
-        // includedSnapshots is the chain-link-ordered input (R-2). For single-binary genesis-anchored MGs the order
-        // equals the input, so it round-trips to `pending`.
-        cp.value.derivedStateDelta.includedSnapshots == pending,
-        // Other delta fields are empty in slice 8 (wired in slice 9/13 when real derivation closure is plugged in).
-        cp.value.derivedStateDelta.tokenLockBalancesDelta.isEmpty,
-        cp.value.derivedStateDelta.perMetagraphArtifacts.isEmpty,
-        cp.value.derivedStateDelta.perMetagraphSyncDataDelta.isEmpty
+        // includedSnapshots is the replayable, chain-link-ordered input.
+        cp.value.derivedStateDelta.includedSnapshots == pending
       )
   }
 
@@ -641,8 +572,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         rigA,
         Ratio.One,
         shardEta,
-        derive = (mg, snaps, anchor, diffBase) =>
-          if (mg == omittedMg) IO.pure(None: Option[(Hash, ChangeSet)]) else deterministicDerive(mg, snaps, anchor, diffBase)
+        derive = (mg, snaps, anchor, executionBase) =>
+          if (mg == omittedMg) IO.pure(None: Option[Hash]) else deterministicDerive(mg, snaps, anchor, executionBase)
       )
       deferred <- tryProduceUntilSome(
         producerDefer,
@@ -669,9 +600,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       expect.all(
         // (A) on-duty (σ=1) but one MG can't derive ⇒ the producer mints NOTHING (defer), so produce returns None on every attempt
         deferred.isEmpty,
-        // (B) all derived ⇒ a COMPLETE checkpoint: all 4 MGs present in all three per-MG fields
+        // (B) all derived ⇒ a complete checkpoint carries every input/root.
         d.perMetagraphMptRoots.keys.toSet == pending.keys.toSet,
-        d.perMetagraphStateDiff.keys.toSet == pending.keys.toSet,
         d.includedSnapshots.keys.toSet == pending.keys.toSet,
         d.perMetagraphMptRoots.size == 4
       )
@@ -823,7 +753,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         pending = mkPendingChainedOff(SortedMap.empty, round = 0)
       )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
-      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty, slot = 4000L)
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
       perMgTip <- rig.chainStore.perMgTip
       second <- tryProduceUntilSome(
         producer,
@@ -843,102 +773,6 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         secondCp.value.parentCheckpointHash == firstHash, // ord-2 chains off ord-1
         firstHash =!= secondHash // a genuinely new mint, not a stale re-publish of ord-1
       )
-  }
-
-  // ===========================================================================
-  // Test 13 — Cross-shard receipts PRODUCER (§8.4)
-  // ===========================================================================
-
-  /** Find a `numShards` in [2, 64] that places `targetMg` OFF shard 0 (the producer's own `shardZero`) — so the SpendAction targeting it is
-    * a genuine cross-shard write. Mirrors `SpendActionValidatorCrossShardSuite.findNumShardsSplitting`'s scan shape.
-    */
-  private def findNumShardsTargetingOffShardZero(targetMg: Address)(implicit hasher: Hasher[IO]): IO[Int] =
-    (2 to 64).toList
-      .findM(n => ShardAssignment.make[IO](n).shardIdFor(targetMg).map(_ =!= shardZero))
-      .map(_.getOrElse(throw new AssertionError(s"no numShards in [2,64] places $targetMg off shard 0")))
-
-  test(
-    "cross-shard receipt: a SpendAction targeting a metagraph in a DIFFERENT shard ⇒ one MetagraphSyncDataWrite receipt with the right " +
-      "source/target shardIds + target MG + gl0Anchor-bearing increment; same-MG (None currencyId) emits nothing"
-  ) { res =>
-    implicit val (h, sp, ssl) = res
-    for {
-      implicit0(json: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO]
-      rig <- freshRig
-      gl0Eta = randomGl0Eta()
-      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
-      sourceMg = mkAddress("source-mg")
-      targetMg = mkAddress("target-mg")
-      numShards <- findNumShardsTargetingOffShardZero(targetMg)
-      assignment = ShardAssignment.make[IO](numShards)
-      sourceShard <- assignment.shardIdFor(sourceMg)
-      targetShard <- assignment.shardIdFor(targetMg)
-      sourceMg2 = mkAddress("source-mg-2")
-      mgKp <- KeyPairGenerator.makeKeyPair[IO]
-      // `sourceMg`'s genesis-anchored window carries a binary whose decoded currency-incremental holds a SpendAction targeting the
-      // cross-shard `targetMg` (currencyId = Some(targetMg)) ⇒ exactly one MetagraphSyncDataWrite. `sourceMg2`'s binary holds a
-      // SpendAction with currencyId = None (DAG-hypergraph scope — never a cross-shard MG write) ⇒ contributes NO receipt.
-      crossBinary <- mkCurrencyBinaryWithSpend(mgKp, Some(CurrencyId(targetMg)))
-      dagScopeBinary <- mkCurrencyBinaryWithSpend(mgKp, None)
-      pending = SortedMap(sourceMg -> NonEmptyList.of(crossBinary), sourceMg2 -> NonEmptyList.of(dagScopeBinary))(Address.OrderingInstance)
-      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, numShards = numShards)
-      result <- tryProduceUntilSome(
-        producer,
-        startOrd = 7000L,
-        EtaPeriod(0L),
-        pending = pending,
-        maxAttempts = 100,
-        committee = Set(rig.selfPeerId)
-      )
-      cp <- IO.fromOption(result)(new RuntimeException("cross-shard produce should win at σ=1 within 100 attempts"))
-      receipts = cp.value.emittedReceipts
-      writes = receipts.collect { case w: CrossShardReceipt.MetagraphSyncDataWrite => w }
-      anchorOrd = cp.value.gl0AnchorOrdinal
-    } yield
-      expect.all(
-        receipts.size == 1,
-        writes.size == 1,
-        writes.head.sourceMetagraph == sourceMg,
-        writes.head.targetMetagraph == targetMg,
-        writes.head.sourceShardId == sourceShard,
-        writes.head.targetShardId == targetShard,
-        writes.head.targetShardId =!= shardZero, // genuinely cross-shard
-        // sourceCheckpointHash = the chain-link parent (genesis here ⇒ Hash.empty), per the producer's deterministic non-load-bearing choice
-        writes.head.sourceCheckpointHash == cp.value.parentCheckpointHash,
-        // increment carries exactly the new info the consumer unions in: gl0Anchor in the unapplied-ordinals set, scalars at MinValue
-        writes.head.increment.unappliedGlobalChangeOrdinals == scala.collection.immutable.SortedSet(anchorOrd),
-        writes.head.increment.globalOrdinalLastAcceptedOn == SnapshotOrdinal.MinValue,
-        writes.head.increment.globalEpochProgressLastAcceptedOn == EpochProgress.MinValue
-      )
-  }
-
-  test(
-    "numShards=1 regression bar: the SAME cross-targeting SpendAction emits NO receipts (every target collapses to shard 0 == this " +
-      "shard) ⇒ emittedReceipts is empty (byte-identical to the pre-receipts path)"
-  ) { res =>
-    implicit val (h, sp, ssl) = res
-    for {
-      implicit0(json: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO]
-      rig <- freshRig
-      gl0Eta = randomGl0Eta()
-      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
-      sourceMg = mkAddress("source-mg")
-      targetMg = mkAddress("target-mg")
-      mgKp <- KeyPairGenerator.makeKeyPair[IO]
-      crossBinary <- mkCurrencyBinaryWithSpend(mgKp, Some(CurrencyId(targetMg)))
-      pending = SortedMap(sourceMg -> NonEmptyList.of(crossBinary))(Address.OrderingInstance)
-      // numShards defaults to 1 ⇒ shardIdFor(targetMg) == shard 0 == shardZero ⇒ NOT cross-shard ⇒ no receipt.
-      producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
-      result <- tryProduceUntilSome(
-        producer,
-        startOrd = 7100L,
-        EtaPeriod(0L),
-        pending = pending,
-        maxAttempts = 100,
-        committee = Set(rig.selfPeerId)
-      )
-      cp <- IO.fromOption(result)(new RuntimeException("numShards=1 produce should win at σ=1 within 100 attempts"))
-    } yield expect(cp.value.emittedReceipts.isEmpty)
   }
 
   // ===========================================================================
@@ -973,24 +807,27 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     loop(0)
   }
 
-  /** Helper to insert a produced envelope into a `ShardChainStore`. Mirrors the store contract: pass the envelope + parentHash + ord + slot
-    * + a deterministic vrfOutput stub. Slice 8 tests don't exercise fork choice; vrfOutput choice doesn't matter as long as it's stable.
+  /** Helper to insert a produced envelope into a `ShardChainStore`. Mirrors the store contract: pass the envelope's signed ordinal and
+    * slot, plus a deterministic vrfOutput stub. Slice 8 tests don't exercise fork choice; vrfOutput choice doesn't matter as long as it's
+    * stable.
     */
   private def insertIntoStore(
     store: ShardChainStore[IO],
     signed: Signed[ShardCheckpoint],
-    parentHash: Hash,
-    slot: Long
+    parentHash: Hash
   ): IO[Unit] =
     store
       .store(
         checkpoint = signed,
         parentHash = parentHash,
         shardOrdinal = signed.value.shardOrdinal,
-        slot = slot,
+        slot = signed.value.slot.value.value,
         vrfOutput = Array.fill[Byte](32)(0x42.toByte)
       )
-      .void
+      .flatMap {
+        case true  => IO.unit
+        case false => IO.raiseError(new AssertionError("produced checkpoint was rejected by ShardChainStore"))
+      }
 
   /** Minimal stub checkpoint — same shape as the chain-store tests use. Only the `shardOrdinal` field varies for the publisher tests. */
   private def stubCheckpoint(ord: Long): Signed[ShardCheckpoint] = {
@@ -1004,7 +841,6 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(0L)),
       slot = SlotT.unsafeApply(0L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(
         CommitteeMemberSignature(
           peerId = PeerId(Hex("aa" * 64)),

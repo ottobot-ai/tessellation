@@ -19,15 +19,16 @@ import io.circe.generic.semiauto.deriveEncoder
 /** Per-metagraph committee sortition (Algorand-style VRF-threshold).
   *
   * Each operator key independently checks whether its VRF output for the canonical message `Hasher.hash(CommitteeVrfInput("committee", eta,
-  * metagraphAddress, parentHash))` falls below the stake-weighted threshold `K_draw · σ_i`. Operators whose VRF output is below the
-  * threshold are committee members; non-committee operators ignore the metagraph snapshot.
+  * metagraphAddress, parentHash))` falls below `K_draw * sigma_i`. The live gate supplies uniform `sigma_i = 1/N`; the algebra retains a
+  * ratio parameter but current admission is not stake weighted. Operators whose VRF output is below the threshold are committee members;
+  * non-committee operators ignore the metagraph snapshot.
   *
   * '''Draw/quorum decouple.''' `K_draw` is the committee DRAW target — it sizes the elected committee (`E[|committee|] ≈ K_draw · σ · N`).
   * It is deliberately distinct from the admit-quorum the gate waits for (`MetagraphAttestationAggregator.thresholdReached`'s
-  * `requiredQuorum` / the shard `kQuorum`). Coupling the two (expected-committee == admit-quorum) made ~36% of binaries draw a committee
-  * SMALLER than the quorum they could never reach → committee-gate timeout → metagraph-admission lag. Keeping `K_draw` large (≥
-  * ~1.5·quorum, or `= N` so `K_draw · σ = 1` saturates and the committee is everyone) restores `P(|committee| ≥ quorum) ≈ 1`. This file
-  * owns ONLY the draw — the quorum lives in the aggregator / shard acceptance manager.
+  * `requiredQuorum`). Coupling the two (expected-committee == admit-quorum) made ~36% of binaries draw a committee SMALLER than the quorum
+  * they could never reach → committee-gate timeout → metagraph-admission lag. Keeping `K_draw` large (≥ ~1.5·quorum, or `= N` so `K_draw ·
+  * σ = 1` saturates and the committee is everyone) restores `P(|committee| ≥ quorum) ≈ 1`. This file owns ONLY the draw — the quorum lives
+  * in the aggregator / shard acceptance manager.
   *
   * See `docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md` for the design rationale, threat model, and Chernoff honest-majority bound. This file
   * is Slice S1 plus the S3-prep refactor to `parentHash` keying.
@@ -51,8 +52,8 @@ import io.circe.generic.semiauto.deriveEncoder
   */
 trait CommitteeSortition[F[_]] {
 
-  /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, parentHash)` given their `sigmaOperatorKey` stake
-    * share and the committee DRAW target `kDraw`.
+  /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, parentHash)` given their uniform
+    * `sigmaOperatorKey` draw weight and the committee DRAW target `kDraw`.
     *
     * Returns the VRF proof + output on success (caller signs it with their KES key and gossips it as their committee-attestation
     * contribution). Returns `None` if the operator key is not in the committee for this `(eta, metagraphAddress, parentHash)`.
@@ -140,10 +141,8 @@ object CommitteeSortition {
   }
 
   /** Committee threshold: `min(K_draw · σ, 1)`. Saturates at one — an operator whose `K_draw · σ` ≥ 1 is always in the committee (when
-    * `kDraw = N` and σ = 1/N this is `= 1` exactly, so the committee is everyone). `kDraw` is the DRAW target, decoupled from the admit
-    * quorum (see the class scaladoc's "draw/quorum decouple"). Per the design doc §3 this is fine for v1 since the sortition unit is
-    * per-operator-key (an operator with 40% total stake splits it across multiple keys to restore the sampling property at the cluster's
-    * K_draw).
+    * `kDraw = N` and uniform σ = 1/N this is `= 1` exactly, so the committee is everyone). `kDraw` is the draw target, decoupled from the
+    * admission quorum. Both live committee mechanisms currently supply identity-uniform `σ = 1/N`; this is not stake weighting.
     */
   def threshold(kDraw: Int, sigmaOperatorKey: Ratio): Ratio = {
     require(kDraw > 0, s"K_draw must be positive, got $kDraw")
@@ -159,19 +158,16 @@ object CommitteeSortition {
   // it cannot ENUMERATE the whole committee (a VRF output is not computable from the VK alone).
   //
   // The gl0 shard-checkpoint adopt path needs a different shape: `committeeFor(shardId, epoch)` must DETERMINISTICALLY
-  // ENUMERATE the committee SET on every node (it feeds the per-signer set-membership pre-check; the admit quorum in
-  // `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` is the decoupled `kQuorum`, NOT `|committee|`). Enumeration from
+  // ENUMERATE the committee SET on every node (it feeds the per-signer set-membership pre-check). The configured `kQuorum` is a separate
+  // selection-finality count and never bypasses `verifyEmbedded`. Enumeration from
   // public material only is the hard requirement (no node holds peers' VRF SKs). So the shard draw is a DETERMINISTIC
   // PSEUDO-RANDOM draw keyed on each operator's registered VRF *VK* (a public PRF), NOT a per-operator VRF evaluation:
   // `H(tag, eta, shardId, epoch, vrfVk)` interpreted as a Ratio in `[0,1)` (the SAME interpretation
   // `EligibilityChecker.vrfOutputAsRatio` uses) compared against the SAME `threshold(kDraw, σ)`. Reusing the registered VK
   // as the per-operator seed makes the draw (a) enumerable from the cluster-wide-identical VRF-VK registry + the
-  // cluster-wide-identical eta, and (b) per-operator (different VKs ⇒
-  // different draws) and per-shard (shardId is in the preimage). v1 trade-off (acceptable per design §10 — honest-testnet,
-  // slashing is the v2 backstop): the committee for a future `(shard, epoch)` is PREDICTABLE because VKs are public; the
-  // Algorand player-replaceability property is a v2 hardening. It is still UNFORGEABLE in the sense that matters for v1: a
-  // non-drawn operator cannot place itself in the set (every node computes the same set), and cannot forge a drawn operator's
-  // Ed25519/KES signatures over the checkpoint.
+  // cluster-wide-identical eta, and (b) per-operator (different VKs ⇒ different draws) and per-shard (shardId is in the preimage).
+  // Predictability is an explicit v1 property, not secret sortition. A non-drawn operator cannot place itself in the set because every node
+  // recomputes the same predicate, and it cannot forge a drawn operator's Ed25519/KES signatures.
 
   /** Domain-separation tag for the shard-committee VK-seeded draw. Distinct from [[DomainTag]] so the shard draw can never collide with the
     * per-metagraph committee VRF or the leader VRF.
@@ -194,9 +190,19 @@ object CommitteeSortition {
     implicit val encoder: Encoder[CommitteeShardVrfInput] = deriveEncoder
   }
 
-  /** Deterministic per-operator draw value for the shard committee: `Hasher.hash(CommitteeShardVrfInput(...))` interpreted as a `Ratio ∈
-    * [0,1)` via the same `BigInt(1, bytes) / 2^(8·len)` convention `EligibilityChecker.vrfOutputAsRatio` uses. Pure + deterministic in
-    * `(eta, shardId, epoch, vrfVk)`.
+  /** Interpret a SHA-256 [[Hash]] as an unsigned, big-endian value in `[0, 1)`. [[Hash.getBytes]] is deliberately not used here: it returns
+    * the UTF-8 bytes of the 64-character hex rendering, not the 32 digest bytes. Treating that text as a 512-bit integer confines draws to
+    * approximately `[0.1875, 0.4023)` and destroys the uniform threshold distribution.
+    */
+  private[nakamoto] def hashDigestAsRatio(hash: Hash): Ratio = {
+    val digestBytes = Hex(hash.value).toBytes
+    require(digestBytes.length == 32, s"SHA-256 hash must decode to 32 bytes, got ${digestBytes.length}")
+    Ratio(BigInt(1, digestBytes), BigInt(2).pow(8 * digestBytes.length))
+  }
+
+  /** Deterministic per-operator draw value for the shard committee: `Hasher.hash(CommitteeShardVrfInput(...))` decoded from its hex
+    * rendering to the actual 32-byte SHA-256 digest, then interpreted as a `Ratio ∈ [0,1)` via the unsigned `BigInt(1, digestBytes) /
+    * 2^256` convention. Pure + deterministic in `(eta, shardId, epoch, vrfVk)`.
     *
     * `eta` MUST be 32 bytes (epoch randomness), matching the per-metagraph [[message]] contract.
     */
@@ -208,14 +214,14 @@ object CommitteeSortition {
   ): F[Ratio] = {
     require(eta.length == 32, s"Eta must be 32 bytes, got ${eta.length}")
     val input = CommitteeShardVrfInput(ShardDomainTag, Hex.fromBytes(eta), shardId, epoch, Hex.fromBytes(vrfVk))
-    Hasher[F].hash(input).map(h => Ratio(BigInt(1, h.getBytes), BigInt(2).pow(8 * h.getBytes.length)))
+    Hasher[F].hash(input).map(hashDigestAsRatio)
   }
 
   /** Deterministic shard-committee membership predicate for the holder of `vrfVk`: `shardDrawValue(...) < threshold(kDraw, σ)`. Enumerated
     * over all active operators by [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.committeeFor]] to
     * materialize the committee SET — identical on every node because every input is cluster-wide-identical (registry VK + eta + HOCON kDraw
-    * + uniform σ). `kDraw · σ ≥ 1` saturates to "always a member" via [[threshold]]. `kDraw` is the DRAW target; the shard ADMIT quorum
-    * (`kQuorum`) is decoupled and lives in `ShardCheckpointGl0AcceptanceManager` / `ShardFinalityTriggers`.
+    * + uniform sigma). `kDraw * sigma >= 1` saturates to "always a member" via [[threshold]]. `kDraw` is the draw target; configured
+    * `kQuorum` is decoupled selection finality in [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardFinalityTriggers]].
     */
   def isInShardCommittee[F[_]: Sync: Hasher](
     vrfVk: Array[Byte],

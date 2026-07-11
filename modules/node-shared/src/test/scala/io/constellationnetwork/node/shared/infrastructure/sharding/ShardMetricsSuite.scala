@@ -11,8 +11,8 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, VrfRegistry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   ShardCheckpointAcceptResult,
@@ -27,8 +27,8 @@ import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
-import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -52,14 +52,15 @@ import weaver.MutableIOSuite
   */
 object ShardMetricsSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], RegisteredCheckpointSigner)
 
   override def sharedResource: Resource[IO, Res] =
     for {
       sp <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
-    } yield (h, sp, j)
+      checkpointSigner <- RegisteredCheckpointSigner.make.asResource
+    } yield (h, sp, j, checkpointSigner)
 
   // ============================================================================
   // Fixtures (cribbed from ShardCheckpointGl0AcceptanceManagerSuite; same shape)
@@ -78,18 +79,8 @@ object ShardMetricsSuite extends MutableIOSuite {
     checkpoint: ShardCheckpoint,
     kp: KeyPair,
     peerId: PeerId
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[CommitteeMemberSignature] =
-    for {
-      preimageHash <- Hasher[IO].hash(checkpoint.signingPreimage)
-      edSig <- Signing.signData[IO](preimageHash.getBytes)(kp.getPrivate)
-    } yield
-      CommitteeMemberSignature(
-        peerId = peerId,
-        vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)),
-        ed25519Sig = Hex.fromBytes(edSig),
-        kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)),
-        kesTreeStep = 0
-      )
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], checkpointSigner: RegisteredCheckpointSigner): IO[CommitteeMemberSignature] =
+    checkpointSigner.sign(checkpoint, kp, peerId)
 
   /** Dummy `CommitteeMemberSignature` used to satisfy the 3-arg `recordAttestation` signature in tests that only care about peerId-based
     * counting. The tracker stores/counts by the explicit `peerId` argument, not by the sig's internal peerId.
@@ -118,11 +109,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   private def mkDelta(mg: Address, root: Hash, binary: Signed[StateChannelSnapshotBinary]): ShardDerivedStateDelta =
     ShardDerivedStateDelta(
       perMetagraphMptRoots = SortedMap(mg -> root),
-      perMetagraphStateDiff = SortedMap.empty,
-      includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary)),
-      tokenLockBalancesDelta = SortedMap.empty,
-      perMetagraphArtifacts = SortedMap.empty,
-      perMetagraphSyncDataDelta = SortedMap.empty
+      includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary))
     )
 
   private def mkCheckpointShell(
@@ -138,7 +125,6 @@ object ShardMetricsSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = delta,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(
         CommitteeMemberSignature(
           peerId = placeholderPeerId,
@@ -153,8 +139,8 @@ object ShardMetricsSuite extends MutableIOSuite {
 
   /** Seed a linear chain of `n` checkpoints into the store. Same shape as the gl0 acceptance suite's `seedChain`. */
   private def seedChain(store: ShardChainStore[IO], n: Int): IO[List[Hash]] =
-    (0L until n.toLong).toList
-      .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash("0" * 64))) {
+    (1L to n.toLong).toList
+      .foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
         case ((acc, parent), ord) =>
           val cp = ShardCheckpoint(
             shardId = shardZero,
@@ -163,7 +149,6 @@ object ShardMetricsSuite extends MutableIOSuite {
             gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L + ord)),
             slot = SlotT.unsafeApply(100L + ord),
             derivedStateDelta = ShardDerivedStateDelta.empty,
-            emittedReceipts = List.empty,
             committeeSignatures = NonEmptyList.of(
               CommitteeMemberSignature(
                 peerId = PeerId(Hex(f"${ord.toInt + 1}%02x" * 64)),
@@ -182,7 +167,7 @@ object ShardMetricsSuite extends MutableIOSuite {
               signed,
               parentHash = parent,
               shardOrdinal = ShardOrdinal(ord),
-              slot = ord + 1L,
+              slot = 100L + ord,
               vrfOutput = Array.fill[Byte](32)(ord.toByte)
             )
             .flatMap { _ =>
@@ -196,7 +181,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   // ============================================================================
 
   test("Accepted via T_count path → checkpoint_total{path=t_count} incremented") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       pair <- CountingMetrics.makeWithState
       (stateRef, m) = pair
@@ -224,23 +209,19 @@ object ShardMetricsSuite extends MutableIOSuite {
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
-        chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kDraw = 1,
-        kQuorum = 1,
-        selfPeerId = selfPeer,
-        kesRegistry = KesRegistry.empty[IO],
-        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
-        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
-        vrfRegistry = VrfRegistry.empty[IO],
-        shardEtaFor = (_, _) => IO.pure(None),
-        reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("ff" * 32))
+        kesRegistry = checkpointSigner.kesRegistry,
+        vrfRegistry = checkpointSigner.vrfRegistry,
+        shardAssignment = ShardAssignment.make[IO](numShards = 1),
+        shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
+        reExecuteDerivation = (_, _, _, _) => IO.pure(mptRoot)
       )
 
-      _ <- mgr.evaluate(checkpoint)
+      result <- mgr.evaluate(checkpoint)
       state <- stateRef.get
     } yield
-      expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 1) &&
+      expect.same(ShardCheckpointAcceptResult.Accepted, result) &&
+        expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 1) &&
         // T_count fast path must NOT bump the committee_partition counter (that's the T_depth1 fallback signal).
         expect(state.counters.getOrElse(ShardMetrics.CommitteePartitionTotal.value, 0) == 0)
   }
@@ -250,7 +231,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   // ============================================================================
 
   test("Accepted via T_depth1 re-exec → checkpoint_total{path=t_depth1} + committee_partition_total incremented") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       pair <- CountingMetrics.makeWithState
       (stateRef, m) = pair
@@ -276,16 +257,11 @@ object ShardMetricsSuite extends MutableIOSuite {
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
-        chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kDraw = 1000,
-        kQuorum = 1000,
-        selfPeerId = selfPeer,
-        kesRegistry = KesRegistry.empty[IO],
-        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
-        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
-        vrfRegistry = VrfRegistry.empty[IO],
-        shardEtaFor = (_, _) => IO.pure(None),
+        kesRegistry = checkpointSigner.kesRegistry,
+        vrfRegistry = checkpointSigner.vrfRegistry,
+        shardAssignment = ShardAssignment.make[IO](numShards = 1),
+        shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
         reExecuteDerivation = (_, _, _, _) => IO.pure(mptRoot)
       )
 
@@ -303,7 +279,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   // ============================================================================
 
   test("pre-check reject (signer not in committee) → checkpoint_rejected_total{reason=pre_check_committee} incremented") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       pair <- CountingMetrics.makeWithState
       (stateRef, m) = pair
@@ -329,16 +305,11 @@ object ShardMetricsSuite extends MutableIOSuite {
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
-        chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set.empty[PeerId]),
-        kDraw = 1,
-        kQuorum = 1,
-        selfPeerId = selfPeer,
-        kesRegistry = KesRegistry.empty[IO],
-        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
-        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
-        vrfRegistry = VrfRegistry.empty[IO],
-        shardEtaFor = (_, _) => IO.pure(None),
+        kesRegistry = checkpointSigner.kesRegistry,
+        vrfRegistry = checkpointSigner.vrfRegistry,
+        shardAssignment = ShardAssignment.make[IO](numShards = 1),
+        shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
         reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("0" * 64))
       )
 
@@ -354,7 +325,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   // ============================================================================
 
   test("re-exec mismatch → checkpoint_rejected_total{reason=re_exec_mismatch} incremented + slash signers in result") { res =>
-    implicit val (h, sp, _) = res
+    implicit val (h, sp, _, checkpointSigner) = res
     for {
       pair <- CountingMetrics.makeWithState
       (stateRef, m) = pair
@@ -380,26 +351,27 @@ object ShardMetricsSuite extends MutableIOSuite {
 
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
         finalityTriggers = _ => IO.pure(Some(triggers)),
-        chainStore = _ => IO.pure(None),
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kDraw = 1000,
-        kQuorum = 1000,
-        selfPeerId = selfPeer,
-        kesRegistry = KesRegistry.empty[IO],
-        // Empty VRF registry + None shardEta ⇒ the committee-VRF verify falls back to the structural proof-length carve-out
-        // (these metric tests use 80-byte structural proofs), so the accept/reject paths under test are unchanged.
-        vrfRegistry = VrfRegistry.empty[IO],
-        shardEtaFor = (_, _) => IO.pure(None),
+        kesRegistry = checkpointSigner.kesRegistry,
+        vrfRegistry = checkpointSigner.vrfRegistry,
+        shardAssignment = ShardAssignment.make[IO](numShards = 1),
+        shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
         reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("ff" * 32))
       )
 
-      _ <- mgr.evaluate(checkpoint)
+      result <- mgr.evaluate(checkpoint)
       state <- stateRef.get
-    } yield
+    } yield {
+      val mismatchHasSigner = result match {
+        case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, slashSigners) => slashSigners == List(signerPeer)
+        case _                                                                        => false
+      }
+      expect(mismatchHasSigner) &&
       expect(state.counters.getOrElse(ShardMetrics.CheckpointRejectedTotal.value, 0) == 1) &&
-        // Same path also bumps committee_partition (the T_depth1 fallback fired before we discovered the mismatch).
-        expect(state.counters.getOrElse(ShardMetrics.CommitteePartitionTotal.value, 0) == 1) &&
-        expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 0)
+      // A replay mismatch is rejected before either finality path is selected.
+      expect(state.counters.getOrElse(ShardMetrics.CommitteePartitionTotal.value, 0) == 0) &&
+      expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 0)
+    }
   }
 
   // ============================================================================
@@ -433,7 +405,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   // ============================================================================
 
   test("store: advancing tip updates chain_height gauge to the new tip ord") { res =>
-    implicit val (h, _, _) = res
+    implicit val (h, _, _, _) = res
     for {
       pair <- CountingMetrics.makeWithState
       (stateRef, m) = pair
@@ -444,9 +416,9 @@ object ShardMetricsSuite extends MutableIOSuite {
       state <- stateRef.get
     } yield {
       val tag = ShardMetrics.shardIdTag(shardZero)
-      // After seeding 5 ords (0..4), the chain_height gauge tracks the highest ord stored.
+      // Checkpoints start at Root.next=1, so seeding 5 entries produces ordinals 1..5.
       val height = state.gauges.getOrElse((ShardMetrics.ChainHeight.value, tag), -1.0)
-      expect(height == 4.0)
+      expect(height == 5.0)
     }
   }
 
@@ -455,7 +427,7 @@ object ShardMetricsSuite extends MutableIOSuite {
   // ============================================================================
 
   test("finalize: updates chain_finalized_ordinal gauge to the finalized ord") { res =>
-    implicit val (h, _, _) = res
+    implicit val (h, _, _, _) = res
     for {
       pair <- CountingMetrics.makeWithState
       (stateRef, m) = pair
@@ -463,13 +435,13 @@ object ShardMetricsSuite extends MutableIOSuite {
 
       store <- ShardChainStore.make[IO](shardZero, keepDepthBehindFinalized = 100L)
       hashes <- seedChain(store, 10)
-      // Finalize the 5th hash (ord 4).
+      // Finalize the 5th hash (ord 5).
       _ <- store.`finalize`(hashes(4))
       state <- stateRef.get
     } yield {
       val tag = ShardMetrics.shardIdTag(shardZero)
       val finalized = state.gauges.getOrElse((ShardMetrics.ChainFinalizedOrdinal.value, tag), -1.0)
-      expect(finalized == 4.0)
+      expect(finalized == 5.0)
     }
   }
 }

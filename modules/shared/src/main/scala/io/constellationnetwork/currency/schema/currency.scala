@@ -237,48 +237,6 @@ object currency {
     allowSpendBlocks: Option[SortedSet[Signed[AllowSpendBlock]]],
     tokenLockBlocks: Option[SortedSet[Signed[TokenLockBlock]]],
     globalSyncView: Option[GlobalSyncView],
-    // The metagraph's OWN authoritative cumulative balance map — the EXACT `CurrencySnapshotInfo.balances` the signed
-    // `stateProof.balancesProof` is computed over (so the field and the proof are byte-consistent: hash(authoritativeBalances) ===
-    // stateProof.balancesProof is the security anchor). Under roots-only sharding gl0 cannot reproduce this map by re-deriving from its
-    // path-dependent base, so ml0 PUSHES it here; the producer puts it in the per-MG checkpoint diff and gl0 ADOPTS it after verifying it
-    // against the metagraph-signed `balancesProof` (no re-derive carry-forward for balances in the sharded path). `None` for genesis and
-    // pre-this-field snapshots (greenfield: Option, no wire back-compat — all nodes rebuild together).
-    authoritativeBalances: Option[SortedMap[Address, Balance]] = None,
-    // The metagraph's OWN authoritative active-allow-spend / active-token-lock maps — the EXACT
-    // `CurrencySnapshotInfo.activeAllowSpends` / `activeTokenLocks` the signed `stateProof.activeAllowSpends` /
-    // `stateProof.activeTokenLocks` (`activeAllowSpends.traverse(_.hash)` / `activeTokenLocks.traverse(_.hash)`) are computed over (so
-    // each field and its proof are byte-consistent — the security anchor). These are reduced by cross-shard SPEND transactions whose
-    // input is global-snapshot-sourced (empty in gl0's split-safe replay), so gl0's re-derivation RETAINS an allow-spend/token-lock the
-    // metagraph already consumed; ml0 PUSHES the authoritative (reduced) sets here, the producer puts them in the per-MG checkpoint diff,
-    // and gl0 ADOPTS them after verifying each against the metagraph-signed proof (no re-derive carry-forward for these in the sharded
-    // path). `None` for genesis and pre-this-field snapshots (greenfield: Option, no wire back-compat — all nodes rebuild together).
-    authoritativeActiveAllowSpends: Option[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] = None,
-    authoritativeActiveTokenLocks: Option[SortedMap[Address, SortedSet[Signed[TokenLock]]]] = None,
-    // The metagraph's OWN authoritative cumulative last-transaction-reference map — the EXACT `CurrencySnapshotInfo.lastTxRefs` the signed
-    // `stateProof.lastTxRefsProof` is computed over (so the field and the proof are byte-consistent — the security anchor). `lastTxRefs` is a
-    // CUMULATIVE per-source map carried across the metagraph's whole history; under roots-only sharding gl0 only sees the per-incremental
-    // `AdoptFromSignedFields` replay (the blocks in THIS signed incremental), so it cannot reproduce a ref set onto its own path-dependent
-    // carry-forward prior — once gl0 carries a stale `lastTxRefs` forward, every later per-incremental derive compounds the divergence and
-    // `lastTxRefsProof` never re-converges (the cl1 `/transactions/last-reference` freeze: derivedProof.lastTxRefsProof never equals the
-    // committed proof, so the per-field gate carries the prior forever). ml0 PUSHES the authoritative map here, the producer puts it in the
-    // per-MG checkpoint diff, and gl0 ADOPTS it after verifying it against the metagraph-signed `lastTxRefsProof` (no re-derive carry-forward
-    // for lastTxRefs in the sharded path — symmetric with `authoritativeBalances`). `None` for genesis and pre-this-field snapshots
-    // (greenfield: Option, no wire back-compat — all nodes rebuild together).
-    authoritativeLastTxRefs: Option[SortedMap[Address, TransactionReference]] = None,
-    // The metagraph's OWN authoritative cumulative last-fee-tx-ref / last-allow-spend-ref / last-token-lock-ref / last-message maps —
-    // the EXACT `CurrencySnapshotInfo.{lastFeeTxRefs, lastAllowSpendRefs, lastTokenLockRefs, lastMessages}` the signed
-    // `stateProof.{lastFeeTxRefsProof, lastAllowSpendRefsProof, lastTokenLockRefsProof, lastMessagesProof}` are hashed over (so each field
-    // and its proof are byte-consistent — the security anchor). Like `authoritativeLastTxRefs`, these are CUMULATIVE per-source / per-type
-    // maps carried across the metagraph's whole history; gl0's per-incremental `AdoptFromSignedFields` replay rebuilds them onto its OWN
-    // path-dependent carry-forward prior, so once a single ordinal's events (fee-txs / allow-spends / token-locks / messages) land outside
-    // the incremental gl0 replays, the per-field gate carries a stale prior and the proof never re-converges. ml0 PUSHES the authoritative
-    // maps here, the producer puts them in the per-MG checkpoint diff, and gl0 ADOPTS each after verifying it against the metagraph-signed
-    // proof (no re-derive carry-forward in the sharded path). Each is Option-shaped exactly like the corresponding `CurrencySnapshotInfo`
-    // field (`None` pre-migration / when empty). `None` for genesis and pre-this-field snapshots (greenfield: Option, no wire back-compat).
-    authoritativeLastFeeTxRefs: Option[SortedMap[Address, TransactionReference]] = None,
-    authoritativeLastAllowSpendRefs: Option[SortedMap[Address, AllowSpendReference]] = None,
-    authoritativeLastTokenLockRefs: Option[SortedMap[Address, TokenLockReference]] = None,
-    authoritativeLastMessages: Option[SortedMap[MessageType, Signed[CurrencyMessage]]] = None,
     version: SnapshotVersion = SnapshotVersion("0.0.1")
   ) extends IncrementalSnapshot[CurrencySnapshotStateProof]
 
@@ -305,14 +263,6 @@ object currency {
           None,
           None,
           None,
-          None, // authoritativeBalances — None for the genesis→first-incremental transition (populated by the production creator)
-          None, // authoritativeActiveAllowSpends — None for the genesis→first-incremental transition
-          None, // authoritativeActiveTokenLocks — None for the genesis→first-incremental transition
-          None, // authoritativeLastTxRefs — None for the genesis→first-incremental transition
-          None, // authoritativeLastFeeTxRefs — None for the genesis→first-incremental transition
-          None, // authoritativeLastAllowSpendRefs — None for the genesis→first-incremental transition
-          None, // authoritativeLastTokenLockRefs — None for the genesis→first-incremental transition
-          None, // authoritativeLastMessages — None for the genesis→first-incremental transition
           snapshot.version
         )
       }
@@ -351,14 +301,6 @@ object currency {
         None,
         None,
         None,
-        None, // authoritativeBalances — legacy V1 carries no authoritative balance map
-        None, // authoritativeActiveAllowSpends — legacy V1 carries no authoritative active-allow-spend map
-        None, // authoritativeActiveTokenLocks — legacy V1 carries no authoritative active-token-lock map
-        None, // authoritativeLastTxRefs — legacy V1 carries no authoritative last-tx-ref map
-        None, // authoritativeLastFeeTxRefs — legacy V1 carries no authoritative last-fee-tx-ref map
-        None, // authoritativeLastAllowSpendRefs — legacy V1 carries no authoritative last-allow-spend-ref map
-        None, // authoritativeLastTokenLockRefs — legacy V1 carries no authoritative last-token-lock-ref map
-        None, // authoritativeLastMessages — legacy V1 carries no authoritative last-message map
         version
       )
   }
@@ -425,14 +367,6 @@ object currency {
           None,
           None,
           genesis.globalSyncView,
-          None, // authoritativeBalances — genesis→first-incremental; the production creator populates it on subsequent incrementals
-          None, // authoritativeActiveAllowSpends — genesis→first-incremental; populated on subsequent incrementals
-          None, // authoritativeActiveTokenLocks — genesis→first-incremental; populated on subsequent incrementals
-          None, // authoritativeLastTxRefs — genesis→first-incremental; populated on subsequent incrementals
-          None, // authoritativeLastFeeTxRefs — genesis→first-incremental; populated on subsequent incrementals
-          None, // authoritativeLastAllowSpendRefs — genesis→first-incremental; populated on subsequent incrementals
-          None, // authoritativeLastTokenLockRefs — genesis→first-incremental; populated on subsequent incrementals
-          None, // authoritativeLastMessages — genesis→first-incremental; populated on subsequent incrementals
           genesis.version
         )
       }

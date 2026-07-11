@@ -14,6 +14,7 @@ import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo}
 import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
@@ -38,6 +39,7 @@ object ChainSyncServer {
     // #259: orphan buffer, scanned NON-DESTRUCTIVELY (`peekForValueHash`) so we can also serve a
     // binary that is buffered locally but not yet folded into a finalized snapshot.
     orphanBuffer: MetagraphOrphanBuffer[F],
+    dataDir: java.nio.file.Path,
     dispatcher: Dispatcher[F]
   )(implicit ec: ExecutionContext): pb.ChainSyncInboundGrpc.ChainSyncInbound = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ChainSyncServer")
@@ -65,50 +67,59 @@ object ChainSyncServer {
               //   1. `chainStore.get(hash)` — in-memory `byHash`, full `StoredSnapshot` (hot path).
               //   2. `snapshotStorage.get(hash)` — disk-backed by-hash file index; engaged whenever
               //      Fix B's k₁-bounded retention has evicted the in-memory entry. Disk stores only
-              //      `Signed[GlobalIncrementalSnapshot]` (no GSI context), so the disk-fallback
-              //      response carries an empty/placeholder context-encoded payload — peer-side
-              //      handler must tolerate the slim form (matches the BackfillSnapshot shape and the
-              //      legacy `serveByRange` path).
+              //      `Signed[GlobalIncrementalSnapshot]` (no GSI context), so the same payload object is sent without its optional context.
+              //      The peer recursively obtains ancestry and recreates context by ordinary transition replay; peer-carried context is
+              //      never installed as state.
               chainStore.get(hash).flatMap {
                 case Some(stored) =>
-                  val payload = {
-                    import io.circe.syntax._
-                    val snapshotJson = stored.signedSnapshot.asJson
-                    val contextJson = stored.context.asJson
-                    val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                    combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                  SnapshotKesStorage.get[F](dataDir, stored.hash).flatMap {
+                    case None =>
+                      logger.error(
+                        s"ChainSync SERVE: refusing hash ${stored.hash.value.take(12)} because its KES evidence is unavailable"
+                      )
+                    case Some(kesSignature) =>
+                      val payload = {
+                        import io.circe.syntax._
+                        val snapshotJson = stored.signedSnapshot.asJson
+                        val contextJson = stored.context.asJson
+                        val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                        combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                      }
+                      // Extract VRF proof, public key, and producer ID from the SlotCertificate.
+                      // stored.vrfOutput is the VRF OUTPUT (hash of gamma), NOT the proof.
+                      // The validator needs the actual proof bytes for verification.
+                      val cert = stored.signedSnapshot.value.slotCertificate
+                      val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
+                      val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
+                      val etaBytes = cert.map(c => Hex(c.eta.value).toBytes).getOrElse(Array.empty[Byte])
+                      val producerIdBytes = stored.signedSnapshot.proofs.head.id.hex.toBytes
+                      val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
+                      // #56.8 disposition: snapshots at ordinal ≤ finalizedOrdinal are on the canonical
+                      // chain by construction (chainStore.finalize prunes non-canonical at-or-below
+                      // finalized in the same step that advances `lastFinalizedOrdinal`). Snapshots
+                      // above are pending — `branch_id` is the snapshot's own hash (branch identity =
+                      // tip hash in the multi-branch overlay model).
+                      val isFinalized = stored.ordinal <= finalizedOrdinal
+                      val branchIdBytes =
+                        if (isFinalized) com.google.protobuf.ByteString.EMPTY
+                        else com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes)
+                      val snap = pb.Snapshot(
+                        hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
+                        slot = stored.slot,
+                        ordinal = stored.ordinal,
+                        parentHash = com.google.protobuf.ByteString.copyFrom(stored.parentHash.value.getBytes),
+                        payload = com.google.protobuf.ByteString.copyFrom(payload),
+                        vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
+                        vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
+                        eta = com.google.protobuf.ByteString.copyFrom(etaBytes),
+                        producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
+                        parentSlot = parentSlot,
+                        finalized = isFinalized,
+                        branchId = branchIdBytes,
+                        kesSignature = com.google.protobuf.ByteString.copyFrom(kesSignature)
+                      )
+                      Async[F].delay(responseObserver.onNext(snap))
                   }
-                  // Extract VRF proof, public key, and producer ID from the SlotCertificate.
-                  // stored.vrfOutput is the VRF OUTPUT (hash of gamma), NOT the proof.
-                  // The validator needs the actual proof bytes for verification.
-                  val cert = stored.signedSnapshot.value.slotCertificate
-                  val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
-                  val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
-                  val producerIdBytes = stored.signedSnapshot.proofs.head.id.hex.toBytes
-                  val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
-                  // #56.8 disposition: snapshots at ordinal ≤ finalizedOrdinal are on the canonical
-                  // chain by construction (chainStore.finalize prunes non-canonical at-or-below
-                  // finalized in the same step that advances `lastFinalizedOrdinal`). Snapshots
-                  // above are pending — `branch_id` is the snapshot's own hash (branch identity =
-                  // tip hash in the multi-branch overlay model).
-                  val isFinalized = stored.ordinal <= finalizedOrdinal
-                  val branchIdBytes =
-                    if (isFinalized) com.google.protobuf.ByteString.EMPTY
-                    else com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes)
-                  val snap = pb.Snapshot(
-                    hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
-                    slot = stored.slot,
-                    ordinal = stored.ordinal,
-                    parentHash = com.google.protobuf.ByteString.copyFrom(stored.parentHash.value.getBytes),
-                    payload = com.google.protobuf.ByteString.copyFrom(payload),
-                    vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
-                    vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
-                    producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
-                    parentSlot = parentSlot,
-                    finalized = isFinalized,
-                    branchId = branchIdBytes
-                  )
-                  Async[F].delay(responseObserver.onNext(snap))
 
                 case None =>
                   // In-memory miss — try disk-backed by-hash lookup. Path 1 Finding 2: under Fix B's
@@ -118,45 +129,58 @@ object ChainSyncServer {
                     snapshotStorage.get(hash).flatMap {
                       case Some(signedSnapshot) =>
                         signedSnapshot.toHashed[F].flatMap { hashed =>
-                          import io.circe.syntax._
-                          // Disk doesn't carry `GlobalSnapshotInfo`; peer must reconstruct or
-                          // fall back to backfill. Encode snapshot-only to stay consistent with
-                          // `serveByRange`. Peers asking by-hash for evicted snapshots typically
-                          // are doing historical / NIPoPoW queries — those don't need GSI context.
-                          val payload = signedSnapshot.asJson.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                          val cert = signedSnapshot.value.slotCertificate
-                          val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
-                          val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
-                          val producerIdBytes = signedSnapshot.proofs.head.id.hex.toBytes
-                          val slot = cert.map(_.slot.value.value).getOrElse(0L)
-                          val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
-                          val ordinal = signedSnapshot.value.ordinal.value.value
-                          // Disposition uses the same finalizedOrdinal snapshot taken at request top.
-                          // A disk-resident snapshot below `finalizedOrdinal` is canonical by the
-                          // same Fix-B invariant (only canonical entries survive eviction at-or-below
-                          // finalized).
-                          val isFinalized = ordinal <= finalizedOrdinal
-                          val branchIdBytes =
-                            if (isFinalized) com.google.protobuf.ByteString.EMPTY
-                            else com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes)
-                          val snap = pb.Snapshot(
-                            hash = com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes),
-                            slot = slot,
-                            ordinal = ordinal,
-                            parentHash = com.google.protobuf.ByteString.copyFrom(hashed.lastSnapshotHash.value.getBytes),
-                            payload = com.google.protobuf.ByteString.copyFrom(payload),
-                            vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
-                            vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
-                            producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
-                            parentSlot = parentSlot,
-                            finalized = isFinalized,
-                            branchId = branchIdBytes
-                          )
-                          logger
-                            .info(
-                              s"ChainSync SERVE: hash ${hash.value.take(12)} from disk (in-memory evicted, ordinal=$ordinal)"
-                            ) >>
-                            Async[F].delay(responseObserver.onNext(snap))
+                          SnapshotKesStorage.get[F](dataDir, hashed.hash).flatMap {
+                            case None =>
+                              logger.error(
+                                s"ChainSync SERVE: refusing disk hash ${hashed.hash.value.take(12)} because its KES evidence is unavailable"
+                              )
+                            case Some(kesSignature) =>
+                              import io.circe.syntax._
+                              // Greenfield wire shape: every ChainSync snapshot payload is an object
+                              // with a required `snapshot` member and an optional `context` member.
+                              // Disk does not retain context, so omit that member. The receiver derives
+                              // context by replay in either case.
+                              val payload = io.circe.Json
+                                .obj("snapshot" -> signedSnapshot.asJson)
+                                .noSpaces
+                                .getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                              val cert = signedSnapshot.value.slotCertificate
+                              val vrfProofBytes = cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])
+                              val vrfPkBytes = cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])
+                              val etaBytes = cert.map(c => Hex(c.eta.value).toBytes).getOrElse(Array.empty[Byte])
+                              val producerIdBytes = signedSnapshot.proofs.head.id.hex.toBytes
+                              val slot = cert.map(_.slot.value.value).getOrElse(0L)
+                              val parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
+                              val ordinal = signedSnapshot.value.ordinal.value.value
+                              // Disposition uses the same finalizedOrdinal snapshot taken at request top.
+                              // A disk-resident snapshot below `finalizedOrdinal` is canonical by the
+                              // same Fix-B invariant (only canonical entries survive eviction at-or-below
+                              // finalized).
+                              val isFinalized = ordinal <= finalizedOrdinal
+                              val branchIdBytes =
+                                if (isFinalized) com.google.protobuf.ByteString.EMPTY
+                                else com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes)
+                              val snap = pb.Snapshot(
+                                hash = com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes),
+                                slot = slot,
+                                ordinal = ordinal,
+                                parentHash = com.google.protobuf.ByteString.copyFrom(hashed.lastSnapshotHash.value.getBytes),
+                                payload = com.google.protobuf.ByteString.copyFrom(payload),
+                                vrfProof = com.google.protobuf.ByteString.copyFrom(vrfProofBytes),
+                                vrfPublicKey = com.google.protobuf.ByteString.copyFrom(vrfPkBytes),
+                                eta = com.google.protobuf.ByteString.copyFrom(etaBytes),
+                                producerId = com.google.protobuf.ByteString.copyFrom(producerIdBytes),
+                                parentSlot = parentSlot,
+                                finalized = isFinalized,
+                                branchId = branchIdBytes,
+                                kesSignature = com.google.protobuf.ByteString.copyFrom(kesSignature)
+                              )
+                              logger
+                                .info(
+                                  s"ChainSync SERVE: hash ${hash.value.take(12)} from disk (in-memory evicted, ordinal=$ordinal)"
+                                ) >>
+                                Async[F].delay(responseObserver.onNext(snap))
+                          }
                         }
 
                       case None =>

@@ -1,5 +1,13 @@
 # Nakamoto Execution-Sharding & Economic-Security — Architecture Handoff (evidence map)
 
+> **HISTORICAL PRE-FIX AUDIT EVIDENCE, NOT A DESIGN SPECIFICATION.** This packet
+> captures claims and defects at the cited 2026-07-09 tree. Subsequent changes may
+> have removed the named wire fields, state-diff adoption paths, or enforcement
+> gaps, so every finding must be rechecked against current source before use. Its
+> descriptions never override [`../../AGENTS.md`](../../AGENTS.md), ADR-0016, or
+> ADR-0017, and do not create backward-compatibility requirements in this
+> greenfield fork.
+
 **Purpose.** Give an external reviewer (Codex) a self-contained, line-anchored map of the execution-sharding + economic-security architecture so they can double-check our mental model *against the code* before we spend more cycles. Every non-trivial claim below carries a `file:line`. The canonical design decisions are **`docs/adr/0016`** (execution-sharding re-exec + cross-shard) and **`docs/adr/0017`** (committee re-execution is the primary economic-validity gate — the fix for the §4 defect); this doc is the *evidence* behind them.
 
 **Repo state.** Branch `feature/committee-state-diff`, HEAD `5557ee084` (2026-07-09). All paths are under `modules/`.
@@ -49,7 +57,7 @@ GL0 cannot hold arbitrary data-app code, so DL1 state is adopted-and-verified ag
 
 ## 3. Shard checkpoint structure ◆ AGENT
 
-`ShardCheckpoint` (`shared/.../sharding/ShardCheckpoint.scala:68-79`): `shardId`, `parentCheckpointHash`, `shardOrdinal`, `gl0AnchorOrdinal`, `slot`, **`derivedStateDelta`**, `emittedReceipts: List[CrossShardReceipt]`, `committeeSignatures: NonEmptyList[CommitteeMemberSignature]`, `epoch`, `diffBaseOrdinal`. The whole `derivedStateDelta` is inside the committee sig preimage (`:98`; `ShardDerivedStateDelta.scala:33-34`) → consensus-load-bearing.
+`ShardCheckpoint` (`shared/.../sharding/ShardCheckpoint.scala:68-79`): `shardId`, `parentCheckpointHash`, `shardOrdinal`, `gl0AnchorOrdinal`, `slot`, **`derivedStateDelta`**, `emittedReceipts: List[CrossShardReceipt]`, `committeeSignatures: NonEmptyList[CommitteeMemberSignature]`, `epoch`, `executionBaseOrdinal`. The whole `derivedStateDelta` is inside the committee sig preimage (`:98`; `ShardDerivedStateDelta.scala:33-34`) → consensus-load-bearing.
 
 `ShardDerivedStateDelta` (`ShardDerivedStateDelta.scala:87-94`): **`perMetagraphMptRoots: Map[Address,Hash]`** (the committee-attested commitment), **`perMetagraphStateDiff: Map[Address,ShardCurrencyStateDiff]`** ("the OUTPUT of the committee's re-execution", `:68`), `includedSnapshots`, `tokenLockBalancesDelta`, `perMetagraphArtifacts`, `perMetagraphSyncDataDelta`. `ShardCurrencyStateDiff` = `{upserts: Map[Hex,Hex], removals: Set[Hex]}` (`:37-40`) — the per-MG byte-diff over gl0's finalized base that every gl0 node applies and checks against `perMetagraphMptRoots`.
 
@@ -100,7 +108,7 @@ The gl0 accept path reads cross-shard values off gl0's own consensus-pinned **fi
 ## 7. Store-fidelity mirror — how gl0 carries + adopts the committee's re-executed state ◆ AGENT
 
 Three fixes make the sharded-currency-mirror byte-faithful so adopters reconstruct the committee's per-MG root:
-- **Diff-base-pin** — producer diffs against a version-retained pinned prior, never the live store: `ShardCheckpointWiring.scala:196-218` ("deliberately NO live-store fast path"), diff-base = signed store's latest `:234-235`, producer reads pinned prior `:328-335` (fail-closed if unresolvable).
+- **Diff-base-pin** — producer diffs against a version-retained pinned prior, never the live store: `ShardCheckpointWiring.scala:196-218` ("deliberately NO live-store fast path"), execution-base = signed store's latest `:234-235`, producer reads pinned prior `:328-335` (fail-closed if unresolvable).
 - **Stage-on-adopt** — adopted root-verified bytes staged into the signed byte store (closes fail-close "holes"): `SnapshotLeaderLoop.scala:189` (`stageAdoptedPostBytes`), finalize-sink promote `:717-733` (`case None => unit` = the "Absent ⇒ skip"), 3 adopt sites `NakamotoSyncDaemon.scala:2249,3515,3675`.
 - **Read-time backfill** — on a pinned-read miss, fetch peer bytes, **strip to `consensusRootEntries`**, verify `sidecarFreeMptRoot === committed stateProof.mptRoot`, persist+serve only on match else fail-closed: `PinnedCurrencyInfoReader.scala:360,369,370-371,374-377,381,386`. Wired gl0-only: `GlobalSnapshotConsensus.scala:577-595,706`.
 

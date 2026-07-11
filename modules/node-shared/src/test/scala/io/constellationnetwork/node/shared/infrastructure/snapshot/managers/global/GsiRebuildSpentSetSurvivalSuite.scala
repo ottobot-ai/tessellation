@@ -30,13 +30,12 @@ import io.constellationnetwork.security.signature.Signed
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
-/** FINDING-S01 regression — the GSI-rebuild paths silently WIPE the MPT-native consensus partitions.
+/** FINDING-S01 regression — local GSI reconstruction must not wipe MPT-native consensus partitions.
   *
   * `ConsumedAllowSpends` (fieldId 33, the cross-shard single-use spent-set / nullifier) and `Slashings` (fieldId 34) are IN the signed
   * consensus root (`GlobalStateKey.consensusRootEntries` keeps them; `GlobalSnapshotInfo.sidecarFreeMptRoot` folds them), but
-  * `GlobalSnapshotInfo` has NO case-class field for either partition. So every `syncFromGlobalSnapshotInfo` rebuild (reorg self-heal
-  * `NakamotoSyncDaemon.storeForkBranch`, reward-realign, gossip catch-up fallback, dag-l0 `Main` cold-restart / peer-join, `Download`)
-  * clears the store and repopulates ONLY the GSI-native partitions — dropping 33/34:
+  * `GlobalSnapshotInfo` has NO case-class field for either partition. A local `syncFromGlobalSnapshotInfo` reconstruction that clears the
+  * store and repopulates only GSI-native partitions would therefore drop 33/34:
   *
   *   1. the spent-set marker written at a FINALIZED ordinal vanishes ⇒ the SAME cross-shard allow-spend passes the W3d absence check again
   *      (a flag-independent cross-shard DOUBLE-SPEND), and
@@ -46,8 +45,9 @@ import weaver.MutableIOSuite
   * Scope is `numShards > 1` (both partitions are structurally empty at `numShards = 1`, which the identity test pins).
   *
   * The fix under test: `syncFromGlobalSnapshotInfo` PRESERVES the `GlobalStateFieldId.mptNativeConsensusFields` entries verbatim across the
-  * rebuild, and the root-verified adopt variant (`syncFromGlobalSnapshotInfoVerified`) reconciles {with-preserve, without-preserve} against
-  * the SIGNED `mptRoot` BEFORE writing, failing CLOSED (no write, `false`) when neither candidate reproduces the signed root.
+  * rebuild, and the root-verified local-recovery variant (`syncFromGlobalSnapshotInfoVerified`) reconciles {with-preserve,
+  * without-preserve} against this node's persisted SIGNED `mptRoot` BEFORE writing, failing CLOSED (no write, `false`) when neither
+  * candidate reproduces it. This byte/root check is not authority for peer state; network recovery still requires global replay.
   */
 object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
 
@@ -181,7 +181,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
     } yield signedRoot
 
   // ───────────────────────────────────────────────────────────────────────────
-  // Test 1 — THE S01 regression (RED until the preservation fix lands)
+  // Test 1 — the S01 preservation regression
   // ───────────────────────────────────────────────────────────────────────────
 
   test(
@@ -193,8 +193,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       signedRoot <- consumeAndFinalize(f)
       spentBefore <- f.mgr.materializeConsumedAllowSpendsFromMpt
 
-      // ===== THE S01 EVENT: any GSI-rebuild self-heal (reorg storeForkBranch:2144 / cold restart Main:430 / catch-up :3499)
-      // rebuilds the base from the carried GlobalSnapshotInfo — which structurally has NO field for partitions 33/34.
+      // ===== THE S01 EVENT: a local GSI reconstruction rebuilds from GlobalSnapshotInfo, which structurally has no field for 33/34.
       _ <- f.store.syncFromGlobalSnapshotInfo(f.gsi, ord2)
 
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
@@ -211,21 +210,20 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       expect.all(
         // sanity: the first consume settled and was committed at the finalized ordinal
         spentBefore.contains(f.asHash),
-        // (1) the spent-set marker SURVIVES the rebuild — RED today: the rebuild wipes fieldId 33
+        // (1) the spent-set marker survives the rebuild
         spentAfter.contains(f.asHash),
-        // (2) the Slashings (fieldId 34) entry SURVIVES the rebuild — RED today
+        // (2) the Slashings (fieldId 34) entry survives the rebuild
         entriesAfter.contains(f.slashingsHex),
-        // (3) the rebuilt sidecar-free root still equals the SIGNED consensus root — RED today (self-fork on next stateProof compare)
+        // (3) the rebuilt sidecar-free root still equals the locally persisted signed consensus root
         rebuiltRoot === signedRoot,
-        // (4) the replay of the SAME allow-spend is REJECTED — RED today: with the spent-set wiped the absence check passes
-        //     and the double-spend is (wrongly) accepted
+        // (4) replay of the same allow-spend is rejected because the spent-set survived
         replay.newMarkers.isEmpty,
         replay.rejected.contains(f.asHash)
       )
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // Test 2 — numShards=1 byte-identity (GREEN before AND after the fix)
+  // Test 2 — numShards=1 byte identity
   // ───────────────────────────────────────────────────────────────────────────
 
   test("numShards=1 identity: with EMPTY 33/34 partitions the rebuild reproduces the exact same root (preservation is a no-op)") { res =>
@@ -244,21 +242,21 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
   }
 
   // ───────────────────────────────────────────────────────────────────────────
-  // Tests 3-6 — the ROOT-VERIFIED adopt variant (syncFromGlobalSnapshotInfoVerified)
+  // Tests 3-6 — ROOT-VERIFIED local reconstruction (syncFromGlobalSnapshotInfoVerified)
   // ───────────────────────────────────────────────────────────────────────────
 
-  test("verified adopt: WITH-preserve reconcile — signed root carries 33/34 ⇒ adopt=true, markers survive, root == signed") { res =>
+  test("verified local rebuild: WITH-preserve reconcile — signed root carries 33/34, markers survive, root == signed") { res =>
     implicit val (h, sp, js) = res
     for {
       f <- mkFixture
       signedRoot <- consumeAndFinalize(f)
-      adopted <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, signedRoot.some)
+      rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, signedRoot.some)
       entriesAfter <- f.store.allEntriesAsBytes
       rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
-        adopted,
+        rebuilt,
         spentAfter.contains(f.asHash),
         entriesAfter.contains(f.slashingsHex),
         rootAfter === signedRoot
@@ -266,44 +264,44 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
   }
 
   test(
-    "verified adopt: WITHOUT-preserve reconcile — target root has EMPTY 33/34 while OUR store holds stale markers ⇒ adopt=true, stale markers dropped, root == target"
+    "verified local rebuild: WITHOUT-preserve reconcile — persisted target root has EMPTY 33/34, stale local markers drop, root == target"
   ) { res =>
     implicit val (h, sp, js) = res
     for {
       f <- mkFixture
-      // The target chain never consumed anything: its signed root is the GSI-only root (fresh store seeded from the same GSI).
+      // The persisted local target never contained a consume: its signed root is the GSI-only root.
       freshProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       freshStore <- MptStore.make[IO, GlobalStateKey](freshProducer, GlobalStateKey.toHex[IO])
       _ <- freshStore.syncFromGlobalSnapshotInfo(f.gsi, ord2)
       targetRoot <- freshStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
-      // OUR store DID consume (stale local markers that must NOT be carried into the adopted state).
+      // The current store did consume (stale local markers that must not survive reconstruction to the persisted target).
       _ <- consumeAndFinalize(f)
-      adopted <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, targetRoot.some)
+      rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, targetRoot.some)
       entriesAfter <- f.store.allEntriesAsBytes
       rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
-        adopted,
+        rebuilt,
         spentAfter.isEmpty,
         !entriesAfter.contains(f.slashingsHex),
         rootAfter === targetRoot
       )
   }
 
-  test("verified adopt: FAIL-CLOSED — neither candidate reproduces the signed root ⇒ adopt=false and the store is UNTOUCHED") { res =>
+  test("verified local rebuild: FAIL-CLOSED — neither candidate reproduces the signed root, so the store is UNTOUCHED") { res =>
     implicit val (h, sp, js) = res
     for {
       f <- mkFixture
       signedRoot <- consumeAndFinalize(f)
       bogus = Hash("ff".padTo(64, 'f').take(64))
-      adopted <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, bogus.some)
+      rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, bogus.some)
       entriesAfter <- f.store.allEntriesAsBytes
       rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
-        !adopted,
+        !rebuilt,
         // nothing was written: the pre-rebuild state (markers included) is intact
         spentAfter.contains(f.asHash),
         entriesAfter.contains(f.slashingsHex),
@@ -311,16 +309,16 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       )
   }
 
-  test("verified adopt: signedMptRoot=None (pre-MPT legacy snapshot) ⇒ adopt=false, store untouched") { res =>
+  test("verified local rebuild: signedMptRoot=None (pre-MPT legacy snapshot) fails closed with store untouched") { res =>
     implicit val (h, sp, js) = res
     for {
       f <- mkFixture
       signedRoot <- consumeAndFinalize(f)
-      adopted <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, none[Hash])
+      rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, none[Hash])
       rootAfter <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
     } yield
       expect.all(
-        !adopted,
+        !rebuilt,
         rootAfter === signedRoot
       )
   }

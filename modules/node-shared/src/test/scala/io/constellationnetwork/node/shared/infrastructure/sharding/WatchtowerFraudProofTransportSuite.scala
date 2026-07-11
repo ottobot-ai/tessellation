@@ -39,11 +39,11 @@ import weaver.MutableIOSuite
 
 /** FINDING-F2 (EPIC-9-NET M4) — the JVM legs of the watchtower fraud-proof transport, end to end:
   *
-  * {{{ emit (re-exec mismatch) → sign → publish (wire) → [sidecar gossip, covered by the Go suite] → fromWire → verdict → pool }}}
+  * {{{emit (re-exec mismatch) → sign → publish (wire) → [sidecar gossip, covered by the Go suite] → fromWire → verdict → pool}}}
   *
   *   - '''emit → publish''': a watchtower mismatch produces exactly one signed `FraudProofEnvelopeWire` on the sidecar client. Pre-fix the
-  *     RPC died in the sidecar (UNIMPLEMENTED — no Go handler/topic/relay existed) and the emitter warn-swallowed after ONE attempt, so
-  *     the evidence never left the node.
+  *     RPC died in the sidecar (UNIMPLEMENTED — no Go handler/topic/relay existed) and the emitter warn-swallowed after ONE attempt, so the
+  *     evidence never left the node.
   *   - '''retry-or-outbox''': a transiently-failing publish (sidecar restarting) is retried
   *     (`nakamoto.invalidity-slashing.fraud-proof-publish-*`); total failure is still swallowed after the configured attempts — the
   *     adopt/receive path must never crash on watchtower trouble.
@@ -52,11 +52,11 @@ import weaver.MutableIOSuite
   *     [[InvalidStateProofValidator]] upholds (including verifying the emitter's REAL Ed25519 challenger signature), and the upheld
   *     evidence is admitted into the [[WatchtowerFraudProofPool]] the gl0 leader embeds from.
   *
-  * The Go-side transport hop (topic join, relay, Subscribe arm, outbox durability) is pinned by
-  * `p2p/internal/grpcserver/server_test.go` + `p2p/internal/gossip/gossip_fraud_test.go`; the daemon's dispatch arm exists at
-  * `NakamotoSyncDaemon` `case pb.GossipMessage.Body.FraudProof`. NOT covered here: the daemon's chain-store lookup of the disputed
-  * checkpoint (needs full `AcceptanceDeps`), and the downstream slash CONSEQUENCE (committee exclusion — FINDING-002, a separate task; the
-  * boundary is the pool → leader-embedded `fraudProofs` artifact → GSAM re-validate + `applySlash`).
+  * The Go-side transport hop (topic join, relay, Subscribe arm, outbox durability) is pinned by `p2p/internal/grpcserver/server_test.go` +
+  * `p2p/internal/gossip/gossip_fraud_test.go`; the daemon's dispatch arm exists at `NakamotoSyncDaemon` `case
+  * pb.GossipMessage.Body.FraudProof`. NOT covered here: the daemon's chain-store lookup of the disputed checkpoint (needs full
+  * `AcceptanceDeps`), and the downstream slash CONSEQUENCE (committee exclusion — FINDING-002, a separate task; the boundary is the pool →
+  * leader-embedded `fraudProofs` artifact → GSAM re-validate + `applySlash`).
   */
 object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
 
@@ -95,7 +95,6 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L)),
       slot = Slot.unsafeApply(1L),
       derivedStateDelta = delta,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(committeeSig(1)),
       epoch = EtaPeriod(0L)
     )
@@ -107,6 +106,8 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
       def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
         IO.raiseError(new UnsupportedOperationException("not under test"))
       def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
+        IO.raiseError(new UnsupportedOperationException("not under test"))
+      def verifyCommitteeSignature(checkpoint: ShardCheckpoint, signature: CommitteeMemberSignature): IO[Either[String, Unit]] =
         IO.raiseError(new UnsupportedOperationException("not under test"))
       def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] = IO.pure(mismatches)
       def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit

@@ -93,9 +93,21 @@ object GlobalStateKeyCodecSuite extends FunSuite {
   }
 
   test("GlobalStateFieldId round-trips for every registered id") {
-    val ids = (0 to 18).flatMap(GlobalStateFieldId.fromInt)
-    val decoded = ids.map(_.immutableBytes.fromImmutableBytes[GlobalStateFieldId])
-    expect(decoded == ids.map(Right(_)))
+    val expectedInts = (0 to 23) ++ (25 to 34)
+    val ids = expectedInts.map(GlobalStateFieldId.fromInt)
+    val decoded = ids.flatten.map(_.immutableBytes.fromImmutableBytes[GlobalStateFieldId])
+    expect.all(
+      ids.forall(_.nonEmpty),
+      decoded == ids.flatten.map(Right(_))
+    )
+  }
+
+  test("retired field 24 fails decode while later field IDs remain registered") {
+    val retired = ByteVector.fromByte(24.toByte).fromImmutableBytes[GlobalStateFieldId]
+    expect.all(
+      retired.isLeft,
+      (25 to 34).forall(GlobalStateFieldId.fromInt(_).nonEmpty)
+    )
   }
 
   test("Unregistered GlobalStateFieldId byte fails decode") {

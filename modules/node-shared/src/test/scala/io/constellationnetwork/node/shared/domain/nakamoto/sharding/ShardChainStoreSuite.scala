@@ -95,16 +95,16 @@ object ShardChainStoreSuite extends MutableIOSuite {
     ord: Long,
     parent: Hash,
     peerByte: Int,
-    gl0Anchor: Long
+    gl0Anchor: Long,
+    slot: Long
   ): ShardCheckpoint =
     ShardCheckpoint(
       shardId = shardZero,
       parentCheckpointHash = parent,
       shardOrdinal = ShardOrdinal(ord),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(gl0Anchor)),
-      slot = SlotT.unsafeApply(gl0Anchor),
+      slot = SlotT.unsafeApply(slot),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      emittedReceipts = List.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(peerByte)),
       epoch = EtaPeriod(0L)
     )
@@ -114,9 +114,10 @@ object ShardChainStoreSuite extends MutableIOSuite {
     ord: Long,
     parent: Hash,
     peerByte: Int = 1,
-    gl0Anchor: Long = 100L
+    gl0Anchor: Long = 100L,
+    slotOverride: Option[Long] = None
   ): Signed[ShardCheckpoint] =
-    mkSigned(mkCheckpoint(ord, parent, peerByte, gl0Anchor))
+    mkSigned(mkCheckpoint(ord, parent, peerByte, gl0Anchor, slotOverride.getOrElse(ord)))
 
   /** Build deterministic VRF output bytes from an int seed. Used for fork tiebreaks. */
   private def vrf(seed: Int): Array[Byte] = Array.fill[Byte](32)(seed.toByte)
@@ -144,7 +145,7 @@ object ShardChainStoreSuite extends MutableIOSuite {
     included: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
   ): Signed[ShardCheckpoint] =
     mkSigned(
-      mkCheckpoint(ord, parent, peerByte, gl0Anchor = 100L)
+      mkCheckpoint(ord, parent, peerByte, gl0Anchor = 100L, slot = ord)
         .copy(derivedStateDelta = ShardDerivedStateDelta.empty.copy(includedSnapshots = included))
     )
 
@@ -156,24 +157,24 @@ object ShardChainStoreSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
-      // a: genesis-like (parent = Hash.empty), shardOrdinal = 0
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      storedA <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      // a: first checkpoint after the synthetic root (parent = Hash.empty), shardOrdinal = 1
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      storedA <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       tipAfterA <- store.bestTip
       hashA = tipAfterA.get.hash
-      // b: child of a, shardOrdinal = 1, later slot
-      signedB = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 2)
-      storedB <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrf(2))
+      // b: child of a, shardOrdinal = 2, later slot
+      signedB = mkSignedCheckpoint(ord = 2L, parent = hashA, peerByte = 2)
+      storedB <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 2L, vrfOutput = vrf(2))
       tipAfterB <- store.bestTip
       walkB <- store.walkBackTo(tipAfterB.get.hash, depth = 2L)
     } yield
       expect.all(
         storedA,
         storedB,
-        tipAfterB.exists(_.signed.value.shardOrdinal == ShardOrdinal(1L)),
+        tipAfterB.exists(_.signed.value.shardOrdinal == ShardOrdinal(2L)),
         walkB.size == 2,
-        walkB.head.signed.value.shardOrdinal == ShardOrdinal(1L),
-        walkB(1).signed.value.shardOrdinal == ShardOrdinal(0L),
+        walkB.head.signed.value.shardOrdinal == ShardOrdinal(2L),
+        walkB(1).signed.value.shardOrdinal == ShardOrdinal(1L),
         walkB.head.hash =!= walkB(1).hash
       )
   }
@@ -198,15 +199,15 @@ object ShardChainStoreSuite extends MutableIOSuite {
       x2h <- SignedOps(x2).toHashed[IO].map(_.hash)
       y1 = mkBinary("Y", 0, Hash.empty)
       y1h <- SignedOps(y1).toHashed[IO].map(_.hash)
-      // A (ord 0): includes BOTH MGs.
+      // A (ord 1): includes BOTH MGs.
       aIncl = SortedMap(mgX -> NonEmptyList.of(x1), mgY -> NonEmptyList.of(y1))(Address.OrderingInstance)
-      signedA = mkSignedCheckpointIncl(0L, Hash.empty, peerByte = 1, included = aIncl)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpointIncl(1L, Hash.empty, peerByte = 1, included = aIncl)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       hashA <- store.bestTip.map(_.get.hash)
-      // B (ord 1, child of A): includes ONLY mgX, OMITS mgY — the partial bestTip that reverts perMgTip(mgY).
+      // B (ord 2, child of A): includes ONLY mgX, OMITS mgY — the partial bestTip that reverts perMgTip(mgY).
       bIncl = SortedMap(mgX -> NonEmptyList.of(x2))(Address.OrderingInstance)
-      signedB = mkSignedCheckpointIncl(1L, hashA, peerByte = 2, included = bIncl)
-      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrf(2))
+      signedB = mkSignedCheckpointIncl(2L, hashA, peerByte = 2, included = bIncl)
+      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 2L, vrfOutput = vrf(2))
       perMg <- store.perMgTip
       frontier <- store.lastCheckpointedPerMgTip
     } yield
@@ -229,22 +230,22 @@ object ShardChainStoreSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       hashA <- store.bestTip.map(_.get.hash)
-      // b and c both children of a, SAME shardOrdinal=1 and SAME slot. We vary `gl0Anchor` so the canonical preimages differ (peerByte
+      // b and c both children of a, SAME shardOrdinal=2 and SAME slot. We vary `gl0Anchor` so the canonical preimages differ (peerByte
       // varies committeeSignatures, but that field is EXCLUDED from the signing preimage, so two checkpoints with identical preimage
       // fields hash identically — `gl0AnchorOrdinal` IS part of the preimage so varying it gives distinct hashes).
       //
       // The fork tiebreak: maxvalid-tk → equal ordinal → equal slot → lower VRF output wins. We make c's VRF the lower one, so c MUST be
       // picked.
-      signedB = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 2, gl0Anchor = 101L)
-      signedC = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 3, gl0Anchor = 102L)
+      signedB = mkSignedCheckpoint(ord = 2L, parent = hashA, peerByte = 2, gl0Anchor = 101L)
+      signedC = mkSignedCheckpoint(ord = 2L, parent = hashA, peerByte = 3, gl0Anchor = 102L)
       vrfB = vrf(0xff) // larger BigInt
       vrfC = vrf(0x10) // smaller BigInt
-      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrfB)
+      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 2L, vrfOutput = vrfB)
       // c arrives second
-      _ <- store.store(signedC, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrfC)
+      _ <- store.store(signedC, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 2L, vrfOutput = vrfC)
       tipFinal <- store.bestTip
       sizeAfter <- store.size
     } yield
@@ -266,12 +267,12 @@ object ShardChainStoreSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      stored1 <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      stored1 <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       size1 <- store.size
       tip1 <- store.bestTip.map(_.get.hash)
       // Re-store the same envelope — bytes-identical, so canonical hash collides; store must return false.
-      stored2 <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      stored2 <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       size2 <- store.size
       tip2 <- store.bestTip.map(_.get.hash)
     } yield
@@ -290,16 +291,16 @@ object ShardChainStoreSuite extends MutableIOSuite {
 
   test("finalize: advances lastFinalizedOrdinal; checkpoints past the retention boundary are evicted") { hasher =>
     implicit val h: Hasher[IO] = hasher
-    // keepDepth=3 ⇒ at finalize(ord=5), keepFloor=2. Ords 0..1 evicted; ords 2..5 retained.
+    // keepDepth=3 ⇒ at finalize(ord=6), keepFloor=3. Ords 1..2 evicted; ords 3..6 retained.
     val keepDepth = 3L
     for {
       store <- ShardChainStore.make[IO](shardZero, keepDepthBehindFinalized = keepDepth)
-      // Seed a chain of 6 chained checkpoints (ords 0..5).
-      hashesIO = (0L until 6L).toList.foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
+      // Seed a chain of 6 chained checkpoints (ords 1..6).
+      hashesIO = (1L to 6L).toList.foldLeftM[IO, (List[Hash], Hash)]((List.empty, Hash.empty)) {
         case ((acc, parent), ord) =>
           val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = ord.toInt + 1)
           store
-            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1, vrfOutput = vrf(ord.toInt + 1))
+            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord, vrfOutput = vrf(ord.toInt + 1))
             .flatMap { _ =>
               store.bestTip.map(_.get.hash).map(h => (acc :+ h, h))
             }
@@ -308,24 +309,24 @@ object ShardChainStoreSuite extends MutableIOSuite {
       (hashes, _) = hashesPair
       preFinalized <- store.lastFinalizedOrdinal
       preSize <- store.size
-      // Finalize at ord=5 ⇒ keepFloor = max(0, 5-3) = 2. Ords 0,1 evicted; ords 2,3,4,5 retained (4 entries).
+      // Finalize at ord=6 ⇒ keepFloor = max(0, 6-3) = 3. Ords 1,2 evicted; ords 3,4,5,6 retained (4 entries).
       _ <- store.`finalize`(hashes(5))
       postFinalized <- store.lastFinalizedOrdinal
       postSize <- store.size
-      ord5Present <- store.getByHash(hashes(5)).map(_.isDefined)
-      ord2Present <- store.getByHash(hashes(2)).map(_.isDefined)
-      ord1Absent <- store.getByHash(hashes(1)).map(_.isEmpty)
-      ord0Absent <- store.getByHash(hashes(0)).map(_.isEmpty)
+      ord6Present <- store.getByHash(hashes(5)).map(_.isDefined)
+      ord3Present <- store.getByHash(hashes(2)).map(_.isDefined)
+      ord2Absent <- store.getByHash(hashes(1)).map(_.isEmpty)
+      ord1Absent <- store.getByHash(hashes(0)).map(_.isEmpty)
     } yield
       expect.all(
-        preFinalized == ShardOrdinal.Genesis,
+        preFinalized == ShardOrdinal.Root,
         preSize == 6,
-        postFinalized == ShardOrdinal(5L),
+        postFinalized == ShardOrdinal(6L),
         postSize == 4,
-        ord5Present,
-        ord2Present,
-        ord1Absent,
-        ord0Absent
+        ord6Present,
+        ord3Present,
+        ord2Absent,
+        ord1Absent
       )
   }
 
@@ -337,12 +338,12 @@ object ShardChainStoreSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       tip <- store.bestTip
       hashA = tip.get.hash
       byHashOut <- store.getByHash(hashA)
-      byOrdinalOut <- store.getByOrdinal(ShardOrdinal(0L))
+      byOrdinalOut <- store.getByOrdinal(ShardOrdinal(1L))
       missByHash <- store.getByHash(Hash.empty)
       missByOrdinal <- store.getByOrdinal(ShardOrdinal(99L)) // requested future
     } yield
@@ -351,7 +352,7 @@ object ShardChainStoreSuite extends MutableIOSuite {
         byHashOut.exists(_.hash === hashA),
         byOrdinalOut.isDefined,
         byOrdinalOut.exists(_.hash === hashA),
-        byOrdinalOut.exists(_.signed.value.shardOrdinal == ShardOrdinal(0L)),
+        byOrdinalOut.exists(_.signed.value.shardOrdinal == ShardOrdinal(1L)),
         missByHash.isEmpty,
         missByOrdinal.isEmpty
       )
@@ -366,20 +367,20 @@ object ShardChainStoreSuite extends MutableIOSuite {
     for {
       store <- ShardChainStore.make[IO](shardZero)
       // a: shared root
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       hashA <- store.bestTip.map(_.get.hash)
-      // b: child of a at ord=1, slot=10 (higher slot → loses on slot tiebreak when c comes in at same ord and lower slot). Vary
+      // b: child of a at ord=2, slot=10 (higher slot → loses on slot tiebreak when c comes in at same ord and lower slot). Vary
       // `gl0Anchor` to produce a distinct canonical preimage hash from c — peerByte alone doesn't change the hash because
       // committeeSignatures are EXCLUDED from the signing preimage.
-      signedB = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 2, gl0Anchor = 101L)
-      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 10L, vrfOutput = vrf(2))
+      signedB = mkSignedCheckpoint(ord = 2L, parent = hashA, peerByte = 2, gl0Anchor = 101L, slotOverride = Some(10L))
+      _ <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 10L, vrfOutput = vrf(2))
       tipBeforeReorg <- store.bestTip
       hashB = tipBeforeReorg.get.hash
       walkBeforeReorg <- store.walkBackTo(hashB, depth = 2L)
-      // c: alternate child of a at ord=1, slot=2 (LOWER slot → wins maxvalid-tk slot tiebreak). Distinct gl0Anchor ⇒ distinct hash.
-      signedC = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 3, gl0Anchor = 102L)
-      _ <- store.store(signedC, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrf(3))
+      // c: alternate child of a at ord=2, slot=2 (LOWER slot → wins maxvalid-tk slot tiebreak). Distinct gl0Anchor ⇒ distinct hash.
+      signedC = mkSignedCheckpoint(ord = 2L, parent = hashA, peerByte = 3, gl0Anchor = 102L, slotOverride = Some(2L))
+      _ <- store.store(signedC, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 2L, vrfOutput = vrf(3))
       tipAfterReorg <- store.bestTip
       hashC = tipAfterReorg.get.hash
       walkAfterReorg <- store.walkBackTo(hashC, depth = 2L)
@@ -414,11 +415,11 @@ object ShardChainStoreSuite extends MutableIOSuite {
     for {
       store <- ShardChainStore.make[IO](shardZero, keepDepthBehindFinalized = keepDepth)
       // Seed and finalize each ord one at a time — simulates production Phase 1→2 transitions.
-      _ <- (0L until totalOrds).toList.foldLeftM[IO, Hash](Hash.empty) {
+      _ <- (1L to totalOrds).toList.foldLeftM[IO, Hash](Hash.empty) {
         case (parent, ord) =>
           val signed = mkSignedCheckpoint(ord, parent = parent, peerByte = (ord.toInt % 200) + 1)
           store
-            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord + 1, vrfOutput = vrf(ord.toInt + 1)) >>
+            .store(signed, parentHash = parent, shardOrdinal = ShardOrdinal(ord), slot = ord, vrfOutput = vrf(ord.toInt + 1)) >>
             store.bestTip.map(_.get.hash).flatTap(h => store.`finalize`(h))
       }
       finalSize <- store.size
@@ -427,7 +428,7 @@ object ShardChainStoreSuite extends MutableIOSuite {
       expect.all(
         // After 20 finalizes at keepDepth=4, in-memory map holds at most keepDepth+1 = 5 entries (keepFloor..tip inclusive).
         finalSize <= (keepDepth + 1L).toInt,
-        finalFinalized == ShardOrdinal(totalOrds - 1L)
+        finalFinalized == ShardOrdinal(totalOrds)
       )
   }
 
@@ -439,15 +440,15 @@ object ShardChainStoreSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero, keepDepthBehindFinalized = 8L)
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       tip <- store.bestTip
       hashA = tip.get.hash
       _ <- store.`finalize`(hashA)
       finalized1 <- store.lastFinalizedOrdinal
       _ <- store.`finalize`(hashA) // second call should be no-op
       finalized2 <- store.lastFinalizedOrdinal
-    } yield expect.all(finalized1 == ShardOrdinal(0L), finalized2 == ShardOrdinal(0L))
+    } yield expect.all(finalized1 == ShardOrdinal(1L), finalized2 == ShardOrdinal(1L))
   }
 
   test("shardId is set at construction and exposed through the accessor") { hasher =>
@@ -457,7 +458,7 @@ object ShardChainStoreSuite extends MutableIOSuite {
     } yield expect(store.shardId == ShardId.unsafeApply(5))
   }
 
-  test("empty store: bestTip = None, size = 0, lastFinalizedOrdinal = Genesis") { hasher =>
+  test("empty store: bestTip = None, size = 0, lastFinalizedOrdinal = Root") { hasher =>
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
@@ -465,15 +466,32 @@ object ShardChainStoreSuite extends MutableIOSuite {
       sz <- store.size
       fo <- store.lastFinalizedOrdinal
       missByOrd <- store.getByOrdinal(ShardOrdinal(0L))
-    } yield expect.all(tip.isEmpty, sz == 0, fo == ShardOrdinal.Genesis, missByOrd.isEmpty)
+    } yield expect.all(tip.isEmpty, sz == 0, fo == ShardOrdinal.Root, missByOrd.isEmpty)
+  }
+
+  test("synthetic Root ordinal is not a checkpoint: parent=empty must start at Root.next") { hasher =>
+    implicit val h: Hasher[IO] = hasher
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      invalidRoot = mkSignedCheckpoint(ord = ShardOrdinal.Root.value, parent = Hash.empty)
+      stored <- store.store(
+        invalidRoot,
+        parentHash = Hash.empty,
+        shardOrdinal = ShardOrdinal.Root,
+        slot = ShardOrdinal.Root.value,
+        vrfOutput = vrf(1)
+      )
+      tip <- store.bestTip
+      size <- store.size
+    } yield expect.all(!stored, tip.isEmpty, size == 0)
   }
 
   test("walkBackTo with depth=0 returns empty list") { hasher =>
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       hashA <- store.bestTip.map(_.get.hash)
       walk <- store.walkBackTo(hashA, depth = 0L)
     } yield expect(walk.isEmpty)
@@ -504,18 +522,18 @@ object ShardChainStoreSuite extends MutableIOSuite {
     implicit val h: Hasher[IO] = hasher
     for {
       store <- ShardChainStore.make[IO](shardZero)
-      signedA = mkSignedCheckpoint(ord = 0L, parent = Hash.empty)
-      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(0L), slot = 1L, vrfOutput = vrf(1))
+      signedA = mkSignedCheckpoint(ord = 1L, parent = Hash.empty)
+      _ <- store.store(signedA, parentHash = Hash.empty, shardOrdinal = ShardOrdinal(1L), slot = 1L, vrfOutput = vrf(1))
       hashA <- store.bestTip.map(_.get.hash)
-      signedB = mkSignedCheckpoint(ord = 1L, parent = hashA, peerByte = 2)
+      signedB = mkSignedCheckpoint(ord = 2L, parent = hashA, peerByte = 2)
       hashB <- h.hash(signedB.value.signingPreimage)
-      signedC = mkSignedCheckpoint(ord = 2L, parent = hashB, peerByte = 3)
+      signedC = mkSignedCheckpoint(ord = 3L, parent = hashB, peerByte = 3)
       // C gossips in FIRST (its parent B is unknown). It must be stored but must NOT become a floating tip.
-      storedC <- store.store(signedC, parentHash = hashB, shardOrdinal = ShardOrdinal(2L), slot = 3L, vrfOutput = vrf(3))
+      storedC <- store.store(signedC, parentHash = hashB, shardOrdinal = ShardOrdinal(3L), slot = 3L, vrfOutput = vrf(3))
       tipAfterC <- store.bestTip
       orphanHeld = tipAfterC.exists(_.hash === hashA)
       // B lands — connectivity cascades: B connects to A, C reconnects through B, the tip jumps to C.
-      storedB <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(1L), slot = 2L, vrfOutput = vrf(2))
+      storedB <- store.store(signedB, parentHash = hashA, shardOrdinal = ShardOrdinal(2L), slot = 2L, vrfOutput = vrf(2))
       tipAfterB <- store.bestTip
       walk <- store.walkBackTo(tipAfterB.get.hash, depth = 3L)
     } yield
@@ -523,9 +541,9 @@ object ShardChainStoreSuite extends MutableIOSuite {
         storedC,
         storedB,
         orphanHeld,
-        tipAfterB.exists(_.signed.value.shardOrdinal == ShardOrdinal(2L)),
+        tipAfterB.exists(_.signed.value.shardOrdinal == ShardOrdinal(3L)),
         walk.size == 3,
-        walk.map(_.signed.value.shardOrdinal.value) == List(2L, 1L, 0L)
+        walk.map(_.signed.value.shardOrdinal.value) == List(3L, 2L, 1L)
       )
   }
 }

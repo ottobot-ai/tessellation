@@ -21,7 +21,7 @@ import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions.InvalidArtifact
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
 import io.constellationnetwork.node.shared.domain.event.EventCutter
-import io.constellationnetwork.node.shared.domain.nakamoto.ShardReanchor
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardWindowContinuation
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
@@ -94,8 +94,8 @@ object GlobalSnapshotConsensusFunctions {
   val pendingAccumulatorsToKeep: Int = 512
 
   /** Slice 14 — splice the committee attestations collected in the per-shard `ShardTipTracker` (gossiped `CommitteeMemberSignature`s, full
-    * signature form) into a candidate checkpoint's `committeeSignatures`, so the deterministic `ShardCheckpointGl0AcceptanceManager`
-    * `verifyEmbedded` adopt gate counts `>= kQuorum` distinct signers and admits via the FAST verify path instead of the re-exec failover.
+    * signature form) into a candidate checkpoint's `committeeSignatures`. Signature count is a selection signal only;
+    * `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` still re-executes every included transition before acceptance.
     *
     * Pure + LEADER-PATH ONLY (callers gate on `sourceShardCheckpoints`): the produce leader enriches its candidates from its node-local
     * tracker; the resulting checkpoint is what the leader embeds + proposes, and every follower threads that SAME embedded set unchanged
@@ -571,11 +571,11 @@ object GlobalSnapshotConsensusFunctions {
         // Empty (byte-identical to today, the regression bar) when EITHER `numShards = 1` (deps None)
         // OR this is the follower validation re-derivation (`sourceShardCheckpoints = false` — see the
         // determinism contract on `createProposalArtifactInternal`). On the genuine produce path with
-        // sharding active: for each tracked shard, advance the composite finality triggers (reads the
-        // chain store's bestTip + attestation tally), read `latestQualifyingOrdinal` (the highest
-        // shard-ord qualified by `T_count_shard` OR `T_depth1_shard`, max-of), and pull the canonical
-        // checkpoint at that ord from the chain store. Skip shards whose latest qualifying ord is
-        // Genesis (nothing finalized yet) or whose canonical entry was already evicted.
+        // sharding active: for each tracked shard, advance the composite finality triggers, then freshly
+        // resolve the highest hash-bearing checkpoint on the current best-tip ancestry qualified by
+        // `T_count_shard` OR `T_depth1_shard` (max-of). Never resolve a historical monotone ordinal through
+        // the current fork: quorum/depth observed for branch A must not qualify branch B at the same ordinal.
+        // Skip shards with no currently canonical qualified checkpoint.
         //
         // ─── Q1 — deterministic inclusion cutoff ──────────────────────────────────────────────────────
         // Without a cutoff, the chosen checkpoint depends on how far this node's shard chain + attestation
@@ -601,135 +601,117 @@ object GlobalSnapshotConsensusFunctions {
             deps.registry.toList.traverse {
               case (shardId, entry) =>
                 entry.finalityTriggers.advance >>
-                  entry.finalityTriggers.latestQualifyingOrdinal.flatMap { qualifyingOrd =>
-                    if (qualifyingOrd.value <= 0L)
+                  entry.finalityTriggers.currentQualifyingCheckpoint.flatMap {
+                    case None =>
                       none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
                         .pure[F]
-                    else
-                      entry.chainStore.getByOrdinal(qualifyingOrd).flatMap {
-                        case None =>
-                          none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
-                            .pure[F]
-                        case Some(qualifying) =>
-                          // ANCESTOR-FIRST SELECTION (chain-hole fix, 2026-06-10). Walk the canonical ancestry of the
-                          // qualifying checkpoint and embed the OLDEST entry that (a) anchors at-or-below N (the Q1
-                          // cutoff, unchanged) and (b) whose per-MG windows chain off gl0's CURRENT SC tips
-                          // (`snapshotContext.lastStateChannelSnapshotHashes`, `Hash.empty` for an unseeded MG).
-                          //
-                          // The previous rule embedded the NEWEST qualifying checkpoint regardless of ancestry. When an
-                          // ancestor never qualified (genesis fork split its attestations below kQuorum), the newest
-                          // child was embedded over a CHAIN HOLE: its windows are incrementals chained past the
-                          // never-adopted genesis window, the currency derivation silently produced nothing, the SC tip
-                          // advanced past genesis, and the MG wedged permanently (run brkbktoet, 2026-06-10).
-                          //
-                          // Walking back from the QUALIFYING checkpoint keeps the committee-endorsement invariant: the
-                          // ancestry is bound by each child's `parentCheckpointHash`, which the committee signatures on
-                          // the qualifying descendant transitively commit to. A sub-quorum ancestor (signers=1) embeds
-                          // with whatever attestations the tracker collected; followers re-verify it deterministically
-                          // via `verifyEmbedded`'s sub-quorum re-exec rail (byte-matched per-MG roots — wire-carried
-                          // bytes only, no node-local reads).
-                          //
-                          // Selecting NOTHING when no entry anchors at the tips (everything already adopted) also stops
-                          // the re-embed churn of already-adopted checkpoints. Empty-window checkpoints are skipped —
-                          // none are produced today (the producer omits empty rounds); when T_alive/receipts-only
-                          // checkpoints land they will need an adopted-checkpoint marker in the GSI to make progress
-                          // observable (flagged in PRODUCTION-READINESS-AUDIT.md).
-                          entry.chainStore
-                            .walkBackTo(qualifying.hash, qualifyingOrd.value)
-                            .flatMap { chainTipFirst =>
-                              val scTips = snapshotContext.lastStateChannelSnapshotHashes
-                              // TRIM-AWARE match (mirrors the GSAM adoption guard): a checkpoint is the next-to-adopt
-                              // if any of its windows CONTAINS the binary continuing gl0's SC tip — not only at the
-                              // window head. Post-reorg, canonical windows OVERLAP the already-adopted orphaned
-                              // prefix; head-only matching stalled adoption permanently (run bml994k4d shard 1)
-                              // while the chain kept producing. The adoption side trims the overlap.
-                              chainTipFirst.reverse.findM { h =>
-                                val cp = h.signed.value
-                                if (
-                                  cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
-                                  cp.derivedStateDelta.includedSnapshots.nonEmpty
-                                )
-                                  cp.derivedStateDelta.includedSnapshots.toList.existsM {
-                                    case (mg, nel) =>
-                                      // ORPHANED-TIP REANCHOR (2026-06-29) + FULLY-ADOPTED SKIP (2026-07-08): byte-identical to the
-                                      // GSAM adopt-guard via the shared `ShardReanchor` — a checkpoint qualifies if a window continues
-                                      // gl0's SC tip (Continue) OR gl0's tip was orphaned by a same-ordinal reorg and this is the
-                                      // genesis-rooted canonical lineage (Reanchor). A FULLY-ADOPTED window (AlreadyAdopted — its tail
-                                      // IS gl0's tip) does NOT qualify: pre-fix it misclassified as Reanchor, so this oldest-first
-                                      // `find` re-embedded the fully-adopted genesis checkpoint every gl0 ordinal, shadowing its
-                                      // successor forever (the 3gl0/2shard startup freeze — mirror frozen at currency ord 1 while the
-                                      // producer's awaiting-embed pipeline gate blocked all further minting). A Defer window (true
-                                      // chain hole) does not qualify either. `windowTipHashF` is the SAME deterministic value-hash the
-                                      // SC-tip setter records — wire-carried bytes only, split-safe.
-                                      ShardReanchor.windowTipHashF(nel).map { windowTipHash =>
-                                        ShardReanchor.classify(
-                                          nel,
-                                          windowTipHash,
-                                          scTips.getOrElse(mg, Hash.empty),
-                                          ShardReanchor.tipOrdinalFor(snapshotContext.lastCurrencySnapshots, mg)
-                                        ) match {
-                                          case ShardReanchor.Continue(_) | ShardReanchor.Reanchor(_) => true
-                                          case ShardReanchor.Defer | ShardReanchor.AlreadyAdopted    => false
-                                        }
-                                      }
-                                  }
-                                else
-                                  false.pure[F]
-                              }.flatMap {
-                                case None =>
-                                  // embed-none observability (mirrors produce-skip). This fires BOTH when fully
-                                  // caught up (normal: every window already adopted, tips == newest tail) AND on an
-                                  // adoption-side stall — the reader disambiguates by whether the shard chain height
-                                  // keeps growing while this line repeats with unchanged tips.
-                                  //
-                                  // INSTRUMENTATION (run-24 genesis-seam): when nothing matches, dump per-MG the SC tip we
-                                  // match against vs the ACTUAL window parent-refs across the whole ancestry. If matched=false
-                                  // and the parentRefs never contain scTip, the producer's window anchoring (its own perMgTip)
-                                  // has diverged from gl0's adopted SC tip — the suspected freeze. Remove after diagnosis.
-                                  val anchorDiag = chainTipFirst
-                                    .flatMap(_.signed.value.derivedStateDelta.includedSnapshots.keys.toList)
-                                    .distinct
-                                    .map { mg =>
-                                      val tip = scTips.getOrElse(mg, Hash.empty)
-                                      val parentRefs = chainTipFirst.flatMap { hh =>
-                                        hh.signed.value.derivedStateDelta.includedSnapshots
-                                          .get(mg)
-                                          .toList
-                                          .flatMap(_.toList.map(_.value.lastSnapshotHash))
-                                      }.distinct
-                                      s"${mg.value.value.take(8)}{scTip=${tip.value.take(8)} matched=${parentRefs
-                                          .contains(tip)} parentRefs=[${parentRefs.map(_.value.take(8)).mkString(",")}]}"
+                    case Some(qualifying) =>
+                      val qualifyingOrd = qualifying.signed.value.shardOrdinal
+                      // ANCESTOR-FIRST SELECTION (chain-hole fix, 2026-06-10). Walk the canonical ancestry of the
+                      // qualifying checkpoint and embed the OLDEST entry that (a) anchors at-or-below N (the Q1
+                      // cutoff, unchanged) and (b) whose per-MG windows chain off gl0's CURRENT SC tips
+                      // (`snapshotContext.lastStateChannelSnapshotHashes`, `Hash.empty` for an unseeded MG).
+                      //
+                      // The previous rule embedded the NEWEST qualifying checkpoint regardless of ancestry. When an
+                      // ancestor never qualified (genesis fork split its attestations below kQuorum), the newest
+                      // child was embedded over a CHAIN HOLE: its windows are incrementals chained past the
+                      // never-adopted genesis window, the currency derivation silently produced nothing, the SC tip
+                      // advanced past genesis, and the MG wedged permanently (run brkbktoet, 2026-06-10).
+                      //
+                      // Walking back from the QUALIFYING checkpoint preserves chain linkage through each child's
+                      // `parentCheckpointHash`. A checkpoint embeds with the signatures the tracker collected, but
+                      // followers never infer economic validity from that count: `verifyEmbedded` deterministically
+                      // replays every included transition and compares the recreated per-MG roots.
+                      //
+                      // Selecting NOTHING when no entry anchors at the tips (everything already adopted) also stops
+                      // the re-embed churn of already-adopted checkpoints. Empty checkpoints are structurally invalid.
+                      entry.chainStore
+                        .walkBackTo(qualifying.hash, qualifyingOrd.value)
+                        .flatMap { chainTipFirst =>
+                          val scTips = snapshotContext.lastStateChannelSnapshotHashes
+                          // TRIM-AWARE match (mirrors the GSAM adoption guard): a checkpoint is the next-to-adopt
+                          // if any of its windows CONTAINS the binary continuing gl0's SC tip — not only at the
+                          // window head. Post-reorg, canonical windows OVERLAP the already-adopted orphaned
+                          // prefix; head-only matching stalled adoption permanently (run bml994k4d shard 1)
+                          // while the chain kept producing. The adoption side trims the overlap.
+                          chainTipFirst.reverse.findM { h =>
+                            val cp = h.signed.value
+                            if (
+                              cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
+                              cp.derivedStateDelta.includedSnapshots.nonEmpty
+                            )
+                              cp.derivedStateDelta.includedSnapshots.toList.existsM {
+                                case (mg, nel) =>
+                                  // Byte-identical to the GSAM adopt guard. Only a window containing a binary whose parent is GL0's
+                                  // committed SC tip qualifies. A fully adopted window is skipped, and a sibling lineage is deferred:
+                                  // without authoritative diffs GL0 cannot recreate a sibling from its committed pre-state.
+                                  ShardWindowContinuation.windowTipHashF(nel).map { windowTipHash =>
+                                    ShardWindowContinuation.classify(
+                                      nel,
+                                      windowTipHash,
+                                      scTips.getOrElse(mg, Hash.empty)
+                                    ) match {
+                                      case ShardWindowContinuation.Continue(_)    => true
+                                      case ShardWindowContinuation.Defer          => false
+                                      case ShardWindowContinuation.AlreadyAdopted => false
                                     }
-                                    .mkString(" ")
-                                  logger
-                                    .info(
-                                      s"🧩 embed-none shard=${shardId.value.value} " +
-                                        s"chainLen=${chainTipFirst.size} qualifyingOrd=${qualifyingOrd.value} " +
-                                        s"tips=${snapshotContext.lastStateChannelSnapshotHashes.toList.map {
-                                            case (mg, hh) => s"${mg.value.value.take(8)}:${hh.value.take(8)}"
-                                          }.mkString(",")} " +
-                                        s"anchorDiag=$anchorDiag"
-                                    )
-                                    .as(
-                                      none[
-                                        (
-                                          io.constellationnetwork.schema.sharding.ShardId,
-                                          io.constellationnetwork.schema.sharding.ShardCheckpoint
-                                        )
-                                      ]
-                                    )
-                                case Some(h) =>
-                                  // Slice 14: enrich the candidate with the committee attestations this node collected in
-                                  // the per-shard tracker (keyed by the canonical checkpoint hash = chain-store `.hash`),
-                                  // so `verifyEmbedded` counts >= kQuorum and adopts via the fast verify path when quorum
-                                  // exists. LEADER-path only (gated `sourceShardCheckpoints` above); the follower threads
-                                  // the leader's already-enriched set unchanged (split-safety).
-                                  entry.tipTracker
-                                    .signaturesFor(h.hash)
-                                    .map(collected => (shardId -> spliceCommitteeSignatures(h.signed.value, collected)).some)
+                                  }
                               }
-                            }
-                      }
+                            else
+                              false.pure[F]
+                          }.flatMap {
+                            case None =>
+                              // embed-none observability (mirrors produce-skip). This fires BOTH when fully
+                              // caught up (normal: every window already adopted, tips == newest tail) AND on an
+                              // adoption-side stall — the reader disambiguates by whether the shard chain height
+                              // keeps growing while this line repeats with unchanged tips.
+                              //
+                              // INSTRUMENTATION (run-24 genesis-seam): when nothing matches, dump per-MG the SC tip we
+                              // match against vs the ACTUAL window parent-refs across the whole ancestry. If matched=false
+                              // and the parentRefs never contain scTip, the producer's window anchoring (its own perMgTip)
+                              // has diverged from gl0's adopted SC tip — the suspected freeze. Remove after diagnosis.
+                              val anchorDiag = chainTipFirst
+                                .flatMap(_.signed.value.derivedStateDelta.includedSnapshots.keys.toList)
+                                .distinct
+                                .map { mg =>
+                                  val tip = scTips.getOrElse(mg, Hash.empty)
+                                  val parentRefs = chainTipFirst.flatMap { hh =>
+                                    hh.signed.value.derivedStateDelta.includedSnapshots
+                                      .get(mg)
+                                      .toList
+                                      .flatMap(_.toList.map(_.value.lastSnapshotHash))
+                                  }.distinct
+                                  s"${mg.value.value.take(8)}{scTip=${tip.value.take(8)} matched=${parentRefs
+                                      .contains(tip)} parentRefs=[${parentRefs.map(_.value.take(8)).mkString(",")}]}"
+                                }
+                                .mkString(" ")
+                              logger
+                                .info(
+                                  s"🧩 embed-none shard=${shardId.value.value} " +
+                                    s"chainLen=${chainTipFirst.size} qualifyingOrd=${qualifyingOrd.value} " +
+                                    s"tips=${snapshotContext.lastStateChannelSnapshotHashes.toList.map {
+                                        case (mg, hh) => s"${mg.value.value.take(8)}:${hh.value.take(8)}"
+                                      }.mkString(",")} " +
+                                    s"anchorDiag=$anchorDiag"
+                                )
+                                .as(
+                                  none[
+                                    (
+                                      io.constellationnetwork.schema.sharding.ShardId,
+                                      io.constellationnetwork.schema.sharding.ShardCheckpoint
+                                    )
+                                  ]
+                                )
+                            case Some(h) =>
+                              // Slice 14: enrich the candidate with the committee attestations this node collected in
+                              // the per-shard tracker (keyed by the canonical checkpoint hash = chain-store `.hash`).
+                              // This is leader-path selection metadata only. The follower threads the leader's set
+                              // unchanged and independently replays the checkpoint through `verifyEmbedded`.
+                              entry.tipTracker
+                                .signaturesFor(h.hash)
+                                .map(collected => (shardId -> spliceCommitteeSignatures(h.signed.value, collected)).some)
+                          }
+                        }
                   }
             }
               .map(entries => SortedMap.from(entries.flatten))

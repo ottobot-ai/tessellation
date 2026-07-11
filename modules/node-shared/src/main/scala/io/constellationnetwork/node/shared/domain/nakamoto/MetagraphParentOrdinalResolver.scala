@@ -69,8 +69,7 @@ object MetagraphParentOrdinalResolver {
     * '''Total on malformed input.''' `JsonSerializer.deserialize` returns `F[Either[Throwable, A]]`, but the underlying brotli frame decode
     * can *raise* in `F` (e.g. `NullPointerException` from `ByteBuffer.wrap` on a corrupt brotli header) rather than yielding a `Left`. We
     * `handleError` each decode to `Left` so a raised decode error is treated IDENTICALLY to a `Left` decode failure — a malformed binary
-    * fails closed (`None`) instead of crashing the gate-processing fiber. Mirrors
-    * `GlobalSnapshotStateChannelEventsProcessor.deriveMetagraphRoot`'s `.handleErrorWith` defense over the same decode surface.
+    * fails closed (`None`) instead of crashing the gate-processing fiber.
     */
   def parentOrdinalFromContent[F[_]: Async: JsonSerializer](
     content: Array[Byte]
