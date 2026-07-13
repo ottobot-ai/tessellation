@@ -30,7 +30,8 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage}
 import io.constellationnetwork.node.shared.modules.SharedValidators
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.Amount
+import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageOrdinal, MessageType}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
@@ -76,7 +77,12 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
 
   def mkProcessorHarness(
     stateChannelAllowanceLists: Map[Address, NonEmptySet[PeerId]],
-    failed: Option[(Address, StateChannelValidator.StateChannelValidationError)] = None
+    failed: Option[(Address, StateChannelValidator.StateChannelValidationError)] = None,
+    feeConfigs: SortedMap[SnapshotOrdinal, FeeCalculatorConfig] = SortedMap.empty,
+    contextFnsOverride: Option[CurrencySnapshotContextFunctions[IO]] = None,
+    validationOverride: Option[
+      (StateChannelOutput, SnapshotFeesInfo) => StateChannelValidator.StateChannelValidationErrorOr[StateChannelOutput]
+    ] = None
   )(implicit H: Hasher[IO], S: SecurityProvider[IO], J: JsonSerializer[IO], K: KryoSerializer[IO]) = {
     implicit val hs = HasherSelector.forSyncAlwaysCurrent(H)
     implicit val csps = CurrencyStateProofSelector.instance
@@ -89,7 +95,11 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
           globalOrdinal: SnapshotOrdinal,
           snapshotFeesInfo: SnapshotFeesInfo
         )(implicit hasher: Hasher[IO]) =
-          IO.pure(failed.filter(f => f._1 == output.address).map(_._2.invalidNec).getOrElse(output.validNec))
+          IO.pure(
+            validationOverride
+              .map(_(output, snapshotFeesInfo))
+              .getOrElse(failed.filter(f => f._1 == output.address).map(_._2.invalidNec).getOrElse(output.validNec))
+          )
         def validateHistorical(output: StateChannelOutput, globalOrdinal: SnapshotOrdinal, snapshotFeesInfo: SnapshotFeesInfo)(
           implicit hasher: Hasher[IO]
         ) =
@@ -163,7 +173,8 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
         GlobalStateKey.toHex[IO]
       )
 
-      currencySnapshotContextFns = CurrencySnapshotContextFunctions.make(currencySnapshotValidator)
+      defaultCurrencySnapshotContextFns = CurrencySnapshotContextFunctions.make(currencySnapshotValidator)
+      currencySnapshotContextFns = contextFnsOverride.getOrElse(defaultCurrencySnapshotContextFns)
       manager = new GlobalSnapshotStateChannelAcceptanceManager[IO] {
         def accept(
           ordinal: SnapshotOrdinal,
@@ -178,7 +189,7 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
           )
         ] = IO.pure((events.groupByNel(_.address).map { case (k, v) => k -> v.map(_.snapshotBinary) }, Set.empty))
       }
-      feeCalculator = FeeCalculator.make(SortedMap.empty)
+      feeCalculator = FeeCalculator.make(feeConfigs)
       processor = GlobalSnapshotStateChannelEventsProcessor
         .make[IO](
           validator,
@@ -328,6 +339,133 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
         _ => none.pure[IO]
       )
     } yield expect(accepted.contains(address)).and(expect(rejected.isEmpty))
+  }
+
+  test("shared fee payer debits are serialized in canonical metagraph order") { res =>
+    implicit val (ks, h, j, sp) = res
+    implicit val currencySelector: CurrencyStateProofSelector = CurrencyStateProofSelector.instance
+
+    val ordinal = SnapshotOrdinal.unsafeApply(1L)
+    val fee = SnapshotFee(10L)
+    val feeConfigs = SortedMap(
+      SnapshotOrdinal.MinValue -> FeeCalculatorConfig(
+        baseFee = 1L,
+        stakingWeight = BigDecimal(0),
+        computationalCost = 1L,
+        proWeight = BigDecimal(0)
+      )
+    )
+
+    val emptyInfo = CurrencySnapshotInfo(
+      lastTxRefs = SortedMap.empty,
+      balances = SortedMap.empty,
+      lastMessages = None,
+      lastFeeTxRefs = None,
+      lastAllowSpendRefs = None,
+      activeAllowSpends = None,
+      globalSnapshotSyncView = None,
+      lastTokenLockRefs = None,
+      activeTokenLocks = None
+    )
+
+    val messageContextFns = new CurrencySnapshotContextFunctions[IO] {
+      def createContext(
+        context: CurrencySnapshotContext,
+        lastArtifact: Signed[CurrencyIncrementalSnapshot],
+        signedArtifact: Signed[CurrencyIncrementalSnapshot],
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[CurrencySnapshotContext] = {
+        val ownerMessage = signedArtifact.value.messages.flatMap(_.find(_.value.messageType === MessageType.Owner))
+        val lastMessages = ownerMessage.map(message => SortedMap[MessageType, Signed[CurrencyMessage]](MessageType.Owner -> message))
+        context.copy(snapshotInfo = context.snapshotInfo.copy(lastMessages = lastMessages)).pure[IO]
+      }
+    }
+
+    val enforceUniqueFeeAddress
+      : (StateChannelOutput, SnapshotFeesInfo) => StateChannelValidator.StateChannelValidationErrorOr[StateChannelOutput] =
+      (output, feesInfo) =>
+        StateChannelValidator
+          .validateIfAddressAlreadyUsed(output.address, feesInfo.allFeesAddresses, feesInfo.ownerAddress)
+          .as(output)
+
+    def incrementalChain(
+      metagraphKeyPair: KeyPair,
+      ownerMessage: Signed[CurrencyMessage]
+    ): IO[(Signed[CurrencyIncrementalSnapshot], Signed[StateChannelSnapshotBinary])] =
+      for {
+        firstValue <- CurrencyIncrementalSnapshot.fromCurrencySnapshot[IO](CurrencySnapshot.mkGenesis(Map.empty, None, None))(
+          implicitly[Parallel[IO]],
+          implicitly[Async[IO]],
+          h,
+          j,
+          currencySelector
+        )
+        first <- forAsyncHasher(firstValue, metagraphKeyPair)
+        firstHash <- first.toHashed.map(_.hash)
+        secondValue = firstValue.copy(
+          ordinal = SnapshotOrdinal.unsafeApply(1L),
+          lastSnapshotHash = firstHash,
+          messages = Some(SortedSet(ownerMessage))
+        )
+        second <- forAsyncHasher(secondValue, metagraphKeyPair)
+        content <- j.serialize(second)
+        binary <- forAsyncHasher(StateChannelSnapshotBinary(firstHash, content, fee), metagraphKeyPair)
+      } yield (first, binary)
+
+    for {
+      feePayerKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphKeyPairA <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphKeyPairB <- KeyPairGenerator.makeKeyPair[IO]
+      feePayer = feePayerKeyPair.getPublic.toAddress
+      metagraphA = metagraphKeyPairA.getPublic.toAddress
+      metagraphB = metagraphKeyPairB.getPublic.toAddress
+      ownerMessageA <- forAsyncHasher(
+        CurrencyMessage(MessageType.Owner, feePayer, metagraphA, MessageOrdinal.MinValue),
+        feePayerKeyPair
+      )
+      ownerMessageB <- forAsyncHasher(
+        CurrencyMessage(MessageType.Owner, feePayer, metagraphB, MessageOrdinal.MinValue),
+        feePayerKeyPair
+      )
+      chainA <- incrementalChain(metagraphKeyPairA, ownerMessageA)
+      chainB <- incrementalChain(metagraphKeyPairB, ownerMessageB)
+      prior = SortedMap(
+        metagraphA -> (Right((chainA._1, emptyInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState),
+        metagraphB -> (Right((chainB._1, emptyInfo)): StateChannelAcceptanceResult.CurrencySnapshotWithState)
+      )
+      eventA = metagraphA -> NonEmptyList.one(chainA._2)
+      eventB = metagraphB -> NonEmptyList.one(chainB._2)
+      eventsAB = SortedMap.from(List(eventA, eventB))
+      eventsBA = SortedMap.from(List(eventB, eventA))
+      processor <- mkProcessorHarness(
+        Map.empty,
+        feeConfigs = feeConfigs,
+        contextFnsOverride = messageContextFns.some
+      ).map(_.processor)
+      uniquenessProcessor <- mkProcessorHarness(
+        Map.empty,
+        feeConfigs = feeConfigs,
+        contextFnsOverride = messageContextFns.some,
+        validationOverride = enforceUniqueFeeAddress.some
+      ).map(_.processor)
+      currentBalances = SortedMap(feePayer -> Balance(100L))
+      processedAB <- processor.processCurrencySnapshots(ordinal, currentBalances, prior, eventsAB, _ => none.pure[IO])
+      processedBA <- processor.processCurrencySnapshots(ordinal, currentBalances, prior, eventsBA, _ => none.pure[IO])
+      acceptedAB = processor.assembleAcceptanceResult(processedAB, prior, Set.empty)
+      acceptedBA = processor.assembleAcceptanceResult(processedBA, prior, Set.empty)
+      uniqueAB <- uniquenessProcessor.processCurrencySnapshots(ordinal, currentBalances, prior, eventsAB, _ => none.pure[IO])
+      uniqueBA <- uniquenessProcessor.processCurrencySnapshots(ordinal, currentBalances, prior, eventsBA, _ => none.pure[IO])
+      uniqueAcceptedAB = uniquenessProcessor.assembleAcceptanceResult(uniqueAB, prior, Set.empty)
+      uniqueAcceptedBA = uniquenessProcessor.assembleAcceptanceResult(uniqueBA, prior, Set.empty)
+    } yield
+      expect
+        .eql(Balance(80L).some, acceptedAB.balanceUpdate.get(feePayer))
+        .and(expect.eql(acceptedAB.balanceUpdate, acceptedBA.balanceUpdate))
+        .and(expect.eql(processedAB.keySet, processedBA.keySet))
+        .and(expect.eql(Balance(90L).some, uniqueAcceptedAB.balanceUpdate.get(feePayer)))
+        .and(expect.eql(uniqueAcceptedAB.balanceUpdate, uniqueAcceptedBA.balanceUpdate))
+        .and(expect.eql(1, uniqueAB.size))
+        .and(expect.eql(uniqueAB.keySet, uniqueBA.keySet))
   }
 
   test("an unseeded currency incremental is rejected instead of advancing as opaque state") { res =>

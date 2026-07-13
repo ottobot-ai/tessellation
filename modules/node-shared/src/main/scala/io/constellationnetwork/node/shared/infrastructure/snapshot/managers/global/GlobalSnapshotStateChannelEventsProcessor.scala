@@ -221,7 +221,8 @@ object GlobalSnapshotStateChannelEventsProcessor {
       ): StateChannelAcceptanceResult = {
         val (lastCurrencyStates, incomingCurrencyState) = calculateLastCurrencySnapshots(processed, priorLastCurrencySnapshots)
         val finalScSnapshots = processed.map { case (k, (v, _)) => k -> v.map(_._1) }
-        // TODO: ASSUMING that owner addresses are restricted from being shared at this point
+        // processCurrencySnapshots threads fee-payer balances in this same canonical metagraph order. Each per-MG map is therefore a
+        // cumulative absolute update, and the right-biased merge retains the latest checked debit when metagraphs share a fee payer.
         val balanceUpdates = processed.values.map(_._2).foldLeft(SortedMap.empty[Address, Balance])(_ ++ _)
 
         StateChannelAcceptanceResult(
@@ -275,8 +276,8 @@ object GlobalSnapshotStateChannelEventsProcessor {
         *   1. Fee not required (pre-fee-ordinal or fee waived): accept the binary unconditionally. 2. Fee required but no fee address
         *      (owner address missing from currency messages): reject the binary — we cannot deduct fees without a destination address. 3.
         *      Fee required with fee address: look up the metagraph owner's balance first in the local accumulator (tracks balance changes
-        *      within this batch), then fall back to MptStore. If the balance covers the fee, deduct it and accept; otherwise reject
-        *      remaining binaries.
+        *      within this metagraph window), then fall back to the canonically threaded global balance accumulator. If the balance covers
+        *      the fee, deduct it and accept; otherwise reject remaining binaries.
         */
       def processCurrencySnapshots(
         snapshotOrdinal: SnapshotOrdinal,
@@ -301,7 +302,8 @@ object GlobalSnapshotStateChannelEventsProcessor {
 
         def validateForGlobalExecution(
           address: Address,
-          binary: Signed[StateChannelSnapshotBinary]
+          binary: Signed[StateChannelSnapshotBinary],
+          availableFeeAddresses: Map[Address, Set[Address]]
         ): F[StateChannelValidator.StateChannelValidationErrorOr[StateChannelOutput]] = {
           val output = StateChannelOutput(address, binary)
           if (binary.value.lastSnapshotHash === Hash.empty)
@@ -321,192 +323,216 @@ object GlobalSnapshotStateChannelEventsProcessor {
                 stateChannelValidator.validate(
                   output,
                   snapshotOrdinal,
-                  SnapshotFeesInfo(allFeesAddresses, stakingBalance, ownerAddress, stakingAddress)
+                  SnapshotFeesInfo(availableFeeAddresses, stakingBalance, ownerAddress, stakingAddress)
                 )
             }
         }
 
-        events.toList.parTraverse {
-          case (address, binaries) =>
-            type Result = Option[MetagraphAcceptanceResult]
-            type Agg = (Result, List[Signed[StateChannelSnapshotBinary]])
+        type Processed = SortedMap[Address, MetagraphAcceptanceResult]
+        type GlobalFeeAccumulator = (SortedMap[Address, Balance], Map[Address, Set[Address]], Processed)
 
-            val stubBinary: Signed[StateChannelSnapshotBinary] = Signed(
-              StateChannelSnapshotBinary(Hash.empty, Array.emptyByteArray, SnapshotFee.MinValue),
-              NonEmptySet.one(SignatureProof(Id(Hex("")), Signature(Hex(""))))
-            )
+        // `events` is a SortedMap, so this fold is the consensus order for cross-metagraph access to a shared fee payer. Parallel replay
+        // from one prior balance lets two windows both debit 100 -> 90 and makes the final right-biased map waive one fee. Publish each
+        // accepted window's checked absolute updates before evaluating the next metagraph instead.
+        events.toList
+          .foldLeftM[F, GlobalFeeAccumulator]((currentBalances, allFeesAddresses, SortedMap.empty)) {
+            case ((availableBalances, availableFeeAddresses, processed), (address, binaries)) =>
+              type Result = Option[MetagraphAcceptanceResult]
+              type Agg = (Result, List[Signed[StateChannelSnapshotBinary]])
 
-            val emptyBalanceUpdate = SortedMap.empty[Address, Balance]
+              val stubBinary: Signed[StateChannelSnapshotBinary] = Signed(
+                StateChannelSnapshotBinary(Hash.empty, Array.emptyByteArray, SnapshotFee.MinValue),
+                NonEmptySet.one(SignatureProof(Id(Hex("")), Signature(Hex(""))))
+              )
 
-            // initialState reads from `priorLastCurrencySnapshots` (materialized via the
-            // `getAllLastCurrencySnapshots` MPT prefix-scan) rather than a synthetic
-            // `lastGlobalSnapshotInfo.copy(...)`, because the Left(fullSnapshot) vs Right(incremental, info)
-            // distinction matters: the Left branch handles the first-incremental-over-full transition without
-            // calling applyCurrencySnapshot. The materialize preserves Left bindings via the per-address
-            // `Left(Signed[CurrencySnapshot])` partition lookup.
-            val initialState =
-              priorLastCurrencySnapshots
-                .get(address)
-                .map(init => (stubBinary, init.some))
-                .map(s => (NonEmptyList.one(s), SortedMap.empty[Address, Balance]))
+              val emptyBalanceUpdate = SortedMap.empty[Address, Balance]
 
-            binaries.toList
-              .traverse(binary => validateForGlobalExecution(address, binary))
-              .flatMap { authorizations =>
-                if (authorizations.forall(_.isValid))
-                  (initialState, binaries.toList.reverse)
-                    .tailRecM[F, Result] {
-                      case (state, Nil) => state.asRight[Agg].pure[F]
+              // initialState reads from `priorLastCurrencySnapshots` (materialized via the
+              // `getAllLastCurrencySnapshots` MPT prefix-scan) rather than a synthetic
+              // `lastGlobalSnapshotInfo.copy(...)`, because the Left(fullSnapshot) vs Right(incremental, info)
+              // distinction matters: the Left branch handles the first-incremental-over-full transition without
+              // calling applyCurrencySnapshot. The materialize preserves Left bindings via the per-address
+              // `Left(Signed[CurrencySnapshot])` partition lookup.
+              val initialState =
+                priorLastCurrencySnapshots
+                  .get(address)
+                  .map(init => (stubBinary, init.some))
+                  .map(s => (NonEmptyList.one(s), SortedMap.empty[Address, Balance]))
 
-                      case (None, head :: tail) =>
-                        deserialize[Signed[CurrencySnapshot]](head).flatMap {
-                          case Some(snapshot) => // full snapshot - we don't subtract fee
-                            Async[F].pure(
-                              (
-                                (NonEmptyList.one((head, snapshot.asLeft.some)), emptyBalanceUpdate).some,
-                                tail
-                              ).asLeft[Result]
-                            )
-                          case None =>
-                            deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
-                              case Some(_) =>
-                                // A decodable CL1 incremental needs a globally recreated prior. Advancing its state-channel tip without one
-                                // would make the economic transition permanently unexecutable.
-                                logger.error(
-                                  s"Currency recreation requires a full genesis snapshot: mg=${address.show}; dropping incremental-only window"
-                                ) >> Async[F].pure(none.asRight[Agg])
-                              case None =>
-                                // Opaque DL1 state is authenticated carriage, not CL1 state. Preserve the binary/tip before the fee cutover,
-                                // but attach no currency state and therefore no balance, supply, active-set, or reference-map effect.
-                                Async[F].pure(
-                                  if (isFeeRequired) none.asRight[Agg]
-                                  else ((NonEmptyList.one((head, none)), emptyBalanceUpdate).some, tail).asLeft[Result]
-                                )
-                            }
-                        }
+              binaries.toList
+                .traverse(binary => validateForGlobalExecution(address, binary, availableFeeAddresses))
+                .flatMap { authorizations =>
+                  if (authorizations.forall(_.isValid))
+                    (initialState, binaries.toList.reverse)
+                      .tailRecM[F, Result] {
+                        case (state, Nil) => state.asRight[Agg].pure[F]
 
-                      case (Some((nel, balanceUpdate)), head :: tail) =>
-                        val current: Result = (nel, balanceUpdate).some
-                        nel.head match {
-                          case (_, None) =>
-                            deserialize[Signed[CurrencySnapshot]](head).flatMap {
-                              case Some(snapshot) =>
-                                ((nel.prepend((head, snapshot.asLeft.some)), balanceUpdate).some, tail).asLeft[Result].pure[F]
-                              case None =>
-                                deserialize[Signed[CurrencyIncrementalSnapshot]](head).map {
-                                  case Some(_)                => current.asRight[Agg]
-                                  case None if !isFeeRequired => ((nel.prepend((head, none)), balanceUpdate).some, tail).asLeft[Result]
-                                  case None                   => current.asRight[Agg]
-                                }
-                            }
+                        case (None, head :: tail) =>
+                          deserialize[Signed[CurrencySnapshot]](head).flatMap {
+                            case Some(snapshot) => // full snapshot - we don't subtract fee
+                              Async[F].pure(
+                                (
+                                  (NonEmptyList.one((head, snapshot.asLeft.some)), emptyBalanceUpdate).some,
+                                  tail
+                                ).asLeft[Result]
+                              )
+                            case None =>
+                              deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
+                                case Some(_) =>
+                                  // A decodable CL1 incremental needs a globally recreated prior. Advancing its state-channel tip without one
+                                  // would make the economic transition permanently unexecutable.
+                                  logger.error(
+                                    s"Currency recreation requires a full genesis snapshot: mg=${address.show}; dropping incremental-only window"
+                                  ) >> Async[F].pure(none.asRight[Agg])
+                                case None =>
+                                  // Opaque DL1 state is authenticated carriage, not CL1 state. Preserve the binary/tip before the fee cutover,
+                                  // but attach no currency state and therefore no balance, supply, active-set, or reference-map effect.
+                                  Async[F].pure(
+                                    if (isFeeRequired) none.asRight[Agg]
+                                    else ((NonEmptyList.one((head, none)), emptyBalanceUpdate).some, tail).asLeft[Result]
+                                  )
+                              }
+                          }
 
-                          case (_, Some(Left(fullSnapshot))) =>
-                            deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
-                              case Some(snapshot) => // first incremental - recreate it, but don't subtract a state-channel fee
-                                implicit val selector: io.constellationnetwork.schema.StateProofSelector =
-                                  CurrencyStateProofSelector.instance
-                                CurrencyIncrementalSnapshot
-                                  .fromCurrencySnapshot[F](fullSnapshot.value)
-                                  .flatMap { previousValue =>
-                                    val previous = Signed(previousValue, fullSnapshot.proofs)
-                                    deriveNextCurrencyInfo(
-                                      address,
-                                      fullSnapshot.value.info.toCurrencySnapshotInfo,
-                                      previous,
-                                      snapshot
-                                    ).map { state =>
-                                      (
-                                        (nel.prepend((head, (snapshot, state).asRight.some)), balanceUpdate).some,
-                                        tail
-                                      ).asLeft[Result]
-                                    }
+                        case (Some((nel, balanceUpdate)), head :: tail) =>
+                          val current: Result = (nel, balanceUpdate).some
+                          nel.head match {
+                            case (_, None) =>
+                              deserialize[Signed[CurrencySnapshot]](head).flatMap {
+                                case Some(snapshot) =>
+                                  ((nel.prepend((head, snapshot.asLeft.some)), balanceUpdate).some, tail).asLeft[Result].pure[F]
+                                case None =>
+                                  deserialize[Signed[CurrencyIncrementalSnapshot]](head).map {
+                                    case Some(_)                => current.asRight[Agg]
+                                    case None if !isFeeRequired => ((nel.prepend((head, none)), balanceUpdate).some, tail).asLeft[Result]
+                                    case None                   => current.asRight[Agg]
                                   }
-                                  .handleErrorWith { error =>
-                                    logger.warn(error)(
-                                      s"First currency incremental for address ${address.show} failed full recreation"
-                                    ) >> current.asRight[Agg].pure[F]
-                                  }
-                              case None => current.asRight[Agg].pure[F]
-                            }
+                              }
 
-                          case (_, Some(Right((lastIncremental, lastState)))) =>
-                            deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
-                              case Some(snapshot) => // second or subsequent incremental snapshot - we do subtract fee
-                                deriveNextCurrencyInfo(
-                                  address,
-                                  lastState,
-                                  lastIncremental,
-                                  snapshot
-                                ).flatMap { state =>
-                                  val maybeFeeAddress = state.lastMessages.flatMap(_.get(MessageType.Owner)).map(_.address)
-
-                                  // Fee deduction: if fee is required, we need a fee address (owner address from
-                                  // currency messages). Without one we reject. With one, we check the local balance
-                                  // accumulator first (to account for fees already deducted earlier in this batch),
-                                  // falling back to `currentBalances` for the initial balance lookup.
-                                  //
-                                  // `currentBalances` is the in-progress balance map (`priorBalances ++` block-level
-                                  // delta) materialized once by GSAM before calling `process`. It is deliberately NOT
-                                  // a per-event MptStore read because accept() mutates the MptStore as a side-effect
-                                  // (syncFromStateChanges). When validateArtifact calls accept() a second time, the
-                                  // MptStore would already reflect the validator's own proposal computation,
-                                  // producing a different balance than the leader saw — causing
-                                  // currencyAcceptanceBalanceUpdate to diverge. Pinning to a snapshot value avoids
-                                  // that, and also correctly reflects block-level balance changes that the MptStore
-                                  // does not yet contain at the time of fee calculation.
-                                  maybeFeeAddress
-                                    .filter(_ => isFeeRequired)
-                                    .fold(
-                                      if (!isFeeRequired)
-                                        ((nel.prepend((head, (snapshot, state).asRight.some)), balanceUpdate).some, tail)
-                                          .asLeft[Result]
-                                          .pure[F]
-                                      else
-                                        current.asRight[Agg].pure[F]
-                                    ) { feeAddress =>
-                                      val localBalance = balanceUpdate.get(feeAddress)
-                                      val contextBalance = currentBalances.getOrElse(feeAddress, Balance.empty)
-                                      localBalance.getOrElse(contextBalance).pure[F].map { balance =>
-                                        // We're inside the Some(feeAddress) handler, so isFeeRequired is always true here.
-                                        // If fee deduction succeeds, continue processing; otherwise reject remaining binaries.
-                                        (balance.minus(head.fee).toOption.map(uBalance => balanceUpdate + (feeAddress -> uBalance)) match {
-                                          case Some(newBalanceUpdate) =>
-                                            ((nel.prepend((head, (snapshot, state).asRight.some)), newBalanceUpdate).some, tail)
-                                              .asLeft[Result]
-                                          case None => // insufficient balance to cover fee — reject remaining binaries
-                                            current.asRight[Agg]
-                                        }): Either[Agg, Result]
+                            case (_, Some(Left(fullSnapshot))) =>
+                              deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
+                                case Some(snapshot) => // first incremental - recreate it, but don't subtract a state-channel fee
+                                  implicit val selector: io.constellationnetwork.schema.StateProofSelector =
+                                    CurrencyStateProofSelector.instance
+                                  CurrencyIncrementalSnapshot
+                                    .fromCurrencySnapshot[F](fullSnapshot.value)
+                                    .flatMap { previousValue =>
+                                      val previous = Signed(previousValue, fullSnapshot.proofs)
+                                      deriveNextCurrencyInfo(
+                                        address,
+                                        fullSnapshot.value.info.toCurrencySnapshotInfo,
+                                        previous,
+                                        snapshot
+                                      ).map { state =>
+                                        (
+                                          (nel.prepend((head, (snapshot, state).asRight.some)), balanceUpdate).some,
+                                          tail
+                                        ).asLeft[Result]
                                       }
                                     }
-                                }.handleErrorWith { e => // we don't accept neither binary nor incremental
-                                  logger.warn(e)(
-                                    s"Currency snapshot of ordinal ${snapshot.value.ordinal.show} for address ${address.show} couldn't be applied"
-                                  ) >> Async[F].pure(current.asRight)
-                                }
-                              case None => current.asRight[Agg].pure[F]
-                            }
-                        }
-                    }
-                    .map(_.map { case (snaps, balances) => (snaps.reverse, balances) })
-                    .map { maybeProcessed =>
-                      initialState match {
-                        case Some(_) =>
-                          maybeProcessed.flatMap { case (nel, balances) => NonEmptyList.fromList(nel.tail).map((_, balances)) }
-                        case None => maybeProcessed
+                                    .handleErrorWith { error =>
+                                      logger.warn(error)(
+                                        s"First currency incremental for address ${address.show} failed full recreation"
+                                      ) >> current.asRight[Agg].pure[F]
+                                    }
+                                case None => current.asRight[Agg].pure[F]
+                              }
+
+                            case (_, Some(Right((lastIncremental, lastState)))) =>
+                              deserialize[Signed[CurrencyIncrementalSnapshot]](head).flatMap {
+                                case Some(snapshot) => // second or subsequent incremental snapshot - we do subtract fee
+                                  deriveNextCurrencyInfo(
+                                    address,
+                                    lastState,
+                                    lastIncremental,
+                                    snapshot
+                                  ).flatMap { state =>
+                                    val maybeFeeAddress = state.lastMessages.flatMap(_.get(MessageType.Owner)).map(_.address)
+
+                                    // Fee deduction: if fee is required, we need a fee address (owner address from
+                                    // currency messages). Without one we reject. With one, we check the local balance
+                                    // accumulator first (to account for fees already deducted earlier in this metagraph window),
+                                    // falling back to `availableBalances`, which includes prior metagraph windows in canonical order.
+                                    //
+                                    // `currentBalances` is the in-progress balance map (`priorBalances ++` block-level
+                                    // delta) materialized once by GSAM before calling `process`. It is deliberately NOT
+                                    // a per-event MptStore read because accept() mutates the MptStore as a side-effect
+                                    // (syncFromStateChanges). When validateArtifact calls accept() a second time, the
+                                    // MptStore would already reflect the validator's own proposal computation,
+                                    // producing a different balance than the leader saw — causing
+                                    // currencyAcceptanceBalanceUpdate to diverge. Pinning to a snapshot value avoids
+                                    // that, and also correctly reflects block-level balance changes that the MptStore
+                                    // does not yet contain at the time of fee calculation.
+                                    maybeFeeAddress
+                                      .filter(_ => isFeeRequired)
+                                      .fold(
+                                        if (!isFeeRequired)
+                                          ((nel.prepend((head, (snapshot, state).asRight.some)), balanceUpdate).some, tail)
+                                            .asLeft[Result]
+                                            .pure[F]
+                                        else
+                                          current.asRight[Agg].pure[F]
+                                      ) { feeAddress =>
+                                        val localBalance = balanceUpdate.get(feeAddress)
+                                        val contextBalance = availableBalances.getOrElse(feeAddress, Balance.empty)
+                                        localBalance.getOrElse(contextBalance).pure[F].map { balance =>
+                                          // We're inside the Some(feeAddress) handler, so isFeeRequired is always true here.
+                                          // If fee deduction succeeds, continue processing; otherwise reject remaining binaries.
+                                          (balance
+                                            .minus(head.fee)
+                                            .toOption
+                                            .map(uBalance => balanceUpdate + (feeAddress -> uBalance)) match {
+                                            case Some(newBalanceUpdate) =>
+                                              ((nel.prepend((head, (snapshot, state).asRight.some)), newBalanceUpdate).some, tail)
+                                                .asLeft[Result]
+                                            case None => // insufficient balance to cover fee — reject remaining binaries
+                                              current.asRight[Agg]
+                                          }): Either[Agg, Result]
+                                        }
+                                      }
+                                  }.handleErrorWith { e => // we don't accept neither binary nor incremental
+                                    logger.warn(e)(
+                                      s"Currency snapshot of ordinal ${snapshot.value.ordinal.show} for address ${address.show} couldn't be applied"
+                                    ) >> Async[F].pure(current.asRight)
+                                  }
+                                case None => current.asRight[Agg].pure[F]
+                              }
+                          }
                       }
-                    }
-                    .map(result => address -> result)
-                else
-                  logger
-                    .warn(s"Rejected unauthenticated state-channel window for currency address=${address.show}")
-                    .as(address -> none[MetagraphAcceptanceResult])
-              }
-        }.map { results =>
-          results.foldLeft(SortedMap.empty[Address, MetagraphAcceptanceResult]) {
-            case (acc, (address, Some(result))) => acc + (address -> result)
-            case (acc, (_, None))               => acc
+                      .map(_.map { case (snaps, balances) => (snaps.reverse, balances) })
+                      .map { maybeProcessed =>
+                        initialState match {
+                          case Some(_) =>
+                            maybeProcessed.flatMap { case (nel, balances) => NonEmptyList.fromList(nel.tail).map((_, balances)) }
+                          case None => maybeProcessed
+                        }
+                      }
+                      .map {
+                        case Some(result @ (_, balanceUpdate)) =>
+                          val acceptedFeeAddresses = result._1.toList
+                            .flatMap(_._2.toList)
+                            .flatMap {
+                              case Left(_)          => List.empty[Address]
+                              case Right((_, info)) => info.lastMessages.toList.flatMap(_.values.map(_.address))
+                            }
+                            .toSet
+                          val nextFeeAddresses =
+                            if (acceptedFeeAddresses.isEmpty) availableFeeAddresses
+                            else
+                              availableFeeAddresses.updatedWith(address) { existing =>
+                                (existing.getOrElse(Set.empty) ++ acceptedFeeAddresses).some
+                              }
+                          (availableBalances ++ balanceUpdate, nextFeeAddresses, processed + (address -> result))
+                        case None =>
+                          (availableBalances, availableFeeAddresses, processed)
+                      }
+                  else
+                    logger
+                      .warn(s"Rejected unauthenticated state-channel window for currency address=${address.show}")
+                      .as((availableBalances, availableFeeAddresses, processed))
+                }
           }
-        }
+          .map(_._3)
       }
 
       private def processStateChannelEvents(
