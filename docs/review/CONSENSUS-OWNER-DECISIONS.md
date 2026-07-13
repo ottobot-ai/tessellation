@@ -162,6 +162,85 @@ Eligibility in period `N` must intersect active paired keys with this authentica
 historical committee resolution returns unavailable rather than substituting a
 current or key-only population.
 
+**Observed implementation gap.** `StakeRegistry` still defines the validator
+population through a startup-updated local set and filters historical stake through
+that current set; the MPT path can also fall back to live aggregate/equal weight
+(`StakeRegistry.scala:32-45,68-85,425-438,480-503`). `SharedServices` supplies the
+set from the receiver's seedlist (`SharedServices.scala:275,300-304`). GSI roots
+stake amounts, paired-key histories/pointers, and immutable genesis keys, but no
+operator roster (`GlobalSnapshotInfo.scala:145-179`). The isolated historical
+resolver correctly keeps a roster separate from key registration and fails when
+one is unavailable; production does not yet supply that rooted roster
+(`HistoricalOperatorConsensusKeyRegistry.scala:37-63,126-140,201-231`). Its model
+also requires positive stake after the supplied roster intersection
+(`HistoricalOperatorConsensusKeyRegistry.scala:169-198`); that may be an
+owner-ratified backing predicate, but cannot define the roster by itself. Neither
+the seedlist, observed peers, a valid key record, nor positive stake is an interim
+authority.
+
+**PROPOSED, NOT RATIFIED - atomic historical population boundary.** At the exact
+closing snapshot of period `P`, every GL0 producer and verifier would run one pure,
+era-selected authorization rule over the same post-transition rooted state and
+commit one canonical value whose sorted map keys are the exact authorized operator
+population and whose values are their raw consensus stake/weight. The same boundary
+value may carry `eta_P`, preserving the current one-read period cache. Thus one MPT
+witness cannot mix one branch's roster with another branch's stake. Paired KES+VRF
+registration remains a separate identity registry; final eligibility is still the
+intersection of the boundary population and active paired records. This paragraph
+does not freeze a Scala type, field number, codec, or authorization predicate.
+
+**Required lookup invariant.** Regardless of the eventual encoding, a period-`N`
+consumer resolves one exact candidate-parent `(ordinal, hash, stateRoot)` capability:
+
+- population and raw stake/weight from that branch's `N-2` boundary;
+- the active atomic KES+VRF pair whose record is present in the same `N-2` prefix;
+- eta evidence for `N` from that branch's `N-1` history; and
+- the active period-`N` protocol parameters from the same branch.
+
+The result is a single eligible population plus the derived KES step. A same-ordinal
+sibling, wrong root, current seedlist/stake, receiver tip, live-peer set, or missing
+history rejects or defers before draw, proof, signature, storage, acceptance, or
+slash. Shard callers additionally bind this lookup to their exact Phase-2 GL0
+anchor. Portable evidence carries MPT inclusion/activation witnesses; a peer may
+supply those bytes but cannot select the root or population.
+
+**Reusable upstream state, not upstream authority.** Tessellation v4.0.0 provides
+signed chained node profiles and token-lock-backed delegated-stake/collateral
+create, withdrawal, and pending-withdrawal records
+(`v4.0.0:modules/shared/src/main/scala/io/constellationnetwork/schema/node.scala:146-189`,
+`v4.0.0:modules/shared/src/main/scala/io/constellationnetwork/schema/delegatedStake.scala:80-159`,
+`v4.0.0:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:67-108`). These can supply
+identity/profile and bonded-principal facts. Their validators authorize target
+nodes through the seedlist
+(`v4.0.0:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/node/UpdateNodeParametersValidator.scala:67-80`,
+`v4.0.0:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/delegatedStake/UpdateDelegatedStakeValidator.scala:137-144`,
+`v4.0.0:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nodeCollateral/UpdateNodeCollateralValidator.scala:163-170`), and v4 GSI contains no permissionless
+operator roster. The event/state machinery may be reused; the seedlist decision may
+not.
+
+**Owner answers still required before schema or runtime work:**
+
+- minimum self-bond versus total delegated/collateral backing, and whether a third
+  party may collateralize an operator;
+- the quantitative anti-stake-splitting rule for uniform `1/N` populations;
+- activation, exit, unbond, and evidence/slash horizons, including whether pending
+  withdrawals remain slashable through the last eligible artifact's challenge
+  window;
+- slash/cooldown timing and whether any liveness cap may keep a slashed operator in
+  the population;
+- whether lifecycle membership is purely derived from rooted profile/backing state
+  or requires a separately authorized join/exit event;
+- the independently authorized immutable genesis population and its backing rule;
+  and
+- bounded registration/state-growth fees or limits, without making registration a
+  membership grant.
+
+After those answers, delivery order is: canonical codec/root ownership, immutable
+genesis population, pure boundary derivation and undo/refold, exact-parent N-2/N-1
+resolver, exact Phase-2 artifact references, all-consumer migration, then fixture
+and adversarial qualification. O-11 remains open until that sequence passes the
+`KEYREG-013`, `PERM-*`, and `PARAM-001` gates.
+
 ### O-12 Runtime KES secret deletion and N-2 reorg boundary
 
 Freeze the common-prefix assumption under which an operator may delete/evolve

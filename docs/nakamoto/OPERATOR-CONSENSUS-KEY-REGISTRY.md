@@ -59,6 +59,83 @@ registry view and the independently authorized delayed canonical operator/stake
 roster. A self-signed pair outside that roster has zero weight and cannot enter
 an admission, execution, watchtower, finality, or tower population.
 
+### 2.1 O-11 population authority packet
+
+**Current gap.** The rooted state contains stake amounts and paired-key state, but
+not the permissionless operator population. `StakeRegistry` still filters through
+a startup-updated validator set and its historical MPT path may fall back to a
+live aggregate/equal-weight result (`StakeRegistry.scala:32-45,68-85,425-438,
+480-503`). `SharedServices` currently derives that set from the local seedlist
+(`SharedServices.scala:275,300-304`). The isolated historical resolver models the
+missing authority as a separate `CanonicalOperatorRosterSource` and returns
+unavailable without it. This containment is correct; the local seedlist must not
+be promoted into the missing source. The model's additional `stakeOf > 0` filter
+can enforce a ratified backing condition after roster resolution, but positive
+stake cannot become the roster rule by itself.
+
+**PROPOSED, NOT RATIFIED.** The smallest common boundary model is conceptually:
+
+```scala
+CanonicalOperatorPopulation(
+  members: SortedMap[PeerId, BigInt]
+)
+
+HistoricalOperatorBoundary(
+  population: CanonicalOperatorPopulation,
+  eta: Hash
+)
+```
+
+The names and representation are illustrative, not a frozen schema. The sorted
+map keys are the exact authorized roster and the values are its raw consensus
+stake/weight. At the closing GL0 snapshot of period `P`, producer and verifier run
+the same pure, era-selected O-11 rule over the exact post-transition state and
+commit the period-`P` population atomically with the historical boundary. Keeping
+roster and weight in one authenticated value prevents mixed-branch denominators.
+Keeping `eta_P` in the same period entry is compatible with the current one-read
+historical cache, but does not change the lookup lag below. No field number, codec,
+or membership predicate is selected by this proposal.
+
+The key registry remains separate. Registration may occur before an operator is
+authorized, and an authorized operator may temporarily lack an active pair. In
+both cases the operator has zero eligibility because every consumer takes the
+intersection. A registration endpoint's resource controls likewise cannot become
+a membership rule.
+
+For eligibility period `N`, the exact-parent resolver must produce one capability
+containing:
+
+```text
+population/stake = boundary[N-2].population
+active key pair  = paired registry prefix present at end of N-2
+eta              = boundary[N-1].eta
+parameters       = active branch-bound parameters for N
+eligible         = population keys intersect active paired records
+```
+
+The input authority is an authenticated candidate parent `(ordinal, hash,
+stateRoot)`, not just an ordinal. The output binds the source periods, MPT/root
+witnesses, exact operator map, weights, active records, and derived KES steps.
+Missing history returns unavailable/recovery. A same-ordinal sibling, current
+seedlist/stake, observed peers, receiver head, or candidate-carried key is never a
+fallback. A shard checkpoint uses this API only through its exact Phase-2 GL0
+anchor.
+
+Portable evidence should carry a separate inclusion witness containing the
+accepted record, the containing snapshot header/root, and its MPT path. The
+registration body cannot safely embed the hash of the snapshot that contains it
+without creating a circular commitment.
+
+Tessellation v4.0.0's signed chained node profile and token-lock-backed delegated
+stake/collateral create, withdrawal, and pending-withdrawal state can be reused as
+identity/profile and bonded-principal inputs. Their validators use the seedlist to
+authorize target nodes, and v4 GSI contains no permissionless roster. Therefore
+the event/accounting machinery is reusable, but its membership authority is not.
+The unresolved minimum bond, delegation/collateralization, stake-splitting,
+activation/exit/unbond, slash/cooldown, genesis-population, lifecycle-event, and
+state-growth rules remain owner gate O-11 in
+`docs/review/CONSENSUS-OWNER-DECISIONS.md`.
+
 ## 3. Signed Record
 
 The target canonical runtime record must bind, in one explicit signature domain:
@@ -231,8 +308,10 @@ The exact historical resolver enforces the N-2 cutoff and current
 `inclusionPeriod + 2` period-index rule in isolation. It is not wired as runtime
 authority for all production consumers. Those consumers remain
 frozen-genesis or unavailable because the branch-bound operator roster is not
-rooted and checkpoint artifacts
-do not commit the exact Phase-2 GL0 hash/root needed to select historical state.
+rooted. The live population/weight services still admit receiver-local seedlist
+and current-state inputs, so they cannot be substituted for that resolver.
+Checkpoint artifacts do not commit the exact Phase-2 GL0 hash/root needed to
+select historical state.
 The exact-hash hot-chain view adapter distinguishes same-ordinal siblings by
 requested hash and rejects a mismatched, malformed, or missing chain-store
 result, but production does not construct it as the registry authority.
@@ -275,9 +354,11 @@ empty nonempty-proof shapes, and never reads sender `activePoolSize` as stake.
 It then returns historical eligibility unavailable for every otherwise-valid
 nonempty proof. This is a fail-closed safety cut, not a portable historical
 membership proof: branch-bound roster/stake/eta witnesses remain absent.
-Backfill does not carry the complete registered KES/VRF/eta authority context,
-and the slashing path does not yet have a production exact-offence-parent
-historical resolver. Unavailable history therefore cannot be treated as guilt.
+The old ordinal-range archival backfill did not carry complete registered
+KES/VRF/eta authority context and has been removed. Any replacement must carry
+that evidence and re-enter the normal parent-first validator. The slashing path
+still does not have a production exact-offence-parent historical resolver.
+Unavailable history therefore cannot be treated as guilt.
 
 This is not runtime completion. The following remain merge gates:
 
