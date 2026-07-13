@@ -226,7 +226,7 @@ transport) and the DoS surface, then prove the drop-vs-recover loop is stable.
 |---|---|---|
 | **M1** | Kill the dual-`Subscribe` shard race: implement `SubscribeRequest.topics` filtering (`server.go` ignores `req` today); bridge subscribes rumor-only, daemon the rest; metric on concurrent streams. | **F1 (Critical)** |
 | **M2** | Rumor-bridge reconnect loop (mirror the daemon), landed **with** M1. | F8 |
-| **M3** | ChainSync serve hardening: wire `RateLimitPerPeer`, enforce `MaxHashesPerRequest` + `maxPullRange` on all serve handlers **both hops**, replace `ChainSyncServer` `(start to end).toList` with lazy iteration. | F3 (High) |
+| **M3** | **Partial landed 2026-07-13:** removed the unverifiable range/backfill protocol; enforced 64-item request caps on every remaining list RPC (plus JVM defense for hash streams), a per-peer sliding-window rate limit, and a 30-second stream deadline. Remaining: explicit global/per-peer in-flight stream and JVM-work budgets, rejection metrics, and Sybil-resistant admission cost. | F3 (High) |
 | **M4** | Fraud-proof transport slice: sidecar topic + relay + `Subscribe` arm + `PublishFraudProof` + **outbox durability**; emitter retry-or-outbox, not warn-and-drop. | **F2 (High)** — ties to EPIC-3 |
 | **M5** | Bound `GossipStream` queue + gRPC `request(n)` (F4/F5 interlock — one coherent change; per-topic streams natural after M1). | F4, F5 |
 | **M6** | Shard topic `SetScoreParams` (dynamic, API-verified) + scale the shard relay buffer per-shard + broaden mesh-health check. | F6, F7 |

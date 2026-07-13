@@ -142,13 +142,14 @@ dropping together (`gossip.go:727-731` loud-drop). The per-topic Go buffers (`co
 this but the final funnel is serial. `server.go:296-299` explicitly notes "the JVM holds exactly one
 stream."
 
-**G3 — the ChainSync *inbound serve* path has no rate-limit or inbound request cap (DoS surface).**
-`RateLimitPerPeer = 10 // requests per minute` is **declared but never used** (`protocol.go:37` — zero
-references). `MaxHashesPerRequest = 64` is enforced only on the **outbound** client calls
-but **not** on the inbound `serveFetchSnapshots` and `serveMetagraphBinaries` handlers, which
-unmarshal the request and relay it straight to the JVM. The removed `serveFetchByRange` path had an
-additional unbounded `[start,end]` amplification; deleting it closes that specific allocation/disk
-DoS, but the shared per-peer throttle and inbound hash-count caps remain open.
+**G3 — ChainSync request bounds are landed; global/concurrent admission remains open (DoS surface).**
+`handleIncoming` now applies a sliding one-minute, 10-request limit per libp2p peer before reading the
+request body and installs a 30-second stream deadline. The Go serve handlers reject more than 64
+snapshot hashes, metagraph-binary hashes, or intersection points before connecting to the JVM; the
+JVM independently enforces the 64-item bound on both hash-based streaming handlers. The obsolete
+unbounded `[start,end]` protocol was removed instead of capped. Remaining exposure is aggregate
+Sybil amplification and the absence of explicit global/per-peer in-flight stream and JVM-work
+budgets; the 16 MiB frame bound and per-peer request rate do not prove bounded aggregate work.
 
 **G4 — per-shard topics are absent from peer-scoring.** `buildPeerScoreParams` builds
 `TopicScoreParams` for exactly the **8 universal topics** (`gossip.go:1016-1025`); the per-shard
@@ -194,7 +195,7 @@ one score component that catches "in the mesh but not forwarding."
 | # | Opportunity | Tag | Value | Anchor |
 |---|---|---|---|---|
 | **S1** | Bound `GossipStream`'s queue and drive gRPC `request(n)` flow-control back to the sidecar; and/or split the single `Subscribe` into per-topic streams to kill head-of-line coupling. Closes the last open TIER-1 audit item + G2. | impl robustness | **HIGH** | G1/G2; `GossipStream.scala:23`, `server.go:304-463` |
-| **S2** | Wire the dead `RateLimitPerPeer` into `handleIncoming` and enforce `MaxHashesPerRequest` on both hash-based serve handlers. The obsolete unbounded ordinal-range handler is removed; these shared caps remain necessary. | impl robustness | **HIGH** | G3; `protocol.go` ChainSync serve handlers |
+| **S2** | **Partial landed 2026-07-13:** obsolete range/backfill RPC removed; 64-item inbound/outbound caps, per-peer sliding-window rate limit, and stream deadline enforced. Add explicit global/per-peer in-flight stream and JVM-work budgets with rejection metrics to close aggregate/Sybil amplification. | impl robustness | **HIGH** | G3; `protocol.go` ChainSync serve handlers |
 | **S3** | Add the per-shard topic families to `buildPeerScoreParams`, and scale the shard relay buffer per-shard (or per-`(shard×mg)`) instead of one shared 256. Directly on the sharding critical path. | impl robustness | **MED** | G4/G5; `gossip.go:282,1016` |
 | **S4** | Build the **sidecar BLS committee-attestation aggregation** slices (Phase 4/5 of `SIDECAR-BLS-ATTESTATION-AGGREGATION-DESIGN.md`) — collapse the committee-gate's O(N) per-attestation verify to O(1). *The aggregation approach is settled (BLS); the sidecar-side slices are unbuilt.* Gated on BouncyCastle 1.85. Efficiency win at scale, not a robustness fix. | new capability | **MED** (gated) | design §6 Phases 4-6; `gossip.go` publish sites, `server.go` |
 | **S5** | Backstop the unbounded state: TTL/size-cap on `pendingParentRef`; size-cap (+ optional persistence) on the outbox. | impl robustness | **LOW** | G6/G7; `NakamotoSyncDaemon.scala:733`, `outbox.go:59` |
