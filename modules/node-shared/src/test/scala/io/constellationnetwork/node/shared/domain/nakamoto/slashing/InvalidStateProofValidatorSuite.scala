@@ -333,8 +333,6 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(honestDifferent)
       for {
         rig <- authenticatedCheckpoint(attested)
         cp = rig.checkpoint
@@ -342,13 +340,42 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
         cpHash = ev.fraudProof.disputedCheckpointHash
         reader = InvalidStateProofSlashedReader.fromSet[IO](Set((shardZero, cpHash)))
+        replayCalls <- cats.effect.Ref.of[IO, Int](0)
+        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
+          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
         validator = makeValidator(
           reDerive,
           verifyCertificate = rig.acceptanceManager.verifyExecutionCertificate,
           slashedReader = reader
         )
         res <- validator.validate(ev)
-      } yield expect(res == Left(InvalidStateProofRejection.AlreadySlashed(shardZero, cpHash)))
+        calls <- replayCalls.get
+      } yield expect.all(res == Left(InvalidStateProofRejection.AlreadySlashed(shardZero, cpHash)), calls == 0)
+  }
+
+  test("FAIL-CLOSED: unavailable slash-registry state aborts validation before replay") {
+    case (h0, sp0) =>
+      implicit val h: Hasher[IO] = h0
+      implicit val sp: SecurityProvider[IO] = sp0
+      val unavailable = new IllegalStateException("exact slash-registry state unavailable")
+      val reader = new InvalidStateProofSlashedReader[IO] {
+        def wasSlashed(shardId: ShardId, disputedCheckpointHash: Hash): IO[Boolean] = IO.raiseError(unavailable)
+      }
+      for {
+        rig <- authenticatedCheckpoint(attested)
+        (kp, pid) <- challengerSetup(rig.checkpointSigner)
+        ev <- mkEvidence(rig.checkpoint, kp, pid, claimed = attested, challengerRoot = honestDifferent)
+        replayCalls <- cats.effect.Ref.of[IO, Int](0)
+        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
+          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
+        validator = makeValidator(
+          reDerive,
+          verifyCertificate = rig.acceptanceManager.verifyExecutionCertificate,
+          slashedReader = reader
+        )
+        result <- validator.validate(ev).attempt
+        calls <- replayCalls.get
+      } yield expect.all(result == Left(unavailable), calls == 0)
   }
 
   test("FAIL-CLOSED: unauthenticated checkpoint signer IDs reject before replay and can never become slash targets") {

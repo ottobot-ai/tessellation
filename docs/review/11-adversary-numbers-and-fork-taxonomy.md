@@ -244,6 +244,9 @@ Eight real divergences this project hit. Each hash `git`-verified on `feature/co
   authoritative-push fields, MPT entries, inclusion proofs). Any serve path with two encodings and
   one parser recurs; the "don't advance the cursor on decode-None" trap is the livelock cousin of
   FORK-008.
+- **Retirement (2026-07-13):** this incident remains provenance, but the undeployed
+  `BackfillDaemon`/ordinal-range protocol was later removed because it lacked KES and complete
+  registered KES/VRF/eta authority evidence. Hash-keyed recovery now re-enters the normal validator.
 
 ### FORK-003: Allow-spend epoch / currency-fold wedge (the canonical cross-shard violation)
 - **Symptom:** gl0 (numShards=1 re-exec path) re-derives `activeAllowSpends = empty` ≠ the
@@ -398,6 +401,9 @@ Eight real divergences this project hit. Each hash `git`-verified on `feature/co
   → `storeForkBranch`). All 2026-06-25. Clean deep catch-up after: 1 Tier-3 / 1 adopt / 0 re-adopt.
 - **Fault class:** **catch-up / restart livelock** — orphan-adopt freezes the gap-reference metric →
   re-teleport; monotonic-only guard against a stale adopt; first-not-freshest peer pick.
+- **Retirement (2026-07-13):** the referenced `BackfillDaemon` no longer exists. Missing ancestry is
+  fetched by hash and each child re-enters the normal parent-first validator; this paragraph remains
+  the historical mechanism and incident record.
 - **Still-relevant risk:** **HIGH.** Catch-up/restart paths are exactly where HANDOFF §5.5
   (set-valued P-window ⊇ U-window on *every* restart/catch-up path) and §5.6 (k₂ deep-revert
   determinism) live. Sharding adds per-shard mirror catch-up. Any adopt path that stores orphans

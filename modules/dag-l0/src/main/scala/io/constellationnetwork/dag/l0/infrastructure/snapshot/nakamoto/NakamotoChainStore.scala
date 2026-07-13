@@ -242,9 +242,8 @@ object NakamotoChainStore {
     //     leaves genesis-eta on the typical ~500-ord runs) but production deployments
     //     should set `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED` to at least
     //     `2 * NAKAMOTO_ETA_ROTATION_SNAPSHOTS` if `etaRotationSnapshots > 255`.
-    //   - `ChainSyncServer.serveSnapshots` answers `NotFound` for hashes not in `byHash`;
-    //     historical-query peers can fall back to `serveByRange` (disk-backed) or full
-    //     catch-up.
+    //   - `ChainSyncServer.serveSnapshots` falls through to disk-backed `SnapshotStorage.get(hash)`
+    //     after an in-memory miss, so retained historical snapshots keep the same full-envelope path.
     keepDepthBehindFinalized: Long = DefaultKeepDepthBehindFinalized,
     // Transitional flag selecting which legacy ordinal floor the store gate uses:
     //   - false (default) ⇒ the k₁ `nakamotoFinalizedOrdinalRef` — the legacy write-freeze at operational
@@ -639,8 +638,8 @@ object NakamotoChainStore {
               Async[F].pure(result(complete = true, acc, current.hash, current.ordinal.some))
             else if (current.ordinal < cutoff && current.vrfOutput.isEmpty)
               // Every ordinal in [periodStart, cutoff) contributes rho. Treat a missing output as an
-              // evidence gap even when the parent chain itself is intact (for example, downgraded
-              // backfill data reconstructed without a slot certificate).
+              // evidence gap even when the parent chain itself is intact (for example, historical
+              // data imported without a slot certificate).
               Async[F].pure(result(complete = false, acc, current.hash, current.ordinal.some))
             else {
               val nextAcc =

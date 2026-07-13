@@ -1986,8 +1986,10 @@ object GlobalSnapshotConsensus {
                   Some(
                     io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
                       reDerivePerMgRoot = watchtowerReDerive,
-                      slashedReader =
-                        io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.neverSlashed[F],
+                      // Daemon validation only stages evidence; bind its duplicate guard to the stable finalized MPT base available here.
+                      // The authoritative GSAM fold revalidates against its own consensus-state reader before applying any slash.
+                      slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader
+                        .fromMptStore[F](mptStore),
                       verifyExecutionCertificate = deps.acceptanceManager.verifyExecutionCertificate
                     )
                   ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
@@ -2454,27 +2456,6 @@ object GlobalSnapshotConsensus {
             )
             .toResource
 
-          // Check for persisted backfill cursor from a previous session (crash recovery).
-          // If found, resume backfill with production paused until it completes.
-          existingCursor <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.BackfillDaemon
-            .loadCursor[F](nakamotoDataDir)
-            .toResource
-          _ <- (existingCursor match {
-            case Some(cursor) =>
-              nakLogger.info(
-                s"🔄 Resuming backfill from crash: ordinal ${cursor.currentOrdinal} → ${cursor.targetOrdinal} " +
-                  s"(started at ${cursor.startedAtOrdinal})"
-              ) >>
-                supervisor
-                  .supervise(
-                    io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.BackfillDaemon
-                      .run[F](cursor, sidecarClient.channel, globalSnapshotStorage, productionGate, nakamotoDataDir)
-                      .handleErrorWith(e => nakLogger.warn(s"Backfill daemon failed on resume: ${e.getMessage}"))
-                  )
-                  .void
-            case None =>
-              Async[F].unit
-          }).toResource
         } yield ()
       }
       consensus = new Consensus(

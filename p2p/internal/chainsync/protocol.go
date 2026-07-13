@@ -30,9 +30,9 @@ import (
 )
 
 const (
-	ProtocolID     = protocol.ID("/nakamoto/chainsync/1.0.0")
-	MaxMessageSize = 16 * 1024 * 1024 // 16 MB max per message
-	RequestTimeout = 30 * time.Second
+	ProtocolID          = protocol.ID("/nakamoto/chainsync/1.0.0")
+	MaxMessageSize      = 16 * 1024 * 1024 // 16 MB max per message
+	RequestTimeout      = 30 * time.Second
 	MaxHashesPerRequest = 64
 	RateLimitPerPeer    = 10 // requests per minute
 )
@@ -111,7 +111,7 @@ func (h *Handler) handleIncoming(s network.Stream) {
 	case 0x03: // GetPeerTip — no body
 		h.serveGetPeerTip(s, remotePeer)
 		return
-	case 0x01, 0x02, 0x04, 0x05: // FetchSnapshots / FindIntersection / FetchByRange / FetchMetagraphBinaries — length-prefixed body
+	case 0x01, 0x02, 0x05: // FetchSnapshots / FindIntersection / FetchMetagraphBinaries — length-prefixed body
 		data, err := readLengthPrefixed(s)
 		if err != nil {
 			fmt.Printf("[chainsync] Failed to read request from %s: %v\n", remotePeer, err)
@@ -122,8 +122,6 @@ func (h *Handler) handleIncoming(s network.Stream) {
 			h.serveFetchSnapshots(s, data, remotePeer)
 		case 0x02:
 			h.serveFindIntersection(s, data, remotePeer)
-		case 0x04:
-			h.serveFetchByRange(s, data, remotePeer)
 		case 0x05:
 			h.serveMetagraphBinaries(s, data, remotePeer)
 		}
@@ -368,50 +366,10 @@ func (h *Handler) GetPeerTip(ctx context.Context) (*pb.PeerTipResponse, error) {
 	return &resp, nil
 }
 
-// serveFetchByRange handles incoming range requests from peers by relaying to JVM.
-func (h *Handler) serveFetchByRange(s network.Stream, data []byte, from peer.ID) {
-	conn := h.ensureJVMConn()
-	if conn == nil {
-		fmt.Printf("[chainsync] No JVM connection, cannot serve range to %s\n", from)
-		return
-	}
-
-	var req pb.FetchByRangeRequest
-	if err := proto.Unmarshal(data, &req); err != nil {
-		fmt.Printf("[chainsync] Failed to unmarshal FetchByRange from %s: %v\n", from, err)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-
-	client := pb.NewChainSyncInboundClient(conn)
-	stream, err := client.ServeByRange(ctx, &req)
-	if err != nil {
-		fmt.Printf("[chainsync] JVM ServeByRange failed: %v\n", err)
-		return
-	}
-
-	for {
-		snap, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			fmt.Printf("[chainsync] JVM ServeByRange stream error: %v\n", err)
-			break
-		}
-		respBytes, _ := proto.Marshal(snap)
-		if err := writeLengthPrefixed(s, respBytes); err != nil {
-			break
-		}
-	}
-}
-
 // serveMetagraphBinaries handles incoming metagraph-binary fetch requests (#259)
 // from peers by relaying to the JVM ServeMetagraphBinaries stream. The JVM looks
 // up each requested value-hash among recent-finalized snapshots + a non-destructive
-// orphan-buffer peek; the sidecar is a pure relay (mirrors serveFetchByRange).
+// orphan-buffer peek; the sidecar is a pure relay.
 func (h *Handler) serveMetagraphBinaries(s network.Stream, data []byte, from peer.ID) {
 	conn := h.ensureJVMConn()
 	if conn == nil {
@@ -506,70 +464,6 @@ func (h *Handler) FetchMetagraphBinaries(ctx context.Context, address string, ha
 	}
 
 	return responses, nil
-}
-
-// FetchByRange sends a range request to a specific peer (or random if no target).
-// Returns BackfillSnapshot messages for the requested ordinal range.
-func (h *Handler) FetchByRange(ctx context.Context, startOrdinal, endOrdinal int64, targetPeerID []byte) ([]*pb.BackfillSnapshot, error) {
-	var target peer.ID
-	if len(targetPeerID) > 0 {
-		target = peer.ID(targetPeerID)
-	} else {
-		var err error
-		target, err = h.pickPeer()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-
-	s, err := h.host.NewStream(reqCtx, target, ProtocolID)
-	if err != nil {
-		h.markFailed(target)
-		return nil, fmt.Errorf("stream to %s failed: %w", target, err)
-	}
-	defer s.Close()
-
-	req := &pb.FetchByRangeRequest{
-		StartOrdinal: startOrdinal,
-		EndOrdinal:   endOrdinal,
-	}
-	reqBytes, _ := proto.Marshal(req)
-	if _, err := s.Write([]byte{0x04}); err != nil {
-		h.markFailed(target)
-		return nil, err
-	}
-	if err := writeLengthPrefixed(s, reqBytes); err != nil {
-		h.markFailed(target)
-		return nil, err
-	}
-	s.CloseWrite()
-
-	var snapshots []*pb.BackfillSnapshot
-	for {
-		data, err := readLengthPrefixed(s)
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			h.markFailed(target)
-			return snapshots, err
-		}
-		var snap pb.BackfillSnapshot
-		if err := proto.Unmarshal(data, &snap); err != nil {
-			continue
-		}
-		snapshots = append(snapshots, &snap)
-	}
-
-	return snapshots, nil
-}
-
-// ListPeers returns the IDs of all connected peers.
-func (h *Handler) ListPeers() []peer.ID {
-	return h.host.Network().Peers()
 }
 
 func (h *Handler) pickPeer() (peer.ID, error) {

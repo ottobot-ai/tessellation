@@ -251,9 +251,10 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       }
       reader = InvalidStateProofSlashedReader.fromMptStore[IO](store)
       slashedA <- reader.wasSlashed(shardZero, cpA)
+      duplicateA <- reader.wasSlashed(shardZero, cpA)
       notSlashedB <- reader.wasSlashed(shardZero, cpB)
       notSlashedShard <- reader.wasSlashed(shardOne, cpA)
-    } yield expect.all(slashedA, !notSlashedB, !notSlashedShard, app.registryEntries.size == 2)
+    } yield expect.all(slashedA, duplicateA, !notSlashedB, !notSlashedShard, app.registryEntries.size == 2)
   }
 
   test("empty Slashings partition ⇒ wasSlashed is always false") { res =>

@@ -514,10 +514,6 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
           implicit hasher: Hasher[GlobalSnapshotTraverseSuite.F]
         ): GlobalSnapshotTraverseSuite.F[Unit] = ().pure
 
-        override def writeForBackfill(snapshot: Signed[GlobalSnapshotArtifact])(
-          implicit hasher: Hasher[GlobalSnapshotTraverseSuite.F]
-        ): GlobalSnapshotTraverseSuite.F[Unit] = ().pure
-
         override def confirmHead(hash: Hash): GlobalSnapshotTraverseSuite.F[Unit] = ().pure
 
         override def pruneTentative(finalizedOrdinal: GlobalSnapshotKey): GlobalSnapshotTraverseSuite.F[Unit] = ().pure

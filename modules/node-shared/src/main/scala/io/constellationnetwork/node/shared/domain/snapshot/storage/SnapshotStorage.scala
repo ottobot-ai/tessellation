@@ -40,7 +40,4 @@ trait SnapshotStorage[F[_], S <: Snapshot, State] {
     */
   def pruneTentative(finalizedOrdinal: SnapshotOrdinal): F[Unit]
 
-  /** Write a snapshot to disk for backfill without changing the head. Used by BackfillDaemon to fill historical chain gaps. */
-  def writeForBackfill(snapshot: Signed[S])(implicit hasher: Hasher[F]): F[Unit]
-
 }

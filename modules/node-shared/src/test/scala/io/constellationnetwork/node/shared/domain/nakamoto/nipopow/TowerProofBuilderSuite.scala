@@ -166,7 +166,6 @@ object TowerProofBuilderSuite extends MutableIOSuite {
       ): IO[Unit] = IO.unit
       override def confirmHead(hash: Hash): IO[Unit] = IO.unit
       override def pruneTentative(finalizedOrdinal: SnapshotOrdinal): IO[Unit] = IO.unit
-      override def writeForBackfill(snapshot: Signed[GlobalIncrementalSnapshot])(implicit hasher: Hasher[IO]): IO[Unit] = IO.unit
     }
 
   /** Constructed once — every test that needs a `head` returns this `GlobalSnapshotInfo`. The builder ignores the state component, so a

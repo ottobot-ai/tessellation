@@ -195,8 +195,10 @@ criteria are in `NAKAMOTO-PLAN.md`.
     in constant time, rejects empty/nonempty malformed shapes, and never treats
     sender `activePoolSize` as stake. It then fails closed with historical
     eligibility unavailable because branch-bound roster/stake/eta witnesses do
-    not exist. Backfill still lacks registered KES/VRF/eta authority context, and
-    slashing cannot decide against unavailable exact offence-parent history.
+    not exist. The unverifiable ordinal-range archival backfill path is removed;
+    any replacement must carry registered KES/VRF/eta evidence and re-enter the
+    normal parent-first snapshot validator. Slashing cannot decide against
+    unavailable exact offence-parent history.
   - **Gate:** `KEYREG-001..015`, `FIN-B-004`, `CRYPTO-001`, `TOWER-004/005`,
     `SHARD-S-003`, `ADMIT-003`, cross-consumer and restart/reorg vectors.
 

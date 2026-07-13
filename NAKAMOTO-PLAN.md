@@ -191,8 +191,10 @@ only. Registration proves key ownership and never grants operator eligibility.
   and its carried output, rejects malformed/empty nonempty-proof shapes, and
   ignores sender `activePoolSize`. Every otherwise-valid nonempty proof still
   fails closed because exact branch-historical roster/stake/eta eligibility is
-  unavailable. Backfill lacks the full registered KES/VRF/eta context, and
-  slashing lacks production exact-offence-parent historical resolution.
+  unavailable. The unverifiable ordinal-range archival backfill path has been
+  removed; any replacement must use full registered KES/VRF/eta evidence and the
+  normal parent-first snapshot validator. Slashing still lacks production exact-
+  offence-parent historical resolution.
 
 Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
 

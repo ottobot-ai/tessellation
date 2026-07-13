@@ -225,52 +225,6 @@ object ChainSyncServer {
         dispatcher.unsafeToFuture(effect)
       }
 
-      override def serveByRange(
-        request: pb.FetchByRangeRequest,
-        responseObserver: StreamObserver[pb.BackfillSnapshot]
-      ): Unit =
-        dispatcher.unsafeRunAndForget {
-          import eu.timepit.refined.types.numeric.NonNegLong
-
-          val start = request.startOrdinal
-          val end = request.endOrdinal
-
-          logger.info(s"ChainSync SERVE RANGE: ordinals $start to $end") >>
-            HasherSelector[F].withCurrent { implicit hasher =>
-              (start to end).toList.traverse_ { ord =>
-                val ordinal = io.constellationnetwork.schema.SnapshotOrdinal(NonNegLong.unsafeFrom(ord))
-                snapshotStorage.get(ordinal).flatMap {
-                  case Some(signedSnapshot) =>
-                    signedSnapshot.toHashed[F].flatMap { hashed =>
-                      val payload = {
-                        import io.circe.syntax._
-                        signedSnapshot.asJson.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                      }
-                      val cert = signedSnapshot.value.slotCertificate
-                      val snap = pb.BackfillSnapshot(
-                        hash = com.google.protobuf.ByteString.copyFrom(hashed.hash.value.getBytes),
-                        slot = cert.map(_.slot.value.value).getOrElse(0L),
-                        ordinal = ord,
-                        parentHash = com.google.protobuf.ByteString.copyFrom(hashed.lastSnapshotHash.value.getBytes),
-                        payload = com.google.protobuf.ByteString.copyFrom(payload),
-                        vrfProof = com.google.protobuf.ByteString
-                          .copyFrom(cert.map(_.vrfProof.value.toBytes).getOrElse(Array.empty[Byte])),
-                        vrfPublicKey = com.google.protobuf.ByteString
-                          .copyFrom(cert.map(_.vrfPublicKey.value.toBytes).getOrElse(Array.empty[Byte])),
-                        producerId = com.google.protobuf.ByteString
-                          .copyFrom(signedSnapshot.proofs.head.id.hex.toBytes),
-                        parentSlot = cert.map(_.parentSlot.value.value).getOrElse(0L)
-                      )
-                      Async[F].delay(responseObserver.onNext(snap))
-                    }
-                  case None =>
-                    logger.debug(s"ChainSync SERVE RANGE: ordinal=$ord not found") >>
-                      Async[F].unit
-                }
-              }
-            } >> Async[F].delay(responseObserver.onCompleted())
-        }
-
       // #259: serve local metagraph state-channel binaries to a peer's active-recovery fetch.
       //
       // The peer's gl0 orphan-buffered a binary whose parent it never admitted; it now pulls that

@@ -77,8 +77,8 @@ object InvalidStateProofValidator {
     *   exact `perMetagraphMptRoots` (PIN-1) encoding and byte-comparable against the committee-attested value. Production wiring passes the
     *   identical instance constructed in `SharedServices`/`GlobalSnapshotConsensus`.
     * @param slashedReader
-    *   the double-slash MPT guard, keyed on `(shardId, disputedCheckpointHash)`. `InvalidStateProofSlashedReader.neverSlashed` for tests /
-    *   pre-MPT-partition wiring.
+    *   the double-slash MPT guard, keyed on `(shardId, disputedCheckpointHash)`. Production callers must bind the exact rooted state view;
+    *   `InvalidStateProofSlashedReader.neverSlashed` is only for isolated tests.
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
     // Track-1 execution-base-pin: the 4th arg is the disputed checkpoint's `executionBaseOrdinal`, so the honest re-derivation reads S(N) at the

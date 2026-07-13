@@ -47,7 +47,7 @@ without breaking the e2e clients.
 | Server bootstrap | `GlobalSnapshotConsensus.scala:1206-1240` (`io.grpc.ServerBuilder.forPort(50053)...`) |
 | Resource lifecycle (start + graceful shutdown w/ 5s grace) | same block, `Resource.make(...)(srv => srv.shutdown(); srv.awaitTermination(5, SECONDS))` |
 | Dispatcher pattern for async-to-gRPC bridging | `chainSyncDispatcher <- Dispatcher.sequential[F]` then passed to `ChainSyncServer.make` |
-| ServerStreamingObserver pattern | `ChainSyncServer.scala` (`serveByRange` etc.) |
+| ServerStreamingObserver pattern | `ChainSyncServer.scala` (`serveSnapshots`, `serveMetagraphBinaries`) |
 | FS2 `Topic` for fan-out | `ClusterStorage.scala:31` (`topic <- Topic[F, Ior[Peer, Peer]]`) and `NodeStorage.scala:28` |
 | HOCON-typed config (env-var fallback) | `application.conf:281-302` `nakamoto { ... }`, mirror class `NakamotoConfig` in `config/types.scala:85` |
 

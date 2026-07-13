@@ -78,9 +78,6 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       ): IO[Unit] = IO.unit
       def confirmHead(hash: Hash): IO[Unit] = IO.unit
       def pruneTentative(finalizedOrdinal: SnapshotOrdinal): IO[Unit] = IO.unit
-      def writeForBackfill(snapshot: Signed[GlobalIncrementalSnapshot])(
-        implicit hasher: Hasher[IO]
-      ): IO[Unit] = IO.unit
     }
 
   /** In-memory disk-simulator: the `NakamotoChainStore.getWithOrdinalFallback` path consults `SnapshotStorage.get(ordinal)` when the
@@ -119,9 +116,6 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       ): IO[Unit] = IO.unit
       def confirmHead(hash: Hash): IO[Unit] = IO.unit
       def pruneTentative(finalizedOrdinal: SnapshotOrdinal): IO[Unit] = IO.unit
-      def writeForBackfill(snapshot: Signed[GlobalIncrementalSnapshot])(
-        implicit hasher: Hasher[IO]
-      ): IO[Unit] = IO.unit
     }
 
   // Test fixture: NakamotoChainStore + the finalized-ordinal Ref it gates against.

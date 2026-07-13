@@ -543,11 +543,9 @@ object NakamotoSyncDaemon {
     localTipOrdinal: Long,
     isReady: Boolean,
     lastCatchUpAttemptMs: Long = 0L,
-    // Highest ordinal a Tier-3 catch-up has ADOPTED (max-monotone). A catch-up stores the pulled snapshot as an ORPHAN — its
-    // ancestors aren't in the chain store until the BackfillDaemon connects them — so `chainStore.bestTipOrdinal` keeps reporting the
-    // OLD connected tip (chain-selection prefers the connected chain over the orphan). The Tier-3 gap-check maxes bestTip with THIS so
-    // a just-adopted catch-up can't immediately re-fire Tier-3 over the same window (the orphan-adopt livelock); subsequent gossip
-    // falls to Tier-2 walk-back, which connects the gap, instead of re-teleporting forever.
+    // Highest ordinal a Tier-3 catch-up has ADOPTED (max-monotone). A pulled child remains inert while its parent is absent, so
+    // `chainStore.bestTipOrdinal` can still report the old connected tip. The Tier-3 gap-check maxes bestTip with this watermark to avoid
+    // repeatedly requesting the same window while hash-keyed parent recovery connects the gap.
     lastCatchUpAdoptedOrdinal: Long = 0L
   )
 
@@ -1505,10 +1503,9 @@ object NakamotoSyncDaemon {
                   // Tier 2 (>6, <=k): sequential walk-back via ChainSync (moderate drift)
                   // Tier 3 (>k): full catch-up — network finalized past us
                   (chainStore.bestTipOrdinal, stateRef.get).flatMapN { (localBestOrdinal, syncSt) =>
-                    // Orphan-adopt livelock guard: a Tier-3 catch-up stores the pulled snapshot as an ORPHAN, so `bestTipOrdinal` keeps
-                    // reporting the OLD connected tip until the BackfillDaemon links the ancestors. Max it with the highest ordinal a
-                    // catch-up has already adopted so we DON'T re-teleport over the same window every gossip (the livelock observed under a
-                    // gossip flood); once a catch-up has adopted ord M, the residual gap to the tip is closed by Tier-2 walk-back instead.
+                    // Recovery livelock guard: while a parent-missing child is buffered, `bestTipOrdinal` still reports the connected tip.
+                    // Max it with the highest already-requested catch-up ordinal so gossip cannot restart the same large-gap request before
+                    // hash-keyed parent recovery connects it.
                     val localOrd = math.max(localBestOrdinal.getOrElse(0L), syncSt.lastCatchUpAdoptedOrdinal)
                     val gap = snap.ordinal - localOrd
                     if (gap > confirmationDepthK) {

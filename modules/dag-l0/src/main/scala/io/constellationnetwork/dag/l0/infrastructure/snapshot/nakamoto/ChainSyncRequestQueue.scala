@@ -37,7 +37,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *     suppress re-requests for longer (e.g. "don't retry this ordinal for 30s even after failure"), layer TTL on top — don't widen the
   *     queue.
   *   - Bounded capacity, drop-on-full. A hot producer should not be able to DOS the drainer or balloon memory. Drops are logged so they
-  *     show up in diagnostics; the periodic backstop (existing BackfillDaemon / ChainSync sweeps) catches what's dropped.
+  *     show up in diagnostics; the periodic hash-keyed ChainSync sweep catches what's dropped.
   *
   * ==Cats Effect primitives in play==
   *
@@ -149,8 +149,8 @@ object ChainSyncRequestQueue {
     *
     * Caveats this worker does *not* address (leave for later / richer scheduler):
     *   - No peer selection. Uses whichever peer the sidecar returns from `GetPeerTip`. If peers disagree, we pick whoever answers first.
-    *   - No bound on how large a gap to attempt. If peer tip is 10_000 ahead, this still triggers. In practice `NakamotoSyncDaemon` has its
-    *     own tiering (Tier 1/2/3) that caps walk-back depth and falls back to `BackfillDaemon`.
+    *   - No bound on how large a gap to attempt. If peer tip is 10_000 ahead, this still triggers. `NakamotoSyncDaemon` buffers every child
+    *     until its exact parent is present and recursively requests missing hashes through the same validator-bound path.
     *   - No retry/backoff. If the peer is unresponsive, the worker fails; the next 5s finality-monitor tick re-offers.
     *
     * @param channel
@@ -171,7 +171,7 @@ object ChainSyncRequestQueue {
         .flatMap { tip =>
           val peerOrdinal = tip.ordinal
           if (peerOrdinal < ordinal) {
-            // Peer is behind us — nothing to pull. The gap is upstream or we're already ahead; let BackfillDaemon / periodic sync handle it.
+            // Peer is behind us — nothing to pull. The gap is upstream or we're already ahead; let the periodic sync pass retry.
             logger.debug(s"walkback worker: peer tip ordinal=$peerOrdinal < requested=$ordinal; skipping")
           } else {
             // Wire format is 64-byte ASCII hex (Hash.value is a hex string). Every other decode

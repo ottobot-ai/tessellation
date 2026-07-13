@@ -732,10 +732,8 @@ var SidecarService_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	ChainSyncOutbound_FetchSnapshots_FullMethodName         = "/nakamoto.p2p.ChainSyncOutbound/FetchSnapshots"
-	ChainSyncOutbound_FetchByRange_FullMethodName           = "/nakamoto.p2p.ChainSyncOutbound/FetchByRange"
 	ChainSyncOutbound_FindIntersection_FullMethodName       = "/nakamoto.p2p.ChainSyncOutbound/FindIntersection"
 	ChainSyncOutbound_GetPeerTip_FullMethodName             = "/nakamoto.p2p.ChainSyncOutbound/GetPeerTip"
-	ChainSyncOutbound_ListPeers_FullMethodName              = "/nakamoto.p2p.ChainSyncOutbound/ListPeers"
 	ChainSyncOutbound_FetchMetagraphBinaries_FullMethodName = "/nakamoto.p2p.ChainSyncOutbound/FetchMetagraphBinaries"
 )
 
@@ -748,10 +746,8 @@ const (
 // and streams the response back to the JVM.
 type ChainSyncOutboundClient interface {
 	FetchSnapshots(ctx context.Context, in *FetchSnapshotsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Snapshot], error)
-	FetchByRange(ctx context.Context, in *FetchByRangeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackfillSnapshot], error)
 	FindIntersection(ctx context.Context, in *FindIntersectionRequest, opts ...grpc.CallOption) (*FindIntersectionResponse, error)
 	GetPeerTip(ctx context.Context, in *GetPeerTipRequest, opts ...grpc.CallOption) (*PeerTipResponse, error)
-	ListPeers(ctx context.Context, in *ListPeersRequest, opts ...grpc.CallOption) (*ListPeersResponse, error)
 	// #259: pull missing metagraph binaries by value-hash from a peer.
 	FetchMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error)
 }
@@ -783,25 +779,6 @@ func (c *chainSyncOutboundClient) FetchSnapshots(ctx context.Context, in *FetchS
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ChainSyncOutbound_FetchSnapshotsClient = grpc.ServerStreamingClient[Snapshot]
 
-func (c *chainSyncOutboundClient) FetchByRange(ctx context.Context, in *FetchByRangeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackfillSnapshot], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ChainSyncOutbound_ServiceDesc.Streams[1], ChainSyncOutbound_FetchByRange_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[FetchByRangeRequest, BackfillSnapshot]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ChainSyncOutbound_FetchByRangeClient = grpc.ServerStreamingClient[BackfillSnapshot]
-
 func (c *chainSyncOutboundClient) FindIntersection(ctx context.Context, in *FindIntersectionRequest, opts ...grpc.CallOption) (*FindIntersectionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(FindIntersectionResponse)
@@ -822,19 +799,9 @@ func (c *chainSyncOutboundClient) GetPeerTip(ctx context.Context, in *GetPeerTip
 	return out, nil
 }
 
-func (c *chainSyncOutboundClient) ListPeers(ctx context.Context, in *ListPeersRequest, opts ...grpc.CallOption) (*ListPeersResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ListPeersResponse)
-	err := c.cc.Invoke(ctx, ChainSyncOutbound_ListPeers_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *chainSyncOutboundClient) FetchMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ChainSyncOutbound_ServiceDesc.Streams[2], ChainSyncOutbound_FetchMetagraphBinaries_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &ChainSyncOutbound_ServiceDesc.Streams[1], ChainSyncOutbound_FetchMetagraphBinaries_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -860,10 +827,8 @@ type ChainSyncOutbound_FetchMetagraphBinariesClient = grpc.ServerStreamingClient
 // and streams the response back to the JVM.
 type ChainSyncOutboundServer interface {
 	FetchSnapshots(*FetchSnapshotsRequest, grpc.ServerStreamingServer[Snapshot]) error
-	FetchByRange(*FetchByRangeRequest, grpc.ServerStreamingServer[BackfillSnapshot]) error
 	FindIntersection(context.Context, *FindIntersectionRequest) (*FindIntersectionResponse, error)
 	GetPeerTip(context.Context, *GetPeerTipRequest) (*PeerTipResponse, error)
-	ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error)
 	// #259: pull missing metagraph binaries by value-hash from a peer.
 	FetchMetagraphBinaries(*FetchMetagraphBinariesRequest, grpc.ServerStreamingServer[MetagraphBinaryResponse]) error
 	mustEmbedUnimplementedChainSyncOutboundServer()
@@ -879,17 +844,11 @@ type UnimplementedChainSyncOutboundServer struct{}
 func (UnimplementedChainSyncOutboundServer) FetchSnapshots(*FetchSnapshotsRequest, grpc.ServerStreamingServer[Snapshot]) error {
 	return status.Error(codes.Unimplemented, "method FetchSnapshots not implemented")
 }
-func (UnimplementedChainSyncOutboundServer) FetchByRange(*FetchByRangeRequest, grpc.ServerStreamingServer[BackfillSnapshot]) error {
-	return status.Error(codes.Unimplemented, "method FetchByRange not implemented")
-}
 func (UnimplementedChainSyncOutboundServer) FindIntersection(context.Context, *FindIntersectionRequest) (*FindIntersectionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method FindIntersection not implemented")
 }
 func (UnimplementedChainSyncOutboundServer) GetPeerTip(context.Context, *GetPeerTipRequest) (*PeerTipResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetPeerTip not implemented")
-}
-func (UnimplementedChainSyncOutboundServer) ListPeers(context.Context, *ListPeersRequest) (*ListPeersResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ListPeers not implemented")
 }
 func (UnimplementedChainSyncOutboundServer) FetchMetagraphBinaries(*FetchMetagraphBinariesRequest, grpc.ServerStreamingServer[MetagraphBinaryResponse]) error {
 	return status.Error(codes.Unimplemented, "method FetchMetagraphBinaries not implemented")
@@ -925,17 +884,6 @@ func _ChainSyncOutbound_FetchSnapshots_Handler(srv interface{}, stream grpc.Serv
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ChainSyncOutbound_FetchSnapshotsServer = grpc.ServerStreamingServer[Snapshot]
-
-func _ChainSyncOutbound_FetchByRange_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(FetchByRangeRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(ChainSyncOutboundServer).FetchByRange(m, &grpc.GenericServerStream[FetchByRangeRequest, BackfillSnapshot]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ChainSyncOutbound_FetchByRangeServer = grpc.ServerStreamingServer[BackfillSnapshot]
 
 func _ChainSyncOutbound_FindIntersection_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(FindIntersectionRequest)
@@ -973,24 +921,6 @@ func _ChainSyncOutbound_GetPeerTip_Handler(srv interface{}, ctx context.Context,
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ChainSyncOutbound_ListPeers_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ListPeersRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ChainSyncOutboundServer).ListPeers(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: ChainSyncOutbound_ListPeers_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ChainSyncOutboundServer).ListPeers(ctx, req.(*ListPeersRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _ChainSyncOutbound_FetchMetagraphBinaries_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(FetchMetagraphBinariesRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -1017,20 +947,11 @@ var ChainSyncOutbound_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "GetPeerTip",
 			Handler:    _ChainSyncOutbound_GetPeerTip_Handler,
 		},
-		{
-			MethodName: "ListPeers",
-			Handler:    _ChainSyncOutbound_ListPeers_Handler,
-		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
 			StreamName:    "FetchSnapshots",
 			Handler:       _ChainSyncOutbound_FetchSnapshots_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "FetchByRange",
-			Handler:       _ChainSyncOutbound_FetchByRange_Handler,
 			ServerStreams: true,
 		},
 		{
@@ -1044,7 +965,6 @@ var ChainSyncOutbound_ServiceDesc = grpc.ServiceDesc{
 
 const (
 	ChainSyncInbound_ServeSnapshots_FullMethodName         = "/nakamoto.p2p.ChainSyncInbound/ServeSnapshots"
-	ChainSyncInbound_ServeByRange_FullMethodName           = "/nakamoto.p2p.ChainSyncInbound/ServeByRange"
 	ChainSyncInbound_ServeChainPoints_FullMethodName       = "/nakamoto.p2p.ChainSyncInbound/ServeChainPoints"
 	ChainSyncInbound_ServeMetagraphBinaries_FullMethodName = "/nakamoto.p2p.ChainSyncInbound/ServeMetagraphBinaries"
 )
@@ -1058,7 +978,6 @@ const (
 // methods on the JVM to fulfill the request.
 type ChainSyncInboundClient interface {
 	ServeSnapshots(ctx context.Context, in *ServeSnapshotsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[Snapshot], error)
-	ServeByRange(ctx context.Context, in *FetchByRangeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackfillSnapshot], error)
 	ServeChainPoints(ctx context.Context, in *ServeChainPointsRequest, opts ...grpc.CallOption) (*ServeChainPointsResponse, error)
 	// #259: serve local metagraph binaries (recent-finalized snapshots +
 	// non-destructive orphan-buffer peek) to an incoming network request.
@@ -1092,25 +1011,6 @@ func (c *chainSyncInboundClient) ServeSnapshots(ctx context.Context, in *ServeSn
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ChainSyncInbound_ServeSnapshotsClient = grpc.ServerStreamingClient[Snapshot]
 
-func (c *chainSyncInboundClient) ServeByRange(ctx context.Context, in *FetchByRangeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackfillSnapshot], error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ChainSyncInbound_ServiceDesc.Streams[1], ChainSyncInbound_ServeByRange_FullMethodName, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	x := &grpc.GenericClientStream[FetchByRangeRequest, BackfillSnapshot]{ClientStream: stream}
-	if err := x.ClientStream.SendMsg(in); err != nil {
-		return nil, err
-	}
-	if err := x.ClientStream.CloseSend(); err != nil {
-		return nil, err
-	}
-	return x, nil
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ChainSyncInbound_ServeByRangeClient = grpc.ServerStreamingClient[BackfillSnapshot]
-
 func (c *chainSyncInboundClient) ServeChainPoints(ctx context.Context, in *ServeChainPointsRequest, opts ...grpc.CallOption) (*ServeChainPointsResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ServeChainPointsResponse)
@@ -1123,7 +1023,7 @@ func (c *chainSyncInboundClient) ServeChainPoints(ctx context.Context, in *Serve
 
 func (c *chainSyncInboundClient) ServeMetagraphBinaries(ctx context.Context, in *FetchMetagraphBinariesRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MetagraphBinaryResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ChainSyncInbound_ServiceDesc.Streams[2], ChainSyncInbound_ServeMetagraphBinaries_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &ChainSyncInbound_ServiceDesc.Streams[1], ChainSyncInbound_ServeMetagraphBinaries_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -1149,7 +1049,6 @@ type ChainSyncInbound_ServeMetagraphBinariesClient = grpc.ServerStreamingClient[
 // methods on the JVM to fulfill the request.
 type ChainSyncInboundServer interface {
 	ServeSnapshots(*ServeSnapshotsRequest, grpc.ServerStreamingServer[Snapshot]) error
-	ServeByRange(*FetchByRangeRequest, grpc.ServerStreamingServer[BackfillSnapshot]) error
 	ServeChainPoints(context.Context, *ServeChainPointsRequest) (*ServeChainPointsResponse, error)
 	// #259: serve local metagraph binaries (recent-finalized snapshots +
 	// non-destructive orphan-buffer peek) to an incoming network request.
@@ -1166,9 +1065,6 @@ type UnimplementedChainSyncInboundServer struct{}
 
 func (UnimplementedChainSyncInboundServer) ServeSnapshots(*ServeSnapshotsRequest, grpc.ServerStreamingServer[Snapshot]) error {
 	return status.Error(codes.Unimplemented, "method ServeSnapshots not implemented")
-}
-func (UnimplementedChainSyncInboundServer) ServeByRange(*FetchByRangeRequest, grpc.ServerStreamingServer[BackfillSnapshot]) error {
-	return status.Error(codes.Unimplemented, "method ServeByRange not implemented")
 }
 func (UnimplementedChainSyncInboundServer) ServeChainPoints(context.Context, *ServeChainPointsRequest) (*ServeChainPointsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ServeChainPoints not implemented")
@@ -1207,17 +1103,6 @@ func _ChainSyncInbound_ServeSnapshots_Handler(srv interface{}, stream grpc.Serve
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ChainSyncInbound_ServeSnapshotsServer = grpc.ServerStreamingServer[Snapshot]
-
-func _ChainSyncInbound_ServeByRange_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(FetchByRangeRequest)
-	if err := stream.RecvMsg(m); err != nil {
-		return err
-	}
-	return srv.(ChainSyncInboundServer).ServeByRange(m, &grpc.GenericServerStream[FetchByRangeRequest, BackfillSnapshot]{ServerStream: stream})
-}
-
-// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type ChainSyncInbound_ServeByRangeServer = grpc.ServerStreamingServer[BackfillSnapshot]
 
 func _ChainSyncInbound_ServeChainPoints_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ServeChainPointsRequest)
@@ -1264,11 +1149,6 @@ var ChainSyncInbound_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ServeSnapshots",
 			Handler:       _ChainSyncInbound_ServeSnapshots_Handler,
-			ServerStreams: true,
-		},
-		{
-			StreamName:    "ServeByRange",
-			Handler:       _ChainSyncInbound_ServeByRange_Handler,
 			ServerStreams: true,
 		},
 		{

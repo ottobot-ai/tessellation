@@ -70,7 +70,7 @@ MPT, and **all consumer-facing REST** (§3b). It talks to its own sidecar over l
 
 ### 1.2 The boundary interface (protobuf/gRPC)
 
-Defined in `p2p/proto/sidecar.proto` (584 lines). Three gRPC services:
+Defined in `p2p/proto/sidecar.proto`. Three gRPC services:
 
 - **`SidecarService`** (`sidecar.proto:332-397`) — JVM → sidecar, on `127.0.0.1:50051`
   (`compose-runner`/`main.go:47`). 11 `Publish*` unary RPCs (snapshot, attestation, rumor,
@@ -78,12 +78,11 @@ Defined in `p2p/proto/sidecar.proto` (584 lines). Three gRPC services:
   **shard-checkpoint-attestation**, **fraud-proof**), `ConfirmFinalized` (outbox ack), a
   **server-streaming `Subscribe`** that pushes every received `GossipMessage` to the JVM, plus
   `PeerCount` / `Health`.
-- **`ChainSyncOutbound`** (`sidecar.proto:564-572`) — JVM → sidecar → peer: `FetchSnapshots`,
-  `FetchByRange` (backfill), `FindIntersection`, `GetPeerTip`, `ListPeers`, `FetchMetagraphBinaries`
-  (#259 active recovery).
-- **`ChainSyncInbound`** (`sidecar.proto:577-584`) — sidecar → JVM on `gl0:50053` (`main.go:50`): when
-  a *peer* asks this node for data, the sidecar calls back into the JVM to serve it (`ServeSnapshots`,
-  `ServeByRange`, `ServeChainPoints`, `ServeMetagraphBinaries`).
+- **`ChainSyncOutbound`** — JVM → sidecar → peer: `FetchSnapshots`, `FindIntersection`,
+  `GetPeerTip`, and `FetchMetagraphBinaries` (#259 active recovery).
+- **`ChainSyncInbound`** — sidecar → JVM on `gl0:50053` (`main.go:50`): when a *peer* asks this
+  node for data, the sidecar calls back into the JVM to serve it (`ServeSnapshots`,
+  `ServeChainPoints`, `ServeMetagraphBinaries`).
 
 The gossip envelope is `GossipMessage` — a `oneof body` with **11 arms** (`sidecar.proto:313-327`),
 one per message type. The **flow-control / backpressure fields** on the wire:
@@ -143,17 +142,13 @@ dropping together (`gossip.go:727-731` loud-drop). The per-topic Go buffers (`co
 this but the final funnel is serial. `server.go:296-299` explicitly notes "the JVM holds exactly one
 stream."
 
-**G3 — the ChainSync *inbound serve* path has no rate-limit and no range cap (DoS surface).**
+**G3 — the ChainSync *inbound serve* path has no rate-limit or inbound request cap (DoS surface).**
 `RateLimitPerPeer = 10 // requests per minute` is **declared but never used** (`protocol.go:37` — zero
 references). `MaxHashesPerRequest = 64` is enforced only on the **outbound** client calls
-(`protocol.go:248,460`), **not** on the inbound serve handlers: `serveFetchSnapshots`
-(`protocol.go:135-173`), `serveMetagraphBinaries` (`protocol.go:415-452`), and `serveFetchByRange`
-(`protocol.go:372-409`) unmarshal the request and relay it straight to the JVM with no length/range
-check. `serveFetchByRange` in particular streams **any** `[start, end]` ordinal range a peer names —
-`[0, 2^63]` streams the whole chain. The only bounds are the 16 MB frame cap (`protocol.go:34,607`) and
-a 30s/2-min stream timeout. A single unthrottled peer can pin the JVM serve path. (Contrast
-`SHARD-CHECKPOINT-CHAINSYNC-DESIGN.md §9.5 F6`, which *designs* a `maxPullRange` cap — not yet on the
-generic ChainSync serve.)
+but **not** on the inbound `serveFetchSnapshots` and `serveMetagraphBinaries` handlers, which
+unmarshal the request and relay it straight to the JVM. The removed `serveFetchByRange` path had an
+additional unbounded `[start,end]` amplification; deleting it closes that specific allocation/disk
+DoS, but the shared per-peer throttle and inbound hash-count caps remain open.
 
 **G4 — per-shard topics are absent from peer-scoring.** `buildPeerScoreParams` builds
 `TopicScoreParams` for exactly the **8 universal topics** (`gossip.go:1016-1025`); the per-shard
@@ -199,7 +194,7 @@ one score component that catches "in the mesh but not forwarding."
 | # | Opportunity | Tag | Value | Anchor |
 |---|---|---|---|---|
 | **S1** | Bound `GossipStream`'s queue and drive gRPC `request(n)` flow-control back to the sidecar; and/or split the single `Subscribe` into per-topic streams to kill head-of-line coupling. Closes the last open TIER-1 audit item + G2. | impl robustness | **HIGH** | G1/G2; `GossipStream.scala:23`, `server.go:304-463` |
-| **S2** | Wire the dead `RateLimitPerPeer` into `handleIncoming`, enforce `MaxHashesPerRequest` on the *serve* handlers, and cap `serveFetchByRange`'s ordinal span (`maxPullRange`). Closes the ChainSync serve DoS surface. | impl robustness | **HIGH** | G3; `protocol.go:37,135,372,415` |
+| **S2** | Wire the dead `RateLimitPerPeer` into `handleIncoming` and enforce `MaxHashesPerRequest` on both hash-based serve handlers. The obsolete unbounded ordinal-range handler is removed; these shared caps remain necessary. | impl robustness | **HIGH** | G3; `protocol.go` ChainSync serve handlers |
 | **S3** | Add the per-shard topic families to `buildPeerScoreParams`, and scale the shard relay buffer per-shard (or per-`(shard×mg)`) instead of one shared 256. Directly on the sharding critical path. | impl robustness | **MED** | G4/G5; `gossip.go:282,1016` |
 | **S4** | Build the **sidecar BLS committee-attestation aggregation** slices (Phase 4/5 of `SIDECAR-BLS-ATTESTATION-AGGREGATION-DESIGN.md`) — collapse the committee-gate's O(N) per-attestation verify to O(1). *The aggregation approach is settled (BLS); the sidecar-side slices are unbuilt.* Gated on BouncyCastle 1.85. Efficiency win at scale, not a robustness fix. | new capability | **MED** (gated) | design §6 Phases 4-6; `gossip.go` publish sites, `server.go` |
 | **S5** | Backstop the unbounded state: TTL/size-cap on `pendingParentRef`; size-cap (+ optional persistence) on the outbox. | impl robustness | **LOW** | G6/G7; `NakamotoSyncDaemon.scala:733`, `outbox.go:59` |

@@ -39,8 +39,8 @@ trait InvalidStateProofSlashedReader[F[_]] {
 
 object InvalidStateProofSlashedReader {
 
-  /** Always-false stub — for the validator unit tests and for nodes that have not yet wired the MPT partition. Byte-equivalent trivially
-    * (same answer on every call).
+  /** Always-false stub for isolated validator unit tests only. Production validation must bind an exact rooted MPT view; otherwise an
+    * already-applied slash can be processed again.
     */
   def neverSlashed[F[_]](implicit F: cats.Applicative[F]): InvalidStateProofSlashedReader[F] =
     (_: ShardId, _: Hash) => F.pure(false)

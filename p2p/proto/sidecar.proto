@@ -516,44 +516,13 @@ message MetagraphBinaryResponse {
   bytes signed_binary = 1;          // JsonSerializer bytes of Signed[StateChannelSnapshotBinary]
 }
 
-// ─── Backfill: Range-Based Chain Sync ───────────────────────────────
-// Lightweight snapshot for backfill — no GlobalSnapshotInfo context.
-// Cuts per-snapshot transfer from 100KB-10MB to 1-5KB.
-message BackfillSnapshot {
-  bytes hash = 1;
-  int64 slot = 2;
-  int64 ordinal = 3;
-  bytes parent_hash = 4;
-  bytes vrf_proof = 5;
-  bytes vrf_public_key = 6;
-  bytes payload = 7;        // Signed[GlobalIncrementalSnapshot] JSON only, NO context
-  bytes producer_id = 8;
-  int64 parent_slot = 9;
-}
-
-// Fetch a contiguous range of snapshots by ordinal.
-message FetchByRangeRequest {
-  int64 start_ordinal = 1;  // inclusive
-  int64 end_ordinal = 2;    // inclusive
-  bytes target_peer_id = 3; // optional: direct to specific peer for parallel chunking
-}
-
-// List connected peers (for parallel chunk assignment).
-message ListPeersRequest {}
-
-message ListPeersResponse {
-  repeated bytes peer_ids = 1;
-}
-
 // JVM → Sidecar: request chain data from the network.
 // The sidecar picks a peer, opens a libp2p stream, relays the request,
 // and streams the response back to the JVM.
 service ChainSyncOutbound {
   rpc FetchSnapshots(FetchSnapshotsRequest) returns (stream Snapshot);
-  rpc FetchByRange(FetchByRangeRequest) returns (stream BackfillSnapshot);
   rpc FindIntersection(FindIntersectionRequest) returns (FindIntersectionResponse);
   rpc GetPeerTip(GetPeerTipRequest) returns (PeerTipResponse);
-  rpc ListPeers(ListPeersRequest) returns (ListPeersResponse);
   // #259: pull missing metagraph binaries by value-hash from a peer.
   rpc FetchMetagraphBinaries(FetchMetagraphBinariesRequest) returns (stream MetagraphBinaryResponse);
 }
@@ -563,7 +532,6 @@ service ChainSyncOutbound {
 // methods on the JVM to fulfill the request.
 service ChainSyncInbound {
   rpc ServeSnapshots(ServeSnapshotsRequest) returns (stream Snapshot);
-  rpc ServeByRange(FetchByRangeRequest) returns (stream BackfillSnapshot);
   rpc ServeChainPoints(ServeChainPointsRequest) returns (ServeChainPointsResponse);
   // #259: serve local metagraph binaries (recent-finalized snapshots +
   // non-destructive orphan-buffer peek) to an incoming network request.
