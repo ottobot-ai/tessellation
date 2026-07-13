@@ -1,134 +1,170 @@
-# 16. Execution-sharding re-execution model and cross-shard finality-first reads
+# 16. Execution sharding and finality-first cross-metagraph reads
 
 Date: 2026-07-10
 
 ## Status
 
-Accepted (amended 2026-07-10 by ADR-0017)
+Accepted; corrected 2026-07-11 by owner clarification and ADR-0017.
+
+**Implementation status: BLOCKED.** Commit `c610a0740` changed ordinary GL0
+adoption from committee-produced byte diffs to universal currency recreation.
+That is not this decision. The forward repair is specified in ADR-0017.
 
 ## Context
 
-Tessellation runs a hierarchical DAG. Under execution sharding, the pieces and
-their trust relationships are frequently mis-stated (including in prior internal
-notes), so this ADR fixes the model as the canonical record.
+Tessellation has two submission paths and one canonical return path:
 
-The dividing question for **every** piece of state is: **does the global
-hypergraph have the code to re-execute this?**
+```text
+client -> GL1 --------------------> GL0
 
-**Global layer — universal, every GL0 node re-executes:**
+client -> CL1 --+
+                +-> ML0 ---------> GL0
+client -> DL1 --+
 
-- **dag-l0 / GL0** — global snapshot producer + verifier. The snapshot every
-  shard embeds into and every metagraph reads back through a consensus-pinned
-  `globalSyncView`.
-- **dag-l1 / GL1** — the global DAG-token edge application. Packages DAG
-  transactions into blocks, submits them to dag-l0 for inclusion. This global
-  currency movement is re-executed by **all** GL0 nodes.
+canonical Phase-2 GL0 state -> GL1 / ML0 / CL1 / DL1
+```
 
-**Metagraph layer — L2, execution-sharded (only *processing* is sharded; the
-global layer stays universal):**
+- GL0 is Global L0 / DAG L0 (`dag-l0`, `gl0.jar`). It runs global snapshot
+  consensus, holds the canonical MPT, settles cross-metagraph effects, and owns
+  global finality.
+- GL1 is Global L1 / DAG L1 (`dag-l1`, `gl1.jar`). It submits native DAG-token
+  blocks directly to GL0.
+- ML0 / CL0 is Metagraph L0 / Currency L0 (`currency-l0`, `ml0.jar`). It runs
+  metagraph snapshot consensus and submits state-channel binaries to GL0.
+- CL1 is Currency L1 (`currency-l1`, `cl1.jar`). It submits framework-defined
+  currency operations to ML0.
+- DL1 is a data-application L1. In source it is a `CurrencyL1App` with an injected
+  data-application service, not a separate formal `Layer` case.
 
-- **CL1 (currency-L1)** — the **L2 framework economic layer**: allow-spend,
-  spend, token-lock, transfer, fee, balance, supply. GL0 ships this framework
-  code — it is identical for every metagraph.
-- **DL1 (data-L1)** — arbitrary, per-metagraph data-application logic. GL0 does
-  **not** have and **cannot** have this code.
-- **ml0** — produces the metagraph snapshot aggregating CL1 + DL1.
+The formal enum contains only `DagL0`, `DagL1`, `CurrencyL0`, and `CurrencyL1`
+(`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/app/Layer.scala:3-7`).
 
-Because CL1 is framework code GL0 possesses, it **can** and **must** be
-re-executed. Because DL1 is custom code GL0 does not possess, it **cannot** be
-re-executed by GL0 — its authoritative state must be carried as state + proof.
+ML0 consensus and the two GL0 committees are distinct:
 
-The open question this ADR settles: when a CL1 op in shard A depends on state
-owned by shard B (cross-shard framework functionality), what does shard A read,
-and does it wait for global finality or act on shard B's committee attestation?
-See the sequence and analysis in
-`docs/nakamoto/CROSS-SHARD-PROTOCOL-RESEARCH.md`.
+1. ML0 operators agree on and sign the metagraph binary.
+2. A per-metagraph admission committee of eligible GL0 operators authenticates
+   and admits a binary.
+3. A separately selected execution-shard committee of eligible GL0 operators
+   accumulates and executes a checkpoint window.
+
+Operating ML0 does not automatically make an operator a member of either GL0
+committee.
 
 ## Decision
 
-**1. Re-execution split — the economic guarantee is RE-EXECUTION.**
+### 1. Sharding partitions execution work
 
-- Global DAG-token movement (dag-l1 / GL1): re-executed by **every GL0 node**.
-- Metagraph economic ops (CL1): re-executed by the assigned **shard committee**
-  before it signs and re-executed again by **every GL0 adopter** before state is
-  usable. A committee root is a claim, never an economic authority.
-  Watchtowers are a slashing backstop, not the validity gate.
-- Metagraph data-app logic (DL1): **proof-carried** — authoritative at the
-  metagraph, adopted-and-verified by GL0 against a proof/root. Re-execution is
-  *impossible* here, so a proof is the only mechanism and is correct **for DL1
-  only**.
+Metagraph assignment is deterministic:
 
-"Roots-only" / "proof-carrying" describes the **storage commitment** and the
-**DL1** path. It is **never** a licence to skip re-executing a CL1-processed
-economic operation. Execution sharding may reduce proposal work and organize
-data availability; it does not remove universal GL0 economic verification.
+```text
+shardId = unsignedBigEndian(SHA-256(metagraphAddress)) mod numShards
+```
 
-**2. Cross-shard framework reads are finality-first (Option A).**
+Execution-shard membership is the current public deterministic VK-hash draw over
+eligible GL0 operators, not the abandoned stake-weighted secret-VRF design. The
+registered VRF proof establishes key possession for the checkpoint slot; it does
+not make membership secret. Producer duty rotates within a committee by the
+deterministic staircase schedule.
 
-Shard committees do not share state through a direct channel — they share it
-**through the global snapshot** every shard embeds into. A cross-shard CL1 read
-resolves against gl0's **consensus-pinned, finalized** global mirror:
+The committee executes framework currency inputs and emits a canonical byte diff
+and result root. Every execution signature means its signer independently
+reproduced those exact outputs. Noncommittee GL0 nodes verify the execution
+threshold and apply the diff with a root check. Watchtowers independently replay
+as the collusion backstop. ADR-0017 defines this contract.
 
-- On the gl0 consensus accept path, the cross-shard read source resolves through
-  `gl0Local` over `MptOverlay.base`, the finalized MPT store. It does not read the
-  candidate's `parentTip` branch.
-- If the needed cross-shard value is not yet embedded in gl0's finalized mirror,
-  the read returns absent → the consuming op is rejected this round and retried
-  on the next gl0 ord (it **waits** for finality; bounded ~one global cadence).
+### 2. Layer topology does not change
 
-The alternative — admitting a cross-shard input on shard B's committee
-attestation *before* global finality (attestation-first) — is **rejected** for
-now in favour of safety. It is implemented nowhere and must not be added to the
-consensus path.
+Execution shards are internal GL0 infrastructure. They are not an additional
+application layer and do not reroute applications:
 
-**3. The invariant: a proof/read supplies an INPUT, never a substitute for
-re-execution.**
+```text
+GL1 -> GL0
+CL1/DL1 -> ML0 -> GL0
+Phase-2 GL0 state -> every downstream follower
+```
 
-In every cross-shard case the consuming CL1 op is **still re-executed** by the
-committee and every gl0 adopter. The cross-shard read (or, on the committee-to-committee
-P2P path, an inclusion proof) supplies only the *input value* the local shard
-cannot compute — it never replaces executing the op.
+ML0 may retain BFT consensus for its small, well-connected validator set. Global
+GL0 consensus remains Nakamoto/Taktikos/LDD. Do not introduce a global
+proposal/vote/lock/QC/view-change protocol.
+
+### 3. Framework currency and custom data have different guarantees
+
+Currency and currency-with-data metagraphs share the framework currency schema.
+Their economic portion is execution-sharded and re-executed before an execution
+signature. Custom DL1 bytes are isolated commitment/availability payloads because
+GL0 does not run arbitrary metagraph code. Custom application output cannot
+authorize, synthesize, or overwrite balances, supply, locks, reservations,
+nullifiers, fees, rewards, or framework references. An independently signed
+framework fee/intent may explicitly bind the exact custom-data commitment; changing
+that commitment rejects the bound framework intent atomically.
+
+General opaque-only state-channel support is not required by this ADR. If retained,
+it is authenticated data carriage only and has no framework-economic effect.
+
+### 4. Cross-metagraph reads are Phase-2-first
+
+Shard committees do not directly trust or settle with one another. A consuming
+framework operation resolves its source authorization against an exact canonical
+GL0 Phase-2 reference:
+
+```text
+GlobalSnapshotRef(ordinal, hash, stateRoot)
+```
+
+Phase 0/1, a local best tip, an ordinal without its hash/root, a committee-only
+root, a peer-selected response, and receiver wall clock are not valid read bases.
+If the referenced value has not reached Phase 2, processing defers and retries.
+
+Phase 2 is operational finality, not an absolute floor. A maxvalid-bg density
+reorg can orphan a Phase-2 hash. Checkpoints and followers whose base is orphaned
+must roll back and replay against the replacement Phase-2 branch. `k2` is retained
+recovery capacity and never prevents an objectively denser valid branch from
+winning; history older than local retention requires authenticated reconstruction
+before comparison and mutation.
+
+### 5. GL0 serializes cross-metagraph effects
+
+A per-metagraph diff is confined to its registered framework namespace. It may
+not directly mutate another metagraph or global replay/nullifier state.
+Cross-metagraph authorizations and consumes are extracted from replayed framework
+inputs, ordered by one canonical GL0 rule, checked against the Phase-2 owner state,
+and committed with permanent semantic replay keys and exact conservation deltas.
+
+The physical shard count cannot change authorization, ordering, conservation, or
+replay semantics. The same input trace must have the same economic result at
+`numShards=1` and `numShards=K`.
+
+In the target economic protocol, `numShards=1` means one execution shard; it does
+not disable the committee/diff/watchtower validity path. Current `numShards > 1`
+semantic gates are implementation defects. A direct full-recreation path may
+exist only in an explicitly unsafe development profile and cannot define different
+validity or state bytes.
 
 ## Consequences
 
-- **Safety over latency.** Every cross-shard input sits behind global finality,
-  so a corrupted, thinned shard committee cannot poison a consuming shard: the
-  bad state must survive *global* consensus + watchtowers, not just its own
-  committee. This is what keeps the cross-shard chain-quality collapse bound
-  (α_total > 1/(2S)) from biting. The cost is up to ~one global-snapshot cadence
-  of cross-shard latency and a retry loop on the consuming op.
+- CL1 does not re-execute canonical state flowing back from GL0. It verifies the
+  exact Phase-2 reference and adopts/resyncs it.
+- A checkpoint is not globally operational merely because it has execution
+  signatures or shard depth. Its effects become downstream-referenceable only
+  when the containing GL0 snapshot reaches Phase 2 and the owner-ratified
+  watchtower release condition is satisfied.
+- A tentative containing GL0 snapshot cannot advance the durable shard anchor.
+  Phase-2 transition of that exact GL0 hash advances it.
+- The current ordinal-only `FinalityGate` is insufficient for cross-metagraph
+  reads because it cannot distinguish a replaced hash at the same ordinal.
+- Direct shard-to-shard receipts are unnecessary for the first protocol version.
+  GL0 canonical state and nullifiers are the rendezvous point.
 
-- **The committee-to-committee P2P proof path is also finality-anchored.**
-  `ShardSubtreeProofClient.http` verifies every proof against gl0's
-  **last-finalized** checkpoint (`verifyProof` requires the proof's `perMgMptRoot`
-  and `shardCheckpointHash` to match what gl0 finalized) and fails closed when
-  there is no finalized anchor. The serve side may generate over `bestTip`, but a
-  too-fresh proof simply fails the consumer's finalized cross-check and is retried
-  — never trusted early.
+## Required follow-up decisions
 
-- **Determinism guard — do NOT wire a node-local reader into consensus.** A live
-  `ShardSubtreeProofClient.http` (peer fetch: network / peer-pick / cooldown) or
-  any best-tip / pending / live-store reader on the gl0 accept path feeds the
-  consensus `mptRoot` non-deterministically and forks the cluster. The accept
-  path must always use `gl0Local` off the consensus-pinned finalized reader.
-
-- **Anti-drift rule (load-bearing).** Do not propose roots-only, proof-carrying,
-  state-diff, or attestation-only validation as a replacement for every GL0 node
-  re-executing a CL1 economic op. Storage commitments and transport formats may
-  change; universal economic execution does not.
-
-- **Revisiting Option B** (attestation-first cross-shard admission) requires a
-  new ADR that supersedes this one, with an explicit analysis of the CQ-collapse
-  exposure it reintroduces.
+1. Whether pure opaque/data-only metagraphs remain a supported public lane.
+2. The exact Phase-2 rollback contract exposed to ML0 and external integrators.
+3. The canonical ordering between same-snapshot cross-metagraph consumes,
+   cancellation, expiry, refunds, and local spends.
 
 ## References
 
-- `modules/node-shared/.../domain/swap/SpendActionValidator.scala` — same-shard
-  vs cross-shard classification and read paths.
-- `modules/node-shared/.../domain/nakamoto/sharding/ShardSubtreeProofClient.scala`
-  — `gl0Local` (deterministic consensus read source) and `http` (finality-anchored
-  committee P2P path).
-- `modules/node-shared/.../infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala`
-  — the gl0 accept wiring that defaults to `gl0Local` over the finalized MPT base.
-- `docs/nakamoto/CROSS-SHARD-PROTOCOL-RESEARCH.md`
-- `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §8
+- `docs/adr/0017-committee-reexecution-is-the-primary-economic-validity-gate.md`
+- `docs/nakamoto/GENESIS-DENSITY-PHASE2-REORG-AUDIT.md`
+- `docs/review/CONSENSUS-ARTIFACT-LIFECYCLE.md`
+- `docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`

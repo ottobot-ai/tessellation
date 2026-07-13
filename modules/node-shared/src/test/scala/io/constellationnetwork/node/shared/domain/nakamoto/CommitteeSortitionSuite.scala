@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto
 
-import java.security.SecureRandom
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
@@ -8,10 +9,11 @@ import cats.syntax.all._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.numerics.Ratio
+import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.vrf.EcVrf25519
 
 import weaver.MutableIOSuite
 
@@ -27,38 +29,21 @@ import weaver.MutableIOSuite
   */
 object CommitteeSortitionSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], CommitteeSortition[IO])
+  override type Res =
+    (Hasher[IO], CommitteeSortition[IO], EligibilityChecker[IO], CanonicalOperatorConsensusPopulation)
 
   override def sharedResource: Resource[IO, Res] =
     for {
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
-    } yield (h, CommitteeSortition.make[IO])
+      log1p <- Log1pInterpreter.make[IO](maxIterations = 10000, precision = 8).asResource
+      exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38).asResource
+      eligibility = EligibilityChecker.make[IO](log1p, exp)
+      operators <- CanonicalOperatorConsensusFixture.makePopulation(8)
+    } yield (h, CommitteeSortition.make[IO], eligibility, operators)
 
-  private val vrf = new EcVrf25519()
-
-  // Deterministic SHA1PRNG so the statistical inclusion-rate test is reproducible across CI runs.
-  // `SecureRandom.getInstance("SHA1PRNG")` then setSeed BEFORE any draw makes the byte stream a pure
-  // function of the seed (default constructor mixes in /dev/(u)random first, which would only
-  // append). The VRF determinism tests don't depend on this, but the Chernoff-sanity test at K=50
-  // has a ~10⁻⁵ tail-deviation probability per run; pinning the seed keeps the tolerance tight.
-  private val random = {
-    val r = SecureRandom.getInstance("SHA1PRNG")
-    r.setSeed(0x53_4f_52_54_49_54_49L) // ASCII "SORTITI"
-    r
-  }
-
-  private def randomSk(): Array[Byte] = {
-    val sk = new Array[Byte](32)
-    random.nextBytes(sk)
-    sk
-  }
-
-  private def randomEta(): Array[Byte] = {
-    val eta = new Array[Byte](32)
-    random.nextBytes(eta)
-    eta
-  }
+  private def eta(tag: String): Array[Byte] =
+    MessageDigest.getInstance("SHA-256").digest(tag.getBytes(StandardCharsets.UTF_8))
 
   /** Synthesize a test metagraph address from a deterministic byte tag. */
   private def metagraphAddr(tag: String): Address =
@@ -71,17 +56,17 @@ object CommitteeSortitionSuite extends MutableIOSuite {
   // ============ Determinism ============
 
   test("isInCommittee is deterministic for identical inputs") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val sk = operators.operators.head.localVrfSecret
+      val etaBytes = eta("determinism")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-A")
       val sigma = Ratio(1, 8)
       val k = 100
 
       for {
-        r1 <- sortition.isInCommittee(sk, eta, addr, ph, sigma, k)
-        r2 <- sortition.isInCommittee(sk, eta, addr, ph, sigma, k)
+        r1 <- sortition.isInCommittee(sk, etaBytes, addr, ph, sigma, k)
+        r2 <- sortition.isInCommittee(sk, etaBytes, addr, ph, sigma, k)
       } yield
         expect(r1.isDefined == r2.isDefined).and {
           (r1, r2) match {
@@ -93,69 +78,65 @@ object CommitteeSortitionSuite extends MutableIOSuite {
   }
 
   test("message bytes are deterministic and length-stable") {
-    case (hasher, _) =>
+    case (hasher, _, _, _) =>
       implicit val h: Hasher[IO] = hasher
-      val eta = randomEta()
+      val etaBytes = eta("message-determinism")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-A")
       for {
-        m1 <- CommitteeSortition.message[IO](eta, addr, ph)
-        m2 <- CommitteeSortition.message[IO](eta, addr, ph)
+        m1 <- CommitteeSortition.message[IO](etaBytes, addr, ph)
+        m2 <- CommitteeSortition.message[IO](etaBytes, addr, ph)
       } yield expect(m1.sameElements(m2)).and(expect(m1.length == 64)) // SHA-256 hex string → 64 UTF-8 bytes
   }
 
   // ============ Domain separation (committee vs leader VRF) ============
 
   test("committee VRF output differs from a leader-VRF style output for the same (sk, eta)") {
-    case (hasher, _) =>
-      implicit val h: Hasher[IO] = hasher
+    case (_, sortition, eligibility, operators) =>
       // The leader VRF hashes `eta ‖ slot` (per EligibilityChecker.vrfProofForSlot). The committee
       // VRF hashes `Hasher.hash(CommitteeVrfInput("committee", eta, addr, parentHash))`. These are distinct
       // messages — the proofs (and thus outputs) must differ for the same SK.
-      val sk = randomSk()
-      val eta = randomEta()
+      val sk = operators.operators.head.localVrfSecret
+      val etaBytes = eta("domain-separation")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-A")
-      val slot = 50L
-
-      val leaderMsg = eta ++ java.nio.ByteBuffer.allocate(8).putLong(slot).array()
-      val leaderProof = vrf.vrfProof(sk, leaderMsg)
+      val leaderProof = eligibility.vrfProofForSlot(sk, Slot.unsafeApply(50L), etaBytes)
 
       for {
-        commMsg <- CommitteeSortition.message[IO](eta, addr, ph)
-        commProof = vrf.vrfProof(sk, commMsg)
-      } yield expect(!commProof.sameElements(leaderProof))
+        committeeResult <- sortition.isInCommittee(sk, etaBytes, addr, ph, Ratio.One, kDraw = 1)
+        committeeProof <- IO.fromOption(committeeResult.map(_._1))(new IllegalStateException("saturated registered draw was not selected"))
+      } yield expect(!committeeProof.sameElements(leaderProof))
   }
 
   // ============ Per-metagraph isolation ============
 
   test("different metagraph addresses produce independent committee draws") {
-    case (hasher, _) =>
+    case (hasher, _, _, _) =>
       implicit val h: Hasher[IO] = hasher
-      val eta = randomEta()
+      val etaBytes = eta("metagraph-isolation")
       val addrA = metagraphAddr("metagraph-A")
       val addrB = metagraphAddr("metagraph-B")
       val ph = parent("parent-A")
 
       for {
-        mA <- CommitteeSortition.message[IO](eta, addrA, ph)
-        mB <- CommitteeSortition.message[IO](eta, addrB, ph)
+        mA <- CommitteeSortition.message[IO](etaBytes, addrA, ph)
+        mB <- CommitteeSortition.message[IO](etaBytes, addrB, ph)
       } yield expect(!mA.sameElements(mB))
   }
 
   // ============ Per-parent rotation ============
 
   test("different parent hashes produce different VRF outputs") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val sk = operators.operators.head.localVrfSecret
+      val etaBytes = eta("parent-rotation")
       val addr = metagraphAddr("metagraph-A")
       val sigma = Ratio(1, 4)
       val k = 100
 
       for {
-        r1 <- sortition.isInCommittee(sk, eta, addr, parent("p1"), sigma, k)
-        r2 <- sortition.isInCommittee(sk, eta, addr, parent("p2"), sigma, k)
+        r1 <- sortition.isInCommittee(sk, etaBytes, addr, parent("p1"), sigma, k)
+        r2 <- sortition.isInCommittee(sk, etaBytes, addr, parent("p2"), sigma, k)
       } yield
         (r1, r2) match {
           case (Some((_, o1)), Some((_, o2))) => expect(!o1.sameElements(o2))
@@ -166,21 +147,22 @@ object CommitteeSortitionSuite extends MutableIOSuite {
   // ============ Verify roundtrip ============
 
   test("isInCommittee + verifyMembership roundtrip succeeds for an in-committee key") {
-    case (_, sortition) =>
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val operator = operators.operators.head
+      val etaBytes = eta("roundtrip")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-roundtrip")
       val sigma = Ratio.One // forces selection; K·σ = K ≥ 1 saturates threshold to 1
       val k = 100
 
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
 
       for {
-        out <- sortition.isInCommittee(sk, eta, addr, ph, sigma, k)
+        out <- sortition.isInCommittee(sk, etaBytes, addr, ph, sigma, k)
         verified <- out match {
           case Some((proof, _)) =>
-            sortition.verifyMembership(vk, eta, addr, ph, sigma, k, proof)
+            sortition.verifyMembership(vk, etaBytes, addr, ph, sigma, k, proof)
           case None => IO.pure(false)
         }
       } yield expect(out.isDefined).and(expect(verified, "verifyMembership must succeed for an in-committee key"))
@@ -189,52 +171,55 @@ object CommitteeSortitionSuite extends MutableIOSuite {
   // ============ Negative tests ============
 
   test("verifyMembership fails with wrong VRF VK") {
-    case (_, sortition) =>
-      val sk1 = randomSk()
-      val sk2 = randomSk()
-      val vk2 = vrf.getVerificationKey(sk2)
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val producer = operators.operators.head
+      val otherRegisteredOperator = operators.operators.tail.head
+      val sk1 = producer.localVrfSecret
+      val vk2 = otherRegisteredOperator.resolvedPair.vrfPublicKey.toBytes
+      val etaBytes = eta("wrong-vk")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-neg-vk")
       val sigma = Ratio.One
       val k = 100
 
       for {
-        out <- sortition.isInCommittee(sk1, eta, addr, ph, sigma, k)
+        out <- sortition.isInCommittee(sk1, etaBytes, addr, ph, sigma, k)
         verified <- out match {
-          case Some((proof, _)) => sortition.verifyMembership(vk2, eta, addr, ph, sigma, k, proof)
+          case Some((proof, _)) => sortition.verifyMembership(vk2, etaBytes, addr, ph, sigma, k, proof)
           case None             => IO.pure(false)
         }
       } yield expect(out.isDefined).and(expect(!verified))
   }
 
   test("verifyMembership fails with tampered proof") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val operator = operators.operators.head
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
+      val etaBytes = eta("tampered-proof")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-neg-tamper")
       val sigma = Ratio.One
       val k = 100
 
       for {
-        out <- sortition.isInCommittee(sk, eta, addr, ph, sigma, k)
+        out <- sortition.isInCommittee(sk, etaBytes, addr, ph, sigma, k)
         verified <- out match {
           case Some((proof, _)) =>
             val tampered = proof.clone()
             tampered(0) = (tampered(0) ^ 0xff.toByte).toByte
-            sortition.verifyMembership(vk, eta, addr, ph, sigma, k, tampered)
+            sortition.verifyMembership(vk, etaBytes, addr, ph, sigma, k, tampered)
           case None => IO.pure(false)
         }
       } yield expect(out.isDefined).and(expect(!verified))
   }
 
   test("verifyMembership fails with wrong metagraph address") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val operator = operators.operators.head
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
+      val etaBytes = eta("wrong-metagraph")
       val addrA = metagraphAddr("metagraph-A")
       val addrB = metagraphAddr("metagraph-B")
       val ph = parent("parent-neg-mg")
@@ -242,27 +227,28 @@ object CommitteeSortitionSuite extends MutableIOSuite {
       val k = 100
 
       for {
-        out <- sortition.isInCommittee(sk, eta, addrA, ph, sigma, k)
+        out <- sortition.isInCommittee(sk, etaBytes, addrA, ph, sigma, k)
         verified <- out match {
-          case Some((proof, _)) => sortition.verifyMembership(vk, eta, addrB, ph, sigma, k, proof)
+          case Some((proof, _)) => sortition.verifyMembership(vk, etaBytes, addrB, ph, sigma, k, proof)
           case None             => IO.pure(false)
         }
       } yield expect(out.isDefined).and(expect(!verified))
   }
 
   test("verifyMembership fails with wrong eta") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
-      val wrongEta = randomEta()
+    case (_, sortition, _, operators) =>
+      val operator = operators.operators.head
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
+      val etaBytes = eta("correct-eta")
+      val wrongEta = eta("wrong-eta")
       val addr = metagraphAddr("metagraph-A")
       val ph = parent("parent-neg-eta")
       val sigma = Ratio.One
       val k = 100
 
       for {
-        out <- sortition.isInCommittee(sk, eta, addr, ph, sigma, k)
+        out <- sortition.isInCommittee(sk, etaBytes, addr, ph, sigma, k)
         verified <- out match {
           case Some((proof, _)) => sortition.verifyMembership(vk, wrongEta, addr, ph, sigma, k, proof)
           case None             => IO.pure(false)
@@ -271,10 +257,11 @@ object CommitteeSortitionSuite extends MutableIOSuite {
   }
 
   test("verifyMembership fails with wrong parent hash") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val operator = operators.operators.head
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
+      val etaBytes = eta("wrong-parent")
       val addr = metagraphAddr("metagraph-A")
       val phA = parent("parent-neg-A")
       val phB = parent("parent-neg-B")
@@ -282,9 +269,9 @@ object CommitteeSortitionSuite extends MutableIOSuite {
       val k = 100
 
       for {
-        out <- sortition.isInCommittee(sk, eta, addr, phA, sigma, k)
+        out <- sortition.isInCommittee(sk, etaBytes, addr, phA, sigma, k)
         verified <- out match {
-          case Some((proof, _)) => sortition.verifyMembership(vk, eta, addr, phB, sigma, k, proof)
+          case Some((proof, _)) => sortition.verifyMembership(vk, etaBytes, addr, phB, sigma, k, proof)
           case None             => IO.pure(false)
         }
       } yield expect(out.isDefined).and(expect(!verified))
@@ -305,31 +292,31 @@ object CommitteeSortitionSuite extends MutableIOSuite {
   }
 
   test("σ=0 → threshold=0 → always out of committee") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val sk = operators.operators.head.localVrfSecret
+      val etaBytes = eta("zero-threshold")
       val addr = metagraphAddr("metagraph-A")
       val k = 100
 
       // Check several parents; σ=0 must always exclude.
       for {
         results <- (1 to 20).toList.traverse { i =>
-          sortition.isInCommittee(sk, eta, addr, parent(s"sigma-zero-$i"), Ratio.Zero, k)
+          sortition.isInCommittee(sk, etaBytes, addr, parent(s"sigma-zero-$i"), Ratio.Zero, k)
         }
       } yield expect(results.forall(_.isEmpty))
   }
 
   test("σ ≥ 1/K (saturated) → always in committee") {
-    case (_, sortition) =>
-      val sk = randomSk()
-      val eta = randomEta()
+    case (_, sortition, _, operators) =>
+      val sk = operators.operators.head.localVrfSecret
+      val etaBytes = eta("saturated-threshold")
       val addr = metagraphAddr("metagraph-A")
       val k = 5
       val sigma = Ratio(1, 4) // 5 · 1/4 = 5/4 > 1, saturates
 
       for {
         results <- (1 to 20).toList.traverse { i =>
-          sortition.isInCommittee(sk, eta, addr, parent(s"sigma-sat-$i"), sigma, k)
+          sortition.isInCommittee(sk, etaBytes, addr, parent(s"sigma-sat-$i"), sigma, k)
         }
       } yield expect(results.forall(_.isDefined))
   }
@@ -378,24 +365,34 @@ object CommitteeSortitionSuite extends MutableIOSuite {
 
   // ============ Statistical inclusion-rate sanity check ============
 
-  test("inclusion rate over many operators tracks K · σ (Chernoff sanity)") {
-    case (_, sortition) =>
-      // 1000 operator keys, each with σ = 1/1000 (so total stake = 1). K_target = 50.
-      // Expected committee size = K · Σσ = 50. Chernoff variance ≤ K = 50.
-      // We test that the observed rate is within a generous ±50% window (acceptance bound = 25..75)
-      // — this is a sanity check on the primitive, not a tight bound.
-      val n = 1000
-      val k = 50
-      val sigma = Ratio(1, n)
-      val eta = randomEta()
+  test("aggregate inclusion over registered operators tracks kDraw per independent draw") {
+    case (_, sortition, _, population) =>
+      // Eight loader-validated period-zero identities participate in 125 independent committee
+      // elections. With uniform sigma=1/8 and kDraw=1, each election has expected committee size
+      // one, so the 1,000 registered proof evaluations have 125 expected selections.
+      val drawCount = 125
+      val k = 1
+      val sigma = Ratio(1, population.operators.size)
       val addr = metagraphAddr("statistical-test")
-      val ph = parent("statistical-parent")
-
-      val sks = (1 to n).map(_ => randomSk()).toList
 
       for {
-        selected <- sks.traverse(sortition.isInCommittee(_, eta, addr, ph, sigma, k))
+        selected <- (1 to drawCount).toList.flatTraverse { draw =>
+          population.operators.traverse { operator =>
+            sortition.isInCommittee(
+              operator.localVrfSecret,
+              eta(s"statistical-eta-$draw"),
+              addr,
+              parent(s"statistical-parent-$draw"),
+              sigma,
+              k
+            )
+          }
+        }
         committeeSize = selected.count(_.isDefined)
-      } yield expect(committeeSize >= 25 && committeeSize <= 75, s"Expected ~50 selected, got $committeeSize")
+      } yield
+        expect(
+          committeeSize >= 80 && committeeSize <= 170,
+          s"Expected approximately $drawCount aggregate selections, got $committeeSize"
+        )
   }
 }

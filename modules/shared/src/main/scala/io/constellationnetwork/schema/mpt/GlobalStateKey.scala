@@ -235,6 +235,13 @@ object GlobalStateFieldId {
     */
   case object LastKesRegistrationRefs extends GlobalStateFieldId { def toInt: Int = 23 }
 
+  /** Immutable period-zero operator KES+VRF identities. One entry per `PeerId`, carrying the complete long-term-signed genesis record with
+    * network/activation context. This partition is part of the canonical global `mptRoot`, is populated before the first incremental
+    * snapshot is signed, and is never changed by runtime registration events. It commits key ownership only; eligibility is derived from a
+    * separate delayed canonical operator/stake roster.
+    */
+  case object GenesisOperatorKeys extends GlobalStateFieldId { def toInt: Int = 24 }
+
   /** Per-metagraph UNROLLED `CurrencySnapshotInfo` sub-fields (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). These REPLACE the
     * monolithic `LastCurrencySnapshotInfo` blob (fieldId 6): instead of one `metagraph(mgAddr, LastCurrencySnapshotInfo) ->
     * CurrencySnapshotInfo` key per MG (O(N) rewrite on any change), each `CurrencySnapshotInfo` field becomes per-ENTRY keys under the MG's
@@ -373,6 +380,7 @@ object GlobalStateFieldId {
     case 21 => Some(TowerEntries)
     case 22 => Some(KesRegistrationCerts)
     case 23 => Some(LastKesRegistrationRefs)
+    case 24 => Some(GenesisOperatorKeys)
     case 25 => Some(MgBalances)
     case 26 => Some(MgLastTxRefs)
     case 27 => Some(MgLastFeeTxRefs)
@@ -455,8 +463,8 @@ object GlobalStateKey {
     }
 
   /** Hypergraph key into the `KesRegistrationCerts` partition. Keyed by `peerId` (hex of operator's long-term pubkey) hashed into the
-    * user-namespace slot. One MPT entry per operator carrying the full `SortedSet[KesRegistrationRecord]` history (latest at head by
-    * `acceptedAt + ordinal`).
+    * user-namespace slot. One MPT entry per operator carrying the full `SortedSet[KesRegistrationRecord]` history (earliest at head by
+    * `acceptedAt + signed event`).
     */
   def kesRegistrationCertsKey[F[_]: Sync: Hasher](peerId: PeerId): F[GlobalStateKey] =
     Hasher[F].hash(peerId.value.value).map { h =>
@@ -470,6 +478,14 @@ object GlobalStateKey {
   def lastKesRegistrationRefsKey[F[_]: Sync: Hasher](peerId: PeerId): F[GlobalStateKey] =
     Hasher[F].hash(peerId.value.value).map { h =>
       GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.LastKesRegistrationRefs, EmptyNamespace, HashNamespace(h))
+    }
+
+  /** Hypergraph key into the immutable period-zero operator identity partition. The value carries the same `PeerId`; readers must derive
+    * this key again and reject misplaced or duplicate claims rather than trusting a lossy prefix-scan key.
+    */
+  def genesisOperatorKey[F[_]: Sync: Hasher](peerId: PeerId): F[GlobalStateKey] =
+    Hasher[F].hash(peerId.value.value).map { h =>
+      GlobalStateKey(HypergraphNamespace, GlobalStateFieldId.GenesisOperatorKeys, EmptyNamespace, HashNamespace(h))
     }
 
   /** Hypergraph key whose user-namespace component carries a pre-computed hash of a `TokenPair`. Used for the `PriceState` partition which

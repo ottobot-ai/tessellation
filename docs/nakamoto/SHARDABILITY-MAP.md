@@ -1,5 +1,13 @@
 # Shardability Map of `GlobalSnapshotAcceptanceManager.accept()`
 
+> **HISTORICAL SOURCE INVENTORY, NOT A TARGET AUTHORITY MODEL.** This map was
+> written against an older GSAM and remains useful for identifying global versus
+> per-MG dependencies. Its universal-GL0 recreation, GSI, subtree-stub, receipt,
+> or authoritative-view suggestions are superseded by ADR-0016/0017 and the active
+> lifecycle. Target CL1 execution is producer plus every execution signer replay,
+> ordinary noncommittee diff application/root verification, and watchtower replay;
+> the small cross-MG settlement/nullifier kernel remains universal.
+
 **Purpose.** Pre-design research for execution-sharding of `gl0`. Classifies every derivation step inside `GlobalSnapshotAcceptanceManager.accept()` (henceforth GSAM) as **shard-local** (per-metagraph, can run inside a shard committee using only that metagraph's state + global background config), **cross-metagraph** (references state for metagraph X while processing data from metagraph Y — requires cross-shard coordination), or **global** (gl0-wide, not per-metagraph at all).
 
 **Sources.** All citations in this document are line-stable as of HEAD `6e49b7d5` on `feature/serde-typeclass-shim`. The pipeline lives in:

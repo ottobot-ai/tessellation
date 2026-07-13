@@ -1,8 +1,20 @@
 # Avalanche-style subsampling for attestation decisions
 
-**Status:** research proposal. Decision input. Implementation deferred behind
-stake-weighted VRF + KES. Written 2026-05-15. Revised 2026-05-15 to fold in
-locked decisions and the quick-sweep sim recommendation from
+> **TARGET ROLE CLARIFICATION (2026-07-11):** Avalanche/Snowball is the
+> optimistic GL0 Phase-2 finality path, paired with the Nakamoto `k1` depth
+> fallback. It is not economic validation and does not introduce global BFT
+> votes, locks, QCs, or view changes. Every decided attestation must name an
+> authenticated snapshot the signer has locally executed. Phase 2 remains
+> maxvalid-bg density-reorgable; `k2` is retention/recovery capacity, not a later
+> finality phase or floor. The exact decision of whether a
+> local beta result directly advances Phase 2 or still feeds `T_weight` is open
+> in `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` section 14.
+
+**Status:** historical research proposal and active evidence input, not a protocol
+decision. Its old “locked/settled” labels are superseded by
+`../review/CONSENSUS-OWNER-DECISIONS.md`; D-01 through D-03 control. Implementation
+is not complete. Written 2026-05-15. Revised 2026-05-15 to fold in then-current
+decisions and the quick-sweep sim recommendation from
 [`~/repos/research-nipopos-2026` commit `15983f1a`](#). Revised again
 2026-05-15 to flip cascade semantics from **Snowflake → Snowball** (per-color
 persistent confidence accumulator, decide by margin) and fold in two
@@ -24,14 +36,15 @@ violations under the same conditions because the per-color accumulator
 margin is sub-β under adversary-induced noise. **K ≥ 8 with α ≥ ⅝K is
 the empirical floor for Snowball.**
 
-This document proposes replacing the current "attest the current canonical
+This document historically proposed replacing the current "attest the current canonical
 bestTip per (ord, hash) pair" emit policy with an **Avalanche-style
 subsampling decision protocol** that converges on a single hash per
 validator per ordinal *before* emitting attestation. Once decided, no
-re-emit. The aggregation policy at the receiver (TipTracker newer-wins,
+re-emit. It kept the receiver aggregation policy (TipTracker newer-wins,
 T_weight / T_count / T_depth1 / T_depth2 triggers, canonical-hash filter)
-is **unchanged** — Avalanche reshapes how attestations are *produced*, not
-how they are *consumed*.
+unchanged. That is no longer settled: the active design must choose whether local
+beta directly advances P2 or feeds a fixed-registry T_weight trigger, and must
+prove its interaction with density replacement and current-canonical evidence.
 
 Cross-references:
 - [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md)
@@ -76,9 +89,11 @@ Cross-references:
 
 ---
 
-## §0. Locked decisions (TL;DR)
+## §0. Historical decisions from the 2026-05-15 proposal (superseded)
 
-The 13 decisions below are settled. The rest of the doc derives from them.
+The 13 entries below were treated as settled by this proposal. They are not current
+owner decisions; retain them only as research rationale. The active owner register
+and lifecycle control implementation.
 
 | # | Decision | Where it lands |
 |---|---|---|
@@ -1306,13 +1321,12 @@ from this list. What remains genuinely open:
    this chain happen" question for archival ranges and per-light-client.
    The two compose by: (a) Avalanche-decided attestations are the
    strongest possible Phase 2 finality input for any single ordinal;
-   (b) the NIPoPoW superblock tower anchors on Phase 3 (T_depth2)
-   ordinals, by which point Avalanche has long-since decided each
-   ord on the tower. The composition is "stack the bounds: pr[finality
-   failure] ≤ pr[Avalanche split] × pr[NIPoPoW soundness break]";
-   both are exponentially small, and the product is dominated by
-   whichever is larger. The cryptographer audit (§6.3, §0.D) should
-   independently cover this composition.
+   (b) the NIPoPoW tower commits branch-bound eligible trials and pointers in
+   signed snapshots, while a verifier separately checks current canonicality or
+   compares candidate proofs from its trusted genesis/cached commitment. `k2`
+   does not anchor the proof. No multiplication of failure probabilities is a
+   protocol claim until an independent proof covers the dependence between the
+   optimistic and tower constructions.
 
 6. **Cross-metagraph (gl1) Avalanche — out of scope (decision §0.J).**
    The Avalanche paper's DAG-form is richer than Snowman and could be

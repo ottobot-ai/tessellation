@@ -16,9 +16,10 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageType}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt.MptStore
 import io.constellationnetwork.schema.mpt.PartitionNamespace.{AddressNamespace, MetagraphNamespace}
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GenesisOperatorConsensusKey, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.peer.PeerId
@@ -38,8 +39,10 @@ import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
+import io.constellationnetwork.serde.codecs.instances.GenesisOperatorConsensusKeyCodec.{immutableCodec => genesisOperatorKeyImmutable}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.kesRegistrationReferenceImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
@@ -92,7 +95,10 @@ object GlobalStateConverter {
     // for `EtaStateManager.getEta(period)` against chainStore eviction).
     // `removedHistoricalStakeSnapshotKeys` carries the period keys evicted by retention.
     historicalStakeSnapshots: SortedMap[EtaPeriod, HistoricalStakeSnapshot] = SortedMap.empty,
-    removedHistoricalStakeSnapshotKeys: Set[EtaPeriod] = Set.empty
+    removedHistoricalStakeSnapshotKeys: Set[EtaPeriod] = Set.empty,
+    // Complete post-update values for touched operators. Both maps are written atomically into rooted fields 22/23.
+    kesRegistrationCerts: SortedMap[PeerId, SortedSet[KesRegistrationRecord]] = SortedMap.empty,
+    lastKesRegistrationRefs: SortedMap[PeerId, KesRegistrationReference] = SortedMap.empty
   )
 
   /** Apply a per-ordinal typed [[StateChangesAccumulator]] delta to a prior [[GlobalSnapshotInfo]], yielding the GSI the producer's
@@ -137,6 +143,8 @@ object GlobalStateConverter {
     // Bare (non-Option) historicalStakeSnapshots — apply retention removals then overlay boundary adds.
     val historicalStakeSnapshots =
       (prior.historicalStakeSnapshots -- delta.removedHistoricalStakeSnapshotKeys) ++ delta.historicalStakeSnapshots
+    val kesRegistrationCerts = prior.kesRegistrationCerts ++ delta.kesRegistrationCerts
+    val lastKesRegistrationRefs = prior.lastKesRegistrationRefs ++ delta.lastKesRegistrationRefs
 
     // Option helper for per-key-additive optional maps (no removal set): result Some iff prior was Some or the delta is non-empty.
     def mergeOptAdditive[K, V](
@@ -221,7 +229,10 @@ object GlobalStateConverter {
       ),
       priceState = mergeOptAdditive(prior.priceState, delta.priceState),
       metagraphSyncData = mergeOptAdditive(prior.metagraphSyncData, delta.metagraphSyncData),
-      historicalStakeSnapshots = historicalStakeSnapshots
+      historicalStakeSnapshots = historicalStakeSnapshots,
+      kesRegistrationCerts = kesRegistrationCerts,
+      lastKesRegistrationRefs = lastKesRegistrationRefs,
+      genesisOperatorKeys = prior.genesisOperatorKeys
     )
   }
 
@@ -501,6 +512,22 @@ object GlobalStateConverter {
       .getOrElse(Map.empty)
       .pure[F]
 
+  private def convertKesRegistrationCerts[F[_]: Sync: Parallel: Hasher](
+    data: SortedMap[PeerId, SortedSet[KesRegistrationRecord]]
+  ): F[Map[GlobalStateKey, Json]] =
+    data.toList.parTraverse { case (peerId, records) => GlobalStateKey.kesRegistrationCertsKey[F](peerId).map(_ -> records.asJson) }
+      .map(_.toMap)
+
+  private def convertLastKesRegistrationRefs[F[_]: Sync: Parallel: Hasher](
+    data: SortedMap[PeerId, KesRegistrationReference]
+  ): F[Map[GlobalStateKey, Json]] =
+    data.toList.parTraverse { case (peerId, ref) => GlobalStateKey.lastKesRegistrationRefsKey[F](peerId).map(_ -> ref.asJson) }.map(_.toMap)
+
+  private def convertGenesisOperatorKeys[F[_]: Sync: Parallel: Hasher](
+    data: SortedMap[PeerId, GenesisOperatorConsensusKey]
+  ): F[Map[GlobalStateKey, Json]] =
+    data.toList.parTraverse { case (peerId, record) => GlobalStateKey.genesisOperatorKey[F](peerId).map(_ -> record.asJson) }.map(_.toMap)
+
   def toStateKeyValuePairsFromAccumulator[F[_]: Async: Parallel: Hasher: JsonSerializer](
     acc: StateChangesAccumulator
   )(
@@ -545,9 +572,11 @@ object GlobalStateConverter {
       convertOptionalHypergraph(
         if (acc.metagraphSyncData.nonEmpty) acc.metagraphSyncData.some else none,
         GlobalStateFieldId.MetagraphSyncData
-      )
-    ).parMapN { (m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) =>
-      m1 ++ m2 ++ m3 ++ m4 ++ m5 ++ m6 ++ m7 ++ m8 ++ m9 ++ m10 ++ m11 ++ m12 ++ m13 ++ m14 ++ m15
+      ),
+      convertKesRegistrationCerts(acc.kesRegistrationCerts),
+      convertLastKesRegistrationRefs(acc.lastKesRegistrationRefs)
+    ).parMapN { (m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m16, m17) =>
+      m1 ++ m2 ++ m3 ++ m4 ++ m5 ++ m6 ++ m7 ++ m8 ++ m9 ++ m10 ++ m11 ++ m12 ++ m13 ++ m14 ++ m15 ++ m16 ++ m17
     }
 
   def toAllStateKeyValuePairs[F[_]: Async: Parallel: Hasher: JsonSerializer](
@@ -570,10 +599,13 @@ object GlobalStateConverter {
       convertOptionalHypergraph(info.delegatedStakesWithdrawals, GlobalStateFieldId.DelegatedStakesWithdrawals),
       convertOptionalHypergraph(info.activeNodeCollaterals, GlobalStateFieldId.ActiveNodeCollaterals),
       convertOptionalHypergraph(info.nodeCollateralWithdrawals, GlobalStateFieldId.NodeCollateralWithdrawals),
-      convertOptionalHypergraph(info.metagraphSyncData, GlobalStateFieldId.MetagraphSyncData)
-    ).parMapN { (m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15) =>
+      convertOptionalHypergraph(info.metagraphSyncData, GlobalStateFieldId.MetagraphSyncData),
+      convertKesRegistrationCerts(info.kesRegistrationCerts),
+      convertLastKesRegistrationRefs(info.lastKesRegistrationRefs),
+      convertGenesisOperatorKeys(info.genesisOperatorKeys)
+    ).parMapN { (m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m16, m17, m18) =>
       // Merge all maps - O(n) instead of O(n log n) foldLeft
-      val allMaps = List(m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15)
+      val allMaps = List(m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, m13, m14, m15, m16, m17, m18)
       val expectedSize = allMaps.map(_.size).sum
       val merged = allMaps.foldLeft(Map.empty[GlobalStateKey, Json])(_ ++ _)
 
@@ -732,6 +764,30 @@ object GlobalStateConverter {
       }
     }
 
+    val kesRegistrationCertsF: F[List[(GlobalStateKey, Array[Byte])]] =
+      info.kesRegistrationCerts.toList.parTraverse {
+        case (peerId, records) =>
+          GlobalStateKey
+            .kesRegistrationCertsKey[F](peerId)
+            .map(_ -> enc[SortedSet[KesRegistrationRecord]](records))
+      }
+
+    val lastKesRegistrationRefsF: F[List[(GlobalStateKey, Array[Byte])]] =
+      info.lastKesRegistrationRefs.toList.parTraverse {
+        case (peerId, ref) =>
+          GlobalStateKey
+            .lastKesRegistrationRefsKey[F](peerId)
+            .map(_ -> enc[KesRegistrationReference](ref))
+      }
+
+    val genesisOperatorKeysF: F[List[(GlobalStateKey, Array[Byte])]] =
+      info.genesisOperatorKeys.toList.parTraverse {
+        case (peerId, record) =>
+          GlobalStateKey
+            .genesisOperatorKey[F](peerId)
+            .map(_ -> enc[GenesisOperatorConsensusKey](record)(genesisOperatorKeyImmutable))
+      }
+
     // Token-lock expiry index: one bucket per `unlockEpoch` (records with `None` unlock aren't indexed).
     val tokenLockExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = {
       val flat = info.activeTokenLocks.toList.flatMap(_.toList).flatMap {
@@ -769,9 +825,23 @@ object GlobalStateConverter {
       allowSpendExpiryIndexF,
       tokenLockExpiryIndexF,
       nodeCollateralWithdrawalExpiryIndexF,
-      historicalStakeSnapshotsF
+      historicalStakeSnapshotsF,
+      kesRegistrationCertsF,
+      lastKesRegistrationRefsF,
+      genesisOperatorKeysF
     ).mapN {
-      (currencyEntries, unpEntries, priceEntries, allowSpendExpiryEntries, tokenLockExpiryEntries, ncwExpiryEntries, histStakeEntries) =>
+      (
+        currencyEntries,
+        unpEntries,
+        priceEntries,
+        allowSpendExpiryEntries,
+        tokenLockExpiryEntries,
+        ncwExpiryEntries,
+        histStakeEntries,
+        kesCertEntries,
+        kesRefEntries,
+        genesisKeyEntries
+      ) =>
         val all: Iterable[(GlobalStateKey, Array[Byte])] =
           stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
             activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
@@ -780,7 +850,7 @@ object GlobalStateConverter {
             activeNodeCollaterals ++ nodeCollateralWithdrawals ++
             metagraphSyncData ++ currencyEntries ++ unpEntries ++ priceEntries ++
             allowSpendExpiryEntries ++ tokenLockExpiryEntries ++ ncwExpiryEntries ++
-            histStakeEntries
+            histStakeEntries ++ kesCertEntries ++ kesRefEntries ++ genesisKeyEntries
         all.toMap
     }
   }
@@ -899,17 +969,39 @@ object GlobalStateConverter {
       }
     }
 
-    (currencyEntriesF, updateNodeParametersF, priceStateF, historicalStakeSnapshotsF).mapN {
-      (currencyEntries, unpEntries, priceEntries, histStakeEntries) =>
-        val all: Iterable[(GlobalStateKey, Array[Byte])] =
-          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-            lastAllowSpendRefs ++ lastTokenLockRefs ++
-            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
-            histStakeEntries
-        all.toMap
+    val kesRegistrationCertsF: F[List[(GlobalStateKey, Array[Byte])]] =
+      acc.kesRegistrationCerts.toList.parTraverse {
+        case (peerId, records) =>
+          GlobalStateKey
+            .kesRegistrationCertsKey[F](peerId)
+            .map(_ -> enc[SortedSet[KesRegistrationRecord]](records))
+      }
+
+    val lastKesRegistrationRefsF: F[List[(GlobalStateKey, Array[Byte])]] =
+      acc.lastKesRegistrationRefs.toList.parTraverse {
+        case (peerId, ref) =>
+          GlobalStateKey
+            .lastKesRegistrationRefsKey[F](peerId)
+            .map(_ -> enc[KesRegistrationReference](ref))
+      }
+
+    (
+      currencyEntriesF,
+      updateNodeParametersF,
+      priceStateF,
+      historicalStakeSnapshotsF,
+      kesRegistrationCertsF,
+      lastKesRegistrationRefsF
+    ).mapN { (currencyEntries, unpEntries, priceEntries, histStakeEntries, kesCertEntries, kesRefEntries) =>
+      val all: Iterable[(GlobalStateKey, Array[Byte])] =
+        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+          lastAllowSpendRefs ++ lastTokenLockRefs ++
+          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
+          histStakeEntries ++ kesCertEntries ++ kesRefEntries
+      all.toMap
     }
   }
 
@@ -2177,6 +2269,21 @@ object GlobalStateConverter {
             case (period, entry) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> entry)
           }.map(_.toMap)
 
+        val kesRegistrationCertEntriesF: F[Map[GlobalStateKey, SortedSet[KesRegistrationRecord]]] =
+          info.kesRegistrationCerts.toList.parTraverse {
+            case (peerId, records) => GlobalStateKey.kesRegistrationCertsKey[F](peerId).map(_ -> records)
+          }.map(_.toMap)
+
+        val lastKesRegistrationRefEntriesF: F[Map[GlobalStateKey, KesRegistrationReference]] =
+          info.lastKesRegistrationRefs.toList.parTraverse {
+            case (peerId, ref) => GlobalStateKey.lastKesRegistrationRefsKey[F](peerId).map(_ -> ref)
+          }.map(_.toMap)
+
+        val genesisOperatorKeyEntriesF: F[Map[GlobalStateKey, GenesisOperatorConsensusKey]] =
+          info.genesisOperatorKeys.toList.parTraverse {
+            case (peerId, record) => GlobalStateKey.genesisOperatorKey[F](peerId).map(_ -> record)
+          }.map(_.toMap)
+
         // Reconstruct the allow-spend expiry index from `info.activeAllowSpends`: each active record contributes one entry in
         // `index[lastValidEpochProgress]`. Buckets are `SortedSet[AllowSpendExpiryKey]`; empty buckets are omitted entirely.
         val allowSpendExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[AllowSpendExpiryKey]]] = {
@@ -2268,6 +2375,9 @@ object GlobalStateConverter {
           tokenLockExpiryBuckets <- tokenLockExpiryBucketsF
           nodeCollateralWithdrawalExpiryBuckets <- nodeCollateralWithdrawalExpiryBucketsF
           historicalStakeEntries <- historicalStakeEntriesF
+          kesRegistrationCertEntries <- kesRegistrationCertEntriesF
+          lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
+          genesisOperatorKeyEntries <- genesisOperatorKeyEntriesF
           _ <- store.insert[Hash](stateChanHashes)
           _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
           _ <- store.insert[Balance](balances)
@@ -2296,6 +2406,9 @@ object GlobalStateConverter {
           _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
           _ <- store.insert[PriceRecord](priceStateEntries)
           _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
+          _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
+          _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
+          _ <- store.insert[GenesisOperatorConsensusKey](genesisOperatorKeyEntries)
           _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
           _ <- store.insert[SortedSet[TokenLockExpiryKey]](tokenLockExpiryBuckets)
           _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](nodeCollateralWithdrawalExpiryBuckets)
@@ -2490,6 +2603,16 @@ object GlobalStateConverter {
             case (period, entry) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> entry)
           }.map(_.toMap)
 
+        val kesRegistrationCertEntriesF: F[Map[GlobalStateKey, SortedSet[KesRegistrationRecord]]] =
+          acc.kesRegistrationCerts.toList.parTraverse {
+            case (peerId, records) => GlobalStateKey.kesRegistrationCertsKey[F](peerId).map(_ -> records)
+          }.map(_.toMap)
+
+        val lastKesRegistrationRefEntriesF: F[Map[GlobalStateKey, KesRegistrationReference]] =
+          acc.lastKesRegistrationRefs.toList.parTraverse {
+            case (peerId, ref) => GlobalStateKey.lastKesRegistrationRefsKey[F](peerId).map(_ -> ref)
+          }.map(_.toMap)
+
         val totalEntries =
           stateChanHashes.size + txRefs.size + balances.size + currencyProofs.size +
             acc.lastCurrencySnapshots.size * 2 +
@@ -2499,7 +2622,7 @@ object GlobalStateConverter {
             activeNodeCollateralsEntries.size + nodeCollateralWithdrawalsEntries.size +
             metagraphSyncDataEntries.size +
             acc.updateNodeParameters.size + acc.priceState.size +
-            acc.historicalStakeSnapshots.size
+            acc.historicalStakeSnapshots.size + acc.kesRegistrationCerts.size + acc.lastKesRegistrationRefs.size
 
         for {
           t0 <- Async[F].monotonic.map(_.toMillis)
@@ -2521,6 +2644,7 @@ object GlobalStateConverter {
               s"collateralWithdrawals=${acc.nodeCollateralWithdrawals.size} " +
               s"metagraphSync=${acc.metagraphSyncData.size} " +
               s"historicalStake=${acc.historicalStakeSnapshots.size} " +
+              s"operatorKeyRegistrations=${acc.kesRegistrationCerts.size} " +
               s"totalEntries=$totalEntries removals=${keysToRemove.size}"
           )
 
@@ -2560,9 +2684,13 @@ object GlobalStateConverter {
           updateNodeParametersEntries <- updateNodeParametersEntriesF
           priceStateEntries <- priceStateEntriesF
           historicalStakeEntries <- historicalStakeEntriesF
+          kesRegistrationCertEntries <- kesRegistrationCertEntriesF
+          lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
           _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
           _ <- store.insert[PriceRecord](priceStateEntries)
           _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
+          _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
+          _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
           _ <- applySystemIndexDelta[F, AllowSpendExpiryKey](
             store,
             SystemNamespaceLabel.ExpiryIndexAllowSpends,

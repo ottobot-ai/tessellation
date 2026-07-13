@@ -18,7 +18,9 @@ import io.constellationnetwork.env.AppEnvironment._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.RegistrationEvaluationContext
 import io.constellationnetwork.node.shared.domain.snapshot.finality.{FinalityGate, FinalizedSnapshotReader}
 import io.constellationnetwork.node.shared.http.p2p.middlewares.{MetricsMiddleware, PeerAuthMiddleware, `X-Id-Middleware`}
 import io.constellationnetwork.node.shared.http.routes._
@@ -30,6 +32,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.TessellationVersion
@@ -69,7 +72,8 @@ object HttpApi {
     getLocalChainTip: Option[F[Option[ChainTip]]] = None,
     maybeMarkSeen: Option[Hash => F[Unit]] = None
   ): F[HttpApi[F, R]] =
-    // GL0 runs Nakamoto consensus — head may run ahead of the attestation-finalized ordinal held in `FinalityGate`. The
+    // GL0 runs Nakamoto consensus. Current `FinalityGate` is a transitional ordinal-only P2 watermark; target gating is exact-hash and
+    // reorg-aware. The
     // `FinalizedSnapshotReader.nakamoto` variant serves `/latest/combined` and its kin from the on-disk checkpoint at-or-below
     // finalized, so tentative (pre-finality) state never leaves the node via HTTP — that channel is reserved for sidecar gossip.
     //
@@ -250,17 +254,27 @@ sealed abstract class HttpApi[
     )
   }
 
-  // §1.2 Slice 10 (#179): Runtime KES master-VK registration intake. The route validates the cert (signature,
-  // monotonic ordinal, chain-link parent, forward activation, well-formed VK) and on success offers it into
-  // the cell that publishes a `KesRegistrationCertEvent` for the mempool. Reads/writes the shared
-  // `services.mutableKesRegistry` so `lastReference` matches what the validator + GSAM accept-pipeline see.
+  // Preliminary operator-key registration intake. The route binds its check to the exact current snapshot hash and eta period; the future
+  // GSAM path must revalidate against the actual proposal parent because a queued candidate can outlive this HTTP-time context.
   private val kesRegistrationCertRoutes = HasherSelector[F].withCurrent { implicit hasher =>
     val validator = KesRegistrationCertValidator.make[F](sharedValidators.signedValidator, l0Seedlist)
     val onAccepted: Signed[KesRegistrationCert] => F[Unit] = cert => mkKesRegistrationCertCell(cert).run().void
+    val registrationContext: F[Option[RegistrationEvaluationContext]] =
+      storages.globalSnapshot.head.flatMap {
+        case None => none[RegistrationEvaluationContext].pure[F]
+        case Some((snapshot, _)) =>
+          snapshot.toHashed.map { hashedSnapshot =>
+            val period = EtaCalculation.rotationPeriod(
+              snapshot.value.ordinal.value.value,
+              sharedConfig.nakamoto.etaRotationSnapshots(environment).value
+            )
+            RegistrationEvaluationContext(hashedSnapshot.hash, EtaPeriod(period)).some
+          }
+      }
     KesRegistrationCertRoutes[F](
       onAccepted,
       validator,
-      storages.globalSnapshot,
+      registrationContext,
       services.mutableKesRegistry
     )
   }
@@ -276,8 +290,8 @@ sealed abstract class HttpApi[
   // consensus semantics change.
   private val finalityTriggersRoutes = FinalityTriggersRoutes[F](
     services.finalityTriggerViewRef,
-    // Track-3 S1: read-only settled (k₂-archival) marker + the configured k₂ depth (= 100·k₁, the single canonical
-    // `NakamotoConfig.keepDepthBehindFinalized` accessor) for `GET /global-snapshots/settled`.
+    // Transitional read-only local k2 retention telemetry. The route's legacy `settled`
+    // naming does not imply a phase, irreversible state, or fork-choice floor.
     services.settledOrdinalTracker.settledOrdinal,
     sharedConfig.nakamoto.keepDepthBehindFinalized(environment).value
   )

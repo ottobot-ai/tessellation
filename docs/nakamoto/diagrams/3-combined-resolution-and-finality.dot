@@ -1,7 +1,10 @@
-// Checkpoint inclusion and inherited GL0 finality.
+// TARGET DESIGN: checkpoint inclusion and inherited GL0 finality.
 // Render: dot -Tpng -Gdpi=150 3-combined-resolution-and-finality.dot -o 3-combined-resolution-and-finality.png
 
 digraph combined {
+  label="TARGET DESIGN: execution certification, diff adoption, and GL0 phases";
+  labelloc=t;
+  fontsize=15;
   rankdir=TB;
   ranksep=0.8;
   nodesep=0.5;
@@ -10,18 +13,22 @@ digraph combined {
 
   ml0 [label="ML0 signed state-channel binary", fillcolor="#E3F2FD", color="#1565C0"];
   admission [label="GL0 binary admission committee", fillcolor="#FFF3CD", color="#E67E00"];
-  checkpoint [label="Execution-shard checkpoint\nroot claims + complete replay inputs", fillcolor="#E8E0FF", color="#6A3D9A", penwidth=2];
-  replay [label="Every GL0 adopter verifies identities and keys,\nthen recreates every CL1 transition", fillcolor="#D4EDDA", color="#1A7F37", penwidth=2];
-  global [label="Canonical GL0 snapshot\ncheckpoint inherits this ordinal's finality", fillcolor="#D7E9FC", color="#0B5394", penwidth=2];
-  downstream [label="Finalized GL0 state returns to\nGL1, ML0, CL1, and DL1", fillcolor="#FFFFFF", color="#555555"];
+  checkpoint [label="Execution-shard checkpoint\nexact inputs + scoped diff + complete root\n+ exact Phase-2 base/pre-root", fillcolor="#E8E0FF", color="#6A3D9A", penwidth=2];
+  replay [label="Producer and every execution signer independently replay;\nsign only an identical diff and root", fillcolor="#D4EDDA", color="#1A7F37", penwidth=2];
+  threshold [label="Distinct execution threshold", fillcolor="#FFF3CD", color="#E67E00", penwidth=2];
+  adopt [label="Ordinary noncommittee GL0 verifies base/pre-root CAS,\ncontinuity, namespace, identities, and threshold;\napplies diff and recomputes root", fillcolor="#D4EDDA", color="#1A7F37", penwidth=2];
+  global [label="Canonical GL0 snapshot on maxvalid-tk tine\ncontaining hash: P1 provisional -> P2 operational\n(P2 remains density-reorgable)", fillcolor="#D7E9FC", color="#0B5394", penwidth=2];
+  downstream [label="Exact Phase-2 GL0 state returns to\nGL1, ML0, CL1, and DL1", fillcolor="#FFFFFF", color="#555555"];
 
-  ml0 -> admission -> checkpoint -> replay -> global -> downstream;
+  ml0 -> admission -> checkpoint -> replay -> threshold -> adopt -> global -> downstream;
 
-  quorum [shape=note, label="Committee quorum and shard depth\nselect only among replay-valid checkpoints.", fillcolor="#FFFFFF", color="#888888"];
-  watchtower [shape=octagon, label="Watchtower\ndefense-in-depth replay", fillcolor="#FFF3CD", color="#E67E00"];
-  slash [label="Self-contained fraud evidence\ncanonical deterministic slash", fillcolor="#F8D7DA", color="#721C24"];
+  quorum [shape=note, label="Execution threshold is required for diff adoption.\nExactly one checkpoint may be outstanding per shard;\nshard depth never replaces replay signatures.", fillcolor="#FFFFFF", color="#888888"];
+  watchtower [shape=octagon, label="Selected noncommittee watchtower replay\npositive coverage required before GL0 inclusion", fillcolor="#FFF3CD", color="#E67E00"];
+  challenge [label="Mismatch challenge\nnot itself a fraud verdict", fillcolor="#F8D7DA", color="#721C24"];
+  adjudicator [label="Ratified adjudicator computes result\nexceptional bounded GL0 replay, step proof,\nor independently verified succinct proof", fillcolor="#F8D7DA", color="#721C24"];
+  slash [label="Computed mismatch only\ncanonical rollback + actual-signer slash", fillcolor="#F8D7DA", color="#721C24"];
 
-  replay -> quorum [style=dashed];
-  watchtower -> slash [style=dashed];
+  threshold -> quorum [style=dashed];
+  watchtower -> challenge -> adjudicator -> slash [style=dashed];
   checkpoint -> watchtower [style=dashed];
 }

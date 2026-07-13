@@ -33,7 +33,10 @@ sealed trait ChainSyncStateResponse[+A] extends Product with Serializable {
 
 object ChainSyncStateResponse {
 
-  /** Snapshot at a finalized ordinal — durable, immutable. Served from the on-disk base trie / chain store's canonical view. */
+  /** Snapshot at the currently canonical Phase-2 exact hash. It is durable operational state, but a density reorg may replace it at the
+    * same ordinal; callers must retain the hash-bound rollback/re-follow contract. Served from the on-disk base trie / chain store's
+    * canonical view.
+    */
   final case class Finalized[A](state: A) extends ChainSyncStateResponse[A]
 
   /** Snapshot on a pending branch, identified by `branch`. May be discarded if the branch is reorged out. The branch id is the snapshot's

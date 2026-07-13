@@ -69,9 +69,13 @@ object TowerProofBuilder {
       snapshotHash: Hash
     ): Option[TowerProofHeader] = {
       val s = signed.value
-      s.slotCertificate.map { cert =>
+      val signers = signed.proofs.toNonEmptyList.map(_.id.toPeerId).distinct
+      // A Nakamoto snapshot has one producer. Without that unique identity a portable
+      // verifier cannot resolve the certificate key from the operator registry.
+      s.slotCertificate.filter(_ => signers.size == 1).map { cert =>
         TowerProofHeader(
           ordinal = s.ordinal,
+          producerId = signers.head,
           slot = cert.slot,
           parentSlot = cert.parentSlot,
           vrfProof = cert.vrfProof,

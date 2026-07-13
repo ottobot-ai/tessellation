@@ -57,6 +57,27 @@ trait ShardSlotLeader[F[_]] {
 
 object ShardSlotLeader {
 
+  sealed trait StaircaseDutyError extends Product with Serializable {
+    def diagnostic: String
+  }
+
+  object StaircaseDutyError {
+    case object EmptyCommittee extends StaircaseDutyError {
+      val diagnostic: String = "empty execution committee"
+    }
+
+    final case class InvalidDelta(deltaSlots: Int) extends StaircaseDutyError {
+      val diagnostic: String = s"invalid staircase delta slots=$deltaSlots"
+    }
+
+    final case class NonMonotoneSlot(parentSlot: Slot, checkpointSlot: Slot) extends StaircaseDutyError {
+      val diagnostic: String =
+        s"checkpoint slot=${checkpointSlot.value.value} is not strictly greater than parent slot=${parentSlot.value.value}"
+    }
+  }
+
+  final case class StaircaseDuty(peerId: PeerId, rank: Int, slotGap: Long, effectiveDeltaSlots: Long)
+
   /** Domain-separation tag carried in-band on the encoded `ShardEtaInput`. Must NOT collide with any other VRF or eta-derivation tag in the
     * codebase — keeps the per-shard possession-proof eta independent of `CommitteeSortition`'s `"committee"` tag and of GL0's leader VRF
     * (which has no tagged eta input, just `eta || slot`). Mirrors the `CommitteeSortition.CommitteeVrfInput.tag` pattern.
@@ -126,6 +147,48 @@ object ShardSlotLeader {
     implicit val encoder: Encoder[StaircaseRankInput] = deriveEncoder
   }
 
+  /** Single consensus definition of the shuffled staircase owner for a checkpoint slot.
+    *
+    * The caller supplies the canonical hash-ordered committee from [[dutyOrder]]. Genesis uses the widened 12x window already specified by
+    * the protocol; every non-genesis checkpoint must be strictly later than its retained parent. There is deliberately no receiver
+    * wall-clock input here: duty is a pure function of signed checkpoint data, the retained parent, committee membership, and configured
+    * delta.
+    */
+  def scheduledDuty(
+    orderedCommittee: List[PeerId],
+    checkpointSlot: Slot,
+    parentSlot: Option[Slot],
+    staircaseDeltaSlots: Int
+  ): Either[StaircaseDutyError, StaircaseDuty] = {
+    import StaircaseDutyError._
+
+    if (orderedCommittee.isEmpty) Left(EmptyCommittee)
+    else if (staircaseDeltaSlots <= 0) Left(InvalidDelta(staircaseDeltaSlots))
+    else
+      parentSlot match {
+        case Some(parent) if checkpointSlot.value.value <= parent.value.value =>
+          Left(NonMonotoneSlot(parent, checkpointSlot))
+        case _ =>
+          val slotGap = parentSlot.fold(math.max(1L, checkpointSlot.value.value))(parent => checkpointSlot.value.value - parent.value.value)
+          val effectiveDelta =
+            if (parentSlot.isEmpty) staircaseDeltaSlots.toLong * 12L
+            else staircaseDeltaSlots.toLong
+          val rank = (((slotGap - 1L) / effectiveDelta) % orderedCommittee.size.toLong).toInt
+          Right(StaircaseDuty(orderedCommittee(rank), rank, slotGap, effectiveDelta))
+      }
+  }
+
+  /** Standalone staircase hash ordering shared by production and receive-side duty validation. */
+  def dutyOrder[F[_]: Sync](
+    committee: List[PeerId],
+    shardEta: Array[Byte],
+    shardOrdinal: ShardOrdinal
+  )(implicit hasher: Hasher[F]): F[List[PeerId]] =
+    committee.traverse { p =>
+      hasher.hash(StaircaseRankInput(StaircaseTag, Hex.fromBytes(shardEta), shardOrdinal, p)).map(h => (h.value, p))
+    }
+      .map(_.sortBy(_._1).map(_._2))
+
   /** Build a [[ShardSlotLeader]] backed by the supplied [[EligibilityChecker]]. Eta derivation and duty ranking use `Hasher[F]`; the
     * eligibility checker is used only for its canonical `(eta || slot)` VRF proof primitive.
     */
@@ -143,12 +206,9 @@ object ShardSlotLeader {
       shardEta: Array[Byte],
       shardOrdinal: ShardOrdinal
     )(implicit hasher: Hasher[F]): F[List[PeerId]] =
-      committee.traverse { p =>
-        hasher.hash(StaircaseRankInput(StaircaseTag, Hex.fromBytes(shardEta), shardOrdinal, p)).map(h => (h.value, p))
-      }
-        // Lexicographic sort on the canonical hex hash; ties impossible (distinct peerIds hash distinctly modulo SHA-256
-        // collisions). Deterministic across JVMs: same Hasher, same String ordering.
-        .map(_.sortBy(_._1).map(_._2))
+      // Lexicographic sort on the canonical hex hash; ties impossible (distinct peerIds hash distinctly modulo SHA-256
+      // collisions). Deterministic across JVMs: same Hasher, same String ordering.
+      ShardSlotLeader.dutyOrder[F](committee, shardEta, shardOrdinal)
 
     def membershipProof(vrfSk: Array[Byte], shardEta: Array[Byte], slot: Slot): F[Array[Byte]] =
       Sync[F].delay(eligibilityChecker.vrfProofForSlot(vrfSk, slot, shardEta))

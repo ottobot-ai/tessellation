@@ -4,7 +4,7 @@ import cats.Order
 
 import scala.collection.immutable.SortedSet
 
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 
 import scodec.Codec
 
@@ -18,6 +18,12 @@ import scodec.Codec
 object SetCodec {
   def set[A: Order](inner: Codec[A]): Codec[Set[A]] =
     sortedSet(inner).xmap[Set[A]](
+      ss => ss.toSet,
+      s => SortedSet.empty[A](Order[A].toOrdering) ++ s
+    )
+
+  def setCanonical[A: Order](inner: Codec[A]): Codec[Set[A]] =
+    sortedSetCanonical(inner).xmap[Set[A]](
       ss => ss.toSet,
       s => SortedSet.empty[A](Order[A].toOrdering) ++ s
     )

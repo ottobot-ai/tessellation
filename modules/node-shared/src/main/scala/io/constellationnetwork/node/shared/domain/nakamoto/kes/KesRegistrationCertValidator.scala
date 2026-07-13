@@ -4,21 +4,25 @@ import cats.data.{NonEmptySet, ValidatedNec}
 import cats.effect.Async
 import cats.syntax.all._
 
+import scala.util.Try
+
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.validated._
-import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationReference}
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.SignedValidator.SignedValidationError
 import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
-import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
 import derevo.cats.{eqv, show}
 import derevo.derive
 
-/** Validator for [[KesRegistrationCert]] — §1.2 Slice 10 (#179) runtime KES master-VK registration certs.
+/** Validator for the current unified KES+VRF [[KesRegistrationCert]] candidate.
   *
   * Rejection paths (validator is fail-closed across all of them; each is exercised in `KesRegistrationCertValidatorSuite`):
   *
@@ -29,21 +33,30 @@ import derevo.derive
   *      we accept). Same gate the node-collateral validator uses.
   *   1. '''SignerOperatorMismatch''' — the `Signed` proof was made by a key that does not match `operatorPeerId`. Operator self-binds: the
   *      cert is identifying its subject, and that subject must be the one signing it.
-  *   1. '''NonMonotonicOrdinal''' — the cert's `ordinal` is `<= lastSeenOrdinal` for this operator. Replay / out-of-order delivery is
-  *      rejected. The first cert from a fresh operator must use `KesRegistrationOrdinal.first`.
+  *   1. '''InvalidRegistrationOrdinal''' — the cert's `ordinal` is not exactly the next per-operator ordinal. Replays, skips, and
+  *      out-of-order delivery are rejected; the first cert must use `KesRegistrationOrdinal.first`.
+  *   1. '''RegistrationOrdinalOverflow''' — computing the exact next ordinal overflowed. The cert fails closed.
   *   1. '''InvalidParent''' — the cert's `parent` reference does not match the last accepted cert for this operator. Mirrors the
   *      `NodeCollateralValidator.validateParent` chain-link check.
-  *   1. '''NotForwardActivation''' — `effectiveFromEpoch <= currentEpoch`. Retroactive registration would skip the N-2-style staggering
-  *      window receivers need to observe finality before a new VK becomes load-bearing.
-  *   1. '''NonMonotonicEffectiveFromEpoch''' — the cert's `effectiveFromEpoch` is `<= lastSeen.effectiveFromEpoch` for this operator.
-  *      Closes the Risk-5 lookup hole: without this check, a cert with a LOWER `effectiveFromEpoch` could be accepted at a higher ordinal,
-  *      meaning the pointer-only lookup in `MutableKesRegistry.getKesVk` would falsely fall through to genesis when an earlier (lower-
-  *      ordinal) cert IS active at `currentEpoch`. By enforcing strict monotonicity, the latest accepted cert is guaranteed to have the
-  *      highest `effectiveFromEpoch`, so pointer-only lookup is correct: if the pointer's cert is effective, return it; if not, the genesis
-  *      fallback is unambiguous.
-  *   1. '''MalformedVk''' — the `kesMasterVK` bytes are empty, or `kesMasterVKStep < 0`, or `offset < 0`. Cryptographic well-formedness of
-  *      the bytes (that they form a valid super × sub Merkle root) is intentionally not checked here — that's the verifier-side check at
-  *      sig-presentation time. We catch only the obvious structural breakage.
+  *   1. '''InvalidRegistrationParent''' — the signed GL0 branch parent differs from the exact candidate parent being evaluated.
+  *   1. '''InsufficientActivationDelay''' — `effectiveFromPeriod < currentPeriod + 2`. This is the period-index rule used by the historical
+  *      resolver: period `N` may use only a pair present in the exact canonical `N-2` registry view, while eta comes from `N-1`. It does
+  *      not claim that two full wall-clock periods elapsed after a late-`N-2` inclusion.
+  *   1. '''ActivationPeriodOverflow''' — the checked `currentPeriod + 2` calculation overflowed. The cert fails closed.
+  *   1. '''InvalidInclusionPeriod''' — a negative period was supplied for canonical inclusion/evaluation. The cert fails closed.
+  *   1. '''NonMonotonicEffectiveFromPeriod''' — the cert's `effectiveFromPeriod` is `<= lastSeen.effectiveFromPeriod` for this operator.
+  *      Rotations cannot backdate a higher ordinal into an earlier activation period. Runtime lookup also walks the exact pointer-selected
+  *      chain so a later pending rotation preserves the prior active runtime key.
+  *   1. '''MalformedVk''' — the `kesMasterVK` is not exactly the 32-byte Blake2b-256 product-tree root used by the active KES
+  *      implementation, or is invalid hex.
+  *   1. '''InconsistentKesActivation''' — a runtime master tree does not start at step 0 or its nonnegative offset differs from
+  *      `effectiveFromPeriod`. KES and VRF therefore cannot activate under different period interpretations.
+  *   1. '''MalformedVrfPublicKey''' — `vrfPublicKey` is not exactly 32 decoded bytes.
+  *
+  * This validator does not itself make the registration canonical. Its `currentPeriod` argument must be the candidate's canonical
+  * inclusion/evaluation eta period when the GSAM path is wired; route-time validation is only a preliminary filter. Network/genesis and
+  * signature-domain binding, global cross-operator KES/VRF-key uniqueness, canonical MPT inclusion, and exact branch-historical consumer
+  * lookup remain separate mandatory gates.
   */
 trait KesRegistrationCertValidator[F[_]] {
 
@@ -53,21 +66,26 @@ trait KesRegistrationCertValidator[F[_]] {
     *   the candidate cert wrapped in its long-term-key signature
     * @param lastRef
     *   the previously-accepted [[KesRegistrationReference]] for this operator, or [[KesRegistrationReference.empty]] for a fresh operator
-    * @param lastEffectiveFromEpoch
-    *   the `effectiveFromEpoch` of the previously-accepted cert for this operator. Used by the monotonic-effective-epoch check (Risk 5).
-    *   `EpochProgress(0)` for a fresh operator (matches `KesRegistrationReference.empty`'s implicit zero baseline).
-    * @param currentEpoch
-    *   the snapshot epoch the cert is being evaluated against
+    * @param lastEffectiveFromPeriod
+    *   the `effectiveFromPeriod` of the previously-accepted cert for this operator. Used by the monotonic-effective-period check.
+    *   `EtaPeriod.Zero` for a fresh operator (matches `KesRegistrationReference.empty`'s implicit zero baseline).
+    * @param context
+    *   exact GL0 candidate-parent hash and its canonical inclusion/evaluation eta period
     */
   def validate(
     signed: Signed[KesRegistrationCert],
     lastRef: KesRegistrationReference,
-    lastEffectiveFromEpoch: EpochProgress,
-    currentEpoch: EpochProgress
+    lastEffectiveFromPeriod: EtaPeriod,
+    context: KesRegistrationCertValidator.RegistrationEvaluationContext
   ): F[KesRegistrationCertValidator.KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]]]
 }
 
 object KesRegistrationCertValidator {
+
+  val ActivationDelayPeriods: Long = 2L
+  val KesMasterVerificationKeyLength: Int = 32
+
+  case class RegistrationEvaluationContext(candidateParentHash: Hash, inclusionPeriod: EtaPeriod)
 
   /** Validator that always rejects. Used in modules that don't carry the long-term seedlist needed to verify the operator binding (mirrors
     * the `UpdateNodeCollateralValidator.rejectAll` fallback).
@@ -76,13 +94,13 @@ object KesRegistrationCertValidator {
     def validate(
       signed: Signed[KesRegistrationCert],
       lastRef: KesRegistrationReference,
-      lastEffectiveFromEpoch: EpochProgress,
-      currentEpoch: EpochProgress
+      lastEffectiveFromPeriod: EtaPeriod,
+      context: RegistrationEvaluationContext
     ): F[KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]]] =
       (Rejected: KesRegistrationCertValidationError).invalidNec[Signed[KesRegistrationCert]].pure[F]
   }
 
-  def make[F[_]: Async: SecurityProvider](
+  def make[F[_]: Async](
     signedValidator: SignedValidator[F],
     l0Seedlist: Option[Set[SeedlistEntry]]
   )(implicit hasher: Hasher[F]): KesRegistrationCertValidator[F] =
@@ -91,8 +109,8 @@ object KesRegistrationCertValidator {
       def validate(
         signed: Signed[KesRegistrationCert],
         lastRef: KesRegistrationReference,
-        lastEffectiveFromEpoch: EpochProgress,
-        currentEpoch: EpochProgress
+        lastEffectiveFromPeriod: EtaPeriod,
+        context: RegistrationEvaluationContext
       ): F[KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]]] =
         for {
           numberOfSignaturesV <- validateNumberOfSignatures(signed)
@@ -101,21 +119,27 @@ object KesRegistrationCertValidator {
             .map(_.errorMap[KesRegistrationCertValidationError](InvalidSigned))
           signerMatchV <- validateSignerMatchesOperator(signed)
           authorizedV = validateAuthorizedOperator(signed)
-          monotonicV = validateOrdinalMonotonic(signed, lastRef)
+          ordinalContinuityV = validateOrdinalContinuity(signed, lastRef)
           parentV = validateParentLink(signed, lastRef)
-          activationV = validateForwardActivation(signed, currentEpoch)
-          monotonicEpochV = validateMonotonicEffectiveFromEpoch(signed, lastRef, lastEffectiveFromEpoch)
-          wellFormedV = validateVkWellFormedness(signed)
+          registrationParentV = validateRegistrationParent(signed, context.candidateParentHash)
+          activationV = validateForwardActivation(signed, context.inclusionPeriod)
+          monotonicPeriodV = validateMonotonicEffectiveFromPeriod(signed, lastRef, lastEffectiveFromPeriod)
+          kesWellFormedV = validateKesVkWellFormedness(signed)
+          kesActivationV = validateKesActivation(signed)
+          vrfWellFormedV = validateVrfPublicKeyWellFormedness(signed)
         } yield
           numberOfSignaturesV
             .productR(signaturesV)
             .productR(signerMatchV)
             .productR(authorizedV)
-            .productR(monotonicV)
+            .productR(ordinalContinuityV)
             .productR(parentV)
+            .productR(registrationParentV)
             .productR(activationV)
-            .productR(monotonicEpochV)
-            .productR(wellFormedV)
+            .productR(monotonicPeriodV)
+            .productR(kesWellFormedV)
+            .productR(kesActivationV)
+            .productR(vrfWellFormedV)
 
       private def validateNumberOfSignatures(
         signed: Signed[KesRegistrationCert]
@@ -143,12 +167,20 @@ object KesRegistrationCertValidator {
         if (l0Seedlist.forall(_.exists(_.peerId === signed.value.operatorPeerId))) signed.validNec
         else UnauthorizedOperator(signed.value.operatorPeerId).invalidNec
 
-      private def validateOrdinalMonotonic(
+      private def validateOrdinalContinuity(
         signed: Signed[KesRegistrationCert],
         lastRef: KesRegistrationReference
-      ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] =
-        if (signed.value.ordinal > lastRef.ordinal) signed.validNec
-        else NonMonotonicOrdinal(signed.value.ordinal, lastRef.ordinal).invalidNec
+      ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] = {
+        val expectedOrdinal =
+          if (lastRef === KesRegistrationReference.empty) Some(KesRegistrationOrdinal.first)
+          else lastRef.ordinal.next
+
+        expectedOrdinal match {
+          case Some(expected) if signed.value.ordinal === expected => signed.validNec
+          case Some(expected)                                      => InvalidRegistrationOrdinal(signed.value.ordinal, expected).invalidNec
+          case None                                                => RegistrationOrdinalOverflow(lastRef.ordinal).invalidNec
+        }
+      }
 
       private def validateParentLink(
         signed: Signed[KesRegistrationCert],
@@ -157,41 +189,71 @@ object KesRegistrationCertValidator {
         if (signed.value.parent === lastRef) signed.validNec
         else InvalidParent(signed.value.parent).invalidNec
 
+      private def validateRegistrationParent(
+        signed: Signed[KesRegistrationCert],
+        candidateParentHash: Hash
+      ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] =
+        if (signed.value.registrationParentHash === candidateParentHash) signed.validNec
+        else InvalidRegistrationParent(signed.value.registrationParentHash, candidateParentHash).invalidNec
+
       private def validateForwardActivation(
         signed: Signed[KesRegistrationCert],
-        currentEpoch: EpochProgress
+        currentPeriod: EtaPeriod
       ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] =
-        if (signed.value.effectiveFromEpoch > currentEpoch) signed.validNec
-        else NotForwardActivation(signed.value.effectiveFromEpoch, currentEpoch).invalidNec
+        if (currentPeriod.value < 0L) InvalidInclusionPeriod(currentPeriod).invalidNec
+        else
+          Try(Math.addExact(currentPeriod.value, ActivationDelayPeriods)).toOption match {
+            case Some(minimumValue) if signed.value.effectiveFromPeriod >= EtaPeriod(minimumValue) => signed.validNec
+            case Some(minimumValue) =>
+              InsufficientActivationDelay(signed.value.effectiveFromPeriod, currentPeriod, EtaPeriod(minimumValue)).invalidNec
+            case None => ActivationPeriodOverflow(currentPeriod).invalidNec
+          }
 
-      /** Risk-5 fix: enforce that `effectiveFromEpoch` is strictly increasing across the operator's per-peer cert chain. Skipped when this
-        * is the operator's first cert (`lastRef == KesRegistrationReference.empty`) — no prior effectiveFromEpoch to compare against.
-        * Closes the bug where the pointer-only lookup in [[MutableKesRegistry.getKesVk]] would fall through to genesis when the latest
-        * pointer's cert was pending (eff > current) but an earlier (lower-ordinal) cert was active. Mirrors the per-peer
-        * `validateOrdinalMonotonic` shape.
+      /** Enforce that `effectiveFromPeriod` is strictly increasing across the operator's per-peer cert chain. Skipped when this is the
+        * operator's first cert (`lastRef == KesRegistrationReference.empty`) because there is no prior activation to compare. This forbids
+        * a higher-ordinal rotation from backdating itself ahead of its predecessor.
         */
-      private def validateMonotonicEffectiveFromEpoch(
+      private def validateMonotonicEffectiveFromPeriod(
         signed: Signed[KesRegistrationCert],
         lastRef: KesRegistrationReference,
-        lastEffectiveFromEpoch: EpochProgress
+        lastEffectiveFromPeriod: EtaPeriod
       ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] =
         if (lastRef === KesRegistrationReference.empty) signed.validNec
-        else if (signed.value.effectiveFromEpoch > lastEffectiveFromEpoch) signed.validNec
+        else if (signed.value.effectiveFromPeriod > lastEffectiveFromPeriod) signed.validNec
         else
-          NonMonotonicEffectiveFromEpoch(
+          NonMonotonicEffectiveFromPeriod(
             signed.value.ordinal,
-            signed.value.effectiveFromEpoch,
+            signed.value.effectiveFromPeriod,
             lastRef.ordinal,
-            lastEffectiveFromEpoch
+            lastEffectiveFromPeriod
           ).invalidNec
 
-      private def validateVkWellFormedness(
+      private def validateKesVkWellFormedness(
         signed: Signed[KesRegistrationCert]
       ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] = {
         val cert = signed.value
-        val vkBytes = scala.util.Try(cert.kesMasterVK.toBytes).toOption.getOrElse(Array.emptyByteArray)
-        if (vkBytes.nonEmpty && cert.kesMasterVKStep >= 0 && cert.offset >= 0) signed.validNec
+        val vkBytes = Try(cert.kesMasterVK.toBytes).toOption
+        if (vkBytes.exists(_.length == KesMasterVerificationKeyLength)) signed.validNec
         else MalformedVk(cert.kesMasterVK).invalidNec
+      }
+
+      private def validateKesActivation(
+        signed: Signed[KesRegistrationCert]
+      ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] = {
+        val cert = signed.value
+        if (
+          cert.kesMasterVKStep == 0 && cert.offset >= 0L && cert.effectiveFromPeriod.value >= 0L &&
+          cert.offset == cert.effectiveFromPeriod.value
+        ) signed.validNec
+        else InconsistentKesActivation(cert.kesMasterVKStep, cert.offset, cert.effectiveFromPeriod).invalidNec
+      }
+
+      private def validateVrfPublicKeyWellFormedness(
+        signed: Signed[KesRegistrationCert]
+      ): KesRegistrationCertValidationErrorOr[Signed[KesRegistrationCert]] = {
+        val vrfPublicKeyBytes = Try(signed.value.vrfPublicKey.toBytes).toOption
+        if (vrfPublicKeyBytes.exists(_.length == VrfPublicKey.ExpectedLength)) signed.validNec
+        else MalformedVrfPublicKey(signed.value.vrfPublicKey).invalidNec
       }
     }
 
@@ -206,26 +268,55 @@ object KesRegistrationCertValidator {
 
   case class SignerOperatorMismatch(operatorPeerId: PeerId, signerPeerIds: Set[PeerId]) extends KesRegistrationCertValidationError
 
-  case class NonMonotonicOrdinal(certOrdinal: KesRegistrationOrdinal, lastOrdinal: KesRegistrationOrdinal)
+  case class InvalidRegistrationOrdinal(certOrdinal: KesRegistrationOrdinal, expectedOrdinal: KesRegistrationOrdinal)
       extends KesRegistrationCertValidationError
+
+  case class RegistrationOrdinalOverflow(lastOrdinal: KesRegistrationOrdinal) extends KesRegistrationCertValidationError
+
+  case class ConflictingOperatorRegistrations(operatorPeerId: PeerId, ordinals: List[KesRegistrationOrdinal])
+      extends KesRegistrationCertValidationError
+
+  case class KesKeyAlreadyRegistered(
+    kesMasterVK: io.constellationnetwork.security.hex.Hex,
+    claimant: PeerId,
+    registeredOperators: List[PeerId]
+  ) extends KesRegistrationCertValidationError
+
+  case class VrfKeyAlreadyRegistered(
+    vrfPublicKey: io.constellationnetwork.security.hex.Hex,
+    claimant: PeerId,
+    registeredOperators: List[PeerId]
+  ) extends KesRegistrationCertValidationError
 
   case class InvalidParent(parent: KesRegistrationReference) extends KesRegistrationCertValidationError
 
-  case class NotForwardActivation(effectiveFromEpoch: EpochProgress, currentEpoch: EpochProgress) extends KesRegistrationCertValidationError
+  case class InvalidRegistrationParent(registrationParentHash: Hash, candidateParentHash: Hash) extends KesRegistrationCertValidationError
 
-  /** Risk-5 (#179) — the operator's per-peer cert chain must have strictly-increasing `effectiveFromEpoch`. Without this constraint, the
-    * pointer-only lookup in [[MutableKesRegistry.getKesVk]] (which checks ONLY the latest cert's effective-epoch) could fall through to
-    * genesis when the highest-ordinal cert is pending, even though an earlier cert IS active at `currentEpoch`. Enforced strictly so
-    * (ordinal, effective) are jointly monotone.
+  case class InsufficientActivationDelay(
+    effectiveFromPeriod: EtaPeriod,
+    currentPeriod: EtaPeriod,
+    minimumEffectivePeriod: EtaPeriod
+  ) extends KesRegistrationCertValidationError
+
+  case class ActivationPeriodOverflow(currentPeriod: EtaPeriod) extends KesRegistrationCertValidationError
+
+  case class InvalidInclusionPeriod(currentPeriod: EtaPeriod) extends KesRegistrationCertValidationError
+
+  /** The operator's per-peer cert chain must have strictly increasing `effectiveFromPeriod`; ordinal and activation order cannot diverge.
     */
-  case class NonMonotonicEffectiveFromEpoch(
+  case class NonMonotonicEffectiveFromPeriod(
     certOrdinal: KesRegistrationOrdinal,
-    certEffectiveFromEpoch: EpochProgress,
+    certEffectiveFromPeriod: EtaPeriod,
     lastOrdinal: KesRegistrationOrdinal,
-    lastEffectiveFromEpoch: EpochProgress
+    lastEffectiveFromPeriod: EtaPeriod
   ) extends KesRegistrationCertValidationError
 
   case class MalformedVk(kesMasterVK: io.constellationnetwork.security.hex.Hex) extends KesRegistrationCertValidationError
+
+  case class InconsistentKesActivation(kesMasterVKStep: Int, offset: Long, effectiveFromPeriod: EtaPeriod)
+      extends KesRegistrationCertValidationError
+
+  case class MalformedVrfPublicKey(vrfPublicKey: io.constellationnetwork.security.hex.Hex) extends KesRegistrationCertValidationError
 
   case object Rejected extends KesRegistrationCertValidationError
 

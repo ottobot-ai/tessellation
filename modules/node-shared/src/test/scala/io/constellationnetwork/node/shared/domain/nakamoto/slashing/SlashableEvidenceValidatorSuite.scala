@@ -9,6 +9,8 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.slashing.{MetagraphAttestation, SlashableEvidence, SlashingRejection}
 import io.constellationnetwork.security.hash.Hash
@@ -16,47 +18,42 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes._
 import io.constellationnetwork.security.signature.Signing
 import io.constellationnetwork.security.signature.signature.Signature
-import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 
 import weaver.MutableIOSuite
 
 /** Slice S4a — coverage for [[SlashableEvidenceValidator]] per `SLASHING-DESIGN.md` §4.1.
   *
-  * 10 tests, 1:1 with the design checklist:
+  * The core tests map 1:1 to the design checklist:
   *   - happy path (all 9 steps pass on a real equivocation)
   *   - 9 negative-path tests, one per `SlashingRejection` variant
   *
   * Plus 1 property test: an honest committee member who signs exactly ONE attestation can't produce SlashableEvidence (step 4 always fires
   * when both binaryHashes are equal).
   *
-  * '''Fixture strategy.''' Real KES key (via `OperationalKeyMaker.bootstrap`) + real committee VRF (via `CommitteeSortition.make`) + real
-  * Ed25519 long-term key (via `KeyPairGenerator.makeKeyPair`). Building the attestations through the same path the production sender uses
-  * keeps the test true to the algebra — a faked-signature happy-path test would not catch KES verification regressions in the validator.
+  * '''Fixture strategy.''' The operative KES+VRF pair comes from a long-term-signed genesis record validated by `L0GenesisLoader` and
+  * rematerialized through the immutable atomic registry. The matching local secrets build attestations through the production crypto path;
+  * a faked-signature happy-path test would not catch registry or KES verification regressions.
   */
 object SlashableEvidenceValidatorSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO])
+  override type Res = ((Hasher[IO], SecurityProvider[IO]), CanonicalOperatorConsensusFixture)
 
   override def sharedResource: Resource[IO, Res] =
     for {
       sp <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
-    } yield (h, sp)
+      operator <- CanonicalOperatorConsensusFixture.make
+    } yield ((h, sp), operator)
 
   // ===== fixture builders =====
 
-  /** A complete equivocation fixture — single committee member (`offenderKp`) with both KES and VRF keys, signs two DIFFERENT metagraph
-    * binaries on the SAME parent hash. Plus a submitter (`submitterKp`) who signs the bounty digest with their long-term Ed25519 key.
+  /** A complete equivocation fixture — one canonically registered committee member signs two DIFFERENT metagraph binaries on the SAME
+    * parent hash. A separate submitter signs the bounty digest with their long-term Ed25519 key.
     */
   private case class EquivocationFixture(
-    offenderKp: KeyPair,
-    offenderPeerId: PeerId,
-    offenderVrfSk: Array[Byte],
-    offenderVrfVk: Array[Byte],
-    offenderKesVk: VerificationKeyKesProduct,
-    kesMakerResource: Resource[IO, OperationalKeyMakerAlgebra[IO]],
+    operator: CanonicalOperatorConsensusFixture,
     submitterKp: KeyPair,
     submitterPeerId: PeerId,
     metagraphAddress: Address,
@@ -68,8 +65,51 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
     sigmaOperatorKey: Ratio
   ) {
 
-    def kesRegistry: KesRegistry[IO] =
-      KesRegistry.make[IO](Map(offenderPeerId -> KesRegistryEntry(offenderKesVk, offset = 0L)))
+    val offenderPeerId: PeerId = operator.resolvedPair.operatorPeerId
+    def offenderVrfSk: Array[Byte] = operator.localVrfSecret
+    def offenderVrfVk: Array[Byte] = operator.resolvedPair.vrfPublicKey.toBytes
+    def kesMakerResource: Resource[IO, OperationalKeyMakerAlgebra[IO]] = Resource.pure(operator.kesSigner)
+
+    def canonicalResolution(offencePeriod: EtaPeriod, vrfEta: Array[Byte]): IO[SlashingOperatorKeyResolution] =
+      operator.operatorKeyRegistry.get(offenderPeerId).map {
+        case Some(keys) => SlashingOperatorKeyResolution.Resolved(keys, offencePeriod, vrfEta)
+        case None =>
+          SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+            HistoricalStateUnavailableReason.MissingOperatorRegistration
+          )
+      }
+
+    def keyResolver(): SlashingOperatorKeyResolver[IO] =
+      SlashingOperatorKeyResolver.make[IO] { (peerId, context) =>
+        val contextMatches = context match {
+          case SlashingOffenceContext.MetagraphAdmission(mg, parent, binary) =>
+            mg == metagraphAddress && parent == parentHash && Set(binaryHashA, binaryHashB).contains(binary)
+          case _ => false
+        }
+        if (peerId == offenderPeerId && contextMatches) canonicalResolution(EtaPeriod.Zero, eta)
+        else
+          IO.pure(
+            SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+              HistoricalStateUnavailableReason.AmbiguousHistoricalState
+            )
+          )
+      }
+
+    def keyResolver(resolution: SlashingOperatorKeyResolution): SlashingOperatorKeyResolver[IO] =
+      SlashingOperatorKeyResolver.make[IO] { (peerId, context) =>
+        val contextMatches = context match {
+          case SlashingOffenceContext.MetagraphAdmission(mg, parent, binary) =>
+            mg == metagraphAddress && parent == parentHash && Set(binaryHashA, binaryHashB).contains(binary)
+          case _ => false
+        }
+        IO.pure(
+          if (peerId == offenderPeerId && contextMatches) resolution
+          else
+            SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+              HistoricalStateUnavailableReason.AmbiguousHistoricalState
+            )
+        )
+      }
 
     /** Build a [[MetagraphAttestation]] body for the given binary, using the real KES + VRF keys.
       *
@@ -134,27 +174,14 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
     *
     * Distinct binary hashes on the same parent ⇒ equivocation.
     */
-  private def freshFixture(implicit sp: SecurityProvider[IO]): IO[EquivocationFixture] =
+  private def freshFixture(
+    operator: CanonicalOperatorConsensusFixture
+  )(implicit sp: SecurityProvider[IO]): IO[EquivocationFixture] =
     for {
-      offenderKp <- KeyPairGenerator.makeKeyPair[IO]
       submitterKp <- KeyPairGenerator.makeKeyPair[IO]
-      // Deterministic VRF SK for reproducibility — committee sortition will draw the same proof every run.
-      offenderVrfSk = Array.fill[Byte](32)(0x55.toByte)
-      offenderVrfVk = new EcVrf25519().getVerificationKey(offenderVrfSk)
-      // Build the KES store & bootstrap a fresh master key for the offender.
-      store <- SecureStore.inMemory[IO]
-      seed = Array.fill[Byte](32)(0x11.toByte)
-      kesMaterial <- OperationalKeyMaker.generateFreshKesKeyMaterial[IO](seed, height = (2, 2), offset = 0L)
-      (encodedSk, masterVk) = kesMaterial
-      _ <- store.write("kes-sk.bin", encodedSk)
     } yield
       EquivocationFixture(
-        offenderKp = offenderKp,
-        offenderPeerId = PeerId.fromPublic(offenderKp.getPublic),
-        offenderVrfSk = offenderVrfSk,
-        offenderVrfVk = offenderVrfVk,
-        offenderKesVk = masterVk,
-        kesMakerResource = OperationalKeyMaker.make[IO](store, "kes-sk.bin", etaPeriodLength = 100L),
+        operator = operator,
         submitterKp = submitterKp,
         submitterPeerId = PeerId.fromPublic(submitterKp.getPublic),
         metagraphAddress = Address.fromBytes("mg-equiv".getBytes("UTF-8")),
@@ -169,13 +196,13 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
   // ===== happy path — all 9 steps pass =====
 
   test("happy: full equivocation evidence validates") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -183,30 +210,28 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidence(sortition, kesMaker)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
-    } yield expect(result.isRight)
+    } yield matches(result) { case SlashingValidationResult.Valid(_) => success }
   }
 
   // ===== step 1 — identity mismatch =====
 
   test("step 1: identity mismatch — evidenceA.peerId != evidenceB.peerId rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       otherKp <- KeyPairGenerator.makeKeyPair[IO]
       otherPeer = PeerId.fromPublic(otherKp.getPublic)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -219,18 +244,16 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(attA, mutatedB)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.IdentityMismatch(a, b)) =>
+        case SlashingValidationResult.Invalid(SlashingRejection.IdentityMismatch(a, b)) =>
           expect(a == f.offenderPeerId).and(expect(b == otherPeer))
       }
   }
@@ -238,14 +261,14 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
   // ===== step 2 — subject mismatch =====
 
   test("step 2: subject mismatch — different metagraphAddresses rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       otherMg = Address.fromBytes("mg-other".getBytes("UTF-8"))
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -256,18 +279,16 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(attA, mutatedB)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.SubjectMismatch(a, b)) =>
+        case SlashingValidationResult.Invalid(SlashingRejection.SubjectMismatch(a, b)) =>
           expect(a == f.metagraphAddress).and(expect(b == otherMg))
       }
   }
@@ -275,14 +296,14 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
   // ===== step 3 — parent mismatch =====
 
   test("step 3: parent mismatch — different parentHash rejects (load-bearing identity)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       otherParent = Hash.fromBytes("parent-2".getBytes("UTF-8"))
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -293,18 +314,16 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(attA, mutatedB)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.ParentMismatch(a, b)) =>
+        case SlashingValidationResult.Invalid(SlashingRejection.ParentMismatch(a, b)) =>
           expect(a == f.parentHash).and(expect(b == otherParent))
       }
   }
@@ -312,13 +331,13 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
   // ===== step 4 — duplicate binary =====
 
   test("step 4: duplicate binary — identical binaryHash rejects (not equivocation)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -329,31 +348,29 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(attA, attB)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
+        case SlashingValidationResult.Invalid(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
       }
   }
 
   // ===== step 5 — invalid KES signature =====
 
   test("step 5: invalid KES — tampered kesSignature on evidenceA rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -371,31 +388,29 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(tamperedA, attB)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.InvalidKesSignature.OnEvidenceA) => success
+        case SlashingValidationResult.Invalid(SlashingRejection.InvalidKesSignature.OnEvidenceA) => success
       }
   }
 
   // ===== step 6 — invalid committee VRF =====
 
   test("step 6: invalid committee VRF — tampered VRF proof on evidenceB rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -408,34 +423,208 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(attA, tamperedB)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.InvalidCommitteeVrf.OnEvidenceB) => success
+        case SlashingValidationResult.Invalid(SlashingRejection.InvalidCommitteeVrf.OnEvidenceB) => success
+      }
+  }
+
+  test("step 6: evidence-carried VRF key is never authority") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      results <- f.kesMakerResource.use { kesMaker =>
+        val sortition = CommitteeSortition.make[IO]
+        val replacementKey = Array.fill[Byte](f.offenderVrfVk.length)(0x33.toByte)
+        val wrongPair = SlashingOperatorKeyResolution.Resolved(
+          f.operator.resolvedPair.copy(vrfPublicKey = VrfPublicKey.fromBytes(replacementKey)),
+          EtaPeriod.Zero,
+          f.eta
+        )
+        val unavailable = SlashingOperatorKeyResolver.unavailable[IO](HistoricalStateUnavailableReason.HistoryPruned)
+
+        def validator(resolver: SlashingOperatorKeyResolver[IO]) =
+          SlashableEvidenceValidator.make[IO](
+            keyResolver = resolver,
+            sortition = sortition,
+            slashedReader = SlashedSeenReader.neverSlashed[IO]
+          )
+
+        def validate(resolver: SlashingOperatorKeyResolver[IO], evidence: SlashableEvidence) =
+          validator(resolver).validate(
+            evidence = evidence,
+            sigmaForEvidenceA = f.sigmaOperatorKey,
+            sigmaForEvidenceB = f.sigmaOperatorKey,
+            kTarget = f.kTarget,
+            currentEpoch = 5L
+          )
+
+        for {
+          original <- f.buildEvidence(sortition, kesMaker)
+          carriedReplacementA = original.evidenceA.copy(vrfPublicKey = Hex.fromBytes(replacementKey))
+          carriedReplacement <- f.buildEvidenceFrom(carriedReplacementA, original.evidenceB)
+          carriedResult <- validate(f.keyResolver(), carriedReplacement)
+          wrongPairResult <- validate(f.keyResolver(wrongPair), original)
+          unavailableResult <- validate(unavailable, original)
+        } yield (carriedResult, wrongPairResult, unavailableResult)
+      }
+    } yield {
+      val expected = SlashingValidationResult.Invalid(SlashingRejection.InvalidCommitteeVrf.OnEvidenceA)
+      expect.same(expected, results._1) &&
+      expect.same(expected, results._2) &&
+      matches(results._3) {
+        case SlashingValidationResult.Unverifiable(
+              SlashingUnverifiableReason.HistoricalKeyStateUnavailable(_, HistoricalStateUnavailableReason.HistoryPruned)
+            ) =>
+          success
+      }
+    }
+  }
+
+  test("historical pair: stale or wrong wire KES step cannot prove guilt") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val sortition = CommitteeSortition.make[IO]
+        for {
+          periodOne <- f.canonicalResolution(EtaPeriod(1L), f.eta)
+          validator = SlashableEvidenceValidator.make[IO](
+            f.keyResolver(periodOne),
+            sortition,
+            SlashedSeenReader.neverSlashed[IO]
+          )
+          evidence <- f.buildEvidence(sortition, kesMaker)
+          r <- validator.validate(evidence, f.sigmaOperatorKey, f.sigmaOperatorKey, f.kTarget, currentEpoch = 1L)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(SlashingRejection.InvalidKesSignature.OnEvidenceA) => success
+      }
+  }
+
+  test("same metagraph parent across eta rotation is not equivocation") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val sortition = CommitteeSortition.make[IO]
+        val resolver = SlashingOperatorKeyResolver.make[IO] { (peerId, context) =>
+          context match {
+            case SlashingOffenceContext.MetagraphAdmission(mg, parent, binary)
+                if peerId == f.offenderPeerId && mg == f.metagraphAddress && parent == f.parentHash && binary == f.binaryHashA =>
+              f.canonicalResolution(EtaPeriod.Zero, f.eta)
+            case SlashingOffenceContext.MetagraphAdmission(mg, parent, binary)
+                if peerId == f.offenderPeerId && mg == f.metagraphAddress && parent == f.parentHash && binary == f.binaryHashB =>
+              f.canonicalResolution(EtaPeriod(1L), Array.fill[Byte](32)(0x08.toByte))
+            case _ =>
+              IO.pure(
+                SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+                  HistoricalStateUnavailableReason.AmbiguousHistoricalState
+                )
+              )
+          }
+        }
+        val validator = SlashableEvidenceValidator.make[IO](resolver, sortition, SlashedSeenReader.neverSlashed[IO])
+        for {
+          evidence <- f.buildEvidence(sortition, kesMaker)
+          r <- validator.validate(evidence, f.sigmaOperatorKey, f.sigmaOperatorKey, f.kTarget, currentEpoch = 1L)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(
+              SlashingRejection.AdmissionDrawPeriodMismatch(EtaPeriod(0L), EtaPeriod(1L))
+            ) =>
+          success
+      }
+  }
+
+  test("historical pair: not-yet-active registration is unverifiable and never guilt") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val sortition = CommitteeSortition.make[IO]
+        val future = EtaPeriod(2L)
+        val premature = SlashingOperatorKeyResolution.Resolved(
+          f.operator.resolvedPair.copy(
+            kes = KesRegistryEntry(f.operator.resolvedPair.kes.vk, offset = future.value),
+            effectiveFromPeriod = future
+          ),
+          EtaPeriod(1L),
+          f.eta
+        )
+        val validator = SlashableEvidenceValidator.make[IO](
+          f.keyResolver(premature),
+          sortition,
+          SlashedSeenReader.neverSlashed[IO]
+        )
+        for {
+          evidence <- f.buildEvidence(sortition, kesMaker)
+          r <- validator.validate(evidence, f.sigmaOperatorKey, f.sigmaOperatorKey, f.kTarget, currentEpoch = 1L)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Unverifiable(
+              SlashingUnverifiableReason.ResolvedPairNotActive(EtaPeriod(2L), EtaPeriod(1L))
+            ) =>
+          success
+      }
+  }
+
+  test("historical pair: KES from a different pair cannot be combined with the registered VRF key") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      otherKes <- OperationalKeyMaker
+        .generateFreshKesKeyMaterial[IO](Array.fill[Byte](32)(0x66.toByte), height = (2, 2), offset = 0L)
+        .map(_._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val sortition = CommitteeSortition.make[IO]
+        val halfPair = SlashingOperatorKeyResolution.Resolved(
+          f.operator.resolvedPair.copy(kes = KesRegistryEntry(otherKes, f.operator.resolvedPair.kes.offset)),
+          EtaPeriod.Zero,
+          f.eta
+        )
+        val validator = SlashableEvidenceValidator.make[IO](
+          f.keyResolver(halfPair),
+          sortition,
+          SlashedSeenReader.neverSlashed[IO]
+        )
+        for {
+          evidence <- f.buildEvidence(sortition, kesMaker)
+          r <- validator.validate(evidence, f.sigmaOperatorKey, f.sigmaOperatorKey, f.kTarget, currentEpoch = 0L)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(SlashingRejection.InvalidKesSignature.OnEvidenceA) => success
       }
   }
 
   // ===== step 7 — already slashed =====
 
   test("step 7: already slashed — SlashedSeenReader returns true rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val seenReader = SlashedSeenReader.fromSet[IO](
           Set((f.offenderPeerId, f.metagraphAddress, f.parentHash))
         )
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = seenReader
         )
@@ -443,18 +632,16 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidence(sortition, kesMaker)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.AlreadySlashed(peer, mg, parent)) =>
+        case SlashingValidationResult.Invalid(SlashingRejection.AlreadySlashed(peer, mg, parent)) =>
           expect(peer == f.offenderPeerId)
             .and(expect(mg == f.metagraphAddress))
             .and(expect(parent == f.parentHash))
@@ -464,49 +651,46 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
   // ===== step 8 — evidence window expired =====
 
   test("step 8: evidence window expired — currentEpoch > eventEpoch + window rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
-          slashedReader = SlashedSeenReader.neverSlashed[IO],
-          evidenceWindowEpochs = 100L
+          slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
         for {
           evidence <- f.buildEvidence(sortition, kesMaker)
-          // eventEpoch=5, current=200 → 200 > 5 + 100 ⇒ expired
+          // The resolver proves offencePeriod=0; 200 > 0 + 100, so the evidence is expired.
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 200L,
-            eventEpoch = 5L
+            currentEpoch = 200L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.EvidenceWindowExpired(cur, evt, win)) =>
-          expect(cur == 200L).and(expect(evt == 5L)).and(expect(win == 100L))
+        case SlashingValidationResult.Invalid(SlashingRejection.EvidenceWindowExpired(cur, evt, win)) =>
+          expect(cur == 200L).and(expect(evt == 0L)).and(expect(win == 100L))
       }
   }
 
   // ===== step 9 — invalid bounty signature =====
 
   test("step 9: invalid bounty signature — tampered bountySignature rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       otherKp <- KeyPairGenerator.makeKeyPair[IO]
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -523,34 +707,32 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           tamperedEvidence = evidence.copy(bountySignature = Signature(Hex.fromBytes(wrongSig)))
           r <- validator.validate(
             evidence = tamperedEvidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.InvalidBountySignature) => success
+        case SlashingValidationResult.Invalid(SlashingRejection.InvalidBountySignature) => success
       }
   }
 
   // ===== property: single honest attestation can't be slashed =====
 
   test("property: a single honest attestation duplicated cannot produce SlashableEvidence (step 4 always fires)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     // The honest committee member signs exactly ONE binary on a parent. Even if an adversary tries to construct evidence by passing the
     // same attestation twice (or any two attestations with the same binaryHash), step 4 (distinct binaries) MUST fire. This is the
     // load-bearing property of the slashing safety bar: requiring TWO genuinely different binaries on the same parent.
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
         val sortition = CommitteeSortition.make[IO]
         val validator = SlashableEvidenceValidator.make[IO](
-          kesRegistry = f.kesRegistry,
+          keyResolver = f.keyResolver(),
           sortition = sortition,
           slashedReader = SlashedSeenReader.neverSlashed[IO]
         )
@@ -560,18 +742,16 @@ object SlashableEvidenceValidatorSuite extends MutableIOSuite {
           evidence <- f.buildEvidenceFrom(honest, honest)
           r <- validator.validate(
             evidence = evidence,
-            eta = f.eta,
             sigmaForEvidenceA = f.sigmaOperatorKey,
             sigmaForEvidenceB = f.sigmaOperatorKey,
             kTarget = f.kTarget,
-            currentEpoch = 5L,
-            eventEpoch = 5L
+            currentEpoch = 5L
           )
         } yield r
       }
     } yield
       matches(result) {
-        case Left(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
+        case SlashingValidationResult.Invalid(SlashingRejection.DuplicateBinary(b)) => expect(b == f.binaryHashA)
       }
   }
 }

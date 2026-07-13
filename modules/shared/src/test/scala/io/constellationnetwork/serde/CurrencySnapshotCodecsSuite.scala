@@ -1,13 +1,20 @@
 package io.constellationnetwork.serde
 
+import cats.data.NonEmptySet
+
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency._
+import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedCurrencyIncrementalSnapshotImmutableCodec
 import io.constellationnetwork.serde.implicits._
 
 import eu.timepit.refined.api.Refined
@@ -84,6 +91,17 @@ object CurrencySnapshotCodecsSuite extends FunSuite {
       tokenLockBlocks = Some(SortedSet.empty)
     )
     expect(sample.immutableBytes.fromImmutableBytes[CurrencyIncrementalSnapshot] == Right(sample))
+  }
+
+  test("MPT Signed[CurrencyIncrementalSnapshot] round-trips with multiple proofs") {
+    val proofs = NonEmptySet.of(
+      SignatureProof(Id(Hex("B0")), Signature(Hex("11"))),
+      SignatureProof(Id(Hex("a0")), Signature(Hex("22"))),
+      SignatureProof(Id(Hex("c0")), Signature(Hex("33")))
+    )
+    val sample = Signed(minimalCurrent, proofs)
+
+    expect(sample.immutableBytes.fromImmutableBytes[Signed[CurrencyIncrementalSnapshot]].isRight)
   }
 
   private def minimalFull = CurrencySnapshot(

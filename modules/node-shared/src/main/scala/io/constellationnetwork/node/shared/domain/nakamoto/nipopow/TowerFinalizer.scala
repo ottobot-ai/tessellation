@@ -12,10 +12,10 @@ import io.constellationnetwork.security.hash.Hash
 import eu.timepit.refined.auto._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** §3 NIPoPoW S3 — Phase-3 sink that grows the local [[TowerStore]] from finalized snapshots.
+/** Local NIPoPoW updater that grows [[TowerStore]] from tower-eligible snapshots.
   *
-  * Called at the `T_depth2.advance` boundary in `SnapshotLeaderLoop.finalityMonitor` for every newly archival-finalized
-  * `GlobalIncrementalSnapshot`. For each super-level µ ∈ {1..L-1}:
+  * Current wiring calls it from the legacy `T_depth2` retention watermark. That scheduling is local proof-service policy, not a global
+  * finality phase. For each super-level µ in 1..L-1:
   *
   *   - looks up `tower.latestAt(µ).ordinal` (or 0 if none — every snapshot starts with `g_µ = ord - 0`)
   *   - derives `g_µ = ord - lastLevelMuOrdinal` (snapshots since previous level-µ hit, in ordinal-units NOT slot-units)
@@ -163,7 +163,7 @@ object TowerFinalizer {
                   // Important: gaps are computed in ordinal units, not slot units (proposal §2.1).
                   // The producer-side equivalent in the next slice (S2 phase 2c, deferred) will track these gaps
                   // incrementally; here we recompute from the store on each finalize, which is fine because
-                  // T_depth2 fires once per snapshot at Phase-3 and the read is a fixed L-1 prefix-scans.
+                  // Current tower scheduling visits each eligible snapshot once; the read is a fixed L-1 prefix scan.
                   gaps <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse { µ =>
                     tower.latestAt(µ).map { latest =>
                       val baseOrd = latest.map(_.ordinal.value.value).getOrElse(0L)
@@ -189,7 +189,7 @@ object TowerFinalizer {
         }
     }
 
-  /** No-op finalizer for layers that don't run the Phase-3 sink (cl0/dl1/etc). Allows the call site to wire a single value without
+  /** No-op finalizer for layers that do not maintain the local tower partition. Allows the call site to wire a single value without
     * importing the trait directly.
     */
   def noop[F[_]: Async]: TowerFinalizer[F] = new TowerFinalizer[F] {

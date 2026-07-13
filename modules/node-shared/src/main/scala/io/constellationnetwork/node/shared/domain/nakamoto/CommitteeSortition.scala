@@ -52,8 +52,8 @@ import io.circe.generic.semiauto.deriveEncoder
   */
 trait CommitteeSortition[F[_]] {
 
-  /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, parentHash)` given their uniform
-    * `sigmaOperatorKey` draw weight and the committee DRAW target `kDraw`.
+  /** Check whether the holder of `vrfSk` is in the committee for `(metagraphAddress, parentHash)` given their uniform `sigmaOperatorKey`
+    * draw weight and the committee DRAW target `kDraw`.
     *
     * Returns the VRF proof + output on success (caller signs it with their KES key and gossips it as their committee-attestation
     * contribution). Returns `None` if the operator key is not in the committee for this `(eta, metagraphAddress, parentHash)`.
@@ -221,7 +221,8 @@ object CommitteeSortition {
     * over all active operators by [[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.committeeFor]] to
     * materialize the committee SET — identical on every node because every input is cluster-wide-identical (registry VK + eta + HOCON kDraw
     * + uniform sigma). `kDraw * sigma >= 1` saturates to "always a member" via [[threshold]]. `kDraw` is the draw target; configured
-    * `kQuorum` is decoupled selection finality in [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardFinalityTriggers]].
+    * `kQuorum` is the decoupled execution-certificate threshold in
+    * [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardFinalityTriggers]].
     */
   def isInShardCommittee[F[_]: Sync: Hasher](
     vrfVk: Array[Byte],

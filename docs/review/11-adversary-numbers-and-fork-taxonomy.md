@@ -1,5 +1,12 @@
 # 11 — Measured Adversary Numbers & Known-Fork Taxonomy
 
+> **HISTORICAL AUDIT INPUT, NOT THE ACTIVE SECURITY ARGUMENT.** The measured
+> failures remain evidence, but later universal-replay, `numShards=1`, finality,
+> P3, authoritative-field, and parameter conclusions may be superseded. The active
+> lifecycle/roadmap requires re-deriving Taktikos/LDD + Avalanche + execution-shard
+> bounds and treats one shard as the same replay-sign-diff-watchtower protocol, not
+> a safe universal-replay bypass.
+
 > **Purpose.** Companion reference for the Fable review (`FABLE-REVIEW-PROMPT.md`, `HANDOFF.md`).
 > Part A gives the *measured* adversary numbers so parameter claims are grounded, not asserted.
 > Part B is a taxonomy of how this system has *actually* forked — so the adversarial search in

@@ -1,5 +1,8 @@
+// HISTORICAL / SUPERSEDED: not the target protocol or current implementation.
 // Hypergraph / Shard / Metagraph chains — finality-tiered grounding
 // ==================================================================
+// The A0/A1/A2/A3 and 2/3-attestation terminology below predates the hash-bound
+// P0/P1/P2/P3 FinalityGate design. Retained only as an archived visual record.
 //
 // Render:
 //   dot -Tpng -Gdpi=150 chains-grounding.dot -o chains-grounding.png

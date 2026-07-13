@@ -590,22 +590,17 @@ object StateChannel {
         _ <- persistGlobalSnapshot(snapshot, context)
         _ <- sendGlobalSnapshotSyncConsensusEvent(snapshot)
         _ <- triggerOnGlobalSnapshotPullHook(snapshot, context)
-        // Fetch GL0's authoritative finalized ordinal so we only prune SC binaries whose
-        // containing GL0 snapshot is actually durable. In BFT GL0 mode every snapshot is
-        // immediately final and the endpoint returns the snapshot's own ordinal — same as
-        // the legacy behavior. In Nakamoto GL0 mode the endpoint returns the lagging
-        // depth-k / attestation-2/3 marker, so binaries stay re-sendable until their
-        // containing snapshot is finalized — closes the reorg-loses-binaries gap.
-        // Best-effort: if the fetch fails (network blip, BFT GL0 with old binary), fall
-        // back to the snapshot's own ordinal which is the legacy default.
+        // Fetch GL0's transitional operational ordinal for binary retention. Target GL0 is
+        // Nakamoto/Taktikos and Phase 2 is exact-hash and density-reorgable; the return path
+        // ultimately needs the containing hash plus rollback/requeue notification.
+        // A failed Phase-2 read is passed as None and must defer pruning. Even an explicit ordinal
+        // remains transitional: exact-hash density replacement still requires retained inputs and
+        // rollback/requeue beyond this ordinal-only API.
         finalizedOrdinal <- services.globalL0.pullLatestFinalizedOrdinal.handleError(_ => none)
-        // Extract gl0's authoritative current currency ord for *our* metagraph
-        // identifier from the GSI we just computed (#125). This is the watermark for
-        // GC'ing stale Pending binaries: anything below this ord on our local fork is
-        // definitively past — gl0 has accepted a later currency snapshot for us, so
-        // older Pendings (e.g. from a brief metagraph fork that gl0 didn't pick) can
-        // never land. Without this, ml0's queue accumulates indefinitely under chain
-        // drift and slows tight-budget tests like data-with-fee (iter25 failure mode).
+        // Extract GL0's current Phase-2 currency ordinal for this metagraph. The current
+        // tracker uses it as a monotone queue-GC watermark, but it is not definitive under
+        // density replacement: target exact-hash retention must restore/requeue any older
+        // binary required by the replacement. This watermark only bounds today's queue.
         ourIdentifier <- storages.identifier.get
         gl0KnownCurrencyOrd = context.lastCurrencySnapshots.get(ourIdentifier).map {
           case Left(genesisSnap)   => genesisSnap.value.ordinal

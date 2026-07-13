@@ -2,12 +2,16 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 
 import cats.effect.IO
 
+import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 
 import eu.timepit.refined.auto._
+import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import weaver.SimpleIOSuite
 
@@ -26,6 +30,16 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
 
   private def pid(name: String): PeerId =
     PeerId(Hex(name.getBytes("UTF-8").map(b => f"$b%02x").mkString))
+
+  private def context(parentOrdinal: Long): MetagraphParentOrdinalResolver.CurrencyBinaryContext =
+    MetagraphParentOrdinalResolver.CurrencyBinaryContext(
+      parentOrdinal,
+      GlobalSyncView(
+        SnapshotOrdinal.unsafeApply(100L + parentOrdinal),
+        mkHash(s"a$parentOrdinal"),
+        EpochProgress(NonNegLong.unsafeFrom(100L + parentOrdinal))
+      )
+    )
 
   private def mkAtt(
     peer: String,
@@ -160,56 +174,53 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
     } yield expect.eql(0, drainedB.length).and(expect.eql(1, drainedA.length))
   }
 
-  // #213/#290 liveness: pending-parent-ordinal cache (keyed on the WIRE hash == `att.binaryHash`). Lets the
-  // committee-attestation receiver recover an IN-FLIGHT (non-buffered) binary's parent ordinal — the case
-  // `peekForWireHash` cannot serve, and the reason the committee threshold was previously reached zero times.
-  test("pending-parent-ordinal — record then lookup by wire hash returns the parent ordinal") {
+  test("pending binary context records the signed GL0 anchor and ML0 parent ordinal") {
     val wireHash = mkHash("e1e1")
     for {
       buf <- MetagraphOrphanBuffer.make[IO](logger)
-      before <- buf.lookupPendingParentOrdinal(mgA, wireHash)
-      _ <- buf.recordPendingParentOrdinal(mgA, wireHash, 41L)
-      after <- buf.lookupPendingParentOrdinal(mgA, wireHash)
-    } yield expect(before.isEmpty).and(expect(after.contains(41L)))
+      before <- buf.lookupPendingBinaryContext(mgA, wireHash)
+      _ <- buf.recordPendingBinaryContext(mgA, wireHash, context(41L))
+      after <- buf.lookupPendingBinaryContext(mgA, wireHash)
+    } yield expect(before.isEmpty).and(expect(after.contains(context(41L))))
   }
 
-  test("pending-parent-ordinal — keyed by (metagraph, wireHash); no cross-talk") {
+  test("pending binary context is keyed by (metagraph, wireHash) with no cross-talk") {
     val wireHash = mkHash("f2f2")
     for {
       buf <- MetagraphOrphanBuffer.make[IO](logger)
-      _ <- buf.recordPendingParentOrdinal(mgA, wireHash, 7L)
-      sameKey <- buf.lookupPendingParentOrdinal(mgA, wireHash)
-      otherMg <- buf.lookupPendingParentOrdinal(mgB, wireHash)
-      otherHash <- buf.lookupPendingParentOrdinal(mgA, mkHash("9999"))
+      _ <- buf.recordPendingBinaryContext(mgA, wireHash, context(7L))
+      sameKey <- buf.lookupPendingBinaryContext(mgA, wireHash)
+      otherMg <- buf.lookupPendingBinaryContext(mgB, wireHash)
+      otherHash <- buf.lookupPendingBinaryContext(mgA, mkHash("9999"))
     } yield
-      expect(sameKey.contains(7L))
+      expect(sameKey.contains(context(7L)))
         .and(expect(otherMg.isEmpty))
         .and(expect(otherHash.isEmpty))
   }
 
-  test("pending-parent-ordinal — last write wins for the same wire hash") {
+  test("pending binary context last write wins for the same wire hash") {
     val wireHash = mkHash("d3d3")
     for {
       buf <- MetagraphOrphanBuffer.make[IO](logger)
-      _ <- buf.recordPendingParentOrdinal(mgA, wireHash, 1L)
-      _ <- buf.recordPendingParentOrdinal(mgA, wireHash, 2L)
-      got <- buf.lookupPendingParentOrdinal(mgA, wireHash)
-    } yield expect(got.contains(2L))
+      _ <- buf.recordPendingBinaryContext(mgA, wireHash, context(1L))
+      _ <- buf.recordPendingBinaryContext(mgA, wireHash, context(2L))
+      got <- buf.lookupPendingBinaryContext(mgA, wireHash)
+    } yield expect(got.contains(context(2L)))
   }
 
-  test("pending-parent-ordinal — FIFO eviction past the admissions cap drops the oldest") {
+  test("pending binary context FIFO eviction past the admissions cap drops the oldest") {
     for {
       buf <- MetagraphOrphanBuffer.make[IO](logger, admissionsCap = 2)
-      _ <- buf.recordPendingParentOrdinal(mgA, mkHash("0001"), 10L)
-      _ <- buf.recordPendingParentOrdinal(mgA, mkHash("0002"), 20L)
-      _ <- buf.recordPendingParentOrdinal(mgA, mkHash("0003"), 30L)
-      first <- buf.lookupPendingParentOrdinal(mgA, mkHash("0001"))
-      second <- buf.lookupPendingParentOrdinal(mgA, mkHash("0002"))
-      third <- buf.lookupPendingParentOrdinal(mgA, mkHash("0003"))
+      _ <- buf.recordPendingBinaryContext(mgA, mkHash("0001"), context(10L))
+      _ <- buf.recordPendingBinaryContext(mgA, mkHash("0002"), context(20L))
+      _ <- buf.recordPendingBinaryContext(mgA, mkHash("0003"), context(30L))
+      first <- buf.lookupPendingBinaryContext(mgA, mkHash("0001"))
+      second <- buf.lookupPendingBinaryContext(mgA, mkHash("0002"))
+      third <- buf.lookupPendingBinaryContext(mgA, mkHash("0003"))
     } yield
       expect(first.isEmpty)
-        .and(expect(second.contains(20L)))
-        .and(expect(third.contains(30L)))
+        .and(expect(second.contains(context(20L))))
+        .and(expect(third.contains(context(30L))))
   }
 
   test("record is idempotent on identical (mg, parent, bytes) triple") {
@@ -401,68 +412,4 @@ object MetagraphOrphanBufferSuite extends SimpleIOSuite {
         .and(expect(foundB.exists(java.util.Arrays.equals(_, bB))))
   }
 
-  // ─── #213/#290: peekForWireHash — the receiver-side content lookup for handleMetagraphAttestation ──
-  //
-  // The attestation receiver looks up the ATTESTED binary by the WIRE digest the attestation carries
-  // (`att.binaryHash` == `Hasher.hashBytes(wireBytes)`) so it can derive the parent ordinal from that
-  // binary's content. Distinct buffered binaries (even under different parents) are disambiguated by
-  // their wire digest, NON-DESTRUCTIVELY, and a miss returns None so the receiver FAILS CLOSED.
-
-  test("peekForWireHash — finds the matching bytes by wire digest NON-DESTRUCTIVELY") {
-    val parent = mkHash("parent")
-    val wh1 = mkHash("wh1")
-    val wh2 = mkHash("wh2")
-    val b1 = mkBytes(11)
-    val b2 = mkBytes(22)
-    def wireHashOf(bytes: Array[Byte]): IO[Option[Hash]] =
-      IO.pure {
-        if (java.util.Arrays.equals(bytes, b1)) Some(wh1)
-        else if (java.util.Arrays.equals(bytes, b2)) Some(wh2)
-        else None
-      }
-    for {
-      buf <- MetagraphOrphanBuffer.make[IO](logger)
-      _ <- buf.record(mgA, parent, b1)
-      _ <- buf.record(mgA, parent, b2)
-      sizeBefore <- buf.size
-      found2 <- buf.peekForWireHash(mgA, wh2)(wireHashOf)
-      found1 <- buf.peekForWireHash(mgA, wh1)(wireHashOf)
-      sizeAfter <- buf.size
-    } yield
-      expect(found1.exists(java.util.Arrays.equals(_, b1)))
-        .and(expect(found2.exists(java.util.Arrays.equals(_, b2))))
-        .and(expect.eql(2, sizeBefore))
-        .and(expect.eql(2, sizeAfter))
-  }
-
-  test("peekForWireHash — miss returns None (receiver fails closed) and leaves the buffer unchanged") {
-    val parent = mkHash("parent")
-    val b1 = mkBytes(11)
-    val wantedButAbsent = mkHash("absent-wire")
-    def wireHashOf(bytes: Array[Byte]): IO[Option[Hash]] =
-      IO.pure(if (java.util.Arrays.equals(bytes, b1)) Some(mkHash("wh1")) else None)
-    for {
-      buf <- MetagraphOrphanBuffer.make[IO](logger)
-      _ <- buf.record(mgA, parent, b1)
-      result <- buf.peekForWireHash(mgA, wantedButAbsent)(wireHashOf)
-      sizeAfter <- buf.size
-    } yield expect(result.isEmpty).and(expect.eql(1, sizeAfter))
-  }
-
-  test("peekForWireHash — scopes to the requested metagraph") {
-    val parent = mkHash("parent")
-    val wh = mkHash("wh")
-    val bA = mkBytes(11)
-    val bB = mkBytes(22)
-    def wireHashOf(@annotation.unused bytes: Array[Byte]): IO[Option[Hash]] = IO.pure(Some(wh))
-    for {
-      buf <- MetagraphOrphanBuffer.make[IO](logger)
-      _ <- buf.record(mgA, parent, bA)
-      _ <- buf.record(mgB, parent, bB)
-      foundA <- buf.peekForWireHash(mgA, wh)(wireHashOf)
-      foundB <- buf.peekForWireHash(mgB, wh)(wireHashOf)
-    } yield
-      expect(foundA.exists(java.util.Arrays.equals(_, bA)))
-        .and(expect(foundB.exists(java.util.Arrays.equals(_, bB))))
-  }
 }

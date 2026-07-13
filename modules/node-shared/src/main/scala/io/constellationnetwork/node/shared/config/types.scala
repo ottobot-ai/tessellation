@@ -72,11 +72,11 @@ object types {
     maxUnappliedGlobalChangeOrdinals: PosInt
   )
 
-  /** Consensus-parameter family. `confirmationDepthK` (k₁) is the SINGLE free config knob; the two related depths are DERIVED from it
-    * (settled by Ouroboros + our fork-race sims) rather than loaded independently — which removes the previous mis-configuration where
+  /** Nakamoto parameter family. `confirmationDepthK` (k1) is the single free security knob; the related eta period and recommended local
+    * retention capacity are derived from it rather than loaded independently, removing the previous misconfiguration where
     * `eta-rotation-snapshots` held k₂'s value (10·k₁) and `keep-depth-behind-finalized` held k₁'s.
     *
-    *   - k₁ = `confirmationDepthK(env)` — confirmation depth (fork-race statistical finality). Loaded from HOCON PER-ENVIRONMENT
+    *   - k1 = `confirmationDepthK(env)` — canonical-depth fallback for reversible exact-hash Phase 2. Loaded from HOCON per environment
     *     (`nakamoto.confirmation-depth-k` is a `{ mainnet, testnet, integrationnet, dev }` block, mirroring `last-kryo-hash-ordinal`) and
     *     resolved ONCE for the active `AppEnvironment` at the use site — mainnet 1024, test/integration nets 256, dev 32 (with the
     *     `${?NAKAMOTO_CONFIRMATION_DEPTH}` override applied to the dev value only). REUSED by the §3 NIPoPoW historical-commitment SMT as
@@ -84,7 +84,8 @@ object types {
     *   - R = `etaRotationSnapshots(env)` = round(3.1·k₁) — eta-rotation period. Ouroboros: the eta nonce uses the first 2/3 of the period's
     *     VRF rho values, so the last 1/3 = R/3 must be ≥ k₁ (those inputs FINALIZED before use) ⇒ R ≥ 3·k₁; the .1 over 3 is the worst-case
     *     finalization margin (the 2/3-mark must FINALIZE before the boundary; finalization lags production by ≤ k₁) ⇒ (R/3−k₁)=0.033·k₁.
-    *   - k₂ = `keepDepthBehindFinalized(env)` = 100·k₁ — historical-archive / phase-3 retention depth (the tower's moving checkpoint).
+    *   - k2 = `keepDepthBehindFinalized(env)` = 100*k1 — recommended local retention, proof-service, and automatic-rollback capacity. It is
+    *     not a finality phase, validity threshold, or fork-choice floor
     *
     * Both derived depths are env-parameterized methods (NOT vals) so they resolve from the SAME per-env k₁ as the active environment;
     * resolve the env from the wrapping `SharedConfig.environment` and pass it once (see the call sites in `GlobalSnapshotConsensus` /
@@ -122,13 +123,13 @@ object types {
     // data-app-fee reorg storm — gl0-4 self-finalized 857 while peers held 819-822). The refuse-counter trigger is
     // conservative (K sustained different-hash writes at-or-below finalized; no false-positive scenario for the gate).
     rebootstrapEnabled: Boolean,
-    // Track-3 S3 CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`). false (default) = legacy k₁-freeze fork choice: the
+    // TRANSITIONAL CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`). false (default) = legacy k1-freeze fork choice: the
     // `NakamotoChainStore` store-gate + `ChainSelection.shouldSwitch` both key off the k₁ finalized marker (byte-identical to
     // the post-`376d09fbc` baseline — the 2026-06-27 storm backstop). true = re-key BOTH to the k₂ "settled" marker so forks
     // in the `(settled, finalized]` band are density-revertable (maxvalid-bg), AND enable the commutative true-MRCA density
     // comparator. Consensus-critical + cluster-uniform: EVERY node must run the same value (a split would fork the chain), so
-    // this is a single global switch (NOT per-env). Keep OFF until a deep-fork sim validates cluster-uniformity — this is
-    // attempt #2 of the reverted `86f390130`. The production PRODUCTION-floor (`SnapshotLeaderLoop`) stays k₁ regardless.
+    // this is a single global switch (NOT per-env). Neither branch is the locked target: objective maxvalid-bg must remain
+    // available for P2 density reorgs, and unavailable retained history must enter RecoveryRequired rather than use a k1/k2 floor.
     bandDensityReorgEnabled: Boolean,
     // ml0 gl0-follow changeset transport (task #12). `changesetRingDepth` bounds the gl0 producer's SERVED ring of
     // recent finalized per-ordinal accumulators (`GlobalChangeSetService` / `SnapshotLeaderLoop.ringInsertTrimmed`) —
@@ -162,20 +163,18 @@ object types {
       confirmationDepthKByEnv.getOrElse(env, NakamotoConfig.DefaultConfirmationDepthK)
     // R = 3.1·k₁ (Ouroboros: eta uses the first 2/3 of the period; last 1/3 = R/3 ≥ k₁ so those inputs FINALIZE before use ⇒ R ≥ 3·k₁).
     // The .1 over 3 (was .03) is the worst-case finalization margin: the 2/3-mark must FINALIZE before the boundary consumes the eta,
-    // and finalization can lag production by k₁ (depth-k, no optimistic finality) ⇒ margin (R/3 − k₁) = 0.033·k₁ (#31 eta-amortization).
+    // and the depth fallback can lag production by k1 even when optimistic Phase 2 does not ⇒ margin (R/3 - k1) = 0.033*k1.
     // Derived from the per-env k₁, NOT loaded — keeps the eta-rotation period in lockstep with the confirmation depth.
     def etaRotationSnapshots(env: AppEnvironment): PosLong =
       PosLong.unsafeFrom(math.round(3.1d * confirmationDepthK(env).value))
-    // k₂ = 100·k₁ — historical-archive / phase-3 retention (tower moving checkpoint) AND the "settled" (Phase 2 → Phase 3 archival)
-    // depth. Deep deliberately: prod keeps a long, slow, stable consensus history (≈8 days at k₁=1024 / 7s snapshots). Derived from the
-    // per-env k₁, NOT loaded. This is THE single canonical k₂ accessor (Track-3 S1): the former duplicate inline `ArchivalDepthK =
-    // 100 * confirmationDepthK` in `SnapshotLeaderLoop` is gone — k₂ is threaded from here (`GlobalSnapshotConsensus` → `archivalDepthK`).
+    // k2 = 100*k1 recommended local retention/proof/recovery capacity. It does not create Phase 3 or an
+    // absolute fork-choice floor. Derived from per-environment k1 and threaded through legacy `archivalDepthK`
+    // parameter names until those Phase-3-era symbols are removed.
     def keepDepthBehindFinalized(env: AppEnvironment): PosLong =
       PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
     // Track-3 S3 fork-choice lookback = k₁ + 1. Forks shallower than this are resolved by the tip
     // tiebreak (maxvalid-tk, longest-chain); deeper forks switch to the density rule (maxvalid-bg). At
-    // k₁ + 1 the density rule engages exactly one ordinal past operational finality, so the whole
-    // `(settled, finalized]` band is density-arbitrated. Derived from the per-env k₁, NOT loaded —
+    // k1 + 1 the density rule engages after the shallow-fork window. Derived from per-environment k1 —
     // replaces the hardcoded `ChainSelection.DefaultKLookback` (50) at the production wiring.
     def kLookback(env: AppEnvironment): Long = confirmationDepthK(env).value + 1L
     // Track-3 S3 density window = round(R / 3), R = etaRotationSnapshots (= round(3.1·k₁)), so
@@ -200,7 +199,7 @@ object types {
     val DefaultConfirmationDepthK: PosLong = PosLong.unsafeFrom(32L)
 
     // The `confirmationDepthKByEnv` field reads from the HOCON key `confirmation-depth-k` (the per-env block), NOT the
-    // default kebab-cased `confirmation-depth-k-by-env`. Same `ProductHint` field-override technique as [[ShardFinalityConfig]];
+    // default kebab-cased `confirmation-depth-k-by-env`. Use an explicit `ProductHint` field override;
     // every OTHER field falls through to pureconfig's default `CamelCase` → `KebabCase` so they keep their existing keys.
     implicit val configHint: _root_.pureconfig.generic.ProductHint[NakamotoConfig] =
       _root_.pureconfig.generic.ProductHint[NakamotoConfig](_root_.pureconfig.ConfigFieldMapping {
@@ -217,8 +216,8 @@ object types {
     *     size is `≈ kDraw·σ·N`. With uniform σ = 1/N this is `≈ kDraw`; setting `kDraw = N` makes `kDraw·σ = 1` saturate ⇒ committee =
     *     everyone.
     *   - `kQuorum` — admit quorum. The number of distinct committee attestations the metagraph gate waits for
-    *     (`MetagraphAttestationAggregator.thresholdReached`) and the shard selection-finality count (`ShardFinalityTriggers.tCountShard`).
-    *     Economic validity never depends on this count: GL0 re-executes every included CL1 transition.
+    *     (`MetagraphAttestationAggregator.thresholdReached`) and the mandatory shard execution-certificate count
+    *     (`ShardFinalityTriggers.tCountShard`). GL0 also re-executes every included CL1 transition; the count alone is never sufficient.
     *
     * '''Invariant (validated fail-fast at config load via [[validated]]): `0 < kQuorum <= kDraw`.''' Decoupling the two fixes the
     * throughput lag where expected-committee == admit-quorum: a binomial committee draw around `kDraw` left ~36% of binaries with a
@@ -265,11 +264,11 @@ object types {
     *     transient sidecar restart silently disarmed the tooth. Once the RPC lands, the sidecar's durable outbox owns network delivery.
     *     Node-local QoS knobs (NOT consensus-critical — divergent values cannot split the cluster).
     *
-    * '''Challenge window.''' A checkpoint's economic effects are not irreversible until `confirmationDepthK` (k₁) finalized ordinals after
-    * adoption — the window in which a fraud proof can land and revert it. The window is NOT a separate knob: it is the existing
-    * `nakamoto.confirmation-depth-k`, so the slashable/irreversible point is gated at depth-k₁ (the same depth all other finality gates
-    * use). The GSAM accept path only applies the irreversible slash for an upheld dispute whose disputed checkpoint is still within k₁ of
-    * the tip.
+    * '''Current challenge-window gap.''' Live GSAM limits disputes by `confirmationDepthK`, but target k1 only makes an exact hash Phase-2
+    * operational; it does not make checkpoint economics irreversible or prevent a later density reorg. Positive deterministic watchtower
+    * replay coverage is required before checkpoint-derived value is inclusion-eligible. Later fraud evidence remains a collusion backstop,
+    * and any retained resource bound must defer without slash when exact inputs/base are unavailable rather than treating k1 as a safety
+    * floor.
     */
   case class InvalidStateProofSlashingConfig(
     watchtowerEnabled: Boolean,
@@ -295,8 +294,7 @@ object types {
     *
     *   - `numShards`: cluster-wide static shard count. Metagraph → shard is deterministic via `Hasher.hash(metagraphAddress) mod
     *     numShards`. Default `1` ⇒ every metagraph maps to shard 0.
-    *   - `finality`: per-shard FinalityTrigger params (`k1Shard` is the depth-finality fallback in the shard's own mini-chain — smaller
-    *     than gl0 k₁=255 because shard ords are sparser).
+    *   - `retention`: bounded in-memory checkpoint history. It is not a finality or checkpoint-qualification threshold.
     *   - `checkpoint`: emission cadence + burst cap for shard checkpoints (Option C per `SHARD-CHECKPOINT-GRANULARITY.md`).
     *
     * NOTE: the shard committee DRAW target + ADMIT quorum are NOT here — they are the cluster-wide [[CommitteeConfig]] (`kDraw` /
@@ -305,31 +303,15 @@ object types {
     */
   case class ShardingConfig(
     numShards: Int,
-    finality: ShardFinalityConfig,
-    checkpoint: ShardCheckpointConfig,
-    observability: ShardObservabilityConfig
+    retention: ShardCheckpointRetentionConfig,
+    checkpoint: ShardCheckpointConfig
   )
 
-  /** `k1Shard` maps to HOCON key `k1-shard` (the digit binds tight to the preceding letter — same convention as `k₁` in the design doc). A
-    * `ProductHint` is supplied in [[ShardFinalityConfig]]'s companion so pureconfig's default `CamelCase` → `KebabCase` doesn't split the
-    * field into the unwanted `k-1-shard`.
-    */
-  case class ShardFinalityConfig(k1Shard: Long)
-
-  object ShardFinalityConfig {
-    implicit val configHint: _root_.pureconfig.generic.ProductHint[ShardFinalityConfig] =
-      _root_.pureconfig.generic.ProductHint[ShardFinalityConfig](
-        _root_.pureconfig.ConfigFieldMapping(Map("k1Shard" -> "k1-shard"))
-      )
-  }
+  /** Bounded shard-chain storage. Checkpoint retention never qualifies an execution checkpoint and is not a fork-choice rule. */
+  case class ShardCheckpointRetentionConfig(retainedCheckpoints: Long)
 
   case class ShardCheckpointConfig(
     binaryBufferCap: Int,
-    /** Bounded checkpoint pipeline (2026-06-11): max unadopted windows in flight before the producer holds production so pending binaries
-      * batch into one bigger window (catch-up margin — see ShardCheckpointProducer). MUST be 1 (run-27): the producer diffs each window
-      * against the FINALIZED base S(N); at depth>1 a 2nd in-flight window is diffed against a stale base the verifier never matches.
-      */
-    pipelineDepth: Int = 1,
     /** Shuffled-staircase proposal window width in slots (design §5.7 rev 2, owner 2026-06-12; default 5). Per shard ordinal the committee
       * is hash-sorted under the epoch eta; rank r proposes for this many slots, wrapping modulo committee size. Replaces the per-slot LDD
       * lottery (run-13/14: genesis forks + same-ord sibling lineages split attestations below kQuorum at ANY density).
@@ -355,15 +337,6 @@ object types {
     absenceTickIntervalMs: Long = 2000,
     pullDedupCooldownMs: Long = 30000
   )
-
-  /** Slice 19 observability tunables (see `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19 + §9.4).
-    *
-    *   - `tPartitionHardMs`: if a shard goes longer than this without ANY `T_count_shard` attestation reaching threshold (only the
-    *     `T_depth1_shard` fallback fires), the gl0 leader logs a `SHARD-PARTITION-SUSPECT` WARN and increments
-    *     `dag_nakamoto_shard_partition_hard_total{shard_id}`. Operator intervention is expected; per design-doc §9.4, v1 does not perform
-    *     automatic rotation. Default `600000` ms = 10 minutes.
-    */
-  case class ShardObservabilityConfig(tPartitionHardMs: Long)
 
   /** Configuration for the gl0-embedded `LocalEvents` reactive event stream (see `docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Drives
     * the gRPC server that publishes consensus events to local subscribers (e2e tests, operator GUI).

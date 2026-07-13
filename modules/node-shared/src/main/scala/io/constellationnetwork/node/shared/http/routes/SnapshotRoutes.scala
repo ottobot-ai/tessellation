@@ -55,8 +55,8 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
       .map(validStateForSnapshotReturn)
       .ifM(action, serviceUnavailableNodeNotReady)
 
-  // Gating delegates to FinalityGate[F]. BFT mode instance returns head == finalized;
-  // Nakamoto instance reads the attestation-finalized Ref and rejects ordinals past it.
+  // Gating delegates to FinalityGate[F]. ML0 may use its BFT pass-through instance. GL0 currently
+  // reads an ordinal-only transitional watermark; target serving is exact-hash Phase 2 and reorg-aware.
   private def effectiveLatestOrdinal: F[Option[SnapshotOrdinal]] =
     FinalityGate[F].finalizedOrdinal
 

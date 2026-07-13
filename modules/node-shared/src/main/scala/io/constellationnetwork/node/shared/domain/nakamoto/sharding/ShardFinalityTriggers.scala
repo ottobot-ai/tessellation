@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.sharding
 
-import cats.Monad
+import cats.Functor
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
@@ -13,170 +13,63 @@ import io.constellationnetwork.security.hash.Hash
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** Per-shard composite finality trigger pair — Slice 6 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §5.4.
+/** Per-shard execution-quorum qualification.
   *
-  * Holds the two shard-layer Phase 1→2 [[FinalityTrigger]] instances built from the existing typeclass machinery
-  * (`FinalityTrigger.scala:124-144`):
+  * A checkpoint qualifies only after at least `kQuorum` distinct execution-committee members have signed its exact signing preimage. Shard
+  * chain depth is not an alternative validity or liveness path: depth cannot prove that any committee member reproduced the economic
+  * transition.
   *
-  *   - `tCountShard` — qualifies a shard ord N when `attestationCountFor(checkpoint-at-N) >= kQuorum` (the cluster-uniform admit count
-  *     `nakamoto.committee.kQuorum`, decoupled from the committee DRAW target `kDraw`; per design doc §5.4 row 2, §5.3 quorum rule).
-  *   - `tDepth1Shard` — qualifies a shard ord N when `bestTipOrd - N > k1Shard` (per design doc §5.4 row 3; degraded-liveness depth
-  *     fallback that fires when the attestation gate stalls).
-  *
-  * The `latestQualifyingOrdinal` composite follows the same **max-of** composition as the gl0 finality monitor uses across its Phase 1→2
-  * triggers (see `docs/nakamoto/attestation-and-finality.md` §0.2 — "The semantics are max-of: the Phase 2 boundary at any tick is the
-  * maximum `latestQualifying` ordinal across all registered Phase-2 triggers. Each trigger gives a *sufficient* condition, not a
-  * *necessary* one."). Mirrors `FinalityTrigger.maxLatestQualifyingOrdinal` (`FinalityTrigger.scala:107-113`).
-  *
-  * '''Phase 2→3 trigger.''' Not included here — per design doc §5.4 row 4, "ARCHIVAL is NOT required for shard chains in v1 — gl0 is the
-  * archival anchor". A shard checkpoint becomes archival-finalized when its gl0 admission ord (gl0 ord N that included `shardCheckpoints[s]
-  * \= sc`) reaches gl0's Phase 3 (T_depth2 at k₂ = 65536). The shard layer has no `T_depth2_shard` analog.
-  *
-  * '''Why the trigger functions ignore [[FinalityTrigger.ConsensusState]].''' The shard triggers' eval functions close over their captured
-  * dependencies ([[ShardChainStore]] and [[ShardTipTracker]]) rather than reading from the [[FinalityTrigger.ConsensusState]] argument.
-  * This matches the typeclass scaladoc — "concrete triggers ignore fields they don't care about" — and avoids inventing a second
-  * `ConsensusState` shape just for the shard layer. `ConsensusState[F]` carries gl0-flavored fields (`selfId`, `bestTipOrdinal`,
-  * `bestTipHash`, `canonicalHashAt`) that aren't load-bearing for shard finality; we pass a dummy state when invoking `evaluateAndAdvance`
-  * (see [[ShardFinalityTriggers.advance]]).
-  *
-  * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`):
-  *   - Fresh composite for the shard layer. The gl0 finality monitor composes its own triggers via
-  *     `FinalityTrigger.maxLatestQualifyingOrdinal` directly; this class is the analogous boundary for shards.
-  *
-  * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`):
-  *   - `kQuorum` and `k1Shard` are constructor params. Callers wire from `cfg.nakamoto.committee.kQuorum` and
-  *     `cfg.nakamoto.sharding.finality.k1Shard`. No `sys.env.get` anywhere in this slice.
+  * This component is producer-side selection state. The consensus-critical embedded checkpoint verifier independently checks the distinct
+  * carried signatures against the same `kQuorum`; a node-local tracker can therefore delay selection but can never make an under-signed
+  * artifact valid.
   */
 final case class ShardFinalityTriggers[F[_]](
   shardId: ShardId,
   tCountShard: FinalityTrigger[F],
-  tDepth1Shard: FinalityTrigger[F],
   advance: F[ShardOrdinal],
   currentQualifyingCheckpoint: F[Option[Hashed[ShardCheckpoint]]]
 ) {
 
-  /** Composite "max-of" qualifier — the highest shard-ordinal that has been qualified by EITHER `tCountShard` or `tDepth1Shard`. Same
-    * semantics as the gl0 finality monitor uses across `T_weight + T_count + T_depth1` (`FinalityTrigger.maxLatestQualifyingOrdinal`).
-    *
-    * Pure read of each inner trigger's `latestQualifyingOrdinal` `Ref` — no chain walk, no recomputation. Bounded constant time.
-    *
-    * Note: this reads from the inner triggers' Refs that are advanced by [[advance]]; if no caller has invoked `advance` yet on this
-    * composite, the result is [[ShardOrdinal.Root]]. The result is historical and ordinal-only. It MUST NOT be resolved back through
-    * `ShardChainStore.getByOrdinal`: after a reorg, that ordinal may name a different checkpoint. Consensus selection uses
-    * [[currentQualifyingCheckpoint]], which binds qualification to a hash on the current best-tip ancestry.
+  /** Highest ordinal observed with execution quorum. Diagnostic only; consensus selection uses the hash-bound
+    * [[currentQualifyingCheckpoint]].
     */
-  def latestQualifyingOrdinal(implicit M: Monad[F]): F[ShardOrdinal] =
-    FinalityTrigger
-      .maxLatestQualifyingOrdinal[F](List(tCountShard, tDepth1Shard))
-      .map(snap => ShardFinalityTriggers.snapshotOrdinalToShardOrdinal(snap))
+  def latestQualifyingOrdinal(implicit F: Functor[F]): F[ShardOrdinal] =
+    tCountShard.latestQualifyingOrdinal.map(ShardFinalityTriggers.snapshotOrdinalToShardOrdinal)
 }
 
 object ShardFinalityTriggers {
 
-  /** Construct the per-shard composite finality triggers. Returns a `F[ShardFinalityTriggers[F]]` because the inner [[FinalityTrigger]]
-    * instances back themselves with `Ref[F, SnapshotOrdinal]` and so must be constructed in `F` (per `FinalityTrigger.fromRef[F]`).
-    *
-    * @param shardId
-    *   the shard this trigger pair is scoped to. Stamped on the returned record for diagnostic logging and observability; the inner
-    *   triggers don't bind to it because they pull their inputs from the captured `chainStore` and `tipTracker`.
-    * @param kQuorum
-    *   the shard committee's selection-finality count (the cluster-uniform `cfg.nakamoto.committee.kQuorum`, decoupled from the committee
-    *   DRAW target `kDraw`). The `T_count_shard` qualifier compares the distinct-attester count against `kQuorum` DIRECTLY (no further 2/3
-    *   multiplier — that is already folded into the chosen `kQuorum`, e.g. 6 = 2/3 of N=8). v1 stable-σ rule
-    *   (`[[project-216-committee-stake-drift-fix]]`) treats every committee member as equally weighted; the count check degenerates to a
-    *   1-validator-1-vote tally over a uniform committee.
-    * @param k1Shard
-    *   shard-layer depth-finality fallback (design doc §5.4 row 3 — the per-shard `k₁`). Default per HOCON is 8 shard-ords ≈ 56s, smaller
-    *   than gl0's `k₁ = 255` because shard ords are sparser.
-    * @param chainStore
-    *   per-shard chain store from Slice 5 (`ShardChainStore`). Read on every advance — `bestTip` provides the head ordinal + canonical
-    *   hash; `walkBackTo` supplies the hash-bound ancestry used by consensus checkpoint selection.
-    * @param tipTracker
-    *   per-shard attestation tracker (Slice 6 — this same file's sibling `ShardTipTracker`). Drives `T_count_shard` via
-    *   `attestationCountFor(checkpointHash, excludeSelf = false)`. This qualifies a checkpoint for producer-side selection only;
-    *   `verifyEmbedded` independently re-executes the checkpoint and does not treat this count as economic validity.
-    */
   def make[F[_]: Async](
     shardId: ShardId,
     kQuorum: Int,
-    k1Shard: Long,
     chainStore: ShardChainStore[F],
     tipTracker: ShardTipTracker[F]
   ): F[ShardFinalityTriggers[F]] = {
-    // ----- T_count_shard ----------------------------------------------------
-    //
-    // Qualifies a shard ord N when `attestationCountFor(canonicalHashAt(N), excludeSelf = false) >= kQuorum`.
-    //
-    // Draw/quorum decouple: `kQuorum` is the cluster-uniform admit count (`nakamoto.committee.kQuorum`) — the count DIRECTLY, NOT a 2/3
-    // fraction of the committee DRAW target. (The old `⌈2·K_S/3⌉` conversion off the draw target is exactly the coupling that left
-    // undersized committees stranded; the quorum is now chosen independently and large enough that a saturated draw clears it.)
-    //
-    // Threshold math via `BigInt` (matches `TCountTrigger.scala:330-335` for cluster-wide hash-determinism — both honest nodes
-    // recompute byte-equivalent `required` values and either both qualify or both don't).
-    //
-    // Self is included because the signed checkpoint carries every distinct committee attestation. With the configured `kQuorum >= 2`, a
-    // node's own signature cannot qualify a checkpoint by itself. GL0 replay remains mandatory after this selection trigger qualifies.
-    //
-    // The eval function closes over `chainStore` and `tipTracker`; the `ConsensusState[F]` arg is ignored — the trigger is shard-scoped
-    // and reads ALL its inputs from the captured shard dependencies.
-    val requiredCount: BigInt = BigInt(kQuorum)
+    val requiredCount = BigInt(kQuorum)
+
+    // A stored checkpoint already carries the producer's replay-backed signature and may carry other signatures gathered before this node
+    // received it. The local tracker contains later gossip contributions. Selection must count the union: relying on tracker delivery alone
+    // makes a complete certificate appear one short on the producer when the sidecar does not loop the producer's own publication back.
+    // External checkpoints enter the chain store only after signature/replay admission; embedded verification independently validates the
+    // spliced certificate, so this union is a liveness selector rather than an artifact-validity shortcut.
+    def certificateSignerCount(checkpoint: Hashed[ShardCheckpoint]): F[Int] = {
+      val carried = checkpoint.signed.value.committeeSignatures.toList.iterator.map(_.peerId).toSet
+      tipTracker.signaturesFor(checkpoint.hash).map(collected => (carried ++ collected.keySet).size)
+    }
 
     val countEval: FinalityTrigger.ConsensusState[F] => F[SnapshotOrdinal] = _ =>
       chainStore.bestTip.flatMap {
-        case None =>
-          // No tip yet → no checkpoint to count attestations for. Genesis-equivalent.
-          Async[F].pure(SnapshotOrdinal.MinValue)
-
+        case None => SnapshotOrdinal.MinValue.pure[F]
         case Some(tip) =>
-          // Count attestations on the canonical-bestTip hash. The Ref-backed advance is monotone so calling this with the bestTip
-          // hash at every tick is sufficient — once the count crosses threshold for ord N, the Ref locks in at N. A later reorg
-          // that demotes ord N to a different hash doesn't roll the Ref back (that's the monotonicity contract — see
-          // `FinalityTrigger.evaluateAndAdvance` lines 137-142).
-          //
-          // Why the bestTip hash specifically (and not "every known checkpoint"): the trigger answers "highest ord qualified", and
-          // only the canonical chain matters for that question. A fork-branch checkpoint with K_S attestations doesn't qualify
-          // anything on OUR canonical chain because it's not on it — same cross-fork filter principle as `TCountTrigger`'s
-          // canonical-hash filter (lines 305-312 in that file).
-          //
-          // SELF INCLUDED (2026-06-11, run-10 Gap-B). The count must match the bar the embed is actually held to:
-          // The leader's `signaturesFor` enrichment splices all collected signatures without self-exclusion. Excluding self here made
-          // the selection trigger stricter than the configured count — at N=5/kQuorum=4 it demanded all 4 REMOTE attestations
-          // (unanimity), so one slow-delivery peer stalled every shard embed (~3 min plateaus that expired allow-spends
-          // mid-flight). The P-11b solo-self-finalize hazard doesn't arise at kQuorum >= 2 (self alone can never clear the
-          // threshold), and adoption safety never rests on this trigger — `verifyEmbedded` re-checks signatures and replays every
-          // included CL1 transition on every GL0 node.
-          tipTracker.attestationCountFor(tip.hash, excludeSelf = false).map { count =>
+          certificateSignerCount(tip).map { count =>
             if (BigInt(count) >= requiredCount)
               shardOrdinalToSnapshotOrdinal(tip.signed.value.shardOrdinal)
             else SnapshotOrdinal.MinValue
           }
       }
 
-    // ----- T_depth1_shard ---------------------------------------------------
-    //
-    // Qualifies ord N when `bestTipOrd - N > k1Shard`. Equivalent to gl0's `TDepth1Trigger` mechanics (`FinalityTrigger.scala:227-236`)
-    // but scoped to the shard's chain store rather than gl0's `bestTipOrdinal` from `ConsensusState`. We read shard `bestTip` directly
-    // from the captured `chainStore` and ignore the `ConsensusState[F]` argument for the same reason as `T_count_shard`.
-    //
-    // Note the `>` vs `>=`: design doc §5.4 row 3 says "depth > k1Shard" (strict), so an ord-N checkpoint qualifies once the chain
-    // extends to ord N + k1Shard + 1 or later. Matches gl0's `bestOrd - k > 0` predicate at lines 230-234 of FinalityTrigger.scala
-    // (effectively `bestOrd > k`, which is the strict form of "depth at ord 0 is bestOrd, must exceed k").
-    val depthEval: FinalityTrigger.ConsensusState[F] => F[SnapshotOrdinal] = _ =>
-      chainStore.bestTip.map {
-        case None => SnapshotOrdinal.MinValue
-        case Some(tip) =>
-          val bestOrd = tip.signed.value.shardOrdinal.value
-          // `bestOrd - k1Shard` is the highest ord whose depth at the tip is > k1Shard. Clamp at 0 — chains shorter than k1Shard
-          // qualify nothing.
-          val qualifying = bestOrd - k1Shard
-          if (qualifying > 0L) shardOrdinalToSnapshotOrdinal(ShardOrdinal(qualifying))
-          else SnapshotOrdinal.MinValue
-      }
-
-    // Consensus selection cannot safely turn the monotone trigger ordinal back into a checkpoint with `getByOrdinal`: a quorum observed
-    // for branch A at ord N would then qualify branch B if fork choice later put B at N. Recompute against one captured best-tip ancestry
-    // and return the qualified checkpoint itself. Count and depth remain max-of sufficient conditions; the count scan is tip-first so an
-    // older quorum checkpoint remains usable after un-attested descendants extend the same branch.
+    // Recompute against one captured best-tip ancestry. A monotone ordinal observed for branch A must never qualify branch B at the same
+    // ordinal after a shard-chain reorg.
     val currentQualifyingCheckpoint: F[Option[Hashed[ShardCheckpoint]]] =
       chainStore.bestTip.flatMap {
         case None => none[Hashed[ShardCheckpoint]].pure[F]
@@ -184,75 +77,36 @@ object ShardFinalityTriggers {
           val bestOrd = tip.signed.value.shardOrdinal.value
           val walkDepth = if (bestOrd == Long.MaxValue) Long.MaxValue else math.max(1L, bestOrd + 1L)
 
-          chainStore.walkBackTo(tip.hash, walkDepth).flatMap { canonicalTipFirst =>
-            val countQualified = canonicalTipFirst.findM { checkpoint =>
-              tipTracker
-                .attestationCountFor(checkpoint.hash, excludeSelf = false)
-                .map(count => BigInt(count) >= requiredCount)
-            }
-
-            val depthQualifyingOrd = bestOrd - k1Shard
-            val depthQualified =
-              if (depthQualifyingOrd > 0L)
-                canonicalTipFirst.find(_.signed.value.shardOrdinal.value == depthQualifyingOrd)
-              else none[Hashed[ShardCheckpoint]]
-
-            countQualified.map { countCheckpoint =>
-              List(countCheckpoint, depthQualified).flatten
-                .sortBy(_.signed.value.shardOrdinal.value)
-                .lastOption
+          chainStore.walkBackTo(tip.hash, walkDepth).flatMap {
+            _.findM { checkpoint =>
+              certificateSignerCount(checkpoint).map(count => BigInt(count) >= requiredCount)
             }
           }
       }
 
-    for {
-      tCount <- FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TCount, SnapshotOrdinal.MinValue)(countEval)
-      tDepth1 <- FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TDepth1, SnapshotOrdinal.MinValue)(depthEval)
-    } yield
+    FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TCount, SnapshotOrdinal.MinValue)(countEval).map { tCount =>
+      val dummyState = FinalityTrigger.ConsensusState[F](
+        selfId = dummySelfId,
+        bestTipOrdinal = SnapshotOrdinal.MinValue,
+        bestTipHash = dummyHash,
+        canonicalHashAt = _ => none[Hash].pure[F]
+      )
+
       ShardFinalityTriggers(
         shardId = shardId,
         tCountShard = tCount,
-        tDepth1Shard = tDepth1,
-        advance = {
-          // Drive both inner triggers via their `evaluateAndAdvance` with a dummy ConsensusState — the eval functions ignore the state,
-          // so the values inside are irrelevant. We pass `selfId = dummySelfId`, ords at MinValue, an empty canonicalHashAt — pure
-          // sentinels. The shard-scoped advance returns the new composite max-of in `F[ShardOrdinal]`.
-          val dummyState = FinalityTrigger.ConsensusState[F](
-            selfId = ShardFinalityTriggers.dummySelfId,
-            bestTipOrdinal = SnapshotOrdinal.MinValue,
-            bestTipHash = ShardFinalityTriggers.dummyHash,
-            canonicalHashAt = _ => Async[F].pure(Option.empty[Hash])
-          )
-          for {
-            _ <- tCount.evaluateAndAdvance(dummyState)
-            _ <- tDepth1.evaluateAndAdvance(dummyState)
-            maxOrd <- FinalityTrigger.maxLatestQualifyingOrdinal[F](List(tCount, tDepth1))
-          } yield snapshotOrdinalToShardOrdinal(maxOrd)
-        },
+        advance = tCount.evaluateAndAdvance(dummyState).map(snapshotOrdinalToShardOrdinal),
         currentQualifyingCheckpoint = currentQualifyingCheckpoint
       )
+    }
   }
 
-  /** Convert a shard-domain ordinal to the snapshot-domain ordinal used by the inner [[FinalityTrigger]] `Ref[F, SnapshotOrdinal]`.
-    *
-    * Bridging is byte-faithful for the shard domain (ord >= 0): `ShardOrdinal` is a raw `Long` per `ShardOrdinal.scala:24-29`
-    * (negative-during-bootstrap-init tolerated), but the trigger Refs hold `SnapshotOrdinal` (`NonNegLong`-backed per
-    * `SnapshotOrdinal.scala:21-23`). Negative shard ords are clamped to `SnapshotOrdinal.MinValue` (0) here so the bridge never throws —
-    * matches the same clamp-at-zero discipline `TDepth1Trigger` uses for chains shorter than `k`.
-    */
   private[sharding] def shardOrdinalToSnapshotOrdinal(o: ShardOrdinal): SnapshotOrdinal =
     if (o.value <= 0L) SnapshotOrdinal.MinValue
     else SnapshotOrdinal(NonNegLong.unsafeFrom(o.value))
 
-  /** Inverse projection — the inner trigger Refs only ever hold non-negative values (clamped at construction), so the conversion is total.
-    */
   private[sharding] def snapshotOrdinalToShardOrdinal(o: SnapshotOrdinal): ShardOrdinal =
     ShardOrdinal(o.value.value)
-
-  // --- Dummies for the unused ConsensusState fields ----------------------------------------------
-  //
-  // The shard triggers' eval functions ignore every field of `ConsensusState[F]` — the inputs come from the captured shard `chainStore`
-  // and `tipTracker`. We pre-allocate sentinel values so we don't reconstruct them on every `advance` call.
 
   private val dummySelfId: PeerId =
     PeerId(io.constellationnetwork.security.hex.Hex("00" * 64))

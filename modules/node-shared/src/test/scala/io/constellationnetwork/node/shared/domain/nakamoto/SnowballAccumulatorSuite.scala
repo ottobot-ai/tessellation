@@ -10,11 +10,11 @@ import io.constellationnetwork.security.hex.Hex
 
 import weaver.SimpleIOSuite
 
-/** Tests for [[SnowballAccumulator]] — the per-(ordinal, hash) lifetime accumulator implementing Snowball decision semantics from the Snow
-  * family.
+/** Behavioral tests for the transitional latest-attestation margin implemented by [[SnowballAccumulator]].
   *
-  * Anchors: `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §2.2 (algebraic decision rule), §3.4 (why K=8/α=5/β=10), GPU sim kernel at
-  * `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py` commit `5ace3d36` (reference implementation).
+  * These tests do not establish Snowball/Avalanche safety. The implementation has no K-peer query loop or alpha-majority cascade, and its
+  * sticky first-crossing decision is arrival-order sensitive. Calibration of a separate K/alpha/beta model therefore does not transfer to
+  * this code.
   */
 object SnowballAccumulatorSuite extends SimpleIOSuite {
 
@@ -26,7 +26,7 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
   private def hash(s: String): Hash = Hash(s.padTo(64, '0'))
 
   // ============================================================
-  // §2.2 decision rule: leader_count − runner_up_count >= β
+  // Executable transitional rule: current leader_count - runner_up_count >= beta
   // ============================================================
 
   test("decision rule: 0 peers — no decision") {
@@ -87,15 +87,12 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
   }
 
   // ============================================================
-  // Snowball ≠ Snowflake — counter is NON-RESETTING (load-bearing property)
+  // Current latest-attestation counting behavior (not Snowball lifetime confidence)
   // ============================================================
 
-  test("non-reset on flip: losing-hash accumulator persists across other-peer flips") {
-    // The defining property of Snowball vs Snowflake: a flip in the leader does NOT reset the
-    // accumulator of the losing hash. This is the per-color persistent confidence accumulator
-    // (proposal §2.1, §2.2). Here: 5 peers on A, then 5 different peers on B → leader = 5 on B
-    // (most recent ties broken by insertion-order — leader by count alone is "any of A/B");
-    // both accumulators show their full lifetime evidence regardless of who's currently leading.
+  test("current counts retain contributions from different peers on competing hashes") {
+    // Five distinct peers currently point at A and five different peers currently point at B.
+    // Both current-count entries remain present; this says nothing about lifetime confidence.
     val tipA = hash("A")
     val tipB = hash("B")
     for {
@@ -104,14 +101,14 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
       _ <- (1 to 5).toList.traverse_(i => acc.recordAttestation(pid(s"b-$i"), 50L, tipB))
       counts <- acc.accumAt(50L)
     } yield
-      // Both lifetime accumulators preserved — neither was reset by the other.
+      // Both sets of current peer contributions are represented.
       expect.same(5, counts.getOrElse(tipA, 0)) &&
         expect.same(5, counts.getOrElse(tipB, 0))
   }
 
-  test("non-reset on flip: peer flipping its OWN preference moves its contribution but doesn't zero others") {
-    // A peer's flip from hash A to hash B moves THAT peer's contribution; OTHER peers' lifetime
-    // contributions on A are preserved (Snowball's per-color persistence at the cluster level).
+  test("peer changing hash moves its current contribution and preserves other peers") {
+    // A peer's change from A to B moves that peer's current contribution. Other peers currently
+    // pointing at A remain counted.
     val tipA = hash("A")
     val tipB = hash("B")
     for {
@@ -126,9 +123,9 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
         expect.same(1, counts.getOrElse(tipB, 0))
   }
 
-  test("monotone (irrevocable) decision: once decided, the decision is sticky") {
-    // Snowball decisions are irrevocable at the protocol layer (proposal §2.1 "decided ⇒ quiescent").
-    // After 10 peers decide A, more peers attesting a contradicting hash do NOT unset the decision.
+  test("transitional first-crossing decision is sticky") {
+    // This is executable behavior, not a proof that irrevocability is safe: after A first crosses
+    // the margin, later contradictory current attestations cannot unset it.
     val tipA = hash("A")
     val tipB = hash("B")
     for {
@@ -155,13 +152,13 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
   }
 
   // ============================================================
-  // NID property test — the load-bearing assertion
+  // Repeatability and arrival-order safety gap
   // ============================================================
 
-  test("NID: identical transcripts ⇒ identical decisions regardless of who is observing") {
-    // Two SnowballAccumulator instances built independently and fed the SAME (peer, ord, hash)
-    // tuples produce IDENTICAL decided maps. This is the property that Snowball restores at the
-    // T_weight position after P-11b is rolled back — the defining property of consensus.
+  test("same ordered transcript produces the same result on two fresh accumulators") {
+    // This proves ordinary deterministic replay of one ordered input stream. It does not prove
+    // observer-independent consensus because honest observers can receive attestations in
+    // different orders.
     val tipH = hash("H")
     val transcript: List[(PeerId, Long, Hash)] =
       (1 to 12).toList.map(i => (pid(s"peer-$i"), 50L, tipH)) ++
@@ -178,7 +175,7 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
       countsA <- accA.accumAt(50L)
       countsB <- accB.accumAt(50L)
     } yield
-      // Identical decisions — NID property.
+      // Identical ordered inputs produce identical local results.
       expect.same(decA50, decB50) &&
         expect.same(decA60, decB60) &&
         expect.same(countsA, countsB) &&
@@ -187,13 +184,10 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
         expect.same(None, decA60)
   }
 
-  test("NID: final accumulator counts are permutation-invariant (decisions are intentionally order-sensitive)") {
-    // Snowball decisions are made in real-time as the margin first crosses β; the *decision* IS
-    // intentionally order-sensitive — that's the irrevocability property (proposal §2.1 "decided
-    // ⇒ quiescent"). The accumulator *counts*, however, must be permutation-invariant — the
-    // per-color lifetime evidence is a commutative sum. This test asserts the latter, which is
-    // the load-bearing NID guarantee for downstream consumers that only read counts (e.g. the
-    // ATTEST-FINALIZED log line's diagnostic accumulator dump).
+  test("terminal current counts are permutation-invariant when each peer appears once") {
+    // Current counts are a commutative sum for this restricted transcript. Sticky decisions are
+    // not permutation-invariant, so equal terminal counts are diagnostic only and cannot serve as
+    // portable finality evidence.
     val tipA = hash("A")
     val tipB = hash("B")
     val baseTranscript: List[(PeerId, Long, Hash)] =
@@ -208,29 +202,53 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
       countsA <- accA.accumAt(50L)
       countsB <- accB.accumAt(50L)
     } yield
-      // Counts are commutative — accumulator state is permutation-invariant.
+      // Terminal counts match even though the general decision rule is arrival-order sensitive.
       expect.same(countsA, countsB) &&
         // Sanity: both terminal states show the correct totals.
         expect.same(10, countsA.getOrElse(tipA, 0)) &&
         expect.same(3, countsA.getOrElse(tipB, 0))
   }
 
+  test("same eventual current-attestation map can retain opposing decisions under different arrival orders") {
+    val tipA = hash("A")
+    val tipB = hash("B")
+    val aFirst = List(
+      (pid("a-1"), 50L, tipA),
+      (pid("a-2"), 50L, tipA),
+      (pid("b-1"), 50L, tipB),
+      (pid("b-2"), 50L, tipB)
+    )
+    val bFirst = aFirst.reverse
+
+    for {
+      accA <- SnowballAccumulator.make[IO](beta = 2)
+      accB <- SnowballAccumulator.make[IO](beta = 2)
+      _ <- aFirst.traverse_ { case (p, o, h) => accA.recordAttestation(p, o, h) }
+      _ <- bFirst.traverse_ { case (p, o, h) => accB.recordAttestation(p, o, h) }
+      countsA <- accA.accumAt(50L)
+      countsB <- accB.accumAt(50L)
+      decidedA <- accA.decidedAt(50L)
+      decidedB <- accB.decidedAt(50L)
+    } yield
+      expect.same(countsA, countsB) &&
+        expect.same(Some(tipA), decidedA) &&
+        expect.same(Some(tipB), decidedB)
+  }
+
   // ============================================================
-  // Smoke validation: K=8/α=5/β=10 prevents safety violations on a small synthetic transcript
+  // Illustrative beta-margin example; K and alpha are not exercised
   // ============================================================
 
-  test("smoke validation: K=8/α=5/β=10 — at f_adv=0.33 with structured transcripts, observers agree") {
-    // This is a Scala-side sanity check that the Snowball accumulator's decision tracks the
-    // empirically-validated GPU sim result at K=8/α=5/β=10. NOT a replacement for the GPU sim
-    // (`~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py` commit
-    // `5ace3d36`) — just a smoke test that the Scala port computes consistent decisions.
+  test("current-count margin reaches beta after two additional A attestations") {
+    // This exercises only the local beta-margin arithmetic. It cannot be compared to a
+    // K/alpha/beta cascade simulation because this implementation performs no K-peer sampling or
+    // alpha-majority rounds.
     //
     // Setup: cluster of 12 validators (8 honest, 4 Byzantine — f_adv ≈ 0.33). All 8 honest peers
     // attest hash A; 4 Byzantines split — 2 attest hash B, 2 attest hash A (lying to drain).
     // Expected: A is the canonical leader (10 attestations) vs B (2 attestations); margin = 8 < 10,
     // so undecided yet. Add one more honest peer and the margin becomes 9 ≠ 10 still undecided.
-    // Add ANOTHER honest peer → margin 10 ≥ β=10 → decided A. This walks the cascade through the
-    // narrow window where the decision crystallises.
+    // Add ANOTHER honest peer → margin 10 ≥ β=10 → the local current-count rule sticks to A.
     val tipA = hash("A")
     val tipB = hash("B")
     for {
@@ -247,14 +265,13 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
       _ <- acc.recordAttestation(pid("honest-10"), 50L, tipA)
       finalState <- acc.decidedAt(50L)
     } yield
-      // Cascade lands on canonical (A) — no safety violation in this trial. Aligns with the GPU
-      // sim's 0 / 10000 safety violations result at this configuration.
+      // The transitional current-count rule crosses its beta margin on A.
       expect.same(None, midState) &&
         expect.same(Some(tipA), finalState)
   }
 
   // ============================================================
-  // Canonical-chain walk (NID-restored path)
+  // Canonical-chain filtering of transitional sticky decisions
   // ============================================================
 
   test("highestDecidedOnCanonical: returns highest decided ord whose decided hash matches canonical") {

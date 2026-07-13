@@ -4,8 +4,9 @@ import cats.data.NonEmptyList
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardFinalityTriggers
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, ShardAssignment, VrfRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardCheckpointProducerDutyValidator
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -34,24 +35,53 @@ sealed trait ShardCheckpointAcceptResult extends Product with Serializable
 
 object ShardCheckpointAcceptResult {
 
-  /** The checkpoint passes signer pre-checks and GL0 reproduced every included per-MG root. `evaluate` additionally requires a local
-    * finality trigger before selection; `verifyEmbedded` is the trigger-independent consensus replay gate.
+  /** The checkpoint carries a valid distinct execution certificate and GL0 reproduced every included per-MG root.
     */
   case object Accepted extends ShardCheckpointAcceptResult
 
-  /** Pre-checks pass but neither finality trigger qualifies yet — checkpoint is in-flight and will be re-evaluated at a later gl0 ord (per
-    * §7.2 the `gl0AnchorOrdinal` allows the checkpoint to ride into N, N+1, N+2…). Caller skips inclusion this ord.
+  /** Intake replay succeeded, but the checkpoint does not yet carry a distinct execution quorum. It remains admissible for committee replay
+    * and attestation, but cannot be embedded. Consensus verification never returns this result.
     */
   case object PendingMoreAttestations extends ShardCheckpointAcceptResult
 
-  /** The checkpoint failed one of the pre-checks or the shard is not tracked locally. `reason` is diagnostic; the typed branch is the
-    * control-flow signal.
+  /** The checkpoint failed a structural, signer, quorum, or replay check. `reason` is diagnostic; the typed branch is the control-flow
+    * signal.
     */
   final case class Rejected(reason: String) extends ShardCheckpointAcceptResult
 
   /** GL0 affirmatively recomputed at least one different per-MG root. Signatures and quorum never suppress this result.
     */
   final case class RejectedReExecutionMismatch(reason: String, slashSigners: List[PeerId]) extends ShardCheckpointAcceptResult
+}
+
+/** Capability proving that this node ran GL0 checkpoint intake validation, including deterministic framework replay, for the exact
+  * [[checkpoint]]. The attestation emitter accepts this capability instead of naked routing/hash fields, so receipt, chain position, and
+  * signature count cannot reach a state-validity signing API.
+  *
+  * Construction is private to the concrete manager returned by [[ShardCheckpointGl0AcceptanceManager.make]]. The capability binds the
+  * replayed checkpoint to its canonical [[ShardCheckpoint.signingPreimage]] hash; callers cannot supply either an acceptance verdict or a
+  * hash independently of the bytes that concrete manager replayed.
+  */
+sealed trait VerifiedShardCheckpoint extends Product with Serializable {
+  def checkpoint: ShardCheckpoint
+  def signingPreimageHash: Hash
+}
+
+/** Typed failure returned when a checkpoint cannot produce a [[VerifiedShardCheckpoint]]. */
+sealed trait VerifiedShardCheckpointFailure extends Product with Serializable {
+  def acceptanceResult: ShardCheckpointAcceptResult
+}
+
+object VerifiedShardCheckpointFailure {
+
+  final case class Rejected(reason: String) extends VerifiedShardCheckpointFailure {
+    val acceptanceResult: ShardCheckpointAcceptResult = ShardCheckpointAcceptResult.Rejected(reason)
+  }
+
+  final case class ReExecutionMismatch(reason: String, slashSigners: List[PeerId]) extends VerifiedShardCheckpointFailure {
+    val acceptanceResult: ShardCheckpointAcceptResult =
+      ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners)
+  }
 }
 
 /** Redundant watchtower finding for a per-MG root not reproduced by global re-execution. Primary admission already executes the same check;
@@ -76,46 +106,61 @@ final case class WatchtowerMismatch(
   * Sits between the shard committee's checkpoint gossip and the gl0 leader's per-ord accept loop. For each candidate checkpoint included in
   * the next gl0 snapshot:
   *
-  *   1. '''Pre-checks''' (always): every committee signer must be (a) in the committee for `(shardId, epoch)`, (b) verifiable by their
-  *      registered long-term Ed25519 VK, (c) verifiable by their KES product VK at the embedded tree-internal step, and (d) prove
-  *      possession of their registered VRF key over the canonical `(shardEta, slot)` message. Failure on ANY signer ⇒ `Rejected("invalid
-  *      pre-check ...")`.
+  *   1. '''Pre-checks''' (always): intake and embedded verification first prove that the retained head signature belongs to the exact
+  *      parent-relative staircase producer. Then every committee signer must be (a) in the committee for `(shardId, epoch)`, (b) verifiable
+  *      by their registered long-term Ed25519 VK, (c) verifiable by their KES product VK at the embedded tree-internal step, and (d) prove
+  *      possession of their registered VRF key over the canonical `(shardEta, slot)` message. Failure on ANY check ⇒ rejection.
   *
   *   1. '''Execution''' (always): recreate every included CL1 window and compare every claimed root. Missing inputs or claims fail closed.
   *
-  *   1. '''Selection finality''' (`evaluate` only): after successful execution, require `tCountShard` or `tDepth1Shard`; otherwise return
-  *      `PendingMoreAttestations`. `verifyEmbedded` skips node-local triggers but never skips execution.
+  *   1. '''Execution certificate''' (always): require at least `kQuorum` distinct, valid execution-committee signatures. Shard-chain depth
+  *      is never a substitute for independently reproduced execution.
   *
   * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`):
   *   - Fresh manager for the shard-checkpoint admission path. No compat ceremony with [[GlobalSnapshotStateChannelAcceptanceManager]] —
   *     Slice 13 rewires GSAM to consume this; this slice creates the manager standalone.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`):
-  *   - This manager has no tunable threshold. Committee construction and selection finality are injected by their owning components.
+  *   - The execution quorum is injected from the validated committee configuration. There are no environment reads in this component.
   *
   * '''Decoupling rule''':
-  *   - All shard-scope lookups are injected as callbacks (`finalityTriggers`, `committeeMembership`, `reExecuteDerivation`). Tests can stub
-  *     each path independently; production wires the live per-shard maps. The trait stays agnostic to where the per-shard state lives.
+  *   - All shard-scope lookups are injected as callbacks (`committeeMembership`, `reExecuteDerivation`). Tests can stub each path
+  *     independently; production wiring owns the per-shard state.
   */
 trait ShardCheckpointGl0AcceptanceManager[F[_]] {
 
   /** gl0 leader runs this for each candidate [[ShardCheckpoint]] under consideration for inclusion in the next gl0 snapshot.
     *
-    * '''Node-local — selection / finality-monitor path only.''' [[evaluate]] consults the node-local [[ShardFinalityTriggers]] (read of
-    * `tCountShard` / `tDepth1Shard` `latestQualifyingOrdinal`). Those are advanced by the shard chain's tick loop at wall-clock-dependent
-    * speed, so two honest nodes can return DIFFERENT results for the same checkpoint at the same instant. That is acceptable for the gl0
-    * leader's PRODUCE-side selection (which checkpoints to even consider this ord — a liveness/selection decision, gossip-timing-tolerant
-    * by §7.2 loose coupling) but is NOT safe for the consensus-critical ADOPT decision. The adopt path uses [[verifyEmbedded]] instead.
+    * Intake calls this before storing and attesting a candidate. Every carried signature and the deterministic transition are validated
+    * first. A replay-valid candidate below quorum returns [[ShardCheckpointAcceptResult.PendingMoreAttestations]] so independently
+    * replaying committee members can add signatures; it is not yet eligible for embedding.
     *
     * Returns one of the [[ShardCheckpointAcceptResult]] variants; the caller branches on the variant for inclusion / deferral / rejection
     * (+ optional slashing evidence emission).
     */
   def evaluate(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult]
 
-  /** Consensus-critical verifier. It checks every signer and then globally recreates every included CL1 transition. Signature count and
-    * local finality triggers are not validity inputs.
+  /** Run intake validation exactly once and return an attestation capability only when framework replay succeeds. Implementations outside
+    * [[ShardCheckpointGl0AcceptanceManager.make]] cannot construct the sealed capability, even if their ordinary [[evaluate]] method claims
+    * `Accepted`.
+    */
+  def evaluateForSigning(
+    checkpoint: ShardCheckpoint
+  ): F[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]]
+
+  /** Consensus-critical verifier. It checks retained producer duty against the exact parent checkpoint, checks every signer, requires the
+    * distinct execution quorum, and recreates every included CL1 transition. Missing retained parent data fails closed.
     */
   def verifyEmbedded(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult]
+
+  /** Verify that the checkpoint carries a complete execution certificate before any signer can become a slash target. This runs the exact
+    * epoch, structure, committee-membership, Ed25519, registered KES, registered VRF, distinct-signer, and execution-quorum checks used by
+    * [[verifyEmbedded]], but deliberately does not replay the claimed state transition or consult receiver-local producer-duty history.
+    * Producer scheduling is enforced on ordinary intake/adoption; it is not relevant to whether each authenticated execution signer vouched
+    * for a wrong root, and a pruned local shard parent must not change a slashing verdict. Fraud-proof adjudication invokes this first,
+    * then performs its own pinned-base replay to decide whether the authenticated signers actually deviated.
+    */
+  def verifyExecutionCertificate(checkpoint: ShardCheckpoint): F[Either[String, Unit]]
 
   /** Validate one after-the-fact committee attestation against a locally known checkpoint. This is the admission gate used before inserting
     * a gossiped signature into [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardTipTracker]]: committee membership,
@@ -147,49 +192,65 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     */
   def watchtowerReExec(checkpoint: ShardCheckpoint): F[List[WatchtowerMismatch]]
 
-  /** Record that a checkpoint at `shardOrdinal` for `shardId` completed the global accept path after every newly selected metagraph suffix
-    * was independently replayed and matched its claimed root. Max-monotone — replays of earlier ordinals (proposal/validation/reorg
-    * re-runs) never move the watermark backwards. Node-local observability; never read by any consensus-deterministic decision (the
-    * producer consumes it as a PRODUCTION POLICY gate — bounded pipeline depth).
+  /** Record that the exact checkpoint at `shardOrdinal` for `shardId` was carried by a canonical GL0 snapshot that reached Phase 2.
+    * Tentative proposal/acceptance must never call this method. Max-monotone by shard ordinal; the future hash-bound Phase-2 reorg
+    * coordinator owns replacement/rollback semantics. The producer consumes the atomic ordinal/hash pair only as a fail-closed production
+    * policy gate.
     */
   def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): F[Unit]
 
-  /** Highest shard ordinal adopted into a global snapshot for `shardId` on this node (None before the first adoption). */
+  /** Highest Phase-2-anchored shard ordinal for `shardId` on this node (None before the first anchor). */
   def lastAdoptedOrd(shardId: ShardId): F[Option[ShardOrdinal]]
 
-  /** Anchor-compatibility (task #42): canonical hash of the most recently adopted checkpoint for `shardId` — the fork-choice anchor the
-    * daemon feeds into [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore.noteAnchor]].
+  /** Anchor-compatibility (task #42): canonical hash of the most recently Phase-2-anchored checkpoint for `shardId` — the fork-choice
+    * anchor the daemon feeds into [[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore.noteAnchor]].
     */
   def lastAdoptedAnchor(shardId: ShardId): F[Option[Hash]]
+
+  /** Atomic checkpoint reference for the latest exact shard checkpoint whose containing GL0 snapshot reached Phase 2. Producer policy must
+    * use this pair rather than separately sampled ordinal/hash reads.
+    */
+  def lastAdoptedCheckpoint(shardId: ShardId): F[Option[(ShardOrdinal, Hash)]]
 }
 
 object ShardCheckpointGl0AcceptanceManager {
 
+  /** The only signing-capability implementation. Both the class and constructor are private to this companion; its sole allocation site is
+    * the replay-backed concrete manager built by [[make]].
+    */
+  private final case class VerifiedImpl(checkpoint: ShardCheckpoint, signingPreimageHash: Hash) extends VerifiedShardCheckpoint
+
   /** Construct a manager. All shard-scope dependencies are callbacks so the trait stays free of the concrete per-shard registries (those
     * live in the GSAM wiring slice).
     *
-    * @param finalityTriggers
-    *   `shardId => F[Option[ShardFinalityTriggers[F]]]`. Returns `None` when the shard isn't tracked locally (e.g., we're the gl0 leader
-    *   but never started a `ShardChainStore` for this shard, or the chain hasn't bootstrapped). `None` ⇒ reject.
+    * @param executionQuorum
+    *   minimum number of distinct execution-committee signers carried by an adoptable checkpoint. This is checked directly against the
+    *   checkpoint bytes on both producer and follower paths; node-local attestation-tracker depth or state cannot replace it.
+    * @param etaRotationSnapshots
+    *   positive execution-committee period length `R`. The manager derives `checkpoint.epoch` from the signed `gl0AnchorOrdinal` with the
+    *   same pure function used by the producer and rejects a mismatch before committee lookup or replay. This only rejects inconsistent
+    *   pairs: a producer can still choose an older ordinal and its matching favorable epoch because this manager receives neither the exact
+    *   proposal-parent Phase-2 hash nor a freshness constraint. Production's local parameter source also remains consensus-unsafe until
+    *   network/genesis/era bound.
     * @param committeeMembership
     *   `(shardId, epoch) => F[Set[PeerId]]`. The committee draw for this `(shard, epoch)`. Used in the pre-check to confirm each signer is
     *   actually a committee member at the claimed epoch. Empty set ⇒ any signer fails the membership pre-check ⇒ reject.
-    * @param kesRegistry
-    *   registered KES master VKs. Used in the pre-check to verify each committee signer's KES product sig at the embedded tree-internal
-    *   step (`CommitteeMemberSignature.kesTreeStep`). Missing registry entries fail closed.
-    * @param vrfRegistry
-    *   registered per-operator VRF verification keys (the SAME genesis/seedlist-loaded registry `ShardCheckpointWiring.committeeFor` draws
-    *   the committee from). Each `CommitteeMemberSignature.vrfProof` must verify possession of the signer's registered VRF key over the
-    *   canonical `(shardEta(shardId, epoch), checkpoint.slot)` message — the SAME message the producer's
-    *   `ShardCheckpointAttestationEmitter` / `ShardSlotLeader.membershipProof` signed (`vrfProofForSlot`). A missing VK fails closed. The
-    *   registry MUST be byte-identical cluster-wide on every path that runs `verifyEmbedded` (produce + validateArtifact + follower
-    *   createContext) or key-possession verify diverges and the cluster splits (#261).
+    * @param operatorKeyRegistry
+    *   atomic preregistered KES+VRF identities. Every signer is resolved once and the same record supplies both the KES master key and VRF
+    *   verification key; sender-carried keys and KES steps are evidence, never authority. This current-view parameter is restricted to the
+    *   committed period-zero genesis pair. Runtime records fail closed until checkpoints bind an exact Phase-2 GL0 anchor hash and this
+    *   boundary can resolve them through [[HistoricalOperatorConsensusKeyRegistry]]; a receiver-current runtime view is never sufficient.
     * @param shardEtaFor
     *   `(shardId, epoch) => F[Option[Array[Byte]]]` — resolves the 32-byte per-shard possession-proof eta
     *   (`ShardSlotLeader.computeShardEta`) for the GIVEN eta-period, keyed on the WIRE-CARRIED `checkpoint.epoch`. The SAME resolver the
     *   producer's emitter (`shardEtaFor` at the `ShardCheckpointAttestationEmitter.make` call site) uses, so producer + verifier derive
     *   byte-identical eta bytes across an eta boundary. `None` fails closed; unverifiable signatures never count. MPT-committed eta ⇒
     *   byte-identical cluster-wide.
+    * @param producerDutyValidator
+    *   validates the retained head signature against the shuffled-staircase owner derived from the exact parent checkpoint, committee, eta,
+    *   ordinal, and signed slot. It runs before replay capability creation, storage, countersigning, or embedded adoption. Production
+    *   currently resolves the parent from a receiver-local shard store; missing data rejects, but that local dependency leaves
+    *   `SHARD-C-009` RED until proposal-parent-bound portable evidence replaces it.
     * @param reExecuteDerivation
     *   `(metagraphAddress, includedChain, gl0AnchorOrdinal) => F[Hash]`. Called for every checkpoint. Production wiring passes the closure
     *   that re-runs `ShardCheckpointWiring.reExecDerivationAtPinnedBase` (the same derivation the producer uses, seeded from this node's
@@ -198,16 +259,19 @@ object ShardCheckpointGl0AcceptanceManager {
     *   root). GSAM independently reruns the transition and never adopts committee-provided economic state.
     */
   def make[F[_]: Async: Hasher: SecurityProvider: Metrics](
-    finalityTriggers: ShardId => F[Option[ShardFinalityTriggers[F]]],
+    executionQuorum: Int,
+    etaRotationSnapshots: Long,
     committeeMembership: (ShardId, EtaPeriod) => F[Set[PeerId]],
-    kesRegistry: KesRegistry[F],
-    vrfRegistry: VrfRegistry[F],
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
     shardAssignment: ShardAssignment[F],
     shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
+    producerDutyValidator: ShardCheckpointProducerDutyValidator[F],
     // The 4th arg is the checkpoint's `executionBaseOrdinal`, so mandatory replay seeds S(N) at the same pinned
     // base the producer executed over (call sites pass `checkpoint.executionBaseOrdinal`).
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash]
   ): F[ShardCheckpointGl0AcceptanceManager[F]] = {
+
+    require(etaRotationSnapshots > 0L, s"etaRotationSnapshots must be positive, got $etaRotationSnapshots")
 
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointGl0AcceptanceManager")
 
@@ -226,90 +290,99 @@ object ShardCheckpointGl0AcceptanceManager {
         def lastAdoptedAnchor(shardId: ShardId): F[Option[Hash]] =
           lastAdoptedR.get.map(_.get(shardId).map(_._2))
 
+        def lastAdoptedCheckpoint(shardId: ShardId): F[Option[(ShardOrdinal, Hash)]] =
+          lastAdoptedR.get.map(_.get(shardId).map { case (o, hash) => (ShardOrdinal(o), hash) })
+
         def verifyCommitteeSignature(
           checkpoint: ShardCheckpoint,
           signature: CommitteeMemberSignature
         ): F[Either[String, Unit]] =
-          preCheck(checkpoint, Some(List(signature)))
+          preCheck(checkpoint, Some(List(signature)), validateProducerDuty = false)
+
+        private def evaluateIntake(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
+          verifyForIntake(checkpoint).flatTap {
+            case ShardCheckpointAcceptResult.Accepted =>
+              ShardMetrics.incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.ExecutionQuorum)
+            case _ => Async[F].unit
+          }
 
         def evaluate(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
-          // Step 1: pre-checks. Run on every signer; fail-fast at the first signer that doesn't pass all four predicates.
-          // The pre-check covers committee membership, Ed25519, KES, and VRF for each `CommitteeMemberSignature`. If any check
-          // fails for any signer, the entire checkpoint is rejected (signers must be honest committee members; one bad signer
-          // is enough to taint the envelope from gl0's perspective).
-          preCheck(checkpoint).flatMap {
-            case Left(reason) =>
-              logger
-                .warn(s"reject pre-check: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} reason=$reason") >>
-                // Slice 19: emit `dag_nakamoto_shard_checkpoint_rejected_total{shard_id, reason}`. Bucket the free-form diagnostic
-                // through `RejectReason.fromDiagnostic` to keep Prometheus cardinality bounded — see the helper's scaladoc.
-                ShardMetrics
-                  .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.fromDiagnostic(reason))
-                  .as(ShardCheckpointAcceptResult.Rejected(reason): ShardCheckpointAcceptResult)
-            case Right(()) =>
-              // Step 2: resolve the per-shard finality triggers. None ⇒ unknown shard ⇒ reject (we can't tell if T_count or T_depth1
-              // qualifies because we don't track this shard).
-              finalityTriggers(checkpoint.shardId).flatMap {
-                case None =>
-                  val msg = s"unknown shard: shardId=${checkpoint.shardId} not in finalityTriggers map"
-                  logger.warn(msg) >>
-                    ShardMetrics
-                      .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.UnknownShard)
-                      .as(ShardCheckpointAcceptResult.Rejected(msg): ShardCheckpointAcceptResult)
-                case Some(triggers) =>
-                  // Step 3: read the latest qualifying ord from each inner trigger. The triggers are advanced asynchronously by the
-                  // shard chain's tick loop; we read here, not advance — same pattern as the gl0 finality monitor (`evaluate` is read-only).
-                  for {
-                    countOrdSnap <- triggers.tCountShard.latestQualifyingOrdinal
-                    depthOrdSnap <- triggers.tDepth1Shard.latestQualifyingOrdinal
-                    // Bridge the inner trigger's `SnapshotOrdinal` to the checkpoint's `ShardOrdinal` via direct value comparison.
-                    // The inner triggers clamp negatives to `SnapshotOrdinal.MinValue` (per ShardFinalityTriggers scaladoc) so the
-                    // raw .value.value Long is a safe direct counterpart to `checkpoint.shardOrdinal.value`. Avoiding the package-private
-                    // converters keeps this manager free of cross-package coupling beyond the public trait surface.
-                    checkpointOrd = checkpoint.shardOrdinal
-                    countQualifies = countOrdSnap.value.value >= checkpointOrd.value
-                    depthQualifies = depthOrdSnap.value.value >= checkpointOrd.value
-                    executionResult <- reExecPath(checkpoint)
-                    result <-
-                      executionResult match {
-                        case ShardCheckpointAcceptResult.Accepted if countQualifies =>
-                          logger
-                            .info(
-                              s"accept T_count_shard after re-exec: shardId=${checkpoint.shardId} shardOrd=${checkpointOrd.value} " +
-                                s"countQualifying=${countOrdSnap.value.value}"
-                            ) >>
-                            ShardMetrics
-                              .incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TCount)
-                              .as(ShardCheckpointAcceptResult.Accepted: ShardCheckpointAcceptResult)
-                        case ShardCheckpointAcceptResult.Accepted if depthQualifies =>
-                          ShardMetrics.incCommitteePartition[F](checkpoint.shardId) >>
-                            ShardMetrics.incCheckpointAccepted[F](checkpoint.shardId, ShardMetrics.Path.TDepth1) >>
-                            ShardCheckpointAcceptResult.Accepted.pure[F]
-                        case ShardCheckpointAcceptResult.Accepted =>
-                          // The checkpoint is safe to attest, but not yet finality-qualified for adoption.
-                          ShardCheckpointAcceptResult.PendingMoreAttestations.pure[F]
-                        case rejected => rejected.pure[F]
-                      }
-                  } yield result
-              }
+          evaluateIntake(checkpoint)
+
+        def evaluateForSigning(
+          checkpoint: ShardCheckpoint
+        ): F[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]] =
+          evaluateIntake(checkpoint).flatMap {
+            case ShardCheckpointAcceptResult.Accepted | ShardCheckpointAcceptResult.PendingMoreAttestations =>
+              Hasher[F].hash(checkpoint.signingPreimage).map(hash => Right(VerifiedImpl(checkpoint, hash)))
+            case ShardCheckpointAcceptResult.Rejected(reason) =>
+              Async[F].pure(Left(VerifiedShardCheckpointFailure.Rejected(reason)))
+            case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
+              Async[F].pure(Left(VerifiedShardCheckpointFailure.ReExecutionMismatch(reason, slashSigners)))
           }
 
         def verifyEmbedded(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
-          // Step 1: pre-checks — IDENTICAL to `evaluate` (committee membership + Ed25519 + KES + VRF-structural per signer). Fully
-          // deterministic: the only inputs are the checkpoint bytes + the deterministic `committeeMembership(shardId, epoch)` draw.
-          preCheck(checkpoint).flatMap {
-            case Left(reason) =>
-              logger.warn(
-                s"verifyEmbedded reject pre-check: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} reason=$reason"
-              ) >>
-                ShardMetrics
-                  .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.fromDiagnostic(reason))
-                  .as(ShardCheckpointAcceptResult.Rejected(reason): ShardCheckpointAcceptResult)
-            case Right(()) =>
-              // A signature count proves only who vouched for the bytes. It never proves the economic transition, including when a
-              // Byzantine quorum colludes. Every GL0 adopter therefore recreates every included currency snapshot synchronously.
+          verifyForAdoption(checkpoint, "verifyEmbedded")
+
+        def verifyExecutionCertificate(checkpoint: ShardCheckpoint): F[Either[String, Unit]] =
+          preCheck(checkpoint, signaturesOverride = None, validateProducerDuty = false).map {
+            _.flatMap { _ =>
+              val distinctSigners = distinctSignerCount(checkpoint)
+              Either.cond(
+                distinctSigners >= executionQuorum,
+                (),
+                s"execution quorum missing: distinctSigners=$distinctSigners required=$executionQuorum"
+              )
+            }
+          }
+
+        private def verifyForIntake(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] =
+          preCheck(checkpoint, signaturesOverride = None, validateProducerDuty = true).flatMap {
+            case Left(reason) => rejectPreCheck(checkpoint, "evaluate", reason)
+            case Right(())    =>
+              // Intake must replay before it can admit the candidate for storage or emit a state-validity signature. A matching result may
+              // remain pending while other independently replaying committee members add signatures.
+              reExecPath(checkpoint).map {
+                case ShardCheckpointAcceptResult.Accepted if distinctSignerCount(checkpoint) < executionQuorum =>
+                  ShardCheckpointAcceptResult.PendingMoreAttestations: ShardCheckpointAcceptResult
+                case result => result
+              }
+          }
+
+        private def verifyForAdoption(
+          checkpoint: ShardCheckpoint,
+          path: String
+        ): F[ShardCheckpointAcceptResult] =
+          preCheck(checkpoint, signaturesOverride = None, validateProducerDuty = true).map {
+            _.flatMap { _ =>
+              val distinctSigners = distinctSignerCount(checkpoint)
+              Either.cond(
+                distinctSigners >= executionQuorum,
+                (),
+                s"execution quorum missing: distinctSigners=$distinctSigners required=$executionQuorum"
+              )
+            }
+          }.flatMap {
+            case Left(reason) => rejectPreCheck(checkpoint, path, reason)
+            case Right(())    =>
+              // Every carried signature and the execution quorum were checked above. The certificate is mandatory but not sufficient:
+              // replay/root validation still decides whether the economic transition is acceptable.
               reExecPath(checkpoint)
           }
+
+        private def distinctSignerCount(checkpoint: ShardCheckpoint): Int =
+          checkpoint.committeeSignatures.toList.iterator.map(_.peerId).toSet.size
+
+        private def rejectPreCheck(
+          checkpoint: ShardCheckpoint,
+          path: String,
+          reason: String
+        ): F[ShardCheckpointAcceptResult] =
+          logger
+            .warn(s"$path reject pre-check: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} reason=$reason") >>
+            ShardMetrics
+              .incCheckpointRejected[F](checkpoint.shardId, ShardMetrics.RejectReason.fromDiagnostic(reason))
+              .as(ShardCheckpointAcceptResult.Rejected(reason): ShardCheckpointAcceptResult)
 
         def watchtowerReExec(checkpoint: ShardCheckpoint): F[List[WatchtowerMismatch]] = {
           val included = checkpoint.derivedStateDelta.includedSnapshots
@@ -343,11 +416,18 @@ object ShardCheckpointGl0AcceptanceManager {
             }
         }
 
-        /** Pre-check pipeline: for each `CommitteeMemberSignature` in `checkpoint.committeeSignatures`, run four predicates in order
-          * (cheapest first):
+        /** Pre-check pipeline. Epoch, certificate-shape, and producer-duty checks run before any signer signature verification:
+          *   1. derive the expected execution epoch from the signed `gl0AnchorOrdinal` and reject a wire mismatch before committee lookup
+          *   1. reject duplicate committee peer IDs
+          *   1. resolve the deterministic committee and reject a signature list larger than that committee
+          *   1. for intake and embedded validation, resolve the exact parent and require the retained head signer to own the corresponding
+          *      shuffled-staircase duty; unavailable or inconsistent parent context fails closed
+          *
+          * Then, for each `CommitteeMemberSignature`, run four predicates in order (cheapest first):
           *   1. signer's peerId is in `committeeMembership(checkpoint.shardId, checkpoint.epoch)`
           *   1. Ed25519 sig verifies under the signer's long-term VK
-          *   1. KES product sig verifies under the registered master VK at the embedded tree-internal step; missing registry entry rejects
+          *   1. KES product sig verifies under the registered master VK at the tree-internal step derived from `checkpoint.epoch -
+          *      registeredOffset`; the wire step must equal that value and cannot select it
           *   1. VRF proof verifies under the signer's registered VRF VK over the canonical `(shardEta(shardId, epoch), checkpoint.slot)`
           *      message — REAL `EcVrf25519` verify; missing registry entry or eta rejects
           *
@@ -357,114 +437,178 @@ object ShardCheckpointGl0AcceptanceManager {
           */
         private def preCheck(
           checkpoint: ShardCheckpoint,
-          signaturesOverride: Option[List[CommitteeMemberSignature]] = None
+          signaturesOverride: Option[List[CommitteeMemberSignature]],
+          validateProducerDuty: Boolean
         ): F[Either[String, Unit]] = {
-          val expectedCommitteeF: F[Set[PeerId]] =
-            committeeMembership(checkpoint.shardId, checkpoint.epoch)
+          val signatures = signaturesOverride.getOrElse(checkpoint.committeeSignatures.toList)
+          val distinctSignerCount = signatures.iterator.map(_.peerId).toSet.size
+          val expectedEpoch = EtaCalculation.executionShardEpoch(checkpoint.gl0AnchorOrdinal, etaRotationSnapshots)
 
-          val assignedShardsF = checkpoint.derivedStateDelta.includedSnapshots.keys.toList.traverse { mg =>
-            shardAssignment.shardIdFor(mg).map(mg -> _)
-          }
+          if (checkpoint.epoch =!= expectedEpoch)
+            Async[F].pure(
+              Left(
+                s"checkpoint epoch mismatch: wire=${checkpoint.epoch.value} expected=${expectedEpoch.value} " +
+                  s"for gl0AnchorOrdinal=${checkpoint.gl0AnchorOrdinal.value.value} etaRotationSnapshots=$etaRotationSnapshots"
+              ): Either[String, Unit]
+            )
+          else if (distinctSignerCount =!= signatures.size)
+            Async[F].pure(
+              Left(
+                s"duplicate committee peer IDs: signatures=${signatures.size} distinctPeerIds=$distinctSignerCount"
+              ): Either[String, Unit]
+            )
+          else
+            committeeMembership(checkpoint.shardId, checkpoint.epoch).flatMap { expectedCommittee =>
+              if (signatures.size > expectedCommittee.size)
+                Async[F].pure(
+                  Left(
+                    s"signature-list cardinality=${signatures.size} exceeds deterministic committee size=${expectedCommittee.size}; " +
+                      "at least one signer not in committee"
+                  ): Either[String, Unit]
+                )
+              else {
+                val assignedShardsF = checkpoint.derivedStateDelta.includedSnapshots.keys.toList.traverse { mg =>
+                  shardAssignment.shardIdFor(mg).map(mg -> _)
+                }
 
-          // Hash the canonical signing pre-image once — every signer signed over these same bytes (per design doc §3.3).
-          val preimageHashF: F[Hash] = Hasher[F].hash(checkpoint.signingPreimage)
+                // Hash the canonical signing pre-image once — every signer signed over these same bytes (per design doc §3.3).
+                val preimageHashF: F[Hash] = Hasher[F].hash(checkpoint.signingPreimage)
 
-          (expectedCommitteeF, preimageHashF, assignedShardsF).tupled.flatMap {
-            case (expectedCommittee, preimageHash, assignedShards) =>
-              val msgBytes = preimageHash.getBytes
-              val includedKeys = checkpoint.derivedStateDelta.includedSnapshots.keySet
-              val rootKeys = checkpoint.derivedStateDelta.perMetagraphMptRoots.keySet
-              val wrongShard = assignedShards.collect { case (mg, assigned) if assigned =!= checkpoint.shardId => mg -> assigned }
-              val structuralFailure =
-                if (includedKeys =!= rootKeys)
-                  Some(s"included/root metagraph key mismatch: included=${includedKeys.size} roots=${rootKeys.size}")
-                else if (wrongShard.nonEmpty)
-                  Some(
-                    s"metagraph assigned to wrong shard: ${wrongShard.map { case (mg, assigned) => s"$mg->$assigned" }.mkString(",")} " +
-                      s"checkpointShard=${checkpoint.shardId}"
-                  )
-                else None
-              // foldM short-circuits on Left — the first failing signer wins. `.zipWithIndex` exposes a stable signer ordinal for
-              // diagnostic messages without revealing peer-identity details to the log line itself.
-              signaturesOverride
-                .getOrElse(checkpoint.committeeSignatures.toList)
-                .zipWithIndex
-                .foldM[F, Either[String, Unit]](
-                  structuralFailure.toLeft(())
-                ) {
-                  case (Right(()), (sig, idx)) =>
-                    for {
-                      // (1) committee membership — cheap set lookup.
-                      membershipOk <- Async[F].pure(expectedCommittee.contains(sig.peerId))
-                      result <-
-                        if (!membershipOk)
-                          Async[F].pure(
-                            Left(
-                              s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... not in committee for epoch=${checkpoint.epoch.value}"
-                            ): Either[String, Unit]
-                          )
-                        else
-                          for {
-                            // (2) Ed25519 over `preimageHash` bytes. Mirrors `MetagraphCommitteeGate.recordReceivedAttestation`:
-                            // `messageBytes ← Hasher[F].hash(...).map(_.getBytes)`, then `Signing.verifySignature` against the
-                            // peer's long-term VK (recovered from the PeerId).
-                            edOk <- verifyEd25519(msgBytes, sig.ed25519Sig.toBytes, sig.peerId)
-                            step2 <-
-                              if (!edOk)
-                                Async[F].pure(
-                                  Left(s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... Ed25519 sig verify failed"): Either[
-                                    String,
-                                    Unit
-                                  ]
-                                )
-                              else
-                                // (3) KES product sig. The KES verification is non-interactive — we use the embedded
-                                // `sig.kesTreeStep` for the tree-internal step rather than rederiving it from the epoch (the design
-                                // doc §3.1 specifically calls out this is wire-carried — see also #211 wire-step landing).
-                                verifyKes(msgBytes, sig.kesProductSig.toBytes, sig.peerId, sig.kesTreeStep).flatMap { kesOk =>
-                                  if (!kesOk)
+                val producerDutyF =
+                  if (validateProducerDuty) producerDutyValidator.validate(checkpoint, expectedCommittee)
+                  else Async[F].pure(Right(()): Either[String, Unit])
+
+                producerDutyF.flatMap {
+                  case left @ Left(_) => Async[F].pure(left)
+                  case Right(()) =>
+                    (preimageHashF, assignedShardsF).tupled.flatMap {
+                      case (preimageHash, assignedShards) =>
+                        val msgBytes = preimageHash.getBytes
+                        val includedKeys = checkpoint.derivedStateDelta.includedSnapshots.keySet
+                        val rootKeys = checkpoint.derivedStateDelta.perMetagraphMptRoots.keySet
+                        val wrongShard = assignedShards.collect { case (mg, assigned) if assigned =!= checkpoint.shardId => mg -> assigned }
+                        val structuralFailure =
+                          if (includedKeys =!= rootKeys)
+                            Some(s"included/root metagraph key mismatch: included=${includedKeys.size} roots=${rootKeys.size}")
+                          else if (wrongShard.nonEmpty)
+                            Some(
+                              s"metagraph assigned to wrong shard: ${wrongShard.map { case (mg, assigned) => s"$mg->$assigned" }.mkString(",")} " +
+                                s"checkpointShard=${checkpoint.shardId}"
+                            )
+                          else None
+                        // foldM short-circuits on Left — the first failing signer wins. `.zipWithIndex` exposes a stable signer ordinal for
+                        // diagnostic messages without revealing peer-identity details to the log line itself.
+                        signatures.zipWithIndex
+                          .foldM[F, Either[String, Unit]](
+                            structuralFailure.toLeft(())
+                          ) {
+                            case (Right(()), (sig, idx)) =>
+                              for {
+                                // (1) committee membership — cheap set lookup.
+                                membershipOk <- Async[F].pure(expectedCommittee.contains(sig.peerId))
+                                result <-
+                                  if (!membershipOk)
                                     Async[F].pure(
-                                      Left(s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... KES sig verify failed"): Either[
-                                        String,
-                                        Unit
-                                      ]
+                                      Left(
+                                        s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... not in committee for epoch=${checkpoint.epoch.value}"
+                                      ): Either[String, Unit]
                                     )
                                   else
-                                    // (4) VRF — confirms the signer holds the VRF SK matching its REGISTERED VRF VK, by verifying the
-                                    // wire-carried `vrfProof` (a real EcVrf25519 proof the producer computed via
-                                    // `ShardSlotLeader.membershipProof` / `EligibilityChecker.vrfProofForSlot`) under the signer's
-                                    // `vrfRegistry` VK over the canonical `(shardEta(shardId, epoch), checkpoint.slot)` message. This
-                                    // cryptographically BINDS the signature to the committee member (a forged/replayed/wrong-epoch proof
-                                    // fails). Layered on top of: (a) the set-membership pre-check (peerId ∈ the VRF-VK-sortitioned
-                                    // committee for this `(shard, epoch)`), (b) Ed25519 over the checkpoint hash, (c) KES forward security.
-                                    // We do not re-assert a secret draw threshold here: public committee SET membership is predicate (a),
-                                    // while this proof binds the attestation to the signer's registered VRF key. Missing inputs fail closed.
-                                    verifyVrf(
-                                      checkpoint.shardId,
-                                      checkpoint.epoch,
-                                      checkpoint.slot,
-                                      sig.peerId,
-                                      sig.vrfProof.toBytes
-                                    ).map { vrfOk =>
-                                      if (!vrfOk)
-                                        Left(
-                                          s"signer[$idx] peerId=${sig.peerId.value.value
-                                              .take(16)}... committee-VRF proof verify failed for shardId=${checkpoint.shardId} epoch=${checkpoint.epoch.value} slot=${checkpoint.slot.value.value}"
-                                        ): Either[String, Unit]
-                                      else
-                                        Right(()): Either[String, Unit]
-                                    }
-                                }
-                          } yield step2
-                    } yield result
-                  case (left @ Left(_), _) => Async[F].pure(left) // already failed earlier signer; propagate
+                                    for {
+                                      // (2) Ed25519 over `preimageHash` bytes. Mirrors `MetagraphCommitteeGate.recordReceivedAttestation`:
+                                      // `messageBytes ← Hasher[F].hash(...).map(_.getBytes)`, then `Signing.verifySignature` against the
+                                      // peer's long-term VK (recovered from the PeerId).
+                                      edOk <- verifyEd25519(msgBytes, sig.ed25519Sig.toBytes, sig.peerId)
+                                      step2 <-
+                                        if (!edOk)
+                                          Async[F].pure(
+                                            Left(
+                                              s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... Ed25519 sig verify failed"
+                                            ): Either[
+                                              String,
+                                              Unit
+                                            ]
+                                          )
+                                        else
+                                          operatorKeyRegistry.get(sig.peerId).flatMap {
+                                            case None =>
+                                              Async[F].pure(
+                                                Left(
+                                                  s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... has no preregistered KES+VRF identity"
+                                                ): Either[String, Unit]
+                                              )
+                                            case Some(keys) if keys.registration.nonEmpty =>
+                                              Async[F].pure(
+                                                Left(
+                                                  s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... runtime KES+VRF identity requires exact-parent historical resolution"
+                                                ): Either[String, Unit]
+                                              )
+                                            case Some(keys) if !validOperatorPair(sig.peerId, keys) =>
+                                              Async[F].pure(
+                                                Left(
+                                                  s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... has a malformed KES+VRF registration"
+                                                ): Either[String, Unit]
+                                              )
+                                            case Some(keys) if keys.effectiveFromPeriod.value > checkpoint.epoch.value =>
+                                              Async[F].pure(
+                                                Left(
+                                                  s"signer[$idx] peerId=${sig.peerId.value.value
+                                                      .take(16)}... KES+VRF identity is not active at epoch=${checkpoint.epoch.value}"
+                                                ): Either[String, Unit]
+                                              )
+                                            case Some(keys) =>
+                                              // (3) KES product sig. This exact active paired registration chooses the master key and
+                                              // offset. The checkpoint epoch chooses the tree-relative step; the carried step is evidence
+                                              // that must match that derivation and is never authority.
+                                              verifyKes(
+                                                msgBytes,
+                                                sig.kesProductSig.toBytes,
+                                                keys,
+                                                checkpoint.epoch,
+                                                sig.kesTreeStep
+                                              ).flatMap { kesOk =>
+                                                if (!kesOk)
+                                                  Async[F].pure(
+                                                    Left(
+                                                      s"signer[$idx] peerId=${sig.peerId.value.value.take(16)}... KES sig verify failed"
+                                                    ): Either[
+                                                      String,
+                                                      Unit
+                                                    ]
+                                                  )
+                                                else
+                                                  // (4) VRF proves possession of the VRF secret paired with the SAME registration used
+                                                  // for KES. Committee membership remains the separate public sortition predicate.
+                                                  verifyVrf(
+                                                    checkpoint.shardId,
+                                                    checkpoint.epoch,
+                                                    checkpoint.slot,
+                                                    keys,
+                                                    sig.vrfProof.toBytes
+                                                  ).map { vrfOk =>
+                                                    if (!vrfOk)
+                                                      Left(
+                                                        s"signer[$idx] peerId=${sig.peerId.value.value
+                                                            .take(16)}... committee-VRF proof verify failed for shardId=${checkpoint.shardId} epoch=${checkpoint.epoch.value} slot=${checkpoint.slot.value.value}"
+                                                      ): Either[String, Unit]
+                                                    else
+                                                      Right(()): Either[String, Unit]
+                                                  }
+                                              }
+                                          }
+                                    } yield step2
+                              } yield result
+                            case (left @ Left(_), _) => Async[F].pure(left) // already failed earlier signer; propagate
+                          }
+                    }
                 }
-          }
+              }
+            }
         }
 
         /** Re-exec path. For each MG in `checkpoint.includedSnapshots`, run `reExecuteDerivation` against the full binary chain and compare
           * the recomputed hash against the committee-signed `perMetagraphMptRoots(mg)`. Empty checkpoints are rejected because they carry
-          * no economic transition to replay and must not advance shard fork choice or finality.
+          * no economic transition to replay and must not advance the shard checkpoint lineage.
           *
           * All-match ⇒ `Accepted`. Any AFFIRMATIVE mismatch (a real re-derived root ≠ the claimed root) ⇒ `RejectedReExecutionMismatch`
           * with the entire signer list as the slash target (§10.2 — every signer attested to the same wrong-derivation result; all of them
@@ -539,7 +683,7 @@ object ShardCheckpointGl0AcceptanceManager {
                 val mismatchedMgs = mismatches.map(_._1).map(_.value.value).mkString(", ")
                 logger
                   .warn(
-                    s"reject T_depth1_shard re-exec mismatch: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
+                    s"reject checkpoint re-exec mismatch: shardId=${checkpoint.shardId} shardOrd=${checkpoint.shardOrdinal.value} " +
                       s"mismatchedMgs=[$mismatchedMgs] firstReason=$firstReason slashSigners=${signers.map(_.value.value.take(16) + "...").mkString(",")}"
                   ) >>
                   ShardMetrics
@@ -553,7 +697,7 @@ object ShardCheckpointGl0AcceptanceManager {
                 val uncheckableMgs = uncheckable.map(_._1).map(_.value.value).mkString(", ")
                 logger
                   .warn(
-                    s"reject T_depth1_shard re-exec CANNOT-RE-DERIVE (fail-closed, no slash): shardId=${checkpoint.shardId} " +
+                    s"reject checkpoint re-exec CANNOT-RE-DERIVE (fail-closed, no slash): shardId=${checkpoint.shardId} " +
                       s"shardOrd=${checkpoint.shardOrdinal.value} uncheckableMgs=[$uncheckableMgs] firstReason=$firstReason"
                   ) >>
                   ShardMetrics
@@ -582,10 +726,23 @@ object ShardCheckpointGl0AcceptanceManager {
               ok <- Signing.verifySignature[F](msgBytes, sigBytes)(pubKey)
             } yield ok).handleError(_ => false)
 
-        /** Verify the KES product sig under the signer's registered master VK at the wire-carried `kesTreeStep`. Mirrors
-          * [[io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.KesGossipVerification.verifyAttestation]] minus the eta-period
-          * derivation: the design doc §3.1 puts `kesTreeStep` on the wire (CommitteeMemberSignature field) so the receiver can verify
-          * non-interactively without re-deriving global eta period.
+        /** Defense-in-depth validation for registry implementations that are not constructed by [[OperatorConsensusKeyRegistry.make]]. This
+          * current-view boundary accepts only the complete committed genesis pair. Runtime records are rejected above until checkpoint
+          * evidence carries an exact Phase-2 GL0 anchor hash and this manager can use [[HistoricalOperatorConsensusKeyRegistry]]; accepting
+          * a best-tip/current runtime record here would make sibling validity local.
+          */
+        private def validOperatorPair(peerId: PeerId, keys: OperatorConsensusKeys): Boolean =
+          keys.registration.isEmpty &&
+            keys.operatorPeerId === peerId &&
+            keys.kes.vk.value.length == 32 &&
+            keys.kes.vk.step == 0 &&
+            keys.kes.offset == 0L &&
+            keys.effectiveFromPeriod === EtaPeriod.Zero &&
+            keys.vrfPublicKey.toBytes.length == 32
+
+        /** Verify the KES product sig under the signer's registered master VK at the only step valid for the checkpoint epoch. The expected
+          * tree-relative step is `artifactPeriod - registeredOffset`; the wire field must equal it. This prevents a signer from selecting a
+          * stale/future KES step even when the product signature itself verifies.
           *
           * Missing registry entries, empty signatures, decode failures, invalid steps, and failed verification all reject. There is no
           * Ed25519-only bootstrap exception on an economic checkpoint.
@@ -593,23 +750,28 @@ object ShardCheckpointGl0AcceptanceManager {
         private def verifyKes(
           msgBytes: Array[Byte],
           kesSigBytes: Array[Byte],
-          peerId: PeerId,
+          keys: OperatorConsensusKeys,
+          artifactPeriod: EtaPeriod,
           kesTreeStep: Int
         ): F[Boolean] =
           if (kesSigBytes.isEmpty) Async[F].pure(false)
-          else
-            kesRegistry.getKesVk(peerId).map {
-              case None => false
-              case Some(entry) =>
-                if (kesTreeStep < 0) false
-                else
-                  OperationalKeyMaker.decodeSignature(kesSigBytes) match {
-                    case Left(_) => false
-                    case Right(kSig) =>
-                      val vkAtStep = entry.vk.copy(step = kesTreeStep)
-                      OperationalKeyMaker.verify(kSig, msgBytes, vkAtStep)
-                  }
+          else {
+            val entry = keys.kes
+            val expectedStep = BigInt(artifactPeriod.value) - BigInt(entry.offset)
+            Async[F].pure {
+              if (
+                artifactPeriod.value < 0L || entry.offset < 0L || expectedStep < 0 || expectedStep > Int.MaxValue ||
+                kesTreeStep != expectedStep.intValue
+              ) false
+              else
+                OperationalKeyMaker.decodeSignature(kesSigBytes) match {
+                  case Left(_) => false
+                  case Right(kSig) =>
+                    val vkAtStep = entry.vk.copy(step = kesTreeStep)
+                    OperationalKeyMaker.verify(kSig, msgBytes, vkAtStep)
+                }
             }
+          }
 
         /** REAL committee-VRF membership verify — confirms the signer's wire-carried `vrfProof` is a valid `EcVrf25519` proof under its
           * REGISTERED VRF VK over the canonical `(shardEta(shardId, epoch), slot)` message (the SAME message the producer's
@@ -621,9 +783,9 @@ object ShardCheckpointGl0AcceptanceManager {
           * is `EcVrf25519.vrfVerify(vk, msg, proof)` — pure, deterministic, no LDD/threshold re-assertion (committee SET membership is the
           * separate set-lookup pre-check (1); this binds the signature to its drawn member).
           *
-          * '''Determinism (the #261 split invariant).''' Every input is cluster-uniform: `vrfRegistry` (genesis/seedlist-loaded VKs),
-          * `shardEtaFor` (MPT-committed eta + `Hasher`-based `computeShardEta`), `EcVrf25519.vrfVerify` (pure). So every honest gl0 node
-          * reaches the same verdict for the same signer.
+          * '''Determinism (the #261 split invariant).''' Every input is cluster-uniform: the active atomic operator-key record,
+          * `shardEtaFor` (MPT-committed eta + `Hasher`-based `computeShardEta`), and `EcVrf25519.vrfVerify` (pure). So every honest GL0
+          * node reaches the same verdict for the same signer.
           *
           * Missing VK/eta, empty or malformed proof bytes, and verification exceptions all fail closed without crashing the GL0 accept
           * loop.
@@ -632,18 +794,18 @@ object ShardCheckpointGl0AcceptanceManager {
           shardId: ShardId,
           epoch: EtaPeriod,
           slot: Slot,
-          peerId: PeerId,
+          keys: OperatorConsensusKeys,
           proofBytes: Array[Byte]
         ): F[Boolean] =
           if (proofBytes.isEmpty) Async[F].pure(false)
           else
-            (shardEtaFor(shardId, epoch), vrfRegistry.getVrfVk(peerId)).tupled.map {
-              case (Some(shardEta), Some(vrfVk)) if shardEta.length == 32 =>
+            shardEtaFor(shardId, epoch).map {
+              case Some(shardEta) if shardEta.length == 32 =>
                 // Real cryptographic verify. Reconstruct the producer's exact `(shardEta || slot)` message
                 // (EligibilityChecker.vrfProofForSlot byte shape) and verify the proof under the registered VK.
                 val slotBytes = java.nio.ByteBuffer.allocate(8).putLong(slot.value.value).array()
                 val msg = shardEta ++ slotBytes
-                try EcVrf25519.default.vrfVerify(vrfVk, msg, proofBytes)
+                try EcVrf25519.default.vrfVerify(keys.vrfPublicKey.toBytes, msg, proofBytes)
                 catch { case _: Throwable => false }
               case _ => false
             }

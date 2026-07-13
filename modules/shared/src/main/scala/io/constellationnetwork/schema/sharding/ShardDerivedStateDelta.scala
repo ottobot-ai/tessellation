@@ -14,15 +14,22 @@ import derevo.cats.eqv
 import derevo.circe.magnolia.{decoder, encoder}
 import derevo.derive
 
-/** The per-shard checkpoint payload for one cycle. [[includedSnapshots]] is the only economic transition input: GL0 authenticates and
-  * re-executes every included CL1 snapshot with the global currency transition function before adoption. The committee-provided root is an
-  * equality claim checked against that local execution. No committee-produced diff, artifact list, balance delta, sync delta, or receipt
-  * can authorize economic state.
+/** Transitional per-shard checkpoint payload for one cycle. [[includedSnapshots]] is the only encoded economic transition input. The
+  * current implementation makes every GL0 adopter authenticate and replay each included CL1 snapshot, then compare the claimed root. That
+  * universal replay is transitional behavior, not the target execution-sharding contract.
+  *
+  * In the target contract the producer and every execution signer replay the complete ordered input; deterministic noncommittee watchtowers
+  * provide positive replay coverage before GL0 inclusion. An ordinary noncommittee GL0 node verifies those identities and signatures,
+  * applies the canonical namespace-confined byte diff to the exact Phase-2 base, and recomputes the root without replaying the CL1
+  * transition. This schema does not yet carry that diff or complete exact-hash base and therefore cannot implement the target adoption
+  * path. A root, artifact list, balance delta, sync delta, receipt, or signature count alone never authorizes economic state.
   *
   * @param perMetagraphMptRoots
-  *   committee claim for the per-MG MPT subtree root. GL0 recreates the included snapshots and accepts only an exact local-root match.
+  *   committee claim for each per-MG MPT subtree root. Under the current transitional path GL0 recreates the included snapshots and accepts
+  *   only an exact local-root match; target adopters root-check the certified canonical diff
   * @param includedSnapshots
-  *   per-MG signed state-channel binary chain. This is the input GL0 authenticates and re-executes before adoption.
+  *   complete ordered per-MG signed state-channel binary chain. Producer, execution signers, and watchtowers replay this input. Ordinary
+  *   GL0 universal replay remains current transitional behavior until the canonical diff schema and adoption verifier land
   */
 @derive(encoder, decoder, eqv)
 final case class ShardDerivedStateDelta(

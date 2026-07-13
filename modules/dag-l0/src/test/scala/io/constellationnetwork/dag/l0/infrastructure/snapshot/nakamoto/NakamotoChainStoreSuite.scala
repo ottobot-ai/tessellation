@@ -891,6 +891,16 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
             }
         }
         .map(_._1)
+      completeBeforeEviction <- chainStore.vrfOutputRangeForPeriodFrom(
+        period = 1L,
+        etaRotationSnapshots = etaRotation,
+        fromHash = hashes.last
+      )
+      prematurePrefix <- chainStore.vrfOutputRangeForPeriodFrom(
+        period = 1L,
+        etaRotationSnapshots = etaRotation,
+        fromHash = hashes(8) // ordinal 9 is below the exclusive cutoff at ordinal 10
+      )
       // Finalize at ord=10 ⇒ keepFloor = max(0, 10-3) = 7. Ords 1..6 evicted from byHash.
       _ <- chainStore.finalize(hashes.last, ordinal = 10L)
       postSize <- chainStore.size
@@ -902,8 +912,12 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       // fixture), so the next hop attempts `getWithOrdinalFallback(Hash.empty, 5)` and fails the
       // hash-verify (disk's ord 5 hash != Hash.empty), terminating the walk. Period 1 covers
       // ords [6, 9].
-      vrfsForPeriod1 <- chainStore.vrfOutputsForPeriod(period = 1L, etaRotationSnapshots = etaRotation)
-      ordsRecovered = vrfsForPeriod1.map(_._1).toSet
+      incompleteAfterEviction <- chainStore.vrfOutputRangeForPeriodFrom(
+        period = 1L,
+        etaRotationSnapshots = etaRotation,
+        fromHash = hashes.last
+      )
+      ordsRecovered = incompleteAfterEviction.outputs.map(_._1).toSet
 
       // Cross-check: the walk DID visit ord 6 (the disk-fallback engaged); we verify this via
       // `getWithOrdinalFallback` directly to demonstrate the disk path returns a value, and we
@@ -917,6 +931,9 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         // Direct fallback test: ord 6 IS reachable via disk fallback.
         ord6Resolved.isDefined,
         ord6Resolved.exists(_.hash === hashes(5)),
+        completeBeforeEviction.isInstanceOf[NakamotoChainStore.VrfOutputRange.Complete],
+        prematurePrefix.isInstanceOf[NakamotoChainStore.VrfOutputRange.Incomplete],
+        incompleteAfterEviction.isInstanceOf[NakamotoChainStore.VrfOutputRange.Incomplete],
         // In-memory ords contribute their VRF outputs to the walk (production fixture would also
         // include the disk-recovered ord 6 since its SlotCertificate.vrfOutput would be set).
         ordsRecovered.contains(7L),

@@ -12,7 +12,7 @@ import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
-import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardFinalityTriggers, ShardTipTracker}
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardTipTracker}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   ShardCheckpointAcceptResult,
@@ -38,9 +38,8 @@ import weaver.MutableIOSuite
   * [[ShardCheckpointGl0AcceptanceManager]] — Slice 19 of `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §13 row 19.
   *
   * '''Required coverage''' (per slice spec):
-  *   1. '''Accepted (T_count)''' → `dag_nakamoto_shard_checkpoint_total{path=t_count}` incremented
-  *   1. '''Accepted (T_depth1 re-exec OK)''' → `dag_nakamoto_shard_checkpoint_total{path=t_depth1}` incremented +
-  *      `dag_nakamoto_shard_committee_partition_total` incremented
+  *   1. '''Accepted (execution quorum)''' → `dag_nakamoto_shard_checkpoint_total{path=execution_quorum}` incremented
+  *   1. '''Rejected (missing execution quorum)''' → `dag_nakamoto_shard_checkpoint_rejected_total{reason=execution_quorum}` incremented
   *   1. '''Rejected (pre-check)''' → `dag_nakamoto_shard_checkpoint_rejected_total{reason=*}` incremented
   *   1. '''Rejected (re-exec mismatch)''' → `dag_nakamoto_shard_checkpoint_rejected_total{reason=re_exec_mismatch}` incremented
   *   1. '''Attestation''' → `dag_nakamoto_shard_committee_attestation_total` incremented per NEW (peer, hash) pair (replay is no-op)
@@ -70,10 +69,16 @@ object ShardMetricsSuite extends MutableIOSuite {
   private val epochZero: EtaPeriod = EtaPeriod(0L)
   private val genesisHash: Hash = Hash("0" * 64)
 
-  private def mkSigner(implicit sp: SecurityProvider[IO]): IO[(KeyPair, PeerId)] =
-    KeyPairGenerator.makeKeyPair[IO].map { kp =>
-      (kp, PeerId.fromPublic(kp.getPublic))
-    }
+  private def mkSigner(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    checkpointSigner: RegisteredCheckpointSigner
+  ): IO[(KeyPair, PeerId)] =
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      peerId = PeerId.fromPublic(kp.getPublic)
+      _ <- checkpointSigner.preregisterGenesis(kp, peerId)
+    } yield (kp, peerId)
 
   private def mkValidSig(
     checkpoint: ShardCheckpoint,
@@ -177,10 +182,10 @@ object ShardMetricsSuite extends MutableIOSuite {
       .map(_._1)
 
   // ============================================================================
-  // Test 1: Accept via T_count → counter increments
+  // Test 1: Accept via execution quorum → counter increments
   // ============================================================================
 
-  test("Accepted via T_count path → checkpoint_total{path=t_count} incremented") { res =>
+  test("Accepted via execution quorum path → checkpoint_total{path=execution_quorum} incremented") { res =>
     implicit val (h, sp, _, checkpointSigner) = res
     for {
       pair <- CountingMetrics.makeWithState
@@ -188,7 +193,6 @@ object ShardMetricsSuite extends MutableIOSuite {
       implicit0(metrics: Metrics[IO]) = m
 
       (signerKp, signerPeer) <- mkSigner
-      (_, selfPeer) <- mkSigner
 
       mg = Address.fromBytes("mg-t-count".getBytes("UTF-8"))
       mptRoot = Hash("11" * 32)
@@ -199,21 +203,14 @@ object ShardMetricsSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      store <- ShardChainStore.make[IO](shardZero)
-      _ <- seedChain(store, 6)
-      tip <- store.bestTip.map(_.get)
-      tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      _ <- tracker.recordAttestation(tip.hash, signerPeer, dummyCommitteeSig)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
-      _ <- triggers.advance
-
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
-        finalityTriggers = _ => IO.pure(Some(triggers)),
+        executionQuorum = 1,
+        etaRotationSnapshots = 1000L,
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kesRegistry = checkpointSigner.kesRegistry,
-        vrfRegistry = checkpointSigner.vrfRegistry,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
         shardAssignment = ShardAssignment.make[IO](numShards = 1),
         shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
+        producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
         reExecuteDerivation = (_, _, _, _) => IO.pure(mptRoot)
       )
 
@@ -221,16 +218,14 @@ object ShardMetricsSuite extends MutableIOSuite {
       state <- stateRef.get
     } yield
       expect.same(ShardCheckpointAcceptResult.Accepted, result) &&
-        expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 1) &&
-        // T_count fast path must NOT bump the committee_partition counter (that's the T_depth1 fallback signal).
-        expect(state.counters.getOrElse(ShardMetrics.CommitteePartitionTotal.value, 0) == 0)
+        expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 1)
   }
 
   // ============================================================================
-  // Test 2: Accept via T_depth1 re-exec → partition + checkpoint counters
+  // Test 2: Missing execution quorum is rejected
   // ============================================================================
 
-  test("Accepted via T_depth1 re-exec → checkpoint_total{path=t_depth1} + committee_partition_total incremented") { res =>
+  test("missing execution quorum → checkpoint_rejected_total{reason=execution_quorum} incremented") { res =>
     implicit val (h, sp, _, checkpointSigner) = res
     for {
       pair <- CountingMetrics.makeWithState
@@ -238,9 +233,8 @@ object ShardMetricsSuite extends MutableIOSuite {
       implicit0(metrics: Metrics[IO]) = m
 
       (signerKp, signerPeer) <- mkSigner
-      (_, selfPeer) <- mkSigner
 
-      mg = Address.fromBytes("mg-t-depth1".getBytes("UTF-8"))
+      mg = Address.fromBytes("mg-missing-quorum".getBytes("UTF-8"))
       mptRoot = Hash("11" * 32)
       binary = mkSignedBinary("content".getBytes("UTF-8"))
       delta = mkDelta(mg, mptRoot, binary)
@@ -249,29 +243,23 @@ object ShardMetricsSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      store <- ShardChainStore.make[IO](shardZero)
-      _ <- seedChain(store, 10)
-      tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1000, k1Shard = 3L, store, tracker)
-      _ <- triggers.advance
-
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
-        finalityTriggers = _ => IO.pure(Some(triggers)),
+        executionQuorum = 2,
+        etaRotationSnapshots = 1000L,
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kesRegistry = checkpointSigner.kesRegistry,
-        vrfRegistry = checkpointSigner.vrfRegistry,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
         shardAssignment = ShardAssignment.make[IO](numShards = 1),
         shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
+        producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
         reExecuteDerivation = (_, _, _, _) => IO.pure(mptRoot)
       )
 
-      result <- mgr.evaluate(checkpoint)
+      result <- mgr.verifyEmbedded(checkpoint)
       state <- stateRef.get
     } yield
-      expect.same(ShardCheckpointAcceptResult.Accepted, result) &&
-        expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 1) &&
-        // T_depth1 fallback MUST bump the partition counter — depth-only acceptance signals partial-committee offline.
-        expect(state.counters.getOrElse(ShardMetrics.CommitteePartitionTotal.value, 0) == 1)
+      expect(result.isInstanceOf[ShardCheckpointAcceptResult.Rejected]) &&
+        expect(state.counters.getOrElse(ShardMetrics.CheckpointRejectedTotal.value, 0) == 1) &&
+        expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 0)
   }
 
   // ============================================================================
@@ -286,7 +274,6 @@ object ShardMetricsSuite extends MutableIOSuite {
       implicit0(metrics: Metrics[IO]) = m
 
       (signerKp, signerPeer) <- mkSigner
-      (_, selfPeer) <- mkSigner
 
       mg = Address.fromBytes("mg-reject".getBytes("UTF-8"))
       mptRoot = Hash("22" * 32)
@@ -297,19 +284,14 @@ object ShardMetricsSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      store <- ShardChainStore.make[IO](shardZero)
-      _ <- seedChain(store, 5)
-      tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1, k1Shard = 100L, store, tracker)
-      _ <- triggers.advance
-
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
-        finalityTriggers = _ => IO.pure(Some(triggers)),
+        executionQuorum = 1,
+        etaRotationSnapshots = 1000L,
         committeeMembership = (_, _) => IO.pure(Set.empty[PeerId]),
-        kesRegistry = checkpointSigner.kesRegistry,
-        vrfRegistry = checkpointSigner.vrfRegistry,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
         shardAssignment = ShardAssignment.make[IO](numShards = 1),
         shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
+        producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
         reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("0" * 64))
       )
 
@@ -332,7 +314,6 @@ object ShardMetricsSuite extends MutableIOSuite {
       implicit0(metrics: Metrics[IO]) = m
 
       (signerKp, signerPeer) <- mkSigner
-      (_, selfPeer) <- mkSigner
 
       mg = Address.fromBytes("mg-mismatch".getBytes("UTF-8"))
       mptRoot = Hash("11" * 32)
@@ -343,19 +324,14 @@ object ShardMetricsSuite extends MutableIOSuite {
       validSig <- mkValidSig(shell, signerKp, signerPeer)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
-      store <- ShardChainStore.make[IO](shardZero)
-      _ <- seedChain(store, 10)
-      tracker <- ShardTipTracker.make[IO](shardZero, selfPeer)
-      triggers <- ShardFinalityTriggers.make[IO](shardZero, kQuorum = 1000, k1Shard = 3L, store, tracker)
-      _ <- triggers.advance
-
       mgr <- ShardCheckpointGl0AcceptanceManager.make[IO](
-        finalityTriggers = _ => IO.pure(Some(triggers)),
+        executionQuorum = 1,
+        etaRotationSnapshots = 1000L,
         committeeMembership = (_, _) => IO.pure(Set(signerPeer)),
-        kesRegistry = checkpointSigner.kesRegistry,
-        vrfRegistry = checkpointSigner.vrfRegistry,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
         shardAssignment = ShardAssignment.make[IO](numShards = 1),
         shardEtaFor = (_, _) => IO.pure(checkpointSigner.defaultShardEta.some),
+        producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
         reExecuteDerivation = (_, _, _, _) => IO.pure(Hash("ff" * 32))
       )
 
@@ -368,8 +344,6 @@ object ShardMetricsSuite extends MutableIOSuite {
       }
       expect(mismatchHasSigner) &&
       expect(state.counters.getOrElse(ShardMetrics.CheckpointRejectedTotal.value, 0) == 1) &&
-      // A replay mismatch is rejected before either finality path is selected.
-      expect(state.counters.getOrElse(ShardMetrics.CommitteePartitionTotal.value, 0) == 0) &&
       expect(state.counters.getOrElse(ShardMetrics.CheckpointTotal.value, 0) == 0)
     }
   }

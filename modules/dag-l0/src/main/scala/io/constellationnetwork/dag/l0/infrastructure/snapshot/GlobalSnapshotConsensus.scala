@@ -30,6 +30,8 @@ import io.constellationnetwork.node.shared.domain.cluster.services.Session
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.{EtaSourceRange, EtaSourceUnavailable}
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardWindowContinuation
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
@@ -70,16 +72,17 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.Json
 import org.http4s.client.Client
 
-/** Factory for creating the Global L0 consensus engine.
+/** Factory and wiring surface for the Global L0 consensus runtime.
   *
   * Wires together all components and starts the consensus background stream. Returns a Consensus instance with handler (for gossip),
   * manager (external API), storage (state queries), and routes (HTTP endpoints).
   *
-  * When NAKAMOTO_ENABLED env var is set, uses VRF slot-based leader election via NakamotoTriggerDaemon instead of the traditional
-  * EventTrigger + TimeTrigger system. The BFT round machinery (Facility → Proposal → Signature → Finished) remains unchanged.
+  * GL0 consensus is Nakamoto/Taktikos/LDD with VRF slot leadership and an exact-hash Phase-2 gadget. It must not run the inherited
+  * facility/proposal/vote/lock/QC/view-change BFT lifecycle. The generic [[Consensus]] return shape and dormant engine wiring are migration
+  * plumbing, not global consensus authority; ML0 may continue using the separate shared BFT engine.
   *
   * @see
-  *   ConsensusEventLoop for FSM and command processing
+  *   ConsensusEventLoop for inherited plumbing that must remain outside the target GL0 lifecycle
   * @see
   *   NakamotoTriggerDaemon for VRF slot clock implementation
   */
@@ -88,21 +91,19 @@ object GlobalSnapshotConsensus {
   // GL0 is Nakamoto-only. No env var check needed — the run-nakamoto CLI command
   // is the single source of truth. Tunables come from NAKAMOTO_* env vars below.
 
-  /** Contiguous-window retention DEPTH (in ordinals) for the 3c-A SERVED signed-bytes store (`mpt_snapshot_info_signed`), as a function of
-    * the k₂ archival depth (`NakamotoConfig.keepDepthBehindFinalized` = 100·k₁).
+  /** Contiguous-window retention depth (in ordinals) for the 3c-A served signed-bytes store (`mpt_snapshot_info_signed`), derived from the
+    * recommended local k₂ capacity (`NakamotoConfig.keepDepthBehindFinalized` = 100·k₁).
     *
     * The store is written at every finalized ordinal; without a cutoff it grows unbounded. We retain a CONTIGUOUS recent window (not the
     * default logarithmic, which is gappy below the head) so the serve route's resolved ordinal — the latest combined checkpoint at-or-below
     * finalized, hence recent — is always present and the 3c-A fast path never 404s into the legacy GSI re-encode path.
     *
-    * '''Track-3 S2 (disk-backed k₂ revert — Cardano UTxO-HD analog).''' Raised from the old hardcoded `512` to k₂. The prior "512 > prod k₁
-    * \= 255" rationale was STALE: mainnet k₁ = 1024 > 512, so 512 didn't even cover the operational challenge window, let alone a deep
-    * density reorg. This store is the DISK tier of the retention model — it holds the deep signed per-ordinal bytes to k₂ so a later
-    * density-driven revert in the (k₂, k₁] band (Track-3 S4 disk-revert executor) can `readState` + re-fold from any anchor within k₂, and
-    * the 2a `PinnedCurrencyInfoReader` gl0 rail resolves deep pinned anchors toward k₂ instead of hard-rejecting at 512. Crucially the
-    * IN-MEMORY RAM fast-path window (`MptOverlay.undoJournalRef`) stays bounded to the operational k₁ (Heap-leak Fix A prune) — ONLY the
-    * on-disk bytes reach k₂. k₂-deep byte files are ~GB (k₂ ≈ 102400 on mainnet) — acceptable disk; the point is RAM stays bounded. Not a
-    * consensus parameter — a follower past the window falls back to the legacy path, whose verify gate rejects any inconsistent base.
+    * Raised from the old hardcoded `512` to the recommended k₂ capacity because mainnet k₁ = 1024 already exceeds 512. This is the disk
+    * tier for authenticated replay, proof service, and automatic rollback; the in-memory `MptOverlay.undoJournalRef` may use a smaller
+    * fast-path window. k₂ is not a protocol phase, finality threshold, or fork-choice floor. If objective valid-chain comparison needs
+    * history that is unavailable locally, the target behavior is `RecoveryRequired`: stop production/mutation, fetch exact authenticated
+    * history/state, and resume ordinary density comparison only after verified reconstruction. A legacy fallback path does not authorize
+    * operator-selected realignment.
     *
     * Clamped to `Int.MaxValue` because `ContiguousOrdinalCutoff.make` takes an `Int` depth; k₂ = 100·k₁ fits comfortably for any realistic
     * k₁ (mainnet 102400).
@@ -128,11 +129,11 @@ object GlobalSnapshotConsensus {
   // `sys.env` + `System.currentTimeMillis()` val was both an idiom violation and an eager class-load clock read
   // (2026-06-12 idiom audit, items #2/#3).
 
-  /** §3 NIPoPoW genesis eta — Blake2b-256 digest of a fixed domain string. 32 bytes; used to seed `EtaCalculation` for period 0 (and as the
-    * empty-chain-walk fallback at every higher period, incl. the COMPUTED period 1, #259) and as the bootstrap fall-through for
-    * `EtaStateManager`. Must be identical across all nodes in a cluster — derived from a constant rather than env var to avoid a
-    * config-drift class of bug (different operators setting different `NAKAMOTO_GENESIS_ETA` values would silently fork the chain). Future
-    * work: derive from the genesis snapshot hash so it's chain-bound instead of literal-bound.
+  /** §3 NIPoPoW genesis eta — Blake2b-256 digest of a fixed domain string. 32 bytes; used by `EtaCalculation.bootstrapEta` for periods 0
+    * and 1 and as the seed for later complete-range derivations. It is never a missing-history fallback for N >= 2. Must be identical
+    * across all nodes in a cluster — derived from a constant rather than env var to avoid a config-drift class of bug (different operators
+    * setting different `NAKAMOTO_GENESIS_ETA` values would silently fork the chain). Future work: derive from the genesis snapshot hash so
+    * it's chain-bound instead of literal-bound.
     *
     * Path 1 (heap-leak workstream): hoisted to a top-level helper so the boundary-write `etaForPeriod` callback in `make` can construct an
     * `EtaStateManager` BEFORE the GSAM (and before the chain store is built); the previous in-place definition lived inside the inner
@@ -182,8 +183,8 @@ object GlobalSnapshotConsensus {
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
     mptStore: MptStore[F, GlobalStateKey],
     // #56.6: branch-aware overlay over `mptStore`. Plumbed straight through to SnapshotLeaderLoop
-    // so the finality call sites (depth-k + attestation-2/3) can notify the overlay when a branch
-    // becomes canonical at an ordinal. Currently a passthrough impl by default — finalize is a
+    // so exact-hash Phase-2 qualification (decided-attestation T_weight or k1 depth) can notify the
+    // overlay when a branch becomes operational. Currently a passthrough impl by default — finalize is a
     // no-op until accept() migrates to the overlay (#56.10).
     mptOverlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[F, GlobalStateKey],
     // #56.10 Phase I (multi-tip in #115): setter on `SharedStorages` for the overlay's eviction
@@ -212,24 +213,20 @@ object GlobalSnapshotConsensus {
     eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
     rumorQueue: Queue[F, Hashed[RumorRaw]],
-    // Updated by SnapshotLeaderLoop after every chainStore.finalize call. Read by HttpApi
-    // to expose /global-snapshots/latest/finalized-ordinal so CL0 can gate state-channel
-    // -binary pruning on actual finality. Seeded with SnapshotOrdinal.MinIncrementalValue
-    // (ordinal 1 = genesis); grows monotonically as finality advances.
+    // Transitional ordinal-only Phase-2 watermark updated after `chainStore.finalize`. The target
+    // FinalityGate is keyed by exact `(ordinal, hash)` and must publish rollback/re-follow when a
+    // density reorg replaces a P2 hash; monotone ordinal state alone cannot implement that contract.
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
-    // Track-3 S1.5 "marker split": the settled (k₂) ref — the SAME ref backing `settledOrdinalTracker` (one settled source),
-    // DISTINCT from the k₁ `nakamotoFinalizedOrdinalRef`. Passed to `NakamotoChainStore.make` (below, in the chain-store wiring
-    // region) so the store can consume it for the S3 store-gate/fork-choice and reset it in `unsafe_clearFinality`. The k₂ marker
-    // is advanced only by the leader loop's `T_depth2` sink (through the tracker); the store just reads/resets it.
+    // Transitional legacy-named k2 retention watermark. Live code still passes it to the store as a
+    // revert floor; that is an implementation gap. Target k2 is local retention/proof/recovery
+    // capacity only and must never decide validity, add a phase, or constrain objective fork choice.
     nakamotoSettledOrdinalRef: Ref[F, SnapshotOrdinal],
-    // Observability seam for the chain-quality HTTP route (#138). Populated by SnapshotLeaderLoop
-    // once the four FinalityTriggers are constructed; read by `FinalityTriggersRoutes` to answer
-    // "which triggers qualified ord N?" without owning trigger references. Empty until the
-    // leader-loop fiber has started — the route handles `None` as a 503.
+    // Observability seam for the chain-quality HTTP route (#138). The current view still exposes
+    // legacy T_count/T_depth2 kinds. Target Phase 2 is only decided-attestation T_weight OR k1 depth;
+    // no count rail or later phase exists. Empty until startup; the route handles `None` as 503.
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
-    // Track-3 S1: the injected settled (k₂-archival) marker (a NEW ref, never the k₁ `nakamotoFinalizedOrdinalRef`). Threaded straight
-    // into `SnapshotLeaderLoop.run` (whose T_depth2 sink is its only writer) and read by `FinalityTriggersRoutes`. DI shape mirrors
-    // `finalityTriggerViewRef`.
+    // Write-restricted view over the transitional legacy k2 watermark above. It is local telemetry
+    // only in the target architecture; `T_depth2` and Phase 3 must be removed rather than promoted.
     settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
     // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Populated
     // here in the resource block once the local `TowerStore` and snapshot storage are available.
@@ -291,22 +288,16 @@ object GlobalSnapshotConsensus {
     ] => F[Unit],
     // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
     sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F],
-    // §1.2 Slice 3c: (peerId → KES master VK) registry loaded from L0 genesis. Empty for the CSV-
-    // genesis bootstrap path (no per-operator KES VKs registered). Read by Slice 5/6 verification
-    // on every incoming attestation/snapshot to confirm the sender's KES signature against the
-    // genesis-registered VK without trusting the sender to ship its own VK in-band.
-    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    // Task #44: the VRF-VK registry the shard committee sortition consumes is now loaded ONCE (via
-    // `nakamotoShardRegistries`) and threaded into `SharedServices.make`, whose single `shardAcceptanceDeps`
-    // this make() reuses. The former separate `vrfRegistry` param here fed a SECOND, now-deleted acceptanceDeps
-    // build, so it has been removed (the genesis VRF registry still reaches the committee draw via SharedServices).
+    // The atomic genesis KES+VRF registry is owned by `SharedServices`; every consensus consumer resolves one pair from it. No standalone
+    // KES or VRF registry crosses this boundary.
     // Split-safety (#261, eta axis): the deferred chain-walk handle the follower / `createContext` GSAM's
     // committee-eta resolver reads (created in `TessellationIOApp.make`, threaded here via `Services.make`).
     // Set ONCE below — right after the leader's own `chainStoreForLookupRef` — to the SAME
-    // `chainStore.vrfOutputsForPeriod`-backed walk the leader uses, so the follower `EtaStateManager.getEta(P)`
-    // returns byte-identical eta to the leader's for EVERY period P (incl. the cross-period checkpoint ride).
-    // gl0 is the only layer that sets it; non-gl0 layers leave it `None` (empty walk → genesis, unchanged).
-    setFollowerEtaChainWalk: (Long => F[List[(Long, Array[Byte])]]) => F[Unit]
+    // `chainStore.vrfOutputRangeForPeriodFrom`-backed exact walk the leader uses, so candidate replay calls
+    // `EtaStateManager.getEtaAt(P, parentHash)` against the same branch. Ambient `getEta(P)` remains only for shard code whose wire schema
+    // still lacks an exact GL0 hash/root and is tracked as an open protocol gap.
+    // gl0 is the only layer that sets it; a missing range is incomplete and cannot become eta for N >= 2.
+    setFollowerEtaChainWalk: ((Long, Option[io.constellationnetwork.security.hash.Hash]) => F[EtaSourceRange]) => F[Unit]
   )(
     implicit supervisor: Supervisor[F],
     globalStateProofSelector: GlobalStateProofSelector,
@@ -376,12 +367,12 @@ object GlobalSnapshotConsensus {
           (SnapshotOrdinal, Map[io.constellationnetwork.security.hex.Hex, Array[Byte]])
         ]](Map.empty)
         .toResource
-      // 3c-A enabler — the authoritative SERVED signed-bytes store, a sibling of the producer's `mpt_snapshot_info`
-      // (`<...>_signed`). ONLY the finalize sink writes it (the signed bytes of a FINALIZED branch), so the byte map
+      // 3c-A enabler — the served signed-bytes store, a sibling of the producer's `mpt_snapshot_info`
+      // (`<...>_signed`). ONLY the current Phase-2 sink writes it, so the byte map
       // served to followers reproduces the signed `mptRoot` BY CONSTRUCTION — never the producer's async finalize-time
       // re-fold (which can diverge under MultiBranch). The 3c-A serve route reads from this store.
       //
-      // Retention: this store is written at EVERY finalized ordinal (one file per finalized ordinal) and was previously
+      // Retention: this store is written at every current Phase-2 ordinal (one file per ordinal) and was previously
       // left to grow UNBOUNDED. We instead bound it with a CONTIGUOUS recent window rather than the default
       // `LogarithmicOrdinalCutoff` (whose kept set has geometric GAPS below the head). The 3c-A serve route
       // (`FinalizedSnapshotReader.latestMptEntriesResponse`) resolves the latest combined checkpoint AT-OR-BELOW the
@@ -390,14 +381,11 @@ object GlobalSnapshotConsensus {
       // legacy (drift-prone) `syncFromGlobalSnapshotInfo` path. A contiguous window guarantees the resolved ordinal is
       // present so the fast path always fires.
       //
-      // Depth = k₂ (`NakamotoConfig.keepDepthBehindFinalized` = 100·k₁). Track-3 S2 (disk-backed k₂ revert): raised from
-      // the old hardcoded 512, which was STALE — mainnet k₁ = 1024 already exceeds 512, so the window didn't even cover
-      // the operational challenge window, let alone a deep density reorg. This is the DISK tier of the retention model —
-      // deep signed per-ordinal bytes are kept to k₂ so a later density-driven revert in the (k₂, k₁] band (S4 disk-revert
-      // executor) can `readState` + re-fold from any anchor within k₂, and the 2a `PinnedCurrencyInfoReader` gl0 rail
-      // resolves deep pinned anchors instead of hard-rejecting. The IN-MEMORY RAM journal (`MptOverlay.undoJournalRef`)
-      // stays bounded to operational k₁ (Heap-leak Fix A prune) — ONLY the on-disk bytes reach k₂; k₂-deep files are ~GB,
-      // acceptable disk. (`LogarithmicOrdinalCutoff` stays the default for all OTHER `MptStateStorage` users.)
+      // Capacity = recommended local k2 (`NakamotoConfig.keepDepthBehindFinalized` = 100*k1), raised from the stale
+      // hardcoded 512. This disk tier supports authenticated replay, proof service, and automatic rollback while the
+      // in-memory journal stays smaller. k2 is never a finality/fork-choice floor. If an objective comparison exceeds
+      // retained history, the target enters RecoveryRequired and reconstructs exact authenticated state before resuming.
+      // (`LogarithmicOrdinalCutoff` stays the default for all other `MptStateStorage` users.)
       signedBytesStore <- io.constellationnetwork.security.mpt.storages.MptStateStorage
         .make[F](
           fs2.io.file.Path(sharedCfg.mptSnapshotInfoPath.toString + "_signed"),
@@ -408,7 +396,7 @@ object GlobalSnapshotConsensus {
           )
         )
         .toResource
-      // Track-3 S4: point the overlay's DEEP revert-executor at this contiguous k₂ signed-bytes tier. When a density
+      // Point the overlay's deep revert executor at this contiguous local-retention tier. When a density
       // reorg (S3) reverts to a fork ordinal below the in-memory RAM undo-journal window, `MptOverlay.revertToOrdinal`
       // reads the signed bytes here (`deleteAbove(fork)` + `loadBytes(readState(fork))`) to rebuild a byte-identical
       // base; a fork deeper than the retained window returns `None` → fail-closed `RevertGapError`.
@@ -452,7 +440,7 @@ object GlobalSnapshotConsensus {
       //
       // Pattern:
       //   - The eta resolver is an [[EtaStateManager]] (MPT-cache point read first; chainStore-walk fallback on cache miss).
-      //   - The chain-walk fallback routes to `chainStore.vrfOutputsForPeriod` for `period - 1`. Because the chain store
+      //   - The chain-walk fallback routes to an exact `chainStore.vrfOutputRangeForPeriodFrom` for `period - 1`. Because the chain store
       //     is built *later* in the inner Resource block (after this GSAM is constructed), we route the walk through
       //     [[chainStoreForLookupRef]] (the same Ref that backs the `getGlobalSnapshotByOrdinalWithFallback` indirection
       //     above) — set once by the inner block, observed by every walk thereafter.
@@ -461,29 +449,58 @@ object GlobalSnapshotConsensus {
       //     for prior-state reads from within accept(), not for boundary lookups (the boundary key is being WRITTEN this
       //     ordinal — the reader will miss either way, and chain-walk takes over).
       //
-      // Note: pre-chainStore-setup boundary writes (genesis seed + period 0/1) compute genesisEta via EtaCalculation; this
-      // is the same value `EtaStateManager.getEta` returns when the walk yields an empty list, so the pre-/post-setup
-      // boundary writes are byte-identical and the MPT entry is deterministic across nodes.
-      etaForPeriodCallback <- {
+      // Note: pre-chainStore-setup boundary writes for periods 0/1 use the explicit bootstrap. Any N >= 2 request before an exact range or
+      // rooted MPT eta exists fails closed.
+      etaSourceRangeFor = (sourcePeriod: Long, parentHash: Option[io.constellationnetwork.security.hash.Hash]) =>
+        chainStoreForLookupRef.get.flatMap {
+          case Some(cs) =>
+            parentHash.fold(cs.bestTip.map(_.map(_.hash)))(hash => Async[F].pure(hash.some)).flatMap {
+              case Some(fromHash) =>
+                cs
+                  .vrfOutputRangeForPeriodFrom(
+                    sourcePeriod,
+                    sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value,
+                    fromHash
+                  )
+                  .map[EtaSourceRange] {
+                    case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.VrfOutputRange.Complete(
+                          outputs
+                        ) =>
+                      EtaSourceRange.Complete(outputs)
+                    case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.VrfOutputRange.Incomplete(
+                          outputs,
+                          _,
+                          _
+                        ) =>
+                      EtaSourceRange.Incomplete(outputs)
+                  }
+              case None => Async[F].pure[EtaSourceRange](EtaSourceRange.Incomplete(Nil))
+            }
+          case None => Async[F].pure[EtaSourceRange](EtaSourceRange.Incomplete(Nil))
+        }
+      etaResolvers <- {
         val historicalStakeReaderForOuterGsam =
           io.constellationnetwork.node.shared.domain.nakamoto.HistoricalStakeReader
             .make[F](io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.fromMptStore[F](mptStore))
-        val chainWalkFallback: Long => F[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
-          chainStoreForLookupRef.get.flatMap {
-            case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value)
-            case None     => Async[F].pure(List.empty[(Long, Array[Byte])])
-          }
         io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager
           .make[F](
             genesisEta = nakamotoGenesisEta,
             historicalStakeReader = historicalStakeReaderForOuterGsam,
-            chainWalkFallback = chainWalkFallback
+            chainWalkFallback = etaSourceRangeFor
           )
-          .map { mgr => (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
-            HasherSelector[F].withCurrent(implicit hasher => mgr.getEta(period.value).map(etaBytesToHash))
+          .map { mgr =>
+            val ambient = (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
+              HasherSelector[F].withCurrent(implicit hasher => mgr.getEta(period.value).map(etaBytesToHash))
+            val exact = (
+              period: io.constellationnetwork.schema.nakamoto.EtaPeriod,
+              parent: io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId
+            ) => HasherSelector[F].withCurrent(implicit hasher => mgr.getEtaAt(period.value, parent.value).map(etaBytesToHash))
+            ambient -> exact
           }
           .toResource
       }
+      etaForPeriodCallback = etaResolvers._1
+      etaForPeriodAtParentCallback = etaResolvers._2
 
       // ─── LocalEventsService — gl0 reactive event stream (gated on HOCON enabled) ───
       // Constructed BEFORE GSAM so the publisher can be threaded in. When `nakamoto.local-events.enabled`
@@ -525,12 +542,11 @@ object GlobalSnapshotConsensus {
         .map(_.publisher)
         .getOrElse(io.constellationnetwork.node.shared.infrastructure.local_events.LocalEventsPublisher.noop[F])
 
-      // S3 committee re-execution processor: the SAME `GlobalSnapshotStateChannelEventsProcessor` gl0 uses for
-      // metagraph snapshots, built once here and shared by (a) THIS GSAM's acceptance and (b) the shard
-      // producer's `derivePerMgState` (the call site further below). Running the IDENTICAL currency derivation
-      // on producer + verifier is the byte-identity contract that prevents false slashing. The shard verifier's re-exec lives
-      // in the unified acceptance manager built in `SharedServices.make` (see `shardAcceptanceDeps` below); it is
-      // byte-identical because the derivation is a pure function of its inputs, not of the processor instance.
+      // Shared committee replay processor. The producer and every execution signer use the identical currency
+      // derivation before signing; selected watchtowers replay as the noncommittee collusion backstop. Current
+      // ordinary GL0 acceptance also invokes this processor, but that universal replay is transitional: target
+      // noncommittee adoption verifies the replay certificate and positive watchtower coverage, applies the
+      // namespace-confined canonical diff to the exact Phase-2 base, and recomputes the root.
       shardScEventsProcessor = GlobalSnapshotStateChannelEventsProcessor.make[F](
         validators.stateChannelValidator,
         globalStateChannelManager,
@@ -591,8 +607,9 @@ object GlobalSnapshotConsensus {
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
           .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback, backfill = Some(gl0PinnedBackfill))
       }
-      // Resolve the finalized state reader AT a pinned ordinal — ALWAYS the version-retained, root-verified pinned reader over
-      // `signedBytesStore`. `None` ⇒ the anchor can't be served (evicted below k₂ / not yet finalize-persisted / not on this chain).
+      // Resolve the current Phase-2 state reader at a pinned ordinal through the version-retained, root-verified
+      // signed-byte store. Ordinal-only lookup is transitional; the target checkpoint also binds the exact hash
+      // and state root so a density reorg cannot make the reference ambiguous. `None` defers without signing.
       // NO live fast path: `lastPersistedOrdinal == ord` does NOT imply the live store's content is state@ord (Passthrough accept
       // writes land before the watermark bumps), and that skew minted quorum-attested checkpoints whose root no honest verifier could
       // reproduce — the 2026-07-08 shard-0 shardOrd=8 wedge (see `ShardCheckpointWiring.pinnedPriorReaderAt` scaladoc).
@@ -636,18 +653,23 @@ object GlobalSnapshotConsensus {
       // byte-identical regression bar. Passed into BOTH this gl0 GSAM (leader-produce + `validateArtifact`) below; the SharedServices
       // `createContext` GSAM gets its own via the same recipe (so all three mptRoot-computing paths slash identically).
       gsamInvalidStateProofValidator = shardAcceptanceDeps match {
-        case Some(_) =>
+        case Some(deps) =>
           implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
           Some(
             io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
               reDerivePerMgRoot = watchtowerReDerive,
               slashedReader =
-                io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[F](mptStore)
+                io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[F](mptStore),
+              verifyExecutionCertificate = deps.acceptanceManager.verifyExecutionCertificate
             )
           ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
         case None =>
           Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
       }
+
+      anchoredConsensusKeyClaims <- GlobalSnapshotAcceptanceManager
+        .anchoredConsensusKeyClaimsFromRegistry(sharedServices.operatorKeyRegistry)
+        .toResource
 
       snapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager
         .make[F](
@@ -673,7 +695,7 @@ object GlobalSnapshotConsensus {
           // existing behavior of this construction site — the SharedServices GSAM sets it to true,
           // but reconciling the two flags is out of scope for the Path 1 fix.
           etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value,
-          etaForPeriod = Some(etaForPeriodCallback),
+          etaForPeriod = Some(etaForPeriodAtParentCallback),
           localEventsPublisher = Some(localEventsPublisher),
           // Hierarchical-shard-checkpoints v1 acceptance-side deps. `None` at `numShards = 1` (regression bar);
           // `Some(...)` activates the shard-checkpoint admission path inside `accept()`. Task #44: this is the
@@ -691,7 +713,17 @@ object GlobalSnapshotConsensus {
           invaliditySlashingConfig = sharedCfg.nakamoto.invaliditySlashing,
           // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs + surface the bounty slash. SAME instance the
           // leader-produce and `validateArtifact` paths share (this single GSAM). `None` at numShards=1.
-          invalidStateProofValidator = gsamInvalidStateProofValidator
+          invalidStateProofValidator = gsamInvalidStateProofValidator,
+          kesRegistrationAcceptanceManagerForHasher = Some { registrationHasher =>
+            implicit val h: io.constellationnetwork.security.Hasher[F] = registrationHasher
+            io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertAcceptanceManager.make[F](
+              io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.make[F](
+                validators.signedValidator,
+                seedlist
+              )
+            )
+          },
+          anchoredConsensusKeyClaims = anchoredConsensusKeyClaims
         )
         .toResource
 
@@ -985,7 +1017,7 @@ object GlobalSnapshotConsensus {
           // until `pruneParents` is called from the finality hook. The committee DRAW target (kDraw)
           // and ADMIT quorum (kQuorum) are the cluster-uniform `nakamoto.committee` HOCON params
           // (kDraw=N ⇒ committee=everyone; admit at kQuorum). The gate itself is constructed below
-          // once the operationalKeyMaker + kesRegistry are in scope.
+          // once the operationalKeyMaker + atomic operator-key registry are in scope.
           // CommitteeSortition uses `Hasher[F]` to encode the canonical VRF input. The Selector's
           // current hasher matches the message-side encoding the rest of the consensus surface
           // uses; sortition messages aren't ordinal-bound (they key on parent hash) so picking
@@ -995,75 +1027,32 @@ object GlobalSnapshotConsensus {
           committeeAggregator <- io.constellationnetwork.node.shared.domain.nakamoto.MetagraphAttestationAggregator
             .make[F]
             .toResource
-          // §1.2 Slice 3c: bootstrap an OperationalKeyMaker. Two paths:
-          //   - Disk-backed (production / e2e harness): if `CL_KES_SECURE_STORE_DIR` is set, open a
-          //     [[io.constellationnetwork.security.kes.SecureStore.disk]] at that directory and
-          //     `OperationalKeyMaker.make` against the pre-staged `kes-sk.bin` written by the
-          //     genesis generator (Slice 3b). Its master VK matches the genesis-registered VK by
-          //     construction, so Slice 5 verification works end-to-end out of the box.
-          //   - Fallback (dev / unit-test): no env var → in-memory store + fresh bootstrap with a
-          //     SecureRandom seed. The master VK is per-JVM-run and will NOT match anything in
-          //     `kesRegistry`, so Slice 5 receivers will count it as "no registry entry" — fine for
-          //     local dev (warn-only) but not for cross-node verification.
-          kesSecureStore <- sys.env.get("CL_KES_SECURE_STORE_DIR") match {
-            case Some(dir) =>
-              io.constellationnetwork.security.kes.SecureStore.disk[F](java.nio.file.Paths.get(dir)).toResource
-            case None =>
-              io.constellationnetwork.security.kes.SecureStore.inMemory[F].toResource
-          }
-          operationalKeyMaker <- sys.env.get("CL_KES_SECURE_STORE_DIR") match {
-            case Some(_) =>
-              // Disk path: SK was pre-staged at `<dir>/kes-sk.bin` by the genesis generator
-              // (Slice 3b). Just open; do not regenerate.
-              io.constellationnetwork.security.kes.OperationalKeyMaker
-                .make[F](
-                  secureStore = kesSecureStore,
-                  keyName = "kes-sk.bin",
-                  etaPeriodLength = etaRotationSnapshots.toLong
-                )
-            case None =>
-              // Fallback: in-memory + fresh bootstrap with SecureRandom seed.
-              val seed = new Array[Byte](32)
-              new java.security.SecureRandom().nextBytes(seed)
-              io.constellationnetwork.security.kes.OperationalKeyMaker
-                .bootstrap[F](
-                  secureStore = kesSecureStore,
-                  keyName = "gl0-operational-kes.key",
-                  seed = seed,
-                  etaPeriodLength = etaRotationSnapshots.toLong
-                )
-          }
-          // §1.2 Slice 2: bind the KES master VK (period-0 root of the super × sub tree) to the
-          // operator's long-term Ed25519 key via a SHA512withECDSA signature over kesVk.value.
-          // The pair (kesVk, kesVkSigByLongTerm) is the registration certificate: it lets any
-          // other validator confirm that the KES VK they see in genesis (or in a future runtime
-          // registration tx) was issued by this operator without anyone needing access to the
-          // KES SK. KES forward security is preserved because the long-term key signs the VK,
-          // not the SK — compromise of the long-term key still cannot forge KES sigs for
-          // past periods (those required the corresponding SK leaf that has been erased).
-          kesRegistration <- operationalKeyMaker.currentPublicKey.flatMap { kesVk =>
-            io.constellationnetwork.security.signature.Signing
-              .signData[F](kesVk.value)(keyPair.getPrivate)
-              .map(regSig => (kesVk, regSig))
-          }.toResource
-          _ <- {
-            val (kesVk, regSig) = kesRegistration
-            val vkHex = kesVk.value.take(16).map("%02x".format(_)).mkString
-            val regHex = regSig.take(16).map("%02x".format(_)).mkString
-            nakLogger.info(
-              s"🔐 KES bootstrap: period=0 height=${io.constellationnetwork.security.kes.OperationalKeyMaker.DefaultHeight} vk=$vkHex... step=${kesVk.step}"
-            ) >>
-              nakLogger.info(
-                s"🔐 KES-REG: master-vk-sig=$regHex... (SHA512withECDSA over kesVk by operator long-term key, ${regSig.length}B)"
-              ) >>
-              // §1.2 Slice 3c: log the genesis-loaded KesRegistry size. Empty means no peers were
-              // registered at genesis (CSV-genesis bootstrap, or JSON without the kesRegistrations
-              // field) — Slice 5 verification will count incoming KES sigs against the empty
-              // registry as "no entry" and warn-only-skip.
-              kesRegistry.list.flatMap { regs =>
-                nakLogger.info(s"📋 KES registry loaded: ${regs.size} peer(s) registered")
-              }
-          }.toResource
+          // Consensus signing material is provisioned out-of-band and must already match the local operator's atomic genesis KES+VRF
+          // registration. Missing directories/files and either key mismatch abort Resource construction. There is deliberately no
+          // in-memory/random fallback and no startup-time ad-hoc registration: a key becomes eligible only through canonical registration.
+          kesSecureStoreDir <- Async[F]
+            .fromEither(
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.LocalOperatorKeyPairGate
+                .requireSecureStoreDirectory(sys.env.get("CL_KES_SECURE_STORE_DIR"))
+            )
+            .toResource
+          kesSecureStore <- io.constellationnetwork.security.kes.SecureStore.disk[F](kesSecureStoreDir).toResource
+          localOperatorKeyMaterial <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.LocalOperatorKeyPairGate
+            .loadVerified[F](
+              secureStore = kesSecureStore,
+              keyName = "kes-sk.bin",
+              etaPeriodLength = etaRotationSnapshots.toLong,
+              selfId = selfId,
+              longTermKeyPair = keyPair,
+              operatorKeyRegistry = sharedServices.operatorKeyRegistry
+            )
+          (operationalKeyMaker, verifiedLocalOperatorKeys) = localOperatorKeyMaterial
+          _ <- nakLogger
+            .info(
+              s"Local GL0 KES+VRF material matches the preregistered operator pair for ${selfId.value.value.take(16)}... " +
+                s"(KES period offset=${verifiedLocalOperatorKeys.kesPeriodOffset})"
+            )
+            .toResource
 
           // Numerics for VRF eligibility threshold. Bifrost prod precision: log1p=8, exp=38, maxIter=10000.
           // We use prec=8 / prec=38 to match Bifrost exactly. The Lentz iteration runs in exact `Ratio`
@@ -1085,28 +1074,27 @@ object GlobalSnapshotConsensus {
               case Some(cs) => cs.tipFor(tip.parentHash)
               case None     => cats.Applicative[F].pure(None: Option[io.constellationnetwork.schema.nakamoto.ChainTip])
             }
-          // Track-3 S3: wire the config-DERIVED fork-choice params (kills the hardcoded 50/200) + the k₂
-          // ancestor-walk bound + the settled-floor reader + the band-density flag. Flag OFF (default) ⇒
-          // ChainSelection is byte-identical to the pre-S3 baseline (k₁ hash-exact clamp, kLookback-truncated
-          // ancestor walk). Flag ON ⇒ k₂ settled floor + true-MRCA commutative density (maxvalid-bg).
+          // TRANSITIONAL IMPLEMENTATION GAP: live wiring still offers k1/k2 ordinal revert floors.
+          // Target maxvalid-tk/maxvalid-bg remains objective across P2 density reorgs; k2 only sizes local
+          // history/proof/recovery capacity and never freezes fork choice. The reader/flag below must be
+          // removed or reduced to retention diagnostics when the hash-bound FinalityGate lands.
           chainSelection = io.constellationnetwork.node.shared.domain.nakamoto.ChainSelection.make[F](
             tipTracker,
             fetchParent,
             kLookback = sharedCfg.nakamoto.kLookback(sharedCfg.environment),
             sWindow = sharedCfg.nakamoto.sWindow(sharedCfg.environment),
-            // k₂ (= keepDepthBehindFinalized) bounds the true-MRCA search so a band fork resolves against
-            // its real fork point instead of a kLookback-truncated pseudo-anchor; matches in-memory retention.
+            // Local retained-history bound for the current true-MRCA search. Exhaustion must become
+            // RecoveryRequired plus authenticated reconstruction, never an operator-selected winner.
             maxAncestorDepth = sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value,
-            // The settled (k₂) floor: shouldSwitch (flag ON) refuses ONLY reverts at/below this ordinal.
+            // Legacy floor input retained by current executable code; forbidden by the target protocol.
             settledOrdinalReader = Some(nakamotoSettledOrdinalRef.get.map(_.value.value)),
             bandDensityReorgEnabled = sharedCfg.nakamoto.bandDensityReorgEnabled
           )
-          // Heap-leak Fix B — `nakamoto.keep-depth-behind-finalized` (default = k₁ = 255). Bounds
-          // in-memory canonical-chain retention to a sliding window behind the finalized tip; older
+          // Local retention bound. Bounds in-memory canonical-chain retention to a sliding window; older
           // lookups fall through to disk-backed `SnapshotStorage` via
           // `NakamotoChainStore.getWithOrdinalFallback`. Path 1 of the workstream: with the disk
-          // fallback wired through `vrfOutputsForPeriod`, this is a perf knob (in-memory speed vs
-          // bounded heap), not a correctness gate, even when `etaRotationSnapshots > keepDepth`.
+          // fallback wired through the exact VRF-output range API, this is intended as capacity rather than a
+          // correctness gate. Missing objective comparison history must enter RecoveryRequired.
           // Migrated from `sys.env.get("NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED")` to HOCON; the
           // application.conf entry still honors `${?NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED}` so ops
           // scripts keep working.
@@ -1117,13 +1105,12 @@ object GlobalSnapshotConsensus {
               chainSelection,
               tipTracker,
               nakamotoFinalizedOrdinalRef,
-              // Track-3 S1.5: the distinct k₂ settled source (same ref as `settledOrdinalTracker`). Consumed by the store's S3
-              // store-gate/fork-choice and reset alongside the k₁ ref in `unsafe_clearFinality`. The k₁ store-gate + production
-              // floor are UNCHANGED in S1.5 — only the reset uses this ref for now.
+              // Transitional legacy k2 watermark. Current store consumption as a floor is a known target
+              // violation; k2 may size retention/recovery only.
               nakamotoSettledOrdinalRef,
               keepDepthBehindFinalized,
-              // Track-3 S3: the SAME flag ChainSelection reads — selects the store-gate floor (k₁ finalized
-              // vs k₂ settled). Both read `sharedCfg.nakamoto.bandDensityReorgEnabled`, so they never diverge.
+              // Transitional flag selecting a legacy ordinal floor in live code. Target removes both floors
+              // and keeps density comparison active for reversible exact-hash P2 state.
               bandDensityReorgEnabled = sharedCfg.nakamoto.bandDensityReorgEnabled
             )
             .toResource
@@ -1132,16 +1119,11 @@ object GlobalSnapshotConsensus {
           // Split-safety (#261, eta axis): install the SAME chain-walk the leader's committee-eta resolver uses
           // (`etaForPeriodCallback`'s `chainWalkFallback` at the top of this `make`) into the follower /
           // `createContext` GSAM's `EtaStateManager` via the deferred Ref. Both walks read the identical
-          // `chainStoreForLookupRef` and call `cs.vrfOutputsForPeriod(sourcePeriod, etaRotationSnapshots)`, so the
-          // follower's `getEta(P)` now byte-equals the leader's for EVERY period P ≥ 2 — closing the
+          // `chainStoreForLookupRef` and call `cs.vrfOutputRangeForPeriodFrom(sourcePeriod, etaRotationSnapshots, tipHash)`, so the
+          // follower's exact-parent `getEtaAt(P, parentHash)` byte-equals the leader's for EVERY period P ≥ 2 — closing the
           // `C_real ≠ C_genesis` committee split on the gl0 Download / RollbackLoader rebuild paths. Set AFTER
           // `chainStoreForLookupRef` so the very first follower walk already observes the chain store.
-          _ <- setFollowerEtaChainWalk { (sourcePeriod: Long) =>
-            chainStoreForLookupRef.get.flatMap {
-              case Some(cs) => cs.vrfOutputsForPeriod(sourcePeriod, sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value)
-              case None     => Async[F].pure(List.empty[(Long, Array[Byte])])
-            }
-          }.toResource
+          _ <- setFollowerEtaChainWalk(etaSourceRangeFor).toResource
           // #56.10 Phase I (multi-tip in #115): wire the overlay's eviction `bestTipsFn` to
           // `chainStore.allTips` so ancestor protection covers EVERY viable chain head — the
           // canonical bestTip AND any tentative-branch heads being followed during fork-recovery.
@@ -1272,61 +1254,90 @@ object GlobalSnapshotConsensus {
           // admits at the same threshold. 8-node testnet default: kDraw = 8, kQuorum = 6.
           committeeKDraw = sharedCfg.nakamoto.committee.kDraw
           committeeKQuorum = sharedCfg.nakamoto.committee.kQuorum
-          // VRF SK/VK derived from the long-term keypair via the same `VrfKeyDeriver` path the leader
-          // VRF uses. For v1 sortition uses the same VRF identity as leader election; per-operator-key
-          // VRF keys land later (#180).
-          committeeVrfKeys = {
-            val rawPrivKey: Array[Byte] = keyPair.getPrivate match {
-              case ecKey: java.security.interfaces.ECPrivateKey =>
-                val bytes = ecKey.getS.toByteArray
-                if (bytes.length > 32) bytes.drop(bytes.length - 32)
-                else if (bytes.length < 32) Array.fill(32 - bytes.length)(0.toByte) ++ bytes
-                else bytes
-              case other =>
-                other.getEncoded.takeRight(32)
-            }
-            val seed = io.constellationnetwork.security.vrf.VrfKeyDeriver.deriveVrfSeed(rawPrivKey)
-            val vk = new io.constellationnetwork.security.vrf.EcVrf25519().getVerificationKey(seed)
-            (seed, vk)
-          }
+          // Frozen-genesis compatibility: the local VRF secret is deterministically derived from the long-term key and the committee gate
+          // refuses every proof/signature side effect unless its VK equals the same operator's rooted atomic genesis KES+VRF pair. Runtime
+          // rotation remains disabled until a secure independently provisioned VRF secret is resolved with the exact candidate-parent
+          // HistoricalOperatorConsensusKeyRegistry record; it must never reuse this genesis derivation as implicit authority.
+          committeeVrfKeys = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop.deriveVrfKeys(keyPair)
           committeeGateLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger
             .getLoggerFromName[F]("MetagraphCommitteeGate")
             .pure[F]
             .toResource
-          // KES adapter — sender signs at the operator's CURRENT KES tree-internal step (read via
-          // `operationalKeyMaker.currentPeriod`) and embeds that step on the wire so the receiver can
-          // verify non-interactively. `signAt` returns the encoded bytes; on signer failure (e.g.
-          // `StepNotMonotonic` if the caller passed a stale step) returns empty bytes which the
-          // receiver-side gate treats as "no KES sig" and rejects. The gate always passes
-          // `currentPeriod` here so monotonic failure cannot happen in normal operation.
+          // All local validity-signature adapters share this period-authoritative gate. The artifact's
+          // global eta period and the preregistered offset derive the only permissible KES tree step;
+          // mutable `OperationalKeyMaker.currentPeriod` is checked for monotonicity, never selected as
+          // authority. No bytes means no signature side effect may be published or counted.
+          signKesAtRegisteredPeriod =
+            (
+              operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
+              artifactPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod,
+              message: Array[Byte]
+            ) =>
+              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.LocalOperatorKeyPairGate
+                .signingKeyFromResolved(
+                  operationalKeyMaker,
+                  selfId,
+                  keyPair,
+                  operatorKeys,
+                  artifactPeriod.value
+                )
+                .flatMap {
+                  case Left(error) =>
+                    nakLogger
+                      .warn(
+                        s"Refusing local KES signature at artifactPeriod=${artifactPeriod.value}: ${error.getMessage}"
+                      )
+                      .as(Option.empty[(Int, Array[Byte])])
+                  case Right(signingKey) =>
+                    operationalKeyMaker.signAt(signingKey.treeStep, message).flatMap {
+                      case Left(error) =>
+                        nakLogger
+                          .warn(
+                            s"Refusing local KES signature at artifactPeriod=${artifactPeriod.value} treeStep=${signingKey.treeStep}: ${error.message}"
+                          )
+                          .as(Option.empty[(Int, Array[Byte])])
+                      case Right(signature) =>
+                        Async[F].pure[Option[(Int, Array[Byte])]](
+                          Some(
+                            signingKey.treeStep -> io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(signature)
+                          )
+                        )
+                    }
+                }
           committeeKesSigner = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesSigner[F] {
-            def currentPeriod: F[Int] = operationalKeyMaker.currentPeriod
-            def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]] =
-              operationalKeyMaker.signAt(kesStep, message).map {
-                case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
-                case Left(_)    => Array.empty[Byte]
-              }
+            def sign(
+              operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
+              artifactPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod,
+              message: Array[Byte]
+            ): F[Option[io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesSignature]] =
+              signKesAtRegisteredPeriod(operatorKeys, artifactPeriod, message).map(
+                _.map {
+                  case (treeStep, bytes) =>
+                    io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesSignature(treeStep, bytes)
+                }
+              )
           }
-          // KES verifier — uses `verifyAttestationByStep` so the tree-internal step comes straight off
-          // the wire (`MetagraphAttestation.sender_tree_step`). No chain-state derivation, no
-          // operator-offset lookup — receiver-side verification is non-interactive. Admission is
-          // fail-closed: empty/decode-fail/verify-fail/no-registry-entry all reject.
+          // KES verifier — the artifact period plus preregistered offset determine the only valid
+          // tree-internal step. The wire `sender_tree_step` is rejected unless it equals that result;
+          // it is never authority. Admission is fail-closed on a missing/inactive registration,
+          // mismatch, empty/decode-failed signature, or cryptographic verification failure.
           committeeKesVerifier = new io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.KesVerifier[F] {
             def verify(
               messageBytes: Array[Byte],
               kesSigBytes: Array[Byte],
-              attesterId: io.constellationnetwork.schema.peer.PeerId,
-              attesterHex: io.constellationnetwork.security.hex.Hex,
-              kesStep: Int
+              expectedOperatorId: io.constellationnetwork.schema.peer.PeerId,
+              operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
+              kesStep: Int,
+              artifactPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod
             ): F[Boolean] =
               io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.KesGossipVerification
                 .verifyAttestationByStep[F](
                   messageBytes = messageBytes,
                   kesSigBytes = kesSigBytes,
-                  attesterId = attesterId,
-                  attesterHex = attesterHex,
+                  expectedOperatorId = expectedOperatorId,
+                  operatorKeys = operatorKeys,
                   kesStep = kesStep,
-                  kesRegistry = kesRegistry,
+                  artifactPeriod = artifactPeriod,
                   logger = committeeGateLogger
                 )
           }
@@ -1364,63 +1375,42 @@ object GlobalSnapshotConsensus {
               }
             }
           }
-          // #213/#290: CONTENT-DERIVED parent-ordinal resolver — the SINGLE resolver used on every
-          // committee-gate parent-ordinal site (admission processor + inbound-attestation receiver).
-          // It derives the ordinal from the incoming binary's own content (ordinal − 1) once the GSI
-          // identity guard (`lastStateChannelSnapshotHashes[mg] == parentHash`) passes, instead of
-          // reading gl0's currency partitions — which `calculateLastCurrencySnapshots` drops via
-          // `.filterNot(_.isEmpty)` whenever the mg produced no state in the window, while still writing
-          // `lastStateChannelSnapshotHashes[mg]`. That GSI gap made the legacy GSI-only `resolve` return
-          // `None` (tip-matched, both currency partitions empty) → both the admission path AND the
-          // attestation gate fail-closed → the metagraph tip froze and 0 incrementals were admitted at
-          // 8gl0+4mg. Determinism is unchanged on the non-empty path: `resolveFromBinary` returns N−1,
-          // which equals the legacy `resolve`'s `lastIncrementalCurrencySnapshot.ordinal` (both = the
-          // parent ordinal), so the committee-VRF eta is byte-for-byte identical there; only the empty
-          // path changes (None → N−1). Reads through `pendingReader` (overlay-aware, #118).
-          //   - ADMISSION: `makeMetagraphBinaryProcessor` (this binary's `signed.value.content`).
-          //   - RECEIVER:  `NakamotoSyncDaemon.handleMetagraphAttestation` — looks the ATTESTED binary up
-          //     in the orphan buffer by its wire digest, then feeds its content here. Both sender and
-          //     receiver are now content-derived, so the eta agrees sender↔receiver. The committee gate
-          //     itself no longer resolves the ordinal at all — it verifies against the eta it is handed.
-          committeeParentOrdinalForBinary: (
+          // The signed currency payload commits an ML0 continuity ordinal and an independent exact GL0
+          // globalSyncView. Only the latter may select eta, active operator keys, or KES period.
+          committeeCurrencyContextForBinary: (
             (
               io.constellationnetwork.schema.address.Address,
               io.constellationnetwork.security.hash.Hash,
               Array[Byte]
             ) => F[
-              Option[Long]
+              Option[
+                io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.CurrencyBinaryContext
+              ]
             ]
           ) = (mg, parent, content) => {
             implicit val resolverLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
             io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver
-              .resolveFromBinary[F](pendingReader, mg, parent, content)
+              .resolveCurrencyContextFromBinary[F](pendingReader, mg, parent, content)
           }
-          // #213/#290 (liveness completion): the RECEIVER variant of the resolver — content ONLY, NO
-          // gl0-tip identity guard. The inbound-attestation handler needs only the parent ordinal the
-          // binary itself declares (ordinal − 1) to compute the eta it verifies the committee-VRF
-          // against; it already holds the attested binary (orphan-buffer wire-digest match) before
-          // resolving, so that ordinal is a pure, cross-node-deterministic function of the held content.
-          // The tip-guarded `committeeParentOrdinalForBinary` above (which the ADMISSION processor uses,
-          // where its `None` correctly BUFFERS an ahead-binary until its parent is admitted) fail-closed
-          // on the receiver path whenever gl0's tip trailed the binary's parent — the steady state, since
-          // ml0 outpaces gl0's gate cadence — and DROPPED the attestation, so binaries never reached the
-          // committee threshold, gl0's metagraph tip never advanced, and it trailed ml0 further: a
-          // self-reinforcing lag that stranded late state (e.g. an epoch-323 token lock) out of Global L0.
-          // Safety is unchanged: the guard never inspected the ordinal (only the parentHash), so a forged
-          // ordinal is exactly as (im)possible as before — the committee-VRF verify (against this
-          // content-derived eta) and the admission chain-check remain the real gates. Returns `None` ONLY
-          // when the binary content is malformed (decodes as neither incremental nor full snapshot).
-          committeeParentOrdinalFromContent: (
-            (
-              io.constellationnetwork.schema.address.Address,
-              io.constellationnetwork.security.hash.Hash,
-              Array[Byte]
-            ) => F[
-              Option[Long]
-            ]
-          ) = (_, _, content) =>
+          committeeCurrencyContextFromContent = (content: Array[Byte]) =>
             io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver
-              .parentOrdinalFromContent[F](content)
+              .currencyContextFromContent[F](content)
+          // Transitional exact Phase-2 check. The target FinalityGate will mint this hash-bound
+          // capability directly; the current ordinal watermark alone is insufficient.
+          committeeIsExactPhase2 = (
+            anchorOrdinal: io.constellationnetwork.schema.SnapshotOrdinal,
+            anchorHash: io.constellationnetwork.security.hash.Hash
+          ) =>
+            (nakamotoFinalizedOrdinalRef.get, chainStore.bestTip).tupled.flatMap {
+              case (phase2Ordinal, Some(tip)) if anchorOrdinal <= phase2Ordinal =>
+                chainStore.walkBackTo(tip.hash, anchorOrdinal.value.value).map(_.contains(anchorHash))
+              case _ => Async[F].pure(false)
+            }
+          committeeVerifyPhase2CurrencyContext = (
+            context: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.CurrencyBinaryContext
+          ) =>
+            io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.Phase2CurrencyBinaryContext
+              .verify[F](context)(committeeIsExactPhase2)
           committeeGate = {
             implicit val gateLogger: org.typelevel.log4cats.Logger[F] = committeeGateLogger
             implicit val gateHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
@@ -1432,7 +1422,7 @@ object GlobalSnapshotConsensus {
               sortition = committeeSortition,
               // Admission runs independently of execution sharding. Use the genesis-loaded
               // registry retained by SharedServices even when `numShards = 1`.
-              vrfRegistry = sharedServices.vrfRegistry,
+              operatorKeyRegistry = sharedServices.operatorKeyRegistry,
               aggregator = committeeAggregator,
               kesSigner = committeeKesSigner,
               kesVerifier = committeeKesVerifier,
@@ -1443,14 +1433,13 @@ object GlobalSnapshotConsensus {
               pollIntervalMs = io.constellationnetwork.node.shared.domain.nakamoto.MetagraphCommitteeGate.DefaultPollIntervalMs
             )
           }
-          // Resolve eta for a metagraph-parent ordinal. For v1 we reuse the same logic the snapshot
-          // production path uses — derive period from the parent ordinal, fold over per-period VRF
-          // outputs from the chain store, fall back to `genesisEta` when no chain data yet. The
-          // receiver-side gate VRF input MUST agree with the sender's input; this resolver is the
-          // single source of truth on both sides.
-          committeeEtaForOrdinal: (Long => F[Array[Byte]]) = (parentOrdinal: Long) => {
+          // Resolve eta from the exact Phase-2 GL0 anchor's own ancestry, never from ML0 cadence or
+          // whichever best tip happens to be local when the callback runs.
+          committeeEtaForPhase2Anchor = (
+            context: io.constellationnetwork.node.shared.domain.nakamoto.MetagraphParentOrdinalResolver.Phase2CurrencyBinaryContext
+          ) => {
             val currentPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
-              .rotationPeriod(parentOrdinal, etaRotationSnapshots.toLong)
+              .rotationPeriod(context.gl0AnchorOrdinal.value.value, etaRotationSnapshots.toLong)
             // Cardano/Praos bootstrap: periods 0 and 1 genesis-derivable via bootstrapEta. The committee
             // draw eta MUST match the producer/validator eta exactly — same convention, same sites.
             if (currentPeriod <= 1)
@@ -1458,15 +1447,35 @@ object GlobalSnapshotConsensus {
                 io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation.bootstrapEta(g.genesisEta, currentPeriod)
               )
             else
-              for {
-                genesis <- epochStateRef.get.map(_.genesisEta)
-                chainOutputs <- chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots.toLong)
-              } yield
-                if (chainOutputs.nonEmpty)
-                  io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
-                    .computeEta(genesis, currentPeriod, chainOutputs.map(_._2))
-                else
-                  io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation.bootstrapEta(genesis, currentPeriod)
+              epochStateRef.get.map(_.genesisEta).flatMap { genesis =>
+                chainStore
+                  .vrfOutputRangeForPeriodFrom(
+                    currentPeriod - 1,
+                    etaRotationSnapshots.toLong,
+                    context.gl0AnchorHash
+                  )
+                  .flatMap {
+                    case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.VrfOutputRange.Complete(
+                          chainOutputs
+                        ) if chainOutputs.nonEmpty =>
+                      io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+                        .computeEta(genesis, currentPeriod, chainOutputs.map(_._2))
+                        .pure[F]
+                    case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.VrfOutputRange.Complete(_) =>
+                      EtaSourceUnavailable(currentPeriod, currentPeriod - 1L, "complete range contained no VRF outputs")
+                        .raiseError[F, Array[Byte]]
+                    case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.VrfOutputRange.Incomplete(
+                          chainOutputs,
+                          _,
+                          _
+                        ) =>
+                      EtaSourceUnavailable(
+                        currentPeriod,
+                        currentPeriod - 1L,
+                        s"Phase-2 anchor ancestry incomplete after ${chainOutputs.size} outputs"
+                      ).raiseError[F, Array[Byte]]
+                  }
+              }
           }
 
           _ <- nakLogger
@@ -1478,8 +1487,8 @@ object GlobalSnapshotConsensus {
           // #214: orphan buffer + admission cache. Hoisted from `NakamotoSyncDaemon.run` so the
           // SnapshotLeaderLoop.onFinalize drain hook below and the daemon's gossip handler share
           // the same in-memory instance. The orphan-drain on finalize unsticks chains where the
-          // local committee gate dropped a binary that nevertheless reached cluster finalization
-          // via 2/3-attestation or depth-k.
+          // local admission gate did not complete but a later exact ML0/global reference makes the
+          // binary's child eligible for another ordinary admission attempt.
           orphanBufferLogger <- org.typelevel.log4cats.slf4j.Slf4jLogger
             .fromName[F]("MetagraphOrphanBuffer")
             .toResource
@@ -1497,11 +1506,11 @@ object GlobalSnapshotConsensus {
             .makeMetagraphBinaryProcessor[F](
               processMetagraphBinary = processMetagraphBinary,
               committeeGate = committeeGate,
-              // #213/#290: admission resolver derives the parent ordinal from the incoming binary's own
-              // content (ordinal − 1), not the (possibly-dropped) gl0 currency partition. Committee gate
-              // wiring (below + the receiver attestation handler) is unchanged — still GSI-only.
-              parentOrdinalFor = committeeParentOrdinalForBinary,
-              etaForParentOrdinal = committeeEtaForOrdinal,
+              currencyContextFor = committeeCurrencyContextForBinary,
+              currencyContextFromContent = committeeCurrencyContextFromContent,
+              verifyPhase2CurrencyContext = committeeVerifyPhase2CurrencyContext,
+              etaForPhase2Anchor = committeeEtaForPhase2Anchor,
+              etaRotationSnapshots = etaRotationSnapshots.toLong,
               selfStake = stakeRegistry.committeeStake(selfId),
               // #29 verify-on-attach: same per-sender stake lookup the inbound-attestation receiver uses (see the
               // `senderStakeLookup` wiring below), so attestations buffered while a binary was an orphan verify
@@ -1514,7 +1523,9 @@ object GlobalSnapshotConsensus {
               shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
               logger = orphanBufferLogger
             )
-          // §3 NIPoPoW S3 — dedicated tower store + finalizer for the Phase-3 sink in SnapshotLeaderLoop.
+          // Dedicated local NIPoPoW tower store + finalizer. Tower retention/proof eligibility is not a
+          // protocol phase or a fork-choice floor. Current invocation from the legacy T_depth2 branch is
+          // transitional and must not be interpreted as global finality.
           // The tower lives in its own in-memory MPT producer (NOT the shared `mptStore`); proposal §4.5
           // explicitly forbids anchoring the tower root in headers, so its bytes never enter the global
           // `mptRoot` / `stateProof`. Each node maintains its own copy; corruption recovery is a chain
@@ -1543,7 +1554,8 @@ object GlobalSnapshotConsensus {
             val proofBuilder = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerProofBuilder
               .make[F](towerStore, globalSnapshotStorage)
             val proofVerifier =
-              io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerVerifier.make[F](log1p, exp)
+              io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerVerifier
+                .make[F](log1p, exp, sharedServices.operatorKeyRegistry)
             val provider = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider.make[F](
               proofBuilder,
               proofVerifier,
@@ -1749,25 +1761,26 @@ object GlobalSnapshotConsensus {
               val shardSlotLeader =
                 io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSlotLeader.make[F](eligibilityChecker)
               val shardKesSigner = new io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSigner[F] {
-                def currentPeriod: F[Int] = operationalKeyMaker.currentPeriod
-                def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]] =
-                  operationalKeyMaker.signAt(kesStep, message).map {
-                    case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
-                    case Left(_)    => Array.empty[Byte]
-                  }
+                def sign(
+                  operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
+                  checkpointEpoch: io.constellationnetwork.schema.nakamoto.EtaPeriod,
+                  message: Array[Byte]
+                ): F[
+                  Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSignature]
+                ] =
+                  signKesAtRegisteredPeriod(operatorKeys, checkpointEpoch, message).map(
+                    _.map {
+                      case (treeStep, bytes) =>
+                        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSignature(treeStep, bytes)
+                    }
+                  )
               }
-              val shardVrfSk = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+              val shardVrfKeys = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
                 .deriveVrfKeys(keyPair)
-                ._1
               // §5.7 (owner-corrected 2026-06-11): the lottery clock is the WALL-CLOCK slot grid — the producer
               // receives `currentSlot` per fan-out tick and stamps it on the envelope (signed); no anchor→slot
               // mapping exists anymore (the old `slotForGl0Anchor` identity map downsampled the lottery to
               // gl0-snapshot cadence — the run-10 Gap-A inversion).
-              // LDD slot-gap: genesis (no parent) → the slot itself (EligibilityChecker "first wins"
-              // seed); else currentSlot - parentSlot clamped to ≥ 1 (mirrors the gl0 loop's clamp).
-              val slotGapFor
-                : (io.constellationnetwork.schema.nakamoto.slot.Slot, Option[io.constellationnetwork.schema.nakamoto.slot.Slot]) => Long =
-                (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => math.max(1L, cur.value.value - p.value.value))
               // Slice S4: per-period rotated gl0 eta → 32 raw digest bytes. `etaForPeriodCallback` is the SAME
               // `EtaStateManager.getEta` resolver the GSAM boundary writer uses; it returns a hex `Hash`, which we decode
               // to the 32-byte shape `computeShardEta` requires (mirrors `ShardSlotLeader.computeShardEta`'s own
@@ -1790,7 +1803,7 @@ object GlobalSnapshotConsensus {
                       // S2 — BASE-ANCHORED window (VERSION-MODEL §4): the producer's `chainLinkOrder` anchors each MG's binary window on the
                       // gl0 DEPTH-K-FINALIZED base's per-MG `lastStateChannelSnapshotHashes` — the SAME finalized base `derivePerMgState`
                       // reads. So window-anchor == execution prior on every verifier, all on
-                      // the finalized base; the window RE-INCLUDES base->adopted binaries at pipelineDepth>1 and advances on gl0 finalization
+                      // the finalized base; the window RE-INCLUDES base->adopted binaries and advances on GL0 finalization
                       // (NOT the bestTip-derived `chainStore.perMgTip`, which ran ahead of base — the run-24..27 §4 window-anchor violation).
                       finalizedBasePerMgTip = {
                         import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax.MptStoreReadOps
@@ -1801,28 +1814,29 @@ object GlobalSnapshotConsensus {
                       // the latest-PRODUCED global GSI. `getCombined` LAGS the in-flight per-MG adoptions, so it sits BEHIND gl0's true
                       // adopt tip and let a stale re-include slip the gate → ord-26 re-froze (verified live). The chain-wide frontier is
                       // reorg-safe and at-or-AHEAD of gl0's adopt tip (gl0 only adopts what this chain minted), so requiring the next
-                      // window to extend past it guarantees gl0's embed-match can continue — the producer never advances bestTip past
-                      // adoptedShardOrd with an un-embeddable checkpoint (the permanent pipeline freeze).
+                      // window to extend past it guarantees gl0's embed-match can continue. Exactly one checkpoint may be outstanding;
+                      // advancing a child before the exact containing GL0 snapshot reaches P2 causes a permanent await-embed freeze.
                       adoptedPerMgTip = entry.chainStore.lastCheckpointedPerMgTip,
                       slotLeader = shardSlotLeader,
                       publisher = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointPublisher
                         .sidecar[F](sidecarClient),
                       selfPeerId = selfId,
                       selfKeyPair = keyPair,
-                      selfVrfSk = shardVrfSk,
+                      selfVrfSk = shardVrfKeys._1,
+                      selfVrfVk = shardVrfKeys._2,
+                      operatorKeyRegistry = sharedServices.operatorKeyRegistry,
                       kesSigner = shardKesSigner,
                       shardEtaFor = shardEtaFor,
                       staircaseDeltaSlots = deps.shardingConfig.checkpoint.staircaseDeltaSlots,
-                      slotGapFor = slotGapFor,
-                      // The producer re-executes each MG's currency derivation against pinned state S(N) and emits the per-MG root plus the
-                      // complete signed snapshot inputs. Every GL0 verifier runs the same
-                      // `shardScEventsProcessor` and compares its recreated root before adoption.
+                      // The producer and every execution signer re-execute each MG currency derivation against the pinned Phase-2 base.
+                      // Selected watchtowers replay before inclusion as positive collusion coverage. Current ordinary GL0 verification also
+                      // runs this processor, but that universal replay is transitional; target adopters verify the certificate/coverage,
+                      // apply the namespace-confined diff, and recompute the root.
                       //
                       // S(N) READER = FINALIZED `fromMptStore(mptStore)`, NOT `pendingReader` (run-27 freeze fix). The execution prior MUST
-                      // be byte-identical to the prior every GL0 verifier reads, and gl0 reads the PARENT branch's COMMITTED
-                      // state (`GlobalSnapshotAcceptanceManager.accept`'s branch-aware reader off the parent tip — which equals the
-                      // finalized base AT pipeline depth 1, since the producer holds after one unadopted window so the branch never
-                      // runs ahead of base for an MG's currency partitions). `pendingReader` (`GlobalStateReader.pending`, best-tip
+                      // be byte-identical to the prior all replaying execution signers/watchtowers read. The producer holds exactly one
+                      // unadopted checkpoint until its containing GL0 snapshot reaches P2, so no second checkpoint can run ahead of the
+                      // base for an MG's currency partitions. `pendingReader` (`GlobalStateReader.pending`, best-tip
                       // overlay) instead bakes in this node's LOCAL pending state — un-adopted snapshots, advanced lastTxRefs /
                       // sync-view / allow-spend-expiry — produced by the local metagraph fold, a different input than GL0's pinned replay.
                       // So best-tip S(N) ≠ adopted S(N) even in the happy path and the producer root cannot be reproduced (run-26:
@@ -1851,10 +1865,8 @@ object GlobalSnapshotConsensus {
                       // store's own latest is resolvable-by-construction on the minting node and finalize-synchronized on every verifier.
                       executionBaseOrdinalF = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
                         .pinnedExecutionBaseOrdinal[F](signedBytesStore),
-                      // Bounded checkpoint pipeline (2026-06-11): gl0's adopted-watermark from the acceptance
-                      // manager gates new window production so pending batches while embedding catches up.
-                      lastAdoptedOrd = deps.acceptanceManager.lastAdoptedOrd(shardId),
-                      pipelineDepth = deps.shardingConfig.checkpoint.pipelineDepth,
+                      // V1 permits one outstanding checkpoint per shard. Only the exact Phase-2 checkpoint anchor releases its successor.
+                      lastPhase2Checkpoint = deps.acceptanceManager.lastAdoptedCheckpoint(shardId),
                       // Tier-1 idempotence cadence (task #45): re-publish a held checkpoint's bytes every N ticks
                       // instead of re-minting (which churned the hash every tick and split attestations — run-19).
                       republishEveryTicks = deps.shardingConfig.checkpoint.republishEveryTicks
@@ -1866,10 +1878,10 @@ object GlobalSnapshotConsensus {
                 .toResource
           }
 
-          // ─── T_count_shard quorum closure — receiver-side attestation emitter ──────────────────
+          // ─── Execution-certificate threshold closure — receiver-side replay-signature emitter ──
           // Built alongside the producers, reusing the SAME signing material (selfId, keyPair, KES adapter,
           // shard VRF sk) and per-shard proof etas. After an admissible receipt, the daemon walks canonical ancestors and emits any missing
-          // self-attestations so peers can reach the configured `kQuorum` selection count.
+          // local replay signatures so peers can reach the configured `kQuorum` execution-certificate threshold.
           // `None` (numShards <= 1, regression bar) ⇒ the daemon's emit branch is skipped — byte-identical no-op.
           shardCheckpointAttestationEmitter <- shardAcceptanceDeps match {
             case None =>
@@ -1883,16 +1895,22 @@ object GlobalSnapshotConsensus {
               val shardSlotLeader =
                 io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSlotLeader.make[F](eligibilityChecker)
               val shardKesSigner = new io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSigner[F] {
-                def currentPeriod: F[Int] = operationalKeyMaker.currentPeriod
-                def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]] =
-                  operationalKeyMaker.signAt(kesStep, message).map {
-                    case Right(sig) => io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(sig)
-                    case Left(_)    => Array.empty[Byte]
-                  }
+                def sign(
+                  operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
+                  checkpointEpoch: io.constellationnetwork.schema.nakamoto.EtaPeriod,
+                  message: Array[Byte]
+                ): F[
+                  Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSignature]
+                ] =
+                  signKesAtRegisteredPeriod(operatorKeys, checkpointEpoch, message).map(
+                    _.map {
+                      case (treeStep, bytes) =>
+                        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.KesSignature(treeStep, bytes)
+                    }
+                  )
               }
-              val shardVrfSk = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
+              val shardVrfKeys = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop
                 .deriveVrfKeys(keyPair)
-                ._1
               // §5.7: the attester reads the checkpoint's WIRE slot directly — no anchor→slot mapping.
               // Epoch-aware per-shard registered-key proof eta resolver — must match the producer's `shardEtaFor`
               // byte-for-byte for the same `(shardId, epoch)` so the attester's VRF message agrees. Same
@@ -1918,9 +1936,12 @@ object GlobalSnapshotConsensus {
                     io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter.make[F](
                       selfPeerId = selfId,
                       selfKeyPair = keyPair,
-                      selfVrfSk = shardVrfSk,
+                      selfVrfSk = shardVrfKeys._1,
+                      selfVrfVk = shardVrfKeys._2,
+                      operatorKeyRegistry = sharedServices.operatorKeyRegistry,
                       kesSigner = shardKesSigner,
                       eligibilityChecker = eligibilityChecker,
+                      verifyCommitteeSignature = deps.acceptanceManager.verifyCommitteeSignature,
                       sidecarClient = sidecarClient,
                       tipTrackerFor = tipTrackerFor,
                       shardEtaFor = shardEtaFor
@@ -1958,7 +1979,7 @@ object GlobalSnapshotConsensus {
                 .toResource
           }
           invalidStateProofValidator <- shardAcceptanceDeps match {
-            case Some(_) =>
+            case Some(deps) =>
               implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
               Async[F]
                 .pure(
@@ -1966,7 +1987,8 @@ object GlobalSnapshotConsensus {
                     io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
                       reDerivePerMgRoot = watchtowerReDerive,
                       slashedReader =
-                        io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.neverSlashed[F]
+                        io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.neverSlashed[F],
+                      verifyExecutionCertificate = deps.acceptanceManager.verifyExecutionCertificate
                     )
                   ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
                 )
@@ -1991,6 +2013,7 @@ object GlobalSnapshotConsensus {
                   sidecarClient = sidecarClient,
                   tipTracker = tipTracker,
                   stakeRegistry = stakeRegistry,
+                  operatorKeyRegistry = sharedServices.operatorKeyRegistry,
                   nodeStorage = nodeStorage,
                   keyPair = keyPair,
                   selfId = selfId,
@@ -2000,8 +2023,8 @@ object GlobalSnapshotConsensus {
                   // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior
                   // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside the loop).
                   confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
-                  // k₂ = 100·k₁ — the single canonical accessor `NakamotoConfig.keepDepthBehindFinalized` (DERIVED from the per-env
-                  // `nakamoto.confirmation-depth-k`, Track-3 S1). Replaces the loop's former inline `100L * confirmationDepthK`.
+                  // Legacy parameter name: k2 = 100*k1 recommended local retention/proof/recovery capacity.
+                  // It is not a Phase-3 threshold or fork-choice floor in the target protocol.
                   archivalDepthK = sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value,
                   slotDurationMs = sharedCfg.nakamoto.slotDurationMs.value,
                   shardBootGraceSlots = shardAcceptanceDeps.map(_.shardingConfig.checkpoint.bootGraceSlots.toLong).getOrElse(30L),
@@ -2038,6 +2061,7 @@ object GlobalSnapshotConsensus {
                   settledOrdinalTracker = settledOrdinalTracker,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
                   operationalKeyMaker = operationalKeyMaker,
+                  verifiedLocalOperatorKeys = verifiedLocalOperatorKeys,
                   dataDir = nakamotoDataDir,
                   // Slice S3: drop aggregator entries for `(mg, parent)` pairs in the finalized
                   // snapshot's `stateChannelSnapshots`. Otherwise the tally grows monotonically.
@@ -2051,10 +2075,9 @@ object GlobalSnapshotConsensus {
                   // The earlier attempt (ad7d4f041, reverted in fea66fc7d) bypassed the gate and
                   // polluted the state-channel queue with locally-unverified binaries.
                   //
-                  // After finalize gl0's GSI contains the just-finalized binary's value-hash, so
-                  // `resolveParent` inside the processor will resolve via `parentOrdinalFor` and
-                  // the child enters `attestAndAdmit` normally — accumulating peer attestations
-                  // already arrived during the GSI-lag window, plus the local self-attestation.
+                  // After finalization, the child's ML0 parent identity is canonical. The processor decodes the child's signed exact GL0
+                  // reference, rechecks that `(ordinal, hash)` as current Phase 2, and only then derives eta/key period and enters
+                  // `attestAndAdmit`, including attestations buffered during the parent-continuity lag.
                   // Background-fire (`Async.start`) so the 30s gate timeout doesn't block the
                   // SnapshotLeaderLoop's finalize sink.
                   onFinalize = (snap: io.constellationnetwork.schema.GlobalIncrementalSnapshot) =>
@@ -2076,6 +2099,70 @@ object GlobalSnapshotConsensus {
                               }
                             }
                           }
+                    } >> shardAcceptanceDeps.traverse_ { deps =>
+                      // A shard checkpoint releases its successor only when its exact containing GL0 snapshot reaches Phase 2. Tentative
+                      // GSAM acceptance is deliberately not an anchor. The finalized-range driver invokes this callback for every newly
+                      // finalized canonical snapshot, including intermediate ordinals skipped by a multi-ordinal finality advance.
+                      HasherSelector[F].withCurrent { implicit hasher =>
+                        hasher.hash(snap).flatMap { containingGl0Hash =>
+                          chainStore.get(snap.lastSnapshotHash).flatMap {
+                            case None if snap.shardCheckpoints.nonEmpty =>
+                              nakLogger.warn(
+                                s"Shard checkpoint Phase-2 anchor deferred: gl0Ord=${snap.ordinal.value.value} " +
+                                  s"gl0Hash=${containingGl0Hash.value.take(12)} parent=${snap.lastSnapshotHash.value.take(12)} " +
+                                  "parent context unavailable"
+                              )
+                            case None => Async[F].unit
+                            case Some(parent) =>
+                              snap.shardCheckpoints.toList.traverse_ {
+                                case (shardId, checkpoint) =>
+                                  ShardWindowContinuation
+                                    .wasFullyAppliedF(
+                                      shardId,
+                                      checkpoint,
+                                      parent.context.lastStateChannelSnapshotHashes,
+                                      snap.stateChannelSnapshots
+                                    )
+                                    .flatMap {
+                                      case false =>
+                                        nakLogger.warn(
+                                          s"Shard checkpoint Phase-2 anchor rejected: gl0Ord=${snap.ordinal.value.value} " +
+                                            s"gl0Hash=${containingGl0Hash.value.take(12)} outerShard=${shardId.value.value} " +
+                                            s"checkpointShard=${checkpoint.shardId.value.value} shardOrd=${checkpoint.shardOrdinal.value} " +
+                                            "checkpoint was not atomically represented by accepted state-channel snapshots"
+                                        )
+                                      case true =>
+                                        hasher.hash(checkpoint.signingPreimage).flatMap { checkpointHash =>
+                                          deps.registry.get(shardId).traverse_ { entry =>
+                                            // A follower may learn this checkpoint only through the validated GL0 artifact. Recover it
+                                            // into the local shard store before anchoring so an unknown hash cannot leave the next duty
+                                            // producer permanently waiting for a best tip it already has authenticated bytes for.
+                                            io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointChainStoreRecovery
+                                              .ingestValidated(checkpoint, entry.chainStore)
+                                              .flatMap { recovered =>
+                                                Async[F].raiseUnless(recovered.checkpointHash === checkpointHash) {
+                                                  new IllegalStateException(
+                                                    s"Phase-2 checkpoint recovery hash mismatch: expected=${checkpointHash.value} " +
+                                                      s"recovered=${recovered.checkpointHash.value}"
+                                                  )
+                                                } >>
+                                                  deps.acceptanceManager
+                                                    .noteAdopted(shardId, checkpoint.shardOrdinal, checkpointHash) >>
+                                                  entry.chainStore.noteAnchor(checkpointHash) >>
+                                                  entry.chainStore.finalize(checkpointHash)
+                                              }
+                                          } >>
+                                            nakLogger.debug(
+                                              s"Shard checkpoint Phase-2 anchor: gl0Ord=${snap.ordinal.value.value} " +
+                                                s"gl0Hash=${containingGl0Hash.value.take(12)} shard=${shardId.value.value} " +
+                                                s"shardOrd=${checkpoint.shardOrdinal.value} checkpoint=${checkpointHash.value.take(12)}"
+                                            )
+                                        }
+                                    }
+                              }
+                          }
+                        }
+                      }
                     } >> {
                       // LocalEvents: emit `SnapshotFinalized` for this just-finalized snapshot. The publisher
                       // is wired up above; default = noop when local events disabled, so this call is cheap.
@@ -2095,9 +2182,9 @@ object GlobalSnapshotConsensus {
                         }
                       }
                     },
-                  // §3 NIPoPoW S3: Phase-3 sink for the local TowerStore. Constructed above with
-                  // a dedicated MPT producer (NOT in the consensus stateProof). Invoked at T_depth2
-                  // archival watermark advance in SnapshotLeaderLoop.finalityMonitor.
+                  // Local NIPoPoW tower finalizer (not in the consensus stateProof). Current code invokes
+                  // it from the legacy T_depth2 retention branch; tower updates must not imply a phase or
+                  // constrain objective GL0 fork choice.
                   towerFinalizer = towerFinalizer,
                   // Gap A — per-shard checkpoint producers + the SAME chain stores they write into + the
                   // per-shard admission-approved binary buffers (the producer fan-out input) + the
@@ -2152,10 +2239,11 @@ object GlobalSnapshotConsensus {
           // (snapshot-indexed, not slot-indexed — see attestation-and-finality.md §1). Aligns with
           // [[project_consensus_epoch_staggering]]'s "KES periods aligned with eta cadence" rule.
           //
-          // Skipped entirely on the in-memory fallback path (no CL_KES_SECURE_STORE_DIR) — the
-          // evolution would write to nowhere persistent and just waste cycles. Disk path is the
-          // only one where the proactive evolution materially shrinks the exposure window.
-          lastEvolvedKesPeriodRef <- Ref.of[F, Int](0).toResource
+          // GL0 has no in-memory fallback: the key maker above is backed by the mandatory secure
+          // store and authenticated against the preregistered operator pair. Evolution targets the
+          // operator's tree-relative step (`globalPeriod - registeredOffset`), never the raw global
+          // eta period. Advancing to the raw period would irreversibly burn a rotated operator key
+          // past the step receivers derive from its registration.
           _ <- supervisor
             .supervise(
               fs2.Stream
@@ -2163,24 +2251,40 @@ object GlobalSnapshotConsensus {
                 .evalMap { _ =>
                   for {
                     finalizedOrd <- nakamotoFinalizedOrdinalRef.get
-                    currentPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+                    globalPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
                       .rotationPeriod(finalizedOrd.value.value, etaRotationSnapshots.toLong)
-                      .toInt
-                    lastEvolved <- lastEvolvedKesPeriodRef.get
-                    _ <-
-                      if (currentPeriod > lastEvolved)
-                        operationalKeyMaker.evolveTo(currentPeriod).flatMap {
-                          case Right(_) =>
-                            lastEvolvedKesPeriodRef.set(currentPeriod) >>
-                              nakLogger.info(
-                                s"🔐 KES period rotated: $lastEvolved → $currentPeriod (finalizedOrd=${finalizedOrd.value.value}, etaRotationSnapshots=$etaRotationSnapshots)"
-                              ) >>
-                              Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotations_total") >>
-                              Metrics[F].updateGauge("dag_nakamoto_kes_current_period", currentPeriod.toLong)
-                          case Left(err) =>
-                            nakLogger.warn(s"⚠️ KES evolveTo($currentPeriod) failed: $err")
+                    _ <- verifiedLocalOperatorKeys.treeStepFor(globalPeriod) match {
+                      case Left(error) =>
+                        nakLogger.debug(
+                          s"KES proactive evolution deferred at finalizedOrd=${finalizedOrd.value.value}: ${error.getMessage}"
+                        )
+                      case Right(requiredTreeStep) =>
+                        operationalKeyMaker.currentPeriod.flatMap { currentTreeStep =>
+                          if (currentTreeStep > requiredTreeStep)
+                            Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotation_failures_total") >>
+                              nakLogger.warn(
+                                s"KES secret is ahead of its preregistered tree step: current=$currentTreeStep required=$requiredTreeStep " +
+                                  s"globalPeriod=$globalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset}; refusing further evolution"
+                              )
+                          else if (currentTreeStep < requiredTreeStep)
+                            operationalKeyMaker.evolveTo(requiredTreeStep).flatMap {
+                              case Right(_) =>
+                                nakLogger.info(
+                                  s"KES tree step rotated: $currentTreeStep -> $requiredTreeStep " +
+                                    s"(globalPeriod=$globalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset} " +
+                                    s"finalizedOrd=${finalizedOrd.value.value})"
+                                ) >>
+                                  Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotations_total") >>
+                                  Metrics[F].updateGauge("dag_nakamoto_kes_current_period", requiredTreeStep.toLong)
+                              case Left(err) =>
+                                Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotation_failures_total") >>
+                                  nakLogger.warn(
+                                    s"KES evolveTo(treeStep=$requiredTreeStep, globalPeriod=$globalPeriod) failed: $err"
+                                  )
+                            }
+                          else cats.Applicative[F].unit
                         }
-                      else cats.Applicative[F].unit
+                    }
                   } yield ()
                 }
                 .compile
@@ -2252,6 +2356,7 @@ object GlobalSnapshotConsensus {
                   nodeStorage = nodeStorage,
                   tipTracker = tipTracker,
                   stakeRegistry = stakeRegistry,
+                  operatorKeyRegistry = sharedServices.operatorKeyRegistry,
                   sidecarClient = sidecarClient,
                   selfId = selfId,
                   keyPair = keyPair,
@@ -2285,26 +2390,11 @@ object GlobalSnapshotConsensus {
                   // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
                   // Always-on; no env flag — verification failures drop the message.
                   operationalKeyMaker = operationalKeyMaker,
-                  kesRegistry = kesRegistry,
-                  // Slice S3: gate metagraph binaries on committee threshold + verify received
-                  // committee attestations against the aggregator. The daemon needs both an ordinal
-                  // resolver (#201) and an ordinal-to-eta function (#202) — handlers chain them so
-                  // the eta passed to the gate is byte-equivalent to the sender's eta.
+                  // Gate metagraph binaries on committee threshold. Eta and active key period derive
+                  // from the binary's exact signed Phase-2 GL0 anchor, never its ML0 ordinal or a local head.
                   committeeGate = committeeGate,
-                  // #213/#290 + liveness completion: the inbound-attestation receiver derives the parent
-                  // ordinal PURELY from the ATTESTED binary's own content (ordinal − 1; looked up in the
-                  // orphan buffer by wire digest) via the content-only resolver — NO gl0-tip identity
-                  // guard. The receiver only needs the binary's self-declared ordinal to compute the eta
-                  // it verifies the committee-VRF against, and it already holds the binary, so that
-                  // ordinal is pure + cross-node-deterministic. The tip-GUARDED resolver
-                  // (`committeeParentOrdinalForBinary`) is what the ADMISSION processor uses — there a
-                  // `None` correctly buffers an ahead-binary — but on THIS receiver path it fail-closed
-                  // whenever gl0's tip trailed the binary's parent (the steady state under ml0's faster
-                  // cadence) and DROPPED the attestation, so binaries never reached threshold and gl0's
-                  // metagraph tip never advanced (self-reinforcing lag behind ml0). Content-only here;
-                  // tip-guard stays on admission. Safety unchanged — the guard never inspected the ordinal.
-                  parentOrdinalFor = committeeParentOrdinalFromContent,
-                  etaForParentOrdinal = committeeEtaForOrdinal,
+                  verifyPhase2CurrencyContext = committeeVerifyPhase2CurrencyContext,
+                  etaForPhase2Anchor = committeeEtaForPhase2Anchor,
                   senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
                   processOrphanedMetagraphBinary = processOrphanedMetagraphBinary,
                   // #259: same orphan-buffer instance the processor closure writes into — the
@@ -2318,8 +2408,8 @@ object GlobalSnapshotConsensus {
                   shardAcceptanceDeps = shardAcceptanceDeps,
                   // Chain-sync recovery (run-20, task #A): the HTTP puller driving the T2 absence stream.
                   shardCheckpointFetcher = shardCheckpointFetcher,
-                  // T_count_shard quorum closure: on best-tip receipt, sign + gossip our own attestation so
-                  // peers reach configured `kQuorum`. `None` at numShards=1 means no emit.
+                  // Execution-certificate closure: after local replay of the exact checkpoint, sign and gossip our
+                  // execution signature so peers can reach configured `kQuorum`. `None` at numShards=1 means no emit.
                   shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,
                   // WATCHTOWER (fraud-proof part 1 + 2): re-execute each adopted checkpoint on the quorum path +
                   // gossip a FraudProofEnvelope on a per-MG root mismatch; the validator re-runs the deterministic

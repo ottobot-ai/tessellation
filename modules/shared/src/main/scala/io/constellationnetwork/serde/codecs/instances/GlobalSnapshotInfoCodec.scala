@@ -9,9 +9,11 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationRecord, KesRegistrationReference}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GenesisOperatorConsensusKey, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
@@ -23,19 +25,22 @@ import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.EitherCodec.either
 import io.constellationnetwork.serde.codecs.OptionCodec.option
-import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedMapCodec.{sortedMap, sortedMapCanonical}
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{codec => allowSpendRefCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
 import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs._
+import io.constellationnetwork.serde.codecs.instances.GenesisOperatorConsensusKeyCodec.{codec => genesisOperatorConsensusKeyCodec}
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.{kesRegistrationRecordCodec, kesRegistrationReferenceCodec}
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.{proofCodec => merkleProofCodec}
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{codec => metagraphSyncCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
+import io.constellationnetwork.serde.codecs.instances.PeerIdCodec.{codec => peerIdCodec}
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.{priceRecordCodec, tokenPairCodec}
 import io.constellationnetwork.serde.codecs.instances.SignatureCodecs.{idCodec, signatureProofCodec}
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
@@ -51,7 +56,7 @@ import io.constellationnetwork.serde.codecs.instances.UpdateNodeParametersCodec.
 import scodec.Codec
 import shapeless.{::, HNil}
 
-/** Canonical scodec codec for `GlobalSnapshotInfo` — the 18-field current info record.
+/** Canonical scodec codec for `GlobalSnapshotInfo` — the 21-field current info record.
   *
   * Capstone codec for the info layer. Composes every inner-type codec built to this point.
   *
@@ -60,7 +65,8 @@ import shapeless.{::, HNil}
   * Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]] 5 — lastCurrencySnapshotsProofs:
   * SortedMap[Address, Proof] 6..17 — 12 Option[SortedMap[_, _]] fields for post-V1 feature activations 18 — historicalStakeSnapshots:
   * SortedMap[EtaPeriod, StakeDistribution] (NIPoPoW S0 N-2 epoch staggering — required, not Option, since it has a sensible empty default
-  * the genesis loader / V1+V2 upgrade paths supply)
+  * the genesis loader / V1+V2 upgrade paths supply) 19..20 — rooted unified operator-key histories and latest references. 21 — immutable
+  * signed period-zero operator-key identities committed at genesis.
   */
 object GlobalSnapshotInfoCodec {
 
@@ -83,7 +89,7 @@ object GlobalSnapshotInfoCodec {
     : Codec[Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]] =
     either(signedCurrencySnapshotCodec, incrementalWithInfoTupleCodec)
 
-  // ---- All 17 field codecs ------------------------------------------------
+  // ---- All 20 field codecs ------------------------------------------------
 
   private val stateChannelHashesMapCodec: Codec[SortedMap[Address, Hash]] =
     sortedMap(addressCodec, hashCodec)
@@ -106,7 +112,7 @@ object GlobalSnapshotInfoCodec {
   private val optionalAddressCodec: Codec[Option[Address]] = option(addressCodec)
 
   private val activeAllowSpendsInnerMapCodec: Codec[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-    sortedMap(addressCodec, sortedSet(signedAllowSpendCodec))
+    sortedMap(addressCodec, sortedSetCanonical(signedAllowSpendCodec))
 
   private val activeAllowSpendsMapCodec: Codec[SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]] =
     sortedMap(optionalAddressCodec, activeAllowSpendsInnerMapCodec)
@@ -116,7 +122,7 @@ object GlobalSnapshotInfoCodec {
   // Field 7
   private val signedTokenLockCodec: Codec[Signed[TokenLock]] = signedCodecFor(tokenLockCodec)
   private val activeTokenLocksMapCodec: Codec[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-    sortedMap(addressCodec, sortedSet(signedTokenLockCodec))
+    sortedMap(addressCodec, sortedSetCanonical(signedTokenLockCodec))
   private val activeTokenLocksOptCodec = option(activeTokenLocksMapCodec)
 
   // Field 8: SortedMap[Address, SortedMap[Address, Balance]]
@@ -143,7 +149,7 @@ object GlobalSnapshotInfoCodec {
         t => t._1 :: t._2 :: HNil
       )
   private val updateNodeParametersMapCodec: Codec[SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)]] =
-    sortedMap(idCodec, unpWithOrdinalTupleCodec)
+    sortedMapCanonical(idCodec, unpWithOrdinalTupleCodec)
   private val updateNodeParametersOptCodec = option(updateNodeParametersMapCodec)
 
   // Fields 12, 13
@@ -182,6 +188,13 @@ object GlobalSnapshotInfoCodec {
   private val historicalStakeSnapshotsMapCodec: Codec[SortedMap[EtaPeriod, HistoricalStakeSnapshot]] =
     sortedMap(etaPeriodCodec, historicalStakeSnapshotCodec)
 
+  private val kesRegistrationCertsMapCodec: Codec[SortedMap[PeerId, SortedSet[KesRegistrationRecord]]] =
+    sortedMapCanonical(peerIdCodec, sortedSetCanonical(kesRegistrationRecordCodec))
+  private val lastKesRegistrationRefsMapCodec: Codec[SortedMap[PeerId, KesRegistrationReference]] =
+    sortedMapCanonical(peerIdCodec, kesRegistrationReferenceCodec)
+  private val genesisOperatorKeysMapCodec: Codec[SortedMap[PeerId, GenesisOperatorConsensusKey]] =
+    sortedMapCanonical(peerIdCodec, genesisOperatorConsensusKeyCodec)
+
   // Witness to keep SignatureProof import referenced.
   private val _spWitness: Codec[SignatureProof] = signatureProofCodec
   locally { val _ = _spWitness }
@@ -206,13 +219,16 @@ object GlobalSnapshotInfoCodec {
       nodeCollateralWithdrawalsOptCodec ::
       priceStateOptCodec ::
       metagraphSyncDataOptCodec ::
-      historicalStakeSnapshotsMapCodec)
+      historicalStakeSnapshotsMapCodec ::
+      kesRegistrationCertsMapCodec ::
+      lastKesRegistrationRefsMapCodec ::
+      genesisOperatorKeysMapCodec)
       .xmap[GlobalSnapshotInfo](
         {
           case sch :: tx :: bal :: lcs :: lcsp ::
               aas :: atl :: tlb :: lasr :: ltlr ::
               unp :: ads :: dsw :: anc :: ncw ::
-              ps :: msd :: hss :: HNil =>
+              ps :: msd :: hss :: kesCerts :: kesRefs :: genesisKeys :: HNil =>
             GlobalSnapshotInfo(
               sch,
               tx,
@@ -231,7 +247,10 @@ object GlobalSnapshotInfoCodec {
               ncw,
               ps,
               msd,
-              hss
+              hss,
+              kesCerts,
+              kesRefs,
+              genesisKeys
             )
         },
         i =>
@@ -253,6 +272,9 @@ object GlobalSnapshotInfoCodec {
             i.priceState ::
             i.metagraphSyncData ::
             i.historicalStakeSnapshots ::
+            i.kesRegistrationCerts ::
+            i.lastKesRegistrationRefs ::
+            i.genesisOperatorKeys ::
             HNil
       )
 

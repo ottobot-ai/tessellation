@@ -34,7 +34,7 @@ object ShardMetrics {
   // All under `dag_nakamoto_shard_*`. Counter keys end in `_total` per Prometheus convention; gauge keys do NOT
   // (matches the existing `dag_nakamoto_*` family in `NakamotoMetrics`).
 
-  /** Counter — one increment per checkpoint accepted. Labels: `shard_id`, `path` ∈ {`t_count`, `t_depth1`}. */
+  /** Counter — one increment per checkpoint accepted. Labels: `shard_id`, `path=execution_quorum`. */
   val CheckpointTotal: MetricKey = "dag_nakamoto_shard_checkpoint_total"
 
   /** Counter — one increment per checkpoint rejected. Labels: `shard_id`, `reason`. */
@@ -42,14 +42,6 @@ object ShardMetrics {
 
   /** Counter — one increment per committee attestation received (recorded in `ShardTipTracker.recordAttestation`). Labels: `shard_id`. */
   val CommitteeAttestationTotal: MetricKey = "dag_nakamoto_shard_committee_attestation_total"
-
-  /** Counter — one increment when a shard takes the `T_depth1_shard` fallback path (committee partly offline). Labels: `shard_id`. */
-  val CommitteePartitionTotal: MetricKey = "dag_nakamoto_shard_committee_partition_total"
-
-  /** Counter — one increment when a shard has been in `T_depth1`-only mode beyond `t-partition-hard-ms` without any `T_count` fire. Labels:
-    * `shard_id`.
-    */
-  val PartitionHardTotal: MetricKey = "dag_nakamoto_shard_partition_hard_total"
 
   /** Gauge — per-shard `bestTip.shardOrdinal`. Labels: `shard_id`. */
   val ChainHeight: MetricKey = "dag_nakamoto_shard_chain_height"
@@ -80,8 +72,8 @@ object ShardMetrics {
     *   - `pre_check_ed25519` — Ed25519 sig failed under signer's long-term VK
     *   - `pre_check_kes` — KES product sig failed under registered master VK
     *   - `pre_check_vrf` — VRF proof structural check failed
-    *   - `unknown_shard` — shard not in local `finalityTriggers` map
-    *   - `re_exec_mismatch` — `T_depth1` re-exec hash differs from committee-signed root
+    *   - `execution_quorum` — fewer than the mandatory number of distinct execution signers
+    *   - `re_exec_mismatch` — re-executed hash differs from committee-signed root
     *   - `other` — fallback bucket; ought to be empty in practice
     */
   object RejectReason {
@@ -89,7 +81,7 @@ object ShardMetrics {
     val PreCheckEd25519 = "pre_check_ed25519"
     val PreCheckKes = "pre_check_kes"
     val PreCheckVrf = "pre_check_vrf"
-    val UnknownShard = "unknown_shard"
+    val ExecutionQuorum = "execution_quorum"
     val ReExecMismatch = "re_exec_mismatch"
     val Other = "other"
 
@@ -106,15 +98,14 @@ object ShardMetrics {
       else if (reason.contains("Ed25519")) PreCheckEd25519
       else if (reason.contains("KES")) PreCheckKes
       else if (reason.contains("VRF")) PreCheckVrf
-      else if (reason.contains("unknown shard")) UnknownShard
+      else if (reason.contains("execution quorum")) ExecutionQuorum
       else if (reason.contains("re-exec mismatch")) ReExecMismatch
       else Other
   }
 
   /** Path values for [[CheckpointTotal]]. */
   object Path {
-    val TCount = "t_count"
-    val TDepth1 = "t_depth1"
+    val ExecutionQuorum = "execution_quorum"
   }
 
   // ---- Tagging helpers -----------------------------------------------------
@@ -149,18 +140,6 @@ object ShardMetrics {
     */
   def incCommitteeAttestation[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
     Metrics[F].incrementCounter(CommitteeAttestationTotal, shardIdTag(shardId))
-
-  /** Increment [[CommitteePartitionTotal]]`{shard_id}`. Call from `ShardCheckpointGl0AcceptanceManager` when the `T_depth1_shard` fallback
-    * path fires (committee partly offline; depth fallback covers liveness).
-    */
-  def incCommitteePartition[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
-    Metrics[F].incrementCounter(CommitteePartitionTotal, shardIdTag(shardId))
-
-  /** Increment [[PartitionHardTotal]]`{shard_id}`. Call from `ShardPartitionMonitor` when the per-shard "last T_count fire" timestamp is
-    * older than `t-partition-hard-ms`.
-    */
-  def incPartitionHard[F[_]: Async: Metrics](shardId: ShardId): F[Unit] =
-    Metrics[F].incrementCounter(PartitionHardTotal, shardIdTag(shardId))
 
   // ---- Gauge update helpers ------------------------------------------------
 

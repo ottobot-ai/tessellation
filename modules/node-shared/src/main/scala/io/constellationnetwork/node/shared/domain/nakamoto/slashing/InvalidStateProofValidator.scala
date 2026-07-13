@@ -17,9 +17,10 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   * `InvalidStateProof` 100% slashing tier). Companion to [[SlashableEvidenceValidator]] / [[ShardCheckpointEquivocationValidator]].
   *
   * '''The single non-negotiable: the verdict is a pure, byte-identical function of the evidence + the canonical re-derivation, on every
-  * honest node.''' Part 2 of the watchtower spec — "EVERY gl0 node independently re-runs the same deterministic re-derivation from the
-  * disputed checkpoint's `includedSnapshots` and decides UPHELD iff attested ≠ honest-re-derived. Never trust the challenger's claimed
-  * roots — recompute." This validator implements exactly that.
+  * honest node.''' Current exceptional adjudication makes every GL0 node independently re-run the disputed exact inputs/base and decides
+  * UPHELD iff the checkpoint result differs from that reproduction. Never trust the challenger's claimed roots. Ordinary target adoption
+  * does not universally replay: execution signers replay before signing, positive watchtower coverage is required pre-inclusion, and other
+  * GL0 nodes verify the certificate/coverage/base/namespace/diff/root.
   *
   * '''The re-derivation primitive (`reDerivePerMgRoot`).''' Injected as the SAME `(metagraphAddress, includedChain, gl0AnchorOrdinal,
   * executionBaseOrdinal) => F[Hash]` closure the
@@ -30,13 +31,12 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   *   1. The closure reads NO live snapshot storage for the derivation itself (`noGlobalSnapshotLookup`), and the `S(N)` prior is read at
   *      the wire-carried, committee-signed `executionBaseOrdinal` — NEVER this node's live base (a validator whose tip ran ahead of the
   *      checkpoint's base would otherwise recompute a different root and false-uphold against an honest committee).
-  *   1. The dispute is gated to land WITHIN the challenge window (`depth-k1`); below depth-k1 the pinned base `S(N)` is cluster-uniform
-  *      (consensus has finalized it), so every honest node's PIN-1 re-derivation reads the IDENTICAL prior and computes the IDENTICAL root.
-  *      Above the window the economic effect is already irreversible, so a late dispute is rejected by the GSAM gate before it reaches this
-  *      validator (the validator itself stays pure given its inputs; the window gate is the caller's contract — same shape as
-  *      [[SlashableEvidenceValidator]]'s `currentEpoch`/`eventEpoch` caller contract). A node that cannot RESOLVE the pinned base
-  *      (retention miss / not reached) yields the `Hash.empty` sentinel and the verdict FAILS CLOSED
-  *      ([[io.constellationnetwork.schema.slashing.InvalidStateProofRejection.CannotRederive]]) — an unverifiable dispute never slashes.
+  *   1. Live code gates disputes to a `depth-k1` window and expects the pinned base `S(N)` to resolve identically. This is a transitional
+  *      resource policy, not an irreversibility claim: target Phase 2 remains density-reorgable and exact `(ordinal,hash,root)` identity is
+  *      required. The caller owns the current window gate (same shape as [[SlashableEvidenceValidator]]'s `currentEpoch`/`eventEpoch`
+  *      contract). A node that cannot RESOLVE the exact pinned base (retention miss / not reached) yields the `Hash.empty` sentinel and the
+  *      verdict FAILS CLOSED ([[io.constellationnetwork.schema.slashing.InvalidStateProofRejection.CannotRederive]]) — an unverifiable
+  *      dispute never slashes.
   *
   * '''Why re-derive from the checkpoint's OWN signed bytes, not the challenger's claim.''' The committee SIGNED `disputedCheckpoint` (its
   * `committeeSignatures` cover the `ShardCheckpointSigPreimage`, which includes `derivedStateDelta.includedSnapshots` and
@@ -49,7 +49,8 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   *
   * '''Safety bar.''' Every check is cryptographically verifiable or a pure recomputation: header equality, the canonical checkpoint-hash
   * binding, the challenger Ed25519 signature, the double-slash MPT guard, and the load-bearing honest-re-derivation comparison. No
-  * behavioral heuristics. See `feedback_slashing_safety_bar`.
+  * behavioral heuristics. In particular, the disputed checkpoint's execution certificate is authenticated before its claimed signer IDs can
+  * become slash targets. See `feedback_slashing_safety_bar`.
   */
 trait InvalidStateProofValidator[F[_]] {
 
@@ -71,9 +72,9 @@ object InvalidStateProofValidator {
   /** Construct the validator.
     *
     * @param reDerivePerMgRoot
-    *   the canonical per-MG root re-derivation — MUST be the SAME closure the shard acceptance manager's unconditional replay uses
-    *   (`ShardCheckpointWiring.reExecDerivationAtPinnedBase` seeded from the finalized base reader), so the recomputed root is in the exact
-    *   `perMetagraphMptRoots` (PIN-1) encoding and byte-comparable against the committee-attested value. Production wiring passes the
+    *   the canonical per-MG root re-derivation — currently the SAME closure the shard acceptance manager's transitional universal replay
+    *   uses (`ShardCheckpointWiring.reExecDerivationAtPinnedBase` seeded from the Phase-2 base reader), so the recomputed root is in the
+    *   exact `perMetagraphMptRoots` (PIN-1) encoding and byte-comparable against the committee-attested value. Production wiring passes the
     *   identical instance constructed in `SharedServices`/`GlobalSnapshotConsensus`.
     * @param slashedReader
     *   the double-slash MPT guard, keyed on `(shardId, disputedCheckpointHash)`. `InvalidStateProofSlashedReader.neverSlashed` for tests /
@@ -84,7 +85,8 @@ object InvalidStateProofValidator {
     // SAME pinned base the committee executed over (call site passes `cp.executionBaseOrdinal`) — a watchtower that read its own live base would
     // recompute a different root and false-slash an honest checkpoint whose base lags the watchtower's.
     reDerivePerMgRoot: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash],
-    slashedReader: InvalidStateProofSlashedReader[F]
+    slashedReader: InvalidStateProofSlashedReader[F],
+    verifyExecutionCertificate: ShardCheckpoint => F[Either[String, Unit]]
   ): InvalidStateProofValidator[F] = new InvalidStateProofValidator[F] {
 
     def validate(evidence: InvalidStateProofEvidence): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]] = {
@@ -130,18 +132,32 @@ object InvalidStateProofValidator {
             .handleError(_ => Left[InvalidStateProofRejection, Unit](InvalidStateProofRejection.InvalidChallengerSignature))
       }
 
-      // Step 6 — double-slash guard: (shardId, disputedCheckpointHash) not already slashed.
+      // Step 6 — authenticate the exact disputed checkpoint before trusting any claimed slash target. The injected verifier runs
+      // deterministic committee membership, distinct/quorum, Ed25519, registered KES, and registered VRF possession checks. Producer duty
+      // is deliberately excluded: it is enforced on ordinary checkpoint intake, while a receiver-local retained parent must not alter the
+      // culpability of execution signers who authenticated a wrong root. Missing historical key/eta/roster state fails closed here; a
+      // receiver can defer, but it cannot slash an unauthenticated PeerId list.
       def step6: F[Either[InvalidStateProofRejection, Unit]] =
+        verifyExecutionCertificate(cp)
+          .map(_.leftMap[InvalidStateProofRejection](InvalidStateProofRejection.InvalidCheckpointCertificate(_)))
+          .handleError(error =>
+            Left[InvalidStateProofRejection, Unit](
+              InvalidStateProofRejection.InvalidCheckpointCertificate(error.getClass.getSimpleName)
+            )
+          )
+
+      // Step 7 — double-slash guard: (shardId, disputedCheckpointHash) not already slashed.
+      def step7: F[Either[InvalidStateProofRejection, Unit]] =
         slashedReader.wasSlashed(evidence.shardId, fp.disputedCheckpointHash).map {
           case true  => Left(InvalidStateProofRejection.AlreadySlashed(evidence.shardId, fp.disputedCheckpointHash))
           case false => Right(())
         }
 
-      // Step 7 — THE VERDICT (load-bearing). Re-derive the honest per-MG root from the checkpoint's OWN signed binaries at its OWN
+      // Step 8 — THE VERDICT (load-bearing). Re-derive the honest per-MG root from the checkpoint's OWN signed binaries at its OWN
       // gl0AnchorOrdinal over its OWN pinned executionBaseOrdinal, using the SAME closure the checkpoint replay uses (PIN-1 encoding,
       // execution-base-pinned reader). Compare against the committee-attested root read off the signed envelope. UPHELD iff the re-derivation
       // AFFIRMATIVELY differs. Never trusts the challenger's carried roots.
-      def step7(binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]]): F[Either[InvalidStateProofRejection, Unit]] = {
+      def step8(binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]]): F[Either[InvalidStateProofRejection, Unit]] = {
         val attested: Option[Hash] = cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
         reDerivePerMgRoot(mg, binaries, cp.gl0AnchorOrdinal, cp.executionBaseOrdinal).map { honest =>
           // FAIL-CLOSED (Track-1 execution-base-pin, FINDING-B1): `Hash.empty` is the wiring's "cannot re-derive" sentinel
@@ -167,7 +183,8 @@ object InvalidStateProofValidator {
         }
       }
 
-      // Short-circuit chain: cheap pure checks first (1-3), then the hash binding + crypto (4-5), the I/O guard (6), the verdict (7).
+      // Short-circuit chain: cheap pure checks first (1-3), hash/challenger crypto (4-5), checkpoint certificate authentication (6), the
+      // I/O double-slash guard (7), then the replay verdict (8).
       val pureUnit: F[Either[InvalidStateProofRejection, Unit]] = Async[F].pure(Right(()))
       def lift(e: Either[InvalidStateProofRejection, Unit]): F[Either[InvalidStateProofRejection, Unit]] = Async[F].pure(e)
 
@@ -181,7 +198,7 @@ object InvalidStateProofValidator {
           step3 match {
             case Left(r) => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])
             case Right(binaries) =>
-              List(step4, step5, step6, step7(binaries))
+              List(step4, step5, step6, step7, step8(binaries))
                 .foldLeft(pureUnit) { (acc, next) =>
                   acc.flatMap {
                     case Left(r)  => Async[F].pure(Left(r): Either[InvalidStateProofRejection, Unit])

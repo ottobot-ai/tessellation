@@ -1,8 +1,13 @@
 package io.constellationnetwork.node.shared.domain.nakamoto
 
+import cats.Monad
 import cats.data.NonEmptyList
-import cats.syntax.eq._
+import cats.syntax.all._
 
+import scala.collection.immutable.SortedMap
+
+import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -43,4 +48,61 @@ object ShardWindowContinuation {
     else if (windowTipHash === tipHash) AlreadyAdopted
     else Defer
   }
+
+  /** A checkpoint is eligible for atomic adoption only when at least one window continues GL0 state and no window is deferred. */
+  def isAtomicallyContinuableF[F[_]: Monad](
+    outerShardId: ShardId,
+    checkpoint: ShardCheckpoint,
+    priorTips: SortedMap[Address, Hash]
+  )(implicit hasher: Hasher[F]): F[Boolean] =
+    if (outerShardId =!= checkpoint.shardId) false.pure[F]
+    else
+      classifyAllF(checkpoint, priorTips).map { decisions =>
+        decisions.exists { case (_, Continue(_)) => true; case _ => false } &&
+        decisions.forall { case (_, Defer) => false; case _ => true }
+      }
+
+  /** Proves that a checkpoint embedded in a GL0 snapshot was applied atomically.
+    *
+    * Every continuing window must appear as the exact accepted suffix in that GL0 artifact. Already-applied windows are no-ops. A deferred,
+    * missing, shortened, or otherwise rejected suffix makes the whole checkpoint ineligible for a Phase-2 shard anchor.
+    */
+  def wasFullyAppliedF[F[_]: Monad](
+    outerShardId: ShardId,
+    checkpoint: ShardCheckpoint,
+    priorTips: SortedMap[Address, Hash],
+    acceptedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+  )(implicit hasher: Hasher[F]): F[Boolean] =
+    if (outerShardId =!= checkpoint.shardId) false.pure[F]
+    else
+      classifyAllF(checkpoint, priorTips).flatMap { decisions =>
+        val hasContinuation = decisions.exists { case (_, Continue(_)) => true; case _ => false }
+        if (!hasContinuation) false.pure[F]
+        else
+          decisions.forallM {
+            case (mg, Continue(idx)) =>
+              val expected = NonEmptyList.fromList(checkpoint.derivedStateDelta.includedSnapshots(mg).toList.drop(idx))
+              (expected, acceptedSnapshots.get(mg)) match {
+                case (Some(suffix), Some(actual)) =>
+                  (
+                    suffix.toList.traverse(hasher.hash(_)),
+                    actual.toList.traverse(hasher.hash(_))
+                  ).mapN(_ === _)
+                case _ => false.pure[F]
+              }
+            case (_, AlreadyAdopted) => true.pure[F]
+            case (_, Defer)          => false.pure[F]
+          }
+      }
+
+  private def classifyAllF[F[_]: Monad](
+    checkpoint: ShardCheckpoint,
+    priorTips: SortedMap[Address, Hash]
+  )(implicit hasher: Hasher[F]): F[List[(Address, Decision)]] =
+    checkpoint.derivedStateDelta.includedSnapshots.toList.traverse {
+      case (mg, nel) =>
+        windowTipHashF(nel).map { windowTipHash =>
+          mg -> classify(nel, windowTipHash, priorTips.getOrElse(mg, Hash.empty))
+        }
+    }
 }

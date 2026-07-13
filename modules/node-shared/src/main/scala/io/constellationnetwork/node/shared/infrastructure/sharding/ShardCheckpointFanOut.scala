@@ -15,7 +15,6 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import org.typelevel.log4cats.Logger
@@ -24,8 +23,9 @@ import org.typelevel.log4cats.Logger
   * global GL0 leader win.
   *
   * Production is called from the ready branch of `SnapshotLeaderLoop` on every slot. Each eligible GL0 operator checks public execution
-  * membership and the producer's staircase duty; a shard with no content emits nothing. The GL0 anchor is the latest finalized ordinal, so
-  * several slots may attempt against the same anchor while the one-checkpoint pipeline and chain store prevent duplicate advancement.
+  * membership and the producer's staircase duty; a shard with no content emits nothing. The GL0 base is the latest exact Phase-2 state, so
+  * several slots may attempt against the same base while the single-outstanding checkpoint rule and chain store prevent duplicate
+  * advancement. There is no checkpoint pipeline-depth parameter.
   *
   * '''numShards = 1 regression bar.''' Both call sites gate this on `shardProducers.nonEmpty && shardAssignment.isDefined`. At numShards=1
   * those are `Map.empty` / `None` ⇒ the call site is `whenA(false)` ⇒ this helper is never entered (no allocation, no log). Even if entered
@@ -45,18 +45,6 @@ import org.typelevel.log4cats.Logger
   */
 object ShardCheckpointFanOut {
 
-  /** Recover the VRF output (beta) from VRF proof bytes.
-    *
-    * '''Why duplicated here (module layering).''' `NakamotoSyncDaemon.vrfOutputFromProof` is the canonical copy, but it lives in `dag-l0`;
-    * `node-shared` (this module) cannot reference it without inverting the dependency direction. Both copies are the SAME one-liner over
-    * the SAME `EcVrf25519.default.vrfProofToHash`, so producer + receiver store byte-identical `vrfOutput` for the same checkpoint. If a
-    * future refactor lifts the daemon helper into `shared`/`node-shared`, both sites should re-route through it.
-    */
-  private val vrf = EcVrf25519.default
-
-  private[sharding] def vrfOutputFromProof(proofBytes: Array[Byte]): Array[Byte] =
-    vrf.vrfProofToHash(proofBytes).getOrElse(proofBytes) // fallback to raw proof if derivation fails
-
   /** Drive every per-shard producer for the single gl0 ord `producedOrd`.
     *
     * @param shardBinaryBuffers
@@ -64,8 +52,8 @@ object ShardCheckpointFanOut {
     *   the input, not GL0's post-chain-link map. A shard with an absent / empty buffer feeds the producer an empty map ⇒ `produce` returns
     *   `None`. SAME instances the daemon's gossip-intake writes into.
     * @param producedOrd
-    *   the finalized GL0 ordinal used as `gl0AnchorOrdinal` and as the pinned replay context. The independent `currentSlot` parameter
-    *   drives staircase duty.
+    *   the Phase-2 GL0 ordinal currently used both as the legacy `gl0AnchorOrdinal` scheduling hint and the ordinal component of the pinned
+    *   replay context. The target checkpoint binds its exact hash and root as well. The independent `currentSlot` drives staircase duty
     * @param epoch
     *   eta-rotation period for `producedOrd` (`EtaPeriod(EtaCalculation.rotationPeriod(producedOrd, etaRotationSnapshots))`). Threaded onto
     *   the produced checkpoint's `epoch` field so verifiers look up the right active set.
@@ -73,7 +61,7 @@ object ShardCheckpointFanOut {
     *   per-shard producers keyed by `ShardId`. Empty ⇒ no-op `traverse_` (the short-circuit).
     * @param shardChainStores
     *   the SAME per-shard chain stores the producers + the acceptance side share. On `Some(checkpoint)` the producing node stores its own
-    *   checkpoint here so the local chain advances toward finality without waiting for its own gossip echo.
+    *   checkpoint here so local execution-quorum collection can begin without waiting for its own gossip echo.
     * @param selfPeerId
     *   this GL0 operator's PeerId. A producer runs for shard `s` only when `selfPeerId` is in the public deterministic
     *   `committeeMembership(s, epoch)` (Task 2 membership gate) — a non-member's checkpoint can never reach committee quorum at any
@@ -135,20 +123,15 @@ object ShardCheckpointFanOut {
                     // receiver-side `vrfOutputFromProof` recovery so both writers store byte-identical vrfOutput
                     // for the same checkpoint.
                     val cp = checkpoint.value
-                    val localSlot = cp.slot.value.value
-                    val vrfProofBytes = cp.committeeSignatures.head.vrfProof.toBytes
-                    val vrfOut = vrfOutputFromProof(vrfProofBytes)
                     shardChainStores.get(sid) match {
                       case Some(store) =>
-                        store
-                          .store(checkpoint, cp.parentCheckpointHash, cp.shardOrdinal, localSlot, vrfOut)
-                          .flatMap { stored =>
-                            logger.info(
-                              s"🧩 Shard producer: stored own checkpoint shard=${sid.value.value} " +
-                                s"shardOrd=${cp.shardOrdinal.value} gl0Anchor=${cp.gl0AnchorOrdinal.value.value} " +
-                                s"new=$stored mgs=${forShard.size}"
-                            )
-                          }
+                        ShardCheckpointChainStoreRecovery.ingestValidated(cp, store).flatMap { recovered =>
+                          logger.info(
+                            s"🧩 Shard producer: stored own checkpoint shard=${sid.value.value} " +
+                              s"shardOrd=${cp.shardOrdinal.value} gl0Anchor=${cp.gl0AnchorOrdinal.value.value} " +
+                              s"new=${recovered.inserted} mgs=${forShard.size}"
+                          )
+                        }
                       case None =>
                         logger.warn(
                           s"🧩 Shard producer won shard=${sid.value.value} but no chain store registered; checkpoint not stored locally"

@@ -124,6 +124,13 @@ object InvalidStateProofRejection {
     */
   case object InvalidChallengerSignature extends InvalidStateProofRejection
 
+  /** The disputed checkpoint did not carry an authentic execution certificate. This rejects before any carried `peerId` can become a slash
+    * target. The verifier covers committee membership, distinct quorum, Ed25519, registered KES, and registered VRF possession against the
+    * checkpoint's historical period context. Producer-duty history is an admission condition, not signer-culpability evidence.
+    */
+  @derive(eqv, show)
+  final case class InvalidCheckpointCertificate(reason: String) extends InvalidStateProofRejection
+
   /** The double-slash guard fired — a slash record already exists for `(shardId, disputedCheckpointHash)`. Only the first
     * invalid-state-proof for a given wrong checkpoint slashes; subsequent submissions are rejected here.
     */

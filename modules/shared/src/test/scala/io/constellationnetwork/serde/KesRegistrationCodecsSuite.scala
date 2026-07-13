@@ -4,9 +4,9 @@ import cats.data.NonEmptySet
 
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -20,7 +20,7 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import scodec.bits.ByteVector
 import weaver.FunSuite
 
-/** §1.2 Slice 10 (#179) — wire-format canary suite for the KES runtime-registration codec family.
+/** Wire-format canary suite for the current unified KES+VRF operator-key registration candidate.
   *
   * Pins the on-wire shape of every codec exported by `KesRegistrationCodecs`:
   *
@@ -48,7 +48,8 @@ object KesRegistrationCodecsSuite extends FunSuite {
   // -----------------------------------------------------------------------------------------------
 
   private def opPeerId: PeerId = PeerId(Hex("aabb"))
-  private def vkBytes: Hex = Hex("cafebabe")
+  private def vkBytes: Hex = Hex("ca" * 32)
+  private def vrfVk: Hex = Hex("01" * 32)
   private def proof: SignatureProof = SignatureProof(Id(Hex("11")), Signature(Hex("22")))
 
   private def sampleOrdinal: KesRegistrationOrdinal = KesRegistrationOrdinal(NonNegLong.unsafeFrom(7L))
@@ -60,9 +61,11 @@ object KesRegistrationCodecsSuite extends FunSuite {
     KesRegistrationCert(
       operatorPeerId = opPeerId,
       kesMasterVK = vkBytes,
-      kesMasterVKStep = 3,
-      offset = 5L,
-      effectiveFromEpoch = EpochProgress(NonNegLong.unsafeFrom(100L)),
+      kesMasterVKStep = 0,
+      offset = 100L,
+      vrfPublicKey = vrfVk,
+      effectiveFromPeriod = EtaPeriod(100L),
+      registrationParentHash = Hash("b" * 64),
       ordinal = sampleOrdinal,
       parent = KesRegistrationReference.empty
     )
@@ -113,8 +116,8 @@ object KesRegistrationCodecsSuite extends FunSuite {
 
   // -----------------------------------------------------------------------------------------------
   // KesRegistrationCert — operator body. Layout:
-  //   [peerId hex-len-prefixed | kesMasterVK hex-len-prefixed | vkStep:4 | offset:8 |
-  //    effectiveFromEpoch:8 | ordinal:8 | parent:40]
+  //   [peerId hex-len-prefixed | kesMasterVK hex-len-prefixed | vkStep:4 | offset:8 | vrfPublicKey:32-len-prefixed |
+  //    effectiveFromPeriod:8 | registrationParentHash:32 | ordinal:8 | parent:40]
   // -----------------------------------------------------------------------------------------------
 
   test("KesRegistrationCert: round-trips") {
@@ -127,13 +130,17 @@ object KesRegistrationCodecsSuite extends FunSuite {
     val bytes = sampleCert.immutableBytes
     // Build the expected bytes piecewise and assert structural correctness.
     // PeerId.codec writes a uint16 length prefix + hex bytes: "aabb" → "0002 aabb"
-    // Hex codec same shape: "cafebabe" → "0004 cafebabe"
+    // Hex codec same shape: 32 bytes of 0xca → "0020" + 32 bytes.
     val expected = ByteVector.fromValidHex(
       "0002aabb" + // peerId: len=2 + bytes aabb
-        "0004cafebabe" + // kesMasterVK: len=4 + bytes cafebabe
-        "00000003" + // kesMasterVKStep: int32 = 3
-        "0000000000000005" + // offset: int64 = 5
-        "0000000000000064" + // effectiveFromEpoch: 100
+        "0020" + // kesMasterVK: len=32
+        ("ca" * 32) +
+        "00000000" + // kesMasterVKStep: int32 = 0
+        "0000000000000064" + // offset: int64 = 100
+        "0020" + // vrfPublicKey: len=32
+        ("01" * 32) +
+        "0000000000000064" + // effectiveFromPeriod: 100
+        ("bb" * 32) + // registrationParentHash
         "0000000000000007" + // ordinal: 7
         ("00" * 40) // parent: KesRegistrationReference.empty
     )
@@ -141,8 +148,12 @@ object KesRegistrationCodecsSuite extends FunSuite {
   }
 
   test("KesRegistrationCert: changing a field changes the bytes") {
-    val mutated = sampleCert.copy(kesMasterVKStep = 4)
-    expect(sampleCert.immutableBytes != mutated.immutableBytes)
+    val changedKesStep = sampleCert.copy(kesMasterVKStep = 1)
+    val changedVrfKey = sampleCert.copy(vrfPublicKey = Hex("02" * 32))
+    val changedRegistrationParent = sampleCert.copy(registrationParentHash = Hash("c" * 64))
+    expect(sampleCert.immutableBytes != changedKesStep.immutableBytes)
+      .and(expect(sampleCert.immutableBytes != changedVrfKey.immutableBytes))
+      .and(expect(sampleCert.immutableBytes != changedRegistrationParent.immutableBytes))
   }
 
   // -----------------------------------------------------------------------------------------------
@@ -160,10 +171,14 @@ object KesRegistrationCodecsSuite extends FunSuite {
     // Cert bytes + uint16 proof count (1) + proof: (Id "11" → 0001 11) (Signature "22" → 0001 22)
     val certBytes =
       "0002aabb" +
-        "0004cafebabe" +
-        "00000003" +
-        "0000000000000005" +
+        "0020" +
+        ("ca" * 32) +
+        "00000000" +
         "0000000000000064" +
+        "0020" +
+        ("01" * 32) +
+        "0000000000000064" +
+        ("bb" * 32) +
         "0000000000000007" +
         ("00" * 40)
     val proofsBytes = "0001" + "000111" + "000122"

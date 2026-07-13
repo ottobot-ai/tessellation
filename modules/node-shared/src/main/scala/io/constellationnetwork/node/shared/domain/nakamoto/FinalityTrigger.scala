@@ -9,16 +9,16 @@ import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 
-/** Finality trigger.
+/** Ordinal-projection trigger abstraction plus transitional legacy telemetry kinds.
   *
-  * The 4-phase finality model (see `docs/nakamoto/attestation-and-finality.md` §0) has three Phase 1→2 triggers — `T_weight` (2/3
-  * attestation weight), `T_count` (1-validator-1-vote ≥ 2/3 attester count), `T_depth1` (depth-k₁ confirmation) — plus one Phase 2→3
-  * trigger: `T_depth2` (depth-k₂ archival gate, see §0.3). The Phase 1→2 triggers run in parallel with max-of semantics — a snapshot
-  * advances to Phase 2 as soon as ANY trigger qualifies it. `T_depth2` advances Phase 2 → Phase 3 independently and gates archival-only
-  * sinks (overlay history pruning, future aggregate-signature certificates, light-client trust anchor publication).
+  * The locked GL0 lifecycle has P0/P1/P2 only. An exact locally authenticated and executed snapshot reaches reversible P2 through
+  * decided-attestation `T_weight` or canonical k1 depth. This is an OR of independent optimistic/depth rails, not a BFT vote/lock/QC.
+  * `T_count` and `T_depth2` remain represented by current executable telemetry, but they are not target finality predicates: count is
+  * subsumed by decided-attestation weight, and k2 is only recommended local retention/proof/recovery capacity.
   *
-  * Each trigger is a small monotone observable: given a `ConsensusState`, compute the highest ordinal the trigger has qualified. The result
-  * may NEVER go backwards — once a trigger has qualified ordinal N, every ord ≤ N is also qualified by that trigger.
+  * Each trigger is currently a monotone ordinal observable: given a `ConsensusState`, compute the highest ordinal the trigger has
+  * qualified. This type cannot identify the qualifying hash, represent same-ordinal replacement, or own target Phase-2 state. The
+  * hash-bound finality coordinator must replace this projection at the state-changing boundary; these values may remain telemetry.
   *
   * Use [[FinalityTrigger.triggersFor]] for the inverse lookup ("which triggers qualified ord N?"), built directly from each trigger's
   * `latestQualifyingOrdinal`. This is free observability for the future chain-quality observable (task #138) and post-mortem
@@ -48,8 +48,8 @@ trait FinalityTrigger[F[_]] {
 
 object FinalityTrigger {
 
-  /** Tag for each finality trigger. Phase 1→2: [[Kind.TWeight]], [[Kind.TCount]], [[Kind.TDepth1]]. Phase 2→3: [[Kind.TDepth2]] (archival
-    * depth gate). All four are wired today; see `docs/nakamoto/attestation-and-finality.md` §0.3 for the Phase 2→3 semantics.
+  /** Stable tag for current trigger/telemetry instances. Target P2 kinds are [[Kind.TWeight]] and [[Kind.TDepth1]]. [[Kind.TCount]] and
+    * [[Kind.TDepth2]] are legacy implementation debt and must not be interpreted as extra phases or finality rails.
     */
   sealed trait Kind { def name: String }
   object Kind {
@@ -69,14 +69,15 @@ object FinalityTrigger {
     * @param selfId
     *   this node's PeerId. Retained for [[TCountTrigger]] self-exclusion (task #133, still needed for the count path because T_count counts
     *   distinct attesters and self-counting would double-promote a node's own evidence under the count rule). NOT used by
-    *   [[TWeightTrigger]] in the post-Snowball wiring — the Snowball decision is observer-independent by construction (NID-restored).
+    *   [[TWeightTrigger]] in the current wiring. That omission of `selfId` does not make its sticky margin observer-independent: receipt
+    *   order can still produce opposing decisions from the same eventual current attestations.
     * @param bestTipOrdinal
     *   ordinal of the current best chain tip. Used by [[TDepth1Trigger]] to compute `bestTipOrdinal - k₁`.
     * @param bestTipHash
     *   hash of the current best chain tip. Used by [[TWeightTrigger]] to walk back into canonical history.
     * @param canonicalHashAt
     *   chain walk: returns the hash on our canonical chain at the given ordinal (typically `chainStore.walkBackTo(bestTipHash, ord)`). Used
-    *   by [[TWeightTrigger]] to filter cross-fork attestations from the Snowball decision set.
+    *   by [[TWeightTrigger]] to filter cross-fork entries from the transitional sticky-decision set.
     */
   final case class ConsensusState[F[_]](
     selfId: PeerId,
@@ -88,7 +89,7 @@ object FinalityTrigger {
   /** Pure lookup: which triggers have qualified `ord`?
     *
     * Monotonicity means a trigger qualifies `ord` iff its `latestQualifyingOrdinal >= ord`. Set-valued so all subsets are representable (a
-    * snapshot can be qualified by any combination of T_weight, T_count, T_depth1, T_depth2).
+    * current telemetry can report any combination of T_weight, T_count, T_depth1, T_depth2).
     *
     * Returned as a `Set[Kind]` (not `List`) because order is irrelevant — the lookup is "did each trigger qualify yet?", not "in which
     * order did they fire?".
@@ -101,8 +102,8 @@ object FinalityTrigger {
       .traverse(t => t.latestQualifyingOrdinal.map(latest => Option.when(latest >= ord)(t.kind)))
       .map(_.flatten.toSet)
 
-  /** Helper: choose the highest `latestQualifyingOrdinal` across a list of triggers. Equivalent to today's `max(t_weight, t_depth1)` before
-    * `chainStore.finalize` — preserves the max-of semantics under any composition.
+  /** Legacy helper: choose the highest ordinal projection across a list of triggers. It cannot select or prove an exact hash and therefore
+    * must not drive the target Phase-2 transition coordinator.
     */
   def maxLatestQualifyingOrdinal[F[_]: Monad](
     triggers: List[FinalityTrigger[F]]
@@ -112,7 +113,8 @@ object FinalityTrigger {
       else ords.maxBy(_.value.value)
     }
 
-  /** Common construction: a trigger backed by a `Ref[F, SnapshotOrdinal]` that only ever increases.
+  /** Common transitional construction backed by an ordinal-only `Ref` that only ever increases. This cannot represent a same-ordinal
+    * canonical replacement; use it for calculator telemetry, not canonical phase ownership.
     *
     * @param myKind
     *   the trigger's stable tag
@@ -152,8 +154,8 @@ object FinalityTrigger {
   */
 trait FinalityTriggerView[F[_]] {
 
-  /** Which finality triggers have qualified the given ordinal? Set-valued — any combination of `T_weight`, `T_count`, `T_depth1`,
-    * `T_depth2` is representable. Empty set means no trigger has qualified `ord` yet.
+  /** Which current trigger/telemetry calculators have qualified the given ordinal? Set-valued so legacy kinds remain observable. Only
+    * `T_weight` and `T_depth1` are target P2 rails. Empty means no calculator has qualified `ord` yet.
     */
   def triggersFor(ord: SnapshotOrdinal): F[Set[FinalityTrigger.Kind]]
 }
@@ -171,32 +173,25 @@ object FinalityTriggerView {
     }
 }
 
-/** Production builder for the `T_weight` trigger.
+/** Transitional builder occupying the target `T_weight` trigger position.
   *
-  * '''Mechanism (post-Snowball commit).''' The trigger's qualifying ordinal is the highest ordinal where the sibling
-  * [[SnowballAccumulator]] has reached a decision on our canonical-chain hash. This is the Avalanche- Snowball cascade primary output
-  * (`docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §2, §3.1) — replacing the prior Snowflake-style weight-sum gate at this position in
-  * the trigger stack. The trigger's *position* in the stack (`T_weight`) is unchanged; only the *mechanism* flips from "Snowflake counter"
-  * to "Snowball margin-based decision". Position-name kept as `T_weight` so downstream metrics, log lines, and observability surfaces are
-  * unchanged.
-  *
-  * '''NID restoration.''' Snowball is observer-independent — every honest observer plugging in the same attestation transcript reaches the
-  * same decision regardless of their own identity. This is the property the prior P-11b self-exclusion (commit `95471c7f`) broke to prevent
-  * self-finalize-then-deadlock; with Snowball the deadlock attractor is gone structurally and self-attestation is included again.
+  * The trigger's qualifying ordinal is the highest ordinal where the sibling [[SnowballAccumulator]] has a sticky latest-attestation margin
+  * decision matching our canonical hash. The sibling does not implement the intended K/alpha query cascade and its first-crossing decision
+  * is arrival-order sensitive. This trigger therefore marks the integration point; it is not yet a sound Avalanche/Snowball Phase-2 rail.
   *
   * '''Cross-fork filter.''' Decisions on a divergent fork (decided hash differs from our canonical hash at that ordinal) are skipped via
   * the same `canonicalHashAt` predicate the legacy weight-sum path used. Only decisions matching our canonical chain contribute.
   *
-  * '''Threshold parameter.''' Retained for signature stability; not used by the Snowball path (decision is margin-based, not
-  * threshold-based). The 2/3 stake threshold lives in the legacy weight-sum `TipTracker.highestFinalizedOrdinal` which remains available as
-  * fallback evidence.
+  * '''Threshold parameter.''' Retained for signature stability; not used by the transitional margin path (decision is margin-based, not
+  * threshold-based). The legacy weight-sum `TipTracker.highestFinalizedOrdinal` remains executable migration debt and is still the live
+  * state-changing sink; it is not a target fallback rail. Canonical k1 depth is the only target fallback.
   */
 object TWeightTrigger {
 
   /** @param tipTracker
-    *   attestation accumulator (sibling Snowball accumulator is read for the decision)
+    *   attestation tracker whose sibling transitional margin accumulator is read here
     * @param threshold
-    *   retained for signature stability; not used by the Snowball decision (margin-based, not threshold-based)
+    *   retained for signature stability; not used by the sticky-margin decision (margin-based, not threshold-based)
     */
   def make[F[_]: Sync](
     tipTracker: TipTracker[F],
@@ -214,7 +209,7 @@ object TWeightTrigger {
   }
 }
 
-/** Production builder for the `T_depth1` trigger (depth-k₁ confirmation finality).
+/** Production builder for the `T_depth1` canonical-depth Phase-2 fallback.
   *
   * Qualifies ordinal `bestTipOrdinal - k`, clamped to `MinValue` while the chain is shorter than `k`. This is the structural Bitcoin-style
   * fallback that fires when attestation triggers stall (small clusters, partition, adversarial 1/3).
@@ -235,23 +230,19 @@ object TDepth1Trigger {
     }
 }
 
-/** Production builder for the `T_depth2` trigger (Phase 2 → Phase 3, ARCHIVAL depth gate).
+/** Legacy builder for the `T_depth2` local retention/tower watermark.
   *
   * Mirrors [[TDepth1Trigger]] structurally — qualifies ordinal `bestTipOrdinal - k₂`, clamped to `MinValue` while the chain is shorter than
   * `k₂`. The difference is only the constant: `k₂ ≫ k₁` so a strictly deeper / strictly later qualifying ordinal.
   *
-  * Provides the boundary where common-prefix is overwhelmingly safe and Phase-3 sinks (overlay history pruning #139, future
-  * aggregate-signature certificates, light-client trust anchor publication) become eligible to run. Today the wiring in
-  * `SnapshotLeaderLoop.finalityMonitor` only emits a log line + Prometheus counter when `T_depth2` advances — no downstream effects yet.
-  *
-  * See `docs/nakamoto/attestation-and-finality.md` §0.3 for the rationale. k₂ = 100·k₁ (mainnet 102400 / dev 3200) — the single canonical
-  * `NakamotoConfig.keepDepthBehindFinalized` accessor.
+  * This calculator remains wired by transitional code. Its output may schedule local retention/proof work, but it does not advance a
+  * protocol phase, certify common prefix, authorize irreversible pruning, or constrain objective fork choice. k2 = 100*k1 is the
+  * recommended local capacity from `NakamotoConfig.keepDepthBehindFinalized`.
   */
 object TDepth2Trigger {
 
   /** @param k2
-    *   archival depth k₂ = 100·k₁ (mainnet 102400 / dev 3200), threaded from the single canonical
-    *   `NakamotoConfig.keepDepthBehindFinalized`. Distinct from `k₁` (mainnet 1024 / dev 32).
+    *   recommended local retention/proof/recovery capacity k2 = 100*k1
     */
   def make[F[_]: Sync](k2: Long): F[FinalityTrigger[F]] =
     FinalityTrigger.fromRef[F](FinalityTrigger.Kind.TDepth2, SnapshotOrdinal.MinValue) { state =>
@@ -264,18 +255,17 @@ object TDepth2Trigger {
     }
 }
 
-/** Production builder for the `T_count` trigger (1-validator-1-vote count finality on the canonical chain).
+/** Legacy `T_count` calculator retained for telemetry during FinalityGate migration.
   *
   * Counts the number of DISTINCT attesters whose `tipHash` matches our canonical chain at their `tipOrdinal`, walks attestation ordinals
   * from highest down, and qualifies the highest ordinal where the cumulative count reaches `ceil(threshold * validatorCount)`. Counts
   * peers, not weights — under equal stake this ties with [[TWeightTrigger]]; under future stake-weighted VRF this is strictly stronger
   * evidence (a single high-stake validator can hit the 2/3 *weight* threshold alone, but cannot fake a count of distinct attesters).
   *
-  * '''Why hash-aware''': same as `T_weight`. Attesting to ordinal N on fork A must not count toward finalizing ordinal N on fork B.
+  * '''Why hash-aware''': same as `T_weight`. Attesting to ordinal N on fork A must not qualify ordinal N on fork B.
   *
-  * '''Why self-exclusion''' (task #133): a node MUST NOT count its own attestation toward its own finality threshold, otherwise it can
-  * self-finalize a divergent fork and trip the finality-safety gate in `chainStore.finalize`, locking the node out of canonical recovery
-  * (the "fork-recovery deadlock" of #119). Parity with [[TWeightTrigger]].
+  * Live code still allows this calculator to influence finalization; that is a target violation. `T_count` must be removed/subsumed by
+  * decided-attestation `T_weight`, not treated as a third P2 rail.
   *
   * '''Denominator''': `validatorCount` (full seedlist), NOT the observed-active set. Counting against the full validator set means a
   * partition that loses 1/3 of the network correctly DOES NOT count-finalize (count below 2/3 of full). This is intentional — depth-k
@@ -300,8 +290,7 @@ object TCountTrigger {
       for {
         attestations <- tipTracker.allAttestations
         validatorCount <- stakeRegistry.validatorCount
-        // Self-exclusion (#133): drop our own attestation before the canonical-hash filter.
-        // Parity with TWeight — see the docstring on this object for why.
+        // Legacy self-exclusion before the canonical-hash filter.
         nonSelf = attestations.iterator.filter { case (peerId, _) => peerId =!= state.selfId }.toList
         // Canonical-hash filter: keep only attestations whose tipHash is on our chain at their
         // tipOrdinal. Attestations on other forks contribute zero count for finalizing our chain.
@@ -313,7 +302,7 @@ object TCountTrigger {
             }
         }
       } yield {
-        // GRANDPA ancestor rule (parity with TWeight): attesting to ord N with a hash on our
+        // Legacy ancestor aggregation: attesting to ord N with a hash on our
         // canonical chain implicitly attests to all ancestors of that hash. Walk from highest
         // ordinal down, accumulating the count of distinct peers reached so far. The highest
         // ordinal at which the cumulative count meets the threshold is T_count's qualifying ord.

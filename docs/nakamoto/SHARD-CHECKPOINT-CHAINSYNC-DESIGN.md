@@ -1,5 +1,13 @@
 # Shard-Checkpoint Chain-Sync (pull-based recovery) — Design Proposal
 
+> **HISTORICAL FORENSIC DESIGN, NOT THE CURRENT VALIDITY RULE.** The missing-parent
+> recovery evidence remains useful, but the `T_depth1` shard fallback and
+> `numShards=1` bypass described below are retired. Pulling bytes never makes a
+> checkpoint valid: every execution signature requires replay, distinct
+> `kQuorum` is mandatory, positive watchtower coverage precedes GL0 inclusion,
+> and one outstanding checkpoint is released only by its exact containing GL0
+> Phase-2 hash. Use ADR-0016/0017 and the consensus lifecycle for implementation.
+
 **Status:** draft for critic review. No code commitment. Written 2026-06-12 against
 `feature/serde-typeclass-shim` (HEAD `beaef8fa8` — the intake-demux-completion commit,
 on top of Tier-1 idempotence `c995c088a` and #44 `09af4447e`). Authored after run-20

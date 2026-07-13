@@ -1,7 +1,8 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.slashing
 
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
+import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId, ShardOrdinal}
 import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.{eqv, show}
@@ -14,11 +15,11 @@ import derevo.derive
   * of a single signer producing two contradictory artefacts) lifted to the shard-checkpoint layer per
   * `docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.1.
   *
-  * '''Equivocation identity.''' The equivocation key is `(shardId, parentCheckpointHash)` — exactly mirroring the metagraph case where the
-  * key is `(metagraph_address, parent_hash)`. Two distinct `ShardCheckpoint` envelopes that share that key and carry a signature from the
-  * same `peerId` in their respective `committeeSignatures` lists prove the offender signed both children. The KES forward-security property
-  * (`SLASHING-DESIGN.md` §7) means an honest signer who deleted their old SK cannot produce the second signature — so two distinct KES
-  * signatures on two distinct children at the same key is adversarial action by construction.
+  * '''Candidate identity.''' Two children must share shard, parent, shard ordinal, and execution period before comparison. This proves the
+  * same operator authenticated both artifacts, but it does not yet prove misconduct: execution signatures attest reproduced state validity,
+  * and the protocol has not specified a Nakamoto/staircase-safe exclusivity rule forbidding an honest signer from attesting two
+  * individually valid competing proposals. The validator therefore fails closed as `Unverifiable` after authenticating both legs. A BFT
+  * lock must not be invented to fill this design gap.
   *
   * '''Why this is a separate evidence type, not a variant of `SlashableEvidence`.''' The existing schema is tightly coupled to
   * [[io.constellationnetwork.schema.slashing.MetagraphAttestation]] bodies, which carry the per-binary attestation fields (`binaryHash`,
@@ -28,35 +29,31 @@ import derevo.derive
   * sketch literally — separate evidence case class, same ledger-effect pipeline downstream.
   *
   * '''No bounty/submitter fields on this case class.''' Unlike [[io.constellationnetwork.schema.slashing.SlashableEvidence]] the evidence
-  * here is the pure equivocation proof — the bounty / submitter / replay-bound-signature concerns live on the wrapping L0 tx type. Slice 16
-  * delivers the evidence + validator; the GSAM accept-path agent will choose whether to expose the bounty surface via the existing
-  * [[io.constellationnetwork.schema.slashing.SlashableEvidence]] envelope (extended with a `kind` discriminator) or a parallel L0 tx — both
-  * routes preserve byte-equivalence of the underlying equivocation proof since the validation algebra below is the load-bearing piece.
+  * here authenticates the two signatures only. No bounty or ledger slash may be wired until signer exclusivity is specified and this
+  * validator can prove that rule without BFT locking.
   *
-  * '''Validator coverage.''' See [[ShardCheckpointEquivocationValidator]] — six checks total, mirroring the slashing safety bar
-  * (`feedback_slashing_safety_bar`):
+  * '''Validator coverage.''' See [[ShardCheckpointEquivocationValidator]]:
   *
   *   1. Parent-hash match (both children point to the same parent + evidence header agrees) — without this the two children belong to
   *      different fork points and the signer was not equivocating, just voting on disjoint chain positions.
   *   1. Shard-id match (both children belong to the same shard + evidence header agrees) — without this the signatures aren't on
   *      contradictory artefacts but on parallel-universe shard outputs.
+  *   1. Shard-ordinal and execution-period match — different heights or committee draws are not equivocation.
   *   1. Distinct child canonical hashes (`Hasher[F].hash(child.signingPreimage)`) — equal hashes ⇒ duplicate retransmission of the same
   *      checkpoint, not equivocation.
   *   1. Signer present in BOTH `committeeSignatures` lists — without this the evidence pair fails to attribute the offence to a single key.
   *   1. Both signer Ed25519 signatures verify under the signer's long-term VK (recovered from `equivocatingSigner.value.toPublicKey`) over
   *      the respective child's preimage-hash bytes — the load-bearing cryptographic proof.
-  *   1. Both signer KES product signatures verify under the signer's KES master VK at the wire-carried `kesTreeStep` — the deliberate
-  *      adversarial-action proof (KES forward-security means the offender had to keep two-period material live, which is provably wrong).
+  *   1. Both signer KES product signatures verify under the exact historical atomic pair at `checkpoint.epoch - registeredOffset`; the wire
+  *      step must equal that derivation and is never authority.
+  *   1. Both registered-key possession proofs verify under the same pair over the historical shard eta and signed slot.
   *
   * '''Determinism contract.''' Same as [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashableEvidenceValidator]]: every
-  * honest node computing this validator over the same `(evidence, kesRegistry)` inputs returns byte-equivalent accept/reject. No clock, no
-  * env reads, no consensus-state heuristics. The `Hasher[F]` invocations (signing-preimage hashing for cryptographic verification) are
-  * deterministic by construction — same canonical-JSON serialization surface as everywhere else in the codebase.
+  * honest node computing this validator over the same evidence and exact historical resolver view returns the same
+  * `Valid`/`Invalid`/`Unverifiable` result. No receiver-current registry may fill missing history.
   *
-  * '''Frozen wire shape.''' The fields here are part of the consensus contract — they participate in any wrapping L0 tx's canonical bytes.
-  * Adding optional fields, reordering, or wrapping a field in `Option` silently changes the digest and breaks cross-version evidence
-  * verification. Same discipline as [[io.constellationnetwork.schema.slashing.SlashableEvidence.BountyDigestPreimage]]; if the schema needs
-  * to evolve, version the case class explicitly (`ShardCheckpointEquivocationEvidenceV2`) and version the validator branch.
+  * '''Wire shape.''' The fields participate in any wrapping L0 transaction's canonical bytes. This fork is greenfield, so an incomplete
+  * fork-only shape must be replaced atomically rather than retained behind V1/V2 compatibility branches.
   *
   * @param shardId
   *   the shard whose committee produced the conflicting checkpoints. Header equality with `childA.shardId` / `childB.shardId` is asserted
@@ -105,6 +102,14 @@ object ShardCheckpointEquivocationRejection {
   @derive(eqv, show)
   final case class ShardMismatch(shardA: ShardId, shardB: ShardId, evidenceShard: ShardId) extends ShardCheckpointEquivocationRejection
 
+  /** Children at different shard ordinals are not competing children at one chain height. */
+  @derive(eqv, show)
+  final case class ShardOrdinalMismatch(ordinalA: ShardOrdinal, ordinalB: ShardOrdinal) extends ShardCheckpointEquivocationRejection
+
+  /** Execution committee identity changes with eta period. Two signatures from different periods do not prove same-draw equivocation. */
+  @derive(eqv, show)
+  final case class ExecutionPeriodMismatch(periodA: EtaPeriod, periodB: EtaPeriod) extends ShardCheckpointEquivocationRejection
+
   /** §10.1 step 3 — `Hasher[F].hash(childA.signingPreimage) == Hasher[F].hash(childB.signingPreimage)`. Equal canonical hashes ⇒ duplicate
     * retransmission of the same checkpoint, not equivocation.
     */
@@ -134,15 +139,21 @@ object ShardCheckpointEquivocationRejection {
     case object OnChildB extends InvalidEd25519Signature
   }
 
-  /** §10.1 step 6 — the signer's KES product signature on one of the children does not verify under the signer's KES master VK at the
-    * wire-carried `kesTreeStep`. Same fail-closed semantics as [[SlashableEvidenceValidator]]: if the signer has no `KesRegistry` entry, we
-    * can't establish the equivocation evidence cryptographically, so we reject. The `OnChildA`/`OnChildB` distinction mirrors
-    * [[InvalidEd25519Signature]] for diagnostic parity.
+  /** §10.1 step 6 — the signer's KES product signature does not verify at the historically derived tree step. Missing historical state is
+    * not this rejection; it is a typed `Unverifiable` result and cannot slash.
     */
   @derive(eqv, show)
   sealed trait InvalidKesSignature extends ShardCheckpointEquivocationRejection
   object InvalidKesSignature {
     case object OnChildA extends InvalidKesSignature
     case object OnChildB extends InvalidKesSignature
+  }
+
+  /** §10.1 step 7 — registered-VRF-key possession proof failed under the exact atomic pair and historical shard eta. */
+  @derive(eqv, show)
+  sealed trait InvalidVrfProof extends ShardCheckpointEquivocationRejection
+  object InvalidVrfProof {
+    case object OnChildA extends InvalidVrfProof
+    case object OnChildB extends InvalidVrfProof
   }
 }

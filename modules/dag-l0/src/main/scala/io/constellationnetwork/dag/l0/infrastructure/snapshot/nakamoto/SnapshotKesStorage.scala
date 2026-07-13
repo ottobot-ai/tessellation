@@ -42,8 +42,7 @@ object SnapshotKesStorage {
               Files.write(temporary, signature)
               try {
                 val _ = Files.move(temporary, target, StandardCopyOption.ATOMIC_MOVE)
-              }
-              catch {
+              } catch {
                 case _: java.nio.file.FileAlreadyExistsException =>
                   val existing = Files.readAllBytes(target)
                   if (!java.util.Arrays.equals(existing, signature))

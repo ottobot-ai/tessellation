@@ -28,8 +28,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *     prevent unbounded growth — analogous to the heap-leak Fix B applied to `NakamotoChainStore.byHash`.
   *   - `bestTip` selected by Taktikos `maxvalid-tk` (same algorithm used by gl0's `ChainSelection.standardCompare`, replicated here per the
   *     task constraint because `standardCompare` is private on `ChainSelection`).
-  *   - `lastFinalizedOrdinal` — driven by the Phase 1→2 transition at the shard layer (§5.4). Finalize advances the local boundary and
-  *     evicts entries below the keep-floor.
+  *   - `lastFinalizedOrdinal` — a storage-retention boundary advanced only for an externally adopted checkpoint. Finalize evicts entries
+  *     below the configured keep-floor; chain depth never advances it.
   *
   * '''Reuse from gl0 chain store''':
   *   - The `maxvalid-tk` rule (longer chain wins, ties broken by lower head slot, then by lower VRF output) is the same algorithm
@@ -46,8 +46,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - No compat ceremony. This is a fresh per-shard store. The gl0 store stays as-is for the universal global chain.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`):
-  *   - `keepDepthBehindFinalized` is a constructor parameter; callers wire `cfg.nakamoto.sharding.finality.k1Shard` from the Slice 2 typed
-  *     config (`ShardFinalityConfig.k1Shard` defaults to 8 per `application.conf`). No `sys.env.get` anywhere.
+  *   - `keepDepthBehindFinalized` is a constructor parameter; callers wire `cfg.nakamoto.sharding.retention.retainedCheckpoints`. This is
+  *     storage retention only, not checkpoint finality.
   */
 trait ShardChainStore[F[_]] {
 
@@ -74,12 +74,11 @@ trait ShardChainStore[F[_]] {
     vrfOutput: Array[Byte]
   ): F[Boolean]
 
-  /** Anchor-compatibility (task #42, 2026-06-12): record the canonical hash of the checkpoint gl0 most recently ADOPTED for this shard.
-    * Fork choice then puts anchor-ancestry FIRST: a connected candidate whose ancestry contains the anchor beats any that doesn't, before
-    * length/slot/VRF. gl0 is the finality gadget — once it commits a lineage, every honest node must follow it; without this rule runs
-    * 14/15 showed nodes sitting canonical on an un-adopted branch forever (embed-none / frozen watermark), because the pipeline gate
-    * freezes the length race the longest-chain rule would otherwise win by. Idempotent; max-monotone by the adopted checkpoint's shard
-    * ordinal (an older anchor never replaces a newer one).
+  /** Record the exact hash of the checkpoint whose containing GL0 snapshot reached Phase 2 for this shard. This must never be called from
+    * tentative snapshot acceptance. The stored checkpoint becomes an authorized retained-history boundary, allowing a follower that did not
+    * retain its older shard ancestry to continue from the exact GL0-authenticated checkpoint. Fork choice then puts anchor ancestry first:
+    * a connected candidate whose ancestry contains the anchor beats any that does not, before length/slot/VRF. Idempotent and max-monotone
+    * by shard ordinal; an older anchor never replaces a newer one.
     */
   def noteAnchor(anchorHash: Hash): F[Unit]
 
@@ -118,8 +117,8 @@ trait ShardChainStore[F[_]] {
     */
   def walkBackTo(hash: Hash, depth: Long): F[List[Hashed[ShardCheckpoint]]]
 
-  /** Mark a checkpoint as locally-finalized at the shard layer (Phase 1→2 transition per §5.4). Advances `lastFinalizedOrdinal` and evicts
-    * entries whose ordinal is strictly below the keep-floor (`finalized.ordinal - keepDepthBehindFinalized`, clamped to 0).
+  /** Advance the storage-retention boundary to an externally adopted checkpoint and evict entries whose ordinal is strictly below the
+    * keep-floor (`finalized.ordinal - keepDepthBehindFinalized`, clamped to 0). This method does not qualify a checkpoint for adoption.
     *
     * Idempotent: calling with the same hash twice is a no-op on the second call. Monotone: never moves `lastFinalizedOrdinal` backward — a
     * finalize at an ordinal at-or-below the current finalized ordinal is dropped without side effect.
@@ -145,10 +144,7 @@ trait ShardChainStore[F[_]] {
 
 object ShardChainStore {
 
-  /** Default for `keepDepthBehindFinalized` — matches the Slice 2 HOCON default for `nakamoto.sharding.finality.k1Shard`. Smaller than
-    * gl0's `NakamotoChainStore.DefaultKeepDepthBehindFinalized = 255` because shard ords are sparser and degraded shards want tighter
-    * depth-finality fallback (§5.4 / application.conf:358).
-    */
+  /** Default for `keepDepthBehindFinalized`, matching `nakamoto.sharding.retention.retainedCheckpoints`. */
   val DefaultKeepDepthBehindFinalized: Long = 8L
 
   /** Stored shard-checkpoint envelope. Wraps `Signed[ShardCheckpoint]` with the cached canonical hash + outer-proofs hash plus the
@@ -219,7 +215,7 @@ object ShardChainStore {
     * @param keepDepthBehindFinalized
     *   in-memory retention window. Entries at `ordinal < (finalizedOrdinal - keepDepthBehindFinalized)` are evicted at each `finalize`
     *   call. Defaults to [[DefaultKeepDepthBehindFinalized]] (8). Production callers wire
-    *   `sharedConfig.nakamoto.sharding.finality.k1Shard`.
+    *   `sharedConfig.nakamoto.sharding.retention.retainedCheckpoints`.
     *
     * The implicit `Hasher[F]` is required because the store keys its in-memory `byHash` map by the canonical signing-preimage hash (per
     * design doc §3.3 — "the bytes a signer signs are `Hasher[F](ShardCheckpointSigPreimage)`"). Routing through the typeclass avoids
@@ -337,28 +333,26 @@ object ShardChainStore {
                       // Best tip = anchor-compatibility FIRST (task #42), then maxvalid-tk — over CONNECTED entries only. Fold every
                       // newly-connected entry (the incoming one plus any reconnected descendants) against the current best; an orphan
                       // store leaves the tip untouched.
-                      val newBestTipHash: Hash = {
+                      val newBestTipHash: Option[Hash] = {
                         val candidates = newlyConnected.toList.flatMap(newByHash.get)
                         val seed = resolvedBest
-                        candidates.foldLeft(seed) {
-                          case (None, cand) => Some(cand)
-                          case (Some(best), cand) =>
-                            if (compareAnchoredMaxvalid(newByHash, state.anchorHash, cand, best) > 0) Some(cand) else Some(best)
-                        } match {
-                          case Some(best) => best.hash
-                          case None       => snapshotHash // unreachable in practice: first store is genesis-connected
-                        }
+                        candidates
+                          .foldLeft(seed) {
+                            case (None, cand) => Some(cand)
+                            case (Some(best), cand) =>
+                              if (compareAnchoredMaxvalid(newByHash, state.anchorHash, cand, best) > 0) Some(cand) else Some(best)
+                          }
+                          .map(_.hash)
                       }
 
                       val newState =
-                        state.copy(byHash = newByHash, bestTipHash = Some(newBestTipHash), connected = newConnected, byParent = newByParent)
+                        state.copy(byHash = newByHash, bestTipHash = newBestTipHash, connected = newConnected, byParent = newByParent)
                       // Slice 19: emit per-shard `dag_nakamoto_shard_chain_height{shard_id}` gauge whenever the bestTip moves.
                       // The gauge follows the highest-stored-tip ord, so we only emit on the three branches where the bestTip
                       // ACTUALLY advanced (bootstrap, linear-extension, reorg). The alternate-branch case keeps the prior tip.
-                      val newTipOrd: ShardOrdinal = ShardOrdinal(
-                        newState.byHash.get(newBestTipHash).map(_.shardOrdinal.value).getOrElse(0L)
-                      )
-                      val effect: F[Boolean] = (newBestTipHash === snapshotHash, resolvedBest) match {
+                      val newTipOrd: ShardOrdinal =
+                        ShardOrdinal(newBestTipHash.flatMap(newState.byHash.get).map(_.shardOrdinal.value).getOrElse(0L))
+                      val effect: F[Boolean] = (newBestTipHash.contains(snapshotHash), resolvedBest) match {
                         case (true, None) =>
                           logger
                             .info(s"store: chain bootstrapped at shardOrdinal=${shardOrdinal.value} slot=$slot")
@@ -395,10 +389,12 @@ object ShardChainStore {
 
         def noteAnchor(anchorHash: Hash): F[Unit] =
           stateRef.modify { state =>
-            if (state.anchorHash.contains(anchorHash)) (state, Async[F].unit)
+            val storedAnchor = state.byHash.get(anchorHash)
+            val boundaryAlreadyEstablished = state.anchorHash.contains(anchorHash) && storedAnchor.forall(_ => state.connected(anchorHash))
+            if (boundaryAlreadyEstablished) (state, Async[F].unit)
             else {
               val curOrdOpt = state.anchorHash.flatMap(state.byHash.get).map(_.shardOrdinal.value)
-              val newOrdOpt = state.byHash.get(anchorHash).map(_.shardOrdinal.value)
+              val newOrdOpt = storedAnchor.map(_.shardOrdinal.value)
               val advance = (curOrdOpt, newOrdOpt) match {
                 case (Some(c), Some(n)) => n >= c
                 case (None, _)          => true
@@ -406,15 +402,43 @@ object ShardChainStore {
               }
               if (!advance) (state, Async[F].unit)
               else {
-                // Re-run fork choice over ALL connected entries under the new anchor — this is the heal: a node canonical on an
-                // un-adopted branch REORGS here the moment gl0 commits the other lineage.
-                val candidates = state.connected.toList.flatMap(state.byHash.get)
+                // An exact GL0-adopted anchor is also a retained catch-up boundary. A follower may learn this checkpoint from the
+                // validated Phase-2 GL0 artifact without retaining its older shard ancestry. Mark the stored anchor and every
+                // ordinal-contiguous stored descendant connected; this is the only path that may make an otherwise parentless checkpoint
+                // canonical. Unknown hashes remain disconnected.
+                val connectedFromAnchor: Set[Hash] =
+                  storedAnchor.fold(Set.empty[Hash]) { _ =>
+                    val acc = scala.collection.mutable.Set.empty[Hash]
+                    val queue = scala.collection.mutable.Queue(anchorHash)
+                    while (queue.nonEmpty) {
+                      val h = queue.dequeue()
+                      if (!acc(h)) {
+                        acc += h
+                        val parentOrdinal = state.byHash.get(h).map(_.shardOrdinal)
+                        state.byParent
+                          .getOrElse(h, Set.empty)
+                          .filter { child =>
+                            (parentOrdinal, state.byHash.get(child).map(_.shardOrdinal)) match {
+                              case (Some(parent), Some(childOrdinal)) => childOrdinal === parent.next
+                              case _                                  => false
+                            }
+                          }
+                          .foreach(queue.enqueue(_))
+                      }
+                    }
+                    acc.toSet
+                  }
+                val newConnected = state.connected ++ connectedFromAnchor
+
+                // Re-run fork choice over all connected entries under the new anchor. A node canonical on an un-adopted branch reorgs
+                // here the moment GL0 makes the other exact checkpoint Phase 2.
+                val candidates = newConnected.toList.flatMap(state.byHash.get)
                 val newBest = candidates
                   .reduceOption((x, y) => if (compareAnchoredMaxvalid(state.byHash, Some(anchorHash), x, y) >= 0) x else y)
                   .map(_.hash)
                   .orElse(state.bestTipHash)
                 val reorged = newBest =!= state.bestTipHash
-                val ns = state.copy(anchorHash = Some(anchorHash), bestTipHash = newBest)
+                val ns = state.copy(anchorHash = Some(anchorHash), bestTipHash = newBest, connected = newConnected)
                 val log =
                   if (reorged)
                     logger.info(
@@ -494,8 +518,8 @@ object ShardChainStore {
             state.byHash.get(checkpointHash) match {
               case None =>
                 // Finalize on an unknown hash — no-op + warn. We could record the ordinal-only if the caller supplied it, but for the
-                // shard-layer use case (Phase 1→2 transitions are driven by `FinalityTrigger` on entries we know about) this branch is
-                // a misuse signal worth surfacing.
+                // storage-retention boundary must refer to an entry already known to this store, so this branch is a misuse signal worth
+                // surfacing.
                 (
                   state,
                   logger.warn(

@@ -23,11 +23,13 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceManager,
   UpdateDelegatedStakeAcceptanceResult
 }
+import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.RegistrationEvaluationContext
+import io.constellationnetwork.node.shared.domain.nakamoto.kes._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofClient
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.SlashedRegistryEntry
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashManager, InvalidStateProofSlashedReader}
-import io.constellationnetwork.node.shared.domain.nakamoto.{NodeStakeAggregator, ShardAssignment, ShardWindowContinuation}
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersAcceptanceManager
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
   UpdateNodeCollateralAcceptanceManager,
@@ -51,6 +53,7 @@ import io.constellationnetwork.node.shared.infrastructure.local_events.proto.loc
 }
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.kes.KesRegistrationStateManager
 import io.constellationnetwork.node.shared.logger.LoggerBundle
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
@@ -59,6 +62,8 @@ import io.constellationnetwork.schema.artifact._
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
@@ -74,6 +79,7 @@ import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.StatefulMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
@@ -174,7 +180,11 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     // `applyWatchtowerSlashes` fold the self-detected re-exec mismatch feeds (durable slash + bounty to the challenger + `Slashings` MPT
     // write). The set is `(shardId, disputedCheckpointHash)`-ordered so the same wrong checkpoint appears at most once. Default
     // `SortedSet.empty` (every test/cl0/dl1 call site) ⇒ no slash ⇒ byte-identical; ALWAYS empty at `numShards = 1` ⇒ the regression bar holds.
-    fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
+    fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty,
+    // Unified operator-key registrations are ordinary consensus events. They are evaluated against the exact parent branch and inclusion
+    // eta period; only accepted certs are embedded and rooted. A missing verifier rejects every candidate rather than accepting unverified
+    // key authority.
+    kesRegistrationCerts: List[Signed[KesRegistrationCert]] = Nil
   ): F[
     (
       BlockAcceptanceResult,
@@ -203,12 +213,52 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
       // can promote the FINALIZED ordinal's accumulator into the bounded changeset ring the ml0
       // adopt-and-verify follow path serves. Followers (`GlobalSnapshotContextFunctions`) ignore it.
       // Pure read-out — does NOT change snapshot content / finality / mptRoot.
-      StateChangesAccumulator
+      StateChangesAccumulator,
+      KesRegistrationCertAcceptanceResult
     )
   ]
 }
 
 object GlobalSnapshotAcceptanceManager {
+
+  /** Project the frozen atomic genesis registry into the permanent ownership set. The registry is read once as paired records; KES and VRF
+    * projections are never joined here and therefore cannot drift into independent authority surfaces. A map key that disagrees with its
+    * embedded operator identity is startup corruption and fails closed. This helper does not manufacture runtime registration certificates;
+    * genesis remains a distinct canonical anchor.
+    */
+  def anchoredConsensusKeyClaimsFromRegistry[F[_]: Async](
+    registry: OperatorConsensusKeyRegistry[F]
+  ): F[List[RegisteredConsensusKeyClaim]] =
+    registry.list.flatMap { entries =>
+      val mismatchedOperators = entries.toList.collect {
+        case (stateOperator, keys) if stateOperator =!= keys.operatorPeerId =>
+          s"$stateOperator->${keys.operatorPeerId}"
+      }.sorted
+
+      if (mismatchedOperators.nonEmpty)
+        Async[F].raiseError(
+          new IllegalStateException(
+            s"Malformed atomic genesis consensus-key registry: operator mismatches=${mismatchedOperators.mkString(",")}"
+          )
+        )
+      else {
+        val claims = entries.toList.sortBy(_._1).map {
+          case (peerId, keys) =>
+            RegisteredConsensusKeyClaim(
+              peerId,
+              Hex.fromBytes(keys.kes.vk.value),
+              Hex.fromBytes(keys.vrfPublicKey.toBytes)
+            )
+        }
+        Async[F]
+          .fromEither(
+            RegisteredConsensusKeyOwnership
+              .fromState(claims, SortedMap.empty[PeerId, SortedSet[KesRegistrationRecord]])
+              .leftMap(errors => new IllegalStateException(s"Invalid paired genesis KES+VRF ownership: ${errors.toList.mkString(", ")}"))
+          )
+          .as(claims)
+      }
+    }
 
   private final case class PendingCheckpointAdoption(
     shardId: ShardId,
@@ -391,7 +441,7 @@ object GlobalSnapshotAcceptanceManager {
     // suitable for tests / pre-wire-up call sites where boundary writes can fall through to
     // `Hash.empty`; production overrides at `GlobalSnapshotConsensus` construction with a
     // chainStore-backed walk.
-    etaForPeriod: Option[EtaPeriod => F[Hash]] = None,
+    etaForPeriod: Option[(EtaPeriod, BranchId) => F[Hash]] = None,
     // [[LocalEventsPublisher]] gates emission of consensus events into the gl0-embedded gRPC stream
     // (`docs/nakamoto/LOCAL-EVENTS-SERVICE-DESIGN.md`). Production wiring at `GlobalSnapshotConsensus` /
     // `SharedServices` constructs a `Topic`-backed publisher when `nakamoto.local-events.enabled = true`;
@@ -411,11 +461,12 @@ object GlobalSnapshotAcceptanceManager {
     //
     // Activation requires (1) `shardingConfig.numShards > 1`, (2) `shardCheckpointAcceptanceManager.isDefined`,
     // (3) a non-empty `accept(..., shardCheckpoints)` argument. Production wiring will populate all three at
-    // `GlobalSnapshotConsensus` construction once a later slice surfaces the wired shard pipeline.
+    // `GlobalSnapshotConsensus` construction once the single-outstanding checkpoint path is wired.
     //
     // `shardAssignment` is the deterministic, cluster-wide static metagraph → shard map (Hasher-based; identical
     // on every node). At `numShards > 1` it is consulted in `accept()` to PARTITION the raw `scEvents`: a metagraph
-    // address that maps to a shard flows ONLY through the adopt path (its committee-attested checkpoint), so it is
+    // address that maps to a shard flows only through the checkpoint path. Target inclusion requires replay-backed
+    // execution quorum plus positive watchtower coverage; a committee signature count alone is insufficient. It is
     // EXCLUDED from the base `processStateChannelEvents` chain-link call. Because the static assignment is total,
     // in practice this excludes every metagraph SC event at `numShards > 1`; the base path then handles only any
     // genuinely non-sharded events (none under the current total assignment). This removes the double-path, the
@@ -486,7 +537,13 @@ object GlobalSnapshotAcceptanceManager {
     // `numShards = 1` byte-identical regression bar is preserved independently of this validator.
     invalidStateProofValidator: Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
-    ] = None
+    ] = None,
+    // The validator consumes the ordinal-selected hasher, so it is constructed per accept call. `None` is fail-closed: all registration
+    // candidates are rejected and returned to the event pool.
+    kesRegistrationAcceptanceManagerForHasher: Option[Hasher[F] => KesRegistrationCertAcceptanceManager[F]] = None,
+    // Paired genesis KES+VRF claims remain permanent key owners. Runtime histories are added from the exact parent branch before each
+    // acceptance pass; malformed or colliding ownership state aborts acceptance.
+    anchoredConsensusKeyClaims: List[RegisteredConsensusKeyClaim] = Nil
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
@@ -506,11 +563,20 @@ object GlobalSnapshotAcceptanceManager {
     // child sees its parent branch's pending writes (#56.10 Phase J).
     val mptStore: MptStore[F, GlobalStateKey] = overlay.base
     // Construct the consensus sync manager alongside the branch tip and acceptance mutex in one effect.
+    val validateAnchoredClaims = Async[F]
+      .fromEither(
+        RegisteredConsensusKeyOwnership
+          .fromState(anchoredConsensusKeyClaims, SortedMap.empty[PeerId, SortedSet[KesRegistrationRecord]])
+          .leftMap(errors => new IllegalStateException(s"Invalid anchored KES+VRF ownership: ${errors.toList.mkString(", ")}"))
+      )
+      .void
+
     (
       cats.effect.Ref.of[F, BranchId](BranchId.base),
       cats.effect.std.Semaphore[F](1),
-      MetagraphSyncManager.make[F]
-    ).mapN { (branchTipRef, acceptMutex, metagraphSyncManager) =>
+      MetagraphSyncManager.make[F],
+      validateAnchoredClaims
+    ).mapN { (branchTipRef, acceptMutex, metagraphSyncManager, _) =>
       val branchAwareReader = io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.dynamic[F](
         overlay,
         branchTipRef.get
@@ -528,6 +594,7 @@ object GlobalSnapshotAcceptanceManager {
       // `numShards > 1 ∧ shardAssignment.isDefined`; at `numShards = 1` the classification yields no cross-shard consume ⇒ the spent-set
       // stays empty ⇒ the reservation-adjustment overlay is the identity ⇒ the mptRoot is byte-identical to the pre-change path.
       val consumedAllowSpendStateManager = ConsumedAllowSpendStateManager.make[F](branchAwareReader)
+      val kesRegistrationStateManager = KesRegistrationStateManager.make[F](branchAwareReader)
       // Generic cross-shard-message nullifier seam (thin): one handler per cross-shard message TYPE, each owning its own distinct nullifier
       // partition. Instance 1 = allow-spend consume over `ConsumedAllowSpends` (fieldId 33). A future type (cross-shard token-lock,
       // transfer, data-app message) adds another handler here over its own fieldId; the generic `CrossShardMessageEngine` writes them all
@@ -742,10 +809,10 @@ object GlobalSnapshotAcceptanceManager {
               )
             ) {
               case ((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions), (shardId, cp)) =>
-                // DETERMINISTIC adopt-verifier — NOT node-local `evaluate`. `verifyEmbedded` decides purely from the checkpoint bytes +
-                // the committee membership for `(shardId, epoch)`, so the leader (produce), the follower (`createContext`), and every gl0
-                // peer (`validateArtifact`) reach a byte-identical adopt decision + committed state. Using `evaluate` here (which reads the
-                // node-local `ShardFinalityTriggers`) would split the cluster — the prior-pass bug this change fixes.
+                // DETERMINISTIC adopt-verifier — NOT intake `evaluate`. `verifyEmbedded` decides from the checkpoint bytes, the committee
+                // membership for `(shardId, epoch)`, the configured execution quorum, and deterministic replay, so the leader (produce),
+                // the follower (`createContext`), and every gl0 peer (`validateArtifact`) reach a byte-identical adopt decision + committed
+                // state. Intake evaluation may return PendingMoreAttestations below quorum; embedded verification must reject it.
                 if (shardId =!= cp.shardId)
                   loggerBundle.app
                     .warn(
@@ -877,9 +944,9 @@ object GlobalSnapshotAcceptanceManager {
                         .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
 
                     case ShardCheckpointAcceptResult.Rejected(reason) =>
-                      // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient
-                      // (e.g., a shard not yet in the local finalityTriggers map during bootstrap). Slashing for malicious
-                      // rejections is Slice 16/17 territory; this slice surfaces the rejection but takes no slashing action.
+                      // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient, such as an
+                      // unavailable pinned replay base. Slashing for malicious rejections is Slice 16/17 territory; this slice surfaces
+                      // the rejection but takes no slashing action.
                       loggerBundle.app
                         .info(
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
@@ -1264,6 +1331,7 @@ object GlobalSnapshotAcceptanceManager {
         private def computeHistoricalStakeBoundaryDelta(
           ordinal: SnapshotOrdinal,
           baseInfo: GlobalSnapshotInfo,
+          parentTip: BranchId,
           pinnedBoundaryEta: Option[Hash]
         )(
           implicit hasher: Hasher[F]
@@ -1281,7 +1349,7 @@ object GlobalSnapshotAcceptanceManager {
             // (derived from period (currentPeriod-1)'s first 2/3 VRF outputs, fully knowable before currentPeriod even starts).
             //
             val etaF: F[Hash] =
-              pinnedBoundaryEta.fold(etaForPeriod.map(_(currentPeriod)).getOrElse(Async[F].pure(Hash.empty)))(Async[F].pure)
+              pinnedBoundaryEta.fold(etaForPeriod.map(_(currentPeriod, parentTip)).getOrElse(Async[F].pure(Hash.empty)))(Async[F].pure)
             (NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator), etaF).mapN { (newStakeSnapshot, eta) =>
               val newSnapshot = HistoricalStakeSnapshot(newStakeSnapshot, eta)
               val retentionMinPeriod = currentPeriod.value - 3L
@@ -1346,6 +1414,9 @@ object GlobalSnapshotAcceptanceManager {
           updatedWithdrawNodeCollateralsCleaned: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
           updatedPriceState: SortedMap[TokenPair, PriceRecord],
           updatedAcceptedMetagraphSyncData: SortedMap[Address, MetagraphSyncDataInfo],
+          updatedKesRegistrationCerts: SortedMap[PeerId, SortedSet[KesRegistrationRecord]],
+          updatedLastKesRegistrationRefs: SortedMap[PeerId, KesRegistrationReference],
+          parentTip: BranchId,
           pinnedBoundaryEta: Option[Hash]
         )(
           implicit hasher: Hasher[F]
@@ -1372,7 +1443,10 @@ object GlobalSnapshotAcceptanceManager {
             era.postMetagraphSync(ordinal)(updatedAcceptedMetagraphSyncData),
             // §3 NIPoPoW S0.4: passthrough initially; the boundary write below overwrites if this ordinal
             // closes an eta-period (`ord % R == R - 1`).
-            lastSnapshotContext.historicalStakeSnapshots
+            lastSnapshotContext.historicalStakeSnapshots,
+            updatedKesRegistrationCerts,
+            updatedLastKesRegistrationRefs,
+            lastSnapshotContext.genesisOperatorKeys
           )
           // §3 NIPoPoW S0.4 — Cardano-style mark/set/go boundary write.
           //
@@ -1389,7 +1463,7 @@ object GlobalSnapshotAcceptanceManager {
           //
           // §G2 — `computeHistoricalStakeBoundaryDelta` is now `F[]` (reads the boundary `StakeDistribution` from MPT via
           // `NodeStakeAggregator.snapshotFromMpt`). `buildGlobalSnapshotInfo` lifts into `F[]` here.
-          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo, pinnedBoundaryEta).map {
+          computeHistoricalStakeBoundaryDelta(ordinal, baseInfo, parentTip, pinnedBoundaryEta).map {
             case (adds, removes, nextHistorical) =>
               BuildGlobalSnapshotInfoResult(
                 gsi = baseInfo.copy(historicalStakeSnapshots = nextHistorical),
@@ -1595,7 +1669,8 @@ object GlobalSnapshotAcceptanceManager {
           shardCheckpoints: SortedMap[ShardId, ShardCheckpoint] = SortedMap.empty,
           pinnedBoundaryEta: Option[Hash] = None,
           // WATCHTOWER fraud-proof artifact (W3a) — see the trait scaladoc. Threaded identically on every path; folded into the slash sink.
-          fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
+          fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty,
+          kesRegistrationCerts: List[Signed[KesRegistrationCert]] = Nil
         ): F[
           (
             BlockAcceptanceResult,
@@ -1615,7 +1690,8 @@ object GlobalSnapshotAcceptanceManager {
             BranchHandle[F, GlobalStateKey],
             // Task #12 slice 2b — see the trait return type. The typed per-ordinal delta, returned for the
             // producer's changeset-ring staging. Additive; followers ignore it.
-            StateChangesAccumulator
+            StateChangesAccumulator,
+            KesRegistrationCertAcceptanceResult
           )
         ] = {
           implicit val hasher: Hasher[F] = HasherSelector[F].getForOrdinal(ordinal)
@@ -1661,6 +1737,70 @@ object GlobalSnapshotAcceptanceManager {
                 // is shared across accept() calls but `acceptMutex` (above) ensures only one
                 // accept() reads/writes it at a time.
                 _ <- branchTipRef.set(parentTip)
+
+                // Resolve the unified operator-key registry from this exact candidate-parent branch. Complete histories are load-bearing:
+                // permanent ownership prevents a former holder's KES or VRF key from being reassigned after rotation. Pointer/history
+                // disagreement is corrupt consensus state and aborts construction rather than weakening ownership to an empty view.
+                priorKesRegistrationCerts <- kesRegistrationStateManager.materializeActiveKesRegistrationCertsFromMpt
+                priorLastKesRegistrationRefs <- kesRegistrationStateManager.materializeLastRefsFromMpt
+                priorLatestKesRegistrations <- kesRegistrationStateManager.materializeAllFromMpt
+                _ <-
+                  if (priorKesRegistrationCerts.keySet === priorLastKesRegistrationRefs.keySet)
+                    Async[F].unit
+                  else
+                    Async[F].raiseError[Unit](
+                      new IllegalStateException(
+                        s"Corrupt KES+VRF registration parent state at ${parentTip.value}: " +
+                          s"historyPeers=${priorKesRegistrationCerts.keySet.mkString(",")} " +
+                          s"referencePeers=${priorLastKesRegistrationRefs.keySet.mkString(",")}"
+                      )
+                    )
+                lastEffectiveFromPeriods = priorLatestKesRegistrations.view
+                  .mapValues(_.event.value.effectiveFromPeriod)
+                  .to(SortedMap)
+                registeredKeyOwnership <- Async[F].fromEither(
+                  RegisteredConsensusKeyOwnership
+                    .fromState(anchoredConsensusKeyClaims, priorKesRegistrationCerts)
+                    .leftMap(errors =>
+                      new IllegalStateException(
+                        s"Invalid KES+VRF ownership at parent ${parentTip.value}: ${errors.toList.mkString(", ")}"
+                      )
+                    )
+                )
+                kesRegistrationAcceptanceManager = kesRegistrationAcceptanceManagerForHasher
+                  .fold(
+                    KesRegistrationCertAcceptanceManager.make[F](
+                      io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.rejectAll[F]
+                    )
+                  )(_(hasher))
+                kesRegistrationAcceptanceResult <- kesRegistrationAcceptanceManager.accept(
+                  kesRegistrationCerts.sorted,
+                  priorLastKesRegistrationRefs,
+                  lastEffectiveFromPeriods,
+                  registeredKeyOwnership,
+                  RegistrationEvaluationContext(
+                    candidateParentHash = parentTip.value,
+                    inclusionPeriod = EtaPeriod(EtaCalculation.rotationPeriod(ordinal.value.value, etaRotationSnapshots))
+                  ),
+                  ordinal
+                )
+                updatedKesRegistrationCerts = kesRegistrationStateManager.getUpdatedKesRegistrationCerts(
+                  kesRegistrationAcceptanceResult,
+                  priorKesRegistrationCerts
+                )
+                updatedLastKesRegistrationRefs <- kesRegistrationStateManager.getUpdatedLastRefs(
+                  kesRegistrationAcceptanceResult,
+                  priorLastKesRegistrationRefs
+                )
+                acceptedKesRegistrationPeers = kesRegistrationAcceptanceResult.accepted.keySet
+                kesRegistrationCertDeltas = updatedKesRegistrationCerts.filter {
+                  case (peerId, _) =>
+                    acceptedKesRegistrationPeers.contains(peerId)
+                }
+                lastKesRegistrationRefDeltas = updatedLastKesRegistrationRefs.filter {
+                  case (peerId, _) =>
+                    acceptedKesRegistrationPeers.contains(peerId)
+                }
 
                 (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
                   acceptAllowSpendAndTokenLockBlocks(
@@ -2032,7 +2172,7 @@ object GlobalSnapshotAcceptanceManager {
                     currencyAcceptanceBalanceUpdate,
                     incomingCurrencySnapshots
                   ),
-                  verifiedAdoptedMetagraphs
+                  _
                 ) = acceptanceAndVerifiedMetagraphs
 
                 transactionsRefsDeltas <- transactionReferenceManager.acceptTransactionRefs(
@@ -2625,6 +2765,9 @@ object GlobalSnapshotAcceptanceManager {
                   updatedWithdrawNodeCollateralsCleaned,
                   updatedPriceState,
                   updatedAcceptedMetagraphSyncData,
+                  updatedKesRegistrationCerts,
+                  updatedLastKesRegistrationRefs,
+                  parentTip,
                   pinnedBoundaryEta
                 )
                 gsi = gsiResult.gsi
@@ -2696,7 +2839,9 @@ object GlobalSnapshotAcceptanceManager {
                   removedDelegatedStakeKeys = removedDelegatedStakeKeys,
                   removedDelegatedStakeWithdrawalKeys = removedDelegatedStakeWithdrawalKeys,
                   removedNodeCollateralKeys = removedNodeCollateralKeys,
-                  removedNodeCollateralWithdrawalKeys = removedNodeCollateralWithdrawalKeys
+                  removedNodeCollateralWithdrawalKeys = removedNodeCollateralWithdrawalKeys,
+                  kesRegistrationCerts = kesRegistrationCertDeltas,
+                  lastKesRegistrationRefs = lastKesRegistrationRefDeltas
                 )
 
                 _ <- loggerBundle.app.info(
@@ -3077,26 +3222,6 @@ object GlobalSnapshotAcceptanceManager {
                   )
                   .void
 
-                // Advance the node-local shard pipeline watermark and fork-choice anchor only after the whole GL0 acceptance pass
-                // succeeded and every newly selected MG suffix for that checkpoint survived independent replay plus root comparison.
-                // A deferred lineage never creates a pending acknowledgement; one failed MG root suppresses the checkpoint as a whole.
-                _ <- shardCheckpointAcceptanceManager.traverse_ { checkpointManager =>
-                  adoptedResult._4.traverse_ { pending =>
-                    val failedMetagraphs = pending.replayedMetagraphs -- verifiedAdoptedMetagraphs
-                    if (failedMetagraphs.isEmpty)
-                      checkpointManager.noteAdopted(
-                        pending.shardId,
-                        pending.shardOrdinal,
-                        pending.checkpointHash
-                      )
-                    else
-                      loggerBundle.app.warn(
-                        s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=${pending.shardId} " +
-                          s"shardOrd=${pending.shardOrdinal.value} NOT-ACKNOWLEDGED replay/root mismatch " +
-                          s"metagraphs=${failedMetagraphs.toList.sorted.mkString(",")}"
-                      )
-                  }
-                }
               } yield
                 (
                   initialData.blockResult,
@@ -3116,7 +3241,8 @@ object GlobalSnapshotAcceptanceManager {
                   handle,
                   // Task #12 slice 2b — the typed per-ordinal delta this accept() applied (built at the
                   // `stateChangesAccumulator = StateChangesAccumulator(...)` step above, still in scope).
-                  stateChangesAccumulator
+                  stateChangesAccumulator,
+                  kesRegistrationAcceptanceResult
                 )
             }
           }

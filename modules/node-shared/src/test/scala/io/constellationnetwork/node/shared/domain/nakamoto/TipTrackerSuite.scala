@@ -82,7 +82,7 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect.same(Ratio.One, heaviest.get._3)
   }
 
-  test("majority attestation reaches finality (3 of 4 peers attest same tip → >2/3 weight)") {
+  test("local isFinalized predicate renormalizes three active of four validators to weight one") {
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val peer3 = pid("peer3")
@@ -91,9 +91,9 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3, peer4))
-      // 3 of 4 peers attest. Active fraction = 3/4 = 75% ≥ MinActiveQuorumFraction (50%),
-      // so optimistic weighting kicks in: weight is computed against the active set (3 peers),
-      // and all 3 attested the same tip → weight = 1.0. Finality threshold (2/3) is met.
+      // Current behavior: once the local activity gate opens, the denominator is the receiver's
+      // observed-active set. This test records that behavior; it does not establish a portable
+      // Phase-2 decision because another receiver can observe a different active set.
       _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
       _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
       _ <- record(tracker, peer3, att(tipA, slot(10), 100L, slot(11)))
@@ -123,7 +123,7 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect.same(Ratio.One, weightB)
   }
 
-  test("split attestations (2 peers on tip A, 2 on tip B → neither finalized with equal weight)") {
+  test("local isFinalized predicate rejects both sides of an equal two-versus-two split") {
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val peer3 = pid("peer3")
@@ -194,7 +194,7 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect(!afterPrune.contains(peer1))
   }
 
-  test("fork choice: heaviestTip returns tip with most weight") {
+  test("heaviestTip local query returns the tip with most observed weight") {
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val peer3 = pid("peer3")
@@ -214,7 +214,7 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect.same(Ratio(2, 3), heaviest.get._3)
   }
 
-  test("attestation from non-validator (zero stake) doesn't count toward finality") {
+  test("attestation from non-validator has zero local attestation weight") {
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val nonValidator = pid("nonValidator")
@@ -232,7 +232,7 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect(!isFinalized)
   }
 
-  test("2/3+1 threshold: exactly 2 of 3 validators is 0.667 (borderline, should finalize)") {
+  test("local active-set weighting turns two active of three validators into weight one") {
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
     val peer3 = pid("peer3")
@@ -240,9 +240,8 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
-      // 2 of 3 peers attest. Active fraction = 2/3 ≈ 66.7% ≥ MinActiveQuorumFraction (50%),
-      // so optimistic weighting is active: both attesters voted the same tip, weight = 1.0
-      // against the 2-peer active set, which trivially exceeds the 2/3 finality threshold.
+      // The current receiver-local active denominator turns two attestations into weight one.
+      // This is a documented target violation, not evidence for a network-wide threshold.
       _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
       _ <- record(tracker, peer2, att(tipA, slot(10), 100L, slot(11)))
       weight <- tracker.attestationWeight(tipA)
@@ -252,10 +251,9 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect(isFinalized)
   }
 
-  test("chain finalization: when tip at ordinal 100 finalizes, all ancestors are implicitly finalized") {
-    // This test verifies the conceptual model: we don't need to explicitly track
-    // ancestor finalization because any tip that finalizes implies all its ancestors
-    // are finalized. The markFinalized/lastFinalized tracks the frontier.
+  test("markFinalized stores the supplied local frontier tuple") {
+    // This tests only the mutable marker API. It does not prove ancestor finality, establish an
+    // exact-hash Phase-2 decision, or make the marker irreversible under a density reorg.
     val peer1 = pid("peer1")
     val tipFinal = hash("tipFinal")
 
@@ -264,8 +262,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       _ <- tracker.markFinalized(tipFinal, slot(100))
       lastFin <- tracker.lastFinalized
     } yield
-      // When we finalize tip at slot 100, ordinals 1-99 are implicitly finalized
-      // because a snapshot at slot 100 must have all previous snapshots in its chain
+      // The supplied tuple is returned unchanged.
       expect.same(Some((tipFinal, slot(100))), lastFin)
   }
 
@@ -305,21 +302,17 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect(all.get(peer2).exists(_.tipHash == tipB))
   }
 
-  test("highestFinalizedOrdinal: NID-restored — all observers reach the same decision (Snowball commit, P-11b rolled back)") {
-    // Snowball commit: the legacy weight-sum `highestFinalizedOrdinal` no longer self-excludes.
-    // Two honest observers walking the same canonical chain with identical signed attestation
-    // transcripts MUST compute the same finality decision regardless of their `selfId` — this is
-    // Non-Interactive Determinism (NID), the defining property of consensus.
+  test("highestFinalizedOrdinal legacy query includes self and filters by the supplied canonical hash") {
+    // The legacy weight-sum query no longer self-excludes. Repeating a query against this same
+    // tracker with the same canonical-hash callback returns the same value. That is ordinary local
+    // repeatability, not a proof that independently receiving observers have identical state.
     //
     // Setup: 3-validator cluster (gl0-0, gl0-1, gl0-2). All three attest their local tip at
     // ord 100. gl0-0 and gl0-1 share chain A; gl0-2 is on chain B. Two honest observers walking
-    // the SAME canonical chain (A) — one is gl0-0, the other an external observer — must produce
-    // the same finality decision. Pre-Snowball this test asserted the opposite (P-11b
-    // self-exclusion gave different answers); we now flip the expectation to confirm NID.
+    // chain A. The two chain-A reads below intentionally use the same tracker and callback.
     val gl0_0 = pid("gl0-0")
     val gl0_1 = pid("gl0-1")
     val gl0_2 = pid("gl0-2")
-    val observer = pid("observer")
     val hashA100 = hash("chainA_ord100")
     val hashB100 = hash("chainB_ord100")
 
@@ -329,51 +322,41 @@ object TipTrackerSuite extends SimpleIOSuite {
       _ <- record(tracker, gl0_1, att(hashA100, slot(200), 100L, slot(201)))
       _ <- record(tracker, gl0_2, att(hashB100, slot(205), 100L, slot(206)))
 
-      // gl0-0's view of canonical chain A: includes self again (NID-restored). gl0-0 + gl0-1 =
-      // 2/3 stake on A → finalizes ord 100. The off-chain attestation from gl0-2 (on B) is
-      // filtered by the canonical-hash predicate.
-      fromChainA_selfGl00 <- tracker.highestFinalizedOrdinal(
+      // Chain A includes gl0-0 + gl0-1 = 2/3 seedlist weight. The hash callback filters gl0-2's
+      // competing attestation.
+      firstChainAQuery <- tracker.highestFinalizedOrdinal(
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
       )
 
-      // External observer's view of chain A. Same `canonicalHashAt` lookup → same set of
-      // contributing attestations → same finality decision as gl0-0's view above. This is the
-      // NID property the Snowball commit restores.
-      fromChainA_observer <- tracker.highestFinalizedOrdinal(
+      // Repeat the exact same local query.
+      secondChainAQuery <- tracker.highestFinalizedOrdinal(
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
       )
 
-      // gl0-2's view of canonical chain B: only gl0-2's own attestation matches B (1/3 weight).
-      // Below 2/3 → no finality. Same canonical filter, no self-exclusion.
-      fromChainB <- tracker.highestFinalizedOrdinal(
+      // Chain B matches only gl0-2's attestation (1/3 weight), so the legacy threshold is not met.
+      firstChainBQuery <- tracker.highestFinalizedOrdinal(
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
       )
 
-      // Observer's view of chain B is identical to gl0-2's view of chain B (NID property —
-      // same transcript + same canonical lookup ⇒ same decision).
-      fromChainB_observer <- tracker.highestFinalizedOrdinal(
+      // Repeat the exact same chain-B query.
+      secondChainBQuery <- tracker.highestFinalizedOrdinal(
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
       )
 
-      _ = (observer, gl0_2) // observer / gl0_2 reserved for narrative; tests share canonicalHashAt
     } yield
-      // NID: gl0-0's view and the external observer's view of chain A are identical.
-      expect.same(fromChainA_selfGl00, fromChainA_observer) &&
-        // Chain A finalizes at ord 100 with 2/3 weight.
-        expect(fromChainA_selfGl00.isDefined) &&
-        expect.same(100L, fromChainA_selfGl00.get._1) &&
-        expect.same(Ratio(2, 3), fromChainA_selfGl00.get._2) &&
-        // NID: gl0-2's view and the external observer's view of chain B are identical.
-        expect.same(fromChainB, fromChainB_observer) &&
-        // Chain B fails to finalize (only 1/3 attestation weight on B's canonical hash).
-        expect.same(None, fromChainB)
+      expect.same(firstChainAQuery, secondChainAQuery) &&
+        expect(firstChainAQuery.isDefined) &&
+        expect.same(100L, firstChainAQuery.get._1) &&
+        expect.same(Ratio(2, 3), firstChainAQuery.get._2) &&
+        expect.same(firstChainBQuery, secondChainBQuery) &&
+        expect.same(None, firstChainBQuery)
   }
 
-  test("highestFinalizedOrdinal: GRANDPA ancestor rule still works (all agree chain)") {
+  test("highestFinalizedOrdinal legacy weight sum follows the matching hash-chain prefix") {
     // No fork: all three peers attest different ordinals on the same chain.
     // Finality should pick the highest ordinal where cumulative weight ≥ 2/3.
     // The legacy weight-sum path walks attestation ordinals from highest down and accumulates
@@ -408,13 +391,10 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect.same(60L, result.get._1)
   }
 
-  test("highestFinalizedOrdinal: NID — same transcript across two observers ⇒ same decision (P-11b rolled back)") {
-    // Snowball commit: the legacy weight-sum path no longer self-excludes. Two validators (self +
-    // peer) both attesting the same ord/hash now both contribute to the legacy 2/3 weight gate
-    // — full weight, finalizes. The earlier P-11b semantics (exclude `selfId`) is gone; NID is
-    // restored at this position. The Snowball accumulator (the primary T_weight driver now) is
-    // also observer-independent — see the SnowballAccumulatorSuite for the load-bearing NID
-    // assertion on the new path.
+  test("highestFinalizedOrdinal repeated query returns the same legacy result") {
+    // Two validators attesting the same ordinal/hash both contribute because the query no longer
+    // self-excludes. Calling the same tracker twice proves local repeatability only. The live
+    // legacy weight sum and the transitional margin accumulator are not portable Phase-2 evidence.
     val self = pid("self")
     val peer = pid("peer")
     val h100 = hash("ord100")
@@ -424,8 +404,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       _ <- record(tracker, self, att(h100, slot(200), 100L, slot(201)))
       _ <- record(tracker, peer, att(h100, slot(200), 100L, slot(201)))
 
-      // Every observer using the same canonical-hash lookup sees the same decision: both
-      // validators on the same hash ⇒ 2/2 = full weight ⇒ finalize ord 100.
+      // Same tracker and same canonical-hash callback for both reads.
       result1 <- tracker.highestFinalizedOrdinal(
         Ratio(2, 3),
         ord => IO.pure(if (ord == 100L) Some(h100) else None)
@@ -435,18 +414,17 @@ object TipTrackerSuite extends SimpleIOSuite {
         ord => IO.pure(if (ord == 100L) Some(h100) else None)
       )
     } yield
-      // NID: identical decisions across the two queries.
+      // Repeated local queries match.
       expect.same(result1, result2) &&
-        // Decision: finalize ord 100 at full weight.
+        // The legacy query returns ordinal 100 at full local weight.
         expect(result1.isDefined) &&
         expect.same(100L, result1.get._1)
   }
 
   test("highestFinalizedOrdinal includes others' attestations of the same ordinal as expected") {
-    // 4-node cluster: self + 3 peers all attest ord 100 with the same hash. With P-11b rolled
-    // back, self IS included again — total weight = 4/4 = full ≥ 2/3 → finalize. The legacy
-    // weight-sum path remains correct cluster-wide as long as the canonical-hash filter is in
-    // place.
+    // Four validators all attest ordinal 100 with the same hash. Self is included, so this local
+    // legacy calculation returns full weight. The assertion does not establish cluster-wide
+    // safety or validate the receiver-local activity denominator.
     val self = pid("self")
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
@@ -466,8 +444,7 @@ object TipTrackerSuite extends SimpleIOSuite {
       )
       _ = self // referenced for symmetry / narrative
     } yield
-      // All 4 validators attest the same ord/hash ⇒ full weight against the active set ⇒
-      // finalize at ord 100.
+      // All four validators contribute to the legacy local result.
       expect(result.isDefined) &&
         expect.same(100L, result.get._1)
   }
@@ -586,21 +563,20 @@ object TipTrackerSuite extends SimpleIOSuite {
 
     for {
       (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
-      // Build up state that would represent a divergent self-finalize.
+      // Build up a local marker and attestation state that reset must clear.
       _ <- record(tracker, peer1, att(tipOld, slot(10), 100L, slot(11)))
       _ <- record(tracker, peer2, att(tipOld, slot(10), 100L, slot(11)))
       _ <- tracker.markFinalized(tipOld, slot(10))
       // Reset (simulating re-bootstrap orchestrator firing).
       _ <- tracker.unsafe_reset
-      // Post-reset: receive fresh canonical attestations.
+      // Post-reset: receive fresh attestations.
       _ <- record(tracker, peer1, att(tipNew, slot(20), 200L, slot(21)))
       _ <- record(tracker, peer2, att(tipNew, slot(20), 200L, slot(21)))
       newWeight <- tracker.attestationWeight(tipNew)
       oldWeight <- tracker.attestationWeight(tipOld)
       isNewFinalized <- tracker.isFinalized(tipNew)
     } yield
-      // Old tip has zero weight (attestations cleared), new tip has 2/3+ weight,
-      // confirming the tracker is fully reusable post-reset.
+      // Old current weight is cleared and the tracker accepts new local observations.
       expect.same(Ratio.Zero, oldWeight) &&
         expect(newWeight >= Ratio(2, 3)) &&
         expect(isNewFinalized)

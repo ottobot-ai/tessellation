@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.slot._
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.eqv
@@ -11,24 +12,27 @@ import derevo.derive
 /** §3 NIPoPoW S4.1 — serializable header bundle for a single snapshot in a tower proof.
   *
   * Just enough of the `Signed[GlobalIncrementalSnapshot]` for verifier replays:
-  *   - `ordinal`, `slot`, `parentSlot` — slot/ordinal positioning + slotGap reconstruction.
+  *   - `ordinal`, `producerId`, `slot`, `parentSlot` — registered producer identity plus slot/ordinal positioning and slotGap
+  *     reconstruction.
   *   - `vrfProof`, `vrfOutput`, `vrfPublicKey` — L0 eligibility re-verification via
   *     [[io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker.verifyEligibility]].
   *   - `eta` — proof builder copies the certificate's `eta` field; verifier independently re-derives an eta over the L0 suffix via
   *     [[io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation]] (against the level-0 suffix only — the only place the proof
   *     gives the verifier per-snapshot VRF outputs).
   *   - `subchainLevelCounts` — per-super-level cumulative counts at this ordinal, for level-density reconciliation.
-  *   - `snapshotHash` — verifier cross-references `chain headers ↔ tower entries` (must match `TowerEntry.snapshotHash`).
+  *   - `snapshotHash` — intended tower-entry content address. The current proof does not carry an authenticated tower-entry inclusion
+  *     witness, so the verifier cannot yet cross-reference this field against `TowerEntry.snapshotHash`.
   *   - `activePoolSize` — passed through unchanged; verifier doesn't re-derive the eligibility relativeStake (would require historical
   *     state). Proof v1 just records the certificate's claimed `activePoolSize` for diagnostic completeness.
   *
-  * Size: 8 (ord) + 8 (slot) + 8 (parentSlot) + 80 (proof) + 64 (output) + 32 (pk) + 32 (eta) + 72 (9·int64 counts) + 32 (hash) + 4
-  * (poolSize) = 340 bytes per header (raw); JSON-encoded ~600-800 bytes. Budget calculus: 250 headers cap → ~85 KB raw, ~200 KB JSON.
-  * Suffix-trimmed proofs (k=5 L0 suffix + sparse upper levels) come in well under 50 KB.
+  * Size: 8 (ord) + 64 (producer) + 8 (slot) + 8 (parentSlot) + 80 (proof) + 64 (output) + 32 (pk) + 32 (eta) + 72 (9·int64 counts) + 32
+  * (hash) + 4 (poolSize) = 404 bytes per header (raw); JSON-encoded ~700-900 bytes. Suffix-trimmed proofs (k=5 L0 suffix + sparse upper
+  * levels) come in well under 50 KB.
   */
 @derive(eqv, encoder, decoder)
 final case class TowerProofHeader(
   ordinal: SnapshotOrdinal,
+  producerId: PeerId,
   slot: Slot,
   parentSlot: Slot,
   vrfProof: VrfProof,
@@ -50,8 +54,8 @@ final case class TowerProofHeader(
 
 /** §3 NIPoPoW S4.1 — full proof structure produced by [[TowerProofBuilder]] and consumed by [[TowerVerifier]].
   *
-  *   - `level0Suffix` — the k most-recent finalized snapshot headers (default k=5 per `T_depth2 = 5`). Verifier replays L0 trials over the
-  *     suffix and re-derives `g_µ` to prime its own tower view.
+  *   - `level0Suffix` — the k most-recent tower-eligible snapshot headers (local proof default k=5). Verifier replays L0 trials over the
+  *     suffix and re-derives `g_µ`; this proof-suffix parameter is unrelated to GL0 k1/k2 finality semantics.
   *   - `levelChains` — per-super-level (1..9) chain of headers, one entry per level-µ tower hit since `since`. Sparse: lower-frequency
   *     levels (L7-L9) typically have ≤ 1 entry per eta period.
   *   - `since` — anchor ordinal the proof is taken FROM (inclusive). Verifier uses this as the base for density-relative-error
@@ -91,7 +95,7 @@ final case class TowerProof(
 
 object TowerProof {
 
-  /** Default suffix length k = `T_depth2` finality depth (= 5). Verifier replays L0 trials over this suffix. */
+  /** Local proof suffix length. This `k = 5` is not GL0 k1, k2, or a finality threshold. */
   val DefaultSuffixLength: Int = 5
 
   /** Empty proof at the genesis anchor — no L0 suffix yet, no level-µ hits. Verifier treats as a vacuous-OK base case. */

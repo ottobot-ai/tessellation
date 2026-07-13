@@ -571,9 +571,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     val shardingCfg: ShardingConfig =
       ShardingConfig(
         numShards = 4,
-        finality = ShardFinalityConfig(k1Shard = 8L),
-        checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
-        observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
+        retention = ShardCheckpointRetentionConfig(retainedCheckpoints = 8L),
+        checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096)
       )
 
     for {
@@ -586,11 +585,11 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       followerDeps <- io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
         .acceptanceDeps[IO](
           cfg = shardingCfg,
+          etaRotationSnapshots = 100L,
           kDraw = 4,
           kQuorum = 3,
           selfPeerId = selfId,
-          kesRegistry = io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
-          vrfRegistry = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO],
+          operatorKeyRegistry = io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry.empty[IO],
           activeValidators = IO.pure(Set(selfId)),
           etaForEpoch = (_: io.constellationnetwork.schema.nakamoto.EtaPeriod) => IO.pure(Array.fill[Byte](32)(0.toByte))
         )

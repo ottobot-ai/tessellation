@@ -11,8 +11,8 @@ import io.constellationnetwork.security.signature.Signing
 
 import weaver.SimpleIOSuite
 
-/** Round-trip tests for `GenesisGenerator.generate` — verifies that the §1.2 Slice 3b KES registration fields are populated correctly and
-  * that the long-term-signature binding actually verifies against the operator's long-term ECDSA public key.
+/** Round-trip tests for `GenesisGenerator.generate`: every operator receives one complete KES+VRF record whose long-term signature covers
+  * the canonical domain-separated chain-context preimage.
   */
 object GenesisGeneratorSuite extends SimpleIOSuite {
 
@@ -34,14 +34,12 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
       startingEpochProgress = 0L
     )
 
-  test("generate: kesRegistrations is populated with one entry per operator") {
+  test("generate: one atomic consensus-key record is populated per operator") {
     sp.use { implicit s =>
       for {
         out <- GenesisGenerator.generate[IO](opts(), invocation = "test")
-        regs = out.l0Genesis.kesRegistrations.getOrElse(Nil)
       } yield
-        expect(out.l0Genesis.kesRegistrations.isDefined) &&
-          expect.same(2, regs.size) &&
+        expect.same(2, out.l0Genesis.operators.size) &&
           expect.same(2, out.kesSecretKeys.size)
     }
   }
@@ -50,10 +48,10 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
     sp.use { implicit s =>
       for {
         out <- GenesisGenerator.generate[IO](opts(), invocation = "test")
-        regs = out.l0Genesis.kesRegistrations.getOrElse(Nil)
+        operators = out.l0Genesis.operators
       } yield
-        regs
-          .map(r => expect.same(64, r.kesVk.length) && expect.same(32, Hex(r.kesVk).toBytes.length))
+        operators
+          .map(r => expect.same(64, r.kesMasterVk.length) && expect.same(32, Hex(r.kesMasterVk).toBytes.length))
           .combineAll
     }
   }
@@ -62,8 +60,8 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
     sp.use { implicit s =>
       for {
         out <- GenesisGenerator.generate[IO](opts(), invocation = "test")
-        regs = out.l0Genesis.kesRegistrations.getOrElse(Nil)
-      } yield regs.map(r => expect.same(0, r.kesVkStep)).combineAll
+        operators = out.l0Genesis.operators
+      } yield operators.map(r => expect.same(0, r.kesMasterVkStep) && expect.same(0L, r.kesPeriodOffset)).combineAll
     }
   }
 
@@ -77,32 +75,43 @@ object GenesisGeneratorSuite extends SimpleIOSuite {
   )(implicit s: SecurityProvider[IO]): IO[PublicKey] =
     GenesisGenerator.deterministicKeyPair[IO](seedVal, s"operator:$operatorIndex").map(_.getPublic)
 
-  test("generate: longTermSig verifies under SHA512withECDSA against the operator long-term pubkey + raw kesVk bytes") {
+  test("generate: longTermSignature verifies against the canonical complete KES+VRF chain-context preimage") {
     sp.use { implicit s =>
       val seedVal = 123L
       for {
         out <- GenesisGenerator.generate[IO](opts(seedVal), invocation = "test")
-        regs = out.l0Genesis.kesRegistrations.getOrElse(Nil)
-        verifications <- regs.zipWithIndex.traverse {
-          case (reg, i) =>
+        verifications <- out.l0Genesis.operators.zipWithIndex.traverse {
+          case (operator, i) =>
             for {
               pub <- derivePublicKeyFromOperator(i, seedVal)
-              vkBytes = Hex(reg.kesVk).toBytes
-              sigBytes = Hex(reg.longTermSig).toBytes
-              ok <- Signing.verifySignature[IO](vkBytes, sigBytes)(pub)
+              preimage = io.constellationnetwork.node.shared.domain.genesis.types.L0GenesisOperator.signaturePreimage(
+                out.l0Genesis.networkMagic,
+                out.l0Genesis.activationOrdinal,
+                out.l0Genesis.startingEpochProgress,
+                Hex(operator.peerId).toBytes,
+                operator.address,
+                Hex(operator.kesMasterVk).toBytes,
+                operator.kesMasterVkStep,
+                operator.kesPeriodOffset,
+                Hex(operator.vrfVk).toBytes
+              )
+              sigBytes = Hex(operator.longTermSignature).toBytes
+              ok <- Signing.verifySignature[IO](preimage, sigBytes)(pub)
             } yield expect(ok)
         }
       } yield verifications.combineAll
     }
   }
 
-  test("generate: kesRegistration peerId matches the operator's peerId at the same index") {
+  test("generate: each emitted record carries exact 32-byte KES and VRF keys") {
     sp.use { implicit s =>
       for {
         out <- GenesisGenerator.generate[IO](opts(), invocation = "test")
-        regs = out.l0Genesis.kesRegistrations.getOrElse(Nil)
         ops = out.l0Genesis.operators
-      } yield regs.zip(ops).map { case (reg, op) => expect.same(op.peerId, reg.peerId) }.combineAll
+      } yield
+        ops
+          .map(op => expect.same(32, Hex(op.kesMasterVk).toBytes.length) && expect.same(32, Hex(op.vrfVk).toBytes.length))
+          .combineAll
     }
   }
 

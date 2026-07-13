@@ -14,10 +14,10 @@ import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.ByteArrayCodec.{codec => byteArrayCodec}
 import io.constellationnetwork.serde.codecs.ListCodec.list
-import io.constellationnetwork.serde.codecs.NonEmptySetCodec.nonEmptySet
+import io.constellationnetwork.serde.codecs.NonEmptySetCodec.nonEmptySetCanonical
 import io.constellationnetwork.serde.codecs.OptionCodec.option
 import io.constellationnetwork.serde.codecs.Primitives._
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.BlockCodec.{codec => blockCodec}
 import io.constellationnetwork.serde.codecs.instances.BlockReferenceCodec.{codec => blockReferenceCodec}
@@ -66,7 +66,7 @@ object CurrencyRecordCodecs {
   import io.constellationnetwork.currency.schema.currency.{DataApplicationPart, DataApplicationPartV1}
 
   private val blocksListCodec: Codec[List[Array[Byte]]] = list(byteArrayCodec)
-  private val sortedHashSetCodec: Codec[SortedSet[Hash]] = sortedSet(hashCodec)
+  private val sortedHashSetCodec: Codec[SortedSet[Hash]] = sortedSetCanonical(hashCodec)
   private val updateHashesOptCodec: Codec[Option[SortedSet[Hash]]] = option(sortedHashSetCodec)
 
   implicit val dataApplicationPartV1Codec: Codec[DataApplicationPartV1] =
@@ -111,8 +111,10 @@ object CurrencyRecordCodecs {
   implicit val deprecatedTipImmutableCodec: ImmutableCodec[DeprecatedTip] =
     ImmutableCodec.fromScodecCodec(deprecatedTipCodec)
 
-  private val deprecatedSetCodec: Codec[SortedSet[DeprecatedTip]] = sortedSet(deprecatedTipCodec)
-  private val activeSetCodec: Codec[SortedSet[ActiveTip]] = sortedSet(activeTipCodec)
+  private val deprecatedSetCodec: Codec[SortedSet[DeprecatedTip]] =
+    sortedSetCanonical(deprecatedTipCodec)
+  private val activeSetCodec: Codec[SortedSet[ActiveTip]] =
+    sortedSetCanonical(activeTipCodec)
 
   implicit val snapshotTipsCodec: Codec[SnapshotTips] =
     (deprecatedSetCodec :: activeSetCodec)
@@ -145,8 +147,10 @@ object CurrencyRecordCodecs {
 
   private val signedAllowSpendCodec: Codec[Signed[AllowSpend]] = signedCodecFor(allowSpendCodec)
   private val signedTokenLockCodec: Codec[Signed[TokenLock]] = signedCodecFor(tokenLockCodec)
-  private val allowSpendNesCodec: Codec[NonEmptySet[Signed[AllowSpend]]] = nonEmptySet(signedAllowSpendCodec)
-  private val tokenLockNesCodec: Codec[NonEmptySet[Signed[TokenLock]]] = nonEmptySet(signedTokenLockCodec)
+  private val allowSpendNesCodec: Codec[NonEmptySet[Signed[AllowSpend]]] =
+    nonEmptySetCanonical(signedAllowSpendCodec)
+  private val tokenLockNesCodec: Codec[NonEmptySet[Signed[TokenLock]]] =
+    nonEmptySetCanonical(signedTokenLockCodec)
 
   implicit val allowSpendBlockCodec: Codec[AllowSpendBlock] =
     (roundIdCodec :: allowSpendNesCodec)

@@ -123,8 +123,10 @@ message TokenLockBlock {
 //
 // Emitted by a gl0 operator key that wins the committee VRF for a given
 // (metagraph_address, parent_hash) under the per-metagraph sortition
-// (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver verifies the
-// VRF proof against the sender's published VK + the threshold `K · σ`, then
+// (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver resolves the
+// sender's exact active preregistered KES+VRF pair from canonical historical
+// state, requires any carried VK to match, and verifies the VRF proof under the
+// resolved VK plus the threshold `K · σ`, then
 // tallies toward the per-binary `≥ 2K/3` quorum. Slice S3 will flip the
 // aggregate from warn-only observability into the load-bearing pre-inclusion
 // gate that lets non-committee operators skip the binary entirely.
@@ -149,23 +151,15 @@ message MetagraphAttestation {
   bytes binary_hash = 4;         // 32 bytes; hash of the MetagraphBinary
   bytes committee_vrf_proof = 5; // committee VRF proof — gates membership
   bytes signature = 6;           // long-term-key signature over the canonical bytes
-  bytes kes_signature = 7;       // KES product signature (Slice 9 path); empty during S2 warn-only
-  bytes vrf_public_key = 8;      // sender's committee VRF VK (32 bytes); receiver verifies committee_vrf_proof
-                                 // against this. Required because deriving the sender's VRF VK from the public
-                                 // peer-id alone is cryptographically impossible — `VrfKeyDeriver` needs the
-                                 // sender's PRIVATE key. When per-operator-key VRF keys land (#180), this field
-                                 // plumbs through unchanged; the source of the VK shifts on the sender side to
-                                 // the per-operator registration table.
-  uint32 sender_tree_step = 9;   // KES tree-internal step the sender used for `kes_signature`. This is the
-                                 // sender's OperationalKeyMaker.currentPeriod at sign time — i.e. the offset
-                                 // from the sender's own KES activation period, not the global eta period.
-                                 // Receiver passes this directly to `kesVk.copy(step = sender_tree_step)`
-                                 // (SumComposition tree-walk index) without any chain-state lookup. This makes
-                                 // KES verification non-interactive: the sender's evolution offset is operator-
-                                 // private; the receiver never needs to know the operator's activation period
-                                 // or eta-rotation cadence to verify. Freshness (no replay) is gated separately
-                                 // by the `parent_hash` + `binary_hash` pinning the attestation to a specific
-                                 // commitment point, plus the per-binary aggregator dedup.
+  bytes kes_signature = 7;       // Required KES product signature over the same canonical bytes as `signature`.
+  bytes vrf_public_key = 8;      // sender-carried committee VRF VK (32 bytes), used only as comparison evidence.
+                                 // The receiver resolves the exact active preregistered KES+VRF pair from canonical
+                                 // historical registry state, requires byte equality, and verifies the proof under
+                                 // that resolved key. A missing, pending, stale, or mismatched pair fails closed.
+  uint32 sender_tree_step = 9;   // Sender-carried comparison evidence only. The receiver resolves the atomic
+                                 // preregistered KES+VRF pair for the artifact period, derives the required step
+                                 // as `artifact_period - registered_offset`, requires exact equality here, and
+                                 // verifies under that derived key. The wire value never selects a KES key or era.
 }
 
 // ─── Hierarchical-shard-checkpoints v1 — Slice 14 wire format ───────

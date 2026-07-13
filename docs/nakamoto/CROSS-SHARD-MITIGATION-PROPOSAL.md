@@ -2,8 +2,9 @@
 
 > **HISTORICAL, SUPERSEDED RESEARCH PROPOSAL.** Do not implement this document's
 > VRF-sortition/slashing authority model or treat it as current behavior. The
-> current design makes GL0 re-execution authoritative for framework economics;
-> committees partition work but do not confer economic validity. Preserve the
+> target makes execution-committee replay-before-sign authoritative for the
+> checkpoint computation; ordinary GL0 nodes apply/root-check the certified diff,
+> and assigned watchtowers replay as the collusion backstop. Preserve the
 > analysis below only as decision history. See [`../../AGENTS.md`](../../AGENTS.md)
 > and ADR-0016/ADR-0017.
 

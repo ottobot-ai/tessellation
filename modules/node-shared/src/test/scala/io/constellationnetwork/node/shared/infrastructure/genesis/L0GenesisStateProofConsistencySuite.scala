@@ -15,6 +15,8 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops._
+import io.constellationnetwork.security.signature.Signing
+import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.estatico.newtype.ops._
@@ -57,6 +59,31 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
       operatorKp <- KeyPairGenerator.makeKeyPair[F]
       delegatorAddr = delegatorKp.getPublic.toAddress
       operatorPeerId = io.constellationnetwork.schema.peer.PeerId.fromPublic(operatorKp.getPublic)
+      operatorAddress = operatorKp.getPublic.toAddress.value.value
+      kesVk = Array.tabulate[Byte](32)(i => (i + 1).toByte)
+      vrfVk = VrfKeyDeriver.deriveVrfKeyPair(operatorKp)._2
+      operatorSignature <- Signing.signData[F](
+        L0GenesisOperator.signaturePreimage(
+          "test",
+          0L,
+          0L,
+          operatorPeerId.value.toBytes,
+          operatorAddress,
+          kesVk,
+          0,
+          0L,
+          vrfVk
+        )
+      )(operatorKp.getPrivate)
+      genesisOperator = L0GenesisOperator(
+        operatorPeerId.value.value,
+        operatorAddress,
+        Hex.fromBytes(kesVk).value,
+        0,
+        0L,
+        Hex.fromBytes(vrfVk).value,
+        Hex.fromBytes(operatorSignature).value
+      )
       privHex = Hex.fromBytes(delegatorKp.getPrivate.getEncoded).value
       event = UpdateDelegatedStake.Create(
         source = delegatorAddr,
@@ -79,7 +106,7 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
         activationOrdinal = 0L,
         startingEpochProgress = 0L,
         protocolParams = L0GenesisProtocolParams.default,
-        operators = Nil,
+        operators = List(genesisOperator),
         delegatedStakes = List(
           L0GenesisDelegatedStake(
             event = event,

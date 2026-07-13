@@ -13,8 +13,8 @@ import scala.concurrent.duration._
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinaryBuffer, ShardChainStore, ShardSlotLeader}
-import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, ShardAssignment}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
@@ -26,7 +26,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.security.{Hasher, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -43,8 +43,8 @@ import weaver.MutableIOSuite
   *      nothing (§15.5 content-only) — no empty checkpoint.
   *
   * Fixture strategy mirrors [[ShardCheckpointProducerSuite]]: real `ShardSlotLeader` (σ=1 ⇒ always wins, σ=0 ⇒ never), real
-  * `ShardChainStore` + `Hasher[IO]`, real Ed25519 keypair, stub KES + stub derive. `ShardAssignment.make` is the real deterministic
-  * hash-mod-M mapping.
+  * `ShardChainStore` + `Hasher[IO]`, a real signed-and-rooted genesis operator identity and its matching KES signer, plus a stubbed state
+  * derivation. `ShardAssignment.make` is the real deterministic hash-mod-M mapping.
   */
 object ShardCheckpointFanOutSuite extends MutableIOSuite {
 
@@ -75,12 +75,6 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     val r = SecureRandom.getInstance("SHA1PRNG")
     r.setSeed(0x53_48_43_50_46_41_4eL) // ASCII "SHCPFAN"
     r
-  }
-
-  private def randomVrfSk(): Array[Byte] = {
-    val sk = new Array[Byte](32)
-    random.nextBytes(sk)
-    sk
   }
 
   private def randomGl0Eta(): Array[Byte] = {
@@ -117,13 +111,6 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   private val slotForGl0Anchor: SnapshotOrdinal => Slot =
     ord => Slot.unsafeApply(ord.value.value)
 
-  private val slotGapFor: (Slot, Option[Slot]) => Long =
-    (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => cur.value.value - p.value.value)
-
-  private val fixedKesPayload: Array[Byte] = Array.fill[Byte](128)(0xab.toByte)
-  private def stubKesSigner: ShardCheckpointProducer.KesSigner[IO] =
-    ShardCheckpointProducer.KesSigner.fixed[IO](period = 7, signatureBytes = fixedKesPayload)
-
   private def deterministicDerive(
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
@@ -153,6 +140,10 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     shardId: ShardId,
     chainStore: ShardChainStore[IO],
     keyPair: KeyPair,
+    vrfSk: Array[Byte],
+    vrfVk: Array[Byte],
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[IO],
+    kesSigner: ShardCheckpointProducer.KesSigner[IO],
     sigma: Ratio,
     shardEta: Array[Byte]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
@@ -166,17 +157,17 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         publisher = ShardCheckpointPublisher.noop[IO],
         selfPeerId = PeerId.fromPublic(keyPair.getPublic),
         selfKeyPair = keyPair,
-        selfVrfSk = randomVrfSk(),
-        kesSigner = stubKesSigner,
+        selfVrfSk = vrfSk,
+        selfVrfVk = vrfVk,
+        operatorKeyRegistry = operatorKeyRegistry,
+        kesSigner = kesSigner,
         // Slice S4: epoch-keyed eta resolver; the fan-out tests don't exercise eta rotation, so a constant precomputed
         // shardEta (independent of epoch) keeps the slot-leader draw deterministic.
         shardEtaFor = _ => IO.pure(shardEta),
-        slotGapFor = slotGapFor,
         staircaseDeltaSlots = 5,
         derivePerMgState = deterministicDerive,
         executionBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
-        lastAdoptedOrd = cats.effect.IO.pure(None),
-        pipelineDepth = Int.MaxValue,
+        lastPhase2Checkpoint = cats.effect.IO.pure(None),
         republishEveryTicks = 1
       )
     }
@@ -194,27 +185,46 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     ssl: ShardSlotLeader[IO],
     sigma: Ratio
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[Rig] =
-    for {
-      keyPair <- KeyPairGenerator.makeKeyPair[IO]
-      gl0Eta = randomGl0Eta()
-      assignment = ShardAssignment.make[IO](numShards)
-      perShard <- (0 until numShards).toList.traverse { i =>
-        val sid = ShardId.unsafeApply(i)
-        for {
-          store <- ShardChainStore.make[IO](sid)
-          buffer <- ShardBinaryBuffer.make[IO](sid, cap = 4096)
-          shardEta <- ssl.computeShardEta(sid, gl0Eta)
-          producer <- makeProducer(ssl, sid, store, keyPair, sigma, shardEta)
-        } yield (sid, producer, store, buffer)
-      }
-    } yield
-      Rig(
-        selfPeerId = PeerId.fromPublic(keyPair.getPublic),
-        assignment = assignment,
-        producers = perShard.map { case (sid, p, _, _) => sid -> p }.toMap,
-        chainStores = perShard.map { case (sid, _, s, _) => sid -> s }.toMap,
-        buffers = perShard.map { case (sid, _, _, b) => sid -> b }.toMap
-      )
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val keyPair = operator.localLongTermKeyPairForConsensusTest
+      val selfPeerId = operator.resolvedPair.operatorPeerId
+      val vrfSk = operator.localVrfSecret
+      val vrfVk = operator.resolvedPair.vrfPublicKey.toBytes
+
+      for {
+        checkpointSigner <- RegisteredCheckpointSigner.make
+        _ <- checkpointSigner.preregisterGenesis(keyPair, selfPeerId)
+        gl0Eta <- IO(randomGl0Eta())
+        assignment = ShardAssignment.make[IO](numShards)
+        perShard <- (0 until numShards).toList.traverse { i =>
+          val sid = ShardId.unsafeApply(i)
+          for {
+            store <- ShardChainStore.make[IO](sid)
+            buffer <- ShardBinaryBuffer.make[IO](sid, cap = 4096)
+            shardEta <- ssl.computeShardEta(sid, gl0Eta)
+            producer <- makeProducer(
+              ssl,
+              sid,
+              store,
+              keyPair,
+              vrfSk,
+              vrfVk,
+              checkpointSigner.operatorKeyRegistry,
+              checkpointSigner.producerKesSigner,
+              sigma,
+              shardEta
+            )
+          } yield (sid, producer, store, buffer)
+        }
+      } yield
+        Rig(
+          selfPeerId = selfPeerId,
+          assignment = assignment,
+          producers = perShard.map { case (sid, p, _, _) => sid -> p }.toMap,
+          chainStores = perShard.map { case (sid, _, s, _) => sid -> s }.toMap,
+          buffers = perShard.map { case (sid, _, _, b) => sid -> b }.toMap
+        )
+    }
 
   /** EXECUTION-SHARDING R-1: feed the per-shard buffers from `sc`, partitioned by the SAME deterministic shard mapping the daemon's
     * gossip-intake uses. After this, `buffer.snapshotPending` is the producer fan-out's input — replacing the old gl0

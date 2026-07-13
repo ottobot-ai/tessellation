@@ -1,114 +1,229 @@
-# 17. Universal GL0 re-execution is the CL1 economic-validity gate
+# 17. Committee replay-before-sign is the CL1 execution gate
 
 Date: 2026-07-10
 
 ## Status
 
-Accepted (amended 2026-07-10)
+Accepted; restored and clarified 2026-07-11 by owner decision.
 
-**Implementation safety status (2026-07-11): BLOCKED.** This ADR defines the
-required authority boundary. Source audit confirms that the roots/diff/quorum
-bypass is removed, but does not certify the global transition function itself.
-Unsigned token unlocks and no-reference spends, bounded processed-history replay,
-unbacked stake records, and unsafe finality still violate the broader economic
-invariant. See `docs/review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`.
+**Implementation status: REGRESSED / BLOCKED.** The original blind-sign defect
+must not be restored, but commit `c610a0740` overcorrected by deleting the
+checkpoint byte diff and making ordinary GL0 nodes replay CL1. The required repair
+is selective: keep replay-before-sign, restore a canonical diff, and make
+noncommittee adoption apply and verify that diff.
 
-Supersedes the earlier revision of this ADR that allowed non-committee GL0 nodes to adopt on committee signatures and a verified byte-diff.
-That was not sufficient under the stated threat model: a colluding quorum can sign the same invalid computation, and a root or proof only
-binds a claim; it does not establish that the framework transition was executed.
+## Non-negotiable invariant
+
+**A node never adds a state-validity signature to a result it has not independently
+re-executed.** For a shard checkpoint, the signature means:
+
+> I executed the exact signed framework inputs at the exact signed Phase-2 base
+> and reproduced this exact canonical byte diff and this exact result root.
+
+Receipt, best-tip selection, committee membership, ancestor status, signature
+count, shard depth, or producer reputation can never construct that meaning.
 
 ## Context
 
-CL1 transfer, fee, reward, allow-spend, spend, token-lock, balance, reference, and supply effects are framework-defined. Every GL0 binary
-contains the same Scala implementation needed to execute them. Before this decision, three shortcuts bypassed that implementation:
+The original implementation violated the invariant:
 
-1. Currency snapshots carried cumulative `authoritative*` fields that could replace balances, active sets, and reference maps.
-2. A shard committee byte-diff replaced the result produced by the GL0 currency processor.
-3. `kQuorum` signatures allowed `verifyEmbedded` to return `Accepted` without re-execution; committee members also signed best-tip
-   checkpoints and stored ancestors without first recomputing their roots.
+- committee members signed a checkpoint hash on best-tip without replay;
+- `kQuorum` let GL0 adopt without replay;
+- only the producer replayed on the happy path;
+- watchtower replay happened after adoption.
 
-Hash equality, a metagraph signature, committee agreement, and post-adoption slashing are not substitutes for executing CL1 before value is
-usable.
+The first ADR revision correctly required every committee signer to replay. The
+later universal-replay amendment conflated two unrelated concepts:
+
+1. **forbidden authority overrides:** ML0-carried `authoritative*` cumulative
+   fields and `AdoptFromSignedFields`, which could replace framework state; and
+2. **required execution output:** a canonical committee-produced byte diff that
+   every signer independently reproduces and every adopter root-checks.
+
+The first must remain deleted. The second must be restored in a greenfield-only
+schema without compatibility shims.
 
 ## Decision
 
-### 1. One CL1 transition function
+### 1. Producer execution
 
-`CurrencySnapshotValidator` artifact recreation, reached through `CurrencySnapshotContextFunctions.createContext`, is the only accepted
-CL1 transition function. Producer, committee signer, global-snapshot producer, and every GL0 follower must run it over the checkpoint's full
-included snapshot bytes.
+The deterministic staircase producer:
 
-Re-execution uses:
+1. resolves the checkpoint's exact canonical Phase-2 GL0 execution base;
+2. collects a deterministic bounded window of complete signed ML0 binaries in
+   per-metagraph parent order;
+3. runs the current framework recreation path for every currency portion;
+4. extracts globally serialized framework effects separately from per-MG writes;
+5. emits a canonical namespace-bounded per-MG byte diff and a complete root that
+   commits every diff-writable key;
+6. signs the complete checkpoint preimage.
 
-- the checkpoint's signed `executionBaseOrdinal` for the prior currency state;
-- the currency snapshot's signed `globalSyncView`, resolved through a finalized ordinal lookup and checked by hash;
-- deterministic framework code only.
+The preimage binds at least network, genesis, protocol era/parameter hash, shard,
+execution epoch/roster, shard parent, shard ordinal, slot/duty, exact Phase-2 base
+`(ordinal,hash,stateRoot)`, complete ordered inputs or their availability-bound
+commitment, per-MG diffs, per-MG roots, and custom-data commitments.
 
-An unavailable pinned input means defer/reject. It never means use a live head, use a local best tip, or trust a claimed cumulative field.
+### 2. Committee replay-before-sign
 
-### 2. Signatures do not establish execution
+Every execution-committee member runs the same recreation at the same base and
+compares both the canonical diff bytes and root:
 
-Committee signatures retain their authentication, availability, and finality roles. Their count never establishes economic validity.
+```text
+match                -> construct VerifiedShardCheckpoint -> sign once
+missing base/input    -> defer; no signature; no slash
+diff or root mismatch -> refuse; emit deterministic fraud evidence if available
+```
 
-- A committee member re-executes before signing a received tip.
-- Retroactive ancestor signing runs the same verifier.
-- `evaluate` re-executes even when `T_count` qualifies.
-- `verifyEmbedded` re-executes even when `distinctSigners >= kQuorum`.
+The attestation API must accept a verified capability, not a naked checkpoint
+hash. A raw `emit(hash, ...)` API leaves blind signing representable and is not an
+acceptable enforcement boundary.
 
-A real mismatch is rejected and may form slash evidence. `Hash.empty` means cannot verify and is rejected without slashing.
+### 3. Execution certificate and shard chain
 
-### 3. No fork-only authority schema
+`kQuorum` distinct signatures from the checkpoint's anchored execution committee
+form an execution certificate. It asserts independent execution, not BFT consensus.
 
-This repository is a greenfield fork of upstream Tessellation v4.0.0. No fork-added authority schema has been deployed, so there is no
-compatibility exception:
+The shard chain remains Nakamoto-style:
 
-- `CurrencyIncrementalSnapshot.authoritative*` fields and codec slots do not exist;
-- checkpoint state-diff, receipt, artifact-delta, balance-delta, and sync-delta fields do not exist;
-- the checkpoint carries signed state-channel binaries, locally reproducible per-metagraph root claims, and a signed
-  `executionBaseOrdinal`;
-- decoders require the current fork schema rather than silently defaulting missing fork consensus fields.
+- deterministic staircase producer duty;
+- hash-linked checkpoint ancestry;
+- maxvalid-tk sibling/tine selection; and
+- Phase-2 GL0 hard anchors.
 
-### 4. DL1 remains proof-carried
+There is no shard proposal/vote/lock/view-change state machine. Depth qualifies
+neither validity nor an execution certificate. `kQuorum` distinct replay-backed
+signatures are mandatory for economic diff adoption. Each shard has at most one
+checkpoint whose exact containing GL0 snapshot has not reached Phase 2; that exact
+Phase-2 anchor releases its successor. There is no checkpoint pipeline and no
+shard-depth fallback.
 
-This decision applies to framework CL1 economics. Arbitrary DL1 application state remains metagraph-defined because GL0 does not have its
-code. A proof may authenticate that custom state, but DL1 state cannot authorize or override a CL1 economic transition.
+### 4. Noncommittee GL0 adoption
 
-### 5. GL0 recovery cannot install producer-carried state
+An ordinary GL0 node does not call currency recreation for an execution-certified
+checkpoint. It performs:
 
-A GL0 snapshot enters fork choice only after exact replay against its stored parent. The receiver ignores the producer-carried
-`GlobalSnapshotInfo` and stores the context returned by local replay. A missing parent is fetched and buffered; a content mismatch is
-rejected. Signature/root self-consistency, peer-served MPT bytes, and reward-only mismatch classification cannot authorize a canonical
-state install. Recovery must obtain ancestry and replay each transition.
+1. producer/duty/VRF/KES and checkpoint signature verification;
+2. anchored committee derivation and distinct `kQuorum` verification;
+3. exact Phase-2 base, parent, ordinal, per-MG continuation, and input-availability
+   checks;
+4. diff canonicality, namespace, field allowlist, key uniqueness, and size bounds;
+5. signed per-MG pre-root/version equality with the proposal parent's current
+   `Ml0FrameworkMirror` root/version (or an equally strong unchanged proof);
+6. apply diff to the pinned base and recompute every committed root;
+7. global ordering/conflict checks for extracted cross-metagraph effects;
+8. atomic adoption or no mutation.
 
-KES verification is a pre-storage condition. A producer must also obtain its KES signature before writing its own candidate to the chain
-store; signing failure aborts the proposal and rolls back its state transaction.
+This is verified computation reuse, not an authoritative override. The claimed
+root is never installed directly.
 
-## Consequences
+### 5. Watchtower replay
 
-- Every GL0 node pays the CL1 execution cost before adoption. Execution sharding may reduce proposal work and transport, but does not remove
-  universal economic verification.
-- A Byzantine committee at or beyond `kQuorum` cannot bypass recreation merely by colluding on signatures or a root claim. This does not
-  prevent invalid state that the recreated global transition rules themselves accept.
-- Determinism and pinned-input availability are now both safety and liveness requirements. Missing history fails closed and can halt the
-  affected metagraph until the pinned input is recovered.
-- Non-empty rewards are rejected when GL0 has no registered deterministic framework reward implementation; echoing the metagraph's claimed
-  reward set is forbidden.
-- Watchtower disputes remain defense in depth. They are not the pre-adoption validity gate.
+Deterministically selected noncommittee watchtowers independently execute the
+same complete checkpoint. They detect a colluding execution threshold and submit a
+challenge only when exact inputs/base are available and their reproduced diff/root
+differs. An unavailable base is not evidence of fraud. The assertion is not itself
+objective: the ratified adjudicator must independently compute the mismatch, with
+exceptional bounded GL0 replay of the challenged checkpoint as the initial
+recommendation. Happy-path ordinary adoption remains zero-replay.
 
-## Enforcement sites
+Evidence identifies and can slash actual checkpoint signers. Detection, evidence
+transport, adjudication, bonded-principal debit, committee exclusion, and reward
+must be deterministic canonical state. Slashing never repairs value that was
+allowed to leave before the challenge was resolved. The locked release rule is
+positive deterministic noncommittee replay coverage before the checkpoint becomes
+GL0-inclusion-eligible. No checkpoint-derived local or external economic derivative
+is usable while coverage is missing; unrelated GL0 snapshots may continue.
 
-- `CurrencySnapshotValidator.scala`: signature verification plus exact artifact recreation; unregistered rewards default to empty.
-- `GlobalSnapshotStateChannelEventsProcessor.scala`: every CL1 adoption mode calls `createContext`.
-- `ShardCheckpointWiring.scala`: producer/verifier root derivation uses full recreation with pinned prior and global snapshot lookups.
-- `GlobalSnapshotAcceptanceManager.scala`: adopted state is the recreation result.
-- `ShardCheckpointGl0AcceptanceManager.scala`: `evaluate` and `verifyEmbedded` unconditionally re-execute.
-- `NakamotoSyncDaemon.scala`: stored ancestors are verified before retroactive signing.
-- `NakamotoSyncDaemon.scala`: parentless and replay-invalid snapshots never reach `chainStore.store`; producer-carried GSI/MPT recovery
-  installers are removed.
-- `SnapshotLeaderLoop.scala`: KES signing succeeds before a locally produced snapshot reaches `chainStore.store`.
+### 6. Schema boundary
 
-## Out of scope
+Restore only the greenfield execution result:
 
-This ADR does not certify transition authorization/conservation, stake backing, replay protection, optimistic/depth finality, KES/VRF
-fail-open behavior, cross-shard atomic settlement, or slashing-evidence authorization. Those are separate safety requirements and currently
-block production.
+```text
+ShardCurrencyStateDiff(
+  upserts: SortedMap[CanonicalMptKey, CanonicalValueBytes],
+  removals: SortedSet[CanonicalMptKey]
+)
+
+ShardDerivedStateDelta(
+  perMetagraphMptRoots,
+  perMetagraphStateDiff,
+  includedSnapshots,
+  customDataCommitments
+)
+```
+
+Exact final fields depend on the payload-lane decision. Do not restore:
+
+- any `authoritative*` currency snapshot field;
+- `AdoptFromSignedFields`;
+- `CrossShardReceipt` or direct shard-to-shard settlement;
+- unproved per-field balance/artifact/sync replacement deltas;
+- fork-only V1/V2 decoders, defaulted missing fields, or compatibility bridges.
+
+Every key writable by the diff must be covered by the verified per-MG root. The
+current root covers field 5 plus seven MG partitions 25-31, but excludes economic
+active allow-spends field 7 and observation metadata field 32. The target complete
+root must add active allow-spends. Approved field-32 observation metadata remains
+outside both root and diff and cannot be written by a checkpoint.
+
+## Current source gap
+
+- `ShardDerivedStateDelta.scala` currently carries roots and binaries but no diff.
+- `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` unconditionally replays.
+- `GlobalSnapshotAcceptanceManager.deriveAdoptedCurrencyState` replays again.
+- `ShardCheckpointAttestationEmitter.emit` now accepts only a sealed
+  `VerifiedShardCheckpoint` minted after intake replay. Rejected/mismatching
+  checkpoints cannot reach this signing API, and replay-valid under-quorum
+  checkpoints can collect signatures. The capability still proves the current
+  root-only recreation, not the target diff/intents/complete-root result.
+- intake and `verifyEmbedded` now enforce distinct configured execution `kQuorum`;
+  current universal replay remains the temporary economic backstop until canonical
+  diff adoption and positive watchtower coverage land.
+- the signed checkpoint binds an execution-base ordinal but not the exact Phase-2
+  hash/root or network/genesis/era/parameter domain.
+- the current `numShards > 1` activation gate still makes the one-shard economic
+  configuration bypass the target committee/diff/watchtower path.
+
+These facts prove neither the old blind-sign path nor universal replay is the
+target.
+
+## Required tests
+
+1. Honest producer and every signer reproduce exact diff and root.
+2. Changed root, changed diff, extra/unrooted key, wrong base, and wrong input order
+   prevent signing.
+3. Missing history defers and never creates slash evidence.
+4. Ordinary noncommittee adoption performs zero currency recreation calls and
+   still rejects every malformed diff/root/certificate.
+5. Shard depth cannot bypass the execution threshold.
+6. Tentative GL0 inclusion cannot advance the shard hard anchor; Phase 2 can.
+7. A colluding execution threshold is caught by an assigned watchtower before the
+   owner-approved release boundary.
+8. `numShards=1` and `numShards=K` produce identical economic writes and roots.
+
+## Locked follow-up decisions
+
+1. Distinct configured execution `kQuorum` is mandatory; depth never substitutes.
+2. A deterministic noncommittee complement/sample with minimum positive replay
+   coverage is required before GL0 inclusion eligibility. Exact population,
+   coverage threshold, deadline, and availability fallback remain parameter work,
+   not an alternate release rule.
+3. Every framework-economic field, including active allow-spends, is in the complete
+   per-MG root and diff. Approved field-32 observation metadata is outside both and
+   is not writable through the checkpoint.
+4. The checkpoint binds and retains the exact signed currency incrementals needed
+   for replay. Custom application data uses content-addressed commitments/chunks.
+   Retention lasts through the maximum challenge, Phase-2 recovery, and downstream
+   acknowledgement horizon.
+5. V1 has one outstanding checkpoint per shard, may batch multiple metagraphs and
+   contiguous binaries per metagraph, and has no configurable pipeline or
+   shard-depth qualification.
+6. A bonded, assigned, rate/resource-bounded challenge triggers exceptional GL0
+   replay of the exact retained inputs and base. The computed result controls
+   rollback/slash; missing authenticated data defers and cannot slash.
+
+## References
+
+- `docs/adr/0016-execution-sharding-reexecution-and-cross-shard-reads.md`
+- `docs/review/CONSENSUS-ARTIFACT-LIFECYCLE.md`
+- `docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`

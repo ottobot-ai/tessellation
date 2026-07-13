@@ -29,6 +29,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.Spen
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
+import io.constellationnetwork.node.shared.infrastructure.sharding.RegisteredCheckpointSigner
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{CurrencySnapshotContextFunctions, DelegatedRewardsResult}
 import io.constellationnetwork.node.shared.logger.Slf4jLoggerBundle
 import io.constellationnetwork.schema._
@@ -40,6 +41,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey,
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
 import io.constellationnetwork.schema.tokenLock._
@@ -87,14 +89,25 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   // has NO mptRoot and a "mptRoot equality" assert would compare None == None (trivially green).
   implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
 
-  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+  final case class RegisteredCommitteeIdentity(
+    checkpointSigner: RegisteredCheckpointSigner,
+    keyPair: KeyPair,
+    peerId: PeerId
+  )
+
+  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], RegisteredCommitteeIdentity)
 
   override def sharedResource: Resource[IO, Res] =
     for {
-      sp <- SecurityProvider.forAsync[IO]
+      implicit0(sp: SecurityProvider[IO]) <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       h = Hasher.forJson[IO]
-    } yield (h, sp, j)
+      checkpointSigner <- RegisteredCheckpointSigner.make.asResource
+      committeeKeyPair <- KeyPairGenerator.makeKeyPair[IO].asResource
+      committeeId = PeerId.fromPublic(committeeKeyPair.getPublic)
+      _ <- checkpointSigner.preregisterGenesis(committeeKeyPair, committeeId).asResource
+      committeeIdentity = RegisteredCommitteeIdentity(checkpointSigner, committeeKeyPair, committeeId)
+    } yield (h, sp, j, committeeIdentity)
 
   implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
@@ -263,15 +276,23 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   }
 
   /** Stubbed committee-quorum decision: `verifyEmbedded` always `Accepted` (the mock quorum acceptance); everything downstream of the
-    * decision — the chain-hole/anchor guard, the adopt merge, the currency derivation, the MPT fold — is REAL production code.
+    * decision — the chain-hole/anchor guard, the adopt merge, the currency derivation, the MPT fold — is REAL production code. Stub
+    * authority stops at this verifier boundary: every checkpoint it accepts carries a real preregistered KES+VRF signature. Concrete
+    * certificate rejection is covered by [[ShardCheckpointGl0AcceptanceManagerSuite]].
     */
   private final case class StubAcceptanceManager(
     callsRef: Ref[IO, List[ShardCheckpoint]]
   ) extends ShardCheckpointGl0AcceptanceManager[IO] {
     override def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(ShardCheckpointAcceptResult.Accepted)
+    override def evaluateForSigning(
+      checkpoint: ShardCheckpoint
+    ): IO[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]] =
+      IO.pure(Left(VerifiedShardCheckpointFailure.Rejected("test stub cannot mint signing capabilities")))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(ShardCheckpointAcceptResult.Accepted)
+    override def verifyExecutionCertificate(checkpoint: ShardCheckpoint): IO[Either[String, Unit]] =
+      IO.pure(Left("byte-identity stub has no authenticated execution certificate"))
     override def verifyCommitteeSignature(
       checkpoint: ShardCheckpoint,
       signature: CommitteeMemberSignature
@@ -279,6 +300,7 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
     override def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit
     override def lastAdoptedOrd(shardId: ShardId): IO[Option[ShardOrdinal]] = IO.pure(None)
     override def lastAdoptedAnchor(shardId: ShardId): IO[Option[Hash]] = IO.pure(None)
+    override def lastAdoptedCheckpoint(shardId: ShardId): IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None)
     override def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] = IO.pure(List.empty[WatchtowerMismatch])
   }
 
@@ -327,9 +349,8 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
       numShards = numShards,
-      finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
+      retention = ShardCheckpointRetentionConfig(retainedCheckpoints = 8L),
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096)
     )
 
   /** One independent "node": a fresh GSAM over a fresh MPT store + a fresh REAL processor. Returns the manager and the committee-stub call
@@ -460,23 +481,31 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   private val genesisHash: Hash = Hash("0" * 64)
   private val epochZero: EtaPeriod = EtaPeriod(0L)
 
-  /** Minimal accepted checkpoint shell carrying the given per-MG windows and their globally-derived roots. The committee signature is a
-    * placeholder because this suite stubs only the checkpoint verdict; GL0's recreation and root comparison remain real.
+  /** Structural seed used only to construct the signature-excluded checkpoint preimage required by [[RegisteredCheckpointSigner]]. It is
+    * replaced before the checkpoint leaves [[mkCheckpoint]] and is never passed to [[StubAcceptanceManager]].
     */
-  private def mkCheckpoint(
-    shardId: ShardId,
-    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-    roots: SortedMap[Address, Hash]
-  ): ShardCheckpoint = {
-    val placeholderPeerId = io.constellationnetwork.schema.peer.PeerId(Hex("ab" * 64))
-    val placeholderSig = CommitteeMemberSignature(
-      peerId = placeholderPeerId,
+  private def unsignedTemplateSeed(peerId: PeerId): CommitteeMemberSignature =
+    CommitteeMemberSignature(
+      peerId = peerId,
       vrfProof = Hex(""),
       ed25519Sig = Hex(""),
       kesProductSig = Hex(""),
       kesTreeStep = 0
     )
-    ShardCheckpoint(
+
+  /** Minimal checkpoint carrying the given per-MG windows and their globally-derived roots, signed by the suite's loader-validated atomic
+    * KES+VRF identity before it can reach the verifier stub.
+    */
+  private def mkCheckpoint(
+    shardId: ShardId,
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    roots: SortedMap[Address, Hash]
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    committeeIdentity: RegisteredCommitteeIdentity
+  ): IO[ShardCheckpoint] = {
+    val template = ShardCheckpoint(
       shardId = shardId,
       parentCheckpointHash = genesisHash,
       shardOrdinal = ShardOrdinal(1L),
@@ -486,9 +515,13 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
         perMetagraphMptRoots = roots,
         includedSnapshots = windows
       ),
-      committeeSignatures = NonEmptyList.of(placeholderSig),
+      committeeSignatures = NonEmptyList.one(unsignedTemplateSeed(committeeIdentity.peerId)),
       epoch = epochZero
     )
+
+    committeeIdentity.checkpointSigner
+      .sign(template, committeeIdentity.keyPair, committeeIdentity.peerId)
+      .map(signature => template.copy(committeeSignatures = NonEmptyList.one(signature)))
   }
 
   /** Group the per-MG windows into one checkpoint per statically-assigned shard — the same deterministic `shardIdFor` routing production
@@ -498,16 +531,20 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
     numShards: Int,
     windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     roots: SortedMap[Address, Hash]
-  )(implicit h: Hasher[IO]): IO[SortedMap[ShardId, ShardCheckpoint]] = {
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    committeeIdentity: RegisteredCommitteeIdentity
+  ): IO[SortedMap[ShardId, ShardCheckpoint]] = {
     val assignment = ShardAssignment.make[IO](numShards = numShards)
-    windows.toList.traverse { case (mg, nel) => assignment.shardIdFor(mg).map(sid => (sid, mg, nel)) }.map { routed =>
-      val byShard = routed.groupBy(_._1)
-      SortedMap.from(byShard.map {
+    for {
+      routed <- windows.toList.traverse { case (mg, nel) => assignment.shardIdFor(mg).map(sid => (sid, mg, nel)) }
+      checkpoints <- routed.groupBy(_._1).toList.traverse {
         case (sid, entries) =>
           val shardWindows = SortedMap.from(entries.map { case (_, mg, nel) => mg -> nel })(Address.OrderingInstance)
-          sid -> mkCheckpoint(sid, shardWindows, roots.filter { case (mg, _) => shardWindows.contains(mg) })
-      })
-    }
+          mkCheckpoint(sid, shardWindows, roots.filter { case (mg, _) => shardWindows.contains(mg) }).map(sid -> _)
+      }
+    } yield SortedMap.from(checkpoints)
   }
 
   /** The three byte-identity observables: accepted `scSnapshots`, the derived `GlobalSnapshotInfo`, and the `GlobalSnapshotStateProof`. */
@@ -554,7 +591,12 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
     k: Int,
     windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     roots: SortedMap[Address, Hash]
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO], j: JsonSerializer[IO]): IO[
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    j: JsonSerializer[IO],
+    committeeIdentity: RegisteredCommitteeIdentity
+  ): IO[
     (
       (SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], GlobalSnapshotInfo, GlobalSnapshotStateProof),
       (SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], GlobalSnapshotInfo, GlobalSnapshotStateProof),
@@ -624,7 +666,7 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   // ============================================================================
 
   test("TG-02 cross-count byte-identity: numShards=1 (raw/re-exec) == numShards=2 (committee adopt) — genesis windows, 2 MGs") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       mgKeyPairA <- KeyPairGenerator.makeKeyPair[IO]
       mgKeyPairB <- KeyPairGenerator.makeKeyPair[IO]
@@ -662,7 +704,7 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
   // ============================================================================
 
   test("TG-02 cross-count byte-identity: numShards=1 == numShards=4 — genesis windows") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       mgKeyPairA <- KeyPairGenerator.makeKeyPair[IO]
       mgKeyPairB <- KeyPairGenerator.makeKeyPair[IO]

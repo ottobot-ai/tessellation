@@ -42,7 +42,7 @@ object ImmutableCodec {
       }
 
     def fromImmutableBytes(bytes: ByteVector): Either[SerdeError, T] =
-      codec
+      codec.complete
         .decodeValue(bytes.toBitVector)
         .toEither
         .leftMap(e => SerdeError.ScodecFailure(e.messageWithContext))
@@ -62,7 +62,7 @@ object ImmutableCodec {
           throw new IllegalArgumentException(s"ImmutableCodec encode failed: ${cause.messageWithContext}")
       }
     def fromImmutableBytes(bytes: ByteVector): Either[SerdeError, T] =
-      dec
+      dec.complete
         .decodeValue(bytes.toBitVector)
         .toEither
         .leftMap(e => SerdeError.ScodecFailure(e.messageWithContext))

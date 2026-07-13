@@ -7,12 +7,14 @@ import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
+import io.constellationnetwork.node.shared.domain.nakamoto.{CanonicalOperatorConsensusFixture, EligibilityChecker}
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security.Hasher
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.vrf.EcVrf25519
 
 import weaver.MutableIOSuite
@@ -28,7 +30,7 @@ import weaver.MutableIOSuite
   */
 object ShardSlotLeaderSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], EligibilityChecker[IO], ShardSlotLeader[IO])
+  override type Res = (Hasher[IO], EligibilityChecker[IO], ShardSlotLeader[IO], CanonicalOperatorConsensusFixture)
 
   override def sharedResource: Resource[IO, Res] =
     for {
@@ -40,9 +42,13 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
       exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38).asResource
       ec = EligibilityChecker.make[IO](log1p, exp)
       ssl = ShardSlotLeader.make[IO](ec)
-    } yield (h, ec, ssl)
+      operator <- CanonicalOperatorConsensusFixture.make
+    } yield (h, ec, ssl, operator)
 
   private val vrf = new EcVrf25519()
+
+  private val staircasePeers: List[PeerId] =
+    List(1, 2, 3).map(n => PeerId(Hex(f"$n%02x" * 64)))
 
   // Deterministic SHA1PRNG so proof tests are reproducible across CI runs. `setSeed` BEFORE `nextBytes` makes the byte stream a
   // pure function of the seed (default constructor mixes in /dev/(u)random first, which would only append entropy). Matches the seeding
@@ -53,12 +59,6 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
     r
   }
 
-  private def randomSk(): Array[Byte] = {
-    val sk = new Array[Byte](32)
-    random.nextBytes(sk)
-    sk
-  }
-
   private def randomGl0Eta(): Array[Byte] = {
     val eta = new Array[Byte](32)
     random.nextBytes(eta)
@@ -67,8 +67,40 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
 
   // ============ §1 computeShardEta determinism =============================
 
+  test("scheduledDuty follows exact delta windows, wraps, and widens only genesis") { _ =>
+    val parent = Slot.unsafeApply(100L)
+    val nonGenesis = List(101L, 105L, 106L, 110L, 111L, 115L, 116L).map { slot =>
+      ShardSlotLeader.scheduledDuty(staircasePeers, Slot.unsafeApply(slot), parent.some, staircaseDeltaSlots = 5)
+    }
+    val genesisBeforeHandoff = ShardSlotLeader.scheduledDuty(staircasePeers, Slot.unsafeApply(60L), None, staircaseDeltaSlots = 5)
+    val genesisAfterHandoff = ShardSlotLeader.scheduledDuty(staircasePeers, Slot.unsafeApply(61L), None, staircaseDeltaSlots = 5)
+
+    (expect.same(List(0, 0, 1, 1, 2, 2, 0), nonGenesis.flatMap(_.toOption.map(_.rank))) &&
+      expect.same(0, genesisBeforeHandoff.toOption.map(_.rank).get) &&
+      expect.same(1, genesisAfterHandoff.toOption.map(_.rank).get)).pure[IO]
+  }
+
+  test("scheduledDuty rejects empty committees, invalid delta, and non-monotone child slots") { _ =>
+    val slot = Slot.unsafeApply(100L)
+    (expect(ShardSlotLeader.scheduledDuty(Nil, slot, None, 5).isLeft) &&
+      expect(ShardSlotLeader.scheduledDuty(staircasePeers, slot, None, 0).isLeft) &&
+      expect(ShardSlotLeader.scheduledDuty(staircasePeers, slot, slot.some, 5).isLeft) &&
+      expect(ShardSlotLeader.scheduledDuty(staircasePeers, Slot.unsafeApply(99L), slot.some, 5).isLeft)).pure[IO]
+  }
+
+  test("SHARD-C-011 remains RED: identical parent, roster, and slot select different duty under local delta 5 vs 10") { _ =>
+    val parent = Slot.unsafeApply(100L)
+    val child = Slot.unsafeApply(106L)
+    val delta5 = ShardSlotLeader.scheduledDuty(staircasePeers, child, parent.some, staircaseDeltaSlots = 5)
+    val delta10 = ShardSlotLeader.scheduledDuty(staircasePeers, child, parent.some, staircaseDeltaSlots = 10)
+
+    (expect.same(1, delta5.toOption.map(_.rank).get) &&
+      expect.same(0, delta10.toOption.map(_.rank).get) &&
+      expect(delta5.toOption.map(_.peerId) =!= delta10.toOption.map(_.peerId))).pure[IO]
+  }
+
   test("computeShardEta is deterministic — same (shardId, gl0Eta) ⇒ identical bytes across calls") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, _) =>
       implicit val h: Hasher[IO] = hasher
       val shardId = ShardId.unsafeApply(3)
       val gl0Eta = randomGl0Eta()
@@ -85,7 +117,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   // ============ §2 computeShardEta domain separation across shards ==========
 
   test("computeShardEta domain-separates across shards — different shardIds with same gl0Eta ⇒ different shardEtas") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, _) =>
       implicit val h: Hasher[IO] = hasher
       val gl0Eta = randomGl0Eta()
       val shardA = ShardId.unsafeApply(0)
@@ -103,7 +135,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   }
 
   test("computeShardEta also varies with gl0Eta at fixed shardId") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, _) =>
       implicit val h: Hasher[IO] = hasher
       val shardId = ShardId.unsafeApply(7)
       val gl0EtaA = randomGl0Eta()
@@ -118,7 +150,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   // ============ §3 computeShardEta length invariant =========================
 
   test("computeShardEta produces a 32-byte eta — matches EligibilityChecker.vrfProofForSlot invariant") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, _) =>
       implicit val h: Hasher[IO] = hasher
       val gl0Eta = randomGl0Eta()
       // Sweep across several shardIds because the encoding shape depends on Circe's Int rendering width — a regression in the encoder
@@ -130,7 +162,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   }
 
   test("computeShardEta rejects wrong-length gl0Eta") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, _) =>
       implicit val h: Hasher[IO] = hasher
       val shardId = ShardId.unsafeApply(0)
       val shortEta = new Array[Byte](16)
@@ -170,7 +202,7 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
     etaForPeriod(epoch).flatMap(gl0Eta => ssl.computeShardEta(shardId, gl0Eta))
 
   test("S4 rotation: computeShardEta over two distinct period etas yields distinct shard etas") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, _) =>
       implicit val h: Hasher[IO] = hasher
       val shardId = ShardId.unsafeApply(2)
       for {
@@ -189,35 +221,40 @@ object ShardSlotLeaderSuite extends MutableIOSuite {
   test(
     "producer and verifier keyed on the same (shardId, epoch) derive identical shardEta and a membership proof round-trips"
   ) {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, operator) =>
       implicit val h: Hasher[IO] = hasher
       val shardId = ShardId.unsafeApply(5)
       val epoch = EtaPeriod(7L)
       val slot = Slot.unsafeApply(42L)
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
 
       for {
+        registered <- operator.operatorKeyRegistry.get(operator.resolvedPair.operatorPeerId)
         producerEta <- resolveShardEta(ssl, shardId, epoch)
         verifierEta <- resolveShardEta(ssl, shardId, epoch)
         proof <- ssl.membershipProof(sk, producerEta, slot)
         message = verifierEta ++ java.nio.ByteBuffer.allocate(8).putLong(slot.value.value).array()
       } yield
-        expect(
-          java.util.Arrays.equals(producerEta, verifierEta),
-          "producer and verifier shard etas for the same epoch must be byte-identical"
-        ).and(expect(vrf.vrfVerify(vk, message, proof), "membership proof verifies under the verifier's same-epoch shard eta"))
+        expect(registered.exists(_.operatorPeerId == operator.resolvedPair.operatorPeerId), "operator pair must resolve from genesis")
+          .and(
+            expect(
+              java.util.Arrays.equals(producerEta, verifierEta),
+              "producer and verifier shard etas for the same epoch must be byte-identical"
+            )
+          )
+          .and(expect(vrf.vrfVerify(vk, message, proof), "membership proof verifies under the registered same-epoch key"))
   }
 
   test("a verifier keyed on the wrong epoch derives a different eta and rejects the membership proof") {
-    case (hasher, _, ssl) =>
+    case (hasher, _, ssl, operator) =>
       implicit val h: Hasher[IO] = hasher
       val shardId = ShardId.unsafeApply(5)
       val producerEpoch = EtaPeriod(7L)
       val wrongEpoch = EtaPeriod(8L)
       val slot = Slot.unsafeApply(42L)
-      val sk = randomSk()
-      val vk = vrf.getVerificationKey(sk)
+      val sk = operator.localVrfSecret
+      val vk = operator.resolvedPair.vrfPublicKey.toBytes
 
       for {
         producerEta <- resolveShardEta(ssl, shardId, producerEpoch)

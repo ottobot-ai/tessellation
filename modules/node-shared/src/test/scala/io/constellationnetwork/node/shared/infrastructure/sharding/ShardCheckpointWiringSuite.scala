@@ -6,15 +6,24 @@ import cats.syntax.all._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types._
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.{EtaSourceRange, EtaSourceUnavailable}
 import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord}
+import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.security._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.kes.VerificationKeyKesProduct
+import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 
+import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
 
 /** Wiring smoke test for [[ShardCheckpointWiring.acceptanceDeps]] — the priority-1 acceptance-side production wiring of
@@ -34,63 +43,74 @@ import weaver.MutableIOSuite
   */
 object ShardCheckpointWiringSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO])
+  override type Res = (Hasher[IO], SecurityProvider[IO], CanonicalOperatorConsensusPopulation)
 
   override def sharedResource: Resource[IO, Res] =
     for {
       sp <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       h = Hasher.forJson[IO]
-    } yield (h, sp)
+      operators <- CanonicalOperatorConsensusFixture.makePopulation(20)
+    } yield (h, sp, operators)
 
   implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
-  private val selfPeerId: PeerId = PeerId(Hex("ab" * 64))
-  private val otherPeerId: PeerId = PeerId(Hex("cd" * 64))
-  private val validators: Set[PeerId] = Set(selfPeerId, otherPeerId)
+  private def orderedOperators(implicit population: CanonicalOperatorConsensusPopulation): List[OperatorConsensusKeys] =
+    population.operators.map(_.resolvedPair).sortBy(_.operatorPeerId.value.value)
+
+  private def selfPeerId(implicit population: CanonicalOperatorConsensusPopulation): PeerId = orderedOperators.head.operatorPeerId
+  private def otherPeerId(implicit population: CanonicalOperatorConsensusPopulation): PeerId = orderedOperators.apply(1).operatorPeerId
+  private def validators(implicit population: CanonicalOperatorConsensusPopulation): Set[PeerId] = Set(selfPeerId, otherPeerId)
 
   /** Build a [[ShardingConfig]] with the supplied `numShards`. Other fields use representative defaults — only `numShards` and
-    * `finality.k1Shard` are consulted by the wiring helper. The committee draw/quorum (`kDraw`/`kQuorum`) are now separate params, not on
-    * `ShardingConfig` (the test passes them directly to [[ShardCheckpointWiring.acceptanceDeps]]).
+    * `retention.retainedCheckpoints` are consulted by the wiring helper. The committee draw/quorum (`kDraw`/`kQuorum`) are separate params,
+    * not on `ShardingConfig` (the test passes them directly to [[ShardCheckpointWiring.acceptanceDeps]]).
     */
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
       numShards = numShards,
-      finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
+      retention = ShardCheckpointRetentionConfig(retainedCheckpoints = 8L),
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096)
     )
 
   // Fixed 32-byte eta resolver for the committee draw (deterministic across calls — what `committeeFor` consumes).
   private val fixedEta: Array[Byte] = Array.fill[Byte](32)(7.toByte)
   private val etaForEpoch: io.constellationnetwork.schema.nakamoto.EtaPeriod => IO[Array[Byte]] = _ => IO.pure(fixedEta)
 
+  private val vkSelf: Array[Byte] = Array.fill[Byte](32)(0x11.toByte)
+  private def operatorRegistry(implicit population: CanonicalOperatorConsensusPopulation): OperatorConsensusKeyRegistry[IO] =
+    population.operatorKeyRegistry
+
   private def runAcceptanceDeps(
     numShards: Int
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[Option[ShardCheckpointWiring.AcceptanceDeps[IO]]] =
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    population: CanonicalOperatorConsensusPopulation
+  ): IO[Option[ShardCheckpointWiring.AcceptanceDeps[IO]]] =
     ShardCheckpointWiring.acceptanceDeps[IO](
       cfg = mkShardingConfig(numShards),
+      etaRotationSnapshots = 100L,
       kDraw = 4,
       kQuorum = 3,
       selfPeerId = selfPeerId,
-      kesRegistry = KesRegistry.empty[IO],
-      vrfRegistry = VrfRegistry.empty[IO],
+      operatorKeyRegistry = operatorRegistry,
       activeValidators = IO.pure(validators),
       etaForEpoch = etaForEpoch
     )(implicitly, h, sp, implicitly)
 
   test("numShards=1 ⇒ None (regression bar — nothing constructed)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp, population) = res
     runAcceptanceDeps(numShards = 1).map(deps => expect(deps.isEmpty))
   }
 
   test("numShards=0 ⇒ None (degenerate guard, <= 1 not just == 1)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp, population) = res
     runAcceptanceDeps(numShards = 0).map(deps => expect(deps.isEmpty))
   }
 
   test("numShards=4 ⇒ Some with config + manager + assignment + 4-shard registry keyed {0,1,2,3}") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp, population) = res
     runAcceptanceDeps(numShards = 4).map {
       case None => failure("expected Some(acceptanceDeps) at numShards=4, got None")
       case Some(deps) =>
@@ -108,7 +128,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   }
 
   test("buildRegistry: one entry per shard with the matching ShardId stamped on store + tracker + triggers") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp, population) = res
     ShardCheckpointWiring.buildRegistry[IO](mkShardingConfig(numShards = 3), kQuorum = 3, selfPeerId).map { registry =>
       val perShardIdConsistent = registry.toList.forall {
         case (sid, entry) =>
@@ -125,20 +145,21 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
     }
   }
 
-  // VRF-VK registry: each validator → a distinct 32-byte VK (the per-operator seed for the draw). Bytes are arbitrary; the
-  // draw is deterministic in (eta, shardId, epoch, vrfVk), so distinct VKs give the per-operator independence the sortition needs.
-  private val vkSelf: Array[Byte] = Array.fill[Byte](32)(0x11.toByte)
-  private val vkOther: Array[Byte] = Array.fill[Byte](32)(0x22.toByte)
-  private val vrfReg: VrfRegistry[IO] = VrfRegistry.make[IO](Map(selfPeerId -> vkSelf, otherPeerId -> vkOther))
-
-  private def committee(shardId: Int, epoch: Long, kDraw: Int, reg: VrfRegistry[IO] = vrfReg)(
-    implicit h: Hasher[IO]
+  // Every draw fixture registers an atomic KES+VRF pair before period-zero eligibility.
+  private def committee(
+    shardId: Int,
+    epoch: Long,
+    kDraw: Int,
+    registry: Option[OperatorConsensusKeyRegistry[IO]] = None
+  )(
+    implicit h: Hasher[IO],
+    population: CanonicalOperatorConsensusPopulation
   ): IO[Set[PeerId]] =
     ShardCheckpointWiring.committeeFor[IO](
       ShardId.unsafeApply(shardId),
       io.constellationnetwork.schema.nakamoto.EtaPeriod(epoch),
       IO.pure(validators),
-      reg,
+      registry.getOrElse(operatorRegistry),
       etaForEpoch,
       kDraw,
       kQuorum = 1,
@@ -146,38 +167,110 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
     )
 
   test("committeeFor: result is always a SUBSET of the active validator set") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     (committee(0, 7L, 2), committee(2, 99L, 1)).tupled.map {
       case (c0, c2) => expect.all(c0.subsetOf(validators), c2.subsetOf(validators))
     }
   }
 
   test("committeeFor: deterministic — same (shardId, epoch, VKs, eta) ⇒ identical committee") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     (committee(1, 5L, 1), committee(1, 5L, 1)).tupled.map { case (a, b) => expect(a == b) }
   }
 
-  test("committeeFor: an operator with NO registered VRF VK is never sortitioned in") { res =>
-    implicit val (h, _sp) = res
+  test("committeeFor: an operator with NO registered KES+VRF pair is never sortitioned in") { res =>
+    implicit val (h, _sp, population) = res
     // Registry missing `otherPeerId` ⇒ it can never be a committee member regardless of kTarget.
-    val regSelfOnly = VrfRegistry.make[IO](Map(selfPeerId -> vkSelf))
-    committee(0, 7L, kDraw = 4, reg = regSelfOnly).map(c => expect(!c.contains(otherPeerId)))
+    val selfPair = orderedOperators.head
+    val selfOnly = OperatorConsensusKeyRegistry.make[IO](Map(selfPair.operatorPeerId -> selfPair))
+    committee(0, 7L, kDraw = 4, registry = Some(selfOnly)).map(c => expect(!c.contains(otherPeerId)))
+  }
+
+  test("committeeFor: current-view lookup rejects a runtime pair before and after its effective period") { res =>
+    implicit val (h, sp, population) = res
+    val effective = EtaPeriod(8L)
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      peerId = PeerId.fromPublic(keyPair.getPublic)
+      cert = KesRegistrationCert(
+        operatorPeerId = peerId,
+        kesMasterVK = Hex("31" * 32),
+        kesMasterVKStep = 0,
+        offset = effective.value,
+        vrfPublicKey = Hex.fromBytes(vkSelf),
+        effectiveFromPeriod = effective,
+        registrationParentHash = Hash("41" * 32),
+        ordinal = KesRegistrationOrdinal.first
+      )
+      signed <- forAsyncHasher(cert, keyPair)
+      record = KesRegistrationRecord(signed, SnapshotOrdinal(NonNegLong.unsafeFrom(600L)))
+      pair = OperatorConsensusKeys(
+        operatorPeerId = peerId,
+        kes = KesRegistryEntry(VerificationKeyKesProduct(cert.kesMasterVK.toBytes, step = 0), offset = effective.value),
+        vrfPublicKey = VrfPublicKey.fromBytes(vkSelf),
+        effectiveFromPeriod = effective,
+        registration = Some(record)
+      )
+      registry = OperatorConsensusKeyRegistry.make[IO](Map(peerId -> pair))
+      beforeActivation <- ShardCheckpointWiring.committeeFor[IO](
+        ShardId.unsafeApply(0),
+        EtaPeriod(7L),
+        IO.pure(Set(peerId)),
+        registry,
+        etaForEpoch,
+        kDraw = 4,
+        kQuorum = 1,
+        slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
+      )
+      atActivation <- ShardCheckpointWiring.committeeFor[IO](
+        ShardId.unsafeApply(0),
+        effective,
+        IO.pure(Set(peerId)),
+        registry,
+        etaForEpoch,
+        kDraw = 4,
+        kQuorum = 1,
+        slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
+      )
+    } yield expect.all(beforeActivation.isEmpty, atActivation.isEmpty)
+  }
+
+  test("committeeFor: unregistered seedlist peers do not dilute the registered draw denominator") { res =>
+    implicit val (h, _sp, population) = res
+    val twenty = population.peerIds
+    val soleRegistered = twenty.toList.sortBy(_.value.value).head
+    val solePair = orderedOperators.find(_.operatorPeerId == soleRegistered).get
+    val registry = OperatorConsensusKeyRegistry.make[IO](Map(soleRegistered -> solePair))
+
+    ShardCheckpointWiring
+      .committeeFor[IO](
+        ShardId.unsafeApply(0),
+        EtaPeriod(7L),
+        IO.pure(twenty),
+        registry,
+        etaForEpoch,
+        kDraw = 1,
+        kQuorum = 1,
+        slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
+      )
+      .map(c => expect(c == Set(soleRegistered)))
   }
 
   test("committeeFor: kDraw >= N saturates threshold to 1 ⇒ all registered operators are members") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     // threshold = min(kDraw/N, 1); kDraw=8, N=2 ⇒ kDraw·σ = 8·(1/2) = 4 ≥ 1 ⇒ everyone in.
     committee(0, 7L, kDraw = 8).map(c => expect(c == validators))
   }
 
   test("committeeFor: empty active set ⇒ empty committee") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     ShardCheckpointWiring
       .committeeFor[IO](
         ShardId.unsafeApply(0),
         io.constellationnetwork.schema.nakamoto.EtaPeriod(7L),
         IO.pure(Set.empty[PeerId]),
-        vrfReg,
+        operatorRegistry,
         etaForEpoch,
         kDraw = 4,
         kQuorum = 1,
@@ -195,9 +288,8 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   // a no-op walk. During the ACTIVE window of period P (before the boundary MPT write at `ord % R == R-1`), the MPT lookup
   // MISSES on both paths, so:
   //   - leader  getEta(P≥2) = computeEta(genesis, P, realVrfOutputs)   (non-genesis)
-  //   - buggy follower getEta(P≥2) = bootstrapEta(genesis, P)          (empty walk → per-period bootstrap)
-  // ⇒ different eta ⇒ different `shardDrawValue` ⇒ different committee SET ⇒ a follower (gl0 Download / RollbackLoader /
-  // fork-recovery rebuild) ADOPTS / REJECTS checkpoints differently than the leader ⇒ StateProofMismatch split.
+  //   - buggy follower getEta(P≥2) previously substituted bootstrapEta(genesis, P) for an unproven empty walk.
+  // The hardened resolver represents that walk as `Incomplete` and fails closed before a different committee can be drawn.
   //
   // The fix threads the SAME real chain walk into the follower's `EtaStateManager`. These tests model the production seam
   // directly at the `EtaStateManager` → `committeeFor` level: they FAIL on the old (no-op-walk) follower and PASS on the
@@ -209,12 +301,10 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   // sits inside that band: membership genuinely depends on the lower hash bytes — i.e. on `eta`. Two distinct etas (leader's
   // chain-walk eta vs the buggy follower's genesis eta) thus draw DIFFERENT committee sets — the observable split. (A 0.5
   // threshold would put every operator in for ANY eta — the high-byte band tops out below 0.40 — making the test eta-blind.)
-  private val symmetryValidators: Set[PeerId] =
-    (0 until 20).map(i => PeerId(Hex(f"$i%02x" * 64))).toSet
-  private val symmetryVrfReg: VrfRegistry[IO] =
-    VrfRegistry.make[IO](symmetryValidators.toList.zipWithIndex.map {
-      case (p, i) => p -> Array.fill[Byte](32)((0xa0 + i).toByte)
-    }.toMap)
+  private def symmetryValidators(implicit population: CanonicalOperatorConsensusPopulation): Set[PeerId] = population.peerIds
+  private def symmetryOperatorRegistry(
+    implicit population: CanonicalOperatorConsensusPopulation
+  ): OperatorConsensusKeyRegistry[IO] = population.operatorKeyRegistry
   private val symmetryKTarget = 6
   private val symmetryNumShards = 4
 
@@ -243,76 +333,72 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   // The leader's chain-walk fallback: returns the REAL VRF outputs for ANY source period ≥ 1 (so periods ≥ 2 compute a
   // non-genesis eta), and empty for source period 0. Periods 0 AND 1 are genesis-derivable bootstrapEta (Cardano/Praos
   // bootstrap — they short-circuit before the walk and fold NO VRF outputs), so the chain walk only matters for period ≥ 2.
-  private val realChainWalk: Long => IO[List[(Long, Array[Byte])]] = (sourcePeriod: Long) =>
-    if (sourcePeriod >= 1L) IO.pure(realVrfOutputs) else IO.pure(List.empty[(Long, Array[Byte])])
+  private val realChainWalk: Long => IO[EtaSourceRange] = (sourcePeriod: Long) =>
+    IO.pure(
+      if (sourcePeriod >= 1L) EtaSourceRange.Complete(realVrfOutputs)
+      else EtaSourceRange.Incomplete(Nil)
+    )
 
   // The BUGGY follower's chain-walk fallback: the no-op walk (`SharedServices.noopEtaChainWalk` analog) — empty for every
-  // source period ⇒ `getEta(P≥2)` falls through to genesisEta.
-  private val noopChainWalk: Long => IO[List[(Long, Array[Byte])]] = (_: Long) => IO.pure(List.empty[(Long, Array[Byte])])
+  // source period. It is unavailable evidence, never a successful empty eta source.
+  private val noopChainWalk: Long => IO[EtaSourceRange] = (_: Long) => IO.pure(EtaSourceRange.Incomplete(Nil))
 
   // Build a `committeeFor`-shaped `EtaPeriod => IO[Array[Byte]]` resolver from an `EtaStateManager` with the given chain
   // walk — exactly the production shape (`etaForEpoch = epoch => mgr.getEta(epoch.value)`).
-  private def etaResolver(chainWalk: Long => IO[List[(Long, Array[Byte])]])(
+  private def etaResolver(chainWalk: Long => IO[EtaSourceRange])(
     implicit h: Hasher[IO]
   ): IO[EtaPeriod => IO[Array[Byte]]] =
     EtaStateManager
-      .make[IO](symmetryGenesisEta, emptyMptReader, chainWalk)
+      .make[IO](symmetryGenesisEta, emptyMptReader, (sourcePeriod, _) => chainWalk(sourcePeriod))
       .map(mgr => (epoch: EtaPeriod) => mgr.getEta(epoch.value))
 
   private def committeeForResolver(resolver: EtaPeriod => IO[Array[Byte]], shardId: Int, epoch: Long)(
-    implicit h: Hasher[IO]
+    implicit h: Hasher[IO],
+    population: CanonicalOperatorConsensusPopulation
   ): IO[Set[PeerId]] =
     ShardCheckpointWiring.committeeFor[IO](
       ShardId.unsafeApply(shardId),
       EtaPeriod(epoch),
       IO.pure(symmetryValidators),
-      symmetryVrfReg,
+      symmetryOperatorRegistry,
       resolver,
       symmetryKTarget,
       kQuorum = 1,
       slashCooldown = io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader.noExclusion[IO]
     )
 
-  test("#261 eta axis — ROOT CAUSE: leader getEta(epoch≥2) ≠ buggy-follower getEta (real walk vs no-op→genesis)") { res =>
-    implicit val (h, _sp) = res
+  test("#261 eta axis — incomplete follower history fails closed instead of substituting a different eta") { res =>
+    implicit val (h, _sp, population) = res
     for {
       leader <- etaResolver(realChainWalk)
       buggy <- etaResolver(noopChainWalk)
       leaderEta2 <- leader(EtaPeriod(2L))
-      buggyEta2 <- buggy(EtaPeriod(2L))
-      // The leader's period-2 eta IS the chain-walk recompute; the buggy follower's empty walk falls back
-      // to the per-period bootstrapEta(genesis, 2) (the N>=2 degenerate fallback — NOT raw genesis).
+      buggyEta2 <- buggy(EtaPeriod(2L)).attempt
       expectedLeaderEta2 = EtaCalculation.computeEta(symmetryGenesisEta, 2L, realVrfOutputs.map(_._2))
-      expectedBuggyEta2 = EtaCalculation.bootstrapEta(symmetryGenesisEta, 2L)
     } yield
       expect.all(
         leaderEta2.sameElements(expectedLeaderEta2),
-        buggyEta2.sameElements(expectedBuggyEta2),
-        !leaderEta2.sameElements(buggyEta2) // the asymmetry that drives the committee split
+        buggyEta2.left.exists(_.isInstanceOf[EtaSourceUnavailable])
       )
   }
 
-  test("#261 eta axis — FAIL-BEFORE: buggy follower draws a DIFFERENT committee than the leader for some shard at epoch≥2") { res =>
-    implicit val (h, _sp) = res
+  test("#261 eta axis — incomplete follower history cannot reach a committee draw") { res =>
+    implicit val (h, _sp, population) = res
     for {
       leader <- etaResolver(realChainWalk)
       buggy <- etaResolver(noopChainWalk)
       epoch = 2L
       leaderSets <- (0 until symmetryNumShards).toList.traverse(committeeForResolver(leader, _, epoch))
-      buggySets <- (0 until symmetryNumShards).toList.traverse(committeeForResolver(buggy, _, epoch))
+      buggySets <- (0 until symmetryNumShards).toList.traverse(committeeForResolver(buggy, _, epoch)).attempt
     } yield
-      // At least one shard's committee differs between the leader and the buggy follower — this is the cluster split the
-      // fix eliminates. (Pre-fix this holds; it is the failure the fix prevents from ever mattering, since post-fix the
-      // follower uses the SAME walk and the next test shows the sets become identical.)
-      expect(
-        leaderSets.zip(buggySets).exists { case (l, b) => l != b },
-        s"expected the buggy follower to draw a different committee than the leader on some shard; " +
-          s"leaderSets=$leaderSets buggySets=$buggySets"
+      expect.all(
+        leaderSets.nonEmpty,
+        buggySets.left.exists(_.isInstanceOf[EtaSourceUnavailable])
       )
   }
 
   test("#261 eta axis — PASS-AFTER: fixed follower (SAME real walk) getEta byte-equals leader for every epoch incl. ≥2") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     for {
       leader <- etaResolver(realChainWalk)
       fixed <- etaResolver(realChainWalk) // the fix: follower threads the IDENTICAL chain walk the leader uses
@@ -329,7 +415,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   }
 
   test("#261 eta axis — PASS-AFTER: fixed follower draws the IDENTICAL committee as the leader on every shard at epoch≥2") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     for {
       leader <- etaResolver(realChainWalk)
       fixed <- etaResolver(realChainWalk)
@@ -340,7 +426,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   }
 
   test("#261 eta axis — BOOTSTRAP-SAFE: leader, buggy follower, and fixed follower all agree at epochs 0 and 1") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     // Cardano/Praos bootstrap: periods 0 AND 1 are genesis-derivable bootstrapEta(genesis, p) (fold NO VRF
     // outputs, bypass the chain walk), so all three resolvers — regardless of their walk — agree byte-for-byte
     // and draw identical committees. This is what makes the first eta rotation (0 → 1) fork-proof.
@@ -377,7 +463,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   // store, which OMIT-deferred nearly every mint once the fast path was removed.
 
   test("pinnedExecutionBaseOrdinal: returns the signed byte store's NEWEST persisted ordinal") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     val _ = h
     JsonSerializer.forAsync[IO].flatMap { implicit js =>
       fs2.io.file.Files[IO].tempDirectory.use { dir =>
@@ -393,7 +479,7 @@ object ShardCheckpointWiringSuite extends MutableIOSuite {
   }
 
   test("pinnedExecutionBaseOrdinal: EMPTY store (pre-first-finalize) ⇒ SnapshotOrdinal.MinValue (produce defers, fail-closed)") { res =>
-    implicit val (h, _sp) = res
+    implicit val (h, _sp, population) = res
     val _ = h
     JsonSerializer.forAsync[IO].flatMap { implicit js =>
       fs2.io.file.Files[IO].tempDirectory.use { dir =>

@@ -1,7 +1,10 @@
-// Metagraph binaries sharing one execution shard.
+// TARGET DESIGN: metagraph binaries sharing one execution shard.
 // Render: dot -Tpng -Gdpi=150 2-metagraph-to-shard.dot -o 2-metagraph-to-shard.png
 
 digraph metagraph_to_shard {
+  label="TARGET DESIGN: metagraph binaries to one execution shard";
+  labelloc=t;
+  fontsize=15;
   rankdir=TB;
   ranksep=0.75;
   nodesep=0.45;
@@ -24,12 +27,17 @@ digraph metagraph_to_shard {
   ml0a -> admission;
   ml0b -> admission;
 
-  checkpoint [label="One shard checkpoint\nincluded binaries + per-MG root claims\n+ finalized executionBaseOrdinal", fillcolor="#E8E0FF", color="#6A3D9A", penwidth=2];
+  checkpoint [label="One shard checkpoint\nexact ordered inputs + scoped per-MG diff\n+ complete root + exact Phase-2 base/pre-root", fillcolor="#E8E0FF", color="#6A3D9A", penwidth=2];
   admission -> checkpoint [label="static hash(address) mod numShards"];
 
-  replay [label="Every GL0 adopter recreates\nevery included CL1 transition\nand compares roots", fillcolor="#D4EDDA", color="#1A7F37", penwidth=2];
-  checkpoint -> replay;
+  replay [label="Producer and every execution signer\nindependently replay exact inputs;\nsign only identical diff + root", fillcolor="#D4EDDA", color="#1A7F37", penwidth=2];
+  threshold [label="Distinct execution threshold", fillcolor="#FFF3CD", color="#E67E00", penwidth=2];
+  adopt [label="Ordinary noncommittee GL0 verifies exact base/pre-root CAS,\ncontinuity, assignment, namespace, and threshold;\napplies scoped diff and recomputes root", fillcolor="#D7E9FC", color="#0B5394", penwidth=2];
+  checkpoint -> replay -> threshold -> adopt;
 
-  note [shape=note, label="ML0 operators produce binaries.\nAdmission and execution committees are GL0 operators.\nDL1 custom semantics remain proof-carried.", fillcolor="#FFFFFF", color="#888888"];
-  replay -> note [style=invis];
+  watchtower [shape=octagon, label="Selected noncommittee watchtowers\nindependently replay; release and\nadjudication timing remains open", fillcolor="#FFF3CD", color="#E67E00"];
+  checkpoint -> watchtower [style=dashed];
+
+  note [shape=note, label="ML0 operators produce binaries.\nAdmission and execution committees are GL0 operators.\nCustom DL1 bytes are isolated commitment/DA payload,\nnot framework-economic authority.", fillcolor="#FFFFFF", color="#888888"];
+  adopt -> note [style=invis];
 }

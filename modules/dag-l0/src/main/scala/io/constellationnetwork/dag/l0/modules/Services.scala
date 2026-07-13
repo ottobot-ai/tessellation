@@ -28,6 +28,7 @@ import io.constellationnetwork.node.shared.domain.cluster.services.{Cluster, Ses
 import io.constellationnetwork.node.shared.domain.collateral.Collateral
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.healthcheck.LocalHealthcheck
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
@@ -73,15 +74,11 @@ object Services {
     txHasher: Hasher[F],
     loggerBundle: LoggerBundle[F],
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
-    // Track-3 S1.5 "marker split": the settled (k₂) ref — the SAME ref that backs `settledOrdinalTracker` below (one settled source),
-    // DISTINCT from the k₁ `nakamotoFinalizedOrdinalRef`. Threaded straight into GlobalSnapshotConsensus.make → NakamotoChainStore
-    // (which consumes it for the S3 store-gate/fork-choice and resets it in `unsafe_clearFinality`). No Services field — like the k₁
-    // ref, only the store/leader-loop need it; HttpApi reads the settled value through `settledOrdinalTracker` instead.
+    // Transitional legacy k2 watermark. Current chain-store floor use is a target violation;
+    // intended semantics are local retention/proof/recovery capacity and telemetry only.
     nakamotoSettledOrdinalRef: Ref[F, SnapshotOrdinal],
     finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
-    // Track-3 S1: injected settled (k₂-archival) marker — a NEW instance created in Main (never the k₁ `nakamotoFinalizedOrdinalRef`),
-    // threaded into GlobalSnapshotConsensus.make (the leader loop is its only writer) and re-exposed as a field for HttpApi →
-    // FinalityTriggersRoutes (`GET /global-snapshots/settled`). Backed by `nakamotoSettledOrdinalRef` above (Track-3 S1.5).
+    // Write-restricted view over the legacy local k2 watermark for current HTTP telemetry.
     settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
     // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Mirrors
     // `finalityTriggerViewRef`; populated inside GlobalSnapshotConsensus.make once the tower store
@@ -112,17 +109,13 @@ object Services {
     shardProofServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[F]
     ]],
-    // §1.2 Slice 3c: KesRegistry loaded from L0 genesis (or empty for CSV-genesis). Threaded
-    // through to GlobalSnapshotConsensus.make.
-    kesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    // Task #44: the genesis VRF-VK registry the shard committee draw consumes is now loaded once and threaded
-    // straight into `SharedServices.make` (via `nakamotoShardRegistries`); the single `shardAcceptanceDeps` it
-    // builds is reused by `GlobalSnapshotConsensus.make`. The former `vrfRegistry` pass-through here is gone.
+    // The atomic genesis KES+VRF registry is owned by `SharedServices`. Consensus consumers resolve one pair from that object; no split
+    // KES or VRF projection crosses this service boundary.
     // Split-safety (#261, eta axis): setter for the follower / `createContext` GSAM's deferred committee-eta
     // chain walk (the Ref lives on `NodeShared`, created in `TessellationIOApp.make`). Flowed straight into
     // `GlobalSnapshotConsensus.make`, which calls it once the chain store is built so the follower
-    // `EtaStateManager.getEta(P)` walks the SAME chain as the leader for every period P.
-    setFollowerEtaChainWalk: (Long => F[List[(Long, Array[Byte])]]) => F[Unit]
+    // `EtaStateManager.getEtaAt(P, parentHash)` walks the SAME exact chain as the leader for every period P.
+    setFollowerEtaChainWalk: ((Long, Option[io.constellationnetwork.security.hash.Hash]) => F[EtaSourceRange]) => F[Unit]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
@@ -318,7 +311,6 @@ object Services {
             enqueueDAGBlock,
             enqueueTokenLockBlock,
             sidecarClient,
-            kesRegistry,
             setFollowerEtaChainWalk
           )
       }
@@ -329,11 +321,11 @@ object Services {
       )
       collateralService = MptStoreCollateral.make[F](cfg.collateral, pendingReader)
       recoveryPeerHintService <- RecoveryPeerHint.make[F].toResource
-      // §1.2 Slice 10 (#179): Runtime-mutable KES registry overlay built on top of the genesis-frozen
-      // `kesRegistry`. Lookups fall through to the genesis base until a Slice 10 registration cert finalizes for that
-      // operator. Wired here so HttpApi (POST /kes-registration) and GSAM accept-pipeline share the same instance.
+      // Runtime paired-key reader. Its KES- and VRF-only adapters both project from one `OperatorConsensusKeys`
+      // result, including paired genesis fallback. GSAM persistence is canonical; this best-tip reader is not the still-required
+      // candidate-parent historical consensus resolver.
       mutableKesRegistry <- io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry
-        .make[F](kesRegistry, pendingReader)
+        .make[F](sharedServices.operatorKeyRegistry, pendingReader)
         .toResource
     } yield
       new Services[F, R](
@@ -382,8 +374,7 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // SnapshotLeaderLoop after trigger construction; read by FinalityTriggersRoutes. The
   // route returns 503 while the Ref is empty (pre-startup window).
   val finalityTriggerViewRef: Ref[F, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[F]]],
-  // Track-3 S1: settled (k₂-archival) marker. HttpApi hands its read-only `settledOrdinal` to FinalityTriggersRoutes for
-  // `GET /global-snapshots/settled`. Backed by its own Ref — never the k₁ `nakamotoFinalizedOrdinalRef`.
+  // Legacy local k2 retention telemetry exposed to FinalityTriggersRoutes; not a consensus phase or floor.
   val settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
   // §3 NIPoPoW S5 — observability seam for /nakamoto/nipopow/* routes. Populated inside
   // GlobalSnapshotConsensus.make once the tower store + snapshot storage are wired. The
@@ -413,9 +404,9 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   // chain's bestTip under MultiBranch so reads pick up the chain's pending writes, falling
   // through to base on miss. See `GlobalStateReader.pending` for the contract.
   val pendingReader: GlobalStateReader[F],
-  // §1.2 Slice 10 (#179): Runtime-mutable KES registry overlay shared by the HTTP intake
-  // (KesRegistrationCertRoutes) and the GSAM accept-pipeline (wave 2). Backed by an in-memory
-  // overlay until the MPT migration lands; reads fall through to the genesis-frozen base.
+  // Runtime registration reader shared by preliminary HTTP intake and read paths. It resolves records from the supplied best-tip
+  // branch-aware MPT view and falls through to genesis only when no runtime chain exists. GSAM selection/persistence is wired; exact
+  // candidate-parent historical consumer lookup is not.
   val mutableKesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry[F],
   // Chain-sync (task #A): the single per-node shard acceptance deps, exposed for `ShardCheckpointRoutes` serve.
   val shardAcceptanceDeps: Option[

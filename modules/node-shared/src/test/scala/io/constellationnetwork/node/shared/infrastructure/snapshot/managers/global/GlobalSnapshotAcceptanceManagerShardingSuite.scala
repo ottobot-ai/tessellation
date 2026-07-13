@@ -28,6 +28,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.Spen
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
+import io.constellationnetwork.node.shared.infrastructure.sharding.{RegisteredCheckpointSigner, TestCheckpointDutyValidator}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsResult
 import io.constellationnetwork.node.shared.logger.Slf4jLoggerBundle
 import io.constellationnetwork.schema._
@@ -300,8 +301,14 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   ) extends ShardCheckpointGl0AcceptanceManager[IO] {
     override def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
+    override def evaluateForSigning(
+      checkpoint: ShardCheckpoint
+    ): IO[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]] =
+      IO.pure(Left(VerifiedShardCheckpointFailure.Rejected("test stub cannot mint signing capabilities")))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(decision(checkpoint))
+    override def verifyExecutionCertificate(checkpoint: ShardCheckpoint): IO[Either[String, Unit]] =
+      IO.pure(Left("test stub has no authenticated execution certificate"))
     override def verifyCommitteeSignature(
       checkpoint: ShardCheckpoint,
       signature: CommitteeMemberSignature
@@ -317,6 +324,10 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     override def lastAdoptedAnchor(
       shardId: io.constellationnetwork.schema.sharding.ShardId
     ): IO[Option[io.constellationnetwork.security.hash.Hash]] =
+      IO.pure(None)
+    override def lastAdoptedCheckpoint(
+      shardId: io.constellationnetwork.schema.sharding.ShardId
+    ): IO[Option[(ShardOrdinal, io.constellationnetwork.security.hash.Hash)]] =
       IO.pure(None)
     override def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] =
       IO.pure(List.empty[WatchtowerMismatch])
@@ -626,9 +637,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
       numShards = numShards,
-      finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
+      retention = ShardCheckpointRetentionConfig(retainedCheckpoints = 8L),
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096)
     )
 
   /** Shared no-op rewards function — none of the suite tests exercise the rewards path. */
@@ -863,7 +873,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       )
   }
 
-  test("checkpoint watermark advances only after its selected MG replay matches the claimed root") { res =>
+  test("tentative GSAM acceptance never advances the Phase-2 checkpoint anchor") { res =>
     implicit val (h, sp) = res
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("31" * 64)), Signature(Hex("32" * 70)))
@@ -889,11 +899,11 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         )
         _ <- invokeAccept(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
         recorded <- adoptions.get
-      } yield expect(recorded.map { case (shard, ord, _) => shard -> ord } == List(cp.shardId -> cp.shardOrdinal))
+      } yield expect(recorded.isEmpty)
     }
   }
 
-  test("one failed MG root suppresses the whole checkpoint watermark and fork anchor") { res =>
+  test("one failed MG root cannot advance the Phase-2 checkpoint anchor") { res =>
     implicit val (h, sp) = res
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("41" * 64)), Signature(Hex("42" * 70)))
@@ -1218,27 +1228,60 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   private val wtAttestedRoot: Hash = Hash("a" * 64)
   private val wtHonestDiffersFromAttested: Hash = Hash("b" * 64) // honest ≠ attested ⇒ UPHELD
 
-  /** A one-MG checkpoint carrying `attestedRoot` as the disputed MG's `perMetagraphMptRoots` (the value the verdict compares the recomputed
-    * honest root against).
+  private final case class WatchtowerCheckpointRig(
+    checkpoint: ShardCheckpoint,
+    checkpointSigner: RegisteredCheckpointSigner,
+    acceptanceManager: ShardCheckpointGl0AcceptanceManager[IO]
+  )
+
+  /** Build a one-MG checkpoint carrying `attestedRoot` as the disputed MG's `perMetagraphMptRoots`. The sole execution signer is first
+    * committed through the loader-validated period-zero KES+VRF registration path, then emits real Ed25519, KES, and VRF evidence. The
+    * returned concrete manager resolves that same atomic pair and is the execution-certificate authority used by the fraud-proof verdict.
     */
-  private def wtCheckpoint(mg: Address, attestedRoot: Hash): ShardCheckpoint = {
-    val delta = ShardDerivedStateDelta(
-      perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
-      includedSnapshots = SortedMap(mg -> NonEmptyList.of(mkSignedBinary("wt-content".getBytes("UTF-8"))))
-    )
-    mkCheckpoint(ShardId.unsafeApply(0), shardOrd = 1L, gl0Anchor = 2L, delta = delta)
-  }
+  private def wtCheckpoint(mg: Address, attestedRoot: Hash)(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO]
+  ): IO[WatchtowerCheckpointRig] =
+    for {
+      checkpointSigner <- RegisteredCheckpointSigner.make
+      committeeKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      committeeId = io.constellationnetwork.schema.peer.PeerId.fromPublic(committeeKeyPair.getPublic)
+      _ <- checkpointSigner.preregisterGenesis(committeeKeyPair, committeeId)
+      shardAssignment = ShardAssignment.make[IO](numShards = 4)
+      shardId <- shardAssignment.shardIdFor(mg)
+      delta = ShardDerivedStateDelta(
+        perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
+        includedSnapshots = SortedMap(mg -> NonEmptyList.of(mkSignedBinary("wt-content".getBytes("UTF-8"))))
+      )
+      shell = mkCheckpoint(shardId, shardOrd = 1L, gl0Anchor = 2L, delta = delta)
+      signature <- checkpointSigner.sign(shell, committeeKeyPair, committeeId, checkpointSigner.defaultShardEta)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.one(signature))
+      acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[IO](
+        executionQuorum = 1,
+        etaRotationSnapshots = 2550L,
+        committeeMembership = (_, _) => IO.pure(Set(committeeId)),
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
+        shardAssignment = shardAssignment,
+        shardEtaFor = (_, _) => IO.pure(Some(checkpointSigner.defaultShardEta)),
+        producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
+        reExecuteDerivation = (_, _, _, _) => IO.pure(attestedRoot)
+      )
+      certificate <- acceptanceManager.verifyExecutionCertificate(checkpoint)
+      _ <- IO.fromEither(
+        certificate.leftMap(reason => new IllegalStateException(s"watchtower checkpoint fixture certificate rejected: $reason"))
+      )
+    } yield WatchtowerCheckpointRig(checkpoint, checkpointSigner, acceptanceManager)
 
   /** Build an `InvalidStateProofEvidence` with a REAL challenger Ed25519 signature over the canonical preimage (so the validator's step-5
     * signature check passes), binding the carried checkpoint by its canonical hash (step-4). Mirrors InvalidStateProofValidatorSuite.
     */
-  private def wtEvidence(mg: Address, cp: ShardCheckpoint)(
+  private def wtEvidence(mg: Address, cp: ShardCheckpoint, checkpointSigner: RegisteredCheckpointSigner)(
     implicit h: Hasher[IO],
     sp: SecurityProvider[IO]
   ): IO[(io.constellationnetwork.schema.slashing.InvalidStateProofEvidence, Address)] =
     KeyPairGenerator.makeKeyPair[IO].flatMap { kp =>
       val submitterId = io.constellationnetwork.schema.peer.PeerId.fromPublic(kp.getPublic)
-      h.hash(cp.signingPreimage).flatMap { cpHash =>
+      checkpointSigner.preregisterGenesis(kp, submitterId) >> h.hash(cp.signingPreimage).flatMap { cpHash =>
         val attested = cp.derivedStateDelta.perMetagraphMptRoots.getOrElse(mg, Hash.empty)
         val unsigned = io.constellationnetwork.schema.sharding.FraudProofEnvelope(
           shardId = cp.shardId,
@@ -1271,14 +1314,21 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       }
     }
 
-  /** A pure stubbed re-derivation closure returning a fixed honest root — the verdict UPHOLDS iff `honest != attested`. */
-  private def wtValidator(honestRoot: Hash, store: MptStore[IO, GlobalStateKey])(
+  /** A pure stubbed re-derivation closure returning a fixed honest root — the verdict UPHOLDS iff `honest != attested`. Certificate
+    * authentication remains concrete and resolves the checkpoint's preregistered atomic KES+VRF signer identity.
+    */
+  private def wtValidator(
+    honestRoot: Hash,
+    store: MptStore[IO, GlobalStateKey],
+    verifyExecutionCertificate: ShardCheckpoint => IO[Either[String, Unit]]
+  )(
     implicit h: Hasher[IO],
     sp: SecurityProvider[IO]
   ): io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[IO] =
     io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[IO](
       reDerivePerMgRoot = (_, _, _, _) => IO.pure(honestRoot),
-      slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[IO](store)
+      slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[IO](store),
+      verifyExecutionCertificate = verifyExecutionCertificate
     )
 
   /** Invoke `accept()` with a `fraudProofs` set (no shard checkpoints, no scEvents) and return the GSAM-derived `(GSI, stateProof)`. */
@@ -1323,20 +1373,22 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     * return `(mgr, mptStore)`. `honestRoot != wtAttestedRoot` ⇒ disputes are UPHELD; `== wtAttestedRoot` ⇒ DisputeNotUpheld
     * (honest-committee floor).
     */
-  private def mkWatchtowerMgr(honestRoot: Hash)(
+  private def mkWatchtowerMgr(
+    honestRoot: Hash,
+    checkpointManager: ShardCheckpointGl0AcceptanceManager[IO],
+    numShards: Int = 4
+  )(
     implicit h: Hasher[IO],
     sp: SecurityProvider[IO]
   ): IO[(GlobalSnapshotAcceptanceManager[IO], MptStore[IO, GlobalStateKey])] =
     for {
-      callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
       eventsRef <- Ref.of[IO, List[StateChannelOutput]](List.empty)
       adoptedRef <- Ref.of[IO, SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]](SortedMap.empty)
-      stubMgr = StubAcceptanceManager(callsRef, _ => ShardCheckpointAcceptResult.Accepted)
       pair <- mkSuiteManagerWithProcessorAndStore(
-        Some(mkShardingConfig(numShards = 4)),
-        Some(stubMgr),
+        Some(mkShardingConfig(numShards = numShards)),
+        Some(checkpointManager),
         mkCaptorProcessor(eventsRef, adoptedRef),
-        store => Some(wtValidator(honestRoot, store))
+        store => Some(wtValidator(honestRoot, store, checkpointManager.verifyExecutionCertificate))
       )
     } yield pair
 
@@ -1344,12 +1396,16 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     res =>
       implicit val (h, sp) = res
       val mg = mkAddress("wt-upheld-mg")
-      val cp = wtCheckpoint(mg, wtAttestedRoot)
       for {
+        rig <- wtCheckpoint(mg, wtAttestedRoot)
+        cp = rig.checkpoint
         // honest re-derivation DIFFERS from the attested root ⇒ committee deviated ⇒ UPHELD.
-        pair <- mkWatchtowerMgr(honestRoot = wtHonestDiffersFromAttested)
+        pair <- mkWatchtowerMgr(
+          honestRoot = wtHonestDiffersFromAttested,
+          checkpointManager = rig.acceptanceManager
+        )
         (mgr, store) = pair
-        evPair <- wtEvidence(mg, cp)
+        evPair <- wtEvidence(mg, cp, rig.checkpointSigner)
         (evidence, submitterAddr) = evPair
         cpHash = evidence.fraudProof.disputedCheckpointHash
         _ <- invokeAcceptFraudProofs(mgr, SortedSet(evidence))
@@ -1367,12 +1423,13 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   test("W3a FRIVOLOUS: a fraud-proof whose recomputed honest root MATCHES the attested root ⇒ DisputeNotUpheld ⇒ NO slash") { res =>
     implicit val (h, sp) = res
     val mg = mkAddress("wt-frivolous-mg")
-    val cp = wtCheckpoint(mg, wtAttestedRoot)
     for {
+      rig <- wtCheckpoint(mg, wtAttestedRoot)
+      cp = rig.checkpoint
       // honest re-derivation REPRODUCES the attested root ⇒ committee did NOT deviate ⇒ NOT upheld (honest-committee floor).
-      pair <- mkWatchtowerMgr(honestRoot = wtAttestedRoot)
+      pair <- mkWatchtowerMgr(honestRoot = wtAttestedRoot, checkpointManager = rig.acceptanceManager)
       (mgr, store) = pair
-      evPair <- wtEvidence(mg, cp)
+      evPair <- wtEvidence(mg, cp, rig.checkpointSigner)
       (evidence, _) = evPair
       cpHash = evidence.fraudProof.disputedCheckpointHash
       _ <- invokeAcceptFraudProofs(mgr, SortedSet(evidence))
@@ -1383,11 +1440,15 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   test("W3a DOUBLE-SLASH: the same upheld fraud-proof applied twice ⇒ slashed once (Slashings record idempotent)") { res =>
     implicit val (h, sp) = res
     val mg = mkAddress("wt-double-mg")
-    val cp = wtCheckpoint(mg, wtAttestedRoot)
     for {
-      pair <- mkWatchtowerMgr(honestRoot = wtHonestDiffersFromAttested)
+      rig <- wtCheckpoint(mg, wtAttestedRoot)
+      cp = rig.checkpoint
+      pair <- mkWatchtowerMgr(
+        honestRoot = wtHonestDiffersFromAttested,
+        checkpointManager = rig.acceptanceManager
+      )
       (mgr, store) = pair
-      evPair <- wtEvidence(mg, cp)
+      evPair <- wtEvidence(mg, cp, rig.checkpointSigner)
       (evidence, _) = evPair
       cpHash = evidence.fraudProof.disputedCheckpointHash
       // First accept: UPHELD ⇒ writes the Slashings record.
@@ -1405,33 +1466,16 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   test("W3a numShards=1 byte-identity: a carried fraud proof yields NO slash and the SAME mptRoot as no fraud proof") { res =>
     implicit val (h, sp) = res
     val mg = mkAddress("wt-noshard-mg")
-    val cp = wtCheckpoint(mg, wtAttestedRoot)
     for {
+      rig <- wtCheckpoint(mg, wtAttestedRoot)
+      cp = rig.checkpoint
       // numShards=1 ⇒ shardAcceptanceDeps-equivalent gate off; even WITH a validator wired, the fraud-proof slash must not fire (no
       // committees exist). Build numShards=1 managers; the validator is present but the carried proof must be a no-op for byte-identity.
-      eventsRef1 <- Ref.of[IO, List[StateChannelOutput]](List.empty)
-      adoptedRef1 <- Ref.of[IO, SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]](SortedMap.empty)
-      callsRef1 <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-      stub1 = StubAcceptanceManager(callsRef1, _ => ShardCheckpointAcceptResult.Accepted)
-      withProofPair <- mkSuiteManagerWithProcessorAndStore(
-        Some(mkShardingConfig(numShards = 1)),
-        Some(stub1),
-        mkCaptorProcessor(eventsRef1, adoptedRef1),
-        store => Some(wtValidator(wtHonestDiffersFromAttested, store))
-      )
+      withProofPair <- mkWatchtowerMgr(wtHonestDiffersFromAttested, rig.acceptanceManager, numShards = 1)
       (mgrWithProof, storeWithProof) = withProofPair
-      eventsRef2 <- Ref.of[IO, List[StateChannelOutput]](List.empty)
-      adoptedRef2 <- Ref.of[IO, SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]](SortedMap.empty)
-      callsRef2 <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
-      stub2 = StubAcceptanceManager(callsRef2, _ => ShardCheckpointAcceptResult.Accepted)
-      noProofPair <- mkSuiteManagerWithProcessorAndStore(
-        Some(mkShardingConfig(numShards = 1)),
-        Some(stub2),
-        mkCaptorProcessor(eventsRef2, adoptedRef2),
-        store => Some(wtValidator(wtHonestDiffersFromAttested, store))
-      )
+      noProofPair <- mkWatchtowerMgr(wtHonestDiffersFromAttested, rig.acceptanceManager, numShards = 1)
       (mgrNoProof, _) = noProofPair
-      evPair <- wtEvidence(mg, cp)
+      evPair <- wtEvidence(mg, cp, rig.checkpointSigner)
       (evidence, _) = evPair
       cpHash = evidence.fraudProof.disputedCheckpointHash
       // accept WITH a carried fraud proof at numShards=1 ...
@@ -1451,17 +1495,27 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
   test("W3a DETERMINISM: leader/follower/peer fold the SAME upheld fraud proof to a byte-identical post-slash stateProof") { res =>
     implicit val (h, sp) = res
     val mg = mkAddress("wt-determinism-mg")
-    val cp = wtCheckpoint(mg, wtAttestedRoot)
     // Three INDEPENDENT GSAM instances (each its own MPT) — the leader (produce), the follower (createContext), and a validating peer
     // (validateArtifact) all run accept() over the SAME embedded `fraudProofs` set + the SAME deterministic dispute validator. They MUST
     // reach the byte-identical post-slash stateProof — a divergence here would be a consensus fork.
     for {
-      evPair <- wtEvidence(mg, cp)
+      rig <- wtCheckpoint(mg, wtAttestedRoot)
+      cp = rig.checkpoint
+      evPair <- wtEvidence(mg, cp, rig.checkpointSigner)
       (evidence, _) = evPair
       cpHash = evidence.fraudProof.disputedCheckpointHash
-      leaderPair <- mkWatchtowerMgr(honestRoot = wtHonestDiffersFromAttested)
-      followerPair <- mkWatchtowerMgr(honestRoot = wtHonestDiffersFromAttested)
-      peerPair <- mkWatchtowerMgr(honestRoot = wtHonestDiffersFromAttested)
+      leaderPair <- mkWatchtowerMgr(
+        honestRoot = wtHonestDiffersFromAttested,
+        checkpointManager = rig.acceptanceManager
+      )
+      followerPair <- mkWatchtowerMgr(
+        honestRoot = wtHonestDiffersFromAttested,
+        checkpointManager = rig.acceptanceManager
+      )
+      peerPair <- mkWatchtowerMgr(
+        honestRoot = wtHonestDiffersFromAttested,
+        checkpointManager = rig.acceptanceManager
+      )
       leader <- invokeAcceptFraudProofs(leaderPair._1, SortedSet(evidence))
       follower <- invokeAcceptFraudProofs(followerPair._1, SortedSet(evidence))
       peer <- invokeAcceptFraudProofs(peerPair._1, SortedSet(evidence))
@@ -1478,5 +1532,25 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         leader._2.mptRoot == follower._2.mptRoot,
         leader._2.mptRoot == peer._2.mptRoot
       )
+  }
+
+  test("W3a UNAUTHENTICATED: a correctly bound fraud proof cannot slash signer IDs from an invalid execution certificate") { res =>
+    implicit val (h, sp) = res
+    val mg = mkAddress("wt-unauthenticated-mg")
+    for {
+      rig <- wtCheckpoint(mg, wtAttestedRoot)
+      invalidSignature = rig.checkpoint.committeeSignatures.head.copy(ed25519Sig = Hex.fromBytes(Array.fill(64)(0.toByte)))
+      invalidCheckpoint = rig.checkpoint.copy(committeeSignatures = NonEmptyList.one(invalidSignature))
+      certificate <- rig.acceptanceManager.verifyExecutionCertificate(invalidCheckpoint)
+      pair <- mkWatchtowerMgr(
+        honestRoot = wtHonestDiffersFromAttested,
+        checkpointManager = rig.acceptanceManager
+      )
+      (mgr, store) = pair
+      evPair <- wtEvidence(mg, invalidCheckpoint, rig.checkpointSigner)
+      (evidence, _) = evPair
+      _ <- invokeAcceptFraudProofs(mgr, SortedSet(evidence))
+      slashed <- wasSlashed(store, invalidCheckpoint.shardId, evidence.fraudProof.disputedCheckpointHash)
+    } yield expect.all(certificate.isLeft, !slashed)
   }
 }

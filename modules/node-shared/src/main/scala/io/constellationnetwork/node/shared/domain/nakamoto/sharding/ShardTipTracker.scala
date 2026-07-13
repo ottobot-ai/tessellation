@@ -20,17 +20,15 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * '''Why a separate tracker per shard.''' Two independent reasons:
   *   - '''Scope.''' A shard committee is a sortitioned subset of the gl0 operator set (per the `sharding-direction-clarified` memory note —
   *     execution sharded, not data sharded). Mixing attestations from different shards' committees in one tracker would lose the
-  *     per-committee accounting used by `T_count_shard`. The cluster-uniform configured `kQuorum` is compared directly.
-  *   - '''Pruning floor.''' Each shard advances its `lastFinalizedOrdinal` independently. Pruning needs to know "what's below the shard's
-  *     own floor" — a single mixed tracker would have to track per-(shardId) floors anyway, which is just this per-shard tracker
-  *     constructor-fed a `ShardId` for diagnostic logging plus a per-shard `Map[Hash, Map[PeerId, CommitteeMemberSignature]]`.
+  *     per-committee accounting used by the execution-certificate selector. The cluster-uniform configured `kQuorum` is compared directly.
+  *   - '''Pruning floor.''' Each shard advances its current certificate-qualified ordinal independently. Pruning needs to know "what's
+  *     below the shard's own floor" — a single mixed tracker would have to track per-(shardId) floors anyway, which is just this per-shard
+  *     tracker constructor-fed a `ShardId` for diagnostic logging plus a per-shard `Map[Hash, Map[PeerId, CommitteeMemberSignature]]`.
   *
-  * '''Self-exclusion.''' `attestationCountFor` defaults to excluding the local node (`selfPeerId`) from the returned count. This mirrors
-  * the [[io.constellationnetwork.node.shared.domain.nakamoto.TCountTrigger]] self-exclusion rule (#133 self-exclusion + P-11b small-cluster
-  * deadlock prevention; see `TCountTrigger`'s scaladoc and the `[[project-117-path-b-fork-recovery-deadlock]]` memory entry). The mechanism
-  * is identical at the shard layer: a single committee member must not count its own attestation toward its own finality threshold,
-  * otherwise it can self-finalize a divergent shard fork and lock itself out of canonical recovery. Callers wire `excludeSelf = false` only
-  * for diagnostic / aggregate accounting paths where the self-count is informational.
+  * '''Self-exclusion.''' `attestationCountFor` retains the global tracker's default self-excluded diagnostic view. Shard execution-quorum
+  * selection explicitly passes `excludeSelf = false`, because the embedded certificate and `verifyEmbedded` count every distinct valid
+  * committee signer, including the local operator. Each counted signature is required to be replay-backed; a local signature alone cannot
+  * qualify when `kQuorum > 1` and is not a shortcut.
   *
   * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`):
   *   - Fresh per-shard tracker. The gl0 `TipTracker` stays as-is for the universal global chain.
@@ -44,8 +42,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * shard-ord falls below the floor). Retaining the FULL signature (not just the `PeerId`, the original Slice-6 shape) is what slice 14
   * needs: the gl0 consensus leader reads [[signaturesFor]] and splices the ≥`kQuorum` collected signatures back into a candidate
   * checkpoint's `committeeSignatures` before the deterministic `verifyEmbedded` replay gate. Signature enrichment never bypasses replay.
-  * (The gl0 `TipTracker` is keyed by `PeerId` instead because there each peer's latest attestation supersedes its previous — P-11b NID; the
-  * shard's one-sig-per-checkpoint invariant makes the `Hash`-keyed shape sound here.)
+  * (The gl0 `TipTracker` is keyed by `PeerId` because each peer's latest attestation supersedes its previous; the shard's
+  * one-sig-per-checkpoint invariant makes the `Hash`-keyed shape sound here.)
   */
 trait ShardTipTracker[F[_]] {
 
@@ -69,9 +67,9 @@ trait ShardTipTracker[F[_]] {
     * @param checkpointHash
     *   the canonical hash of the shard checkpoint (`Hasher[F]` over `ShardCheckpointSigPreimage` per design doc §3.3)
     * @param excludeSelf
-    *   when `true` (the default), the local node's `selfPeerId` is excluded from the count — matching the [[TCountTrigger]] self-exclusion
-    *   rule (#133 + P-11b). When `false`, returns the raw size including any self-attestation, intended for diagnostic logging and
-    *   post-mortem analysis where the inflated count is the desired view.
+    *   when `true` (the default), the local node's `selfPeerId` is excluded from the count for parity with global count-trigger
+    *   diagnostics. When `false`, returns the raw distinct-signer count including any self-attestation; shard execution-quorum selection
+    *   uses this view so it matches the embedded certificate count.
     */
   def attestationCountFor(checkpointHash: Hash, excludeSelf: Boolean = true): F[Int]
 
@@ -94,8 +92,8 @@ trait ShardTipTracker[F[_]] {
   def pruneBelow(shardOrdinal: ShardOrdinal, lookupOrdinal: Hash => F[Option[ShardOrdinal]]): F[Unit]
 
   /** Diagnostic / observability — read the full attestation map (signer sets per checkpoint hash). Production callers should NOT route
-    * control flow through this; use [[attestationCountFor]] (self-exclusion-consistent counting) or [[signaturesFor]] (the slice-14 signer
-    * signatures). The signature payloads are dropped here — observability only needs the signer identities.
+    * control flow through this; use [[attestationCountFor]] with the desired explicit self-count policy or [[signaturesFor]] for the
+    * carried signer payloads. The signature payloads are dropped here — observability only needs the signer identities.
     */
   def allAttestations: F[Map[Hash, Set[PeerId]]]
 }
@@ -108,8 +106,8 @@ object ShardTipTracker {
     *   which shard this tracker is scoped to. Used for diagnostic logging; the tracker does not enforce that recorded attestations
     *   originate from this shard's committee (membership verification lives in the gossip/admission layer — see design doc §6.3).
     * @param selfPeerId
-    *   the local node's PeerId — captured here so `attestationCountFor(excludeSelf = true)` (the default) can apply the #133/P-11b
-    *   self-exclusion without re-threading the identity through every call site.
+    *   the local node's PeerId, captured so diagnostic callers can request self-excluded counts without re-threading the identity through
+    *   every call site.
     */
   def make[F[_]: Async: Metrics](
     shardId: ShardId,

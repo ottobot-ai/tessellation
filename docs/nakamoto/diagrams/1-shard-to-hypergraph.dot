@@ -1,13 +1,17 @@
 // Diagram 1 — SHARD checkpoint chains ride into the HYPERGRAPH (gl0) chain
 // =========================================================================
-// Every claim here is from schema/sharding/ShardCheckpoint.scala:
+// Target checkpoint contract (the schema migration is scoped separately):
 //   - a SHARD is its own chain of ShardCheckpoint envelopes:
 //       parentCheckpointHash (chain-link)  +  shardOrdinal (monotone)  +  slot (producer-duty clock)
-//   - it anchors into gl0 via  gl0AnchorOrdinal : "the gl0 ord it expects to ride into;
-//     gl0 accepts at this ord OR ANY LATER ord"  (loose coupling — shard pace != gl0 pace)
+//   - every checkpoint executes against one exact canonical Phase-2 GL0
+//     executionBaseRef = (ordinal, snapshotHash, stateRoot)
+//   - an optional inclusionHeightHint is scheduling metadata only. It never
+//     substitutes for, weakens, or rebases that exact execution reference
 //   - MANY shards = MANY independent checkpoint chains, all riding into the ONE gl0 chain
-//   - committee signatures authenticate a replayable claim; they are not economic validity or finality
-//   - every GL0 adopter re-executes included framework operations before canonical adoption
+//   - every committee execution signature follows independent replay of the exact diff/root
+//   - ordinary GL0 adopters apply the signed pinned-base diff and recompute its root
+//   - containing GL0 Phase 2 makes the checkpoint operational and reversible;
+//     density fork choice can orphan it and require rollback/re-follow
 //
 // Render: dot -Tpng -Gdpi=150 1-shard-to-hypergraph.dot -o 1-shard-to-hypergraph.png
 
@@ -17,27 +21,27 @@ digraph shard_to_hypergraph {
   node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, margin="0.16,0.09"];
   edge [fontname="Helvetica", fontsize=9, arrowsize=0.8];
   graph [fontname="Helvetica", labelloc=t, fontsize=14,
-    label=<<B>1 &middot; Shard checkpoint chains ride into the hypergraph (gl0) chain</B><BR/><FONT POINT-SIZE="10">shards partition replay work &middot; gl0 re-execution and finality decide canonical validity</FONT><BR/> >];
+    label=<<B>1 &middot; Shard checkpoint chains ride into the hypergraph (gl0) chain</B><BR/><FONT POINT-SIZE="10">committee replay certifies the diff &middot; gl0 apply/root-check and phases decide canonical use</FONT><BR/> >];
 
   // ================= SHARD A — own chain, own pace =================
   tagA [shape=plaintext, label=<<B>SHARD&nbsp;A</B><BR/><FONT POINT-SIZE="8">eligible gl0 execution committee</FONT>>];
-  CA1  [label=<<B>C<SUB>A</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;7</FONT>>, fillcolor="#EDE7F6", color="#6A3D9A", penwidth=1.6];
-  CA2  [label=<<B>C<SUB>A</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;8</FONT>>, fillcolor="#EDE7F6", color="#6A3D9A", penwidth=1.6];
+  CA1  [label=<<B>C<SUB>A</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;7</FONT><BR/><FONT POINT-SIZE="7">base=(n&minus;2,h1,r1)<BR/>inclusionHint=n&minus;1 (non-authoritative)</FONT>>, fillcolor="#EDE7F6", color="#6A3D9A", penwidth=1.6];
+  CA2  [label=<<B>C<SUB>A</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;8</FONT><BR/><FONT POINT-SIZE="7">base=(n&minus;1,h2,r2)<BR/>inclusionHint=n (non-authoritative)</FONT>>, fillcolor="#EDE7F6", color="#6A3D9A", penwidth=1.6];
   { rank=same; tagA; CA1; CA2; }
   CA1 -> CA2 [color="#6A3D9A", penwidth=2.2, label="parentCheckpointHash", fontcolor="#6A3D9A"];
 
   // ================= SHARD B — DIFFERENT checkpoint pace =================
   tagB [shape=plaintext, label=<<B>SHARD&nbsp;B</B><BR/><FONT POINT-SIZE="8">separate checkpoint pace</FONT>>];
-  CB1  [label=<<B>C<SUB>B</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;3</FONT>>, fillcolor="#E0F2F1", color="#00796B", penwidth=1.6];
-  CB2  [label=<<B>C<SUB>B</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;4</FONT>>, fillcolor="#E0F2F1", color="#00796B", penwidth=1.6];
+  CB1  [label=<<B>C<SUB>B</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;3</FONT><BR/><FONT POINT-SIZE="7">base=(n&minus;2,h1,r1)<BR/>inclusionHint=n&minus;1 (non-authoritative)</FONT>>, fillcolor="#E0F2F1", color="#00796B", penwidth=1.6];
+  CB2  [label=<<B>C<SUB>B</SUB></B><BR/><FONT POINT-SIZE="8">shardOrd&nbsp;4</FONT><BR/><FONT POINT-SIZE="7">base=(n&minus;1,h2,r2)<BR/>inclusionHint=n (non-authoritative)</FONT>>, fillcolor="#E0F2F1", color="#00796B", penwidth=1.6];
   { rank=same; tagB; CB1; CB2; }
   CB1 -> CB2 [color="#00796B", penwidth=2.2];
 
   // ================= HYPERGRAPH gl0 — the ONE master chain =================
   tagG [shape=plaintext, label=<<B>HYPERGRAPH&nbsp;gl0</B><BR/><FONT POINT-SIZE="8">global snapshots &middot; master ordinal grid</FONT>>];
-  S1   [label=<<B>S(n&minus;2)</B>>, fillcolor="#EAF2FB", color="#1a5fb4", penwidth=1.8];
-  S2   [label=<<B>S(n&minus;1)</B>>, fillcolor="#EAF2FB", color="#1a5fb4", penwidth=1.8];
-  S3   [label=<<B>S(n)&nbsp;tip</B>>, fillcolor="#D7E9FC", color="#1a5fb4", penwidth=2.6];
+  S1   [label=<<B>S(n&minus;2)</B><BR/><FONT POINT-SIZE="8">hash h1 &middot; root r1 &middot; Phase 2</FONT>>, fillcolor="#EAF2FB", color="#1a5fb4", penwidth=1.8];
+  S2   [label=<<B>S(n&minus;1)</B><BR/><FONT POINT-SIZE="8">hash h2 &middot; root r2 &middot; Phase 2</FONT>>, fillcolor="#EAF2FB", color="#1a5fb4", penwidth=1.8];
+  S3   [label=<<B>S(n)&nbsp;P2 head</B><BR/><FONT POINT-SIZE="8">hash h3 &middot; root r3 &middot; Phase 2</FONT>>, fillcolor="#D7E9FC", color="#1a5fb4", penwidth=2.6];
   { rank=same; tagG; S1; S2; S3; }
   S1 -> S2 -> S3 [color="#1a5fb4", penwidth=2.8];
 
@@ -46,17 +50,17 @@ digraph shard_to_hypergraph {
   CA1 -> CB1 -> S1 [style=invis];
   CA2 -> CB2 -> S2 [style=invis];
 
-  // ================= ANCHOR edges: checkpoint --gl0AnchorOrdinal--> gl0 =================
-  // bold+labeled = the live tip binding; the "or later" note shows the loose coupling.
+  // ================= EXACT EXECUTION-BASE edges =================
+  // These bind validation to one Phase-2 (ordinal, snapshotHash, stateRoot).
+  // The separately displayed inclusionHeightHint is non-authoritative scheduling data.
   CA1 -> S1 [constraint=false, style=dashed, color="#6A3D9A", penwidth=1.3, arrowsize=0.7];
   CA2 -> S2 [constraint=false, style=dashed, color="#6A3D9A", penwidth=1.6, arrowsize=0.7,
-             label="gl0AnchorOrdinal", fontcolor="#6A3D9A"];
+             label="exact Phase-2\nexecutionBaseRef", fontcolor="#6A3D9A"];
   CB1 -> S1 [constraint=false, style=dashed, color="#00796B", penwidth=1.3, arrowsize=0.7];
-  CB2 -> S3 [constraint=false, style=dashed, color="#00796B", penwidth=1.6, arrowsize=0.7,
-             taillabel="rides into this ord\nOR any later", labelangle=20, labeldistance=3.0, fontcolor="#00796B"];
+  CB2 -> S2 [constraint=false, style=dashed, color="#00796B", penwidth=1.6, arrowsize=0.7];
 
   // one-line legend
   Legend [shape=note, style=filled, fillcolor="#FFFFFF", color="#999999", fontsize=9,
-    label=<<B>read it as</B><BR ALIGN="LEFT"/>&bull; horizontal solid = each chain's own links (parentCheckpointHash / gl0 next)<BR ALIGN="LEFT"/>&bull; dashed down = gl0AnchorOrdinal (checkpoint rides into gl0 at that ord, or later)<BR ALIGN="LEFT"/>&bull; signatures authenticate the claim; every gl0 adopter replays it before canonical use<BR ALIGN="LEFT"/>&bull; A &amp; B advance at DIFFERENT shardOrdinals &mdash; independent chains, one gl0>];
+    label=<<B>read it as</B><BR ALIGN="LEFT"/>&bull; horizontal solid = each chain's own links (parentCheckpointHash / gl0 next)<BR ALIGN="LEFT"/>&bull; dashed down = exact Phase-2 executionBaseRef (ordinal, snapshotHash, stateRoot)<BR ALIGN="LEFT"/>&bull; inclusionHeightHint is scheduling metadata only; it has no validity or rebasing authority<BR ALIGN="LEFT"/>&bull; execution signatures mean replay matched; ordinary gl0 applies the diff and checks the root<BR ALIGN="LEFT"/>&bull; exact containing gl0 Phase 2 makes it operational and reversible under density reorg<BR ALIGN="LEFT"/>&bull; k2 is only a recommended local retention/proof/recovery horizon, never a checkpoint-validity floor<BR ALIGN="LEFT"/>&bull; A &amp; B advance at DIFFERENT shardOrdinals &mdash; independent chains, one gl0>];
   S3 -> Legend [style=invis];
 }

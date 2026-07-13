@@ -1,11 +1,23 @@
 # Currency-App Token Enforcement
 
-**Status:** canonical, amended 2026-07-10.
+> **HISTORICAL REGRESSION RECORD - NOT CANONICAL.** This document describes the
+> universal-GL0 recreation direction introduced by `c610a0740`. The owner rejected
+> that architecture on 2026-07-11. Do not implement its “every GL0 adopter
+> recreates CL1” rule. The target is ADR-0017: producer and every execution signer
+> replay before signing; ordinary noncommittee GL0 nodes require the distinct
+> execution threshold, compare-and-set the signed pre-root, apply the canonical
+> scoped diff, and recompute the root; assigned watchtowers replay as the collusion
+> backstop. `authoritative*` and `AdoptFromSignedFields` remain deleted.
+
+**Status:** superseded historical record of current regression behavior.
 
 ## Invariant
 
-Every framework-defined CL1 economic transition is recreated and enforced by every GL0 node before its result is usable. A root, proof,
-metagraph signature, committee signature, byte-diff, attestation, or later slash never substitutes for execution.
+Historical rejected invariant: every framework-defined CL1 economic transition is
+recreated by every GL0 node. The surviving invariant is narrower and stronger at
+the signing boundary: no execution-validity signer signs without independent
+replay, and no ordinary adopter installs a claimed root without threshold/base/
+diff/root verification.
 
 This covers transfers, rewards, fees, allow-spends, spends, token-locks/unlocks, balances, active sets, reference maps, replay/nullifier
 state, and supply effects.

@@ -49,6 +49,22 @@ object NakamotoChainStore {
     val empty: ChainState = ChainState(Map.empty, None, 0L)
   }
 
+  /** Result of an exact-parent eta-source walk. `Complete` means the walk crossed the requested period's lower ordinal boundary while
+    * preserving every parent hash/ordinal link. `Incomplete` is never an eta input, even when it contains a nonempty prefix.
+    */
+  sealed trait VrfOutputRange {
+    def outputs: List[(Long, Array[Byte])]
+  }
+
+  object VrfOutputRange {
+    final case class Complete(outputs: List[(Long, Array[Byte])]) extends VrfOutputRange
+    final case class Incomplete(
+      outputs: List[(Long, Array[Byte])],
+      missingHash: Hash,
+      expectedOrdinal: Option[Long]
+    ) extends VrfOutputRange
+  }
+
   trait NakamotoChainStoreAlgebra[F[_]] {
 
     /** Store a new snapshot. If it extends the best chain or creates a better fork, update the tip. Returns true if the snapshot was new
@@ -102,9 +118,9 @@ object NakamotoChainStore {
       * '''Why hash + ordinal both.''' Disk indexes by ordinal; chain-walk callers know the parent's ordinal (`current.ordinal - 1`) and its
       * hash. Combining them lets a single point read on disk produce a hash-verified result even though disk has no hash index. Tests this
       * is the load-bearing path for:
-      *   - [[vrfOutputsForPeriod]] / [[collectVrfOutputsForPeriod]] walking back to `periodStart` of period N-1. With Fix B's k₁-bounded
-      *     in-memory retention the walk hits the eviction floor after ~k₁ ords; the fallback recovers VRF outputs from disk so eta rotation
-      *     is preserved across the eviction boundary (Path 1, Finding 1).
+      *   - [[vrfOutputRangeForPeriodFrom]] walking back to `periodStart` of period N-1. With Fix B's k₁-bounded in-memory retention the
+      *     walk hits the eviction floor after ~k₁ ords; the fallback recovers VRF outputs from disk so eta rotation is preserved across the
+      *     eviction boundary (Path 1, Finding 1).
       *   - [[ChainSyncServer.serveSnapshots]] hash-keyed peer queries (Path 1, Finding 2).
       *
       * '''Why not always disk-first.''' In-memory `byHash` is O(1) hash-map lookup; disk is a file open + parse. The hot path (chain
@@ -116,16 +132,11 @@ object NakamotoChainStore {
     /** Get the chain of snapshots from tip back to genesis (or pruning point) */
     def chainFromTip: F[List[StoredSnapshot]]
 
-    /** Get VRF outputs for snapshots in the first 2/3 of a rotation period (for eta calculation). Walks from bestTip — use
-      * vrfOutputsForPeriodFrom for fork-aware queries. The Long in the returned pairs is the snapshot's **ordinal** (rotation periods are
-      * keyed on ordinal to satisfy the R ≥ 3·k₁ stability bound; see `docs/nakamoto/attestation-and-finality.md` §1).
+    /** Exact-parent variant that proves whether the ancestry walk covered the complete source-period interval. Consensus eta derivation
+      * must consume only `Complete(nonEmpty)`; a partial nonempty prefix and an empty range are not eta evidence. The Long in each output
+      * pair is the snapshot ordinal.
       */
-    def vrfOutputsForPeriod(period: Long, etaRotationSnapshots: Long): F[List[(Long, Array[Byte])]]
-
-    /** Get VRF outputs for a rotation period by walking backward from a specific hash. Used to compute eta for an incoming snapshot on a
-      * potentially different fork. The Long in the returned pairs is the snapshot's **ordinal**.
-      */
-    def vrfOutputsForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]]
+    def vrfOutputRangeForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[VrfOutputRange]
 
     /** Mark a snapshot as finalized and prune older fork branches. Keeps the finalized chain but removes orphaned snapshots with ordinal <=
       * finalizedOrdinal that aren't ancestors of the finalized tip.
@@ -196,35 +207,26 @@ object NakamotoChainStore {
     underlyingStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainSelection: ChainSelection[F],
     tipTracker: TipTracker[F],
-    // Finalized-ordinal guard. `store` refuses to write a snapshot whose ordinal is
-    // at-or-below finalized when its hash differs from the already-stored one — that
-    // would silently rewrite finalized content (the gl0-2-divergent-517 class of bug
+    // Transitional ordinal guard. `store` refuses a different hash at-or-below its
+    // configured watermark. This prevented silent overwrite (the gl0-2-divergent-517 bug)
     // we saw: local slot-win produced own snapshot at ord N that was already finalized
     // via gossip with a different hash, and blindly overwrote it, causing permanent
     // cross-node hash disagreement at ord N).
     //
-    // Writes above finalized are always allowed (that's the normal reorg path). Writes
-    // at-or-below finalized with MATCHING hash are no-ops (legitimate re-delivery or
-    // download-replay). Only differing-hash writes at-or-below finalized are refused.
+    // but it is not the target Phase-2 rule: P2 is exact-hash and density-reorgable, so a
+    // replacement must trigger rollback/re-follow rather than a permanent ordinal freeze.
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
-    // Track-3 S1.5 "marker split". The DISTINCT k₂ "settled" ordinal source — the deepest ordinal past the Phase-2→Phase-3
-    // archival gate (k₂ = 100·k₁), advanced ONLY by SnapshotLeaderLoop's `T_depth2` sink (via the `SettledOrdinalTracker` that
-    // shares this exact ref, so there is ONE settled source). This is NOT `nakamotoFinalizedOrdinalRef` (k₁) — the two markers are
-    // separate refs and advance independently, with the invariant `settled ≤ finalized` maintained by construction (k₂ is the
-    // deeper window: T_depth2 always trails T_depth1).
-    //
-    // In S1.5 the store only RESETS this ref (in `unsafe_clearFinality`, in lock-step with the k₁ ref) — it is threaded in now so
-    // it is AVAILABLE to the store-gate + fork-choice, but the store-gate (the `ordinal <= finalized` finality-safety check in
-    // `store`) and the production floor (`SnapshotLeaderLoop`) stay keyed on the k₁ `nakamotoFinalizedOrdinalRef`. Re-keying the
-    // store-gate + `shouldSwitch` onto this settled ref is Track-3 S3; wiring it now (without S3) would either be inert or drag
-    // production to k₂ — the `86f390130` self-contradiction that got reverted.
+    // Transitional legacy k2 watermark, distinct from the current k1 ordinal ref. Target k2 is
+    // local retention/proof/recovery capacity only. Its live use as a store/fork-choice floor is
+    // an implementation gap; no k2 marker may create Phase 3 or choose/refuse a valid branch.
     nakamotoSettledOrdinalRef: Ref[F, SnapshotOrdinal],
-    // Heap-leak Fix B. Number of ordinals BEHIND the finalized tip to retain in
+    // Local in-memory capacity behind the current P2 tip. Older exact history must remain
+    // reconstructible from authenticated storage/proofs or comparison enters RecoveryRequired.
     // `ChainState.byHash`. Defaults to [[DefaultKeepDepthBehindFinalized]] = 255 (k₁,
     // matching the operational confirmation depth). The production call site overrides via
     // `NAKAMOTO_KEEP_DEPTH_BEHIND_FINALIZED`.
     //
-    // Safety: chain-selection / fork-choice operates only on the top-k₁ chain entries
+    // Current chain-selection hot path operates on recent entries
     // (`ChainSelection.shouldSwitch` walks at most `ConfirmationDepthK` ordinals via
     // `chainStore.tipFor`; `walkBackTo` falls through to disk via `SnapshotStorage.getHash`
     // when the in-memory chain breaks). Older `chainStore.get(hash)` lookups (e.g. the
@@ -233,7 +235,7 @@ object NakamotoChainStore {
     // in-memory.
     //
     // Caveats observed during implementation (worth feeding back to operators):
-    //   - `vrfOutputsForPeriod(period - 1, etaRotationSnapshots)` walks back up to one
+    //   - `vrfOutputRangeForPeriodFrom(period - 1, etaRotationSnapshots, tipHash)` walks back up to one
     //     full eta-rotation window. Default rotation is 2550 ords (10·k₁); with
     //     `keepDepthBehindFinalized = 255`, walks below 255 ords behind the finalized
     //     tip return a partial set. This is fine for e2e tests (rotation period 0 never
@@ -244,18 +246,14 @@ object NakamotoChainStore {
     //     historical-query peers can fall back to `serveByRange` (disk-backed) or full
     //     catch-up.
     keepDepthBehindFinalized: Long = DefaultKeepDepthBehindFinalized,
-    // Track-3 S3 CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`, default false). Selects WHICH
-    // finality marker the store-gate (the `ordinal <= floor` finality-safety refusal in `store`) keys
-    // off:
+    // Transitional flag selecting which legacy ordinal floor the store gate uses:
     //   - false (default) ⇒ the k₁ `nakamotoFinalizedOrdinalRef` — the legacy write-freeze at operational
     //     finality (byte-identical to the post-`376d09fbc` baseline; the 2026-06-27 storm backstop).
     //   - true ⇒ the k₂ `nakamotoSettledOrdinalRef` — a different-hash write in the `(settled, finalized]`
     //     band is no longer auto-refused here; it is routed to `ChainSelection.shouldSwitch` → `compare`
     //     (density-revertable). Only at/below the k₂ settled floor does the store-gate freeze.
-    // The different-hash refusal + P-11 `divergentRefuseCounter` semantics are IDENTICAL either way; only
-    // the floor ordinal moves. Kept OFF until a deep-fork sim validates cluster-uniformity (this is
-    // attempt #2 of the reverted `86f390130`, whose store-internal archive marker never fired — here the
-    // settled marker is the live, T_depth2-driven ref shared with `SettledOrdinalTracker`).
+    // The target removes both absolute floors, keeps density comparison active for reversible P2,
+    // and enters RecoveryRequired when objective comparison history is unavailable.
     bandDensityReorgEnabled: Boolean = false
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
@@ -406,12 +404,13 @@ object NakamotoChainStore {
                 }
               }.flatten
 
-              // Track-3 S3: the store-gate floor. Flag OFF (default) keys off the k₁
-              // `nakamotoFinalizedOrdinalRef` (legacy write-freeze at operational finality — the
+              // TRANSITIONAL IMPLEMENTATION GAP: flag-selected ordinal store floor. Flag OFF keys off the
+              // k1 `nakamotoFinalizedOrdinalRef` (legacy write-freeze at operational finality — the
               // 2026-06-27 storm backstop). Flag ON keys off the k₂ `nakamotoSettledOrdinalRef`, so a
               // different-hash write in the `(settled, finalized]` band is NOT refused here — it falls
               // through to `tryStore`, where `ChainSelection.shouldSwitch` → `compare` decides the reorg
-              // (density-revertable band). Only at/below the settled floor does the store-gate freeze.
+              // (density-revertable band). Target code must replace this floor with exact-hash P2 rollback/re-follow
+              // and RecoveryRequired on unavailable history.
               val floorRef = if (bandDensityReorgEnabled) nakamotoSettledOrdinalRef else nakamotoFinalizedOrdinalRef
               floorRef.get.flatMap { floor =>
                 // Chain-store API is Long-indexed; compare against the floor ordinal's Long value.
@@ -518,7 +517,7 @@ object NakamotoChainStore {
                           // Disk doesn't persist `GlobalSnapshotInfo`; the StoredSnapshot.context
                           // is left as the snapshot's `info` slice from the toGlobalSnapshotInfo
                           // path. For the chain-walk consumers wired by Path 1
-                          // (`vrfOutputsForPeriod` and `ChainSyncServer.serveSnapshots`) the
+                          // (exact eta range collection and `ChainSyncServer.serveSnapshots`) the
                           // `context` field is unused on the fallback path — they read only
                           // `signedSnapshot`, `ordinal`, `parentHash`, and `vrfOutput`. We populate
                           // an empty placeholder GSI to satisfy the record shape; if a future
@@ -582,7 +581,7 @@ object NakamotoChainStore {
         //      large R, requiring a disk `SnapshotStorage.getHash(ordinal)` hop).
         //   2. `confirmationDepthK` is not plumbed into this store / method, so the alternative origin
         //      `(bestTip.ordinal - k₁)` is not computable here without threading it in.
-        //   3. TIMING HAZARD: production calls `vrfOutputsForPeriod(currentPeriod - 1, …)` right as the
+        //   3. TIMING HAZARD: production requests the exact range for `currentPeriod - 1` right as the
         //      tip enters period N (tip ≈ N·R). At that instant `lastFinalizedOrdinal` can be as low as
         //      `bestTip.ordinal − k₁`, i.e. just BELOW the period-(N−1) cutoff `N·R − R/3`. Starting the
         //      walk from the finalized tip there would TRUNCATE the `[periodStart, cutoff)` set and yield
@@ -590,14 +589,9 @@ object NakamotoChainStore {
         //      every node must flip together and validate e2e.
         // Tracked for the eta-amortization rework; until then the existing best-tip walk is preserved so
         // behavior is byte-identical to the validated baseline.
-        def vrfOutputsForPeriod(period: Long, etaRotationSnapshots: Long): F[List[(Long, Array[Byte])]] =
+        def vrfOutputRangeForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[VrfOutputRange] =
           stateRef.get.flatMap { state =>
-            collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, state.bestTipHash)
-          }
-
-        def vrfOutputsForPeriodFrom(period: Long, etaRotationSnapshots: Long, fromHash: Hash): F[List[(Long, Array[Byte])]] =
-          stateRef.get.flatMap { state =>
-            collectVrfOutputsForPeriod(state, period, etaRotationSnapshots, Some(fromHash))
+            collectVrfOutputRangeForPeriod(state, period, etaRotationSnapshots, Some(fromHash))
           }
 
         // Filters by **ordinal**, not slot — rotation periods are snapshot-indexed so R satisfies the
@@ -611,12 +605,12 @@ object NakamotoChainStore {
         // parent lookup tries in-memory `byHash` first; on miss it falls through to disk-backed
         // `SnapshotStorage.get(ordinal)` with hash-verify. This is the load-bearing fix for Finding 1
         // (eta silently degrading to genesis when Fix B evicts pre-rotation VRF outputs).
-        private def collectVrfOutputsForPeriod(
+        private def collectVrfOutputRangeForPeriod(
           state: ChainState,
           period: Long,
           etaRotationSnapshots: Long,
           startHash: Option[Hash]
-        ): F[List[(Long, Array[Byte])]] = {
+        ): F[VrfOutputRange] = {
           val periodStart = period * etaRotationSnapshots
           val cutoff = periodStart + (etaRotationSnapshots * 2 / 3)
           // Walk chain from the given starting hash backward.
@@ -629,24 +623,54 @@ object NakamotoChainStore {
           // evicted the caller's chain context already broke (this method is only invoked with a
           // known live `bestTip` or a known-recent fork hash, both within `keepDepthBehindFinalized`
           // of the tip).
-          def goImpl(
-            current: Option[StoredSnapshot],
-            acc: List[StoredSnapshot]
-          ): F[List[StoredSnapshot]] =
-            current match {
-              case None => Async[F].pure(acc)
-              case Some(cur) =>
-                if (cur.ordinal < periodStart) Async[F].pure(acc)
-                else {
-                  val nextAcc =
-                    if (cur.ordinal < cutoff && cur.vrfOutput.nonEmpty) cur :: acc
-                    else acc
-                  // Parent ordinal is `cur.ordinal - 1` (chain is linear by construction once we're
-                  // walking back from a tip). Use that to drive `getWithOrdinalFallback` so the disk
-                  // path engages when in-memory retention has evicted the parent.
-                  if (cur.ordinal <= 0L) Async[F].pure(nextAcc)
-                  else getWithOrdinalFallback(cur.parentHash, cur.ordinal - 1L).flatMap(goImpl(_, nextAcc))
+          def result(
+            complete: Boolean,
+            collected: List[StoredSnapshot],
+            missingHash: Hash,
+            expectedOrdinal: Option[Long]
+          ): VrfOutputRange = {
+            val outputs = collected.sortBy(_.ordinal).map(s => (s.ordinal, s.vrfOutput))
+            if (complete) VrfOutputRange.Complete(outputs)
+            else VrfOutputRange.Incomplete(outputs, missingHash, expectedOrdinal)
+          }
+
+          def goImpl(current: StoredSnapshot, acc: List[StoredSnapshot]): F[VrfOutputRange] =
+            if (current.ordinal < periodStart)
+              Async[F].pure(result(complete = true, acc, current.hash, current.ordinal.some))
+            else if (current.ordinal < cutoff && current.vrfOutput.isEmpty)
+              // Every ordinal in [periodStart, cutoff) contributes rho. Treat a missing output as an
+              // evidence gap even when the parent chain itself is intact (for example, downgraded
+              // backfill data reconstructed without a slot certificate).
+              Async[F].pure(result(complete = false, acc, current.hash, current.ordinal.some))
+            else {
+              val nextAcc =
+                if (current.ordinal < cutoff) current :: acc
+                else acc
+
+              if (current.ordinal <= 0L)
+                Async[F].pure(
+                  result(
+                    complete = periodStart <= 0L,
+                    nextAcc,
+                    current.parentHash,
+                    none[Long]
+                  )
+                )
+              else {
+                val expectedParentOrdinal = current.ordinal - 1L
+                getWithOrdinalFallback(current.parentHash, expectedParentOrdinal).flatMap {
+                  case Some(parent) => goImpl(parent, nextAcc)
+                  case None =>
+                    Async[F].pure(
+                      result(
+                        complete = false,
+                        nextAcc,
+                        current.parentHash,
+                        expectedParentOrdinal.some
+                      )
+                    )
                 }
+              }
             }
 
           val startStored = startHash.flatMap(state.byHash.get)
@@ -655,8 +679,16 @@ object NakamotoChainStore {
           // context already broke (we have no `expectedOrdinal` for it). In practice every call site
           // supplies a `startHash` taken from `bestTip` or a recent fork head, both within
           // `keepDepthBehindFinalized` of the tip.
-          goImpl(startStored, Nil).map { collected =>
-            collected.sortBy(_.ordinal).map(s => (s.ordinal, s.vrfOutput))
+          (startHash, startStored) match {
+            // Crossing the lower boundary is insufficient if the supplied head never reached the
+            // exclusive cutoff. This prevents a prefix of the source window from being labeled complete.
+            case (_, Some(start)) if start.ordinal < cutoff =>
+              Async[F].pure(VrfOutputRange.Incomplete(Nil, start.hash, cutoff.some))
+            case (_, Some(start)) => goImpl(start, Nil)
+            case (Some(missing), None) =>
+              Async[F].pure(VrfOutputRange.Incomplete(Nil, missing, none))
+            case (None, None) =>
+              Async[F].pure(VrfOutputRange.Incomplete(Nil, Hash.empty, none))
           }
         }
 
@@ -824,11 +856,9 @@ object NakamotoChainStore {
             _ <- divergentRefuseCounterRef.set(0L)
             _ <- divergentRefuseSampleRef.set(None)
             _ <- nakamotoFinalizedOrdinalRef.set(SnapshotOrdinal.MinValue)
-            // Track-3 S1.5: reset the DISTINCT k₂ settled marker in lock-step with the k₁ finalized ref. Resetting both together
-            // preserves the `settled ≤ finalized` invariant through a re-bootstrap (leaving settled high while finalized drops to
-            // MinValue would transiently violate it). This ref is shared with `SettledOrdinalTracker`, whose only other writer is
-            // the monotone `T_depth2` sink — so this reset is the one place the settled marker can move backward, and it is gated by
-            // the same `unsafe_` re-bootstrap contract as the finalized reset.
+            // Reset the separate legacy k2 telemetry/floor ref with the current k1 watermark during
+            // unsafe rebootstrap. Target RecoveryRequired reconstructs exact authenticated history and
+            // does not allow an operator reset to select the winning branch.
             _ <- nakamotoSettledOrdinalRef.set(SnapshotOrdinal.MinValue)
             anyCleared = preChainSize > 0 || preFinalized > 0 || preBestTip.isDefined
             _ <-

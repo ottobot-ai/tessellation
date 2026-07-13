@@ -19,10 +19,9 @@ import org.http4s.dsl.Http4sDsl
 
 /** HTTP route for the chain-quality / finality-triggers observable (task #138).
   *
-  * `GET /global-snapshots/{ord}/finality-triggers` answers "which finality triggers qualified the given ordinal?" without taking on
-  * leader-loop internals. The trigger list is owned by
-  * [[io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop]], which publishes a [[FinalityTriggerView]]
-  * through a `Ref` at startup. This route reads that Ref each request — lock-free, no caching.
+  * `GET /global-snapshots/{ord}/finality-triggers` reports current trigger calculators without taking on leader-loop internals. The trigger
+  * list is owned by [[io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.SnapshotLeaderLoop]], which publishes a
+  * [[FinalityTriggerView]] through a `Ref` at startup. This route reads that Ref each request — lock-free, no caching.
   *
   * Returns 503 while the Ref is empty (the leader-loop hasn't initialized yet — startup window).
   *
@@ -30,8 +29,8 @@ import org.http4s.dsl.Http4sDsl
   */
 final case class FinalityTriggersRoutes[F[_]: Async](
   viewRef: Ref[F, Option[FinalityTriggerView[F]]],
-  // Track-3 S1 — read-only settled (k₂-archival) marker + the configured k₂ depth for `GET /global-snapshots/settled`.
-  // `settledOrdinal` is `SnapshotOrdinal.MinValue` (0) until the chain first advances past k₂ (cold start); `k2Depth` = 100·k₁.
+  // Legacy-named local k2 retention telemetry for `/settled`. It is not a phase, validity
+  // threshold, or fork-choice floor; target P2 remains exact-hash and density-reorgable.
   settledOrdinal: F[SnapshotOrdinal],
   k2Depth: Long
 ) extends Http4sDsl[F]
@@ -40,8 +39,7 @@ final case class FinalityTriggersRoutes[F[_]: Async](
   protected val prefixPath: InternalUrlPrefix = "/global-snapshots"
 
   protected val public: HttpRoutes[F] = HttpRoutes.of[F] {
-    // Track-3 S1: the k₂ "settled" (Phase 2 → Phase 3 archival) marker. Read-only observability — NOT in
-    // GlobalSnapshotInfo / stateProof (G3). `settled_ordinal` = MinValue (0) at cold start, then tracks the T_depth2 sink.
+    // Legacy local-retention watermark. Read-only and outside GlobalSnapshotInfo/stateProof.
     case GET -> Root / "settled" =>
       settledOrdinal.flatMap { ord =>
         Ok(
@@ -81,10 +79,9 @@ final case class FinalityTriggersRoutes[F[_]: Async](
 
 object FinalityTriggersRoutes {
 
-  /** Response payload for `GET /global-snapshots/settled` (Track-3 S1):
-    *   - `settled_ordinal` — the deepest ordinal past the k₂ archival gate (Phase 2 → Phase 3 "settled"). `MinValue` (0) at cold start,
-    *     then tracks the `T_depth2` sink (`bestTip − k₂` once `bestTip > k₂`).
-    *   - `k2_depth` — the configured archival depth k₂ = 100·k₁ (the single canonical `NakamotoConfig.keepDepthBehindFinalized`).
+  /** Transitional response payload for `GET /global-snapshots/settled`:
+    *   - `settled_ordinal` — legacy JSON name for the current local k2 watermark; it does not identify consensus-settled state
+    *   - `k2_depth` — recommended local retention/proof/recovery capacity k2 = 100*k1
     *
     * G3: RESPONSE-JSON ONLY — this is NOT part of `GlobalSnapshotInfo` / the stateProof consensus root (the field-32 syncView regression
     * class); it is pure observability derived from a node-local marker.
@@ -98,9 +95,9 @@ object FinalityTriggersRoutes {
     implicit val encoder: Encoder[SettledPayload] = deriveEncoder
   }
 
-  /** Response payload sub-object. Mirrors the design in task #138:
-    *   - `phase_1_to_2_count` — count of qualifying Phase 1→2 triggers (`t_weight`, `t_count`, `t_depth1`); range 0..3.
-    *   - `phase_2_to_3` — boolean: did `t_depth2` fire for this ordinal?
+  /** Transitional response payload sub-object:
+    *   - `phase_1_to_2_count` includes legacy `t_count`; target P2 uses only `t_weight` or `t_depth1`
+    *   - `phase_2_to_3` is a stale JSON name for whether the local `t_depth2` calculator crossed the ordinal; no Phase 3 exists
     */
   final case class PhasesPayload(
     phase_1_to_2_count: Int,

@@ -240,7 +240,10 @@ object GlobalSnapshotContextFunctions {
               // WATCHTOWER fraud proofs (W3a) — thread the signed snapshot's `fraudProofs` consensus field so this `createContext` GSAM
               // re-validates each carried dispute and applies the SAME slash the producer did, reproducing the signed mptRoot. Empty at
               // numShards=1 (the artifact carries an empty map) ⇒ byte-identical regression bar.
-              fraudProofs = signedArtifact.fraudProofs
+              fraudProofs = signedArtifact.fraudProofs,
+              // Unified operator keys are consensus events. Replay the exact signed artifact field against the exact parent branch; the
+              // resulting records and pointers must reproduce the artifact's rooted MPT state.
+              kesRegistrationCerts = signedArtifact.operatorKeyRegistrations.toList
             )
             .flatMap {
               case (
@@ -262,6 +265,7 @@ object GlobalSnapshotContextFunctions {
                     // Task #12 slice 2b — the producer-only changeset accumulator. The follower/verifier path
                     // does NOT stage it (only the gl0 producer fills the changeset ring); ignored here. No
                     // behavior change.
+                    _,
                     _
                   ) =>
                 // For followers (currency-l0, dag-l1, currency-l1), we log warnings instead of raising errors

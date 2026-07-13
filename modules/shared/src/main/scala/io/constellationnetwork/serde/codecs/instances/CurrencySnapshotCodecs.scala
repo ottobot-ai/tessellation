@@ -21,7 +21,7 @@ import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.OptionCodec.option
 import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{codec => allowSpendRefCodec}
@@ -56,7 +56,8 @@ object CurrencySnapshotCodecs {
   private val subHeightCodec: Codec[SubHeight] = Codec[SubHeight]
   private val epochCodec: Codec[EpochProgress] = Codec[EpochProgress]
   private val versionCodec: Codec[SnapshotVersion] = snapshotVersionCodec
-  private val blocksCodec: Codec[SortedSet[BlockAsActiveTip]] = sortedSet(blockAsActiveTipCodec)
+  private val blocksCodec: Codec[SortedSet[BlockAsActiveTip]] =
+    sortedSetCanonical(blockAsActiveTipCodec)
   private val rewardsCodec: Codec[SortedSet[RewardTransaction]] = sortedSet(rewardTransactionCodec)
   private val tipsCodec: Codec[SnapshotTips] = snapshotTipsCodec
   private val optGlobalSyncViewCodec = option(globalSyncViewCodec)
@@ -109,12 +110,12 @@ object CurrencySnapshotCodecs {
   private val signedAllowSpendBlockCodec: Codec[Signed[AllowSpendBlock]] = signedCodecFor(allowSpendBlockCodec)
   private val signedTokenLockBlockCodec: Codec[Signed[TokenLockBlock]] = signedCodecFor(tokenLockBlockCodec)
 
-  private val optMessagesCodec = option(sortedSet(signedCurrencyMessageCodec))
-  private val optGlobalSyncsCodec = option(sortedSet(signedGlobalSyncCodec))
-  private val optFeeTransactionsCodec = option(sortedSet(signedFeeTransactionCodec))
-  private val optArtifactsCodec = option(sortedSet(sharedArtifactCodec))
-  private val optAllowSpendBlocksCodec = option(sortedSet(signedAllowSpendBlockCodec))
-  private val optTokenLockBlocksCodec = option(sortedSet(signedTokenLockBlockCodec))
+  private val optMessagesCodec = option(sortedSetCanonical(signedCurrencyMessageCodec))
+  private val optGlobalSyncsCodec = option(sortedSetCanonical(signedGlobalSyncCodec))
+  private val optFeeTransactionsCodec = option(sortedSetCanonical(signedFeeTransactionCodec))
+  private val optArtifactsCodec = option(sortedSetCanonical(sharedArtifactCodec))
+  private val optAllowSpendBlocksCodec = option(sortedSetCanonical(signedAllowSpendBlockCodec))
+  private val optTokenLockBlocksCodec = option(sortedSetCanonical(signedTokenLockBlockCodec))
 
   implicit val currencyIncrementalSnapshotCodec: Codec[CurrencyIncrementalSnapshot] =
     (ordinalCodec ::

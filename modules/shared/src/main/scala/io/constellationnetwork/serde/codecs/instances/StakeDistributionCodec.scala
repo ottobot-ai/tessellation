@@ -6,7 +6,7 @@ import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapsh
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.ImmutableCodec
-import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
+import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMapCanonical
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
 import io.constellationnetwork.serde.codecs.instances.PeerIdCodec.{codec => peerIdCodec}
 
@@ -19,8 +19,8 @@ import scodec.{Attempt, Codec}
   *   - `BigInt` — two's-complement variable-length bytes, length-prefixed with uint32. Matches `java.math.BigInteger.toByteArray` / `new
   *     BigInteger(bytes)` round-trip — the canonical wire form for arbitrary-precision integers. Stake sums in practice fit comfortably in
   *     16 bytes but the codec accepts anything we'd ever produce.
-  *   - `StakeDistribution` — sortedMap(PeerId, BigInt). Determinism comes from the `SortedMap` insertion order plus PeerId's canonical
-  *     `Order` instance.
+  *   - `StakeDistribution` — sortedMap(PeerId, BigInt). The encode path canonicalizes each PeerId through its wire codec once before
+  *     sorting, so mixed-case source hex cannot disagree with lowercase decoded order.
   *   - `HistoricalStakeSnapshot` — pair-codec `(StakeDistribution, Hash)`. The stake half rides the same `stakeDistributionCodec`; the eta
   *     half rides `HashCodec` (fixed-width 32 bytes). Order: stakes first, then eta — chosen to keep the GSI / MPT byte-prefix of an
   *     extended entry stable with the legacy stake-only encoding for the bytes that overlap.
@@ -40,7 +40,7 @@ object StakeDistributionCodec {
     )
 
   implicit val stakesMapCodec: Codec[SortedMap[PeerId, BigInt]] =
-    sortedMap(peerIdCodec, bigIntCodec)
+    sortedMapCanonical(peerIdCodec, bigIntCodec)
 
   implicit val codec: Codec[StakeDistribution] =
     stakesMapCodec.xmap[StakeDistribution](StakeDistribution(_), _.stakes)

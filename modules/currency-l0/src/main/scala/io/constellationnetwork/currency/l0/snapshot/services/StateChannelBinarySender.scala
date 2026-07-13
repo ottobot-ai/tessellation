@@ -31,12 +31,15 @@ trait StateChannelBinarySender[F[_]] {
     lastGlobalSnapshotSigners: Option[NonEmptySet[PeerId]]
   ): F[Unit]
 
-  /** Confirm binaries that landed in this finality-gated global snapshot, advance the GC watermark to gl0's authoritative currency ord
-    * (from GSI), and prune below finality.
+  /** Confirm binaries observed in this finality-gated global snapshot and optionally prune against an explicit GL0 Phase-2 ordinal.
     *
     * `gl0KnownCurrencyOrd` is the authoritative source for stale-Pending GC — it MUST come from
     * `GlobalSnapshotInfo.lastCurrencySnapshots[ourIdentifier].ordinal`, not inferred from local hash matches. Pass `None` to skip GC (e.g.
     * tests, or when GSI isn't available for the caller). See `BinaryTracker.markAsConfirmed`.
+    *
+    * `lastFinalizedGlobalOrdinal=None` means the Phase-2 read was unavailable and MUST skip pruning. It must never substitute
+    * `globalSnapshot.ordinal`. Even with `Some`, ordinal-only pruning remains transitional because Phase 2 is exact-hash and
+    * density-reorgable.
     */
   def confirm(
     globalSnapshot: Hashed[GlobalIncrementalSnapshot],
@@ -157,13 +160,10 @@ object StateChannelBinarySender {
         retryMode = RetryStrategy.shouldEnterRetryMode(updatedState, globalSnapshot.ordinal)
         _ <- tracker.updateState(_.copy(retryMode = retryMode))
         _ <- tracker.updateState(RetryStrategy.updateRetryParameters(_, oldRetryMode))
-        // Finality-gated pruning: defaults to the snapshot's own ordinal (BFT — every snapshot
-        // is immediately final). For Nakamoto GL0, the caller MUST supply the actual finalized
-        // ordinal from GL0's finality endpoint or confirmed binaries get dropped before the
-        // containing GL0 snapshot is durable, losing them on reorg. See task #6/#7 in
-        // NAKAMOTO-PLAN.md for the wire-up.
-        finalizedOrdinal = lastFinalizedGlobalOrdinal.getOrElse(globalSnapshot.ordinal)
-        _ <- tracker.pruneFinalizedBelow(finalizedOrdinal)
+        // Fail closed when the separate Phase-2 read is unavailable. Residual target gap: the supplied
+        // watermark is still ordinal-only, while reversible Phase 2 requires exact-hash retention and
+        // requeue on density replacement.
+        _ <- lastFinalizedGlobalOrdinal.traverse_(tracker.pruneFinalizedBelow)
         metricsState <- tracker.getState
         _ <- updateStateChannelRetryParametersMetrics(metricsState)
       } yield ()

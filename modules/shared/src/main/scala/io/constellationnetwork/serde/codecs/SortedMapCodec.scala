@@ -5,14 +5,14 @@ import cats.Order
 import scala.collection.immutable.SortedMap
 
 import scodec.codecs.{listOfN, uint16}
-import scodec.{Attempt, Codec}
+import scodec.{Attempt, Codec, Err}
 
 /** Generic scodec codec factory for `SortedMap[K, V]`.
   *
   * Wire format: 2-byte length prefix (uint16) + entries in sorted-by-key order.
   *
-  * Determinism: the encode path iterates via `SortedMap`'s natural iteration, which is already `Order[K]`-sorted. Two nodes serializing the
-  * same logical map produce bit-identical bytes.
+  * Determinism: the encode path explicitly sorts by the codec's `Order[K]`. It does not trust the `Ordering[K]` retained by the input
+  * `SortedMap`, which may differ. Two nodes serializing the same logical map produce bit-identical bytes.
   *
   * Not marked implicit — `K` needs an explicit `Order[K]` and both `K`/`V` need explicit codecs. Call sites invoke `sortedMap(keyCodec,
   * valueCodec)` explicitly.
@@ -22,14 +22,33 @@ import scodec.{Attempt, Codec}
   */
 object SortedMapCodec {
 
-  def sortedMap[K: Order, V](keyCodec: Codec[K], valueCodec: Codec[V]): Codec[SortedMap[K, V]] = {
+  def sortedMap[K: Order, V](keyCodec: Codec[K], valueCodec: Codec[V]): Codec[SortedMap[K, V]] =
+    make(keyCodec, valueCodec, canonicalizeKeysOnEncode = false)
+
+  /** Variant for key codecs that normalize their source representation while decoding, such as mixed-case hex to lowercase. */
+  def sortedMapCanonical[K: Order, V](keyCodec: Codec[K], valueCodec: Codec[V]): Codec[SortedMap[K, V]] =
+    make(keyCodec, valueCodec, canonicalizeKeysOnEncode = true)
+
+  private def make[K: Order, V](
+    keyCodec: Codec[K],
+    valueCodec: Codec[V],
+    canonicalizeKeysOnEncode: Boolean
+  ): Codec[SortedMap[K, V]] = {
     implicit val ordering: Ordering[K] = Order[K].toOrdering
 
     val entryCodec: Codec[(K, V)] = keyCodec.pairedWith(valueCodec)
 
-    listOfN(uint16, entryCodec).xmap(
-      list => SortedMap.from(list),
-      (m: SortedMap[K, V]) => m.toList
+    listOfN(uint16, entryCodec).exmap(
+      list =>
+        if (CanonicalCollectionCodec.isStrictlyIncreasing(list.map(_._1))) Attempt.successful(SortedMap.from(list))
+        else Attempt.failure(Err("SortedMap decode: keys must be strictly increasing")),
+      // A SortedMap carries its own Ordering, which need not agree with the
+      // protocol Order[K] supplied to this codec. Canonicalize explicitly so
+      // logically equal maps cannot hash differently based on construction.
+      (m: SortedMap[K, V]) =>
+        if (canonicalizeKeysOnEncode)
+          CanonicalCollectionCodec.sortByCanonicalKey(m.toList, keyCodec, (entry: (K, V)) => entry._1, "SortedMap")
+        else Attempt.successful(m.toList.sortBy(_._1)(ordering))
     )
   }
 
@@ -43,7 +62,9 @@ object SortedMapCodec {
     val entryCodec: Codec[(K, V)] = keyCodec.pairedWith(valueCodec)
 
     listOfN(uint16, entryCodec).exmap(
-      list => Attempt.successful(SortedMap.from(list)),
+      list =>
+        if (CanonicalCollectionCodec.isStrictlyIncreasing(list.map(_._1))) Attempt.successful(SortedMap.from(list))
+        else Attempt.failure(Err("SortedMap decode: keys must be strictly increasing")),
       (m: SortedMap[K, V]) => {
         val keysSorted = m.keys.toList
         val resorted = keysSorted.sorted(ordering)

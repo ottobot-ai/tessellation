@@ -13,6 +13,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.HistoricalStakeSnapshot
@@ -30,6 +31,7 @@ import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutable}
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.kesRegistrationReferenceImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.proofImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncImmutable}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
@@ -190,6 +192,16 @@ object AcceptanceMptStateChanges {
         case (period, entry) => GlobalStateKey.historicalStakeSnapshotsKey[F](period).map(_ -> entry)
       }.map(_.toMap)
 
+    val kesRegistrationCertEntriesF: F[Map[GlobalStateKey, SortedSet[KesRegistrationRecord]]] =
+      acc.kesRegistrationCerts.toList.parTraverse {
+        case (peerId, records) => GlobalStateKey.kesRegistrationCertsKey[F](peerId).map(_ -> records)
+      }.map(_.toMap)
+
+    val lastKesRegistrationRefEntriesF: F[Map[GlobalStateKey, KesRegistrationReference]] =
+      acc.lastKesRegistrationRefs.toList.parTraverse {
+        case (peerId, ref) => GlobalStateKey.lastKesRegistrationRefsKey[F](peerId).map(_ -> ref)
+      }.map(_.toMap)
+
     for {
       keysToRemove <- toRemovalKeys
       // Remove stale keys first — same as the legacy syncFromStateChanges (line 1597).
@@ -225,9 +237,13 @@ object AcceptanceMptStateChanges {
       updateNodeParametersEntries <- updateNodeParametersEntriesF
       priceStateEntries <- priceStateEntriesF
       historicalStakeEntries <- historicalStakeEntriesF
+      kesRegistrationCertEntries <- kesRegistrationCertEntriesF
+      lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
       _ <- mpt.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
       _ <- mpt.insert[PriceRecord](priceStateEntries)
       _ <- mpt.insert[HistoricalStakeSnapshot](historicalStakeEntries)
+      _ <- mpt.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
+      _ <- mpt.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
 
       _ <- applySystemIndexDeltaViaMpt[F, AllowSpendExpiryKey](
         mpt,

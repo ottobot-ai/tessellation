@@ -11,6 +11,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types.SharedConfig
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.http.p2p.SharedP2PClient
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.logger.LoggerBundle
@@ -58,15 +59,15 @@ trait NodeShared[F[_], A <: CliMethod] {
 
   /** Split-safety (#261, eta axis): the deferred handle that lets the gl0 follower / `createContext` GSAM's committee-eta resolver walk the
     * SAME chain the leader's resolver walks. The follower GSAM is built in [[TessellationIOApp]] (early, before any chain store exists), so
-    * its `EtaStateManager` is wired against a chain-walk closure that reads THIS Ref; gl0's `Main.run` flows
-    * `chainStore.vrfOutputsForPeriod` into it once `GlobalSnapshotConsensus.make` has built the chain store (mirrors the leader's own
-    * `chainStoreForLookupRef` deferred handle). Stays `None` for every non-gl0 layer (cl0/cl1/dl1/gl1) — the follower eta walk then returns
-    * an empty list, byte-identical to the prior `noopEtaChainWalk`, so those layers' startup is unchanged.
+    * its `EtaStateManager` is wired against a chain-walk closure that reads THIS Ref; gl0's `Main.run` flows an exact
+    * `chainStore.vrfOutputRangeForPeriodFrom` callback into it once `GlobalSnapshotConsensus.make` has built the chain store (mirrors the
+    * leader's own `chainStoreForLookupRef` deferred handle). A missing callback is explicitly incomplete and cannot be used as eta for N >=
+    * 2.
     *
-    * Type is a plain `Long => F[List[(Long, Array[Byte])]]` (a `vrfOutputsForPeriod(sourcePeriod, etaRotationSnapshots)`-shaped closure
-    * with the rotation length already partially applied) so node-shared has no dependency on the dag-l0 `NakamotoChainStore` type.
+    * The shared [[EtaSourceRange]] preserves complete/incomplete ancestry without introducing a node-shared dependency on dag-l0's chain
+    * store type.
     */
-  val nakamotoFollowerEtaChainWalkRef: Ref[F, Option[Long => F[List[(Long, Array[Byte])]]]]
+  val nakamotoFollowerEtaChainWalkRef: Ref[F, Option[(Long, Option[io.constellationnetwork.security.hash.Hash]) => F[EtaSourceRange]]]
 
   def restartSignal: SignallingRef[F, Option[A]]
   def stopSignal: SignallingRef[F, Boolean]

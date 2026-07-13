@@ -2,8 +2,8 @@ package io.constellationnetwork.serde.codecs
 
 import cats.Order
 
-import scodec.Codec
 import scodec.codecs.{listOfN, uint16}
+import scodec.{Attempt, Codec, Err}
 
 /** Generic scodec codec factory for plain `Map[K, V]`.
   *
@@ -19,9 +19,11 @@ object MapCodec {
 
     val entryCodec: Codec[(K, V)] = keyCodec.pairedWith(valueCodec)
 
-    listOfN(uint16, entryCodec).xmap(
-      list => list.toMap,
-      (m: Map[K, V]) => m.toList.sortBy(_._1)
+    listOfN(uint16, entryCodec).exmap(
+      list =>
+        if (CanonicalCollectionCodec.isStrictlyIncreasing(list.map(_._1))) Attempt.successful(list.toMap)
+        else Attempt.failure(Err("Map decode: keys must be strictly increasing")),
+      (m: Map[K, V]) => Attempt.successful(m.toList.sortBy(_._1))
     )
   }
 }

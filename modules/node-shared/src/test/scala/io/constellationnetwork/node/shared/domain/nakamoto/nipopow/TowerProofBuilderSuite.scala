@@ -1,27 +1,30 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
+import java.nio.ByteBuffer
+
 import cats.data.{NonEmptyList, NonEmptySet}
-import cats.effect.IO
+import cats.effect.{IO, Resource}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.nakamoto.CanonicalOperatorConsensusFixture
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.nakamoto.slot._
-import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.security.signature.{Signed, signature}
+import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.security.{Hashed, Hasher}
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
-import weaver.SimpleIOSuite
+import weaver.MutableIOSuite
 
 /** §3 NIPoPoW S4.2 — [[TowerProofBuilder]] suite.
   *
@@ -31,7 +34,13 @@ import weaver.SimpleIOSuite
   *   - Empty store and tip-only edge cases.
   *   - `since` parameter filters lower-bound.
   */
-object TowerProofBuilderSuite extends SimpleIOSuite {
+object TowerProofBuilderSuite extends MutableIOSuite {
+
+  override type Res = CanonicalOperatorConsensusFixture
+
+  override def sharedResource: Resource[IO, Res] = CanonicalOperatorConsensusFixture.make
+
+  private val vrf = EcVrf25519.default
 
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(n))
 
@@ -49,19 +58,25 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
     * load-bearing field; everything else is filler-but-typed.
     */
   private def syntheticSnapshot(
+    operator: CanonicalOperatorConsensusFixture,
     ordinal: SnapshotOrdinal,
     slot: Long,
     parentSlot: Long,
     parentHash: Hash,
     subchainLevelCounts: Vector[Long] = SlotCertificate.ZeroSubchainLevelCounts
   ): Signed[GlobalIncrementalSnapshot] = {
+    val eta = h(s"eta-$ordinal")
+    val vrfMessage = eta.getBytes ++ ByteBuffer.allocate(8).putLong(slot).array()
+    val vrfProof = vrf.vrfProof(operator.localVrfSecret, vrfMessage)
+    val vrfOutput = vrf.vrfProofToHash(vrfProof).getOrElse(throw new IllegalStateException("fixture VRF proof did not hash"))
+    val producerId = operator.resolvedPair.operatorPeerId
     val cert = SlotCertificate(
       slot = Slot.unsafeApply(slot),
       parentSlot = Slot.unsafeApply(parentSlot),
-      vrfProof = VrfProof(Hex("0a" * 80)),
-      vrfOutput = VrfOutput(Hex("0b" * 64)),
-      vrfPublicKey = VrfPublicKey(Hex("0c" * 32)),
-      eta = h(s"eta-$ordinal"),
+      vrfProof = VrfProof(Hex.fromBytes(vrfProof)),
+      vrfOutput = VrfOutput(Hex.fromBytes(vrfOutput)),
+      vrfPublicKey = operator.resolvedPair.vrfPublicKey,
+      eta = eta,
       activePoolSize = 8,
       activePoolHash = h(s"pool-$ordinal"),
       subchainLevelCounts = subchainLevelCounts
@@ -77,7 +92,7 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
       rewards = SortedSet.empty,
       delegateRewards = None,
       epochProgress = EpochProgress(NonNegLong(0L)),
-      nextFacilitators = NonEmptyList.of(PeerId(Hex("0d" * 64))),
+      nextFacilitators = NonEmptyList.of(producerId),
       tips = SnapshotTips(SortedSet.empty, SortedSet.empty),
       stateProof = GlobalSnapshotStateProof(
         h("00"),
@@ -111,13 +126,13 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
       nodeCollateralWithdrawals = None,
       version = SnapshotVersion("0.0.1"),
       slotCertificate = Some(cert),
-      eta = Some(h(s"eta-$ordinal"))
+      eta = Some(eta)
     )
     Signed(
       unsigned,
       NonEmptySet.of(
         SignatureProof(
-          PeerId(Hex("0d" * 64)).toId,
+          producerId.toId,
           signature.Signature(Hex("0e" * 64))
         )
       )
@@ -161,19 +176,31 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
     GlobalSnapshotInfo.empty
 
   /** Build a chain of n+1 snapshots ordinal 0..n. Each snapshot's `lastSnapshotHash = h(s"snap-$prevOrdinal")`. */
-  private def chain(n: Int): Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]] =
+  private def chain(
+    operator: CanonicalOperatorConsensusFixture,
+    n: Int
+  ): Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]] =
     (0 to n).map { i =>
       val prev = if (i == 0) h("genesis") else h(s"snap-${i - 1}")
-      ord(i.toLong) -> syntheticSnapshot(ord(i.toLong), slot = (i * 10L) + 1L, parentSlot = math.max(0L, i * 10L - 9L), parentHash = prev)
+      ord(i.toLong) -> syntheticSnapshot(
+        operator,
+        ord(i.toLong),
+        slot = (i * 10L) + 1L,
+        parentSlot = math.max(0L, i * 10L - 9L),
+        parentHash = prev
+      )
     }.toMap
 
   /** Build the chain map plus head. Head is the snapshot at ordinal `n`. */
-  private def chainWithHead(n: Int): (Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]], Signed[GlobalIncrementalSnapshot]) = {
-    val m = chain(n)
+  private def chainWithHead(
+    operator: CanonicalOperatorConsensusFixture,
+    n: Int
+  ): (Map[SnapshotOrdinal, Signed[GlobalIncrementalSnapshot]], Signed[GlobalIncrementalSnapshot]) = {
+    val m = chain(operator, n)
     (m, m(ord(n.toLong)))
   }
 
-  test("empty storage — builder returns canonical empty proof") {
+  test("empty storage — builder returns canonical empty proof") { _ =>
     for {
       tower <- TowerStore.inMemory[IO]
       builder = TowerProofBuilder.make[IO](tower, dummyStorage(Map.empty, None))
@@ -181,8 +208,8 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
     } yield expect(proof == TowerProof.Empty)
   }
 
-  test("L0 suffix length honored — k=5 returns most-recent 5 headers in ascending order") {
-    val (snaps, headSnap) = chainWithHead(10)
+  test("L0 suffix length honored — k=5 returns most-recent 5 headers in ascending order") { operator =>
+    val (snaps, headSnap) = chainWithHead(operator, 10)
     for {
       tower <- TowerStore.inMemory[IO]
       builder = TowerProofBuilder.make[IO](tower, dummyStorage(snaps, Some(headSnap)))
@@ -190,11 +217,13 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
     } yield
       expect(proof.level0Suffix.size == 5)
         .and(expect(proof.level0Suffix.map(_.ordinal.value.value) == Vector(6L, 7L, 8L, 9L, 10L)))
+        .and(expect(proof.level0Suffix.forall(_.producerId == operator.resolvedPair.operatorPeerId)))
+        .and(expect(proof.level0Suffix.forall(_.vrfPublicKey == operator.resolvedPair.vrfPublicKey)))
         .and(expect(proof.tipOrdinal == ord(10L)))
   }
 
-  test("L0 suffix shorter than k when tip < k — suffix is whatever's available") {
-    val (snaps, headSnap) = chainWithHead(3)
+  test("L0 suffix shorter than k when tip < k — suffix is whatever's available") { operator =>
+    val (snaps, headSnap) = chainWithHead(operator, 3)
     for {
       tower <- TowerStore.inMemory[IO]
       builder = TowerProofBuilder.make[IO](tower, dummyStorage(snaps, Some(headSnap)))
@@ -204,8 +233,8 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
         .and(expect(proof.level0Suffix.map(_.ordinal.value.value) == Vector(0L, 1L, 2L, 3L)))
   }
 
-  test("level-µ chain materialized from tower entries — L1 hit at ord=5 surfaces in proof") {
-    val (snaps, headSnap) = chainWithHead(10)
+  test("level-µ chain materialized from tower entries — L1 hit at ord=5 surfaces in proof") { operator =>
+    val (snaps, headSnap) = chainWithHead(operator, 10)
     for {
       tower <- TowerStore.inMemory[IO]
       _ <- tower.appendAtFinality(ord(5L), h("snap-5-content"), trials(Set(1, 3)))
@@ -220,8 +249,8 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
         .and(expect(proof.levelChains(1).head.snapshotHash == h("snap-5-content")))
   }
 
-  test("`since` filters lower-bound — entries below since are excluded from levelChains") {
-    val (snaps, headSnap) = chainWithHead(20)
+  test("`since` filters lower-bound — entries below since are excluded from levelChains") { operator =>
+    val (snaps, headSnap) = chainWithHead(operator, 20)
     for {
       tower <- TowerStore.inMemory[IO]
       _ <- tower.appendAtFinality(ord(3L), h("snap-3-content"), trials(Set(1)))
@@ -235,8 +264,8 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
         .and(expect(proof.since == ord(7L)))
   }
 
-  test("missing snapshot in storage — header silently skipped, chain shorter") {
-    val (full, headSnap) = chainWithHead(10)
+  test("missing snapshot in storage — header silently skipped, chain shorter") { operator =>
+    val (full, headSnap) = chainWithHead(operator, 10)
     // Drop ord=5 from storage to simulate a backfill gap.
     val sparse = full - ord(5L)
     for {
@@ -251,8 +280,8 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
         .and(expect(proof.levelChains(1).size == 2))
   }
 
-  test("pre-activation snapshot (no slotCertificate) skipped in L0 suffix") {
-    val (snaps, headSnap) = chainWithHead(5)
+  test("pre-activation snapshot (no slotCertificate) skipped in L0 suffix") { operator =>
+    val (snaps, headSnap) = chainWithHead(operator, 5)
     // Replace ord=2 with a snapshot that has no slot certificate.
     val noCert = snaps(ord(2L)).copy(value = snaps(ord(2L)).value.copy(slotCertificate = None))
     val patched = snaps.updated(ord(2L), noCert)
@@ -266,8 +295,8 @@ object TowerProofBuilderSuite extends SimpleIOSuite {
         .and(expect(proof.level0Suffix.map(_.ordinal.value.value).toSet == Set(0L, 1L, 3L, 4L, 5L)))
   }
 
-  test("totalHeaderCount + allHeadersByOrdinal — dedup across levels, sort ascending") {
-    val (snaps, headSnap) = chainWithHead(10)
+  test("totalHeaderCount + allHeadersByOrdinal — dedup across levels, sort ascending") { operator =>
+    val (snaps, headSnap) = chainWithHead(operator, 10)
     for {
       tower <- TowerStore.inMemory[IO]
       _ <- tower.appendAtFinality(ord(2L), h("snap-2-content"), trials(Set(1, 2)))

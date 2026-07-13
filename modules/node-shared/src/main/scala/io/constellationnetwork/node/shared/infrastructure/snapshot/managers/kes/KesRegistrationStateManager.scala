@@ -16,20 +16,18 @@ import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.kesR
 
 /** §1.2 Slice 10 — MPT-backed state manager for runtime KES registration certs (#179).
   *
-  * The durable source of truth for the post-genesis KES master-VK registry: every accepted [[KesRegistrationRecord]] is persisted in the
-  * `KesRegistrationCerts` partition (per-operator [[SortedSet]]), with a parallel pointer record in `LastKesRegistrationRefs` (per-operator
-  * latest [[KesRegistrationReference]]) for O(1) chain-link lookup.
+  * Reader/delta primitives for the target post-genesis unified KES+VRF registry. Records use the `KesRegistrationCerts` partition
+  * (per-operator [[SortedSet]]) with a parallel `LastKesRegistrationRefs` pointer (per-operator latest [[KesRegistrationReference]]) for
+  * exact chain-tip lookup.
   *
   * Mirrors `NodeCollateralStateManager` 1:1 in shape: the trait exposes materializers that the GSAM acceptance pipeline calls to recover
   * prior state from MPT, plus a `getUpdatedKesRegistrationCerts` delta-merge that takes the per-call
   * [[KesRegistrationCertAcceptanceResult]] and returns the new per-operator [[SortedSet]]s that the writer (`AcceptanceMptStateChanges`)
   * will persist.
   *
-  * '''Durability contract''' (the load-bearing reason this manager exists): after `applyStateChanges` writes a snapshot's accepted certs
-  * into MPT, the same view can be reconstituted on any node — including a freshly-restarted operator that lost its in-memory
-  * [[io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry]] state, or a peer that joined the cluster after the cert
-  * was accepted. The MPT is byte-equivalent across honest nodes by the consensus state-proof contract, so every node observes the same
-  * runtime registry view at every snapshot ordinal.
+  * GSAM selects and validates registration events against the exact candidate parent, then atomically writes the resulting record set and
+  * pointer through the same branch handle as every other rooted state change. Runtime eligibility still requires consumers to resolve this
+  * branch-historical registry rather than a live or wire-carried key.
   */
 trait KesRegistrationStateManager[F[_]] {
 
@@ -51,9 +49,9 @@ trait KesRegistrationStateManager[F[_]] {
     */
   def materializeChainForPeer(peer: PeerId)(implicit hasher: Hasher[F]): F[SortedSet[KesRegistrationRecord]]
 
-  /** Prefix-scan every per-peer chain in `KesRegistrationCerts` and return the latest accepted record per peer.
+  /** Prefix-scan every per-peer chain in `KesRegistrationCerts` and resolve each exact latest-reference pointer.
     *
-    * `SortedSet[KesRegistrationRecord]` is ordered by `(acceptedAt, ordinal)` so `.lastOption` gives the latest. Used by
+    * Both pointer ordinal and pointer hash must match exactly; zero or multiple matches fail closed for that peer. Used by
     * [[io.constellationnetwork.node.shared.domain.nakamoto.kes.MutableKesRegistry]] to rebuild its overlay snapshot at startup or after an
     * MPT-rebuild bootstrap.
     *
@@ -64,8 +62,10 @@ trait KesRegistrationStateManager[F[_]] {
   /** Full per-peer chain materializer. Returns the complete `SortedSet[KesRegistrationRecord]` for every operator that has ever had a cert
     * accepted. Used by the GSAM acceptance pipeline to recover prior state for the delta-merge step.
     *
-    * Returns the per-peer SortedSet keyed by `peerId` from the head record's `event.value.operatorPeerId` — the cert body carries the
-    * operator identity, so the manager doesn't need a sidecar address-index partition like NodeCollateral does.
+    * A partition entry is usable only when every record names the same operator, the actual MPT key equals that operator's canonical
+    * derived key, and exactly one entry in the prefix scan claims that operator. Mixed sets, empty sets, misplaced entries, and duplicate
+    * homogeneous claims raise deterministic corruption; they are never silently omitted, because omission could erase permanent ownership
+    * and permit a duplicate key registration.
     */
   def materializeActiveKesRegistrationCertsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[PeerId, SortedSet[KesRegistrationRecord]]]
 
@@ -73,8 +73,7 @@ trait KesRegistrationStateManager[F[_]] {
     * (recovered from the corresponding cert in the per-peer chain). Used by the GSAM acceptance pipeline to seed the validator's `lastRefs`
     * map for chain-link checks on incoming certs.
     *
-    * On a partition where the pointer exists but the corresponding cert is missing (impossible under normal operation; would indicate
-    * corruption), the entry is silently dropped. This matches NodeCollateral's tolerance for transient inconsistency.
+    * On a partition where the pointer has zero or multiple exact record matches, the entry is dropped fail-closed as corrupted/ambiguous.
     */
   def materializeLastRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[PeerId, KesRegistrationReference]]
 
@@ -106,6 +105,19 @@ object KesRegistrationStateManager {
 
   def make[F[_]: Async](reader: GlobalStateReader[F]): KesRegistrationStateManager[F] = new KesRegistrationStateManager[F] {
 
+    private def resolveExactReference(
+      ref: KesRegistrationReference,
+      records: SortedSet[KesRegistrationRecord]
+    )(implicit hasher: Hasher[F]): F[Option[KesRegistrationRecord]] =
+      records.toList.traverse { record =>
+        KesRegistrationReference.of[F](record.event).map(_ -> record)
+      }.map { referenced =>
+        referenced.collect { case (candidateRef, record) if candidateRef === ref => record } match {
+          case record :: Nil => record.some
+          case _             => none[KesRegistrationRecord]
+        }
+      }
+
     override def materializeFromMpt(peer: PeerId)(implicit hasher: Hasher[F]): F[Option[KesRegistrationRecord]] =
       for {
         lastRefKey <- GlobalStateKey.lastKesRegistrationRefsKey[F](peer)
@@ -116,7 +128,7 @@ object KesRegistrationStateManager {
             for {
               certsKey <- GlobalStateKey.kesRegistrationCertsKey[F](peer)
               certSetOpt <- reader.get[SortedSet[KesRegistrationRecord]](certsKey)
-              matched = certSetOpt.flatMap(_.find(_.event.value.ordinal === lastRef.ordinal))
+              matched <- certSetOpt.fold(none[KesRegistrationRecord].pure[F])(resolveExactReference(lastRef, _))
             } yield matched
         }
       } yield result
@@ -127,10 +139,9 @@ object KesRegistrationStateManager {
         certSetOpt <- reader.get[SortedSet[KesRegistrationRecord]](certsKey)
       } yield certSetOpt.getOrElse(SortedSet.empty[KesRegistrationRecord])
 
-    /** Pointer-canonical materializer (aligned with `materializeFromMpt`). For each peer that has a `LastKesRegistrationRefs` entry, looks
-      * up the cert in `KesRegistrationCerts[peer]` whose ordinal matches the pointer's ordinal, and returns it. Returns no entry for a peer
-      * whose pointer is absent or whose cert set lacks the matching ordinal (treated as transient inconsistency, same tolerance as the
-      * single-peer version).
+    /** Pointer-canonical materializer (aligned with `materializeFromMpt`). For each peer that has a `LastKesRegistrationRefs` entry,
+      * resolves the unique cert whose computed `(ordinal, hash)` exactly equals the pointer. Missing or ambiguous matches fail closed for
+      * that peer.
       *
       * Why the alignment matters: under MultiBranch a delta merge can transiently leave the pointer and the set out of sync (different
       * branch handles, different write timings). The single-peer `materializeFromMpt` resolves this defensively via the pointer; the
@@ -140,12 +151,13 @@ object KesRegistrationStateManager {
     override def materializeAllFromMpt(implicit hasher: Hasher[F]): F[SortedMap[PeerId, KesRegistrationRecord]] =
       for {
         perPeer <- materializeActiveKesRegistrationCertsFromMpt
-        resolved <- perPeer.keySet.toList.traverse { peer =>
-          for {
-            refKey <- GlobalStateKey.lastKesRegistrationRefsKey[F](peer)
-            refOpt <- reader.get[KesRegistrationReference](refKey)
-            matched = refOpt.flatMap(ref => perPeer.get(peer).flatMap(_.find(_.event.value.ordinal === ref.ordinal)))
-          } yield matched.map(peer -> _)
+        resolved <- perPeer.toList.traverse {
+          case (peer, records) =>
+            for {
+              refKey <- GlobalStateKey.lastKesRegistrationRefsKey[F](peer)
+              refOpt <- reader.get[KesRegistrationReference](refKey)
+              matched <- refOpt.fold(none[KesRegistrationRecord].pure[F])(resolveExactReference(_, records))
+            } yield matched.map(peer -> _)
         }
       } yield SortedMap.from(resolved.flatten)
 
@@ -155,12 +167,45 @@ object KesRegistrationStateManager {
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.KesRegistrationCerts)
         entries <- reader.getAllForPrefix[SortedSet[KesRegistrationRecord]](prefix)
-      } yield
-        SortedMap.from(
-          entries.values.toList.mapFilter { set =>
-            set.headOption.map(h => h.event.value.operatorPeerId -> set)
-          }.filter(_._2.nonEmpty)
-        )
+        classified <- entries.toList.sortBy(_._1.value).traverse {
+          case (actualKey, records) =>
+            val peers = records.toList.map(_.event.value.operatorPeerId).toSet
+            peers.toList match {
+              case peer :: Nil =>
+                GlobalStateKey
+                  .kesRegistrationCertsKey[F](peer)
+                  .flatMap(GlobalStateKey.toHex[F])
+                  .map(expectedKey => (actualKey, records, peers, (peer -> expectedKey).some))
+              case _ =>
+                (actualKey, records, peers, Option.empty[(PeerId, io.constellationnetwork.security.hex.Hex)]).pure[F]
+            }
+        }
+        result <- {
+          val homogeneousByPeer = classified.collect {
+            case (actualKey, records, _, Some((peer, expectedKey))) if actualKey === expectedKey => peer -> records
+          }.groupBy(_._1)
+          val malformedEntryCount = classified.count { case (_, _, peers, _) => peers.sizeCompare(1) != 0 }
+          val misplacedOperators = classified.collect {
+            case (actualKey, _, _, Some((peer, expectedKey))) if actualKey =!= expectedKey => peer
+          }.distinct.sorted
+          val duplicateOperators = homogeneousByPeer.collect {
+            case (peer, claims) if claims.sizeCompare(1) > 0 => peer
+          }.toList.sorted
+
+          if (malformedEntryCount > 0 || misplacedOperators.nonEmpty || duplicateOperators.nonEmpty)
+            Async[F].raiseError[SortedMap[PeerId, SortedSet[KesRegistrationRecord]]](
+              new IllegalStateException(
+                s"Corrupt KES+VRF registration partition: malformedEntries=$malformedEntryCount " +
+                  s"misplacedOperators=${misplacedOperators.mkString(",")} " +
+                  s"duplicateOperators=${duplicateOperators.mkString(",")}"
+              )
+            )
+          else
+            SortedMap
+              .from(homogeneousByPeer.toList.collect { case (peer, (_, records) :: Nil) => peer -> records })
+              .pure[F]
+        }
+      } yield result
 
     override def materializeLastRefsFromMpt(
       implicit hasher: Hasher[F]
@@ -169,11 +214,19 @@ object KesRegistrationStateManager {
         // We can't recover PeerId from KesRegistrationReference alone (it carries only ordinal+hash).
         // Materialize the per-peer chain first to recover peerIds, then look up each pointer.
         perPeer <- materializeActiveKesRegistrationCertsFromMpt
-        refs <- perPeer.keySet.toList.traverse { peer =>
-          GlobalStateKey
-            .lastKesRegistrationRefsKey[F](peer)
-            .flatMap(reader.get[KesRegistrationReference])
-            .map(_.map(peer -> _))
+        refs <- perPeer.toList.traverse {
+          case (peer, records) =>
+            GlobalStateKey
+              .lastKesRegistrationRefsKey[F](peer)
+              .flatMap(reader.get[KesRegistrationReference])
+              .flatMap {
+                case None => none[(PeerId, KesRegistrationReference)].pure[F]
+                case Some(ref) =>
+                  resolveExactReference(ref, records).flatMap {
+                    case Some(_) => (peer -> ref).some.pure[F]
+                    case None    => none[(PeerId, KesRegistrationReference)].pure[F]
+                  }
+              }
         }
       } yield SortedMap.from(refs.flatten)
 
@@ -199,7 +252,9 @@ object KesRegistrationStateManager {
         case (peerId, record) =>
           KesRegistrationReference.of[F](record.event).map(peerId -> _)
       }.map { newRefs =>
-        priorLastRefs ++ SortedMap.from(newRefs)
+        newRefs.foldLeft(priorLastRefs) {
+          case (refs, (peerId, ref)) => refs.updated(peerId, ref)
+        }
       }
   }
 }

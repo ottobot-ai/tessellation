@@ -17,6 +17,7 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 import io.constellationnetwork.schema.peer.PeerId
@@ -138,7 +139,10 @@ case class GlobalIncrementalSnapshot(
   // and the follower/peer threads `signedArtifact.fraudProofs` back through `accept()` (NOT re-sourcing node-local gossip) so the byte-exact
   // `recreatedArtifact === artifact` round-trip holds and EVERY node folds the SAME slash. Empty set = no disputes this ord; ALWAYS empty at
   // `numShards = 1` (no committees ⇒ no fraud proofs) ⇒ mptRoot byte-identical to the pre-watchtower path.
-  fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty
+  fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty,
+  // Unified operator KES+VRF registrations accepted against this snapshot's exact parent. This is a required greenfield consensus field:
+  // followers reconstruct the same acceptance result from these signed candidates, and rejected mempool candidates are never embedded.
+  operatorKeyRegistrations: SortedSet[Signed[KesRegistrationCert]] = SortedSet.empty
 ) extends IncrementalSnapshot[GlobalSnapshotStateProof]
 
 object GlobalIncrementalSnapshot {
@@ -185,6 +189,9 @@ object GlobalIncrementalSnapshot {
       version <- c.downField("version").as[Option[SnapshotVersion]].map(_.getOrElse(SnapshotVersion("0.0.1")))
       slotCertificate <- c.downField("slotCertificate").as[Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate]]
       eta <- c.downField("eta").as[Option[io.constellationnetwork.security.hash.Hash]]
+      operatorKeyRegistrations <- c
+        .downField("operatorKeyRegistrations")
+        .as[SortedSet[Signed[KesRegistrationCert]]]
       fraudProofs <- c
         .downField("fraudProofs")
         .as[SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]]
@@ -215,7 +222,8 @@ object GlobalIncrementalSnapshot {
         version,
         slotCertificate,
         eta,
-        fraudProofs
+        fraudProofs,
+        operatorKeyRegistrations
       )
   }
 

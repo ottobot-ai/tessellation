@@ -61,18 +61,10 @@ case class TrackerState(
   // Cleared per-hash when the binary is truly confirmed (markAsConfirmed) or pruned
   // (pruneFinalizedBelow). #123.
   softObservedHashes: Set[Hash],
-  // High-water mark sourced from gl0's authoritative `GlobalSnapshotInfo
-  // .lastCurrencySnapshots[ourIdentifier].ordinal` — the ord of the last currency
-  // snapshot gl0 has accepted for our metagraph. Monotonic (never decreases). Used
-  // by `markAsConfirmed` to GC superseded Pendings.
-  //
-  // Why this is safe under BFT metagraph consensus: ml0 nodes don't race siblings,
-  // they vote on a single binary at each currencyOrd. The only way Pendings below
-  // gl0's known ord can exist is a brief metagraph fork (rare; resolved by ml0
-  // re-syncing to gl0's pick). Those forked-off Pendings are definitionally past:
-  // gl0 has accepted a later snapshot, so older versions on the abandoned branch
-  // can never land. Dropping them prevents queue growth under chain drift
-  // (#125, iter25 data-with-fee root cause).
+  // Transitional ordinal high-water mark from GL0's current Phase-2 GSI view. It is
+  // monotone here and drives stale-Pending GC, but target Phase 2 is hash-bound and
+  // density-reorgable. A replacement may require exact older binaries this watermark
+  // deleted. Retention/requeue must become branch-aware before this GC is production-safe.
   highestConfirmedCurrencyOrd: SnapshotOrdinal
 )
 
@@ -125,19 +117,16 @@ trait BinaryTracker[F[_]] {
   def clear: F[Unit]
   def pruneConfirmed: F[Unit]
 
-  /** Prune confirmed binaries whose containing GL0 snapshot has reached finality.
+  /** Prune confirmed binaries whose exact containing GL0 hash has reached the current operational phase.
     *
     * Fixes the reorg-loses-binaries bug: with the original [[pruneConfirmed]], a binary is dropped from the tracker as soon as it is seen
     * in any GL0 snapshot. If that GL0 snapshot is later orphaned in a Nakamoto reorg, the binary is gone and the metagraph builds the next
     * snapshot referencing a `lastSnapshotHash` that no longer exists in GL0's canonical chain — a permanent gap.
     *
-    * This variant only prunes confirmed binaries whose `proof.globalOrdinal <= lastFinalizedGlobalOrdinal`, where the finalized ordinal
-    * must come from GL0's authoritative finality marker (depth-k or attestation-2/3, whichever fires first). Binaries confirmed in
-    * still-unfinalized GL0 snapshots stay in the tracker; if their containing snapshot is orphaned they will be re-promoted to pending and
-    * re-sent on the next worker tick.
+    * The current method accepts only an ordinal watermark, so it cannot distinguish same-ordinal hash replacement. Target retention must
+    * bind the exact containing Phase-2 hash and re-promote/requeue on a density replacement. Binaries in P0/P1 snapshots stay retained.
     *
-    * In BFT GL0 mode every snapshot is immediately final, so passing the snapshot's own ordinal here is equivalent to the legacy behavior —
-    * the new method is strictly safer and a drop-in replacement.
+    * Passing a locally observed snapshot ordinal when the Phase-2 reference is unavailable is unsafe and must defer rather than prune.
     */
   def pruneFinalizedBelow(lastFinalizedGlobalOrdinal: SnapshotOrdinal): F[Unit]
 }
@@ -180,26 +169,16 @@ object BinaryTracker {
               case (other, _) => other
             }
 
-            // High-water mark: gl0's authoritative `lastCurrencySnapshots[ourIdentifier]
-            // .ordinal` from GlobalSnapshotInfo. The ord of the last currency snapshot
-            // gl0 has accepted for our metagraph. Monotonic — never decreases. Falls
-            // back to the existing watermark when GSI doesn't yet have an entry for
-            // our identifier (e.g. very-early bootstrap before our first binary lands).
+            // Transitional high-water mark from the current GL0 Phase-2 GSI view. It never
+            // decreases here, so it cannot represent an exact-hash density replacement.
             val newWatermark = gl0KnownCurrencyOrd.fold(state.highestConfirmedCurrencyOrd) { gl0Ord =>
               if (gl0Ord.value.value > state.highestConfirmedCurrencyOrd.value.value) gl0Ord
               else state.highestConfirmedCurrencyOrd
             }
 
-            // GC superseded Pendings: any PendingBinary whose currencySnapshotOrdinal
-            // is STRICTLY LESS than gl0's known current ord is past — gl0 has accepted
-            // a later snapshot for us, so no version of our binary at this ord can land.
-            //
-            // Strict `<` (not `<=`) preserves binaries at the exact same ord as gl0's
-            // current. Under BFT metagraph consensus there's typically only one binary
-            // per ord, and if it's ours we just confirmed it (now ConfirmedBinary, not
-            // PendingBinary). But during a transient metagraph fork our Pending at the
-            // gl0-known ord might be on the abandoned branch — those drop on the next
-            // confirmation tick once gl0 advances to ord+1.
+            // Current GC deletes Pending binaries strictly below the ordinal watermark.
+            // This bounds the queue but is not reorg-safe: target retention must keep or
+            // recover the exact branch inputs until replacement/rebase/ack obligations end.
             val gcd = promoted.filterNot {
               case p: PendingBinary => p.currencySnapshotOrdinal.value.value < newWatermark.value.value
               case _                => false

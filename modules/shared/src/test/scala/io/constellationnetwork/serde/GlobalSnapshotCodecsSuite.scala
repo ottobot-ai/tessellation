@@ -1,16 +1,21 @@
 package io.constellationnetwork.serde
 
-import cats.data.NonEmptyList
+import cats.data.{NonEmptyList, NonEmptySet}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationOrdinal
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotCodecs._
 import io.constellationnetwork.serde.implicits._
 
@@ -63,7 +68,7 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
     expect(sample.immutableBytes.fromImmutableBytes[GlobalIncrementalSnapshotV1] == Right(sample))
   }
 
-  test("GlobalIncrementalSnapshot (current, 26 fields) round-trips with all options absent") {
+  test("GlobalIncrementalSnapshot (current, 27 fields) round-trips with empty and populated operator-key registrations") {
     val stateProof = GlobalSnapshotStateProof(
       Hash("a" * 64),
       Hash("b" * 64),
@@ -113,6 +118,23 @@ object GlobalSnapshotCodecsSuite extends FunSuite {
       eta = None,
       fraudProofs = SortedSet.empty
     )
-    expect(sample.immutableBytes.fromImmutableBytes[GlobalIncrementalSnapshot] == Right(sample))
+    val registration = Signed(
+      KesRegistrationCert(
+        operatorPeerId = peer,
+        kesMasterVK = Hex("11" * 32),
+        kesMasterVKStep = 0,
+        offset = 2L,
+        vrfPublicKey = Hex("22" * 32),
+        effectiveFromPeriod = EtaPeriod(2L),
+        registrationParentHash = Hash("3" * 64),
+        ordinal = KesRegistrationOrdinal.first
+      ),
+      NonEmptySet.one(SignatureProof(peer.toId, Signature(Hex("44" * 64))))
+    )
+    val populated = sample.copy(operatorKeyRegistrations = SortedSet(registration))
+    expect.all(
+      sample.immutableBytes.fromImmutableBytes[GlobalIncrementalSnapshot] == Right(sample),
+      populated.immutableBytes.fromImmutableBytes[GlobalIncrementalSnapshot] == Right(populated)
+    )
   }
 }

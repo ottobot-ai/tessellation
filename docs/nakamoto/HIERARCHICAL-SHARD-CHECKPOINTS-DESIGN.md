@@ -1,153 +1,255 @@
 # Hierarchical Shard Checkpoints
 
-**Status:** current design of record, rewritten 2026-07-10. ADR-0016 and ADR-0017 are normative on economic authority.
+**Status:** Target shard design; implementation currently regressed to universal
+GL0 currency recreation. ADR-0016/0017 and
+`../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` are normative.
 
-## 1. Purpose
+## 1. Purpose and topology
 
-Execution shards partition collection and pre-execution of metagraph work. They do not partition economic trust. A shard checkpoint is a
-signed, replayable proposal that GL0 may include after validating its operator duties and locally recreating every included CL1 transition.
-
-The production default is `numShards = 1`, which disables this subsystem. Enabling multiple shards is a cluster-uniform configuration
-change.
-
-## 2. Operators And Topology
-
-Both sharding committees are selected from eligible GL0 operators:
-
-- The metagraph-binary admission committee self-sortitions independently for each `(eta, metagraph, parentHash)` with a secret-key VRF.
-- The execution-shard committee is a separate public deterministic VK-hash draw for `(eta, shardId, epoch, registeredVrfVk)`.
-
-Both draws currently use uniform `1/N` operator weight, but admission uses the full eligible GL0 validator set while execution uses the
-post-cooldown eligible pool. ML0 operators produce and sign metagraph binaries; they are not members of either GL0 committee by virtue of
-operating ML0.
-
-Data flow:
+Execution shards partition accumulation and framework execution. They are internal
+GL0 infrastructure, not another application layer:
 
 ```text
 CL1 economic blocks ----+
-                       +--> ML0 binary --> GL0 admission --> shard buffer --> checkpoint --> GL0 snapshot
-DL1 custom data blocks -+
+                       +-> ML0 binary -> GL0 admission -> shard buffer
+DL1 custom data blocks -+                                  |
+                                                           v
+                                  staircase checkpoint -> GL0 snapshot
 ```
 
-## 3. Current Schema
+ML0 operators run metagraph consensus and sign the binary. A GL0 admission
+committee authenticates intake. A separate GL0 execution committee builds the
+checkpoint. Membership in one group never implies membership in another.
 
-`ShardCheckpoint` contains:
+In the target economic mode, `numShards=1` creates one execution shard and uses
+the same protocol. Current code paths that treat one shard as disabled are gaps.
 
-- `shardId`, `shardOrdinal`, and `parentCheckpointHash`;
-- the GL0 anchor, slot, and eta period;
-- a signed `executionBaseOrdinal` naming the finalized prior used for replay;
-- per-metagraph root claims;
-- the complete included signed state-channel binary window;
-- committee member signatures.
+## 2. Assignment and committee rotation
 
-It does not contain a framework-economic state diff, balance replacement, artifact delta, sync delta, or cross-shard receipt. Those
-fork-only schemas were never deployed and have been removed.
-
-The checkpoint signing preimage covers the complete current shape, including the execution base and included binaries. JSON, scodec, and
-protobuf decoders reject missing current fields and invalid negative ordinals.
-
-Three ordinal spaces are independent and must never be compared as if they were
-one counter:
-
-| Space | Advanced by | Owner |
-|---|---|---|
-| GL0 global ordinal | Global snapshot consensus | GL0 cluster |
-| Metagraph currency ordinal | Currency snapshot production | One ML0 cohort |
-| Shard checkpoint ordinal | A checkpoint over a window of metagraph binaries | Execution-shard committee |
-
-A normal state can therefore be GL0 ordinal 462, currency ordinal 250, and shard
-checkpoint ordinal 3. The checkpoint ordinal counts windows, not currency
-snapshots.
-
-## 4. Assignment And Rotation
-
-Metagraph assignment is static in v1:
+V1 metagraph assignment is deterministic:
 
 ```text
 unsignedBigEndian(SHA-256(metagraphAddress)) mod numShards
 ```
 
-Every GL0 node computes the same result. ML0 does not select a shard.
+V1 `numShards` is immutable for the network/era. A local or ordinary parameter
+change would remap metagraphs and fork state. Live resharding is future protocol
+work requiring a hash-bound era transition, deterministic drain and state handoff,
+old/new committee overlap rule, replay/nullifier continuity, Phase-2 replacement
+behavior, and one atomic activation. `k2` cannot authorize resharding.
 
-Honest production redraws execution membership once per `(shardId, etaPeriod)` using the period of the checkpoint's finalized GL0 anchor,
-and may cache it only after the period's slash-exclusion anchor is settled. The current adopter verifies the committee for the
-wire-carried period but does not recompute that period from the anchor; SHARD-03 therefore leaves rotation grindable by a Byzantine
-producer. An eta period is `R = round(3.1 * k1)` GL0 ordinals: 3174 on mainnet, 794 on testnet/integrationnet, and 99 on dev under current
-defaults.
+The execution committee is selected by the current public deterministic VK-hash
+draw over the eligible GL0 set for a Phase-2-anchored `(eta, shardId, epoch)`.
+This is deliberately not the abandoned stake-weighted secret-VRF draw. The
+checkpoint VRF proves possession of the registered key for the slot.
 
-Within a committee, members are hash-ordered for each next shard ordinal. One rank owns each five-slot duty window by default, wrapping
-over the committee. Genesis uses a 12x wider window while gossip converges. This staircase duty replaced the abandoned per-slot LDD shard
-leader lottery.
+Membership rotates at the eta/epoch boundary derived from the exact Phase-2 GL0
+anchor. The checkpoint cannot self-claim a favorable wire epoch. Within one
+committee, members are deterministically hash-ordered for the next shard ordinal.
+One member owns each staircase duty window, then duty moves to the next rank and
+wraps. The exact duty length and genesis multiplier are canonical parameters.
 
-## 5. Shard Chain And Selection Finality
+Current source parameters, pending final security ratification:
 
-Each shard maintains a chain keyed by checkpoint hash and parent hash. `ShardOrdinal.Root` is zero; the first emitted checkpoint is one.
-Committee-count and shard-depth triggers choose when a replay-valid checkpoint is selectable for GL0 inclusion. Neither trigger proves
-economic validity. A checkpoint must pass replay before it is stored, attested, counted, or returned as accepted.
+| Mechanism | Current cadence/rule |
+|---|---|
+| Binary-admission committee | New secret-VRF self-sortition for each `(eta, metagraph, parentHash)`; a new ML0 parent or eta changes the draw. |
+| Execution membership | Fixed for one `(shardId, etaPeriod)`; eta period length `R = round(3.1*k1)` = 3174 mainnet, 794 test/integration, 99 dev. |
+| Producer duty | Hash-shuffled anew for each next shard ordinal; each rank owns 5 slots, wrapping through the committee. |
+| Genesis duty | Same order with a 12x window, currently 60 slots per rank while the mesh forms. |
+| Draw/quorum | Current test/default target `kDraw=8`, `kQuorum=6`; quorum is a direct count, not an implicit `ceil(2*k/3)` formula. |
+| Shard depth fallback | Removed. Distinct replay-backed `kQuorum` is mandatory; `retainedCheckpoints` is storage capacity only. |
 
-## 6. Production
+`R` is currently derived with `Double`; the target parameter contract replaces it
+with exact rational/integer arithmetic and binds every value in canonical state.
 
-The scheduled GL0 operator:
+## 3. Two independent checkpoint axes
 
-1. reads the finalized per-metagraph base tips;
-2. takes a deterministic, chain-linked window from the shard buffer;
-3. captures one finalized `executionBaseOrdinal`;
-4. recreates each CL1 transition against that exact prior and finalized GL0 references;
-5. computes the per-metagraph MPT roots from the recreated state;
-6. signs and publishes the checkpoint only if the base did not move during execution.
+Execution validity:
 
-An unavailable base, missing finalized GL0 reference, empty window, duty mismatch, or replay failure produces no checkpoint.
+```text
+UnexecutedClaim
+  -> ProducerExecuted
+  -> SignerVerified (independently for each signer)
+  -> ExecutionCertified (distinct kQuorum)
+  -> Challenged/Invalid, if objective watchtower evidence succeeds
+```
 
-## 7. GL0 Admission
+Chain/global position:
 
-Every GL0 adopter independently verifies:
+```text
+ShardCandidate
+  -> ShardPreferred
+  -> EmbeddedTentative
+  -> Operational at containing GL0 Phase 2
+  -> locally retention-eligible only after all k2/challenge/DA/recovery/ack horizons
 
-- outer and committee Ed25519 signatures;
-- KES evidence and registered keys;
-- committee membership and registered VRF-key possession;
-- shard ownership for every metagraph key;
-- checkpoint chain linkage and current schema validity;
-- exact CL1 replay at `executionBaseOrdinal`;
-- equality between each recreated MPT root and the signed root claim.
+P2 -> Orphaned/Requeued on a later valid GL0 density reorg
+```
 
-Signature quorum and depth are selection inputs only. They never bypass replay. `Hash.empty` or unavailable pinned history is a fail-closed
-defer/reject and is not slash evidence by itself.
+Staircase parent/ordinal ordering and fork choice select a checkpoint candidate.
+They do not establish execution and cannot bypass missing `kQuorum` replay
+signatures. The exact containing GL0 Phase 2 supplies global operational status.
 
-**Open enforcement gap (SHARD-03):** committee membership is checked against `checkpoint.epoch`, but the adopter does not yet require
-`checkpoint.epoch == executionShardEpoch(checkpoint.gl0AnchorOrdinal)`. Until that equality is enforced, the producer can choose among
-resolvable public epoch draws even though honest producer policy uses the finalized anchor.
+## 4. Producer accumulation and execution
 
-## 8. Cross-Shard Economics
+V1 permits exactly one checkpoint per shard whose exact containing GL0 snapshot
+has not reached Phase 2. That checkpoint may batch multiple metagraphs and one
+bounded parent-contiguous ordered binary list per metagraph. Later inputs remain
+buffered for its successor. Tentative embedding, ordinal equality, shard depth,
+or a different same-ordinal hash never releases the successor; only the exact
+checkpoint carried by the exact GL0 snapshot that reaches Phase 2 does. Restart,
+replacement, and orphan requeue are owned by the durable FinalityGate transaction.
 
-Shards never settle directly with one another. A consuming CL1 operation is recreated at GL0 against owner state from a consensus-pinned,
-finalized GL0 MPT view. A proof supplies an input; it never substitutes for executing the operation.
+The scheduled producer:
 
-Allow-spend consumption records a permanent canonical GL0 nullifier. Pending settlement overlays remain only while the exact owner action
-is still in the consensus pending set, and acknowledgements are generated from GL0 ordinals actually replayed by the owner.
+1. resolves an exact canonical Phase-2 GL0 base `(ordinal,hash,stateRoot)`;
+2. derives the anchored execution roster/epoch and validates its staircase duty;
+3. takes a deterministic bounded fair window from assigned metagraph queues while
+   preserving each MG's exact parent order;
+4. resolves every complete signed ML0 binary/custom-data commitment;
+5. runs the shared framework kernel for every currency portion;
+6. creates one canonical per-MG diff and complete root that covers every writable
+   key;
+7. extracts cross-metagraph framework intents without pre-writing global
+   nullifier/inbox or another MG's partition;
+8. signs and publishes the complete checkpoint.
 
-The GL0 accept wiring constructs the cross-shard client from the finalized MPT base. State visible only on an unfinalized candidate branch
-is absent to the consuming operation and must wait for a later finalized GL0 snapshot.
+Missing base, parent, body, DA material, schema, or deterministic result means no
+checkpoint. There is no fallback to best tip, live store, peer-selected state, or
+claimed ML0 cumulative fields.
 
-## 9. Recovery And Observability
+## 5. Replay-before-sign
 
-Checkpoint pull is read-only. A fetched checkpoint re-enters the same signature, duty, assignment, and replay gates as gossip. Node-local
-peer choice, retry timing, metrics, cooldowns, and best tips may affect availability but may not affect a root or validity decision.
+Every execution-committee member independently resolves the same base and bytes,
+runs the same framework kernel, and compares accepted/rejected IDs, extracted
+intents, canonical diff, and root:
 
-Metrics are shard-labelled and bounded-cardinality. Partition monitors are diagnostic only.
+```text
+exact match         -> build VerifiedShardCheckpoint -> sign exact preimage once
+unavailable input   -> defer; no signature; no slash
+result mismatch     -> reject; retain objective comparison evidence
+```
 
-## 10. Slashing
+Best-tip selection, ancestor reception, signature count, and depth cannot produce
+`VerifiedShardCheckpoint`. The attestation emitter must accept that capability,
+not a naked hash. Retroactive ancestor signing follows the same replay rule.
 
-Invalid-state and equivocation evidence must be self-contained, cryptographically authenticated, deterministic, and folded into canonical
-GL0 state before it has economic effect. Watchtower detection is defense in depth; later slashing is never permission to expose value from
-an unexecuted checkpoint.
+The signed preimage binds network, genesis, era/parameters, shard, roster/epoch,
+parent, ordinal, slot/duty, Phase-2 base, exact ordered inputs/DA commitments,
+per-MG diffs/roots, extracted global intents, and custom commitments.
 
-## 13. Operational Gate
+## 6. Ordinary GL0 adoption
 
-Before `numShards > 1` is deployable, the repository must prove:
+An ordinary noncommittee GL0 node does not recreate ML0 currency snapshots. It:
 
-- universal GL0 replay on every admission/finality branch;
-- finalized cross-shard reads;
-- deterministic replay across independent nodes;
-- lossless backpressure and restart recovery;
-- valid, non-forgeable slash evidence with honest-node false-positive tests;
-- full topology tests with Byzantine producers and committees at and beyond quorum.
+1. verifies producer eligibility, KES/VRF, anchored roster, distinct execution
+   signatures, and the mandatory threshold;
+2. verifies shard parent/ordinal and every per-MG parent/continuation;
+3. verifies the exact Phase-2 base and required bytes/commitments;
+4. validates canonical diff ordering, uniqueness, bounds, namespace, and complete
+   root coverage;
+5. compare-and-sets each signed per-MG pre-root/version against the proposal
+   parent's current `Ml0FrameworkMirror` root/version;
+6. applies the diff to the exact base and recomputes each root;
+7. submits extracted global intents to the universal GL0 conflict/settlement
+   kernel;
+8. stages all effects atomically in the containing GL0 branch.
+
+The root is checked, never installed directly. The diff is reproduced committee
+output, not an ML0 authoritative override.
+
+The greenfield schema restores only `ShardCurrencyStateDiff` and
+`perMetagraphStateDiff`. It does not restore `authoritative*`,
+`AdoptFromSignedFields`, direct cross-shard receipts, unproved per-field
+replacement deltas, or undeployed compatibility codecs.
+
+## 7. GL0 phase integration
+
+A checkpoint may be stored/selected and included in a tentative GL0 candidate
+without becoming a durable shard anchor. When the exact containing GL0 hash enters
+Phase 2:
+
+- the checkpoint becomes operational;
+- its hard anchor advances;
+- downstream layers may reference its GL0 state;
+- its binaries become operationally confirmed but remain retained/reversible.
+
+If maxvalid-bg replaces that Phase-2 branch, the anchor reverses, the checkpoint
+is orphaned, and each still-valid input requeues exactly once against the new
+base. Local pruning waits for the maximum of recommended `k2`, challenge, DA,
+recovery, and acknowledgement horizons. Pruning never creates a fork-choice
+floor; an older candidate forces authenticated reconstruction before comparison.
+
+## 8. Cross-metagraph economics
+
+Shards do not settle directly. A source authorization must already exist in an
+exact canonical Phase-2 GL0 state. Execution committees reproduce and sign the
+framework consume intent, but their per-MG diff cannot decide a global conflict.
+Every GL0 node runs one deterministic global order/nullifier/settlement kernel
+over intents from all included checkpoints.
+
+One-shot settlement writes authorization status, permanent nullifier, exact
+balance/reservation deltas, and pending delivery atomically. ML0 acknowledgement
+is hash-bound mirror progress only. Physical shard count cannot change the result.
+
+## 9. Payload and data availability
+
+V1 proposes two explicit signed lanes:
+
+- `FrameworkCurrency`;
+- `FrameworkCurrencyWithData`.
+
+The framework portion always follows replay/diff rules. Custom bytes are a
+separate authenticated availability commitment and cannot influence the framework
+result. Standalone opaque/data-only state channels are disabled unless the owner
+explicitly retains them.
+
+Complete inputs remain available through the maximum of recommended `k2`, challenge,
+watchtower, rollback, recovery, and downstream acknowledgement horizons. Missing
+data prevents execution/signing/eligibility; network nonresponse alone is not
+slash evidence.
+
+## 10. Watchtowers and slashing
+
+Deterministically assigned noncommittee watchtowers replay the complete checkpoint.
+A challenge binds exact base, inputs, signed checkpoint, signer set, reproduced
+diff/root, and mismatch. Only actual signers are liable. Missing history, transport
+timeout, or an unresolvable base cannot slash. The watchtower assertion is not a
+verdict; a ratified deterministic adjudicator computes the mismatch, initially by
+exceptional bounded universal GL0 replay of the challenged exact checkpoint.
+
+The protocol still requires owner decisions for watchtower population/coverage and
+whether replay must finish before economic Phase-2 release or a bounded challenge
+window quarantines every derived use. Blocking only withdraw/cross-MG is
+insufficient: invalid value must not transfer locally, pay fees, stake, gain reward
+weight, mint, bridge, or compact before release.
+
+The conservative planning default makes positive coverage a prerequisite for
+GL0-inclusion eligibility. An uncovered checkpoint waits while unrelated GL0 and
+other-shard work proceeds.
+
+## 11. Current implementation delta
+
+Commit `c610a0740` removed the diff and made ordinary receivers/adopters replay:
+
+- current `ShardDerivedStateDelta` has roots and binaries only;
+- `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` replays unconditionally;
+- GSAM recreates adopted currency state again;
+- the emitter still accepts a naked hash.
+
+The repair must retain current full framework recreation for producer/signers and
+watchtowers, restore only the canonical root-covered diff, make blind signing
+unrepresentable, and replace ordinary replay with apply/root verification.
+
+## 12. Required gates
+
+- honest root/diff signs; tampered root/diff/base/input/intent never signs;
+- missing history defers and never false-slashes;
+- ordinary adoption records zero recreation calls;
+- apply-diff produces exact root across independent nodes/platforms;
+- depth cannot bypass the execution threshold;
+- tentative inclusion cannot hard-anchor; P2 can; P2 reorg reverses/requeues;
+- colluding threshold is caught under the owner-approved watchtower release rule;
+- concurrent cross-shard consume yields one global winner;
+- shard counts 1 and K yield byte-identical economic state.

@@ -17,8 +17,8 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.OptionCodec.option
-import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedMapCodec.{sortedMap, sortedMapCanonical}
+import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSetCanonical
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{codec => allowSpendRefCodec}
@@ -114,13 +114,13 @@ object CurrencySnapshotInfoCodecs {
   private val lastAllowSpendRefsMapCodec: Codec[SortedMap[Address, AllowSpendReference]] =
     sortedMap(addressCodec, allowSpendRefCodec)
   private val activeAllowSpendsMapCodec: Codec[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
-    sortedMap(addressCodec, sortedSet(signedAllowSpendCodec))
+    sortedMap(addressCodec, sortedSetCanonical(signedAllowSpendCodec))
   private val globalSyncViewMapCodec: Codec[SortedMap[PeerId, Signed[GlobalSnapshotSync]]] =
-    sortedMap(peerIdCodec, signedGlobalSyncCodec)
+    sortedMapCanonical(peerIdCodec, signedGlobalSyncCodec)
   private val lastTokenLockRefsMapCodec: Codec[SortedMap[Address, TokenLockReference]] =
     sortedMap(addressCodec, tokenLockRefCodec)
   private val activeTokenLocksMapCodec: Codec[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-    sortedMap(addressCodec, sortedSet(signedTokenLockCodec))
+    sortedMap(addressCodec, sortedSetCanonical(signedTokenLockCodec))
 
   private val optLastMessagesCodec = option(lastMessagesMapCodec)
   private val optLastFeeTxRefsCodec = option(lastFeeTxRefsMapCodec)
@@ -133,7 +133,7 @@ object CurrencySnapshotInfoCodecs {
   // Witness so NonEmptySet import survives lint (it's imported for scodec.Codec
   // types that reference it transitively via Signed).
   private val _nesWitness: Codec[NonEmptySet[Signed[AllowSpend]]] =
-    io.constellationnetwork.serde.codecs.NonEmptySetCodec.nonEmptySet(signedAllowSpendCodec)
+    io.constellationnetwork.serde.codecs.NonEmptySetCodec.nonEmptySetCanonical(signedAllowSpendCodec)
   locally { val _ = _nesWitness }
 
   implicit val currencySnapshotInfoCodec: Codec[CurrencySnapshotInfo] =
@@ -194,7 +194,9 @@ object CurrencySnapshotInfoCodecs {
 
   /** `MgActiveTokenLocks` (30) value: `(holder, locks)`. */
   implicit val mgActiveTokenLocksEntryImmutableCodec: ImmutableCodec[(Address, SortedSet[Signed[TokenLock]])] =
-    ImmutableCodec.fromScodecCodec(entryTupleCodec(addressCodec, sortedSet(signedTokenLockCodec)))
+    ImmutableCodec.fromScodecCodec(
+      entryTupleCodec(addressCodec, sortedSetCanonical(signedTokenLockCodec))
+    )
 
   /** `MgLastMessages` (31) value: `(messageType, signedMessage)`. */
   implicit val mgLastMessagesEntryImmutableCodec: ImmutableCodec[(MessageType, Signed[CurrencyMessage])] =

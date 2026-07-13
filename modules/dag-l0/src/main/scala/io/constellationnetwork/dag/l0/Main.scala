@@ -15,6 +15,7 @@ import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.infrastructure.consensus.state._
@@ -47,6 +48,19 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 import pureconfig.generic.auto._
 import pureconfig.module.enumeratum._
 
+private[l0] object GenesisOperatorKeyAnchor {
+  def requireJson(path: Option[fs2.io.file.Path]): Either[IllegalArgumentException, fs2.io.file.Path] =
+    path
+      .filter(_.extName == ".json")
+      .toRight(
+        new IllegalArgumentException(
+          s"Nakamoto GL0 requires the canonical L0 genesis operator-key anchor as a JSON genesis argument for every startup mode " +
+            s"(including cold restart and rollback). The JSON supplies local startup material, but the signed MPT root is authoritative; received " +
+            path.fold("no genesis argument")(_.toString)
+        )
+      )
+}
+
 object Main
     extends TessellationIOApp[RunNakamoto](
       name = "dag-l0",
@@ -65,37 +79,23 @@ object Main
   val kryoRegistrar: Map[Class[_], KryoRegistrationId[KryoRegistrationIdRange]] =
     dagL0KryoRegistrar
 
-  /** Split-safety (#261): give the createContext / follower GSAM (built inside `SharedServices.make`) the SAME genesis-derived KES + VRF
-    * registries the gl0 produce + validateArtifact paths use, so `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` draws the IDENTICAL
-    * VRF-VK-sortitioned committee and verifies KES identically on every gl0 path. Loaded from the SAME L0 genesis JSON `run` reads for
-    * `GlobalSnapshotConsensus.make`; empty for non-JSON bootstrap paths (rollback / CSV-genesis) where the verify path likewise has no
-    * registry.
+  /** Load the complete signed genesis operator-key material before constructing any GL0 service. Every bootstrap mode, including cold
+    * restart and rollback, requires the JSON material; startup later proves exact equality with the root-authenticated field-24 identity.
+    * CSV and absent-genesis fallbacks fail here rather than starting a node whose consensus consumers have empty or asymmetric identities.
     */
-  override protected def nakamotoShardRegistries(method: RunNakamoto)(
-    implicit jsonSerializer: io.constellationnetwork.json.JsonSerializer[IO]
-  ): Resource[
-    IO,
-    (
-      io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[IO],
-      io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[IO]
-    )
-  ] =
-    (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
-      case (Some(gPath), true) =>
+  override protected def nakamotoOperatorKeyRegistries(method: RunNakamoto)(
+    implicit jsonSerializer: io.constellationnetwork.json.JsonSerializer[IO],
+    securityProvider: io.constellationnetwork.security.SecurityProvider[IO]
+  ): Resource[IO, io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry[IO]] =
+    GenesisOperatorKeyAnchor.requireJson(method.genesisPath) match {
+      case Right(gPath) =>
         GenesisLoader
           .make[IO, GlobalSnapshot]
           .loadL0Genesis(gPath)
-          .flatMap { data =>
-            (L0GenesisLoader.buildKesRegistry[IO](data), L0GenesisLoader.buildVrfRegistry[IO](data)).tupled
-          }
+          .flatMap(L0GenesisLoader.buildOperatorKeyRegistry[IO])
           .asResource
-      case _ =>
-        Resource.pure(
-          (
-            io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
-            io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO]
-          )
-        )
+      case Left(error) =>
+        IO.raiseError[io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry[IO]](error).toResource
     }
 
   def run(method: RunNakamoto, nodeShared: NodeShared[IO, RunNakamoto]): Resource[IO, Unit] = {
@@ -142,13 +142,9 @@ object Main
       finalityTriggerViewRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.FinalityTriggerView[IO]]](None)
         .asResource
-      // Track-3 S1.5 "marker split": the settled (k₂-archival) ordinal is now a first-class injected Ref, DISTINCT from the k₁
-      // `nakamotoFinalizedOrdinalRef` (G1: never alias — aliasing would report k₁ as "settled" and let a route corrupt the k₁
-      // production floor). There is exactly ONE settled (k₂) source: this ref backs BOTH the `SettledOrdinalTracker` (the monotone
-      // advance-and-read surface for SnapshotLeaderLoop's `T_depth2` sink + `GET /global-snapshots/settled`) AND
-      // `NakamotoChainStore`'s `nakamotoSettledOrdinalRef` — available to the store-gate/fork-choice in Track-3 S3, and reset here
-      // in lock-step with `nakamotoFinalizedOrdinalRef` inside `unsafe_clearFinality`. Same lifetime + Main→Services→HttpApi
-      // sharing pattern as `nakamotoFinalizedOrdinalRef`.
+      // Transitional legacy k2 watermark shared by the tracker, HTTP telemetry, and current
+      // chain-store floor wiring. It stays distinct from the current k1 ref to avoid aliasing, but
+      // target k2 is local retention/proof/recovery capacity only and has no Phase-3/fork-choice role.
       nakamotoSettledOrdinalRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue).asResource
       settledOrdinalTracker = io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker
         .makeFromRef[IO](nakamotoSettledOrdinalRef)
@@ -195,36 +191,10 @@ object Main
         )
         .asResource
 
-      // Finality gate: Nakamoto GL0 serves only attestation-finalized snapshot data
-      // over HTTP. Sidecar GossipSub is the only path for pending (pre-finality)
-      // snapshots between GL0 peers. Constructed here once per node and flowed as
-      // an implicit through Services/HttpApi/route constructors so gating is uniform
-      // — no more ad-hoc Option[F[Option[SnapshotOrdinal]]] threading.
+      // Transitional ordinal-only P2 HTTP release gate. Target FinalityGate is keyed by
+      // exact `(ordinal, hash)`, carries P0/P1/P2, and emits density-reorg rollback/re-follow.
+      // Constructed once here so current route gating is at least uniform.
       implicit0(finalityGate: FinalityGate[IO]) = FinalityGate.fromRef[IO](nakamotoFinalizedOrdinalRef)
-
-      // §1.2 Slice 3c: pre-load the L0 genesis JSON (if any) ONLY to extract the KES registry
-      // — the full load (with delegated-stake + collateral signing) happens later in PATH 4
-      // below. Reading the file twice is fine: it's a few KB and parsed once at startup. For
-      // bootstrap paths that don't take PATH 4 (rollback / CSV-genesis), the registry is
-      // empty. Legacy tip/snapshot KES verification retains its bootstrap carve-out, but the
-      // metagraph admission committee is fail-closed: an unregistered attester cannot count
-      // toward admission quorum.
-      kesRegistry <- (method.genesisPath, method.genesisPath.exists(_.extName == ".json")) match {
-        case (Some(gPath), true) =>
-          GenesisLoader
-            .make[IO, GlobalSnapshot]
-            .loadL0Genesis(gPath)
-            .flatMap(L0GenesisLoader.buildKesRegistry[IO])
-            .asResource
-        case _ =>
-          io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO].pure[IO].asResource
-      }
-
-      // Task #44: the gl0-leader produce path no longer loads its own VRF-VK registry. The committee-sortition
-      // registry is loaded once via `nakamotoShardRegistries` (above, in `TessellationIOApp`) and threaded into
-      // `SharedServices.make`; `GlobalSnapshotConsensus.make` reuses that single `shardAcceptanceDeps`, so the
-      // former second genesis parse + `vrfRegistry` thread-through here is gone (the KES registry below stays —
-      // the gl0 leader loop / sync daemon still consume it directly).
 
       services <- Services
         .make[IO, RunNakamoto](
@@ -251,12 +221,11 @@ object Main
           globalFollowSliceServiceRef,
           globalChangeSetServiceRef,
           shardProofServiceRef,
-          kesRegistry,
           // Split-safety (#261, eta axis): install the leader's chain-walk into the follower / `createContext`
           // GSAM's deferred committee-eta resolver (the Ref created in `TessellationIOApp.make`, exposed on
           // `NodeShared`). `GlobalSnapshotConsensus.make` invokes this once the chain store exists so the
-          // follower `EtaStateManager.getEta(P)` byte-matches the leader's for every period P.
-          setFollowerEtaChainWalk = (walk: Long => IO[List[(Long, Array[Byte])]]) => nakamotoFollowerEtaChainWalkRef.set(Some(walk))
+          // follower `EtaStateManager.getEtaAt(P, parentHash)` byte-matches the leader's exact branch for every period P.
+          setFollowerEtaChainWalk = (walk: (Long, Option[Hash]) => IO[EtaSourceRange]) => nakamotoFollowerEtaChainWalkRef.set(Some(walk))
         )
 
       programs = Programs.make[IO, RunNakamoto](
@@ -459,6 +428,30 @@ object Main
                                   )
                                 )
                                 .whenA(!mptAdopted)
+                              rootedGenesisOperatorKeys <- L0GenesisLoader
+                                .materializeRootedGenesisOperatorKeys[IO](sharedStorages.mptStore)
+                              localGenesisData <- GenesisOperatorKeyAnchor.requireJson(method.genesisPath) match {
+                                case Right(path) => GenesisLoader.make[IO, GlobalSnapshot].loadL0Genesis(path)
+                                case Left(error) =>
+                                  IO.raiseError[io.constellationnetwork.node.shared.domain.genesis.types.L0GenesisData](error)
+                              }
+                              _ <- L0GenesisLoader.requireGenesisDataMatchesRooted[IO](
+                                localGenesisData,
+                                rootedGenesisOperatorKeys
+                              )
+                              _ <- IO
+                                .raiseError[Unit](
+                                  new RuntimeException(
+                                    s"Cold restart at ordinal=$latestOrdinal: persisted GlobalSnapshotInfo genesis operator keys do not " +
+                                      "equal the root-authenticated field-24 partition. Refusing to construct the next snapshot from " +
+                                      "unrooted or stale identity state."
+                                  )
+                                )
+                                .unlessA(latestInfo.genesisOperatorKeys === rootedGenesisOperatorKeys)
+                              _ <- L0GenesisLoader.requireLocalRegistryMatchesRooted[IO](
+                                sharedServices.operatorKeyRegistry,
+                                rootedGenesisOperatorKeys
+                              )
                               _ <- services.consensus.manager
                                 .startFacilitatingAfterRollback(
                                   latestSnapshot.ordinal,
@@ -561,14 +554,19 @@ object Main
                                 fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >> {
                                   // Order matters: apply the Tier-1 augmenter BEFORE building the
                                   // ord=1 incremental snapshot. The augmenter overlays
-                                  // `activeDelegatedStakes` + `activeNodeCollaterals` (JSON path);
+                                  // `activeDelegatedStakes`, `activeNodeCollaterals`, and the immutable
+                                  // long-term-signed genesis KES+VRF identities (JSON path);
                                   // CSV path is identity. We pass the post-augmentation GSI to
                                   // `mkFirstIncrementalSnapshot` so the stateProof in the snapshot
                                   // matches the GSI + MPT we are about to persist. The CSV path
                                   // is unaffected (augmenter == identity → same bytes as before).
                                   val baseGsi = hashedGenesis.info.toGlobalSnapshotInfo
                                   augmenter(baseGsi).flatMap { globalSnapshotInfo =>
-                                    GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis, globalSnapshotInfo).flatMap {
+                                    L0GenesisLoader
+                                      .requireLocalRegistryMatchesRooted[IO](
+                                        sharedServices.operatorKeyRegistry,
+                                        globalSnapshotInfo.genesisOperatorKeys
+                                      ) >> GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis, globalSnapshotInfo).flatMap {
                                       firstIncrementalSnapshot =>
                                         Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).flatMap {
                                           signedFirstIncrementalSnapshot =>
@@ -582,11 +580,32 @@ object Main
                                                 hashedSnapshot,
                                                 globalSnapshotInfo
                                               )
-                                              _ <- sharedStorages.mptStore
-                                                .syncFromGlobalSnapshotInfo(globalSnapshotInfo, hashedSnapshot.ordinal)(
+                                              mptAdopted <- sharedStorages.mptStore
+                                                .syncFromGlobalSnapshotInfoVerified(
+                                                  globalSnapshotInfo,
+                                                  hashedSnapshot.ordinal,
+                                                  hashedSnapshot.signed.value.stateProof.mptRoot
+                                                )(
                                                   globalStateProofSelector,
                                                   withdrawalTimeLimit
                                                 )
+                                              _ <- IO
+                                                .raiseError[Unit](
+                                                  new RuntimeException(
+                                                    "Fresh genesis MPT rebuild did not reproduce the signed first-incremental mptRoot"
+                                                  )
+                                                )
+                                                .unlessA(mptAdopted)
+                                              rootedGenesisOperatorKeys <- L0GenesisLoader
+                                                .materializeRootedGenesisOperatorKeys[IO](sharedStorages.mptStore)
+                                              _ <- IO
+                                                .raiseError[Unit](
+                                                  new RuntimeException(
+                                                    "Fresh genesis field-24 operator identity partition differs from the GSI used to sign " +
+                                                      "the first incremental snapshot"
+                                                  )
+                                                )
+                                                .unlessA(rootedGenesisOperatorKeys === globalSnapshotInfo.genesisOperatorKeys)
                                               _ <- services.consensus.manager
                                                 .startFacilitatingAfterRollback(
                                                   signedFirstIncrementalSnapshot.ordinal,

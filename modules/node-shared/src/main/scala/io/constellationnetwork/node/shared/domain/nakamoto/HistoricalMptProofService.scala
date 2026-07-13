@@ -17,8 +17,9 @@ import io.constellationnetwork.security.mpt.prover.{MerklePatriciaProofError, Me
   * reconstruction structurally.
   *
   * Lock pattern: keeps `MptStore.withExclusiveLock` defensively because `overlay.buildRoot` calls `underlying.build(ordinal)` which mutates
-  * the producer's "current" pointer and could race with concurrent writes from `accept()`. Once finalized base becomes fully immutable on
-  * disk, this lock can drop.
+  * the producer's "current" pointer and could race with concurrent writes from `accept()`. Phase 2 remains density-reorgable, so dropping
+  * this lock requires a replacement store API that provides an equivalent exact-branch atomic read; age alone never makes the base
+  * immutable.
   */
 trait HistoricalMptProofService[F[_]] {
 

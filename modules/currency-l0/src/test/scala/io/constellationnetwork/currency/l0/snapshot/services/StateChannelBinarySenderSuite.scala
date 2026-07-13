@@ -231,6 +231,7 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
         retryMode = RetryStrategy.shouldEnterRetryMode(updatedState, globalSnapshot.ordinal)
         _ <- tracker.updateState(_.copy(retryMode = retryMode))
         _ <- tracker.updateState(RetryStrategy.updateRetryParameters(_, oldRetryMode))
+        _ <- lastFinalizedGlobalOrdinal.traverse_(tracker.pruneFinalizedBelow)
       } yield ()
 
     // Manually trigger queue processing for tests (simulates background worker)
@@ -304,7 +305,7 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
       signedBinary <- signedOf(StateChannelSnapshotBinary(hash, content.getBytes, SnapshotFee.MinValue))
     } yield signedBinary
 
-  test("should add confirmation proof for confirmed binaries in the queue") { res =>
+  test("confirm marks binaries but missing Phase-2 ordinal defers pruning") { res =>
     implicit val (_, hs, sp, metrics, j) = res
 
     forall(Gen.nonEmptyListOf(binaryGen)) { binaries =>
@@ -332,6 +333,49 @@ object StateChannelBinarySenderSuite extends MutableIOSuite with Checkers {
           } yield expect.eql(state.tracked.toList, expected)
         )
       } yield result).use(IO.pure)
+    }
+  }
+
+  test("explicit Phase-2 ordinal prunes only confirmations at or below it") { res =>
+    implicit val (_, hs, sp, metrics, j) = res
+
+    val distinctBinaryPairGen =
+      for {
+        older <- binaryGen
+        newer <- binaryGen.suchThat(_.value =!= older.value)
+      } yield (older, newer)
+
+    forall(distinctBinaryPairGen) {
+      case (older, newer) =>
+        (for {
+          kp <- Resource.eval(KeyPairGenerator.makeKeyPair)
+          (sender, tracker, _) <- mkService(
+            kp.getPublic.toAddress,
+            currentOrdinal = SnapshotOrdinal.MinValue,
+            state = TrackerState.empty
+          )
+          result <- Resource.eval(
+            for {
+              olderHashed <- older.toHashed
+              newerHashed <- newer.toHashed
+              testSender = sender.asInstanceOf[TestStateChannelBinarySender[IO]]
+              _ <- testSender.process(olderHashed, none)
+              _ <- testSender.process(newerHashed, none)
+              olderSnapshot <- mkSnapshot(SnapshotOrdinal(10L), kp, List(older))
+              _ <- sender.confirm(olderSnapshot, lastFinalizedGlobalOrdinal = None)
+              newerSnapshot <- mkSnapshot(SnapshotOrdinal(20L), kp, List(newer))
+              _ <- sender.confirm(newerSnapshot, lastFinalizedGlobalOrdinal = None)
+              beforePrune <- tracker.getState
+              _ <- sender.confirm(newerSnapshot, lastFinalizedGlobalOrdinal = olderSnapshot.ordinal.some)
+              afterPrune <- tracker.getState
+              beforeOrdinals = beforePrune.tracked.collect { case ConfirmedBinary(_, proof) => proof.globalOrdinal }.toList
+              remaining = afterPrune.tracked.collect { case c: ConfirmedBinary => c }.toList
+            } yield
+              expect.same(List(olderSnapshot.ordinal, newerSnapshot.ordinal), beforeOrdinals) &&
+                expect.same(List(newerHashed.hash), remaining.map(_.pendingBinary.binary.hash)) &&
+                expect.same(List(newerSnapshot.ordinal), remaining.map(_.confirmationProof.globalOrdinal))
+          )
+        } yield result).use(IO.pure)
     }
   }
 

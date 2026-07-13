@@ -24,9 +24,9 @@ import derevo.derive
   *   - `parentHash` — load-bearing committee-VRF input (per `COMMITTEE-SORTITION-DESIGN.md` §2)
   *   - `binaryHash` — the distinguishing field (equal across the two evidence attestations = duplicate, distinct = equivocation)
   *   - `committeeVrfProof` — verified via `CommitteeSortition.verifyMembership` against the operator's VRF VK
-  *   - `vrfPublicKey` — operator's VRF VK at attest time (carried on-wire; same Slice-S3 design as `IncomingAttestation`)
+  *   - `vrfPublicKey` — comparison evidence only; it must equal the atomic pair resolved at the exact offence context
   *   - `kesSignature` — KES product signature reused by [[io.constellationnetwork.security.kes.OperationalKeyMaker.decodeSignature]]
-  *   - `senderTreeStep` — KES tree-internal step at sign time, enables non-interactive receiver verify
+  *   - `senderTreeStep` — comparison evidence only; the verifier derives `offencePeriod - registeredOffset` and requires equality
   *
   * '''No long-term Ed25519 sig on the body or evidence envelope.''' The gossip path wraps `MetagraphAttestation` in `Signed[_]` for Ed25519
   * verification on receive; that envelope stays on the gossip path. Slashing evidence consumes the body directly because the KES product

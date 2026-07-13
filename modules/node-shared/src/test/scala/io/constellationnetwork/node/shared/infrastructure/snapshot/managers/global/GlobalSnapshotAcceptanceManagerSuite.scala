@@ -118,7 +118,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         tokenLockResult.accepted == List(tokenLockBlock),
@@ -217,7 +217,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         newSnapshotInfo.delegatedStakesWithdrawals.isDefined,
@@ -294,7 +294,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         newSnapshotInfo.activeDelegatedStakes.isDefined,
@@ -360,7 +360,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
 
       updatedRecord = newSnapshotInfo.activeDelegatedStakes.get(address1).head
     } yield
@@ -444,7 +444,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should succeed
@@ -530,7 +530,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should succeed
@@ -612,7 +612,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Delegated stake should be created
@@ -696,7 +696,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _, _, _) = result1
+      (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _, _, _, _) = result1
 
       // Second snapshot: create the withdrawal
       withdrawalEvent <- mkDelegatedStakeWithdraw(keyPair, hashedDelegatedStakeEvent)
@@ -724,7 +724,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _, _, _) = result2
+      (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _, _, _, _) = result2
     } yield
       expect.all(
         // First snapshot should have created the delegated stake
@@ -842,7 +842,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock should be replaced
@@ -938,7 +938,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should succeed
@@ -1021,7 +1021,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _, _, _) = result1
+      (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _, _, _, _) = result1
 
       // Second snapshot: create the withdrawal
       withdrawalEvent <- mkDelegatedStakeWithdraw(keyPair, hashedDelegatedStakeEvent)
@@ -1048,7 +1048,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, snapshotWithWithdrawal, _, _, _, _, _, _, _) = result2
+      (_, _, _, _, _, _, _, _, snapshotWithWithdrawal, _, _, _, _, _, _, _, _) = result2
 
       // Third snapshot: try to replace the token lock (should fail because original is no longer active)
       replacementTokenLock <- mkTokenLock(
@@ -1083,7 +1083,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
           getGlobalSnapshotByOrdinal = _ => None.pure[IO],
           parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
         )
-      (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _, _, _) = result3
+      (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _, _, _, _) = result3
     } yield
       expect.all(
         // First snapshot should have created the delegated stake
@@ -1191,7 +1191,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _, _, _) = result1
+      (_, _, _, _, _, _, _, _, snapshotWithDelegatedStake, _, _, _, _, _, _, _, _) = result1
 
       // Second snapshot: replace the token lock
       replacementTokenLock <- mkTokenLock(
@@ -1225,7 +1225,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, snapshotWithReplacement, _, _, _, _, _, _, _) = result2
+      (_, _, _, _, _, _, _, _, snapshotWithReplacement, _, _, _, _, _, _, _, _) = result2
 
       // Third snapshot: withdraw the delegated stake
       withdrawalEvent <- mkDelegatedStakeWithdraw(keyPair, hashedDelegatedStakeEvent)
@@ -1252,7 +1252,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, snapshotWithWithdrawal, _, _, _, _, _, _, _) = result3
+      (_, _, _, _, _, _, _, _, snapshotWithWithdrawal, _, _, _, _, _, _, _, _) = result3
 
       // Fourth snapshot: test withdrawal expiration (advance epoch significantly)
       result4 <- manager.accept(
@@ -1277,7 +1277,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _, _, _) = result4
+      (_, _, _, _, _, _, _, _, finalSnapshotInfo, _, _, _, _, _, _, _, _) = result4
     } yield
       expect.all(
         // First snapshot should have created the delegated stake
@@ -1389,7 +1389,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be rejected due to lower amount
@@ -1459,7 +1459,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be rejected due to equal amount
@@ -1534,7 +1534,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be rejected because reference not found
@@ -1601,7 +1601,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be rejected because reference not found in empty transactions
@@ -1672,7 +1672,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be rejected because source address doesn't match
@@ -1755,7 +1755,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
       // Determine which replacement was accepted
       acceptedReplacements = newSnapshotInfo.activeTokenLocks.get.getOrElse(address1, SortedSet.empty[Signed[TokenLock]])
       acceptedReplacement = acceptedReplacements.headOption
@@ -1852,7 +1852,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
       // Determine which replacement was accepted
       acceptedReplacements = newSnapshotInfo.activeTokenLocks.get.getOrElse(address1, SortedSet.empty[Signed[TokenLock]])
       acceptedReplacement = acceptedReplacements.headOption
@@ -1943,7 +1943,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be rejected due to insufficient balance
@@ -2016,7 +2016,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough
       )
 
-      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, tokenLockResult, _, _, _, _, _, newSnapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield
       expect.all(
         // Token lock replacement should be accepted

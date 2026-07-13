@@ -16,10 +16,12 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto._
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
 import io.constellationnetwork.schema.snapshot.{MetagraphSyncDataInfo, SnapshotInfo, StateProof}
 import io.constellationnetwork.schema.stateproof.StateProofBuilder
@@ -167,7 +169,14 @@ case class GlobalSnapshotInfo(
   // retention pruning keeps the last 4 periods (algorithm needs N-2; extra grace for reorgs).
   // Empty on V1/V2 upgrade and on genesis until the loader seeds it; eligibility / eta reads fall
   // through to the warmup branch (current GSI / genesis eta) in that case.
-  historicalStakeSnapshots: SortedMap[EtaPeriod, HistoricalStakeSnapshot]
+  historicalStakeSnapshots: SortedMap[EtaPeriod, HistoricalStakeSnapshot],
+  // Canonical unified operator-key registry. Per-operator histories and exact latest pointers are rooted in MPT fields 22/23.
+  // Carrying both in the current context makes full-state rebuild/bootstrap byte-equivalent to incremental acceptance.
+  kesRegistrationCerts: SortedMap[PeerId, SortedSet[KesRegistrationRecord]] = SortedMap.empty,
+  lastKesRegistrationRefs: SortedMap[PeerId, KesRegistrationReference] = SortedMap.empty,
+  // Immutable period-zero identity anchor. These signed atomic KES+VRF records live in rooted MPT field 24 and are never runtime
+  // registration history or an eligibility roster.
+  genesisOperatorKeys: SortedMap[PeerId, GenesisOperatorConsensusKey] = SortedMap.empty
 ) extends SnapshotInfo[GlobalSnapshotStateProof] {
 
   def toGlobalSnapshotInfo: GlobalSnapshotInfo =
@@ -189,7 +198,10 @@ case class GlobalSnapshotInfo(
       nodeCollateralWithdrawals,
       priceState,
       metagraphSyncData,
-      historicalStakeSnapshots
+      historicalStakeSnapshots,
+      kesRegistrationCerts,
+      lastKesRegistrationRefs,
+      genesisOperatorKeys
     )
 
   def stateProof[F[_]: Parallel: Async: Hasher: JsonSerializer](ordinal: SnapshotOrdinal)(

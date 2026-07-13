@@ -20,6 +20,7 @@ import io.constellationnetwork.node.shared.domain.cluster.services.{Cluster, Ses
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceManager
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.healthcheck.LocalHealthcheck
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.domain.node.UpdateNodeParametersAcceptanceManager
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralAcceptanceManager
 import io.constellationnetwork.node.shared.domain.priceOracle.PriceStateUpdater
@@ -56,10 +57,9 @@ import fs2.concurrent.SignallingRef
 
 object SharedServices {
 
-  /** Path 1 (heap-leak workstream): the default genesis eta seed used as a 32-byte fall-through whenever the §3 NIPoPoW boundary writer
-    * cannot derive eta from the chain (period 0, no chain-store, or empty chain walk). Mirrors the per-cluster constant the dag-l0
-    * `GlobalSnapshotConsensus.nakamotoGenesisEta` helper computes — both call sites produce byte-identical bytes so the MPT entry is
-    * deterministic across the leader (gl0 with chain-store walk) and the follower-path SharedServices GSAM (no-op walk → genesisEta).
+  /** Default 32-byte eta seed. Periods 0/1 derive their explicit bootstrap from it; periods N >= 2 use it only together with a
+    * proven-complete N-1 VRF-output range. Missing history never substitutes this seed. Mirrors the per-cluster constant the dag-l0
+    * `GlobalSnapshotConsensus.nakamotoGenesisEta` helper computes.
     *
     * Constructed lazily (not via `val`) because the Blake2b digest is a stateful instance; building one per call avoids accidental cross-
     * call mutation.
@@ -73,13 +73,11 @@ object SharedServices {
     out
   }
 
-  /** Path 1 (heap-leak workstream): default no-op chain walk for [[EtaStateManager]]. Layers without a chain store pass this (returns an
-    * empty list for every source-period query); the manager falls through to `genesisEta` on the cache miss, matching the pre-Path-1
-    * `Hash.empty` semantics in spirit but with a deterministic non-zero value (so the MPT entry is informative rather than a sentinel
-    * `Hash.empty`).
+  /** Default unavailable eta source for layers without a GL0 chain store. This is deliberately `Incomplete`, not an empty successful range:
+    * periods N >= 2 must defer unless a rooted MPT eta or a proven-complete N-1 ancestry range is available.
     */
-  def noopEtaChainWalk[F[_]: Async]: Long => F[List[(Long, Array[Byte])]] =
-    (_: Long) => Async[F].pure(List.empty[(Long, Array[Byte])])
+  def noopEtaChainWalk[F[_]: Async]: (Long, Option[Hash]) => F[EtaSourceRange] =
+    (_: Long, _: Option[Hash]) => Async[F].pure(EtaSourceRange.Incomplete(Nil))
 
   /** Path 1 (heap-leak workstream): hex-encode a 32-byte eta into the [[Hash]] shape the [[GlobalSnapshotAcceptanceManager]] boundary
     * writer stores in `HistoricalStakeSnapshot.eta`. Mirrors the inverse decode in
@@ -102,6 +100,14 @@ object SharedServices {
     (period: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
       HasherSelector[F].withCurrent { implicit hasher =>
         mgr.getEta(period.value).map(etaBytesToHash)
+      }
+
+  def etaForPeriodAtParentCallback[F[_]: Async: HasherSelector](
+    mgr: io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager[F]
+  ): (io.constellationnetwork.schema.nakamoto.EtaPeriod, io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId) => F[Hash] =
+    (period, parent) =>
+      HasherSelector[F].withCurrent { implicit hasher =>
+        mgr.getEtaAt(period.value, parent.value).map(etaBytesToHash)
       }
 
   def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: Metrics: Supervisor: JsonSerializer: KryoSerializer, A <: CliMethod](
@@ -127,24 +133,21 @@ object SharedServices {
     metagraphId: Option[Address],
     loggerBundle: LoggerBundle[F],
     // Path 1 (heap-leak workstream): genesis eta + chain-walk fallback for the [[EtaStateManager]]
-    // that backs the GSAM boundary-write callback. Default = a constant Blake2b-domain-string genesis
-    // and a no-op chain walk; layers that don't run a Nakamoto chain store (cl0, cl1, dl1, gl1) get
-    // `genesisEta`-bytes written at every boundary (period N reads `EtaStateManager.getEta(N)` which
-    // hits MPT first, then falls through to chain walk; empty walk → `genesisEta` per `EtaCalculation`
-    // convention). gl0 callers MAY override the chain-walk to thread `NakamotoChainStore.vrfOutputsForPeriod`
+    // that backs the GSAM boundary-write callback. Default = a constant Blake2b-domain-string bootstrap
+    // and an unavailable range. Layers without a local GL0 chain store must read a rooted/pinned eta; they
+    // cannot synthesize an N >= 2 eta from missing history. gl0 callers override the callback with an exact chain range
     // through a Ref (the chain store is built later in the Resource graph, so callers pass a closure that
     // reads from a `Ref[Option[NakamotoChainStoreAlgebra[F]]]`). See `GlobalSnapshotConsensus.make` for the
     // dag-l0 GSAM construction which also uses the same `EtaStateManager.make` shape.
     nakamotoGenesisEta: Array[Byte] = SharedServices.DefaultNakamotoGenesisEta,
-    nakamotoEtaChainWalkFallback: Option[Long => F[List[(Long, Array[Byte])]]] = None,
-    // Split-safety (#261): the genesis-derived KES + VRF registries the createContext / follower GSAM uses to verify embedded shard
+    nakamotoEtaChainWalkFallback: Option[(Long, Option[Hash]) => F[EtaSourceRange]] = None,
+    // Split-safety (#261): the genesis-derived atomic KES+VRF registry the createContext / follower GSAM uses to verify embedded shard
     // checkpoints IDENTICALLY to the gl0 produce + validateArtifact paths. With real VRF-VK committee sortition + KES, an empty registry
     // here would draw a DIFFERENT committee than the leader (and skip KES verify), so a follower could ADOPT a checkpoint the leader
     // REJECTED → StateProofMismatch split. The sole caller `TessellationIOApp.make` supplies these via the overridable
-    // `nakamotoShardRegistries` hook: gl0's `Main` loads the real genesis registries; layers that don't run shard-committee acceptance
+    // `nakamotoOperatorKeyRegistries` hook: gl0's `Main` loads the real genesis registry; layers that don't run shard-committee acceptance
     // (cl0/cl1/dl1/gl1) pass empty — byte-identical to before, since those layers don't activate shard-committee acceptance.
-    shardKesRegistry: io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[F],
-    shardVrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
+    operatorKeyRegistry: io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry[F]
   )(
     implicit globalStateProofSelector: GlobalStateProofSelector,
     currencyStateProofSelector: CurrencyStateProofSelector
@@ -241,11 +244,8 @@ object SharedServices {
       // Path 1 (heap-leak workstream): construct the [[EtaStateManager]] backing the GSAM `etaForPeriod` callback.
       //
       // The manager wraps an MPT-cache point read (`HistoricalStakeReader.lookup(period)`) + a caller-supplied chain-walk fallback.
-      // On the SharedServices side both the MPT cache and the chain walk are layer-agnostic — gl0 still gets a richer chain walk via
-      // the `GlobalSnapshotConsensus` GSAM (which has access to `NakamotoChainStore.vrfOutputsForPeriod`). Layers without a chain
-      // store (cl0, cl1, dl1, gl1) use the default no-op walk; their boundary write at `ord % R == R - 1` lands
-      // `genesisEta` for period 0 and the empty-chain-walk genesis fallback for every higher period (incl. the
-      // COMPUTED period 1, #259) until/unless a custom walk is wired.
+      // On the SharedServices side both the MPT cache and chain-range callback are layer-agnostic. GL0 installs an exact chain callback;
+      // downstream layers use their rooted/pinned GL0 eta. If neither exists, periods N >= 2 defer instead of inventing an eta.
       //
       // Wiring through a fresh MPT-only `GlobalStateReader.fromMptStore(storages.mptStore)` matches the existing
       // `HistoricalStakeReader` usage in `GlobalSnapshotConsensus.make` — both producer and reader observe the same per-key bytes that
@@ -259,6 +259,7 @@ object SharedServices {
           chainWalkFallback = nakamotoEtaChainWalkFallback.getOrElse(SharedServices.noopEtaChainWalk[F])
         )
       sharedEtaForPeriod = SharedServices.etaForPeriodCallback[F](etaStateManager)
+      sharedEtaForPeriodAtParent = SharedServices.etaForPeriodAtParentCallback[F](etaStateManager)
       // Track-3 S4: wire the overlay's base-revert hook to drop the eta walk cache on every base revert
       // (`MptOverlay.finalizeBranch` reorg-replace arms + `MptOverlay.revertToOrdinal`). After the drop,
       // `getEta` re-derives over the now-canonical chain via the MPT-lookup → chain-walk fallback
@@ -270,7 +271,7 @@ object SharedServices {
       // byte-identical to the pre-wiring call (the regression bar). See `ShardCheckpointWiring` scaladoc.
       //
       // The SharedServices GSAM is the verify/follower path (cl0/cl1/dl1/gl1 + gl0 follower). Activated sharding receives the same
-      // genesis-loaded KES and VRF registries as the GL0 producer path; missing registered keys fail checkpoint verification closed.
+      // genesis-loaded atomic KES+VRF registry as the GL0 producer path; missing registered keys fail checkpoint verification closed.
       // The active-validator set is the seedlist minus `metagraph-op` aliases, falling back to `{nodeId}`.
       // S3 committee re-execution: the SAME `GlobalSnapshotStateChannelEventsProcessor` this (verify/follower) GSAM
       // uses is built once and shared by the shard verifier's `reExecuteDerivation`, so the verifier re-runs the
@@ -285,17 +286,17 @@ object SharedServices {
         )
       shardAcceptanceDeps <- ShardCheckpointWiring.acceptanceDeps[F](
         cfg = cfg.nakamoto.sharding,
+        etaRotationSnapshots = cfg.nakamoto.etaRotationSnapshots(cfg.environment).value,
         // Draw/quorum decouple — cluster-uniform `nakamoto.committee` (shared with the per-metagraph gate). MUST match the gl0
         // produce path's params (split-safety #261): kDraw sizes the committee DRAW, kQuorum is the admit count `verifyEmbedded` needs.
         kDraw = cfg.nakamoto.committee.kDraw,
         kQuorum = cfg.nakamoto.committee.kQuorum,
         selfPeerId = nodeId,
-        // Split-safety (#261): the createContext / follower GSAM MUST use the SAME genesis-derived KES + VRF registries the gl0
+        // Split-safety (#261): the createContext / follower GSAM MUST use the SAME genesis-derived atomic KES+VRF registry the gl0
         // produce path uses, or `verifyEmbedded` draws a different committee (VRF) / skips KES verify and the adopt decision
-        // diverges → StateProofMismatch split. Passed in via `TessellationIOApp.nakamotoShardRegistries` (gl0 loads the real ones;
+        // diverges → StateProofMismatch split. Passed in via `TessellationIOApp.nakamotoOperatorKeyRegistries` (gl0 loads the real ones;
         // other layers + tests get empty — identical to before, since those layers don't activate shard-committee acceptance).
-        kesRegistry = shardKesRegistry,
-        vrfRegistry = shardVrfRegistry,
+        operatorKeyRegistry = operatorKeyRegistry,
         activeValidators = Async[F].pure(
           seedlist
             .map(_.collect { case e if !e.alias.exists(_.value.value == "metagraph-op") => e.peerId })
@@ -370,7 +371,7 @@ object SharedServices {
       // `createContext` path threads `signedArtifact.fraudProofs` into accept(); this validator re-validates each one identically. `None` at
       // `numShards = 1` (`shardAcceptanceDeps = None`) ⇒ carried fraud proofs (always empty there) ignored ⇒ byte-identical regression bar.
       createContextInvalidStateProofValidator = shardAcceptanceDeps match {
-        case Some(_) =>
+        case Some(deps) =>
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
           // Track-1 execution-base-pin (FINDING-B1): the SAME pinned reader-resolution as `reExecuteDerivation` above — the honest
           // re-derivation reads S(N) at the DISPUTED checkpoint's own `executionBaseOrdinal`, never this follower's live base. A follower
@@ -403,12 +404,14 @@ object SharedServices {
             io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
               reDerivePerMgRoot = reDerive,
               slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader
-                .fromMptStore[F](storages.mptStore)
+                .fromMptStore[F](storages.mptStore),
+              verifyExecutionCertificate = deps.acceptanceManager.verifyExecutionCertificate
             )(Async[F], implicitly[SecurityProvider[F]], h)
           ): Option[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
         case None =>
           Option.empty[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]]
       }
+      anchoredConsensusKeyClaims <- GlobalSnapshotAcceptanceManager.anchoredConsensusKeyClaimsFromRegistry(operatorKeyRegistry)
       globalSnapshotAcceptanceManager <- GlobalSnapshotAcceptanceManager.make(
         cfg.fieldsAddedOrdinals,
         cfg.metagraphsSync,
@@ -437,7 +440,7 @@ object SharedServices {
         // Path 1 (heap-leak workstream): wire the eta callback so the boundary-write at `ord % R == R - 1` lands a
         // real computed eta in the `HistoricalStakeSnapshot` MPT entry instead of `Hash.empty`. The callback is backed
         // by an [[EtaStateManager]] (MPT cache + caller-supplied chain-walk fallback) constructed above.
-        etaForPeriod = Some(sharedEtaForPeriod),
+        etaForPeriod = Some(sharedEtaForPeriodAtParent),
         // Hierarchical-shard-checkpoints v1 acceptance-side deps. `None` at `numShards = 1` (regression bar);
         // `Some(...)` activates the shard-checkpoint admission path inside `accept()`. The same
         // `ShardCheckpointWiring.acceptanceDeps` result feeds both GSAM construction sites so they stay consistent.
@@ -451,7 +454,17 @@ object SharedServices {
         invaliditySlashingConfig = cfg.nakamoto.invaliditySlashing,
         // WATCHTOWER on-chain dispute verdict (W3a): re-validate carried fraud proofs on the `createContext` path so gl0 followers slash
         // identically and reproduce the signed mptRoot. `None` at numShards=1.
-        invalidStateProofValidator = createContextInvalidStateProofValidator
+        invalidStateProofValidator = createContextInvalidStateProofValidator,
+        kesRegistrationAcceptanceManagerForHasher = Some { registrationHasher: Hasher[F] =>
+          implicit val h: Hasher[F] = registrationHasher
+          io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertAcceptanceManager.make[F](
+            io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.make[F](
+              validators.signedValidator,
+              seedlist
+            )
+          )
+        },
+        anchoredConsensusKeyClaims = anchoredConsensusKeyClaims
       )
       globalSnapshotContextFns = GlobalSnapshotContextFunctions.make(
         globalSnapshotAcceptanceManager,
@@ -491,9 +504,9 @@ object SharedServices {
         shardAcceptanceDeps = shardAcceptanceDeps,
         // The genesis-loaded VRF identity registry is also load-bearing for the per-binary
         // admission committee, which remains active when execution sharding is disabled.
-        // Expose the exact instance passed into SharedServices so the admission gate never
-        // falls back to an in-band, sender-selected verification key.
-        vrfRegistry = shardVrfRegistry
+        // Expose the exact atomic registry passed into SharedServices so GL0 consensus and
+        // admission never re-read a mutable genesis path or fall back to in-band keys.
+        operatorKeyRegistry = operatorKeyRegistry
       ) {}
 }
 
@@ -517,7 +530,7 @@ sealed abstract class SharedServices[F[_], A <: CliMethod] private (
   // Task #44 — the single per-node shard acceptance deps, owned here and threaded into the gl0-leader
   // produce path (`GlobalSnapshotConsensus.make`) so adopt ↔ produce ↔ heal share ONE registry.
   val shardAcceptanceDeps: Option[ShardCheckpointWiring.AcceptanceDeps[F]],
-  // Genesis-bound operator VRF identities. Admission sortition consumes this even at
-  // `numShards = 1`; execution-shard activation must not control identity verification.
-  val vrfRegistry: io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[F]
+  // Genesis-bound operator KES/VRF identities. Derived projections remain compatibility adapters;
+  // this atomic registry is the only authority object threaded through the application.
+  val operatorKeyRegistry: io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry[F]
 )

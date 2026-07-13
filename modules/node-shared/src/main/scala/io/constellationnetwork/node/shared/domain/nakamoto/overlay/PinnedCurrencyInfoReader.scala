@@ -44,10 +44,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * '''Retention (version depth this reader can serve depends ENTIRELY on the injected `byteStore`):'''
   *   - gl0 produce/validate rail: `byteStore` = the `signedBytesStore` (`<mptSnapshotInfoPath>_signed`,
-  *     `ContiguousOrdinalCutoff(keepDepthBehindFinalized)`) — a CONTIGUOUS window of k₂ = 100·k₁ finalized ordinals after Track-3 S2
-  *     (raised from the old, stale 512), whose bytes reproduce the signed `mptRoot` by construction. Serves any anchor within k₂ of the
-  *     finalized tip; only anchors deeper than the k₂ absolute floor hard-reject. (S2 raised the DISK depth; the deep-revert EXECUTOR that
-  *     consumes it is S4.)
+  *     `ContiguousOrdinalCutoff(keepDepthBehindFinalized)`) — a contiguous local k2 = 100*k1 retention window (raised from stale 512),
+  *     whose bytes reproduce the signed `mptRoot`. Missing older bytes hard-reject this read; k2 is not an absolute fork-choice/finality
+  *     floor. Objective comparison that needs older state must enter RecoveryRequired and reconstruct exact authenticated history.
   *   - follower `createContext` rail (cl0/dl1): `byteStore` = a read-only view over the producer's `mpt_snapshot_info` store, which prunes
   *     with `LogarithmicOrdinalCutoff` — a SPARSE, gappy retention below the head. By-ordinal reads at an arbitrary past ordinal MISS
   *     unless that ordinal happens to sit on the logarithmic ladder ⇒ this rail hard-rejects most anchors. '''Track-3 S2 decision: the

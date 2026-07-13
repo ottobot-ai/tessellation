@@ -6,10 +6,10 @@ import cats.syntax.all._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
-import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, StakeRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
-import io.constellationnetwork.schema.nakamoto.LddConfig
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security._
@@ -38,8 +38,59 @@ object NakamotoSnapshotValidator {
   final case class VrfFailed(slot: Long, detail: String) extends Invalid
   final case class SignatureInvalid(ordinal: Long) extends Invalid
   final case class KesInvalid(ordinal: Long) extends Invalid
+  final case class HistoricalEtaUnavailable(period: Long, parentHash: Hash) extends Invalid
   final case class ContentMismatch(detail: String) extends Invalid
   final case class PayloadMissing(ordinal: Long) extends Invalid
+
+  /** Resolve the only VRF verification key authorized for `producerId` and require the wire key to match it exactly. The key carried by a
+    * snapshot is evidence for portable verification, never an identity-registration source.
+    *
+    * This currently reads the frozen genesis registry. The runtime operator-key epic replaces that registry with a candidate-parent,
+    * activation-era view while preserving this fail-closed contract.
+    */
+  private[nakamoto] def resolveRegisteredOperatorKeys[F[_]: Async](
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
+    producerId: PeerId,
+    carriedVrfPublicKey: Array[Byte],
+    artifactPeriod: EtaPeriod
+  ): F[Option[io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys]] =
+    if (carriedVrfPublicKey.length != io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.ExpectedLength)
+      none[io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys].pure[F]
+    else
+      ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, producerId, artifactPeriod).map {
+        _.filter { keys =>
+          java.security.MessageDigest.isEqual(keys.vrfPublicKey.toBytes, carriedVrfPublicKey)
+        }
+      }
+
+  /** Validate signed slot lineage against the exact retained GL0 parent and bound every embedded shard checkpoint to the containing
+    * snapshot's signed protocol slot. These are artifact-validity checks: receiver wall clock and transport-provided `parentSlot` are not
+    * authoritative inputs.
+    */
+  private[nakamoto] def validateSlotLineage(
+    certificate: io.constellationnetwork.schema.nakamoto.slot.SlotCertificate,
+    parentCertificate: Option[io.constellationnetwork.schema.nakamoto.slot.SlotCertificate],
+    embeddedCheckpointSlots: Iterable[(io.constellationnetwork.schema.sharding.ShardId, Slot)]
+  ): Either[String, Unit] = {
+    val expectedParentSlot = parentCertificate.fold(Slot.MinValue)(_.slot)
+
+    if (certificate.parentSlot =!= expectedParentSlot)
+      Left(
+        s"SlotCertificate parentSlot (${certificate.parentSlot.value.value}) != retained parent slot " +
+          s"(${expectedParentSlot.value.value})"
+      )
+    else if (certificate.slot.value.value <= expectedParentSlot.value.value)
+      Left(
+        s"SlotCertificate slot (${certificate.slot.value.value}) must be strictly greater than retained parent slot " +
+          s"(${expectedParentSlot.value.value})"
+      )
+    else
+      embeddedCheckpointSlots.collectFirst {
+        case (shardId, checkpointSlot) if checkpointSlot.value.value > certificate.slot.value.value =>
+          s"embedded shard checkpoint slot (${checkpointSlot.value.value}) exceeds containing GL0 slot " +
+            s"(${certificate.slot.value.value}) for shard=${shardId.value.value}"
+      }.toLeft(())
+  }
 
   def validate[F[_]: Async: SecurityProvider: HasherSelector](
     signedSnapshot: Signed[GlobalIncrementalSnapshot],
@@ -49,7 +100,9 @@ object NakamotoSnapshotValidator {
     producerIdBytes: Array[Byte],
     eta: Array[Byte],
     slotGap: Long,
+    etaRotationSnapshots: Long,
     stakeRegistry: StakeRegistry[F],
+    operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
     consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
@@ -81,16 +134,23 @@ object NakamotoSnapshotValidator {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoValidator")
     val producerHex = Hex(producerIdBytes.map("%02x".format(_)).mkString)
     val producerId = PeerId(producerHex)
+    val parentOrdinal = math.max(0L, signedSnapshot.ordinal.value.value - 1L)
+    val artifactPeriod = EtaPeriod(EtaCalculation.rotationPeriod(parentOrdinal, etaRotationSnapshots))
+    val stakeLookbackPeriod: EtaPeriod = EtaCalculation.leaderStakeLookbackPeriod(parentOrdinal, etaRotationSnapshots)
 
     for {
       // ── Step 1: VRF proof verification ──
-      producerStake <- stakeRegistry.relativeStake(producerId)
+      producerStake <- stakeRegistry.relativeStakeAt(producerId, stakeLookbackPeriod)
 
-      vrfValid <-
-        if (vrfPublicKey.isEmpty || vrfProof.isEmpty) false.pure[F]
-        else
+      registeredVrfPublicKey = Option.when(
+        ActiveOperatorConsensusKeys.isValidAt(operatorKeys, producerId, artifactPeriod) &&
+          java.security.MessageDigest.isEqual(operatorKeys.vrfPublicKey.toBytes, vrfPublicKey)
+      )(operatorKeys.vrfPublicKey.toBytes)
+
+      vrfValid <- registeredVrfPublicKey match {
+        case Some(registeredKey) if vrfProof.nonEmpty =>
           eligibilityChecker.verifyEligibility(
-            vrfVK = vrfPublicKey,
+            vrfVK = registeredKey,
             slot = Slot(NonNegLong.unsafeFrom(slot)),
             slotGap = slotGap,
             eta = eta,
@@ -98,12 +158,23 @@ object NakamotoSnapshotValidator {
             config = lddConfig,
             proof = vrfProof
           )
+        case _ => false.pure[F]
+      }
 
       result <-
         if (!vrfValid) {
           logger
-            .warn(s"❌ VRF failed: slot=$slot producer=${producerHex.value.take(8)} stake=$producerStake gap=$slotGap")
-            .as(VrfFailed(slot, s"producer=${producerHex.value.take(8)} stake=$producerStake gap=$slotGap"): ValidationResult)
+            .warn(
+              s"❌ VRF failed: slot=$slot producer=${producerHex.value.take(8)} stake=$producerStake gap=$slotGap " +
+                s"registeredIdentity=${registeredVrfPublicKey.nonEmpty}"
+            )
+            .as(
+              VrfFailed(
+                slot,
+                s"producer=${producerHex.value.take(8)} stake=$producerStake gap=$slotGap " +
+                  s"registeredIdentity=${registeredVrfPublicKey.nonEmpty}"
+              ): ValidationResult
+            )
         } else {
           // ── Step 2: Signature verification ──
           HasherSelector[F].withCurrent { implicit hasher =>
@@ -125,6 +196,12 @@ object NakamotoSnapshotValidator {
                     val expectedSubchain = lastSignedArtifact.value.slotCertificate
                       .fold(io.constellationnetwork.schema.nakamoto.slot.SlotCertificate.ZeroSubchainLevelCounts)(_.subchainLevelCounts)
 
+                    val slotLineage = validateSlotLineage(
+                      cert,
+                      lastSignedArtifact.value.slotCertificate,
+                      signedSnapshot.value.shardCheckpoints.iterator.map { case (shardId, checkpoint) => shardId -> checkpoint.slot }.toList
+                    )
+
                     // Verify cert slot matches gossip slot
                     if (cert.slot.value.value != slot)
                       Left(s"SlotCertificate slot (${cert.slot.value.value}) != gossip slot ($slot)")
@@ -140,6 +217,8 @@ object NakamotoSnapshotValidator {
                         s"SlotCertificate.subchainLevelCounts (${cert.subchainLevelCounts.mkString(",")}) " +
                           s"!= expected carry-forward (${expectedSubchain.mkString(",")})"
                       )
+                    else if (slotLineage.isLeft)
+                      slotLineage
                     else
                       Right(())
                 }

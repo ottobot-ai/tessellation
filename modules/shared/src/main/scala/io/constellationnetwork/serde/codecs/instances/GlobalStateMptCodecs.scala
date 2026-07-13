@@ -15,7 +15,7 @@ import io.constellationnetwork.schema.tokenLock.TokenLock
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.OptionCodec.option
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
@@ -49,10 +49,10 @@ object GlobalStateMptCodecs {
   private val signedCurrencyIncrementalSnapshotCodec = signedCodecFor(currencyIncrementalSnapshotCodec)
 
   implicit val signedAllowSpendSetCodec: ImmutableCodec[SortedSet[Signed[AllowSpend]]] =
-    ImmutableCodec.fromScodecCodec(sortedSet(signedAllowSpendCodec))
+    ImmutableCodec.fromScodecCodec(sortedSetCanonical(signedAllowSpendCodec))
 
   implicit val signedTokenLockSetCodec: ImmutableCodec[SortedSet[Signed[TokenLock]]] =
-    ImmutableCodec.fromScodecCodec(sortedSet(signedTokenLockCodec))
+    ImmutableCodec.fromScodecCodec(sortedSetCanonical(signedTokenLockCodec))
 
   implicit val delegatedStakeRecordSetCodec: ImmutableCodec[SortedSet[DelegatedStakeRecord]] =
     ImmutableCodec.fromScodecCodec(sortedSet(delegatedStakeRecordCodec))
@@ -72,7 +72,7 @@ object GlobalStateMptCodecs {
     * reverse, which is fine for the bounded chains expected here (kept short by §1.2 rotation cadence).
     */
   implicit val kesRegistrationRecordSetCodec: ImmutableCodec[SortedSet[KesRegistrationRecord]] =
-    ImmutableCodec.fromScodecCodec(sortedSet(kesRegistrationRecordCodec))
+    ImmutableCodec.fromScodecCodec(sortedSetCanonical(kesRegistrationRecordCodec))
 
   implicit val signedCurrencySnapshotImmutableCodec: ImmutableCodec[Signed[CurrencySnapshot]] =
     ImmutableCodec.fromScodecCodec(signedCurrencySnapshotCodec)
@@ -101,7 +101,7 @@ object GlobalStateMptCodecs {
     )
 
   implicit val allowSpendExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[AllowSpendExpiryKey]] =
-    ImmutableCodec.fromScodecCodec(sortedSet(allowSpendExpiryKeyCodec))
+    ImmutableCodec.fromScodecCodec(sortedSetCanonical(allowSpendExpiryKeyCodec))
 
   private val tokenLockExpiryKeyCodec: Codec[TokenLockExpiryKey] =
     (addressCodec :: hashCodec).xmap[TokenLockExpiryKey](
@@ -110,7 +110,7 @@ object GlobalStateMptCodecs {
     )
 
   implicit val tokenLockExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[TokenLockExpiryKey]] =
-    ImmutableCodec.fromScodecCodec(sortedSet(tokenLockExpiryKeyCodec))
+    ImmutableCodec.fromScodecCodec(sortedSetCanonical(tokenLockExpiryKeyCodec))
 
   private val nodeCollateralWithdrawalExpiryKeyCodec: Codec[NodeCollateralWithdrawalExpiryKey] =
     (addressCodec :: hashCodec).xmap[NodeCollateralWithdrawalExpiryKey](
@@ -119,7 +119,7 @@ object GlobalStateMptCodecs {
     )
 
   implicit val nodeCollateralWithdrawalExpiryKeySetImmutableCodec: ImmutableCodec[SortedSet[NodeCollateralWithdrawalExpiryKey]] =
-    ImmutableCodec.fromScodecCodec(sortedSet(nodeCollateralWithdrawalExpiryKeyCodec))
+    ImmutableCodec.fromScodecCodec(sortedSetCanonical(nodeCollateralWithdrawalExpiryKeyCodec))
 
   // ---- ActiveAddressIndex value codec --------------------------------------
 

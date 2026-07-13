@@ -9,18 +9,20 @@ import derevo.derive
 
 /** A validator's endorsement of a chain tip.
   *
-  * Replaces the 4 BFT declaration types (Facility/Proposal/MajoritySignature/BinarySignature) with a simpler Nakamoto-style attestation.
-  * Validators broadcast these after verifying a SlotCertificate to endorse the chain tip they consider canonical.
+  * GL0 uses this Nakamoto/Snow-family evidence instead of the inherited global BFT declaration lifecycle. A validator may emit one only
+  * after authenticating and locally executing the exact snapshot candidate, not merely after receiving a tip or verifying its slot proof.
   *
-  * GRANDPA-style finality: attestations finalize chains, not individual snapshots. When a tip accumulates ≥ 2/3+1 attestation weight, it
-  * and all its ancestors back to the last finalized tip become finalized.
+  * The attestation identifies an exact tip and therefore its ancestor prefix. It is input to the intended K/alpha/beta optimistic Phase-2
+  * cascade; it is not itself a BFT vote, lock, quorum certificate, or finality proof. The live cumulative-2/3 sink is transitional protocol
+  * debt and must not be inferred from this schema.
   *
   * TipAttestations are wrapped in Signed[TipAttestation] for transport and verification.
   *
   * `attestedAt` is wall-clock epoch milliseconds at the time of attestation, sourced via `Clock[F].realTime` (NEVER
   * `System.currentTimeMillis()`). It is **NOT** a consensus slot — wall-clock semantics here are deliberate, to keep the door open for a
-  * future Ouroboros Chronos-style time-sync layer that reuses the attestation gossip topic as a timestamp-claim transport. Today it is only
-  * used by `TipTracker.recordAttestation` for the "newer wins" rule, which compares Longs.
+  * future Ouroboros Chronos-style time-sync layer that reuses the attestation gossip topic as a timestamp-claim transport. Today it is used
+  * by the transitional `TipTracker.recordAttestation` "newer wins" rule. Receiver-local wall-clock ordering cannot be a target consensus
+  * input.
   */
 @derive(decoder, encoder, eqv, show)
 case class TipAttestation(

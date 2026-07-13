@@ -1,21 +1,22 @@
+%% TARGET DESIGN: a Phase-1 branch reorg above an unchanged exact Phase-2 base.
 flowchart TD
-    F100["gl0 F_100<br/>(finalized, Phase 2+)"]
-    F100 --> Na["gl0 N_a (Phase 1)<br/>shardCheckpoints 0:cpA"]
-    F100 --> Nb["gl0 N_b (Phase 1)<br/>WINS via maxvalid-tk"]
-    Na -. "Phase-1 reorg: best-tip a to b<br/>(reorg is ABOVE finalized F_100)" .-> Nb
-    Nb --> Re["leader-b re-includes the SAME cpA<br/>accept where gl0AnchorOrdinal <= N_b"]
+    F100["GL0 F_100<br/>exact Phase-2 operational ref<br/>(ordinal, hash, root)"]
+    F100 --> Na["GL0 N_a (Phase 1)<br/>shardCheckpoints 0:cpA"]
+    F100 --> Nb["GL0 N_b (Phase 1)<br/>WINS via maxvalid-tk"]
+    Na -. "Phase-1 reorg: canonical tine a to b<br/>(reorg is above unchanged F_100)" .-> Nb
+    Nb --> Re["leader b may re-include the SAME cpA<br/>only while cpA's exact base remains canonical<br/>and parent/ordinal continuity still holds"]
 
-    subgraph MG["metagraph_A — keeps growing, untouched"]
+    subgraph MG["Metagraph A — keeps growing, untouched"]
         direction LR
         CAk["CA_k<br/>gsv = F_100"] --> CAk1["CA_k+1"] --> CAk2["CA_k+2"]
     end
-    subgraph SH["Shard-0 committee chain — untouched"]
+    subgraph SH["Shard-0 checkpoint chain — untouched"]
         direction LR
         cpAs["cpA_s"] --> cpAs1["cpA_s+1"]
     end
 
-    F100 -. "ml0 pinned FINALIZED F_100 (below the reorg)<br/>so consumed state is unchanged -> snapshots valid" .-> CAk
-    cpAs1 -. "content-addressed + committee-signed<br/>so re-anchorable into the winning branch" .-> Re
+    F100 -. "ML0 pinned exact Phase-2 F_100 below the reorg;<br/>consumed state is unchanged, so snapshots remain valid" .-> CAk
+    cpAs1 -. "execution-threshold signatures attest independently replayed<br/>exact inputs, diff, and root at F_100;<br/>ordinary GL0 still applies diff and recomputes root" .-> Re
 
     classDef win fill:#e8f5e9,stroke:#2e7d32,color:#13361a;
     classDef lose fill:#fdecea,stroke:#c62828,color:#4d130f;

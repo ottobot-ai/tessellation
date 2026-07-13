@@ -11,14 +11,14 @@ import scala.collection.immutable.SortedSet
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay.OverlayMode
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, GlobalStateReader, MptOverlay}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry, ParentChildTree}
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -36,9 +36,9 @@ import weaver.MutableIOSuite
 /** Golden tests for the MPT-backed MutableKesRegistry overlay (Slice 10 / #179). Asserts:
   *
   *   - genesis-only lookups continue to resolve from the base registry
-  *   - a runtime cert persisted in MPT with `effectiveFromEpoch <= currentEpoch` overrides the genesis entry
-  *   - a runtime cert with future `effectiveFromEpoch` is held "pending" — genesis still wins
-  *   - rotations apply (newer accepted cert with `effectiveFromEpoch <= currentEpoch` overrides earlier one)
+  *   - a runtime cert persisted in MPT with `effectiveFromPeriod <= currentPeriod` overrides the genesis entry
+  *   - a runtime cert with future `effectiveFromPeriod` is held "pending" — genesis still wins
+  *   - rotations apply (newer accepted cert with `effectiveFromPeriod <= currentPeriod` overrides earlier one)
   *   - '''statelessness''': `MutableKesRegistry.make` allocates no mutable state — two registries built over the same reader give
   *     byte-equivalent lookups (the registry IS a pure read overlay over MPT)
   *   - '''persistence''': MPT bytes survive across `MptStore.make` restart cycles over the same underlying producer — proves the producer
@@ -62,20 +62,39 @@ object MutableKesRegistrySuite extends MutableIOSuite {
 
   private def mkCert(
     operatorId: PeerId,
-    effectiveFromEpoch: EpochProgress,
+    effectiveFromPeriod: EtaPeriod,
     ordinal: KesRegistrationOrdinal = KesRegistrationOrdinal.first,
     parent: KesRegistrationReference = KesRegistrationReference.empty,
     kesMasterVK: Hex = Hex("11" * 32),
-    offset: Long = 0L
+    offset: Option[Long] = None
   ): KesRegistrationCert =
     KesRegistrationCert(
       operatorPeerId = operatorId,
       kesMasterVK = kesMasterVK,
       kesMasterVKStep = 0,
-      offset = offset,
-      effectiveFromEpoch = effectiveFromEpoch,
+      offset = offset.getOrElse(effectiveFromPeriod.value),
+      vrfPublicKey = Hex("22" * 32),
+      effectiveFromPeriod = effectiveFromPeriod,
+      registrationParentHash = Hash("aa" * 32),
       ordinal = ordinal,
       parent = parent
+    )
+
+  private def genesisRegistry(
+    operatorId: PeerId,
+    kes: KesRegistryEntry,
+    vrfByte: Byte = 0x66.toByte
+  ): OperatorConsensusKeyRegistry[IO] =
+    OperatorConsensusKeyRegistry.make[IO](
+      Map(
+        operatorId -> OperatorConsensusKeys(
+          operatorId,
+          kes,
+          io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.fromBytes(Array.fill(32)(vrfByte)),
+          EtaPeriod.Zero,
+          None
+        )
+      )
     )
 
   /** Build an in-memory MPT-backed GlobalStateReader plus an effectful "write a cert" helper. The writes go directly through MptStore
@@ -142,51 +161,85 @@ object MutableKesRegistrySuite extends MutableIOSuite {
     implicit val (j, h, _, _, operatorId) = res
     val genesisVk = VerificationKeyKesProduct(Array.fill(32)(0x33.toByte), 0)
     val genesisEntry = KesRegistryEntry(genesisVk, 0L)
-    val base = KesRegistry.make[IO](Map(operatorId -> genesisEntry))
+    val base = genesisRegistry(operatorId, genesisEntry)
     for {
       (reader, _) <- mkMptHarness
       mut <- MutableKesRegistry.make[IO](base, reader)
-      result <- mut.getKesVk(operatorId, EpochProgress(NonNegLong(50L)))
+      result <- mut.getKesVk(operatorId, EtaPeriod(50L))
+      pair <- mut.getConsensusKeys(operatorId, EtaPeriod(50L))
+      vrf <- mut.getVrfVk(operatorId, EtaPeriod(50L))
     } yield
       expect.all(
         result.isDefined,
         result.exists(_.vk == genesisVk),
-        result.exists(_.offset == 0L)
+        result.exists(_.offset == 0L),
+        pair.exists(_.kes.vk == genesisVk),
+        pair.exists(_.registration.isEmpty),
+        vrf.exists(_.toBytes.sameElements(Array.fill(32)(0x66.toByte)))
       )
+  }
+
+  test("genesis lookup fails closed when the atomic paired identity is absent") { res =>
+    implicit val (j, h, _, _, operatorId) = res
+    val empty = OperatorConsensusKeyRegistry.empty[IO]
+    for {
+      (reader, _) <- mkMptHarness
+      registry <- MutableKesRegistry.make[IO](empty, reader)
+      pair <- registry.getConsensusKeys(operatorId, EtaPeriod(50L))
+      kes <- registry.getKesVk(operatorId, EtaPeriod(50L))
+      vrf <- registry.getVrfVk(operatorId, EtaPeriod(50L))
+    } yield expect.all(pair.isEmpty, kes.isEmpty, vrf.isEmpty)
+  }
+
+  test("paired lookup fails closed for a negative evaluation period") { res =>
+    implicit val (j, h, _, _, operatorId) = res
+    val base = genesisRegistry(
+      operatorId,
+      KesRegistryEntry(VerificationKeyKesProduct(Array.fill(32)(0x33.toByte), 0), 0L)
+    )
+    for {
+      (reader, _) <- mkMptHarness
+      registry <- MutableKesRegistry.make[IO](base, reader)
+      result <- registry.getConsensusKeys(operatorId, EtaPeriod(-1L))
+    } yield expect(result.isEmpty)
   }
 
   test("a runtime cert in MPT whose effective-epoch has arrived overrides genesis") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
     val genesisVk = VerificationKeyKesProduct(Array.fill(32)(0x33.toByte), 0)
-    val base = KesRegistry.make[IO](Map(operatorId -> KesRegistryEntry(genesisVk, 0L)))
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("aa" * 32))
+    val base = OperatorConsensusKeyRegistry.empty[IO]
+    val cert = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("aa" * 32))
     for {
       signed <- forAsyncHasher(cert, kp)
       (reader, store) <- mkMptHarness
       _ <- writeRecord(store, KesRegistrationRecord(signed, SnapshotOrdinal.MinValue))
       mut <- MutableKesRegistry.make[IO](base, reader)
-      result <- mut.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      result <- mut.getKesVk(operatorId, EtaPeriod(150L))
+      pair <- mut.getConsensusKeys(operatorId, EtaPeriod(150L))
     } yield
       expect.all(
         result.isDefined,
         result.exists(_.vk.value.length == 32),
         result.exists(_.vk.value.sameElements(Hex("aa" * 32).toBytes)),
-        result.exists(_.vk != genesisVk)
+        result.exists(_.vk != genesisVk),
+        pair.exists(_.kes.vk.value.sameElements(Hex("aa" * 32).toBytes)),
+        pair.exists(_.vrfPublicKey.toBytes.sameElements(Hex("22" * 32).toBytes)),
+        pair.flatMap(_.registration).exists(_.event.value === cert)
       )
   }
 
   test("a runtime cert with future effective-epoch is held pending — genesis still wins") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
     val genesisVk = VerificationKeyKesProduct(Array.fill(32)(0x33.toByte), 0)
-    val base = KesRegistry.make[IO](Map(operatorId -> KesRegistryEntry(genesisVk, 0L)))
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(300L)), kesMasterVK = Hex("bb" * 32))
+    val base = genesisRegistry(operatorId, KesRegistryEntry(genesisVk, 0L))
+    val cert = mkCert(operatorId, EtaPeriod(300L), kesMasterVK = Hex("bb" * 32))
     for {
       signed <- forAsyncHasher(cert, kp)
       (reader, store) <- mkMptHarness
       _ <- writeRecord(store, KesRegistrationRecord(signed, SnapshotOrdinal.MinValue))
       mut <- MutableKesRegistry.make[IO](base, reader)
-      // currentEpoch (100) < effectiveFromEpoch (300), so runtime is pending; genesis still resolves.
-      result <- mut.getKesVk(operatorId, EpochProgress(NonNegLong(100L)))
+      // currentPeriod (100) < effectiveFromPeriod (300), so runtime is pending; genesis still resolves.
+      result <- mut.getKesVk(operatorId, EtaPeriod(100L))
     } yield
       expect.all(
         result.isDefined,
@@ -194,17 +247,17 @@ object MutableKesRegistrySuite extends MutableIOSuite {
       )
   }
 
-  test("later rotation overrides earlier runtime cert once its effective-epoch arrives") { res =>
+  test("pending rotation preserves the prior active runtime key, then overrides at its effective period") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val base = KesRegistry.empty[IO]
-    val cert1 = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("aa" * 32))
+    val base = OperatorConsensusKeyRegistry.empty[IO]
+    val cert1 = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("aa" * 32))
     for {
       signed1 <- forAsyncHasher(cert1, kp)
       hashed1 <- signed1.toHashed
       ref1 = KesRegistrationReference.of(hashed1)
       cert2 = mkCert(
         operatorId,
-        EpochProgress(NonNegLong(200L)),
+        EtaPeriod(200L),
         ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
         parent = ref1,
         kesMasterVK = Hex("cc" * 32)
@@ -213,16 +266,42 @@ object MutableKesRegistrySuite extends MutableIOSuite {
       (reader, store) <- mkMptHarness
       _ <- writeRecord(store, KesRegistrationRecord(signed1, SnapshotOrdinal.MinValue))
       mut1 <- MutableKesRegistry.make[IO](base, reader)
-      // currentEpoch (150) >= cert1.effective (100) but only cert1 written → cert1 active.
-      mid <- mut1.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      // currentPeriod (150) >= cert1.effective (100) but only cert1 written -> cert1 active.
+      mid <- mut1.getKesVk(operatorId, EtaPeriod(150L))
       _ <- writeRecord(store, KesRegistrationRecord(signed2, SnapshotOrdinal(NonNegLong(1L))))
-      // After cert2 written, currentEpoch (250) >= both → cert2 wins (LastKesRegistrationRefs pinned to cert2).
-      later <- mut1.getKesVk(operatorId, EpochProgress(NonNegLong(250L)))
+      pendingRotation <- mut1.getKesVk(operatorId, EtaPeriod(150L))
+      // After cert2 written, currentPeriod (250) >= both -> cert2 wins (LastKesRegistrationRefs pinned to cert2).
+      later <- mut1.getKesVk(operatorId, EtaPeriod(250L))
     } yield
       expect.all(
         mid.exists(_.vk.value.sameElements(Hex("aa" * 32).toBytes)),
+        pendingRotation.exists(_.vk.value.sameElements(Hex("aa" * 32).toBytes)),
         later.exists(_.vk.value.sameElements(Hex("cc" * 32).toBytes))
       )
+  }
+
+  test("a pointer-selected cert with a missing exact parent fails closed instead of falling back to genesis") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val genesisVk = VerificationKeyKesProduct(Array.fill(32)(0x33.toByte), 0)
+    val base = genesisRegistry(operatorId, KesRegistryEntry(genesisVk, 0L))
+    val cert1 = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("aa" * 32))
+    val missingParent = KesRegistrationReference(KesRegistrationOrdinal.first, Hash("ff" * 32))
+    val cert2 = mkCert(
+      operatorId,
+      EtaPeriod(200L),
+      ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
+      parent = missingParent,
+      kesMasterVK = Hex("cc" * 32)
+    )
+    for {
+      signed1 <- forAsyncHasher(cert1, kp)
+      signed2 <- forAsyncHasher(cert2, kp)
+      (reader, store) <- mkMptHarness
+      _ <- writeRecord(store, KesRegistrationRecord(signed1, SnapshotOrdinal.MinValue))
+      _ <- writeRecord(store, KesRegistrationRecord(signed2, SnapshotOrdinal(NonNegLong(1L))))
+      registry <- MutableKesRegistry.make[IO](base, reader)
+      result <- registry.getKesVk(operatorId, EtaPeriod(250L))
+    } yield expect(result.isEmpty)
   }
 
   test(
@@ -233,8 +312,8 @@ object MutableKesRegistrySuite extends MutableIOSuite {
     // so it only demonstrates that `make` allocates zero per-instance mutable state — two registries over the
     // same reader give byte-equivalent lookups. The real durability assertion is the "persistence across
     // MptStore restart" test below, which threads a SECOND MptStore over the same producer.
-    val base = KesRegistry.empty[IO]
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("ab" * 32))
+    val base = OperatorConsensusKeyRegistry.empty[IO]
+    val cert = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("ab" * 32))
     for {
       signed <- forAsyncHasher(cert, kp)
       record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
@@ -242,9 +321,9 @@ object MutableKesRegistrySuite extends MutableIOSuite {
       _ <- writeRecord(store, record)
       // Two distinct registry instances, same reader. Stateless make() means they observe identical state.
       mut1 <- MutableKesRegistry.make[IO](base, reader)
-      r1 <- mut1.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      r1 <- mut1.getKesVk(operatorId, EtaPeriod(150L))
       mut2 <- MutableKesRegistry.make[IO](base, reader)
-      r2 <- mut2.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      r2 <- mut2.getKesVk(operatorId, EtaPeriod(150L))
       list2 <- mut2.runtimeCertsFor(operatorId)
     } yield
       expect.all(
@@ -266,8 +345,8 @@ object MutableKesRegistrySuite extends MutableIOSuite {
     // (the `MptStore` is a thin Ref+Semaphore wrapper over `producer.entries`), this proves the producer IS the
     // source of truth — not anything the `MptStore` instance caches.
     implicit val (j, h, sp, kp, operatorId) = res
-    val base = KesRegistry.empty[IO]
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("ce" * 32))
+    val base = OperatorConsensusKeyRegistry.empty[IO]
+    val cert = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("ce" * 32))
     for {
       signed <- forAsyncHasher(cert, kp)
       record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
@@ -276,12 +355,12 @@ object MutableKesRegistrySuite extends MutableIOSuite {
       store1 <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
       _ <- writeRecord(store1, record)
       mut1 <- MutableKesRegistry.make[IO](base, GlobalStateReader.fromMptStore[IO](store1))
-      r1 <- mut1.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      r1 <- mut1.getKesVk(operatorId, EtaPeriod(150L))
       // Phase 2: drop store1 + mut1. Build store2 over the SAME producer. The producer holds the byte state;
       // store2 starts with a fresh Ref/Semaphore but reads through the producer's entries.
       store2 <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
       mut2 <- MutableKesRegistry.make[IO](base, GlobalStateReader.fromMptStore[IO](store2))
-      r2 <- mut2.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      r2 <- mut2.getKesVk(operatorId, EtaPeriod(150L))
       list2 <- mut2.runtimeCertsFor(operatorId)
       // Witness that the producer is the load-bearing component — keeping the producer alive across the
       // store boundary is exactly the contract that real disk-backed producers (RocksDB etc.) provide.
@@ -300,18 +379,18 @@ object MutableKesRegistrySuite extends MutableIOSuite {
   test("REORG: removing the runtime cert from MPT falls back to genesis on next lookup") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
     val genesisVk = VerificationKeyKesProduct(Array.fill(32)(0x55.toByte), 0)
-    val base = KesRegistry.make[IO](Map(operatorId -> KesRegistryEntry(genesisVk, 0L)))
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("ce" * 32))
+    val base = genesisRegistry(operatorId, KesRegistryEntry(genesisVk, 0L))
+    val cert = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("ce" * 32))
     for {
       signed <- forAsyncHasher(cert, kp)
       record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
       (reader, store) <- mkMptHarness
       _ <- writeRecord(store, record)
       mut <- MutableKesRegistry.make[IO](base, reader)
-      before <- mut.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      before <- mut.getKesVk(operatorId, EtaPeriod(150L))
       // Simulate reorg: remove the cert from MPT (the overlay's rollback would do this transparently).
       _ <- removeRecord(store, record)
-      after <- mut.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      after <- mut.getKesVk(operatorId, EtaPeriod(150L))
     } yield
       expect.all(
         // Before the reorg, runtime cert wins.
@@ -324,10 +403,10 @@ object MutableKesRegistrySuite extends MutableIOSuite {
 
   test("list returns one entry per operator with latest cert when MPT has multiple peers") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val base = KesRegistry.empty[IO]
+    val base = OperatorConsensusKeyRegistry.empty[IO]
     // A second operator: derive a distinct PeerId by reusing the same keypair but flagging via an unrelated cert.
     // (Real cluster would use distinct keypairs; here we exercise the list-shape codepath using a single one.)
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)))
+    val cert = mkCert(operatorId, EtaPeriod(100L))
     for {
       signed <- forAsyncHasher(cert, kp)
       (reader, store) <- mkMptHarness
@@ -382,8 +461,8 @@ object MutableKesRegistrySuite extends MutableIOSuite {
     // property the iteration-B persistence design depends on.
     implicit val (j, h, sp, kp, operatorId) = res
     val genesisVk = VerificationKeyKesProduct(Array.fill(32)(0x44.toByte), 0)
-    val base = KesRegistry.make[IO](Map(operatorId -> KesRegistryEntry(genesisVk, 0L)))
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("de" * 32))
+    val base = genesisRegistry(operatorId, KesRegistryEntry(genesisVk, 0L))
+    val cert = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("de" * 32))
     val tipA: BranchId = BranchId(Hash("a" * 64))
     val tipB: BranchId = BranchId(Hash("b" * 64))
     val finalOrdinal = SnapshotOrdinal(NonNegLong(1L))
@@ -399,19 +478,19 @@ object MutableKesRegistrySuite extends MutableIOSuite {
       // Step 2: build a reader bound to branch A — should see the cert.
       readerA = GlobalStateReader.fromOverlay[IO](overlay, tipA)
       mutA <- MutableKesRegistry.make[IO](base, readerA)
-      onA <- mutA.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      onA <- mutA.getKesVk(operatorId, EtaPeriod(150L))
       // Step 3: check out branch B from base (sibling of A). NO cert written; B's view sees only base+genesis.
       handleB <- overlay.checkout(BranchId.base)
       _ <- overlay.commit(handleB, tipB, finalOrdinal)
       readerB = GlobalStateReader.fromOverlay[IO](overlay, tipB)
       mutB <- MutableKesRegistry.make[IO](base, readerB)
-      onB <- mutB.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      onB <- mutB.getKesVk(operatorId, EtaPeriod(150L))
       // Step 4: finalize branch A. The cert should fold into the underlying base; a reader over the base store
       // now sees the cert.
       _ <- overlay.finalizeBranch(tipA, finalOrdinal)
       readerBase = GlobalStateReader.fromMptStore[IO](store)
       mutBase <- MutableKesRegistry.make[IO](base, readerBase)
-      onBase <- mutBase.getKesVk(operatorId, EpochProgress(NonNegLong(150L)))
+      onBase <- mutBase.getKesVk(operatorId, EtaPeriod(150L))
     } yield
       expect.all(
         // Branch A sees the cert.

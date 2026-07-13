@@ -50,7 +50,11 @@ import eu.timepit.refined.auto._
 import org.typelevel.log4cats.SelfAwareStructuredLogger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Advances Global L0 consensus through status phases and extracts final outcomes.
+/** Inherited global BFT round-state advancer retained as dormant migration plumbing.
+  *
+  * Target GL0 production is owned by `SnapshotLeaderLoop` under Nakamoto/Taktikos/LDD. This facility/proposal/signature lifecycle must not
+  * be started or interpreted as global P0/P1/P2 finality. The numbered phases below are only this dormant round machine's internal
+  * statuses; ML0 may continue using its separate BFT consensus implementation.
   *
   * '''Consensus Flow (Leader-Based Proposal Model)''':
   * {{{
@@ -73,7 +77,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *       (`alreadyWithdrawn`) prevents hot-loop re-entry.
   *   - On success, the peer signs the agreed artifact hash.
   *
-  * '''Phase 3: CollectingSignatures → Finished'''
+  * '''Dormant round step 3: CollectingSignatures → Finished'''
   *   - Quorum of valid signatures collected.
   *   - `snapshotHash` uses the artifact hash (agreed in Phase 2), NOT the signed artifact hash, to avoid non-determinism from different
   *     signature counts per node.

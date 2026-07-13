@@ -9,8 +9,13 @@
 > restart. Do not use any probability, "first wins", phase, or common-prefix
 > statement below as a guarantee. See
 > [`../review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`](../review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md),
-> findings FIN-01 through FIN-12. The text below is preserved only as design
-> history until it is replaced by a proved certificate protocol.
+> findings FIN-01 through FIN-12. The text below is preserved as design history.
+> It is superseded by
+> [`../review/CONSENSUS-ARTIFACT-LIFECYCLE.md`](../review/CONSENSUS-ARTIFACT-LIFECYCLE.md):
+> GL0 remains Nakamoto/Taktikos/LDD, real Avalanche/Snowball plus `k1` supplies
+> the Phase-2 optimistic/depth rails, Phase 2 remains density-reorgable, and
+> `k2` is only recommended retention/recovery capacity, not a phase or floor. No global proposal/vote/lock/QC or
+> view-change certificate protocol is intended.
 
 **Status:** historical design record; implementation and safety claims rejected
 by source audit on 2026-07-11.

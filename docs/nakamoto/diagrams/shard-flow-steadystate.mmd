@@ -1,3 +1,4 @@
+%% TARGET DESIGN. GL0 uses chain consensus, not a global BFT round.
 sequenceDiagram
     autonumber
     participant C as CL1 / DL1
@@ -5,23 +6,27 @@ sequenceDiagram
     participant A as GL0 admission committee
     participant E as GL0 execution committee
     participant G as GL0 producer
-    participant F as GL0 followers
+    participant F as ordinary GL0 followers
+    participant W as selected noncommittee watchtowers
 
     C->>M: submit framework-economic or custom-data block
     M->>M: metagraph snapshot consensus
     M->>A: signed state-channel binary
     A->>A: per-binary secret VRF admission and authentication
     A->>E: buffer binary in static execution shard
-    E->>E: scheduled producer pins finalized execution base
-    E->>E: recreate every CL1 transition and compute roots
-    E->>E: build and sign checkpoint with roots plus replay inputs
-    E->>E: attesters validate and recreate before signing
-    E->>G: replay-valid checkpoint
-    G->>G: independently verify and recreate every CL1 transition
-    G->>G: embed checkpoint in global snapshot
+    E->>E: scheduled producer pins exact Phase-2 base and pre-root
+    E->>E: replay exact ordered CL1 inputs and compute canonical diff and root
+    E->>E: build checkpoint committing inputs, diff, root, base, and ancestry
+    E->>E: every signer independently replays and signs only identical diff and root
+    E->>G: checkpoint with distinct execution threshold
+    G->>G: verify threshold, exact base and pre-root CAS, continuity, namespace
+    G->>G: apply scoped diff, recompute root, embed in global snapshot
     G->>F: signed global snapshot
-    F->>F: independently verify and recreate before adoption
-    F-->>M: finalized canonical GL0 state
-    F-->>C: finalized canonical GL0 state
+    F->>F: repeat adoption checks, apply scoped diff, and recompute root
+    E-->>W: checkpoint inputs, diff, root, and execution certificate
+    W->>W: independently replay for collusion detection
+    Note over E,W: Watchtower release and adjudication timing is an open protocol decision
+    F-->>M: exact Phase-2 canonical GL0 state
+    F-->>C: exact Phase-2 canonical GL0 state
 
-    Note over E,F: Quorum selects only among replay-valid checkpoints and never makes economic state valid
+    Note over E,F: Execution threshold is required for diff adoption. Shard depth selects the checkpoint chain and cannot replace missing executions.

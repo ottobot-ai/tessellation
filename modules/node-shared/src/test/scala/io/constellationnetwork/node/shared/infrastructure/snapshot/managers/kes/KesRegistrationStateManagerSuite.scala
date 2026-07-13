@@ -11,14 +11,16 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertAcceptanceResult
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, GlobalStateReader, MptOverlay}
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
@@ -59,7 +61,7 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
 
   private def mkCert(
     operatorId: PeerId,
-    effectiveFromEpoch: EpochProgress,
+    effectiveFromPeriod: EtaPeriod,
     ordinal: KesRegistrationOrdinal = KesRegistrationOrdinal.first,
     parent: KesRegistrationReference = KesRegistrationReference.empty,
     kesMasterVK: Hex = Hex("11" * 32)
@@ -68,8 +70,10 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
       operatorPeerId = operatorId,
       kesMasterVK = kesMasterVK,
       kesMasterVKStep = 0,
-      offset = 0L,
-      effectiveFromEpoch = effectiveFromEpoch,
+      offset = effectiveFromPeriod.value,
+      vrfPublicKey = Hex("22" * 32),
+      effectiveFromPeriod = effectiveFromPeriod,
+      registrationParentHash = Hash("aa" * 32),
       ordinal = ordinal,
       parent = parent
     )
@@ -111,7 +115,7 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
 
   test("materializeFromMpt returns the only cert when one is written") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)))
+    val cert = mkCert(operatorId, EtaPeriod(100L))
     for {
       signed <- forAsyncHasher(cert, kp)
       record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
@@ -127,16 +131,64 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
       )
   }
 
+  test("pointer resolution requires both ordinal and hash and fails closed on corruption") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val cert = mkCert(operatorId, EtaPeriod(100L))
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
+      (reader, store) <- mkHarness
+      _ <- writeRecord(store, record)
+      refKey <- GlobalStateKey.lastKesRegistrationRefsKey[IO](operatorId)
+      wrongRef = KesRegistrationReference(cert.ordinal, Hash("ff" * 32))
+      _ <- store.insert[KesRegistrationReference](Map(refKey -> wrongRef))
+      manager = KesRegistrationStateManager.make[IO](reader)
+      single <- manager.materializeFromMpt(operatorId)
+      all <- manager.materializeAllFromMpt
+      refs <- manager.materializeLastRefsFromMpt
+    } yield expect.all(single.isEmpty, all.isEmpty, refs.isEmpty)
+  }
+
+  test("pointer resolution fails closed when multiple records have the same exact event reference") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val cert = mkCert(operatorId, EtaPeriod(100L))
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      first = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
+      duplicateEvent = KesRegistrationRecord(signed, SnapshotOrdinal(NonNegLong(1L)))
+      (reader, store) <- mkHarness
+      _ <- writeRecord(store, first)
+      _ <- writeRecord(store, duplicateEvent)
+      manager = KesRegistrationStateManager.make[IO](reader)
+      single <- manager.materializeFromMpt(operatorId)
+      all <- manager.materializeAllFromMpt
+      refs <- manager.materializeLastRefsFromMpt
+    } yield expect.all(single.isEmpty, all.isEmpty, refs.isEmpty)
+  }
+
+  test("record ordering retains conflicting bodies with the same accepted ordinal") { res =>
+    implicit val (_, h, sp, kp, operatorId) = res
+    val cert1 = mkCert(operatorId, EtaPeriod(100L))
+    val cert2 = cert1.copy(vrfPublicKey = Hex("33" * 32))
+    for {
+      signed1 <- forAsyncHasher(cert1, kp)
+      signed2 <- forAsyncHasher(cert2, kp)
+      record1 = KesRegistrationRecord(signed1, SnapshotOrdinal.MinValue)
+      record2 = KesRegistrationRecord(signed2, SnapshotOrdinal.MinValue)
+      records = SortedSet(record1, record2)
+    } yield expect(records.size == 2)
+  }
+
   test("materializeFromMpt with multi-cert history resolves to the latest via LastKesRegistrationRefs pointer") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val cert1 = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("aa" * 32))
+    val cert1 = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("aa" * 32))
     for {
       signed1 <- forAsyncHasher(cert1, kp)
       hashed1 <- signed1.toHashed
       ref1 = KesRegistrationReference.of(hashed1)
       cert2 = mkCert(
         operatorId,
-        EpochProgress(NonNegLong(200L)),
+        EtaPeriod(200L),
         ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
         parent = ref1,
         kesMasterVK = Hex("bb" * 32)
@@ -159,7 +211,7 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
 
   test("materializeAllFromMpt returns latest cert per peer via prefix scan") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)))
+    val cert = mkCert(operatorId, EtaPeriod(100L))
     for {
       signed <- forAsyncHasher(cert, kp)
       record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
@@ -184,16 +236,90 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
     } yield expect(result.isEmpty)
   }
 
+  test("prefix materialization rejects a mixed-operator record set") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val cert = mkCert(operatorId, EtaPeriod(100L))
+    for {
+      otherKp <- KeyPairGenerator.makeKeyPair[IO]
+      otherPeer = PeerId.fromPublic(otherKp.getPublic)
+      otherCert = mkCert(otherPeer, EtaPeriod(100L), kesMasterVK = Hex("33" * 32))
+      signed <- forAsyncHasher(cert, kp)
+      otherSigned <- forAsyncHasher(otherCert, otherKp)
+      ownRecord = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
+      otherRecord = KesRegistrationRecord(otherSigned, SnapshotOrdinal.MinValue)
+      (reader, store) <- mkHarness
+      ownKey <- GlobalStateKey.kesRegistrationCertsKey[IO](operatorId)
+      shadowKey = GlobalStateKey(
+        PartitionNamespace.HypergraphNamespace,
+        GlobalStateFieldId.KesRegistrationCerts,
+        PartitionNamespace.EmptyNamespace,
+        PartitionNamespace.HashNamespace(Hash("ff" * 32))
+      )
+      _ <- store.insert[SortedSet[KesRegistrationRecord]](
+        Map(
+          ownKey -> SortedSet(ownRecord),
+          shadowKey -> SortedSet(ownRecord, otherRecord)
+        )
+      )
+      result <- KesRegistrationStateManager.make[IO](reader).materializeActiveKesRegistrationCertsFromMpt.attempt
+    } yield expect(result.isLeft)
+  }
+
+  test("prefix materialization rejects a homogeneous record stored under another MPT key") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val cert = mkCert(operatorId, EtaPeriod(100L))
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
+      (reader, store) <- mkHarness
+      misplacedKey = GlobalStateKey(
+        PartitionNamespace.HypergraphNamespace,
+        GlobalStateFieldId.KesRegistrationCerts,
+        PartitionNamespace.EmptyNamespace,
+        PartitionNamespace.HashNamespace(Hash("dd" * 32))
+      )
+      _ <- store.insert[SortedSet[KesRegistrationRecord]](Map(misplacedKey -> SortedSet(record)))
+      result <- KesRegistrationStateManager.make[IO](reader).materializeActiveKesRegistrationCertsFromMpt.attempt
+    } yield expect(result.isLeft)
+  }
+
+  test("prefix materialization rejects a peer claimed by multiple homogeneous MPT entries") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val cert1 = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("11" * 32))
+    val cert2 = cert1.copy(kesMasterVK = Hex("44" * 32), vrfPublicKey = Hex("55" * 32))
+    for {
+      signed1 <- forAsyncHasher(cert1, kp)
+      signed2 <- forAsyncHasher(cert2, kp)
+      record1 = KesRegistrationRecord(signed1, SnapshotOrdinal.MinValue)
+      record2 = KesRegistrationRecord(signed2, SnapshotOrdinal.MinValue)
+      (reader, store) <- mkHarness
+      canonicalKey <- GlobalStateKey.kesRegistrationCertsKey[IO](operatorId)
+      duplicateKey = GlobalStateKey(
+        PartitionNamespace.HypergraphNamespace,
+        GlobalStateFieldId.KesRegistrationCerts,
+        PartitionNamespace.EmptyNamespace,
+        PartitionNamespace.HashNamespace(Hash("ee" * 32))
+      )
+      _ <- store.insert[SortedSet[KesRegistrationRecord]](
+        Map(
+          canonicalKey -> SortedSet(record1),
+          duplicateKey -> SortedSet(record2)
+        )
+      )
+      result <- KesRegistrationStateManager.make[IO](reader).materializeActiveKesRegistrationCertsFromMpt.attempt
+    } yield expect(result.isLeft)
+  }
+
   test("materializeChainForPeer returns full history sorted earliest-first") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val cert1 = mkCert(operatorId, EpochProgress(NonNegLong(100L)), kesMasterVK = Hex("aa" * 32))
+    val cert1 = mkCert(operatorId, EtaPeriod(100L), kesMasterVK = Hex("aa" * 32))
     for {
       signed1 <- forAsyncHasher(cert1, kp)
       hashed1 <- signed1.toHashed
       ref1 = KesRegistrationReference.of(hashed1)
       cert2 = mkCert(
         operatorId,
-        EpochProgress(NonNegLong(200L)),
+        EtaPeriod(200L),
         ordinal = KesRegistrationOrdinal(NonNegLong(2L)),
         parent = ref1,
         kesMasterVK = Hex("cc" * 32)
@@ -214,9 +340,43 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
       )
   }
 
+  test("candidate-parent reads isolate registration histories on sibling forks") { res =>
+    implicit val (j, h, sp, kp, operatorId) = res
+    val cert = mkCert(operatorId, EtaPeriod(100L))
+    val parent = BranchId(Hash("00" * 32))
+    val branchA = BranchId(Hash("aa" * 32))
+    val branchB = BranchId(Hash("bb" * 32))
+    for {
+      signed <- forAsyncHasher(cert, kp)
+      record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
+      ref <- KesRegistrationReference.of[IO](signed)
+      (_, store) <- mkHarness
+      tree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        MptOverlay.OverlayMode.productionDefault,
+        store,
+        tree,
+        GlobalStateKey.toHex[IO],
+        IO.pure(Set.empty[BranchId])
+      )
+      historyKey <- GlobalStateKey.kesRegistrationCertsKey[IO](operatorId)
+      refKey <- GlobalStateKey.lastKesRegistrationRefsKey[IO](operatorId)
+      handleA <- overlay.checkout(parent)
+      _ <- handleA.insert[SortedSet[KesRegistrationRecord]](historyKey, SortedSet(record))
+      _ <- handleA.insert[KesRegistrationReference](refKey, ref)
+      _ <- overlay.commit(handleA, branchA, SnapshotOrdinal.MinValue)
+      onA <- KesRegistrationStateManager
+        .make[IO](GlobalStateReader.fromOverlay(overlay, branchA))
+        .materializeActiveKesRegistrationCertsFromMpt
+      onB <- KesRegistrationStateManager
+        .make[IO](GlobalStateReader.fromOverlay(overlay, branchB))
+        .materializeActiveKesRegistrationCertsFromMpt
+    } yield expect.all(onA.get(operatorId).exists(_.contains(record)), onB.isEmpty)
+  }
+
   test("getUpdatedKesRegistrationCerts is idempotent on (peerId, ordinal) replays") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)))
+    val cert = mkCert(operatorId, EtaPeriod(100L))
     for {
       signed <- forAsyncHasher(cert, kp)
       record = KesRegistrationRecord(signed, SnapshotOrdinal.MinValue)
@@ -242,7 +402,7 @@ object KesRegistrationStateManagerSuite extends MutableIOSuite {
 
   test("getUpdatedLastRefs advances accepted pointers and preserves untouched ones") { res =>
     implicit val (j, h, sp, kp, operatorId) = res
-    val cert = mkCert(operatorId, EpochProgress(NonNegLong(100L)))
+    val cert = mkCert(operatorId, EtaPeriod(100L))
     val priorPeer = PeerId(Hex("ff" * 64))
     val priorRef = KesRegistrationReference(KesRegistrationOrdinal(NonNegLong(7L)), io.constellationnetwork.security.hash.Hash("ab" * 32))
     val priorRefs: SortedMap[PeerId, KesRegistrationReference] = SortedMap(priorPeer -> priorRef)

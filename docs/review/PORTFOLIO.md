@@ -4,7 +4,12 @@
 > review packet and its then-current workstreams. It is not the current backlog,
 > design of record, or a compatibility contract; linked claims and priorities may
 > now be closed or obsolete. Recheck current source and follow
-> [`../../AGENTS.md`](../../AGENTS.md), ADR-0016, and ADR-0017.
+> [`../../AGENTS.md`](../../AGENTS.md),
+> `CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`,
+> `CONSENSUS-ARTIFACT-LIFECYCLE.md`, and
+> `CONSENSUS-PROTOCOL-TEST-PLAN.md`, with open/locked choices in
+> `CONSENSUS-OWNER-DECISIONS.md`. ADR-0016/0017 remain architecture inputs,
+> not proof that the implementation satisfies those contracts.
 
 > **This is the entry point.** It ranks the frontier-reasoning questions across **all** open
 > workstreams so limited Fable (`claude-fable-5`) access is spent on the highest-value work — not

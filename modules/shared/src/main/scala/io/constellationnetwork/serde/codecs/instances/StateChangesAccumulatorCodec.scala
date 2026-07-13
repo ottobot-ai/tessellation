@@ -15,8 +15,8 @@ import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.EitherCodec.either
 import io.constellationnetwork.serde.codecs.OptionCodec.option
 import io.constellationnetwork.serde.codecs.SetCodec.set
-import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedMapCodec.{sortedMap, sortedMapCanonical}
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendCodec.{codec => allowSpendCodec}
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{codec => allowSpendRefCodec}
@@ -24,10 +24,12 @@ import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs._
 import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.{kesRegistrationRecordCodec, kesRegistrationReferenceCodec}
 import io.constellationnetwork.serde.codecs.instances.MerkleTreeCodecs.{proofCodec => merkleProofCodec}
 import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{codec => metagraphSyncCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs._
+import io.constellationnetwork.serde.codecs.instances.PeerIdCodec.{codec => peerIdCodec}
 import io.constellationnetwork.serde.codecs.instances.PriceOracleCodecs.{priceRecordCodec, tokenPairCodec}
 import io.constellationnetwork.serde.codecs.instances.SignatureCodecs.idCodec
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
@@ -50,7 +52,8 @@ import shapeless.{::, HNil}
   * signing/hashing preimage — the cryptographic anchor is the snapshot's `mptRoot`, recomputed independently by applying this delta. The
   * encoding is nonetheless an explicit, hand-written spec (no auto-derivation): the wire layout follows the case-class field order exactly
   * (1..17 the GSI-shaped partition deltas, 18..20 the system expiry-index deltas, 21..27 the removed-key sets, 28..29 the historical-stake
-  * delta + removed periods). `Set` fields are sorted on encode for determinism (see [[SetCodec]]).
+  * delta + removed periods, 30..31 the unified operator-key histories and latest references). `Set` fields are sorted on encode for
+  * determinism (see [[SetCodec]]).
   */
 object StateChangesAccumulatorCodec {
 
@@ -98,8 +101,9 @@ object StateChangesAccumulatorCodec {
   private val f3 = sortedMap(addressCodec, Codec[Balance])
   private val f4 = sortedMap(addressCodec, currencySnapshotEitherCodec)
   private val f5 = sortedMap(addressCodec, merkleProofCodec)
-  private val f6 = sortedMap(option(addressCodec), sortedMap(addressCodec, sortedSet(signedAllowSpendCodec)))
-  private val f7 = sortedMap(addressCodec, sortedSet(signedTokenLockCodec))
+  private val f6 =
+    sortedMap(option(addressCodec), sortedMap(addressCodec, sortedSetCanonical(signedAllowSpendCodec)))
+  private val f7 = sortedMap(addressCodec, sortedSetCanonical(signedTokenLockCodec))
   private val f8 = sortedMap(addressCodec, sortedMap(addressCodec, Codec[Balance]))
   private val f9 = sortedMap(addressCodec, allowSpendRefCodec)
   private val f10 = sortedMap(addressCodec, tokenLockRefCodec)
@@ -108,11 +112,11 @@ object StateChangesAccumulatorCodec {
   private val f13 = sortedMap(addressCodec, sortedSet(nodeCollateralRecordCodec))
   private val f14 = sortedMap(addressCodec, sortedSet(pendingNodeCollateralWithdrawalCodec))
   private val f15 = sortedMap(addressCodec, metagraphSyncCodec)
-  private val f16 = sortedMap(idCodec, unpWithOrdinalTupleCodec)
+  private val f16 = sortedMapCanonical(idCodec, unpWithOrdinalTupleCodec)
   private val f17 = sortedMap(tokenPairCodec, priceRecordCodec)
-  private val f18 = systemIndexDeltaCodec(allowSpendExpiryKeyCodec)
-  private val f19 = systemIndexDeltaCodec(tokenLockExpiryKeyCodec)
-  private val f20 = systemIndexDeltaCodec(nodeCollateralWithdrawalExpiryKeyCodec)
+  private val f18 = canonicalSystemIndexDeltaCodec(allowSpendExpiryKeyCodec)
+  private val f19 = canonicalSystemIndexDeltaCodec(tokenLockExpiryKeyCodec)
+  private val f20 = canonicalSystemIndexDeltaCodec(nodeCollateralWithdrawalExpiryKeyCodec)
   private val f21 = set(optAddrAddrTupleCodec)
   private val f22 = set(addressCodec)
   private val f23 = set(addrAddrTupleCodec)
@@ -122,16 +126,19 @@ object StateChangesAccumulatorCodec {
   private val f27 = set(addressCodec)
   private val f28 = sortedMap(etaPeriodCodec, historicalStakeSnapshotCodec)
   private val f29 = set(etaPeriodCodec)
+  private val f30 =
+    sortedMapCanonical(peerIdCodec, sortedSetCanonical(kesRegistrationRecordCodec))
+  private val f31 = sortedMapCanonical(peerIdCodec, kesRegistrationReferenceCodec)
 
   implicit val codec: Codec[StateChangesAccumulator] =
     (f1 :: f2 :: f3 :: f4 :: f5 :: f6 :: f7 :: f8 :: f9 :: f10 ::
       f11 :: f12 :: f13 :: f14 :: f15 :: f16 :: f17 :: f18 :: f19 :: f20 ::
-      f21 :: f22 :: f23 :: f24 :: f25 :: f26 :: f27 :: f28 :: f29)
+      f21 :: f22 :: f23 :: f24 :: f25 :: f26 :: f27 :: f28 :: f29 :: f30 :: f31)
       .xmap[StateChangesAccumulator](
         {
           case lsch :: ltx :: bal :: lcs :: lcsp :: aas :: atl :: tlb :: lasr :: ltlr ::
               ads :: dsw :: anc :: ncw :: msd :: unp :: ps :: asei :: tlei :: ncwei ::
-              rask :: rtlk :: rtlbk :: rdsk :: rdswk :: rnck :: rncwk :: hss :: rhssk :: HNil =>
+              rask :: rtlk :: rtlbk :: rdsk :: rdswk :: rnck :: rncwk :: hss :: rhssk :: kesCerts :: kesRefs :: HNil =>
             StateChangesAccumulator(
               lsch,
               ltx,
@@ -161,7 +168,9 @@ object StateChangesAccumulatorCodec {
               rnck,
               rncwk,
               hss,
-              rhssk
+              rhssk,
+              kesCerts,
+              kesRefs
             )
         },
         a =>
@@ -170,7 +179,8 @@ object StateChangesAccumulatorCodec {
             a.activeDelegatedStakes :: a.delegatedStakesWithdrawals :: a.activeNodeCollaterals :: a.nodeCollateralWithdrawals :: a.metagraphSyncData ::
             a.updateNodeParameters :: a.priceState :: a.allowSpendExpiryIndex :: a.tokenLockExpiryIndex :: a.nodeCollateralWithdrawalExpiryIndex ::
             a.removedAllowSpendKeys :: a.removedTokenLockKeys :: a.removedTokenLockBalanceKeys :: a.removedDelegatedStakeKeys :: a.removedDelegatedStakeWithdrawalKeys ::
-            a.removedNodeCollateralKeys :: a.removedNodeCollateralWithdrawalKeys :: a.historicalStakeSnapshots :: a.removedHistoricalStakeSnapshotKeys :: HNil
+            a.removedNodeCollateralKeys :: a.removedNodeCollateralWithdrawalKeys :: a.historicalStakeSnapshots :: a.removedHistoricalStakeSnapshotKeys ::
+            a.kesRegistrationCerts :: a.lastKesRegistrationRefs :: HNil
       )
 
   implicit val immutableCodec: ImmutableCodec[StateChangesAccumulator] = ImmutableCodec.fromScodecCodec(codec)

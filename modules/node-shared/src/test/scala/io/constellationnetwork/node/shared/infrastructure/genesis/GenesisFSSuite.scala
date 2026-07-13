@@ -18,6 +18,7 @@ import io.constellationnetwork.security.signature.Signed
 import fs2.io.file.Files
 import fs2.text
 import io.circe.Printer
+import io.circe.parser.decode
 import io.circe.syntax._
 import org.scalacheck.Gen
 import weaver._
@@ -124,13 +125,10 @@ object GenesisFSSuite extends MutableIOSuite with Checkers {
     }
   }
 
-  // Tier-1 fixture-library smoke test. Loads each committed `test-vectors/genesis/*.json` fixture
-  // and confirms the operator count + delegated-stake count match the documented expectation.
-  // This is the regression gate for "the on-disk fixtures decode successfully on the current
-  // schema". When a future schema change requires a fixture regeneration, this suite breaks; the
-  // fix is to re-run the generator with the same seeds and commit the new bytes.
-  test("Tier-1 fixtures decode against the current schema") { res =>
-    implicit val (_, js, _, _) = res
+  // Every committed greenfield fixture must use the current atomic operator-key schema and pass the
+  // same strict loader as GL0 startup. Parse-only stale fixtures are not retained.
+  test("Tier-1 fixtures decode and pass strict atomic operator-key loading") { res =>
+    implicit val (_, js, _, sp) = res
     val genesisFS = GenesisFS.make[IO, CurrencySnapshot]
 
     // Each tuple is (relativePath, expectedOperators, expectedStakes, expectedCollaterals).
@@ -162,14 +160,51 @@ object GenesisFSSuite extends MutableIOSuite with Checkers {
             // independently verified by the determinism diff in commit history).
             IO.pure(success)
           case Some(path) =>
-            genesisFS.loadL0Genesis(path).map { data =>
-              expect
-                .eql(data.operators.size, expOps)
-                .and(expect.eql(data.delegatedStakes.size, expStakes))
-                .and(expect.eql(data.nodeCollaterals.size, expColls))
+            genesisFS.loadL0Genesis(path).flatMap { data =>
+              L0GenesisLoader.buildOperatorKeyRegistry[IO](data).attempt.map { registryResult =>
+                expect
+                  .eql(data.operators.size, expOps)
+                  .and(expect.eql(data.delegatedStakes.size, expStakes))
+                  .and(expect.eql(data.nodeCollaterals.size, expColls))
+                  .and(expect(data.operators.forall(op => op.kesMasterVk.length == 64 && op.vrfVk.length == 64)))
+                  .and(expect(registryResult.isRight))
+              }
             }
         }
     }.map(_.combineAll)
+  }
+
+  test("abandoned split or incomplete operator-key records do not decode") { _ =>
+    val abandonedSplitSchema =
+      """{
+        |  "_meta": {
+        |    "generatorVersion": "stale",
+        |    "generatedAt": "1970-01-01T00:00:00Z",
+        |    "invocation": "stale",
+        |    "seed": 0,
+        |    "expectedProperties": []
+        |  },
+        |  "networkMagic": "test",
+        |  "activationOrdinal": 0,
+        |  "startingEpochProgress": 0,
+        |  "protocolParams": {
+        |    "lddCutoff": 16,
+        |    "etaRotationSnapshots": 3174,
+        |    "genesisEta": "tessellation-nakamoto-genesis",
+        |    "startingEpochProgress": 0
+        |  },
+        |  "operators": [{
+        |    "peerId": "00",
+        |    "address": "DAG0",
+        |    "vrfPublicKey": null
+        |  }],
+        |  "kesRegistrations": [],
+        |  "delegatedStakes": [],
+        |  "nodeCollaterals": [],
+        |  "initialBalances": []
+        |}""".stripMargin
+
+    IO.pure(expect(decode[L0GenesisData](abandonedSplitSchema).isLeft))
   }
 
 }

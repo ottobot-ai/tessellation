@@ -9,6 +9,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.CanonicalOperatorConsensusFixture
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
 import io.constellationnetwork.schema._
@@ -16,6 +17,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
@@ -60,6 +62,52 @@ object CatchUpVerificationSuite extends MutableIOSuite {
     h = Hasher.forJson[IO]
     hs = HasherSelector.forSyncAlwaysCurrent(h)
   } yield (ks, j, h, sp, hs)
+
+  test("GL0 leader identity accepts only the producer's preregistered atomic KES+VRF pair") { _ =>
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val producerId = operator.resolvedPair.operatorPeerId
+      val unknownProducerId = PeerId(Hex("22" * 32))
+      val registeredKey = operator.resolvedPair.vrfPublicKey.toBytes
+      val replacementKeys = (1 to 128).toList.map { attempt =>
+        registeredKey.indices.map(i => (registeredKey(i) + attempt).toByte).toArray
+      }
+
+      for {
+        accepted <- NakamotoSnapshotValidator.resolveRegisteredOperatorKeys(
+          operator.operatorKeyRegistry,
+          producerId,
+          registeredKey,
+          EtaPeriod.Zero
+        )
+        replacements <- replacementKeys.traverse { replacement =>
+          NakamotoSnapshotValidator.resolveRegisteredOperatorKeys(
+            operator.operatorKeyRegistry,
+            producerId,
+            replacement,
+            EtaPeriod.Zero
+          )
+        }
+        missing <- NakamotoSnapshotValidator.resolveRegisteredOperatorKeys(
+          operator.operatorKeyRegistry,
+          unknownProducerId,
+          registeredKey,
+          EtaPeriod.Zero
+        )
+        malformed <- NakamotoSnapshotValidator.resolveRegisteredOperatorKeys(
+          operator.operatorKeyRegistry,
+          producerId,
+          Array.fill[Byte](31)(1),
+          EtaPeriod.Zero
+        )
+      } yield
+        expect.all(
+          accepted.exists(keys => java.security.MessageDigest.isEqual(keys.vrfPublicKey.toBytes, registeredKey)),
+          replacements.forall(_.isEmpty),
+          missing.isEmpty,
+          malformed.isEmpty
+        )
+    }
+  }
 
   /** A GlobalSnapshotInfo carrying `balances` so the rebuilt state proof is non-trivial (`balancesProof` is a real MPT subtree root). */
   private def mkInfo(balances: SortedMap[Address, Balance]): GlobalSnapshotInfo =
@@ -231,6 +279,55 @@ object CatchUpVerificationSuite extends MutableIOSuite {
         signed
       )
     } yield expect.all(valid.isRight, wrongOrdinal.isLeft, wrongParent.isLeft, wrongProducer.isLeft, wrongEta.isLeft)
+  }
+
+  test("slot lineage uses the retained parent and bounds embedded checkpoint slots") { _ =>
+    def certificate(slot: Long, parentSlot: Long): SlotCertificate =
+      SlotCertificate(
+        slot = Slot.unsafeApply(slot),
+        parentSlot = Slot.unsafeApply(parentSlot),
+        vrfProof = VrfProof(Hex("")),
+        vrfOutput = VrfOutput(Hex("")),
+        vrfPublicKey = VrfPublicKey(Hex("")),
+        eta = Hash.empty,
+        activePoolSize = 1,
+        activePoolHash = Hash.empty,
+        subchainLevelCounts = SlotCertificate.ZeroSubchainLevelCounts
+      )
+
+    val shardZero = io.constellationnetwork.schema.sharding.ShardId(0).get
+    val retainedParent = certificate(slot = 9L, parentSlot = 8L)
+    val child = certificate(slot = 10L, parentSlot = 9L)
+    val forgedGap = child.copy(parentSlot = Slot.unsafeApply(0L))
+    val nonMonotone = child.copy(slot = Slot.unsafeApply(9L))
+
+    IO.pure(
+      expect.all(
+        NakamotoSnapshotValidator.validateSlotLineage(child, retainedParent.some, List(shardZero -> Slot.unsafeApply(10L))).isRight,
+        NakamotoSnapshotValidator.validateSlotLineage(forgedGap, retainedParent.some, List.empty).isLeft,
+        NakamotoSnapshotValidator.validateSlotLineage(nonMonotone, retainedParent.some, List.empty).isLeft,
+        NakamotoSnapshotValidator
+          .validateSlotLineage(child, retainedParent.some, List(shardZero -> Slot.unsafeApply(11L)))
+          .isLeft
+      )
+    )
+  }
+
+  test("producer slot-lineage rejection cleans up without signing or terminating later slot work") { _ =>
+    for {
+      cleanupCount <- Ref.of[IO, Int](0)
+      signingCount <- Ref.of[IO, Int](0)
+      invalid <- SnapshotLeaderLoop.afterProducerSlotLineageValidation[IO, String](Left("future checkpoint slot"))(_ =>
+        cleanupCount.update(_ + 1)
+      )(
+        signingCount.update(_ + 1).as("signed")
+      )
+      valid <- SnapshotLeaderLoop.afterProducerSlotLineageValidation[IO, String](Right(()))(_ => cleanupCount.update(_ + 1))(
+        signingCount.update(_ + 1).as("signed")
+      )
+      cleanups <- cleanupCount.get
+      signatures <- signingCount.get
+    } yield expect.all(invalid.isEmpty, valid.contains("signed"), cleanups == 1, signatures == 1)
   }
 
   test("parent-missing snapshot is inert; fetched ancestry replays parent-first before write/store/attest") { res =>

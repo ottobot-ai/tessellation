@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.domain.genesis
 import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
+import io.constellationnetwork.schema.nakamoto.GenesisOperatorConsensusKey
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
 
 import derevo.cats.{eqv, show}
@@ -77,20 +78,50 @@ object types {
     )
   }
 
-  /** Operator-set entry: per-validator identity. `peerId` is the canonical sortition unit (per `project_consensus_epoch_staggering`).
-    * `vrfPublicKey` and `kesPublicKey` are reserved for §1.2 KES wire-in and §1.3 VRF reroll; they are nullable in Tier-1 (the generator
-    * emits null — the existing ECDSA key in `nodes/N/key.p12` is the operator credential at boot).
+  /** Atomic genesis operator-key record. The long-term operator identity signs one domain-separated preimage that binds the chain context,
+    * operator identity/address, KES master verification key metadata, and VRF verification key. No key field is optional and there is no
+    * second registration list whose coverage or signature semantics can drift from this record.
     */
   case class L0GenesisOperator(
     peerId: String,
     address: String,
-    vrfPublicKey: Option[String],
-    kesPublicKey: Option[String]
+    kesMasterVk: String,
+    kesMasterVkStep: Int,
+    kesPeriodOffset: Long,
+    vrfVk: String,
+    longTermSignature: String
   )
 
   object L0GenesisOperator {
     implicit val encoder: Encoder[L0GenesisOperator] = deriveEncoder[L0GenesisOperator]
     implicit val decoder: Decoder[L0GenesisOperator] = deriveDecoder[L0GenesisOperator]
+
+    /** Canonical long-term-signature preimage for a genesis operator-key record. Length-prefixing every variable-width field and using
+      * fixed-width big-endian integers makes concatenation unambiguous. `networkMagic`, activation ordinal, and starting epoch progress
+      * bind the record to the intended chain/hard-fork context; a record copied to another network or activation point cannot verify.
+      */
+    def signaturePreimage(
+      networkMagic: String,
+      activationOrdinal: Long,
+      startingEpochProgress: Long,
+      peerId: Array[Byte],
+      address: String,
+      kesMasterVk: Array[Byte],
+      kesMasterVkStep: Int,
+      kesPeriodOffset: Long,
+      vrfVk: Array[Byte]
+    ): Array[Byte] =
+      GenesisOperatorConsensusKey.signaturePreimage(
+        networkMagic,
+        activationOrdinal,
+        startingEpochProgress,
+        peerId,
+        address,
+        kesMasterVk,
+        kesMasterVkStep,
+        kesPeriodOffset,
+        vrfVk
+      )
   }
 
   /** Genesis-seeded delegated-stake record. Tier-1 design: the fixture file is BYTE-DETERMINISTIC across regenerations with the same seed,
@@ -143,37 +174,6 @@ object types {
     * `GlobalSnapshot.mkGenesis`, and applies the `delegatedStakes` and `nodeCollaterals` fields by overlay onto the in-memory
     * `GlobalSnapshotInfo` AFTER `toGlobalSnapshotInfo` is called (Option (ii) in the plan — the on-disk `Signed[GlobalSnapshot]` stays V1).
     */
-  /** Per-operator KES master-VK registration cert embedded in L0 genesis. Slice 3 of §1.2 KES wiring.
-    *
-    *   - `peerId` — hex-encoded operator PeerId (matches `L0GenesisOperator.peerId`).
-    *   - `kesVk` — hex-encoded `VerificationKeyKesProduct.value` (the period-0 root of the super × sub Merkle tree, 32 bytes for the
-    *     Blake2b-256 default).
-    *   - `kesVkStep` — `VerificationKeyKesProduct.step`. Always `0` for a freshly-generated master VK at genesis time; carried explicitly
-    *     so reconstruction of the `VerificationKeyKesProduct` doesn't have to assume a fixed step.
-    *   - `longTermSig` — hex-encoded SHA512withECDSA signature of `kesVk` raw bytes (after hex-decode) under the operator's long-term
-    *     Ed25519 private key. This is the registration binding: any receiver who knows the operator's long-term public key (from the
-    *     seedlist / `L0GenesisOperator`) can verify the binding without ever seeing the KES SK.
-    *
-    * Optional in the L0 genesis JSON for backward compatibility with fixtures generated before §1.2 Slice 3 (they parse with the field
-    * absent and `KesRegistry.empty` is used downstream).
-    */
-  case class L0GenesisKesRegistration(
-    peerId: String,
-    kesVk: String,
-    kesVkStep: Int,
-    longTermSig: String,
-    // Eta-period offset for this operator's KES tree. Genesis operators register at offset=0
-    // (their tree's step 0 == global eta period 0). Mid-life joiners (Slice 10 #179) use a
-    // positive offset matching the global eta period at registration activation. See
-    // KesRegistryEntry doc for verifier semantics.
-    offset: Long
-  )
-
-  object L0GenesisKesRegistration {
-    implicit val encoder: Encoder[L0GenesisKesRegistration] = deriveEncoder[L0GenesisKesRegistration]
-    implicit val decoder: Decoder[L0GenesisKesRegistration] = deriveDecoder[L0GenesisKesRegistration]
-  }
-
   case class L0GenesisData(
     _meta: L0GenesisMeta,
     networkMagic: String,
@@ -183,11 +183,7 @@ object types {
     operators: List[L0GenesisOperator],
     delegatedStakes: List[L0GenesisDelegatedStake],
     nodeCollaterals: List[L0GenesisNodeCollateral],
-    initialBalances: List[L0GenesisBalance],
-    // §1.2 Slice 3: per-operator KES master VK registration. Optional so existing Tier-1 fixtures
-    // (8-node-uniform-stake.json etc) still parse — they pre-date this field and consume the
-    // `KesRegistry.empty` default downstream.
-    kesRegistrations: Option[List[L0GenesisKesRegistration]] = None
+    initialBalances: List[L0GenesisBalance]
   ) {
 
     /** Build a deterministic balance map for `GlobalSnapshot.mkGenesis`. Combines `initialBalances` with the delegator/owner addresses from

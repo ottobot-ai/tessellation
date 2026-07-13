@@ -10,7 +10,6 @@ import scala.concurrent.duration._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
-import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
@@ -92,6 +91,22 @@ object SharedEpochState {
   * without needing global state.
   */
 object SnapshotLeaderLoop {
+
+  /** Fail-closed control-flow seam for the producer's slot-lineage gate. `validated` is by-name so an invalid locally constructed artifact
+    * cannot evaluate any Ed25519/KES signing or chain-store effect. The caller owns branch/staging cleanup and the enclosing MPT
+    * transaction returns `Rollback`; a rejected slot is an ordinary `None`, not an exception that can terminate the slot stream.
+    */
+  private[nakamoto] def afterProducerSlotLineageValidation[F[_]: cats.Monad, A](
+    lineage: Either[String, Unit]
+  )(
+    onInvalid: String => F[Unit]
+  )(
+    validated: => F[A]
+  ): F[Option[A]] =
+    lineage match {
+      case Left(reason) => onInvalid(reason).as(none[A])
+      case Right(_)     => validated.map(_.some)
+    }
 
   /** Mutable state tracked across slots. */
   final case class LoopState(
@@ -184,24 +199,15 @@ object SnapshotLeaderLoop {
     else withNew
   }
 
-  /** Execution-shard committee epoch for a checkpoint anchored at `finalizedAnchor`. Keeping this pure and separate from the global
-    * best-tip period prevents a reorgable tip from rotating membership ahead of the replay base.
-    */
-  private[nakamoto] def executionShardEpoch(
-    finalizedAnchor: SnapshotOrdinal,
-    etaRotationSnapshots: Long
-  ): EtaPeriod =
-    EtaPeriod(EtaCalculation.rotationPeriod(finalizedAnchor.value.value, etaRotationSnapshots))
-
   /** Emit the chain-quality gauge + per-kind "fired" counters for task #138.
     *
-    * Called from both finalize sites (depth-k and attestation-2/3). Counter names are spelled out literally so the [[Metrics.MetricKey]]
-    * refinement (compile-time regex match) is satisfied — a `s"…${k.name}…"` interpolation can't be refined at compile time. Kept private
-    * to this object so neither the metric names nor the choice of "which triggers count" leak into the shared `FinalityTrigger` API (which
-    * would create a circular dep on the metric refinement).
+    * Called from both current finalize sites (depth-k and the legacy cumulative-weight sink). Counter names are spelled out literally so
+    * the [[Metrics.MetricKey]] refinement (compile-time regex match) is satisfied — a `s"…${k.name}…"` interpolation can't be refined at
+    * compile time. Kept private to this object so neither the metric names nor the choice of "which triggers count" leak into the shared
+    * `FinalityTrigger` API (which would create a circular dep on the metric refinement).
     *
-    * T_depth2 is intentionally not emitted as a fired counter here — that's the Phase 2→3 archival trigger and gets its own
-    * `dag_nakamoto_archival_finalized` counter from the settled-ordinal (T_depth2) branch below.
+    * The legacy `T_depth2` kind is excluded here. Its current counter is retention telemetry only: target GL0 has no Phase 3, and k2 never
+    * qualifies a snapshot or constrains fork choice.
     *
     * '''Per-ordinal companion counters.''' If `finalizedOrdinal` is supplied, ALSO emits `*_per_ordinal_total` counters tagged with
     * `snapshot_ordinal`. The original (unlabelled) counters stay so existing alerts continue to fire. Per-ordinal cardinality is bounded —
@@ -351,16 +357,15 @@ object SnapshotLeaderLoop {
       }
   }
 
-  /** §3 NIPoPoW S3 — bound on the number of newly-archival ordinals processed per `finalityMonitor` tick. Catch-up after a process restart
-    * walks (`prev`, `archivalQualifying`] which could be many K₂ values if the leader-loop was offline; capping keeps each tick's wall-time
-    * predictable. Remaining ordinals roll forward on the next tick — the finalizer's high-water-mark guarantees forward-only progression
-    * regardless of how many ticks the catch-up spans.
+  /** Bound on the number of local NIPoPoW tower entries processed per `finalityMonitor` tick. Catch-up after a process restart walks a
+    * retained-history interval that may be large; capping keeps each tick's wall-time predictable. Remaining ordinals roll forward on the
+    * next tick — the finalizer's high-water-mark guarantees forward-only progression regardless of how many ticks the catch-up spans.
     */
   private val TowerFinalizerMaxCatchupPerTick: Long = 100L
 
-  /** §3 NIPoPoW S3 — drive `towerFinalizer.finalize` for each newly-archival ordinal in `(prev, archivalQualifying]`. Resolves the
-    * canonical hash via `chainStore.walkBackTo(tipHash, ord)`, fetches the snapshot via `snapshotStorage.get(hash)`, and computes the
-    * content-address via `Signed.toHashed`. Errors are logged and swallowed — the next tick will retry remaining ordinals.
+  /** Drive `towerFinalizer.finalize` for each newly tower-eligible retained ordinal in `(prev, archivalQualifying]`. Resolves the canonical
+    * hash via `chainStore.walkBackTo(tipHash, ord)`, fetches the snapshot via `snapshotStorage.get(hash)`, and computes the content-address
+    * via `Signed.toHashed`. Errors are logged and swallowed — the next tick will retry remaining ordinals.
     */
   private def driveTowerFinalizer[F[_]: Async: HasherSelector](
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -435,6 +440,7 @@ object SnapshotLeaderLoop {
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTracker: TipTracker[F],
     stakeRegistry: StakeRegistry[F],
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
     nodeStorage: NodeStorage[F],
     keyPair: KeyPair,
     selfId: PeerId,
@@ -452,10 +458,9 @@ object SnapshotLeaderLoop {
     // (replaces the prior `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; HOCON over scattered sys.env). Drives the
     // depth-k finality gate (`ConfirmationDepthK` below).
     confirmationDepthK: Long,
-    // Archival depth k₂ (= 100·k₁) — threaded from `sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value`
-    // at the call site (Track-3 S1). Replaces the prior inline `val ArchivalDepthK = 100L * confirmationDepthK` derivation
-    // below, so k₂ now has a single canonical source (`NakamotoConfig.keepDepthBehindFinalized`). Feeds `TDepth2Trigger`
-    // (the Phase 2 → Phase 3 archival gate). REQUIRED — no default (same no-value-defaults rule as k₁ above).
+    // Legacy parameter name for k2 (= 100*k1), the recommended local retention/proof/recovery
+    // capacity. Current code still feeds a TDepth2Trigger; that must remain telemetry/local tower
+    // scheduling only and must not create Phase 3 or a fork-choice floor.
     archivalDepthK: Long,
     // Slot duration ms — threaded from `sharedCfg.nakamoto.slotDurationMs.value` at the call site (§5.7: the
     // consensus time UNIT; replaces the prior `sys.env.get("NAKAMOTO_SLOT_DURATION_MS")` read here).
@@ -482,7 +487,7 @@ object SnapshotLeaderLoop {
     mptOverlay: MptOverlay[F, GlobalStateKey],
     // Tracks the highest finalized ordinal so HttpApi can expose it via
     // /global-snapshots/latest/finalized-ordinal. Updated after every successful
-    // chainStore.finalize call (depth-k or attestation-2/3, whichever fires first).
+    // current chainStore.finalize call (depth-k or the legacy cumulative-weight sink, whichever fires first).
     nakamotoFinalizedOrdinalRef: Ref[F, SnapshotOrdinal],
     // Axis 2 (gl1 inclusion-proof follow) — the latest-FINALIZED `(ordinal, GlobalSnapshotInfo)` the gl0-side
     // slice producer (`GlobalFollowSliceService`) serves. Captured at the SAME two finalize sinks that advance
@@ -550,17 +555,16 @@ object SnapshotLeaderLoop {
     // request here instead of silently waiting for the next periodic sync. See
     // ChainSyncRequestQueue for why this is a queue rather than a direct call.
     chainSyncRequestQueue: ChainSyncRequestQueue[F],
-    // Chain-quality observable seam (#138). Populated AFTER the four triggers
-    // (T_weight, T_count, T_depth1, T_depth2) are constructed in this stream so the
+    // Chain-quality observable seam (#138). Current telemetry exposes four legacy trigger kinds;
+    // target Phase 2 uses only decided-attestation T_weight OR T_depth1, so T_count/T_depth2
+    // must not be interpreted as additional finality rails. Populated after construction so the
     // HTTP route /global-snapshots/{ord}/finality-triggers can answer "which triggers
     // qualified ord N?" without taking on the leader-loop's internal state. Caller
     // creates the Ref before HttpApi wiring; we set it once at startup. Pure
     // observability — never feeds back into consensus.
     finalityTriggerViewRef: Ref[F, Option[FinalityTriggerView[F]]],
-    // Track-3 S1: injected, write-restricted marker for the k₂ "settled" (Phase 2 → Phase 3 archival) ordinal — promoted out of the
-    // fiber-local `lastArchivalOrdinalRef` below so `FinalityTriggersRoutes` (`GET /global-snapshots/settled`) can read it. DI shape
-    // mirrors `finalityTriggerViewRef`. G1: its backing Ref is a NEW one — NEVER the k₁ `nakamotoFinalizedOrdinalRef` (aliasing would
-    // report k₁ as "settled" and let a route corrupt the k₁ production floor). Only writer is the `T_depth2` sink below (`markSettled`).
+    // Write-restricted view over the legacy k2 watermark. In the target architecture this is
+    // local retention/tower telemetry only, never a settled consensus phase or production/fork floor.
     settledOrdinalTracker: SettledOrdinalTracker[F],
     // §1.2 Slice 5/6: KES parallel-signing for attestations + snapshots. `operationalKeyMaker`
     // signs the attestation hash + snapshot hash at the period derived from the rotation
@@ -568,20 +572,20 @@ object SnapshotLeaderLoop {
     // Receivers (NakamotoSyncDaemon) re-derive the same period from the wire ordinal and
     // verify with the master VK looked up in the registry — warn-only this slice.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    verifiedLocalOperatorKeys: LocalOperatorKeyPairGate.VerifiedLocalOperatorKeys,
     // Public KES evidence is persisted beside snapshot storage so an evicted ancestor remains fully verifiable over ChainSync.
     dataDir: java.nio.file.Path,
-    // Slice S3: invoked at finalize sinks (depth-k AND attestation-2/3) with the canonical
+    // Slice S3: invoked at current finalize sinks (depth-k AND the legacy cumulative-weight sink) with the canonical
     // GlobalIncrementalSnapshot. Iterates `stateChannelSnapshots` to drop `(metagraphAddress,
     // parentHash)` tally entries from the committee-attestation aggregator once their binary
     // has rolled into a finalized global snapshot. Without this the aggregator grows
     // monotonically (one entry per `(metagraph, parent, binary)` seen on the wire). Callers
     // that haven't wired the gate yet can pass `_ => Async[F].unit`.
     onFinalize: io.constellationnetwork.schema.GlobalIncrementalSnapshot => F[Unit],
-    // §3 NIPoPoW S3: Phase-3 sink that grows the local TowerStore from finalized snapshots.
-    // Invoked next to the overlay history prune in `finalityMonitor` when T_depth2's archival
-    // watermark advances. The finalizer's high-water-mark Ref guarantees no double-write, so
+    // Local NIPoPoW tower finalizer. Current code invokes it when the legacy T_depth2 retention
+    // watermark advances; that scheduling does not confer global finality. Its high-water-mark Ref guarantees no double-write, so
     // missed ticks (e.g. process restart) are safely re-driven from chain replay. Layers that
-    // don't run the Phase-3 sink (followers without the tower partition) pass `TowerFinalizer.noop`.
+    // do not maintain the local tower partition pass `TowerFinalizer.noop`.
     towerFinalizer: io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer[F],
     // ─── Hierarchical-shard-checkpoints v1 — Gap A producer loop ───────────────────────────────
     // Per-shard checkpoint producers, keyed by `ShardId`. EMPTY at `numShards = 1` (the regression
@@ -660,7 +664,7 @@ object SnapshotLeaderLoop {
     //   - absent (a snapshot this node did NOT itself stage) ⇒ skip — the ml0 follower full-GSI-adopts that
     //     gap. Absence MUST NOT error; this is a best-effort transport optimization.
     // Idempotent on re-finalize of the same ordinal (re-promote is a no-op once staging is drained). Called at
-    // BOTH finalize sinks (depth-k AND attestation-2/3), exactly paralleling `recordFollowProjection`.
+    // BOTH current finalize sinks (depth-k AND the legacy cumulative-weight sink), exactly paralleling `recordFollowProjection`.
     def recordFinalizedAccumulator(ordinal: SnapshotOrdinal, finalizedHash: Hash): F[Unit] =
       // Atomically (a) pull the staged accumulator out under the finalized (with-cert canonical) hash, AND (b)
       // FINALIZED-WATERMARK prune: drop every OTHER staged entry whose ordinal is at-or-below this just-finalized
@@ -708,7 +712,7 @@ object SnapshotLeaderLoop {
 
     // Task #12 staging-completeness fix — promote the accumulator of EVERY ordinal that this finalize tick made
     // final, not just the single highest one. Both finalize sinks jump straight to a single `finalizeAtOrdinal`
-    // (depth-k's `tip.ordinal − k`, or the attestation-2/3 qualifying ordinal) which can advance by MORE than one
+    // (depth-k's `tip.ordinal - k`, or the legacy cumulative-weight qualifying ordinal) which can advance by MORE than one
     // ordinal per tick whenever the tip grew several ordinals between two loop iterations. Finalizing the highest
     // ordinal implicitly finalizes its canonical ancestors, but the single-ordinal `recordFinalizedAccumulator`
     // call above promotes ONLY that highest ordinal AND its watermark prune then DROPS every staged ancestor
@@ -725,8 +729,13 @@ object SnapshotLeaderLoop {
       else
         (fromExclusive + 1L to toInclusive).toList.traverse_ { o =>
           chainStore.walkBackTo(tipHash, o).flatMap {
-            case Some(hashAtOrdinal) => recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(o), hashAtOrdinal)
-            case None                => Async[F].unit
+            case Some(hashAtOrdinal) =>
+              recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(o), hashAtOrdinal) >>
+                // `chainStore.finalize` may already have evicted intermediate ancestors from its bounded in-memory retention window.
+                // Finality callbacks are consensus-adjacent release events and must not depend on that cache. SnapshotStorage is the
+                // durable canonical byte source used by the other finalized-range consumers.
+                snapshotStorage.get(hashAtOrdinal).flatMap(_.traverse_(stored => onFinalize(stored.value)))
+            case None => Async[F].unit
           }
         }
     // Use shared genesis time if provided, else fall back to wall clock
@@ -814,9 +823,10 @@ object SnapshotLeaderLoop {
                         // EpochStakeHistory hasn't yet recorded (e.g., post-restart before backfill), the
                         // impl falls back to the current GSI — correct because the genesis distribution
                         // is unchanged during warmup.
-                        lastChainOrdinal <- chainStore.bestTipOrdinal.map(_.getOrElse(0L))
+                        bestTip <- chainStore.bestTip
+                        lastChainOrdinal = bestTip.fold(0L)(_.ordinal)
                         currentPeriod = EtaCalculation.rotationPeriod(lastChainOrdinal, etaRotationSnapshots)
-                        lookbackPeriod = EtaPeriod(currentPeriod - 2L)
+                        lookbackPeriod = EtaCalculation.leaderStakeLookbackPeriod(lastChainOrdinal, etaRotationSnapshots)
                         myStake <- stakeRegistry.relativeStakeAt(selfId, lookbackPeriod)
 
                         // Chain-derived eta: deterministic from stored chain, no in-memory accumulator.
@@ -833,82 +843,123 @@ object SnapshotLeaderLoop {
                             // Cardano/Praos bootstrap: periods 0 and 1 are genesis-derivable (distinct, no
                             // VRF-output dependency). First VRF-folded eta is period 2. Removes the period
                             // 0→1 boundary fork (#259 folded period 0's unsettled outputs here).
-                            Async[F].pure(EtaCalculation.bootstrapEta(genesisEta, currentPeriod))
+                            Async[F].pure(EtaCalculation.bootstrapEta(genesisEta, currentPeriod).some)
                           } else {
-                            chainStore.vrfOutputsForPeriod(currentPeriod - 1, etaRotationSnapshots).map { chainOutputs =>
-                              if (chainOutputs.nonEmpty) {
-                                EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2))
-                              } else {
-                                // No chain data yet for previous period (>= 1) — per-period bootstrap value
-                                EtaCalculation.bootstrapEta(genesisEta, currentPeriod)
-                              }
+                            bestTip match {
+                              case None => Async[F].pure(none[Array[Byte]])
+                              case Some(tip) =>
+                                chainStore
+                                  .vrfOutputRangeForPeriodFrom(currentPeriod - 1, etaRotationSnapshots, tip.hash)
+                                  .flatMap {
+                                    case NakamotoChainStore.VrfOutputRange.Complete(chainOutputs) if chainOutputs.nonEmpty =>
+                                      Async[F].pure(
+                                        EtaCalculation.computeEta(genesisEta, currentPeriod, chainOutputs.map(_._2)).some
+                                      )
+                                    case NakamotoChainStore.VrfOutputRange.Complete(_) =>
+                                      logger
+                                        .warn(
+                                          s"Slot $currentSlot: refusing leader trial because eta source period=${currentPeriod - 1L} " +
+                                            s"is complete but contains no VRF outputs"
+                                        )
+                                        .as(none[Array[Byte]])
+                                    case incomplete: NakamotoChainStore.VrfOutputRange.Incomplete =>
+                                      logger
+                                        .warn(
+                                          s"Slot $currentSlot: refusing leader trial because eta source period=${currentPeriod - 1L} " +
+                                            s"is incomplete at hash=${incomplete.missingHash.value.take(12)} " +
+                                            s"ordinal=${incomplete.expectedOrdinal.fold("unknown")(_.toString)}"
+                                        )
+                                        .as(none[Array[Byte]])
+                                  }
                             }
                           }
 
-                        // Raw VRF-trial counter (incremented BEFORE win/loss check) — pairs with `dag_nakamoto_slots_won` to surface silently-degraded validators (clock skew, missing eta, bad keystore) that would otherwise vanish from finality counters; Prometheus scrapes per node so {node} is added by the collector.
-                        _ <- Metrics[F].incrementCounter("dag_nakamoto_slots_trialed_total")
-
-                        result <- eligibilityChecker.checkEligibility(
-                          vrfSK = vrfSeed,
-                          slot = slotRefined,
-                          slotGap = slotGap,
-                          eta = eta,
-                          relativeStake = myStake,
-                          config = lddConfig
+                        localSigningKey <- LocalOperatorKeyPairGate.registeredSigningKey(
+                          operationalKeyMaker,
+                          selfId,
+                          keyPair,
+                          operatorKeyRegistry,
+                          currentPeriod
                         )
 
-                        _ <- result match {
-                          case Some((proof, vrfOutput)) =>
-                            snapshotSemaphore.permit.use { _ =>
-                              onSlotWon(
-                                stateRef,
-                                consensusFns,
-                                snapshotStorage,
-                                chainStore,
-                                eventMempool,
-                                sidecarClient,
-                                tipTracker,
-                                stakeRegistry,
-                                lastGlobalSnapshotStorage,
-                                lastNGlobalSnapshotStorage,
-                                keyPair,
-                                selfId,
-                                vrfSeed,
-                                vrfPK,
-                                proof,
-                                vrfOutput,
-                                eta,
-                                currentSlot,
-                                slotGap,
-                                slotRefined,
-                                lddConfig,
-                                etaRotationSnapshots,
-                                lastKnownSlotRef,
-                                epochStateRef,
-                                productionGate,
-                                productionTimestamps,
-                                nakamotoFinalizedOrdinalRef,
-                                mptStore,
-                                mptOverlay,
-                                operationalKeyMaker,
-                                dataDir,
-                                shardProducers,
-                                shardChainStores,
-                                shardBinaryBuffers,
-                                shardAssignment,
-                                shardCommitteeMembership,
-                                pendingAccumulatorsRef,
-                                pendingPostBytesRef,
-                                logger
-                              )
-                            } // snapshotSemaphore.permit
-
-                          case None =>
-                            // Periodic debug log + gauge
-                            Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot) >>
+                        _ <- (eta, localSigningKey) match {
+                          case (None, _) =>
+                            Metrics[F].incrementCounter("dag_nakamoto_slots_eta_unavailable_total")
+                          case (Some(_), Left(error)) =>
+                            Metrics[F].incrementCounter("dag_nakamoto_slots_invalid_local_kes_total") >>
                               Async[F].whenA(currentSlot % 30 == 0) {
-                                logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
+                                logger.warn(
+                                  s"Slot $currentSlot: refusing leader trial because the local atomic KES+VRF pair is unavailable: ${error.getMessage}"
+                                )
                               }
+                          case (Some(verifiedEta), Right(signingKey)) =>
+                            // Raw VRF-trial counter (incremented BEFORE win/loss check) — pairs with
+                            // `dag_nakamoto_slots_won` to surface silently-degraded validators.
+                            Metrics[F].incrementCounter("dag_nakamoto_slots_trialed_total") >>
+                              eligibilityChecker
+                                .checkEligibility(
+                                  vrfSK = vrfSeed,
+                                  slot = slotRefined,
+                                  slotGap = slotGap,
+                                  eta = verifiedEta,
+                                  relativeStake = myStake,
+                                  config = lddConfig
+                                )
+                                .flatMap {
+                                  case Some((proof, vrfOutput)) =>
+                                    snapshotSemaphore.permit.use { _ =>
+                                      onSlotWon(
+                                        stateRef,
+                                        consensusFns,
+                                        snapshotStorage,
+                                        chainStore,
+                                        eventMempool,
+                                        sidecarClient,
+                                        tipTracker,
+                                        stakeRegistry,
+                                        lastGlobalSnapshotStorage,
+                                        lastNGlobalSnapshotStorage,
+                                        keyPair,
+                                        selfId,
+                                        vrfSeed,
+                                        vrfPK,
+                                        proof,
+                                        vrfOutput,
+                                        verifiedEta,
+                                        currentSlot,
+                                        slotGap,
+                                        slotRefined,
+                                        lddConfig,
+                                        etaRotationSnapshots,
+                                        lastKnownSlotRef,
+                                        epochStateRef,
+                                        productionGate,
+                                        productionTimestamps,
+                                        nakamotoFinalizedOrdinalRef,
+                                        mptStore,
+                                        mptOverlay,
+                                        operationalKeyMaker,
+                                        signingKey,
+                                        operatorKeyRegistry,
+                                        verifiedLocalOperatorKeys,
+                                        dataDir,
+                                        shardProducers,
+                                        shardChainStores,
+                                        shardBinaryBuffers,
+                                        shardAssignment,
+                                        shardCommitteeMembership,
+                                        pendingAccumulatorsRef,
+                                        pendingPostBytesRef,
+                                        logger
+                                      )
+                                    }
+
+                                  case None =>
+                                    Metrics[F].updateGauge("dag_nakamoto_slot", currentSlot) >>
+                                      Async[F].whenA(currentSlot % 30 == 0) {
+                                        logger.debug(s"Slot $currentSlot: not eligible (gap=$slotGap, stake=$myStake)")
+                                      }
+                                }
                         }
 
                         // ─── §5.7 per-SLOT shard-checkpoint fan-out (owner-corrected 2026-06-11) ─────────────
@@ -943,7 +994,7 @@ object SnapshotLeaderLoop {
                         nakamotoFinalizedAnchor <- nakamotoFinalizedOrdinalRef.get
                         _ <- Async[F].whenA(shardProducers.nonEmpty && shardAssignment.isDefined && bootGraceElapsed) {
                           val anchorOrd = nakamotoFinalizedAnchor
-                          val shardEpoch = executionShardEpoch(anchorOrd, etaRotationSnapshots)
+                          val shardEpoch = EtaCalculation.executionShardEpoch(anchorOrd, etaRotationSnapshots)
                           supervisor
                             .supervise(
                               shardFanOutGate.tryAcquire.flatMap {
@@ -1006,65 +1057,47 @@ object SnapshotLeaderLoop {
         // deliberately-conservative operating point pending expanded-range sim verification
         // (research-nipopos-2026, sim/adv-7block-private, adv_depth_optimization.py).
         //
-        // Attestation-based BFT finality (≥ 2/3 stake weight, FinalityThreshold in TipTracker)
-        // is the hot path in healthy networks and fires in seconds. Depth-k is the fallback
-        // for adversarial / partition conditions and only binds when attestation finality
-        // stalls. Raising k therefore increases worst-case finality time during degraded
-        // operation without affecting normal-case latency.
+        // The target optimistic hot path is an exact-hash Avalanche/Snowball decision followed by
+        // decided-attestation T_weight. It is not a BFT vote/lock/QC. Canonical k1 depth is the
+        // fallback when the optimistic rail stalls; either rail makes reversible Phase-2 state.
         val ConfirmationDepthK: Long = confirmationDepthK
 
-        // Archival depth k₂ — Phase 2 → Phase 3 boundary (`T_depth2`, task #137).
-        //
-        // Where ConfirmationDepthK (k₁) is the operational "you'll never see a reorg
-        // past this point" finality gate, k₂ is the cryptographic "common prefix violation
-        // is negligibly unlikely" archival gate. At k₂ = 100·k₁ (mainnet 102400) snapshots, CP-violation
-        // probability under a 1/3 adversary is well below 10⁻¹² (Cardano-equivalent),
-        // making it safe to prune the undo journal, emit aggregate-signature certificates
-        // (future Mithril-equivalent), and publish light-client trust anchors.
-        //
-        // For the current trigger landing, the only downstream effects are a log line and
-        // Prometheus counters — Phase-3 sinks (overlay history pruning #139, Mithril, light
-        // client) plug in separately. The Ref-backed monotone-advance tracker is in scope
-        // for them once they land.
-        //
-        // See `docs/nakamoto/attestation-and-finality.md` §0.3 for the formal target.
-        // k₂-depth for T_depth2's overlay prune + archival-log marker. Track-3 S1: NO longer derived inline here — threaded in as the
-        // `archivalDepthK` run parameter, sourced from the single canonical `NakamotoConfig.keepDepthBehindFinalized` (= 100·k₁) at the
-        // `GlobalSnapshotConsensus.make` call site (NO sys.env; the old NAKAMOTO_ARCHIVAL_DEPTH env read was a dead knob). NOTE: this is
-        // NOT a chain-selection freeze — the no-reorg freeze is on the k₁ finalized marker in NakamotoChainStore.store().
+        // `archivalDepthK` is a legacy variable name for the recommended local k2 = 100*k1
+        // retention/proof/automatic-rollback capacity. There is no protocol Phase 3 and neither
+        // k1 nor k2 is an absolute no-reorg floor: Phase 2 remains density-reorgable. If objective
+        // comparison reaches unavailable history, production/mutation stops in RecoveryRequired
+        // until exact authenticated reconstruction completes. Live TDepth2/prune/floor behavior
+        // below is transitional implementation debt, not the target finality contract.
 
-        // FinalityTrigger[F] construction (#135 / #136). T_weight, T_count and T_depth1
-        // are built ONCE per leader-loop instance; each one wraps a `Ref[F, SnapshotOrdinal]`
+        // FinalityTrigger construction. Target P2 uses T_weight OR T_depth1. Live T_count and
+        // T_depth2 instances are retained temporarily for legacy observability and must not
+        // authorize another finality rail or phase. Each trigger wraps a `Ref[F, SnapshotOrdinal]`
         // that tracks its monotone latest-qualifying-ordinal across all ticks. The downstream
         // `FinalityTrigger.triggersFor(triggers, ord)` lookup answers "which triggers
         // qualified ordinal N?" for free — used by the future chain-quality observable
         // (#138) and post-mortem finality analysis without re-walking the chain.
         //
-        // T_weight in the post-Snowball wiring reads the sibling [[SnowballAccumulator]]
-        // (constructed inside `TipTracker.make`) — decision is margin-based per Snowball
-        // semantics (proposal §2, §3.1), not the 2/3 weight-sum gate. The
+        // Transitional T_weight reads the sibling [[SnowballAccumulator]] constructed inside
+        // `TipTracker.make`. That implementation is an arrival-order-sensitive sticky margin,
+        // not the intended K/alpha/beta cascade. The
         // `TipTracker.FinalityThreshold` value (2/3, env `NAKAMOTO_ATTESTATION_THRESHOLD`) is
-        // retained for the T_count rule (1-validator-1-vote ≥ 2/3 distinct attesters), the
-        // legacy fallback evidence at the same position, and the ATTEST-FINALIZED log line.
+        // retained for the T_count rule, the live legacy cumulative-weight sink, and diagnostics.
+        // The legacy sum is implementation debt, not fallback evidence in the target protocol.
         //
-        // Snowball parameters (K, α, β) are documented and defaulted on the
-        // [[SnowballAccumulator]] companion (env: `NAKAMOTO_SNOWBALL_K=8`,
-        // `NAKAMOTO_SNOWBALL_ALPHA=5`, `NAKAMOTO_SNOWBALL_BETA=10`). Empirical floor from the
-        // GPU dual-mode sweep at commit `5ace3d36` of `~/repos/research-nipopos-2026` —
-        // 0 safety violations across all measured cluster sizes N ∈ {16, 32, 100, 500, 1000}
-        // at f_adv=0.33 under all three adversary modes (coordinated_lie, split_honest,
-        // random_honest). See `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §0.A.
+        // `SnowballAccumulator.K` and `.Alpha` are currently unused. Beta is the only value this
+        // implementation consumes. Simulations of a real K/alpha cascade do not validate this
+        // different executable rule.
         //
-        // The triggers are READ-ONLY surfaces here. Side effects (chainStore.finalize,
-        // mptOverlay.finalizeBranch, log lines, metrics, mempool prune) still live in the
-        // monitor body below, driven by the triggers' qualifying ordinals.
+        // The trigger objects are read-only calculators. State-changing side effects remain in
+        // the monitor below; its optimistic branch currently bypasses T_weight and reads the
+        // legacy cumulative-weight query directly.
         Stream.eval(TWeightTrigger.make[F](tipTracker, TipTracker.FinalityThreshold)).flatMap { tWeight =>
           Stream.eval(TCountTrigger.make[F](tipTracker, stakeRegistry, TipTracker.FinalityThreshold)).flatMap { tCount =>
             Stream.eval(TDepth1Trigger.make[F](ConfirmationDepthK)).flatMap { tDepth1 =>
               Stream.eval(TDepth2Trigger.make[F](archivalDepthK)).flatMap { tDepth2 =>
-                // Phase 1→2 triggers — used both for the chain-quality gauge sample (sized
-                // 1..3 at finalize time) and the per-kind "fired" counter increments. T_depth2
-                // is Phase 2→3 archival and is intentionally excluded here.
+                // Transitional telemetry list. T_count is still sampled by live code, but the
+                // locked P2 predicate is decided-attestation T_weight OR T_depth1. T_depth2 is
+                // retention telemetry and cannot advance a phase.
                 val phase12Triggers: List[FinalityTrigger[F]] = List(tWeight, tCount, tDepth1)
                 // Publish the trigger view (#138) so the HTTP route can answer "which
                 // triggers qualified ord N?" without owning trigger references. Set once
@@ -1075,31 +1108,21 @@ object SnapshotLeaderLoop {
                       .set(Some(FinalityTriggerView.fromTriggers[F](List(tWeight, tCount, tDepth1, tDepth2))))
                   )
                   .flatMap { _ =>
-                    // Highest Phase-3 (ARCHIVAL / "settled") qualifying ordinal seen so far. Driven by
-                    // `tDepth2` and advanced strictly forward — Phase-3 sinks (overlay history pruning
-                    // #139, future Mithril cert, future light-client anchor) read it to decide what's
-                    // safe to prune / publish.
-                    //
-                    // Track-3 S1: this was a fiber-local Ref; it is now the INJECTED
-                    // `settledOrdinalTracker` (a NEW ref, never the k₁ `nakamotoFinalizedOrdinalRef`) so
-                    // `FinalityTriggersRoutes` (`GET /global-snapshots/settled`) can read it. Its ONLY
-                    // writer is the `T_depth2` sink below, via `markSettled`. The trivial `Stream.eval`
-                    // keeps the surrounding stream structure unchanged.
+                    // Legacy monotone k2 watermark used by current retention/tower telemetry. It is
+                    // deliberately distinct from the P2 ordinal ref, but the target removes its
+                    // Phase-3/settled meaning entirely. The trivial Stream keeps current wiring intact.
                     Stream.eval(Async[F].unit).flatMap { _ =>
-                      // Heap-leak Fix A: operational-k₁ overlay-prune watermark. Drives
+                      // TRANSITIONAL IMPLEMENTATION GAP: k1-driven overlay-prune watermark. Drives
                       // `mptOverlay.pruneBelow` once per advance of `T_depth1.latestQualifyingOrdinal`
-                      // (the operational k₁ finality trigger). Decoupling from the k₂ archival watermark
+                      // (the k1 Phase-2 depth trigger). Decoupling from the legacy k2 retention watermark
                       // means undoJournalRef + finalizedRef are bounded by k₁ ords instead of k₂ — a
                       // ~257× reduction in worst-case retention (255 vs 65536).
                       //
-                      // Safety: reorg-replace at depth > k₁ is excluded by `ConfirmationDepthK`
-                      // semantics, so the journal entry at `ord` for `ord < tip.ord - k₁` cannot ever
-                      // be replayed. The reorg-replace finalize paths
-                      // (`MptOverlay.finalizeBranch`'s `case Some(prev) =>` arms) only consult
-                      // `undoJournalRef[ord]` when re-finalizing at the same ord — beyond k₁ depth
-                      // that's a CP violation, not a normal reorg.
+                      // Target P2 remains density-reorgable beyond k1, so pruning cannot assume such
+                      // reorgs are impossible. Required history must remain reconstructible from exact
+                      // authenticated disk/proof state or the node must enter RecoveryRequired.
                       //
-                      // Monotone advance via `Ref` mirrors the archival pattern. The overlay's
+                      // Monotone advance via `Ref` mirrors the legacy k2 watermark pattern. The overlay's
                       // `pruneBelow` is itself idempotent and monotone — the local Ref just dedups
                       // the call so we don't emit OVERLAY-PRUNE-BELOW log noise per finality tick.
                       Stream.eval(Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue)).flatMap { lastOperationalPruneOrdinalRef =>
@@ -1138,6 +1161,7 @@ object SnapshotLeaderLoop {
                                       selfId = selfId,
                                       keyPair = keyPair,
                                       operationalKeyMaker = operationalKeyMaker,
+                                      operatorKeyRegistry = operatorKeyRegistry,
                                       etaRotationSnapshots = etaRotationSnapshots,
                                       logger = logger
                                     ) >> logger.info(
@@ -1203,17 +1227,13 @@ object SnapshotLeaderLoop {
                                           tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
                                             tipTracker.pruneBelow(finalizeAtSlot) >>
                                             chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
-                                            // (#196) Phase-3 ack to the sidecar outbox. After this finalize call
+                                            // (#196) Phase-2 operational ack to the sidecar outbox. After this finalize call
                                             // the snapshot's AllowSpendBlocks + StateChannelSnapshots are durably
                                             // committed; the sidecar can drop the corresponding outbox entries
                                             // and stop re-gossiping. Failure here is non-fatal — the outbox TTL
                                             // catches it eventually and the next finalize call would re-confirm
                                             // anyway (Confirm is idempotent on the sidecar side).
                                             confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger) >>
-                                            // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
-                                            // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
-                                            // Default is a no-op; the gate-wired path iterates `stateChannelSnapshots`.
-                                            onFinalize(canonicalSnapshot.signedSnapshot.value) >>
                                             // #56.6: notify the MPT overlay that this branch is finalized. With
                                             // accept() not yet migrated, this is a runtime no-op (pending=empty
                                             // returns NoOp). When #56.10 migrates accept() to commit branches,
@@ -1269,9 +1289,9 @@ object SnapshotLeaderLoop {
                                             // Chain-quality observable (#138): sample which Phase 1→2 triggers
                                             // qualified this ordinal at finalize time. Pure observability — the
                                             // qualifying-set lookup walks each trigger's monotone Ref (no chain
-                                            // walk). Value ∈ {1, 2, 3}: 1 = sketchy single-trigger evidence
-                                            // (typically depth-only in a small-cluster partition), 3 = rock-solid
-                                            // unanimous evidence. The per-kind counter increments let dashboards
+                                            // walk). The value counts current telemetry kinds; it is not a safety
+                                            // score because legacy T_count does not strengthen the target T_weight
+                                            // OR k1 predicate. The per-kind counter increments let dashboards
                                             // break down "what fired" over time.
                                             FinalityTrigger
                                               .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
@@ -1292,25 +1312,13 @@ object SnapshotLeaderLoop {
                                 case _ => Async[F].pure(false)
                               }
 
-                              // GRANDPA-style chain finality, chain-aware: attesting to ordinal N with a hash on
-                              // OUR chain implicitly attests to all ancestors. Attestations with a different hash
-                              // at ordinal N are on a different fork and must NOT contribute weight here — the
-                              // canonicalHashAt predicate filters them out. Walk attestation ordinals from highest
-                              // down, accumulating only matching-hash weight. The highest ordinal where cumulative
-                              // weight >= 2/3 is finalized.
-                              //
-                              // The trigger's `tWeight.latestQualifyingOrdinal` already reflects this evaluation
-                              // (from `evaluateAndAdvance` above) — but `tWeight` now reads the Snowball
-                              // accumulator, not the legacy weight-sum path. The legacy
-                              // `highestFinalizedOrdinal` call below is retained for the ATTEST-FINALIZED log
-                              // line's cumulative `weight` value (downstream log-parsing depends on
-                              // `weight=X.XX` exactly) and as parallel evidence at the same ordinal. The work is
-                              // idempotent — a pure read against the attestations map + canonical chain walk.
-                              //
-                              // '''P-11b rolled back (Snowball commit).''' This call NO LONGER passes `selfId`.
-                              // Snowball's observer-independent decision rule is the primary T_weight driver;
-                              // the legacy weight-sum here can safely include self again. NID is restored at the
-                              // T_weight position. See `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §3.1.
+                              // TRANSITIONAL TARGET VIOLATION: this block still drives `chainStore.finalize`
+                              // from a one-round cumulative 2/3 weight sum. It does not consume
+                              // `tWeight.latestQualifyingOrdinal`, which is currently only the transitional
+                              // sticky-margin ordinal projection and is itself not yet safe evidence.
+                              // Therefore the live optimistic sink is not yet the locked Avalanche/Snowball rail.
+                              // The replacement must use decided-attestation T_weight only; it must not add a
+                              // global BFT vote/lock/QC or retain this weight sum as parallel finality evidence.
                               chainFinalizedOrdinal <- bestTip match {
                                 case Some(tip) =>
                                   tipTracker.highestFinalizedOrdinal(
@@ -1331,13 +1339,9 @@ object SnapshotLeaderLoop {
                                           tipTracker.markFinalized(canonicalHash, finalSlot) >>
                                             tipTracker.pruneBelow(finalSlot) >>
                                             chainStore.finalize(canonicalHash, finalOrdinal) >>
-                                            // (#196) Phase-3 outbox ack — see DEPTH-FINALIZED branch for rationale.
+                                            // (#196) Transitional Phase-2 operational outbox ack — see the depth branch for rationale.
                                             confirmSnapshotOutbox(stored, sidecarClient, logger) >>
-                                            // Slice S3: drop committee-attestation tally entries for `(metagraphAddress,
-                                            // parentHash)` pairs whose binary just rolled into a finalized gl0 snapshot.
-                                            // Same site as the depth-finality path above.
-                                            onFinalize(stored.signedSnapshot.value) >>
-                                            // #56.6: see depth-k branch above. Same wiring at the attestation-2/3 sink.
+                                            // #56.6: see depth-k branch above. Same wiring at the legacy cumulative-weight sink.
                                             mptOverlay
                                               .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalOrdinal))
                                               .void >>
@@ -1374,7 +1378,7 @@ object SnapshotLeaderLoop {
                                             } >>
                                             // Chain-quality observable (#138): see the matching block in the
                                             // DEPTH-FINALIZED branch above for the rationale. Same sample at
-                                            // the attestation-2/3 sink so both finalize paths produce a
+                                            // the legacy cumulative-weight sink so both current paths produce a
                                             // gauge update + per-kind counter increments.
                                             FinalityTrigger
                                               .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalOrdinal))
@@ -1445,7 +1449,7 @@ object SnapshotLeaderLoop {
                                 }
                               }
 
-                              // Heap-leak Fix A — operational-k₁ overlay prune.
+                              // Heap-leak Fix A — transitional k1 overlay prune.
                               //
                               // Drives `mptOverlay.pruneBelow` once per advance of `tDepth1.latestQualifyingOrdinal`
                               // (the operational k₁ finality trigger). Previously the only `pruneBelow` site was
@@ -1455,17 +1459,13 @@ object SnapshotLeaderLoop {
                               // history sets and was the dominant contributor to the leak documented in
                               // `test-runs/soak-12h-preserve-20260521-083116/HEAP-LEAK-DIAGNOSIS.md` §1.
                               //
-                              // Safety: reorg-replace at depth > k₁ is excluded by `ConfirmationDepthK` semantics.
-                              // The reorg-replace finalize paths in `MptOverlay.finalizeBranch` (`case Some(prev) =>`
-                              // arms at MptOverlay.scala:703, :768) consult `undoJournalRef[ord]` only when a
-                              // different canonical re-finalizes at the same `ord`. Beyond k₁ depth that would be
-                              // a common-prefix violation — outside our adversarial model — not a recoverable
-                              // chain switch. Dropping journal entries below the operational k₁ watermark
-                              // therefore cannot break any reachable code path.
+                              // Target safety does not exclude density reorgs beyond k1. This prune is safe only
+                              // when exact authenticated state remains reconstructible outside the RAM journal;
+                              // otherwise a required deeper comparison must enter RecoveryRequired. Treating k1
+                              // itself as an irreversible floor would violate the locked P2 lifecycle.
                               //
-                              // The k₂ archival prune below this block is now a strict subset of what this k₁
-                              // prune already did and is retained only for its side-effects (NIPoPoW tower
-                              // finalizer drive at archival depth + ARCHIVAL-FINALIZED log line). The
+                              // The legacy k2 prune below is now a strict subset of what this k1 prune already
+                              // did and is retained for local NIPoPoW tower scheduling + telemetry. The
                               // `mptOverlay.pruneBelow(archivalQualifying)` call there becomes a no-op once this
                               // k₁ block has already dropped its slice.
                               operationalPruneQualifying <- tDepth1.latestQualifyingOrdinal
@@ -1502,20 +1502,18 @@ object SnapshotLeaderLoop {
                                     )
                                 else Async[F].unit
 
-                              // T_depth2 (Phase 2 → Phase 3, ARCHIVAL) observability + scaffolding.
+                              // Legacy T_depth2 local-retention/tower observability. There is no Phase 3.
                               //
-                              // When `tDepth2.latestQualifyingOrdinal` strictly outruns our local archival
-                              // watermark, advance the watermark, emit the log line + counters, AND drive
-                              // the Phase-3 overlay-history prune sink (#139) so long-running nodes don't
-                              // leak the per-ordinal undo journal / finalizedRef accumulators that grow
-                              // monotonically with every finalize. Future Phase-3 sinks (Mithril aggregate
-                              // cert, light-client trust anchor) plug in here too.
+                              // When `tDepth2.latestQualifyingOrdinal` advances the current local watermark,
+                              // live code emits telemetry, prunes redundant RAM state, and updates the local
+                              // NIPoPoW tower. None of those actions upgrades snapshot validity or freezes fork
+                              // choice. Any future proof/certificate service must retain that separation.
                               //
                               // Heap-leak Fix A note: the `mptOverlay.pruneBelow(archivalQualifying)` call
                               // below is now effectively a no-op for `undoJournalRef`/`finalizedRef` because
                               // the k₁-driven prune above already dropped entries below `tDepth1` (which is
                               // strictly less than `tDepth2`). It remains in place so the archival pattern
-                              // is still self-contained — adding Mithril / light-client sinks later won't
+                              // is still self-contained — adding local proof-service sinks later won't
                               // need to coordinate with the operational-prune block.
                               archivalQualifying <- tDepth2.latestQualifyingOrdinal
                               _ <- settledOrdinalTracker.settledOrdinal.flatMap { prev =>
@@ -1529,12 +1527,11 @@ object SnapshotLeaderLoop {
                                         ) >>
                                         Metrics[F].incrementCounter("dag_nakamoto_archival_finalized") >>
                                         Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value) >>
-                                        // Phase-3 archival prune (#139). `pruneBelow` drops overlay history
-                                        // entries strictly below the new archival watermark — irreversible
-                                        // and safe by depth-k₂ definition (reorgs at this depth excluded).
-                                        // Logged at INFO inside the overlay when entries are dropped.
+                                        // Legacy local-retention prune. k2 does not exclude density reorgs;
+                                        // exact authenticated disk/proof reconstruction must cover removed RAM
+                                        // state or the node must enter RecoveryRequired. Logged inside the overlay.
                                         mptOverlay.pruneBelow(archivalQualifying) >>
-                                        // §3 NIPoPoW S3 Phase-3 sink. Walk newly-archival ordinals
+                                        // Local NIPoPoW tower update. Walk newly retention-eligible ordinals
                                         // `(prev, archivalQualifying]` and feed each to the tower
                                         // finalizer. The walk uses chainStore.walkBackTo from bestTip to
                                         // resolve canonical hashes; snapshotStorage.get fetches the
@@ -1620,6 +1617,9 @@ object SnapshotLeaderLoop {
     mptOverlay: MptOverlay[F, GlobalStateKey],
     // §1.2 Slice 6: KES parallel-signing for the published snapshot's `kes_signature` field.
     operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
+    slotSigningKey: LocalOperatorKeyPairGate.RegisteredSigningKey,
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
+    verifiedLocalOperatorKeys: LocalOperatorKeyPairGate.VerifiedLocalOperatorKeys,
     dataDir: java.nio.file.Path,
     // Gap A — per-shard checkpoint producers + the SAME chain stores they write into + the static
     // metagraph→shard assignment. Empty / None at numShards=1 (regression bar) ⇒ the fan-out below is
@@ -1721,23 +1721,17 @@ object SnapshotLeaderLoop {
             lastSigned.toHashed[F].flatMap { lastHashed =>
               val lastKey = lastHashed.ordinal
               val wouldProduceOrdinal = SnapshotOrdinal.next.next(lastKey)
-              // Finality-safety: never produce a snapshot at-or-below the network-finalized
-              // ordinal. If we won a slot but our local head is stale (below finalized),
+              // Transitional ordinal production guard: never produce at-or-below the local P2
+              // watermark. If we won a slot but our local head is stale,
               // producing would emit a doomed snapshot — refused downstream by
               // NakamotoChainStore's finality guard, and in a past storage-layer regression
               // could have silently overwritten finalized content (the gl0-2-divergent-517
               // class of bug). Skip and let the sync daemon catch us up via gossip/chainsync;
               // the next slot win after catch-up produces the correct (above-finalized) ordinal.
               //
-              // Track-3 S3 — DELIBERATE ASYMMETRY: this PRODUCTION floor stays keyed on the k₁
-              // `nakamotoFinalizedOrdinalRef`, even though S3 re-keys the store-gate + fork-choice
-              // revert floor to the k₂ `nakamotoSettledOrdinalRef` under the band-density flag. Rationale:
-              // production must NOT emit new blocks below OPERATIONAL finality (k₁) — a k₂ floor here would
-              // let a node produce ~100·k₁ ords into already-confirmed history, defeating the purpose of the
-              // finality gate and re-creating the `86f390130` self-contradiction (dragging production to k₂).
-              // Fork choice / storage may REVERT within the (settled, finalized] band (density-arbitrated),
-              // but LOCAL production always extends at-or-above the k₁ tip. So this comparison is intentionally
-              // NOT changed by S3 and is independent of `nakamoto.band-density-reorg-enabled`.
+              // Target production is keyed to the exact canonical P2 hash, not a monotone ordinal
+              // floor. A density reorg must replace that anchor and force rollback/re-follow before
+              // production resumes. This ordinal-only guard is transitional and cannot express that.
               if (wouldProduceOrdinal <= finalizedOrdinal) {
                 logger.warn(
                   s"⛔ Skipping slot-win production: would-be ordinal=${wouldProduceOrdinal.show} ≤ finalized=${finalizedOrdinal.show}. " +
@@ -1814,58 +1808,95 @@ object SnapshotLeaderLoop {
                         .fold(SlotCertificate.ZeroSubchainLevelCounts)(_.subchainLevelCounts)
                       certWithSubchain = cert.copy(subchainLevelCounts = parentSubchainLevelCounts)
                       artifact = rawArtifact.copy(slotCertificate = Some(certWithSubchain), eta = Some(etaHash))
-                      signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
-                      snapshotHashedForStorage <- signed.toHashed[F]
-                      producedOrdinal = lastKey.value.value + 1
-                      kesPeriodSnap = EtaCalculation.rotationPeriod(producedOrdinal, etaRotationSnapshots).toInt
-                      snapshotHashBytes = snapshotHashedForStorage.hash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                      kesSnapAttempt <-
-                        if (gateOpenPreSign) operationalKeyMaker.signAt(kesPeriodSnap, snapshotHashBytes)
+                      // Producer-side artifact-validity gate. The receiver runs this same pure validator, but
+                      // producing an invalid artifact must be impossible too: validate the exact raw artifact's
+                      // embedded checkpoint slots against the exact retained parent and the certificate that will
+                      // be embedded in this artifact. No signature or store effect is reachable on Left.
+                      slotLineage = NakamotoSnapshotValidator.validateSlotLineage(
+                        certWithSubchain,
+                        lastSigned.value.slotCertificate,
+                        rawArtifact.shardCheckpoints.iterator.map { case (shardId, checkpoint) => shardId -> checkpoint.slot }.toList
+                      )
+                      attemptOpt <-
+                        if (gateOpenPreSign)
+                          afterProducerSlotLineageValidation(slotLineage)(reason =>
+                            logger.warn(
+                              s"Refusing locally constructed snapshot at slot=$currentSlot before signing: invalid slot lineage: $reason"
+                            ) >> Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
+                          ) {
+                            for {
+                              signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
+                              snapshotHashedForStorage <- signed.toHashed[F]
+                              producedOrdinal = lastKey.value.value + 1
+                              kesGlobalPeriod = EtaCalculation.rotationPeriod(math.max(0L, producedOrdinal - 1L), etaRotationSnapshots)
+                              snapshotHashBytes = snapshotHashedForStorage.hash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                              kesSnapAttempt <-
+                                if (
+                                  io.constellationnetwork.node.shared.domain.nakamoto.ActiveOperatorConsensusKeys
+                                    .treeStep(
+                                      slotSigningKey.operatorKeys,
+                                      io.constellationnetwork.schema.nakamoto.EtaPeriod(kesGlobalPeriod)
+                                    )
+                                    .contains(slotSigningKey.treeStep)
+                                )
+                                  operationalKeyMaker
+                                    .signAt(slotSigningKey.treeStep, snapshotHashBytes)
+                                    .map(
+                                      _.leftMap(_.message): Either[String, io.constellationnetwork.security.kes.SignatureKesProduct]
+                                    )
+                                else
+                                  Async[F].pure[
+                                    Either[String, io.constellationnetwork.security.kes.SignatureKesProduct]
+                                  ](Left("slot signing capability does not match produced snapshot period"))
+                              kesSnapSigBytes <- kesSnapAttempt match {
+                                case Right(kSig) =>
+                                  val bytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
+                                  Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_signed_total") >>
+                                    logger
+                                      .info(
+                                        s"KES-SNAP ord=$producedOrdinal globalPeriod=$kesGlobalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset} " +
+                                          s"sub-sig=${bytes.take(8).map("%02x".format(_)).mkString} (${bytes.length}B)"
+                                      )
+                                      .as(bytes)
+                                case Left(err) =>
+                                  Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_sign_failed_total") >>
+                                    logger
+                                      .warn(
+                                        s"KES-SNAP sign failed for ord=$producedOrdinal globalPeriod=$kesGlobalPeriod: $err; refusing chain-store write"
+                                      )
+                                      .as(Array.empty[Byte])
+                              }
+                              kesReady = kesSnapAttempt.isRight
+                              parentHashValue = lastHashed.hash
+                              _ <- Async[F].whenA(kesReady) {
+                                SnapshotKesStorage.put[F](dataDir, snapshotHashedForStorage.hash, kesSnapSigBytes)
+                              }
+                              stored <-
+                                if (kesReady)
+                                  chainStore.store(
+                                    signed,
+                                    context,
+                                    lastKey.value.value + 1,
+                                    currentSlot,
+                                    parentHashValue,
+                                    vrfOutput
+                                  )
+                                else Async[F].pure(false)
+                            } yield (signed, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes, stored)
+                          }
                         else
-                          Async[F].pure[
-                            Either[io.constellationnetwork.security.kes.KesError, io.constellationnetwork.security.kes.SignatureKesProduct]
-                          ](Left(io.constellationnetwork.security.kes.KesError.MalformedTree("skipped - gate closed")))
-                      kesSnapSigBytes <- kesSnapAttempt match {
-                        case Right(kSig) =>
-                          val bytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
-                          Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_signed_total") >>
-                            logger
-                              .info(
-                                s"KES-SNAP ord=$producedOrdinal period=$kesPeriodSnap sub-sig=${bytes.take(8).map("%02x".format(_)).mkString} (${bytes.length}B)"
-                              )
-                              .as(bytes)
-                        case Left(err) if gateOpenPreSign =>
-                          Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_sign_failed_total") >>
-                            logger
-                              .warn(
-                                s"KES-SNAP sign failed for ord=$producedOrdinal period=$kesPeriodSnap: ${err.message}; refusing chain-store write"
-                              )
-                              .as(Array.empty[Byte])
-                        case Left(_) => Async[F].pure(Array.empty[Byte])
+                          none[(Signed[GlobalIncrementalSnapshot], Hashed[GlobalIncrementalSnapshot], Hash, Array[Byte], Boolean)].pure[F]
+                      storedOutcomeOpt = attemptOpt.collect {
+                        case (signed, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes, true) =>
+                          (signed, context, returnedEvents, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes)
                       }
-                      kesReady = kesSnapAttempt.isRight
-                      parentHashValue = lastHashed.hash
-                      _ <- Async[F].whenA(gateOpenPreSign && kesReady) {
-                        SnapshotKesStorage.put[F](dataDir, snapshotHashedForStorage.hash, kesSnapSigBytes)
-                      }
-                      stored <-
-                        if (gateOpenPreSign && kesReady)
-                          chainStore.store(
-                            signed,
-                            context,
-                            lastKey.value.value + 1,
-                            currentSlot,
-                            parentHashValue,
-                            vrfOutput
-                          )
-                        else Async[F].pure(false)
                       // Rekey the overlay branch on success; discard it on abandonment.
                       // Done inside the `mptStore.withTransaction` block so the overlay update is
                       // bundled with the underlying-MPT mutation: if the tx rolls back (action =
                       // Rollback), the underlying writes are reverted but the overlay's
                       // `discardBranch` has already cleaned up the now-orphan `pendingRef` entry.
-                      _ <-
-                        if (stored)
+                      _ <- storedOutcomeOpt match {
+                        case Some((_, _, _, snapshotHashedForStorage, _, _)) =>
                           // Rekey the overlay branch AND the gl0 changeset staging map raw -> with-cert. The
                           // accumulator was staged (GlobalSnapshotConsensusFunctions) under the RAW artifact hash
                           // (== `rawArtifactHash`, pre slotCertificate+eta), but the finalize-sink promotion
@@ -1878,125 +1909,127 @@ object SnapshotLeaderLoop {
                             // 3c-A enabler — mirror the rekey for the signed-bytes staging so the finalize sink finds it under the
                             // with-cert canonical hash.
                             pendingPostBytesRef.update(rekeyStagedPostBytes(_, rawArtifactHash, snapshotHashedForStorage.hash))
-                        else
+                        case None =>
                           // Abandoned fork: drop both the overlay branch and its staged accumulator.
                           mptOverlay.discardBranch(BranchId(rawArtifactHash)) >>
-                            pendingAccumulatorsRef.update(_ - rawArtifactHash)
-                      action: MptTxAction = if (stored) MptTxAction.Commit else MptTxAction.Rollback
-                    } yield
-                      (
-                        (signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes),
-                        action
-                      )
-                  }
-                  (signed, context, returnedEvents, stored, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes) = txOutcome
-
-                  // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
-                  // reads on the next slot to determine the parent ordinal. Without this, the
-                  // leader loop re-reads the last GOSSIP ordinal and re-produces the same ordinal.
-                  _ <- Async[F].whenA(stored) {
-                    snapshotStorage.setHeadForRecovery(signed, context) >>
-                      lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                      lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                      lastKnownSlotRef.set(Some(currentSlot)) >>
-                      snapshotStorage.confirmHead(parentHashValue)
-                  }
-
-                  // Clear included events from mempool (returned events were NOT included).
-                  // Only when stored — if we abandoned pre-sign, the events must stay in the
-                  // mempool so the next slot winner (or our next slot) can include them.
-                  includedHashes = hashedEvents.collect {
-                    case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
-                  }.toSet
-                  _ <- Async[F].whenA(stored)(eventMempool.clearIncluded(includedHashes))
-
-                  // Check gate before publishing — a better gossip snapshot may have arrived
-                  // during proposal creation. If gate is closed, abandon this production.
-                  gateOpenBeforePublish <- productionGate.isOpen
-                  stillOpen = stored && gateOpenBeforePublish
-                  _ <-
-                    if (stored && !gateOpenBeforePublish)
-                      productionGate.pauseReasons.flatMap(reasons =>
-                        logger
-                          .info(s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})")
-                      )
-                    else Async[F].unit
-
-                  // Publish + self-attest only if gate is still open
-                  snapshotHash = snapshotHashedForStorage.hash
-                  producedOrdinal = lastKey.value.value + 1
-                  _ <- Async[F].whenA(stillOpen) {
-                    sidecarClient
-                      .publishSnapshot(
-                        SidecarClient.mkSnapshot(
-                          hash = snapshotHash.value.getBytes,
-                          slot = currentSlot,
-                          ordinal = producedOrdinal,
-                          parentHash = lastHashed.hash.value.getBytes,
-                          vrfProof = proof,
-                          vrfPublicKey = vrfPK,
-                          eta = currentEta,
-                          payload = {
-                            import io.circe.syntax._
-                            val snapshotJson = signed.asJson
-                            val contextJson = context.asJson
-                            val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                            combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                          },
-                          producerId = selfId.value.toBytes,
-                          parentSlot = parentSlotValue,
-                          kesSignature = kesSnapSigBytes
-                        )
-                      )
-                      .void
-                      .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
-                      // Unify self-attestation with peer-attestation: route through the same emit
-                      // function the SyncDaemon uses on processValidSnapshot. Eliminates the
-                      // double-implementation where the two paths used different `attestedAt` units
-                      // and peer attestations shadowed self-attestations under TipTracker's "newer
-                      // wins" rule (TipTracker:96-105).
-                      //
-                      // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` (NOT
-                      // System.currentTimeMillis()). Wall-clock semantics here are deliberate —
-                      // keeps the `attestedAt` field reusable as a future Ouroboros-Chronos-style
-                      // timestamp gossip surface, per docs §3.1.
-                      Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
-                        NakamotoSyncDaemon.emitTipAttestation[F](
-                          tipHash = snapshotHash,
-                          tipSlot = slotRefined,
-                          tipOrdinal = producedOrdinal,
-                          attestedAt = attestedAt,
-                          sidecarClient = sidecarClient,
-                          tipTracker = tipTracker,
-                          selfId = selfId,
-                          keyPair = keyPair,
-                          operationalKeyMaker = operationalKeyMaker,
-                          etaRotationSnapshots = etaRotationSnapshots,
-                          logger = logger
-                        )
-                      } >>
-                      logger.info(
-                        s"Produced snapshot ordinal=$producedOrdinal slot=$currentSlot " +
-                          s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
-                      ) >>
-                      Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
-                      Metrics[F].updateGauge("dag_nakamoto_ordinal", producedOrdinal) >>
-                      Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
-                        Metrics[F].recordDistribution("dag_nakamoto_production_duration_ms", (nowMs - productionStartMs).toInt) >>
-                          productionTimestamps.update { ts =>
-                            val updated = ts + (producedOrdinal -> nowMs)
-                            // Evict entries older than 1000 ordinals to bound memory
-                            if (updated.size > 1000) updated.toList.sortBy(-_._1).take(1000).toMap
-                            else updated
-                          }
+                            pendingAccumulatorsRef.update(_ - rawArtifactHash) >>
+                            pendingPostBytesRef.update(_ - rawArtifactHash)
                       }
+                      action: MptTxAction = if (storedOutcomeOpt.nonEmpty) MptTxAction.Commit else MptTxAction.Rollback
+                    } yield (storedOutcomeOpt, action)
+                  }
+                  _ <- txOutcome.traverse_ {
+                    case (signed, context, returnedEvents, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes) =>
+                      for {
+
+                        // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
+                        // reads on the next slot to determine the parent ordinal. Without this, the
+                        // leader loop re-reads the last GOSSIP ordinal and re-produces the same ordinal.
+                        _ <- snapshotStorage.setHeadForRecovery(signed, context) >>
+                          lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
+                          lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
+                          lastKnownSlotRef.set(Some(currentSlot)) >>
+                          snapshotStorage.confirmHead(parentHashValue)
+
+                        // Clear included events from mempool (returned events were NOT included). This
+                        // branch exists only for a successfully stored artifact. Every rejection path
+                        // returns None above, so its inputs remain available for the next slot.
+                        includedHashes = hashedEvents.collect {
+                          case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
+                        }.toSet
+                        _ <- eventMempool.clearIncluded(includedHashes)
+
+                        // Check gate before publishing — a better gossip snapshot may have arrived
+                        // during proposal creation. If gate is closed, abandon this production.
+                        gateOpenBeforePublish <- productionGate.isOpen
+                        _ <-
+                          if (!gateOpenBeforePublish)
+                            productionGate.pauseReasons.flatMap(reasons =>
+                              logger
+                                .info(
+                                  s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})"
+                                )
+                            )
+                          else Async[F].unit
+
+                        // Publish + self-attest only if gate is still open
+                        snapshotHash = snapshotHashedForStorage.hash
+                        producedOrdinal = lastKey.value.value + 1
+                        _ <- Async[F].whenA(gateOpenBeforePublish) {
+                          sidecarClient
+                            .publishSnapshot(
+                              SidecarClient.mkSnapshot(
+                                hash = snapshotHash.value.getBytes,
+                                slot = currentSlot,
+                                ordinal = producedOrdinal,
+                                parentHash = lastHashed.hash.value.getBytes,
+                                vrfProof = proof,
+                                vrfPublicKey = vrfPK,
+                                eta = currentEta,
+                                payload = {
+                                  import io.circe.syntax._
+                                  val snapshotJson = signed.asJson
+                                  val contextJson = context.asJson
+                                  val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                                  combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                                },
+                                producerId = selfId.value.toBytes,
+                                parentSlot = parentSlotValue,
+                                kesSignature = kesSnapSigBytes
+                              )
+                            )
+                            .void
+                            .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
+                            // Unify self-attestation with peer-attestation: route through the same emit
+                            // function the SyncDaemon uses on processValidSnapshot. Eliminates the
+                            // double-implementation where the two paths used different `attestedAt` units
+                            // and peer attestations shadowed self-attestations under TipTracker's "newer
+                            // wins" rule (TipTracker:96-105).
+                            //
+                            // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` (NOT
+                            // System.currentTimeMillis()). Wall-clock semantics here are deliberate —
+                            // keeps the `attestedAt` field reusable as a future Ouroboros-Chronos-style
+                            // timestamp gossip surface, per docs §3.1.
+                            Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
+                              NakamotoSyncDaemon.emitTipAttestation[F](
+                                tipHash = snapshotHash,
+                                tipSlot = slotRefined,
+                                tipOrdinal = producedOrdinal,
+                                attestedAt = attestedAt,
+                                sidecarClient = sidecarClient,
+                                tipTracker = tipTracker,
+                                selfId = selfId,
+                                keyPair = keyPair,
+                                operationalKeyMaker = operationalKeyMaker,
+                                operatorKeyRegistry = operatorKeyRegistry,
+                                etaRotationSnapshots = etaRotationSnapshots,
+                                logger = logger
+                              )
+                            } >>
+                            logger.info(
+                              s"Produced snapshot ordinal=$producedOrdinal slot=$currentSlot " +
+                                s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
+                            ) >>
+                            Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
+                            Metrics[F].updateGauge("dag_nakamoto_ordinal", producedOrdinal) >>
+                            Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
+                              Metrics[F].recordDistribution("dag_nakamoto_production_duration_ms", (nowMs - productionStartMs).toInt) >>
+                                productionTimestamps.update { ts =>
+                                  val updated = ts + (producedOrdinal -> nowMs)
+                                  // Evict entries older than 1000 ordinals to bound memory
+                                  if (updated.size > 1000) updated.toList.sortBy(-_._1).take(1000).toMap
+                                  else updated
+                                }
+                            }
+                        }
+                      } yield ()
                   }
 
                   // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick (design §5.7, 2026-06-12) ───
                   // The GL0-leader self-call that lived here advanced shard duty once per produced GL0 ordinal;
                   // half of the run-10 Gap-A cadence inversion (the daemon's becameBestTip hook was the other
                   // half). The lottery now draws every wall-clock slot in the slot-tick loop above, on every node,
-                  // gated by committee membership + the pipeline-depth watermark. Nothing to do here.
+                  // gated by committee membership + the single-outstanding-checkpoint watermark. Nothing to do here.
                 } yield ()
             }
 

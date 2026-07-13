@@ -18,6 +18,8 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.{StateChangesAccumulator, applyAccumulatorToGSI}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
@@ -287,6 +289,20 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
 
       currencyEntry <- signedIncremental(7L).map(s => (s, currencyInfo(mgAddr, 555L)).asRight[Signed[CurrencySnapshot]])
 
+      registration = KesRegistrationCert(
+        operatorPeerId = peerId,
+        kesMasterVK = Hex("ab" * 32),
+        kesMasterVKStep = 0,
+        offset = 2L,
+        vrfPublicKey = Hex("cd" * 32),
+        effectiveFromPeriod = EtaPeriod(2L),
+        registrationParentHash = testHash("registration-parent"),
+        ordinal = KesRegistrationOrdinal.first
+      )
+      signedRegistration = Signed(registration, testProofs)
+      registrationRecord = KesRegistrationRecord(signedRegistration, ord)
+      registrationRef <- KesRegistrationReference.of[IO](signedRegistration)
+
       stakeDist = StakeDistribution(SortedMap(peerId -> BigInt(123456789L)))
     } yield
       StateChangesAccumulator(
@@ -323,7 +339,9 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
         nodeCollateralWithdrawalExpiryIndex = SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey](
           adds = SortedMap(ncwExpiry -> Set(NodeCollateralWithdrawalExpiryKey(nodeAddr, ncwHashed.hash)))
         ),
-        historicalStakeSnapshots = SortedMap(EtaPeriod(1L) -> HistoricalStakeSnapshot(stakeDist, testHash("eta-period-1")))
+        historicalStakeSnapshots = SortedMap(EtaPeriod(1L) -> HistoricalStakeSnapshot(stakeDist, testHash("eta-period-1"))),
+        kesRegistrationCerts = SortedMap(peerId -> SortedSet(registrationRecord)),
+        lastKesRegistrationRefs = SortedMap(peerId -> registrationRef)
       )
 
   /** Cumulative incremental writer root (producer's signed root) — apply the accumulator, read the FULL in-store root for `ord`. */
@@ -355,6 +373,40 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
         clue(rebuilt).isDefined,
         clue(incremental) === clue(rebuilt)
       )
+  }
+
+  test("unified operator-key registration bytes change the consensus MPT root") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      peerId = kp.getPublic.toId.toPeerId
+      cert1 = KesRegistrationCert(
+        peerId,
+        Hex("11" * 32),
+        0,
+        2L,
+        Hex("22" * 32),
+        EtaPeriod(2L),
+        testHash("registration-parent"),
+        KesRegistrationOrdinal.first
+      )
+      cert2 = cert1.copy(vrfPublicKey = Hex("33" * 32))
+      signed1 = Signed(cert1, testProofs)
+      signed2 = Signed(cert2, testProofs)
+      ref1 <- KesRegistrationReference.of[IO](signed1)
+      ref2 <- KesRegistrationReference.of[IO](signed2)
+      acc1 = StateChangesAccumulator(
+        kesRegistrationCerts = SortedMap(peerId -> SortedSet(KesRegistrationRecord(signed1, ord))),
+        lastKesRegistrationRefs = SortedMap(peerId -> ref1)
+      )
+      acc2 = StateChangesAccumulator(
+        kesRegistrationCerts = SortedMap(peerId -> SortedSet(KesRegistrationRecord(signed2, ord))),
+        lastKesRegistrationRefs = SortedMap(peerId -> ref2)
+      )
+      root1 <- incrementalRoot(acc1)
+      root2 <- incrementalRoot(acc2)
+      rebuilt1 <- rebuildRoot(applyAccumulatorToGSI(GlobalSnapshotInfo.empty, acc1))
+    } yield expect.all(root1.isDefined, root2.isDefined, rebuilt1 == root1, root1 =!= root2)
   }
 
   test("historicalStakeSnapshots-only post-state (multiple periods): incremental writer root === from-GSI rebuild root") { res =>

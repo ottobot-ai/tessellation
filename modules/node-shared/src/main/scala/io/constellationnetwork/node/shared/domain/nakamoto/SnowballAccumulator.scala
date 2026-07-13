@@ -10,49 +10,28 @@ import io.constellationnetwork.security.hash.Hash
 import eu.timepit.refined.auto._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Per-(ordinal, hash) lifetime accumulator implementing **Snowball** decision semantics from the Snow family (Rocco et al. 2018, §3.2;
-  * Amores-Sesar & Schneider 2024).
+/** Transitional per-(ordinal, hash) latest-attestation margin accumulator currently named `SnowballAccumulator`.
   *
-  * '''Why Snowball and not Snowflake.''' Snowflake (single counter per ordinal, reset on every hash flip) is silent under coordinated
-  * split-honest adversaries: the counter never reaches β before resetting, so the node never decides. Snowball replaces the reset-on-flip
-  * counter with a per-color persistent lifetime accumulator — incoming evidence persists across flips. Decision rule is margin-based: hash
-  * `H` is decided when `accum(H) − max{accum(H') : H' ≠ H} ≥ β` (proposal §2.2 algebraic statement; matches the GPU sim kernel at
-  * `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py` commit `5ace3d36`).
+  * '''Executable rule.''' Each peer contributes at most one current count at an ordinal. If that peer changes hash, this implementation
+  * removes its old-color count and adds the new-color count. It permanently records the first hash whose current-count margin over the
+  * runner-up reaches beta. That is a sticky latest-attestation margin, not Snowball's lifetime confidence accumulation.
   *
-  * '''Why this restores Non-Interactive Determinism (NID).''' Snowball is observer-independent: every honest observer plugging in the same
-  * attestation transcript reaches the same decision regardless of their own identity. The pre-Snowball P-11b self-exclusion (commit
-  * `95471c7f`) was the stopgap that prevented self-finalize-then-deadlock at the cost of NID — two observers given the same transcript
-  * could disagree on whether ord N was finalized depending on which `selfId` they plugged in. Snowball deletes the deadlock attractor
-  * structurally (peers don't sample themselves in classic Avalanche), so the P-11b workaround comes off and NID is restored.
+  * '''Safety gap.''' There is no K-peer query loop or alpha-majority cascade here. Sticky first-crossing is arrival-order sensitive: two
+  * nodes can receive the same eventual peer attestations in different orders and retain different decided hashes. Consequently this type is
+  * neither portable decided-attestation evidence nor a proof of the target Avalanche/Snowball optimistic Phase-2 rail.
   *
-  * '''Empirical parameters.''' Production-locked `(K=8, α=5, β=10)` for cluster sizes N ≥ 16, per
-  * `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md` §0.A and the GPU dual-mode sweep at commit `5ace3d36` of
-  * `~/repos/research-nipopos-2026` (6696 cells × 10000 trials, three adversary modes — coordinated_lie, split_honest, random_honest — zero
-  * safety violations across all measured N at f_adv=0.33). The K parameter sets the peer-sample size for the upstream cascade (not used by
-  * this accumulator directly — see §2.4 of the proposal for the relationship); α sets the per-round majority recruitment threshold; β is
-  * the leader-minus-runner-up margin (in distinct peer attestation count) required to decide.
-  *
-  * '''Decision unit.''' β is counted in DISTINCT peer attestations: each peer contributes at most one count to the accumulator for each
-  * (ordinal, hash) pair (the `recordAttestation` call replaces a peer's prior attestation for the same ordinal if it switched hashes —
-  * Snowball's per-color persistence is what survives a peer's flip, not a buggy double-count). This matches
-  * `avalanche_attestation_calibration_gpu.py` line 283+ (`d_b[i * 3 + slot] = new_v` — per-color increment in unit steps).
-  *
-  * '''What this accumulator does NOT do.''' It does not run the full Avalanche cascade — there is no K-sample peer query loop here. This
-  * accumulator is the *receiver-side* aggregation of the persistent per-color evidence that downstream finality triggers (`T_weight`, in
-  * particular) consume. The full per-validator per-ordinal cascade (with K-sample queries, α-majority test, flip-symmetric rollback) is the
-  * future proposal §2.2 work — landing this accumulator is the Phase 1 piece that decouples Snowball semantics from the upstream cascade so
-  * the cascade can land later without re-touching the receiver.
+  * `K` and `Alpha` below are unused constants. Calibration of a different K/alpha/beta simulation does not establish safety of this
+  * executable rule. Target `T_weight` must consume a fully specified, authenticated, exact-hash cascade decision; the live state-changing
+  * sink currently ignores this accumulator and uses the separate legacy cumulative-weight path.
   */
 trait SnowballAccumulator[F[_]] {
 
-  /** Record a peer's attestation. Adds one distinct-peer count to the (ordinal, hash) accumulator. If the same peer previously attested a
-    * DIFFERENT hash at this ordinal, its prior contribution is moved from the old hash to the new hash (per-peer at-most-one-per-ordinal
-    * invariant — matches the Snowball semantics where a peer's preference flip carries the accumulator forward without zeroing prior
-    * accumulation by OTHER peers, but does not let a single peer double-count itself).
+  /** Record a peer's attestation. Adds one distinct-peer current count to the (ordinal, hash) map. If the same peer previously attested a
+    * different hash at this ordinal, its prior contribution is moved from the old hash to the new hash.
     *
     * After updating the accumulator, evaluates the decision rule for this ordinal: `leader_count − runner_up_count >= β` ⇒ decided on
-    * `leader_hash`. Decisions are monotone — once an ordinal is decided, the decision is sticky (a later contradicting attestation does not
-    * unset it; this is the "decision is irrevocable" property of Snowball, proposal §2.1 "decided ⇒ quiescent").
+    * `leader_hash`. Decisions are sticky in this implementation; later evidence cannot unset them. That stickiness is the source of the
+    * arrival-order gap above and must not be read as proof of Snowball safety.
     */
   def recordAttestation(peerId: PeerId, ordinal: Long, hash: Hash): F[Unit]
 
@@ -62,13 +41,10 @@ trait SnowballAccumulator[F[_]] {
   /** Look up the per-hash accumulator counts at an ordinal. Diagnostic / observability. */
   def accumAt(ordinal: Long): F[Map[Hash, Int]]
 
-  /** Highest ordinal where Snowball has decided AND the decided hash matches the canonical-chain hash at that ordinal. Walks decisions from
-    * highest ord down (consistent with `TipTracker.highestFinalizedOrdinal`'s GRANDPA ancestor rule — deciding ord N with the canonical
-    * hash implies all ancestors of that hash were also implicitly endorsed).
+  /** Highest ordinal where this accumulator has a sticky decision matching the canonical-chain hash at that ordinal. Walks decisions from
+    * highest ordinal down; a matching exact tip identifies its canonical ancestor prefix without introducing a BFT ancestor-vote rule.
     *
-    * '''NID property (load-bearing).''' This method takes NO `selfId` — Snowball's decision is observer- independent. Two observers walking
-    * the same canonical chain post-hoc, given identical attestation transcripts, reach IDENTICAL decisions here. This is what P-11b broke
-    * and what Snowball restores at the T_weight position of the trigger stack.
+    * This method takes no `selfId`, but the stored sticky decision can already differ across observers because receipt ordering differs.
     *
     * @param canonicalHashAt
     *   chain walk: returns our canonical hash at the given ordinal (typically `chainStore.walkBackTo`). Decisions whose hash doesn't match
@@ -77,8 +53,8 @@ trait SnowballAccumulator[F[_]] {
     */
   def highestDecidedOnCanonical(canonicalHashAt: Long => F[Option[Hash]]): F[Option[Long]]
 
-  /** Drop accumulator state for ordinals strictly below `finalizedOrdinal`. Mirrors `TipTracker.pruneBelow` — once an ordinal is finalized
-    * the per-color history below it is no longer needed for decisions.
+  /** Drop accumulator state for ordinals strictly below `finalizedOrdinal`. This is transitional ordinal-only pruning. Target reversible
+    * Phase 2 must retain or reconstruct exact-hash decision evidence across a density reorg; pruning cannot make the ordinal immutable.
     */
   def pruneBelow(finalizedOrdinal: Long): F[Unit]
 
@@ -88,42 +64,26 @@ trait SnowballAccumulator[F[_]] {
 
 object SnowballAccumulator {
 
-  /** Beta (β) — the leader-minus-runner-up DISTINCT-peer margin required to decide a hash at an ordinal.
+  /** Beta (β) — the leader-minus-runner-up distinct current-peer margin used by this transitional accumulator.
     *
-    * '''Production default: 10.''' Empirical floor from the GPU dual-mode sweep at commit `5ace3d36` of `~/repos/research-nipopos-2026`
-    * (file `sims/data/avalanche_attestation_full_gpu_n10000_v2.json`): `(K=8, α=5, β=10)` zeroes safety violations across all measured N ∈
-    * {16, 32, 100, 500, 1000} under three adversary modes (coordinated_lie, split_honest, random_honest) at f_adv = 0.33.
-    *
-    * Override via env `NAKAMOTO_SNOWBALL_BETA`. Smaller β decides faster but tolerates a higher noise envelope (proposal §3.4 — Snowball at
-    * K=3/β=10 leaks 31 % under split_honest because the per-color accumulator is at noise floor; β=10 at K=8 is the structural fix).
+    * Default: 10. Existing external K/alpha/beta simulations model the intended cascade, not this latest-attestation implementation, so
+    * they do not validate this threshold as a production safety bound.
     */
   val Beta: Int = 10 // default; production value flows from HOCON `nakamoto.snowball-beta` via TipTracker.make
 
-  /** K — peer-sample size per cascade tick. Not used by this accumulator directly (the upstream cascade in §2.2 of the proposal samples K
-    * peers per Δ); exposed here so the leader loop can read both K and β from the same configuration surface.
-    *
-    * '''Production default: 8.''' Empirical floor from the GPU dual-mode sweep (commit `5ace3d36`) — smaller K leaves the per-color
-    * accumulator at noise floor under split-honest adversaries.
-    *
-    * Override via env `NAKAMOTO_SNOWBALL_K`.
+  /** K — intended peer-sample size per cascade tick. It is not used by this accumulator.
     */
-  val K: Int = 8 // GPU-sim-locked constant; moves to HOCON when the upstream cascade consumes it
+  val K: Int = 8 // legacy intended default; unused until the target cascade consumes it
 
-  /** Alpha (α) — per-round α-majority recruitment threshold (out of K) in the upstream cascade. Not used by this accumulator directly.
-    * Exposed for cluster-wide configuration parity.
-    *
-    * '''Production default: 5.''' Empirically `α ≥ ⅝K` is the floor for safety under noise (proposal §0.A, §2.4); at K=8 that gives α ≥ 5.
-    *
-    * Override via env `NAKAMOTO_SNOWBALL_ALPHA`.
+  /** Alpha (α) — intended per-round majority threshold out of K. It is not used by this accumulator.
     */
-  val Alpha: Int = 5 // GPU-sim-locked constant; moves to HOCON when the upstream cascade consumes it
+  val Alpha: Int = 5 // legacy intended default; unused until the target cascade consumes it
 
   /** Mutable internal state — kept in a single `Ref` so the decision evaluation can see a consistent pair-snapshot of `accum` + `decided` +
     * `lastByPeer`. The per-ordinal slice is a `Map[Hash, Int]` of distinct-peer counts.
     *
-    *   - `accum(ord)(hash)` = number of distinct peers whose latest attestation at this ordinal pointed to `hash`. Counts are unit-step
-    *     (proposal §2.2 line `accum(topHash) += 1`).
-    *   - `decided(ord)` = `Some(hash)` once the margin condition was first satisfied; sticky (Snowball irrevocability).
+    *   - `accum(ord)(hash)` = number of distinct peers whose latest attestation at this ordinal pointed to `hash`.
+    *   - `decided(ord)` = `Some(hash)` once the current-count margin condition was first satisfied; sticky thereafter.
     *   - `lastByPeer(peer)(ord)` = the peer's previously-recorded hash at this ordinal, so on flip we move the contribution from the old
     *     hash to the new one (preserving the at-most-one-per-peer-per-ordinal invariant).
     */
@@ -156,8 +116,7 @@ object SnowballAccumulator {
             val priorAtOrd = peerHistory.get(ordinal)
 
             // Per-peer at-most-one-per-ordinal: if the peer previously attested a different hash at this
-            // ordinal, move its contribution (the "flip" case — Snowball preserves other peers' lifetime
-            // accumulation, but a single peer can't double-count itself).
+            // ordinal, move its current contribution. This is not lifetime confidence accumulation.
             val ordAccum = st.accum.getOrElse(ordinal, Map.empty)
             val ordAccumAfterDrop = priorAtOrd match {
               case Some(prevHash) if prevHash =!= hash =>
@@ -180,9 +139,9 @@ object SnowballAccumulator {
             val newPeerHistory = peerHistory.updated(ordinal, hash)
             val newLastByPeer = st.lastByPeer.updated(peerId, newPeerHistory)
 
-            // Decision rule: leader_count − runner_up_count >= β. Sticky once set.
+            // Transitional rule: current leader_count - runner_up_count >= beta. Sticky once set, so arrival order matters.
             val newDecisionInfo: Option[(Hash, Int, Int)] = st.decided.get(ordinal) match {
-              case Some(_) => None // already decided; Snowball decisions are irrevocable
+              case Some(_) => None // already sticky under the transitional first-crossing rule
               case None =>
                 val sortedDesc = ordAccumAfterAdd.toList.sortBy(-_._2)
                 sortedDesc match {
@@ -226,9 +185,8 @@ object SnowballAccumulator {
         def highestDecidedOnCanonical(canonicalHashAt: Long => F[Option[Hash]]): F[Option[Long]] =
           stateRef.get.flatMap { st =>
             // Walk decisions from highest ord down; return the first one whose decided hash matches our
-            // canonical hash at that ord. GRANDPA ancestor rule: a decision on the canonical chain at ord N
-            // implicitly endorses all ancestors of that hash — the highest matching decision is the
-            // qualifying ordinal.
+            // canonical hash at that ordinal. The highest matching exact tip identifies its canonical prefix;
+            // this is not a GRANDPA/BFT ancestor vote.
             val descending = st.decided.toList.sortBy { case (ord, _) => -ord }
             descending.foldM[F, Option[Long]](Option.empty[Long]) {
               case (Some(found), _) => Sync[F].pure(Some(found))

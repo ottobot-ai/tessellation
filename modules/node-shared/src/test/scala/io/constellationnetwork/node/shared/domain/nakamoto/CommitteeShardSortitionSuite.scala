@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto
 
-import java.security.SecureRandom
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
 
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
@@ -31,7 +32,7 @@ import weaver.MutableIOSuite
   */
 object CommitteeShardSortitionSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], Hasher[IO])
+  override type Res = (Hasher[IO], Hasher[IO], CanonicalOperatorConsensusPopulation)
 
   // Two INDEPENDENT Hasher instances (each over its OWN JsonSerializer) — the determinism tests run the draw under each and assert
   // byte-equality, proving the result is a pure function of the inputs and not of any per-instance state. Built in separate scopes so
@@ -43,22 +44,13 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
     for {
       h1 <- freshHasher
       h2 <- freshHasher
-    } yield (h1, h2)
+      operators <- CanonicalOperatorConsensusFixture.makePopulation(8)
+    } yield (h1, h2, operators)
 
-  // Deterministic PRNG so the statistical size test is reproducible.
-  private val random = {
-    val r = SecureRandom.getInstance("SHA1PRNG")
-    r.setSeed(0x53_48_41_52_44_56_4bL) // ASCII "SHARDVK"
-    r
-  }
+  private def eta(tag: String): Array[Byte] =
+    MessageDigest.getInstance("SHA-256").digest(tag.getBytes(StandardCharsets.UTF_8))
 
-  private def randomVk(): Array[Byte] = {
-    val vk = new Array[Byte](32)
-    random.nextBytes(vk)
-    vk
-  }
-
-  private val eta: Array[Byte] = Array.tabulate[Byte](32)(i => (i * 7 + 1).toByte)
+  private val fixedEta: Array[Byte] = eta("committee-shard-fixed-eta")
 
   test("hashDigestAsRatio: decodes the hex rendering to the actual 32 SHA-256 bytes") { _ =>
     val denominator = BigInt(2).pow(256)
@@ -76,67 +68,75 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
   }
 
   test("shardDrawValue: deterministic across two independent Hasher instances") { res =>
-    val (h1, h2) = res
-    val vk = randomVk()
+    val (h1, h2, operators) = res
+    val vk = operators.operators.head.resolvedPair.vrfPublicKey.toBytes
     (
-      CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(3), EtaPeriod(11L), vk)(implicitly, h1),
-      CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(3), EtaPeriod(11L), vk)(implicitly, h2)
+      CommitteeSortition.shardDrawValue[IO](fixedEta, ShardId.unsafeApply(3), EtaPeriod(11L), vk)(implicitly, h1),
+      CommitteeSortition.shardDrawValue[IO](fixedEta, ShardId.unsafeApply(3), EtaPeriod(11L), vk)(implicitly, h2)
     ).tupled.map { case (a, b) => expect(a == b) }
   }
 
   test("isInShardCommittee: deterministic across two independent Hasher instances") { res =>
-    val (h1, h2) = res
-    val vk = randomVk()
+    val (h1, h2, operators) = res
+    val vk = operators.operators.head.resolvedPair.vrfPublicKey.toBytes
     val sigma = Ratio(1, 8)
     (
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kDraw = 4)(implicitly, h1),
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kDraw = 4)(implicitly, h2)
+      CommitteeSortition.isInShardCommittee[IO](vk, fixedEta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kDraw = 4)(implicitly, h1),
+      CommitteeSortition.isInShardCommittee[IO](vk, fixedEta, ShardId.unsafeApply(1), EtaPeriod(5L), sigma, kDraw = 4)(implicitly, h2)
     ).tupled.map { case (a, b) => expect(a == b) }
   }
 
   test("shardDrawValue: different shardId (same VK/epoch/eta) generally yields a different draw value") { res =>
-    val (h1, _) = res
+    val (h1, _, operators) = res
     implicit val h: Hasher[IO] = h1
-    // Sample many VKs; assert the per-shard draws differ for the overwhelming majority (a hash collision across two shards for the same
-    // VK is cryptographically negligible). Use > 90% as a robust lower bound that still catches a "shardId not in the preimage" bug.
-    val vks = List.fill(64)(randomVk())
-    vks.traverse { vk =>
+    // Repeat independent eta draws over the registered population; a hash collision across two
+    // shards for the same registered VK and eta is cryptographically negligible.
+    (0 until 64).toList.traverse { draw =>
+      val vk = operators.operators(draw % operators.operators.size).resolvedPair.vrfPublicKey.toBytes
+      val drawEta = eta(s"per-shard-independence-$draw")
       (
-        CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(0), EtaPeriod(9L), vk),
-        CommitteeSortition.shardDrawValue[IO](eta, ShardId.unsafeApply(1), EtaPeriod(9L), vk)
+        CommitteeSortition.shardDrawValue[IO](drawEta, ShardId.unsafeApply(0), EtaPeriod(9L), vk),
+        CommitteeSortition.shardDrawValue[IO](drawEta, ShardId.unsafeApply(1), EtaPeriod(9L), vk)
       ).tupled.map { case (a, b) => a != b }
     }
       .map(diffs => expect(diffs.count(identity) >= 60))
   }
 
   test("isInShardCommittee: kTarget·σ >= 1 ⇒ always a member; σ = 0 ⇒ never a member") { res =>
-    val (h1, _) = res
+    val (h1, _, operators) = res
     implicit val h: Hasher[IO] = h1
-    val vk = randomVk()
+    val vk = operators.operators.head.resolvedPair.vrfPublicKey.toBytes
     (
       // σ = 1/2, kDraw = 4 ⇒ kDraw·σ = 2 ≥ 1 ⇒ saturates ⇒ always in.
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(1, 2), kDraw = 4),
+      CommitteeSortition.isInShardCommittee[IO](vk, fixedEta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(1, 2), kDraw = 4),
       // σ = 0 ⇒ threshold 0 ⇒ draw value (in [0,1)) is never < 0 ⇒ always out.
-      CommitteeSortition.isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(0, 1), kDraw = 4)
+      CommitteeSortition.isInShardCommittee[IO](vk, fixedEta, ShardId.unsafeApply(0), EtaPeriod(1L), Ratio(0, 1), kDraw = 4)
     ).tupled.map { case (saturated, zero) => expect.all(saturated, !zero) }
   }
 
   test("enumerated committee ⊆ candidate set with mean size ≈ kDraw at σ = 1/N") { res =>
-    val (h1, _) = res
+    val (h1, _, operators) = res
     implicit val h: Hasher[IO] = h1
-    // N candidates, uniform σ = 1/N, kDraw = K ⇒ per-operator inclusion prob = K/N, so E[|committee|] = K. Average over many shards to
-    // smooth binomial noise, then assert the mean is within a generous band of K and every committee is a subset of the candidates.
-    val n = 40
-    val kDraw = 8
+    // The candidate set is the loader-validated period-zero population. Vary eta, shard, and epoch
+    // over independent contexts; no random public key can enter the enumerated population.
+    val n = operators.operators.size
+    val kDraw = 2
     val sigma = Ratio(1, n)
-    val candidateVks: Vector[(Int, Array[Byte])] = Vector.tabulate(n)(i => i -> randomVk())
-    val shards = (0 until 50).toList
+    val candidateVks = operators.operators.zipWithIndex.map { case (operator, i) => i -> operator.resolvedPair.vrfPublicKey.toBytes }
+    val draws = (0 until 125).toList
 
-    shards.traverse { s =>
-      candidateVks.toList.traverse {
+    draws.traverse { draw =>
+      candidateVks.traverse {
         case (i, vk) =>
           CommitteeSortition
-            .isInShardCommittee[IO](vk, eta, ShardId.unsafeApply(s), EtaPeriod(2L), sigma, kDraw)
+            .isInShardCommittee[IO](
+              vk,
+              eta(s"committee-size-$draw"),
+              ShardId.unsafeApply(draw % 16),
+              EtaPeriod(2L + draw.toLong),
+              sigma,
+              kDraw
+            )
             .map(in => if (in) Some(i) else None)
       }
         .map(_.flatten.toSet)
@@ -146,9 +146,9 @@ object CommitteeShardSortitionSuite extends MutableIOSuite {
       val meanSize = totalSize.toDouble / committees.size
       expect.all(
         allSubsets,
-        // Generous band around K=8 (binomial mean over 40 trials, averaged across 50 shards): well inside ±50%.
-        meanSize >= 4.0,
-        meanSize <= 12.0
+        // Generous band around kDraw=2 across 125 independent registered-population draws.
+        meanSize >= 1.0,
+        meanSize <= 3.0
       )
     }
   }

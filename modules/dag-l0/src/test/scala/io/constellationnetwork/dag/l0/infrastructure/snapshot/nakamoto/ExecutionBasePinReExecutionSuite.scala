@@ -14,10 +14,17 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotStat
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, PinnedCurrencyInfoReader}
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashedReader, InvalidStateProofValidator}
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
-import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
+import io.constellationnetwork.node.shared.infrastructure.sharding.{
+  RegisteredCheckpointSigner,
+  ShardCheckpointWiring,
+  TestCheckpointDutyValidator
+}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager
 import io.constellationnetwork.node.shared.snapshot.currency.CurrencySnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -68,6 +75,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
     } yield (ks, h, j, sp)
 
   implicit val stateProofSelector: StateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(0L)))
+  implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
   private def addr(label: String): Address = Address.fromBytes(label.getBytes("UTF-8"))
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal.unsafeApply(n)
@@ -272,26 +280,54 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       )
     } yield NonEmptyList.one(binary)
 
+  private final case class RegisteredCheckpoint(
+    checkpoint: ShardCheckpoint,
+    checkpointSigner: RegisteredCheckpointSigner,
+    acceptanceManager: ShardCheckpointGl0AcceptanceManager[IO]
+  )
+
   private def mkCheckpoint(
     mg: Address,
     window: NonEmptyList[Signed[StateChannelSnapshotBinary]],
     attestedRoot: Hash
-  ): ShardCheckpoint =
-    ShardCheckpoint(
-      shardId = shardZero,
-      parentCheckpointHash = Hash("0" * 64),
-      shardOrdinal = ShardOrdinal(1L),
-      gl0AnchorOrdinal = anchorOrd,
-      slot = SlotT.unsafeApply(1L),
-      derivedStateDelta = ShardDerivedStateDelta(
-        perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
-        includedSnapshots = SortedMap(mg -> window)
-      ),
-      committeeSignatures =
-        NonEmptyList.of(CommitteeMemberSignature(PeerId(Hex("01" * 64)), Hex("aa" * 80), Hex("bb" * 64), Hex("cc" * 128), 0)),
-      epoch = epochZero,
-      executionBaseOrdinal = executionBase
-    )
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[RegisteredCheckpoint] =
+    for {
+      checkpointSigner <- RegisteredCheckpointSigner.make
+      committeeKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      committeeId = PeerId.fromPublic(committeeKeyPair.getPublic)
+      _ <- checkpointSigner.preregisterGenesis(committeeKeyPair, committeeId)
+      placeholder = CommitteeMemberSignature(committeeId, Hex(""), Hex(""), Hex(""), 0)
+      shell = ShardCheckpoint(
+        shardId = shardZero,
+        parentCheckpointHash = Hash("0" * 64),
+        shardOrdinal = ShardOrdinal(1L),
+        gl0AnchorOrdinal = anchorOrd,
+        slot = SlotT.unsafeApply(1L),
+        derivedStateDelta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
+          includedSnapshots = SortedMap(mg -> window)
+        ),
+        committeeSignatures = NonEmptyList.one(placeholder),
+        epoch = epochZero,
+        executionBaseOrdinal = executionBase
+      )
+      signature <- checkpointSigner.sign(shell, committeeKeyPair, committeeId, checkpointSigner.defaultShardEta)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.one(signature))
+      acceptanceManager <- ShardCheckpointGl0AcceptanceManager.make[IO](
+        executionQuorum = 1,
+        etaRotationSnapshots = 2550L,
+        committeeMembership = (_, _) => IO.pure(Set(committeeId)),
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
+        shardAssignment = ShardAssignment.make[IO](numShards = 1),
+        shardEtaFor = (_, _) => IO.pure(Some(checkpointSigner.defaultShardEta)),
+        producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
+        reExecuteDerivation = (_, _, _, _) => IO.pure(attestedRoot)
+      )
+      certificate <- acceptanceManager.verifyExecutionCertificate(checkpoint)
+      _ <- IO.fromEither(
+        certificate.leftMap(reason => new IllegalStateException(s"execution-base checkpoint fixture rejected: $reason"))
+      )
+    } yield RegisteredCheckpoint(checkpoint, checkpointSigner, acceptanceManager)
 
   private def mkEvidence(
     cp: ShardCheckpoint,
@@ -345,13 +381,14 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         liveAheadRoot <- liveAheadReplay(mg, window, anchorOrd, executionBase)
         pinnedBaseRoot <- pinnedReplay(mg, window, anchorOrd, executionBase)
         pinnedAheadRoot <- pinnedReplay(mg, window, anchorOrd, executionBase)
-      } yield expect.all(
-        liveBaseRoot.exists(_ =!= Hash.empty),
-        liveBaseRoot =!= liveAheadRoot,
-        pinnedBaseRoot.exists(_ =!= Hash.empty),
-        pinnedAheadRoot.exists(_ =!= Hash.empty),
-        pinnedBaseRoot === pinnedAheadRoot
-      )
+      } yield
+        expect.all(
+          liveBaseRoot.exists(_ =!= Hash.empty),
+          liveBaseRoot =!= liveAheadRoot,
+          pinnedBaseRoot.exists(_ =!= Hash.empty),
+          pinnedAheadRoot.exists(_ =!= Hash.empty),
+          pinnedBaseRoot === pinnedAheadRoot
+        )
     }
   }
 
@@ -370,10 +407,11 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         pinnedReplay = mkReplay(harness, productionReaderAt(pinned))
         unpinnedSkewRoot <- unpinnedReplay(mg, window, anchorOrd, executionBase)
         pinnedRoot <- pinnedReplay(mg, window, anchorOrd, executionBase)
-      } yield expect.all(
-        pinnedRoot.exists(_ =!= Hash.empty),
-        unpinnedSkewRoot =!= pinnedRoot
-      )
+      } yield
+        expect.all(
+          pinnedRoot.exists(_ =!= Hash.empty),
+          unpinnedSkewRoot =!= pinnedRoot
+        )
     }
   }
 
@@ -391,22 +429,26 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         replay = mkReplay(harness, productionReaderAt(pinned))
         attestedRootOpt <- replay(mg, window, anchorOrd, executionBase)
         attestedRoot = attestedRootOpt.getOrElse(Hash.empty)
-        checkpoint = mkCheckpoint(mg, window, attestedRoot)
+        checkpointRig <- mkCheckpoint(mg, window, attestedRoot)
+        checkpoint = checkpointRig.checkpoint
         followerReplay = mkReplay(harness, productionReaderAt(pinned))
         validator = InvalidStateProofValidator.make[IO](
           (a, bins, anchor, base) => followerReplay(a, bins, anchor, base).map(_.getOrElse(Hash.empty)),
-          InvalidStateProofSlashedReader.neverSlashed[IO]
+          InvalidStateProofSlashedReader.neverSlashed[IO],
+          checkpointRig.acceptanceManager.verifyExecutionCertificate
         )
         challengerKp <- KeyPairGenerator.makeKeyPair[IO]
         challengerId = PeerId.fromPublic(challengerKp.getPublic)
+        _ <- checkpointRig.checkpointSigner.preregisterGenesis(challengerKp, challengerId)
         evidence <- mkEvidence(checkpoint, mg, challengerKp, challengerId, attestedRoot, Hash("b" * 64))
         verdict <- validator.validate(evidence)
         liveAheadOrdinal <- followerLive.lastPersistedOrdinal
-      } yield expect.all(
-        liveAheadOrdinal.contains(liveAhead),
-        attestedRoot =!= Hash.empty,
-        verdict == Left(InvalidStateProofRejection.DisputeNotUpheld(attestedRoot, attestedRoot))
-      )
+      } yield
+        expect.all(
+          liveAheadOrdinal.contains(liveAhead),
+          attestedRoot =!= Hash.empty,
+          verdict == Left(InvalidStateProofRejection.DisputeNotUpheld(attestedRoot, attestedRoot))
+        )
     }
   }
 }

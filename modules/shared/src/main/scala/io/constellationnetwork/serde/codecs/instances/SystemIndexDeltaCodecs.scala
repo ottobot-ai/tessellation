@@ -9,7 +9,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.codecs.OptionCodec.option
-import io.constellationnetwork.serde.codecs.SetCodec.set
+import io.constellationnetwork.serde.codecs.SetCodec.{set, setCanonical}
 import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
@@ -52,9 +52,19 @@ object SystemIndexDeltaCodecs {
     * `SortedMap[EpochProgress, Set[K]]`. When a second variant is introduced it gets its own discriminator (a new era per the
     * `ImmutableCodec` doctrine) — not added prophylactically.
     */
-  def systemIndexDeltaCodec[K: Order](kCodec: Codec[K]): Codec[SystemIndexDelta[K]] = {
+  def systemIndexDeltaCodec[K: Order](kCodec: Codec[K]): Codec[SystemIndexDelta[K]] =
+    makeSystemIndexDeltaCodec(kCodec, canonicalizeKeysOnEncode = false)
+
+  def canonicalSystemIndexDeltaCodec[K: Order](kCodec: Codec[K]): Codec[SystemIndexDelta[K]] =
+    makeSystemIndexDeltaCodec(kCodec, canonicalizeKeysOnEncode = true)
+
+  private def makeSystemIndexDeltaCodec[K: Order](
+    kCodec: Codec[K],
+    canonicalizeKeysOnEncode: Boolean
+  ): Codec[SystemIndexDelta[K]] = {
+    val keySetCodec = if (canonicalizeKeysOnEncode) setCanonical(kCodec) else set(kCodec)
     val bucketMapCodec: Codec[SortedMap[EpochProgress, Set[K]]] =
-      sortedMap(Codec[EpochProgress], set(kCodec))
+      sortedMap(Codec[EpochProgress], keySetCodec)
 
     (bucketMapCodec :: bucketMapCodec).xmap[SystemIndexDelta[K]](
       { case adds :: removes :: HNil => SystemIndexDelta.EpochBucket(adds, removes) },

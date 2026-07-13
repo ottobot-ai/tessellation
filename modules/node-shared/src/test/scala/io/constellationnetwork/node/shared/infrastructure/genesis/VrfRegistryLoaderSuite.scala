@@ -4,129 +4,203 @@ import cats.effect.{IO, Resource}
 import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.domain.genesis.types._
-import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.signature.Signing
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 import io.constellationnetwork.security.{KeyPairGenerator, SecurityProvider}
 
 import weaver.MutableIOSuite
 
-/** Round-trip + determinism-contract tests for `L0GenesisLoader.buildVrfRegistry` — the Slice S1 entry point that turns the per-operator
-  * `vrfPublicKey` field of an L0 genesis fixture into a runtime `VrfRegistry[F]`. Mirrors `KesRegistryLoaderSuite`.
-  *
-  * '''The determinism contract (the load-bearing test).''' The generator populates `L0GenesisOperator.vrfPublicKey` via
-  * `VrfKeyDeriver.deriveVrfKeyPair(operatorKeyPair)` — the SAME derivation the gl0 snapshot leader loop applies at runtime
-  * (`SnapshotLeaderLoop.deriveVrfKeys`, which now delegates to the same shared helper). This suite generates real secp256k1 operator
-  * keypairs, builds genesis operators with `vrfPublicKey` set that way, loads the registry, and asserts each loaded VRF VK byte-equals
-  * `VrfKeyDeriver.deriveVrfKeyPair(kp)._2`. If this ever drifts (e.g. a re-implemented EC-scalar normalization), a later slice's
-  * `CommitteeSortition.verifyShardMembership` would reject every honest signer — so this byte-identity is the contract that protects it.
-  */
 object VrfRegistryLoaderSuite extends MutableIOSuite {
 
   override type Res = SecurityProvider[IO]
 
   override def sharedResource: Resource[IO, Res] = SecurityProvider.forAsync[IO]
 
-  private val meta = L0GenesisMeta(
-    generatorVersion = "test",
-    generatedAt = "2026-05-26T00:00:00Z",
-    invocation = "test",
-    seed = 0L,
-    expectedProperties = Nil
-  )
+  private val meta = L0GenesisMeta("test", "2026-05-26T00:00:00Z", "test", 0L, Nil)
+  private val protocolParams = L0GenesisProtocolParams(1, 2550L, "00" * 32, 0L)
 
-  private val protocolParams = L0GenesisProtocolParams(
-    lddCutoff = 1,
-    etaRotationSnapshots = 2550L,
-    genesisEta = "00" * 32,
-    startingEpochProgress = 0L
-  )
-
-  private def baseData(operators: List[L0GenesisOperator]): L0GenesisData =
+  private def baseData(
+    operators: List[L0GenesisOperator],
+    networkMagic: String = "test",
+    activationOrdinal: Long = 0L,
+    startingEpochProgress: Long = 0L
+  ): L0GenesisData =
     L0GenesisData(
       _meta = meta,
-      networkMagic = "test",
-      activationOrdinal = 0L,
-      startingEpochProgress = 0L,
+      networkMagic = networkMagic,
+      activationOrdinal = activationOrdinal,
+      startingEpochProgress = startingEpochProgress,
       protocolParams = protocolParams,
       operators = operators,
       delegatedStakes = Nil,
       nodeCollaterals = Nil,
-      initialBalances = Nil,
-      kesRegistrations = None
+      initialBalances = Nil
     )
 
-  /** Build an `L0GenesisOperator` with `vrfPublicKey` populated EXACTLY as the generator does. */
-  private def operatorFrom(kp: java.security.KeyPair): L0GenesisOperator = {
-    val (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(kp)
-    L0GenesisOperator(
-      peerId = PeerId.fromPublic(kp.getPublic).value.value,
-      address = kp.getPublic.toAddress.value.value,
-      vrfPublicKey = Some(Hex.fromBytes(vrfVk).value),
-      kesPublicKey = None
-    )
-  }
-
-  test("buildVrfRegistry: no operators → registry has no entries") { implicit sp =>
+  private def operatorAndRegistration(index: Int)(implicit sp: SecurityProvider[IO]) =
     for {
-      reg <- L0GenesisLoader.buildVrfRegistry[IO](baseData(Nil))
-      all <- reg.list
-    } yield expect.same(0, all.size)
-  }
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      peerId = PeerId.fromPublic(keyPair.getPublic)
+      (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(keyPair)
+      kesVk = Array.tabulate[Byte](32)(i => (index * 37 + i + 1).toByte)
+      address = keyPair.getPublic.toAddress.value.value
+      preimage = L0GenesisOperator.signaturePreimage(
+        "test",
+        0L,
+        0L,
+        peerId.value.toBytes,
+        address,
+        kesVk,
+        0,
+        0L,
+        vrfVk
+      )
+      signature <- Signing.signData[IO](preimage)(keyPair.getPrivate)
+      operator = L0GenesisOperator(
+        peerId = peerId.value.value,
+        address = address,
+        kesMasterVk = Hex.fromBytes(kesVk).value,
+        kesMasterVkStep = 0,
+        kesPeriodOffset = 0L,
+        vrfVk = Hex.fromBytes(vrfVk).value,
+        longTermSignature = Hex.fromBytes(signature).value
+      )
+    } yield (keyPair, operator)
 
-  test("buildVrfRegistry: operator with vrfPublicKey = None → not in registry") { implicit sp =>
+  test("paired loader preserves the generator/runtime VRF derivation contract") { implicit sp =>
     for {
-      kp <- KeyPairGenerator.makeKeyPair[IO]
-      op = operatorFrom(kp).copy(vrfPublicKey = None)
-      reg <- L0GenesisLoader.buildVrfRegistry[IO](baseData(List(op)))
-      lookup <- reg.getVrfVk(PeerId.fromPublic(kp.getPublic))
-      all <- reg.list
-    } yield expect.same(None, lookup.map(_.toList)) && expect.same(0, all.size)
-  }
-
-  test("buildVrfRegistry: loaded vrfVk byte-equals deriveVrfKeyPair(kp)._2 (DETERMINISM CONTRACT)") { implicit sp =>
-    for {
-      kps <- (0 until 4).toList.traverse(_ => KeyPairGenerator.makeKeyPair[IO])
-      ops = kps.map(operatorFrom)
-      reg <- L0GenesisLoader.buildVrfRegistry[IO](baseData(ops))
-      all <- reg.list
-      checks <- kps.traverse { kp =>
-        val expectedVk = VrfKeyDeriver.deriveVrfKeyPair(kp)._2
-        reg.getVrfVk(PeerId.fromPublic(kp.getPublic)).map { loaded =>
-          expect(loaded.isDefined) &&
-          expect(loaded.exists(b => java.util.Arrays.equals(b, expectedVk)))
-        }
+      records <- (0 until 4).toList.traverse(operatorAndRegistration)
+      pairedRegistry <- L0GenesisLoader.buildOperatorKeyRegistry[IO](
+        baseData(records.map(_._2))
+      )
+      kesRegistry = pairedRegistry.kesRegistry
+      vrfRegistry = pairedRegistry.vrfRegistry
+      pairedEntries <- pairedRegistry.list
+      kesEntries <- kesRegistry.list
+      vrfEntries <- vrfRegistry.list
+      checks <- records.traverse {
+        case (keyPair, _) =>
+          val peerId = PeerId.fromPublic(keyPair.getPublic)
+          val expected = VrfKeyDeriver.deriveVrfKeyPair(keyPair)._2
+          vrfRegistry.getVrfVk(peerId).map(loaded => expect(loaded.exists(java.util.Arrays.equals(_, expected))))
       }
-    } yield checks.foldLeft(expect.same(4, all.size))(_ && _)
+    } yield
+      expect.same(4, pairedEntries.size) &&
+        expect.same(pairedEntries.keySet, kesEntries.keySet) &&
+        expect.same(pairedEntries.keySet, vrfEntries.keySet) &&
+        checks.combineAll
   }
 
-  test("buildVrfRegistry: lookup for an unregistered peer returns None") { implicit sp =>
+  test("derived registry projections cannot mutate the paired genesis source") { implicit sp =>
     for {
-      kpA <- KeyPairGenerator.makeKeyPair[IO]
-      kpB <- KeyPairGenerator.makeKeyPair[IO]
-      reg <- L0GenesisLoader.buildVrfRegistry[IO](baseData(List(operatorFrom(kpA))))
-      present <- reg.getVrfVk(PeerId.fromPublic(kpA.getPublic))
-      missing <- reg.getVrfVk(PeerId.fromPublic(kpB.getPublic))
-    } yield expect(present.isDefined) && expect.same(None, missing.map(_.toList))
+      record <- operatorAndRegistration(0)
+      pairedRegistry <- L0GenesisLoader.buildOperatorKeyRegistry[IO](baseData(List(record._2)))
+      kesRegistry = pairedRegistry.kesRegistry
+      vrfRegistry = pairedRegistry.vrfRegistry
+      peerId = PeerId(Hex(record._2.peerId))
+      firstKes <- kesRegistry.getKesVk(peerId)
+      firstVrf <- vrfRegistry.getVrfVk(peerId)
+      _ <- IO {
+        firstKes.foreach(entry => entry.vk.value(0) = (entry.vk.value(0) ^ 0xff).toByte)
+        firstVrf.foreach(bytes => bytes(0) = (bytes(0) ^ 0xff).toByte)
+      }
+      secondKes <- kesRegistry.getKesVk(peerId)
+      secondVrf <- vrfRegistry.getVrfVk(peerId)
+    } yield
+      expect(secondKes.exists(_.vk.value.sameElements(Hex(record._2.kesMasterVk).toBytes))) &&
+        expect(secondVrf.exists(_.sameElements(Hex(record._2.vrfVk).toBytes)))
   }
 
-  test("buildVrfRegistry: malformed vrfPublicKey hex is dropped (peer absent, no boot failure)") { implicit sp =>
+  test("paired loader rejects malformed and wrong-length VRF keys") { implicit sp =>
     for {
-      kp <- KeyPairGenerator.makeKeyPair[IO]
-      op = operatorFrom(kp).copy(vrfPublicKey = Some("zz-not-hex"))
-      reg <- L0GenesisLoader.buildVrfRegistry[IO](baseData(List(op)))
-      lookup <- reg.getVrfVk(PeerId.fromPublic(kp.getPublic))
-      all <- reg.list
-    } yield expect.same(None, lookup.map(_.toList)) && expect.same(0, all.size)
+      record <- operatorAndRegistration(0)
+      malformed <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2.copy(vrfVk = "zz" * 32))))
+        .attempt
+      short <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2.copy(vrfVk = "11" * 31))))
+        .attempt
+    } yield
+      expect(malformed.swap.exists(_.getMessage.contains("not valid hexadecimal"))) &&
+        expect(short.swap.exists(_.getMessage.contains("exactly 32 bytes")))
   }
 
-  test("buildVrfRegistry: empty registry default (VrfRegistry.empty) returns None for any peer") { implicit sp =>
+  test("paired loader rejects duplicate operator identities before map construction") { implicit sp =>
     for {
-      kp <- KeyPairGenerator.makeKeyPair[IO]
-      reg = io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO]
-      lookup <- reg.getVrfVk(PeerId.fromPublic(kp.getPublic))
-    } yield expect.same(None, lookup.map(_.toList))
+      first <- operatorAndRegistration(0)
+      second <- operatorAndRegistration(1)
+      duplicate = second._2.copy(peerId = first._2.peerId)
+      result <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(first._2, duplicate)))
+        .attempt
+    } yield expect(result.swap.exists(_.getMessage.contains("duplicate operator PeerId")))
+  }
+
+  test("paired loader rejects VRF key reuse across distinct operators") { implicit sp =>
+    for {
+      first <- operatorAndRegistration(0)
+      second <- operatorAndRegistration(1)
+      reused = second._2.copy(vrfVk = first._2.vrfVk)
+      result <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(first._2, reused)))
+        .attempt
+    } yield expect(result.swap.exists(_.getMessage.contains("duplicate VRF verification key")))
+  }
+
+  test("paired loader rejects malformed and wrong-length PeerIds") { implicit sp =>
+    for {
+      record <- operatorAndRegistration(0)
+      malformed <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2.copy(peerId = "gg" * 64))))
+        .attempt
+      short <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2.copy(peerId = "11" * 63))))
+        .attempt
+    } yield
+      expect(malformed.swap.exists(_.getMessage.contains("not valid hexadecimal"))) &&
+        expect(short.swap.exists(_.getMessage.contains("exactly 64 bytes")))
+  }
+
+  test("paired loader rejects VRF substitution under an otherwise valid operator record") { implicit sp =>
+    for {
+      record <- operatorAndRegistration(0)
+      substituted = record._2.copy(vrfVk = "42" * 32)
+      result <- L0GenesisLoader.buildOperatorKeyRegistry[IO](baseData(List(substituted))).attempt
+    } yield expect(result.swap.exists(_.getMessage.contains("longTermSignature does not bind")))
+  }
+
+  test("paired loader rejects an operator-key record replayed into another network") { implicit sp =>
+    for {
+      record <- operatorAndRegistration(0)
+      result <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2), networkMagic = "other-network"))
+        .attempt
+    } yield expect(result.swap.exists(_.getMessage.contains("longTermSignature does not bind")))
+  }
+
+  test("paired loader rejects an operator-key record replayed at another genesis activation context") { implicit sp =>
+    for {
+      record <- operatorAndRegistration(0)
+      changedActivation <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2), activationOrdinal = 1L))
+        .attempt
+      changedEpochProgress <- L0GenesisLoader
+        .buildOperatorKeyRegistry[IO](baseData(List(record._2), startingEpochProgress = 1L))
+        .attempt
+    } yield
+      expect(changedActivation.swap.exists(_.getMessage.contains("longTermSignature does not bind"))) &&
+        expect(changedEpochProgress.swap.exists(_.getMessage.contains("longTermSignature does not bind")))
+  }
+
+  test("paired loader rejects an address that does not derive from the signed PeerId") { implicit sp =>
+    for {
+      first <- operatorAndRegistration(0)
+      second <- operatorAndRegistration(1)
+      substituted = first._2.copy(address = second._2.address)
+      result <- L0GenesisLoader.buildOperatorKeyRegistry[IO](baseData(List(substituted))).attempt
+    } yield expect(result.swap.exists(_.getMessage.contains("address does not match its PeerId")))
   }
 }

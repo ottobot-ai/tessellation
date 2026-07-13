@@ -11,15 +11,15 @@ import io.constellationnetwork.schema.peer.PeerId
 
 /** Read-only view of validator stake for Nakamoto consensus.
   *
-  * Used by EligibilityChecker to determine threshold scaling. Phase 3: equal weight (1/N). §1.1: stake-proportional via `stakeWeighted` —
-  * combined `delegatedStake + nodeCollateral` per the strategic-signals memo (two-tier stake is the unit).
+  * Used by EligibilityChecker to determine threshold scaling. The historical implementation-stage label "Phase 3" meant equal weight
+  * `(1/N)` and is unrelated to GL0 finality phases. `stakeWeighted` uses combined `delegatedStake + nodeCollateral`.
   *
   * Stakes are returned as exact `Ratio` so eligibility and finality threshold computations are byte-identical across all JVMs/CPUs (no IEEE
   * 754 sum-order or rounding non-determinism).
   *
-  * Supports optimistic finality: tracks observed active peers (those that have attested recently) and computes finality weight against the
-  * active set rather than the full seedlist. This allows the cluster to finalize when some seedlist peers are offline, without blocking the
-  * online majority.
+  * '''Target violation.''' Optimistic weighting currently renormalizes against this node's observed-active peers. That receiver-local
+  * denominator can differ under partition and must not drive Phase 2. The target cascade binds one delayed canonical epoch validator/stake
+  * set; local activity remains liveness telemetry only.
   */
 trait StakeRegistry[F[_]] {
 

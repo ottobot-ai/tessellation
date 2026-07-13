@@ -3,8 +3,6 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedMap
-
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
@@ -13,7 +11,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** §1 — eta resolver with MPT-cache + chainStore-walk fallback. Path 1 of the heap-leak workstream (Tessellation-Nakamoto).
   *
-  * '''Problem statement.''' `vrfOutputsForPeriod` walks back to `periodStart` of period N-1 to recompute eta_N from VRF outputs. Under Fix
+  * '''Problem statement.''' eta range collection walks back to `periodStart` of period N-1 to recompute eta_N from VRF outputs. Under Fix
   * B's k₁-bounded `byHash` retention (k₁ ords, per-env), that walk hits the eviction floor for any `etaRotationSnapshots > k₁` (always
   * true: R = round(3.1·k₁)). Without a disk-immune cache, eta silently degrades to `genesisEta` for every period after the first eviction
   * crosses the rotation boundary — pseudo-predictability defeated cluster-wide. (Findings 1 + 2 from the reviewer.)
@@ -26,8 +24,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * '''Read path.''' [[getEta]] reads the MPT entry first (via [[HistoricalStakeReader]]); on a hit, returns `entry.eta`. On a miss (the
   * period's boundary hasn't been crossed yet — common during the active period N, where the period's boundary write hasn't fired), it falls
-  * back to a chainStore VRF walk via the caller-supplied `chainWalkFallback`, computes eta via [[EtaCalculation.computeEta]], and returns
-  * the computed value.
+  * back to an exact chainStore VRF range via the caller-supplied `chainWalkFallback`. Only a range whose ancestry walk is proven complete
+  * may feed [[EtaCalculation.computeEta]]. Missing ancestry and empty source ranges fail closed; neither is an eta value.
   *
   * '''Why no lazy MPT write-through.''' The MPT entry is written authoritatively at the period's closing boundary by GSAM's accept()
   * pipeline. Writing outside that flow would either:
@@ -42,27 +40,27 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * branches on chain selection rollback. No additional invalidation logic here. After a reorg, the MPT lookup naturally returns whatever
   * the canonical chain's boundary write put there — or `None` if the canonical chain hasn't crossed the boundary yet.
   *
-  * '''Period 0 (and the COMPUTED period-1 convention, #259).''' Period 0 has no predecessor period to derive from, so [[getEta]] returns
-  * `genesisEta` directly for period ≤ 0 without touching MPT or chain. Period 1 is NOT special-cased: it falls through to the MPT-lookup →
-  * chain-walk path and computes `EtaCalculation.computeEta(genesisEta, 1, vrfOutputsForPeriod(0))` — BYTE-IDENTICAL to the wire /
-  * eligibility eta in `SnapshotLeaderLoop` (which keys on `currentPeriod <= 0`) and to the committee draw. This unifies the per-period eta
-  * across ALL sources (producer MPT boundary record == committee == wire == follower adopt) at every period, closing the #259 period-1
-  * divergence where the record/committee said `genesisEta` while the wire said `computeEta(...)`. When period-0 VRF outputs do not yet
-  * exist the chain walk is empty and the fallback returns `genesisEta` — matching `SnapshotLeaderLoop`'s empty-`vrfOutputsForPeriod(0)`
-  * branch, so the period 0 → 1 rotation stays consistent across sources during warmup.
+  * '''Bootstrap periods.''' Periods 0 and 1 have no settled predecessor range under the two-period lookback, so [[getEta]] derives them
+  * only through [[EtaCalculation.bootstrapEta]] and never consults MPT or chain history. Every period N >= 2 is derived from a
+  * proven-complete range for period N-1. This is the same split used by the GL0 producer and verifier.
   */
 trait EtaStateManager[F[_]] {
 
   /** Resolve eta for `period`. Returns the byte representation directly so callers can feed it into [[EligibilityChecker.checkEligibility]]
     * / [[CommitteeSortition]] / etc. without re-decoding.
     *
-    *   - Period ≤ 0: returns `genesisEta`.
-    *   - Period ≥ 1 with MPT cache hit: returns `entry.eta.toBytes`.
-    *   - Period ≥ 1 with MPT cache miss: falls back to `chainWalkFallback(period - 1)`; if non-empty, computes eta via
-    *     [[EtaCalculation.computeEta]]; if empty, returns `genesisEta` (parent chain not yet in store — the period 0 → 1 warmup window or
-    *     bootstrap edge cases). Period 1 follows the COMPUTED convention (#259) so it byte-matches the wire / eligibility / committee eta.
+    *   - Periods 0 and 1: return their period-specific bootstrap eta.
+    *   - Period ≥ 2 with MPT cache hit: returns `entry.eta.toBytes`.
+    *   - Period ≥ 2 with MPT cache miss: accepts only `EtaSourceRange.Complete(nonEmpty)` for period N-1. An incomplete or empty range
+    *     raises [[EtaSourceUnavailable]] so callers defer instead of deriving a branch-dependent or attacker-chosen eta.
     */
   def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]]
+
+  /** Resolve eta against the exact candidate parent. Unlike [[getEta]], this never consumes the receiver-current MPT entry: that entry may
+    * belong to a sibling branch. The ancestry callback must prove a complete range from `parentHash`, and the memoization key includes the
+    * hash so one branch's eta cannot be served while replaying another.
+    */
+  def getEtaAt(period: Long, parentHash: Hash)(implicit hasher: Hasher[F]): F[Array[Byte]]
 
   /** Drop the in-process chain-walk recompute-suppression cache (`walkCacheRef`). Track-3 S4: invoked on EVERY base-reverting path (the MPT
     * base revert `MptOverlay.revertToOrdinal` / finalize reorg-replace arms, and the follower resync-to-canonical) so a
@@ -79,43 +77,89 @@ trait EtaStateManager[F[_]] {
 
 object EtaStateManager {
 
+  /** Completeness proof carried across the node-shared / dag-l0 module boundary. The range producer must prove it crossed the source
+    * period's lower ordinal boundary while preserving every parent hash and ordinal link. A nonempty `Incomplete` prefix is not usable.
+    */
+  sealed trait EtaSourceRange {
+    def outputs: List[(Long, Array[Byte])]
+  }
+
+  object EtaSourceRange {
+    final case class Complete(outputs: List[(Long, Array[Byte])]) extends EtaSourceRange
+    final case class Incomplete(outputs: List[(Long, Array[Byte])]) extends EtaSourceRange
+  }
+
+  final case class EtaSourceUnavailable(period: Long, sourcePeriod: Long, detail: String)
+      extends RuntimeException(s"eta source unavailable for period=$period sourcePeriod=$sourcePeriod: $detail")
+
   /** Construct an [[EtaStateManager]] backed by an MPT `HistoricalStakeReader` (the eta-half of the per-period boundary record) and a
     * chain-walk callback that produces `(ordinal, vrfOutput)` pairs for the first 2/3 of `period`.
     *
-    * The `chainWalkFallback` typically routes to `chainStore.vrfOutputsForPeriod(period, etaRotationSnapshots)` which under Path 1
-    * disk-falls-through via [[NakamotoChainStore.getWithOrdinalFallback]]. The MPT cache short-circuits the walk for periods whose boundary
-    * write has landed.
+    * The `chainWalkFallback` typically routes to `chainStore.vrfOutputRangeForPeriodFrom(period, etaRotationSnapshots, tipHash)` which
+    * under Path 1 disk-falls-through via [[NakamotoChainStore.getWithOrdinalFallback]]. The MPT cache short-circuits the walk for periods
+    * whose boundary write has landed.
     *
     * @param genesisEta
-    *   bootstrap eta for period ≤ 0 and for the degenerate empty-chain-walk fallback path. 32 bytes.
+    *   bootstrap seed for periods 0 and 1. 32 bytes.
     * @param historicalStakeReader
     *   MPT-primary reader for the per-period boundary record. Returns `None` when the boundary hasn't yet been crossed.
     * @param chainWalkFallback
-    *   `(sourcePeriod: Long) => F[List[(Long, Array[Byte])]]` — VRF outputs for the first 2/3 of `sourcePeriod`. Same return shape as
-    *   [[NakamotoChainStore.vrfOutputsForPeriod]] / [[NakamotoChainStore.vrfOutputsForPeriodFrom]].
+    *   `(sourcePeriod, optionalParentHash) => F[EtaSourceRange]` — ancestry result for the first 2/3 of `sourcePeriod`. `Some(hash)` must
+    *   walk that exact parent; `None` is the explicitly ambient canonical lookup retained for unanchored callers.
     */
   def make[F[_]: Async](
     genesisEta: Array[Byte],
     historicalStakeReader: HistoricalStakeReader[F],
-    chainWalkFallback: Long => F[List[(Long, Array[Byte])]]
+    chainWalkFallback: (Long, Option[Hash]) => F[EtaSourceRange]
   ): F[EtaStateManager[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("EtaStateManager")
     // In-process recompute-suppression cache for the chain-walk path. Periods that hit `None` from
     // MPT are recomputed at most once per (period, F-runtime) — subsequent reads hit this cache,
     // avoiding O(R/3) walks per slot. Cleared on reorg via the `forgetUncommitted` hatch below.
     //
-    // Cache keys are bounded by the small set of in-flight periods (~3 — the active, the prior, and
-    // its prior under N-2 lookback). Not size-capped because the per-period eta is 32 bytes and the
-    // map churn is at-most one entry per boundary crossing.
-    Ref.of[F, SortedMap[EtaPeriod, Array[Byte]]](SortedMap.empty[EtaPeriod, Array[Byte]]).map { walkCacheRef =>
+    // Only the ambient canonical lookup is memoized. Exact-parent requests are deliberately not retained, so an attacker cannot turn
+    // arbitrary candidate hashes into an unbounded cache; their correctness comes from the exact ancestry walk itself.
+    Ref.of[F, Map[(EtaPeriod, Option[Hash]), Array[Byte]]](Map.empty).map { walkCacheRef =>
       new EtaStateManager[F] {
 
         // Track-3 S4: drop the recompute-suppression cache so post-revert `getEta` re-derives over the
         // canonical chain (bootstrap-equivalence). `:93` promised this hatch; here is the implementation.
         def forgetUncommitted: F[Unit] =
-          walkCacheRef.set(SortedMap.empty[EtaPeriod, Array[Byte]])
+          walkCacheRef.set(Map.empty)
 
-        def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]] =
+        private def resolveFromRange(period: Long, parentHash: Option[Hash]): F[Array[Byte]] = {
+          val etaPeriod = EtaPeriod(period)
+          val cacheKey = etaPeriod -> parentHash
+          val cachedF = parentHash.fold(walkCacheRef.get.map(_.get(cacheKey)))(_ => none[Array[Byte]].pure[F])
+          cachedF.flatMap {
+            case Some(cached) => cached.pure[F]
+            case None =>
+              chainWalkFallback(period - 1L, parentHash).flatMap {
+                case EtaSourceRange.Complete(chainOutputs) if chainOutputs.nonEmpty =>
+                  val computed = EtaCalculation.computeEta(genesisEta, period, chainOutputs.map(_._2))
+                  parentHash.fold(walkCacheRef.update(_.updated(cacheKey, computed)))(_ => Async[F].unit) >>
+                    logger
+                      .debug(
+                        s"getEta period=$period parent=${parentHash.fold("best-tip")(_.value.take(12))}: " +
+                          s"complete chain-walk recompute (sourceOutputs=${chainOutputs.size}, cached for reuse)"
+                      )
+                      .as(computed)
+
+                case EtaSourceRange.Complete(_) =>
+                  EtaSourceUnavailable(period, period - 1L, "complete range contained no VRF outputs")
+                    .raiseError[F, Array[Byte]]
+
+                case EtaSourceRange.Incomplete(chainOutputs) =>
+                  EtaSourceUnavailable(
+                    period,
+                    period - 1L,
+                    s"ancestry walk incomplete after ${chainOutputs.size} outputs"
+                  ).raiseError[F, Array[Byte]]
+              }
+          }
+        }
+
+        private def resolve(period: Long, parentHash: Option[Hash])(implicit hasher: Hasher[F]): F[Array[Byte]] =
           // Cardano/Praos bootstrap (supersedes #259): periods 0 AND 1 are genesis-derivable via
           // `EtaCalculation.bootstrapEta` (= Blake2b(genesisEta ‖ period), no VRF-output dependency), so
           // every node computes them identically and the first eta rotation (period 0 → 1) cannot fork.
@@ -125,49 +169,32 @@ object EtaStateManager {
           // follower-adopt at EVERY period. The boundary writer materializes bootstrapEta for periods 0/1,
           // so the MPT-hit branch (reachable for period >= 2 only now) stays consistent.
           if (period <= 1L) EtaCalculation.bootstrapEta(genesisEta, period).pure[F]
-          else {
-            val etaPeriod = EtaPeriod(period)
-            historicalStakeReader.lookup(etaPeriod).flatMap {
-              case Some(entry) =>
-                // MPT hit — the boundary write for `period` has landed. Decode the embedded
-                // 32-byte hash to a byte array (matches [[EtaCalculation.computeEta]]'s output
-                // shape).
-                val bytes = entry.eta.value.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
-                bytes.pure[F]
+          else
+            parentHash match {
+              case Some(_) =>
+                // Exact-candidate replay must not read a receiver-current MPT entry that may belong to a sibling.
+                resolveFromRange(period, parentHash)
 
               case None =>
-                // Pre-boundary recompute via the chain-walk fallback. The N-1 source period
-                // (`period - 1`) carries the VRF outputs whose first 2/3 feed `computeEta`.
-                walkCacheRef.get.flatMap { cache =>
-                  cache.get(etaPeriod) match {
-                    case Some(cached) => cached.pure[F]
-                    case None =>
-                      chainWalkFallback(period - 1L).flatMap { chainOutputs =>
-                        if (chainOutputs.isEmpty) {
-                          // Source period (>= 1) not yet in store — should not happen for period >= 2 in a
-                          // healthy chain (the source is finalized before this is read). Fall back to the
-                          // per-period bootstrapEta, matching [[EtaCalculation.etaForOrdinal]]'s degenerate
-                          // branch. WARN (not debug): a silent genesis substitution here is exactly how a
-                          // lagging node diverges from a caught-up one.
-                          logger
-                            .warn(
-                              s"getEta period=$period: MPT miss + empty chain walk for source=${period - 1L} — falling back to bootstrapEta(period)"
-                            )
-                            .as(EtaCalculation.bootstrapEta(genesisEta, period))
-                        } else {
-                          val computed = EtaCalculation.computeEta(genesisEta, period, chainOutputs.map(_._2))
-                          walkCacheRef.update(_.updated(etaPeriod, computed)) >>
-                            logger
-                              .debug(
-                                s"getEta period=$period: MPT miss + chain-walk recompute (sourceOutputs=${chainOutputs.size}, cached for reuse)"
-                              )
-                              .as(computed)
-                        }
-                      }
-                  }
+                val etaPeriod = EtaPeriod(period)
+                historicalStakeReader.lookup(etaPeriod).flatMap {
+                  case Some(entry) =>
+                    // MPT hit — the boundary write for `period` has landed. Decode the embedded
+                    // 32-byte hash to a byte array (matches [[EtaCalculation.computeEta]]'s output
+                    // shape).
+                    val bytes = entry.eta.value.grouped(2).map(Integer.parseInt(_, 16).toByte).toArray
+                    bytes.pure[F]
+
+                  case None =>
+                    // Receiver-current canonical lookup used only by callers that do not yet carry an exact anchor.
+                    resolveFromRange(period, none)
                 }
             }
-          }
+
+        def getEta(period: Long)(implicit hasher: Hasher[F]): F[Array[Byte]] = resolve(period, none)
+
+        def getEtaAt(period: Long, parentHash: Hash)(implicit hasher: Hasher[F]): F[Array[Byte]] =
+          resolve(period, parentHash.some)
       }
     }
   }

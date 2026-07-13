@@ -117,4 +117,12 @@ object BlockCodecSuite extends FunSuite {
     // Same mathematical set regardless of literal order → same bytes.
     expect(a.immutableBytes == b.immutableBytes)
   }
+
+  test("Transaction set round-trips when source proof case reverses canonical wire order") {
+    val upperFirst = signedTx.copy(proofs = NonEmptySet.of(SignatureProof(Id(Hex("B0")), Signature(Hex("11")))))
+    val lowerFirst = signedTx.copy(proofs = NonEmptySet.of(SignatureProof(Id(Hex("a0")), Signature(Hex("22")))))
+    val block = sample.copy(transactions = NonEmptySet.of(upperFirst, lowerFirst))
+
+    expect(block.immutableBytes.fromImmutableBytes[SchemaBlock].map(_.transactions.toSortedSet.size) == Right(2))
+  }
 }

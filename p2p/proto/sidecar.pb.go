@@ -564,8 +564,10 @@ func (x *TokenLockBlock) GetPayload() []byte {
 //
 // Emitted by a gl0 operator key that wins the committee VRF for a given
 // (metagraph_address, parent_hash) under the per-metagraph sortition
-// (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver verifies the
-// VRF proof against the sender's published VK + the threshold `K · σ`, then
+// (`docs/nakamoto/COMMITTEE-SORTITION-DESIGN.md`). The receiver resolves the
+// sender's exact active preregistered KES+VRF pair from canonical historical
+// state, requires any carried VK to match, and verifies the VRF proof under the
+// resolved VK plus the threshold `K · σ`, then
 // tallies toward the per-binary `≥ 2K/3` quorum. Slice S3 will flip the
 // aggregate from warn-only observability into the load-bearing pre-inclusion
 // gate that lets non-committee operators skip the binary entirely.
@@ -591,13 +593,11 @@ type MetagraphAttestation struct {
 	BinaryHash        []byte                 `protobuf:"bytes,4,opt,name=binary_hash,json=binaryHash,proto3" json:"binary_hash,omitempty"`                        // 32 bytes; hash of the MetagraphBinary
 	CommitteeVrfProof []byte                 `protobuf:"bytes,5,opt,name=committee_vrf_proof,json=committeeVrfProof,proto3" json:"committee_vrf_proof,omitempty"` // committee VRF proof — gates membership
 	Signature         []byte                 `protobuf:"bytes,6,opt,name=signature,proto3" json:"signature,omitempty"`                                            // long-term-key signature over the canonical bytes
-	KesSignature      []byte                 `protobuf:"bytes,7,opt,name=kes_signature,json=kesSignature,proto3" json:"kes_signature,omitempty"`                  // KES product signature (Slice 9 path); empty during S2 warn-only
-	VrfPublicKey      []byte                 `protobuf:"bytes,8,opt,name=vrf_public_key,json=vrfPublicKey,proto3" json:"vrf_public_key,omitempty"`                // sender's committee VRF VK (32 bytes); receiver verifies committee_vrf_proof
-	// against this. Required because deriving the sender's VRF VK from the public
-	// peer-id alone is cryptographically impossible — `VrfKeyDeriver` needs the
-	// sender's PRIVATE key. When per-operator-key VRF keys land (#180), this field
-	// plumbs through unchanged; the source of the VK shifts on the sender side to
-	// the per-operator registration table.
+	KesSignature      []byte                 `protobuf:"bytes,7,opt,name=kes_signature,json=kesSignature,proto3" json:"kes_signature,omitempty"`                  // Required KES product signature over the same canonical bytes as `signature`.
+	VrfPublicKey      []byte                 `protobuf:"bytes,8,opt,name=vrf_public_key,json=vrfPublicKey,proto3" json:"vrf_public_key,omitempty"`                // sender-carried committee VRF VK (32 bytes), used only as comparison evidence.
+	// The receiver resolves the exact active preregistered KES+VRF pair from canonical
+	// historical registry state, requires byte equality, and verifies the proof under
+	// that resolved key. A missing, pending, stale, or mismatched pair fails closed.
 	SenderTreeStep uint32 `protobuf:"varint,9,opt,name=sender_tree_step,json=senderTreeStep,proto3" json:"sender_tree_step,omitempty"` // KES tree-internal step the sender used for `kes_signature`. This is the
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache

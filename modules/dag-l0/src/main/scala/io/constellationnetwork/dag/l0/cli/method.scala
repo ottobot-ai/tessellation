@@ -28,11 +28,12 @@ object method {
     *
     * Bootstrap mode is auto-detected at startup from the flags provided:
     *
-    *   1. `--rollback-hash HASH` → load a specific snapshot (from disk or peer), use as head. Operator escape hatch for anchored recovery.
-    *      2. Local snapshot data on disk → cold restart from the latest ordinal. Automatic — no flag needed. 3. `--nakamoto-peer URL` →
-    *      HTTP-download latest snapshot from a running peer. Used by validators joining mid-chain. 4. `--genesis-csv PATH` → fresh start
-    *      from a genesis CSV. All genesis-time nodes use this with the same file + shared genesis time so they derive the same initial
-    *      state. 5. None of the above → startup error.
+    *   1. `--rollback-hash HASH` → load a specific locally persisted snapshot. 2. Local snapshot data on disk → cold restart from the
+    *      latest ordinal. 3. `--nakamoto-peer URL` → rejected until authenticated ancestry replay exists. 4. Otherwise → fresh genesis.
+    *
+    * Every mode currently requires the positional genesis argument to be the canonical L0 JSON containing the complete, paired operator
+    * KES/VRF key anchor. A CSV, missing argument, or incomplete JSON fails before services become ready. This remains mandatory until the
+    * active operator-key registry is persisted in and recoverable from rooted consensus state.
     *
     * Nakamoto tunables (LDD params, finality knobs, sidecar config, genesis time) are configured via `NAKAMOTO_*` env vars. See
     * `GlobalSnapshotConsensus.scala` for defaults.

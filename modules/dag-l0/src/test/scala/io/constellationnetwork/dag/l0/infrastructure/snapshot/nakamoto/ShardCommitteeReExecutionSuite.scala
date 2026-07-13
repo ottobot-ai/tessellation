@@ -13,9 +13,9 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotStat
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
+import io.constellationnetwork.node.shared.domain.nakamoto.{CanonicalOperatorConsensusFixture, EligibilityChecker}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.node.shared.infrastructure.sharding.{
   ShardCheckpointProducer,
@@ -31,6 +31,7 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
 import io.constellationnetwork.schema.{GlobalStateProofSelector, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.kes.OperationalKeyMaker
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
@@ -70,11 +71,6 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
   private val epochZero: EtaPeriod = EtaPeriod(0L)
   private val anchorStart: Long = 1000L
   private val fixedShardEta: Array[Byte] = Array.fill[Byte](32)(0x7a.toByte)
-  private val fixedVrfSk: Array[Byte] = Array.fill[Byte](32)(0x5c.toByte)
-  private val fixedKesPayload: Array[Byte] = Array.fill[Byte](128)(0xab.toByte)
-
-  private val slotGapFor: (Slot, Option[Slot]) => Long =
-    (current, parent) => parent.fold(current.value.value)(p => math.max(1L, current.value.value - p.value.value))
 
   private def mkCurrencyGenesisBinary(
     metagraphKey: KeyPair
@@ -109,9 +105,29 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
   private def makeProducer(
     slotLeader: ShardSlotLeader[IO],
     chainStore: ShardChainStore[IO],
-    operatorKey: KeyPair,
+    operator: CanonicalOperatorConsensusFixture,
     replay: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]]
-  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] = {
+    val selfPeerId = operator.resolvedPair.operatorPeerId
+    val selfVrfVk = operator.resolvedPair.vrfPublicKey.toBytes
+    val kesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+      def sign(
+        operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
+        checkpointEpoch: EtaPeriod,
+        message: Array[Byte]
+      ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+        operator.kesSigner
+          .signAt(Math.toIntExact(checkpointEpoch.value), message)
+          .map(
+            _.toOption.map(signature =>
+              ShardCheckpointProducer.KesSignature(
+                Math.toIntExact(checkpointEpoch.value),
+                OperationalKeyMaker.encodeSignature(signature)
+              )
+            )
+          )
+    }
+
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = chainStore,
@@ -119,19 +135,20 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       adoptedPerMgTip = SortedMap.empty[Address, Hash].pure[IO],
       slotLeader = slotLeader,
       publisher = ShardCheckpointPublisher.noop[IO],
-      selfPeerId = PeerId.fromPublic(operatorKey.getPublic),
-      selfKeyPair = operatorKey,
-      selfVrfSk = fixedVrfSk,
-      kesSigner = ShardCheckpointProducer.KesSigner.fixed[IO](period = 7, signatureBytes = fixedKesPayload),
+      selfPeerId = selfPeerId,
+      selfKeyPair = operator.localLongTermKeyPairForConsensusTest,
+      selfVrfSk = operator.localVrfSecret,
+      selfVrfVk = selfVrfVk,
+      operatorKeyRegistry = operator.operatorKeyRegistry,
+      kesSigner = kesSigner,
       shardEtaFor = _ => fixedShardEta.pure[IO],
       staircaseDeltaSlots = 5,
-      slotGapFor = slotGapFor,
       derivePerMgState = replay,
       executionBaseOrdinalF = SnapshotOrdinal.MinValue.pure[IO],
-      lastAdoptedOrd = none.pure[IO],
-      pipelineDepth = Int.MaxValue,
+      lastPhase2Checkpoint = none.pure[IO],
       republishEveryTicks = 1
     )
+  }
 
   private def produceUntilSome(
     producer: ShardCheckpointProducer[IO],
@@ -151,34 +168,34 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
 
   test("real currency binary: producer root equals an independent verifier replay root") { res =>
     implicit val (ks, h, js, sp, slotLeader) = res
-    for {
-      operatorKey <- KeyPairGenerator.makeKeyPair[IO]
-      operator = PeerId.fromPublic(operatorKey.getPublic)
-      metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
-      metagraph = PublicKeyOps(metagraphKey.getPublic).toAddress
-      binary <- mkCurrencyGenesisBinary(metagraphKey)
-      pending = SortedMap(metagraph -> NonEmptyList.one(binary))(Address.OrderingInstance)
-      producerReader <- emptyReader
-      verifierReader <- emptyReader
-      producerReplay <- makeReplay(producerReader)
-      verifierReplay <- makeReplay(verifierReader)
-      chainStore <- ShardChainStore.make[IO](shardZero)
-      producer <- makeProducer(slotLeader, chainStore, operatorKey, producerReplay)
-      checkpoint <- produceUntilSome(producer, pending, Set(operator))
-      producedRoot = checkpoint.value.derivedStateDelta.perMetagraphMptRoots(metagraph)
-      verifierRoot <- verifierReplay(
-        metagraph,
-        checkpoint.value.derivedStateDelta.includedSnapshots(metagraph),
-        checkpoint.value.gl0AnchorOrdinal,
-        checkpoint.value.executionBaseOrdinal
-      )
-      addressOnlySentinel <- Hasher[IO].hash(metagraph)
-    } yield
-      expect.all(
-        producedRoot =!= Hash.empty,
-        verifierRoot.contains(producedRoot),
-        producedRoot =!= addressOnlySentinel,
-        checkpoint.value.derivedStateDelta.includedSnapshots(metagraph).size == 1
-      )
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        metagraph = PublicKeyOps(metagraphKey.getPublic).toAddress
+        binary <- mkCurrencyGenesisBinary(metagraphKey)
+        pending = SortedMap(metagraph -> NonEmptyList.one(binary))(Address.OrderingInstance)
+        producerReader <- emptyReader
+        verifierReader <- emptyReader
+        producerReplay <- makeReplay(producerReader)
+        verifierReplay <- makeReplay(verifierReader)
+        chainStore <- ShardChainStore.make[IO](shardZero)
+        producer <- makeProducer(slotLeader, chainStore, operator, producerReplay)
+        checkpoint <- produceUntilSome(producer, pending, Set(operator.resolvedPair.operatorPeerId))
+        producedRoot = checkpoint.value.derivedStateDelta.perMetagraphMptRoots(metagraph)
+        verifierRoot <- verifierReplay(
+          metagraph,
+          checkpoint.value.derivedStateDelta.includedSnapshots(metagraph),
+          checkpoint.value.gl0AnchorOrdinal,
+          checkpoint.value.executionBaseOrdinal
+        )
+        addressOnlySentinel <- Hasher[IO].hash(metagraph)
+      } yield
+        expect.all(
+          producedRoot =!= Hash.empty,
+          verifierRoot.contains(producedRoot),
+          producedRoot =!= addressOnlySentinel,
+          checkpoint.value.derivedStateDelta.includedSnapshots(metagraph).size == 1
+        )
+    }
   }
 }

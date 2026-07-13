@@ -61,13 +61,15 @@ object FeeTransactionValidatorSuite extends MutableIOSuite {
       signed <- Signed.forAsyncHasher(transaction, sourceKeyPair)
       tampered = signed.copy(value = transaction.copy(amount = Amount(11L)))
       result <- FeeTransactionValidator.make[IO](SignedValidator.make[IO]).validate(tampered)
-    } yield expect(result match {
-      case Invalid(errors) => errors.exists {
-          case InvalidSigned(InvalidSignatures(proofs)) => proofs === tampered.proofs
-          case _                                         => false
-        }
-      case Valid(_) => false
-    })
+    } yield
+      expect(result match {
+        case Invalid(errors) =>
+          errors.exists {
+            case InvalidSigned(InvalidSignatures(proofs)) => proofs === tampered.proofs
+            case _                                        => false
+          }
+        case Valid(_) => false
+      })
   }
 
   test("validate rejects a cryptographically valid signature from a non-source key") { res =>
@@ -85,13 +87,15 @@ object FeeTransactionValidatorSuite extends MutableIOSuite {
       )
       signedByOther <- Signed.forAsyncHasher(transaction, otherKeyPair)
       result <- FeeTransactionValidator.make[IO](SignedValidator.make[IO]).validate(signedByOther)
-    } yield expect(result match {
-      case Invalid(errors) => errors.exists {
-          case NotSignedBySourceAddressOwner => true
-          case InvalidSigned(NotSignedExclusivelyByAddressOwner) => true
-          case _ => false
-        }
-      case Valid(_) => false
-    })
+    } yield
+      expect(result match {
+        case Invalid(errors) =>
+          errors.exists {
+            case NotSignedBySourceAddressOwner                     => true
+            case InvalidSigned(NotSignedExclusivelyByAddressOwner) => true
+            case _                                                 => false
+          }
+        case Valid(_) => false
+      })
   }
 }

@@ -63,16 +63,14 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     tracker.recordAttestation(peerId, attestation, attestation.attestedAt)
 
   // ============================================================
-  // TWeight: post-Snowball wiring (`AVALANCHE-ATTESTATION-PROPOSAL.md` §2, §3.1).
+  // TWeight: transitional sticky latest-attestation margin wiring.
   //
-  // TWeight now reads `tipTracker.highestSnowballDecidedOrdinal` — the sibling SnowballAccumulator's
-  // margin-based decision. Beta defaults to 10 distinct peer attestations of margin between leader
-  // and runner-up. The Snowball decision is observer-independent (NID restored). To exercise the
-  // trigger here we feed enough distinct-peer attestations to clear the β=10 margin (or use a
-  // smaller β via env in production; for tests we wire enough peers so β=10 is satisfied).
+  // TWeight reads `tipTracker.highestSnowballDecidedOrdinal`, which currently exposes the sibling
+  // accumulator's arrival-order-sensitive first beta-margin crossing. These are component tests of
+  // that executable integration point, not tests of the intended K/alpha/beta cascade.
   // ============================================================
 
-  // For TWeight tests, use a wider validator set so the Snowball accumulator can clear β=10
+  // Use a wider validator set so the transitional accumulator can clear beta=10
   // (leader needs to be 10 distinct peers ahead of runner-up). With 11 peers all attesting the
   // same hash, leader_count = 11 and runner_up = 0 → margin 11 ≥ 10 → decided.
   private def setupTrackerWithEnoughPeersForBeta(
@@ -97,10 +95,9 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TWeight (Snowball): below β margin → MinValue qualifying ordinal") {
+  test("TWeight transitional margin: below beta returns MinValue") {
     // Three peers attest the same canonical hash; below β=10 margin → not decided yet → MinValue.
-    // Confirms the Snowball decision rule is margin-based, not count-based: a 3-peer
-    // unanimous-on-canonical attestation set is below the β=10 floor.
+    // A three-peer unanimous current set remains below the beta=10 margin.
     val self = pid("self")
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
@@ -115,10 +112,9 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TWeight (Snowball): β-margin cleared on canonical → returns qualifying ordinal") {
+  test("TWeight transitional margin: beta crossing on canonical returns the ordinal") {
     // 11 peers all attest the same canonical hash → leader_count = 11, runner_up = 0, margin 11
-    // ≥ β=10 → decided → trigger qualifies the ordinal. Validates the end-to-end Snowball path
-    // through TWeightTrigger.
+    // >= beta=10, so the sticky local decision qualifies the ordinal through TWeightTrigger.
     val self = pid("self")
     val tipHash = hash("tip-at-50")
     for {
@@ -131,9 +127,9 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(ord(50L), result)
   }
 
-  test("TWeight (Snowball): decisions on non-canonical fork are filtered → MinValue") {
-    // 11 peers attest a forked hash; canonical chain has a different hash. Snowball decides on
-    // the forked hash internally (its accumulator has 11 votes for the forked side), but the
+  test("TWeight transitional margin: non-canonical sticky decision is filtered") {
+    // 11 peers attest a forked hash; canonical chain has a different hash. The accumulator sticks
+    // to the forked hash internally, but the
     // canonical-hash filter in `highestDecidedOnCanonical` returns None for ordinals where the
     // decided hash doesn't match canonical.
     val self = pid("self")
@@ -149,11 +145,10 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TWeight (Snowball): NID — two observers with different selfId reach the same decision") {
-    // Load-bearing NID assertion: post-Snowball the T_weight decision is observer-independent.
-    // The `selfId` field on `ConsensusState` is still passed (T_count uses it), but T_weight no
-    // longer reads it. Two evaluations against the same TipTracker — one as observerA, one as
-    // observerB — produce identical qualifying ordinals.
+  test("TWeight transitional margin ignores selfId for two reads of the same tracker") {
+    // T_weight does not read `selfId`, so two reads of the same in-memory tracker match. This does
+    // not model two independent observers or prove portable determinism under different receipt
+    // orders.
     val observerA = pid("observerA")
     val observerB = pid("observerB")
     val tipHash = hash("tip-at-50")
@@ -168,7 +163,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
       resultA <- triggerA.evaluate(stA)
       resultB <- triggerB.evaluate(stB)
     } yield
-      // NID: identical decisions across different observer identities.
+      // Same stored decision and canonical callback; only the unused selfId differs.
       expect.same(resultA, resultB) &&
         expect.same(ord(50L), resultA)
   }
@@ -237,12 +232,12 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TCount: agrees with TWeight (Snowball) at the same canonical ordinal once both clear their respective thresholds") {
-    // Post-Snowball, T_weight and T_count are independent triggers with different mechanisms:
-    // T_weight = Snowball margin (β=10 distinct peer attestations of leader-vs-runner-up margin)
+  test("TCount and transitional TWeight can report the same canonical ordinal") {
+    // T_weight and T_count are independent current calculators with different mechanisms:
+    // T_weight = sticky current-count margin (beta=10)
     // T_count = ≥ 2/3 distinct non-self attesters on canonical (still self-excludes per #133)
     // Once enough peers attest the canonical hash to clear both gates, both qualify the same ord.
-    // 12-peer cluster (self + 11 attesters all on canonical): T_weight Snowball margin = 11 ≥ 10
+    // 12-peer cluster (self + 11 attesters all on canonical): T_weight current margin = 11 >= 10
     // → qualifies. T_count = 11 attesters, ceil(2/3 * 12) = 8 required → qualifies. Both ord=50.
     val self = pid("self")
     val tipHash = hash("tip-at-50")
@@ -313,7 +308,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
 
   test("TDepth2: returns MinValue when chain is shorter than k₂") {
     // At the production k₂ = 100·k₁ (mainnet 102400) the chain will be shorter than k₂ for the first ~hundred
-    // thousand ordinals; clamp to MinValue so Phase-3 sinks never see a wraparound or negative ordinal.
+    // thousand ordinals; clamp to MinValue so local retention/tower sinks never see a wraparound or negative ordinal.
     val self = pid("self")
     val tipHash = hash("tip")
     val k2 = 102400L
@@ -324,13 +319,11 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     } yield expect.same(SnapshotOrdinal.MinValue, result)
   }
 
-  test("TDepth2 with k₂=102400 fires later than TDepth1 with k₁=1024 (Phase 2 → Phase 3 strictly after Phase 1 → Phase 2)") {
-    // The 4-phase finality model requires that ARCHIVAL (Phase 3) qualification trails SETTLED
-    // (Phase 2) qualification — once a snapshot is depth-k₂ deep, it has trivially been depth-k₁
-    // deep for tens of thousands of snapshots already. This is the structural invariant that lets
-    // Phase-3 sinks (overlay history pruning, future Mithril cert, light-client anchor) safely
-    // assume Phase 2 finality has already fired. Sanity-check: at any bestTip > k₂, the TDepth1
-    // qualifying ordinal strictly exceeds the TDepth2 qualifying ordinal. Uses the mainnet
+  test("TDepth2 local k₂ watermark trails the TDepth1 k₁ operational-depth watermark") {
+    // k2 is recommended local retention/proof/recovery capacity, not a protocol phase. Once a snapshot
+    // is depth-k2 old, it has trivially crossed k1 earlier. This test checks only that arithmetic ordering;
+    // it does not authorize immutable pruning or constrain density fork choice. At any bestTip > k2, the
+    // TDepth1 qualifying ordinal strictly exceeds the TDepth2 qualifying ordinal. Uses the mainnet
     // pair k₁=1024 / k₂=100·k₁=102400.
     val self = pid("self")
     val tipHash = hash("tip")
@@ -347,7 +340,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
       expect.same(ord(198976L), depth1Result) &&
         expect.same(ord(97600L), depth2Result) &&
         // Strict ordering: TDepth2 qualifies a LOWER ordinal (older snapshots), which is the same as
-        // saying TDepth2 "fires later" in time — for any given snapshot N, we cross k₁ depth before
+        // saying the local k2 watermark crosses later in time — for any given snapshot N, we cross k1 depth before
         // we cross k₂ depth.
         expect(depth2Result.value.value < depth1Result.value.value)
   }
@@ -390,7 +383,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
     val tipHash = hash("tip")
     for {
       // Pre-advance T_weight to ord=50 and T_depth1 to ord=90 via two evaluateAndAdvance calls.
-      // Snowball T_weight requires β=10 margin; use 11 peers to clear it.
+      // Transitional T_weight requires beta=10 margin; use 11 peers to clear it.
       triple <- setupTrackerWithEnoughPeersForBeta()
       (tracker, _, peers) = triple
       _ <- peers.toList.traverse_(p => record(tracker, p, att(tipHash, slot(50), 50L, 1000L)))
@@ -419,12 +412,11 @@ object FinalityTriggerSuite extends SimpleIOSuite {
   }
 
   test("triggersFor over all four triggers — only the triggers that qualify N are returned (#138 building block)") {
-    // Scenario for the chain-quality observable (task #138): at finalize time we want to know
-    // exactly which subset of the four triggers (T_weight, T_count, T_depth1, T_depth2) has
-    // qualified the just-finalized ordinal. Uses a 12-peer cluster (self + 11) to clear the
-    // Snowball β=10 margin at T_weight while also satisfying the T_count ≥ 2/3 distinct attesters
-    // gate.
-    //   - T_weight qualifies ord=50 (Snowball margin 11 ≥ β=10)
+    // Scenario for the chain-quality observable (task #138): query which current calculators have
+    // crossed a given ordinal. This is telemetry and does not itself establish an exact-hash phase.
+    // A 12-peer cluster (self + 11) clears the transitional beta=10 margin while also satisfying
+    // the T_count >= 2/3 distinct-attester gate.
+    //   - T_weight reports ord=50 (current margin 11 >= beta=10)
     //   - T_count qualifies ord=50 (11 non-self peers, ceil(2/3 * 12) = 8 → met)
     //   - T_depth1 qualifies ord=90 (bestTip=100, k=10)
     //   - T_depth2 qualifies MinValue (bestTip=100 < k₂=1000)
@@ -473,7 +465,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
   test("FinalityTriggerView.fromTriggers wraps a trigger list and answers triggersFor correctly") {
     // Smoke test for the #138 view shim — confirms the wrapper preserves
     // FinalityTrigger.triggersFor semantics without caching or staleness. Uses enough peers to
-    // clear the Snowball β=10 margin so T_weight qualifies.
+    // clear the transitional beta=10 margin so T_weight reports an ordinal.
     val self = pid("self")
     val tipHash = hash("tip")
     for {
@@ -497,7 +489,7 @@ object FinalityTriggerSuite extends SimpleIOSuite {
         expect.same(Set[FinalityTrigger.Kind](FinalityTrigger.Kind.TDepth1), depthOnly)
   }
 
-  test("maxLatestQualifyingOrdinal: returns max across all triggers (today's max(t_weight, t_depth1) semantics)") {
+  test("maxLatestQualifyingOrdinal legacy helper returns the highest ordinal projection") {
     val self = pid("self")
     val tipHash = hash("tip")
     for {

@@ -8,6 +8,14 @@
 > current behavior in source and follow [`../../AGENTS.md`](../../AGENTS.md).
 > Deleted authority-design paths cited below are intentionally absent and remain
 > available only through git history at commit `725b25b`.
+>
+> **Current migration target (owner clarification 2026-07-11):** a future fork of
+> an existing network is an offline, deterministic transform from one exact
+> finalized upstream snapshot to a new-network ScodecV1 ordinal-0 genesis. The
+> exporter/importer and migration manifest must audit supply and every retained or
+> discarded state namespace. This does not justify legacy runtime codecs or any
+> `authoritative*`/roots-only state import path. Future upgrades after the new
+> network launches use the finalized hash/ordinal-bound `ProtocolEra` mechanism.
 
 > **Purpose.** Ground the *hardfork* workstream so a Fable review can be pointed at it without
 > re-deriving from stale memory. Sibling of `docs/review/HANDOFF.md` (Track-1/Track-3 sharding).

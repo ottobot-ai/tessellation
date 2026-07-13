@@ -1,8 +1,13 @@
 # Unified Chain-Based Consensus Engine — Design (DRAFT for review)
 
-**Status:** DRAFT — owner review required before any surgery (hard-fork-scale for metagraphs).
+**Status:** SUPERSEDED FOR ML0. Do not implement this draft as the current target.
 **Date:** 2026-06-11.
-**Supersedes:** the 2026-05-20 "metagraphs stay BFT" direction, with owner approval pending.
+**Owner clarification 2026-07-11:** ML0 may remain BFT for small, well-connected
+metagraph networks. GL0 remains Nakamoto/Taktikos/LDD, and execution-shard
+checkpoint chains remain staircase/Nakamoto. A future ML0 chain-engine migration
+requires a separate owner decision and must not leak BFT or this draft's generic
+engine assumptions into GL0. Current architecture is in
+`../review/CONSENSUS-ARTIFACT-LIFECYCLE.md`.
 **Companion evidence:** the 2026-06-11 e2e campaign post-mortems (runs `bimn7o09f`, `bmnnfnao7`) and the upstream comparison (mainnet BFT 1,859 LOC / testnet 12,666 / this branch 6,245 in the consensus engine).
 
 ---
@@ -192,21 +197,24 @@ registered collator sets — and relay cadence ≥ parachain cadence, because th
 Ours mirrors both: gl0 keeps Taktikos; the shard committee is hash-sorted per `(shardEta, shardOrdinal)`
 (`ShardSlotLeader.dutyOrder`), rank r proposes for `staircase-delta-slots` (default 5) slots starting one slot after
 the parent's wire slot, wrapping modulo committee size (liveness = ONE live member; censorship bounded by rotation).
-Duty is a pure function of on-wire data (parent slot + current slot + epoch eta + membership) — deterministically
-verifiable. Shard chain growth stays structurally ≤ gl0 growth (the 1-checkpoint/shard/gl0-ord embed lane + the
-pipeline gate are the throughput governors); the staircase's job is mint LATENCY — rank-0 produces within ~1 slot of
+Duty is intended to be a pure function of proposal-parent-bound data (parent ref + child slot + anchored eta/roster). The current receiver
+derives the parent from its local shard store, so embedded-artifact validity remains asymmetric until `SHARD-C-009` supplies portable parent
+evidence. Shard chain growth stays structurally ≤ gl0 growth (the one-outstanding-checkpoint rule is the throughput governor); the
+staircase's job is mint LATENCY — rank-0 produces within ~1 slot of
 the lane opening. Client-facing finality speed lives in the ml0 countersign rail (5.2), not in shard cadence.
 
 **Current mechanics:**
-  - The `ShardCheckpoint` envelope carries its production **`slot`** explicitly. Validation checks monotonicity, skew, deterministic
-    staircase duty, and a registered-key possession proof over `(shardEta, slot)`.
+  - The `ShardCheckpoint` envelope carries its production **`slot`** explicitly. Validation currently checks parent monotonicity,
+    deterministic staircase duty, and a registered-key possession proof over `(shardEta, slot)`. It does **not** yet enforce a canonical
+    upper bound; `SHARD-C-010` requires the exact containing GL0 snapshot's signed slot certificate so receiver wall clock never decides
+    artifact validity.
   - `gl0AnchorOrdinal` REMAINS on the envelope as chain-link data (epoch/eta resolution, adoption anchoring) — it is
     no longer the lottery clock.
   - The producer runs from the slot tick. `slotGap` = slots since the parent checkpoint's wire slot and indexes the staircase window
     (`(slotGap − 1) / δ mod K`), not an LDD threshold.
-  - Every GL0 node has the slot clock. Production remains throughput-governed by the existing pipeline gate
-    (`awaiting-embed`, depth 2) and the one-checkpoint-per-shard-per-GL0-ordinal embed rule. Shard cadence is naturally at least global cadence, restoring the intended
-    frequency ordering (shards fast, global aggregates).
+  - Every GL0 node has the slot clock. Production permits exactly one outstanding checkpoint per shard; only the exact containing GL0
+    snapshot reaching Phase 2 releases its successor. The current honest-producer gate is partial because the checkpoint does not yet carry
+    portable verifier-checkable Phase-2 parent-anchor evidence.
 
 **Safety:** committee membership and duty restrict who may propose, but neither signatures nor depth authorize economic state. Every GL0
 adopter must recreate each included CL1 transition at the signed finalized execution base before storing, attesting, selecting, or embedding

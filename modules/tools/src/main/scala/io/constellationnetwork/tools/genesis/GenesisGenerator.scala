@@ -27,14 +27,14 @@ import io.constellationnetwork.security.vrf.VrfKeyDeriver
 import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** Tier-1 test-vector generator. Emits a byte-deterministic `l0-genesis.json` for a given seed + flag set. See
-  * `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` memory for the design rationale
-  * (genesis-template + generator + fixture library, mirroring Cardano's `cardano-cli genesis create-cardano`).
+/** Tier-1 genesis generator. Operator/economic fixture inputs are deterministic for a given seed + flag set, but freshly generated KES
+  * material and its ECDSA binding signatures intentionally use secure randomness, so a complete `l0-genesis.json` is not byte-reproducible
+  * from the public seed alone. See `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` memory for
+  * the design rationale (genesis-template + generator + fixture library, mirroring Cardano's `cardano-cli genesis create-cardano`).
   *
-  * Determinism contract: for a given (seed, flag-set), the emitted JSON file is byte-identical across runs. ECDSA signatures are NOT
-  * deterministic in this codebase — see `L0GenesisLoader` docstring; the fixture stores RAW events plus delegator private-key hex and
-  * signing happens at load time. This means the fixture-on-disk is reproducible, even if the runtime in-memory `Signed[...]` values aren't
-  * byte-equal across cluster restarts.
+  * Stake/collateral events store raw data plus synthetic private-key material and are signed deterministically by `L0GenesisLoader`.
+  * Operator KES secret keys must not be derived from the public fixture seed; callers must retain the generated KES secret-key files and
+  * distribute one reviewed canonical JSON anchor rather than attempting to regenerate its public registrations later.
   */
 object GenesisGenerator {
 
@@ -187,27 +187,11 @@ object GenesisGenerator {
       collateralOwnerKeys <- (0 until opts.numOperators).toList.traverse { i =>
         deterministicKeyPair[F](opts.seed, s"collateral-owner:$i")
       }
-      operators = operatorKeys.zipWithIndex.map {
-        case (kp, _) =>
-          // §1.3 / Slice S1: populate the per-operator VRF verification key from the operator's long-term
-          // keypair via the SHARED `VrfKeyDeriver.deriveVrfKeyPair` — the SAME derivation the gl0 runtime
-          // applies in `SnapshotLeaderLoop.deriveVrfKeys` (normalize EC scalar → deriveVrfSeed →
-          // EcVrf25519.getVerificationKey). Byte-identity with the runtime is the determinism contract that
-          // lets a later slice's `CommitteeSortition.verifyShardMembership` accept honest signers. We MUST NOT
-          // re-implement the normalization here — both sides funnel through `deriveVrfKeyPair`.
-          val (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(kp)
-          L0GenesisOperator(
-            peerId = PeerId.fromPublic(kp.getPublic).value.value,
-            address = kp.getPublic.toAddress.value.value,
-            vrfPublicKey = Some(Hex.fromBytes(vrfVk).value),
-            kesPublicKey = None
-          )
-      }
-      // §1.2 Slice 3b: per-operator KES master key + registration cert. The KES seed is drawn
+      // Per-operator atomic KES+VRF registration. The KES seed is drawn
       // from a `SecureRandom` (NOT derived from the operator's long-term key) — forward security
       // requires that compromise of the long-term key does not leak the KES SK or any past KES
-      // signature. The registration signature `Sign_ed25519(kesVk.value)` is what binds the master
-      // VK to the operator identity for downstream verifiers.
+      // signature. VRF generation uses the shared runtime derivation helper, but the signature still
+      // binds the resulting VRF VK explicitly: carried/derived keys are never authority by themselves.
       //
       // The encoded SK bytes (raw `SecretKeyCodec.encodeProductSk` output) are carried in
       // `GeneratedOutputs.kesSecretKeys` for the CLI dispatcher to persist via
@@ -216,6 +200,8 @@ object GenesisGenerator {
       kesMaterial <- (0 until opts.numOperators).toList.traverse { i =>
         val kp = operatorKeys(i)
         val peerId = PeerId.fromPublic(kp.getPublic)
+        val address = kp.getPublic.toAddress.value.value
+        val (_, vrfVk) = VrfKeyDeriver.deriveVrfKeyPair(kp)
         for {
           seed <- Async[F].delay {
             val s = new Array[Byte](32)
@@ -225,24 +211,31 @@ object GenesisGenerator {
           skVk <- OperationalKeyMaker.generateFreshKesKeyMaterial[F](seed)
           (skBytes, vk) = skVk
           _ <- Async[F].delay(java.util.Arrays.fill(seed, 0.toByte))
-          // Sign the RAW vk bytes (NOT the hex string) with the operator's long-term Ed25519 key.
-          // Receivers verify with `Signing.verifySignature(vk.value, longTermSig)` using the
-          // operator's long-term pubkey (recovered from `L0GenesisOperator.peerId`).
-          regSig <- Signing.signData[F](vk.value)(kp.getPrivate)
-          registration = L0GenesisKesRegistration(
+          preimage = L0GenesisOperator.signaturePreimage(
+            opts.networkMagic,
+            activationOrdinal = 0L,
+            opts.startingEpochProgress,
+            peerId.value.toBytes,
+            address,
+            vk.value,
+            vk.step,
+            kesPeriodOffset = 0L,
+            vrfVk
+          )
+          regSig <- Signing.signData[F](preimage)(kp.getPrivate)
+          operator = L0GenesisOperator(
             peerId = peerId.value.value,
-            kesVk = Hex.fromBytes(vk.value).value,
-            kesVkStep = vk.step,
-            longTermSig = Hex.fromBytes(regSig).value,
-            // Genesis operators register with offset 0 — their KES tree's step 0 == global eta
-            // period 0. Mid-life joiners (Slice 10 #179) supply a non-zero offset via the runtime
-            // registration tx; they do not flow through this generator.
-            offset = 0L
+            address = address,
+            kesMasterVk = Hex.fromBytes(vk.value).value,
+            kesMasterVkStep = vk.step,
+            kesPeriodOffset = 0L,
+            vrfVk = Hex.fromBytes(vrfVk).value,
+            longTermSignature = Hex.fromBytes(regSig).value
           )
           sk = OperatorKesSecretKey(operatorIndex = i, peerId = peerId, bytes = skBytes)
-        } yield (registration, sk)
+        } yield (operator, sk)
       }
-      kesRegistrations = kesMaterial.map(_._1)
+      operators = kesMaterial.map(_._1)
       kesSecretKeys = kesMaterial.map(_._2)
       stakeAmounts = allocateStakeAmounts(opts.stakeDistribution, opts.stakeBudgetDatum)
       delegatedStakes = delegatorKeys.zipWithIndex.flatMap {
@@ -304,8 +297,7 @@ object GenesisGenerator {
         operators = operators,
         delegatedStakes = delegatedStakes,
         nodeCollaterals = nodeCollaterals,
-        initialBalances = initialBalances,
-        kesRegistrations = Some(kesRegistrations)
+        initialBalances = initialBalances
       )
       cl1 = opts.initialBalancesCsv.map { _ =>
         Cl1GenesisData(

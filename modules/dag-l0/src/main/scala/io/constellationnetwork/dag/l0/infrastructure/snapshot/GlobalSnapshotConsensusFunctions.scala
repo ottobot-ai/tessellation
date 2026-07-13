@@ -94,13 +94,13 @@ object GlobalSnapshotConsensusFunctions {
   val pendingAccumulatorsToKeep: Int = 512
 
   /** Slice 14 — splice the committee attestations collected in the per-shard `ShardTipTracker` (gossiped `CommitteeMemberSignature`s, full
-    * signature form) into a candidate checkpoint's `committeeSignatures`. Signature count is a selection signal only;
-    * `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` still re-executes every included transition before acceptance.
+    * signature form) into a candidate checkpoint's `committeeSignatures`. The resulting artifact must carry at least `kQuorum` distinct
+    * valid execution signatures, and `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` still re-executes every included transition.
     *
     * Pure + LEADER-PATH ONLY (callers gate on `sourceShardCheckpoints`): the produce leader enriches its candidates from its node-local
     * tracker; the resulting checkpoint is what the leader embeds + proposes, and every follower threads that SAME embedded set unchanged
-    * (it does NOT re-source its own tracker), so `verifyEmbedded` — deterministic, reading no node-local state — re-accepts the leader's
-    * set on every node and the artifact round-trips byte-identically (the split-safety invariant). `committeeSignatures` is EXCLUDED from
+    * (it does NOT re-source its own tracker), so `verifyEmbedded` re-accepts only after resolving the exact signed parent by hash from the
+    * retained shard-chain index. Missing parent data fails closed rather than waiving producer duty. `committeeSignatures` is EXCLUDED from
     * `ShardCheckpointSigPreimage`, so splicing extra signers leaves the canonical checkpoint hash (chain-link + signed bytes) untouched —
     * the spliced signers each signed that same hash.
     *
@@ -236,9 +236,11 @@ object GlobalSnapshotConsensusFunctions {
         .getOrElse(SortedMap.empty[Address, List[Signed[UpdateNodeCollateral.Withdraw]]])
         .values
         .flatMap(_.map(WithdrawNodeCollateralEvent(_)))
+      val kesRegistrationEvents = artifact.operatorKeyRegistrations.toList.map(KesRegistrationCertEvent(_))
 
       val events: Set[GlobalSnapshotEvent] =
-        dagEvents ++ scEvents ++ allowSpendEvents ++ unpEvents ++ tokenLockEvents ++ cdsEvents ++ wdsEvents ++ cncEvents ++ wncEvents
+        dagEvents ++ scEvents ++ allowSpendEvents ++ unpEvents ++ tokenLockEvents ++ cdsEvents ++ wdsEvents ++ cncEvents ++ wncEvents ++
+          kesRegistrationEvents
 
       // Derive the consensus trigger from the artifact itself rather than trusting the local
       // consensus trigger, which may differ across nodes (e.g. a node observing EventTrigger
@@ -363,8 +365,8 @@ object GlobalSnapshotConsensusFunctions {
       * The follower validation path (`validateArtifact`) passes `sourceShardCheckpoints = false` and supplies the leader's embedded
       * `artifact.shardCheckpoints` via [[incomingShardCheckpoints]]. Those are already the leader's accepted subset; the follower threads
       * them into `accept()` (re-adopting the same set via the deterministic `verifyEmbedded`) and re-embeds the SAME map, so the recreated
-      * artifact's `shardCheckpoints` AND `stateChannelSnapshots` match the leader's byte-for-byte (no node-local shard state is read on the
-      * follower — the split-safety invariant).
+      * artifact's `shardCheckpoints` AND `stateChannelSnapshots` match the leader's byte-for-byte. The follower resolves each checkpoint's
+      * exact parent by hash from retained shard history; unavailable parent history rejects the artifact.
       *
       * At `numShards = 1` the flag is irrelevant — `shardAcceptanceDeps = None` forces `adoptableShardCheckpoints = SortedMap.empty`
       * regardless, so this method is byte-identical to the pre-wiring code on both paths (the regression bar).
@@ -403,6 +405,7 @@ object GlobalSnapshotConsensusFunctions {
       val wdsEventsForAcceptance = events.collect { case e: WithdrawDelegatedStakeEvent => e }
       val cncEventsForAcceptance = events.collect { case e: CreateNodeCollateralEvent => e }
       val wncEventsForAcceptance = events.collect { case e: WithdrawNodeCollateralEvent => e }
+      val kesRegistrationEventsForAcceptance = events.collect { case e: KesRegistrationCertEvent => e }
 
       val dagEvents = dagEventsBeforeCut.filter(_.value.height > lastArtifact.height)
 
@@ -547,6 +550,7 @@ object GlobalSnapshotConsensusFunctions {
         sortedWncEvents = wncEventsForAcceptance.toList
           .map(_.value)
           .sorted(Signed.ordering(Order[UpdateNodeCollateral.Withdraw].toOrdering))
+        sortedKesRegistrationEvents = kesRegistrationEventsForAcceptance.toList.map(_.value).sorted
 
         _ <- ConsensusLog.info(
           logger,
@@ -564,17 +568,17 @@ object GlobalSnapshotConsensusFunctions {
           "delegStakeCreate" -> sortedCdsEvents.size.toString,
           "delegStakeWithdraw" -> sortedWdsEvents.size.toString,
           "nodeCollCreate" -> sortedCncEvents.size.toString,
-          "nodeCollWithdraw" -> sortedWncEvents.size.toString
+          "nodeCollWithdraw" -> sortedWncEvents.size.toString,
+          "operatorKeyRegistration" -> sortedKesRegistrationEvents.size.toString
         )
 
         // Gap C — source the phase-2-finalized shard checkpoint per shard, to feed into `accept()`.
         // Empty (byte-identical to today, the regression bar) when EITHER `numShards = 1` (deps None)
         // OR this is the follower validation re-derivation (`sourceShardCheckpoints = false` — see the
         // determinism contract on `createProposalArtifactInternal`). On the genuine produce path with
-        // sharding active: for each tracked shard, advance the composite finality triggers, then freshly
-        // resolve the highest hash-bearing checkpoint on the current best-tip ancestry qualified by
-        // `T_count_shard` OR `T_depth1_shard` (max-of). Never resolve a historical monotone ordinal through
-        // the current fork: quorum/depth observed for branch A must not qualify branch B at the same ordinal.
+        // sharding active: for each tracked shard, advance the execution-quorum tracker, then freshly resolve the highest hash-bearing
+        // checkpoint on the current best-tip ancestry with `kQuorum` distinct replay signatures. Never resolve a historical monotone
+        // ordinal through the current fork: quorum observed for branch A must not qualify branch B at the same ordinal.
         // Skip shards with no currently canonical qualified checkpoint.
         //
         // ─── Q1 — deterministic inclusion cutoff ──────────────────────────────────────────────────────
@@ -583,11 +587,13 @@ object GlobalSnapshotConsensusFunctions {
         // honest leaders producing the SAME gl0 ord N could fold DIFFERENT shard checkpoints and diverge.
         // The cutoff makes the selection a pure function of `(N, shard chain)`: clamp to the deterministic
         // MAX checkpoint whose `gl0AnchorOrdinal <= N` (N = `currentOrdinal`, the ord being produced) AND
-        // is Phase-2-qualified. Since `gl0AnchorOrdinal` is monotone non-decreasing along the canonical
-        // shard chain (each checkpoint anchors to a gl0 ord >= its parent's), and any ancestor of a
-        // Phase-2-qualified checkpoint is itself Phase-2-qualified (more depth / older), walking back from
-        // the qualifying checkpoint to the highest-ord ancestor with `gl0AnchorOrdinal <= N` preserves the
-        // qualified invariant while removing the timing dependence. A checkpoint that nominated a FUTURE
+        // has an execution quorum. Since `gl0AnchorOrdinal` is monotone non-decreasing along the canonical
+        // shard chain (each checkpoint anchors to a gl0 ord >= its parent's), walking back from the
+        // qualifying checkpoint to an ancestor with `gl0AnchorOrdinal <= N` removes the timing dependence.
+        // `verifyEmbedded` below still checks that the selected ancestor itself carries execution quorum;
+        // quorum on a child never implies quorum on its parent. Until E8.1A makes parent Phase-2 evidence
+        // artifact-validity load-bearing, a Byzantine unanchored child can therefore fail closed and stall
+        // selection rather than make an under-certified ancestor valid. A checkpoint that nominated a FUTURE
         // gl0 ord (> N) is excluded this ord and folds at a later gl0 ord (loose-coupling §7.2).
         //
         // This clamp runs ONLY on the leader path (`sourceShardCheckpoints = true`). The follower path
@@ -640,23 +646,7 @@ object GlobalSnapshotConsensusFunctions {
                               cp.gl0AnchorOrdinal.value.value <= currentOrdinal.value.value &&
                               cp.derivedStateDelta.includedSnapshots.nonEmpty
                             )
-                              cp.derivedStateDelta.includedSnapshots.toList.existsM {
-                                case (mg, nel) =>
-                                  // Byte-identical to the GSAM adopt guard. Only a window containing a binary whose parent is GL0's
-                                  // committed SC tip qualifies. A fully adopted window is skipped, and a sibling lineage is deferred:
-                                  // without authoritative diffs GL0 cannot recreate a sibling from its committed pre-state.
-                                  ShardWindowContinuation.windowTipHashF(nel).map { windowTipHash =>
-                                    ShardWindowContinuation.classify(
-                                      nel,
-                                      windowTipHash,
-                                      scTips.getOrElse(mg, Hash.empty)
-                                    ) match {
-                                      case ShardWindowContinuation.Continue(_)    => true
-                                      case ShardWindowContinuation.Defer          => false
-                                      case ShardWindowContinuation.AlreadyAdopted => false
-                                    }
-                                  }
-                              }
+                              ShardWindowContinuation.isAtomicallyContinuableF(shardId, cp, scTips)
                             else
                               false.pure[F]
                           }.flatMap {
@@ -727,18 +717,31 @@ object GlobalSnapshotConsensusFunctions {
 
         // CHANGE 4 — keep ONLY the checkpoints the DETERMINISTIC `verifyEmbedded` accepts. These are exactly the ones
         // GSAM's adopt path will fold into `scSnapshots`, so embedding this same subset in the produced artifact keeps the
-        // `shardCheckpoints` field consistent with `stateChannelSnapshots`. `verifyEmbedded` reads no node-local state, so
-        // the leader (produce) and every follower/validator compute the SAME accepted subset over the SAME candidates —
+        // `shardCheckpoints` field consistent with `stateChannelSnapshots`. `verifyEmbedded` also checks producer duty against the exact
+        // retained parent by hash; missing parent history fails closed. Given the same retained history, the leader and every follower compute
+        // the SAME accepted subset over the SAME candidates —
         // the follower's candidates ARE the leader's embedded set, so the subset round-trips identically (recreated
         // artifact === artifact). At `numShards = 1` (deps None) `candidateShardCheckpoints` is empty ⇒ this is empty too.
         adoptableShardCheckpoints <- shardAcceptanceDeps match {
           case Some(deps) if candidateShardCheckpoints.nonEmpty =>
             candidateShardCheckpoints.toList.traverseFilter {
               case (shardId, cp) =>
-                deps.acceptanceManager.verifyEmbedded(cp).map {
-                  case ShardCheckpointAcceptResult.Accepted => (shardId -> cp).some
-                  case _ => none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
-                }
+                if (shardId =!= cp.shardId)
+                  none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)].pure[F]
+                else
+                  ShardWindowContinuation
+                    .isAtomicallyContinuableF(shardId, cp, snapshotContext.lastStateChannelSnapshotHashes)
+                    .flatMap {
+                      case false =>
+                        none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
+                          .pure[F]
+                      case true =>
+                        deps.acceptanceManager.verifyEmbedded(cp).map {
+                          case ShardCheckpointAcceptResult.Accepted => (shardId -> cp).some
+                          case _ =>
+                            none[(io.constellationnetwork.schema.sharding.ShardId, io.constellationnetwork.schema.sharding.ShardCheckpoint)]
+                        }
+                    }
             }
               .map(entries => SortedMap.from(entries))
           case _ =>
@@ -775,7 +778,8 @@ object GlobalSnapshotConsensusFunctions {
           overlayHandle,
           // Task #12 slice 2b — the typed per-ordinal delta accept() applied. Staged hash-keyed below (at
           // the `overlay.commit` site, once `currentSnapshotHash` is known) for the gl0 changeset ring.
-          stateChangesAccumulator
+          stateChangesAccumulator,
+          kesRegistrationAcceptanceResult
         ) <-
           globalSnapshotAcceptanceManager
             .accept(
@@ -811,7 +815,8 @@ object GlobalSnapshotConsensusFunctions {
               shardCheckpoints = adoptableShardCheckpoints,
               // WATCHTOWER fraud-proof artifact (W3a) — folded into the slash sink; the SAME map is embedded in the snapshot below so the
               // follower/validator threading `artifact.fraudProofs` recreates this call identically. Empty at numShards=1 / noop pool.
-              fraudProofs = effectiveFraudProofs
+              fraudProofs = effectiveFraudProofs,
+              kesRegistrationCerts = sortedKesRegistrationEvents
             )
         acceptEndMs <- Async[F].monotonic.map(_.toMillis)
         _ <- ConsensusLog.info(
@@ -840,6 +845,8 @@ object GlobalSnapshotConsensusFunctions {
           "nodeCollCreate.rejected" -> nodeCollateralAcceptanceResult.notAcceptedCreates.size.toString,
           "nodeCollWithdraw.accepted" -> nodeCollateralAcceptanceResult.acceptedWithdrawals.size.toString,
           "nodeCollWithdraw.rejected" -> nodeCollateralAcceptanceResult.notAcceptedWithdrawals.size.toString,
+          "operatorKeyRegistration.accepted" -> kesRegistrationAcceptanceResult.accepted.size.toString,
+          "operatorKeyRegistration.rejected" -> kesRegistrationAcceptanceResult.notAccepted.size.toString,
           "scSnapshots" -> scSnapshots.size.toString,
           "rewards" -> acceptedRewardTxs.size.toString
         )
@@ -894,7 +901,8 @@ object GlobalSnapshotConsensusFunctions {
           // threading `artifact.fraudProofs` back through accept() recreates this snapshot byte-identically (the `recreatedArtifact ===
           // artifact` round-trip). Empty at numShards=1 / noop pool (regression bar). `version`/`slotCertificate`/`eta` keep their defaults
           // here (SnapshotLeaderLoop `.copy(eta = …)`s eta later; that copy preserves this field).
-          fraudProofs = effectiveFraudProofs
+          fraudProofs = effectiveFraudProofs,
+          operatorKeyRegistrations = SortedSet.from(kesRegistrationAcceptanceResult.accepted.values.map(_.event))
         )
         // Phase J: commit the overlay handle once the artifact is built and we have the snapshot's
         // hash to use as the branch's `childTip`. Under MultiBranch this registers `currentSnapshotHash`
@@ -959,7 +967,8 @@ object GlobalSnapshotConsensusFunctions {
             updated.filterNot { case (h, _) => toEvict.contains(h) }
           } else updated
         }
-        returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents
+        returnedEvents = returnedSCEvents.map(StateChannelEvent(_)) ++ returnedDAGEvents ++
+          kesRegistrationAcceptanceResult.notAccepted.map(_._1).map(KesRegistrationCertEvent(_))
         _ <- ConsensusLog.info(
           logger,
           Category.Proposal,

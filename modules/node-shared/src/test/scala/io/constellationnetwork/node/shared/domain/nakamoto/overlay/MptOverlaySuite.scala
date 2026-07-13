@@ -1516,7 +1516,7 @@ object MptOverlaySuite extends MutableIOSuite {
   }
 
   // ============================================================
-  // #139 — Phase-3 (T_depth2) archival prune of overlay history
+  // #139 — legacy T_depth2 local-retention prune of overlay history (not a protocol phase)
   // ============================================================
   //
   // Contract: `pruneBelow(ord)` drops in-memory accumulators whose entries are strictly below `ord`.

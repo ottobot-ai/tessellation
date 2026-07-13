@@ -10,20 +10,26 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.crypto._
-import io.constellationnetwork.node.shared.domain.genesis.types.{L0GenesisData, L0GenesisDelegatedStake, L0GenesisNodeCollateral}
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry, VrfRegistry}
+import io.constellationnetwork.node.shared.domain.genesis.types._
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
+import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistryEntry, OperatorConsensusKeyRegistry}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, UpdateDelegatedStake}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GenesisOperatorConsensusKey}
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes.VerificationKeyKesProduct
-import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.GenesisOperatorConsensusKeyCodec.immutableCodec
 
 import eu.timepit.refined.numeric.NonNegative
 import eu.timepit.refined.refineV
@@ -46,6 +52,8 @@ import io.circe.Encoder
 object L0GenesisLoader {
 
   private val ECDSA = "ECDSA"
+  private val PeerIdLength = 64
+  private val KesMasterVerificationKeyLength = 32
 
   private def parsePrivateKey[F[_]: Async: SecurityProvider](pkcs8Hex: String): F[PrivateKey] =
     Async[F].delay {
@@ -191,6 +199,7 @@ object L0GenesisLoader {
     for {
       stakePairs <- data.delegatedStakes.flatTraverse(s => signStake[F](s).map(_.toList))
       collPairs <- data.nodeCollaterals.flatTraverse(c => signCollateral[F](c).map(_.toList))
+      genesisOperatorKeys <- buildGenesisOperatorKeys[F](data)
     } yield {
       val stakeMap: SortedMap[Address, SortedSet[DelegatedStakeRecord]] =
         SortedMap.from(
@@ -221,64 +230,385 @@ object L0GenesisLoader {
       base.copy(
         balances = mergedBalances,
         activeDelegatedStakes = Some(stakeMap),
-        activeNodeCollaterals = Some(collMap)
+        activeNodeCollaterals = Some(collMap),
+        genesisOperatorKeys = genesisOperatorKeys
       )
     }
 
-  /** Build a [[KesRegistry]] from the `kesRegistrations` field of an L0 genesis fixture. Each entry is hex-decoded into a
-    * `VerificationKeyKesProduct` and keyed by the registered `PeerId`. Entries whose `peerId` or `kesVk` fail to hex-decode are dropped
-    * silently — Tier-1 fixtures are reviewed before landing, so a malformed registration is best surfaced as "peer absent from registry"
-    * rather than as a hard failure during boot.
+  private final case class ParsedOperator(
+    peerId: PeerId,
+    address: Address,
+    kesEntry: KesRegistryEntry,
+    vrfVk: Array[Byte],
+    signature: Array[Byte],
+    sourceIndex: Int
+  )
+
+  private def invalidGenesis(message: String): IllegalArgumentException =
+    new IllegalArgumentException(s"Invalid canonical L0 genesis operator-key anchor: $message")
+
+  private def decodeFixedHex(label: String, value: String, expectedBytes: Int): Either[IllegalArgumentException, Array[Byte]] = {
+    val expectedChars = expectedBytes * 2
+    if (value.length != expectedChars)
+      Left(invalidGenesis(s"$label must encode exactly $expectedBytes bytes, found ${value.length / 2}"))
+    else if (!value.forall(ch => Character.digit(ch, 16) >= 0))
+      Left(invalidGenesis(s"$label is not valid hexadecimal"))
+    else
+      Either
+        .catchNonFatal(Hex(value).toBytes)
+        .leftMap(_ => invalidGenesis(s"$label is not valid hexadecimal"))
+  }
+
+  private def decodeSignatureHex(label: String, value: String): Either[IllegalArgumentException, Array[Byte]] =
+    if (value.isEmpty || value.length % 2 != 0 || !value.forall(ch => Character.digit(ch, 16) >= 0))
+      Left(invalidGenesis(s"$label is not a non-empty even-length hexadecimal signature"))
+    else
+      Either
+        .catchNonFatal(Hex(value).toBytes)
+        .leftMap(_ => invalidGenesis(s"$label is not valid hexadecimal"))
+
+  private def duplicatePeerIds[A](values: List[A], peerId: A => PeerId): List[PeerId] =
+    values.groupBy(peerId).collect { case (id, occurrences) if occurrences.sizeCompare(1) > 0 => id }.toList.sorted
+
+  private def duplicateKeyOwners[A](values: List[A], key: A => Array[Byte], peerId: A => PeerId): List[List[PeerId]] =
+    values
+      .groupBy(value => Hex.fromBytes(key(value)).value)
+      .values
+      .collect { case duplicates if duplicates.sizeCompare(1) > 0 => duplicates.map(peerId).sorted }
+      .toList
+
+  private def peerLabel(peerId: PeerId): String = peerId.value.value.take(12)
+
+  /** Build the immutable rooted genesis KES+VRF identity map from one atomic operator-key record per operator.
     *
-    *   - Missing `kesRegistrations` (None) ⇒ empty registry. Slice 3 backward-compat for fixtures predating the field.
-    *   - `longTermSig` is parsed and kept available for callers that want to re-verify the binding at load time (e.g. a startup sanity
-    *     check that the operator's long-term pubkey actually signed this VK). For Slice 3 we just trust the fixture — the generator side
-    *     runs the binding signature, and the loader trusts the file. A future strict-mode could verify here.
+    * Every GL0 operator supplies one 32-byte VRF verification key and one 32-byte, period-zero KES master verification key. The long-term
+    * signature covers the domain-separated chain context and the complete pair. The loader rejects malformed/incomplete records, duplicate
+    * identities or addresses, reused KES/VRF keys, address/PeerId mismatches, and invalid bindings before constructing the map.
     */
-  def buildKesRegistry[F[_]: Async](data: L0GenesisData): F[KesRegistry[F]] =
-    Async[F].delay {
-      val parsed: Map[PeerId, KesRegistryEntry] =
-        data.kesRegistrations
-          .getOrElse(Nil)
-          .flatMap { r =>
-            val peerOpt = scala.util.Try(Id(Hex(r.peerId)).toPeerId).toOption
-            val vkBytesOpt = scala.util.Try(Hex(r.kesVk).toBytes).toOption
-            (peerOpt, vkBytesOpt) match {
-              case (Some(p), Some(vkBytes)) =>
-                Some(p -> KesRegistryEntry(VerificationKeyKesProduct(vkBytes, r.kesVkStep), r.offset))
-              case _ => None
+  def buildGenesisOperatorKeys[F[_]: Async: SecurityProvider](
+    data: L0GenesisData
+  ): F[SortedMap[PeerId, GenesisOperatorConsensusKey]] = {
+    val parseOperators =
+      data.operators.zipWithIndex.traverse {
+        case (operator, index) =>
+          for {
+            peerBytes <- decodeFixedHex(s"operators[$index].peerId", operator.peerId, PeerIdLength)
+            peerId = Id(Hex.fromBytes(peerBytes)).toPeerId
+            address <- refineV[io.constellationnetwork.schema.address.DAGAddressRefined](operator.address)
+              .leftMap(_ => invalidGenesis(s"operators[$index] (${peerLabel(peerId)}) has an invalid operator address"))
+              .map(Address(_))
+            kesVk <- decodeFixedHex(
+              s"operators[$index].kesMasterVk (${peerLabel(peerId)})",
+              operator.kesMasterVk,
+              KesMasterVerificationKeyLength
+            )
+            _ <- Either.cond(
+              operator.kesMasterVkStep == 0,
+              (),
+              invalidGenesis(s"operators[$index] (${peerLabel(peerId)}) must have kesMasterVkStep=0 at genesis")
+            )
+            _ <- Either.cond(
+              operator.kesPeriodOffset == 0L,
+              (),
+              invalidGenesis(s"operators[$index] (${peerLabel(peerId)}) must have kesPeriodOffset=0 at genesis")
+            )
+            vrfVk <- decodeFixedHex(
+              s"operators[$index].vrfVk (${peerLabel(peerId)})",
+              operator.vrfVk,
+              VrfPublicKey.ExpectedLength
+            )
+            signature <- decodeSignatureHex(
+              s"operators[$index].longTermSignature (${peerLabel(peerId)})",
+              operator.longTermSignature
+            )
+          } yield
+            ParsedOperator(
+              peerId,
+              address,
+              KesRegistryEntry(VerificationKeyKesProduct(kesVk, operator.kesMasterVkStep), operator.kesPeriodOffset),
+              vrfVk,
+              signature,
+              index
+            )
+      }
+
+    for {
+      _ <- Async[F].raiseError[Unit](invalidGenesis("networkMagic must be non-empty")).whenA(data.networkMagic.isEmpty)
+      _ <- Async[F].raiseError[Unit](invalidGenesis("activationOrdinal must be non-negative")).whenA(data.activationOrdinal < 0L)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis("startingEpochProgress must be non-negative"))
+        .whenA(data.startingEpochProgress < 0L)
+      operators <- Async[F].fromEither(parseOperators)
+      _ <- Async[F].raiseError[Unit](invalidGenesis("operators is empty")).whenA(operators.isEmpty)
+      duplicateOperators = duplicatePeerIds[ParsedOperator](operators, operator => operator.peerId)
+      _ <- Async[F]
+        .raiseError[Unit](
+          invalidGenesis(s"duplicate operator PeerId(s): ${duplicateOperators.map(peerLabel).mkString(", ")}")
+        )
+        .whenA(duplicateOperators.nonEmpty)
+      duplicateAddresses = operators.groupBy(_.address).collect { case (address, entries) if entries.sizeCompare(1) > 0 => address }.toList
+      _ <- Async[F]
+        .raiseError[Unit](
+          invalidGenesis(s"duplicate operator address(es): ${duplicateAddresses.mkString(", ")}")
+        )
+        .whenA(duplicateAddresses.nonEmpty)
+      duplicateVrfKeys = duplicateKeyOwners[ParsedOperator](operators, operator => operator.vrfVk, operator => operator.peerId)
+      _ <- Async[F]
+        .raiseError[Unit](
+          invalidGenesis(
+            s"duplicate VRF verification key assigned to operator group(s): " +
+              duplicateVrfKeys.map(_.map(peerLabel).mkString("[", ", ", "]")).mkString(", ")
+          )
+        )
+        .whenA(duplicateVrfKeys.nonEmpty)
+      duplicateKesKeys = duplicateKeyOwners[ParsedOperator](
+        operators,
+        operator => operator.kesEntry.vk.value,
+        operator => operator.peerId
+      )
+      _ <- Async[F]
+        .raiseError[Unit](
+          invalidGenesis(
+            s"duplicate KES master verification key assigned to operator group(s): " +
+              duplicateKesKeys.map(_.map(peerLabel).mkString("[", ", ", "]")).mkString(", ")
+          )
+        )
+        .whenA(duplicateKesKeys.nonEmpty)
+      _ <- operators.traverse_ { operator =>
+        for {
+          publicKey <- operator.peerId.value
+            .toPublicKey[F]
+            .adaptError {
+              case _ =>
+                invalidGenesis(
+                  s"operators[${operator.sourceIndex}] (${peerLabel(operator.peerId)}) has an invalid operator PeerId"
+                )
             }
-          }
-          .toMap
-      KesRegistry.make[F](parsed)
+          expectedAddress = publicKey.toAddress
+          _ <- Async[F]
+            .raiseError[Unit](
+              invalidGenesis(
+                s"operators[${operator.sourceIndex}] (${peerLabel(operator.peerId)}) address does not match its PeerId"
+              )
+            )
+            .unlessA(operator.address === expectedAddress)
+          record = GenesisOperatorConsensusKey(
+            data.networkMagic,
+            data.activationOrdinal,
+            data.startingEpochProgress,
+            operator.peerId,
+            operator.address,
+            Hex.fromBytes(operator.kesEntry.vk.value),
+            operator.kesEntry.vk.step,
+            operator.kesEntry.offset,
+            VrfPublicKey.fromBytes(operator.vrfVk),
+            Signature(Hex.fromBytes(operator.signature))
+          )
+          valid <- Signing
+            .verifySignature[F](GenesisOperatorConsensusKey.signaturePreimage(record), operator.signature)(publicKey)
+            .adaptError {
+              case _ =>
+                invalidGenesis(
+                  s"operators[${operator.sourceIndex}] (${peerLabel(operator.peerId)}) has a malformed longTermSignature"
+                )
+            }
+          _ <- Async[F]
+            .raiseError[Unit](
+              invalidGenesis(
+                s"operators[${operator.sourceIndex}] (${peerLabel(operator.peerId)}) longTermSignature does not bind the complete " +
+                  "genesis operator-key record and chain context"
+              )
+            )
+            .unlessA(valid)
+        } yield ()
+      }
+      records = SortedMap.from(operators.map { operator =>
+        operator.peerId -> GenesisOperatorConsensusKey(
+          data.networkMagic,
+          data.activationOrdinal,
+          data.startingEpochProgress,
+          operator.peerId,
+          operator.address,
+          Hex.fromBytes(operator.kesEntry.vk.value),
+          operator.kesEntry.vk.step,
+          operator.kesEntry.offset,
+          VrfPublicKey.fromBytes(operator.vrfVk),
+          Signature(Hex.fromBytes(operator.signature))
+        )
+      })
+    } yield records
+  }
+
+  /** Build the immutable startup view from the same signed records that are committed into rooted genesis state. */
+  def buildOperatorKeyRegistry[F[_]: Async: SecurityProvider](data: L0GenesisData): F[OperatorConsensusKeyRegistry[F]] =
+    buildGenesisOperatorKeys[F](data).map(operatorKeyRegistryFromValidated[F])
+
+  /** Validate and materialize a rooted genesis identity map. This path is used on restart and authenticated state import; it never consults
+    * a sender-carried key and never synthesizes runtime registration history.
+    */
+  def buildOperatorKeyRegistryFromRooted[F[_]: Async: SecurityProvider](
+    records: SortedMap[PeerId, GenesisOperatorConsensusKey]
+  ): F[OperatorConsensusKeyRegistry[F]] =
+    validateRootedGenesisOperatorKeys[F](records).map(operatorKeyRegistryFromValidated[F])
+
+  /** Read the immutable genesis identity partition after the caller has verified the enclosing MPT root. Lossy hashed MPT keys are not
+    * trusted: every value's `PeerId` is used to rederive its exact expected key, and misplaced/duplicate claims fail closed.
+    */
+  def materializeRootedGenesisOperatorKeys[F[_]: Async: Hasher: SecurityProvider](
+    store: MptStore[F, GlobalStateKey]
+  ): F[SortedMap[PeerId, GenesisOperatorConsensusKey]] =
+    for {
+      prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.GenesisOperatorKeys)
+      entries <- store.getAllForPrefix[GenesisOperatorConsensusKey](prefix)
+      classified <- entries.toList.sortBy(_._1.value).traverse {
+        case (actualKey, record) =>
+          GlobalStateKey
+            .genesisOperatorKey[F](record.operatorPeerId)
+            .flatMap(GlobalStateKey.toHex[F])
+            .map(expectedKey => (actualKey, expectedKey, record))
+      }
+      misplaced = classified.collect { case (actual, expected, record) if actual =!= expected => record.operatorPeerId }.distinct.sorted
+      grouped = classified.groupBy(_._3.operatorPeerId)
+      duplicates = grouped.collect { case (peerId, claims) if claims.sizeCompare(1) > 0 => peerId }.toList.sorted
+      _ <- Async[F]
+        .raiseError[Unit](
+          invalidGenesis(
+            s"corrupt rooted genesis operator-key partition: misplaced=${misplaced.map(peerLabel).mkString(",")} " +
+              s"duplicates=${duplicates.map(peerLabel).mkString(",")}"
+          )
+        )
+        .whenA(misplaced.nonEmpty || duplicates.nonEmpty)
+      records = SortedMap.from(classified.map { case (_, _, record) => record.operatorPeerId -> record })
+      validated <- validateRootedGenesisOperatorKeys[F](records)
+    } yield validated
+
+  /** Require the already-wired local startup view to equal the root-authenticated period-zero key identity at both key halves. Exact
+    * signed-record/context equality is enforced separately by [[requireGenesisDataMatchesRooted]].
+    */
+  def requireLocalRegistryMatchesRooted[F[_]: Async: SecurityProvider](
+    local: OperatorConsensusKeyRegistry[F],
+    rooted: SortedMap[PeerId, GenesisOperatorConsensusKey]
+  ): F[Unit] =
+    for {
+      rootedRegistry <- buildOperatorKeyRegistryFromRooted[F](rooted)
+      localEntries <- local.list
+      rootedEntries <- rootedRegistry.list
+      matches = localEntries.keySet === rootedEntries.keySet && localEntries.forall {
+        case (peerId, localKeys) => rootedEntries.get(peerId).exists(rootedKeys => sameOperatorKeys(localKeys, rootedKeys))
+      }
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis("local operator-key material does not match the root-authenticated genesis identity"))
+        .unlessA(matches)
+    } yield ()
+
+  /** Require the complete locally supplied signed genesis records, including network/activation/start context and signatures, to equal the
+    * root-authenticated records. This is the restart guard against a locally replaced genesis JSON file.
+    */
+  def requireGenesisDataMatchesRooted[F[_]: Async: SecurityProvider](
+    localData: L0GenesisData,
+    rooted: SortedMap[PeerId, GenesisOperatorConsensusKey]
+  ): F[Unit] =
+    buildGenesisOperatorKeys[F](localData).flatMap { localRecords =>
+      Async[F]
+        .raiseError[Unit](invalidGenesis("local signed genesis operator records do not equal the root-authenticated identity"))
+        .unlessA(localRecords === rooted)
     }
 
-  /** Build a [[VrfRegistry]] from the `operators` field of an L0 genesis fixture. Each operator's `vrfPublicKey` (hex-encoded VRF
-    * verification key) is hex-decoded and keyed by the operator `PeerId`. Operators with no `vrfPublicKey` (the field is `Option[String]`),
-    * or whose `peerId` / `vrfPublicKey` fail to hex-decode, are dropped silently — Tier-1 fixtures are reviewed before landing, so a
-    * malformed entry is best surfaced as "peer absent from registry" rather than a hard boot failure.
-    *
-    * '''Determinism.''' The generator (`GenesisGenerator`) populates `vrfPublicKey` via `VrfKeyDeriver.deriveVrfKeyPair(operatorKeyPair)`,
-    * the SAME derivation the gl0 runtime applies in `SnapshotLeaderLoop.deriveVrfKeys`. So the bytes recovered here byte-match the
-    * operator's live VRF identity — the invariant a later slice's `CommitteeSortition.verifyShardMembership` depends on. As of Slice S1 the
-    * registry is built + threaded as an AVAILABLE dependency but not yet consumed for committee membership.
-    *
-    *   - Operators absent / all `vrfPublicKey = None` ⇒ empty registry. Fixtures predating the §1.3 VRF populate produce an empty registry,
-    *     and the (S1-unconsumed) registry simply returns `None` for every lookup.
-    */
-  def buildVrfRegistry[F[_]: Async](data: L0GenesisData): F[VrfRegistry[F]] =
-    Async[F].delay {
-      val parsed: Map[PeerId, Array[Byte]] =
-        data.operators.flatMap { op =>
-          op.vrfPublicKey.flatMap { vkHex =>
-            val peerOpt = scala.util.Try(Id(Hex(op.peerId)).toPeerId).toOption
-            val vkBytesOpt = scala.util.Try(Hex(vkHex).toBytes).toOption
-            (peerOpt, vkBytesOpt) match {
-              case (Some(p), Some(vkBytes)) => Some(p -> vkBytes)
-              case _                        => None
-            }
-          }
-        }.toMap
-      VrfRegistry.make[F](parsed)
-    }
+  private def operatorKeyRegistryFromValidated[F[_]: Async](
+    records: SortedMap[PeerId, GenesisOperatorConsensusKey]
+  ): OperatorConsensusKeyRegistry[F] =
+    OperatorConsensusKeyRegistry.make[F](records.iterator.map { case (peerId, record) => peerId -> toOperatorKeys(record) }.toMap)
+
+  private def toOperatorKeys(record: GenesisOperatorConsensusKey): OperatorConsensusKeys =
+    OperatorConsensusKeys(
+      operatorPeerId = record.operatorPeerId,
+      kes = KesRegistryEntry(
+        VerificationKeyKesProduct(record.kesMasterVerificationKey.toBytes, record.kesMasterVerificationKeyStep),
+        record.kesPeriodOffset
+      ),
+      vrfPublicKey = VrfPublicKey.fromBytes(record.vrfPublicKey.toBytes),
+      effectiveFromPeriod = EtaPeriod.Zero,
+      registration = none
+    )
+
+  private def sameOperatorKeys(left: OperatorConsensusKeys, right: OperatorConsensusKeys): Boolean =
+    left.operatorPeerId === right.operatorPeerId &&
+      left.kes.vk.step === right.kes.vk.step &&
+      left.kes.offset === right.kes.offset &&
+      left.kes.vk.value.sameElements(right.kes.vk.value) &&
+      left.vrfPublicKey.toBytes.sameElements(right.vrfPublicKey.toBytes) &&
+      left.effectiveFromPeriod === right.effectiveFromPeriod &&
+      left.registration.isEmpty && right.registration.isEmpty
+
+  private def validateRootedGenesisOperatorKeys[F[_]: Async: SecurityProvider](
+    records: SortedMap[PeerId, GenesisOperatorConsensusKey]
+  ): F[SortedMap[PeerId, GenesisOperatorConsensusKey]] = {
+    val values = records.values.toList
+    val duplicateAddresses = values
+      .groupBy(_.operatorAddress)
+      .collect {
+        case (address, claims) if claims.sizeCompare(1) > 0 => address
+      }
+      .toList
+    val duplicateKesKeys = duplicateKeyOwners[GenesisOperatorConsensusKey](
+      values,
+      _.kesMasterVerificationKey.toBytes,
+      _.operatorPeerId
+    )
+    val duplicateVrfKeys = duplicateKeyOwners[GenesisOperatorConsensusKey](values, _.vrfPublicKey.toBytes, _.operatorPeerId)
+    val contexts = values.map(record => (record.networkMagic, record.activationOrdinal, record.startingEpochProgress)).distinct
+    val mapIdentityMismatches = records.collect { case (peerId, record) if peerId =!= record.operatorPeerId => peerId }.toList.sorted
+
+    for {
+      _ <- Async[F].raiseError[Unit](invalidGenesis("rooted genesis operator-key set is empty")).whenA(values.isEmpty)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis("rooted genesis operator-key records do not share one network/activation context"))
+        .unlessA(contexts.sizeCompare(1) === 0)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"rooted map identity mismatch: ${mapIdentityMismatches.map(peerLabel).mkString(",")}"))
+        .whenA(mapIdentityMismatches.nonEmpty)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"duplicate rooted operator address(es): ${duplicateAddresses.mkString(",")}"))
+        .whenA(duplicateAddresses.nonEmpty)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"duplicate rooted KES key owner group(s): ${duplicateKesKeys.mkString(",")}"))
+        .whenA(duplicateKesKeys.nonEmpty)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"duplicate rooted VRF key owner group(s): ${duplicateVrfKeys.mkString(",")}"))
+        .whenA(duplicateVrfKeys.nonEmpty)
+      _ <- values.traverse_(validateRootedGenesisOperatorKey[F])
+    } yield records
+  }
+
+  private def validateRootedGenesisOperatorKey[F[_]: Async: SecurityProvider](
+    record: GenesisOperatorConsensusKey
+  ): F[Unit] =
+    for {
+      _ <- Async[F].raiseError[Unit](invalidGenesis("networkMagic must be non-empty")).whenA(record.networkMagic.isEmpty)
+      _ <- Async[F].raiseError[Unit](invalidGenesis("activationOrdinal must be non-negative")).whenA(record.activationOrdinal < 0L)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis("startingEpochProgress must be non-negative"))
+        .whenA(record.startingEpochProgress < 0L)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"${peerLabel(record.operatorPeerId)} genesis KES key must be exactly 32 bytes at step zero"))
+        .unlessA(
+          record.kesMasterVerificationKey.toBytes.length === KesMasterVerificationKeyLength && record.kesMasterVerificationKeyStep === 0
+        )
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"${peerLabel(record.operatorPeerId)} genesis KES period offset must be zero"))
+        .unlessA(record.kesPeriodOffset === 0L)
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"${peerLabel(record.operatorPeerId)} genesis VRF key must be exactly 32 bytes"))
+        .unlessA(record.vrfPublicKey.toBytes.length === VrfPublicKey.ExpectedLength)
+      publicKey <- record.operatorPeerId.value.toPublicKey[F].adaptError { case _ => invalidGenesis("invalid rooted operator PeerId") }
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"${peerLabel(record.operatorPeerId)} rooted address does not match its PeerId"))
+        .unlessA(publicKey.toAddress === record.operatorAddress)
+      valid <- Signing
+        .verifySignature[F](GenesisOperatorConsensusKey.signaturePreimage(record), record.longTermSignature.value.toBytes)(publicKey)
+        .adaptError { case _ => invalidGenesis(s"${peerLabel(record.operatorPeerId)} has a malformed rooted long-term signature") }
+      _ <- Async[F]
+        .raiseError[Unit](invalidGenesis(s"${peerLabel(record.operatorPeerId)} rooted long-term signature is invalid"))
+        .unlessA(valid)
+    } yield ()
 }

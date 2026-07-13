@@ -43,7 +43,7 @@ digraph NakamotoArchitecture {
       slot_clock [label="Slot Clock\n(1s ticks, shared genesis time)", fillcolor="#c8c8e8"];
       vrf [label="VRF Evaluation\n(EcVrf25519 + LDD threshold)", fillcolor="#c8c8e8"];
       eligibility [label="EligibilityChecker\n(threshold = 1-(1-f(δ))^stake)", fillcolor="#c8c8e8"];
-      stake_reg [label="StakeRegistry\n(equal weight → stake-proportional)", fillcolor="#c8c8e8"];
+      stake_reg [label="Global-leader StakeRegistry\n(not execution-shard membership)\nweighting requires source/security audit", fillcolor="#c8c8e8"];
 
       slot_clock -> vrf [label="current slot"];
       vrf -> eligibility [label="proof + output"];
@@ -54,12 +54,17 @@ digraph NakamotoArchitecture {
       label="Attestation & Finality";
       style="filled"; fillcolor="#d8d8f0";
 
-      tip_tracker [label="TipTracker\n(attestation weight per tip)", fillcolor="#c8c8e8"];
-      chain_sel [label="ChainSelection\n(length→weight→slot→hash)", fillcolor="#c8c8e8"];
-      finality [label="FinalityMonitor\n(weight>2/3 OR depth>k)", fillcolor="#c8c8e8"];
+      snowball [label="Snowball Cascade (target)\n(K / alpha / beta)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+      tip_tracker [label="AttestationTracker\n(decided attestations per exact hash)", fillcolor="#c8c8e8"];
+      chain_sel [label="ChainSelection\n(maxvalid-tk / maxvalid-bg)", fillcolor="#c8c8e8"];
+      finality [label="Hash-bound FinalityGate (target)\nP0/P1/P2 operational\nP2 remains density-reorgable", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
+      recovery [label="RecoveryRequired (local safety state)\nrequired comparison exceeds retained history\nfetch exact authenticated history; no operator fork choice", fillcolor="#ffcdd2", style="rounded,filled,dashed"];
 
-      tip_tracker -> chain_sel [label="weighted tips"];
-      tip_tracker -> finality [label="attestation counts"];
+      snowball -> tip_tracker [label="emit-once decision"];
+      tip_tracker -> finality [label="exact-hash T_optimistic\nP2 trigger only"];
+      chain_sel -> finality [label="canonical hash +\nk1 depth/density triggers"];
+      chain_sel -> recovery [label="objective comparison\nneeds unavailable history", style=dashed, color="#b71c1c"];
+      recovery -> chain_sel [label="verified reconstruction", style=dashed];
     }
 
     subgraph cluster_eta {
@@ -79,8 +84,8 @@ digraph NakamotoArchitecture {
     snapshot_leader [label="SnapshotLeaderLoop\n(production + receive + finality)", fillcolor="#a8c8e8", style="rounded,filled,bold"];
     sync_daemon [label="NakamotoSyncDaemon\n(gossip handler)", fillcolor="#a8c8e8", style="rounded,filled,bold"];
 
-    snapshot_leader -> tip_tracker [label="self-attest"];
-    sync_daemon -> tip_tracker [label="record attestation"];
+    snapshot_leader -> snowball [label="locally executed candidate"];
+    sync_daemon -> snowball [label="preferences / attestations"];
     sync_daemon -> chain_sel [label="store snapshot"];
   }
 
@@ -88,7 +93,7 @@ digraph NakamotoArchitecture {
   // LAYER 3: STATE TRANSITION (existing tessellation)
   // ═══════════════════════════════════════════
   subgraph cluster_state {
-    label="State Transition Pipeline\n(reused from BFT mode)";
+    label="Shared Snapshot State Transition Pipeline";
     style="filled"; fillcolor="#f4e8e8";
 
     create_proposal [label="createProposalArtifact\n(deterministic snapshot builder)", fillcolor="#e8c8c8", style="rounded,filled,bold"];
@@ -123,9 +128,9 @@ digraph NakamotoArchitecture {
     nakamoto_chain [label="NakamotoChainStorage\n(fork-aware, indexed by hash)", fillcolor="#ffe8c8", style="rounded,filled,dashed"];
     snapshot_store [label="SnapshotStorage\n(existing, linear)", fillcolor="#e8e8c8"];
     mpt_store [label="MptStore\n(Merkle Patricia Trie)", fillcolor="#e8e8c8"];
-    last_n [label="LastNGlobalSnapshot\n(recent window)", fillcolor="#e8e8c8"];
+    last_n [label="LastNGlobalSnapshot\nlocal retention window\nk2=100*k1 recommended, never a validity floor", fillcolor="#e8e8c8"];
 
-    nakamoto_chain -> snapshot_store [label="finalized snapshots\npromoted to linear", style=dashed];
+    nakamoto_chain -> snapshot_store [label="Phase-2 operational snapshots\npromoted with rollback retained", style=dashed];
   }
 
   // ═══════════════════════════════════════════

@@ -8,12 +8,13 @@ import cats.syntax.all._
 
 import scala.concurrent.duration._
 
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signing
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
@@ -83,6 +84,7 @@ trait MetagraphCommitteeGate[F[_]] {
     parentHash: Hash,
     binaryHash: Hash,
     eta: Array[Byte],
+    artifactPeriod: EtaPeriod,
     sigmaOperatorKey: Ratio
   ): F[Boolean]
 
@@ -96,6 +98,7 @@ trait MetagraphCommitteeGate[F[_]] {
   def recordReceivedAttestation(
     att: MetagraphCommitteeGate.IncomingAttestation,
     eta: Array[Byte],
+    artifactPeriod: EtaPeriod,
     lookupSenderStake: PeerId => F[Ratio]
   ): F[Unit]
 
@@ -144,6 +147,7 @@ object MetagraphCommitteeGate {
     case object NotInCommittee extends SenderOutcome
     final case class Attested(proof: Array[Byte], output: Array[Byte]) extends SenderOutcome
     case object InvalidVrfIdentity extends SenderOutcome
+    case object InvalidAttestationEvidence extends SenderOutcome
 
     /** The metagraph parent ordinal could not be resolved (see `MetagraphParentOrdinalResolver`). We skip publishing — emitting an
       * attestation with a guessed period would be byte-asymmetric to peers who can resolve the right one, so the receivers would reject it
@@ -162,7 +166,7 @@ object MetagraphCommitteeGate {
     case object InvalidLongTermSig extends ReceiverOutcome
     case object EmptyKesSig extends ReceiverOutcome
     case object InvalidKesSig extends ReceiverOutcome
-    case object UnregisteredVrfIdentity extends ReceiverOutcome
+    case object InvalidOperatorIdentity extends ReceiverOutcome
     case object MismatchedVrfIdentity extends ReceiverOutcome
     case object InvalidCommitteeVrf extends ReceiverOutcome
 
@@ -193,47 +197,38 @@ object MetagraphCommitteeGate {
   /** Trait describing the verification of a KES signature for a metagraph attestation. Decoupled from the dag-l0 implementation
     * (`KesGossipVerification`) so the gate can be tested without that file pulled in.
     *
-    * '''Contract.''' Returns `true` iff the KES signature verifies under the registered master VK at the tree-internal `kesStep` supplied
-    * by the call site (wire-carried from the sender). Returns `false` on empty sig, decode failure, or step-out-of-range. No chain-state
-    * lookup is involved — the receiver does not need to know the operator's activation offset or the global eta rotation cadence to verify.
+    * '''Contract.''' Returns `true` iff the KES signature verifies under the active preregistered master VK and the wire-carried `kesStep`
+    * equals `artifactPeriod - registeredOffset`. Returns `false` on a missing/inactive registration, a period/step mismatch, empty sig,
+    * decode failure, or step-out-of-range. The wire step is evidence only; it is never verification authority.
     */
   trait KesVerifier[F[_]] {
     def verify(
       messageBytes: Array[Byte],
       kesSigBytes: Array[Byte],
-      attesterId: PeerId,
-      attesterHex: Hex,
-      kesStep: Int
+      expectedOperatorId: PeerId,
+      operatorKeys: OperatorConsensusKeys,
+      kesStep: Int,
+      artifactPeriod: EtaPeriod
     ): F[Boolean]
   }
 
-  /** Algebra describing the KES product signer (sender side) for a metagraph attestation. Mirrors `KesVerifier` — the gate doesn't depend
-    * on the concrete `OperationalKeyMakerAlgebra` so the test path can stub it. The default impl in `GlobalSnapshotConsensus` adapts
-    * `operationalKeyMaker.currentPeriod` + `operationalKeyMaker.signAt`.
-    *
-    * Sign at the operator's CURRENT KES tree-internal step (`currentPeriod`) and report that step back to the caller via the wire so the
-    * receiver can verify non-interactively. The caller is responsible for embedding `currentPeriod` on the wire alongside the signature.
+  /** Algebra describing the KES product signer (sender side) for a metagraph attestation. The artifact period is authority: a production
+    * adapter resolves the active preregistered pair, derives `artifactPeriod - registeredOffset`, refuses a missing/mismatched/inactive
+    * registration, and signs only at that exact tree-relative step. The mutable key maker's current step is never selected as the wire
+    * step.
     */
   trait KesSigner[F[_]] {
-
-    /** The KES product step currently held by the in-memory key (offset from the operator's activation period). Sender embeds this on the
-      * wire so receivers know which tree-internal step to verify against.
-      */
-    def currentPeriod: F[Int]
-
-    /** Sign `message` at `kesStep`. Returns empty bytes on signer failure — the receiver-side gate treats empty as `EmptyKesSig` and
-      * rejects. Callers should always pass `currentPeriod` here; signing at any other step is an error (`StepNotMonotonic` for past steps,
-      * or destroys forward-secrecy for future steps).
-      */
-    def signAt(kesStep: Int, message: Array[Byte]): F[Array[Byte]]
+    def sign(operatorKeys: OperatorConsensusKeys, artifactPeriod: EtaPeriod, message: Array[Byte]): F[Option[KesSignature]]
   }
+
+  final case class KesSignature(treeStep: Int, bytes: Array[Byte])
 
   /** Algebra describing how to publish a `MetagraphAttestation` to the sidecar. The default impl in `GlobalSnapshotConsensus` wraps
     * `SidecarClient.publishMetagraphAttestation`; tests use a `Ref`-backed stub.
     *
     * The wire-shape is isolated from the gate's pure logic — the gate computes everything, the publisher just sends the bytes. Failures are
-    * logged + swallowed inside the impl (matches the existing `publishAttestation` failure model). `kesStep` is the sender's
-    * `OperationalKeyMakerAlgebra.currentPeriod` at sign time — embedded on the wire so the receiver verifies non-interactively.
+    * logged + swallowed inside the impl (matches the existing `publishAttestation` failure model). `kesStep` is derived from the artifact
+    * period and the active preregistered key's offset. It is embedded on the wire as evidence and independently re-derived by receivers.
     */
   trait Publisher[F[_]] {
     def publish(
@@ -265,26 +260,18 @@ object MetagraphCommitteeGate {
 
   /** Construct a gate. Wires:
     *   - `sortition` for the VRF threshold check (sender) + membership verify (receiver),
-    *   - `vrfRegistry` as the sole authority for operator VRF identities. The sender may self-count only when its configured VK exactly
-    *     matches its registration and its proof verifies under that registered VK. The receiver rejects missing/mismatched registrations
-    *     and never verifies under the wire-selected key,
+    *   - `operatorKeyRegistry` as the sole authority for an atomic, active KES+VRF identity. Sender and receiver resolve one complete pair
+    *     for `artifactPeriod`; pending, malformed, or missing pairs fail before proof generation or tally mutation,
     *   - `aggregator` for the per-binary tally + threshold polling + pruning,
-    *   - `kesSigner` / `kesVerifier` for the REQUIRED KES product signature path. Sender queries `kesSigner.currentPeriod` for the
-    *     tree-internal step it can sign at right now, signs at that step, and embeds the step on the wire (proto field `sender_tree_step`).
-    *     The receiver verifies using the wire-carried step — no chain-state lookup, no offset arithmetic. This makes the verifier
-    *     non-interactive (KES freshness/replay protection is provided separately by the `parentHash` + `binaryHash` fields and the
-    *     per-binary aggregator dedup, not by step bookkeeping).
+    *   - `kesSigner` / `kesVerifier` for the REQUIRED KES product signature path. Sender and receiver both derive the tree-internal step as
+    *     `artifactPeriod - registeredOffset` from the preregistered operator key. The proto `sender_tree_step` is checked evidence, never
+    *     an authority-selected step. Missing/inactive/mismatched registration prevents publishing and counting the attestation.
     *   - `publisher` for the sidecar `PublishMetagraphAttestation` RPC.
     *
-    * '''eta is supplied by the caller — the gate no longer re-resolves the parent ordinal (#213/#290).''' Both `attestAndAdmit` (sender)
-    * and `recordReceivedAttestation` (receiver) take `eta` as a parameter. The caller (the daemon / admission processor) resolves the
-    * metagraph parent ordinal from the incoming binary's OWN content via `MetagraphParentOrdinalResolver.resolveFromBinary` and computes
-    * the eta from it BEFORE invoking the gate — so the gate already receives the correct, content-derived, cross-node-deterministic eta.
-    * The gate used to additionally re-resolve the ordinal via a GSI-only `parentOrdinalFor` (used only to gate `Some`/`None` + a log line;
-    * the resolved value never fed the VRF/eta/signature). That GSI re-resolve returned `None` on the empty-currency-partition path — the
-    * exact deadlock this removal fixes — vetoing a publish/record whose eta the caller had already computed correctly. Safety is unchanged:
-    * the receiver's eta is derived from the binary's content (by the caller), so a forged ordinal yields a wrong eta and the committee-VRF
-    * verify below rejects it.
+    * '''Eta and artifact period are supplied from an exact Phase-2 GL0 anchor.''' Both `attestAndAdmit` and `recordReceivedAttestation`
+    * receive values derived by the admission processor from the signed currency binary's `globalSyncView`. Before either call, the
+    * processor requires that exact `(ordinal, hash)` to be the current canonical Phase-2 reference. The ML0 snapshot ordinal is
+    * chain-continuity data only and cannot select eta, an active VRF/KES registration, or a KES step.
     *
     * `selfPeerId`, `selfVrfSk`, `keyPair` are this operator's identity keys: VRF SK for the committee draw, long-term Ed25519 key
     * (`keyPair.getPrivate`) for the outer signature.
@@ -295,7 +282,7 @@ object MetagraphCommitteeGate {
     selfVrfVk: Array[Byte],
     keyPair: KeyPair,
     sortition: CommitteeSortition[F],
-    vrfRegistry: VrfRegistry[F],
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
     aggregator: MetagraphAttestationAggregator[F],
     kesSigner: KesSigner[F],
     kesVerifier: KesVerifier[F],
@@ -314,15 +301,17 @@ object MetagraphCommitteeGate {
         parentHash: Hash,
         binaryHash: Hash,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         sigmaOperatorKey: Ratio
       ): F[Boolean] =
         for {
           // Sender path — fire-and-forget the committee attestation if we're in this committee.
           // Wrapped in handleError so a sign/publish failure never blocks the gate poll loop.
-          senderOutcome <- senderPath(metagraphAddress, parentHash, binaryHash, eta, sigmaOperatorKey).handleErrorWith { err =>
-            logger
-              .warn(s"⚠️ committee-attestation sender path failed for $metagraphAddress: ${err.getMessage}")
-              .as(SenderOutcome.NotInCommittee: SenderOutcome)
+          senderOutcome <- senderPath(metagraphAddress, parentHash, binaryHash, eta, artifactPeriod, sigmaOperatorKey).handleErrorWith {
+            err =>
+              logger
+                .warn(s"⚠️ committee-attestation sender path failed for $metagraphAddress: ${err.getMessage}")
+                .as(SenderOutcome.NotInCommittee: SenderOutcome)
           }
           _ <- emitSortitionSelfOutcome(senderOutcome)
           admitted <- waitForThreshold(metagraphAddress, parentHash, binaryHash)
@@ -338,10 +327,11 @@ object MetagraphCommitteeGate {
         */
       private def emitSortitionSelfOutcome(outcome: SenderOutcome): F[Unit] = {
         val label = outcome match {
-          case SenderOutcome.Attested(_, _)       => "in_committee"
-          case SenderOutcome.NotInCommittee       => "not_in_committee"
-          case SenderOutcome.InvalidVrfIdentity   => "invalid_vrf_identity"
-          case SenderOutcome.UnknownParentOrdinal => "unknown_parent"
+          case SenderOutcome.Attested(_, _)             => "in_committee"
+          case SenderOutcome.NotInCommittee             => "not_in_committee"
+          case SenderOutcome.InvalidVrfIdentity         => "invalid_vrf_identity"
+          case SenderOutcome.InvalidAttestationEvidence => "invalid_attestation_evidence"
+          case SenderOutcome.UnknownParentOrdinal       => "unknown_parent"
         }
         Metrics[F].incrementCounter(
           "dag_nakamoto_committee_sortition_self_outcome_total",
@@ -354,20 +344,25 @@ object MetagraphCommitteeGate {
         parentHash: Hash,
         binaryHash: Hash,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         sigmaOperatorKey: Ratio
       ): F[SenderOutcome] =
-        vrfRegistry.getVrfVk(selfPeerId).flatMap {
+        ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, selfPeerId, artifactPeriod).flatMap {
           case None =>
             logger
-              .warn(s"committee-gate refusing self-attestation: no registered VRF key for ${selfPeerId.value.value.take(16)}...")
+              .warn(
+                s"committee-gate refusing self-attestation: no active atomic operator-key pair for " +
+                  s"${selfPeerId.value.value.take(16)}... at period=${artifactPeriod.value}"
+              )
               .as(SenderOutcome.InvalidVrfIdentity: SenderOutcome)
-          case Some(registeredVrfVk) if !java.security.MessageDigest.isEqual(registeredVrfVk, selfVrfVk) =>
+          case Some(keys) if !java.security.MessageDigest.isEqual(keys.vrfPublicKey.toBytes, selfVrfVk) =>
             logger
               .warn(
                 s"committee-gate refusing self-attestation: configured VRF key does not match registration for ${selfPeerId.value.value.take(16)}..."
               )
               .as(SenderOutcome.InvalidVrfIdentity: SenderOutcome)
-          case Some(registeredVrfVk) =>
+          case Some(keys) =>
+            val registeredVrfVk = keys.vrfPublicKey.toBytes
             sortition
               .isInCommittee(selfVrfSk, eta, metagraphAddress, parentHash, sigmaOperatorKey, kDraw)
               .flatMap {
@@ -399,10 +394,11 @@ object MetagraphCommitteeGate {
                           parentHash,
                           binaryHash,
                           eta,
+                          artifactPeriod,
                           sigmaOperatorKey,
                           proof,
                           output,
-                          registeredVrfVk
+                          keys
                         )
                       case invalid =>
                         logger
@@ -420,40 +416,71 @@ object MetagraphCommitteeGate {
         parentHash: Hash,
         binaryHash: Hash,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         sigmaOperatorKey: Ratio,
         proof: Array[Byte],
         output: Array[Byte],
-        registeredVrfVk: Array[Byte]
+        operatorKeys: OperatorConsensusKeys
       ): F[SenderOutcome] =
-        for {
-          _ <- aggregator.record(metagraphAddress, parentHash, binaryHash, selfPeerId)
-          msgBytes <- messageBytes[F](selfPeerId, metagraphAddress, parentHash, binaryHash)
-          edSig <- Signing.signData[F](msgBytes)(keyPair.getPrivate)
-          // Sign at the CURRENT KES tree-internal step the in-memory key holds. Embedding
-          // this step on the wire (proto `sender_tree_step`) lets the receiver verify
-          // non-interactively — no chain-state lookup, no offset/eta-period derivation.
-          kesStep <- kesSigner.currentPeriod
-          kesSig <- kesSigner.signAt(kesStep, msgBytes)
-          _ <- publisher.publish(
-            senderPeerIdBytes = selfPeerId.value.toBytes,
-            metagraphAddress = metagraphAddress.value.value,
-            parentHashBytes = parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-            binaryHashBytes = binaryHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-            committeeVrfProof = proof,
-            longTermSignature = edSig,
-            kesSignature = kesSig,
-            vrfPublicKey = registeredVrfVk,
-            kesStep = kesStep
-          )
-          _ <- logger.info(
-            s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
-                .take(12)}... kDraw=$kDraw kQuorum=$kQuorum kesStep=$kesStep " +
-              s"sentEtaFull=${eta.map("%02x".format(_)).mkString} " +
-              s"sentVrfVkFull=${registeredVrfVk.map("%02x".format(_)).mkString} " +
-              s"sentProofFull=${proof.map("%02x".format(_)).mkString} " +
-              s"sentSigma=$sigmaOperatorKey"
-          )
-        } yield SenderOutcome.Attested(proof, output): SenderOutcome
+        messageBytes[F](selfPeerId, metagraphAddress, parentHash, binaryHash).flatMap { msgBytes =>
+          kesSigner.sign(operatorKeys, artifactPeriod, msgBytes).flatMap {
+            case None =>
+              logger
+                .warn(
+                  s"committee-gate refusing self-attestation: no preregistered KES signing capability for " +
+                    s"artifactPeriod=${artifactPeriod.value} peer=${selfPeerId.value.value.take(16)}..."
+                )
+                .as(SenderOutcome.InvalidAttestationEvidence: SenderOutcome)
+            case Some(KesSignature(kesStep, kesSig)) =>
+              for {
+                edSig <- Signing.signData[F](msgBytes)(keyPair.getPrivate)
+                attestation = IncomingAttestation(
+                  senderPeerId = selfPeerId,
+                  senderVrfVk = operatorKeys.vrfPublicKey.toBytes,
+                  metagraphAddress = metagraphAddress,
+                  parentHash = parentHash,
+                  binaryHash = binaryHash,
+                  committeeVrfProof = proof,
+                  longTermSignature = edSig,
+                  kesSignature = kesSig,
+                  senderTreeStep = kesStep
+                )
+                localVerification <- verifyReceived(attestation, eta, artifactPeriod, _ => sigmaOperatorKey.pure[F])
+                outcome <- localVerification match {
+                  case ReceiverOutcome.Recorded =>
+                    publisher.publish(
+                      senderPeerIdBytes = selfPeerId.value.toBytes,
+                      metagraphAddress = metagraphAddress.value.value,
+                      parentHashBytes = parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                      binaryHashBytes = binaryHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                      committeeVrfProof = proof,
+                      longTermSignature = edSig,
+                      kesSignature = kesSig,
+                      vrfPublicKey = operatorKeys.vrfPublicKey.toBytes,
+                      kesStep = kesStep
+                    ) >>
+                      aggregator.record(metagraphAddress, parentHash, binaryHash, selfPeerId) >>
+                      logger
+                        .info(
+                          s"📢 committee-attested mg=$metagraphAddress parent=${parentHash.value.take(12)}... binary=${binaryHash.value
+                              .take(12)}... kDraw=$kDraw kQuorum=$kQuorum kesStep=$kesStep " +
+                            s"sentEtaFull=${eta.map("%02x".format(_)).mkString} " +
+                            s"sentVrfVkFull=${operatorKeys.vrfPublicKey.toBytes.map("%02x".format(_)).mkString} " +
+                            s"sentProofFull=${proof.map("%02x".format(_)).mkString} " +
+                            s"sentSigma=$sigmaOperatorKey"
+                        )
+                        .as(SenderOutcome.Attested(proof, output): SenderOutcome)
+                  case rejected =>
+                    logger
+                      .warn(
+                        s"committee-gate refusing self-attestation after local evidence verification: peer=${selfPeerId.value.value
+                            .take(16)}... reason=$rejected"
+                      )
+                      .as(SenderOutcome.InvalidAttestationEvidence: SenderOutcome)
+                }
+              } yield outcome
+          }
+        }
 
       private def waitForThreshold(
         metagraphAddress: Address,
@@ -499,6 +526,7 @@ object MetagraphCommitteeGate {
       def recordReceivedAttestation(
         att: IncomingAttestation,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         lookupSenderStake: PeerId => F[Ratio]
       ): F[Unit] =
         // DEDUP-BEFORE-VERIFY: gossip re-delivers the same attestation constantly. Re-running the three
@@ -515,7 +543,7 @@ object MetagraphCommitteeGate {
                   .take(16)}... mg=${att.metagraphAddress} parent=${att.parentHash.value.take(12)}..."
             )
           case false =>
-            verifyReceived(att, eta, lookupSenderStake).flatMap {
+            verifyReceived(att, eta, artifactPeriod, lookupSenderStake).flatMap {
               case ReceiverOutcome.Recorded =>
                 aggregator
                   .record(att.metagraphAddress, att.parentHash, att.binaryHash, att.senderPeerId)
@@ -539,6 +567,7 @@ object MetagraphCommitteeGate {
       private def verifyReceived(
         att: IncomingAttestation,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         lookupSenderStake: PeerId => F[Ratio]
       ): F[ReceiverOutcome] =
         if (att.longTermSignature.isEmpty)
@@ -546,16 +575,8 @@ object MetagraphCommitteeGate {
         else if (att.kesSignature.isEmpty)
           Async[F].pure(ReceiverOutcome.EmptyKesSig: ReceiverOutcome)
         else
-          // Verify directly against the caller-supplied `eta`. #213/#290: the gate no longer
-          // re-resolves the metagraph parent ordinal here — the daemon resolves it from the
-          // incoming binary's OWN content (`MetagraphParentOrdinalResolver.resolveFromBinary`)
-          // and passes the content-derived eta in. The old GSI-only re-resolve returned `None`
-          // on the empty-currency-partition path and dropped every attestation as
-          // `UnknownParentOrdinal` (the receiver-side half of the deadlock). The resolved value
-          // never affected verification — only the eta does, and that is now correct by
-          // construction. Safety: a forged ordinal yields a wrong (content-derived) eta upstream,
-          // so the committee-VRF verify below fails — the receiver trusts the binary's content,
-          // never the sender's claimed ordinal.
+          // The caller derives eta and artifactPeriod only after checking the binary's signed exact
+          // GL0 `(ordinal, hash)` as current Phase 2. The metagraph ordinal never enters this draw.
           for {
             msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
             senderPubKey <- att.senderPeerId.value.toPublicKey[F]
@@ -563,19 +584,21 @@ object MetagraphCommitteeGate {
             outcome <-
               if (!edOk) Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
               else
-                vrfRegistry.getVrfVk(att.senderPeerId).flatMap {
+                ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, att.senderPeerId, artifactPeriod).flatMap {
                   case None =>
-                    Async[F].pure(ReceiverOutcome.UnregisteredVrfIdentity: ReceiverOutcome)
-                  case Some(registeredVrfVk) if !java.security.MessageDigest.isEqual(registeredVrfVk, att.senderVrfVk) =>
+                    Async[F].pure(ReceiverOutcome.InvalidOperatorIdentity: ReceiverOutcome)
+                  case Some(keys) if !java.security.MessageDigest.isEqual(keys.vrfPublicKey.toBytes, att.senderVrfVk) =>
                     Async[F].pure(ReceiverOutcome.MismatchedVrfIdentity: ReceiverOutcome)
-                  case Some(registeredVrfVk) =>
+                  case Some(keys) =>
+                    val registeredVrfVk = keys.vrfPublicKey.toBytes
                     for {
                       kesOk <- kesVerifier.verify(
                         messageBytes = msgBytes,
                         kesSigBytes = att.kesSignature,
-                        attesterId = att.senderPeerId,
-                        attesterHex = att.senderPeerId.value,
-                        kesStep = att.senderTreeStep
+                        expectedOperatorId = att.senderPeerId,
+                        operatorKeys = keys,
+                        kesStep = att.senderTreeStep,
+                        artifactPeriod = artifactPeriod
                       )
                       result <-
                         if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)

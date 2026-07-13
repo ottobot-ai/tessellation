@@ -116,7 +116,7 @@ falls back to normal fork handling without incrementing a counter,
 | Metric | Meaning | Source |
 |---|---|---|
 | `dag_nakamoto_shard_checkpoint_total{shard_id, path}` | Accepted checkpoint, `path ∈ {t_count, t_depth1}` | `ShardMetrics.scala:38` |
-| `dag_nakamoto_shard_checkpoint_rejected_total{shard_id, reason}` | Rejected checkpoint. `reason` buckets: `pre_check_committee`, `pre_check_ed25519`, `pre_check_kes`, `pre_check_vrf`, `unknown_shard`, **`re_exec_mismatch`** (T_depth1 re-exec hash differs from the committee-signed root), `other` | `ShardMetrics.scala:41,84-93` |
+| `dag_nakamoto_shard_checkpoint_rejected_total{shard_id, reason}` | Rejected checkpoint. `reason` buckets: `pre_check_committee`, `pre_check_ed25519`, `pre_check_kes`, `pre_check_vrf`, `execution_quorum`, **`re_exec_mismatch`** (local recreation differs from the committee-signed root), `other` | `ShardMetrics.scala` |
 | `dag_nakamoto_shard_committee_attestation_total{shard_id}` | Committee attestation received | `ShardMetrics.scala` (`CommitteeAttestationTotal`) |
 | `dag_nakamoto_shard_chain_height{shard_id}` / `dag_nakamoto_shard_chain_finalized_ordinal{shard_id}` | Per-shard chain progress gauges | `ShardMetrics.scala` |
 | `dag_nakamoto_committee_admit_total{outcome}` | `accepted` / `timeout` | `docs/nakamoto/METRICS-DASHBOARD-REVAMP.md:131-132`; panel query at `nakamoto-test/grafana/dashboards/nakamoto-consensus.json:614` |

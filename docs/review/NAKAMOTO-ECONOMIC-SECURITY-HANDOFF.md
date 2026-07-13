@@ -7,6 +7,14 @@
 > descriptions never override [`../../AGENTS.md`](../../AGENTS.md), ADR-0016, or
 > ADR-0017, and do not create backward-compatibility requirements in this
 > greenfield fork.
+>
+> **Current target correction:** the accepted repair is committee
+> replay-before-sign, a canonical root-covered checkpoint byte diff,
+> noncommittee GL0 apply/root verification, and noncommittee watchtower replay.
+> Commit `c610a0740` removed the old blind-sign/quorum-adopt path but also removed
+> the useful diff and regressed to universal GL0 currency recreation. Do not
+> restore `authoritative*`/`AdoptFromSignedFields`, and do not treat universal
+> recreation as the target. See the current ADR-0017 and consensus lifecycle.
 
 **Purpose.** Give an external reviewer (Codex) a self-contained, line-anchored map of the execution-sharding + economic-security architecture so they can double-check our mental model *against the code* before we spend more cycles. Every non-trivial claim below carries a `file:line`. The canonical design decisions are **`docs/adr/0016`** (execution-sharding re-exec + cross-shard) and **`docs/adr/0017`** (committee re-execution is the primary economic-validity gate — the fix for the §4 defect); this doc is the *evidence* behind them.
 

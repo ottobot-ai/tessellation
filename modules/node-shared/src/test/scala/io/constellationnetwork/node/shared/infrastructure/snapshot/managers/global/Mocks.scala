@@ -82,7 +82,12 @@ object Mocks {
     // regression suite for the eta wiring overrides both with a small rotation + a real `EtaStateManager`-backed
     // callback to drive the boundary fire inside a single-ordinal accept().
     etaRotationSnapshots: Long = 2550L,
-    etaForPeriod: Option[io.constellationnetwork.schema.nakamoto.EtaPeriod => IO[Hash]] = None
+    etaForPeriod: Option[
+      (
+        io.constellationnetwork.schema.nakamoto.EtaPeriod,
+        io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId
+      ) => IO[Hash]
+    ] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {
     // Create mock dependencies for testing
     val mockBlockAcceptanceManager = new BlockAcceptanceManager[IO] {

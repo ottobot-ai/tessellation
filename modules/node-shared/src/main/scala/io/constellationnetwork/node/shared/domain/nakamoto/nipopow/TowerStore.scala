@@ -10,8 +10,8 @@ import io.constellationnetwork.security.hash.Hash
 
 /** Persistent ordered store of finalized super-level hits per `docs/nakamoto/NIPOPOW-PROPOSAL.md` §2.3 + S3 plan slice.
   *
-  * '''Append-only at finalization.''' Entries are added by a Phase-3 sink (`T_depth2.advance`); the tower never moves backwards outside an
-  * explicit prune call. Concurrent appends from the same node are serialized externally (single producer at the finality sink).
+  * '''Append-only local proof state.''' Current wiring schedules entries from a legacy `T_depth2` watermark, but that does not confer a
+  * protocol phase or constrain fork choice. Concurrent appends from one node are serialized by the single local tower updater.
   *
   * '''Per-level read access.''' `entriesAtLevel(µ, since)` returns the ordered subsequence of level-µ hits at or after `since`, used by the
   * proof builder to construct skeletons.

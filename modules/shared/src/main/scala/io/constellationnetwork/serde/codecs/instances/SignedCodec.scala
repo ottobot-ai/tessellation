@@ -1,7 +1,9 @@
 package io.constellationnetwork.serde.codecs.instances
 
+import cats.Order
 import cats.data.NonEmptySet
 
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.serde.ImmutableCodec
@@ -9,6 +11,7 @@ import io.constellationnetwork.serde.codecs.NonEmptySetCodec
 import io.constellationnetwork.serde.codecs.instances.SignatureCodecs._
 
 import scodec.Codec
+import scodec.bits.ByteVector
 import shapeless.{::, HNil}
 
 /** Parameterized scodec codec for `Signed[T]` — the universal signed-envelope wrapper around any consensus type.
@@ -34,14 +37,26 @@ import shapeless.{::, HNil}
   * Consensus contract: FROZEN. Value first, then sorted proofs with 2-byte count prefix. Changing the order, the count prefix width, or the
   * proof sort order breaks every historical signature re-verification.
   *
-  * Determinism: the sort order of `NonEmptySet[SignatureProof]` is derived from cats `Order[SignatureProof]` (which is derivo-derived from
-  * the field order in the case class). Two nodes serializing the same `Signed[T]` must produce bit-identical bytes; the `NonEmptySetCodec`
-  * sorted encode path guarantees that.
+  * Determinism: proof ordering is derived from the canonical decoded bytes of the signer id and signature, not from the source `Hex`
+  * string. `Hex` accepts mixed-case input but its wire codec decodes to lowercase; ordering the source strings would let case change the
+  * encoded order and make strict decode reject an otherwise valid envelope. Two nodes serializing byte-identical proofs therefore produce
+  * bit-identical bytes regardless of input hex case.
   */
 object SignedCodec {
 
+  private def canonicalHexValue(hex: Hex): String =
+    ByteVector.fromHexDescriptive(hex.value).fold(_ => hex.value, _.toHex)
+
+  private val canonicalSignatureProofOrder: Order[SignatureProof] =
+    Order.by { proof =>
+      (
+        canonicalHexValue(proof.id.hex),
+        canonicalHexValue(proof.signature.value)
+      )
+    }
+
   private val proofsCodec: Codec[NonEmptySet[SignatureProof]] =
-    NonEmptySetCodec.nonEmptySet(signatureProofCodec)
+    NonEmptySetCodec.nonEmptySet(signatureProofCodec)(canonicalSignatureProofOrder)
 
   /** Build `Codec[Signed[T]]` from an explicit `Codec[T]`. Call sites that can't rely on implicit resolution (e.g. inside other codec
     * definitions where local implicits shadow) use this directly.

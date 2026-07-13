@@ -284,10 +284,9 @@ object Main
       s" --collateral-per-operator ${cmd.collateralPerOperator}" +
       s" --network-magic ${cmd.networkMagic}"
 
-    // Canonical printer: sort keys, keep nulls (vrfPublicKey/kesPublicKey are intentionally null
-    // in Tier-1), 2-space indent (human-reviewable diffs). `Printer.spaces2` defaults sortKeys=false,
-    // so we override it via .copy(sortKeys = true) — sortKeys is what makes the output
-    // byte-deterministic across JVMs (circe HashMap iteration order is not stable).
+    // Canonical printer: sort keys and use a 2-space indent for human-reviewable diffs.
+    // `Printer.spaces2` defaults sortKeys=false, so override it: key ordering is what makes
+    // output byte-deterministic across JVMs (Circe map iteration order is not stable).
     val printer = Printer.spaces2.copy(sortKeys = true, dropNullValues = false)
 
     for {
@@ -314,7 +313,7 @@ object Main
       _ <- console.green[F](s"  delegatedStakes: ${outputs.l0Genesis.delegatedStakes.size}")
       _ <- console.green[F](s"  nodeCollaterals: ${outputs.l0Genesis.nodeCollaterals.size}")
       _ <- console.green[F](s"  initialBalances: ${outputs.l0Genesis.initialBalances.size}")
-      _ <- console.green[F](s"  kesRegistrations: ${outputs.l0Genesis.kesRegistrations.map(_.size).getOrElse(0)}")
+      _ <- console.green[F](s"  atomic operator key records: ${outputs.l0Genesis.operators.size}")
       _ <- console.green[F](s"  kesSecretKeys written: ${skPaths.size} (under ${cmd.outputDir}/keys/operator-*)")
     } yield ()
   }

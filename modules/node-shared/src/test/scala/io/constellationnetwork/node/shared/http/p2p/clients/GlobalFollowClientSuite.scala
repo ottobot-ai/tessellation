@@ -12,7 +12,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateFieldId
-import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, GlobalFollowSliceResponse}
+import io.constellationnetwork.schema.nakamoto.follow.{ConsumedFieldDelta, GlobalChangeSetResponse, GlobalFollowSliceResponse}
 import io.constellationnetwork.schema.peer.{P2PContext, PeerId}
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.{TransactionOrdinal, TransactionReference}
@@ -26,6 +26,7 @@ import com.comcast.ip4s.IpLiteralSyntax
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import org.http4s.client.Client
 import org.http4s.{Request, Response, Uri}
+import scodec.bits.ByteVector
 import weaver.MutableIOSuite
 
 /** Slice 2b — codec + request-shape tests for [[GlobalFollowClient]] (the gl1-side fetch half of the own-slice follow transport,
@@ -104,6 +105,15 @@ object GlobalFollowClientSuite extends MutableIOSuite {
 
     val r = GlobalFollowSliceResponse(SnapshotOrdinal(NonNegLong(0L)), ConsumedFieldDelta.empty, none)
     IO.pure(expect(r.asJson.as[GlobalFollowSliceResponse] == Right(r)))
+  }
+
+  test("getChangeSetSince decoder rejects a valid response with trailing bytes") { _ =>
+    import io.constellationnetwork.serde.codecs.instances.GlobalChangeSetResponseCodec.codec
+
+    val response = GlobalChangeSetResponse(SnapshotOrdinal(NonNegLong(7L)), SnapshotOrdinal(NonNegLong(7L)).some, Nil)
+    val encodedWithTrailingByte = codec.encode(response).require.toByteVector ++ ByteVector(0x7f)
+
+    IO.pure(expect(GlobalFollowClient.decodeChangeSetResponse(encodedWithTrailingByte.toArray).isLeft))
   }
 
   test("getSliceSince issues GET /global-follow/slice?since=N against the peer") { implicit sp =>

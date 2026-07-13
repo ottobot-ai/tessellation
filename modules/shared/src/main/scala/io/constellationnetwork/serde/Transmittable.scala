@@ -39,7 +39,7 @@ object Transmittable {
           throw new IllegalArgumentException(s"Transmittable encode failed: ${cause.messageWithContext}")
       }
     def fromTransmittableBytes(bytes: ByteVector): Either[SerdeError, T] =
-      codec
+      codec.complete
         .decodeValue(bytes.toBitVector)
         .toEither
         .left

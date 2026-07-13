@@ -1,515 +1,615 @@
-# Consensus Economic Security Roadmap
+# Consensus and Economic Security Roadmap
 
-**Status:** Active planning baseline  
-**Source baseline:** `c610a0740c34833e563f8a94c2ab820186a75897`  
-**Security baseline:** `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`  
-**Scope:** Remaining consensus-level work required before this greenfield network can carry economic value
+**Status:** Active implementation plan; remaining owner decision gates block only their named dependent tasks
+**Source baseline:** `c610a0740c34833e563f8a94c2ab820186a75897`
+**Audit baseline:** `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`
+**Normative architecture:** `CONSENSUS-ARTIFACT-LIFECYCLE.md`
+**Delegation/test contract:** `CONSENSUS-PROTOCOL-TEST-PLAN.md`
+**Owner decision register:** `CONSENSUS-OWNER-DECISIONS.md`
 
-This document supersedes the execution order in `audit/01-epics-and-tasks.md`.
-That packet remains useful historical analysis, but it was written on 2026-07-07 at
-`21933559c`, before universal GL0 replay replaced committee-root/diff adoption and
-before the 2026-07-11 audit expanded the production blockers. No task is complete
-because this document says so. Completion requires the acceptance evidence named
-below and a source re-audit against the then-current commit.
+`NAKAMOTO-PLAN.md` is the active sequence/status authority. This document is the
+detailed security work breakdown and retains its pre-existing `E*.*` task IDs for
+finding/test traceability; a bare epic number is therefore not a cross-document
+identifier. Refer to an epic by document plus full name until E0 emits the
+machine-readable ownership ledger.
 
-## 1. Decision
+This roadmap replaces the incorrect global BFT/universal-CL1-replay plan. It does
+not discard the audit findings. It assigns them to the owner-stated architecture:
+chain-based GL0 finality, replay-before-sign execution committees, verified diff
+adoption, watchtower collusion detection, Phase-2 cross-metagraph reads, and a
+density-based recovery rule beyond `k1`. `k2` is a retention/recovery horizon,
+not a separate finality phase or an absolute fork-choice floor.
 
-There is not yet a safe incremental path that starts by enabling sharding or
-optimistic finality. The dependency head is:
+No task is complete because it appears here. Completion requires the named RED
+test, independent oracle, source re-audit, and closing commit.
 
-1. specify and prove one finality rule;
-2. make every economic transition authorized, deterministic, conservative, and
-   replay-safe in a pure GL0 transition kernel;
-3. make inter-metagraph settlement an exact-once GL0 state machine whose result is
-   unusable until GL0 finality;
-4. make shard scheduling, recovery, networking, and slashing preserve those rules;
-5. pass adversarial model, differential, restart, reorg, partition, and cluster
-   gates before any economic testnet.
-
-Slashing is deterrence and recovery. It is never a substitute for rejecting an
-invalid transition before value is usable.
-
-## 2. Target invariants
-
-| ID | Invariant | Required enforcement point |
-|---|---|---|
-| I-FINAL-1 | Two honest nodes never finalize conflicting hashes at one ordinal. | One fixed-set quorum-certificate protocol with locking/intersection; depth alone cannot release value. |
-| I-FINAL-2 | A finalized `(ordinal, hash)` is durable, atomic with its state commitment, and cannot be erased by restart, rebootstrap, or peer input. | Finality WAL/store transaction used by fork choice, MPT promotion, serving, and downstream release. |
-| I-FINAL-3 | An honest signer never forgets a vote/lock and signs a conflicting branch after crash or KES rotation. | Persist epoch/set, highest voted round, locked QC, and KES period atomically before signing. |
-| I-ECON-1 | ML0, DL1, a committee, or a proof can propose an economic operation but cannot authorize it. | GL0 independently verifies the framework signature/condition and re-executes the transition. |
-| I-ECON-2 | Every accepted transition conserves supply except a named, bounded, consensus-defined mint/burn rule. | One checked GL0 reservation/delta accumulator over all operation classes. |
-| I-ECON-3 | Validation is a total deterministic function of the pinned parent state and ordered inputs. | No wall clock, local head, peer choice, unordered iteration, `Double`, saturation, wraparound, or exception-as-control-flow. |
-| I-XMG-1 | Every inter-metagraph authorization and consumption has one domain-separated canonical identity. A one-shot authorization is consumed at most once; any reusable policy has an explicit nonce/sequence and remaining allowance. | Permanent GL0 replay/status state written atomically with its economic effect. |
-| I-XMG-2 | Shard count and committee outcome affect scheduling only, never authorization or economic semantics. | The same inter-metagraph state machine runs at `numShards=1` and `numShards=K`. |
-| I-XMG-3 | A source authorization is usable only from a finalized GL0 state, and a settlement is externally usable only after the containing GL0 state finalizes. | Finalized `(ordinal, hash, stateRoot, certificate)` reads and finality-gated APIs/followers. |
-| I-XMG-4 | ML0 acknowledgement records mirror progress only. It cannot create, alter, duplicate, cancel, refund, or make a GL0 settlement valid. | GL0 recomputes acknowledgement against its pending queue; acknowledgement only permits deterministic queue compaction. |
-| I-XMG-5 | Every byte needed to replay or deliver a finalized settlement remains available by exact hash. | GL0 validates full replay inputs before voting and exact-byte storage retains finalized settlement batches through acknowledgement/recovery horizons. |
-| I-REC-1 | Restart, rollback, catch-up, and sibling recovery reproduce exact canonical bytes or stop without mutation. | Hash-addressed bytes/full replay, verify-before-write, and no local reconstruction fallback. |
-| I-SLASH-1 | A slash is deterministic evidence over finalized/pinned inputs, debits real bonded principal, and affects the next eligible set. | Evidence verifier plus atomic lock debit, reward cap, registry update, and epoch-boundary activation. |
-
-## 3. Target cross-metagraph protocol
-
-The global snapshot chain is the shared sequencer, escrow, replay-protection
-registry, and finality authority. Metagraphs do not trust one another and shard
-committees do not settle value.
-
-### 3.1 Canonical identity
-
-Every framework-economic interaction has three distinct identities:
+## 1. Target architecture
 
 ```text
-authorizationId = H(canonical authorized intent/body bytes)
-consumptionId   = H(canonical consumption intent/body bytes)
-semanticReplayKey = type-specific one-shot or nonce/sequence key
+GL1 -------------------------------> GL0
 
-signed preimage domain = (
-  networkId,
-  genesisHash,
-  protocolVersion,
-  operationType,
-  sourceOrOwnerMetagraph,
-  targetOrConsumerDomain,
-  assetId,
-  amountAndPolicy,
-  nonceOrSequence,
-  expiry
+CL1 --+
+      +-> ML0 -> binary intake -> execution shard -> GL0 snapshot
+DL1 --+
+
+canonical Phase-2 GL0 state ------> GL1 / ML0 / CL1 / DL1
+```
+
+- GL0 global consensus is Nakamoto/Taktikos/LDD. Avalanche/Snowball supplies an
+  optimistic Phase-2 trigger and depth `k1` supplies the fallback. There are no
+  global BFT votes, locks, QCs, or view changes.
+- ML0 may remain BFT. That local finality authenticates a metagraph binary but is
+  subordinate to GL0.
+- A shard producer and every execution-committee signer replay full framework
+  currency at one exact Phase-2 GL0 base. A signature means exact diff/root
+  reproduction.
+- An ordinary noncommittee GL0 node verifies the execution threshold, applies the
+  canonical namespace-bounded diff to its signed base, and recomputes the root. It
+  does not rerun currency recreation.
+- Noncommittee watchtowers replay as the collusion backstop.
+- Every GL0 node still executes native GL1 transitions and the small deterministic
+  global cross-metagraph ordering/nullifier/settlement kernel.
+- Phase 2 is operational and downstream-consumable but density-reorgable. Valid
+  forks within `k1` use `maxvalid-tk`; valid forks beyond `k1` use the ratified
+  Ouroboros Genesis-family `maxvalid-bg` rule from the true common ancestor.
+  `k2` recommends retained rollback/proof state; it never makes a branch win.
+
+## 2. Current source reality
+
+The plan begins from these source-proven gaps:
+
+| Area | Current source fact | Consequence |
+|---|---|---|
+| Global engine | `SnapshotLeaderLoop` states that it replaces the old BFT rounds (`SnapshotLeaderLoop.scala:81-92`). | Do not design a new global BFT state machine. |
+| Dormant GL0 BFT plumbing | `GlobalSnapshotConsensus` allocates the inherited generic `ConsensusEventLoop` and exposes its manager/handler/routes, but does not start `loop.run`; its global trigger is a no-op and the supervised active loop is `SnapshotLeaderLoop` (`GlobalSnapshotConsensus.scala:847-890,1981-2128,2390-2397`). | Delete the dormant GL0 construction/wiring so it cannot be accidentally reactivated; preserve ML0-local BFT code. |
+| FinalityGate | Only `finalizedOrdinal` and `isServable(ordinal)` exist, and `fromRef` compares ordinals (`FinalityGate.scala:23-30,44-50`). | It cannot own per-hash phases or represent same-ordinal hash replacement. |
+| Avalanche | `SnowballAccumulator` is a sticky latest-attestation margin: a flip moves the old color count, K/alpha are unused, and first crossing is arrival-order sensitive (`SnowballAccumulator.scala:13-25,118-151`; reproduced at `SnowballAccumulatorSuite.scala:212-235`). | The optimistic protocol is not implemented and the current accumulator is not portable decision evidence. |
+| Fast trigger | `T_weight` reads that transitional margin, while the state-changing sink ignores it and still calls the legacy cumulative-2/3 path (`FinalityTrigger.scala:176-207`; `SnapshotLeaderLoop.scala:1271-1299`). | Current behavior is neither the intended optimistic gadget nor one coherent trigger rail. |
+| Invented `k2` floor | `SettledOrdinalTracker` and the density-band flag currently turn an ordinal projection into a branch-rewrite floor. | This does not implement the ratified retention-only `k2`; fork choice, retained recovery state, and service policy must be separated. |
+| Density recovery | Density selection/revert code exists but is disabled by default, currently refuses sufficiently deep forks, and current sinks are not all reversible. | Genesis-family comparison and Phase-2 recovery are incomplete. |
+| Checkpoint diff | `ShardDerivedStateDelta` currently carries roots and binaries, not a state diff (`ShardDerivedStateDelta.scala:17-31`). | Noncommittee verified diff adoption is unavailable. |
+| Embedded execution threshold | Intake and embedded verification now require valid distinct execution signers at `kQuorum`, and shard depth no longer substitutes; both paths still universally replay because the signed canonical diff/type boundary is absent. | Preserve the threshold while replacing caller-ordered signing with a typed replay capability and ordinary universal replay with verified diff apply only after the complete gates pass. |
+| Checkpoint domain/base | The signed checkpoint carries only `executionBaseOrdinal`, not the exact Phase-2 base hash/root, network/genesis, era, or parameter hash; its delta lacks pre-roots, diffs, extracted intents, and custom-lane commitments (`ShardCheckpoint.scala:58-67,80-90,104-112`; `ShardDerivedStateDelta.scala:17-31`). | Freeze and sign the complete preimage before replay signatures or diff adoption can be safe. |
+| Universal replay regression | `verifyEmbedded` calls the replay path (`ShardCheckpointGl0AcceptanceManager.scala:297-312`) and GSAM recreates adopted currency state. | Ordinary GL0 nodes do the work the committee was meant to amortize. |
+| Shard execution-sign boundary | `ShardCheckpointAttestationEmitter.emit` accepts only a sealed replay-minted `VerifiedShardCheckpoint`; intake rejection/mismatch cannot mint it (`ShardCheckpointAttestationEmitter.scala:50-53,102-108`; `ShardCheckpointGl0AcceptanceManager.scala:56-108`). | The current capability proves root-only recreation. Extend its result to the canonical diff/intents/complete root; do not weaken it when ordinary adoption stops replaying. |
+| Global blind-sign type boundary | `NakamotoSyncDaemon.emitTipAttestation` accepts and signs naked tip hash/slot/ordinal inputs, and the best-tip ticker calls it directly (`NakamotoSyncDaemon.scala:2864-2931`; `SnapshotLeaderLoop.scala:1119-1149`). | Global optimistic signing also needs an authenticated-and-locally-executed capability, not caller-order discipline. |
+| Operator consensus keys | One atomic public KES+VRF registry, rooted long-term-signed genesis pairs/runtime histories, an `inclusionPeriod + 2`/N-2 activation model, and exact-hash historical view adapter exist. This is a period-index lookback, not a claim of two fully elapsed durations after intra-period inclusion. Production still uses the period-zero-only `ActiveOperatorConsensusKeys`; the historical resolver and rooted roster are not production-wired. The runtime cert lacks explicit network/genesis/era domain and containing-hash/root witnesses, and acceptance rejects cross-operator collisions but permits same-owner full-pair reuse or a successive complete record in which only one key changes. Atomicity requires both active keys to come from one record; whether either key may remain unchanged across records is an owner decision. Local rotation is also absent: VRF secrets derive from the long-term identity and `OperationalKeyMaker` holds one destructively evolving KES secret (`KesRegistrationCert.scala:94-104`; `KesRegistrationCertValidator.scala:198-209`; `KesRegistrationCertAcceptanceManager.scala:128-153`; `ActiveOperatorConsensusKeys.scala:14-43`; `HistoricalOperatorConsensusKeyRegistry.scala:111-203`; `LocalOperatorKeyPairGate.scala:110-123,174-185`; `OperationalKeyMaker.scala:9-20,37-90`). | Unregistered period-zero grinding is blocked, but runtime rotation needs a domain/witness schema, a ratified same-owner reuse/rotation policy, atomic future KES+VRF secret provisioning, and exact-record selection in addition to public resolver wiring. Registration is not membership. O-12 must freeze the N-2 common-prefix/secret-deletion/recovery rule. |
+| Eta history | Live production/receipt reject incomplete or empty mature-period source ranges. `EtaStateManager.getEtaAt` bypasses receiver-current MPT state and ambient caching; both production GSAMs pass the exact parent, and admission walks the exact Phase-2 anchor (`EtaStateManager.scala:60-64,121-141,174-198`; `GlobalSnapshotAcceptanceManager.scala:1331-1353`; `SharedServices.scala:105-110,443`; `GlobalSnapshotConsensus.scala:480-502,697,1435-1477`). The residual ambient path is shard committee/producer/attester eta (`SharedServices.scala:305-308`; `GlobalSnapshotConsensus.scala:1736-1797,1913-1931`). | Bind exact Phase-2 `(ordinal,hash,mptRoot)` into `ShardCheckpoint`; use `getEtaAt` for every committee draw and proof. Until then sibling-local eta can split identical checkpoint validation. A complete-empty source also needs one explicit portable rule distinct from unavailable history. |
+| Tower verifier safety cut | Every suffix and level-chain occurrence resolves the current atomic period-zero pair, verifies the VRF proof over the header's exact carried `eta || slot` bytes, compares its derived/carried output, and ignores sender `activePoolSize`; every otherwise-valid nonempty proof then returns historical eligibility unavailable (`TowerVerifier.scala:125-147,199-258,344-350`). | Direct forged proof/output and claimed-pool authority are closed. The carried eta is only cryptographic self-consistency, not canonical historical randomness. Portable verification remains disabled until exact branch-historical registry/roster/stake/eta witnesses and authenticated tower/SMT inclusion exist. |
+| Root coverage | Current per-MG root covers field 5 plus seven Mg partitions 25-31, but excludes economic active allow-spends field 7 and observation metadata field 32 (`GlobalStateConverter.scala:1183-1185,1326-1355`; `GlobalStateKey.scala:308-325`). | A restored diff needs a complete root/write-scope contract and an explicit field-32 classification. |
+| Retained `smtRoot` | Audit SMT-01 found followers do not verify this signed historical commitment. | Tower support requires it to become reproducible and load-bearing on produce/follow/restart/bootstrap before eligibility is enabled. |
+| Serde | MPT values use scodec, but ordinary signing/hashing still has JSON/Kryo paths and the era registry is not the production authority. | Scodec migration is not complete. |
+| Derived eta period | `NakamotoConfig.etaRotationSnapshots` uses `math.round(3.1d * k1)` (`config/types.scala:163-168`). | Replace consensus `Double` with an exact ratified integer/rational formula and cross-language vectors. |
+| GSI | `GlobalSnapshotInfo` remains on production read, API, and recovery paths. | MPT-primary state/GSI deletion is not complete. |
+
+## 3. Protocol invariants
+
+| ID | Invariant | Enforcement boundary |
+|---|---|---|
+| SIG-1 | No state-validity signature is emitted without local reproduction of the exact signed result. | Typed verified capabilities at global attestation and shard execution-signature APIs. |
+| FIN-1 | P0/P1/P2 belongs to exact `(ordinal,hash,parent,stateRoot)`, never an ordinal alone. | Hash-bound `FinalityGate` state and APIs. |
+| FIN-2 | P2 is reached only by the ratified optimistic trigger or canonical `k1` depth fallback. | Pure finality transition kernel. |
+| FIN-3 | A P2 hash may be orphaned by the valid chain selected under `maxvalid-tk` within `k1` or `maxvalid-bg` beyond `k1`; replacement emits one durable rollback event. | Fork-choice comparator, true-MRCA/revert transaction, downstream outbox. |
+| FIN-4 | `k2` affects retained rollback/proof availability only. A fork older than local retention causes verified history/state acquisition and a production halt until objective comparison/reconstruction succeeds; it is not refused because of age. | Retention policy, authenticated archive fetch, recovery coordinator, and production gate. |
+| FIN-5 | Global optimistic attestations are for authenticated, locally executed snapshots and are never economic validation or BFT commits. | Snapshot validation plus Snowball emitter. |
+| EXEC-1 | Producer and every execution signer reproduce exact input decisions, diff bytes, extracted intents, and complete root at the same P2 base. | Shared pure framework kernel and verified checkpoint capability. |
+| EXEC-2 | Ordinary adopters never install a claimed root; they verify threshold/base/scope, apply the diff, and recompute the root. | Checkpoint acceptance and GSAM integration. |
+| EXEC-3 | Every diff-writable key is committed by the verified root and confined to the assigned metagraph/framework namespace. | Frozen root/key schema plus bounded diff validator. |
+| EXEC-4 | Shard depth/fork choice never silently substitutes for missing independent executions. | Separate chain-status and execution-status checks. |
+| ECON-1 | Enabled framework operations have explicit authorization, exact checked arithmetic, conservation, and permanent semantic replay protection. | One reference/production kernel used by producer, signer, and watchtower. |
+| ECON-2 | `authoritative*`, `AdoptFromSignedFields`, opaque/custom data, decoder probing, and ML0 claims cannot construct framework writes. A separately typed deterministic GL0 protocol correction may update metagraph state only from GL0 toward downstream. | Closed lane/schema boundary, kernel input ADT, and GL0 correction transition. |
+| XMG-1 | Only an exact canonical P2 origin can authorize a cross-metagraph consume. | `FinalityGate.requireCanonicalAtLeast(ref,P2)`. |
+| XMG-2 | Every GL0 node applies one deterministic conflict/nullifier/settlement kernel over extracted signed intents. | GL0 proposal and follower transition. |
+| XMG-3 | Per-MG diffs cannot write another MG or global nullifier/inbox partitions. | Key-namespace validator. |
+| XMG-4 | One-shot consume, settlement deltas, permanent nullifier, and delivery append are atomic; acknowledgement is metadata-only. | Canonical MPT transaction. |
+| XMG-5 | Shard count changes scheduling only. The same trace at `numShards=1` and K has identical economic results. | Differential cluster gate. |
+| XMG-6 | Execution-certified ML0 mirror state and GL0-owned pending settlement overlay are separate; every read uses their exact effective composition and acknowledgement cannot change it. | Typed MPT partitions, effective-state reader, pre/post-ack byte equality. |
+| WT-1 | Watchtower evidence is exact-base/input reproducible, deterministic, signer-specific, and cannot slash on unavailable history. | Evidence verifier plus generic slash kernel. |
+| SER-1 | Every active consensus object has one bounded canonical Scodec representation and a signed domain. | Genesis manifest and strict codecs. |
+| ERA-1 | Greenfield starts `ScodecV1` at ordinal 0; future upgrades use an exact Phase-2 hash-bound era schedule. | Genesis and protocol-era state. |
+| STATE-1 | Canonical MPT bytes plus exact branch/checkpoint/finality journals are authority; GSI/cache/peer choice never is. | Typed state APIs and production denylist. |
+| REC-1 | Restart, reorg, catch-up, and bootstrap reproduce exact bytes or stop before mutation. | Verify-before-write recovery. |
+| DA-1 | All bytes required to execute, challenge, roll back, or serve remain authenticated and available through the maximum required horizon. | Content commitments, bounded fetch, signer/watchtower retention. |
+| CFG-1 | Consensus parameters, committee derivation, resource limits, and era are genesis/finalized state, never receiver-local configuration. | Canonical parameter hash bound into artifacts. |
+| MIG-1 | Existing-network migration is a deterministic audited snapshot-to-new-genesis transform, not a live legacy-codec mode. | Offline exporter/importer and migration manifest. |
+
+### 3.1 Surgical repair boundary for `c610a0740`
+
+Do not revert `c610a0740` wholesale. It touched 183 module files and combined the
+unwanted universal-replay change with unrelated safety and cleanup work. The
+implementation packet begins with a file-by-file ownership diff and follows this
+boundary:
+
+| Keep | Restore/rewrite | Never restore |
+|---|---|---|
+| Removal of ML0 `authoritative*` fields and `AdoptFromSignedFields`; current full framework recreation path; exact pinned-base/hash checks; replay-only ancestry validation; verify-before-store/KES work; authorization/conservation fixes that survive E2 oracle review; greenfield strict-decode direction. | Only canonical `ShardCurrencyStateDiff`/`perMetagraphStateDiff`; deterministic before/after diff helpers; complete root/write-set contract; producer root+diff output; typed replay-before-sign capability; role-split receive path; ordinary apply/root-check adoption; focused diff/parity tests. | `CrossShardReceipt`; direct shard-to-shard settlement; claimed cumulative balance/lock/artifact/sync deltas; peer/GSI state installation; V1/V2/default-missing compatibility schemas; blind best-tip signing; old `AdoptFromSignedFields` tests. |
+
+Every retained `c610` change still goes through the current audit/oracle. “Keep”
+means it is not part of the architectural rollback, not that it is automatically
+correct.
+
+### 3.2 Audit finding ownership
+
+This preserves the prior roadmap's finding scope. E0.3 turns it into a
+machine-readable one-task/one-test/one-closing-commit ledger; no row below is a
+waiver.
+
+| Findings | Owning epics | Required test families |
+|---|---|---|
+| FIN-01, FIN-02, FIN-03, FIN-12, FIN-13 | E3/E4/E10; the audit's BFT fix direction is rejected, so the owner-ratified Snowball/depth/density protocol and exact-hash downstream retention must close the exploits under their actual assumptions | FIN-M, FIN-D, FIN-S, FOLLOW, REC |
+| FIN-04 through FIN-10 | E4, with branch-sensitive registry/cache work in E6 | FIN-D, FIN-W, FIN-S, SIG |
+| FIN-11 (fixed regression) | E6/E14 | CRYPTO, SIG |
+| ECO-02, ECO-03, ECO-04, ECO-06, ECO-18 | E2/E6/E9 | ECON-A/C/F/G/R, WT, XMG |
+| ECO-05 | E2/E9/E10 | ECON-R, XMG, FOLLOW |
+| ECO-10 through ECO-17 | E2/E9 | ECON-D/C/O/B/F/G, XMG |
+| SHARD-01 through SHARD-10 | E4/E6/E8/E10 | SHARD-C/E/S, FOLLOW, REC |
+| SMT-01 | E1/E11 | ROOT, SER, REC |
+| NET-01, NET-02A, NET-03 through NET-10 | E12, with domain/size schemas in E1/E5 | NET, RESOURCE, DA, REC |
+| ECO-01, ECO-07, ECO-08, ECO-09, NET-02 (fixed regressions) | E2/E7/E9/E12/E14 as applicable | dedicated exploit regression plus differential/qualification suites |
+
+MEDIUM ECO-14/ECO-16 and NET-08/09/10 remain included because they affect
+consensus economics or the permissionless security boundary.
+
+## 4. Ordered epics
+
+### E0 - Architecture freeze and decision register
+
+**Blocks:** every runtime task whose invariant, shared type, or protocol input is
+not already locked. A disjoint packet implementing a locked decision may proceed
+with its RED test and owned write set while unrelated decision gates remain open.
+
+| Task | Exit evidence |
+|---|---|
+| E0.1 | Ratify ADR-0016/0017 and the lifecycle's layer, consensus, phase, signature, diff, lane, and rollback vocabulary. Repository search contains no global `LockedVoted`, QC, or view-change target lifecycle. |
+| E0.2 | Resolve the blocking entries in `CONSENSUS-OWNER-DECISIONS.md` (mirrored in lifecycle section 14). Each answer records rationale, fault model, parameters, and affected tasks/tests. |
+| E0.3 | Create a machine-readable finding ledger mapping every open CRITICAL/HIGH audit item to exactly one task, RED test, owner, and closing commit. CI rejects unowned entries. |
+| E0.4 | Freeze exact Phase-0/1/2 capability matrix: serving, metagraph reference, shard base, spend/withdraw, follower adoption, challenge, rollback, archival service, and prune. |
+| E0.4A | Phase 2 is reversible in-protocol operational state. External bridge/exchange/unbond providers choose and document their own risk threshold; the protocol does not invent an irreversible phase or claim that `k2` makes an external effect final. |
+| E0.5 | Keep economic/public deployment fail-closed until the applicable E14 gates pass. E13 is required before an existing-network snapshot-to-new-genesis fork, not before greenfield development. Development networks may run only with an explicit unsafe/non-economic profile. |
+| E0.6 | Produce the `c610a0740^..c610a0740` surgical repair manifest: every touched file classified keep/restore/rewrite/re-audit with test owner. No bulk revert or unrelated deletion is permitted. |
+
+### E1 - Canonical ScodecV1, identities, parameters, and eras
+
+**Depends on:** E0 schemas/vocabulary. Can run in parallel with E2/E3 models.
+
+| Task | Exit evidence |
+|---|---|
+| E1.1 | Freeze a consensus manifest for snapshots, phase evidence, state-channel envelopes, framework intents, checkpoints, diffs, execution signatures, DA commitments, MPT keys/values, recovery records, and migration manifests. |
+| E1.2 | Implement strict bounded scodec codecs. Reject trailing bytes, duplicates, unsorted collections, unknown tags, invalid refinements, non-minimal integers, and over-limit nesting/length. |
+| E1.3 | Bind network, genesis, era, parameter hash, object domain/type, exact parent/base, and content commitment inside every signature/hash preimage. |
+| E1.4 | Make `ScodecV1` the only new-chain consensus era at ordinal 0; delete undeployed fork compatibility bridges and consensus JSON/Kryo probing. JSON remains API/debug only. |
+| E1.5 | Implement one finalized `ProtocolEra` schedule for post-genesis upgrades, including exact activation predecessor, branch/reorg behavior, state/key transform, live-object semantics, stale-node halt, and historical read-only decode. |
+| E1.6 | Separate consensus-object hashing from frozen MPT-key derivation. Every intentional key migration has an explicit transform and root vector. |
+| E1.7 | Canonical `ConsensusParameters` includes finality, eta, committee/shard, duty, resource, retention, DA, challenge, fee, and upgrade values. Derivations use exact integer/rational arithmetic (`R`, for example, uses a ratified `31/10` rule rather than `Double`). Local mismatch halts before signing/mutation. |
+| E1.8 | Define governance/activation authority and delay for parameter/era/registration changes. A local admin/`ProductionGate` may make one node abstain but cannot change validity, phase, state, or another node. Any network halt is an explicit bounded canonical transition that cannot rewrite/waive validation and has deterministic expiry/resume; omit it entirely if that rule is not ratified. |
+| E1.9 | Inventory every retained signed commitment. `smtRoot` and its tower-eligibility inputs are retained and must be independently reproduced and verified on produce/follow/restart/bootstrap. A decorative, producer-chosen, or follower-ignored root is forbidden. |
+
+### E2 - Deterministic conservative framework kernel
+
+**Depends on:** E0 grammar; final codecs integrate after E1.
+
+One pure kernel consumes an exact base state and canonical ordered framework
+inputs, and returns:
+
+```text
+VerifiedFrameworkExecution(
+  acceptedIds,
+  rejectedIdsWithReason,
+  canonicalPerMgDiff,
+  completePostRoot,
+  extractedGlobalIntents,
+  resourceUnits
 )
 ```
 
-The exact byte encoding must be an ADR and golden-vector contract. Network,
-genesis, protocol/type version, and the complete economic policy must be inside
-the bytes the owner signs. Adding those fields only outside the signature would
-create different nullifier keys without preventing cross-network or
-cross-version signature replay. The current `AllowSpend` schema does not carry a
-network/genesis domain (`swap.scala:85-95`), so this is a greenfield signed-schema
-change, not merely a new hash wrapper.
+| Task | Exit evidence |
+|---|---|
+| E2.1 | Independent small reference interpreter defines separate rows for native/currency transfer and reference successor; balance writes; every fee lane; allow-spend create/consume/expiry/refund; referenced and metagraph-source spend; token-lock create/replacement/expiry/manual unlock; pricing; GL0 protocol correction including declared balance/supply adjustment; node parameters; rewards; stake/collateral create/withdraw/slash; currency owner/staking messages; global-sync acknowledgement; state-channel inclusion; mint/burn; and rejection semantics. Unsupported operations fail closed. |
+| E2.2 | Fix unsigned unlock, no-reference spend authority, fee replay/binding, reward authority, and source/signature/domain checks. |
+| E2.3 | Exact checked arithmetic and per-prefix conservation replace saturation/wraparound. Every fee/refund/mint/burn has a named source/sink and bound. |
+| E2.4 | Permanent semantic IDs/nullifiers and explicit nonce/sequence rules replace bounded-history replay protection. |
+| E2.5 | Same-batch operations thread one ordered state accumulator. Ordering never depends on wall clock, peer arrival, map/set iteration, shard arrival, local head, or exception behavior. |
+| E2.6 | Meter deterministic execution, proof, MPT writes, cardinality, and output bytes. Over-budget batches have no partial effect. |
+| E2.7 | Custom data and ML0-supplied cumulative fields have no constructor into the framework input/output ADTs. |
+| E2.8 | Production/reference differential property tests compare decisions and exact writes after every prefix across supported JVM/OS/CPU targets. |
+| E2.9 | Audit the complete Tessellation v4.0.0 framework grammar operation by operation and preserve functionality whose deterministic authority, conservation, ordering, and replay rules pass the oracle/RED suite. Mechanically inventory every economic ADT constructor, codec, route/event source, validator, acceptance branch, balance/supply writer, and configuration-driven issuance path, then human-classify its authority and lifecycle. Do not invent treasury/oracle concepts or regress an operation merely because its existing rule has not yet been restated; repair defective upstream rules explicitly. |
 
-Identity hashes exclude the signature/proof container: proof ordering, additional
-valid signatures, or signature encoding must not create a second identity for one
-semantic intent. Signatures are verified separately against the canonical body.
-The body includes the authorizing source, nonce/sequence or parent reference, and
-all fields needed to distinguish an intentional replacement from replay.
+`V4-ECONOMIC-GRAMMAR-AUDIT.md` is the initial source-evidence packet for E2.1
+and E2.9. It confirms that manual unlock, metagraph-source spend,
+`PricingUpdate`, and protocol balance correction are real v4 capabilities, and
+it distinguishes their required target authorities. It is explicitly partial:
+until the mechanical reachability inventory and every RED/oracle row close,
+E2.9 and owner gate O-07 remain open.
 
-A transport hash, ML0 snapshot hash, shard, committee, or local ordinal is not an
-operation identity. A consume records both `consumptionId` and the finalized
-`authorizationId`. For the v1 one-shot allow-spend, the permanent replay key is
-the authorization ID even when the consume uses less than the authorized amount.
-Any future reusable policy needs a signed sequence/nonce and canonical remaining
-allowance; it cannot reuse the one-shot rule implicitly.
+### E3 - Pure finality and fork-choice model
 
-### 3.2 State machine
+**Depends on:** E0 phase decisions. Pure model can run in parallel with E1/E2.
+
+| Task | Exit evidence |
+|---|---|
+| E3.1 | Specify exact Phase-0 `Pending`, Phase-1 `Provisional`, and Phase-2 `Operational` transitions over `(ordinal,hash,parent,stateRoot)` and the capability/rollback matrix. Phase-2 conflicts are reversible. `k2` is modeled only as retained-state availability. |
+| E3.2 | Implement an independent K/alpha/beta Snowball/Snowman reference cascade with authenticated uniform sampling, ancestor preference, emit-once, stale/replay rejection, `N<K`, eclipse, and adaptive faults. |
+| E3.3 | Specify the owner-approved predicate `P2 = decided-attestation T_weight OR canonical k1 depth`; remove/subsume `T_count`. No global BFT round, lock, or quorum certificate is introduced. |
+| E3.4 | Model valid-tine `maxvalid-tk` selection within `k1`, Genesis-family `maxvalid-bg` selection beyond `k1`, true MRCA discovery, and the unavailable-local-history state. Prove comparator symmetry/commutativity or produce counterexamples. No ordinal-age floor may override the objective comparison. |
+| E3.5 | Re-derive or explicitly accept `k1`, eta, K/alpha/beta/weight thresholds, and the `k2` retention recommendation under the actual Taktikos/LDD assumptions. Do not import a Praos bound without proof. |
+| E3.6 | Exhaustive small-network and stochastic large-network tests cover partitions, delay cliff, stale samples, equivocation, branch splits, restart, Phase-2 replacement, MRCA older than `k2`, authenticated reconstruction, and refusal to compare truncated asymmetric history. |
+| E3.7 | Specify portable `OperationalEvidence`: optimistic decided-attestation set/`T_weight` proof or an authenticated `k1` suffix proves historical qualification, not current canonicality. A permissionless follower/light client also verifies trusted genesis/cached canonical commitment, chain score/ancestry, stale-orphan status, and live replacement tracking. A single peer may provide a self-verifying proof but cannot make an unproved suffix canonical. |
+| E3.8 | Model the base Taktikos/LDD transition independently of finality: slot/ordinal/parent validity, VRF eligibility, eta derivation/grinding, equivocation/withholding/selfish production, valid-only maxvalid-tk/bg fork choice, and malicious producer wrong-root rejection. |
+| E3.9 | Specify deep-history recovery when the true MRCA predates local `k2` retention. The node halts production, fetches authenticated ancestry/state/proofs, objectively compares valid tines, atomically reconstructs the winner, and then resumes. Manual operation may initiate recovery but cannot select the winner. |
+
+### E4 - Hash-bound durable `FinalityGate`
+
+**Depends on:** E1 artifact bytes, E3 model. Economic release integration also depends on E2; tower tasks E4.10-E4.13 depend on E6's historical identity/registry inputs.
+
+| Task | Exit evidence |
+|---|---|
+| E4.1 | Replace ordinal refs with durable branch-aware finality state: canonical tip, exact Phase-2 refs/evidence, orphan map, and transition journal. Keep retention/service watermarks outside fork-choice truth. |
+| E4.2 | Route all attestation/depth evidence through one pure transition coordinator; remove duplicated direct watermark writes. Delete or rename `SettledOrdinalTracker` so any remaining projection reports retention/service availability and cannot constrain fork choice. |
+| E4.3 | Global optimistic attestation accepts only an authenticated locally executed snapshot capability. Implement real sampling/cascade; remove legacy re-attest/latest-vote shortcuts. |
+| E4.4 | Atomically coordinate phase transition with canonical MPT branch, rollback journal, checkpoint anchor, binary confirmation, mempool state, and durable follower event outbox. |
+| E4.5 | Enable and verify density recovery: unwind to the true MRCA, refold exact branch bytes, recompute eta/registry/finality/tower state, and apply `maxvalid-bg` beyond `k1`. If local rollback state is unavailable, enter the E3.9 authenticated recovery state instead of refusing the valid fork or comparing truncated histories. |
+| E4.6 | Expose exact Phase-2 refs and trigger provenance. Operational APIs/events are hash-bound and explicitly reversible. Archival/retention APIs report what history/proofs are locally available without implying a distinct consensus-final phase. |
+| E4.7 | Restart at every transition write point produces the exact old state or exact new state, never mixed boundaries. Automatic unsafe finality erasure is removed. |
+| E4.8 | Delete dormant GL0 generic BFT event-loop construction, facilitator/round wiring, and global BFT config/API paths. Keep shared/ML0 BFT facilities only where ML0 actively owns them. Startup proves exactly one global consensus engine: `SnapshotLeaderLoop` plus the phase gadget. |
+| E4.9 | Add durable `RecoveryRequired` handling when objective fork comparison or reconstruction lacks authenticated data: fail-stop signing/production/mutation, expose the missing range/evidence, fetch by exact commitment, and resume only after deterministic verification. Missing local history never becomes a social fork-choice vote. |
+| E4.10 | Carry branch-bound tower trial state in signed snapshot certificates, including the per-level history needed to reproduce eligibility and pointers. Producer computes from the selected parent; every recipient independently recomputes it using the exact delayed registry/eta/KES inputs. |
+| E4.11 | Make `smtRoot` consensus-reproduced: the snapshot at `N` commits the verified eligible historical tuple at the specified lag, and producer/follower/restart/bootstrap independently derive the identical SMT update/root. Remove root-blind artifact comparison. |
+| E4.12 | Make tower/SMT persistence branch-aware and density-reorg-safe. Rollback/refold and deep authenticated reconstruction produce the same tower state as uninterrupted execution; append-only local `k2` finalization is not authoritative. |
+| E4.13 | Complete portable tower proof construction and verification: SMT inclusion, hash/pointer ancestry, historical registry and eta transitions, KES/VRF signatures, canonical chain comparison, bounds, freshness, and adversarial single-peer withholding/eclipse tests. `TowerEligibility.NotComputed` is removed only when these gates pass. |
+
+### E5 - Payload lanes, metagraph registration, and data availability
+
+**Depends on:** E0 product decision, E1 base codecs. Can run alongside E2/E3.
+
+| Task | Exit evidence |
+|---|---|
+| E5.1 | Canonical registration fixes metagraph ID/owner, ML0 source proof/set, lane/schema, framework version, custom-data commitment, fee/resource policy, and delayed upgrades. |
+| E5.2 | Implement signed `FrameworkCurrency` and `FrameworkCurrencyWithData` envelopes. Standalone opaque/data-only is absent unless owner-retained. Decoder probing cannot select a lane. |
+| E5.3 | Currency-with-data commits framework execution and custom bytes separately. Custom application output cannot synthesize economics; an independently signed framework fee/intent may bind the exact custom commitment, and mismatch rejects atomically without replay. |
+| E5.4 | Define one protocol hard envelope cap, deterministic chunk/content commitment, bounded authenticated fetch, erasure/reconstruction policy, and exact retention horizons. |
+| E5.5 | Domain-separate ML0 source signatures, GL0 intake/custody receipts, execution signatures, optimistic attestations, and DA custody proofs. Only the execution signature claims CL1 recreation. |
+| E5.6 | Data unavailable before checkpoint eligibility defers the checkpoint. Nonresponse alone is not slash evidence in an asynchronous network. |
+| E5.7 | Implement the separate binary-intake protocol over eligible GL0 operators. Before a custody receipt, derive parent/ordinal from authenticated state, verify the exact ML0 source signatures against the delayed canonical per-MG registry/allowlist, enforce deterministic envelope/resource bounds, and durably store exact bytes. Freeze its distinct threshold/lifetime/equivocation/queue/redraw/censorship rules. Intake receipts never satisfy execution quorum. |
+
+### E6 - Stake, KES/VRF, committee derivation, and slash kernel
+
+**Depends on:** E1 identities/parameters; economic debit integrates with E2.
+
+| Task | Exit evidence |
+|---|---|
+| E6.1 | Every active stake/committee/reward weight is joined to live bonded principal with activation, exit, unbond, and slash horizons. No locally observed-active denominator. |
+| E6.2 | Complete the atomic preregistered operator-pair lifecycle: one long-term-signed `PeerId + KES master VK/offset + VRF VK` record, rooted early enough to be present in the exact N-2 canonical view before activation, and one atomically provisioned local future KES+VRF secret bundle selected only by the exact-parent active-record capability after public-key comparison. Add period-derived KES step, rotation/revocation, crash recovery, historical verification, and double-sign evidence. Missing/invalid/historically unavailable public or local material fails closed. Both active keys always come from the same selected record; decide whether a successive complete record may retain either prior key or repeat the pair. Ratify O-12: the N-2 prefix/common-prefix assumption, secret deletion point, and `RecoveryRequired` response to a reorg crossing erased KES material; do not treat secret rollback or k2 retention as ordinary state recovery. |
+| E6.3 | Bind global leader eligibility and both GL0 committee draws to delayed canonical state. For period `N`, resolve the exact branch's atomic key/authorized-roster/stake intersection from `N-2` and eta from `N-1`; registration fixes keys but grants no eligibility. Bind execution-shard membership/epoch to the exact Phase-2 anchor and close producer-chosen wire epoch grinding. |
+| E6.4 | Preserve the public deterministic execution membership draw and shuffled staircase duty unless a new owner ADR changes it. Do not relabel it stake-weighted secret VRF. |
+| E6.5 | Generic evidence IDs are canonical and replay-proof. The ratified verifier computes the verdict from exact evidence/inputs rather than trusting a claimant; a guilty verdict debits actual bonded principal once, caps reward, and changes eligibility only at the specified anchor. |
+| E6.6 | False, stale, ambiguous, wrong-base, missing-input, split-view, forged-watchtower, or orphaned-branch evidence cannot slash an honest node or force unbounded replay. |
+| E6.7 | State the execution-shard/watchtower adversary model quantitatively for S shards: committee capture and correlated draws, adaptive corruption/bribery after public membership, cross-shard chain-quality collapse (including the claimed alpha_total > 1/(2S) boundary), watchtower coverage, and value-at-risk versus bonded loss. Re-derive rather than inherit Polkadot/Praos bounds. |
+| E6.8 | Define supported validator-set sizes and fail-closed/degraded modes. Never silently clamp/renormalize `kQuorum`, K, alpha, or weight denominators to locally observed N. Small dev networks use explicit canonical non-economic parameters or depth-only behavior; an impossible threshold halts visibly. |
+| E6.9 | Prevent uniform-committee Sybil/key grinding with canonical operator identity, minimum live bonded principal, delayed registration/activation before eta is known, key-count rules, and quantitative stake-splitting/correlated admission-execution-watchtower analysis. |
+
+### E7 - Canonical checkpoint diff and execution result
+
+**Depends on:** E1, E2, E4 Phase-2 ref interface, E5 lanes, E6 committee identity.
+
+| Task | Exit evidence |
+|---|---|
+| E7.1 | Restore only `ShardCurrencyStateDiff(upserts,removals)` and `perMetagraphStateDiff` in the greenfield schema. Keep `executionBase` and full signed inputs/commitments. |
+| E7.2 | Do not restore metagraph-originated `authoritative*`, `AdoptFromSignedFields`, direct receipts, unproved per-field replacement deltas, or old fork V1/V2 compatibility codecs. A future GL0 protocol correction is a separate root-covered global transition under E9.11, never a checkpoint field. |
+| E7.3 | Freeze complete per-MG root and key allowlist so every diff-writable key is root-covered. Keys are canonical, sorted, unique, bounded, and metagraph-scoped. |
+| E7.4 | Refactor the current currency recreation path to return the E2 execution result and deterministic before/after diff. Producer, signer, and watchtower share this exact function. |
+| E7.5 | Checkpoint preimage binds exact Phase-2 base, full ordered inputs/DA commitments, diff, roots, extracted intents, shard parent/ordinal/duty/roster, and parameters. |
+| E7.6 | Apply-diff over the exact base independently reproduces post-root byte-for-byte. Missing base/input defers without mutation. At GL0 composition, every signed per-MG pre-root/version must compare-and-set against the proposal parent's current mirror root/version (or an equally strong unchanged-version proof). |
+| E7.7 | Implement the locked mixed-`globalSyncView` window semantics: each binary uses its signed nondecreasing historical Phase-2 ref for global reads while local state threads from the signed parent/pre-root. No live-head fallback exists. |
+
+### E8 - Staircase shard chain, replay-before-sign, and watchtowers
+
+**Depends on:** E6/E7. Hard-anchor integration depends on E4.
+
+| Task | Exit evidence |
+|---|---|
+| E8.1 | Deterministic bounded fair accumulation preserves per-MG parent order, continuation cursors, exact bytes, and no starvation across mixed lanes. |
+| E8.1A | Enforce exactly one checkpoint per shard whose exact containing GL0 snapshot has not reached Phase 2. It batches multiple metagraphs and one contiguous ordered binary list per metagraph; remove configurable `pipelineDepth`, multi-checkpoint accumulation, and shard-depth validity/finality fallback. A second checkpoint cannot be produced, replay-signed, accepted, or embedded until signed evidence proves the first exact checkpoint hash is Phase-2-anchored or deterministically orphaned/requeued. Tentative embedding, ordinal-only watermarks, and receiver-local anchor state never release a successor. |
+| E8.1B | Treat one multi-MG checkpoint as one atomic GL0 transition. The outer shard-map key must equal the signed shard ID; every MG window must continue or already equal proposal-parent state; every continuing suffix must be represented byte-exactly in the containing artifact. Any deferred/rejected/omitted segment rejects the whole checkpoint and its P2 hard anchor. |
+| E8.2 | Producer duty remains shuffled staircase; enforce the identical parent-relative duty rule at intake, replay-signing, and embedded-artifact validation, then specify timeout/skip, fork choice, sibling recovery, and censorship fallback without BFT locks/views. Embedded validation resolves parent hash/ordinal/slot from portable proposal-parent-bound evidence, not receiver-local shard-gossip state. The producer remains the retained head signature; aggregation may append but never reorder it. |
+| E8.2A | Require an embedded checkpoint's signed slot to be no greater than the signed slot certificate of its exact containing GL0 snapshot; an ahead checkpoint stays pending for a later GL0 slot. Monotonicity alone is insufficient: an arbitrary future slot can select an attacker's valid rank and halt the shard after anchoring. Receiver wall clock, receipt time, local skew configuration, and local best tip cannot decide artifact validity. |
+| E8.3 | Replace naked-hash emitter with `VerifiedShardCheckpoint`. Producer and every execution signer replay and compare exact diff/root/intents before signing. |
+| E8.4 | Separate structural storage, committee replay/sign, watchtower replay, and ordinary noncommittee behavior. Telemetry/tests prove ordinary receivers do not recreate currency. |
+| E8.5 | Require distinct execution `kQuorum` replay signatures for every checkpoint. Staircase duty/parent ordering selects the next checkpoint candidate; no shard-depth threshold can make a subquorum checkpoint diff-adoptable. |
+| E8.6 | Move shard hard-anchor advancement from tentative GL0 evaluation to exact containing-GL0 P2 transition. Before anchoring/finalizing, deterministically ingest the exact validated embedded checkpoint on nodes that missed shard gossip; duplicate ingestion is idempotent. Orphaned checkpoints requeue binaries exactly once. |
+| E8.7 | Implement deterministic noncommittee watchtower assignment/replay/evidence under the locked release rule: required positive coverage makes a checkpoint GL0-inclusion-eligible, while unrelated GL0 snapshots continue without it. No checkpoint-derived local or cross-MG economic effect is released before this coverage. |
+| E8.7A | Implement objective fraud adjudication: an assigned, bonded, age/rate/resource-bounded challenge triggers exceptional universal GL0 replay of exact retained inputs/base. The computed result, not the watchtower assertion, controls rollback/slash; missing authenticated data defers and cannot slash. Happy-path adoption remains zero-replay. |
+| E8.8 | Retain exact binaries/diffs/evidence through the maximum of recommended `k2`, challenge, DA, deep-recovery, and downstream acknowledgement horizons. Retention expiry never changes fork-choice validity. |
+| E8.9 | Remove `numShards > 1` as a validity switch. Economic `numShards=1` runs one execution committee/diff/watchtower path; any direct test shortcut is explicitly unsafe and state-differential checked. |
+| E8.10 | Freeze `numShards` for v1 at genesis/era. Reject local/live changes. Defer resharding until a separate hash-bound protocol-era transition specifies drain, deterministic reassignment/handoff, committee transition, replay/nullifier continuity, rollback, and recovery. |
+| E8.11 | Specify eta/roster crossover for buffered, produced, partly signed, execution-certified, and tentatively embedded checkpoints. One exact anchor selects one roster; no receiver-local expiry or mixed old/new threshold. Activation delay and requeue rule preserve liveness across rotation/reorg. |
+
+Current E8.1A/E8.6 landing is deliberately partial. The exact-hash happy path is
+present and buffer drain no longer suppresses held-byte rebroadcast, but held
+bytes/anchors are volatile, Phase-2 replacement and rollback are not represented,
+finality-to-anchor delivery is not a durable exactly-once transaction, and fair
+bounded batching is absent. The rule currently constrains the honest producer
+only: a checkpoint does not carry verifier-checkable evidence that its exact
+parent reached Phase 2. A Byzantine committee can therefore replay-sign a
+pipelined child; the fail-closed ancestor selector can then repeatedly surface an
+under-certified parent and stall that shard. `REC-002`, `NET-002`, and the
+Phase-2 reorg/malicious-pipeline cases in `SHARD-C-*` remain RED/required; this is
+not a completion claim.
+
+The current receive-side staircase patch rejects off-duty checkpoints at intake,
+replay-signing, and embedded validation, but `SHARD-C-009` remains RED because the
+embedded path resolves its parent from the receiver's local shard-gossip store.
+Nodes with and without prior gossip can therefore disagree on the same GL0 artifact.
+Parent duty context must be portable and bound to the proposal parent: at minimum,
+canonical GL0 state needs a rooted per-shard
+`ShardCheckpointRef(hash, ordinal, slot, epoch)`, or the proposal must carry an
+equivalent inclusion proof against its exact parent-state root. The child must
+compare-and-set that ref, and roster/eta resolution must use the same canonical
+context. For stronger role accountability, a future schema should bind producer
+identity or a producer-role domain explicitly: `committeeSignatures` is excluded
+from the current preimage, so list reordering can change the nominal producer
+label. This is not a demonstrated duty bypass after the current patch: only the
+unique scheduled peer passes as head, an honest scheduled peer will not countersign
+an off-duty-head artifact, and a scheduled Byzantine signer has already vouched for
+the exact checkpoint bytes. The acceptance test rejects a complete execution quorum
+whose retained head is off duty. Even after that, `SHARD-C-010` remains RED: the signed slot is checked for parent monotonicity
+and mapped to a staircase rank, but has no canonical upper bound. An assigned member
+can choose a far-future valid window and, if it obtains the mandatory replay
+signatures, strand the shard behind that parent slot. A receiver-wall-clock check
+would create asymmetric validity and is not an acceptable repair.
+
+SHARD-10/SHARD-C-011 capture that duty validation currently consumes local HOCON `staircaseDeltaSlots`.
+Identical artifacts can therefore select different scheduled peers under
+configuration skew. The delta and its parameter hash must be rooted in the same
+proposal-parent/genesis consensus context as the roster and eta before this is a
+portable validity rule.
+
+E8.3's signing API is also partially landed: only a sealed capability minted by
+checkpoint intake replay can reach the shard attestation emitter, and ancestor
+closure replays with the ancestor's own epoch membership before signing. The
+checkpoint has no canonical diff/intents/complete-root result yet, so this does
+not close E8.3, E8.4, or ordinary zero-replay adoption.
+
+### E9 - Global checkpoint composition and cross-metagraph settlement
+
+**Depends on:** E2, E4, E7/E8. Allow-spend v1 can be implemented before other interaction types.
+
+| Task | Exit evidence |
+|---|---|
+| E9.1 | Ordinary GL0 checkpoint acceptance verifies duty/roster/execution certificate, the separately domain-separated positive replay coverage assignment/signatures/threshold, continuity, exact canonical Phase-2 base/origin refs, scope, and absence of a pending authenticated mismatch; compare-and-sets each signed pre-root/version against the proposal-parent mirror, applies diff, and recomputes root with zero ML0 recreation. |
+| E9.2 | Canonically merge native GL1 writes, per-MG diffs, global framework intents, rewards/slashes/config changes, GL0 protocol corrections, and custom commitments. Conflicting keys or invalid roots reject atomically. |
+| E9.3 | Per-MG diff cannot write global nullifier/inbox or another MG. Every GL0 node runs one pure global intent conflict/settlement kernel. |
+| E9.4 | Define signed authorization/consume identities and permanent replay keys. Network/genesis/era/type replay and proof-container malleability reject. |
+| E9.5 | Implement one-shot allow-spend state machine: reserve, consume/cancel/expiry, exact refund/fee rules, permanent nullifier, and pending delivery in one transaction. |
+| E9.6 | Define deterministic precedence for concurrent consumes, cancel/expiry, inbound delivery, local spend, and same-snapshot dependencies. One authorization has at most one winner across shards/branches. |
+| E9.7 | ML0 inbox/cursor acknowledgement is hash-bound, contiguous, idempotent, and metadata-only. It cannot change effective balances or erase permanent replay state. |
+| E9.7A | Separate `Ml0FrameworkMirror` from `GlobalSettlementOverlay`. Cross-MG global writes never invalidate the checkpoint's certified mirror root; all reads use exact checked effective composition. ML0 applies mandatory inbox before local spends and acknowledgement compacts representation with byte-identical effective state. |
+| E9.8 | Add token-lock/transfer/other cross-MG types only after each has explicit authorization, conservation, timeout/refund, ordering, and acknowledgement rules. |
+| E9.9 | Identical traces at shard counts 1, 2, and K have identical accepted IDs, economic leaves, roots, nullifiers, supply, and delivery state. |
+| E9.10 | Bound permanent nullifier/authorization/inbox/evidence growth without reopening replay: protocol fees/rent, authenticated compaction/accumulator, or archived tombstone proof. Age/window eviction alone is forbidden. |
+| E9.11 | Define the GL0 protocol correction transition for malformed metagraph state. It binds exact target MG/pre-root/version, deterministic correction diff, post-root, activation and replay domain, is executed/root-checked by GL0, and emits a mandatory downstream rebase. No ML0/CL1/DL1 signature or checkpoint field can authorize it. |
+
+### E10 - Downstream exact-hash following and Phase-2 rollback
+
+**Depends on:** E4 and E9; ML0 rollback choice from E0.
+
+| Task | Exit evidence |
+|---|---|
+| E10.1 | GL1, ML0, CL1, and DL1 follow exact P2 `(ordinal,hash,stateRoot)` and verify replacement events. Bare monotone ordinal polling is removed from consensus-bearing alignment. |
+| E10.2 | A metagraph binary's `globalSyncView` and checkpoint execution context must be exact canonical P2 before replay/sign/inclusion and obey E7.7's equality or historical-context rule. Inbound staging may remain ahead. |
+| E10.3 | On P2 density reorg, downstream rolls back/rebases by the ratified rule, invalidates orphan-base checkpoints/binaries, and re-follows without duplicate effects. |
+| E10.4 | CL1 adopts canonical GL0 return state; it does not replay or override the downstream result. ML0 retains local BFT authority only over its own candidate history. |
+| E10.5 | Operational APIs label Phase 2 as reversible and expose exact hash/evidence. Archival APIs expose retained history/proof availability without claiming a stronger protocol phase. External consumers choose and document their own risk boundary. |
+| E10.6 | ML0 reorg handling follows the owner-selected rewind/rebase/new-epoch rule. Currency-with-data applications prove deterministic retained rollback/rebase; noninvertible external effects remain an explicit integrator risk decision. |
+
+### E11 - MPT-primary state, GSI deletion, and exact recovery
+
+**Depends on:** E1/E2 state schema, E4, E7-E10 artifact formats.
+
+| Task | Exit evidence |
+|---|---|
+| E11.1 | Inventory every `GlobalSnapshotInfo`/`GlobalSnapshotWithState` read, write, API DTO, recovery, and follower dependency. Build typed MPT replacements by partition. |
+| E11.2 | During migration tests only, compare typed MPT results to GSI for representable states and absent/empty cases. Then delete production GSI types and fallbacks; do not keep dual authority. |
+| E11.3 | Persist exact branch bytes, checkpoint inputs/diffs, finality evidence/state, undo data, nullifiers, inbox/cursors, custom commitments, and outboxes. |
+| E11.4 | Live and recovery paths share verify-before-mutate artifact application. Missing bytes use authenticated hash fetch or halt, never local reconstruction or peer-state installation. |
+| E11.5 | Crash injection at every write boundary and long reorg/catch-up/bootstrap reproduce exact roots and capability state. Phase-2 data retains through every configured challenge, DA, downstream acknowledgement, and recovery dependency; production capacity is tested at recommended `k2`, while a node retaining less enters authenticated recovery sooner. Expiry never becomes validity or fork-choice truth. |
+| E11.6 | Production-source denylist reports zero GSI authority/fallback references. APIs project from canonical MPT and hash-bound finality state. |
+| E11.7 | Followers/restart/bootstrap verify every retained signed state commitment, including `smtRoot`, against reproduced canonical state; any commitment not made load-bearing under E1.9 is removed. |
+
+### E12 - Bounded permissionless transport and bootstrap
+
+**Depends on:** contract can start after E0/E1/E5; semantic integration after E4/E8/E11.
+
+| Task | Exit evidence |
+|---|---|
+| E12.1 | Bound every Go/JVM topic/RPC/HTTP queue, message, range, cardinality, decompression ratio, concurrent verification, and disk retention before expensive work. |
+| E12.2 | Authenticated content-addressed fetch and durable outboxes cover snapshots, binaries, checkpoint inputs/diffs, phase evidence, fraud evidence, and DA chunks. |
+| E12.3 | Gossip drops, duplicate suppression, sidecar/JVM restart, partition, eclipse, flood, slow peers, and shard fan-in cannot permanently lose a required artifact or cause unbounded resource use. |
+| E12.4 | Peer selection/cooldown/scoring affects transport only, never consensus roots, committee derivation, evidence truth, or finality. Multi-peer recovery verifies exact hashes before mutation. |
+| E12.5 | Specify validator join/exit/offline recovery, maximum safe offline duration, weak-subjectivity/bootstrap checkpoint policy, set/era/parameter proof, and light-client verification. |
+
+### E13 - Existing-network snapshot genesis
+
+**Depends on:** E1 manifest/serde and E2/E11 target state schema. Can be developed offline in parallel after those freeze.
+
+| Task | Exit evidence |
+|---|---|
+| E13.1 | Isolated exporter verifies exact upstream v4 finalized snapshot, source network/genesis/ordinal/hash/root, and source finality evidence. No legacy decoder enters the new runtime. |
+| E13.2 | Explicit transform declares imported/dropped/converted state and preserves audited balances, supply, locks, reservations, live authorizations/nullifiers, registrations, and ownership according to policy. |
+| E13.2A | Define every source-signed live object's fate. Old-domain allow-spends/orders/delegations cannot become new-domain executable intents merely by import; expire/refund, preserve inertly, or require explicit new-chain reauthorization. |
+| E13.3 | Canonical ScodecV1 manifest commits source evidence, transform version, new network/genesis/parameters/operator keys, output root, and replay-domain separation. |
+| E13.4 | Two independent implementations/reproduction paths produce byte-identical new ordinal-0 genesis and supply report. |
+| E13.5 | Cutover rehearsal covers source freeze, export publication, operator/user verification, new-chain launch, rollback/cancel procedure, and old-message replay rejection. |
+
+### E14 - Independent qualification and release
+
+**Depends on:** every enabled feature epic.
+
+| Gate | Required result |
+|---|---|
+| Q1 Architecture | No global BFT lifecycle or universal CL1 recreation path; no blind state signature API; owner decisions and parameters are recorded. |
+| Q2 Finality | Reference/runtime differential, partitions/restarts/eclipses, decided-attestation/depth Phase-2 qualification, density replacement beyond `k1`, and authenticated recovery with MRCA older than local `k2` pass. No age-based floor changes the winning tine. |
+| Q3 Economics | Reference/production decisions and exact writes match after every prefix; conservation/replay/authorization hold for every enabled operation. |
+| Q4 Execution shards | Every signer replays; ordinary adopters do not; malformed diff/root/threshold/base rejects; watchtower collusion test satisfies release rule. |
+| Q5 Cross-MG | Concurrent double-consume, cancel/expiry races, acknowledgement loss, P2 reorg, and shard-count differential yield one exact result. |
+| Q6 Lanes/DA | Currency and currency-with-data progress together; custom application output cannot synthesize economics; explicit signed commitment-bound fees reject on mismatch/replay; withholding/recovery/retention are bounded. |
+| Q7 State/recovery | GSI production denylist is zero; crash/reorg/catch-up/bootstrap reproduce exact roots or halt before mutation. |
+| Q8 Serde/era | Cross-language vectors, strict negative corpus, ordinal-0 ScodecV1, and test-only future era transition pass. |
+| Q9 Permissionless | Join/exit/unbond/slash, weak-subjectivity bootstrap, eclipse/flood/resource, and light-client tests pass. |
+| Q10 Migration | Snapshot-to-genesis reproduction and conservation report pass before a public fork is attempted. |
+
+Release requires an independent team that did not author the closing packets to
+re-audit the exact commit. No waiver closes an open CRITICAL/HIGH finding.
+
+## 5. Dependency graph and parallel work waves
 
 ```text
-Economic authorization:
-Absent -> Authorized/Reserved -> Consumed/Settled
-                              -> Expired/Cancelled
+E0 decisions/contracts
+  |
+  +--> E1 serde/era/parameters --------+
+  +--> E2 economic kernel -------------+--> E7 diff/result --> E8 shard protocol --+
+  +--> E3 finality model --> E4 gate --+-------------------------------------------+--> E9 GL0/XMG
+  +--> E5 lanes/DA --------------------+-------------------------------------------+
+  +--> E6 stake/KES/slash -------------+-------------------------------------------+
+                                                                                     |
+E1 + E2 + E11 target schema --> E13 migration tool                                   +--> E10 followers
+                                                                                     +--> E11 state/recovery
+E0/E1/E5 transport contract --> E12 scaffolding -------------------------------------+--> E12 integration
 
-Delivery progress (created atomically with Consumed/Settled):
-Absent -> PendingDelivery -> Acknowledged
+all enabled epics ---------------------------------------------------------------------> E14 qualification
 ```
 
-- `Authorized/Reserved`: GL0 recreated and verified the owner operation and its
-  reservation against the pinned parent MPT.
-- `Consumed/Settled`: GL0 verified the consuming operation against a finalized
-  authorization, checked all balances cumulatively, moved the authorized
-  reservation according to the operation rules, and atomically wrote the
-  nullifier plus the exact conservation deltas.
-- `Expired/Cancelled`: GL0 derives the timeout or verifies the owner-authorized
-  cancellation. It is mutually exclusive with `Consumed/Settled`.
-- `PendingDelivery/Acknowledged`: ML0 proved only that its next currency snapshot
-  incorporated a finalized settlement. Acknowledgement can compact delivery
-  metadata, not the permanent `Consumed/Settled` status, nullifier, or economic
-  result.
-
-There is no transition from receipt of a committee root, ML0 assertion, DL1
-artifact, watchtower promise, or local cache.
-
-`CanonicalEconomicState` and the latest `Ml0AttestedState` must be separate
-concepts. GL0 can be economically ahead while an ML0 is offline. A pending
-settlement is already part of GL0's canonical effective state; acknowledgement
-only changes its representation after ML0 catches up. The effective balances
-immediately before and after a valid acknowledgement must be identical.
-
-Validation deliberately uses two coherent state views:
-
-```text
-finalizedOriginRef -> proves the authorization was created on a certified ancestor
-proposalParentState -> proves its current Active/Consumed/Expired status and supplies evolving balances
-```
-
-The finalized-origin proof may not come from a pending branch. Status, nullifier,
-and balance checks must use the exact proposal parent so an earlier unfinalized
-descendant consume cannot be forgotten. Same-batch operations then thread one
-ordered in-memory accumulator, so every later operation observes earlier writes.
-The current code already has separate finalized and branch-aware reader roles in
-`GlobalSnapshotAcceptanceManager.scala:514-530,2203-2217`; the new kernel must
-make that split explicit rather than accidentally mixing views.
-
-Descendants may speculatively build on unfinalized effects along the exact same
-branch. Such effects are tentative: they cannot be used as a new cross-metagraph
-origin proof, returned by a finalized API, adopted downstream, withdrawn, or
-otherwise leave the system before their containing certificate. A reorg discards
-the entire dependent branch. This preserves pipelining without pretending that a
-pending state is economically final.
-
-For one-shot allow-spend consumption, the reference transition is per asset:
-
-```text
-reservation -= authorizedAmount
-destination += consumedAmount
-source      += authorizedAmount - consumedAmount
-fee remains in its authorization-time sink
-```
-
-Those deltas, the `Consumed` status, permanent nullifier, and delivery append are
-one checked write set. A partial consume is still one-shot: the unconsumed
-remainder returns to the source and no remaining allowance survives. SEC-0 must
-also fix fee/refund semantics, the certified GL0 epoch/ordinal used for expiry,
-and deterministic priority when consume, cancel, and expiry are eligible in the
-same batch; ML0 progress and wall clock are not valid time sources.
-
-### 3.3 Delivery and acknowledgement
-
-GL0 maintains a lossless, deterministically ordered pending-delivery queue per
-owner metagraph. Each pre-seal entry binds at least `(ownerSequence,
-authorizationId, consumptionId, settlementBatchId, payloadHash, deltaHash)`, where
-`settlementBatchId = H(proposalParentRef, finalizedOriginRef, owner,
-sequenceRange, orderedConsumptionIds, payloadHash, deltaHash)`. The exact proposal
-parent may itself be tentative; `finalizedOriginRef` separately pins authorization
-provenance. The ID must not contain the hash of the snapshot whose MPT root
-contains the entry; that would be self-referential. The durable finality record
-later binds the batch ID to `(ordinal, snapshotHash, mptRoot, validatorSetId,
-certificate)` outside the self-committing payload.
-
-A full queue defers the entire containing ML0 binary before any partial economic
-effect in v1; GL0 must never adopt the binary and silently prune one of its
-framework effects. A future partial-acceptance design would need the recreated ML0
-framework result to encode the identical deterministic rejection. The queue never
-evicts an unacknowledged item.
-
-Every ML0 snapshot declares the exact certified GL0 base and prior settlement
-cursor. ML0 applies mandatory inbox entries first, then local CL1 operations that
-may spend the resulting balances; GL0 replays the same order. ML0 follows a
-finalized GL0 `(ordinal, hash, certificate)`, applies messages idempotently in
-sequence, and emits a contiguous cursor or explicit message IDs in its next
-snapshot. GL0 recreates that snapshot and accepts only acknowledgements for
-messages actually applied in order.
-
-The current bounded reconstruction of processed GL0 ordinals is not sufficient:
-`CurrencySnapshotCreator.scala:353-383` explicitly loses history after a configured
-depth, while `GlobalSnapshotOpsManager.scala:69-77,176-180` states that a still
-pending ordinal can then be reapplied. `artifact.scala:57-65` also describes
-`GlobalSnapshotsProcessed` as temporary and discarded. Replace the bounded `P`
-history with canonical monotone progress and permanent operation nullifiers; do
-not tune the window from 1 to 50 or add keep-alives as a correctness mechanism.
-Ordinal alone is also not a branch pin: `MetagraphSyncDataInfo` stores only pending
-ordinals (`snapshot.scala:75-81`), and `GlobalSnapshotOpsManager.scala:117-134`
-fetches them without an expected hash/certificate. Every delivery batch and cursor
-must bind the exact finalized GL0 reference and batch hash.
-
-### 3.4 Current seam to retain and correct
-
-The following shapes are useful but not a safety proof:
-
-- Allow-spend creation verifies the source signature and exclusive source
-  ownership in `AllowSpendValidator.scala:40-59`.
-- Consume validation matches currency, approver, source, and destination and
-  bounds the consumed amount by the authorization in
-  `SpendActionValidator.scala:485-515`.
-- GL0 reads the owner state from its finalized base in
-  `GlobalSnapshotAcceptanceManager.scala:2203-2217`.
-- Allow-spend consumption writes a canonical marker through the same MPT writer
-  as other consensus state in `GlobalSnapshotAcceptanceManager.scala:2868-2873`.
-- ML0 derives applied actions from pinned pending ordinals and regenerates
-  `GlobalSnapshotsProcessed` in
-  `CurrencySnapshotAcceptanceManager.scala:478-505,672-676`.
-- A supplied `GlobalSnapshotsProcessed` is stripped before regeneration in
-  `CurrencySnapshotAcceptanceManager.scala:83-88,305-308`.
-
-The corrected protocol must remove shard-count gating from economic identity and
-replay protection. `CrossShardMessageHandler.scala:70-72,99-100` and
-`GlobalSnapshotAcceptanceManager.scala:2284-2294` currently make the permanent
-marker conditional on `numShards > 1`, while
-`ConsumedAllowSpendStateManager.scala:179-220` classifies by physical shard
-difference. It must also replace saturating effective balance arithmetic
-(`ConsumedAllowSpendStateManager.scala:289-339`) with exact, checked transition
-arithmetic. Sharding may choose where work is prepared; it must not select a
-different validity function.
-
-Only allow-spend consumption has a registered handler today
-(`CrossShardMessageHandler.scala:61-68`). Token-lock, generic transfer, and custom
-message support remain disabled until each has its own explicit authorization,
-conservation, identity, timeout, and acknowledgement specification.
-
-## 4. Evaluation of the 2026-07-07 epics
-
-The old board covered 2 CRITICAL and 10 HIGH findings. The current audit has 20
-CRITICAL and 20 HIGH findings, of which 16 CRITICAL and 18 HIGH remain open after
-the fixes already landed. Reconciliation against the old acceptance criteria
-found zero fully owned open findings: 10 are only partially covered, 21 are
-absent, and three are contradicted by an old task or sequencing rule. Six fixed
-findings also lacked explicit regression ownership.
-
-| Old epic | Disposition | Reason |
+| Wave | Parallel assignments | Merge gate |
 |---|---|---|
-| EPIC-1, GSI rebuild durability | Re-scope | Exact-byte recovery and verify-before-write remain required, but the old six/17-site GSI migration assumptions predate replay-only recovery. Re-inventory current paths under SEC-7. |
-| EPIC-2, ML0 operator threshold | Demote from economic gate | Source authenticity can be admission/DoS policy. An ML0 threshold can never authorize a framework balance transition under I-ECON-1. |
-| EPIC-3, slash/exclusion | Replace | Cooldown exclusion is partly present, non-participation state was removed, and ECO-06 proves the principal is not debited. Rebuild under SEC-3/SEC-6 after pre-adoption validity is sound. |
-| EPIC-4, pinned re-derivation | Retain residual only | Much of execution-base pinning landed. ECO-15 still reads a node-local GL0 head; every current read must be re-inventoried and pinned under SEC-4. |
-| EPIC-5, bounded P/U windows | Reject design | A 50-deep window, keep-alive, or cache is not replay protection. ECO-05 requires permanent canonical identity/progress. Replace with SEC-5. |
-| EPIC-6, denominator/config fix | Reject as finality plan | Fixing local renormalization alone leaves unlocked votes, unsafe depth finality, fork-choice violations, volatile/nonatomic finality, implicit votes, and branch-stale stake. Replace with SEC-1/SEC-2. |
-| EPIC-7, band reverts | Keep disabled | Do not spend effort enabling deeper reorgs before a single safe finality/fork-choice protocol and exact replay exist. Re-evaluate only after SEC-2/SEC-7. |
-| EPIC-8, invariant tests | Retain method, replace assertions | Differential and adversarial gates are required. The old 8.2 enshrines `smtRootBlind`, while SMT-01 requires recomputation or removal. |
-| EPIC-9-SERDE | Re-scope | Byte-faithful persistence is useful; roots-only/GSI-era migration goals are not automatically current requirements. Keep only source-proven recovery obligations. |
-| EPIC-9-HARDFORK roots-only | Retire | Greenfield scope needs no fork-only migration, and roots-only authority contradicts universal GL0 economic replay. |
-| EPIC-9-NET | Rebase | Preserve boundedness/durability intent, but map work to the current NET-01..NET-10 findings and current sidecar source. |
+| W0 | E0 architecture/decision register, RED exploit corpus, finding ledger, test harness | Owner ratifies blocking protocol choices and capability matrix. |
+| W1 | E1 base serde/era, E2 pure kernel, E3 pure finality model, E5 lane/DA contract, E6 stake/evidence model, E12 transport bounds | Independent models/vectors and frozen shared interfaces pass; no runtime switch. |
+| W2A | E4 durable finality/tower core, E5 DA runtime, E6 runtime primitives; E7 pure diff/root/codecs only against frozen interfaces | Hash-bound Phase-2, density/deep-recovery, tower, and identity/lane interfaces freeze; pure diff vectors pass without premature GL0 integration. |
+| W2B | E4 atomic integration hooks, then E7 checkpoint execution/result integration | Finality commands/events are load-bearing before checkpoint base/anchor code merges. |
+| W3A | E8 staircase/replay/watchtower/adjudication | Committee/noncommittee execution counts, malformed diff, single-outstanding multi-MG batching, no shard-depth fallback, collusion, quarantine, and fraud-verifier tests pass. |
+| W3B | E9 allow-spend-only global settlement after E8 interfaces pass | Exact-once, proposal-parent compare-and-set, mirror/overlay, and acknowledgement tests pass. |
+| W4A | E10 downstream reorg, E11 module-by-module MPT/GSI removal, E12 semantic transport | Full P2 reorg/restart/catch-up and GSI denylist pass; target state schema freezes. |
+| W4B | E13 offline migration against the frozen E11 target schema | Independent genesis transform/root/conservation vectors pass. |
+| W5 | E9 remaining explicitly designed interaction types, permissionless/light-client integration | Every enabled type and public lifecycle has an oracle and fault test. |
+| W6 | E14 independent qualification | All gates pass on the exact release commit. |
 
-The old DoD reference to mainnet `v3.5.12` is not a compatibility requirement for
-this greenfield v4 fork. Its economic scenarios remain useful regression inputs.
-The replacement gate is semantic and byte-level equivalence of canonical economic
-state for the same ordered inputs at `numShards=1` and `numShards=K`.
+Safe early parallelism is model/schema/test work behind frozen interfaces. Shared
+hotspots such as `GlobalSnapshotAcceptanceManager`, `GlobalSnapshotConsensus`,
+`SnapshotLeaderLoop`, `FinalityGate`, checkpoint schemas, and MPT key derivation
+have one integration owner per wave. Agents do not independently rewrite them.
 
-## 5. Ordered epics
+## 6. Initial delegable packets
 
-### SEC-0 - Executable protocol contract
-
-**Blocks:** every consensus implementation epic.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-0.1 | ADR fixes the economic operation grammar, canonical byte encoding, domain-separated IDs, deterministic total order, rejection semantics, mint/burn authority, and cross-metagraph state machine. Framework-generated artifacts are a closed type boundary that DL1/ML0 cannot manufacture as authority. |
-| SEC-0.2 | Small pure reference interpreter over an abstract key/value state implements checked transitions for transfer, fee, allow-spend, spend, token lock/unlock, stake/collateral, slash, rewards, and acknowledgement. |
-| SEC-0.3 | Machine-readable finding ledger maps every open audit finding to one owner task, regression test, status, and closing commit. CI rejects an unowned open CRITICAL/HIGH. |
-| SEC-0.4 | Public/economic deployment remains disabled until SEC-9; zero-value development remains possible, but no configuration can silently enable an unsafe finality rail. |
-| SEC-0.5 | Inventory and ratify the key schema plus atomic storage/WAL contract for tentative branches, signed-vote safety state, certificates, MPT promotion, operation status/nullifiers, pending delivery, and exact replay bytes. This contract blocks SEC-2, SEC-4, and SEC-5 implementation; recovery integration remains SEC-7. |
-
-### SEC-1 - One finality protocol
-
-**Owns:** FIN-01, FIN-02, FIN-03, FIN-12.  
-**Depends on:** SEC-0. Stake-weighted activation also depends on SEC-3.1.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-1.1 | Replace "first wins" with one specified certificate rule and fault model. Name `n`, `f`, `q`, weighted versus unweighted intersection, network synchrony assumptions, adaptive-corruption bound, and the exact safety/liveness claims. |
-| SEC-1.2 | The certificate binds network, protocol version, epoch, round, ordinal, exact body hash, parent hash, state root, and validator-set hash. Each set is derived from a previously finalized state and activates after a specified non-self-referential delay. No observed-active renormalization exists; if stake weights are used, every unit joins to live bonded principal. |
-| SEC-1.3 | Honest signing rules are round/sequence-monotone, prevent conflicting votes, and lock descendants according to the intersection proof; Byzantine signers may equivocate and duplicate signatures count once. Receipt of a proposal never invents a vote. The required `(epoch,setHash,highestVotedRound,lockedQcHash,KES period)` safety state is durable before signing. |
-| SEC-1.4 | Depth/chain quality may drive proposal preference and availability alarms but cannot independently expose irreversible economic state. |
-| SEC-1.5 | Model checker or exhaustive small-N state-machine test covers partitions, delayed/reordered votes, crash/restart, Byzantine equivocation, validator-set transition, and `>k` competing chains; no conflicting certificate is reachable within the stated fault bound. |
-| SEC-1.6 | A validator votes only after fully replaying the exact economic body and durably retaining the body/batch bytes needed for finalized recovery. A hash-only certificate over unavailable data is invalid. |
-| SEC-1.7 | FIN-11 regression: missing, empty, mismatched, or invalid registered KES material rejects every received snapshot/attestation path, including epoch/set transitions. |
-| SEC-1.8 | Specify the full KES lifecycle: finalized registry/PoP, activation delay, durable period evolution, rotation/revocation, crash recovery, and evidence verification across a rotation. No local key state can silently change certificate validity. |
-| SEC-1.9 | Pin global proposer eligibility to the certified epoch/set/stake snapshot and validate the actual Taktikos/LDD process under its stated delay, partition, and adversarial stake assumptions. Do not transfer a Praos/common-prefix bound. Stake-weighted activation waits for SEC-3.1; execution-shard membership remains the separately specified uniform draw. |
-
-### SEC-2 - Durable finality, fork choice, and release gate
-
-**Owns:** FIN-04 through FIN-10.  
-**Depends on:** SEC-0.5, SEC-1, and SEC-3.1 before any live stake/leader-weighted activation.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-2.1 | Persist one atomic record `(ordinal, hash, parent, stateRoot, setHash, certificate)` through a WAL/transaction before any finalized API or downstream release advances. |
-| SEC-2.2 | Fork choice accepts only descendants of the exact finalized hash. Remove unordered same-height lookup and every ordinal-only finality/stake cache. |
-| SEC-2.3 | Atomically persist `(epoch,setHash,highestVotedRound,lockedQcHash,KES period)` before signing; then durably enqueue signed vote bytes. Count only signatures contained in a verifiable QC, retry publication until superseded by protocol rules, and remove receiver-generated producer votes. Crash/restart cannot forget a lock and sign a conflict. |
-| SEC-2.4 | Restart and rebootstrap reload the certificate and can never erase/downgrade it from peer input or retry counters. MPT promotion, outbox state, finality ref, and serving resume idempotently. |
-| SEC-2.5 | Finalized-only APIs, GL1/ML0/CL1/DL1 followers, cross-metagraph reads, reward release, unlocks, and withdrawals all consume the same durable record. |
-| SEC-2.6 | Crash-point tests at every write boundary plus two-partition and descendant-only cluster tests prove no conflicting release or reopening of finalized history. |
-
-### SEC-3 - Authorization, backing, and slash conservation
-
-**Owns:** ECO-02, ECO-03, ECO-04, ECO-06, ECO-18.  
-**Depends on:** SEC-0.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-3.1 | Stake/collateral record has a unique MPT join to one live eligible backing lock. Replacement, expiry, unlock, and slash update lock, indexes, record, voting weight, and reward weight atomically. |
-| SEC-3.2 | Remove unsigned external `TokenUnlock`; GL0 either derives expiry from pinned state or verifies a domain-separated owner/framework authorization. |
-| SEC-3.3 | Remove no-ref spend authority or define and verify a signed, bounded treasury policy. ML0 inclusion alone is rejected. |
-| SEC-3.4 | Fee acceptance verifies its carried data-update binding and writes a permanent `(source,dataUpdateRef)` or signed-fee-hash nullifier before debit. |
-| SEC-3.5 | Define canonical slash evidence bytes and identity. Verify offense signature(s), exact epoch/set/anchor/checkpoint, reporter authorization, deduplication, and a deterministic pinned-state verdict; malformed, ambiguous, stale, or split-view evidence cannot slash an honest signer. |
-| SEC-3.6 | Slash execution debits actual bonded principal, removes every backing/index entry, caps bounty at the debit, and changes only a subsequent pinned eligibility set. |
-| SEC-3.7 | Adversarial tests cover forged ML0 artifacts, replay, lock replacement/expiry, duplicate identities, split slash evidence, false-slash rejection, and slash/reward conservation. |
-| SEC-3.8 | Regression ownership: ECO-01 same-round duplicate collateral/stake creates remain rejected, and ECO-08's `BalanceAdjustment` variant, decoder, loader, resource, and mutation path remain absent. |
-
-### SEC-4 - Deterministic conservative economic kernel
-
-**Owns:** ECO-10 through ECO-17, including MEDIUM ECO-14/ECO-16.  
-**Depends on:** SEC-0/SEC-0.5; authorization schemas from SEC-3.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-4.1 | One pure ordered transition kernel consumes the pinned parent MPT plus sorted GL1/framework CL1 inputs and returns accepted/rejected operations plus one write set. GL0 production and validation call the same function. |
-| SEC-4.2 | One reservation accumulator spans transfers, fees, allow-spends, spends, token locks/unlocks, collateral, rewards, and cross-metagraph effects. Validation threads the evolving state rather than validating classes independently. |
-| SEC-4.3 | All balance/supply math uses checked integer/fixed-point arithmetic. Overflow, underflow, saturation, `Double`, `Math.pow/exp`, and thrown arithmetic failures are forbidden in consensus paths. Invalid operations are deterministically rejected without poisoning the snapshot. |
-| SEC-4.4 | Multi-metagraph maps are globally ordered and folded through the evolving registry, eliminating right-biased address/fee collisions. CL1 message validation reads the exact pinned `(ordinal,hash)` state, never a local GL0 head. |
-| SEC-4.5 | Reward withdrawals group and checked-sum by address, retain unpaid records, and weight the current stake record. Pricing input has a bounded, explicit global authority or remains disabled. |
-| SEC-4.6 | After every accepted operation and for every currency, a test oracle proves `sum(spendable)+sum(locked)+sum(reserved)=declaredSupply` and `declaredSupply'=declaredSupply+authorizedMint-authorizedBurn`, with explicit fee sinks, no duplicated reference, and no negative component. |
-| SEC-4.7 | ECO-07 regression: adversarial aggregate fee vectors around `Long.MaxValue` use checked arithmetic and cannot wrap, saturate, mint, or abort the containing snapshot. |
-
-### SEC-5 - Exact-once inter-metagraph settlement
-
-**Owns:** ECO-05 and the cross-metagraph portions of ECO-03, ECO-04, ECO-12,
-ECO-18.  
-**Depends on:** SEC-2, SEC-3, SEC-4.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-5.1 | Implement the Section 3 state machine and domain-separated operation IDs in canonical GL0 MPT state for every enabled inter-metagraph operation, independent of shard assignment. Unregistered operation types reject rather than falling through to carried authority. |
-| SEC-5.2 | Prove authorization origin against `finalizedOriginRef`, but read Active/Consumed/Expired status and evolving balances from the exact proposal parent; thread same-batch writes in canonical order. Move the reservation under checked rules, write nullifier/status, and enqueue delivery in one write set. No ad hoc or saturating read-side overlay can create spendable value. |
-| SEC-5.3 | Replace bounded `P/U` reconstruction with a canonical lossless pending queue plus permanent nullifier and monotone ML0 progress. Queue compaction requires a finalized, GL0-recreated acknowledgement. |
-| SEC-5.4 | Every ML0 snapshot declares exact certified GL0 base and prior settlement cursor. ML0 applies mandatory inbox entries before local CL1 operations; GL0 replays that same order and rejects gaps/skips/stale bases. Recovery is either contiguous message replay or adoption of a certificate-bound canonical slice/root/cursor, never an ML0-claimed slice. CL1 only adopts the finalized GL0 result. |
-| SEC-5.5 | Timeout/cancel/refund is an exclusive GL0 transition from unconsumed authorization. The ADR fixes its certified GL0 time source, boundary predicate, and same-batch priority against consume/cancel. A consumed intent can never refund, and a refunded intent can never consume. |
-| SEC-5.6 | Deterministic backpressure defers the entire containing ML0 binary before partial effects when a queue/envelope is full; GL0 never adopts it and silently omits one framework effect. Restart, long partition, acknowledgement loss, and replay cannot duplicate or erase settlement. |
-| SEC-5.7 | First ship only one-shot allow-spend consume; a partial consume refunds the remainder and consumes the whole authorization. Each later operation type needs explicit authorization/replay/remainder semantics plus a RED adversarial suite before registration. |
-| SEC-5.8 | Pre-ack, post-ack, and recovered effective balances are byte-identical; one authorization concurrently consumed across metagraphs, shards, ordinals, and forks produces at most one finalized effect. Permanent logical nullifiers may be physically compacted only behind a proven commitment/absence-proof scheme. |
-| SEC-5.9 | Bound permanent state growth with protocol fees/rent and explicit storage limits or a proven accumulator/absence-proof compaction. Age alone never expires replay protection. |
-| SEC-5.10 | Race suite covers consume vs cancel/expiry in one batch, two unfinalized descendants, inbound settlement plus local spend, acknowledgement plus new settlement, fast-forward then replay of the boundary message, and protocol upgrade with an old live authorization. |
-| SEC-5.11 | ECO-09 regression: incremental replay uses one coherent exact parent reader for state, removals, status, and balances; a consumed lock/allow-spend cannot resurrect across a child. |
-
-### SEC-6 - Shard lifecycle without shard authority
-
-**Owns:** SHARD-01, SHARD-02, SHARD-03.  
-**Depends on:** SEC-2, SEC-3.6, and SEC-5.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-6.1 | Replace ordinal-only anchor/base fields with signed certified references `(ordinal,hash,mptRoot,setHash/certificateHash)`, derive execution epoch from that anchor with one pure function, and reject any mismatch before committee lookup or replay. `ShardCheckpoint.scala:53-67` and `PinnedCurrencyInfoReader.scala:90-96` currently rely on ordinal-only resolution. Adversarial branch ambiguity and epoch-grinding tests are RED then GREEN. |
-| SEC-6.2 | Advance checkpoint/adoption watermarks only from the finalized GL0 hook, keyed by exact checkpoint and global hashes. Reorged candidates never suppress replay. |
-| SEC-6.3 | Implement sibling rollback to a common canonical parent and full ordered replay. Missing ancestry or bytes defer without mutation; no ordinal relabel/reanchor exists. |
-| SEC-6.4 | Committee replay/attestation remains an optimization and early fault signal. Every GL0 adopter still runs SEC-4/SEC-5; quorum never bypasses them. |
-| SEC-6.5 | Define deterministic bounded censorship fallbacks for both metagraph-binary admission withholding and checkpoint/window withholding. Every fallback enters universal GL0 replay and cannot bypass ordering, authorization, or envelope limits. Commit `numShards`, assignment rule, admission/execution draw parameters, and rotation rules in network/genesis consensus configuration. |
-| SEC-6.6 | Differential tests run identical inputs at one and many shards, adversarial committee compositions, rotation/cooldown boundaries, withheld windows, and sibling forks. Canonical economic writes and outcomes are identical. |
-| SEC-6.7 | Reconcile mempools after certified fork switches: reinsert every orphaned still-valid DAG/framework input exactly once, discard finalized/conflicting inputs, and prove restart/reorg idempotence. Mempool state never enters the consensus root. |
-| SEC-6.8 | Close the metagraph committee-gate parent-resolution/orphan loop using exact certified references and bounded ancestry recovery; demonstrate the 2-metagraph/2-shard token-lock flow without weakening replay or admission checks. |
-
-### SEC-7 - State commitment and exact recovery
-
-**Owns:** SMT-01 and recovery/root-durability residuals.  
-**Depends on:** SEC-0.5 for the storage contract; integration follows SEC-2,
-SEC-4, and SEC-5.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-7.1 | Either recompute and compare `smtRoot` at consensus/finality or remove it from the signed schema until reproducible. No blind comparison remains. |
-| SEC-7.2 | Inventory every restart, catch-up, rollback, rebootstrap, download, and follower adoption write. Each names an exact byte source and signed-root gate; verification occurs before mutation. Define maximum accepted execution-base age, exact-byte/evidence retention horizons, and the certificate-bound canonical-slice fallback after each horizon; unavailable older references defer/reject without false slash. |
-| SEC-7.3 | Persist/replay every economic status, nullifier, pending queue, slash, backing join, and finality record. No `GlobalSnapshotInfo` projection or node-local cache may reconstruct missing consensus state. |
-| SEC-7.4 | Corrupt/missing-byte and crash-point tests prove fail-closed behavior and byte-identical recovery at one/many shards. |
-
-### SEC-8 - Bounded authenticated consensus transport
-
-**Owns:** NET-01, NET-02A, NET-03 through NET-10. FIN-11 and NET-02 remain
-regression invariants.  
-**Depends on:** SEC-0 envelope definitions; mechanical bounds can run in
-parallel. Finality/evidence outbox acknowledgement depends on SEC-2 and SEC-3.5.
-
-| Task | Acceptance evidence |
-|---|---|
-| SEC-8.1 | Register structural/size topic validators, report application validity, enforce fair per-peer/topic queues and quotas, and score every dynamic critical topic. |
-| SEC-8.2 | Define one protocol-wide envelope maximum above a proved worst valid message. Reject an oversize proposal before local store, mempool clearing, or branch advancement. |
-| SEC-8.3 | Authenticate/localize gRPC (Unix socket or mTLS), permit one subscribed consumer/demux, validate shard ranges, and cap RPC concurrency, queue memory, and outbox storage. |
-| SEC-8.4 | Make every consensus/evidence outbox durable until canonical finalized-inclusion acknowledgement. Every invalid-root rejection of a checkpoint carrying slash-eligible registered signatures emits SEC-3.5 canonical evidence before dropping it; unsigned/malformed junk cannot create slash work. Crash/restart recovers and re-emits valid evidence. Retry semantics must survive GossipSub seen-cache suppression without changing signed bytes. |
-| SEC-8.5 | Enforce ChainSync deadlines, rate/concurrency/range limits before allocation; select eligible scored validators, penalize empty/malformed responses, and require multi-peer agreement where recovery data is not self-authenticating. Health/reconnect requires intersection across every protocol-required topic; one partially subscribed peer cannot mask missing seed/validator connectivity. |
-| SEC-8.6 | Namespace discovery, topics, and protocols by consensus-pinned network/genesis identity; harden metrics/management endpoints. |
-| SEC-8.7 | Flood, slow-read, eclipse, sidecar-crash, message-loss, oversize, and partition tests show bounded memory/disk and eventual recovery without accepting invalid state. |
-| SEC-8.8 | NET-02 regression: message IDs remain domain-separated by exact topic/network domain, with wrong-topic prepublication and same-topic dedup vectors in CI. |
-
-### SEC-9 - Economic release qualification
-
-**Owns:** closure evidence for every finding and invariant.  
-**Depends on:** SEC-1 through SEC-8.
-
-| Gate | Required evidence |
-|---|---|
-| G1 Reference differential | Production kernel and pure interpreter agree on accepted/rejected IDs and exact writes for generated/adversarial traces. |
-| G2 Conservation | Supply/lock/reservation invariant holds after every prefix; replay, input permutation before canonical sorting, and implementation chunking/parallelism within one ordered batch cannot change the result. |
-| G3 Shard equivalence | Same ordered economic trace at `numShards=1`, 2, and K yields identical canonical economic leaves/root and operation statuses. |
-| G4 Byzantine roles | Malicious GL1, ML0, CL1, DL1, producer, admission committee, execution committee, watchtower, and peer cannot authorize an invalid effect. |
-| G5 Finality | Model proof plus cluster partitions/restarts/reordering show no conflicting certificate or finalized economic release within the documented adversary bound. |
-| G6 Recovery | Crash/restart/reorg/catch-up at every write boundary reproduces exact bytes or stops before mutation; nullifiers and finality never disappear. |
-| G7 Platform determinism | Linux/macOS and supported JVM/CPU matrix produce identical roots for boundary vectors; no floating-point consensus arithmetic exists. |
-| G8 Network adversity | Sustained junk, slow peers, lost first publication, sidecar restart, eclipse attempts, and maximum valid envelopes remain bounded and live. |
-| G9 Finding closure | Every open CRITICAL/HIGH row has a merged fix, RED/GREEN exploit regression, source re-audit, and no compensating-control-only waiver. |
-
-## 6. Dependency graph and work waves
-
-```text
-SEC-0 protocol + SEC-0.5 storage contract
-  |-- SEC-1 finality + SEC-3.1 backed stake --> SEC-2 durable finality/release --+
-  |-- SEC-3 authorization/backing ------------> SEC-4 deterministic kernel -----+--> SEC-5 exact-once inter-MG
-  |-- SEC-8 mechanical transport (parallel) -------------------------------------+          |
-                                                                                           +--> SEC-6 shard lifecycle
-SEC-0.5 + SEC-2 + SEC-4 + SEC-5 --> SEC-7 commitment/recovery integration ----------------+
-SEC-1..SEC-8 ----------------------------------------------------------------------------> SEC-9 release gates
-```
-
-Recommended execution waves:
-
-| Wave | Work | Parallelism | Exit condition |
+| Packet | Write scope | Starts | Exit artifact |
 |---|---|---|---|
-| 0 | SEC-0/SEC-0.5 plus RED exploit tests for FIN-01/02/04/06, ECO-02/03/04/05/18, SHARD-03 | One protocol/storage contract owner; test work parallel | ADR, interpreter, key/WAL contract, fail-closed deployment gate, and finding ledger approved. |
-| 1 | SEC-1 finality design/model; SEC-3 authorization/backing; SEC-8 envelope/auth/rate-limit foundations | Three parallel teams | Finality proof/model passes; unsigned/replayed authority paths have specified replacements; transport envelopes frozen. |
-| 2 | SEC-2 durable finality; SEC-4 transition kernel | Two parallel teams with shared state API review | One finalized release gate and one checked kernel used by producer/verifier. |
-| 3 | SEC-5 allow-spend-only exact-once protocol; SEC-7 commitment/recovery integration | Parallel after shared key schema is frozen | Permanent IDs/nullifiers and idempotent finalized delivery survive restart/reorg. |
-| 4 | SEC-6 shard lifecycle; remaining SEC-8 durability/recovery | Parallel | Committee epoch, watermark, sibling recovery, and transport tests pass. |
-| 5 | SEC-9 adversarial qualification | Independent red team owns verdict | Every CRITICAL/HIGH is closed; no economic release waiver. |
+| P0 owner decisions/architecture guard | docs, finding ledger, source denylist test | now | Ratified decision record and CI guard against global BFT/universal replay drift. |
+| P1 Scodec manifest/negative corpus | shared serde/codec tests only | E0 vocabulary | Frozen vectors and strict decoder RED/GREEN corpus. |
+| P2 economic reference interpreter | pure shared model/tests | E0 grammar | Prefix differential oracle covering all enabled operations. |
+| PF finality reference model | pure model/checker/tests | E0 finality answers | Phase/cascade/density counterexample report and vectors. |
+| P4 checkpoint schema/root model | shared schema plus pure diff/root tests | E1 base contract, E2 output shape | Complete root/write-set proof and canonical checkpoint vectors. |
+| P5 stake/KES/evidence model | shared schemas/validators/tests | E1 identities | Backing, rotation, false-slash, and exact-debit model. |
+| P6 transport/resource RED corpus | `p2p` and JVM boundary tests only | E0 caps | Reproducible flood/drop/recovery failures and bounded interface. |
+| P7 FinalityGate/tower runtime | finality/store plus owned GL0 integration | PF model/E1 codecs | Crash-consistent hash-bound Phase-2, density/deep recovery, consensus-reproduced `smtRoot`, and portable tower proofs. |
+| P8 shard execution runtime | sharding code plus owned GSAM adapter | P4/P5/P7 interfaces | Replay-before-sign and zero-replay ordinary adoption. |
+| P9 cross-MG kernel | pure/global settlement plus owned GL0 adapter | P2/P7/P8 | Allow-spend exact-once across shards/reorg/restart. |
+| P10 follower/GSI slices | one module per agent behind typed MPT/finality APIs | P7/P9 interfaces | Exact-hash reorg tests and module-specific GSI removal. |
+| P11 migration tool | isolated tooling/tests | E1/E2/E11 schemas | Reproducible snapshot-to-genesis manifest/root. |
+| P12 independent qualification | black-box tests/audit only | closing candidate | Release verdict and artifact bundle. |
 
-## 7. Finding ownership
+Every packet begins with a write-set manifest and named test IDs from the test
+plan. A shared hotspot change is queued through its integration owner.
 
-| Owner | Findings |
-|---|---|
-| SEC-1 | FIN-01, FIN-02, FIN-03, FIN-12 |
-| SEC-2 | FIN-04, FIN-05, FIN-06, FIN-07, FIN-08, FIN-09, FIN-10 |
-| SEC-3 | ECO-02, ECO-03, ECO-04, ECO-06, ECO-18 |
-| SEC-4 | ECO-10, ECO-11, ECO-12, ECO-13, ECO-14, ECO-15, ECO-16, ECO-17 |
-| SEC-5 | ECO-05 plus cross-metagraph closure for ECO-03/04/12/18 |
-| SEC-6 | SHARD-01, SHARD-02, SHARD-03 |
-| SEC-7 | SMT-01 |
-| SEC-8 | NET-01, NET-02A, NET-03, NET-04, NET-05, NET-06, NET-07, NET-08, NET-09, NET-10 |
-| SEC-1 regression | FIN-11 |
-| SEC-3 regression | ECO-01, ECO-08 |
-| SEC-4 regression | ECO-07 |
-| SEC-5 regression | ECO-09 |
-| SEC-8 regression | NET-02 |
+## 7. Explicit non-goals and retired directions
 
-The ownership table covers every CRITICAL/HIGH finding open in the 2026-07-11
-audit. MEDIUM ECO-14/ECO-16 and NET-08/09/10 are included because they touch
-consensus economics or the production security boundary, not deferred as hygiene.
+- No global partially synchronous BFT proposal/vote/lock/QC/view-change protocol.
+- No universal full CL1 recreation by ordinary GL0 adopters.
+- No blind committee signing for availability/chain agreement under an execution
+  signature type.
+- No ML0 `authoritative*` fields or `AdoptFromSignedFields`.
+- No direct shard-to-shard economic receipts in v1.
+- No stake-weighted secret-VRF claim for the current execution-shard draw.
+- No fork-only compatibility schema for undeployed post-v4 work.
+- No general opaque/data-only lane unless explicitly retained by owner decision.
+- No GSI as consensus or recovery authority in the target.
+- No claim that slashing after value exits is sufficient.
+- No claim that Phase 2 is irreversible or that ordinal-only finality is adequate.
+- No claim that `k2`, local pruning, or a retention watermark is an immutable
+  consensus-finality floor.
 
-## 8. First implementation packets
+## 8. Plan integrity audit
 
-Do not begin with shard expansion. The first mergeable packets are:
+| Prior claim | Verdict at baseline | Roadmap disposition |
+|---|---|---|
+| GL0 Nakamoto loop replaced global BFT rounds | **Source-supported active path**, but dormant inherited event-loop construction remains. | E4.8 deletes the dormant GL0 wiring; ML0 BFT stays. |
+| Avalanche optimistic finality implemented | **False.** Query cascade/alpha are absent; the named accumulator is an arrival-order-sensitive latest-color margin, and the state-changing path is separate legacy aggregation. | E3/E4 plus FIN-M/FIN-S. |
+| Finality phases are implemented by `FinalityGate` | **False.** Gate is an ordinal serving facade; Phase 0/1/2 state is not hash-bound and tower/SMT evidence is not consensus-reproduced. | E3/E4. |
+| Phase 2 cannot reorg | **Rejected owner model.** Phase 2 remains density-reorgable; current density code is default-off, imposes an age floor, and sinks are incomplete. | E3.4/E4.5/E10. |
+| `k2` is an immutable finality floor | **Rejected owner model.** `k2` is recommended retention/recovery capacity only. | E3.9/E4.5/E11.5. |
+| Tower/NiPoPoW eligibility is enabled | **False.** Eligibility is emitted as `NotComputed` and `smtRoot` comparison is not load-bearing. The verifier now binds every carried VRF proof/output to the carried eta/slot under the current atomic period-zero pair and ignores claimed pool size, but deliberately returns historical eligibility unavailable without exact canonical branch registry/roster/stake/eta witnesses. | E1.9/E4.10-E4.13. |
+| Execution committee is stake-weighted secret VRF | **False for current execution shards.** Membership is public deterministic VK-hash with uniform weight; possession VRF is separate. | E6.3/E6.4. |
+| Staircase shard duty exists | **Source-supported**, five-slot normal windows and widened genesis window. The worktree rejects a wire epoch inconsistent with the signed anchor ordinal, but exact hash-bound Phase-2 ancestry and canonical R remain open. | E6.3/E8.2. |
+| Every execution signer replays | **Type-enforced for the current root-recreation checkpoint.** The emitter accepts only `VerifiedShardCheckpoint`; future diff/intents/complete-root parity and all signing surfaces still require closure. | E7/E8.3 plus SIG/SHARD-E tests. |
+| Committee byte diff adoption is active | **False after `c610a0740`.** Diff was removed and ordinary GL0 replay introduced. | E7/E8/E9 selective forward repair. |
+| Removing `authoritative*` is complete economic enforcement | **False.** Those overrides are correctly deleted, but authorization/conservation/replay defects remain and the useful diff was conflated with them. | E2 and E7.2. |
+| `numShards=1` has equivalent security | **False today.** Committee/watchtower paths are gated off. | E8.9 and SHARD-C-005. |
+| Cross-shard reads are finality-first | **Partly source-supported**, but current finality is ordinal-only/unsafe and global conflict semantics are incomplete. | E4/E9/E10. |
+| Watchtower slashing closes collusion | **Unproven.** Replay/evidence scaffold exists; selection, false-slash, bonded debit, and release timing remain blockers. | E6/E8 and WT tests. |
+| Scodec migration complete | **False.** MPT codecs exist; consensus hashing/signing and era dispatch still use legacy paths. | E1. |
+| GSI removed | **False.** Production state/follower/API/recovery references remain. | E11. |
+| Hard-fork migration no longer needed | **False product conclusion.** No live legacy mode is needed, but the requested source-snapshot-to-new-genesis tool does not exist. | E13. |
+| Mempool reinsertion complete | **Not source-verified.** Historical TODO has no reliable closing evidence. | E4.5/E8.6/E10.3 and explicit requeue tests. |
+| Two-level finality complete | **False.** ML0, shard execution/chain, and GL0 phases are not yet integrated under the exact lifecycle. | E4/E8/E10. |
 
-1. **Packet A - SEC-0 contract, storage contract, and reference interpreter.**
-   The only initial runtime change is a fail-closed public deployment/economic
-   release guard. Freeze operation IDs, ordering, checked arithmetic, settlement
-   states, key/WAL atomicity, and finding ownership; add RED vectors for the known
-   exploits.
-2. **Packet B - SEC-3 replay/authorization closures.** Fee nullifier first, then
-   unsigned unlock removal, no-ref spend authority removal/policy, and backing-lock
-   join. These are narrow, independently testable, and unblock the kernel.
-3. **Packet C - SEC-1 finality model and ADR.** Do not patch only the denominator.
-   Select and prove the certificate/lock rule before rewriting live finality.
-4. **Packet D - SEC-4 reservation kernel skeleton.** Route a small operation class
-   through the pure checked accumulator without changing wire schemas, then migrate
-   all economic classes behind differential tests.
+Historical checkmarks in `NAKAMOTO-TODO.md` and `NAKAMOTO-PLAN.md` are not release
+evidence. The current audit, this table, and the machine-readable E0 ledger control.
 
-Only after A-D establish stable contracts should SEC-5 replace the current
-cross-metagraph `P/U` and effective-balance overlay. Otherwise the interaction
-protocol would be built twice on changing finality, identity, and arithmetic rules.
+## 9. Consensus determinism ledger
 
-## 9. Other consensus backlog disposition
+Each item is forbidden from affecting accepted IDs, ordering, a diff/root,
+committee/sample membership, phase, fork choice, slash verdict, or recovery result
+unless converted to the named canonical input.
 
-These existing roadmap items are not silently dropped:
+| Node-local/asymmetric input | Current exposure or risk | Required replacement |
+|---|---|---|
+| Wall clock / local genesis fallback | Slot/expiry/activation can diverge; config still describes a local-clock genesis fallback. | Genesis/finalized protocol time and exact successor/slot evidence only. |
+| Signed/transport `parentSlot` not checked against the exact retained parent | A producer inflates the LDD gap and turns a losing VRF trial into an accepted leader win. | Derive the gap from the exact retained parent certificate and run the same pure check before producer signing and follower storage. |
+| Missing, partial, or wrong-branch eta-source ancestry | Typed range checks defer on incomplete/empty history, and GL0 GSAM/admission use exact parents. Shard committee/producer/attester paths still use ambient eta because `ShardCheckpoint` lacks an exact GL0 hash/root, so identical bytes can draw or verify differently across sibling-local views. | Add signed exact Phase-2 `(ordinal,hash,mptRoot)` and use the exact-parent resolver at every shard consumer; missing/partial history fetches/defers, while a genuinely complete empty interval follows one explicit canonical rule rather than an absence fallback. |
+| Current/live stake substituted for N-2 stake | Producer and verifier use different LDD thresholds after stake changes; a newly enlarged attacker can pass only the live threshold. | One parent-ordinal-derived N-2 period and exact hash-bound historical distribution on both sign and verify paths; missing history defers. |
+| Sender-carried GL0 leader VRF key | Period-zero producer/receiver paths now reject a replacement key, but runtime consumers still lack exact-parent N-2 resolution. | Resolve the atomic KES+VRF pair from the exact branch's N-2 view and intersect it with the delayed authorized roster/stake population; carried key only compares and missing/mismatch rejects. |
+| Local best tip or pending branch used as a “finalized” read | Same operation can see different owner/base state. | Exact canonical P2 `(ordinal,hash,root)` for origins/bases; exact proposal parent for branch-local status. |
+| Live mutable store versus pinned store | Producer/signer/adopter can diff/replay different priors. | Signed exact base plus version-retained reader. |
+| Peer selection, cooldown, response order, timeout | Network success/order can change bytes or slash verdict. | Transport obtains exact hash-addressed bytes only; consensus defers on absence. |
+| Locally observed active set / renormalized stake | Avalanche/finality/committee denominators diverge under partition. | Delayed canonical registry/stake state, modeled as epoch `N-2` registry and epoch `N-1` eta for epoch `N`, with exact anchor/hash. |
+| Wire-carried checkpoint epoch | Worktree rejects an epoch inconsistent with the signed anchor ordinal, but an attacker can still choose an older admissible ordinal and its matching favorable committee; local R can also split validity. | Derive the anchor from exact proposal-parent hash-bound Phase-2 evidence/freshness, then recompute epoch/eta/roster using a canonical parameter hash. |
+| Local eta-period length `R` | The same signed anchor ordinal maps to different execution epochs and rosters. | Canonical network/genesis/era parameter object/hash; local mismatch halts before validation. |
+| Local `staircaseDeltaSlots` | The same signed checkpoint, parent, and roster schedule different producers. | Proposal-parent-bound canonical parameter object/hash; local mismatch halts before validation. |
+| Local HOCON/env override | Validators can apply different k/era/shard/limit semantics. | Canonical parameter hash from genesis/finalized state; local mismatch halts. |
+| `Double`/platform rounding | `R = round(3.1d*k1)` is not a canonical cross-language formula. | Exact bounded integer/rational derivation and golden vectors. |
+| Map/set/hash iteration | Input order, diff bytes, identities, or roots can vary. | Sorted canonical collections and explicit total operation order. |
+| Gossip/queue/shard arrival order | Competing operations/checkpoints can select different winners. | Parent-contiguous buffering plus canonical GL0 merge order. |
+| Thread scheduling/chunking/parallel execution | Same batch can observe partial/interleaved state. | Pure ordered accumulator and atomic write set; parallelism only behind deterministic join. |
+| JSON/Kryo/decoder probing | Multiple byte encodings or decoder choices change hashes/lanes. | One strict Scodec era and explicit signed lane/type. |
+| GSI/local caches/reconstructed projections | Restart or cache history can invent a different state view. | Typed canonical MPT plus exact journals; cache is non-authoritative. |
+| Missing-input sentinels such as `Hash.empty` | A “cannot derive” result can be confused with a real mismatch. | Typed `Verified` / `Mismatch` / `Unavailable`; unavailable defers and cannot slash. |
+| Local watchtower/admission participation | Optional observers can change validity or release asymmetrically. | Canonical assignment and explicit threshold/deadline/release rule. |
+| P2 ordinal without hash | Same-ordinal density replacement is invisible. | Hash-bound phase references and reorg events. |
 
-| Item | Disposition and dependency |
-|---|---|
-| Global stake-weighted leadership | Owned by SEC-1.9 and blocked by live backing in SEC-3.1. It is not execution-shard membership. |
-| KES on-chain rotation | Owned by SEC-1.8 and required before a long-running KES-secured release. |
-| Mempool reinsertion | Owned by SEC-6.7 after certified fork choice/recovery exists. |
-| Metagraph parent-resolution wedge | Owned by SEC-6.8 after exact certified anchor schemas are fixed. It is an e2e liveness blocker, not the security dependency head. |
-| Content-addressed MPT | Adopt only as needed to satisfy SEC-0.5/SEC-7 exact-byte and atomic recovery contracts; storage representation is not economic authority. |
-| Separate two-level economic finality | Not a second release rail. ML0 consensus proposes a candidate; only the GL0 certificate makes framework economics usable. A future independent rail needs a new intersection proof and ADR. |
-| Hard-fork/dual-mode migration | Retired for the greenfield v4 fork unless migration from an actually deployed network becomes a new product requirement. |
-| Roots-only GL0 economics | Retired. It contradicts universal GL0 framework execution. |
-| Secret stake-weighted execution-shard VRF | Retired. The current execution draw is uniform/public; changing it needs a new threat model and does not replace GL0 replay. |
-| NIPoPoW, BLS aggregation, global attestation committees | Post-SEC-9 features/optimizations. None may change the validity or finality rule without reopening SEC-0/SEC-1 proofs and adversarial gates. |
-| Replacing ML0 BFT consensus | Separate product work after SEC-9. It must preserve ML0-as-proposer and GL0-as-economic-authority. |
+The E0 ledger expands this table with every concrete source read and its owning
+test. A code search alone is insufficient; callers must be traced to the signed
+root/phase/slash sink.
+
+## 10. Immediate next order
+
+1. Propagate the locked decisions and remaining open gates into ADR-0016/0017,
+   the artifact lifecycle, test plan, and architecture drift guard.
+2. Resolve only the remaining parameter/recovery gates O-01 through O-10; runtime
+   work must not invent answers.
+3. Run P0/P1/P2/PF/P5/P6 in parallel: decisions/RED ledger, serde vectors,
+   economic oracle, finality model, stake/evidence model, and transport RED corpus.
+4. Freeze the complete root/write set, GL0 correction shape, and checkpoint
+   preimage in P4.
+5. Implement P7 hash-bound Phase-2, density/deep recovery, and tower/SMT
+   reproduction before any checkpoint hard-anchor or cross-metagraph integration.
+6. Implement P8 replay-before-sign/diff adoption, then P9 allow-spend-only global
+   settlement.
+7. Land follower rollback and MPT/GSI removal slices, then recovery/transport.
+8. Keep remaining interaction types disabled until their E9.8 contracts exist.
+9. Perform E14 qualification before any economic/public testnet.

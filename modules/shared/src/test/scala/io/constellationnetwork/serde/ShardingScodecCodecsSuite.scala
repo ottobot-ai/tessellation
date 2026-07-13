@@ -108,13 +108,13 @@ object ShardingScodecCodecsSuite extends FunSuite {
   }
 
   test("current sharding schema round-trips every binary record") {
-    roundTrip(shardId) and
-      roundTrip(ShardOrdinal(11L)) and
-      roundTrip(signature) and
-      roundTrip(delta) and
-      roundTrip(checkpoint) and
-      roundTrip(fraudProof) and
-      roundTrip(evidence)
+    roundTrip(shardId)
+      .and(roundTrip(ShardOrdinal(11L)))
+      .and(roundTrip(signature))
+      .and(roundTrip(delta))
+      .and(roundTrip(checkpoint))
+      .and(roundTrip(fraudProof))
+      .and(roundTrip(evidence))
   }
 
   test("ShardCheckpoint binary encoding commits to executionBaseOrdinal") {

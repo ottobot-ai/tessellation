@@ -1,7 +1,14 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
-import cats.data.NonEmptyList
+import java.security.KeyPair
 
+import cats.data.NonEmptyList
+import cats.effect.{IO, Resource}
+import cats.syntax.all._
+
+import io.constellationnetwork.ext.cats.effect.ResourceIO
+import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.infrastructure.sharding.RegisteredCheckpointSigner
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
@@ -9,40 +16,61 @@ import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 
 import eu.timepit.refined.types.all.NonNegLong
-import weaver.SimpleIOSuite
+import weaver.MutableIOSuite
 
 /** Slice 14 — unit tests for [[GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures]]: the pure helper the gl0 consensus LEADER uses
   * to enrich a candidate checkpoint's `committeeSignatures` with the committee attestations collected in the per-shard `ShardTipTracker`.
-  * The count affects selection only; `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` still replays every included transition.
+  * The count affects producer-side selection only; `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` independently verifies the
+  * execution certificate, continuity, namespace-bounded diff, and resulting root before adoption.
   *
   * Determinism is the load-bearing property: every follower threads the leader's enriched set unchanged and re-verifies it, so the splice
   * must (a) leave the canonical signing-preimage UNTOUCHED (`committeeSignatures` is excluded from `ShardCheckpointSigPreimage`), (b) dedup
   * by `peerId` so the producer's own embedded signature is never double-counted, and (c) order the appended signers canonically (sorted by
   * `peerId` hex) so the leader re-validating its own artifact yields byte-identical bytes regardless of `Map` iteration order.
   */
-object SpliceCommitteeSignaturesSuite extends SimpleIOSuite {
+object SpliceCommitteeSignaturesSuite extends MutableIOSuite {
 
-  private def peer(b: String): PeerId = PeerId(Hex(b * 64))
+  final case class RegisteredOperator(keyPair: KeyPair, peerId: PeerId)
 
-  private def sig(p: PeerId): CommitteeMemberSignature =
+  final case class TestContext(
+    hasher: Hasher[IO],
+    securityProvider: SecurityProvider[IO],
+    checkpointSigner: RegisteredCheckpointSigner,
+    operators: List[RegisteredOperator]
+  )
+
+  override type Res = TestContext
+
+  override def sharedResource: Resource[IO, Res] =
+    for {
+      sp <- SecurityProvider.forAsync[IO]
+      implicit0(securityProvider: SecurityProvider[IO]) = sp
+      implicit0(jsonSerializer: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
+      implicit0(hasher: Hasher[IO]) = Hasher.forJson[IO]
+      checkpointSigner <- RegisteredCheckpointSigner.make.asResource
+      keyPairs <- Resource.eval(List.fill(4)(KeyPairGenerator.makeKeyPair[IO]).sequence)
+      operators = keyPairs
+        .map(keyPair => RegisteredOperator(keyPair, PeerId.fromPublic(keyPair.getPublic)))
+        .sortBy(_.peerId.value.value)
+      _ <- Resource.eval(operators.traverse_(operator => checkpointSigner.preregisterGenesis(operator.keyPair, operator.peerId)))
+    } yield TestContext(hasher, securityProvider, checkpointSigner, operators)
+
+  /** Construction-only placeholder required by the non-empty wire type. It is replaced with a registered signature before any checkpoint is
+    * returned, spliced, or treated as a valid artifact; committee signatures are excluded from the signing preimage.
+    */
+  private def constructionScaffold(p: PeerId): CommitteeMemberSignature =
     CommitteeMemberSignature(
       peerId = p,
-      vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)),
-      ed25519Sig = Hex.fromBytes(Array.fill[Byte](64)(0x11.toByte)),
-      kesProductSig = Hex.fromBytes(Array.fill[Byte](32)(0x43.toByte)),
+      vrfProof = Hex.fromBytes(Array.emptyByteArray),
+      ed25519Sig = Hex.fromBytes(Array.emptyByteArray),
+      kesProductSig = Hex.fromBytes(Array.emptyByteArray),
       kesTreeStep = 0
     )
 
-  // peerIds with KNOWN hex ordering: aa < bb < cc < dd. Producer = pB (the MIDDLE) so the sorted appended set
-  // (pA, then pC, pD) straddles it — proving the producer head is PRESERVED, not re-sorted into position.
-  private val pA = peer("aa")
-  private val pB = peer("bb")
-  private val pC = peer("cc")
-  private val pD = peer("dd")
-
-  private def baseCheckpoint(producer: PeerId): ShardCheckpoint =
+  private def checkpointTemplate(producer: PeerId): ShardCheckpoint =
     ShardCheckpoint(
       shardId = ShardId.unsafeApply(0),
       parentCheckpointHash = Hash("0" * 64),
@@ -50,41 +78,78 @@ object SpliceCommitteeSignaturesSuite extends SimpleIOSuite {
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(5L)),
       slot = SlotT.unsafeApply(5L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
-      committeeSignatures = NonEmptyList.of(sig(producer)),
+      committeeSignatures = NonEmptyList.of(constructionScaffold(producer)),
       epoch = EtaPeriod(0L)
     )
 
-  pureTest("enriches with collected sigs, dedups the producer by peerId, sorts the appended signers by peerId hex") {
-    val cp = baseCheckpoint(pB)
-    // collected includes the producer (pB) plus three others, in NON-sorted insertion order
-    val collected: Map[PeerId, CommitteeMemberSignature] =
-      Map(pD -> sig(pD), pB -> sig(pB), pA -> sig(pA), pC -> sig(pC))
-    val out = GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(cp, collected)
-    val peers = out.committeeSignatures.toList.map(_.peerId)
-    expect(out.committeeSignatures.size == 4)
-      .and( // pB + {pA, pC, pD}; pB NOT doubled
-        expect(peers.toSet == Set(pA, pB, pC, pD))
+  private def sign(
+    checkpoint: ShardCheckpoint,
+    operator: RegisteredOperator,
+    ctx: TestContext
+  ): IO[CommitteeMemberSignature] = {
+    implicit val hasher: Hasher[IO] = ctx.hasher
+    implicit val securityProvider: SecurityProvider[IO] = ctx.securityProvider
+
+    ctx.checkpointSigner.sign(checkpoint, operator.keyPair, operator.peerId)
+  }
+
+  private def checkpointWithProducer(operator: RegisteredOperator, ctx: TestContext): IO[ShardCheckpoint] = {
+    val template = checkpointTemplate(operator.peerId)
+    sign(template, operator, ctx).map(signature => template.copy(committeeSignatures = NonEmptyList.one(signature)))
+  }
+
+  test("enriches with registered collected signatures, dedups the producer, and sorts appended signers") { ctx =>
+    val List(pA, pB, pC, pD) = ctx.operators: @unchecked
+
+    for {
+      checkpoint <- checkpointWithProducer(pB, ctx)
+      signatures <- List(pD, pB, pA, pC).traverse(operator => sign(checkpoint, operator, ctx).map(operator.peerId -> _))
+      collected = signatures.toMap
+      out = GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(checkpoint, collected)
+      peers = out.committeeSignatures.toList.map(_.peerId)
+    } yield
+      expect(out.committeeSignatures.size == 4)
+        .and(expect(peers.toSet == ctx.operators.map(_.peerId).toSet))
+        .and(expect(peers.head == pB.peerId))
+        .and(expect(peers.tail == List(pA.peerId, pC.peerId, pD.peerId)))
+  }
+
+  test("leaves the signing preimage (canonical checkpoint-hash bytes) unchanged") { ctx =>
+    val List(pA, pB, pC, _) = ctx.operators: @unchecked
+
+    for {
+      checkpoint <- checkpointWithProducer(pB, ctx)
+      a <- sign(checkpoint, pA, ctx)
+      c <- sign(checkpoint, pC, ctx)
+      out = GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(checkpoint, Map(pA.peerId -> a, pC.peerId -> c))
+    } yield expect(out.signingPreimage == checkpoint.signingPreimage)
+  }
+
+  test("wire signature reordering changes the nominal producer label without changing signed preimage") { ctx =>
+    val List(pA, pB, _, _) = ctx.operators: @unchecked
+
+    for {
+      checkpoint <- checkpointWithProducer(pB, ctx)
+      a <- sign(checkpoint, pA, ctx)
+      reordered = checkpoint.copy(committeeSignatures = NonEmptyList(a, List(checkpoint.committeeSignatures.head)))
+    } yield
+      expect(checkpoint.producerSignature.peerId == pB.peerId)
+        .and(expect(reordered.producerSignature.peerId == pA.peerId))
+        .and(expect(reordered.signingPreimage == checkpoint.signingPreimage))
+  }
+
+  test("no-op when collected is empty") { ctx =>
+    checkpointWithProducer(ctx.operators(1), ctx).map { checkpoint =>
+      expect(GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(checkpoint, Map.empty) == checkpoint)
+    }
+  }
+
+  test("no-op when the only collected signer is the already-embedded producer (dedup)") { ctx =>
+    checkpointWithProducer(ctx.operators(1), ctx).map { checkpoint =>
+      val producer = checkpoint.producerSignature
+      expect(
+        GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(checkpoint, Map(producer.peerId -> producer)) == checkpoint
       )
-      .and(expect(peers.head == pB))
-      .and( // producer head preserved (not re-sorted)
-        expect(peers.tail == List(pA, pC, pD))
-      ) // appended signers sorted by peerId hex
-  }
-
-  pureTest("leaves the signing preimage (canonical checkpoint-hash bytes) UNCHANGED") {
-    val cp = baseCheckpoint(pB)
-    val out = GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(cp, Map(pA -> sig(pA), pC -> sig(pC)))
-    // committeeSignatures is excluded from ShardCheckpointSigPreimage, so splicing extra signers must not change identity.
-    expect(out.signingPreimage == cp.signingPreimage)
-  }
-
-  pureTest("no-op when collected is empty") {
-    val cp = baseCheckpoint(pB)
-    expect(GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(cp, Map.empty) == cp)
-  }
-
-  pureTest("no-op when the only collected signer is the already-embedded producer (dedup)") {
-    val cp = baseCheckpoint(pB)
-    expect(GlobalSnapshotConsensusFunctions.spliceCommitteeSignatures(cp, Map(pB -> sig(pB))) == cp)
+    }
   }
 }

@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto
 
-import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 
 import org.bouncycastle.crypto.digests.Blake2bDigest
 
@@ -11,24 +12,47 @@ import org.bouncycastle.crypto.digests.Blake2bDigest
   * bootstrap convention — so the first eta rotation (period 0 → 1) cannot fork on disagreement about period 0's still-unsettled VRF
   * outputs. First VRF-folded eta is period 2.
   *
-  * Rotation periods are keyed on **snapshot ordinal**, not slot — slots are LDD-paced and lumpy; ordinals are 1:1 with snapshots and give a
-  * stable R that satisfies the Praos R ≥ 3·k₁ stability bound. See `docs/nakamoto/attestation-and-finality.md` §1.
+  * Rotation periods are currently keyed on snapshot ordinal, not slot, using configured `R`. Earlier comments imported the Praos `R >=
+  * 3*k1` rationale, but GL0 is Taktikos/LDD and no source-proven argument shows that bound or its adversary assumptions transfer.
+  * E3.5/PARAM must model and ratify the Taktikos-specific rotation/chain-quality bound and commit R through canonical parameters.
   *
   * This ensures:
   *   - All nodes seeing the same chain compute the same eta (deterministic from chain)
-  *   - Eta for period N is knowable at the 2/3 point of period N-1 (lookahead)
-  *   - A single adversary cannot grind eta without controlling 2/3 of slot leaders
+  *   - Under the current construction, eta for period N is computable after the selected prefix of period N-1 is available
+  *
+  * No 2/3-slot-leader grinding bound is established here for Taktikos/LDD.
   */
 object EtaCalculation {
 
   /** Compute which rotation period an ordinal belongs to. Period 0 = ordinals [0, etaRotationSnapshots), Period 1 = [etaRotationSnapshots,
     * 2*etaRotationSnapshots), etc.
     *
-    * Keyed on **ordinal**, not slot — the security argument is about CP-safety of VRF inputs (a snapshot-indexed property), and slot rate
-    * varies under LDD-fill drift. See `docs/nakamoto/attestation-and-finality.md` §1.
+    * Keyed on ordinal, not slot. This is the current deterministic convention; its Taktikos/LDD safety and canonical R are open E3.5/PARAM
+    * obligations rather than inherited Praos results.
     */
   def rotationPeriod(ordinal: Long, etaRotationSnapshots: Long): Long =
     ordinal / etaRotationSnapshots
+
+  /** Canonical N-2 stake-distribution period for a GL0 child of `parentOrdinal`.
+    *
+    * Production and verification must call this same function. Using current/live stake in verification while production uses this lookback
+    * changes the LDD threshold whenever stake changes and makes an honest signed child locally valid on one path and invalid on the other.
+    */
+  def leaderStakeLookbackPeriod(parentOrdinal: Long, etaRotationSnapshots: Long): EtaPeriod =
+    EtaPeriod(rotationPeriod(math.max(0L, parentOrdinal), etaRotationSnapshots) - 2L)
+
+  /** Execution-shard committee epoch committed by a checkpoint anchored at `gl0AnchorOrdinal`.
+    *
+    * This is the single producer/verifier calculation for the wire `ShardCheckpoint.epoch`: committee membership rotates on the signed GL0
+    * anchor ordinal, never on a receiver's live tip or on an independently chosen wire epoch. Callers must supply the same positive
+    * `etaRotationSnapshots` protocol parameter. The calculation binds epoch to the claimed anchor ordinal only; it does not prove that the
+    * anchor is the exact canonical Phase-2 `(ordinal, hash)`.
+    */
+  def executionShardEpoch(
+    gl0AnchorOrdinal: SnapshotOrdinal,
+    etaRotationSnapshots: Long
+  ): EtaPeriod =
+    EtaPeriod(rotationPeriod(gl0AnchorOrdinal.value.value, etaRotationSnapshots))
 
   /** Compute the ordinal range for a rotation period. Returns (startOrdinal, endOrdinal) inclusive of start, exclusive of end.
     */

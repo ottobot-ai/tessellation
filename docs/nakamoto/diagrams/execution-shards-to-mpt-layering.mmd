@@ -1,3 +1,4 @@
+%% TARGET DESIGN. This is not a description of the currently deployed code path.
 flowchart TB
     CLIENT["native DAG client"] --> GL1["GL1 / DAG L1"] --> GL0["GL0 / DAG L0<br/>global snapshot consensus and canonical MPT"]
 
@@ -7,15 +8,20 @@ flowchart TB
     DL1 --> ML0
     ML0 --> BIN["signed state-channel binary"]
     BIN --> ADM["GL0 per-binary admission committee"]
-    ADM --> SHARD["GL0 execution shard committee<br/>pre-executes and proposes roots"]
-    SHARD --> GL0
+    ADM --> SHARD["GL0 execution shard committee<br/>producer and every signer independently replay<br/>the exact ordered inputs at one Phase-2 base"]
+    SHARD --> DIFF["distinct execution threshold<br/>byte-identical canonical diff + complete root"]
+    DIFF --> GL0
 
-    GL0 --> REEXEC["every GL0 adopter re-executes<br/>GL1 native economics and CL1 framework economics"]
-    REEXEC --> MPT["canonical global MPT and finality"]
-    MPT -.->|"finalized state"| GL1
-    MPT -.->|"finalized state"| ML0
-    MPT -.->|"finalized state"| CL1
-    MPT -.->|"finalized state"| DL1
+    GL0 --> EXEC["all GL0: execute native GL1 +<br/>global cross-MG settlement kernel"]
+    GL0 --> APPLY["ordinary noncommittee GL0: verify execution threshold,<br/>exact base and pre-root CAS, continuity, and namespace;<br/>apply scoped diff and recompute root"]
+    EXEC --> MPT["canonical global MPT<br/>P2 operational / P3 archival"]
+    APPLY --> MPT
+    MPT -.->|"exact Phase-2 state"| GL1
+    MPT -.->|"exact Phase-2 state"| ML0
+    MPT -.->|"exact Phase-2 state"| CL1
+    MPT -.->|"exact Phase-2 state"| DL1
 
-    DL1NOTE["DL1 custom semantics are proof-carried;<br/>proofs never replace CL1 economic execution"]
+    WT["selected noncommittee watchtowers<br/>independently replay for collusion detection<br/>release and adjudication timing remains open"] -.-> SHARD
+
+    DL1NOTE["DL1 custom bytes are isolated commitment/DA data;<br/>they never authorize framework economics"]
     DL1 -.-> DL1NOTE

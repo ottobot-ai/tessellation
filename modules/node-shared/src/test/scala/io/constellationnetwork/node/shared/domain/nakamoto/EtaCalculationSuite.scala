@@ -17,6 +17,16 @@ object EtaCalculationSuite extends SimpleIOSuite {
     )
   }
 
+  pureTest("leader stake lookback is derived from the exact parent ordinal") {
+    expect.all(
+      EtaCalculation.leaderStakeLookbackPeriod(0L, etaRotation) == io.constellationnetwork.schema.nakamoto.EtaPeriod(-2L),
+      EtaCalculation.leaderStakeLookbackPeriod(599L, etaRotation) == io.constellationnetwork.schema.nakamoto.EtaPeriod(-2L),
+      EtaCalculation.leaderStakeLookbackPeriod(600L, etaRotation) == io.constellationnetwork.schema.nakamoto.EtaPeriod(-1L),
+      EtaCalculation.leaderStakeLookbackPeriod(1199L, etaRotation) == io.constellationnetwork.schema.nakamoto.EtaPeriod(-1L),
+      EtaCalculation.leaderStakeLookbackPeriod(1200L, etaRotation) == io.constellationnetwork.schema.nakamoto.EtaPeriod(0L)
+    )
+  }
+
   pureTest("rotationPeriodRange returns correct bounds") {
     val (start, end) = EtaCalculation.rotationPeriodRange(2, etaRotation)
     expect.all(

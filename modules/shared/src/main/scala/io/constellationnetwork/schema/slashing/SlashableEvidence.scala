@@ -1,6 +1,7 @@
 package io.constellationnetwork.schema.slashing
 
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.signature.Signature
@@ -22,11 +23,12 @@ import derevo.derive
   * '''Why no outer `Signed[_]` envelope on the evidence attestations.''' Each [[MetagraphAttestation]] body already carries the KES product
   * signature (verified at step 5 against the operator's master VK in [[io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry]])
   * and the committee VRF proof (verified at step 6 via `CommitteeSortition.verifyMembership`). KES + VRF together carry all the safety the
-  * validator needs — the gossip-path Ed25519 envelope was never re-verified by `SlashableEvidenceValidator`, so wrapping each attestation
-  * in `Signed[_]` here only inflated the wire bytes and the digest preimage with a redundant signature. Distinct binaries on the same
-  * parent prove equivocation regardless: an honest operator who deletes their old KES SK can never re-sign the second binary, so producing
-  * the second KES sig requires deliberate adversarial action. The detector (S4b) strips the gossip-layer `Signed[_]` envelope via `.value`
-  * when constructing evidence; the gossip envelope continues to live on the gossip path where it does get verified.
+  * validator needs once the exact offence-parent state resolves the offender's atomic KES+VRF pair. The gossip-path Ed25519 envelope was
+  * never re-verified by `SlashableEvidenceValidator`, so wrapping each attestation in `Signed[_]` here only inflated the wire bytes and the
+  * digest preimage with a redundant signature. Distinct binaries on the same parent prove equivocation regardless: an honest operator who
+  * deletes their old KES SK can never re-sign the second binary, so producing the second KES sig requires deliberate adversarial action.
+  * The detector (S4b) strips the gossip-layer `Signed[_]` envelope via `.value` when constructing evidence; the gossip envelope continues
+  * to live on the gossip path where it does get verified.
   *
   * '''Wire-byte stability (hard-fork risk).''' The [[BountyDigestPreimage]] is hashed by `Hasher[F]` (canonical Circe JSON over the case
   * class). Adding optional fields, reordering fields, or wrapping a field in `Signed[_]` silently changes the digest bytes and breaks
@@ -90,8 +92,8 @@ object SlashingRejection {
   @derive(eqv, show)
   final case class SubjectMismatch(metagraphA: Address, metagraphB: Address) extends SlashingRejection
 
-  /** §4.1 step 3 — `evidenceA.parentHash != evidenceB.parentHash`. Different VRF inputs ⇒ two distinct committee draws ⇒ no equivocation.
-    * This is the load-bearing identity per `COMMITTEE-SORTITION-DESIGN.md` §2.
+  /** §4.1 step 3 — `evidenceA.parentHash != evidenceB.parentHash`. Parent equality is necessary but not sufficient: exact historical
+    * resolution must also prove the same eta period because eta is part of the committee VRF input.
     */
   @derive(eqv, show)
   final case class ParentMismatch(parentA: Hash, parentB: Hash) extends SlashingRejection
@@ -99,6 +101,12 @@ object SlashingRejection {
   /** §4.1 step 4 — `evidenceA.binaryHash == evidenceB.binaryHash`. Same binary ⇒ duplicate retransmission, not equivocation. */
   @derive(eqv, show)
   final case class DuplicateBinary(binaryHash: Hash) extends SlashingRejection
+
+  /** The attestations were produced under different eta periods, hence different admission committee draws. Same metagraph parent alone is
+    * not equivocation because eta is part of the VRF input.
+    */
+  @derive(eqv, show)
+  final case class AdmissionDrawPeriodMismatch(periodA: EtaPeriod, periodB: EtaPeriod) extends SlashingRejection
 
   /** §4.1 step 5 — KES signature on at least one attestation does not verify under the operator's master VK.
     *
@@ -125,9 +133,8 @@ object SlashingRejection {
   @derive(eqv, show)
   final case class AlreadySlashed(peerId: PeerId, metagraphAddress: Address, parentHash: Hash) extends SlashingRejection
 
-  /** §4.1 step 8 — `currentEpoch > evidenceEpoch + evidence_window`. Stale evidence — the slashed stake has rolled over by now.
-    *
-    * Producer carries `eventEpoch` out-of-band (the validator's input). Window default is 100 epochs per `NAKAMOTO_SLASH_EVIDENCE_WINDOW`.
+  /** §4.1 step 8 — `currentEpoch > evidenceEpoch + evidence_window`. The event epoch comes from the exact historical context resolved for
+    * the signed metagraph parent; a submitter or acceptance caller cannot supply it as authority.
     */
   @derive(eqv, show)
   final case class EvidenceWindowExpired(currentEpoch: Long, eventEpoch: Long, windowEpochs: Long) extends SlashingRejection

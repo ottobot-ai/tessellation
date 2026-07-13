@@ -65,21 +65,21 @@ trait GlobalL0Service[F[_]] {
   def pullGlobalSnapshot(ordinal: SnapshotOrdinal): F[Option[Hashed[GlobalIncrementalSnapshot]]]
   def pullGlobalSnapshot(hash: Hash): F[Option[Hashed[GlobalIncrementalSnapshot]]]
 
-  /** Highest GL0 snapshot ordinal that has reached finality.
+  /** Highest GL0 snapshot ordinal currently exposed through the transitional Phase-2 watermark API.
     *
-    * In BFT GL0 mode this equals the head ordinal (every snapshot is immediately final). In Nakamoto GL0 mode this lags the head: it's the
-    * ordinal up to which attestation-2/3 OR depth-k confirmation has completed. Used by CL0 to gate state-channel-binary pruning on actual
-    * finality so Nakamoto reorgs cannot silently drop binaries.
+    * GL0 is Nakamoto/Taktikos, not BFT. Target Phase 2 belongs to an exact hash selected by decided-attestation `T_weight` OR canonical k1
+    * depth and remains density-reorgable. This ordinal-only response cannot identify same-ordinal replacement, so followers must not treat
+    * it as an immutable finality proof. ML0 may retain its separate BFT consensus.
     *
     * Returns None if the remote GL0 has no snapshots yet (pre-genesis) or the request fails.
     */
   def pullLatestFinalizedOrdinal: F[Option[SnapshotOrdinal]]
 
-  /** Pull GL0 snapshots in the range (lastOrdinal, finalizedOrdinal], i.e. only depth-k-finalized snapshots above our local head.
+  /** Pull GL0 snapshots in the range `(lastOrdinal, finalizedOrdinal]` under the current ordinal-only Phase-2 facade.
     *
-    * Followers (gl1/cl1/dl1/ml0) MUST consume only finalized snapshots — by construction, GL0 reorgs can only happen within the depth-k
-    * window, so finalized snapshots are immutable from the follower's perspective and `replaceByRefs` / `recoverFromOrphan` paths become
-    * unreachable on the happy path. See #122.
+    * Followers (GL1/ML0/CL1/DL1) consume only exact Phase-2 GL0 state, but Phase 2 can be replaced by density selection even beyond k1.
+    * Therefore the target transport must bind each ordinal to its canonical hash and followers must roll back/re-follow on replacement;
+    * `replaceByRefs` and orphan recovery remain load-bearing.
     *
     * Returns an empty list if `finalizedOrdinal <= lastOrdinal` (nothing finalized beyond local head yet). Returns at most
     * `singlePullLimit` snapshots when configured.
@@ -89,7 +89,7 @@ trait GlobalL0Service[F[_]] {
     finalizedOrdinal: SnapshotOrdinal
   ): F[List[Hashed[GlobalIncrementalSnapshot]]]
 
-  /** Fetch the latest-finalized consumed-field slice from a random GL0 peer (`GET /global-follow/slice/latest`).
+  /** Fetch the latest currently operational consumed-field slice from a random GL0 peer (`GET /global-follow/slice/latest`).
     *
     * The gl1 own-slice follow path (Axis 2 — see `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`) uses this to obtain gl0's claimed
     * Address-keyed slice (`balances`, `lastTxRefs`, `lastAllowSpendRefs`, `lastTokenLockRefs`) at the latest finalized global ordinal,
@@ -97,9 +97,9 @@ trait GlobalL0Service[F[_]] {
     * ([[io.constellationnetwork.node.shared.domain.nakamoto.GlobalFollowMirrorVerifier]]). The slice carries its OWN ordinal, so the
     * verifier anchors against the snapshot AT that ordinal — never a cross-ordinal mismatch.
     *
-    * Returns `None` when no [[GlobalFollowClient]] is wired (the cl0/cl1 callers that don't follow this path) or the peer has no finalized
-    * ordinal yet / the request fails. The caller (`DAGSnapshotProcessor.applyGlobalSnapshotFn`) treats `None` as "do not advance, retry
-    * next tick" — there is no `StateProofMismatch`-style recovery storm.
+    * Returns `None` when no [[GlobalFollowClient]] is wired (the ML0/CL1 callers that don't follow this path) or the peer has no
+    * operational ordinal yet / the request fails. The caller (`DAGSnapshotProcessor.applyGlobalSnapshotFn`) treats `None` as "do not
+    * advance, retry next tick" — there is no `StateProofMismatch`-style recovery storm.
     */
   def getLatestFollowSlice: F[Option[GlobalFollowSliceResponse]]
 

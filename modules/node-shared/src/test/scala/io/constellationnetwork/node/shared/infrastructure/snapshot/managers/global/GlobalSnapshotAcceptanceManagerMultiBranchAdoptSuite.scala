@@ -1,5 +1,7 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global
 
+import java.security.KeyPair
+
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
@@ -29,6 +31,7 @@ import io.constellationnetwork.node.shared.domain.swap.SpendActionValidator.Spen
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
+import io.constellationnetwork.node.shared.infrastructure.sharding.RegisteredCheckpointSigner
 import io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsResult
 import io.constellationnetwork.node.shared.logger.Slf4jLoggerBundle
 import io.constellationnetwork.schema._
@@ -40,6 +43,7 @@ import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
+import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendBlock}
 import io.constellationnetwork.schema.tokenLock._
@@ -64,14 +68,25 @@ import weaver.MutableIOSuite
   */
 object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
+  final case class RegisteredCommitteeIdentity(
+    checkpointSigner: RegisteredCheckpointSigner,
+    keyPair: KeyPair,
+    peerId: PeerId
+  )
+
+  override type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO], RegisteredCommitteeIdentity)
 
   override def sharedResource: Resource[IO, Res] =
     for {
-      sp <- SecurityProvider.forAsync[IO]
+      implicit0(sp: SecurityProvider[IO]) <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       h = Hasher.forJson[IO]
-    } yield (h, sp, j)
+      checkpointSigner <- RegisteredCheckpointSigner.make.asResource
+      committeeKeyPair <- KeyPairGenerator.makeKeyPair[IO].asResource
+      committeeId = PeerId.fromPublic(committeeKeyPair.getPublic)
+      _ <- checkpointSigner.preregisterGenesis(committeeKeyPair, committeeId).asResource
+      committeeIdentity = RegisteredCommitteeIdentity(checkpointSigner, committeeKeyPair, committeeId)
+    } yield (h, sp, j, committeeIdentity)
 
   implicit val metrics: Metrics[IO] = NoOpMetrics.make
 
@@ -155,9 +170,12 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // Checkpoint construction
   // ============================================================================
 
-  private def mkCommitteeSig: CommitteeMemberSignature =
+  /** Structural seed used only to construct the signature-excluded checkpoint preimage required by [[RegisteredCheckpointSigner]]. It is
+    * replaced before the checkpoint leaves this helper and is never passed to [[StubAcceptanceManager]].
+    */
+  private def unsignedTemplateSeed(peerId: PeerId): CommitteeMemberSignature =
     CommitteeMemberSignature(
-      peerId = io.constellationnetwork.schema.peer.PeerId(Hex("ab" * 64)),
+      peerId = peerId,
       vrfProof = Hex(""),
       ed25519Sig = Hex(""),
       kesProductSig = Hex(""),
@@ -171,22 +189,32 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     mg: Address,
     binary: Signed[StateChannelSnapshotBinary],
     attestedRoot: Hash,
-    executionBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
-  ): ShardCheckpoint =
-    ShardCheckpoint(
+    executionBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue,
+    includeAttestedRoot: Boolean = true
+  )(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    committeeIdentity: RegisteredCommitteeIdentity
+  ): IO[ShardCheckpoint] = {
+    val template = ShardCheckpoint(
       shardId = ShardId.unsafeApply(0),
       parentCheckpointHash = genesisHash,
       shardOrdinal = ShardOrdinal(1L),
       gl0AnchorOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(2L)),
       slot = io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(2L),
       derivedStateDelta = ShardDerivedStateDelta(
-        perMetagraphMptRoots = SortedMap(mg -> attestedRoot),
+        perMetagraphMptRoots = if (includeAttestedRoot) SortedMap(mg -> attestedRoot) else SortedMap.empty,
         includedSnapshots = SortedMap(mg -> NonEmptyList.of(binary))
       ),
-      committeeSignatures = NonEmptyList.of(mkCommitteeSig),
+      committeeSignatures = NonEmptyList.one(unsignedTemplateSeed(committeeIdentity.peerId)),
       epoch = epochZero,
       executionBaseOrdinal = executionBaseOrdinal
     )
+
+    committeeIdentity.checkpointSigner
+      .sign(template, committeeIdentity.keyPair, committeeIdentity.peerId)
+      .map(signature => template.copy(committeeSignatures = NonEmptyList.one(signature)))
+  }
 
   // ============================================================================
   // GL0-recreated root (the exact value compared with the checkpoint claim)
@@ -356,7 +384,9 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     }
 
   // ============================================================================
-  // Stub checkpoint manager — captures the GSAM verifier boundary and can model a rejected execution base.
+  // Stub checkpoint manager — captures the GSAM verifier boundary and can model a rejected execution base. Its authority stops at that
+  // boundary: every checkpoint passed to it carries a real preregistered KES+VRF execution signature. Concrete certificate rejection is
+  // covered by ShardCheckpointGl0AcceptanceManagerSuite.
   // ============================================================================
 
   private final case class StubAcceptanceManager(
@@ -365,8 +395,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   ) extends ShardCheckpointGl0AcceptanceManager[IO] {
     override def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(verdict(checkpoint))
+    override def evaluateForSigning(
+      checkpoint: ShardCheckpoint
+    ): IO[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]] =
+      IO.pure(Left(VerifiedShardCheckpointFailure.Rejected("test stub cannot mint signing capabilities")))
     override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] =
       callsRef.update(_ :+ checkpoint).as(verdict(checkpoint))
+    override def verifyExecutionCertificate(checkpoint: ShardCheckpoint): IO[Either[String, Unit]] =
+      IO.pure(Left("adoption-flow stub has no authenticated execution certificate"))
     override def verifyCommitteeSignature(
       checkpoint: ShardCheckpoint,
       signature: CommitteeMemberSignature
@@ -374,6 +410,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     override def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit
     override def lastAdoptedOrd(shardId: ShardId): IO[Option[ShardOrdinal]] = IO.pure(None)
     override def lastAdoptedAnchor(shardId: ShardId): IO[Option[Hash]] = IO.pure(None)
+    override def lastAdoptedCheckpoint(shardId: ShardId): IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None)
     override def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] =
       IO.pure(List.empty[WatchtowerMismatch])
   }
@@ -385,9 +422,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   private def mkShardingConfig(numShards: Int): ShardingConfig =
     ShardingConfig(
       numShards = numShards,
-      finality = ShardFinalityConfig(k1Shard = 8L),
-      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096),
-      observability = ShardObservabilityConfig(tPartitionHardMs = 600000L)
+      retention = ShardCheckpointRetentionConfig(retainedCheckpoints = 8L),
+      checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096)
     )
 
   private val noopRewardsFn: io.constellationnetwork.node.shared.infrastructure.snapshot.RewardsInput => IO[DelegatedRewardsResult] =
@@ -674,7 +710,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // ============================================================================
 
   test("HARNESS: branch reader reconstructs branchPrior, base reader reconstructs basePrior (branch != base is real)") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       store <- freshStore
       basePriorRT <- seedBaseAndRoundTrip(store, mg, inc, basePriorRaw)
@@ -697,14 +733,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   // ============================================================================
 
   test("globally recreated state is adopted on a divergent pending branch") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
       localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
       claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+      checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot)
       ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = Some(branchPriorRaw))
       (overlay, childTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -729,7 +765,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   test("currency replay removes branch-only prior entries and converges to the same canonical MPT root") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
 
     def runFrom(priorOnBranch: Option[CurrencySnapshotInfo]): IO[(GlobalSnapshotInfo, Option[Hash])] =
       for {
@@ -738,7 +774,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
         store <- freshStore
         basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
         claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
-        checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+        checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot)
         ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, priorOnBranch)
         (overlay, parentTip) = ob
         callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -763,14 +799,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   test("matching globally recreated root adopts at branch == base") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
       localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
       claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
+      checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot)
       ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
       (overlay, baseTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -780,13 +816,13 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   test("mismatched claimed root drops globally recreated state and its balance update") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
       localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, Hash("ff" * 32))
+      checkpoint <- mkRightArmCheckpoint(mg, headBinary, Hash("ff" * 32))
       ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = Some(branchPriorRaw))
       (overlay, childTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -814,17 +850,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   test("missing claimed root drops globally recreated state") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
       localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
       claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
-      checkpoint0 = mkRightArmCheckpoint(mg, headBinary, claimedRoot)
-      checkpoint = checkpoint0.copy(
-        derivedStateDelta = checkpoint0.derivedStateDelta.copy(perMetagraphMptRoots = SortedMap.empty)
-      )
+      checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot, includeAttestedRoot = false)
       ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
       (overlay, baseTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -844,7 +877,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   private val executionBase: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
 
   test("execution-base pin reaches the verifier unchanged before replay adoption") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
       localInc = mkSignedIncremental(2L, tipProof)
@@ -852,7 +885,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
       _ <- store.commit(executionBase)
       claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
+      checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
       ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
       (overlay, baseTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -880,14 +913,14 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
   }
 
   test("unavailable execution base rejects before replay and performs no metagraph write") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
     for {
       tipProof <- nextInfo.stateProof[IO](SnapshotOrdinal(NonNegLong(2L)))
       localInc = mkSignedIncremental(2L, tipProof)
       store <- freshStore
       basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
       claimedRoot <- recreatedRoot(mg, localInc, nextInfo)
-      checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
+      checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
       ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
       (overlay, baseTip) = ob
       callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)
@@ -948,7 +981,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       .map(result => (result._9, result._10.mptRoot))
 
   test("numShards=1 ignores checkpoint roots and never enters replay adoption") { res =>
-    implicit val (h, sp, j) = res
+    implicit val (h, sp, j, committeeIdentity) = res
 
     def runNode(claimedRoot: Hash): IO[(GlobalSnapshotInfo, Option[Hash], List[ShardCheckpoint])] =
       for {
@@ -956,7 +989,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
         localInc = mkSignedIncremental(2L, tipProof)
         store <- freshStore
         basePrior <- seedBaseAndRoundTrip(store, mg, localInc, basePriorRaw)
-        checkpoint = mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
+        checkpoint <- mkRightArmCheckpoint(mg, headBinary, claimedRoot, executionBaseOrdinal = executionBase)
         ob <- mkOverlayWithBranch(store, mg, localInc, basePrior, branchPrior = None)
         (overlay, baseTip) = ob
         callsRef <- Ref.of[IO, List[ShardCheckpoint]](List.empty)

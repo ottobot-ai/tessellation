@@ -8,13 +8,12 @@ import io.constellationnetwork.schema.nakamoto.slot.VrfOutput
 
 /** Fork choice rule for Nakamoto consensus — purely structural (Bitcoin/Praos/Polkadot-BABE pattern).
   *
-  * **Strict separation of fork choice and finality.** Fork choice picks the best live branch from block-header structure alone (longest
-  * chain, density on long forks). Finality (attestation ≥ 2/3 OR depth-k) is computed elsewhere by `TipTracker` and feeds into chain
-  * selection only as a *constraint* via `shouldSwitch`'s "don't revert below the settled floor" check. This matches Polkadot's BABE/GRANDPA
-  * split, Cardano Praos/Genesis, and the original Nakamoto rule. It is deliberately NOT Ethereum's LMD-GHOST blend — which couples
-  * latest-attestation weight into the comparator and has produced a long tail of balancing/bouncing/avalanche attacks (Neu/Tas/Tse IACR
-  * 2022/289; D'Amato/Zanolini IACR 2023/279). For a 50-100 validator chain with depth-k fallback, the dynamic- availability
-  * head-convergence properties LMD-GHOST buys aren't worth the attack surface.
+  * **Strict separation of fork choice and Phase 2.** Fork choice picks the best valid branch from header structure (maxvalid-tk for shallow
+  * forks, maxvalid-bg density for long forks). Decided-attestation T_weight or k1 depth makes an exact hash operational but reversible; it
+  * does not create a BFT lock or absolute floor. It is deliberately NOT Ethereum's LMD-GHOST blend, which couples latest-attestation weight
+  * into the comparator and has produced a long tail of balancing/bouncing/avalanche attacks (Neu/Tas/Tse IACR 2022/289; D'Amato/Zanolini
+  * IACR 2023/279). For a 50-100 validator chain with depth-k fallback, the dynamic- availability head-convergence properties LMD-GHOST buys
+  * aren't worth the attack surface.
   *
   * '''The pre-removal bug.''' An earlier version called `tipTracker.attestationWeight(tipHash)` per-hash and let the heavier tip win if
   * either side cleared `minQuorum`. This is a category error: peers always attest the *current* chain head, never older ancestors, so
@@ -28,20 +27,14 @@ import io.constellationnetwork.schema.nakamoto.slot.VrfOutput
   *      output (lower wins). This is Bifrost's maxvalid-tk. 2. **Long forks** (fork depth exceeds `kLookback`): block-density comparison
   *      within `sWindow` slots from the fork point. This is Bifrost's maxvalid-bg.
   *
-  * Finality (orthogonal to this file) is the union of two independent rules:
-  *   - attestation ≥ 2/3 weight on a chain-canonical hash (BFT-classic, fast path in healthy network)
-  *   - depth-k confirmation (probabilistic, fallback when attestations stall) Whichever fires first marks the tip finalized.
+  * Phase 2 (orthogonal to `compare`) is the union of two exact-hash rules:
+  *   - decided-attestation T_weight from the Avalanche/Snowball optimistic rail
+  *   - canonical k1 depth fallback. Neither rule introduces global BFT voting/locking.
   *
-  * '''Track-3 S3 — band-density deep-reorg (CONFIG-FLAGGED, default OFF).''' Two distinct finality depths gate fork choice:
-  *   - k₁ (`confirmationDepthK`) = operational finality — the depth `shouldSwitch` FREEZES at in the legacy (flag-OFF) behavior.
-  *   - k₂ (`keepDepthBehindFinalized` = 100·k₁, the "settled" marker) = the ONLY absolute floor.
-  *
-  * With the `nakamoto.band-density-reorg-enabled` flag ON, `shouldSwitch`'s revert floor moves from k₁ to the k₂ "settled" ordinal, so a
-  * fork anywhere in the `(settled, finalized]` band is density-revertable (maxvalid-bg) instead of frozen — and the density comparator is
-  * made COMMUTATIVE (true-MRCA anchored) so nodes on opposite band branches converge. The flag defaults OFF (byte-identical to the
-  * post-`376d09fbc` k₁-freeze baseline — the 2026-06-27 storm backstop) until a deep-fork sim validates cluster-uniformity; this is attempt
-  * #2 of the reverted `86f390130` (which was inert because its archive marker never fired — here the settled marker is the live,
-  * T_depth2-driven `nakamotoSettledOrdinalRef`).
+  * '''Transitional implementation gap.''' [[shouldSwitch]] still offers a flag-selected k1 or k2 ordinal floor. Neither behavior is the
+  * locked target. P2 density reorgs remain objectively comparable; k2 only recommends local retention/proof/recovery capacity. When the
+  * true MRCA is older than retained history, the node must enter `RecoveryRequired`, reconstruct exact authenticated history, and resume
+  * ordinary comparison. It must not refuse or select a branch merely because a local floor was crossed.
   */
 trait ChainSelection[F[_]] {
 
@@ -61,11 +54,10 @@ trait ChainSelection[F[_]] {
 
   /** Check if we should switch from our current tip to a new candidate.
     *
-    * Returns false when the switch would revert history below the finality floor (k₁ finalized head in the legacy behavior; the k₂
-    * "settled" ordinal under the band-density flag), because settled/finalized history cannot be reverted.
+    * Current code returns false at a flag-selected legacy k1/k2 floor. That behavior is transitional and violates the target rule above.
     *
     * @return
-    *   true if candidate beats current and the switch does not revert below the finality floor
+    *   true if the current implementation permits switching to the structurally preferred candidate
     */
   def shouldSwitch(current: ChainTip, candidate: ChainTip): F[Boolean]
 }
@@ -81,8 +73,8 @@ object ChainSelection {
 
   /** Create a ChainSelection that uses purely structural (Bifrost maxvalid-tk + maxvalid-bg) fork choice.
     *
-    * Attestation weight does not enter `compare`. `tipTracker` is retained only so `shouldSwitch` can consult `lastFinalized` (legacy k₁
-    * clamp) to refuse reverting below a finalized head — a *constraint* on fork choice, not a tiebreaker.
+    * Attestation weight does not enter `compare`. `tipTracker` is retained only for the transitional k1 clamp in `shouldSwitch`; target
+    * fork choice removes that clamp while retaining exact-hash Phase-2 rollback notifications.
     *
     * @param tipTracker
     *   used by `shouldSwitch` (legacy/flag-OFF path) to query the k₁ finalized head; not used in `compare`.
@@ -93,18 +85,11 @@ object ChainSelection {
     * @param sWindow
     *   forward-looking slot window for density comparison.
     * @param maxAncestorDepth
-    *   Track-3 S3: upper bound on the ancestor walk when searching for the TRUE most-recent common ancestor (MRCA). Under the band-density
-    *   flag this is k₂ (the settled floor) so a fork anywhere in the `(settled, finalized]` band resolves against its REAL fork point
-    *   instead of a `kLookback`-truncated pseudo-anchor (the non-commutativity bug). Defaults to `kLookback` so a non-opt-in call site
-    *   keeps the pre-S3 truncating behavior byte-for-byte.
+    *   current local bound on the true-MRCA walk. Exhaustion must ultimately signal RecoveryRequired rather than determine the winner
     * @param settledOrdinalReader
-    *   Track-3 S3: reader for the k₂ "settled" floor ordinal, consulted ONLY on the band-density path (flag ON) by `shouldSwitch`. `None`
-    *   (default) ⇒ floor 0 ⇒ never refuse on the settled floor (tests / non-opt-in). Production wires
-    *   `Some(nakamotoSettledOrdinalRef.get.map(_.value.value))`.
+    *   transitional reader for the legacy k2 floor. Target removes its fork-choice role
     * @param bandDensityReorgEnabled
-    *   Track-3 S3 CONFIG-FLAG (`nakamoto.band-density-reorg-enabled`, default false). false = legacy k₁-freeze fork choice (hash-exact
-    *   finalized clamp + `kLookback`-truncated ancestor walk = byte-identical to the post-`376d09fbc` baseline). true = band-density reorg:
-    *   k₂ settled floor + true-MRCA commutative density.
+    *   transitional selector between legacy k1 and k2 floor behavior. Neither setting is the locked target
     */
   def make[F[_]: Monad](
     tipTracker: TipTracker[F],
@@ -117,13 +102,13 @@ object ChainSelection {
   ): ChainSelection[F] =
     new ChainSelection[F] {
 
-      // Ancestor-walk bound for the true-MRCA search. Flag OFF reproduces the pre-S3 truncation
+      // Local ancestor-walk bound for the true-MRCA search. Flag OFF reproduces the pre-S3 truncation
       // (`depth > kLookback`) EXACTLY via `kLookback + 1` (so `depth >= bound` ⟺ `depth > kLookback`);
-      // flag ON walks up to k₂ (`maxAncestorDepth`) to find the real common ancestor of a band fork.
+      // flag ON walks up to local k2 capacity. Bound exhaustion must become RecoveryRequired in target code.
       private val ancestorWalkBound: Long =
         if (bandDensityReorgEnabled) maxAncestorDepth else kLookback + 1L
 
-      // k₂ "settled" floor reader (band path only). Absent ⇒ 0 ⇒ never refuse on the settled floor.
+      // Transitional legacy k2 floor reader (band path only); forbidden as target fork-choice input.
       private val settledOrdinalF: F[Long] =
         settledOrdinalReader.getOrElse(Monad[F].pure(0L))
 
@@ -143,7 +128,7 @@ object ChainSelection {
         if (current.hash === candidate.hash)
           false.pure[F]
         else if (!bandDensityReorgEnabled)
-          // FLAG OFF — legacy k₁ hash-exact finalized clamp (byte-identical to pre-S3). Fork choice is
+          // FLAG OFF — transitional legacy k1 hash-exact clamp. Fork choice is
           // frozen at the k₁ finalized head: refuse to switch away from a tip that IS the finalized head.
           for {
             lastFinalized <- tipTracker.lastFinalized
@@ -154,7 +139,7 @@ object ChainSelection {
             candidateWins && !currentIsFinalized
           }
         else
-          // FLAG ON — k₂ settled floor. The `(settled, finalized]` band is density-revertable, so the ONLY
+          // FLAG ON — transitional legacy k2 floor. The current implementation's ONLY
           // reorg refusal here is one that would rewrite history at/below the settled (k₂) ordinal: refuse
           // iff the fork's common ancestor is STRICTLY below settled (its deepest reverted block,
           // mrca.ordinal + 1, would then be ≤ settled). A fork deeper than the k₂ walk bound (MRCA not
@@ -220,7 +205,7 @@ object ChainSelection {
         if (headA.hash === headB.hash)
           (tineA, tineB, Some(headA): Option[ChainTip], depth).pure[F]
         // Exceeded the ancestor-walk bound — give up finding the MRCA (flag OFF: reproduces the legacy
-        // `depth > kLookback` truncation; flag ON: fork is deeper than k₂, i.e. below the settled floor).
+        // `depth > kLookback` truncation; flag ON: required history exceeds local k2 capacity).
         else if (depth >= ancestorWalkBound)
           (tineA, tineB, Option.empty[ChainTip], depth).pure[F]
         else {

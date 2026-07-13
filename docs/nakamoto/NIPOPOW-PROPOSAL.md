@@ -4,6 +4,13 @@
 **Date:** 2026-05-15.
 **Scope:** the light-client / finality-cert workstream, as an alternative to porting Mithril.
 
+> **2026-07-12 integration correction:** the paper controls the tower
+> construction, not Tessellation phase policy. Any Phase-3, `T_depth2`, or
+> immutable-`k2` integration language below is rejected. The target commits
+> branch-bound trial/pointer state in signed snapshots, verifies proofs from a
+> trusted genesis or cached canonical commitment, and separately proves current
+> canonicality/compares candidate chains. `k2` is retention capacity only.
+
 ## Provenance
 
 This proposal is the implementation-side translation of the user's

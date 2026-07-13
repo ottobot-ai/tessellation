@@ -1,3 +1,4 @@
+%% TARGET DESIGN. This replaces universal CL1 replay by ordinary GL0 adopters.
 flowchart TB
     B["ML0 signed state-channel binaries"]
     B --> ADM
@@ -6,20 +7,23 @@ flowchart TB
     end
     ADM --> EXEC
     subgraph COMMITTEE["GL0 EXECUTION COMMITTEE"]
-        EXEC["chain-link window<br/>pin finalized execution base"]
-        REPLAY["recreate every included CL1 transition"]
-        BUILD["claim per-metagraph roots<br/>carry all replay inputs"]
-        SIGN["validate, recreate, then sign"]
+        EXEC["scheduled producer chain-links a deterministic window<br/>and pins exact Phase-2 base plus pre-root"]
+        REPLAY["producer replays exact ordered CL1 inputs<br/>and computes canonical diff plus root"]
+        BUILD["commit exact inputs, scoped diff, complete root,<br/>base, shard parent, and ordinal"]
+        SIGN["every execution signer independently replays;<br/>sign only an identical diff and root"]
         EXEC --> REPLAY --> BUILD --> SIGN
     end
     SIGN --> VERIFY
-    subgraph GLOBAL["EVERY GL0 ADOPTER"]
-        VERIFY["verify identity, keys, KES, duty,<br/>assignment, ancestry, and schema"]
-        AGAIN["recreate every CL1 transition<br/>at signed finalized base"]
-        COMPARE{"local roots equal claims?"}
-        EMBED["store, attest, select, and embed"]
-        VERIFY --> AGAIN --> COMPARE
+    subgraph GLOBAL["ORDINARY NONCOMMITTEE GL0 ADOPTER"]
+        VERIFY["verify distinct execution threshold, identity, keys, KES,<br/>duty, assignment, ancestry, and schema"]
+        CAS["require exact canonical base and pre-root;<br/>check continuity and diff-key namespace"]
+        APPLY["apply scoped canonical diff<br/>and recompute complete root"]
+        COMPARE{"recomputed root equals checkpoint root?"}
+        EMBED["eligible to store, select, and embed"]
+        VERIFY --> CAS --> APPLY --> COMPARE
         COMPARE -->|yes| EMBED
-        COMPARE -->|no| REJECT["reject; optional fraud evidence"]
+        COMPARE -->|no| REJECT["reject before economic use"]
     end
-    EMBED --> RETURN["finalized GL0 state returns downstream"]
+    SIGN -.-> WATCH["selected noncommittee watchtowers<br/>independently replay exact inputs;<br/>release and adjudication remains open"]
+    WATCH -.-> EVIDENCE["self-contained mismatch or equivocation evidence"]
+    EMBED --> RETURN["exact containing GL0 hash reaches Phase 2;<br/>operational state returns downstream"]

@@ -3,7 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.slashing
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.{CommitteeSortition, KesRegistry, MetagraphCommitteeGate}
+import io.constellationnetwork.node.shared.domain.nakamoto.{CommitteeSortition, MetagraphCommitteeGate}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.slashing.SlashableEvidence.BountyDigestPreimage
@@ -19,10 +19,11 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
   *
   *   1. identity match (peerId equality on the two [[MetagraphAttestation]] bodies)
   *   1. subject match (metagraph address equality)
-  *   1. parent match (load-bearing — same VRF input ⇒ same committee draw)
+  *   1. parent match, followed by exact historical eta-period equality (both are part of the committee draw identity)
   *   1. distinct binaries (different `binaryHash` ⇒ equivocation, equal ⇒ duplicate retransmission)
-  *   1. both KES-signed by the same registered master VK (reuses `KesRegistry` via [[OperationalKeyMaker.verify]])
-  *   1. both committee VRF proofs verify (reuses `CommitteeSortition.verifyMembership`)
+  *   1. exact offence-parent state resolves one active atomic KES+VRF pair for the offender
+  *   1. both KES-signed by that pair at `offencePeriod - registeredOffset`
+  *   1. both committee VRF proofs verify under the offender's registered VRF key (reuses `CommitteeSortition.verifyMembership`)
   *   1. not already slashed (reads [[SlashedSeenReader]] — stubbed in S4a, MPT-backed in S4c)
   *   1. within evidence window (`currentEpoch ≤ eventEpoch + windowEpochs`)
   *   1. submitter bounty signature verifies under `submitterId`'s long-term Ed25519 key
@@ -31,10 +32,8 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
   * consensus-state inferences. All honest nodes computing the validator over the same inputs produce byte-identical accept/reject results.
   * See `feedback_slashing_safety_bar`.
   *
-  * '''Determinism.''' The validator is pure with respect to: KES registry contents, committee sortition (`CommitteeSortition.make`), the
-  * eta/sigma inputs supplied by the caller (which themselves are read from N-2 frozen GSI state — see
-  * `project_consensus_epoch_staggering`), and the `SlashedSeenReader` view (caller picks pending vs finalized branch view). No clock, no
-  * env reads, no I/O outside these.
+  * '''Determinism.''' Key material, offence period, and VRF eta come from [[SlashingOperatorKeyResolver]], whose implementation must prove
+  * the exact historical state governing the signed parent. Missing/pruned/ambiguous history returns `Unverifiable` and can never slash.
   *
   * '''What's stubbed in S4a.''' The MPT partition `slashings/<peer>/<metagraph>/<parent>` is not yet implemented; this validator depends on
   * [[SlashedSeenReader]] which the test suite stubs and S4c will back with a `GlobalStateReader`-derived implementation. The validator
@@ -46,66 +45,55 @@ import io.constellationnetwork.security.{Hasher, SecurityProvider}
   */
 trait SlashableEvidenceValidator[F[_]] {
 
-  /** Validate a [[SlashableEvidence]] under the caller-supplied chain state (eta, sigmas, current epoch).
+  /** Validate a [[SlashableEvidence]] under exact historical key/randomness state plus caller-supplied stake fractions.
     *
     * The caller is responsible for sourcing these consistently with the rest of the consensus path:
-    *   - `eta` MUST be the 32-byte epoch randomness for the relevant committee draw period (typically the parent's eta at the time of
-    *     attestation),
     *   - `sigmaForEvidenceA` / `sigmaForEvidenceB` MUST be the operator's N-2 frozen stake fraction at the same period,
     *   - `kTarget` MUST match what was in effect when the attestations were produced,
-    *   - `currentEpoch` MUST be the current chain epoch progress; `eventEpoch` is the epoch at which the attestations were produced (caller
-    *     derives this from the same epoch the parent snapshot was created in).
+    *   - `currentEpoch` MUST be the current chain epoch progress. The evidence epoch is resolved from the signed parent context; it is not
+    *     accepted out of band.
     *
     * Different inputs across nodes ⇒ different accept/reject ⇒ consensus split. The validator does not re-source these — that's the
     * caller's contract, same as every other gl0 acceptance validator.
     */
   def validate(
     evidence: SlashableEvidence,
-    eta: Array[Byte],
     sigmaForEvidenceA: Ratio,
     sigmaForEvidenceB: Ratio,
     kTarget: Int,
-    currentEpoch: Long,
-    eventEpoch: Long
-  ): F[Either[SlashingRejection, SlashableEvidence]]
+    currentEpoch: Long
+  ): F[SlashingValidationResult[SlashingRejection, SlashableEvidence]]
 }
 
 object SlashableEvidenceValidator {
 
-  /** Default evidence window — matches `cooldown_epochs` per `SLASHING-DESIGN.md` §6 so the window expires exactly when re-staking becomes
-    * possible. Production-grade values are downstream of public testnet experience.
+  /** Consensus evidence window. This cannot come from a node-local environment variable: differing windows would split acceptance and could
+    * slash an operator on one node while rejecting the same proof on another.
     */
-  val DefaultEvidenceWindowEpochs: Long =
-    sys.env.get("NAKAMOTO_SLASH_EVIDENCE_WINDOW").flatMap(_.toLongOption).getOrElse(100L)
+  val DefaultEvidenceWindowEpochs: Long = 100L
 
-  /** Construct the validator. Dependencies are intentionally minimal: KES registry + committee sortition + the (stubbed in S4a, MPT-backed
-    * in S4c) already-slashed reader. No GSAM, no MPT writer — this slice is purely about accept/reject.
+  /** Construct the validator. There is deliberately no constructor accepting separate/current KES or VRF registries.
     *
-    * @param kesRegistry
-    *   used by step #5 to look up the operator's master VK and verify both KES sigs under it
+    * @param keyResolver
+    *   resolves the atomic active KES+VRF pair, offence period, and eta from the exact signed-parent historical context
     * @param sortition
     *   used by step #6 to re-verify the committee VRF proofs
     * @param slashedReader
     *   used by step #7 to short-circuit on duplicates (`already slashed`); pass `SlashedSeenReader.neverSlashed` for S4a / pre-S4c
-    * @param evidenceWindowEpochs
-    *   step #8 lookback — defaults to [[DefaultEvidenceWindowEpochs]]
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
-    kesRegistry: KesRegistry[F],
+    keyResolver: SlashingOperatorKeyResolver[F],
     sortition: CommitteeSortition[F],
-    slashedReader: SlashedSeenReader[F],
-    evidenceWindowEpochs: Long = DefaultEvidenceWindowEpochs
+    slashedReader: SlashedSeenReader[F]
   ): SlashableEvidenceValidator[F] = new SlashableEvidenceValidator[F] {
 
     def validate(
       evidence: SlashableEvidence,
-      eta: Array[Byte],
       sigmaForEvidenceA: Ratio,
       sigmaForEvidenceB: Ratio,
       kTarget: Int,
-      currentEpoch: Long,
-      eventEpoch: Long
-    ): F[Either[SlashingRejection, SlashableEvidence]] = {
+      currentEpoch: Long
+    ): F[SlashingValidationResult[SlashingRejection, SlashableEvidence]] = {
 
       val attA: MetagraphAttestation = evidence.evidenceA
       val attB: MetagraphAttestation = evidence.evidenceB
@@ -120,7 +108,7 @@ object SlashableEvidenceValidator {
         if (attA.metagraphAddress === attB.metagraphAddress) Right(())
         else Left(SlashingRejection.SubjectMismatch(attA.metagraphAddress, attB.metagraphAddress))
 
-      // Step 3 — parent match (the load-bearing identity).
+      // Step 3 — parent match. Historical resolution later proves eta-period equality; parent equality alone is insufficient.
       lazy val step3: Either[SlashingRejection, Unit] =
         if (attA.parentHash === attB.parentHash) Right(())
         else Left(SlashingRejection.ParentMismatch(attA.parentHash, attB.parentHash))
@@ -130,54 +118,80 @@ object SlashableEvidenceValidator {
         if (attA.binaryHash =!= attB.binaryHash) Right(())
         else Left(SlashingRejection.DuplicateBinary(attA.binaryHash))
 
-      // Step 5 — both KES sigs verify under the SAME registered master VK for `peerId`. Returns
-      // `Left(Some(InvalidKesSignature.OnEvidenceX))` if a sig fails / decodes-fail / no registry
-      // entry; the `OnEvidenceA`/`OnEvidenceB` distinction is preserved in the rejection. The no-registry
-      // case fails CLOSED in slashing (unlike the lenient gossip-path verifier) — there's no
-      // Slice-10 "newly-joined operator pre-registration" carve-out for accusing someone of
-      // equivocation; if we can't verify the KES sig from a registered key, we can't establish
-      // the evidence cryptographically.
-      def verifyKes(att: MetagraphAttestation, onFail: SlashingRejection): F[Either[SlashingRejection, Unit]] =
-        kesRegistry.getKesVk(att.peerId).flatMap {
-          case None => Async[F].pure(Left(onFail))
-          case Some(entry) =>
-            val sigBytes = att.kesSignature.toBytes
-            if (sigBytes.isEmpty) Async[F].pure(Left(onFail))
-            else
-              OperationalKeyMaker.decodeSignature(sigBytes) match {
-                case Left(_) => Async[F].pure(Left(onFail))
-                case Right(kSig) =>
-                  val kesStep = att.senderTreeStep
-                  if (kesStep < 0) Async[F].pure(Left(onFail))
-                  else
-                    MetagraphCommitteeGate
-                      .messageBytes[F](att.peerId, att.metagraphAddress, att.parentHash, att.binaryHash)
-                      .map { msgBytes =>
-                        val vkAtStep = entry.vk.copy(step = kesStep)
-                        if (OperationalKeyMaker.verify(kSig, msgBytes, vkAtStep)) Right(()) else Left(onFail)
-                      }
-              }
-        }
+      def context(att: MetagraphAttestation): SlashingOffenceContext.MetagraphAdmission =
+        SlashingOffenceContext.MetagraphAdmission(att.metagraphAddress, att.parentHash, att.binaryHash)
 
-      // Step 6 — both committee VRF proofs verify under the operator's published VRF VK.
+      def resolve(
+        att: MetagraphAttestation
+      ): F[Either[SlashingUnverifiableReason, SlashingOperatorKeyResolution.Resolved]] = {
+        val offenceContext = context(att)
+        keyResolver.resolve(att.peerId, offenceContext).attempt.map {
+          case Left(_) =>
+            Left(
+              SlashingUnverifiableReason.HistoricalKeyStateUnavailable(
+                offenceContext,
+                HistoricalStateUnavailableReason.RegistryStateInvalid
+              )
+            )
+          case Right(SlashingOperatorKeyResolution.HistoricalStateUnavailable(reason)) =>
+            Left(SlashingUnverifiableReason.HistoricalKeyStateUnavailable(offenceContext, reason))
+          case Right(resolved: SlashingOperatorKeyResolution.Resolved) =>
+            ResolvedSlashingOperatorKeys.validate(att.peerId, resolved).map(_ => resolved)
+        }
+      }
+
+      // The carried step is comparison evidence only. The historical pair offset and offence period derive the only accepted step.
+      def verifyKes(
+        att: MetagraphAttestation,
+        resolved: SlashingOperatorKeyResolution.Resolved,
+        expectedStep: Int,
+        onFail: SlashingRejection
+      ): F[Either[SlashingRejection, Unit]] = {
+        val sigBytes = att.kesSignature.toBytes
+        if (sigBytes.isEmpty || att.senderTreeStep != expectedStep) Async[F].pure(Left(onFail))
+        else
+          OperationalKeyMaker.decodeSignature(sigBytes) match {
+            case Left(_) => Async[F].pure(Left(onFail))
+            case Right(kSig) =>
+              MetagraphCommitteeGate
+                .messageBytes[F](att.peerId, att.metagraphAddress, att.parentHash, att.binaryHash)
+                .map { msgBytes =>
+                  val vkAtStep = resolved.keys.kes.vk.copy(step = expectedStep)
+                  if (OperationalKeyMaker.verify(kSig, msgBytes, vkAtStep)) Right(()) else Left(onFail)
+                }
+                .handleError(_ => Left(onFail))
+          }
+      }
+
+      // Step 6 — both committee VRF proofs verify under the exact historical pair. The evidence-carried key is comparison evidence only:
+      // it must byte-match that pair, and only the resolved bytes reach the verifier.
       def verifyCommitteeVrf(
         att: MetagraphAttestation,
+        resolved: SlashingOperatorKeyResolution.Resolved,
         sigma: Ratio,
         onFail: SlashingRejection
-      ): F[Either[SlashingRejection, Unit]] =
-        sortition
-          .verifyMembership(
-            vrfVk = att.vrfPublicKey.toBytes,
-            eta = eta,
-            metagraphAddress = att.metagraphAddress,
-            parentHash = att.parentHash,
-            sigmaOperatorKey = sigma,
-            // The committee-membership re-verify uses the DRAW target (`CommitteeSortition.verifyMembership`'s `kDraw`); this validator's
-            // own `kTarget` param IS that draw value (it must match what was in effect when the attestation was produced).
-            kDraw = kTarget,
-            proof = att.committeeVrfProof.toBytes
-          )
-          .map(ok => if (ok) Right(()) else Left(onFail))
+      ): F[Either[SlashingRejection, Unit]] = {
+        val registeredVrfVk = resolved.keys.vrfPublicKey.toBytes
+        if (
+          att.vrfPublicKey.toBytes.length == io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.ExpectedLength &&
+          java.security.MessageDigest.isEqual(registeredVrfVk, att.vrfPublicKey.toBytes)
+        )
+          sortition
+            .verifyMembership(
+              vrfVk = registeredVrfVk,
+              eta = resolved.vrfEta,
+              metagraphAddress = att.metagraphAddress,
+              parentHash = att.parentHash,
+              sigmaOperatorKey = sigma,
+              // The committee-membership re-verify uses the DRAW target (`CommitteeSortition.verifyMembership`'s `kDraw`); this
+              // validator's own `kTarget` param IS that draw value (it must match what was in effect when the attestation was produced).
+              kDraw = kTarget,
+              proof = att.committeeVrfProof.toBytes
+            )
+            .map(ok => if (ok) Right(()) else Left(onFail))
+            .handleError(_ => Left(onFail))
+        else Async[F].pure(Left(onFail))
+      }
 
       // Step 7 — not already slashed (MPT lookup; stubbed in S4a). The reader is keyed by the
       // (peerId, metagraphAddress, parentHash) triple — same identity per `SLASHING-DESIGN.md` §4.1#7.
@@ -186,12 +200,6 @@ object SlashableEvidenceValidator {
           case true  => Left(SlashingRejection.AlreadySlashed(attA.peerId, attA.metagraphAddress, attA.parentHash))
           case false => Right(())
         }
-
-      // Step 8 — within evidence window. `currentEpoch ≤ eventEpoch + windowEpochs` ⇒ accept.
-      // Comparing the inclusive sum (so e.g. window=100, event=0 accepts current ≤ 100, rejects 101+).
-      lazy val step8: Either[SlashingRejection, Unit] =
-        if (currentEpoch <= eventEpoch + evidenceWindowEpochs) Right(())
-        else Left(SlashingRejection.EvidenceWindowExpired(currentEpoch, eventEpoch, evidenceWindowEpochs))
 
       // Step 9 — submitter signed the bounty preimage with their long-term Ed25519 key. The preimage
       // binds (evidenceA, evidenceB, submitterId) so the bounty can't be lifted by re-submitting
@@ -220,23 +228,66 @@ object SlashableEvidenceValidator {
           }
         }
 
-      val pipeline: F[Either[SlashingRejection, Unit]] = chain(
-        List(
-          lift(step1),
-          lift(step2),
-          lift(step3),
-          lift(step4),
-          lift(step8),
-          verifyKes(attA, SlashingRejection.InvalidKesSignature.OnEvidenceA),
-          verifyKes(attB, SlashingRejection.InvalidKesSignature.OnEvidenceB),
-          verifyCommitteeVrf(attA, sigmaForEvidenceA, SlashingRejection.InvalidCommitteeVrf.OnEvidenceA),
-          verifyCommitteeVrf(attB, sigmaForEvidenceB, SlashingRejection.InvalidCommitteeVrf.OnEvidenceB),
-          step7Check,
-          step9Check
-        )
-      )
-
-      pipeline.map(_.map(_ => evidence))
+      chain(List(lift(step1), lift(step2), lift(step3), lift(step4))).flatMap {
+        case Left(reason) => Async[F].pure(SlashingValidationResult.Invalid(reason))
+        case Right(()) =>
+          (resolve(attA), resolve(attB)).tupled.flatMap {
+            case (Left(reason), _) => Async[F].pure(SlashingValidationResult.Unverifiable(reason))
+            case (_, Left(reason)) => Async[F].pure(SlashingValidationResult.Unverifiable(reason))
+            case (Right(resolvedA), Right(resolvedB)) =>
+              if (resolvedA.offencePeriod != resolvedB.offencePeriod)
+                Async[F].pure(
+                  SlashingValidationResult.Invalid(
+                    SlashingRejection.AdmissionDrawPeriodMismatch(resolvedA.offencePeriod, resolvedB.offencePeriod)
+                  )
+                )
+              else if (!java.security.MessageDigest.isEqual(resolvedA.vrfEta, resolvedB.vrfEta))
+                Async[F].pure(SlashingValidationResult.Unverifiable(SlashingUnverifiableReason.ResolvedRandomnessMismatch))
+              else if (!ResolvedSlashingOperatorKeys.sameAtomicPair(resolvedA, resolvedB))
+                Async[F].pure(SlashingValidationResult.Unverifiable(SlashingUnverifiableReason.ResolvedAtomicPairMismatch))
+              else
+                (
+                  ResolvedSlashingOperatorKeys.expectedKesStep(resolvedA),
+                  ResolvedSlashingOperatorKeys.expectedKesStep(resolvedB)
+                ) match {
+                  case (Left(reason), _) => Async[F].pure(SlashingValidationResult.Unverifiable(reason))
+                  case (_, Left(reason)) => Async[F].pure(SlashingValidationResult.Unverifiable(reason))
+                  case (Right(expectedStepA), Right(expectedStepB)) =>
+                    val eventEpoch = resolvedA.offencePeriod.value
+                    val expired = BigInt(currentEpoch) > BigInt(eventEpoch) + BigInt(DefaultEvidenceWindowEpochs)
+                    if (expired)
+                      Async[F].pure(
+                        SlashingValidationResult.Invalid(
+                          SlashingRejection.EvidenceWindowExpired(currentEpoch, eventEpoch, DefaultEvidenceWindowEpochs)
+                        )
+                      )
+                    else
+                      chain(
+                        List(
+                          verifyKes(attA, resolvedA, expectedStepA, SlashingRejection.InvalidKesSignature.OnEvidenceA),
+                          verifyKes(attB, resolvedB, expectedStepB, SlashingRejection.InvalidKesSignature.OnEvidenceB),
+                          verifyCommitteeVrf(
+                            attA,
+                            resolvedA,
+                            sigmaForEvidenceA,
+                            SlashingRejection.InvalidCommitteeVrf.OnEvidenceA
+                          ),
+                          verifyCommitteeVrf(
+                            attB,
+                            resolvedB,
+                            sigmaForEvidenceB,
+                            SlashingRejection.InvalidCommitteeVrf.OnEvidenceB
+                          ),
+                          step7Check,
+                          step9Check
+                        )
+                      ).map {
+                        case Left(reason) => SlashingValidationResult.Invalid(reason)
+                        case Right(())    => SlashingValidationResult.Valid(evidence)
+                      }
+                }
+          }
+      }
     }
   }
 

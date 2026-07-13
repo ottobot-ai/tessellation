@@ -12,6 +12,7 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.nakamoto.slot.SlotCertificate
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
@@ -29,8 +30,8 @@ import io.constellationnetwork.serde.codecs.ListCodec.list
 import io.constellationnetwork.serde.codecs.MapCodec.{map => plainMap}
 import io.constellationnetwork.serde.codecs.NonEmptyListCodec.nonEmptyList
 import io.constellationnetwork.serde.codecs.OptionCodec.option
-import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
-import io.constellationnetwork.serde.codecs.SortedSetCodec.sortedSet
+import io.constellationnetwork.serde.codecs.SortedMapCodec.{sortedMap, sortedMapCanonical}
+import io.constellationnetwork.serde.codecs.SortedSetCodec.{sortedSet, sortedSetCanonical}
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencyAtomCodecs.snapshotVersionCodec
 import io.constellationnetwork.serde.codecs.instances.CurrencyRecordCodecs.{allowSpendBlockCodec, tokenLockBlockCodec}
@@ -38,6 +39,7 @@ import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs.updat
 import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotInfoV1Codec.{codec => globalSnapshotInfoV1Codec}
 import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotStateProofCodec._
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
+import io.constellationnetwork.serde.codecs.instances.KesRegistrationCodecs.kesRegistrationCertCodec
 import io.constellationnetwork.serde.codecs.instances.NakamotoSlotCodecs.slotCertificateCodec
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs.updateNodeCollateralCodec
@@ -60,7 +62,7 @@ import shapeless.{::, HNil}
 /** Canonical scodec codecs for the top-level snapshot capstones:
   *   - `GlobalSnapshot` (full, 11 fields, legacy pre-incremental).
   *   - `GlobalIncrementalSnapshotV1` (12 fields, legacy incremental shape).
-  *   - `GlobalIncrementalSnapshot` (26 fields, current shape with Nakamoto sharding and fraud-proof fields).
+  *   - `GlobalIncrementalSnapshot` (27 fields, current shape with Nakamoto sharding, fraud proofs, and operator-key registrations).
   *
   * Final commit of the scodec codec library for the snapshot data path.
   */
@@ -74,7 +76,8 @@ object GlobalSnapshotCodecs {
   private val epochCodec: Codec[EpochProgress] = Codec[EpochProgress]
   private val versionCodec: Codec[SnapshotVersion] = snapshotVersionCodec
   private val tipsCodec: Codec[SnapshotTips] = CurrencyRecordCodecs.snapshotTipsCodec
-  private val blocksCodec: Codec[SortedSet[BlockAsActiveTip]] = sortedSet(CurrencyRecordCodecs.blockAsActiveTipCodec)
+  private val blocksCodec: Codec[SortedSet[BlockAsActiveTip]] =
+    sortedSetCanonical(CurrencyRecordCodecs.blockAsActiveTipCodec)
   private val rewardsCodec: Codec[SortedSet[RewardTransaction]] = sortedSet(rewardTransactionCodec)
 
   private val signedStateChannelBinaryCodec: Codec[Signed[StateChannelSnapshotBinary]] = signedCodecFor(scsbCodec)
@@ -159,7 +162,7 @@ object GlobalSnapshotCodecs {
   implicit val globalIncrementalSnapshotV1ImmutableCodec: ImmutableCodec[GlobalIncrementalSnapshotV1] =
     ImmutableCodec.fromScodecCodec(globalIncrementalSnapshotV1Codec)
 
-  // ---- GlobalIncrementalSnapshot (current, 26 fields) ---------------------
+  // ---- GlobalIncrementalSnapshot (current, 27 fields) ---------------------
 
   // Field 7: every checkpoint carries its replayable CL1 inputs. This field is mandatory in the greenfield schema.
   private val shardCheckpointsCodec: Codec[SortedMap[ShardId, ShardCheckpoint]] =
@@ -169,14 +172,16 @@ object GlobalSnapshotCodecs {
   private val amountCodec: Codec[Amount] = Codec[Amount]
   private val delegateRewardsInnerCodec: Codec[Map[Address, Amount]] = plainMap(addressCodec, amountCodec)
   private val delegateRewardsMapCodec: Codec[SortedMap[PeerId, Map[Address, Amount]]] =
-    sortedMap(peerIdCodec, delegateRewardsInnerCodec)
+    sortedMapCanonical(peerIdCodec, delegateRewardsInnerCodec)
   private val delegateRewardsOptCodec = option(delegateRewardsMapCodec)
 
   // Fields 13..14: Option[SortedSet[Signed[AllowSpendBlock / TokenLockBlock]]]
   private val signedAllowSpendBlockCodec: Codec[Signed[AllowSpendBlock]] = signedCodecFor(allowSpendBlockCodec)
   private val signedTokenLockBlockCodec: Codec[Signed[TokenLockBlock]] = signedCodecFor(tokenLockBlockCodec)
-  private val allowSpendBlocksOptCodec = option(sortedSet(signedAllowSpendBlockCodec))
-  private val tokenLockBlocksOptCodec = option(sortedSet(signedTokenLockBlockCodec))
+  private val allowSpendBlocksOptCodec =
+    option(sortedSetCanonical(signedAllowSpendBlockCodec))
+  private val tokenLockBlocksOptCodec =
+    option(sortedSetCanonical(signedTokenLockBlockCodec))
 
   // Field 15: Option[SortedMap[Address, List[SpendAction]]]
   private val spendActionsMapCodec: Codec[SortedMap[Address, List[SpendAction]]] =
@@ -187,11 +192,11 @@ object GlobalSnapshotCodecs {
   private val idCodec: Codec[Id] = SignatureCodecs.idCodec
   private val signedUnpCodec: Codec[Signed[UpdateNodeParameters]] = signedCodecFor(unpCodec)
   private val updateNodeParametersMapCodec: Codec[SortedMap[Id, Signed[UpdateNodeParameters]]] =
-    sortedMap(idCodec, signedUnpCodec)
+    sortedMapCanonical(idCodec, signedUnpCodec)
   private val updateNodeParametersOptCodec = option(updateNodeParametersMapCodec)
 
   // Field 17: Option[SortedSet[SharedArtifact]]
-  private val artifactsOptCodec = option(sortedSet(sharedArtifactCodec))
+  private val artifactsOptCodec = option(sortedSetCanonical(sharedArtifactCodec))
 
   // Fields 18..21: four `Option[SortedMap[Address, List[Signed[UpdateDelegatedStake/NodeCollateral.Create/Withdraw]]]]`
   // Use the parent `UpdateDelegatedStake` / `UpdateNodeCollateral` codecs for polymorphic decode on
@@ -224,7 +229,11 @@ object GlobalSnapshotCodecs {
   private val etaOptCodec: Codec[Option[Hash]] = option(hashCodec)
 
   // Field 26: self-contained invalid-state-proof evidence. This field is mandatory in the greenfield schema.
-  private val fraudProofsCodec: Codec[SortedSet[InvalidStateProofEvidence]] = sortedSet(invalidStateProofEvidenceCodec)
+  private val fraudProofsCodec: Codec[SortedSet[InvalidStateProofEvidence]] =
+    sortedSetCanonical(invalidStateProofEvidenceCodec)
+  // Field 27: exact-parent unified operator KES+VRF registrations accepted into this snapshot.
+  private val operatorKeyRegistrationsCodec: Codec[SortedSet[Signed[KesRegistrationCert]]] =
+    sortedSetCanonical(signedCodecFor(kesRegistrationCertCodec))
 
   // Keep the parent ADT codecs referenced so their imports survive scalafix.
   private val _udsADT = updateDelegatedStakeCodec
@@ -257,12 +266,13 @@ object GlobalSnapshotCodecs {
       versionCodec ::
       slotCertificateOptCodec ::
       etaOptCodec ::
-      fraudProofsCodec)
+      fraudProofsCodec ::
+      operatorKeyRegistrationsCodec)
       .xmap[GlobalIncrementalSnapshot](
         {
           case ord :: h :: sh :: lsh :: blks :: scs :: shardCheckpoints :: rws :: dr ::
               ep :: nf :: tips :: sp :: asb :: tlb :: sa :: unp ::
-              art :: ads :: dsw :: anc :: ncw :: v :: slot :: eta :: fraudProofs :: HNil =>
+              art :: ads :: dsw :: anc :: ncw :: v :: slot :: eta :: fraudProofs :: registrations :: HNil =>
             GlobalIncrementalSnapshot(
               ord,
               h,
@@ -289,7 +299,8 @@ object GlobalSnapshotCodecs {
               v,
               slot,
               eta,
-              fraudProofs
+              fraudProofs,
+              registrations
             )
         },
         s =>
@@ -319,6 +330,7 @@ object GlobalSnapshotCodecs {
             s.slotCertificate ::
             s.eta ::
             s.fraudProofs ::
+            s.operatorKeyRegistrations ::
             HNil
       )
 

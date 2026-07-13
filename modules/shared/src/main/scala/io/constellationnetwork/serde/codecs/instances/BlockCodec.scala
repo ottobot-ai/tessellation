@@ -39,7 +39,7 @@ object BlockCodec {
   private val signedTransactionCodec: Codec[Signed[Transaction]] = signedCodec(transactionCodec)
 
   private val transactionsCodec: Codec[NonEmptySet[Signed[Transaction]]] =
-    NonEmptySetCodec.nonEmptySet(signedTransactionCodec)
+    NonEmptySetCodec.nonEmptySetCanonical(signedTransactionCodec)
 
   implicit val codec: Codec[Block] =
     (parentsCodec :: transactionsCodec)

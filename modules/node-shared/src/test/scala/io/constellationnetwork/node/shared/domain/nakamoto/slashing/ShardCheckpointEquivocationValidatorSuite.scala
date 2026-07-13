@@ -1,22 +1,20 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.slashing
 
-import java.security.KeyPair
-
 import cats.data.NonEmptyList
 import cats.effect.{IO, Resource}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
+import io.constellationnetwork.node.shared.domain.nakamoto.{CanonicalOperatorConsensusFixture, KesRegistryEntry}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
-import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT, VrfPublicKey}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes._
-import io.constellationnetwork.security.signature.Signing
+import io.constellationnetwork.security.vrf.EcVrf25519
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -25,7 +23,7 @@ import weaver.MutableIOSuite
 /** Slice 16 — coverage for [[ShardCheckpointEquivocationValidator]] per `HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.1.
   *
   * 8 tests, 1:1 with the task spec:
-  *   - happy path (all 6 steps pass on a real equivocation — same signer, same `(shardId, parentCheckpointHash)`, two distinct children)
+  *   - happy path (all identity and cryptographic checks pass on two competing children at one shard height and execution period)
   *   - 7 negative-path tests, one per [[ShardCheckpointEquivocationRejection]] case the design lists:
   *     - different parents → `ParentMismatch`
   *     - different shards → `ShardMismatch`
@@ -35,44 +33,83 @@ import weaver.MutableIOSuite
   *     - invalid signature on childA → `InvalidEd25519Signature.OnChildA`
   *     - invalid signature on childB → `InvalidEd25519Signature.OnChildB`
   *
-  * '''Fixture strategy.''' Mirrors [[SlashableEvidenceValidatorSuite]]: real KES key (via `OperationalKeyMaker.bootstrap`) + real Ed25519
-  * long-term key (via `KeyPairGenerator.makeKeyPair`). Each child checkpoint envelope is built then signed through the same producer-path
-  * recipe (Hasher of `signingPreimage` → `getBytes` → real Ed25519 + real KES sigs). A faked-signature happy path would not catch
-  * verification regressions in the validator.
+  * '''Fixture strategy.''' Mirrors [[SlashableEvidenceValidatorSuite]]: the operative identity is a long-term-signed, loader-validated,
+  * rooted genesis KES+VRF pair. Each child is signed through the producer crypto recipe with that pair's matching local Ed25519, KES, and
+  * VRF secrets. A faked-signature happy path would not catch registry or verification regressions.
   *
-  * '''Two distinct children.''' We vary `shardOrdinal` (and through it the canonical preimage hash) while keeping `(shardId,
-  * parentCheckpointHash)` identical — that's the precise equivocation algebra. The producer's actual chain-continuity rule would forbid a
-  * single committee member from signing two distinct children at the same parent in honest operation; here we deliberately produce the
-  * second signature to simulate adversarial behaviour.
+  * '''Two distinct children.''' Both children use the same shard ordinal and parent; the signed GL0 anchor/slot differs so their canonical
+  * preimages are distinct. A different shard ordinal is a different height and cannot be treated as equivocation.
   */
 object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
 
-  override type Res = (Hasher[IO], SecurityProvider[IO])
+  override type Res = ((Hasher[IO], SecurityProvider[IO]), CanonicalOperatorConsensusFixture)
 
   override def sharedResource: Resource[IO, Res] =
     for {
       sp <- SecurityProvider.forAsync[IO]
       implicit0(j: JsonSerializer[IO]) <- JsonSerializer.forAsync[IO].asResource
       implicit0(h: Hasher[IO]) = Hasher.forJson[IO]
-    } yield (h, sp)
+      operator <- CanonicalOperatorConsensusFixture.make
+    } yield ((h, sp), operator)
 
   // ===== fixture builders =====
 
-  /** Captures everything needed to produce equivocation evidence for a single committee member: real Ed25519 + real KES key materials, the
-    * static parent hash + shard id, and a `kesMakerResource` that bootstraps the KES signer for actual sig production.
+  private val anchorA: SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L))
+  private val anchorB: SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(101L))
+  private val ordinalA: ShardOrdinal = ShardOrdinal(1L)
+  private val ordinalB: ShardOrdinal = ShardOrdinal(1L)
+
+  /** Captures the rooted operator identity and exact signed checkpoint contexts needed to produce equivocation evidence.
     */
   private case class EquivocationFixture(
-    offenderKp: KeyPair,
-    offenderPeerId: PeerId,
-    offenderKesVk: VerificationKeyKesProduct,
-    kesMakerResource: Resource[IO, OperationalKeyMakerAlgebra[IO]],
+    operator: CanonicalOperatorConsensusFixture,
     shardId: ShardId,
     parentCheckpointHash: Hash,
-    epoch: EtaPeriod
+    epoch: EtaPeriod,
+    shardEta: Array[Byte]
   ) {
 
-    def kesRegistry: KesRegistry[IO] =
-      KesRegistry.make[IO](Map(offenderPeerId -> KesRegistryEntry(offenderKesVk, offset = 0L)))
+    val offenderPeerId: PeerId = operator.resolvedPair.operatorPeerId
+    def offenderVrfSk: Array[Byte] = operator.localVrfSecret
+    def kesMakerResource: Resource[IO, OperationalKeyMakerAlgebra[IO]] = Resource.pure(operator.kesSigner)
+
+    private def contextMatches(context: SlashingOffenceContext): Boolean = context match {
+      case SlashingOffenceContext.ShardCheckpointExecution(sid, parent, ordinal, anchor, declaredPeriod) =>
+        sid == shardId && parent == parentCheckpointHash && ordinal == ordinalA &&
+        Set(anchorA, anchorB).contains(anchor) && declaredPeriod == epoch
+      case _ => false
+    }
+
+    def canonicalResolution: IO[SlashingOperatorKeyResolution] =
+      operator.operatorKeyRegistry.get(offenderPeerId).map {
+        case Some(keys) => SlashingOperatorKeyResolution.Resolved(keys, epoch, shardEta)
+        case None =>
+          SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+            HistoricalStateUnavailableReason.MissingOperatorRegistration
+          )
+      }
+
+    def keyResolver(): SlashingOperatorKeyResolver[IO] =
+      SlashingOperatorKeyResolver.make[IO] { (peerId, context) =>
+        if (peerId == offenderPeerId && contextMatches(context)) canonicalResolution
+        else
+          IO.pure(
+            SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+              HistoricalStateUnavailableReason.AmbiguousHistoricalState
+            )
+          )
+      }
+
+    def keyResolver(resolution: SlashingOperatorKeyResolution): SlashingOperatorKeyResolver[IO] =
+      SlashingOperatorKeyResolver.make[IO] { (peerId, context) =>
+        IO.pure(
+          if (peerId == offenderPeerId && contextMatches(context)) resolution
+          else
+            SlashingOperatorKeyResolution.HistoricalStateUnavailable(
+              HistoricalStateUnavailableReason.AmbiguousHistoricalState
+            )
+        )
+      }
 
     /** Build a [[ShardCheckpoint]] with the offender's REAL Ed25519 + REAL KES signature contribution.
       *
@@ -108,16 +145,18 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       for {
         preimageHash <- Hasher[IO].hash(shell.signingPreimage)
         msgBytes = preimageHash.getBytes
-        edSig <- Signing.signData[IO](msgBytes)(offenderKp.getPrivate)
+        edSig <- operator.signWithOperatorIdentity(msgBytes)
         kesStep <- kesMaker.currentPeriod
         kesSigEither <- kesMaker.signAt(kesStep, msgBytes)
         kesSigBytes = kesSigEither match {
           case Right(s) => OperationalKeyMaker.encodeSignature(s)
           case Left(_)  => Array.empty[Byte]
         }
+        slotBytes = java.nio.ByteBuffer.allocate(8).putLong(shell.slot.value.value).array()
+        vrfProof = EcVrf25519.default.vrfProof(offenderVrfSk, shardEta ++ slotBytes)
         sig = CommitteeMemberSignature(
           peerId = offenderPeerId,
-          vrfProof = Hex.fromBytes(Array.fill[Byte](80)(0x42.toByte)),
+          vrfProof = Hex.fromBytes(vrfProof),
           ed25519Sig = Hex.fromBytes(edSig),
           kesProductSig = Hex.fromBytes(kesSigBytes),
           kesTreeStep = kesStep
@@ -142,41 +181,26 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
   }
 
-  /** Construct an equivocation fixture. All committee-VRF / KES bookkeeping is bootstrapped from deterministic seeds so the test is
-    * reproducible across runs.
-    */
-  private def freshFixture(implicit sp: SecurityProvider[IO]): IO[EquivocationFixture] =
-    for {
-      offenderKp <- KeyPairGenerator.makeKeyPair[IO]
-      store <- SecureStore.inMemory[IO]
-      seed = Array.fill[Byte](32)(0x22.toByte)
-      kesMaterial <- OperationalKeyMaker.generateFreshKesKeyMaterial[IO](seed, height = (2, 2), offset = 0L)
-      (encodedSk, masterVk) = kesMaterial
-      _ <- store.write("kes-sk.bin", encodedSk)
-    } yield
+  /** Construct an equivocation fixture from the canonically validated rooted genesis pair and its matching local secrets. */
+  private def freshFixture(operator: CanonicalOperatorConsensusFixture): IO[EquivocationFixture] =
+    IO.pure(
       EquivocationFixture(
-        offenderKp = offenderKp,
-        offenderPeerId = PeerId.fromPublic(offenderKp.getPublic),
-        offenderKesVk = masterVk,
-        kesMakerResource = OperationalKeyMaker.make[IO](store, "kes-sk.bin", etaPeriodLength = 100L),
+        operator = operator,
         shardId = ShardId.unsafeApply(0),
         parentCheckpointHash = Hash.fromBytes("parent-shard-checkpoint".getBytes("UTF-8")),
-        epoch = EtaPeriod(0L)
+        epoch = EtaPeriod(0L),
+        shardEta = Array.fill[Byte](32)(0x24.toByte)
       )
+    )
 
-  private val anchorA: SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(100L))
-  private val anchorB: SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(101L))
-  private val ordinalA: ShardOrdinal = ShardOrdinal(1L)
-  private val ordinalB: ShardOrdinal = ShardOrdinal(2L)
+  // ===== happy path =====
 
-  // ===== happy path — all 6 steps pass =====
-
-  test("happy: valid equivocation evidence validates (same signer, same shard+parent, distinct children)") { res =>
-    implicit val (h, sp) = res
+  test("fully authenticated pair remains Unverifiable until signer exclusivity is specified") { res =>
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -190,18 +214,24 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
           r <- validator.validate(evidence)
         } yield r
       }
-    } yield expect(result.isRight)
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Unverifiable(
+              SlashingUnverifiableReason.CheckpointSignerExclusivityNotSpecified
+            ) =>
+          success
+      }
   }
 
   // ===== step 1 — parent mismatch =====
 
   test("step 1: parent mismatch — childA.parentCheckpointHash != childB.parentCheckpointHash rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       otherParent = Hash.fromBytes("parent-shard-checkpoint-other".getBytes("UTF-8"))
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -218,7 +248,7 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.ParentMismatch(a, b, ev)) =>
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.ParentMismatch(a, b, ev)) =>
           expect(a == f.parentCheckpointHash)
             .and(expect(b == otherParent))
             .and(expect(ev == f.parentCheckpointHash))
@@ -228,12 +258,12 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
   // ===== step 2 — shard mismatch =====
 
   test("step 2: shard mismatch — childA.shardId != childB.shardId rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       otherShard = ShardId.unsafeApply(1)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -250,19 +280,76 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.ShardMismatch(a, b, ev)) =>
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.ShardMismatch(a, b, ev)) =>
           expect(a == f.shardId).and(expect(b == otherShard)).and(expect(ev == f.shardId))
+      }
+  }
+
+  test("different shard ordinals are not two children at one height and cannot slash") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ShardOrdinal(2L), anchorB, kesMaker)
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            childA,
+            childB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(
+              ShardCheckpointEquivocationRejection.ShardOrdinalMismatch(ShardOrdinal(1L), ShardOrdinal(2L))
+            ) =>
+          success
+      }
+  }
+
+  test("different execution periods are different committee draws and cannot slash") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ordinalB, anchorB, kesMaker)
+          nextPeriodB = childB.copy(epoch = EtaPeriod(1L))
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            childA,
+            nextPeriodB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(
+              ShardCheckpointEquivocationRejection.ExecutionPeriodMismatch(EtaPeriod(0L), EtaPeriod(1L))
+            ) =>
+          success
       }
   }
 
   // ===== step 3 — same child =====
 
   test("step 3: same child — identical canonical child hashes rejects (duplicate retransmission, not equivocation)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           child <- f.buildChild(ordinalA, anchorA, kesMaker)
           // Pass the SAME child as both A and B — identical canonical hash.
@@ -279,7 +366,7 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result._1) {
-        case Left(ShardCheckpointEquivocationRejection.SameChildHash(h)) =>
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.SameChildHash(h)) =>
           expect(h == result._2)
       }
   }
@@ -287,11 +374,11 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
   // ===== step 4 — signer not in childA =====
 
   test("step 4: signer not in childA — equivocatingSigner missing from childA.committeeSignatures rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChildWithoutOffender(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -307,7 +394,7 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildA(signer)) =>
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildA(signer)) =>
           expect(signer == f.offenderPeerId)
       }
   }
@@ -315,11 +402,11 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
   // ===== step 4 — signer not in childB =====
 
   test("step 4: signer not in childB — equivocatingSigner missing from childB.committeeSignatures rejects") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChildWithoutOffender(ordinalB, anchorB, kesMaker)
@@ -335,7 +422,7 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildB(signer)) =>
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.SignerNotPresent.OnChildB(signer)) =>
           expect(signer == f.offenderPeerId)
       }
   }
@@ -343,11 +430,11 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
   // ===== step 5 — invalid Ed25519 signature on childA =====
 
   test("step 5: invalid Ed25519 — tampered ed25519Sig on childA rejects (no cryptographic proof of equivocation)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -372,18 +459,18 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildA) => success
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildA) => success
       }
   }
 
   // ===== step 5 — invalid Ed25519 signature on childB =====
 
   test("step 5: invalid Ed25519 — tampered ed25519Sig on childB rejects (no cryptographic proof of equivocation)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -407,18 +494,18 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildB) => success
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidEd25519Signature.OnChildB) => success
       }
   }
 
   // ===== step 6 — invalid KES signature (additional optional coverage) =====
 
   test("step 6: invalid KES — tampered kesProductSig on childA rejects (KES forward-security proof fails)") { res =>
-    implicit val (h, sp) = res
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        val validator = ShardCheckpointEquivocationValidator.make[IO](f.kesRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -444,21 +531,178 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA) => success
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA) => success
       }
   }
 
-  // ===== step 6 — missing KesRegistry entry (fail-closed) =====
-
-  test("step 6: missing KesRegistry entry — signer not registered ⇒ KES verify fails closed (rejects on childA)") { res =>
-    implicit val (h, sp) = res
+  test("wire KES step cannot select the verification key step") { res =>
+    implicit val (h, sp) = res._1
     for {
-      f <- freshFixture
+      f <- freshFixture(res._2)
       result <- f.kesMakerResource.use { kesMaker =>
-        // EMPTY registry — no entry for the offender. Per slashing safety bar the validator fails closed: we can't establish the
-        // cryptographic proof without the master VK, so we reject — matches SlashableEvidenceValidator's no-registry behaviour.
-        val emptyRegistry = KesRegistry.empty[IO]
-        val validator = ShardCheckpointEquivocationValidator.make[IO](emptyRegistry)
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ordinalB, anchorB, kesMaker)
+          wrongStep = childA.committeeSignatures.head.copy(kesTreeStep = 1)
+          mutatedA = childA.copy(committeeSignatures = NonEmptyList.of(wrongStep))
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            mutatedA,
+            childB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA) => success
+      }
+  }
+
+  test("checkpoint VRF possession proof is verified under the resolved pair") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver())
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ordinalB, anchorB, kesMaker)
+          original = childA.committeeSignatures.head
+          garbage = Array.fill[Byte](original.vrfProof.toBytes.length)(0x6a.toByte)
+          mutatedA = childA.copy(committeeSignatures = NonEmptyList.of(original.copy(vrfProof = Hex.fromBytes(garbage))))
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            mutatedA,
+            childB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidVrfProof.OnChildA) => success
+      }
+  }
+
+  test("checkpoint VRF proof cannot be reinterpreted under a mismatched registered pair") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      otherVrfSk = Array.fill[Byte](32)(0x7b.toByte)
+      otherVrfVk = EcVrf25519.default.getVerificationKey(otherVrfSk)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val mismatched = SlashingOperatorKeyResolution.Resolved(
+          f.operator.resolvedPair.copy(vrfPublicKey = VrfPublicKey.fromBytes(otherVrfVk)),
+          f.epoch,
+          f.shardEta
+        )
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver(mismatched))
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ordinalB, anchorB, kesMaker)
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            childA,
+            childB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidVrfProof.OnChildA) => success
+      }
+  }
+
+  test("not-yet-active checkpoint pair is Unverifiable rather than guilt") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val future = EtaPeriod(1L)
+        val premature = SlashingOperatorKeyResolution.Resolved(
+          f.operator.resolvedPair.copy(
+            kes = KesRegistryEntry(f.operator.resolvedPair.kes.vk, offset = future.value),
+            effectiveFromPeriod = future
+          ),
+          f.epoch,
+          f.shardEta
+        )
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver(premature))
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ordinalB, anchorB, kesMaker)
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            childA,
+            childB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Unverifiable(
+              SlashingUnverifiableReason.ResolvedPairNotActive(EtaPeriod(1L), EtaPeriod(0L))
+            ) =>
+          success
+      }
+  }
+
+  test("half-pair substitution cannot combine an unrelated KES key with the registered VRF key") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      otherKes <- OperationalKeyMaker
+        .generateFreshKesKeyMaterial[IO](Array.fill[Byte](32)(0x71.toByte), height = (2, 2), offset = 0L)
+        .map(_._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val substituted = SlashingOperatorKeyResolution.Resolved(
+          f.operator.resolvedPair.copy(kes = KesRegistryEntry(otherKes, f.operator.resolvedPair.kes.offset)),
+          f.epoch,
+          f.shardEta
+        )
+        val validator = ShardCheckpointEquivocationValidator.make[IO](f.keyResolver(substituted))
+        for {
+          childA <- f.buildChild(ordinalA, anchorA, kesMaker)
+          childB <- f.buildChild(ordinalB, anchorB, kesMaker)
+          evidence = ShardCheckpointEquivocationEvidence(
+            f.shardId,
+            f.parentCheckpointHash,
+            childA,
+            childB,
+            f.offenderPeerId
+          )
+          r <- validator.validate(evidence)
+        } yield r
+      }
+    } yield
+      matches(result) {
+        case SlashingValidationResult.Invalid(ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA) => success
+      }
+  }
+
+  // ===== missing exact historical pair (fail-closed without guilt) =====
+
+  test("missing historical registration is Unverifiable and never a slash verdict") { res =>
+    implicit val (h, sp) = res._1
+    for {
+      f <- freshFixture(res._2)
+      result <- f.kesMakerResource.use { kesMaker =>
+        val unavailable = SlashingOperatorKeyResolver.unavailable[IO](
+          HistoricalStateUnavailableReason.MissingOperatorRegistration
+        )
+        val validator = ShardCheckpointEquivocationValidator.make[IO](unavailable)
         for {
           childA <- f.buildChild(ordinalA, anchorA, kesMaker)
           childB <- f.buildChild(ordinalB, anchorB, kesMaker)
@@ -474,7 +718,13 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
       }
     } yield
       matches(result) {
-        case Left(ShardCheckpointEquivocationRejection.InvalidKesSignature.OnChildA) => success
+        case SlashingValidationResult.Unverifiable(
+              SlashingUnverifiableReason.HistoricalKeyStateUnavailable(
+                _,
+                HistoricalStateUnavailableReason.MissingOperatorRegistration
+              )
+            ) =>
+          success
       }
   }
 

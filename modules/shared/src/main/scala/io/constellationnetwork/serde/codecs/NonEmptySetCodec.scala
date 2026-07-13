@@ -23,17 +23,44 @@ import scodec.{Attempt, Codec, Err}
   */
 object NonEmptySetCodec {
 
-  def nonEmptySet[A: Order](inner: Codec[A]): Codec[NonEmptySet[A]] = {
+  def nonEmptySet[A: Order](inner: Codec[A]): Codec[NonEmptySet[A]] =
+    make(inner, canonicalizeOnEncode = false)
+
+  /** Variant for element codecs that normalize their source representation while decoding, such as mixed-case hex to lowercase. */
+  def nonEmptySetCanonical[A: Order](inner: Codec[A]): Codec[NonEmptySet[A]] =
+    make(inner, canonicalizeOnEncode = true)
+
+  private def make[A: Order](inner: Codec[A], canonicalizeOnEncode: Boolean): Codec[NonEmptySet[A]] = {
     implicit val ordering: Ordering[A] = Order[A].toOrdering
 
     listOfN(uint16, inner).exmap(
       list =>
-        NonEmptySet
-          .fromSet(SortedSet.from(list))
-          .fold[Attempt[NonEmptySet[A]]](
-            Attempt.failure(Err("NonEmptySet decode: empty collection"))
-          )(Attempt.successful),
-      (nes: NonEmptySet[A]) => Attempt.successful(nes.toSortedSet.toList)
+        if (!CanonicalCollectionCodec.isStrictlyIncreasing(list))
+          Attempt.failure(Err("NonEmptySet decode: elements must be strictly increasing"))
+        else
+          NonEmptySet
+            .fromSet(SortedSet.from(list))
+            .fold[Attempt[NonEmptySet[A]]](
+              Attempt.failure(Err("NonEmptySet decode: empty collection"))
+            )(Attempt.successful),
+      // NonEmptySet wraps a SortedSet and therefore also carries an arbitrary
+      // construction-time Ordering. The codec Order[A] is the wire order.
+      // Re-check strictness after sorting: a codec-specific canonical Order can
+      // collapse two differently represented source values to the same wire
+      // value (for example upper/lower-case spellings of identical hex bytes).
+      // Emitting both would produce bytes that this codec's strict decoder
+      // rejects, so fail closed at encode instead.
+      (nes: NonEmptySet[A]) => {
+        val sortedAttempt =
+          if (canonicalizeOnEncode)
+            CanonicalCollectionCodec.sortByCanonicalKey(nes.toSortedSet.toList, inner, identity[A], "NonEmptySet")
+          else Attempt.successful(nes.toSortedSet.toList.sorted(ordering))
+
+        sortedAttempt.flatMap { sorted =>
+          if (canonicalizeOnEncode || CanonicalCollectionCodec.isStrictlyIncreasing(sorted)) Attempt.successful(sorted)
+          else Attempt.failure(Err("NonEmptySet encode: elements must be strictly increasing in canonical wire order"))
+        }
+      }
     )
   }
 }

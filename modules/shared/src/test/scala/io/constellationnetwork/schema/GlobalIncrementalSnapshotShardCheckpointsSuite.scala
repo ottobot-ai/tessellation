@@ -9,6 +9,8 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationOrdinal
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
@@ -35,10 +37,10 @@ import weaver.FunSuite
   *   1. '''Round-trip with non-empty content.''' A snapshot constructed with N `ShardId`-keyed `ShardCheckpoint` entries encodes via Circe
   *      and decodes back equal (including ordered iteration: `SortedMap` keys come out in `Ordering[ShardId]` order; per-checkpoint
   *      `NonEmptyList` element order preserved).
-  *   1. '''Required wire shape.''' Omitting `shardCheckpoints` or `fraudProofs` is rejected; this greenfield fork has no deployed
-  *      predecessor shape to support.
+  *   1. '''Required wire shape.''' Omitting `shardCheckpoints`, `fraudProofs`, or `operatorKeyRegistrations` is rejected; this greenfield
+  *      fork has no deployed predecessor shape to support.
   *   1. '''Mixed with existing fields.''' Encoding/decoding does not regress any of the existing field round-trips — the encoder still
-  *      emits a `shardCheckpoints` key, the decoder still requires the other 24 fields, and equality holds.
+  *      emits a `shardCheckpoints` key, the decoder still requires every other current field, and equality holds.
   *
   * '''What this suite does NOT exercise.''' State-application semantics (acceptance into MPT and fork choice) are covered elsewhere.
   *
@@ -270,9 +272,8 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
   }
 
   // ===========================================================================
-  // W3a — WATCHTOWER fraud-proof field round-trip: the `fraudProofs` consensus artifact follows the EXACT `shardCheckpoints` contract
-  //   (a dedicated, defaulted, forgiving-decoded field), so the same three properties hold: non-empty round-trip, missing-key → empty
-  //   (pre-watchtower wire compat), and the encoder always emits the key.
+  // W3a — WATCHTOWER fraud-proof field round-trip: the `fraudProofs` consensus artifact follows the exact greenfield
+  // `shardCheckpoints` contract: non-empty round-trip, missing-key rejection, and unconditional key emission.
   // ===========================================================================
 
   private def mkFraudProofEnvelope(shard: ShardId, cpHash: Hash, mgAddr: Address): FraudProofEnvelope =
@@ -335,5 +336,49 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
     val snapshot = mkSnapshot(SortedMap.empty)
     val jsonStr = snapshot.asJson.noSpaces
     expect(jsonStr.contains("\"fraudProofs\""))
+  }
+
+  private def mkOperatorKeyRegistration: Signed[KesRegistrationCert] =
+    Signed(
+      KesRegistrationCert(
+        operatorPeerId = peerOne,
+        kesMasterVK = Hex("11" * 32),
+        kesMasterVKStep = 0,
+        offset = 7L,
+        vrfPublicKey = Hex("22" * 32),
+        effectiveFromPeriod = EtaPeriod(7L),
+        registrationParentHash = hash('r'),
+        ordinal = KesRegistrationOrdinal.first
+      ),
+      NonEmptySet.one(mkProof(peerOne.value.value, "33" * 64))
+    )
+
+  test("GlobalIncrementalSnapshot.operatorKeyRegistrations — non-empty SortedSet round-trips through Circe") {
+    val registrations = SortedSet(mkOperatorKeyRegistration)
+    val snapshot = mkSnapshot(SortedMap.empty).copy(operatorKeyRegistrations = registrations)
+    val decoded = decodeSnapshot(snapshot.asJson.noSpaces)
+    expect.all(
+      cats.Eq[GlobalIncrementalSnapshot].eqv(decoded, snapshot),
+      decoded.operatorKeyRegistrations == registrations
+    )
+  }
+
+  test("GlobalIncrementalSnapshot.operatorKeyRegistrations — missing key is rejected") {
+    val json = parse(mkSnapshot(SortedMap.empty).asJson.noSpaces)
+      .fold(err => throw new AssertionError(s"parse failed: ${err.getMessage}"), identity)
+    val stripped = json.hcursor
+      .downField("operatorKeyRegistrations")
+      .delete
+      .top
+      .getOrElse(throw new AssertionError("could not strip operatorKeyRegistrations key from JSON"))
+      .noSpaces
+    expect.all(
+      !stripped.contains("operatorKeyRegistrations"),
+      decode[GlobalIncrementalSnapshot](stripped).isLeft
+    )
+  }
+
+  test("GlobalIncrementalSnapshot encoder always emits an `operatorKeyRegistrations` JSON key") {
+    expect(mkSnapshot(SortedMap.empty).asJson.noSpaces.contains("\"operatorKeyRegistrations\""))
   }
 }

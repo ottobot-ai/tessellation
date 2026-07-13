@@ -83,6 +83,18 @@ object CurrencyRecordCodecsSuite extends FunSuite {
       .and(expect(decoded.updateHashes == p.updateHashes))
   }
 
+  test("DataApplicationPart canonicalizes mixed-case update hash order") {
+    val upperFirst = "B0" + "00" * 31
+    val lowerFirst = "a0" + "00" * 31
+    val part = DataApplicationPart(Array.emptyByteArray, Nil, Hash.empty, Some(SortedSet(Hash(upperFirst), Hash(lowerFirst))))
+
+    expect(
+      part.immutableBytes
+        .fromImmutableBytes[DataApplicationPart]
+        .map(_.updateHashes.toList.flatMap(_.iterator.map(_.value))) == Right(List(lowerFirst, upperFirst.toLowerCase))
+    )
+  }
+
   // ---- Tips ---------------------------------------------------------------
 
   private def br = BlockReference(Height(NonNegLong.unsafeFrom(1L)), ProofsHash("f" * 64))
@@ -103,6 +115,24 @@ object CurrencyRecordCodecsSuite extends FunSuite {
       remainedActive = SortedSet(ActiveTip(br, NonNegLong.unsafeFrom(1L), SnapshotOrdinal(NonNegLong.unsafeFrom(2L))))
     )
     expect(t.immutableBytes.fromImmutableBytes[SnapshotTips] == Right(t))
+  }
+
+  test("SnapshotTips canonicalizes mixed-case ProofsHash order") {
+    val upperFirst = "B0" + "00" * 31
+    val lowerFirst = "a0" + "00" * 31
+    def tip(hash: String): ActiveTip =
+      ActiveTip(
+        BlockReference(Height(NonNegLong.unsafeFrom(1L)), ProofsHash(hash)),
+        NonNegLong.unsafeFrom(1L),
+        SnapshotOrdinal(NonNegLong.unsafeFrom(2L))
+      )
+    val tips = SnapshotTips(SortedSet.empty, SortedSet(tip(upperFirst), tip(lowerFirst)))
+
+    expect(
+      tips.immutableBytes
+        .fromImmutableBytes[SnapshotTips]
+        .map(_.remainedActive.iterator.map(_.block.hash.value).toList) == Right(List(lowerFirst, upperFirst.toLowerCase))
+    )
   }
 
   test("BlockAsActiveTip round-trips") {

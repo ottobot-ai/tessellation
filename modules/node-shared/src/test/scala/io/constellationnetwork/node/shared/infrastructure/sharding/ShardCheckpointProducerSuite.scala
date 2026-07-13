@@ -11,7 +11,8 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.EligibilityChecker
+import io.constellationnetwork.node.shared.domain.nakamoto._
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
@@ -19,16 +20,17 @@ import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInter
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT, VrfPublicKey}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.kes.OperationalKeyMaker
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.verifySignatureProof
-import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.security.{Hasher, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -51,9 +53,11 @@ import weaver.MutableIOSuite
   *     → never wins) — the same trick `ShardSlotLeaderSuite` uses for its corner cases. This avoids mocking the slot leader behaviour and
   *     keeps the producer path real.
   *   - '''Real''' `ShardChainStore` + `Hasher[F]` so the canonical preimage hash is byte-equivalent to runtime.
-  *   - '''Real''' Ed25519 key pair (via `KeyPairGenerator.makeKeyPair`) so the signature-verification test is end-to-end.
-  *   - '''Stubbed''' `KesSigner` (the fixture passes a constant byte payload — slice 8 doesn't verify KES; that's slice 14's gossip-side
-  *     verifier) and stubbed `derivePerMgState` (returns a deterministic per-MG hash from a seed).
+  *   - '''Real''' Ed25519 key pair from the same signed-and-rooted genesis operator fixture as the KES+VRF pair, so the
+  *     signature-verification test is end-to-end without inventing an unregistered consensus identity.
+  *   - '''Real''' KES signing from the same loader-validated genesis pair. The producer's complete Ed25519/KES/VRF evidence is therefore
+  *     internally consistent even in tests whose main assertion concerns checkpoint assembly.
+  *   - '''Stubbed''' `derivePerMgState` (returns a deterministic per-MG hash from a seed).
   */
 object ShardCheckpointProducerSuite extends MutableIOSuite {
 
@@ -85,12 +89,6 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     val r = SecureRandom.getInstance("SHA1PRNG")
     r.setSeed(0x53_48_43_50_52_4f_44L) // ASCII "SHCPROD"
     r
-  }
-
-  private def randomVrfSk(): Array[Byte] = {
-    val sk = new Array[Byte](32)
-    random.nextBytes(sk)
-    sk
   }
 
   private def randomGl0Eta(): Array[Byte] = {
@@ -174,36 +172,76 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
   ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
     (mg, snaps, anchor, executionBase) => seen.update(_ :+ mg) >> deterministicDerive(mg, snaps, anchor, executionBase)
 
-  // slotGap: simple subtraction in slot-space; genesis treats the parent as slot=0 (caller-supplied default).
-  private val slotGapFor: (Slot, Option[Slot]) => Long =
-    (cur, parentOpt) => parentOpt.fold(cur.value.value)(p => cur.value.value - p.value.value)
-
-  /** Stub KES signer carrying a fixed byte payload + fixed period. The producer copies the bytes verbatim onto
-    * `CommitteeMemberSignature.kesProductSig` — slice 8 doesn't run a KES verifier (that's slice 14's gossip-side concern).
-    */
-  private val fixedKesPayload: Array[Byte] = Array.fill[Byte](128)(0xab.toByte)
-  private def stubKesSigner: ShardCheckpointProducer.KesSigner[IO] =
-    ShardCheckpointProducer.KesSigner.fixed[IO](period = 7, signatureBytes = fixedKesPayload)
-
   // Convenience: bundle the common deps the producer constructor needs.
   private case class TestRig(
     chainStore: ShardChainStore[IO],
     publisher: ShardCheckpointPublisher[IO],
     recorded: IO[List[Signed[ShardCheckpoint]]],
     keyPair: KeyPair,
-    selfPeerId: PeerId
+    selfPeerId: PeerId,
+    vrfSk: Array[Byte],
+    vrfVk: Array[Byte],
+    operatorKeys: OperatorConsensusKeys,
+    operatorKeyRegistry: OperatorConsensusKeyRegistry[IO],
+    kesSigner: ShardCheckpointProducer.KesSigner[IO]
   )
 
-  /** Build a fresh per-test rig (chain store + recording publisher + a fresh keypair). */
-  private def freshRig(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[TestRig] =
-    for {
-      store <- ShardChainStore.make[IO](shardZero)
-      pubPair <- ShardCheckpointPublisher.recording[IO]
-      kp <- KeyPairGenerator.makeKeyPair[IO]
-    } yield TestRig(store, pubPair._1, pubPair._2, kp, PeerId.fromPublic(kp.getPublic))
+  private def replacementVrfRegistry(
+    operatorKeys: OperatorConsensusKeys,
+    replacementVrfVk: Array[Byte]
+  ): OperatorConsensusKeyRegistry[IO] =
+    OperatorConsensusKeyRegistry.make[IO](
+      Map(operatorKeys.operatorPeerId -> operatorKeys.copy(vrfPublicKey = VrfPublicKey.fromBytes(replacementVrfVk)))
+    )
 
-  /** Build a producer wired with the common defaults: real ShardSlotLeader, real chain store, stub KES, stub derive. The two knobs exposed
-    * to tests are `sigmaInCommittee` (σ=1 ⇒ always wins, σ=0 ⇒ never wins) and the optional `derivePerMgState` override.
+  private def mutableOperatorRegistry(
+    entries: cats.effect.kernel.Ref[IO, Map[PeerId, OperatorConsensusKeys]]
+  ): OperatorConsensusKeyRegistry[IO] = new OperatorConsensusKeyRegistry[IO] { registry =>
+    def get(peerId: PeerId): IO[Option[OperatorConsensusKeys]] = entries.get.map(_.get(peerId))
+    def list: IO[Map[PeerId, OperatorConsensusKeys]] = entries.get
+
+    val kesRegistry: KesRegistry[IO] = new KesRegistry[IO] {
+      def getKesVk(peerId: PeerId): IO[Option[KesRegistryEntry]] = registry.get(peerId).map(_.map(_.kes))
+      def list: IO[Map[PeerId, KesRegistryEntry]] = registry.list.map(_.view.mapValues(_.kes).toMap)
+    }
+    val vrfRegistry: VrfRegistry[IO] = new VrfRegistry[IO] {
+      def getVrfVk(peerId: PeerId): IO[Option[Array[Byte]]] = registry.get(peerId).map(_.map(_.vrfPublicKey.toBytes))
+      def list: IO[Map[PeerId, Array[Byte]]] = registry.list.map(_.view.mapValues(_.vrfPublicKey.toBytes).toMap)
+    }
+  }
+
+  /** Build a fresh per-test rig around the complete signed-and-rooted period-zero operator pair. */
+  private def freshRig(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[TestRig] =
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      for {
+        store <- ShardChainStore.make[IO](shardZero)
+        pubPair <- ShardCheckpointPublisher.recording[IO]
+        kp = operator.localLongTermKeyPairForConsensusTest
+        selfPeerId = operator.resolvedPair.operatorPeerId
+        vrfSk = operator.localVrfSecret
+        vrfVk = operator.resolvedPair.vrfPublicKey.toBytes
+        checkpointSigner <- RegisteredCheckpointSigner.make
+        _ <- checkpointSigner.preregisterGenesis(kp, selfPeerId)
+        registeredPair <- checkpointSigner.operatorKeyRegistry
+          .get(selfPeerId)
+          .flatMap(IO.fromOption(_)(new IllegalStateException("canonical checkpoint identity was not preregistered")))
+      } yield
+        TestRig(
+          store,
+          pubPair._1,
+          pubPair._2,
+          kp,
+          selfPeerId,
+          vrfSk,
+          vrfVk,
+          registeredPair,
+          checkpointSigner.operatorKeyRegistry,
+          checkpointSigner.producerKesSigner
+        )
+    }
+
+  /** Build a producer wired with the common defaults: real ShardSlotLeader, real chain store, registered KES, stub derive. The two knobs
+    * exposed to tests are `sigmaInCommittee` (σ=1 ⇒ always wins, σ=0 ⇒ never wins) and the optional `derivePerMgState` override.
     */
   private def makeProducer(
     ssl: ShardSlotLeader[IO],
@@ -213,12 +251,17 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
       deterministicDerive,
     republishEveryTicks: Int = 1,
+    lastPhase2Checkpoint: IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None),
     // S2: the finalized-base per-MG window anchor. `None` ⇒ the shard's `perMgTip` (so the pre-S2 cases keep their perMgTip-anchored
     // behavior); the dedicated base-anchored case passes a DISTINCT (lower) tip to prove the window re-includes base->latest.
     finalizedBaseTip: Option[IO[SortedMap[Address, Hash]]] = None,
     // Newness-gate (S2-deadlock fix): gl0's ADOPT tip. `None` ⇒ == the window anchor, so the gate is a NO-OP (every existing test
     // sees identical behavior). The dedicated newness-gate case passes a DISTINCT (higher) adopt tip to exercise stale-re-include omit.
-    adoptedTip: Option[IO[SortedMap[Address, Hash]]] = None
+    adoptedTip: Option[IO[SortedMap[Address, Hash]]] = None,
+    selfVrfVk: Option[Array[Byte]] = None,
+    operatorKeyRegistry: Option[OperatorConsensusKeyRegistry[IO]] = None,
+    kesSigner: Option[ShardCheckpointProducer.KesSigner[IO]] = None,
+    publisher: Option[ShardCheckpointPublisher[IO]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       ShardCheckpointProducer.make[IO](
@@ -227,21 +270,21 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         finalizedBasePerMgTip = finalizedBaseTip.getOrElse(rig.chainStore.perMgTip),
         adoptedPerMgTip = adoptedTip.getOrElse(finalizedBaseTip.getOrElse(rig.chainStore.perMgTip)),
         slotLeader = ssl,
-        publisher = rig.publisher,
+        publisher = publisher.getOrElse(rig.publisher),
         selfPeerId = rig.selfPeerId,
         selfKeyPair = rig.keyPair,
-        selfVrfSk = randomVrfSk(),
-        kesSigner = stubKesSigner,
+        selfVrfSk = rig.vrfSk,
+        selfVrfVk = selfVrfVk.getOrElse(rig.vrfVk),
+        operatorKeyRegistry = operatorKeyRegistry.getOrElse(rig.operatorKeyRegistry),
+        kesSigner = kesSigner.getOrElse(rig.kesSigner),
         // Slice S4: producer takes an epoch-keyed eta resolver. Tests pass a fixed precomputed shardEta regardless of
         // epoch — the producer/verifier-agreement property is exercised in ShardSlotLeaderSuite; here we only assert the
         // producer threads the resolved eta through its leader draw, so a constant is sufficient.
         shardEtaFor = _ => IO.pure(shardEta),
-        slotGapFor = slotGapFor,
         staircaseDeltaSlots = 5,
         derivePerMgState = derive,
         executionBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
-        lastAdoptedOrd = cats.effect.IO.pure(None),
-        pipelineDepth = Int.MaxValue,
+        lastPhase2Checkpoint = lastPhase2Checkpoint,
         republishEveryTicks = republishEveryTicks
       )
     }
@@ -271,7 +314,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         produced.value.shardOrdinal == ShardOrdinal(1L),
         produced.value.committeeSignatures.size == 1,
         produced.value.committeeSignatures.head.peerId == rig.selfPeerId,
-        produced.value.committeeSignatures.head.kesTreeStep == 7,
+        produced.value.committeeSignatures.head.kesTreeStep == 0,
         recorded.size == 1,
         recorded.head.value.shardOrdinal == ShardOrdinal(1L),
         recorded.head.value.shardId == shardZero,
@@ -316,6 +359,157 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     } yield expect.all(out.isEmpty, recorded.isEmpty)
   }
 
+  test("missing or mismatched registered VRF identity has zero proof, derivation, signature, and publish effects") { res =>
+    implicit val (h, sp, ssl) = res
+
+    List("missing", "mismatched").traverse { mode =>
+      for {
+        rig <- freshRig
+        shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+        deriveCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
+        proofCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
+        signatureCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
+        publishCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
+        wrongVrfVk = rig.vrfVk.updated(0, (rig.vrfVk(0) ^ 0xff).toByte)
+        registry =
+          if (mode == "missing") OperatorConsensusKeyRegistry.empty[IO]
+          else replacementVrfRegistry(rig.operatorKeys, wrongVrfVk)
+        countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+          def sign(
+            operatorKeys: OperatorConsensusKeys,
+            checkpointEpoch: EtaPeriod,
+            message: Array[Byte]
+          ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+            signatureCalls.update(_ + 1).as(Some(ShardCheckpointProducer.KesSignature(0, Array[Byte](0x7))))
+        }
+        countingPublisher = new ShardCheckpointPublisher[IO] {
+          def publish(checkpoint: Signed[ShardCheckpoint]): IO[Unit] = publishCalls.update(_ + 1)
+        }
+        countingSlotLeader = new ShardSlotLeader[IO] {
+          def computeShardEta(shardId: ShardId, gl0Eta: Array[Byte])(implicit hasher: Hasher[IO]): IO[Array[Byte]] =
+            ssl.computeShardEta(shardId, gl0Eta)(hasher)
+          def dutyOrder(
+            committee: List[PeerId],
+            eta: Array[Byte],
+            shardOrdinal: ShardOrdinal
+          )(implicit hasher: Hasher[IO]): IO[List[PeerId]] =
+            ssl.dutyOrder(committee, eta, shardOrdinal)(hasher)
+          def membershipProof(vrfSk: Array[Byte], eta: Array[Byte], slot: Slot): IO[Array[Byte]] =
+            proofCalls.update(_ + 1) *> ssl.membershipProof(vrfSk, eta, slot)
+        }
+        producer <- makeProducer(
+          countingSlotLeader,
+          rig,
+          Ratio.One,
+          shardEta,
+          derive = (mg, snaps, anchor, executionBase) => deriveCalls.update(_ + 1) >> deterministicDerive(mg, snaps, anchor, executionBase),
+          operatorKeyRegistry = Some(registry),
+          kesSigner = Some(countingKesSigner),
+          publisher = Some(countingPublisher)
+        )
+        result <- producer.produce(
+          mkPendingSnapshots(1),
+          mkOrd(1L),
+          EtaPeriod(0L),
+          Slot.unsafeApply(1L),
+          Set(rig.selfPeerId)
+        )
+        derives <- deriveCalls.get
+        proofs <- proofCalls.get
+        signatures <- signatureCalls.get
+        publishes <- publishCalls.get
+      } yield expect.all(result.isEmpty, proofs == 0, derives == 0, signatures == 0, publishes == 0)
+    }.map(_.combineAll)
+  }
+
+  test("a held checkpoint is not republished after its registered VRF identity disappears") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      registryEntries <- cats.effect.kernel.Ref.of[IO, Map[PeerId, OperatorConsensusKeys]](
+        Map(rig.selfPeerId -> rig.operatorKeys)
+      )
+      mutableRegistry = mutableOperatorRegistry(registryEntries)
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        operatorKeyRegistry = Some(mutableRegistry),
+        republishEveryTicks = 1
+      )
+      first <- tryProduceUntilSome(producer, 1000L, EtaPeriod(0L), 100, Set(rig.selfPeerId))
+      publishedBefore <- rig.recorded.map(_.size)
+      _ <- registryEntries.set(Map.empty)
+      afterRemoval <- producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(2000L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(2000L),
+        Set(rig.selfPeerId)
+      )
+      publishedAfter <- rig.recorded.map(_.size)
+    } yield expect.all(first.nonEmpty, publishedBefore == 1, afterRemoval.isEmpty, publishedAfter == 1)
+  }
+
+  test("Phase-2 checkpoint anchor ahead of local shard tip defers instead of recreating an old ordinal") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        lastPhase2Checkpoint = IO.pure(Some((ShardOrdinal(1L), Hash("a" * 64))))
+      )
+      out <- producer.produce(
+        mkPendingSnapshots(2),
+        mkOrd(10L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(10L),
+        Set(rig.selfPeerId)
+      )
+      recorded <- rig.recorded
+    } yield expect.all(out.isEmpty, recorded.isEmpty)
+  }
+
+  test("same-ordinal Phase-2 checkpoint hash mismatch defers instead of releasing a child") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      gl0Eta = randomGl0Eta()
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      phase2Checkpoint <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, lastPhase2Checkpoint = phase2Checkpoint.get)
+      first <- tryProduceUntilSome(
+        producer,
+        startOrd = 100L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = mkPendingChainedOff(SortedMap.empty, round = 0)
+      )
+      firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
+      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
+      wrongHash = if (firstHash === Hash("b" * 64)) Hash("c" * 64) else Hash("b" * 64)
+      _ <- phase2Checkpoint.set(Some((firstCp.value.shardOrdinal, wrongHash)))
+      perMgTip <- rig.chainStore.perMgTip
+      out <- producer.produce(
+        mkPendingChainedOff(perMgTip, round = 1),
+        mkOrd(200L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(200L),
+        Set(rig.selfPeerId)
+      )
+      tip <- rig.chainStore.bestTip
+    } yield expect.all(out.isEmpty, tip.exists(_.signed.value.shardOrdinal == ShardOrdinal(1L)))
+  }
+
   // ===========================================================================
   // Test 4 — Parent chain-link
   // ===========================================================================
@@ -326,7 +520,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       rig <- freshRig
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
-      producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
+      phase2Checkpoint <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, lastPhase2Checkpoint = phase2Checkpoint.get)
       // Produce one — its binaries are genesis-anchored (Hash.empty), then insert it into the chain store so the next produce sees a
       // non-empty tip. (R-2: the FIRST round's pending must chain off the empty perMgTip ⇒ Hash.empty-anchored binaries.)
       first <- tryProduceUntilSome(
@@ -341,6 +536,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
       tipAfterFirst <- rig.chainStore.bestTip
       firstHash = tipAfterFirst.get.hash
+      _ <- phase2Checkpoint.set(Some((firstCp.value.shardOrdinal, firstHash)))
       // R-2: the second round's pending binaries must now chain off the SHARD's advanced perMgTip (the first round's included-binary
       // hashes), or the producer's chain-link gate omits them and produce returns None.
       perMgTipAfterFirst <- rig.chainStore.perMgTip
@@ -379,12 +575,14 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       b0 = mkSignedBinary("mg-0", 0, parent = Hash.empty)
       b0Hash <- SignedOps(b0).toHashed[IO].map(_.hash)
       b1 = mkSignedBinary("mg-0", 1, parent = b0Hash)
+      phase2Checkpoint <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
       // Producer with the FINALIZED base STUCK at genesis (empty ⇒ Hash.empty anchor) — DISTINCT from (below) perMgTip after round 0.
       producer <- makeProducer(
         ssl,
         rig,
         Ratio.One,
         shardEta,
+        lastPhase2Checkpoint = phase2Checkpoint.get,
         finalizedBaseTip = Some(IO.pure(SortedMap.empty[Address, Hash](Address.OrderingInstance)))
       )
       // Round 0: mint a genesis checkpoint including b0, insert it ⇒ chainStore.perMgTip = hash(b0).
@@ -398,6 +596,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
       _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
+      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
+      _ <- phase2Checkpoint.set(Some((firstCp.value.shardOrdinal, firstHash)))
       perMgTipAfter <- rig.chainStore.perMgTip
       // Round 1: the buffer RE-INCLUDES b0 (already at perMgTip) plus the new b1. A perMgTip-anchored producer (anchor = hash(b0)) would
       // unfold ONLY [b1]; the base-anchored producer (anchor = genesis Hash.empty) unfolds [b0, b1] — re-including b0.
@@ -496,7 +696,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       rig <- freshRig
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
-      producer <- makeProducer(ssl, rig, Ratio.One, shardEta)
+      phase2Checkpoint <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, lastPhase2Checkpoint = phase2Checkpoint.get)
       // Produce 3 in sequence; ordinals should be 1, 2, 3. After each produce, install the result in the chain store so the next call
       // observes the updated tip. R-2: each round's pending binaries chain off the SHARD's current perMgTip (genesis on round 0).
       ords <- (0 until 3).toList
@@ -516,6 +717,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
               _ <- insertIntoStore(rig.chainStore, cp, parentHash = parentHash)
               tip <- rig.chainStore.bestTip
               tipHash = tip.get.hash
+              _ <- phase2Checkpoint.set(Some((cp.value.shardOrdinal, tipHash)))
             } yield (acc :+ cp.value.shardOrdinal.value, tipHash)
         }
         .map(_._1)
@@ -634,6 +836,15 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       // call the existing verifier.
       proofShape = SignatureProof(Id(rig.selfPeerId.value), Signature(committeeSig.ed25519Sig))
       verified <- verifySignatureProof[IO](preimageHash, proofShape)
+      kesVerified = OperationalKeyMaker
+        .decodeSignature(committeeSig.kesProductSig.toBytes)
+        .exists(signature =>
+          OperationalKeyMaker.verify(
+            signature,
+            preimageHash.getBytes,
+            rig.operatorKeys.kes.vk.copy(step = committeeSig.kesTreeStep)
+          )
+        )
       // The outer Signed envelope's SignatureProof is also signed by the same keypair — assert it carries exactly one proof and that
       // proof's signer Id matches the selfPeerId.
       outerProofs = cp.proofs.toNonEmptyList.toList
@@ -643,9 +854,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         committeeSig.peerId == rig.selfPeerId,
         outerProofs.size == 1,
         outerProofs.head.id == Id(rig.selfPeerId.value),
-        // KES signature: producer copies bytes verbatim from the stub signer (slice 8 doesn't run KES verification).
-        committeeSig.kesProductSig == Hex.fromBytes(fixedKesPayload),
-        committeeSig.kesTreeStep == 7
+        kesVerified,
+        committeeSig.kesTreeStep == 0
       )
   }
 
@@ -735,15 +945,54 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       )
   }
 
-  test("task #45 advancement: the memo does NOT block the next ordinal — after the tip advances, produce mints N+1") { res =>
+  test("held checkpoint remains publishable after the pending binary buffer drains") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, republishEveryTicks = 1)
+      first <- producer.produce(
+        mkPendingSnapshots(2),
+        mkOrd(3200L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3200L),
+        Set(rig.selfPeerId)
+      )
+      replay <- producer.produce(
+        SortedMap.empty,
+        mkOrd(3201L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3201L),
+        Set(rig.selfPeerId)
+      )
+      firstHash <- first.traverse(cp => Hasher[IO].hash(cp.value.signingPreimage))
+      replayHash <- replay.traverse(cp => Hasher[IO].hash(cp.value.signingPreimage))
+      recorded <- rig.recorded
+    } yield
+      expect.all(
+        firstHash.nonEmpty,
+        replayHash == firstHash,
+        recorded.size == 2
+      )
+  }
+
+  test("single outstanding checkpoint: self-store re-publishes N; only its exact Phase-2 anchor releases N+1") { res =>
     implicit val (h, sp, ssl) = res
     for {
       rig <- freshRig
       gl0Eta = randomGl0Eta()
       shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
-      producer <- makeProducer(ssl, rig, Ratio.One, shardEta, republishEveryTicks = 1)
-      // Mint ord-1 (held), then INSERT it so bestTip advances to ord-1. The next produce sees nextShardOrdinal=2 ⇒ the held ord-1 is a
-      // MISS (different ordinal) ⇒ the memo is dropped and ord-2 is minted (a new, distinct hash). Proves the memo never wedges progress.
+      phase2Checkpoint <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        republishEveryTicks = 1,
+        lastPhase2Checkpoint = phase2Checkpoint.get
+      )
+      // Mint ord-1 and self-store it, matching the live fan-out path. Until GL0 Phase-2 anchors this exact hash, the producer must return
+      // the exact same checkpoint instead of extending an unanchored checkpoint chain.
       first <- tryProduceUntilSome(
         producer,
         startOrd = 4000L,
@@ -753,8 +1002,17 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         pending = mkPendingChainedOff(SortedMap.empty, round = 0)
       )
       firstCp <- IO.fromOption(first)(new RuntimeException("produce-1 should win at σ=1 within 100 attempts"))
+      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
       _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
       perMgTip <- rig.chainStore.perMgTip
+      heldAgain <- producer.produce(
+        mkPendingChainedOff(perMgTip, round = 1),
+        mkOrd(4050L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(4050L),
+        Set(rig.selfPeerId)
+      )
+      _ <- phase2Checkpoint.set(Some((firstCp.value.shardOrdinal, firstHash)))
       second <- tryProduceUntilSome(
         producer,
         startOrd = 4100L,
@@ -764,14 +1022,180 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         pending = mkPendingChainedOff(perMgTip, round = 1)
       )
       secondCp <- IO.fromOption(second)(new RuntimeException("produce-2 should win and advance to ord-2"))
-      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
+      heldAgainHash <- heldAgain.traverse(cp => Hasher[IO].hash(cp.value.signingPreimage))
       secondHash <- Hasher[IO].hash(secondCp.value.signingPreimage)
     } yield
       expect.all(
         firstCp.value.shardOrdinal == ShardOrdinal(1L),
+        heldAgainHash.contains(firstHash),
         secondCp.value.shardOrdinal == ShardOrdinal(2L),
         secondCp.value.parentCheckpointHash == firstHash, // ord-2 chains off ord-1
         firstHash =!= secondHash // a genuinely new mint, not a stale re-publish of ord-1
+      )
+  }
+
+  test("Phase-2 recovery anchors a non-genesis checkpoint in an empty follower store and permits its successor") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      originalRig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      originalPhase2 <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
+      originalProducer <- makeProducer(
+        ssl,
+        originalRig,
+        Ratio.One,
+        shardEta,
+        lastPhase2Checkpoint = originalPhase2.get
+      )
+      first <- tryProduceUntilSome(
+        originalProducer,
+        startOrd = 4500L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(originalRig.selfPeerId),
+        pending = mkPendingChainedOff(SortedMap.empty, round = 0)
+      )
+      firstCp <- IO.fromOption(first)(new RuntimeException("first checkpoint should be produced"))
+      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
+      _ <- ShardCheckpointChainStoreRecovery.ingestValidated(firstCp.value, originalRig.chainStore)
+      _ <- originalRig.chainStore.noteAnchor(firstHash) >> originalRig.chainStore.finalize(firstHash)
+      _ <- originalPhase2.set(Some((firstCp.value.shardOrdinal, firstHash)))
+      firstTip <- originalRig.chainStore.perMgTip
+      second <- tryProduceUntilSome(
+        originalProducer,
+        startOrd = 4600L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(originalRig.selfPeerId),
+        pending = mkPendingChainedOff(firstTip, round = 1)
+      )
+      secondCp <- IO.fromOption(second)(new RuntimeException("second checkpoint should be produced"))
+      secondHash <- Hasher[IO].hash(secondCp.value.signingPreimage)
+
+      // Model a restarted/follower node that learned only shard ordinal 2 from the validated GL0 artifact. Its process-local store has
+      // neither the checkpoint nor its older shard ancestry. Ingestion keeps the parentless checkpoint noncanonical; exact Phase-2
+      // anchoring establishes the authorized retained-history boundary and releases ordinal 3.
+      recoveredStore <- ShardChainStore.make[IO](shardZero)
+      recoveredRig = originalRig.copy(chainStore = recoveredStore)
+      beforeRecovery <- recoveredStore.bestTip
+      recoveredResult <- ShardCheckpointChainStoreRecovery.ingestValidated(secondCp.value, recoveredStore)
+      duplicateResult <- ShardCheckpointChainStoreRecovery.ingestValidated(secondCp.value, recoveredStore)
+      beforeAnchor <- recoveredStore.bestTip
+      recovered <- recoveredStore.getByHash(secondHash)
+      _ <- recoveredStore.noteAnchor(secondHash) >> recoveredStore.finalize(secondHash)
+      afterAnchor <- recoveredStore.bestTip
+
+      phase2Checkpoint = IO.pure(Some((secondCp.value.shardOrdinal, secondHash)))
+      restartedProducer <- makeProducer(
+        ssl,
+        recoveredRig,
+        Ratio.One,
+        shardEta,
+        lastPhase2Checkpoint = phase2Checkpoint
+      )
+      recoveredTip <- recoveredStore.perMgTip
+      third <- tryProduceUntilSome(
+        restartedProducer,
+        startOrd = 4700L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(recoveredRig.selfPeerId),
+        pending = mkPendingChainedOff(recoveredTip, round = 2)
+      )
+      thirdCp <- IO.fromOption(third)(new RuntimeException("recovered Phase-2 parent should permit its successor"))
+      recoveredProofIds = recovered.toList.flatMap(_.signed.proofs.toSortedSet.toList.map(_.id))
+      committeePeerIds = secondCp.value.committeeSignatures.toList.map(_.peerId.toId)
+    } yield
+      expect.all(
+        beforeRecovery.isEmpty,
+        secondCp.value.shardOrdinal == ShardOrdinal(2L),
+        recoveredResult.checkpointHash == secondHash,
+        recoveredResult.inserted,
+        duplicateResult.checkpointHash == secondHash,
+        !duplicateResult.inserted,
+        beforeAnchor.isEmpty,
+        recovered.exists(_.hash == secondHash),
+        recovered.exists(_.signed.value === secondCp.value),
+        recoveredProofIds.toSet == committeePeerIds.toSet,
+        recovered.exists(_.signed.value.producerSignature.peerId == secondCp.value.producerSignature.peerId),
+        afterAnchor.exists(_.hash == secondHash),
+        thirdCp.value.shardOrdinal == secondCp.value.shardOrdinal.next,
+        thirdCp.value.parentCheckpointHash == secondHash
+      )
+  }
+
+  test("Phase-2 recovery fails closed on a malformed producer VRF proof") { res =>
+    implicit val h: Hasher[IO] = res._1
+    val malformed = stubCheckpoint(1L).value.copy(
+      committeeSignatures = stubCheckpoint(1L).value.committeeSignatures.map(_.copy(vrfProof = Hex("")))
+    )
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      result <- ShardCheckpointChainStoreRecovery.ingestValidated(malformed, store).attempt
+      tip <- store.bestTip
+    } yield expect(result.isLeft).and(expect(tip.isEmpty))
+  }
+
+  test("Phase-2 sibling reorg clears a held losing child and builds on the exact winning parent") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      phase2Checkpoint <- cats.effect.kernel.Ref.of[IO, Option[(ShardOrdinal, Hash)]](None)
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        republishEveryTicks = 1,
+        lastPhase2Checkpoint = phase2Checkpoint.get
+      )
+      first <- tryProduceUntilSome(
+        producer,
+        startOrd = 5000L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = mkPendingChainedOff(SortedMap.empty, round = 0)
+      )
+      firstCp <- IO.fromOption(first)(new RuntimeException("first checkpoint should be produced"))
+      firstHash <- Hasher[IO].hash(firstCp.value.signingPreimage)
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
+      _ <- phase2Checkpoint.set(Some((firstCp.value.shardOrdinal, firstHash)))
+      firstTip <- rig.chainStore.perMgTip
+      heldChild <- tryProduceUntilSome(
+        producer,
+        startOrd = 5100L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = mkPendingChainedOff(firstTip, round = 1)
+      )
+      losingChild <- IO.fromOption(heldChild)(new RuntimeException("losing child should be held"))
+      losingChildHash <- Hasher[IO].hash(losingChild.value.signingPreimage)
+      siblingValue = firstCp.value.copy(slot = Slot.unsafeApply(firstCp.value.slot.value.value + 1L))
+      sibling = Signed(siblingValue, firstCp.proofs)
+      siblingHash <- Hasher[IO].hash(sibling.value.signingPreimage)
+      _ <- insertIntoStore(rig.chainStore, sibling, parentHash = Hash.empty)
+      _ <- rig.chainStore.noteAnchor(siblingHash)
+      _ <- phase2Checkpoint.set(Some((sibling.value.shardOrdinal, siblingHash)))
+      winningTip <- rig.chainStore.perMgTip
+      replacement <- tryProduceUntilSome(
+        producer,
+        startOrd = 5200L,
+        epoch = EtaPeriod(0L),
+        maxAttempts = 100,
+        committee = Set(rig.selfPeerId),
+        pending = mkPendingChainedOff(winningTip, round = 2)
+      )
+      replacementCp <- IO.fromOption(replacement)(new RuntimeException("replacement child should be produced"))
+      replacementHash <- Hasher[IO].hash(replacementCp.value.signingPreimage)
+    } yield
+      expect.all(
+        siblingHash =!= firstHash,
+        replacementCp.value.shardOrdinal == ShardOrdinal(2L),
+        replacementCp.value.parentCheckpointHash == siblingHash,
+        replacementHash =!= losingChildHash
       )
   }
 

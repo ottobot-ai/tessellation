@@ -12,9 +12,9 @@ import io.constellationnetwork.security.hex.Hex
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
-/** Tests for the structural-only fork choice. After the BABE/GRANDPA-style split (attestations only drive finality, never fork choice),
-  * `compare` is a deterministic function of block headers — ordinal/slot/VRF tiebreaks for short forks, density-in-window for long forks.
-  * Attestations are still threaded through `shouldSwitch`'s "don't revert below the finalized head" guard, but never tip selection.
+/** Tests for structural Nakamoto/Taktikos fork choice. `compare` is a deterministic function of block headers: ordinal/slot/VRF tie-breaks
+  * for short forks and density-in-window for long forks. Attestations do not create a GRANDPA/BFT lock or choose the tip. Current
+  * `shouldSwitch` finality guards are transitional target violations because reversible Phase 2 and retention-only k2 cannot floor density.
   */
 object ChainSelectionSuite extends SimpleIOSuite {
 

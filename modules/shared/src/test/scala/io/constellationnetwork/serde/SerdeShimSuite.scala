@@ -42,6 +42,19 @@ object SerdeShimSuite extends FunSuite {
     expect(decoded == Right(sample)).and(expect(reEncoded == Right(bytes)))
   }
 
+  test("ImmutableCodec rejects a valid value with trailing bytes") {
+    val bytes = sample.immutableBytes ++ ByteVector(0x7f)
+
+    expect(bytes.fromImmutableBytes[PilotValue].isLeft)
+  }
+
+  test("Transmittable rejects a valid value with trailing bytes") {
+    val transmittable = Transmittable.fromScodecCodec(PilotValue.codec)
+    val bytes = transmittable.transmittableBytes(sample) ++ ByteVector(0x7f)
+
+    expect(transmittable.fromTransmittableBytes(bytes).isLeft)
+  }
+
   test("Default Persistable matches ImmutableCodec (no compression)") {
     val persist = sample.persistedBytes
     val imm = sample.immutableBytes

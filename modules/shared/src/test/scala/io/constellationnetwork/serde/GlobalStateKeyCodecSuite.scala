@@ -93,7 +93,7 @@ object GlobalStateKeyCodecSuite extends FunSuite {
   }
 
   test("GlobalStateFieldId round-trips for every registered id") {
-    val expectedInts = (0 to 23) ++ (25 to 34)
+    val expectedInts = 0 to 34
     val ids = expectedInts.map(GlobalStateFieldId.fromInt)
     val decoded = ids.flatten.map(_.immutableBytes.fromImmutableBytes[GlobalStateFieldId])
     expect.all(
@@ -102,10 +102,10 @@ object GlobalStateKeyCodecSuite extends FunSuite {
     )
   }
 
-  test("retired field 24 fails decode while later field IDs remain registered") {
-    val retired = ByteVector.fromByte(24.toByte).fromImmutableBytes[GlobalStateFieldId]
+  test("field 24 is the rooted genesis operator KES+VRF registry") {
+    val decoded = ByteVector.fromByte(24.toByte).fromImmutableBytes[GlobalStateFieldId]
     expect.all(
-      retired.isLeft,
+      decoded == Right(GenesisOperatorKeys),
       (25 to 34).forall(GlobalStateFieldId.fromInt(_).nonEmpty)
     )
   }

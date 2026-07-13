@@ -7,6 +7,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.{EtaSourceRange, EtaSourceUnavailable}
 import io.constellationnetwork.node.shared.domain.nakamoto.{EtaCalculation, EtaStateManager, HistoricalStakeReader}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.Mocks._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{DelegatedRewardsResult, RewardsInput}
@@ -67,6 +68,9 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
   // Small rotation period so the boundary fires at low ordinals.
   private val R: Long = 10L
 
+  private def atParent(callback: EtaPeriod => IO[Hash]) =
+    (period: EtaPeriod, _: io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId) => callback(period)
+
   // 5 synthetic VRF outputs for the chain-walk fallback. For periods 0 / 1 the EtaStateManager
   // bypasses the walk (returns bootstrapEta(genesisEta, period) directly); for period ≥ 2 the walk
   // feeds `EtaCalculation.computeEta` over these bytes.
@@ -98,6 +102,8 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     mgr: GlobalSnapshotAcceptanceManager[IO],
     boundaryOrd: Long,
     expectedPeriod: Long,
+    parentTip: io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId =
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
     pinnedBoundaryEta: Option[Hash] = None
   ): IO[Option[HistoricalStakeSnapshot]] = {
     val priorInfo = mkGlobalSnapshotInfo()
@@ -121,10 +127,10 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         calculateRewardsFn = emptyRewardsFn,
         validationType = StateChannelValidationType.Full,
         getGlobalSnapshotByOrdinal = _ => IO.pure(None),
-        parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
+        parentTip = parentTip,
         pinnedBoundaryEta = pinnedBoundaryEta
       )
-      (_, _, _, _, _, _, _, _, snapshotInfo, _, _, _, _, _, _, _) = result
+      (_, _, _, _, _, _, _, _, snapshotInfo, _, _, _, _, _, _, _, _) = result
     } yield snapshotInfo.historicalStakeSnapshots.get(EtaPeriod(expectedPeriod))
   }
 
@@ -149,16 +155,16 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     // bootstrapEta(genesisEta, 0) per the Cardano/Praos bootstrap convention. The wiring still goes
     // through `etaBytesToHash` so the resulting Hash is the hex encoding of that 32-byte value —
     // distinctly NOT `Hash.empty` and NOT raw genesisEta.
-    val chainWalk: Long => IO[List[(Long, Array[Byte])]] = (_: Long) => IO.pure(syntheticVrfOutputs)
+    val chainWalk: Long => IO[EtaSourceRange] = (_: Long) => IO.pure(EtaSourceRange.Complete(syntheticVrfOutputs))
     val expectedEtaHash = SharedServices.etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, 0L))
     for {
       etaMgr <- EtaStateManager.make[IO](
         genesisEta = genesisEta,
         historicalStakeReader = emptyMptReader,
-        chainWalkFallback = chainWalk
+        chainWalkFallback = (sourcePeriod, _) => chainWalk(sourcePeriod)
       )
       callback = (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
-      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(atParent(callback)))
       entry <- runBoundary(mgr, boundaryOrd = 9L, expectedPeriod = 0L)
     } yield
       expect.all(
@@ -179,8 +185,9 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     // would return non-empty period-0 outputs. This is the byte-exact value the wire / eligibility /
     // committee eta also compute for period 1, so producer record == committee == wire == follower-adopt at
     // period 1 — and the first eta rotation (0 → 1) cannot fork on period 0's still-unsettled outputs.
-    val chainWalk: Long => IO[List[(Long, Array[Byte])]] =
-      (sourcePeriod: Long) => if (sourcePeriod == 0L) IO.pure(syntheticVrfOutputs) else IO.pure(List.empty)
+    val chainWalk: Long => IO[EtaSourceRange] =
+      (sourcePeriod: Long) =>
+        IO.pure(if (sourcePeriod == 0L) EtaSourceRange.Complete(syntheticVrfOutputs) else EtaSourceRange.Incomplete(Nil))
     val expectedEtaHash = SharedServices.etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, 1L))
     // The value a period-0-output fold WOULD produce — period 1 must NOT equal this (proves the walk is bypassed).
     val foldedFromPeriod0Hash = SharedServices.etaBytesToHash(EtaCalculation.computeEta(genesisEta, 1L, syntheticVrfOutputs.map(_._2)))
@@ -189,10 +196,10 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
       etaMgr <- EtaStateManager.make[IO](
         genesisEta = genesisEta,
         historicalStakeReader = emptyMptReader,
-        chainWalkFallback = chainWalk
+        chainWalkFallback = (sourcePeriod, _) => chainWalk(sourcePeriod)
       )
       callback = (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
-      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(atParent(callback)))
       entry <- runBoundary(mgr, boundaryOrd = 19L, expectedPeriod = 1L)
     } yield
       expect.all(
@@ -213,8 +220,9 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     // R=10, ord 29 = period 2 closing boundary (29/10 == 2, 29 % 10 == 9 == R-1). At period 2
     // the EtaStateManager falls through to `chainWalkFallback(1L)` (source-period = currentPeriod-1)
     // and computes `EtaCalculation.computeEta(genesisEta, 2, syntheticVrfOutputs.map(_._2))`.
-    val chainWalk: Long => IO[List[(Long, Array[Byte])]] =
-      (sourcePeriod: Long) => if (sourcePeriod == 1L) IO.pure(syntheticVrfOutputs) else IO.pure(List.empty)
+    val chainWalk: Long => IO[EtaSourceRange] =
+      (sourcePeriod: Long) =>
+        IO.pure(if (sourcePeriod == 1L) EtaSourceRange.Complete(syntheticVrfOutputs) else EtaSourceRange.Incomplete(Nil))
     val expectedEtaBytes = EtaCalculation.computeEta(genesisEta, 2L, syntheticVrfOutputs.map(_._2))
     val expectedEtaHash = SharedServices.etaBytesToHash(expectedEtaBytes)
 
@@ -222,10 +230,10 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
       etaMgr <- EtaStateManager.make[IO](
         genesisEta = genesisEta,
         historicalStakeReader = emptyMptReader,
-        chainWalkFallback = chainWalk
+        chainWalkFallback = (sourcePeriod, _) => chainWalk(sourcePeriod)
       )
       callback = (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash)
-      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(atParent(callback)))
       entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L)
     } yield
       expect.all(
@@ -242,6 +250,22 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
       )
   }
 
+  test("boundary eta callback receives the exact candidate parent BranchId") { res =>
+    implicit val (h, sp) = res
+    val parent = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(
+      Hash(Array.fill[Byte](32)(0x6a.toByte).map(b => f"$b%02x").mkString)
+    )
+    val expectedEta = SharedServices.etaBytesToHash(Array.fill[Byte](32)(0x4c.toByte))
+    for {
+      seen <- cats.effect.Ref.of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]](None)
+      callback = (period: EtaPeriod, branch: io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId) =>
+        seen.set(Some(branch)).as(expectedEta)
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L, parentTip = parent)
+      observedParent <- seen.get
+    } yield expect.all(entry.exists(_.eta == expectedEta), observedParent.contains(parent))
+  }
+
   // A downstream follower has the finalized GL0 artifact but not GL0's VRF-output ancestry. At the period boundary it must pin the artifact's
   // signed eta; the full state-proof comparison authenticates the replayed result.
 
@@ -249,37 +273,26 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
   private val gl0AuthoritativeEtaHash: Hash =
     SharedServices.etaBytesToHash(EtaCalculation.computeEta(genesisEta, 2L, syntheticVrfOutputs.map(_._2)))
 
-  // The follower's divergent period-2 recompute value: empty chain walk ⇒ EtaStateManager's N>=2
-  // empty-source fallback returns bootstrapEta(genesisEta, 2), which is NOT gl0's authoritative value —
-  // this is the source of the #259 divergence.
-  private val followerBootstrapEta2Hash: Hash =
-    SharedServices.etaBytesToHash(EtaCalculation.bootstrapEta(genesisEta, 2L))
-
-  // A follower's `etaForPeriod`: empty chain walk ⇒ EtaStateManager falls through to bootstrapEta(genesisEta, 2),
-  // which is NOT gl0's authoritative value for period ≥ 2 — this is the source of the #259 divergence.
+  // A follower without the exact GL0 source range must fail closed for N>=2. A finalized artifact may instead pin GL0's authenticated eta.
   private def followerEtaCallback(implicit h: Hasher[IO]): IO[EtaPeriod => IO[Hash]] = {
-    val emptyChainWalk: Long => IO[List[(Long, Array[Byte])]] = (_: Long) => IO.pure(List.empty)
+    val emptyChainWalk: Long => IO[EtaSourceRange] = (_: Long) => IO.pure(EtaSourceRange.Incomplete(Nil))
     EtaStateManager
-      .make[IO](genesisEta = genesisEta, historicalStakeReader = emptyMptReader, chainWalkFallback = emptyChainWalk)
+      .make[IO](
+        genesisEta = genesisEta,
+        historicalStakeReader = emptyMptReader,
+        chainWalkFallback = (sourcePeriod, _) => emptyChainWalk(sourcePeriod)
+      )
       .map(etaMgr => (period: EtaPeriod) => etaMgr.getEta(period.value).map(SharedServices.etaBytesToHash))
   }
 
-  test("an incomplete follower eta source diverges at the period-2 boundary without the GL0 pin") { res =>
+  test("an incomplete follower eta source fails closed at the period-2 boundary without the GL0 pin") { res =>
     implicit val (h, sp) = res
-    // R=10, ord 29 = period 2 closing boundary. Follower callback ⇒ empty walk ⇒ bootstrapEta(genesisEta, 2).
+    // R=10, ord 29 = period 2 closing boundary. No authenticated eta and no complete ancestry means defer.
     for {
       callback <- followerEtaCallback
-      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
-      entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L)
-    } yield
-      expect.all(
-        entry.isDefined,
-        // The follower's recomputed eta is the N>=2 empty-source bootstrap fall-through...
-        entry.map(_.eta).contains(followerBootstrapEta2Hash),
-        // ...which does NOT match gl0's authoritative value → this is exactly the divergence that
-        // produced StateProofMismatch every period before the fix.
-        !entry.map(_.eta).contains(gl0AuthoritativeEtaHash)
-      )
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(atParent(callback)))
+      entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L).attempt
+    } yield expect(entry.left.exists(_.isInstanceOf[EtaSourceUnavailable]))
   }
 
   test("a follower pins finalized GL0 eta at the period-2 boundary") { res =>
@@ -287,15 +300,15 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
     // The local callback still returns the wrong bootstrap value. The signed finalized artifact supplies GL0's exact eta.
     for {
       callback <- followerEtaCallback
-      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(callback))
+      mgr <- mkManager(initialSnapshotInfo = None, etaRotationSnapshots = R, etaForPeriod = Some(atParent(callback)))
       entry <- runBoundary(mgr, boundaryOrd = 29L, expectedPeriod = 2L, pinnedBoundaryEta = Some(gl0AuthoritativeEtaHash))
     } yield
       expect.all(
         entry.isDefined,
         // The boundary entry uses the finalized GL0 value...
         entry.map(_.eta).contains(gl0AuthoritativeEtaHash),
-        // ...not the follower's incomplete local fallback.
-        !entry.map(_.eta).contains(followerBootstrapEta2Hash)
+        // The incomplete callback is bypassed by the authenticated upstream pin.
+        entry.map(_.eta).contains(gl0AuthoritativeEtaHash)
       )
   }
 }

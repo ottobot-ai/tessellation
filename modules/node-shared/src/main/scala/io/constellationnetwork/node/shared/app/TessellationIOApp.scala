@@ -21,6 +21,7 @@ import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared._
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.types._
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.ext.pureconfig._
 import io.constellationnetwork.node.shared.http.p2p.SharedP2PClient
 import io.constellationnetwork.node.shared.infrastructure.allowance_list.{Loader => AllowanceListLoader}
@@ -96,28 +97,18 @@ abstract class TessellationIOApp[A <: CliMethod](
 
   def run(method: A, nodeShared: NodeShared[IO, A]): Resource[IO, Unit]
 
-  /** Layer-specific KES + VRF registries threaded into [[io.constellationnetwork.node.shared.modules.SharedServices.make]] so the
+  /** Layer-specific atomic operator-key registry threaded into [[io.constellationnetwork.node.shared.modules.SharedServices.make]] so the
     * createContext / follower GSAM verifies embedded shard checkpoints IDENTICALLY to the gl0 leader's produce + validateArtifact paths
     * (split-safety: with real VRF-VK committee sortition + KES, an asymmetric registry would let a follower ADOPT a checkpoint the leader
     * REJECTED → StateProofMismatch split — #261). Default = empty (cl0/cl1/dl1/gl1 don't run shard-committee acceptance); the gl0 `Main`
     * overrides this to load the genesis-derived registries (the SAME ones it passes to `GlobalSnapshotConsensus.make`).
     */
-  protected def nakamotoShardRegistries(method: A)(
-    implicit jsonSerializer: io.constellationnetwork.json.JsonSerializer[IO]
-  ): Resource[
-    IO,
-    (
-      io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry[IO],
-      io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry[IO]
-    )
-  ] = {
-    val _ = (method, jsonSerializer)
-    Resource.pure(
-      (
-        io.constellationnetwork.node.shared.domain.nakamoto.KesRegistry.empty[IO],
-        io.constellationnetwork.node.shared.domain.nakamoto.VrfRegistry.empty[IO]
-      )
-    )
+  protected def nakamotoOperatorKeyRegistries(method: A)(
+    implicit jsonSerializer: io.constellationnetwork.json.JsonSerializer[IO],
+    securityProvider: io.constellationnetwork.security.SecurityProvider[IO]
+  ): Resource[IO, io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry[IO]] = {
+    val _ = (method, jsonSerializer, securityProvider)
+    Resource.pure(io.constellationnetwork.node.shared.domain.nakamoto.OperatorConsensusKeyRegistry.empty[IO])
   }
 
   override final def main: Opts[IO[ExitCode]] =
@@ -282,19 +273,21 @@ abstract class TessellationIOApp[A <: CliMethod](
                                             Some(sharedReader)
                                           )
                                         }
-                                        // Split-safety (#261): load the layer-specific KES + VRF registries so the createContext /
+                                        // Split-safety (#261): load the layer-specific atomic KES+VRF registry so the createContext /
                                         // follower GSAM verifies embedded shard checkpoints IDENTICALLY to the gl0 produce path. gl0
-                                        // overrides `nakamotoShardRegistries` to load the genesis-derived registries; other layers get
+                                        // overrides `nakamotoOperatorKeyRegistries` to load the genesis-derived registries; other layers get
                                         // empty (no shard-committee acceptance).
-                                        shardRegistries <- nakamotoShardRegistries(method)
+                                        operatorKeyRegistry <- nakamotoOperatorKeyRegistries(method)
                                         // Split-safety (#261, eta axis): the deferred chain-walk handle the follower / `createContext`
                                         // GSAM's committee-eta resolver reads. Created here (before `SharedServices.make`, which builds
                                         // that GSAM) and flowed to gl0's `Main.run` via `nakamotoFollowerEtaChainWalkRef` so it can install
-                                        // `chainStore.vrfOutputsForPeriod` once the chain store exists — making the follower `getEta(P)`
-                                        // walk the SAME chain the leader walks for EVERY period P. Stays `None` on non-gl0 layers; the walk
-                                        // closure then returns an empty list ⇒ byte-identical to the prior `noopEtaChainWalk` default.
+                                        // an exact chain-store range once the chain store exists — making candidate replay's
+                                        // `getEtaAt(P, parentHash)` walk the SAME branch the leader walks. Stays `None` on non-gl0 layers; the walk
+                                        // closure then returns `Incomplete`; it is never interpreted as an eta for N >= 2.
                                         _nakamotoFollowerEtaChainWalkRef <-
-                                          Ref.of[IO, Option[Long => IO[List[(Long, Array[Byte])]]]](None).asResource
+                                          Ref
+                                            .of[IO, Option[(Long, Option[Hash]) => IO[EtaSourceRange]]](None)
+                                            .asResource
                                         services <- SharedServices
                                           .make[IO, A](
                                             cfg,
@@ -319,18 +312,17 @@ abstract class TessellationIOApp[A <: CliMethod](
                                             tokenIdentifierOpt,
                                             _loggerBundle,
                                             // Split-safety (#261, eta axis): route the follower GSAM's `EtaStateManager` chain-walk
-                                            // through the deferred Ref. While the Ref is `None` (always, on non-gl0 layers; and on gl0
-                                            // until the chain store is built) this returns an empty list — byte-identical to the prior
-                                            // `noopEtaChainWalk` default. gl0's `Main.run` later sets the Ref to the real
-                                            // `chainStore.vrfOutputsForPeriod` walk so the follower `getEta(P)` byte-matches the leader's.
-                                            nakamotoEtaChainWalkFallback = Some((sourcePeriod: Long) =>
+                                            // through the deferred Ref. While the Ref is `None` (always on non-gl0 layers, and on gl0
+                                            // until the chain store is built) this returns `Incomplete`, which fails closed for N >= 2.
+                                            // gl0's `Main.run` later sets the Ref to the real exact chain walk
+                                            // so follower exact-parent replay byte-matches the leader.
+                                            nakamotoEtaChainWalkFallback = Some((sourcePeriod: Long, parentHash: Option[Hash]) =>
                                               _nakamotoFollowerEtaChainWalkRef.get.flatMap {
-                                                case Some(walk) => walk(sourcePeriod)
-                                                case None       => IO.pure(List.empty[(Long, Array[Byte])])
+                                                case Some(walk) => walk(sourcePeriod, parentHash)
+                                                case None       => IO.pure(EtaSourceRange.Incomplete(Nil))
                                               }
                                             ),
-                                            shardKesRegistry = shardRegistries._1,
-                                            shardVrfRegistry = shardRegistries._2
+                                            operatorKeyRegistry = operatorKeyRegistry
                                           )
                                           .asResource
 

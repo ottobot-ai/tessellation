@@ -30,9 +30,8 @@ import org.http4s.{HttpRoutes, Response}
   *     verified: true }` or 400 `{ verified: false, error: <ProofError JSON> }` on first-failure.
   *
   * '''Defaults''':
-  *   - `k` defaults to [[TowerProof.DefaultSuffixLength]] (= 5, matching `T_depth2` finality depth). The "default k = ConfirmationDepthK"
-  *     wording in the implementation prompt refers to the L0 suffix anchor; the actual `k` value used by the proof builder is the L0-suffix
-  *     length, which is 5 by current convention. Callers may override via query string.
+  *   - `k` defaults to [[TowerProof.DefaultSuffixLength]] (= 5), the local L0 proof-suffix length. It is unrelated to GL0 k1/k2 finality
+  *     semantics. Callers may override it via query string.
   *
   * Mirrors `FinalityTriggersRoutes` (#138): pure observability, reads a Ref populated by the consensus startup once the tower store +
   * snapshot storage + numerics interpreters are wired. Never feeds back into consensus.

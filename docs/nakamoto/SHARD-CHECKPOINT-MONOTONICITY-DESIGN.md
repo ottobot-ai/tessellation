@@ -1,5 +1,14 @@
 # Shard-Checkpoint Monotonicity & Idempotent Production — Design Proposal
 
+> **HISTORICAL FORENSIC DESIGN, NOT THE CURRENT PIPELINE DECISION.** Its run-19
+> identity-churn evidence remains useful, but ordinal-only `gl0Anchor`, universal
+> GL0 replay, `numShards=1` bypass, configurable `pipelineDepth`, and shard-depth
+> qualification are superseded. V1 has exactly one outstanding checkpoint per
+> shard, released only by its exact containing GL0 Phase-2 hash; it may batch
+> multiple metagraphs and contiguous binaries. ADR-0017 controls replay/diff
+> adoption. The numbered recommendations below are historical evidence, not open
+> implementation choices.
+
 **Status:** draft for critic review. No code commitment. Written 2026-06-12 against
 `feature/serde-typeclass-shim` at HEAD `09af4447e` (the task #44 unification commit).
 Authored after the run-19 focused e2e (`5gl0 / 2shard / 2mg`) root-caused the next
@@ -19,7 +28,7 @@ and anything at `numShards = 1` (the regression bar — this whole path is inert
 
 Cross-references (read in conjunction):
 
-- [`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`](./HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md) — the current checkpoint schema, operator duties, and universal GL0 replay contract.
+- [`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`](./HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md) — the target checkpoint roles, operator duties, replay-before-sign, and ordinary diff/root adoption contract.
 - [`../adr/0017-committee-reexecution-is-the-primary-economic-validity-gate.md`](../adr/0017-committee-reexecution-is-the-primary-economic-validity-gate.md) — committee quorum never authorizes framework-economic state.
 - [`SHARD-CHECKPOINT-FLOW-WALKTHROUGH.md`](./SHARD-CHECKPOINT-FLOW-WALKTHROUGH.md) — the produce → gossip → attest → adopt → embed pipeline.
 - [`attestation-and-finality.md`](./attestation-and-finality.md) — `kQuorum` / `tCountShard` / the Phase-0/1/2 finality model.

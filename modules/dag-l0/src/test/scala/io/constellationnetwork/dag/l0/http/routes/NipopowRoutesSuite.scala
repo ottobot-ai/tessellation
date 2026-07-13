@@ -42,6 +42,7 @@ object NipopowRoutesSuite extends HttpSuite {
   private def header(ordinal: Long, slot: Long = 100L, parentSlot: Long = 99L): TowerProofHeader =
     TowerProofHeader(
       ordinal = ord(ordinal),
+      producerId = io.constellationnetwork.schema.peer.PeerId(Hex("0d" * 64)),
       slot = Slot.unsafeApply(slot),
       parentSlot = Slot.unsafeApply(parentSlot),
       vrfProof = VrfProof(Hex("0a" * 80)),

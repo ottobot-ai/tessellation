@@ -6,27 +6,26 @@ import cats.{Applicative, Monad}
 
 import io.constellationnetwork.schema.SnapshotOrdinal
 
-/** Single point of truth for "is this snapshot ordinal allowed to leave this node?"
+/** Current release-gate abstraction and migration surface for the target GL0 finality gadget.
   *
-  * The invariant: only finalized data exits GL0 over HTTP. Tentative (pre-finality) snapshots live inside the node during attestation
-  * collection and propagate between GL0 peers only via the sidecar GossipSub transport — never via the public/p2p HTTP routes.
+  * Target GL0 finality belongs to an exact `(ordinal, hash)` and has P0 Pending, P1 Provisional, and reversible P2 Operational. P2 is
+  * selected by decided-attestation `T_weight` or canonical k1 depth; a density reorg orphans the old hash and triggers rollback/re-follow.
+  * There is no global BFT vote/lock/QC or Phase 3.
   *
-  * Two implementations, both in the companion object:
+  * '''Implementation gap.''' This trait exposes only a monotone ordinal watermark and therefore cannot represent same-ordinal hash
+  * replacement, per-hash phase, or reorg notification. [[fromRef]] is transitional HTTP gating, not the complete target FinalityGate.
   *
-  *   - `passThrough` — BFT mode or non-GL0 layers. Every snapshot in storage is immediately final, so the finalized ordinal is just the
-  *     head ordinal and every served ordinal is considered servable.
-  *   - `fromRef` — Nakamoto GL0 mode. Backed by a `Ref[F, Long]` updated by the attestation/finality daemon after GRANDPA-style depth-k
-  *     finality. Head may run ahead of finalized by a small number of slots; only ordinals at-or-below finalized are servable.
+  * [[passThrough]] remains appropriate for ML0's separate BFT snapshot consensus. [[fromRef]] currently releases ordinals at-or-below the
+  * local watermark. Routes take this type implicitly so the transitional gate is at least uniform.
   *
   * Routes take `FinalityGate[F]` as an implicit so gating is uniform across the codebase rather than hand-coded at each call site.
   */
 trait FinalityGate[F[_]] {
 
-  /** Latest finalized snapshot ordinal visible to external consumers. None if the node isn't initialized enough to answer yet. */
+  /** Transitional latest P2 ordinal visible to consumers. Target API must also expose the exact hash and reorg replacement. */
   def finalizedOrdinal: F[Option[SnapshotOrdinal]]
 
-  /** Whether the given ordinal is within the finalized range (<= finalized ordinal). BFT always true; Nakamoto compares against the
-    * finalized ordinal.
+  /** Transitional ordinal-only release check. ML0 pass-through is always true; GL0 currently compares against the local P2 watermark.
     */
   def isServable(ordinal: SnapshotOrdinal): F[Boolean]
 }
@@ -34,7 +33,7 @@ trait FinalityGate[F[_]] {
 object FinalityGate {
   def apply[F[_]](implicit F: FinalityGate[F]): FinalityGate[F] = F
 
-  /** BFT / non-GL0 instance: head equals finalized. Caller provides how to read the head so this module doesn't depend on SnapshotStorage.
+  /** ML0 BFT/non-GL0 pass-through instance. Caller provides head access without introducing a SnapshotStorage dependency.
     */
   def passThrough[F[_]: Applicative](readHeadOrdinal: F[Option[SnapshotOrdinal]]): FinalityGate[F] =
     new FinalityGate[F] {
@@ -42,8 +41,7 @@ object FinalityGate {
       def isServable(ordinal: SnapshotOrdinal): F[Boolean] = true.pure[F]
     }
 
-  /** Nakamoto instance: finalized ordinal is a mutable `SnapshotOrdinal` tracked by the attestation daemon. Seeded with
-    * `SnapshotOrdinal.MinIncrementalValue` (ordinal 1 = genesis); grows monotonically.
+  /** Transitional Nakamoto ordinal watermark. This cannot satisfy the target exact-hash/reorg contract by itself.
     */
   def fromRef[F[_]: Monad](ref: Ref[F, SnapshotOrdinal]): FinalityGate[F] =
     new FinalityGate[F] {

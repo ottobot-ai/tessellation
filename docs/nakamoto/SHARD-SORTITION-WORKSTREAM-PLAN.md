@@ -9,11 +9,13 @@ ML0 operators produce and sign metagraph binaries. They are not the admission or
 1. **Binary admission:** each eligible GL0 operator privately evaluates a real VRF for
    `(eta, metagraphAddress, parentHash)`. Advancing the metagraph parent or eta redraws membership.
 2. **Execution shard:** every GL0 node publicly enumerates membership from
-   `H(eta, shardId, etaPeriod, registeredVrfVk) < threshold`. Honest producers select the eta period from the finalized GL0 anchor.
+   `H(eta, shardId, etaPeriod, registeredVrfVk) < threshold`. Honest producers select the eta period from the exact canonical Phase-2 GL0 anchor.
 
-Current adopters validate membership against the checkpoint's wire-carried eta period but do not bind that period back to the finalized
-anchor. A Byzantine producer can therefore grind resolvable periods for a favorable public committee. Rotation is intended once per eta
-period but is not adversarially enforced until audit finding SHARD-03 is fixed.
+Current worktree adopters recompute the only admissible wire period as `floor(gl0AnchorOrdinal/R)` before committee lookup, using the same
+pure function as the producer. This rejects only an inconsistent ordinal/period pair. It does not stop a producer from choosing an older
+admissible ordinal and its matching favorable period because GL0 selection currently applies only an upper bound. The checkpoint carries
+no exact canonical anchor hash/freshness evidence and R remains node-local configuration. SHARD-03/SHARD-09 remain RED until the anchor and
+parameters are proposal-parent/genesis/era bound.
 
 The two committees may share `kDraw` and `kQuorum` configuration, but one committee's work never substitutes for the other's.
 
@@ -36,15 +38,20 @@ An eta period contains `R = round(3.1 * k1)` GL0 snapshot ordinals under the cur
 - dev: 99
 
 Execution membership is cached per `(shardId, etaPeriod)` only after the epoch's slash-exclusion anchor is settled. Honest production does
-not redraw it per checkpoint; SHARD-03 tracks the missing verifier-side epoch binding.
+not redraw it per checkpoint. The worktree binds the claimed period to the signed anchor ordinal; exact hash-bound Phase-2 ancestry and a
+canonical R parameter commitment remain open.
 
 ## Producer Duty
 
 Committee members are hash-ordered for the next shard ordinal. One rank owns each five-slot window by default, wrapping through the
 committee; the genesis window is widened by 12x. This deterministic staircase replaced per-slot LDD shard leadership.
 
-Duty determines who may propose. It never determines validity. The producer and every attester replay the included CL1 window before
-signing, and every GL0 adopter replays it again before inclusion can affect canonical state.
+Duty determines who may propose. It never determines validity. The producer and
+every execution signer replay the included CL1 window before signing. Target
+ordinary noncommittee GL0 adopters require distinct execution quorum, compare the
+exact Phase-2 base/pre-root, apply the canonical scoped diff, and recompute its
+root; assigned watchtowers replay as the collusion backstop. Current universal
+adopter replay is a regression, not the target.
 
 ## Enforcement Sites
 

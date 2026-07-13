@@ -18,8 +18,8 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** §3 NIPoPoW — typed key for the durable per-ordinal-commitment partition of [[HistoricalCommitmentSmtStore]]. Encoded as a fixed-width,
-  * lexicographically-sortable hex string of the finalized ordinal, EXACTLY like [[TowerEntryKey]]'s ordinal component, so a full prefix
-  * scan returns commitments in ordinal order for chain-replay recovery.
+  * lexicographically-sortable hex string of the currently selected ordinal, EXACTLY like [[TowerEntryKey]]'s ordinal component, so a full
+  * prefix scan returns commitments in ordinal order for chain-replay recovery.
   */
 final case class CommitmentKey(ordinal: SnapshotOrdinal)
 
@@ -35,7 +35,7 @@ object CommitmentKey {
 }
 
 /** §3 NIPoPoW — the UNBOUNDED, on-disk SMT keyed by snapshot ordinal whose single root is anchored as `smtRoot` in the gl0
-  * `GlobalSnapshotStateProof`. Each leaf is a [[PerOrdinalCommitment]] (commitment hash) for one finalized ordinal.
+  * `GlobalSnapshotStateProof`. Each leaf is a [[PerOrdinalCommitment]] (commitment hash) for one currently selected historical ordinal.
   *
   * '''Two layers, the MptTowerStore relationship.''' The DURABLE substrate is a scodec-coded, MPT-backed commitment KV (`MptStore[F,
   * CommitmentKey]`, value = the ordinal's commitment [[Hash]]) — the same on-disk persistence shape as `MptTowerStore`'s partition. The SMT
@@ -44,32 +44,35 @@ object CommitmentKey {
   * commitment KV is its OWN MPT producer, NOT a `GlobalStateKey` partition, so its bytes NEVER enter the consensus
   * `mptRoot`/`hypergraphRoot` — keeping the hypergraph root independent of `smtRoot` (the circularity rule).
   *
-  * '''Cutoff / determinism.''' `smtRoot(N) = SMT({ (i, commitment_i) : 0 ≤ i ≤ N−k }).root`, where `k` is the existing confirmation depth.
-  * Below the cutoff every ordinal is finalized + immutable, so all nodes agree and there is no rollback — a LAG, not a size bound (the leaf
-  * set grows forever). Expressed on [[VersionedSmt]]: the eligible ordinal `j = N−k` is inserted under `version = N`, so
-  * [[rootForSnapshot]]`(N)` = `VersionedSmt.rootAt(N)` = the root over all leaves `i ≤ N−k`.
+  * '''Current cutoff.''' The live implementation computes `smtRoot(N) = SMT({ (i, commitment_i) : 0 ≤ i ≤ N−k }).root`, where `k` is the k1
+  * depth trigger. This is a lag, not a size bound. Expressed on [[VersionedSmt]]: the eligible ordinal `j = N−k` is inserted under `version
+  * \= N`, so [[rootForSnapshot]]`(N)` = `VersionedSmt.rootAt(N)` = the root over all leaves `i ≤ N−k`.
   *
   * '''Circularity-free.''' Only ordinals `i ≤ N−k` are committed, so snapshot N's OWN `incrementalSnapshotHash` is never in `smtRoot(N)`
   * (it first appears in `smtRoot(N+k)`); references descend strictly toward genesis (well-founded — see [[PerOrdinalCommitment]]).
   *
-  * '''Reorg.''' None needed: the cutoff only commits finalized ordinals, which never reorg.
+  * '''Target gap: Phase-2 reorg.''' k1 makes a snapshot operational; it does not make that ordinal/hash immutable. A later density reorg
+  * may replace a committed hash at the same ordinal. This ordinal-keyed append path has no exact-hash branch identity or atomic
+  * rollback/rebuild transaction, even though `smtRoot` is consensus state. Before this root is load-bearing, the store must version
+  * commitments by exact canonical reference and reproduce the replacement root before snapshot production. A retention miss enters
+  * `RecoveryRequired`; k1 cannot be treated as a fork-choice floor.
   *
   * '''Version-root retention.''' [[VersionedSmt]] retains the most-recent `versionRetention` ROOTS (for [[proveAt]] of recent past
   * ordinals); the accumulated `live` leaf tree is never pruned. So the tree is unbounded; only the queryable-historical-root WINDOW is
-  * bounded — a separate knob from the `≤ N−k` finalized lag.
+  * bounded — a separate knob from the current `≤ N−k` lag.
   */
 trait HistoricalCommitmentSmtStore[F[_]] {
 
-  /** Record the commitment for finalized ordinal `eligibleOrdinal` (`= snapshotOrdinal − k`) as a leaf, and snapshot the resulting root
-    * under version `snapshotOrdinal`. Persists the commitment hash to the durable KV first (recovery substrate), then folds it into the
-    * live SMT. Idempotent: re-appending the same `(snapshotOrdinal, eligibleOrdinal, commitment)` reproduces the same root (upsert with the
-    * same value; the SMT is order-/repeat-independent). Returns `smtRoot(snapshotOrdinal)`.
+  /** Legacy-named append: record the commitment for current-canonical ordinal `eligibleOrdinal` (`= snapshotOrdinal − k`) as a leaf and
+    * snapshot the resulting root under version `snapshotOrdinal`. Persists the commitment hash to the durable KV first (recovery
+    * substrate), then folds it into the live SMT. Idempotent: re-appending the same `(snapshotOrdinal, eligibleOrdinal, commitment)`
+    * reproduces the same root (upsert with the same value; the SMT is order-/repeat-independent). Returns `smtRoot(snapshotOrdinal)`.
     */
   def appendAtFinality(snapshotOrdinal: SnapshotOrdinal, eligibleOrdinal: SnapshotOrdinal, commitment: PerOrdinalCommitment): F[SmtRoot]
 
-  /** The `smtRoot` to anchor in snapshot `snapshotOrdinal`'s state proof: the root over commitments `≤ snapshotOrdinal − k`. `None` if no
-    * version was recorded for `snapshotOrdinal` (e.g. the genesis/warmup window `N ≤ k`, or before any append — the caller maps `None` to
-    * "no smtRoot field", which is deterministic across nodes).
+  /** The current `smtRoot` to anchor in snapshot `snapshotOrdinal`'s state proof: the root over commitments `≤ snapshotOrdinal − k`. `None`
+    * if no version was recorded for `snapshotOrdinal` (e.g. the genesis/warmup window `N ≤ k`, or before any append — the caller maps
+    * `None` to "no smtRoot field", which is deterministic across nodes).
     */
   def rootForSnapshot(snapshotOrdinal: SnapshotOrdinal): F[Option[SmtRoot]]
 
@@ -83,7 +86,8 @@ trait HistoricalCommitmentSmtStore[F[_]] {
 
   /** Chain-replay recovery: rebuild the in-memory SMT version-roots from the durable commitment KV. Re-applies every persisted `(ordinal i,
     * commitmentHash)` as a leaf and re-snapshots the root under version `i + k` (so `rootForSnapshot` is reproduced for the retained
-    * window). Idempotent. Called at boot before the first proof is built. `k` is the confirmation depth.
+    * window). Idempotent for one ordinal-selected history. Called at boot before the first proof is built. `k` is the current k1 lag; this
+    * replay does not yet reconstruct an exact-hash density replacement.
     */
   def replayFrom(k: Long): F[Unit]
 }
@@ -94,7 +98,8 @@ object HistoricalCommitmentSmtStore {
     *
     * The `k` cutoff is owned by the CALLER: [[appendAtFinality]] takes `(snapshotOrdinal, eligibleOrdinal)` explicitly, so the store is a
     * pure ordinal-keyed structure with no snapshot-lookup dependency. The caller (GSAM wiring) computes `eligibleOrdinal = snapshotOrdinal
-    * − k` from the existing confirmation depth and is responsible for passing the matching `k` to [[replayFrom]].
+    * − k` from the existing k1 lag and is responsible for passing the matching `k` to [[replayFrom]]. This ownership does not make the
+    * resulting ordinal immutable.
     */
   def make[F[_]: Async: Hasher](
     durable: MptStore[F, CommitmentKey],

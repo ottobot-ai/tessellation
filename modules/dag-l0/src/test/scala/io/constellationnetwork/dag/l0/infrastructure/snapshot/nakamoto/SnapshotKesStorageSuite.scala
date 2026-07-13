@@ -14,7 +14,10 @@ object SnapshotKesStorageSuite extends SimpleIOSuite {
     Resource.make(IO.blocking(Files.createTempDirectory("snapshot-kes-storage-suite"))) { root =>
       IO.blocking {
         val paths = Files.walk(root)
-        try paths.sorted(java.util.Comparator.reverseOrder()).forEach(path => { val _ = Files.deleteIfExists(path) })
+        try
+          paths.sorted(java.util.Comparator.reverseOrder()).forEach { path =>
+            val _ = Files.deleteIfExists(path)
+          }
         finally paths.close()
       }
     }
@@ -30,12 +33,13 @@ object SnapshotKesStorageSuite extends SimpleIOSuite {
         stored <- SnapshotKesStorage.get[IO](dataDir, hash)
         conflict <- SnapshotKesStorage.put[IO](dataDir, hash, Array[Byte](9, 9)).attempt
         malformed <- SnapshotKesStorage.get[IO](dataDir, Hash("../escape"))
-      } yield expect.all(
-        absent.isEmpty,
-        stored.exists(java.util.Arrays.equals(_, signature)),
-        conflict.isLeft,
-        malformed.isEmpty
-      )
+      } yield
+        expect.all(
+          absent.isEmpty,
+          stored.exists(java.util.Arrays.equals(_, signature)),
+          conflict.isLeft,
+          malformed.isEmpty
+        )
     }
   }
 }

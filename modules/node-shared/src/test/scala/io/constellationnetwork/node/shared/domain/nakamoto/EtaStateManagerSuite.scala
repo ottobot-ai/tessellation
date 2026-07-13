@@ -6,6 +6,7 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.{EtaSourceRange, EtaSourceUnavailable}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -20,7 +21,7 @@ import weaver.MutableIOSuite
   *   - Period ≥ 2 with MPT cache hit returns the cached eta bytes.
   *   - Period ≥ 2 with MPT cache miss falls back to chain-walk and computes via `EtaCalculation.computeEta`.
   *   - Chain-walk recompute is memoized in-process so repeated `getEta(N)` calls on a cache-miss path don't re-walk.
-  *   - Empty chain walk (no VRF outputs) for period ≥ 2 falls back to `bootstrapEta(genesisEta, period)` (NOT raw `genesisEta`).
+  *   - Incomplete or empty chain ranges for period ≥ 2 fail closed and are never cached as eta.
   */
 object EtaStateManagerSuite extends MutableIOSuite {
 
@@ -49,6 +50,9 @@ object EtaStateManagerSuite extends MutableIOSuite {
 
   private val genesisEta: Array[Byte] = Array.fill[Byte](32)(0x00.toByte)
 
+  private def complete(outputs: List[(Long, Array[Byte])]): EtaSourceRange = EtaSourceRange.Complete(outputs)
+  private def incomplete(outputs: List[(Long, Array[Byte])] = Nil): EtaSourceRange = EtaSourceRange.Incomplete(outputs)
+
   test("period 0 → bootstrapEta(genesisEta, 0) (no MPT, no chain)") { res =>
     implicit val (h, _) = res
     // Cardano/Praos bootstrap: period 0 short-circuits to bootstrapEta(genesisEta, 0) without touching
@@ -57,7 +61,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkRef <- Ref.of[IO, List[Long]](Nil) // record which period(s) were walked
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, p => walkRef.update(p :: _).as(List.empty[(Long, Array[Byte])]))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (p, _) => walkRef.update(p :: _).as(incomplete()))
       out <- mgr.getEta(0L)
       walked <- walkRef.get
     } yield expect.all(out.sameElements(EtaCalculation.bootstrapEta(genesisEta, 0L)), walked.isEmpty)
@@ -76,7 +80,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkRef <- Ref.of[IO, List[Long]](Nil)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => walkRef.update(sp :: _).as(vrfOutputs))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (sp, _) => walkRef.update(sp :: _).as(complete(vrfOutputs)))
       out <- mgr.getEta(1L)
       walked <- walkRef.get
     } yield
@@ -97,8 +101,8 @@ object EtaStateManagerSuite extends MutableIOSuite {
     for {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       reader = stubReader(mptRef)
-      mgrEmpty <- EtaStateManager.make[IO](genesisEta, reader, _ => IO.pure(List.empty[(Long, Array[Byte])]))
-      mgrFull <- EtaStateManager.make[IO](genesisEta, reader, _ => IO.pure(nonEmptyWalk))
+      mgrEmpty <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => IO.pure(incomplete()))
+      mgrFull <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => IO.pure(complete(nonEmptyWalk)))
       outEmpty <- mgrEmpty.getEta(1L)
       outFull <- mgrFull.getEta(1L)
     } yield expect.all(outEmpty.sameElements(expectedEta), outFull.sameElements(expectedEta), outEmpty.sameElements(outFull))
@@ -114,7 +118,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap(EtaPeriod(1L) -> cached))
       walkRef <- Ref.of[IO, List[Long]](Nil)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, p => walkRef.update(p :: _).as(List.empty[(Long, Array[Byte])]))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (p, _) => walkRef.update(p :: _).as(incomplete()))
       out <- mgr.getEta(1L)
       walked <- walkRef.get
     } yield
@@ -142,7 +146,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       reader = stubReader(mptRef)
       // Even with non-empty period-0 outputs available, period 1 ignores them under bootstrap.
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => if (sp == 0L) IO.pure(period0Outputs) else IO.pure(Nil))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (sp, _) => IO.pure(if (sp == 0L) complete(period0Outputs) else incomplete()))
       getEta1 <- mgr.getEta(1L)
     } yield expect(getEta1.sameElements(leaderWireEta))
   }
@@ -154,7 +158,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
     for {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, _ => IO.pure(List.empty[(Long, Array[Byte])]))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => IO.pure(incomplete()))
       getEta1 <- mgr.getEta(1L)
     } yield expect(getEta1.sameElements(leaderWireEta))
   }
@@ -168,7 +172,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap(EtaPeriod(2L) -> cached))
       walkRef <- Ref.of[IO, List[Long]](Nil)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, p => walkRef.update(p :: _).as(List.empty[(Long, Array[Byte])]))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (p, _) => walkRef.update(p :: _).as(incomplete()))
       out <- mgr.getEta(2L)
       walked <- walkRef.get
     } yield
@@ -189,7 +193,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkRef <- Ref.of[IO, List[Long]](Nil)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => walkRef.update(sp :: _).as(vrfOutputs))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (sp, _) => walkRef.update(sp :: _).as(complete(vrfOutputs)))
       out <- mgr.getEta(2L)
       walked <- walkRef.get
     } yield
@@ -199,22 +203,37 @@ object EtaStateManagerSuite extends MutableIOSuite {
       )
   }
 
-  test("period >=2 with MPT cache miss + empty chain walk → bootstrapEta(genesisEta, period) (degenerate fallback)") { res =>
+  test("period >=2 with MPT cache miss + incomplete empty chain range fails closed") { res =>
     implicit val (h, _) = res
-    // The N>=2 empty-source fallback now returns the per-period bootstrapEta(genesisEta, 3), NOT raw
-    // genesisEta — a lagging node must not substitute a value a caught-up node won't reproduce.
+    // A lagging node must defer; substituting bootstrap eta would diverge from a caught-up node.
     for {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkRef <- Ref.of[IO, List[Long]](Nil)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, sp => walkRef.update(sp :: _).as(List.empty[(Long, Array[Byte])]))
-      out <- mgr.getEta(3L)
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (sp, _) => walkRef.update(sp :: _).as(incomplete()))
+      out <- mgr.getEta(3L).attempt
       walked <- walkRef.get
     } yield
       expect.all(
-        out.sameElements(EtaCalculation.bootstrapEta(genesisEta, 3L)),
-        !out.sameElements(genesisEta),
+        out.left.exists(_.isInstanceOf[EtaSourceUnavailable]),
         walked == List(2L)
+      )
+  }
+
+  test("period >=2 rejects a nonempty partial prefix and a complete empty range") { res =>
+    implicit val (h, _) = res
+    val partial = List[(Long, Array[Byte])]((7L, Array.fill[Byte](16)(0x71.toByte)))
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
+      reader = stubReader(mptRef)
+      partialMgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => IO.pure(incomplete(partial)))
+      emptyMgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => IO.pure(complete(Nil)))
+      partialResult <- partialMgr.getEta(2L).attempt
+      emptyResult <- emptyMgr.getEta(2L).attempt
+    } yield
+      expect.all(
+        partialResult.left.exists(_.isInstanceOf[EtaSourceUnavailable]),
+        emptyResult.left.exists(_.isInstanceOf[EtaSourceUnavailable])
       )
   }
 
@@ -225,7 +244,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkCount <- Ref.of[IO, Int](0)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, _ => walkCount.update(_ + 1).as(vrfOutputs))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => walkCount.update(_ + 1).as(complete(vrfOutputs)))
       out1 <- mgr.getEta(2L)
       out2 <- mgr.getEta(2L)
       out3 <- mgr.getEta(2L)
@@ -247,13 +266,49 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkCount <- Ref.of[IO, Int](0)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, _ => walkCount.update(_ + 1).as(walkVrf))
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => walkCount.update(_ + 1).as(complete(walkVrf)))
       // First call: MPT miss, walk-cache populated with `EtaCalculation.computeEta(...)` over walkVrf.
       _ <- mgr.getEta(2L)
       // Now populate MPT: subsequent calls must return the MPT-pinned eta, not the prior walk-cache.
       _ <- mptRef.update(_.updated(EtaPeriod(2L), mptEntry))
       out <- mgr.getEta(2L)
     } yield expect.same(true, out.sameElements(mptEtaBytes))
+  }
+
+  test("getEtaAt binds derivation to the exact parent and never consumes a sibling MPT eta") { res =>
+    implicit val (h, _) = res
+    val parentA = hashOf(Array.fill[Byte](32)(0x0a.toByte))
+    val parentB = hashOf(Array.fill[Byte](32)(0x0b.toByte))
+    val outputsA = List[(Long, Array[Byte])]((1L, Array.fill[Byte](16)(0x21.toByte)))
+    val outputsB = List[(Long, Array[Byte])]((1L, Array.fill[Byte](16)(0x31.toByte)))
+    val siblingMptEta = Array.fill[Byte](32)(0x55.toByte)
+    val siblingEntry = HistoricalStakeSnapshot(StakeDistribution.Empty, hashOf(siblingMptEta))
+    for {
+      mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](
+        SortedMap(EtaPeriod(2L) -> siblingEntry)
+      )
+      seenParents <- Ref.of[IO, List[Option[Hash]]](Nil)
+      reader = stubReader(mptRef)
+      mgr <- EtaStateManager.make[IO](
+        genesisEta,
+        reader,
+        (_, parent) =>
+          seenParents.update(parent :: _) >> IO.pure(
+            complete(if (parent.contains(parentA)) outputsA else outputsB)
+          )
+      )
+      ambient <- mgr.getEta(2L)
+      atA <- mgr.getEtaAt(2L, parentA)
+      atB <- mgr.getEtaAt(2L, parentB)
+      seen <- seenParents.get
+    } yield
+      expect.all(
+        ambient.sameElements(siblingMptEta),
+        atA.sameElements(EtaCalculation.computeEta(genesisEta, 2L, outputsA.map(_._2))),
+        atB.sameElements(EtaCalculation.computeEta(genesisEta, 2L, outputsB.map(_._2))),
+        !atA.sameElements(atB),
+        seen.toSet == Set(Some(parentA), Some(parentB))
+      )
   }
 
   // Track-3 S4 eta gate: after a base revert drops the in-process walk cache via `forgetUncommitted`,
@@ -270,7 +325,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       mptRef <- Ref.of[IO, SortedMap[EtaPeriod, HistoricalStakeSnapshot]](SortedMap.empty)
       walkRef <- Ref.of[IO, List[(Long, Array[Byte])]](preReorg)
       reader = stubReader(mptRef)
-      mgr <- EtaStateManager.make[IO](genesisEta, reader, _ => walkRef.get)
+      mgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => walkRef.get.map(complete))
       // Populate the walk cache from the PRE-reorg chain.
       staleComputed <- mgr.getEta(2L)
       // Reorg the underlying chain to the canonical branch. Without a cache drop the suppression cache
@@ -281,7 +336,7 @@ object EtaStateManagerSuite extends MutableIOSuite {
       _ <- mgr.forgetUncommitted
       reDerived <- mgr.getEta(2L)
       // A fresh bootstrap peer that only ever saw the canonical chain.
-      freshMgr <- EtaStateManager.make[IO](genesisEta, reader, _ => IO.pure(canonical))
+      freshMgr <- EtaStateManager.make[IO](genesisEta, reader, (_, _) => IO.pure(complete(canonical)))
       freshEta <- freshMgr.getEta(2L)
     } yield
       expect.all(

@@ -1,12 +1,18 @@
+%% TARGET DESIGN. State-validity signatures follow local reproduction.
 flowchart TB
-    CP["Shard checkpoint<br/>root claims plus complete replay inputs"]
-    CP --> AUTH["verify signatures, registered VRF keys,<br/>KES, committee membership, duty, and ancestry"]
-    AUTH --> REPLAY["every GL0 adopter recreates every CL1 transition<br/>at the signed finalized execution base"]
-    REPLAY --> MATCH{"all recreated roots match?"}
-    MATCH -->|yes| USE["eligible for store, attest, selection,<br/>embedding, and canonical use"]
+    INPUT["deterministic ordered framework inputs<br/>at exact Phase-2 base and pre-root"]
+    INPUT --> PRODUCER["scheduled producer replays;<br/>computes canonical scoped diff and complete root"]
+    PRODUCER --> SIGNERS["every execution signer independently replays;<br/>sign only a byte-identical diff and root"]
+    SIGNERS --> THRESHOLD["distinct execution threshold"]
+    THRESHOLD --> AUTH["ordinary GL0 verifies signatures, registered VRF keys,<br/>KES, committee membership, duty, assignment, and ancestry"]
+    AUTH --> CAS["require exact canonical base and pre-root;<br/>check continuity and diff-key namespace"]
+    CAS --> APPLY["apply scoped diff and recompute complete root"]
+    APPLY --> MATCH{"recomputed root matches?"}
+    MATCH -->|yes| USE["eligible for selection, embedding,<br/>and canonical use"]
     MATCH -->|no| DROP["reject before value is usable"]
     DROP -.-> EVIDENCE["self-contained fraud or equivocation evidence"]
     EVIDENCE --> SLASH["deterministic slash folded into canonical GL0 state"]
-    WATCH["Watchtowers re-execute independently"] -.-> EVIDENCE
-    NOTE["Quorum and depth select among replay-valid checkpoints.<br/>They are not validity gates."]
+    WATCH["Selected noncommittee watchtowers replay independently;<br/>release and adjudication timing remains open"] -.-> EVIDENCE
+    INPUT -.-> WATCH
+    NOTE["Execution threshold is a validity requirement.<br/>Shard depth selects the checkpoint chain;<br/>it cannot replace missing independent executions."]
     USE -.-> NOTE

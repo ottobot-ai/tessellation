@@ -3,236 +3,186 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import cats.effect.kernel.Async
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.{EtaCalculation, KesRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
+import io.constellationnetwork.node.shared.domain.nakamoto.{ActiveOperatorConsensusKeys, EtaCalculation}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes.OperationalKeyMaker
 
 import eu.timepit.refined.auto._
 
-/** §1.2 — KES verification of incoming attestations + snapshots, load-bearing.
+/** Load-bearing KES verification for GL0 snapshots and validity attestations.
   *
-  * Pulled out of [[NakamotoSyncDaemon]] so the verification logic + counter taxonomy live in one place and are independently unit-testable.
-  * Slice 9 made KES authoritative (no warn-only escape hatch); the daemon drops any message that returns `false`. Behavior matrix:
-  *
-  *   - empty wire field → `*_no_sig_total` + WARN, return false (reject)
-  *   - decode failure → `*_decode_failed_total` + WARN, return false
-  *   - sig + no registry → `*_no_registry_entry_total` + WARN, return false
-  *   - sig + verify OK → `*_verified_total` + INFO, return true
-  *   - sig + verify fail → `*_invalid_total` + WARN, return false
+  * Every public method accepts one already-resolved atomic KES+VRF pair. There is no KES-only registry lookup at this boundary. The pair
+  * must be structurally valid and active at the artifact period; the artifact period and pair offset determine the only permissible tree
+  * step. Empty, malformed, inactive, pending, or cryptographically invalid evidence fails closed.
   */
-// Slice S3: the access modifier was relaxed from `private[nakamoto]` so the
-// `MetagraphCommitteeGate` adapter constructed in `GlobalSnapshotConsensus` can
-// reuse this verify path. The KES accept/reject matrix (no-sig → reject, decode-fail →
-// reject, no-registry → reject, verify-fail → reject) is shared by every path.
 object KesGossipVerification {
 
-  /** Verify a KES signature attached to an attestation. `messageBytes` is the Ed25519-signed attestation-hash bytes (the same bytes the
-    * Ed25519 path verified). The KES step is rebound to `globalPeriod - operator.offset` so operators registered mid-life (Slice 10) sign
-    * relative to their own tree's offset rather than global eta period zero.
-    */
+  private final case class MetricKeys(
+    noRegistryEntry: Metrics.MetricKey,
+    invalid: Metrics.MetricKey,
+    noSignature: Metrics.MetricKey,
+    decodeFailed: Metrics.MetricKey,
+    verified: Metrics.MetricKey
+  )
+
+  private val attestationMetrics = MetricKeys(
+    noRegistryEntry = "dag_nakamoto_kes_attestations_no_registry_entry_total",
+    invalid = "dag_nakamoto_kes_attestations_invalid_total",
+    noSignature = "dag_nakamoto_kes_attestations_no_sig_total",
+    decodeFailed = "dag_nakamoto_kes_attestations_decode_failed_total",
+    verified = "dag_nakamoto_kes_attestations_verified_total"
+  )
+
+  private val metagraphAttestationMetrics = MetricKeys(
+    noRegistryEntry = "dag_nakamoto_kes_mg_attestations_no_registry_entry_total",
+    invalid = "dag_nakamoto_kes_mg_attestations_invalid_total",
+    noSignature = "dag_nakamoto_kes_mg_attestations_no_sig_total",
+    decodeFailed = "dag_nakamoto_kes_mg_attestations_decode_failed_total",
+    verified = "dag_nakamoto_kes_mg_attestations_verified_total"
+  )
+
+  private val snapshotMetrics = MetricKeys(
+    noRegistryEntry = "dag_nakamoto_kes_snapshots_no_registry_entry_total",
+    invalid = "dag_nakamoto_kes_snapshots_invalid_total",
+    noSignature = "dag_nakamoto_kes_snapshots_no_sig_total",
+    decodeFailed = "dag_nakamoto_kes_snapshots_decode_failed_total",
+    verified = "dag_nakamoto_kes_snapshots_verified_total"
+  )
+
   def verifyAttestation[F[_]: Async: Metrics](
     messageBytes: Array[Byte],
     kesSigBytes: Array[Byte],
     attesterId: peer.PeerId,
     attesterHex: Hex,
     tipOrdinal: Long,
-    kesRegistry: KesRegistry[F],
+    operatorKeys: OperatorConsensusKeys,
     etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Boolean] = {
-    val tag = "KES-ATT"
-    if (kesSigBytes.isEmpty) {
-      Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_no_sig_total") >>
-        logger.warn(s"⚠️ $tag missing sig — rejecting ord=$tipOrdinal from=${attesterHex.value.take(16)}...").as(false)
-    } else {
-      OperationalKeyMaker.decodeSignature(kesSigBytes) match {
-        case Left(err) =>
-          Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_decode_failed_total") >>
-            logger
-              .warn(s"⚠️ $tag decode failed for ord=$tipOrdinal from=${attesterHex.value.take(16)}...: ${err.message} — rejecting")
-              .as(false)
-        case Right(kSig) =>
-          kesRegistry.getKesVk(attesterId).flatMap {
-            case None =>
-              Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_no_registry_entry_total") >>
-                logger
-                  .warn(
-                    s"⚠️ $tag no registry entry for ord=$tipOrdinal from=${attesterHex.value.take(16)}... — rejecting"
-                  )
-                  .as(false)
-            case Some(entry) =>
-              // Registry holds the master VK captured at registration (step=0 in the tree) plus the
-              // operator's eta-period offset. Sender signs at the *current* product step (=
-              // globalPeriod - offset); `SumComposition.verify` uses `kesVk.step` in its left-vs-right
-              // tree-walk so verifying with a step that doesn't match the sender's mis-walks the path
-              // and rejects every sig. Rebind step to `globalPeriod - operator.offset` so verify
-              // reconstructs the same path the sender used. Root bytes are invariant; only step changes.
-              val globalPeriod = EtaCalculation.rotationPeriod(tipOrdinal, etaRotationSnapshots).toInt
-              val treeInternalStep = globalPeriod - entry.offset.toInt
-              if (treeInternalStep < 0)
-                Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_invalid_total") >>
-                  logger
-                    .warn(
-                      s"⚠️ $tag from operator with offset=${entry.offset} can't sign at globalPeriod=$globalPeriod (treeInternalStep would be $treeInternalStep — operator not yet active)"
-                    )
-                    .as(false)
-              else {
-                val vkAtStep = entry.vk.copy(step = treeInternalStep)
-                val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtStep)
-                if (ok)
-                  Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_verified_total") >>
-                    logger
-                      .info(
-                        s"🔐 $tag verified ord=$tipOrdinal period=$globalPeriod step=$treeInternalStep from=${attesterHex.value.take(16)}..."
-                      )
-                      .as(true)
-                else
-                  Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_invalid_total") >>
-                    logger
-                      .warn(
-                        s"⚠️ $tag invalid ord=$tipOrdinal period=$globalPeriod step=$treeInternalStep from=${attesterHex.value.take(16)}... — rejecting"
-                      )
-                      .as(false)
-              }
-          }
-      }
-    }
+    val artifactPeriod = EtaPeriod(EtaCalculation.rotationPeriod(math.max(0L, tipOrdinal - 1L), etaRotationSnapshots))
+    verifyForArtifact(
+      messageBytes,
+      kesSigBytes,
+      attesterId,
+      attesterHex,
+      operatorKeys,
+      artifactPeriod,
+      wireStep = None,
+      metricKeys = attestationMetrics,
+      tag = "KES-ATT",
+      detail = s"ord=$tipOrdinal",
+      logger
+    )
   }
 
-  /** Verify a KES signature whose tree-internal step is carried directly on the wire (Slice S3 follow-up).
-    *
-    * The sender embeds its `OperationalKeyMakerAlgebra.currentPeriod` on the proto message (e.g. `MetagraphAttestation.sender_tree_step`)
-    * so the receiver doesn't need to derive a step from chain state. This eliminates the asymmetry caused by per-operator KES activation
-    * offsets and per-peer eta-rotation views: the receiver verifies non-interactively, using only the wire bytes + the registered master
-    * VK. Same accept/reject matrix as [[verifyAttestation]] minus the chain-state-dependent step derivation:
-    *
-    *   - empty sig → reject
-    *   - decode fail → reject
-    *   - no registry entry → reject (admission committee membership requires a registered operator identity)
-    *   - registry entry + `kesStep < 0` → reject (impossible by construction; nonetheless guarded)
-    *   - registry entry + verify ok → accept
-    *   - registry entry + verify fail → reject
-    *
-    * The `kesStep` passed in is interpreted as the tree-internal step (i.e. step relative to the master VK at the operator's activation
-    * period) — exactly what `kesVk.copy(step = ...)` expects for the `SumComposition.verify` walk.
+  /** Verify metagraph-admission KES evidence. `kesStep` is wire evidence and must equal the step independently derived from the same active
+    * atomic pair and exact-GL0-anchor artifact period used for VRF membership verification.
     */
   def verifyAttestationByStep[F[_]: Async: Metrics](
     messageBytes: Array[Byte],
     kesSigBytes: Array[Byte],
-    attesterId: peer.PeerId,
-    attesterHex: Hex,
+    expectedOperatorId: peer.PeerId,
+    operatorKeys: OperatorConsensusKeys,
     kesStep: Int,
-    kesRegistry: KesRegistry[F],
+    artifactPeriod: EtaPeriod,
     logger: org.typelevel.log4cats.Logger[F]
-  ): F[Boolean] = {
-    val tag = "KES-MGATT"
-    if (kesSigBytes.isEmpty) {
-      Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_no_sig_total") >>
-        logger.warn(s"⚠️ $tag missing sig — rejecting step=$kesStep from=${attesterHex.value.take(16)}...").as(false)
-    } else {
-      OperationalKeyMaker.decodeSignature(kesSigBytes) match {
-        case Left(err) =>
-          Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_decode_failed_total") >>
-            logger
-              .warn(s"⚠️ $tag decode failed step=$kesStep from=${attesterHex.value.take(16)}...: ${err.message} — rejecting")
-              .as(false)
-        case Right(kSig) =>
-          kesRegistry.getKesVk(attesterId).flatMap {
-            case None =>
-              Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_no_registry_entry_total") >>
-                logger
-                  .warn(
-                    s"⚠️ $tag no registry entry step=$kesStep from=${attesterHex.value.take(16)}... — rejecting"
-                  )
-                  .as(false)
-            case Some(entry) =>
-              if (kesStep < 0)
-                Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_invalid_total") >>
-                  logger
-                    .warn(s"⚠️ $tag negative step=$kesStep from=${attesterHex.value.take(16)}... — rejecting")
-                    .as(false)
-              else {
-                val vkAtStep = entry.vk.copy(step = kesStep)
-                val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtStep)
-                if (ok)
-                  Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_verified_total") >>
-                    logger
-                      .info(s"🔐 $tag verified step=$kesStep from=${attesterHex.value.take(16)}...")
-                      .as(true)
-                else
-                  Metrics[F].incrementCounter("dag_nakamoto_kes_mg_attestations_invalid_total") >>
-                    logger
-                      .warn(s"⚠️ $tag invalid step=$kesStep from=${attesterHex.value.take(16)}... — rejecting")
-                      .as(false)
-              }
-          }
-      }
-    }
-  }
+  ): F[Boolean] =
+    verifyForArtifact(
+      messageBytes,
+      kesSigBytes,
+      expectedOperatorId,
+      expectedOperatorId.value,
+      operatorKeys,
+      artifactPeriod,
+      wireStep = kesStep.some,
+      metricKeys = metagraphAttestationMetrics,
+      tag = "KES-MGATT",
+      detail = s"period=${artifactPeriod.value}",
+      logger
+    )
 
-  /** Verify a KES signature attached to a snapshot. Same accept/reject semantics as [[verifyAttestation]]. */
   def verifySnapshot[F[_]: Async: Metrics](
     messageBytes: Array[Byte],
     kesSigBytes: Array[Byte],
     producerId: peer.PeerId,
     producerHex: Hex,
     ordinal: Long,
-    kesRegistry: KesRegistry[F],
+    operatorKeys: OperatorConsensusKeys,
     etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Boolean] = {
-    val tag = "KES-SNAP"
-    if (kesSigBytes.isEmpty) {
-      Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_no_sig_total") >>
-        logger.warn(s"⚠️ $tag missing sig — rejecting ord=$ordinal from=${producerHex.value.take(16)}...").as(false)
-    } else {
-      OperationalKeyMaker.decodeSignature(kesSigBytes) match {
-        case Left(err) =>
-          Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_decode_failed_total") >>
+    val artifactPeriod = EtaPeriod(EtaCalculation.rotationPeriod(math.max(0L, ordinal - 1L), etaRotationSnapshots))
+    verifyForArtifact(
+      messageBytes,
+      kesSigBytes,
+      producerId,
+      producerHex,
+      operatorKeys,
+      artifactPeriod,
+      wireStep = None,
+      metricKeys = snapshotMetrics,
+      tag = "KES-SNAP",
+      detail = s"ord=$ordinal",
+      logger
+    )
+  }
+
+  private def verifyForArtifact[F[_]: Async: Metrics](
+    messageBytes: Array[Byte],
+    kesSigBytes: Array[Byte],
+    peerId: peer.PeerId,
+    peerHex: Hex,
+    operatorKeys: OperatorConsensusKeys,
+    artifactPeriod: EtaPeriod,
+    wireStep: Option[Int],
+    metricKeys: MetricKeys,
+    tag: String,
+    detail: String,
+    logger: org.typelevel.log4cats.Logger[F]
+  ): F[Boolean] =
+    if (!ActiveOperatorConsensusKeys.isValidAt(operatorKeys, peerId, artifactPeriod))
+      Metrics[F].incrementCounter(metricKeys.noRegistryEntry) >>
+        logger
+          .warn(
+            s"$tag no valid active atomic operator-key pair for $detail period=${artifactPeriod.value} " +
+              s"from=${peerHex.value.take(16)}...; rejecting"
+          )
+          .as(false)
+    else
+      ActiveOperatorConsensusKeys.treeStep(operatorKeys, artifactPeriod) match {
+        case None =>
+          Metrics[F].incrementCounter(metricKeys.invalid) >>
+            logger.warn(s"$tag invalid registered period for $detail; rejecting").as(false)
+        case Some(expectedStep) if wireStep.exists(_ != expectedStep) =>
+          Metrics[F].incrementCounter(metricKeys.invalid) >>
             logger
-              .warn(s"⚠️ $tag decode failed for ord=$ordinal from=${producerHex.value.take(16)}...: ${err.message} — rejecting")
+              .warn(s"$tag wire step=${wireStep.get} != registered step=$expectedStep for $detail; rejecting")
               .as(false)
-        case Right(kSig) =>
-          kesRegistry.getKesVk(producerId).flatMap {
-            case None =>
-              Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_no_registry_entry_total") >>
-                logger
-                  .warn(
-                    s"⚠️ $tag no registry entry for ord=$ordinal from=${producerHex.value.take(16)}... — rejecting"
-                  )
-                  .as(false)
-            case Some(entry) =>
-              val globalPeriod = EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots).toInt
-              val treeInternalStep = globalPeriod - entry.offset.toInt
-              if (treeInternalStep < 0)
-                Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_invalid_total") >>
+        case Some(_) if kesSigBytes.isEmpty =>
+          Metrics[F].incrementCounter(metricKeys.noSignature) >>
+            logger.warn(s"$tag missing signature for $detail from=${peerHex.value.take(16)}...; rejecting").as(false)
+        case Some(expectedStep) =>
+          OperationalKeyMaker.decodeSignature(kesSigBytes) match {
+            case Left(error) =>
+              Metrics[F].incrementCounter(metricKeys.decodeFailed) >>
+                logger.warn(s"$tag decode failed for $detail: ${error.message}; rejecting").as(false)
+            case Right(signature) =>
+              val valid = OperationalKeyMaker.verify(signature, messageBytes, operatorKeys.kes.vk.copy(step = expectedStep))
+              if (valid)
+                Metrics[F].incrementCounter(metricKeys.verified) >>
                   logger
-                    .warn(
-                      s"⚠️ $tag from operator with offset=${entry.offset} can't sign at globalPeriod=$globalPeriod (treeInternalStep would be $treeInternalStep — operator not yet active)"
+                    .info(
+                      s"$tag verified $detail period=${artifactPeriod.value} step=$expectedStep " +
+                        s"from=${peerHex.value.take(16)}..."
                     )
-                    .as(false)
-              else {
-                val vkAtStep = entry.vk.copy(step = treeInternalStep)
-                val ok = OperationalKeyMaker.verify(kSig, messageBytes, vkAtStep)
-                if (ok)
-                  Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_verified_total") >>
-                    logger
-                      .info(
-                        s"🔐 $tag verified ord=$ordinal period=$globalPeriod step=$treeInternalStep from=${producerHex.value.take(16)}..."
-                      )
-                      .as(true)
-                else
-                  Metrics[F].incrementCounter("dag_nakamoto_kes_snapshots_invalid_total") >>
-                    logger
-                      .warn(
-                        s"⚠️ $tag invalid ord=$ordinal period=$globalPeriod step=$treeInternalStep from=${producerHex.value.take(16)}... — rejecting"
-                      )
-                      .as(false)
-              }
+                    .as(true)
+              else
+                Metrics[F].incrementCounter(metricKeys.invalid) >>
+                  logger.warn(s"$tag invalid signature for $detail step=$expectedStep; rejecting").as(false)
           }
       }
-    }
-  }
 }

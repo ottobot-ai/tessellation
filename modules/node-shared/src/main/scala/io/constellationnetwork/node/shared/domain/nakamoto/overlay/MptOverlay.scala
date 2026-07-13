@@ -240,17 +240,15 @@ trait MptOverlay[F[_], K] {
     */
   def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome]
 
-  /** Phase-3 (T_depth2) archival prune of overlay history structures (#139). Drops in-memory accumulators whose entries are strictly below
-    * `ord` — entries at the archival boundary k₂ (≈65536 snapshots, well past any reorg window we permit) cannot be needed by any future
-    * operation, so dropping them is safe and irreversible. Called from `SnapshotLeaderLoop.finalityMonitor` after the local archival
-    * watermark advances past `T_depth2.latestQualifyingOrdinal`.
+  /** Local in-memory retention prune. Current callers include legacy k1/T_depth2 watermarks, but neither watermark is a protocol Phase 3 or
+    * an absolute no-reorg floor. Target P2 remains density-reorgable; callers may drop RAM history only when exact authenticated disk/proof
+    * reconstruction remains available, otherwise a deeper required comparison must enter `RecoveryRequired`.
     *
     * Pruning is purely a memory bound — the production code path produces identical `mptRoot`s before and after the call. Idempotent: a
     * second call with the same `ord` is a no-op; a call with a lower `ord` is a no-op for entries already pruned.
     *
-    * Multi-branch: prunes `undoJournalRef` entries with `finalizedAt < ord` (the reorg-recovery reverse-delta sink; no entry at depth > k₂
-    * can ever be replayed because reorgs at that depth are excluded by `T_depth2`'s definition) AND `finalizedRef` entries below `ord`
-    * (cross-ordinal conflict-detection entries are likewise unreachable past k₂). Passthrough: no-op (no per-branch history to prune).
+    * Multi-branch: prunes `undoJournalRef` and `finalizedRef` entries below `ord`. This operation is not a consensus decision and must not
+    * destroy the only exact reconstruction path. Passthrough: no-op.
     */
   def pruneBelow(ord: SnapshotOrdinal): F[Unit]
 
@@ -959,13 +957,9 @@ object MptOverlay {
         }
 
       def pruneBelow(ord: SnapshotOrdinal): F[Unit] =
-        // Phase-3 archival prune (#139). `ord` is the local archival watermark — `T_depth2.latestQualifyingOrdinal`
-        // advanced past it in `SnapshotLeaderLoop.finalityMonitor`. By definition of k₂ ≈ 65536 snapshots,
-        // reorgs at depth > k₂ are negligibly unlikely, so:
-        //   - `undoJournalRef[finalizedAt]` for `finalizedAt < ord` can never be replayed (reorg-replace
-        //     finality at those ords is excluded by depth-k₂ archival finality).
-        //   - `finalizedRef[ord']` for `ord' < ord` will never be re-finalized with a different canonical
-        //     hash (same reason), so the conflict-detection entry is dead weight.
+        // Local retention prune driven by current legacy watermark wiring. k2 does not exclude
+        // objective density reorgs. Removed RAM state must remain exactly reconstructible from
+        // authenticated storage/proofs; otherwise comparison enters RecoveryRequired.
         //
         // `pendingRef` is deliberately NOT touched here — pending branches are managed by the commit/finalize
         // path (cleared on `finalizeBranch.foldIntoBase`, evicted on cap exceedance) and any live branch with

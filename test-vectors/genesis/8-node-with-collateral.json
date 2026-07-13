@@ -8,7 +8,7 @@
       "ECDSA signatures non-deterministic by RNG (verifiable but not byte-equal across loads)"
     ],
     "generatedAt" : "1970-01-01T00:00:00Z",
-    "generatorVersion" : "tools-3.2.0-rc.2+687.f2983307.local",
+    "generatorVersion" : "tools-4.1.0-alpha.0+914.184f7863.local",
     "invocation" : "generate-genesis --num-operators 8 --seed 1003 --stake-distribution 0.125,0.125,0.125,0.125,0.125,0.125,0.125,0.125 --stake-budget-datum 800000000000 --collateral-per-operator 100000000000 --network-magic test-cluster",
     "seed" : 1003
   },
@@ -177,64 +177,6 @@
       "balance" : 100000000000000
     }
   ],
-  "kesRegistrations" : [
-    {
-      "kesVk" : "586ce167e630e0ffe509033e601e2372417ffb046418a05c567af901157e2228",
-      "kesVkStep" : 0,
-      "longTermSig" : "30440220043c6b04f3f46115e65b2941b850404493c1677c0832947fd557f79bc241bfd8022053885df12b7cbb9e64964b33aef377858a119aa891671dccc447aed2b1c0585c",
-      "peerId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "4531c3caffed959c93af8c39c0805ea8089cceca9845d5a933b08296e4a1287e",
-      "kesVkStep" : 0,
-      "longTermSig" : "30450221009d37299f258eb7281a3429e0beac7df42fa350653df0c964649adedaf5b7fb39022049e8f63d36c173a453c78f305b59cfe8aca72b25bf2d7fa0d49d6f20b3cb8888",
-      "peerId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "6140a4d63102c76c9dc447491f5876ba2f65ad0fc70ae05d6322e8e4a9d82611",
-      "kesVkStep" : 0,
-      "longTermSig" : "3044022005a1b8dc0326cdc541132513c7c7cfcb9b2d11abee3141601d24148136025f7a02204573fd234f9f60c1d27d60d736519307c79c645d88ce7eb762dcc25749307a97",
-      "peerId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "1d899971427484de28615af3d414daa87dbd582c09de33965e6ddac8eefbf871",
-      "kesVkStep" : 0,
-      "longTermSig" : "30450221008b8ded067859b96098edc328cb7d52b6e7c7e36841b7e06f861987c4dc6337f702206a0dcb0d77f03e5f80b1c8d43d0797b010a02146daac860392189b0277f94e1d",
-      "peerId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "f9d7032b195ee13e8d68e228e61d2005e3a5aa2db81bb353b6511edb5c39feb0",
-      "kesVkStep" : 0,
-      "longTermSig" : "3045022100a674d40c21b50d18a2e3143805cd2abf09c00fa2f337401dbbe1efff5a07949402203194355dec8a921900cbedd780506c8899292e9aaeb2771214772032c05af5af",
-      "peerId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "fa431ffe4b9ba696b19620a9493b58e9f9a8d853c02ce77eea299ab62482ec8d",
-      "kesVkStep" : 0,
-      "longTermSig" : "304402202548d01bfd4e599dac75aff159225a4417cab746572e6482638950239b8faa74022023ad590c631c4d8f613266623399ad7ada18798dab165f91e30bf4c98f7ddfb0",
-      "peerId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "c82b045fa694d38ec7e89fea5e8d104429675f44d3e5c29cf066fed2bc2538ae",
-      "kesVkStep" : 0,
-      "longTermSig" : "3045022100c25fc1d452f2bcf9426888f8e87950dbc041a9d5fba8a72cfa86e4eed7fdbf2b02206261c62841309b0e1c9dac70c0582c6ed25d9a93808f7d083ccd8f6b5e5edc38",
-      "peerId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
-      "offset" : 0
-    },
-    {
-      "kesVk" : "5243c7a1ed6c787857c94f619c99132008481af102dce2ac065b3b23fb78e226",
-      "kesVkStep" : 0,
-      "longTermSig" : "3045022059db6b6a30b44b1fe8da754713ec57d99cdbf534773a92f923eac0e4911d4694022100f3de2a0cf1387334cc54fd2d08f5b8e8f734ec19470c0c687bb4333b8d45cf65",
-      "peerId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
-      "offset" : 0
-    }
-  ],
   "networkMagic" : "test-cluster",
   "nodeCollaterals" : [
     {
@@ -361,58 +303,81 @@
   "operators" : [
     {
       "address" : "DAG6DptbddQVYoaga8UsEyKNaxe3gthC4qdviRoi",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "c39f867e3b56fcd7bee39ffe0afcd5720ae3f041c2d80cd60012e41757fd0c48",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "3045022100de82f6ceb3afca3ccda4fbd8c221c32ac537e00fc9878a4f7a4045d2c2da31100220452246a69091f7aee6e1a2ed1162f5133fc96098cc93ec71b7ca2478447524e0",
       "peerId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
-      "vrfPublicKey" : null
+      "vrfVk" : "538db9b0e104ce865d82e527e45b28c47416a277b82c8e5180c5cdf60bbe4551"
     },
     {
       "address" : "DAG7GbAT6aCBcr9uER9vr1v7asRMrmg3ab8p9Eye",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "26fac1ae4356fcd97776a4256b0ccbd78749a778383c5c7370139fa3b4373baa",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "304602210081eaa9a5c4f193b48fd0e777c3fb4d1b0b0bbf5c0e2c49760ee9e1290aad7af0022100b50276a5e77ff7fb2f78a28e65da8a71c6a55644860f8abd3aab051b83212aae",
       "peerId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
-      "vrfPublicKey" : null
+      "vrfVk" : "f17d264d04123410dfed60eab64bdac5891a6142f0e602333e4ee10078a13394"
     },
     {
       "address" : "DAG7o3cgczkXPwsYkwNmZYUaXsVfNLgkfHqZ4otW",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "74f96b591c95a54fd22f21f024704c6bd8f47094e997c41be6c0fcbc493529b1",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "30440220464e81dfa7f952358547fc35bcdee5d3428b592b72c8b84db473edc12ee0e53302200bdf6cd17acd0aa8876d95c3b86c1e49916b4284af9068dca30d5f98add82bb4",
       "peerId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
-      "vrfPublicKey" : null
+      "vrfVk" : "21e0bab7b62c20440485603f81dbc820fa6dfa01db89c4fb5e770068fc3e6c3f"
     },
     {
       "address" : "DAG5Yjhq8fepasaZdCKGQryoCH33RyY9kEHpNzBQ",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "937b7b2d845246621754b84c237f2ea067120550e6a49f9d890fba0d24007408",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "3045022100deea51011d20717b7b5a41376cfd033414a490786ca880463c5d35c3cbac9b38022027091a7de455a4537dac75ba5c842c1f10f50be5dca32afe3d0aa7a72a50a770",
       "peerId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
-      "vrfPublicKey" : null
+      "vrfVk" : "c390c2c8480143aa0a147361a0225ae76e273c86c66d5d45272a8dd1aa5c9550"
     },
     {
       "address" : "DAG2ss5taKrVZWV4szdcLf4QNLqJZt4XGvxG3LfZ",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "e3dfd1417d1b27256f4dc7d6fa3ce81af7f162e63703ce7860e2e418f89d70da",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "3045022100b9869ca2944a2ade20ae093d953eabf053916f96deb6cef831d46410ccd0ba8e02200a3e29d584180609c1a1941b7a08a5f01fa5601df41433b1aa738dbb758aef95",
       "peerId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
-      "vrfPublicKey" : null
+      "vrfVk" : "de7edc94f8d350cad836b2efa078af93a6d47b9273bee7863367f7cbdfbb4b7b"
     },
     {
       "address" : "DAG1xJ47Jmi32XfMB5ZsBHq7YjtvtKiXMJtxXVKc",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "648547487c516c7d55a400d09537cda9254693087672ed8fa94d5375d513e6c7",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "304402204c27a9dff65c8545eac1bbde965138199982dee11a2175faef2d5d3fc4e2555f022051a54acee055ff89f4c1a2e8914706611209b1fc7339f1abf2a0dac745783bf1",
       "peerId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
-      "vrfPublicKey" : null
+      "vrfVk" : "1e93e5d39cae726982e96997c0591cfc9193c6072768bd0c1820adf5fb14d6d2"
     },
     {
       "address" : "DAG5ZuF59FLvSBzwZ6b6HWikzKDChyEDS6QSwRQh",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "3725ebc7a39c7fcad68708f6c318a6d17c7aeef851f6f7a1a456e20ef96fe46c",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "3045022014a752243fcb265c51074f14437678eafd5cba9a9ec74d1a1c2fa1224706ee98022100b8239cb5e1a36e7f146a5ee3d21eb19d79ad08d85f89abffcf60b1683de9b025",
       "peerId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
-      "vrfPublicKey" : null
+      "vrfVk" : "1e1474ca07e6b11ac3b955ff91ae8c956ee262e517fbb480809175a7e0d8dba4"
     },
     {
       "address" : "DAG6zgcDgKF3REs6d4TCXsT353dpSGVAHqZTcFgq",
-      "kesPublicKey" : null,
+      "kesMasterVk" : "c94a2a31bf9b7e54c3be788cd54249b79600ef564a9bf19a9aa8bc2f58ec85e6",
+      "kesMasterVkStep" : 0,
+      "kesPeriodOffset" : 0,
+      "longTermSignature" : "30450221009a37e1a8267cba2ef76da3208a58262eead5788aa02bee42b9be01c8a7212ed602207c5036c3559978f27bf699a2c93ba44321ffe575ff393a8037c146c9dbd4de3e",
       "peerId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
-      "vrfPublicKey" : null
+      "vrfVk" : "aab6ae8625e143811884b4bc52488b2c37860574e38ae84b28ffcc6cf7b34d21"
     }
   ],
   "protocolParams" : {
-    "etaRotationSnapshots" : 2550,
+    "etaRotationSnapshots" : 3174,
     "genesisEta" : "tessellation-nakamoto-genesis",
-    "lddCutoff" : 15,
-    "slotsPerEpoch" : 60,
+    "lddCutoff" : 16,
     "startingEpochProgress" : 0
   },
   "startingEpochProgress" : 0

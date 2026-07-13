@@ -37,11 +37,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
     val cfg = loadDefault
     expect.all(
       cfg.numShards == 1,
-      cfg.finality.k1Shard == 8L,
-      // EXECUTION-SHARDING R-1: default per-shard raw-binary buffer cap.
-      cfg.checkpoint.binaryBufferCap == 4096,
-      // Slice 19: default partition-hard threshold is 10 minutes.
-      cfg.observability.tPartitionHardMs == 600000L
+      cfg.retention.retainedCheckpoints == 8L,
+      cfg.checkpoint.binaryBufferCap == 4096
     )
   }
 
@@ -50,17 +47,15 @@ object ShardingConfigSuite extends SimpleIOSuite {
       """
         |nakamoto.sharding {
         |  num-shards = 4
-        |  finality { k1-shard = 16 }
+        |  retention { retained-checkpoints = 16 }
         |  checkpoint { binary-buffer-cap = 8192 }
-        |  observability { t-partition-hard-ms = 90000 }
         |}
       """.stripMargin
     )
     expect.all(
       cfg.numShards == 4,
-      cfg.finality.k1Shard == 16L,
-      cfg.checkpoint.binaryBufferCap == 8192,
-      cfg.observability.tPartitionHardMs == 90000L
+      cfg.retention.retainedCheckpoints == 16L,
+      cfg.checkpoint.binaryBufferCap == 8192
     )
   }
 
@@ -74,9 +69,8 @@ object ShardingConfigSuite extends SimpleIOSuite {
     )
     expect.all(
       cfg.numShards == 2,
-      cfg.finality.k1Shard == 8L,
-      cfg.checkpoint.binaryBufferCap == 4096,
-      cfg.observability.tPartitionHardMs == 600000L
+      cfg.retention.retainedCheckpoints == 8L,
+      cfg.checkpoint.binaryBufferCap == 4096
     )
   }
 }

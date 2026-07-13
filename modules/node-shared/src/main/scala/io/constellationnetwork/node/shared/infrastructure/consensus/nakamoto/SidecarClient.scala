@@ -80,8 +80,10 @@ object SidecarClient {
       */
     def publishFraudProof(msg: FraudProofEnvelopeWire): F[PublishResponse]
 
-    /** Ack to the sidecar that the listed message ids on `topic` have reached Phase-3 finality and may be dropped from the outbox. Each id
-      * is the sha256 (first 32 bytes) of the same payload bytes the JVM published.
+    /** Ack to the sidecar that the listed message ids on `topic` are contained in the current exact-hash Phase-2 state. Phase 2 is
+      * reversible, so dropping transport copies is safe only when exact inputs remain recoverable and reorg handling deterministically
+      * reinserts or re-fetches them; this ack is not irreversible finality. Each id is the sha256 (first 32 bytes) of the same payload
+      * bytes the JVM published.
       *
       * For AllowSpendBlock + MetagraphBinary: id = sha256(serializedSigned), computed via `Hasher[F].hashBytes` so the Hasher typeclass is
       * the single source of hash truth (per project rule `feedback_use_hasher_no_manual_serialize`). For MetagraphAttestation: id =

@@ -2,9 +2,11 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.IO
 
-import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistry, KesRegistryEntry}
+import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
+import io.constellationnetwork.node.shared.domain.nakamoto.{CanonicalOperatorConsensusFixture, KesRegistryEntry}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.schema.ID.Id
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes._
@@ -18,14 +20,13 @@ import weaver.SimpleIOSuite
   * Asserts the fail-closed behavior matrix for both [[KesGossipVerification.verifyAttestation]] and
   * [[KesGossipVerification.verifySnapshot]]:
   *
-  *   - sender's signature + receiver's verification round-trip cleanly when the kesRegistry has the sender's master VK (hard correctness
-  *     claim from the slice spec)
+  *   - sender's signature + receiver's verification round-trip cleanly under the already-resolved atomic KES+VRF identity
   *   - empty wire field → no-sig counter increments
   *   - present sig + missing registry entry → no-registry-entry counter
   *   - present sig + wrong VK in registry → invalid counter (registry pre-seeded with a different VK)
   *
-  * Uses [[CountingMetrics]] to assert per-counter increments and the existing [[OperationalKeyMaker.bootstrap]] pattern from
-  * `OperationalKeyMakerSuite` for deterministic sender keys (in-memory store + fixed seed).
+  * Uses [[CountingMetrics]] to assert per-counter increments. Positive artifacts are signed by a loader-validated canonical genesis
+  * operator pair; deterministic raw KES signers are confined to explicit wrong-key negative cases.
   */
 object KesGossipVerificationSuite extends SimpleIOSuite {
 
@@ -46,8 +47,21 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   private def setup: IO[(cats.effect.kernel.Ref[IO, Map[String, Int]], Metrics[IO])] =
     CountingMetrics.make
 
-  /** Build a signing OperationalKeyMaker with a deterministic seed; return both the algebra (for `signAt`) and the master VK (for the
-    * registry).
+  /** Models the absence of an upstream exact-pair resolution. Production callers stop before this verifier; the defensive verifier still
+    * rejects a capability whose identity does not match the artifact's actor.
+    */
+  private def invalidKeys(operator: PeerId, keys: OperatorConsensusKeys): OperatorConsensusKeys =
+    keys.copy(operatorPeerId = if (operator == peerId('z')) peerId('y') else peerId('z'))
+
+  private def signWithCanonical(
+    operator: CanonicalOperatorConsensusFixture,
+    step: Int = 0
+  ): IO[Array[Byte]] =
+    operator.kesSigner
+      .signAt(step, testMessageBytes)
+      .map(result => OperationalKeyMaker.encodeSignature(result.toOption.get))
+
+  /** Build a deliberately nonregistered OperationalKeyMaker for wrong-signature/replacement-key negative cases.
     */
   private def buildSigner(seedByte: Byte): IO[(OperationalKeyMakerAlgebra[IO], VerificationKeyKesProduct)] =
     SecureStore.inMemory[IO].flatMap { store =>
@@ -76,143 +90,150 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   // ============================================================
 
   test("attestation: signed-then-verified round-trips when registry has sender's master VK") {
-    for {
-      (counters, metrics) <- setup
-      (signer, vk) <- buildSigner(0x11.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, 0L)))
-      sigResult <- signer.signAt(0, testMessageBytes)
-      sigBytes = sigResult.toOption.get
-      wireBytes = OperationalKeyMaker.encodeSignature(sigBytes)
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(accepted, "a valid registered attestation must be accepted") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        wireBytes <- signWithCanonical(operator)
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            attesterId = operatorId,
+            attesterHex = operatorId.value,
+            tipOrdinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(accepted, "a valid registered attestation must be accepted") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total"))
+    }
   }
 
   test("attestation: empty wire field → no-sig counter, no other increments") {
-    for {
-      (counters, metrics) <- setup
-      registry = KesRegistry.empty[IO]
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = Array.empty[Byte],
-          attesterId = peerId('b'),
-          attesterHex = peerHex('b'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "a missing attestation KES signature must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = Array.empty[Byte],
+            attesterId = operatorId,
+            attesterHex = operatorId.value,
+            tipOrdinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "a missing attestation KES signature must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total"))
+    }
   }
 
   test("attestation: present sig + missing registry entry → no-registry-entry counter") {
-    for {
-      (counters, metrics) <- setup
-      (signer, _) <- buildSigner(0x22.toByte)
-      // Registry has someone else's entry, not the attester
-      (_, otherVk) <- buildSigner(0x33.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('z') -> KesRegistryEntry(otherVk, 0L)))
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'), // not in registry
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "an unregistered attester must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorId = operator.resolvedPair.operatorPeerId
+      val operatorKeys = invalidKeys(operatorId, operator.resolvedPair)
+      for {
+        (counters, metrics) <- setup
+        wireBytes <- signWithCanonical(operator)
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            attesterId = operatorId,
+            attesterHex = operatorId.value,
+            tipOrdinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "an unregistered attester must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_invalid_total"))
+    }
   }
 
   test("attestation: present sig + wrong VK in registry → reject and increment invalid counter") {
-    for {
-      (counters, metrics) <- setup
-      (signerA, _) <- buildSigner(0x44.toByte) // signs the actual message
-      (_, wrongVk) <- buildSigner(0x55.toByte) // different VK seeded in registry
-      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(wrongVk, 0L)))
-      sigResult <- signerA.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "an attestation signed by a key other than the registered KES key must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        (signerA, _) <- buildSigner(0x44.toByte)
+        sigResult <- signerA.signAt(0, testMessageBytes)
+        wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            attesterId = operatorId,
+            attesterHex = operatorId.value,
+            tipOrdinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "an attestation signed by a key other than the registered KES key must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_invalid_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_verified_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_registry_entry_total"))
+    }
   }
 
   test("attestation: garbage wire bytes → decode-failed counter") {
-    for {
-      (counters, metrics) <- setup
-      garbage = Array.fill[Byte](16)(0xff.toByte) // 4-byte length prefix = -1 → MalformedTree
-      registry = KesRegistry.empty[IO]
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = garbage,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          tipOrdinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "a malformed attestation KES signature must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        garbage = Array.fill[Byte](16)(0xff.toByte) // 4-byte length prefix = -1 → MalformedTree
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = garbage,
+            attesterId = operatorId,
+            attesterHex = operatorId.value,
+            tipOrdinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "a malformed attestation KES signature must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_attestations_no_sig_total"))
+    }
   }
 
   // ============================================================
@@ -220,107 +241,114 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   // ============================================================
 
   test("snapshot: signed-then-verified round-trips when registry has sender's master VK") {
-    for {
-      (counters, metrics) <- setup
-      (signer, vk) <- buildSigner(0x66.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(vk, 0L)))
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifySnapshot[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          producerId = peerId('p'),
-          producerHex = peerHex('p'),
-          ordinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(accepted, "a valid registered snapshot must be accepted") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_verified_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        wireBytes <- signWithCanonical(operator)
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifySnapshot[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            producerId = operatorId,
+            producerHex = operatorId.value,
+            ordinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(accepted, "a valid registered snapshot must be accepted") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_verified_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total"))
+    }
   }
 
   test("snapshot: empty wire field → no-sig counter") {
-    for {
-      (counters, metrics) <- setup
-      registry = KesRegistry.empty[IO]
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifySnapshot[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = Array.empty[Byte],
-          producerId = peerId('q'),
-          producerHex = peerHex('q'),
-          ordinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "a snapshot without a KES signature must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_sig_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifySnapshot[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = Array.empty[Byte],
+            producerId = operatorId,
+            producerHex = operatorId.value,
+            ordinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "a snapshot without a KES signature must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_sig_total"))
+    }
   }
 
   test("snapshot: present sig + missing registry entry → no-registry-entry counter") {
-    for {
-      (counters, metrics) <- setup
-      (signer, _) <- buildSigner(0x77.toByte)
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      registry = KesRegistry.empty[IO]
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifySnapshot[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          producerId = peerId('p'),
-          producerHex = peerHex('p'),
-          ordinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "an unregistered snapshot producer must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_registry_entry_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorId = operator.resolvedPair.operatorPeerId
+      val operatorKeys = invalidKeys(operatorId, operator.resolvedPair)
+      for {
+        (counters, metrics) <- setup
+        wireBytes <- signWithCanonical(operator)
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifySnapshot[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            producerId = operatorId,
+            producerHex = operatorId.value,
+            ordinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "an unregistered snapshot producer must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_no_registry_entry_total"))
+    }
   }
 
   test("snapshot: present sig + wrong VK in registry → reject and increment invalid counter") {
-    for {
-      (counters, metrics) <- setup
-      (signer, _) <- buildSigner(0x88.toByte)
-      (_, wrongVk) <- buildSigner(0x99.toByte)
-      registry = KesRegistry.make[IO](Map(peerId('p') -> KesRegistryEntry(wrongVk, 0L)))
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      accepted <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifySnapshot[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          producerId = peerId('p'),
-          producerHex = peerHex('p'),
-          ordinal = testOrdinal,
-          kesRegistry = registry,
-          etaRotationSnapshots = etaRotationSnapshots,
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(!accepted, "a snapshot signed by a key other than the registered KES key must be rejected") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total")) &&
-        expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_verified_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        (signer, _) <- buildSigner(0x88.toByte)
+        sigResult <- signer.signAt(0, testMessageBytes)
+        wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
+        accepted <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifySnapshot[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            producerId = operatorId,
+            producerHex = operatorId.value,
+            ordinal = testOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = etaRotationSnapshots,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(!accepted, "a snapshot signed by a key other than the registered KES key must be rejected") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_invalid_total")) &&
+          expect.same(None, finalCounters.get("dag_nakamoto_kes_snapshots_verified_total"))
+    }
   }
 
   // ============================================================
@@ -331,189 +359,191 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
   // value mapping so the daemon's drop-on-false behavior can't silently flip.
 
   test("return-value matrix: only a valid registered KES signature returns true") {
-    for {
-      (_, metrics) <- setup
-      (signer, vk) <- buildSigner(0xaa.toByte)
-      (_, wrongVk) <- buildSigner(0xbb.toByte)
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      registryGood = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, 0L)))
-      registryWrong = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(wrongVk, 0L)))
-      registryEmpty = KesRegistry.empty[IO]
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorId = operator.resolvedPair.operatorPeerId
+      for {
+        (_, metrics) <- setup
+        (_, wrongVk) <- buildSigner(0xbb.toByte)
+        wireBytes <- signWithCanonical(operator)
+        keysGood = operator.resolvedPair
+        keysWrong = keysGood.copy(kes = KesRegistryEntry(wrongVk, 0L))
+        keysMissing = invalidKeys(operatorId, keysGood)
 
-      okGood <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          wireBytes,
-          peerId('a'),
-          peerHex('a'),
-          testOrdinal,
-          registryGood,
-          etaRotationSnapshots,
-          logger
-        )
-      }
-      okWrong <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          wireBytes,
-          peerId('a'),
-          peerHex('a'),
-          testOrdinal,
-          registryWrong,
-          etaRotationSnapshots,
-          logger
-        )
-      }
-      okEmpty <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          wireBytes,
-          peerId('a'),
-          peerHex('a'),
-          testOrdinal,
-          registryEmpty,
-          etaRotationSnapshots,
-          logger
-        )
-      }
-      okNoSig <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          Array.empty[Byte],
-          peerId('a'),
-          peerHex('a'),
-          testOrdinal,
-          registryGood,
-          etaRotationSnapshots,
-          logger
-        )
-      }
-      okDecodeFail <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          Array.fill[Byte](16)(0xff.toByte),
-          peerId('a'),
-          peerHex('a'),
-          testOrdinal,
-          registryGood,
-          etaRotationSnapshots,
-          logger
-        )
-      }
-    } yield
-      expect(okGood, "valid sig + valid registry must return true") &&
-        expect(!okWrong, "wrong VK in registry must return false") &&
-        expect(!okEmpty, "no registry entry must return false") &&
-        expect(!okNoSig, "missing wire field must return false") &&
-        expect(!okDecodeFail, "decode failure must return false")
+        okGood <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            wireBytes,
+            operatorId,
+            operatorId.value,
+            testOrdinal,
+            keysGood,
+            etaRotationSnapshots,
+            logger
+          )
+        }
+        okWrong <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            wireBytes,
+            operatorId,
+            operatorId.value,
+            testOrdinal,
+            keysWrong,
+            etaRotationSnapshots,
+            logger
+          )
+        }
+        okEmpty <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            wireBytes,
+            operatorId,
+            operatorId.value,
+            testOrdinal,
+            keysMissing,
+            etaRotationSnapshots,
+            logger
+          )
+        }
+        okNoSig <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            Array.empty[Byte],
+            operatorId,
+            operatorId.value,
+            testOrdinal,
+            keysGood,
+            etaRotationSnapshots,
+            logger
+          )
+        }
+        okDecodeFail <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            Array.fill[Byte](16)(0xff.toByte),
+            operatorId,
+            operatorId.value,
+            testOrdinal,
+            keysGood,
+            etaRotationSnapshots,
+            logger
+          )
+        }
+      } yield
+        expect(okGood, "valid sig + valid registry must return true") &&
+          expect(!okWrong, "wrong VK in registry must return false") &&
+          expect(!okEmpty, "no registry entry must return false") &&
+          expect(!okNoSig, "missing wire field must return false") &&
+          expect(!okDecodeFail, "decode failure must return false")
+    }
   }
 
   test("metagraph admission KES-by-step is fail-closed when the operator is not registered") {
-    for {
-      (counters, metrics) <- setup
-      (signer, vk) <- buildSigner(0x6a.toByte)
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      registered = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, 0L)))
-      valid <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestationByStep[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          kesStep = 0,
-          kesRegistry = registered,
-          logger = logger
-        )
-      }
-      unregistered <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestationByStep[IO](
-          messageBytes = testMessageBytes,
-          kesSigBytes = wireBytes,
-          attesterId = peerId('a'),
-          attesterHex = peerHex('a'),
-          kesStep = 0,
-          kesRegistry = KesRegistry.empty[IO],
-          logger = logger
-        )
-      }
-      finalCounters <- counters.get
-    } yield
-      expect(valid, "registered KES identity must verify") &&
-        expect(!unregistered, "missing KES registration must reject admission attestation") &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_verified_total")) &&
-        expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_no_registry_entry_total"))
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorId = operator.resolvedPair.operatorPeerId
+      for {
+        (counters, metrics) <- setup
+        wireBytes <- signWithCanonical(operator)
+        registered = operator.resolvedPair
+        valid <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestationByStep[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            expectedOperatorId = operatorId,
+            operatorKeys = registered,
+            kesStep = 0,
+            artifactPeriod = EtaPeriod.Zero,
+            logger = logger
+          )
+        }
+        unregistered <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestationByStep[IO](
+            messageBytes = testMessageBytes,
+            kesSigBytes = wireBytes,
+            expectedOperatorId = operatorId,
+            operatorKeys = invalidKeys(operatorId, registered),
+            kesStep = 0,
+            artifactPeriod = EtaPeriod.Zero,
+            logger = logger
+          )
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(valid, "registered KES identity must verify") &&
+          expect(!unregistered, "missing KES registration must reject admission attestation") &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_verified_total")) &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_no_registry_entry_total"))
+    }
   }
 
   // ============================================================
-  // Offset semantics — operators registered mid-life
+  // Artifact-period semantics and runtime-registration boundary
   // ============================================================
   //
-  // An operator with `offset = K` has their tree's step 0 active at global eta period K. Sigs
-  // signed at global period K+N use tree-internal step N. The receiver computes
-  // `step = globalPeriod - offset` and verifies with `vk.copy(step = ...)`. Two cases pinned:
-  //   (a) offset > 0 + matching sender step → verify succeeds
-  //   (b) offset > globalPeriod → step would be negative → verify rejects with no actual crypto check
+  // The frozen current-view verifier accepts only genesis pairs. It derives a genesis key's tree step from the artifact's parent period.
+  // Runtime offsets are resolved only by HistoricalOperatorConsensusKeyRegistry; feeding one through this compatibility path must reject.
 
-  test("offset > 0: sig at global period K+N round-trips via tree-internal step N") {
-    // etaRotation=1 makes globalPeriod == tipOrdinal — easier to reason about.
+  test("genesis pair at artifact period N round-trips via tree step N") {
     val rot: Long = 1L
-    val offset: Long = 5L
-    val globalPeriod: Int = 7 // tree-internal step = 7 - 5 = 2
-    for {
-      (_, metrics) <- setup
-      (signer, vk) <- buildSigner(0x11.toByte)
-      // Sender at tree-internal step 2
-      sigResult <- signer.signAt(globalPeriod - offset.toInt, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, offset)))
-      ok <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          wireBytes,
-          peerId('a'),
-          peerHex('a'),
-          tipOrdinal = globalPeriod.toLong, // with rot=1 this is the global period
-          kesRegistry = registry,
-          etaRotationSnapshots = rot,
-          logger = logger
-        )
-      }
-    } yield expect(ok, s"offset=$offset + sig at tree step=${globalPeriod - offset} must verify at globalPeriod=$globalPeriod")
+    val artifactPeriod: Int = 2
+    val tipOrdinal: Long = 3L // verification uses the parent ordinal, so rotationPeriod(3 - 1, 1) = 2
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorId = operator.resolvedPair.operatorPeerId
+      for {
+        (_, metrics) <- setup
+        wireBytes <- signWithCanonical(operator, artifactPeriod)
+        operatorKeys = operator.resolvedPair
+        ok <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            wireBytes,
+            operatorId,
+            operatorId.value,
+            tipOrdinal = tipOrdinal,
+            operatorKeys = operatorKeys,
+            etaRotationSnapshots = rot,
+            logger = logger
+          )
+        }
+      } yield expect(ok, s"genesis pair at artifact period=$artifactPeriod must verify at the same tree step")
+    }
   }
 
-  test("offset > globalPeriod: tree-internal step would be negative — rejected without crypto check") {
+  test("runtime-offset pair is rejected by the current-view verifier even after its claimed activation") {
     val rot: Long = 1L
-    val offset: Long = 50L
-    val globalPeriod: Int = 10 // step = 10 - 50 = -40 — out of range
-    for {
-      (_, metrics) <- setup
-      (signer, vk) <- buildSigner(0x22.toByte)
-      sigResult <- signer.signAt(0, testMessageBytes)
-      wireBytes = OperationalKeyMaker.encodeSignature(sigResult.toOption.get)
-      registry = KesRegistry.make[IO](Map(peerId('a') -> KesRegistryEntry(vk, offset)))
-      ok <- {
-        implicit val m: Metrics[IO] = metrics
-        KesGossipVerification.verifyAttestation[IO](
-          testMessageBytes,
-          wireBytes,
-          peerId('a'),
-          peerHex('a'),
-          tipOrdinal = globalPeriod.toLong,
-          kesRegistry = registry,
-          etaRotationSnapshots = rot,
-          logger = logger
+    val offset: Long = 2L
+    val tipOrdinal: Long = 4L
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorId = operator.resolvedPair.operatorPeerId
+      for {
+        (_, metrics) <- setup
+        wireBytes <- signWithCanonical(operator, 1)
+        runtimePair = operator.resolvedPair.copy(
+          kes = operator.resolvedPair.kes.copy(offset = offset),
+          effectiveFromPeriod = EtaPeriod(offset)
         )
-      }
-    } yield expect(!ok, s"operator registered at offset=$offset can't sign at globalPeriod=$globalPeriod — reject")
+        ok <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification.verifyAttestation[IO](
+            testMessageBytes,
+            wireBytes,
+            operatorId,
+            operatorId.value,
+            tipOrdinal = tipOrdinal,
+            operatorKeys = runtimePair,
+            etaRotationSnapshots = rot,
+            logger = logger
+          )
+        }
+      } yield expect(!ok, "runtime registration must be resolved from exact candidate-parent history, never current view")
+    }
   }
 }

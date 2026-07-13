@@ -12,6 +12,7 @@ import io.constellationnetwork.serde.codecs.instances.SignedCodec._
 import io.constellationnetwork.serde.implicits._
 
 import eu.timepit.refined.types.numeric.NonNegLong
+import scodec.Attempt
 import scodec.bits.ByteVector
 import weaver.FunSuite
 
@@ -74,6 +75,60 @@ object SignedCodecSuite extends FunSuite {
     // The NonEmptySet itself normalises; the bytes must match regardless of
     // how the set was built.
     expect(reversed.immutableBytes == forward.immutableBytes)
+  }
+
+  test("Signed proof order is canonical across mixed-case Hex source values") {
+    val mixedCase = Signed(
+      sampleBalance,
+      NonEmptySet.of(
+        mkProof("B0", "11"),
+        mkProof("a0", "22"),
+        mkProof("c0", "33")
+      )
+    )
+    val canonical = Signed(
+      sampleBalance,
+      NonEmptySet.of(
+        mkProof("b0", "11"),
+        mkProof("a0", "22"),
+        mkProof("c0", "33")
+      )
+    )
+
+    val mixedCaseBytes = mixedCase.immutableBytes
+
+    expect(mixedCaseBytes == canonical.immutableBytes) &&
+    expect(mixedCaseBytes.fromImmutableBytes[Signed[Balance]] == Right(canonical))
+  }
+
+  test("Signed encode rejects byte-duplicate proofs disguised by Hex case") {
+    val duplicateWireProofs = Signed(
+      sampleBalance,
+      NonEmptySet.of(
+        mkProof("B0", "11"),
+        mkProof("b0", "11")
+      )
+    )
+
+    scodec.Codec[Signed[Balance]].encode(duplicateWireProofs) match {
+      case Attempt.Failure(_) => success
+      case other              => failure(s"expected canonical duplicate rejection, got $other")
+    }
+  }
+
+  test("Signed encode reports malformed multi-proof Hex without throwing during canonical sort") {
+    val malformed = Signed(
+      sampleBalance,
+      NonEmptySet.of(
+        mkProof("zz", "11"),
+        mkProof("a0", "22")
+      )
+    )
+
+    scodec.Codec[Signed[Balance]].encode(malformed) match {
+      case Attempt.Failure(_) => success
+      case other              => failure(s"expected malformed Hex rejection, got $other")
+    }
   }
 
   test("Decoding a zero-proof-count prefix yields SerdeError.ScodecFailure (NES must be non-empty)") {

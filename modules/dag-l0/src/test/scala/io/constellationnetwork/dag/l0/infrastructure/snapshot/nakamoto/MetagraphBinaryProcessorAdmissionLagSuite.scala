@@ -6,6 +6,7 @@ import cats.syntax.all._
 import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.currency.schema.currency._
+import io.constellationnetwork.currency.schema.globalSnapshotSync.GlobalSyncView
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto._
@@ -15,6 +16,7 @@ import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{SnapshotOrdinal, SnapshotTips}
 import io.constellationnetwork.security._
@@ -28,15 +30,15 @@ import weaver.MutableIOSuite
 
 /** Regression for the #213/#290 metagraph-admission lag fix in [[NakamotoSyncDaemon.makeMetagraphBinaryProcessor]].
   *
-  * '''The bug.''' `resolveParent` resolves an incoming binary's metagraph parent ordinal via two tiers: (1) the orphan buffer's
-  * value-hash→ordinal admission cache (`lookupAdmittedOrd`), then (2) the tip-guarded `MetagraphParentOrdinalResolver.resolveFromBinary`,
-  * which returns `None` (logging "parentHash mismatch ... returning None") whenever the binary's parent ≠ gl0's single recorded GSI tip.
-  * The admission cache was seeded ONLY inside the `if (admitted)` branch — i.e. only when THIS node's local committee gate reached quorum.
-  * When the local gate TIMES OUT (some peers were transiently behind and buffered the binary instead of attesting, so kQuorum wasn't
-  * reached locally) the binary's value-hash→ordinal was never cached, even though its place in the chain is fixed and the cluster admits it
-  * via 2/3-attestation / depth-k. The very next child then misses the cache, falls through to the tip-guarded resolver, finds gl0's GSI tip
-  * still trailing the not-yet-finalized parent → mismatch → orphan-buffer; every successor re-buffers off it (the observed 733-mismatch /
-  * orphan re-buffer loop, gl0 trailing ml0).
+  * '''The bug.''' `resolveContext` resolves an incoming binary's metagraph parent ordinal via two tiers: (1) the orphan buffer's
+  * value-hash→ordinal admission cache (`lookupAdmittedOrd`), then (2) the tip-guarded signed currency-context resolver, which returns
+  * `None` (logging "parentHash mismatch ... returning None") whenever the binary's parent ≠ gl0's single recorded GSI tip. The admission
+  * cache was seeded ONLY inside the `if (admitted)` branch — i.e. only when THIS node's local committee gate reached quorum. When the local
+  * gate TIMES OUT (some peers were transiently behind and buffered the binary instead of attesting, so kQuorum wasn't reached locally) the
+  * binary's value-hash→ordinal was never cached, even though its place in the chain is fixed and the cluster admits it via 2/3-attestation
+  * / depth-k. The very next child then misses the cache, falls through to the tip-guarded resolver, finds gl0's GSI tip still trailing the
+  * not-yet-finalized parent → mismatch → orphan-buffer; every successor re-buffers off it (the observed 733-mismatch / orphan re-buffer
+  * loop, gl0 trailing ml0).
   *
   * '''The fix (under test).''' Seed the admission cache `(mg, valueHash(B)) → ord(B)` the instant the binary RESOLVES (its parent already
   * passed the tip / cached-ancestor identity guard), BEFORE — and independent of — the local gate outcome. `ord(B) = parentOrdinal + 1` is
@@ -44,7 +46,7 @@ import weaver.MutableIOSuite
   * and enters `attestAndAdmit` regardless of this node's gate result on the parent.
   *
   * '''Harness.''' A stub `MetagraphCommitteeGate` whose `attestAndAdmit` always returns `false` models the local gate timing out on every
-  * binary. The stub `parentOrdinalFor` models the tip-identity guard: it resolves ONLY when the binary's parent is in a fixed known-tip set
+  * binary. The stub context resolver models the tip-identity guard: it resolves only when the binary's parent is in a fixed known-tip set
   * (seeded with the genesis tip and NEVER advanced — exactly gl0's GSI lag), otherwise `None`. So a child whose parent is its predecessor's
   * value-hash can ONLY resolve through the admission cache. Pre-fix, the child would orphan-buffer; post-fix it resolves.
   */
@@ -90,7 +92,7 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       None,
       None,
       None,
-      None
+      Some(GlobalSyncView(SnapshotOrdinal.unsafeApply(100L), Hash("b" * 64), EpochProgress.MinValue))
     )
     KeyPairGenerator.makeKeyPair[IO].flatMap(kp => Signed.forAsyncHasher[IO, CurrencyIncrementalSnapshot](snapshot, kp))
   }
@@ -131,11 +133,13 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
         parentHash: Hash,
         binaryHash: Hash,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         sigmaOperatorKey: Ratio
       ): IO[Boolean] = attemptedRef.update(parentHash :: _).as(false)
       def recordReceivedAttestation(
         att: MetagraphCommitteeGate.IncomingAttestation,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         lookupSenderStake: PeerId => IO[Ratio]
       ): IO[Unit] = IO.unit
       def pruneParents(metagraphAddress: Address, parents: Set[Hash]): IO[Unit] = IO.unit
@@ -148,25 +152,32 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
         parentHash: Hash,
         binaryHash: Hash,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         sigmaOperatorKey: Ratio
       ): IO[Boolean] = IO.pure(true)
       def recordReceivedAttestation(
         att: MetagraphCommitteeGate.IncomingAttestation,
         eta: Array[Byte],
+        artifactPeriod: EtaPeriod,
         lookupSenderStake: PeerId => IO[Ratio]
       ): IO[Unit] = IO.unit
       def pruneParents(metagraphAddress: Address, parents: Set[Hash]): IO[Unit] = IO.unit
     }
 
-  /** A `parentOrdinalFor` that models `resolveFromBinary`'s tip-identity guard: resolves (via the real content decode) ONLY when `parent`
-    * is a known recorded tip; else `None`. The known-tip set is seeded with the genesis tip and NEVER advances — exactly gl0's GSI lag.
+  /** A context resolver that models the tip-identity guard: resolves the signed ML0 continuity + GL0 anchor ONLY when `parent` is a known
+    * recorded tip; else `None`. The known-tip set is seeded with the genesis tip and NEVER advances — exactly gl0's GSI lag.
     */
   private def tipGuardedResolver(knownTips: Set[Hash])(
     implicit json: JsonSerializer[IO]
-  ): (Address, Hash, Array[Byte]) => IO[Option[Long]] =
+  ): (Address, Hash, Array[Byte]) => IO[Option[MetagraphParentOrdinalResolver.CurrencyBinaryContext]] =
     (_, parent, content) =>
-      if (knownTips.contains(parent)) MetagraphParentOrdinalResolver.parentOrdinalFromContent[IO](content)
-      else IO.pure(none[Long])
+      if (knownTips.contains(parent)) MetagraphParentOrdinalResolver.currencyContextFromContent[IO](content)
+      else IO.pure(none[MetagraphParentOrdinalResolver.CurrencyBinaryContext])
+
+  private def verifyPhase2(
+    context: MetagraphParentOrdinalResolver.CurrencyBinaryContext
+  ): IO[Option[MetagraphParentOrdinalResolver.Phase2CurrencyBinaryContext]] =
+    MetagraphParentOrdinalResolver.Phase2CurrencyBinaryContext.verify[IO](context)((_, _) => IO.pure(true))
 
   test("admission cache is seeded at RESOLVE-time even when the local gate times out") { res =>
     implicit val (h, sp, json, hs) = res
@@ -177,8 +188,11 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       process = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
         processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
         committeeGate = gate,
-        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
-        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        currencyContextFor = tipGuardedResolver(Set(genesisTip)),
+        currencyContextFromContent = MetagraphParentOrdinalResolver.currencyContextFromContent[IO],
+        verifyPhase2CurrencyContext = verifyPhase2,
+        etaForPhase2Anchor = _ => IO.pure(Array.fill(32)(0.toByte)),
+        etaRotationSnapshots = 10L,
         selfStake = IO.pure(Ratio(1, 8)),
         senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = buf,
@@ -211,8 +225,11 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       process = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
         processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
         committeeGate = gate,
-        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
-        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        currencyContextFor = tipGuardedResolver(Set(genesisTip)),
+        currencyContextFromContent = MetagraphParentOrdinalResolver.currencyContextFromContent[IO],
+        verifyPhase2CurrencyContext = verifyPhase2,
+        etaForPhase2Anchor = _ => IO.pure(Array.fill(32)(0.toByte)),
+        etaRotationSnapshots = 10L,
         selfStake = IO.pure(Ratio(1, 8)),
         senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = buf,
@@ -248,8 +265,11 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       process = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
         processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
         committeeGate = gate,
-        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
-        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        currencyContextFor = tipGuardedResolver(Set(genesisTip)),
+        currencyContextFromContent = MetagraphParentOrdinalResolver.currencyContextFromContent[IO],
+        verifyPhase2CurrencyContext = verifyPhase2,
+        etaForPhase2Anchor = _ => IO.pure(Array.fill(32)(0.toByte)),
+        etaRotationSnapshots = 10L,
         selfStake = IO.pure(Ratio(1, 8)),
         senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = buf,
@@ -277,8 +297,11 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       timeoutProcess = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
         processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
         committeeGate = timeoutGate(attempted),
-        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
-        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        currencyContextFor = tipGuardedResolver(Set(genesisTip)),
+        currencyContextFromContent = MetagraphParentOrdinalResolver.currencyContextFromContent[IO],
+        verifyPhase2CurrencyContext = verifyPhase2,
+        etaForPhase2Anchor = _ => IO.pure(Array.fill(32)(0.toByte)),
+        etaRotationSnapshots = 10L,
         selfStake = IO.pure(Ratio(1, 8)),
         senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = timeoutOrphans,
@@ -293,8 +316,11 @@ object MetagraphBinaryProcessorAdmissionLagSuite extends MutableIOSuite {
       admittedProcess = NakamotoSyncDaemon.makeMetagraphBinaryProcessor[IO](
         processMetagraphBinary = (_: StateChannelOutput) => IO.unit,
         committeeGate = admitGate,
-        parentOrdinalFor = tipGuardedResolver(Set(genesisTip)),
-        etaForParentOrdinal = (_: Long) => IO.pure(Array.fill(32)(0.toByte)),
+        currencyContextFor = tipGuardedResolver(Set(genesisTip)),
+        currencyContextFromContent = MetagraphParentOrdinalResolver.currencyContextFromContent[IO],
+        verifyPhase2CurrencyContext = verifyPhase2,
+        etaForPhase2Anchor = _ => IO.pure(Array.fill(32)(0.toByte)),
+        etaRotationSnapshots = 10L,
         selfStake = IO.pure(Ratio(1, 8)),
         senderStakeLookup = (_: PeerId) => IO.pure(Ratio(1, 8)),
         orphanBuffer = admittedOrphans,

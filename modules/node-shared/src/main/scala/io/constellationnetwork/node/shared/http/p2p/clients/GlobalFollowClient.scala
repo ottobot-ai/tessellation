@@ -54,6 +54,12 @@ trait GlobalFollowClient[F[_]] {
 
 object GlobalFollowClient {
 
+  private[clients] def decodeChangeSetResponse(bytes: Array[Byte]): Either[String, GlobalChangeSetResponse] =
+    globalChangeSetResponseCodec.complete.decodeValue(BitVector(bytes)) match {
+      case scodec.Attempt.Successful(response) => Right(response)
+      case scodec.Attempt.Failure(err)         => Left(err.messageWithContext)
+    }
+
   def make[F[_]: Async: SecurityProvider](
     client: Client[F],
     maybeSession: Option[Session[F]] = None
@@ -84,11 +90,11 @@ object GlobalFollowClient {
         // matcher fires.
         implicit val changeSetResponseDecoder: EntityDecoder[F, GlobalChangeSetResponse] =
           EntityDecoder.byteArrayDecoder[F].flatMapR { bytes =>
-            globalChangeSetResponseCodec.decodeValue(BitVector(bytes)) match {
-              case scodec.Attempt.Successful(response) => cats.data.EitherT.rightT[F, org.http4s.DecodeFailure](response)
-              case scodec.Attempt.Failure(err) =>
+            decodeChangeSetResponse(bytes) match {
+              case Right(response) => cats.data.EitherT.rightT[F, org.http4s.DecodeFailure](response)
+              case Left(error) =>
                 cats.data.EitherT.leftT[F, GlobalChangeSetResponse](
-                  org.http4s.InvalidMessageBodyFailure(s"GlobalChangeSetResponse scodec decode failed: ${err.messageWithContext}")
+                  org.http4s.InvalidMessageBodyFailure(s"GlobalChangeSetResponse scodec decode failed: $error")
                 )
             }
           }

@@ -286,7 +286,10 @@ Two MPT point reads per verify = 2 × (8 peers × 1/sec) = 16 reads/sec **per no
 
 #### Unit-level
 
-- `KesGossipVerificationSuite` — existing tests use `KesRegistry.make[IO](Map(...))` for the genesis-only registry. Migrate fixtures to construct a `MutableKesRegistry[IO]` over a stub `GlobalStateReader[IO]` + a genesis `KesRegistry[IO]`. Add new test cases:
+- **Superseded by the atomic operator-key design.** `KesGossipVerificationSuite` passes one already-resolved `OperatorConsensusKeys` pair;
+  standalone `KesRegistry.make/empty` factories no longer exist. Runtime activation belongs to the exact candidate-parent
+  `HistoricalOperatorConsensusKeyRegistry`, not a receiver-current mutable KES projection. Historical cases below are retained only as
+  requirements for that branch-pinned resolver:
   - **Genesis-only**: no runtime cert in MPT → fall through to genesis VK (existing matrix unchanged).
   - **Runtime cert active**: runtime cert with `effectiveFromEpoch < currentEpoch` → verify uses runtime VK; genesis VK ignored.
   - **Runtime cert pending**: runtime cert with `effectiveFromEpoch > currentEpoch` → verify falls back to genesis (cert held as "pending").
