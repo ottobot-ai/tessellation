@@ -1195,7 +1195,6 @@ object GlobalSnapshotAcceptanceManager {
               tokenLockBlocksForAcceptance,
               lastSnapshotContext,
               ordinal,
-              fixingAllowSpendAndTokenLockValidation,
               epochProgress
             )
           } yield (allowSpend, tokenLock)
@@ -1836,7 +1835,9 @@ object GlobalSnapshotAcceptanceManager {
                   )
 
                 acceptedGlobalAllowSpends = allowSpendBlockAcceptanceResult.accepted.flatMap(_.value.transactions.toList)
-                _dagLayerTokenLocks = tokenLockBlockAcceptanceResult.accepted.flatMap(_.value.tokenLocks.toList)
+                _dagLayerTokenLocks = tokenLockBlockAcceptanceResult.accepted
+                  .flatMap(_.value.tokenLocks.toList)
+                  .sortBy(tx => (tx.source, tx.ordinal, tx))
                 _ <- loggerBundle.app.info {
                   val sigs = _dagLayerTokenLocks
                     .map(tl =>
@@ -1848,6 +1849,11 @@ object GlobalSnapshotAcceptanceManager {
                 acceptedGlobalTokenLocks <- tokenLockStateManager.acceptReplacementTokenLocks(
                   _dagLayerTokenLocks,
                   lastSnapshotContext
+                )
+                _ <- Async[F].raiseUnless(acceptedGlobalTokenLocks === _dagLayerTokenLocks)(
+                  new IllegalStateException(
+                    s"Token-lock admission/state parity violation: admitted=${_dagLayerTokenLocks.size} stateAccepted=${acceptedGlobalTokenLocks.size}"
+                  )
                 )
 
                 // ─── Q2 hoist: compute expired sets ONCE per accept() ──────────────────────────

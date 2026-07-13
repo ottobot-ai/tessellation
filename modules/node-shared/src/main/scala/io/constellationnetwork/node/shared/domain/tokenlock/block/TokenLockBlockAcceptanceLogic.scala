@@ -4,15 +4,14 @@ import cats.data.{EitherT, NonEmptyList}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedMap
-
 import io.constellationnetwork.node.shared.domain.tokenlock.TokenLockChainValidator.TokenLockNel
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
-import io.constellationnetwork.schema.tokenLock.{TokenLockBlock, TokenLockReference}
+import io.constellationnetwork.schema.balance._
+import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockBlock, TokenLockReference}
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.{Hasher, SecurityProvider}
-import io.constellationnetwork.syntax.sortedCollection.{sortedMapSyntax, sortedSetSyntax}
+import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
+
+import eu.timepit.refined.types.numeric.NonNegLong
 
 trait TokenLockBlockAcceptanceLogic[F[_]] {
   def acceptBlock(
@@ -110,50 +109,89 @@ object TokenLockBlockAcceptanceLogic {
         block: Signed[TokenLockBlock],
         context: TokenLockBlockAcceptanceContext[F],
         contextUpdate: TokenLockBlockAcceptanceContextUpdate
-      ): EitherT[F, TokenLockBlockNotAcceptedReason, TokenLockBlockAcceptanceContextUpdate] = {
-        val minusFn: Amount => Balance => Either[BalanceArithmeticError, Balance] = a => _.minus(a)
-        val plusFn: Amount => Balance => Either[BalanceArithmeticError, Balance] = a => _.plus(a)
+      )(implicit hasher: Hasher[F]): EitherT[F, TokenLockBlockNotAcceptedReason, TokenLockBlockAcceptanceContextUpdate] = {
+        val parentTokenLocksByHash = context.getToBeReplacedHashedTokenLocks.map(tl => tl.hash -> tl).toMap
+        val sortedTxs = block.tokenLocks.toList.sortBy(tx => (tx.source, tx.ordinal, tx))
 
-        val sortedTxs = block.tokenLocks.toNonEmptyList
-        val minusAmountOps = sortedTxs.groupMap(_.source)(tx => minusFn(tx.amount))
-        val minusFeeOps = sortedTxs.groupMap(_.source)(tx => minusFn(tx.fee))
-        val plusReplacedAmountOps = context.getToBeReplacedHashedTokenLocks
-          .groupMap(_.source)(tx => plusFn(tx.amount))
-          .filter(_._2.nonEmpty)
-          .view
-          .mapValues(NonEmptyList.fromListUnsafe)
-          .toSortedMap
+        def checkedBalance(value: BigInt): Either[BalanceArithmeticError, Balance] =
+          if (value < 0) AmountUnderflow.asLeft
+          else if (value > BigInt(Long.MaxValue)) AmountOverflow.asLeft
+          else Balance(NonNegLong.unsafeFrom(value.longValue)).asRight
 
-        val allOps = plusReplacedAmountOps |+| minusAmountOps |+| minusFeeOps
+        sortedTxs.foldLeft(contextUpdate.asRight[TokenLockBlockNotAcceptedReason].toEitherT[F]) { (acc, signedTx) =>
+          acc.flatMap { update =>
+            val tx = signedTx.value
 
-        val balancesUpdate = allOps
-          .foldLeft(contextUpdate.balances.asRight[AddressBalanceOutOfRange].toEitherT[F]) { (acc, addressAndOps) =>
-            acc.flatMap { balancesUpdate =>
-              val (address, ops) = addressAndOps
-
-              EitherT(
-                balancesUpdate
-                  .get(address)
-                  .toOptionT[F]
-                  .orElseF(context.getBalance(address))
-                  .getOrElse(Balance.empty)
-                  .map { balance =>
-                    ops
-                      .foldLeft(balance.asRight[BalanceArithmeticError]) { (acc, op) =>
-                        acc.flatMap(op)
-                      }
-                      .leftMap(AddressBalanceOutOfRange(address, _))
-                      .map(balancesUpdate.updated(address, _))
+            val replacementOrError: F[Either[TokenLockBlockNotAcceptedReason, Option[Hashed[TokenLock]]]] = tx.replaceTokenLockRef match {
+              case Some(replacementRef) if update.claimedReplacementRefs.contains(replacementRef) =>
+                (ReplacementTokenLockAlreadyClaimed(replacementRef): TokenLockBlockNotAcceptedReason)
+                  .asLeft[Option[Hashed[TokenLock]]]
+                  .pure[F]
+              case Some(replacementRef) =>
+                TokenLockReference.of(signedTx).map { txRef =>
+                  update.inRoundTokenLocksByHash.get(replacementRef).orElse(parentTokenLocksByHash.get(replacementRef)) match {
+                    case None =>
+                      AwaitingReplacementTokenLock(txRef, replacementRef).asLeft
+                    case Some(existing) if existing.source =!= tx.source =>
+                      RejectedReplacementTokenLock(
+                        txRef,
+                        replacementRef,
+                        ReplacementSourceMismatch(tx.source, existing.source)
+                      ).asLeft
+                    case Some(existing) if existing.currencyId =!= tx.currencyId =>
+                      RejectedReplacementTokenLock(
+                        txRef,
+                        replacementRef,
+                        ReplacementCurrencyMismatch(tx.currencyId, existing.currencyId)
+                      ).asLeft
+                    case Some(existing) if existing.unlockEpoch.exists(_ < context.getCurrentEpochProgress) =>
+                      RejectedReplacementTokenLock(
+                        txRef,
+                        replacementRef,
+                        ReplacementTargetExpired(existing.unlockEpoch.get, context.getCurrentEpochProgress)
+                      ).asLeft
+                    case Some(existing) if existing.amount >= tx.amount =>
+                      RejectedReplacementTokenLock(
+                        txRef,
+                        replacementRef,
+                        ReplacementAmountNotIncreased(tx.amount, existing.amount)
+                      ).asLeft
+                    case Some(existing) => existing.some.asRight
                   }
-              )
+                }
+              case None => none[Hashed[TokenLock]].asRight[TokenLockBlockNotAcceptedReason].pure[F]
+            }
+
+            EitherT(replacementOrError).flatMap { maybeReplacement =>
+              val balanceUpdate = update.balances
+                .get(tx.source)
+                .toOptionT[F]
+                .orElseF(context.getBalance(tx.source))
+                .getOrElse(Balance.empty)
+                .map { balance =>
+                  val replacementCredit = maybeReplacement.fold(BigInt(0))(replacement => BigInt(replacement.amount.value.value))
+                  val nextValue =
+                    BigInt(balance.value.value) + replacementCredit - BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value)
+
+                  checkedBalance(nextValue)
+                    .leftMap(AddressBalanceOutOfRange(tx.source, _): TokenLockBlockNotAcceptedReason)
+                    .map { nextBalance =>
+                      update.copy(
+                        balances = update.balances.updated(tx.source, nextBalance),
+                        claimedReplacementRefs = update.claimedReplacementRefs ++ maybeReplacement.map(_.hash)
+                      )
+                    }
+                }
+
+              EitherT(balanceUpdate).semiflatMap { balanceUpdated =>
+                if (tx.currencyId.isEmpty)
+                  signedTx.toHashed.map { hashed =>
+                    balanceUpdated.copy(inRoundTokenLocksByHash = balanceUpdated.inRoundTokenLocksByHash.updated(hashed.hash, hashed))
+                  }
+                else balanceUpdated.pure[F]
+              }
             }
           }
-          .leftWiden[TokenLockBlockNotAcceptedReason]
-
-        balancesUpdate.map { balances =>
-          contextUpdate.copy(
-            balances = balances
-          )
         }
       }
     }

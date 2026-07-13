@@ -10,7 +10,7 @@ import io.constellationnetwork.node.shared.domain.statechannel.StateChannelAccep
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.TokenUnlock
-import io.constellationnetwork.schema.balance.{Balance, BalanceArithmeticError}
+import io.constellationnetwork.schema.balance._
 import io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt._
@@ -532,81 +532,111 @@ object TokenLockStateManager {
         generatedTokenUnlocksByAddress: Map[Address, List[TokenUnlock]],
         expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
       )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
-        Async[F].pure(expiredGlobalTokenLocks).flatMap { expiredGlobalTokenLocks =>
-          val afterTokenLocksF = (acceptedGlobalTokenLocks |+| expiredGlobalTokenLocks).toList
-            .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
-              Right((currentBalances, SortedMap.empty[Address, Balance]))
-            ) {
-              case (Left(err), _) =>
-                (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-              case (Right((balances, balancesDelta)), (address, tokenLocks)) =>
-                readBalance(address, balances).map { initialBalance =>
-                  val addressTokenUnlocks = generatedTokenUnlocksByAddress.getOrElse(address, List.empty)
-                  val result: Either[BalanceArithmeticError, Balance] = for {
-                    unlocked <- addressTokenUnlocks.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) {
-                      case (currentBalanceEither, tokenUnlock) =>
-                        for {
-                          currentBalance <- currentBalanceEither
-                          balanceAfterUnlock <- currentBalance.plus(TokenLockAmount.toAmount(tokenUnlock.amount))
-                        } yield balanceAfterUnlock
-                    }
-                    expired <- {
-                      val expiredLocks = tokenLocks.filter(_.unlockEpoch.exists(_ < epochProgress))
-                      expiredLocks.foldLeft[Either[BalanceArithmeticError, Balance]](Right(unlocked)) { (currentBalanceEither, tokenLock) =>
-                        for {
-                          currentBalance <- currentBalanceEither
-                          balanceAfterExpiredAmount <- currentBalance.plus(TokenLockAmount.toAmount(tokenLock.amount))
-                        } yield balanceAfterExpiredAmount
-                      }
-                    }
-                    finalBalance <- {
-                      val unexpired = tokenLocks.filter(_.unlockEpoch.forall(_ >= epochProgress))
-                      unexpired.foldLeft[Either[BalanceArithmeticError, Balance]](Right(expired)) { (currentBalanceEither, tokenLock) =>
-                        for {
-                          currentBalance <- currentBalanceEither
-                          balanceAfterAmount <- currentBalance.minus(TokenLockAmount.toAmount(tokenLock.amount))
-                          balanceAfterFee <- balanceAfterAmount.minus(TokenLockFee.toAmount(tokenLock.fee))
-                        } yield balanceAfterFee
-                      }
-                    }
-                  } yield finalBalance
-
-                  result.map { finalBalance =>
-                    (balances.updated(address, finalBalance), balancesDelta.updated(address, finalBalance))
-                  }
-                }
-            }
-
-          afterTokenLocksF.flatMap {
-            case Left(err) =>
-              (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-            case Right(balancesAfter) =>
-              val addressesWithTokenLocks = acceptedGlobalTokenLocks.keySet ++ expiredGlobalTokenLocks.keySet
-              val addressesWithTokenUnlocksOnly = generatedTokenUnlocksByAddress.keySet -- addressesWithTokenLocks
-
-              addressesWithTokenUnlocksOnly.toList
-                .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
-                  Right(balancesAfter)
-                ) {
-                  case (Left(err), _) =>
-                    (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-                  case (Right((balances, balancesDelta)), address) =>
-                    readBalance(address, balances).map { initialBalance =>
-                      val addressTokenUnlocks = generatedTokenUnlocksByAddress.getOrElse(address, List.empty)
-                      val result = addressTokenUnlocks.foldLeft[Either[BalanceArithmeticError, Balance]](Right(initialBalance)) {
-                        case (currentBalanceEither, tokenUnlock) =>
-                          for {
-                            currentBalance <- currentBalanceEither
-                            balanceAfterUnlock <- currentBalance.plus(TokenLockAmount.toAmount(tokenUnlock.amount))
-                          } yield balanceAfterUnlock
-                      }
-                      result.map { finalBalance =>
-                        (balances.updated(address, finalBalance), balancesDelta.updated(address, finalBalance))
-                      }
-                    }
-                }
+        for {
+          _ <- Async[F].raiseWhen(
+            acceptedGlobalTokenLocks.valuesIterator.flatten.exists(_.unlockEpoch.exists(_ < epochProgress))
+          )(
+            new IllegalStateException(
+              s"Newly accepted token lock is already expired at execution epoch=${epochProgress.value.value}"
+            )
+          )
+          canonicalGeneratedUnlocksByAddress <- generatedTokenUnlocksByAddress.toList.flatMap {
+            case (declaredAddress, unlocks) => unlocks.map(declaredAddress -> _)
           }
-        }
+            .groupBy(_._2.tokenLockRef)
+            .toList
+            .sortBy(_._1)
+            .foldLeftM(Map.empty[Address, List[TokenUnlock]]) {
+              case (canonical, (tokenLockRef, entries)) =>
+                val (_, expected) = entries.head
+                if (entries.forall { case (declaredAddress, unlock) => declaredAddress === unlock.source && unlock === expected })
+                  canonical
+                    .updatedWith(expected.source) {
+                      case Some(unlocks) => Some(unlocks :+ expected)
+                      case None          => Some(List(expected))
+                    }
+                    .pure[F]
+                else
+                  Async[F].raiseError[Map[Address, List[TokenUnlock]]](
+                    new IllegalStateException(s"Conflicting token unlock payloads for ref=$tokenLockRef")
+                  )
+            }
+          expiredUnlockEntries <- expiredGlobalTokenLocks.toList.flatTraverse {
+            case (address, locks) =>
+              locks.toList.traverse { lock =>
+                lock.toHashed.map { hashed =>
+                  hashed.hash -> (
+                    address,
+                    TokenUnlock(hashed.hash, lock.amount, lock.currencyId, lock.source)
+                  )
+                }
+              }
+          }
+          expiredUnlocksByRef <- expiredUnlockEntries.sortBy(_._1).foldLeftM(Map.empty[Hash, TokenUnlock]) {
+            case (canonical, (tokenLockRef, (declaredAddress, unlock))) =>
+              canonical.get(tokenLockRef) match {
+                case _ if declaredAddress =!= unlock.source =>
+                  Async[F].raiseError[Map[Hash, TokenUnlock]](
+                    new IllegalStateException(s"Expired token lock address mismatch for ref=$tokenLockRef")
+                  )
+                case Some(existing) if existing =!= unlock =>
+                  Async[F].raiseError[Map[Hash, TokenUnlock]](
+                    new IllegalStateException(s"Conflicting expired token lock payloads for ref=$tokenLockRef")
+                  )
+                case Some(_) => canonical.pure[F]
+                case None    => canonical.updated(tokenLockRef, unlock).pure[F]
+              }
+          }
+          _ <- canonicalGeneratedUnlocksByAddress.values.toList.flatten.traverse_ { unlock =>
+            expiredUnlocksByRef.get(unlock.tokenLockRef).traverse_ { expiredUnlock =>
+              Async[F].raiseUnless(unlock === expiredUnlock)(
+                new IllegalStateException(s"Generated unlock conflicts with expired token lock ref=${unlock.tokenLockRef}")
+              )
+            }
+          }
+          expiredRefsByAddress = expiredUnlocksByRef.values.toList
+            .groupBy(_.source)
+            .view
+            .mapValues(_.map(_.tokenLockRef).toSet)
+            .toMap
+          result <-
+            (acceptedGlobalTokenLocks.keySet ++ expiredGlobalTokenLocks.keySet ++ canonicalGeneratedUnlocksByAddress.keySet).toList.sorted
+              .foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
+                Right((currentBalances, SortedMap.empty[Address, Balance]))
+              ) {
+                case (Left(err), _) =>
+                  (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
+                case (Right((balances, balancesDelta)), address) =>
+                  readBalance(address, balances).map { initialBalance =>
+                    val tokenLocks = acceptedGlobalTokenLocks.getOrElse(address, SortedSet.empty[Signed[TokenLock]]) ++
+                      expiredGlobalTokenLocks.getOrElse(address, SortedSet.empty[Signed[TokenLock]])
+                    val expiredRefs = expiredRefsByAddress.getOrElse(address, Set.empty)
+                    val uniqueNonExpiredUnlocks = canonicalGeneratedUnlocksByAddress
+                      .getOrElse(address, List.empty)
+                      .filterNot(unlock => expiredRefs.contains(unlock.tokenLockRef))
+                    val unlockCredit = uniqueNonExpiredUnlocks
+                      .foldLeft(BigInt(0))((sum, unlock) => sum + BigInt(unlock.amount.value.value))
+                    val expiredCredit = tokenLocks
+                      .filter(_.unlockEpoch.exists(_ < epochProgress))
+                      .foldLeft(BigInt(0))((sum, lock) => sum + BigInt(lock.amount.value.value))
+                    val unexpiredDebit = tokenLocks
+                      .filter(_.unlockEpoch.forall(_ >= epochProgress))
+                      .foldLeft(BigInt(0)) { (sum, lock) =>
+                        sum + BigInt(lock.amount.value.value) + BigInt(lock.fee.value.value)
+                      }
+                    val finalValue = BigInt(initialBalance.value.value) + unlockCredit + expiredCredit - unexpiredDebit
+
+                    val nextBalance: Either[BalanceArithmeticError, Balance] =
+                      if (finalValue < 0) AmountUnderflow.asLeft
+                      else if (finalValue > BigInt(Long.MaxValue)) AmountOverflow.asLeft
+                      else Balance(NonNegLong.unsafeFrom(finalValue.longValue)).asRight
+
+                    nextBalance.map { finalBalance =>
+                      (balances.updated(address, finalBalance), balancesDelta.updated(address, finalBalance))
+                    }
+                  }
+              }
+        } yield result
 
       def updateTokenLockBalancesFromMpt(
         currencySnapshots: SortedMap[Address, CurrencySnapshotWithState]

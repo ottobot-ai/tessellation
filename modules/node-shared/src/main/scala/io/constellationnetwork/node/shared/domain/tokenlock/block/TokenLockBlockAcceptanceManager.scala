@@ -73,7 +73,7 @@ object TokenLockBlockAcceptanceManager {
                             .focus(_.contextUpdate)
                             .replace(contextUpdate)
                             .focus(_.accepted)
-                            .modify(block :: _)
+                            .modify(_ :+ block)
                       }
                       .leftMap {
                         case reason: TokenLockBlockRejectionReason =>
@@ -102,8 +102,8 @@ object TokenLockBlockAcceptanceManager {
                 blockValidator
                   .validate(block, snapshotOrdinal, TokenLockBlockValidationParams.default, lastGlobalSnapshotEpochProgress)
                   .map {
-                    case Valid(blockAndTxChains) => (blockAndTxChains :: validList, invalidList)
-                    case Invalid(errors)         => (validList, (block, ValidationFailed(errors.toNonEmptyList)) :: invalidList)
+                    case Valid(blockAndTxChains) => (validList :+ blockAndTxChains, invalidList)
+                    case Invalid(errors)         => (validList, invalidList :+ (block, ValidationFailed(errors.toNonEmptyList)))
                   }
             }
           }

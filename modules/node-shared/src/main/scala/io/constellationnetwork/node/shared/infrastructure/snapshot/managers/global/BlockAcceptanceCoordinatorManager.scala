@@ -43,7 +43,6 @@ trait BlockAcceptanceCoordinatorManager[F[_]] {
     blocksForAcceptance: List[Signed[TokenLockBlock]],
     lastSnapshotContext: GlobalSnapshotInfo,
     snapshotOrdinal: SnapshotOrdinal,
-    fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal,
     epochProgress: EpochProgress
   )(implicit hasher: Hasher[F]): F[TokenLockBlockAcceptanceResult]
 }
@@ -118,29 +117,21 @@ object BlockAcceptanceCoordinatorManager {
       blocksForAcceptance: List[Signed[TokenLockBlock]],
       lastSnapshotContext: GlobalSnapshotInfo,
       snapshotOrdinal: SnapshotOrdinal,
-      fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal,
       epochProgress: EpochProgress
     )(implicit hasher: Hasher[F]): F[TokenLockBlockAcceptanceResult] = {
-      val replacementTxs = blocksForAcceptance.flatMap(_.value.tokenLocks.toList).filter(_.replaceTokenLockRef.nonEmpty)
-      val refHashesBySource = replacementTxs
-        .groupBy(_.source)
-        .view
-        .mapValues(_.flatMap(_.replaceTokenLockRef).toSet)
-        .toMap
+      val (nativeBlocks, invalidLaneBlocks) = blocksForAcceptance.sorted.partition(_.tokenLocks.forall(_.currencyId.isEmpty))
+      val replacementTxs = nativeBlocks.flatMap(_.value.tokenLocks.toList).filter(_.replaceTokenLockRef.nonEmpty)
+      val replacementRefHashes = replacementTxs.flatMap(_.replaceTokenLockRef).toSet
 
       for {
-        // Read each replacement source's active locks from the MPT instead of the GSI
-        // `activeTokenLocks` map. The lookup was already scoped per-address; only the
-        // backing store moves. Step toward #11 — drop GSI materialization.
         toBeReplacedHashedTokenLocks <-
-          refHashesBySource.toList.flatTraverse {
-            case (address, refHashes) =>
-              reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, address)).flatMap {
-                case Some(locks) =>
-                  locks.toList.traverse(_.toHashed).map(_.filter(h => refHashes.contains(h.hash)))
-                case None => List.empty[Hashed[TokenLock]].pure[F]
-              }
-          }
+          if (replacementRefHashes.isEmpty) List.empty[Hashed[TokenLock]].pure[F]
+          else
+            for {
+              prefix <- GlobalStateKey.hypergraphFieldPrefix[F](GlobalStateFieldId.ActiveTokenLocks)
+              activeByAddress <- reader.getAllForPrefix[SortedSet[Signed[TokenLock]]](prefix)
+              hashed <- activeByAddress.values.toList.flatMap(_.toList).traverse(_.toHashed)
+            } yield hashed.filter(lock => replacementRefHashes.contains(lock.hash)).sortBy(_.hash)
 
         // §G4: balances + lastTokenLockRefs sourced from the branch-aware MPT reader.
         // `toBeReplacedHashedTokenLocks` already resolves via the same `reader` above.
@@ -148,27 +139,20 @@ object BlockAcceptanceCoordinatorManager {
           reader,
           collateral,
           TokenLockReference.empty,
-          toBeReplacedHashedTokenLocks
+          toBeReplacedHashedTokenLocks,
+          epochProgress
         )
-        res <-
-          if (snapshotOrdinal > fixingAllowSpendAndTokenLockValidation) {
-            tokenLockBlockAcceptanceManager.acceptBlocksIteratively(
-              blocksForAcceptance,
-              context,
-              snapshotOrdinal,
-              shouldPerformMetagraphSpecificValidations = true,
-              epochProgress.some
-            )
-          } else {
-            tokenLockBlockAcceptanceManager.acceptBlocksIteratively(
-              blocksForAcceptance,
-              context,
-              snapshotOrdinal,
-              shouldPerformMetagraphSpecificValidations = true,
-              none
-            )
-          }
-      } yield res
+        res <- tokenLockBlockAcceptanceManager.acceptBlocksIteratively(
+          nativeBlocks,
+          context,
+          snapshotOrdinal,
+          shouldPerformMetagraphSpecificValidations = true,
+          epochProgress.some
+        )
+      } yield
+        res.copy(
+          notAccepted = res.notAccepted ++ invalidLaneBlocks.map(_ -> InvalidGlobalTokenLockLane)
+        )
     }
   }
 }

@@ -5,7 +5,6 @@ import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.security.hash.Hash
 
-import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
@@ -14,9 +13,9 @@ import weaver.SimpleIOSuite
   * Mode-2 bug (see docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md): the chain used to prefer the prior CL0 snapshot's `globalSyncView.ordinal`
   * over the local GL0 head, which created a fixed point at the genesis-inherited `GlobalSyncView(ord=1, epochProgress=1)`.
   *
-  * Fix: when no peer-sync quorum is available, take `max(prior_view, local_head)` instead of `prior_view.orElse(local_head)`. This
-  * preserves the prior view's monotonic lower-bound semantics while letting the producer escape the genesis seed once the local follower
-  * advances.
+  * Fix: peer sync is bounded below by the prior non-sentinel view. When no peer-sync quorum is available, take `max(prior_view,
+  * local_head)` instead of `prior_view.orElse(local_head)`. This preserves monotonicity while letting the producer escape the genesis seed
+  * once the local follower advances.
   */
 object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
 
@@ -40,13 +39,24 @@ object CurrencySnapshotAcceptanceManagerSuite extends SimpleIOSuite {
   }
 
   pureTest(
-    "Peer-sync quorum (path A) takes priority over both prior view (B) and local head (C), " +
-      "even when its ordinal is lower than the local head"
+    "Peer-sync below the prior view cannot regress execution, while the local fallback does not override peer sync"
   ) {
     val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
       pinnedGlobalSyncView = None,
       maybeSnapshotOrdinalSync = Some(ord(50L)),
       maybeLastGlobalSyncView = Some(viewAt(60L, 60L)),
+      fallbackOrdinal = ord(100L)
+    )
+    expect.eql(ord(60L), chosen)
+  }
+
+  pureTest(
+    "Peer-sync with no prior view remains the selected execution ordinal even when below the local fallback"
+  ) {
+    val chosen = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
+      pinnedGlobalSyncView = None,
+      maybeSnapshotOrdinalSync = Some(ord(50L)),
+      maybeLastGlobalSyncView = None,
       fallbackOrdinal = ord(100L)
     )
     expect.eql(ord(50L), chosen)

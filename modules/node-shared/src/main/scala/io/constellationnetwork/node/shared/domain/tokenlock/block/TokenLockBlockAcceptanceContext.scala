@@ -6,6 +6,7 @@ import cats.syntax.applicative._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.security.Hashed
@@ -22,6 +23,8 @@ trait TokenLockBlockAcceptanceContext[F[_]] {
 
   def getCollateral: Amount
 
+  def getCurrentEpochProgress: EpochProgress
+
   def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]]
 }
 
@@ -35,7 +38,8 @@ object TokenLockBlockAcceptanceContext {
     lastTxRefs: Map[Address, TokenLockReference],
     collateral: Amount,
     initialTxRef: TokenLockReference,
-    toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]]
+    toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]],
+    currentEpochProgress: EpochProgress
   ): TokenLockBlockAcceptanceContext[F] =
     new TokenLockBlockAcceptanceContext[F] {
 
@@ -50,6 +54,8 @@ object TokenLockBlockAcceptanceContext {
 
       def getCollateral: Amount = collateral
 
+      def getCurrentEpochProgress: EpochProgress = currentEpochProgress
+
       def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]] = toBeReplacedHashedTokenLocks
     }
 
@@ -62,7 +68,8 @@ object TokenLockBlockAcceptanceContext {
     reader: GlobalStateReader[F],
     collateral: Amount,
     initialTxRef: TokenLockReference,
-    toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]]
+    toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]],
+    currentEpochProgress: EpochProgress
   ): TokenLockBlockAcceptanceContext[F] =
     new TokenLockBlockAcceptanceContext[F] {
 
@@ -76,6 +83,8 @@ object TokenLockBlockAcceptanceContext {
         initialTxRef
 
       def getCollateral: Amount = collateral
+
+      def getCurrentEpochProgress: EpochProgress = currentEpochProgress
 
       def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]] = toBeReplacedHashedTokenLocks
     }

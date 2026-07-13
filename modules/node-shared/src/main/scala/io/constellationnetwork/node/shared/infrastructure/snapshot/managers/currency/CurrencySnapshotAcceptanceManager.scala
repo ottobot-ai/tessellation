@@ -38,7 +38,6 @@ import io.constellationnetwork.syntax.sortedCollection.{sortedMapSyntax, sortedS
 
 import eu.timepit.refined.auto.autoUnwrap
 import fs2.concurrent.SignallingRef
-import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait CurrencySnapshotAcceptanceManager[F[_]] {
   def accept(
@@ -90,10 +89,10 @@ object CurrencySnapshotAcceptanceManager {
   /** Select the GL0 ordinal the CL0 producer will sync to when stamping the next CL0 snapshot.
     *
     * Priority (producer path, when `pinnedGlobalSyncView=None`): (A) peer `GlobalSnapshotSync` quorum (`maybeSnapshotOrdinalSync`) — when
-    * present, it is the consensus-derived sync point and wins outright (committee-of-peers can legitimately be ahead of the local follower
-    * at small CL0 cohort sizes). (B) prior CL0 snapshot's `globalSyncView.ordinal` (`maybeLastGlobalSyncView`) — a monotonic lower bound
-    * that protects against local-follower regression on reorg. (C) the producer's actual GL0 head (`fallbackOrdinal =
-    * lastUnsyncGlobalSnapshot.ordinal`) under finality, this is always reachable and advances monotonically.
+    * present, it is the consensus-derived sync point, but it cannot regress below the prior CL0 snapshot's non-sentinel
+    * `globalSyncView.ordinal`. Committee peers may legitimately be ahead of the local follower, so the local fallback does not cap this
+    * path. (B) prior CL0 snapshot's `globalSyncView.ordinal` (`maybeLastGlobalSyncView`) — a monotonic lower bound. (C) the producer's
+    * actual GL0 head (`fallbackOrdinal = lastUnsyncGlobalSnapshot.ordinal`) — used with the prior lower bound when peer sync is absent.
     *
     * Bug fixed by this helper (see docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md): The previous priority chain preferred (B) over (C)
     * outright via `.orElse`, which created a strict fixed point at the genesis-inherited `GlobalSyncView(ord=1, epochProgress=1)`. Once
@@ -116,11 +115,11 @@ object CurrencySnapshotAcceptanceManager {
     pinnedGlobalSyncView.map(_.ordinal) match {
       case Some(pinned) => pinned
       case None =>
+        val priorOrdinal = maybeLastGlobalSyncView.map(_.ordinal).filter(_ =!= SnapshotOrdinal.MinValue)
+
         maybeSnapshotOrdinalSync match {
-          case Some(peerSync) => peerSync
+          case Some(peerSync) => priorOrdinal.fold(peerSync)(prior => if (prior >= peerSync) prior else peerSync)
           case None =>
-            val priorOrdinal =
-              maybeLastGlobalSyncView.map(_.ordinal).filter(_ =!= SnapshotOrdinal.MinValue)
             priorOrdinal match {
               case Some(prior) => if (prior >= fallbackOrdinal) prior else fallbackOrdinal
               case None        => fallbackOrdinal
@@ -219,9 +218,6 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
   pinnedCurrencyInfoReader: Option[PinnedCurrencyInfoReader[F]]
 )(implicit currencyStateProofSelector: CurrencyStateProofSelector)
     extends CurrencySnapshotAcceptanceManager[F] {
-
-  // [OVERPRUNE-DIAG] (2026-06-13, REMOVE after e2e): only used by the epoch-divergence diagnostic in `accept`.
-  private val logger = Slf4jLogger.getLoggerFromName[F]("CurrencySnapshotAcceptanceManager")
 
   def accept(
     blocksForAcceptance: List[Signed[Block]],
@@ -374,9 +370,9 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
     // submitted snapshot. The ordinal is only a lookup key; finalized hash and epoch
     // equality below are mandatory execution-input checks.
     //
-    // Producer path: see CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot
-    // for the priority semantics (peer-sync > max(prior-view, local-head)). Mode-2 bug fix
-    // documented in docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md.
+    // Producer path: see CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot for the priority semantics. Peer sync is
+    // bounded below by the prior view; without peer sync, max(prior-view, local-head) is used. Mode-2 bug fix documented in
+    // docs/nakamoto/MODE2-GLOBAL-SYNC-VIEW-RCA.md.
     ordinalToFetchGlobalSnapshot = CurrencySnapshotAcceptanceManager.selectOrdinalToFetchGlobalSnapshot(
       pinnedGlobalSyncView,
       maybeSnapshotOrdinalSync,
@@ -415,25 +411,9 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       lastSyncGlobalSnapshot.hash,
       lastSyncGlobalSnapshot.epochProgress
     )
-    globalSyncView = pinnedGlobalSyncView.fold(
-      maybeLastGlobalSyncView
-        .filter(_.ordinal >= lastSyncGlobalSnapshot.ordinal)
-        .getOrElse(finalizedFetchedView)
-    )(_ => finalizedFetchedView)
-
-    // [OVERPRUNE-DIAG/ml0] (2026-06-13, REMOVE after e2e): the smoking gun for run-26 divergence #1. ml0 EXPIRES allow-spends/
-    // token-locks with `lastGlobalSnapshotEpochProgress` (the synced snapshot's epoch at `ordinalToFetch`), but ADVERTISES
-    // `globalSyncView.epochProgress` (monotonic-clamped, can be the higher prior view when peer-sync backstepped below it). gl0's
-    // mirror reads the advertised epoch → over-prunes when these diverge. This fires ONLY on divergence; absence ⇒ #1 didn't fire.
-    _ <- Async[F].whenA(globalSyncView.epochProgress =!= lastGlobalSnapshotEpochProgress)(
-      logger.info(
-        s"[OVERPRUNE-DIAG/ml0] mg=${metagraphId.show.take(10)} cl0Ord=${snapshotOrdinal.show} EPOCH-DIVERGENCE " +
-          s"expiryEpoch=${lastGlobalSnapshotEpochProgress.value.value} advertisedEpoch=${globalSyncView.epochProgress.value.value} " +
-          s"syncedOrd=${lastSyncGlobalSnapshot.ordinal.show} advertisedOrd=${globalSyncView.ordinal.show} " +
-          s"peerSync=${maybeSnapshotOrdinalSync.map(_.show).getOrElse("none")} " +
-          s"prior=${maybeLastGlobalSyncView.map(_.ordinal.show).getOrElse("none")} fallback=${fallbackOrdinal.show}"
-      )
-    )
+    // The signed view is the exact finalized snapshot used for execution. Even a prior view at the same ordinal cannot supply its hash or
+    // epoch: ordinal equality alone does not establish execution-input equality.
+    globalSyncView = finalizedFetchedView
 
     blockAcceptanceResults <- (
       blockOps.acceptTokenLockBlocks(
@@ -442,10 +422,6 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         snapshotOrdinal,
         tokenLockInitialTxRef,
         shouldPerformMetagraphSpecificValidations,
-        // Track-1 I-PIN (Step-1): feature-activation gate keyed off the RECORDED `globalSyncView`, not the node-local head, so the
-        // producer and every re-executing validator apply the identical validation rules (producer==validator determinism).
-        globalSyncView.ordinal,
-        fixingAllowSpendAndTokenLockValidation,
         lastGlobalSnapshotEpochProgress
       ),
       blockOps.acceptAllowSpendBlocks(
