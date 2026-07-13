@@ -71,6 +71,38 @@ object GlobalDelegatedRewardsDistributorSuite extends SimpleIOSuite with Checker
     )
   }
 
+  test("delegated reward weight uses the replacement amount and checked aggregate arithmetic") {
+    val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
+    val nodeId = Id(Hex("1234567890abcdef")).toPeerId
+    val create = Signed(
+      UpdateDelegatedStake.Create(
+        source = address,
+        nodeId = nodeId,
+        amount = DelegatedStakeAmount(100L),
+        fee = DelegatedStakeFee(0L),
+        tokenLockRef = Hash.empty
+      ),
+      NonEmptySet.one[SignatureProof](SignatureProof(nodeId.toId, Signature(Hex(Hash.empty.value))))
+    )
+    val replaced = DelegatedStakeRecord(
+      event = create,
+      createdAt = SnapshotOrdinal(1L),
+      rewards = Amount(5L),
+      currentTokenLockRef = Some(Hash.empty),
+      currentAmount = Some(DelegatedStakeAmount(1000L))
+    )
+    val overflowing = replaced.copy(
+      rewards = Amount(1L),
+      currentAmount = Some(DelegatedStakeAmount(NonNegLong.MaxValue))
+    )
+
+    IO.pure(
+      expect
+        .same(BigInt(1005L), GlobalDelegatedRewardsDistributor.getStakedAmount(replaced))
+        .and(expect(GlobalDelegatedRewardsDistributor.sumStakedAmounts(List(overflowing)).isLeft))
+    )
+  }
+
   // §G5: tests use an empty reader and matching empty state managers as a default — many tests in
   // this suite exercise emission/inflation calculations driven by config + price state, not
   // MPT-backed active stakes. Under an empty reader the materializers return empty maps. Tests

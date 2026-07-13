@@ -55,6 +55,20 @@ object GlobalDelegatedRewardsDistributor {
         } yield totals.updated(address, updated)
     }
 
+  private[rewards] def getStakedAmount(stakeRecord: DelegatedStakeRecord): BigInt =
+    BigInt(stakeRecord.amount.value.value) + BigInt(stakeRecord.rewards.value.value)
+
+  private[rewards] def sumStakedAmounts(
+    records: Iterable[DelegatedStakeRecord]
+  ): Either[IllegalArgumentException, Amount] = {
+    val total = records.iterator.map(getStakedAmount).foldLeft(BigInt(0))(_ + _)
+
+    Either
+      .cond(total.isValidLong, total.toLong, new IllegalArgumentException(s"Active delegated stake exceeds Amount range: $total"))
+      .flatMap(value => NonNegLong.from(value).leftMap(new IllegalArgumentException(_)))
+      .map(Amount(_))
+  }
+
   /** §G5 — MPT-primary reward distribution. The state-manager parameters provide branch-aware MPT reads for `activeDelegatedStakes`
     * (per-record) and `updateNodeParameters` (per-Id), replacing the legacy GSI map closures (`info.activeDelegatedStakes` /
     * `info.updateNodeParameters`). `reader` is used by `DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes` for per-address
@@ -286,28 +300,12 @@ object GlobalDelegatedRewardsDistributor {
         .map(_._2)
     }
 
-    private def getStakedAmount(stakeRecord: DelegatedStakeRecord): Long =
-      stakeRecord.event.value.amount.value.value + stakeRecord.rewards.value
-
     private def getTotalActiveStake(
       activeDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]]
     ): F[Amount] =
       if (activeDelegatedStakes.isEmpty) Amount.empty.pure[F]
-      else {
-        val activeStakes = activeDelegatedStakes.flatMap {
-          case (address, records) =>
-            records.map { record =>
-              (record.event.value.nodeId.toId, address, record)
-            }
-        }
-
-        NonNegLong
-          .from(activeStakes.map(s => getStakedAmount(s._3)).sum)
-          .pure[F]
-          .map(_.leftMap(new IllegalArgumentException(_)))
-          .flatMap(Async[F].fromEither(_))
-          .map(Amount(_))
-      }
+      else
+        Async[F].fromEither(sumStakedAmounts(activeDelegatedStakes.valuesIterator.flatten.toList))
 
     private def calculateDelegatorRewards(
       activeDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
