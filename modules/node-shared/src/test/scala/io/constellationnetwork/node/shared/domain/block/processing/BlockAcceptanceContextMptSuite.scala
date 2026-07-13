@@ -13,6 +13,7 @@ import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlock
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalTimeLimit}
 import io.constellationnetwork.schema.swap.AllowSpendReference
@@ -207,7 +208,8 @@ object BlockAcceptanceContextMptSuite extends MutableIOSuite {
         reader,
         collateral = Amount.empty,
         initialTxRef = TokenLockReference.empty,
-        toBeReplacedHashedTokenLocks = Nil
+        toBeReplacedHashedTokenLocks = Nil,
+        currentEpochProgress = EpochProgress.MinValue
       )
       got <- ctx.getLastTxRef(a)
       missing <- ctx.getLastTxRef(addr("nobody"))
