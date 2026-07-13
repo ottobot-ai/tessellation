@@ -11,8 +11,6 @@ import io.constellationnetwork.schema.swap.{AllowSpendBlock, AllowSpendReference
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
-import eu.timepit.refined.auto._
-
 trait AllowSpendBlockAcceptanceLogic[F[_]] {
   def acceptBlock(
     block: Signed[AllowSpendBlock],
@@ -112,14 +110,15 @@ object AllowSpendBlockAcceptanceLogic {
         contextUpdate: AllowSpendBlockAcceptanceContextUpdate
       ): EitherT[F, AllowSpendBlockNotAcceptedReason, AllowSpendBlockAcceptanceContextUpdate] = {
         val minusFn: Amount => Balance => Either[BalanceArithmeticError, Balance] = a => _.minus(a)
-        val plusFn: Amount => Balance => Either[BalanceArithmeticError, Balance] = a => _.plus(a)
 
         val sortedTxs = block.transactions.toNonEmptyList
         val minusAmountOps = sortedTxs.groupMap(_.source)(tx => minusFn(tx.amount))
         val minusFeeOps = sortedTxs.groupMap(_.source)(tx => minusFn(tx.fee))
-        val plusAmountOps = sortedTxs.groupMap(_.destination)(tx => plusFn(tx.amount))
 
-        val allOps = minusAmountOps |+| minusFeeOps |+| plusAmountOps
+        // Creating an allow-spend reserves source funds. The destination is credited only by a
+        // separately authorized spend; crediting it here lets an unfunded destination create a
+        // second reservation that the final state transition cannot apply.
+        val allOps = minusAmountOps |+| minusFeeOps
 
         allOps
           .foldLeft(contextUpdate.balances.asRight[AddressBalanceOutOfRange].toEitherT[F]) { (acc, addressAndOps) =>
