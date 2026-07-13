@@ -165,7 +165,7 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = None)),
       priorDelegatedStakes = priorStakes,
       priorNodeCollaterals = priorCollaterals,
-      priorBalances = SortedMap.empty[Address, Balance],
+      postEconomicBalances = SortedMap.empty[Address, Balance],
       eventOrdinal = ord,
       currentEpoch = epoch,
       config = config
@@ -191,7 +191,7 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(submitter))),
       priorDelegatedStakes = priorStakes,
       priorNodeCollaterals = priorCollaterals,
-      priorBalances = SortedMap(submitter -> Balance(NonNegLong.unsafeFrom(10L))),
+      postEconomicBalances = SortedMap(submitter -> Balance(NonNegLong.unsafeFrom(10L))),
       eventOrdinal = ord,
       currentEpoch = epoch,
       config = config
@@ -201,6 +201,27 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
     expect.all(
       app.bountyBalanceDelta.get(submitter).map(_.value.value) == Some(10L + bounty),
       app.totalBurned == total - bounty
+    )
+  }
+
+  pureTest("bounty credit starts from the submitter's post-economic balance and does not resurrect an outgoing debit") {
+    val priorBalance = 1000L
+    val postEconomicBalance = 400L
+    val app = applyWatchtowerSlashes(
+      requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(submitter))),
+      priorDelegatedStakes = priorStakes,
+      priorNodeCollaterals = priorCollaterals,
+      postEconomicBalances = SortedMap(submitter -> Balance(NonNegLong.unsafeFrom(postEconomicBalance))),
+      eventOrdinal = ord,
+      currentEpoch = epoch,
+      config = config
+    )
+    val bounty = 165L
+    val credited = app.bountyBalanceDelta.get(submitter).map(_.value.value)
+
+    expect.all(
+      credited == Some(postEconomicBalance + bounty),
+      credited != Some(priorBalance + bounty)
     )
   }
 

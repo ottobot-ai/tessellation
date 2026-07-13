@@ -342,9 +342,9 @@ object GlobalSnapshotAcceptanceManager {
     * computes the byte-identical post-state). Requests are processed in `(shardId, disputedCheckpointHash)` sort order; each
     * [[InvalidStateProofSlashManager.applySlash]] is pure and its post-slash maps seed the next request's prior, so the accumulated maps +
     * registry entries + burn are order-deterministic. Bounty credit: when a request carries a `submitter`, `bountyAmount` is credited to
-    * that address via `creditBalance` over its prior balance (`priorBalances` + any earlier credit this fold); otherwise the whole slashed
-    * pool burns. `disputedCheckpointHash` doubles as the registry entry's `evidenceDigest` (it is the canonical identity of the disputed
-    * checkpoint).
+    * that address via `creditBalance` over its balance after every earlier economic transition in this ordinal (`postEconomicBalances` +
+    * any earlier credit this fold); otherwise the whole slashed pool burns. `disputedCheckpointHash` doubles as the registry entry's
+    * `evidenceDigest` (it is the canonical identity of the disputed checkpoint).
     *
     * Returns the prior maps verbatim + empty deltas when `requests` is empty — the no-op fast path that keeps `numShards = 1` (where no
     * request is ever produced) byte-identical.
@@ -353,7 +353,7 @@ object GlobalSnapshotAcceptanceManager {
     requests: List[WatchtowerSlashRequest],
     priorDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
     priorNodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]],
-    priorBalances: SortedMap[Address, Balance],
+    postEconomicBalances: SortedMap[Address, Balance],
     eventOrdinal: SnapshotOrdinal,
     currentEpoch: EpochProgress,
     config: InvalidStateProofSlashingConfig
@@ -398,11 +398,11 @@ object GlobalSnapshotAcceptanceManager {
             cooldownEpochs = config.cooldownEpochs
           )
           // Bounty credit ONLY when a submitter is present (watchtower-quorum path). The re-exec path passes `None` ⇒ no credit ⇒ the
-          // `bountyAmount` portion also burns (it is never returned to any balance). Read the running balance from the prior map folded with
-          // any earlier credit this same fold so two requests crediting the same submitter accumulate.
+          // `bountyAmount` portion also burns (it is never returned to any balance). Read the running balance from the post-economic map
+          // folded with any earlier credit this same fold so two requests crediting the same submitter accumulate.
           val nextBountyDelta: SortedMap[Address, Balance] = req.submitter match {
             case Some(addr) if res.bountyAmount > 0L =>
-              val current = acc.bountyBalanceDelta.getOrElse(addr, priorBalances.getOrElse(addr, Balance.empty))
+              val current = acc.bountyBalanceDelta.getOrElse(addr, postEconomicBalances.getOrElse(addr, Balance.empty))
               acc.bountyBalanceDelta.updated(addr, InvalidStateProofSlashManager.creditBalance(current, res.bountyAmount))
             case _ => acc.bountyBalanceDelta
           }
@@ -2701,11 +2701,15 @@ object GlobalSnapshotAcceptanceManager {
                 // records (100% tier ⇒ full removal), yields one `SlashedRegistryEntry` per `(operator, shard, checkpoint)` for the
                 // `Slashings` MPT write, and (re-exec path: `submitter = None`) burns the entire pool (no bounty credit). Empty `requests`
                 // (the common path; ALWAYS empty at numShards=1) ⇒ the prior maps verbatim + empty deltas ⇒ byte-identical to pre-slash.
+                // Every ordinary balance effect for this ordinal has completed at this point. Materialize the complete view once so a
+                // right-biased bounty update starts from the submitter's post-transfer/fee/lock/spend balance and cannot restore its
+                // prior-ordinal balance. Addresses untouched this ordinal retain their MPT-materialized prior value.
+                postEconomicBalances = priorBalances ++ updatedBalancesBySpendTransactions
                 slashApplication = applyWatchtowerSlashes(
                   adoptedSlashRequests,
                   updatedCreateDelegatedStakes,
                   updatedCreateNodeCollaterals,
-                  priorBalances,
+                  postEconomicBalances,
                   ordinal,
                   epochProgress,
                   invaliditySlashingConfig
@@ -2771,9 +2775,9 @@ object GlobalSnapshotAcceptanceManager {
                   initialData.blockResult,
                   updatedLastStateChannelSnapshotHashes,
                   (priorLastTxRefs ++ transactionsRefsDeltas).toSortedMap,
-                  // `slashBountyBalanceDelta` already carries the submitter's FINAL credited balance (creditBalance over its prior), so the
-                  // right-biased merge sets it authoritatively. Empty on the reachable re-exec path (no submitter) ⇒ byte-identical.
-                  priorBalances ++ updatedBalancesBySpendTransactions ++ slashBountyBalanceDelta,
+                  // `slashBountyBalanceDelta` already carries the submitter's final credited post-economic balance, so the right-biased
+                  // merge cannot erase an earlier same-ordinal debit. Empty on the reachable re-exec path (no submitter) ⇒ byte-identical.
+                  postEconomicBalances ++ slashBountyBalanceDelta,
                   updatedLastCurrencySnapshots,
                   updatedLastCurrencySnapshotProofs,
                   updatedAllowSpendsCleaned,

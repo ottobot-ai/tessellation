@@ -7,7 +7,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.Amount
+import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeAmount, DelegatedStakeRecord, UpdateDelegatedStake}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralAmount, NodeCollateralRecord, UpdateNodeCollateral}
@@ -198,6 +198,15 @@ object InvalidStateProofSlashManagerSuite extends FunSuite {
       InvalidStateProofSlashManager.splitBountyBurn(1000L, Ratio(1, 20)) == ((50L, 950L)),
       InvalidStateProofSlashManager.splitBountyBurn(999L, Ratio(1, 20)) == ((49L, 950L)),
       InvalidStateProofSlashManager.splitBountyBurn(0L, Ratio(1, 2)) == ((0L, 0L))
+    )
+  }
+
+  test("creditBalance saturates at Long.MaxValue instead of wrapping near the balance ceiling") {
+    val nearMax = Balance(NonNegLong.unsafeFrom(Long.MaxValue - 5L))
+
+    expect.all(
+      InvalidStateProofSlashManager.creditBalance(nearMax, 10L).value.value == Long.MaxValue,
+      InvalidStateProofSlashManager.creditBalance(nearMax, -10L) == nearMax
     )
   }
 }

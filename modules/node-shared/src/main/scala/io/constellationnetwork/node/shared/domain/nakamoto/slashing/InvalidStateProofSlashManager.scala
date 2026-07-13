@@ -191,8 +191,10 @@ object InvalidStateProofSlashManager {
   def asAmount(value: Long): Amount = Amount(NonNegLong.unsafeFrom(math.max(0L, value)))
 
   /** Add a bounty `Long` to an existing `Balance` (the submitter's). Saturating + total. */
-  def creditBalance(prior: Balance, bounty: Long): Balance =
-    Balance(NonNegLong.unsafeFrom(math.max(0L, prior.value.value + math.max(0L, bounty))))
+  def creditBalance(prior: Balance, bounty: Long): Balance = {
+    val credited = (BigInt(prior.value.value) + BigInt(bounty).max(BigInt(0))).min(BigInt(Long.MaxValue)).toLong
+    Balance(NonNegLong.unsafeFrom(credited))
+  }
 
   /** The reason an operator was slashed — the audit discriminator on [[SlashedRegistryEntry]]. Sealed ADT (per
     * `feedback_no_string_matching`): the slash tier is typed, not a string. `InvalidStateProof` is the 100% tier (this manager); future
