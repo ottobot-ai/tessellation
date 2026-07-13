@@ -149,10 +149,7 @@ object MptStore {
           Async[F]
             .start(
               p.persist(ordinal).handleErrorWith { err =>
-                logger.error(err)(s"[MptStore] Background persist failed for ordinal=$ordinal") >>
-                  p.applyCutoff(ordinal).handleErrorWith { cutoffErr =>
-                    logger.error(cutoffErr)(s"[MptStore] Cutoff after failed persist also failed for ordinal=$ordinal")
-                  }
+                logger.error(err)(s"[MptStore] Background persist or retention cutoff failed for ordinal=$ordinal")
               }
             )
             .void

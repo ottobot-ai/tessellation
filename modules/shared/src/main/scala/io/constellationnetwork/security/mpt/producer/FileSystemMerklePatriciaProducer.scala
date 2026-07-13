@@ -285,12 +285,9 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
       state <- stateRef.get
       _ <-
         if (state.nonEmpty)
-          storage.writeState(ordinal, state).attempt.flatMap {
-            case Right(_) => applyCutoff(ordinal)
-            case Left(err) =>
-              logger.error(err)(s"[MPT] Failed to write state for ordinal=$ordinal, applying cutoff anyway") >>
-                applyCutoff(ordinal)
-          }
+          // Never prune other recovery generations after this write reports failure. This ordering does not make the legacy direct
+          // overwrite crash-safe; durable image publication is a separate migration.
+          storage.writeState(ordinal, state) >> applyCutoff(ordinal)
         else logger.warn(s"[MPT] Cannot persist: no state")
     } yield ()
 
