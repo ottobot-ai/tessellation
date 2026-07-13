@@ -422,10 +422,18 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
   settlement kernel over committee-extracted signed intents. Apply mirror diffs
   and GL0-owned settlement overlay atomically without letting either overwrite
   the other.
+- Replace bounded `GlobalSnapshotsProcessed` history with the O-13 per-MG
+  hash-linked delivery sequence, rooted pending leaves, durable ML0 cursor/state
+  proof, and compare-and-set metadata-only acknowledgement.
+- Replace replayable custom-data fees with O-14's domain-separated exact-parent
+  intent over rooted field 27, exact fee/item bijection, available content
+  commitment, and atomic balance/head update. Serialize the outer binary fee and
+  every other global-balance writer in the same checkpoint-wide reservation
+  kernel.
 - `numShards=1`, `2`, and `K` use the identical transition function.
-- Gates: `SHARD-E-003`/`004`, `DIFF-*`, `XMG-001` through `XMG-005A`,
-  `XMG-007`/`008`/`010`, `SHARD-C-004`/`005`, `WT-008`/`008A`, and
-  conservation/replay tests from S2.
+- Gates: `SHARD-E-003`/`004`, `DIFF-*`, `XMG-001` through `XMG-005B`,
+  `XMG-007`/`008`/`010`, `ECON-F-002`/`003`, `ECON-REF-001`,
+  `SHARD-C-004`/`005`, `WT-008`/`008A`, and conservation/replay tests from S2.
 
 ### E10 - Downstream exact-hash rebase and historical-read recovery (`PARTIAL`)
 
@@ -440,8 +448,17 @@ delivery, rollback, and recovery.
 - Historical-view recovery verifies the same exact-origin and nondecreasing-ref
   rules used by E9; missing local data fetches authenticated content or enters
   `RecoveryRequired`, never receiver-live-head fallback.
+- Bind the mutable MPT base to a root-verified `(ordinal,hash,mptRoot)` and use one
+  exact-parent session for all acceptance reads/replay/writes/root/commit. Folding
+  a finalized prefix retains canonical descendants. Restart restores the anchor
+  before production, and global finality stages overlay, chain, tracker, outbox,
+  watermarks, and projections through one recoverable transition.
+- Exact-parent/unknown-branch rejection is activated only with that complete
+  anchor, descendant-retention, recovery, and finality-orchestration slice; a
+  narrow guard alone reaches normal restart/finality paths after partial external
+  mutation and is not mergeable.
 - Gates: `XMG-006`, `FOLLOW-001` through `FOLLOW-005`, `REC-*`, `MEMPOOL-001`,
-  and `GROWTH-001`.
+  `ROOT-002` through `ROOT-004`, and `GROWTH-001`.
 
 ### E11 - Exceptional challenge replay and sound slashing (`SCAFFOLD ONLY`)
 
@@ -510,7 +527,7 @@ These are consensus dependencies, not optional cleanup:
 
 | Track | Work | Earliest parallel start | Blocks |
 |---|---|---|---|
-| S1 canonical identity/serde/era | One bounded ScodecV1 representation and domain-separated preimage for every active artifact; exact parameter/era registry; delete undeployed compatibility paths. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
+| S1 canonical identity/serde/era | Replace the currently unwired Scodec era scaffold and live JSON/Kryo hashing/proofs with one hash-bound ScodecV1 ordinal-0 service; freeze composite vectors and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
 | S2 deterministic framework oracle/kernel | Authorization, checked arithmetic, conservation, semantic replay protection, ordered execution, resource bounds, independent prefix oracle. | After E0 economic grammar | E4/E5/E8-E11/E13 |
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Bounded gossip/RPC/HTTP, durable outboxes, exact-hash multi-peer recovery, fuzz/fault harness. | RED tests can start after E0 | E1/E3/E7/E11/E14 |

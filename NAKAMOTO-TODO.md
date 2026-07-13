@@ -204,8 +204,17 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 - [ ] **S1 PARTIAL - canonical ScodecV1, identity, era, and parameters**
   - Freeze one bounded representation/signature domain for every active artifact.
+  - Replace the unwired era registry and JSON/Kryo `HasherSelector` plus legacy
+    state-proof switches with one canonical hash-bound protocol-era service.
+    Ordinal zero is ScodecV1 for bytes, hashes, signatures, state proofs, MPT
+    nodes/values, and recovery records in every environment.
+  - Replace JSON state-channel content and decoder-success classification with an
+    explicit signed framework-currency / framework-currency-with-data lane.
   - Delete undeployed fork-only compatibility paths; isolate historical disk/
-    upstream import reading from the new-chain runtime.
+    upstream-v4 Kryo/Brotli-JSON import reading from the new-chain runtime. The
+    read-only importer emits a verified ScodecV1 genesis manifest.
+  - Freeze composite byte/hash/signature/root vectors and strict negative vectors;
+    round-trip-only codec tests do not close activation.
   - Bind network/genesis/era/parameters and exact parent/base into artifacts.
   - **Gate:** `SER-*`, `ERA-*`, `PARAM-001`, `CRYPTO-001`.
 
@@ -323,13 +332,33 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - Replace ordinary universal CL1 replay only after malformed-artifact gates pass.
   - Run one deterministic GL0 conflict/nullifier/settlement kernel over signed
     intents and atomically compose per-MG mirrors with GL0-owned overlays.
+  - Replace bounded `GlobalSnapshotsProcessed` reconstruction with a rooted,
+    hash-linked per-MG delivery sequence, durable ML0 applied cursor/state proof,
+    and compare-and-set metadata-only acknowledgement (O-13). No ordinal/history
+    window may restore delivery eligibility.
+  - Replace replayable data-application fees with a domain-separated exact-parent
+    fee intent that atomically advances rooted field 27 and balances, and binds
+    exact available opaque bytes/manifest without GL0 executing DL1 (O-14).
+  - Serialize outer state-channel binary fees and every other global-balance write
+    in the checkpoint-wide GL0 reservation kernel; per-MG roots alone cannot
+    resolve a payer shared across metagraphs.
   - Require identical economics at shard counts 1, 2, and K.
   - **Gate:** `DIFF-*`, `SHARD-E-003/004`, `SHARD-C-004/005`,
-    `XMG-001..005A`, `XMG-007/008/010`, and `WT-008/008A`.
+    `XMG-001..005B`, `XMG-007/008/010`, `ECON-F-002/003`, `ECON-REF-001`,
+    and `WT-008/008A`.
 
 - [ ] **E10 PARTIAL - downstream exact-hash rebase and historical recovery**
   - E9 owns exact-origin/CAS validity before the security cutover. Carry the same
     exact Phase-2 refs through downstream delivery, rollback, and recovery.
+  - Bind every MPT base to a root-verified `(snapshotHash, ordinal, mptRoot)` and
+    acquire one exact-parent session for all reads, replay, writes, and commit.
+    Unknown/evicted hashes and incomplete ancestry enter typed recovery; they
+    never fall through to base. Finalizing an unknown branch cannot mutate base
+    or markers, and finalizing an ancestor retains canonical descendants.
+  - Activate those branch guards only with authenticated restart binding,
+    descendant retention, explicit `RecoveryRequired`, and finality-sink
+    preflight/coordination. Unknown rejection alone halts the current normal path
+    after the tip tracker, chain store, and outbox may already have advanced.
   - Density replacement reverses anchors, mirrors, settlement/nullifiers, and
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters
@@ -379,9 +408,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 E1, E2, E2K, S1, S2, S3, and S4 can run in parallel after E0 freezes shared
 vocabulary. E3/E4 then proceed in parallel against frozen interfaces. E6/E7 may
-run in parallel after E4; E8 follows replay-capable E5. E9 is the security
-cutover. E10/E11 integrate after it; E12/E13 follow the global state contracts;
-E14 qualifies the exact integrated candidate.
+run in parallel after E4; E8 follows replay-capable E5. Inside E9, the delivery,
+data-fee, checkpoint-global-ordering, and exact-branch lanes may build in parallel
+only behind frozen interfaces; they join before any economic activation. E9 is
+the security cutover. E10/E11 integrate after it; E12/E13 follow the global state
+contracts; E14 qualifies the exact integrated candidate.
 
 Every delegated packet records `baseline`, `writeSet`, invariant/finding/test
 IDs, dependencies, commands, artifact directory, and integration owner. Shared

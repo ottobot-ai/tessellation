@@ -265,6 +265,75 @@ not an implicit retention policy. Ratify the exact deletion point, the quantifie
 common-prefix failure probability, whether any offline escrow is permitted, and
 the recovery/rejoin availability consequences before runtime key activation.
 
+### O-13 Durable global delivery sequence and settlement ordering
+
+**PROPOSED, NOT RATIFIED.** Replace `GlobalSnapshotsProcessed` and every bounded
+history reconstruction with a hash-linked sequence per destination metagraph.
+GL0 atomically appends canonical framework delivery records and advances a rooted
+outbox head with the settlement and permanent authorization nullifier. ML0 stores
+an applied `(sequence, deliveryId)` cursor in `CurrencySnapshotInfo` and its state
+proof, executes only a contiguous range from one exact Phase-2 GL0 reference, and
+emits a compare-and-set acknowledgement. Acknowledgement changes representation
+only: effective balances before and after compaction are byte-identical and the
+permanent economic nullifier remains.
+
+The recommended granularity is a bounded canonical per-metagraph batch with
+contiguous multi-entry acknowledgement. GL0 ordinals are not delivery sequence
+numbers: they are sparse, and ML0 may discover an older still-pending delivery
+after observing a higher GL0 ordinal. GL0 assigns its destination sequence at the
+canonical append; receiver observation order cannot change or skip it. Pending records are
+individual rooted leaves, not one growing field-18 ordinal set. Their framework
+bytes remain available until acknowledged; missing bytes defer rather than
+authorizing a peer claim or skipping an effect.
+
+Owner answers still required before schema allocation:
+
+- the exact total order among an already-canonical inbound delivery, local spend,
+  consume, cancel, expiry, and refund; inbox-before-local-spend is the recommended
+  fixed first rule, but it does not settle the other conflicts;
+- rooted limits for record bytes, entries per batch/snapshot, pending entries,
+  deterministic backpressure, and protocol fees; local HOCON is not validity;
+- exact retention and authenticated deep-recovery behavior after local history is
+  unavailable; and
+- O-04's rewind/rebase/new-epoch outcome after ML0 applied a Phase-2 reference that
+  a later density reorg orphans.
+
+No active field number is assigned here. Greenfield active state uses the frozen
+Scodec era from ordinal zero; upstream v4 data remains read-only import input and
+cannot silently default a missing cursor into signable state.
+
+### O-14 Framework fee sequence and opaque-data binding
+
+**PROPOSED, NOT RATIFIED.** Reuse the already rooted per-metagraph
+`MgLastFeeTxRefs` partition (field 27) as the strict head for each fee source. A
+framework fee signs network/genesis, era/lane, metagraph, source, destination,
+amount, exact parent reference, and an exact opaque-data commitment. Acceptance
+requires the parent to equal rooted state, derives the successor reference, checks
+available bytes or a content-addressed chunk manifest without executing DL1 logic,
+and atomically updates balances plus the head. Signature proofs do not change the
+semantic fee identity.
+
+Recommended v1 rules are:
+
+- exactly zero or one framework fee per custom item; no unmatched item, orphan
+  fee, duplicate mapping, or extra fee record is accepted;
+- any invalid fee rejects the complete framework segment without partial debit or
+  custom-item acceptance;
+- outgoing fees reserve against the pre-batch source balance before any same-batch
+  credits become spendable;
+- a parent-valid fee has no protocol expiry in v1; only one same-parent sibling can
+  win, and the others become stale; and
+- a newly signed successor may intentionally pay again for identical data. A ban on
+  repeated semantic data requires a separate explicit data nullifier.
+
+The remaining owner choice is exact signed-item bytes versus a content-addressed
+chunk-manifest root. The recommendation is the manifest only when every exact chunk
+is available before an execution signature. GL0 verifies bytes, availability,
+authorization, sequence, arithmetic, and conservation; it never treats ML0 custom
+execution output as economic authority. The outer `StateChannelSnapshotBinary.fee`
+is a separate global-balance operation and still requires E9's checkpoint-wide
+reservation kernel.
+
 ## Change rule
 
 Changing a locked answer or resolving an open gate requires one coherent change

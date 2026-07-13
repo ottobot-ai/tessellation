@@ -143,7 +143,8 @@ waiver.
 | ECO-05 | E2/E9/E10 | ECON-R, XMG, FOLLOW |
 | ECO-10 through ECO-17 | E2/E9 | ECON-D/C/O/B/F/G, XMG |
 | SHARD-01 through SHARD-10 | E4/E6/E8/E10 | SHARD-C/E/S, FOLLOW, REC |
-| SMT-01 | E1/E11 | ROOT, SER, REC |
+| SMT-01, SMT-02, SMT-03 | E1/E9/E11 | ROOT, SER, REC |
+| SER-01, SER-02, SER-03 | E1/E5/E13 | SER, ERA, LANE, DA, REC |
 | NET-01, NET-02A, NET-03 through NET-10 | E12, with domain/size schemas in E1/E5 | NET, RESOURCE, DA, REC |
 | ECO-01, ECO-07, ECO-08, ECO-09, NET-02 (fixed regressions) | E2/E7/E9/E12/E14 as applicable | dedicated exploit regression plus differential/qualification suites |
 
@@ -183,6 +184,10 @@ with its RED test and owned write set while unrelated decision gates remain open
 | E1.7 | Canonical `ConsensusParameters` includes finality, eta, committee/shard, duty, resource, retention, DA, challenge, fee, and upgrade values. Derivations use exact integer/rational arithmetic (`R`, for example, uses a ratified `31/10` rule rather than `Double`). Local mismatch halts before signing/mutation. |
 | E1.8 | Define governance/activation authority and delay for parameter/era/registration changes. A local admin/`ProductionGate` may make one node abstain but cannot change validity, phase, state, or another node. Any network halt is an explicit bounded canonical transition that cannot rewrite/waive validation and has deterministic expiry/resume; omit it entirely if that rule is not ratified. |
 | E1.9 | Inventory every retained signed commitment. `smtRoot` and its tower-eligibility inputs are retained and must be independently reproduced and verified on produce/follow/restart/bootstrap. A decorative, producer-chosen, or follower-ignored root is forbidden. |
+| E1.10 | Replace the unwired `EraCodecRegistry` scaffold plus `HasherSelector`/state-proof ordinal switches with one typed protocol-era service. New-chain ordinal 0 selects only ScodecV1 for object bytes, hashes, signatures, state proofs, MPT nodes, and recovery records; no local boundary can change consensus. |
+| E1.11 | Give every state-channel payload an explicit signed lane/type. Currency and currency-with-data carry exact framework Scodec bytes for replay plus a separately committed custom payload; decoder success never chooses authority. |
+| E1.12 | Move upstream-v4 Kryo/Brotli-JSON types and probing into a read-only offline importer with frozen fixtures. The importer verifies the source snapshot/state and emits one ScodecV1 genesis manifest; active runtime stores cannot invoke legacy decoders. |
+| E1.13 | Freeze full byte/hash/signature/root vectors for every composite consensus object and MPT node/value, not only round trips or primitive codecs. An independent implementation and negative corpus must reproduce them. |
 
 ### E2 - Deterministic conservative framework kernel
 
@@ -381,14 +386,49 @@ not close E8.3, E8.4, or ordinary zero-replay adoption.
 | E9.2 | Canonically merge native GL1 writes, per-MG diffs, global framework intents, rewards/slashes/config changes, GL0 protocol corrections, and custom commitments. Conflicting keys or invalid roots reject atomically. |
 | E9.3 | Per-MG diff cannot write global nullifier/inbox or another MG. Every GL0 node runs one pure global intent conflict/settlement kernel. |
 | E9.4 | Define signed authorization/consume identities and permanent replay keys. Network/genesis/era/type replay and proof-container malleability reject. |
+| E9.4A | Replace inherited data-application fee replay semantics. A domain-separated fee consumes the rooted per-MG/source field-27 parent, binds exact available opaque bytes or a ratified chunk manifest, and atomically updates balance plus head. Exact fee/custom-item cardinality rejects extras, duplicates, and partial acceptance. |
 | E9.5 | Implement one-shot allow-spend state machine: reserve, consume/cancel/expiry, exact refund/fee rules, permanent nullifier, and pending delivery in one transaction. |
 | E9.6 | Define deterministic precedence for concurrent consumes, cancel/expiry, inbound delivery, local spend, and same-snapshot dependencies. One authorization has at most one winner across shards/branches. |
 | E9.7 | ML0 inbox/cursor acknowledgement is hash-bound, contiguous, idempotent, and metadata-only. It cannot change effective balances or erase permanent replay state. |
+| E9.7B | Replace bounded `GlobalSnapshotsProcessed` reconstruction with a per-MG hash-linked delivery head, rooted pending entries, durable ML0 applied cursor/state proof, and compare-and-set acknowledgement. GL0 append order assigns the destination sequence independently of sparse global ordinals; receiver observation order, restart, compaction, and deep recovery cannot skip or reapply it. |
 | E9.7A | Separate `Ml0FrameworkMirror` from `GlobalSettlementOverlay`. Cross-MG global writes never invalidate the checkpoint's certified mirror root; all reads use exact checked effective composition. ML0 applies mandatory inbox before local spends and acknowledgement compacts representation with byte-identical effective state. |
 | E9.8 | Add token-lock/transfer/other cross-MG types only after each has explicit authorization, conservation, timeout/refund, ordering, and acknowledgement rules. |
 | E9.9 | Identical traces at shard counts 1, 2, and K have identical accepted IDs, economic leaves, roots, nullifiers, supply, and delivery state. |
 | E9.10 | Bound permanent nullifier/authorization/inbox/evidence growth without reopening replay: protocol fees/rent, authenticated compaction/accumulator, or archived tombstone proof. Age/window eviction alone is forbidden. |
 | E9.11 | Define the GL0 protocol correction transition for malformed metagraph state. It binds exact target MG/pre-root/version, deterministic correction diff, post-root, activation and replay domain, is executed/root-checked by GL0, and emits a mandatory downstream rebase. No ML0/CL1/DL1 signature or checkpoint field can authorize it. |
+
+E9.4A and E9.7B are schema-gated by O-14 and O-13 respectively. Their build order is
+pure reference oracle and RED vectors, owner ratification, active Scodec/domain
+freeze, atomic MPT transition, all execution-signer/watchtower integration,
+ordinary diff adoption, then restart/reorg/compaction and shard-count parity.
+Neither slice may ship as a node-local cache, bounded history window, optional
+field default, or ML0-authoritative override.
+
+#### E9 immediate build lanes and join order
+
+| Lane | Ordered work | May run in parallel with | Join gate |
+|---|---|---|---|
+| E9-DLV | O-13 decisions; pure delivery oracle/RED traces; active cursor/delivery codecs and rooted leaves; GL0 append/ack kernel; ML0 cursor/inbox execution; restart/reorg/compaction. | E9-FEE and exact-base recovery design until shared schema integration. | XMG-004/005/005B/006/008 plus codec/root parity. |
+| E9-FEE | O-14 decisions; pure fee oracle/RED traces; domain-separated parented fee codec; field-27 atomic balance/head kernel; exact opaque-byte/manifest bijection; producer/signer/watchtower integration. | E9-DLV and DA retention work until shared balance/reservation integration. | ECON-F-002/003, ECON-REF-001, ECON-C-001, shard-count parity. |
+| E9-GLOBAL | Checkpoint-wide ordering/reservation over outer binary fees, native writes, global intents, rewards, slashes, and protocol corrections; compare-and-set every per-MG mirror version; ordinary GL0 diff adoption. | Pure DLV/FEE models and E7/E8 checkpoint format work. | ECO-10 residual closed; XMG-002/003/007/008 and ECON-O-001. |
+| E9-BRANCH | Verified MPT base-anchor identity, exact-parent sessions, descendant-preserving finalization, scratch candidate validation, crash-safe anchor persistence, and authenticated recovery. | Pure economic models and schema review. | No consensus read can fall back from an unavailable hash to base; branch/restart/reorg model parity. |
+
+E9-BRANCH is one activation unit, not a sequence of independently enabled guards.
+Today a successful fold deletes pending descendants, restart restores no
+authenticated base identity, and the global finality sinks update the tip tracker,
+chain store, and outbox before the overlay. Enabling unknown-branch rejection alone
+therefore converts existing silent corruption into a normal-path halt after partial
+external mutation. The verified anchor, descendant retention, exact session,
+explicit `RecoveryRequired` state, and preflighted finality transaction must be
+available before the fail-closed guard becomes active.
+
+The lanes join before activation in this order: freeze O-13/O-14 and protocol
+bounds; freeze canonical schemas/domains; land atomic DLV and FEE kernels over one
+exact-parent session; integrate checkpoint-wide global ordering; migrate every
+execution signer and watchtower; enable ordinary certified-diff adoption; then run
+crash, density-reorg, deep-recovery, and `numShards=1/2/K` qualification. Work from
+different lanes may merge earlier only when its active behavior is unreachable;
+there is no partial economic-security activation.
 
 ### E10 - Downstream exact-hash following and Phase-2 rollback
 
