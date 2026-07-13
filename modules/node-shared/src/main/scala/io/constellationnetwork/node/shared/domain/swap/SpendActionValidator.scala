@@ -121,6 +121,9 @@ object SpendActionValidator {
     crossShardEffectiveBalanceOverlay: CrossShardEffectiveBalanceOverlay = noEffectiveBalanceOverlay
   ): SpendActionValidator[F] = new SpendActionValidator[F] {
 
+    private type BalanceReservationKey = (Option[Address], Address)
+    private type BalanceReservations = Map[BalanceReservationKey, BigInt]
+
     def validateReturningAcceptedAndRejected(
       spendActions: Map[Address, List[SpendAction]],
       activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
@@ -134,44 +137,64 @@ object SpendActionValidator {
       def processActionsForCurrency(
         currencyId: Address,
         currencySpendActions: List[SpendAction],
-        currentAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+        currentAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+        currentReservations: BalanceReservations
       ): F[
         (
           SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+          BalanceReservations,
           (Address, (List[(SpendAction, List[SpendActionValidationError])], List[SpendAction]))
         )
       ] =
         currencySpendActions
           .foldLeftM(
-            (currentAllowSpends, List.empty[(SpendAction, List[SpendActionValidationError])], List.empty[SpendAction])
+            (
+              currentAllowSpends,
+              currentReservations,
+              List.empty[(SpendAction, List[SpendActionValidationError])],
+              List.empty[SpendAction]
+            )
           ) {
-            case ((allowSpendsAcc, rejectedSpendActions, acceptedSpendActions), action) =>
-              validate(action, allowSpendsAcc, allBalances, currencyId).flatMap {
-                case Valid(validAction) =>
+            case ((allowSpendsAcc, reservationsAcc, rejectedSpendActions, acceptedSpendActions), action) =>
+              validateWithReservations(action, allowSpendsAcc, allBalances, currencyId, reservationsAcc).flatMap {
+                case (Valid(validAction), updatedReservations) =>
                   updateCurrentAllowSpendsForValidation(validAction, allowSpendsAcc).map { updated =>
-                    (updated, rejectedSpendActions, validAction :: acceptedSpendActions)
+                    (updated, updatedReservations, rejectedSpendActions, validAction :: acceptedSpendActions)
                   }
-                case Invalid(errors) =>
-                  Async[F].pure((allowSpendsAcc, (action -> errors.toNonEmptyList.toList) :: rejectedSpendActions, acceptedSpendActions))
+                case (Invalid(errors), _) =>
+                  Async[F].pure(
+                    (
+                      allowSpendsAcc,
+                      reservationsAcc,
+                      (action -> errors.toNonEmptyList.toList) :: rejectedSpendActions,
+                      acceptedSpendActions
+                    )
+                  )
               }
           }
           .map {
-            case (updatedAllowSpends, rejected, accepted) =>
-              updatedAllowSpends -> (currencyId -> (rejected.reverse, accepted.reverse))
+            case (updatedAllowSpends, updatedReservations, rejected, accepted) =>
+              (updatedAllowSpends, updatedReservations, currencyId -> (rejected.reverse, accepted.reverse))
           }
 
-      spendActions.toList
+      SortedMap
+        .from(spendActions)
+        .toList
         .foldLeftM(
-          (activeAllowSpends, List.empty[(Address, (List[(SpendAction, List[SpendActionValidationError])], List[SpendAction]))])
+          (
+            activeAllowSpends,
+            Map.empty[BalanceReservationKey, BigInt],
+            List.empty[(Address, (List[(SpendAction, List[SpendActionValidationError])], List[SpendAction]))]
+          )
         ) {
-          case ((allowSpendsAcc, results), (currencyId, currencySpendActions)) =>
-            processActionsForCurrency(currencyId, currencySpendActions, allowSpendsAcc).map {
-              case (updatedAllowSpends, result) =>
-                (updatedAllowSpends, result :: results)
+          case ((allowSpendsAcc, reservationsAcc, results), (currencyId, currencySpendActions)) =>
+            processActionsForCurrency(currencyId, currencySpendActions, allowSpendsAcc, reservationsAcc).map {
+              case (updatedAllowSpends, updatedReservations, result) =>
+                (updatedAllowSpends, updatedReservations, result :: results)
             }
         }
         .map {
-          case (_, spendTransactionsValidations) =>
+          case (_, _, spendTransactionsValidations) =>
             val acceptedSpendActions = spendTransactionsValidations.map {
               case (address, (_, accepted)) => address -> accepted
             }.filter {
@@ -200,24 +223,55 @@ object SpendActionValidator {
       activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       allBalances: Map[Option[Address], SortedMap[Address, Balance]],
       currencyId: Address
-    ): F[SpendActionValidationErrorOr[SpendAction]] = {
+    ): F[SpendActionValidationErrorOr[SpendAction]] =
+      validateWithReservations(spendAction, activeAllowSpends, allBalances, currencyId, Map.empty).map(_._1)
+
+    private def validateWithReservations(
+      spendAction: SpendAction,
+      activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+      allBalances: Map[Option[Address], SortedMap[Address, Balance]],
+      currencyId: Address,
+      initialReservations: BalanceReservations
+    ): F[(SpendActionValidationErrorOr[SpendAction], BalanceReservations)] = {
       val hasDuplicatedAllowSpendReference = spendAction.spendTransactions
         .groupBy(_.allowSpendRef)
         .collect { case (Some(hash), value) => (hash, value) }
         .exists { case (_, value) => value.size > 1 }
 
       if (hasDuplicatedAllowSpendReference) {
-        (DuplicatedAllowSpendReference(
-          s"Duplicated allow spend reference in the same SpendAction"
-        ): SpendActionValidationError).invalidNec[SpendAction].pure[F]
+        (
+          (DuplicatedAllowSpendReference(
+            s"Duplicated allow spend reference in the same SpendAction"
+          ): SpendActionValidationError).invalidNec[SpendAction],
+          initialReservations
+        ).pure[F]
       } else {
-        val validations = spendAction.spendTransactions.traverse { spendTransaction =>
-          validateAllowSpendRef(spendTransaction, activeAllowSpends, allBalances, currencyId)
-        }
+        spendAction.spendTransactions.toList
+          .foldLeftM((().validNec[SpendActionValidationError], initialReservations)) {
+            case ((validationsAcc, reservationsAcc), spendTransaction) =>
+              validateAllowSpendRef(spendTransaction, activeAllowSpends, allBalances, currencyId, reservationsAcc).map { validation =>
+                val updatedReservations = validation match {
+                  case Valid(validTransaction) if validTransaction.allowSpendRef.isEmpty =>
+                    // Reserve the gross debit. The balance appliers write the source debit last when source == destination, so a self-transfer
+                    // is still a debit. Referenced-transfer credits and incoming destinations were not part of the validator's prior balance
+                    // view and must not make a later no-ref spend self-funding within this batch.
+                    val key = balanceReservationKey(validTransaction, currencyId)
+                    reservationsAcc.updated(
+                      key,
+                      reservationsAcc.getOrElse(key, BigInt(0)) + BigInt(validTransaction.amount.value.value)
+                    )
+                  case _ => reservationsAcc
+                }
 
-        validations.map(_.sequence.as(spendAction))
+                (validationsAcc.productR(validation.void), updatedReservations)
+              }
+          }
+          .map { case (validation, updatedReservations) => (validation.as(spendAction), updatedReservations) }
       }
     }
+
+    private def balanceReservationKey(spendTransaction: SpendTransaction, currencyId: Address): BalanceReservationKey =
+      spendTransaction.currencyId.map(_.value) -> currencyId
 
     private def updateCurrentAllowSpendsForValidation(
       validAction: SpendAction,
@@ -292,7 +346,8 @@ object SpendActionValidator {
       spendTransaction: SpendTransaction,
       currentActiveAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
       allBalances: Map[Option[Address], SortedMap[Address, Balance]],
-      currencyId: Address
+      currencyId: Address,
+      reservations: BalanceReservations
     ): F[SpendActionValidationErrorOr[SpendTransaction]] =
       spendTransaction.allowSpendRef match {
         case Some(allowSpendRef) =>
@@ -322,9 +377,9 @@ object SpendActionValidator {
           // proof client.
           classifyReference(spendTransaction.currencyId.map(_.value), currencyId).flatMap {
             case Same =>
-              validateBalanceSameShard(spendTransaction, allBalances, currencyId).pure[F]
+              validateBalanceSameShard(spendTransaction, allBalances, currencyId, reservations).pure[F]
             case Cross(targetMg, targetShard) =>
-              validateBalanceCrossShard(spendTransaction, targetMg, targetShard, currencyId)
+              validateBalanceCrossShard(spendTransaction, targetMg, targetShard, currencyId, reservations)
           }
       }
 
@@ -372,13 +427,14 @@ object SpendActionValidator {
     private def validateBalanceSameShard(
       spendTransaction: SpendTransaction,
       allBalances: Map[Option[Address], SortedMap[Address, Balance]],
-      currencyId: Address
+      currencyId: Address,
+      reservations: BalanceReservations
     ): SpendActionValidationErrorOr[SpendTransaction] = {
       val spendTransactionCurrencyAddress = spendTransaction.currencyId.map(_.value)
       val spendTransactionCurrencyBalances = allBalances.getOrElse(spendTransactionCurrencyAddress, SortedMap.empty[Address, Balance])
       val currencyIdBalance = spendTransactionCurrencyBalances.getOrElse(currencyId, Balance.empty)
 
-      checkBalanceAndSource(spendTransaction, currencyIdBalance, currencyId)
+      checkBalanceAndSource(spendTransaction, currencyIdBalance, currencyId, reservations)
     }
 
     // -----------------------------------------------------------------------------------------
@@ -435,7 +491,8 @@ object SpendActionValidator {
       spendTransaction: SpendTransaction,
       targetMg: Address,
       targetShard: io.constellationnetwork.schema.sharding.ShardId,
-      currencyId: Address
+      currencyId: Address,
+      reservations: BalanceReservations
     ): F[SpendActionValidationErrorOr[SpendTransaction]] = {
       // Cross-shard Balances lookup: ask shard Y to prove the Balance for `currencyId` under the
       // Balances partition of metagraph M_y. (The `currencyId` here is the validator's current
@@ -466,14 +523,14 @@ object SpendActionValidator {
           // Proof of non-membership → balance is 0 (absent key in the Balances partition is
           // semantically the empty balance, matching the same-shard `getOrElse(_, Balance.empty)`).
           // The overlay still applies (a marker may CREDIT `currencyId` even with a 0 attested base).
-          checkBalanceAndSource(spendTransaction, effectiveBalanceFor(Balance.empty), currencyId).pure[F]
+          checkBalanceAndSource(spendTransaction, effectiveBalanceFor(Balance.empty), currencyId, reservations).pure[F]
 
         case Some((Some(valueBytes), _)) =>
           decodeCrossShardBalance(valueBytes) match {
             case Left(err) =>
               (err: SpendActionValidationError).invalidNec[SpendTransaction].pure[F]
             case Right(balance) =>
-              checkBalanceAndSource(spendTransaction, effectiveBalanceFor(balance), currencyId).pure[F]
+              checkBalanceAndSource(spendTransaction, effectiveBalanceFor(balance), currencyId, reservations).pure[F]
           }
       }
     }
@@ -517,11 +574,16 @@ object SpendActionValidator {
     private def checkBalanceAndSource(
       spendTransaction: SpendTransaction,
       currencyIdBalance: Balance,
-      currencyId: Address
-    ): SpendActionValidationErrorOr[SpendTransaction] =
-      if (spendTransaction.amount.value.value > currencyIdBalance.value.value)
+      currencyId: Address,
+      reservations: BalanceReservations
+    ): SpendActionValidationErrorOr[SpendTransaction] = {
+      val reserved = reservations.getOrElse(balanceReservationKey(spendTransaction, currencyId), BigInt(0))
+      val available = BigInt(currencyIdBalance.value.value) - reserved
+
+      if (BigInt(spendTransaction.amount.value.value) > available)
         NotEnoughCurrencyIdBalance(
-          s"Spend amount: ${spendTransaction.amount} greater than currencyId balance: $currencyIdBalance"
+          s"Spend amount: ${spendTransaction.amount} greater than available currencyId balance: $available " +
+            s"(balance: $currencyIdBalance, reserved: $reserved)"
         ).invalidNec[SpendTransaction]
       else if (spendTransaction.source =!= currencyId)
         InvalidSourceAddress(
@@ -529,6 +591,7 @@ object SpendActionValidator {
         ).invalidNec[SpendTransaction]
       else
         spendTransaction.validNec[SpendActionValidationError]
+    }
 
     // -----------------------------------------------------------------------------------------
     // Cross-shard decode helpers (Circe-based — the proven value bytes carry the canonical wire

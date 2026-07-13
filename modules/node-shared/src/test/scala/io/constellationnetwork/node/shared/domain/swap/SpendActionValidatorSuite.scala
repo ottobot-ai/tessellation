@@ -5,7 +5,7 @@ import cats.effect.IO
 import cats.effect.kernel.Resource
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.{ListMap, SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
@@ -523,6 +523,181 @@ object SpendActionValidatorSuite extends MutableIOSuite {
         rejectedSpendActions(ammAddress).head._2 === List(
           AllowSpendNotFound(s"Allow spend ${Hash.empty} not found in currency active allow spends")
         )
+      )
+  }
+
+  test("rejects one SpendAction whose cumulative no-ref debits exceed the available balance") { res =>
+    implicit val (_, hs, sp) = res
+
+    val validator = SpendActionValidator.make[IO]
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      firstDestinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      secondDestinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      firstSpend = SpendTransaction(
+        none,
+        none,
+        SwapAmount(60L),
+        source,
+        firstDestinationKey.getPublic.toAddress
+      )
+      secondSpend = SpendTransaction(
+        none,
+        none,
+        SwapAmount(60L),
+        source,
+        secondDestinationKey.getPublic.toAddress
+      )
+      action = SpendAction(NonEmptyList.of(firstSpend, secondSpend))
+      balances = Map(none[Address] -> SortedMap(source -> Balance(NonNegLong(100L))))
+      (accepted, rejected) <- validator.validateReturningAcceptedAndRejected(
+        Map(source -> List(action)),
+        SortedMap.empty,
+        balances
+      )
+    } yield
+      expect.all(
+        accepted.isEmpty,
+        rejected.get(source).exists(_.map(_._1) === List(action)),
+        rejected
+          .get(source)
+          .exists(_.flatMap(_._2).exists {
+            case NotEnoughCurrencyIdBalance(_) => true
+            case _                             => false
+          })
+      )
+  }
+
+  test("accepts only the ordered prefix when two SpendActions cumulatively overspend") { res =>
+    implicit val (_, hs, sp) = res
+
+    val validator = SpendActionValidator.make[IO]
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      firstDestinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      secondDestinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      firstAction = SpendAction(
+        NonEmptyList.one(
+          SpendTransaction(none, none, SwapAmount(60L), source, firstDestinationKey.getPublic.toAddress)
+        )
+      )
+      secondAction = SpendAction(
+        NonEmptyList.one(
+          SpendTransaction(none, none, SwapAmount(60L), source, secondDestinationKey.getPublic.toAddress)
+        )
+      )
+      balances = Map(none[Address] -> SortedMap(source -> Balance(NonNegLong(100L))))
+      forward <- validator.validateReturningAcceptedAndRejected(
+        Map(source -> List(firstAction, secondAction)),
+        SortedMap.empty,
+        balances
+      )
+      reversed <- validator.validateReturningAcceptedAndRejected(
+        Map(source -> List(secondAction, firstAction)),
+        SortedMap.empty,
+        balances
+      )
+    } yield
+      expect.all(
+        forward._1.get(source).contains(List(firstAction)),
+        forward._2.get(source).exists(_.map(_._1) === List(secondAction)),
+        reversed._1.get(source).contains(List(secondAction)),
+        reversed._2.get(source).exists(_.map(_._1) === List(firstAction))
+      )
+  }
+
+  test("does not retain provisional reservations from a rejected SpendAction") { res =>
+    implicit val (_, hs, sp) = res
+
+    val validator = SpendActionValidator.make[IO]
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      destination = destinationKey.getPublic.toAddress
+      acceptedPrefix = SpendAction(
+        NonEmptyList.one(SpendTransaction(none, none, SwapAmount(30L), source, destination))
+      )
+      rejectedAction = SpendAction(
+        NonEmptyList.of(
+          SpendTransaction(none, none, SwapAmount(40L), source, destination),
+          SpendTransaction(none, none, SwapAmount(40L), source, destination)
+        )
+      )
+      acceptedAction = SpendAction(
+        NonEmptyList.one(SpendTransaction(none, none, SwapAmount(70L), source, destination))
+      )
+      balances = Map(none[Address] -> SortedMap(source -> Balance(NonNegLong(100L))))
+      (accepted, rejected) <- validator.validateReturningAcceptedAndRejected(
+        Map(source -> List(acceptedPrefix, rejectedAction, acceptedAction)),
+        SortedMap.empty,
+        balances
+      )
+    } yield
+      expect.all(
+        accepted.get(source).contains(List(acceptedPrefix, acceptedAction)),
+        rejected.get(source).exists(_.map(_._1) === List(rejectedAction))
+      )
+  }
+
+  test("normalizes outer Map iteration order before applying reservations") { res =>
+    implicit val (_, hs, sp) = res
+
+    val validator = SpendActionValidator.make[IO]
+
+    for {
+      firstSourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      secondSourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      firstSource = firstSourceKey.getPublic.toAddress
+      secondSource = secondSourceKey.getPublic.toAddress
+      destination = destinationKey.getPublic.toAddress
+      firstAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(60L), firstSource, destination)))
+      secondAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(60L), secondSource, destination)))
+      balances = Map(
+        none[Address] -> SortedMap(
+          firstSource -> Balance(NonNegLong(100L)),
+          secondSource -> Balance(NonNegLong(100L))
+        )
+      )
+      forward <- validator.validateReturningAcceptedAndRejected(
+        ListMap(firstSource -> List(firstAction), secondSource -> List(secondAction)),
+        SortedMap.empty,
+        balances
+      )
+      reversed <- validator.validateReturningAcceptedAndRejected(
+        ListMap(secondSource -> List(secondAction), firstSource -> List(firstAction)),
+        SortedMap.empty,
+        balances
+      )
+    } yield expect(forward === reversed)
+  }
+
+  test("reserves no-ref self-destination spends because balance application debits them") { res =>
+    implicit val (_, hs, sp) = res
+
+    val validator = SpendActionValidator.make[IO]
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      firstAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(60L), source, source)))
+      secondAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(60L), source, source)))
+      balances = Map(none[Address] -> SortedMap(source -> Balance(NonNegLong(100L))))
+      (accepted, rejected) <- validator.validateReturningAcceptedAndRejected(
+        Map(source -> List(firstAction, secondAction)),
+        SortedMap.empty,
+        balances
+      )
+    } yield
+      expect.all(
+        accepted.get(source).contains(List(firstAction)),
+        rejected.get(source).exists(_.map(_._1) === List(secondAction))
       )
   }
 }
