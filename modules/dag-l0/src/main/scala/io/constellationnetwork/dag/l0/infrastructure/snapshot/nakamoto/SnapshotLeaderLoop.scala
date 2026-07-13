@@ -77,18 +77,20 @@ object SharedEpochState {
   }
 }
 
-/** Pure attestation-based Nakamoto consensus loop.
+/** Nakamoto/Taktikos global consensus loop.
   *
   * Replaces the entire BFT round system (Facility → Proposal → Signature → Finished). No multi-party coordination. No rounds. No
   * facilitators.
   *
   * Flow:
-  *   1. Every 1s slot tick → evaluate VRF eligibility via LDD snowplow 2. On win → drain mempool → call createProposalArtifact → sign →
-  *      store → publish via sidecar 3. Other validators receive via GossipSub → validate → broadcast TipAttestation 4. TipTracker
-  *      accumulates attestation weight → ≥ 2/3+1 = finalized
+  *   1. Every slot tick evaluates VRF eligibility via the LDD snowplow. 2. A winner drains the mempool, executes and validates the
+  *      proposal, signs, stores, and publishes it. 3. Other validators receive it through GossipSub, independently validate it, and publish
+  *      exact-hash attestations. 4. The target FinalityGate makes a canonical exact hash operational after a portable K/alpha/beta
+  *      decided-attestation result or canonical k1 depth. This is an optimistic finality gadget over Nakamoto fork choice, not a BFT
+  *      vote/lock/QC.
   *
-  * The `activePoolSize` and `activePoolHash` are embedded in the SlotCertificate so verifiers know what "2/3+1" means for that snapshot
-  * without needing global state.
+  * The current live optimistic sink is transitional and remains audit-open; sender-carried `activePoolSize`/`activePoolHash` are not
+  * authoritative membership or finality denominators.
   */
 object SnapshotLeaderLoop {
 
