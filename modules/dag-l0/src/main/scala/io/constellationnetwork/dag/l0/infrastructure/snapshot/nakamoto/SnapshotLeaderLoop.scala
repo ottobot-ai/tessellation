@@ -1830,7 +1830,7 @@ object SnapshotLeaderLoop {
                               signed <- Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](artifact, keyPair)
                               snapshotHashedForStorage <- signed.toHashed[F]
                               producedOrdinal = lastKey.value.value + 1
-                              kesGlobalPeriod = EtaCalculation.rotationPeriod(math.max(0L, producedOrdinal - 1L), etaRotationSnapshots)
+                              kesGlobalPeriod = EtaCalculation.globalSnapshotArtifactPeriod(producedOrdinal, etaRotationSnapshots).value
                               snapshotHashBytes = snapshotHashedForStorage.hash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
                               kesSnapAttempt <-
                                 if (

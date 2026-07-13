@@ -2237,8 +2237,11 @@ object GlobalSnapshotConsensus {
           // 1/relativeStake snapshots in expectation. This fiber tightens that window to a single
           // poll interval by proactively burning past periods at each eta boundary.
           //
-          // Period derivation matches `EtaCalculation.rotationPeriod(ordinal, etaRotationSnapshots)`
-          // (snapshot-indexed, not slot-indexed — see attestation-and-finality.md §1). Aligns with
+          // This maintenance target is the period of the NEXT child built on `finalizedOrd`, not the period of
+          // the already-finalized artifact. Therefore the finalized ordinal is intentionally treated as a parent
+          // ordinal here. Snapshot sign/verify paths use `globalSnapshotArtifactPeriod(childOrdinal, R)` instead.
+          // Both expressions agree for that next child: `artifactPeriod(finalizedOrd + 1) = rotationPeriod(finalizedOrd)`.
+          // The cadence is snapshot-indexed, not slot-indexed. Aligns with
           // [[project_consensus_epoch_staggering]]'s "KES periods aligned with eta cadence" rule.
           //
           // GL0 has no in-memory fallback: the key maker above is backed by the mandatory secure

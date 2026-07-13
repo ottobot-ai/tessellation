@@ -17,6 +17,31 @@ object EtaCalculationSuite extends SimpleIOSuite {
     )
   }
 
+  pureTest("global snapshot artifact period follows the predecessor at R-1, R, and R+1") {
+    val boundary = etaRotation
+    expect.all(
+      EtaCalculation.globalSnapshotArtifactPeriod(boundary - 1L, boundary) ==
+        io.constellationnetwork.schema.nakamoto.EtaPeriod.Zero,
+      EtaCalculation.globalSnapshotArtifactPeriod(boundary, boundary) ==
+        io.constellationnetwork.schema.nakamoto.EtaPeriod.Zero,
+      EtaCalculation.globalSnapshotArtifactPeriod(boundary + 1L, boundary) ==
+        io.constellationnetwork.schema.nakamoto.EtaPeriod(1L),
+      EtaCalculation.globalSnapshotArtifactPeriod(0L, boundary) ==
+        io.constellationnetwork.schema.nakamoto.EtaPeriod.Zero
+    )
+  }
+
+  pureTest("parent-indexed KES maintenance prepares the same period as its next child") {
+    def maintenancePeriod(parentOrdinal: Long) =
+      io.constellationnetwork.schema.nakamoto.EtaPeriod(EtaCalculation.rotationPeriod(parentOrdinal, etaRotation))
+
+    expect.all(
+      EtaCalculation.globalSnapshotArtifactPeriod(etaRotation, etaRotation) == maintenancePeriod(etaRotation - 1L),
+      EtaCalculation.globalSnapshotArtifactPeriod(etaRotation + 1L, etaRotation) == maintenancePeriod(etaRotation),
+      EtaCalculation.globalSnapshotArtifactPeriod(etaRotation + 2L, etaRotation) == maintenancePeriod(etaRotation + 1L)
+    )
+  }
+
   pureTest("leader stake lookback is derived from the exact parent ordinal") {
     expect.all(
       EtaCalculation.leaderStakeLookbackPeriod(0L, etaRotation) == io.constellationnetwork.schema.nakamoto.EtaPeriod(-2L),

@@ -135,7 +135,7 @@ object NakamotoSnapshotValidator {
     val producerHex = Hex(producerIdBytes.map("%02x".format(_)).mkString)
     val producerId = PeerId(producerHex)
     val parentOrdinal = math.max(0L, signedSnapshot.ordinal.value.value - 1L)
-    val artifactPeriod = EtaPeriod(EtaCalculation.rotationPeriod(parentOrdinal, etaRotationSnapshots))
+    val artifactPeriod = EtaCalculation.globalSnapshotArtifactPeriod(signedSnapshot.ordinal.value.value, etaRotationSnapshots)
     val stakeLookbackPeriod: EtaPeriod = EtaCalculation.leaderStakeLookbackPeriod(parentOrdinal, etaRotationSnapshots)
 
     for {

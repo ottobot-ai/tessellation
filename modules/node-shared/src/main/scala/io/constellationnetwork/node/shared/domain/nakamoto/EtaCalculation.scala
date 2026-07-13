@@ -33,6 +33,19 @@ object EtaCalculation {
   def rotationPeriod(ordinal: Long, etaRotationSnapshots: Long): Long =
     ordinal / etaRotationSnapshots
 
+  /** Eta/KES period of a signed GL0 snapshot artifact.
+    *
+    * A child snapshot is produced from, and proves eligibility against, its predecessor. Therefore child ordinal `N` uses the rotation
+    * period of parent ordinal `max(0, N - 1)`. The saturating genesis rule makes ordinals 0 and 1 both period-zero artifacts and avoids
+    * underflow at genesis. In particular, for period length `R`, child `R` remains in period 0 and child `R + 1` is the first period-1
+    * artifact.
+    *
+    * This helper is only for GL0 snapshot artifacts and attestations over them. A Phase-2 anchor's execution-shard epoch and a
+    * registration's inclusion period have distinct ordinal semantics and must not call this helper.
+    */
+  def globalSnapshotArtifactPeriod(snapshotOrdinal: Long, etaRotationSnapshots: Long): EtaPeriod =
+    EtaPeriod(rotationPeriod(if (snapshotOrdinal <= 0L) 0L else snapshotOrdinal - 1L, etaRotationSnapshots))
+
   /** Canonical N-2 stake-distribution period for a GL0 child of `parentOrdinal`.
     *
     * Production and verification must call this same function. Using current/live stake in verification while production uses this lookback

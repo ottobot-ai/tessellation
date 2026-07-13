@@ -7,7 +7,7 @@ import cats.Monad
 import cats.effect.kernel.Sync
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.{ActiveOperatorConsensusKeys, OperatorConsensusKeyRegistry}
+import io.constellationnetwork.node.shared.domain.nakamoto.{ActiveOperatorConsensusKeys, EtaCalculation, OperatorConsensusKeyRegistry}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.RatioInstances._
 import io.constellationnetwork.numerics.algebras.{Exp, Log1p}
@@ -202,7 +202,7 @@ object TowerVerifier {
       header: TowerProofHeader,
       etaRotationSnapshots: Long
     ): F[Either[ProofError, Array[Byte]]] = {
-      val artifactPeriod = io.constellationnetwork.schema.nakamoto.EtaPeriod(header.ordinal.value.value / etaRotationSnapshots)
+      val artifactPeriod = EtaCalculation.globalSnapshotArtifactPeriod(header.ordinal.value.value, etaRotationSnapshots)
       ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, header.producerId, artifactPeriod).map {
         case Some(registeredPair)
             if registeredPair.vrfPublicKey.toBytes.length == VrfPublicKey.ExpectedLength &&
@@ -351,7 +351,7 @@ object TowerVerifier {
     /** Eta-rotation consistency: within a single rotation period, every header must carry the same eta. */
     private def checkEtaChain(proof: TowerProof, etaRotationSnapshots: Long): Either[ProofError, Unit] =
       proof.level0Suffix
-        .groupBy(h => h.ordinal.value.value / etaRotationSnapshots)
+        .groupBy(h => EtaCalculation.globalSnapshotArtifactPeriod(h.ordinal.value.value, etaRotationSnapshots))
         .toList
         .foldLeft[Either[ProofError, Unit]](Right(())) {
           case (Right(()), (_, headersInPeriod)) =>

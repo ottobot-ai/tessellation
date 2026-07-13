@@ -1372,8 +1372,8 @@ object NakamotoSyncDaemon {
       // at every R boundary. Combined with the Cardano/Praos bootstrap (periods 0 and 1 =
       // bootstrapEta, no VRF fold), the first rotation no longer depends on period-0 outputs
       // at all. See `docs/nakamoto/attestation-and-finality.md` §1.
-      currentPeriod = EtaCalculation.rotationPeriod(math.max(0L, snap.ordinal - 1), etaRotationSnapshots)
-      artifactPeriod = io.constellationnetwork.schema.nakamoto.EtaPeriod(currentPeriod)
+      artifactPeriod = EtaCalculation.globalSnapshotArtifactPeriod(snap.ordinal, etaRotationSnapshots)
+      currentPeriod = artifactPeriod.value
       producerId = peer.PeerId(Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString))
       operatorKeys <-
         if (!metadataBound)
@@ -1952,12 +1952,7 @@ object NakamotoSyncDaemon {
                     .resolve(
                       operatorKeyRegistry,
                       attesterId,
-                      io.constellationnetwork.schema.nakamoto.EtaPeriod(
-                        EtaCalculation.rotationPeriod(
-                          math.max(0L, decoded.domain.tipOrdinal - 1L),
-                          etaRotationSnapshots
-                        )
-                      )
+                      EtaCalculation.globalSnapshotArtifactPeriod(decoded.domain.tipOrdinal, etaRotationSnapshots)
                     )
                     .flatMap {
                       case None =>
@@ -3088,7 +3083,7 @@ object NakamotoSyncDaemon {
   ): F[Unit] = {
     val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)
     val identityMatches = peer.PeerId.fromPublic(keyPair.getPublic) === selfId
-    val globalPeriod = EtaCalculation.rotationPeriod(math.max(0L, tipOrdinal - 1L), etaRotationSnapshots)
+    val globalPeriod = EtaCalculation.globalSnapshotArtifactPeriod(tipOrdinal, etaRotationSnapshots).value
 
     if (!identityMatches)
       logger.warn(

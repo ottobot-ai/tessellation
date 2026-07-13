@@ -506,6 +506,26 @@ object TowerVerifierSuite extends MutableIOSuite {
     }
   }
 
+  test("tower eta buckets match global snapshot artifact periods at R-1, R, and R+1") { verifier =>
+    val suffix = Vector(
+      verifier.header(etaRotationSnapshots - 1L, 5L, 4L, eta = etaHash(0)),
+      verifier.header(etaRotationSnapshots, 10L, 9L, eta = etaHash(0)),
+      verifier.header(etaRotationSnapshots + 1L, 15L, 14L, eta = etaHash(1))
+    )
+    val proof = TowerProof(
+      since = ord(etaRotationSnapshots - 2L),
+      tipOrdinal = ord(etaRotationSnapshots + 1L),
+      level0Suffix = suffix,
+      levelChains = Map.empty
+    )
+
+    verifier.verify(proof, genesisEta, etaRotationSnapshots, LddConfigFixture.production).map { result =>
+      expect(
+        result == Left(ProofError.HistoricalEligibilityUnavailable(ord(etaRotationSnapshots - 1L), verifier.registeredProducer))
+      )
+    }
+  }
+
   // ============== Adversarial S4.5 ==============
 
   test("S4.5 — garbage level (chain of headers with no actual L7 hits) → reject") { verifier =>

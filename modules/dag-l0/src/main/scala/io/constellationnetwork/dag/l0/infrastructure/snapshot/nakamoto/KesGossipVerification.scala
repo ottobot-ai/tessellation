@@ -63,7 +63,7 @@ object KesGossipVerification {
     etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Boolean] = {
-    val artifactPeriod = EtaPeriod(EtaCalculation.rotationPeriod(math.max(0L, tipOrdinal - 1L), etaRotationSnapshots))
+    val artifactPeriod = EtaCalculation.globalSnapshotArtifactPeriod(tipOrdinal, etaRotationSnapshots)
     verifyForArtifact(
       messageBytes,
       kesSigBytes,
@@ -115,7 +115,7 @@ object KesGossipVerification {
     etaRotationSnapshots: Long,
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Boolean] = {
-    val artifactPeriod = EtaPeriod(EtaCalculation.rotationPeriod(math.max(0L, ordinal - 1L), etaRotationSnapshots))
+    val artifactPeriod = EtaCalculation.globalSnapshotArtifactPeriod(ordinal, etaRotationSnapshots)
     verifyForArtifact(
       messageBytes,
       kesSigBytes,
