@@ -54,7 +54,8 @@ import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
   */
 trait InvalidStateProofValidator[F[_]] {
 
-  /** Validate an [[InvalidStateProofEvidence]] under the node's finalized chain state.
+  /** Validate an [[InvalidStateProofEvidence]] against the reader installed at construction. This entry point is for non-authoritative
+    * staging and isolated tests. Consensus acceptance must call [[validateAgainst]] with its exact proposal-parent reader.
     *
     * @param evidence
     *   the candidate invalid-state-proof.
@@ -65,6 +66,15 @@ trait InvalidStateProofValidator[F[_]] {
     *   slash).
     */
   def validate(evidence: InvalidStateProofEvidence): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]]
+
+  /** Validate against an explicitly supplied slash-ledger view. Consensus acceptance must pass the immutable reader bound to the exact
+    * proposal parent; this prevents a construction-time finalized reader (appropriate for daemon staging) from deciding an authoritative
+    * branch transition.
+    */
+  def validateAgainst(
+    evidence: InvalidStateProofEvidence,
+    slashedReader: InvalidStateProofSlashedReader[F]
+  ): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]]
 }
 
 object InvalidStateProofValidator {
@@ -77,7 +87,8 @@ object InvalidStateProofValidator {
     *   exact `perMetagraphMptRoots` (PIN-1) encoding and byte-comparable against the committee-attested value. Production wiring passes the
     *   identical instance constructed in `SharedServices`/`GlobalSnapshotConsensus`.
     * @param slashedReader
-    *   the double-slash MPT guard, keyed on `(shardId, disputedCheckpointHash)`. Production callers must bind the exact rooted state view;
+    *   the default double-slash MPT guard, keyed on `(shardId, disputedCheckpointHash)`. Daemon staging may bind finalized state here;
+    *   authoritative acceptance supplies its exact rooted proposal-parent view to [[InvalidStateProofValidator.validateAgainst]].
     *   `InvalidStateProofSlashedReader.neverSlashed` is only for isolated tests.
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
@@ -89,7 +100,13 @@ object InvalidStateProofValidator {
     verifyExecutionCertificate: ShardCheckpoint => F[Either[String, Unit]]
   ): InvalidStateProofValidator[F] = new InvalidStateProofValidator[F] {
 
-    def validate(evidence: InvalidStateProofEvidence): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]] = {
+    def validate(evidence: InvalidStateProofEvidence): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]] =
+      validateAgainst(evidence, slashedReader)
+
+    def validateAgainst(
+      evidence: InvalidStateProofEvidence,
+      exactSlashedReader: InvalidStateProofSlashedReader[F]
+    ): F[Either[InvalidStateProofRejection, InvalidStateProofEvidence]] = {
       val cp: ShardCheckpoint = evidence.disputedCheckpoint
       val fp = evidence.fraudProof
       val mg = evidence.metagraphAddress
@@ -148,7 +165,7 @@ object InvalidStateProofValidator {
 
       // Step 7 — double-slash guard: (shardId, disputedCheckpointHash) not already slashed.
       def step7: F[Either[InvalidStateProofRejection, Unit]] =
-        slashedReader.wasSlashed(evidence.shardId, fp.disputedCheckpointHash).map {
+        exactSlashedReader.wasSlashed(evidence.shardId, fp.disputedCheckpointHash).map {
           case true  => Left(InvalidStateProofRejection.AlreadySlashed(evidence.shardId, fp.disputedCheckpointHash))
           case false => Right(())
         }

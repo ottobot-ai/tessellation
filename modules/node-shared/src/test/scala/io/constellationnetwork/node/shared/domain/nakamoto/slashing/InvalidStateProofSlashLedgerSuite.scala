@@ -9,6 +9,8 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.InvalidStateProofSlashingConfig
+import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.{SlashReason, SlashedRegistryEntry}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.GlobalSnapshotAcceptanceManager.{
   WatchtowerSlashRequest,
@@ -220,6 +222,39 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
     )
   }
 
+  pureTest("applyWatchtowerSlashes coalesces one checkpoint key independent of duplicate request order") {
+    val lowSubmitter = Address.fromBytes("a-submit".getBytes("UTF-8"))
+    val highSubmitter = Address.fromBytes("z-submit".getBytes("UTF-8"))
+    val low = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(lowSubmitter))
+    val high = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(highSubmitter))
+    val lowHigh = applyWatchtowerSlashes(List(low, high), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
+    val highLow = applyWatchtowerSlashes(List(high, low), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
+    val canonicalSubmitter = SortedSet(lowSubmitter, highSubmitter).head
+
+    expect.all(
+      lowHigh == highLow,
+      lowHigh.registryEntries.size == 1,
+      lowHigh.bountyBalanceDelta.keySet == Set(canonicalSubmitter),
+      lowHigh.totalBurned == highLow.totalBurned
+    )
+  }
+
+  pureTest("self-detected duplicate preserves burn-all policy independent of request order") {
+    val submitter = Address.fromBytes("watchtower".getBytes("UTF-8"))
+    val selfDetected = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = None)
+    val carried = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(submitter))
+    val selfFirst = applyWatchtowerSlashes(List(selfDetected, carried), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
+    val carriedFirst =
+      applyWatchtowerSlashes(List(carried, selfDetected), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
+
+    expect.all(
+      selfFirst == carriedFirst,
+      selfFirst.registryEntries.size == 1,
+      selfFirst.bountyBalanceDelta.isEmpty,
+      selfFirst.totalBurned > 0L
+    )
+  }
+
   // ---- MPT write + read-back ----------------------------------------------------------------------------------------------------------
 
   private def mkStore(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[MptStore[IO, GlobalStateKey]] =
@@ -264,5 +299,31 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       reader = InvalidStateProofSlashedReader.fromMptStore[IO](store)
       r <- reader.wasSlashed(shardZero, cpA)
     } yield expect(!r)
+  }
+
+  test("fromGlobalStateReader sees a slash committed only in the exact proposal-parent branch") { res =>
+    implicit val (h, _, js) = res
+    implicit val codec: io.constellationnetwork.serde.ImmutableCodec[SlashedRegistryEntry] =
+      InvalidStateProofSlashedReader.entryCodec
+    val child = BranchId(Hash("c" * 64))
+    for {
+      store <- mkStore
+      parentChildTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        underlying = store,
+        pcTree = parentChildTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      handle <- overlay.checkout(BranchId.base)
+      acceptanceMpt = AcceptanceMpt.fromOverlay[IO](overlay, BranchId.base, handle)
+      key <- GlobalStateKey.slashingsKey[IO](offender, shardZero, cpA)
+      _ <- acceptanceMpt.insert[SlashedRegistryEntry](key, sampleEntry)
+      _ <- overlay.commit(handle, child, ord)
+      baseResult <- InvalidStateProofSlashedReader.fromMptStore[IO](store).wasSlashed(shardZero, cpA)
+      exactParentReader = GlobalStateReader.fromOverlay[IO](overlay, child)
+      parentResult <- InvalidStateProofSlashedReader.fromGlobalStateReader[IO](exactParentReader).wasSlashed(shardZero, cpA)
+    } yield expect.all(!baseResult, parentResult)
   }
 }

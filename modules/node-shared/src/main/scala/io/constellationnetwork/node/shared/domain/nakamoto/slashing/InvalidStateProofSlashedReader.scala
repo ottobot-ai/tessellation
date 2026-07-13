@@ -5,6 +5,7 @@ import java.nio.charset.StandardCharsets
 import cats.effect.Sync
 import cats.syntax.all._
 
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.SlashedRegistryEntry
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.sharding.ShardId
@@ -20,14 +21,13 @@ import scodec.bits.ByteVector
   * checkpoint identity `(shardId, disputedCheckpointHash)` instead of the metagraph-equivocation triple.
   *
   * '''Why a typed reader, not direct MPT access.''' Keeps the verdict ([[InvalidStateProofValidator]]) testable against a stub before the
-  * GSAM `Slashings/` MPT partition is wired, exactly as `SlashedSeenReader` does for [[SlashableEvidenceValidator]]. The concrete impl
-  * ([[InvalidStateProofSlashedReader.fromMptStore]]) reads the [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.Slashings]]
-  * partition (fieldId 34) written by the GSAM accept path when an invalid-state-proof is upheld.
+  * GSAM `Slashings/` MPT partition is wired, exactly as `SlashedSeenReader` does for [[SlashableEvidenceValidator]]. The concrete reader
+  * scans the [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.Slashings]] partition (fieldId 34) written by the GSAM accept path
+  * when an invalid-state-proof is upheld.
   *
   * '''Honest-node byte-equivalence (slashing safety bar).''' `wasSlashed` MUST be deterministic over the chosen branch view — every honest
-  * node reading the same finalized MPT bytes returns the same answer, so the verdict is cluster-uniform. The concrete impl reads the
-  * FINALIZED base store; the validator's caller-contract gates the dispute to land below depth-k₁, where the base `S(N)` is
-  * cluster-uniform.
+  * node reading the same exact proposal-parent MPT bytes returns the same answer, so the verdict is cluster-uniform. Authoritative
+  * acceptance must never substitute an ambient best tip or an older finalized base for that immutable parent view.
   */
 trait InvalidStateProofSlashedReader[F[_]] {
 
@@ -67,29 +67,37 @@ object InvalidStateProofSlashedReader {
           .leftMap(e => io.constellationnetwork.serde.SerdeError.ScodecFailure(e.getMessage))
     }
 
-  /** Production reader backed by the global MPT store. Prefix-scans the [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.Slashings]]
+  /** Reader backed by an explicit global-state view. Prefix-scans the [[io.constellationnetwork.schema.mpt.GlobalStateFieldId.Slashings]]
     * partition and upholds the double-slash guard iff ANY record matches `(shardId, disputedCheckpointHash)`.
     *
-    * '''Determinism.''' The scan reads the store's canonical byte map and decodes each value via [[entryCodec]]; the membership test is a
-    * pure predicate over the decoded records. Two honest nodes over the same finalized MPT bytes return the same answer. The partition is
-    * tiny (≤ `numShards × committeeSize` per slashed checkpoint, slashes rare), so the full scan is cheap — and it serves BOTH the
-    * double-slash dedup here and a future per-operator cooldown gate from the same single partition (the value carries `peerId` +
+    * '''Determinism.''' The scan reads the view's canonical byte map and decodes each value via [[entryCodec]]; the membership test is a
+    * pure predicate over the decoded records. Two honest nodes over the same proposal-parent MPT bytes return the same answer. The
+    * partition is tiny (≤ `numShards × committeeSize` per slashed checkpoint, slashes rare), so the full scan is cheap — and it serves BOTH
+    * the double-slash dedup here and a future per-operator cooldown gate from the same single partition (the value carries `peerId` +
     * `cooldownUntilEpoch`).
     *
-    * Reads the FINALIZED base store (not a branch-aware view): the double-slash decision is only consulted for disputes gated below
-    * depth-k₁, where the base is cluster-uniform (see the validator scaladoc), so reading the base is the correct, byte-equivalent source.
+    * Authoritative GSAM validation passes its immutable exact proposal-parent `AcceptanceMpt` reader. Daemon staging may pass a finalized
+    * reader because staging does not mutate consensus state; GSAM revalidates before applying a slash.
     */
-  def fromMptStore[F[_]: Sync: Hasher](
-    mptStore: MptStore[F, GlobalStateKey]
+  def fromGlobalStateReader[F[_]: Sync: Hasher](
+    reader: GlobalStateReader[F]
   ): InvalidStateProofSlashedReader[F] =
     new InvalidStateProofSlashedReader[F] {
       private implicit val codec: io.constellationnetwork.serde.ImmutableCodec[SlashedRegistryEntry] = entryCodec
 
       def wasSlashed(shardId: ShardId, disputedCheckpointHash: Hash): F[Boolean] =
         GlobalStateKey.slashingsFieldPrefix[F].flatMap { prefix =>
-          mptStore.getAllForPrefix[SlashedRegistryEntry](prefix).map { entries =>
+          reader.getAllForPrefix[SlashedRegistryEntry](prefix).map { entries =>
             entries.valuesIterator.exists(e => e.shardId === shardId && e.disputedCheckpointHash === disputedCheckpointHash)
           }
         }
     }
+
+  /** Stable finalized-base adapter. Appropriate for non-authoritative staging and read paths; consensus acceptance must use
+    * [[fromGlobalStateReader]] with its exact proposal-parent reader.
+    */
+  def fromMptStore[F[_]: Sync: Hasher](
+    mptStore: MptStore[F, GlobalStateKey]
+  ): InvalidStateProofSlashedReader[F] =
+    fromGlobalStateReader(GlobalStateReader.fromMptStore(mptStore))
 }

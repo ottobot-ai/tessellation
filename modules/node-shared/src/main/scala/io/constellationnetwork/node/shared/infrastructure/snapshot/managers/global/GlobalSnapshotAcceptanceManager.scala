@@ -360,9 +360,27 @@ object GlobalSnapshotAcceptanceManager {
   ): WatchtowerSlashApplication =
     if (requests.isEmpty)
       WatchtowerSlashApplication(priorDelegatedStakes, priorNodeCollaterals, Nil, SortedMap.empty[Address, Balance], 0L)
-    else
-      requests
-        .sortBy(r => (r.shardId.value.value, r.disputedCheckpointHash.value))
+    else {
+      // A checkpoint is slashable once per `(shardId, checkpointHash)`, even when local replay and one or more carried fraud proofs surface
+      // the same dispute in this ordinal. Coalesce before the economic fold so input list order cannot decide which duplicate receives a
+      // bounty. Signers are unioned canonically. A self-detected request keeps the existing burn-all policy; otherwise the lowest ordered
+      // authenticated submitter receives the single bounty.
+      val canonicalRequests = requests
+        .groupBy(r => (r.shardId.value.value, r.disputedCheckpointHash.value))
+        .toList
+        .sortBy(_._1)
+        .map {
+          case (_, duplicates) =>
+            val representative = duplicates.head
+            representative.copy(
+              slashSigners = duplicates.flatMap(_.slashSigners).distinct.sortBy(_.value.value),
+              submitter =
+                if (duplicates.exists(_.submitter.isEmpty)) None
+                else duplicates.flatMap(_.submitter).sorted.headOption
+            )
+        }
+
+      canonicalRequests
         .foldLeft(
           WatchtowerSlashApplication(priorDelegatedStakes, priorNodeCollaterals, Nil, SortedMap.empty[Address, Balance], 0L)
         ) { (acc, req) =>
@@ -401,6 +419,7 @@ object GlobalSnapshotAcceptanceManager {
             totalBurned = acc.totalBurned + (res.totalSlashedAmount - creditedThisStep)
           )
         }
+    }
 
   def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer: Metrics](
     fieldsAddedOrdinals: FieldsAddedOrdinals,
@@ -529,10 +548,11 @@ object GlobalSnapshotAcceptanceManager {
     // is re-validated here via the SAME `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed
     // checkpoint's OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger). On UPHELD a `WatchtowerSlashRequest` with
     // `submitter = Some(challengerAddress)` is surfaced into the SAME `applyWatchtowerSlashes` fold the self-detected re-exec path feeds, so
-    // the leader/follower/peer reach a BYTE-IDENTICAL slash (the validator is pure given its inputs + the finalized base it reads). The
-    // production wiring (`GlobalSnapshotConsensus.make`) passes the validator built with the PIN-1 `watchtowerReDerive` closure + a
-    // `Slashings`-partition-backed `InvalidStateProofSlashedReader.fromMptStore` (so an already-slashed checkpoint yields `AlreadySlashed` ⇒
-    // NOT upheld ⇒ no double slash). `None` (cl0/dl1/tests passing no validator) ⇒ carried fraud proofs are ignored ⇒ no slash. The slash is
+    // the leader/follower/peer reach a BYTE-IDENTICAL slash (the validator is pure given its inputs + the exact proposal-parent reader
+    // supplied inside `accept`). The production wiring (`GlobalSnapshotConsensus.make`) passes the validator built with the PIN-1
+    // `watchtowerReDerive` closure; authoritative validation replaces its staging reader with an
+    // `InvalidStateProofSlashedReader.fromGlobalStateReader(mpt)` bound to `parentTip`, so an already-slashed checkpoint yields
+    // `AlreadySlashed` ⇒ NOT upheld ⇒ no double slash. `None` (cl0/dl1/tests passing no validator) ⇒ carried fraud proofs are ignored ⇒ no slash. The slash is
     // additionally gated by `watchtowerEnabled` and is ONLY reachable at `numShards > 1` (no fraud proofs exist at `numShards = 1`), so the
     // `numShards = 1` byte-identical regression bar is preserved independently of this validator.
     invalidStateProofValidator: Option[
@@ -1733,6 +1753,9 @@ object GlobalSnapshotAcceptanceManager {
                 // by construction.)
                 handle <- overlay.checkout(parentTip)
                 mpt = AcceptanceMpt.fromOverlay[F](overlay, parentTip, handle)
+                // The slash-ledger verdict is consensus-load-bearing. Bind it immutably to this proposal's exact parent branch; the
+                // validator's construction-time reader remains available only for non-authoritative daemon staging.
+                proposalParentSlashedReader = InvalidStateProofSlashedReader.fromGlobalStateReader[F](mpt)
                 // Phase J: bind the per-call `parentTip` into the dynamic reader's Ref. The Ref
                 // is shared across accept() calls but `acceptMutex` (above) ensures only one
                 // accept() reads/writes it at a time.
@@ -2041,10 +2064,10 @@ object GlobalSnapshotAcceptanceManager {
                 // deterministic `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed checkpoint's
                 // OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger's claimed roots), and for each UPHELD dispute
                 // surface a `WatchtowerSlashRequest(submitter = Some(challengerAddress))`. Because the validator is a pure function of the
-                // evidence + the finalized base it reads (cluster-uniform below depth-k₁), the leader/follower/peer reach a BYTE-IDENTICAL
+                // evidence + the exact proposal-parent slash ledger, the leader/follower/peer reach a BYTE-IDENTICAL
                 // verdict and thus the byte-identical slash. The honest-committee floor is enforced INSIDE the validator (`DisputeNotUpheld` on
-                // a frivolous/forged proof ⇒ skipped here). The double-slash guard is the validator's step-6 `slashedReader` (production:
-                // `Slashings`-partition-backed) PLUS `applyWatchtowerSlashes`'s per-`(shardId, checkpointHash)` registry dedup within the fold.
+                // a frivolous/forged proof ⇒ skipped here). The double-slash guard is the validator's step-7 exact-parent `slashedReader`
+                // PLUS `applyWatchtowerSlashes`'s per-`(shardId, checkpointHash)` coalescing within the fold.
                 // `submitterId.toAddress` is the deterministic recover-public-key→address of the challenger (the bounty recipient).
                 // BYTE-IDENTITY GATE: explicitly require `numShards > 1` (the SAME gate `adoptShardCheckpoints` uses) so that even a forged
                 // `fraudProofs` artifact injected at `numShards = 1` is a hard no-op — no committees exist there, so no honest dispute is
@@ -2059,7 +2082,7 @@ object GlobalSnapshotAcceptanceManager {
                       // validator binds the carried checkpoint to (step 4).
                       fraudProofs.toList.flatTraverse { evidence =>
                         val checkpointHash = evidence.fraudProof.disputedCheckpointHash
-                        validator.validate(evidence).flatMap {
+                        validator.validateAgainst(evidence, proposalParentSlashedReader).flatMap {
                           case Right(upheld) =>
                             upheld.fraudProof.submitterId.toAddress[F].map { submitterAddr =>
                               List(

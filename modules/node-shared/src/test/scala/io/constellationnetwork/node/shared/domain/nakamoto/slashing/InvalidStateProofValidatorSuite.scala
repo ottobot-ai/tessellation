@@ -353,6 +353,32 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       } yield expect.all(res == Left(InvalidStateProofRejection.AlreadySlashed(shardZero, cpHash)), calls == 0)
   }
 
+  test("authoritative validation uses the exact caller-supplied parent reader, not the validator's staging reader") {
+    case (h0, sp0) =>
+      implicit val h: Hasher[IO] = h0
+      implicit val sp: SecurityProvider[IO] = sp0
+      for {
+        rig <- authenticatedCheckpoint(attested)
+        cp = rig.checkpoint
+        (kp, pid) <- challengerSetup(rig.checkpointSigner)
+        ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
+        cpHash = ev.fraudProof.disputedCheckpointHash
+        replayCalls <- cats.effect.Ref.of[IO, Int](0)
+        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
+          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
+        // The construction-time reader models daemon staging over finalized state. The authoritative GSAM caller has a newer immutable
+        // proposal-parent view in which this checkpoint is already slashed; that exact view must win.
+        validator = makeValidator(
+          reDerive,
+          verifyCertificate = rig.acceptanceManager.verifyExecutionCertificate,
+          slashedReader = InvalidStateProofSlashedReader.neverSlashed[IO]
+        )
+        parentReader = InvalidStateProofSlashedReader.fromSet[IO](Set((shardZero, cpHash)))
+        result <- validator.validateAgainst(ev, parentReader)
+        calls <- replayCalls.get
+      } yield expect.all(result == Left(InvalidStateProofRejection.AlreadySlashed(shardZero, cpHash)), calls == 0)
+  }
+
   test("FAIL-CLOSED: unavailable slash-registry state aborts validation before replay") {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
