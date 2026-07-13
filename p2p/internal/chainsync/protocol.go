@@ -34,25 +34,39 @@ const (
 	MaxMessageSize      = 16 * 1024 * 1024 // 16 MB max per message
 	RequestTimeout      = 30 * time.Second
 	MaxHashesPerRequest = 64
+	MaxPointsPerRequest = 64
 	RateLimitPerPeer    = 10 // requests per minute
 )
+
+const rateLimitWindow = time.Minute
+
+func validateRequestCount(kind string, count, limit int) error {
+	if count > limit {
+		return fmt.Errorf("too many %s: %d > %d", kind, count, limit)
+	}
+	return nil
+}
 
 // Handler manages the ChainSync libp2p protocol. It registers a stream handler
 // on the host for incoming requests and provides methods for outgoing requests.
 type Handler struct {
-	host      host.Host
-	jvmAddr   string
-	jvmConn   *grpc.ClientConn // gRPC connection to JVM's ChainSyncInbound server
-	mu        sync.RWMutex
-	peerFails map[peer.ID]time.Time // blacklist: peer -> unblock time
+	host             host.Host
+	jvmAddr          string
+	jvmConn          *grpc.ClientConn // gRPC connection to JVM's ChainSyncInbound server
+	mu               sync.RWMutex
+	peerFails        map[peer.ID]time.Time // blacklist: peer -> unblock time
+	rateMu           sync.Mutex
+	lastRateCleanup  time.Time
+	peerRequestTimes map[peer.ID][]time.Time
 }
 
 // New creates a ChainSync handler and registers the libp2p stream handler.
 func New(h host.Host, jvmAddr string) (*Handler, error) {
 	handler := &Handler{
-		host:      h,
-		jvmAddr:   jvmAddr,
-		peerFails: make(map[peer.ID]time.Time),
+		host:             h,
+		jvmAddr:          jvmAddr,
+		peerFails:        make(map[peer.ID]time.Time),
+		peerRequestTimes: make(map[peer.ID][]time.Time),
 	}
 
 	// Register stream handler for incoming requests from peers
@@ -95,6 +109,14 @@ func (h *Handler) handleIncoming(s network.Stream) {
 	defer s.Close()
 
 	remotePeer := s.Conn().RemotePeer()
+	if !h.allowIncomingRequest(remotePeer, time.Now()) {
+		fmt.Printf("[chainsync] Rate limit exceeded by %s\n", remotePeer)
+		return
+	}
+	if err := s.SetDeadline(time.Now().Add(RequestTimeout)); err != nil {
+		fmt.Printf("[chainsync] Failed to set stream deadline for %s: %v\n", remotePeer, err)
+		return
+	}
 
 	// Read request type (1 byte). Body is length-prefixed protobuf for most
 	// types; GetPeerTip (0x03) is a bare ping with no body — reading a length
@@ -130,16 +152,58 @@ func (h *Handler) handleIncoming(s network.Stream) {
 	}
 }
 
-func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.ID) {
-	conn := h.ensureJVMConn()
-	if conn == nil {
-		fmt.Printf("[chainsync] No JVM connection, cannot serve snapshots to %s\n", from)
-		return
+func (h *Handler) allowIncomingRequest(from peer.ID, now time.Time) bool {
+	h.rateMu.Lock()
+	defer h.rateMu.Unlock()
+
+	if h.peerRequestTimes == nil || now.Before(h.lastRateCleanup) {
+		h.peerRequestTimes = make(map[peer.ID][]time.Time)
+		h.lastRateCleanup = now
 	}
 
+	cutoff := now.Add(-rateLimitWindow)
+	if h.lastRateCleanup.IsZero() || !now.Before(h.lastRateCleanup.Add(rateLimitWindow)) {
+		for id, requests := range h.peerRequestTimes {
+			requests = requestsWithinWindow(requests, cutoff)
+			if len(requests) == 0 {
+				delete(h.peerRequestTimes, id)
+			} else {
+				h.peerRequestTimes[id] = requests
+			}
+		}
+		h.lastRateCleanup = now
+	}
+
+	requests := requestsWithinWindow(h.peerRequestTimes[from], cutoff)
+	if len(requests) >= RateLimitPerPeer {
+		return false
+	}
+	h.peerRequestTimes[from] = append(requests, now)
+	return true
+}
+
+func requestsWithinWindow(requests []time.Time, cutoff time.Time) []time.Time {
+	firstCurrent := 0
+	for firstCurrent < len(requests) && !requests[firstCurrent].After(cutoff) {
+		firstCurrent++
+	}
+	return requests[firstCurrent:]
+}
+
+func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.ID) {
 	var req pb.ServeSnapshotsRequest
 	if err := proto.Unmarshal(data, &req); err != nil {
 		fmt.Printf("[chainsync] Failed to unmarshal FetchSnapshots from %s: %v\n", from, err)
+		return
+	}
+	if err := validateRequestCount("snapshot hashes", len(req.Hashes), MaxHashesPerRequest); err != nil {
+		fmt.Printf("[chainsync] Rejected FetchSnapshots from %s: %v\n", from, err)
+		return
+	}
+
+	conn := h.ensureJVMConn()
+	if conn == nil {
+		fmt.Printf("[chainsync] No JVM connection, cannot serve snapshots to %s\n", from)
 		return
 	}
 
@@ -171,6 +235,15 @@ func (h *Handler) serveFetchSnapshots(s network.Stream, data []byte, from peer.I
 }
 
 func (h *Handler) serveFindIntersection(s network.Stream, data []byte, from peer.ID) {
+	var req pb.FindIntersectionRequest
+	if err := proto.Unmarshal(data, &req); err != nil {
+		return
+	}
+	if err := validateRequestCount("chain points", len(req.Points), MaxPointsPerRequest); err != nil {
+		fmt.Printf("[chainsync] Rejected FindIntersection from %s: %v\n", from, err)
+		return
+	}
+
 	conn := h.ensureJVMConn()
 	if conn == nil {
 		return
@@ -183,12 +256,6 @@ func (h *Handler) serveFindIntersection(s network.Stream, data []byte, from peer
 	localPoints, err := client.ServeChainPoints(ctx, &pb.ServeChainPointsRequest{})
 	if err != nil {
 		fmt.Printf("[chainsync] JVM ServeChainPoints failed: %v\n", err)
-		return
-	}
-
-	// Parse the incoming intersection request
-	var req pb.FindIntersectionRequest
-	if err := proto.Unmarshal(data, &req); err != nil {
 		return
 	}
 
@@ -243,8 +310,8 @@ func (h *Handler) serveGetPeerTip(s network.Stream, from peer.ID) {
 // FetchSnapshots sends a FetchSnapshots request to a random peer and returns
 // the response snapshots. Called by the JVM via ChainSyncOutbound gRPC.
 func (h *Handler) FetchSnapshots(ctx context.Context, hashes [][]byte) ([]*pb.Snapshot, error) {
-	if len(hashes) > MaxHashesPerRequest {
-		return nil, fmt.Errorf("too many hashes: %d > %d", len(hashes), MaxHashesPerRequest)
+	if err := validateRequestCount("snapshot hashes", len(hashes), MaxHashesPerRequest); err != nil {
+		return nil, err
 	}
 
 	target, err := h.pickPeer()
@@ -299,6 +366,10 @@ func (h *Handler) FetchSnapshots(ctx context.Context, hashes [][]byte) ([]*pb.Sn
 
 // FindIntersection sends a FindIntersection request to a random peer.
 func (h *Handler) FindIntersection(ctx context.Context, points []*pb.ChainPoint) (*pb.FindIntersectionResponse, error) {
+	if err := validateRequestCount("chain points", len(points), MaxPointsPerRequest); err != nil {
+		return nil, err
+	}
+
 	target, err := h.pickPeer()
 	if err != nil {
 		return nil, err
@@ -371,15 +442,19 @@ func (h *Handler) GetPeerTip(ctx context.Context) (*pb.PeerTipResponse, error) {
 // up each requested value-hash among recent-finalized snapshots + a non-destructive
 // orphan-buffer peek; the sidecar is a pure relay.
 func (h *Handler) serveMetagraphBinaries(s network.Stream, data []byte, from peer.ID) {
-	conn := h.ensureJVMConn()
-	if conn == nil {
-		fmt.Printf("[chainsync] No JVM connection, cannot serve metagraph binaries to %s\n", from)
-		return
-	}
-
 	var req pb.FetchMetagraphBinariesRequest
 	if err := proto.Unmarshal(data, &req); err != nil {
 		fmt.Printf("[chainsync] Failed to unmarshal FetchMetagraphBinaries from %s: %v\n", from, err)
+		return
+	}
+	if err := validateRequestCount("metagraph binary hashes", len(req.BinaryHashes), MaxHashesPerRequest); err != nil {
+		fmt.Printf("[chainsync] Rejected FetchMetagraphBinaries from %s: %v\n", from, err)
+		return
+	}
+
+	conn := h.ensureJVMConn()
+	if conn == nil {
+		fmt.Printf("[chainsync] No JVM connection, cannot serve metagraph binaries to %s\n", from)
 		return
 	}
 
@@ -415,8 +490,8 @@ func (h *Handler) serveMetagraphBinaries(s network.Stream, data []byte, from pee
 // `binaryHashes` are value-hashes (UTF-8 of canonical Hash hex); the JVM
 // re-feeds each returned binary through the committee gate.
 func (h *Handler) FetchMetagraphBinaries(ctx context.Context, address string, hashes [][]byte) ([]*pb.MetagraphBinaryResponse, error) {
-	if len(hashes) > MaxHashesPerRequest {
-		return nil, fmt.Errorf("too many hashes: %d > %d", len(hashes), MaxHashesPerRequest)
+	if err := validateRequestCount("metagraph binary hashes", len(hashes), MaxHashesPerRequest); err != nil {
+		return nil, err
 	}
 
 	target, err := h.pickPeer()

@@ -19,6 +19,7 @@ import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.refineV
+import io.grpc.Status
 import io.grpc.stub.StreamObserver
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
@@ -28,6 +29,11 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * NakamotoChainStore with disk fallback via SnapshotStorage.
   */
 object ChainSyncServer {
+
+  private[nakamoto] val MaxHashesPerRequest = 64
+
+  private[nakamoto] def validateHashCount(kind: String, count: Int): Either[String, Unit] =
+    Either.cond(count <= MaxHashesPerRequest, (), s"too many $kind: $count > $MaxHashesPerRequest")
 
   def make[F[_]: Async: HasherSelector: JsonSerializer](
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -44,24 +50,28 @@ object ChainSyncServer {
   )(implicit ec: ExecutionContext): pb.ChainSyncInboundGrpc.ChainSyncInbound = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ChainSyncServer")
 
+    def runBounded[A](kind: String, count: Int, responseObserver: StreamObserver[A])(serve: => F[Unit]): Unit =
+      validateHashCount(kind, count).fold(
+        error => responseObserver.onError(Status.RESOURCE_EXHAUSTED.withDescription(error).asRuntimeException()),
+        _ => dispatcher.unsafeRunAndForget(serve)
+      )
+
     new pb.ChainSyncInboundGrpc.ChainSyncInbound {
       override def serveSnapshots(
         request: pb.ServeSnapshotsRequest,
         responseObserver: StreamObserver[pb.Snapshot]
       ): Unit =
-        dispatcher.unsafeRunAndForget {
+        runBounded("snapshot hashes", request.hashes.size, responseObserver) {
           val hashes = request.hashes.map(h => Hash(new String(h.toByteArray, java.nio.charset.StandardCharsets.UTF_8)))
-
-          dispatcher.unsafeRunSync(
-            logger.info(s"ChainSync SERVE: ${hashes.size} hash(es) requested: ${hashes.map(_.value.take(12)).mkString(",")}")
-          )
 
           // Look up the finalized boundary ONCE per request — all hashes in this batch are
           // classified against the same snapshot of `lastFinalizedOrdinal`. Reading per-hash would
           // race: a finalize landing mid-iteration could flip a snapshot from Provisional to
           // Finalized between two hashes, producing inconsistent disposition for callers that
           // batch hashes spanning the finality boundary.
-          chainStore.lastFinalizedOrdinal.flatMap { finalizedOrdinal =>
+          logger.info(
+            s"ChainSync SERVE: ${hashes.size} hash(es) requested: ${hashes.map(_.value.take(12)).mkString(",")}"
+          ) >> chainStore.lastFinalizedOrdinal.flatMap { finalizedOrdinal =>
             hashes.toList.traverse_ { hash =>
               // Two-tier lookup (Path 1, Finding 2):
               //   1. `chainStore.get(hash)` — in-memory `byHash`, full `StoredSnapshot` (hot path).
@@ -256,7 +266,7 @@ object ChainSyncServer {
         request: pb.FetchMetagraphBinariesRequest,
         responseObserver: StreamObserver[pb.MetagraphBinaryResponse]
       ): Unit =
-        dispatcher.unsafeRunAndForget {
+        runBounded("metagraph binary hashes", request.binaryHashes.size, responseObserver) {
           refineV[DAGAddressRefined](request.metagraphAddress) match {
             case Left(err) =>
               logger.warn(
