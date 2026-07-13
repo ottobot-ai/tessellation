@@ -23,7 +23,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.{DelegatedRew
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.PricingUpdate
-import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.balance.{Amount, AmountOverflow, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.node._
@@ -44,6 +44,32 @@ import weaver.SimpleIOSuite
 import weaver.scalacheck.Checkers
 
 object GlobalDelegatedRewardsDistributorSuite extends SimpleIOSuite with Checkers {
+
+  test("withdrawal rewards aggregate every matured record for the same address") {
+    val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
+    val five = Amount(NonNegLong.unsafeFrom(5L))
+    val seven = Amount(NonNegLong.unsafeFrom(7L))
+
+    IO.pure(
+      expect.same(
+        Right(SortedMap(address -> Amount(NonNegLong.unsafeFrom(12L)))),
+        GlobalDelegatedRewardsDistributor.aggregateWithdrawalRewards(List(address -> five, address -> seven))
+      )
+    )
+  }
+
+  test("withdrawal reward aggregation rejects overflow instead of wrapping or dropping a record") {
+    val address = Address("DAG0y4eLqhhXUafeE3mgBstezPTnr8L3tZjAtMWB")
+
+    IO.pure(
+      expect.same(
+        Left(AmountOverflow),
+        GlobalDelegatedRewardsDistributor.aggregateWithdrawalRewards(
+          List(address -> Amount(NonNegLong.MaxValue), address -> Amount(NonNegLong.unsafeFrom(1L)))
+        )
+      )
+    )
+  }
 
   // §G5: tests use an empty reader and matching empty state managers as a default — many tests in
   // this suite exercise emission/inflation calculations driven by config + price state, not

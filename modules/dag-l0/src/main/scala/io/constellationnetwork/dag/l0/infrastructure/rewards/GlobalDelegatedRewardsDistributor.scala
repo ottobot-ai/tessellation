@@ -25,7 +25,7 @@ import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance._
-import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, UpdateDelegatedStake}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.node.{DelegatedStakeRewardParameters, RewardFraction, UpdateNodeParameters}
@@ -43,6 +43,17 @@ import eu.timepit.refined.types.all.{NonNegLong, PosLong}
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object GlobalDelegatedRewardsDistributor {
+
+  private[rewards] def aggregateWithdrawalRewards(
+    rewards: List[(Address, Amount)]
+  ): Either[BalanceArithmeticError, SortedMap[Address, Amount]] =
+    rewards.foldLeft[Either[BalanceArithmeticError, SortedMap[Address, Amount]]](SortedMap.empty[Address, Amount].asRight) {
+      case (acc, (address, amount)) =>
+        for {
+          totals <- acc
+          updated <- totals.getOrElse(address, Amount.empty).plus(amount)
+        } yield totals.updated(address, updated)
+    }
 
   /** §G5 — MPT-primary reward distribution. The state-manager parameters provide branch-aware MPT reads for `activeDelegatedStakes`
     * (per-record) and `updateNodeParameters` (per-Id), replacing the legacy GSI map closures (`info.activeDelegatedStakes` /
@@ -534,17 +545,20 @@ object GlobalDelegatedRewardsDistributor {
           partitionedRecords
         )
 
-        withdrawalRewardTxs <-
-          calculateWithdrawalRewardTransactions(
-            partitionedRecords.expiredWithdrawalsDelegatedStaking.toList.flatMap {
-              case (address, withdrawals) =>
-                withdrawals.toList.mapFilter { withdrawal =>
-                  Option.when(withdrawal.rewards.value > Balance.empty.value) {
-                    (address, Amount(NonNegLong.unsafeFrom(withdrawal.rewards.value.value)))
+        withdrawalRewards <-
+          Async[F].fromEither(
+            aggregateWithdrawalRewards(
+              partitionedRecords.expiredWithdrawalsDelegatedStaking.toList.flatMap {
+                case (address, withdrawals) =>
+                  withdrawals.toList.mapFilter { withdrawal =>
+                    Option.when(withdrawal.rewards.value > Balance.empty.value) {
+                      (address, Amount(NonNegLong.unsafeFrom(withdrawal.rewards.value.value)))
+                    }
                   }
-                }
-            }.toMap
+              }
+            )
           )
+        withdrawalRewardTxs <- calculateWithdrawalRewardTransactions(withdrawalRewards)
 
         totalEmittedReward <- DelegatedRewardsDistributor.sumMintedAmount(
           reservedAddressRewards,
