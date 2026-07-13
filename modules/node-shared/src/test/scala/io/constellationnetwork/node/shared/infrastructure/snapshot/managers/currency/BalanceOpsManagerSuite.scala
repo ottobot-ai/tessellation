@@ -101,4 +101,42 @@ object BalanceOpsManagerSuite extends MutableIOSuite {
         .attempt
     } yield expect(result.left.exists(_.isInstanceOf[ArithmeticException]))
   }
+
+  test("ECO-18 / ECON-F-003 remains RED: a successor snapshot reaccepts and reapplies the exact same signed fee") { res =>
+    implicit val (hasher, securityProvider) = res
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO]
+      destination <- KeyPairGenerator.makeKeyPair[IO]
+      fee <- Signed.forAsyncHasher(
+        FeeTransaction(
+          source.getPublic.toAddress,
+          destination.getPublic.toAddress,
+          Amount(NonNegLong.unsafeFrom(10L)),
+          Hash("a" * 64)
+        ),
+        source
+      )
+      manager = BalanceOpsManager.make[IO](FeeTransactionValidator.make[IO](SignedValidator.make[IO]))
+      feeSet = Some(SortedSet(fee))
+      initialBalances = SortedMap(
+        source.getPublic.toAddress -> Balance(NonNegLong.unsafeFrom(100L)),
+        destination.getPublic.toAddress -> Balance.empty
+      )
+
+      _ <- manager.validateFeeTxs(feeSet)
+      (firstSnapshotBalances, firstAccepted) <- manager.acceptFeeTxs(initialBalances, feeSet)
+
+      _ <- manager.validateFeeTxs(feeSet)
+      (successorSnapshotBalances, secondAccepted) <- manager.acceptFeeTxs(firstSnapshotBalances, feeSet)
+    } yield
+      expect.all(
+        firstAccepted == feeSet,
+        secondAccepted == feeSet,
+        firstSnapshotBalances(source.getPublic.toAddress) == Balance(NonNegLong.unsafeFrom(90L)),
+        firstSnapshotBalances(destination.getPublic.toAddress) == Balance(NonNegLong.unsafeFrom(10L)),
+        successorSnapshotBalances(source.getPublic.toAddress) == Balance(NonNegLong.unsafeFrom(80L)),
+        successorSnapshotBalances(destination.getPublic.toAddress) == Balance(NonNegLong.unsafeFrom(20L))
+      )
+  }
 }

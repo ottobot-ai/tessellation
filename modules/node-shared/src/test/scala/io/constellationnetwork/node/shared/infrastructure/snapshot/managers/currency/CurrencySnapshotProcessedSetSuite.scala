@@ -238,6 +238,55 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       )
   }
 
+  test("ECO-05 / XMG-005B remains RED: retained-window eviction re-enables an already applied global delivery") { res =>
+    implicit val (h, j, sp) = res
+    for {
+      ownerKp <- KeyPairGenerator.makeKeyPair[IO]
+      producerKp <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKp <- KeyPairGenerator.makeKeyPair[IO]
+      owner = PublicKeyOps(ownerKp.getPublic).toAddress
+      producer = PublicKeyOps(producerKp.getPublic).toAddress
+      destination = PublicKeyOps(destinationKp.getPublic).toAddress
+      pendingOrdinal = ord(10L)
+      pendingAction = SpendAction(
+        NonEmptyList.one(SpendTransaction(None, Some(CurrencyId(owner)), SwapAmount(PosLong.unsafeFrom(1L)), producer, destination))
+      )
+      pendingSnapshot <- mkGlobalSnapshotAt(pendingOrdinal, SortedMap(producer -> List(pendingAction)))
+      gsom <- mkGsom
+      syncData = Some(SortedMap(owner -> MetagraphSyncDataInfo(ord(0L), EpochProgress.MinValue, oset(10L))))
+      retainedP = GlobalSnapshotOpsManager.reconstructProcessedGlobalOrdinals(
+        List(mkCurrencySnapshotWithProcessed(1L, oset(10L)))
+      )
+      evictedP = GlobalSnapshotOpsManager.reconstructProcessedGlobalOrdinals(Nil)
+      whileRetained <- gsom.getLastGlobalSnapshotsSpendActions(
+        globalSnapshotViewOrdinal = pendingOrdinal,
+        lastGlobalSnapshots = List(pendingSnapshot),
+        getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+        currencyId = owner,
+        metagraphSyncData = syncData,
+        alreadyProcessedGlobalOrdinals = retainedP
+      )
+      afterEviction <- gsom.getLastGlobalSnapshotsSpendActions(
+        globalSnapshotViewOrdinal = pendingOrdinal,
+        lastGlobalSnapshots = List(pendingSnapshot),
+        getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+        currencyId = owner,
+        metagraphSyncData = syncData,
+        alreadyProcessedGlobalOrdinals = evictedP
+      )
+      (retainedActions, retainedProcessed) = whileRetained
+      (evictedActions, evictedProcessed) = afterEviction
+    } yield
+      expect.all(
+        retainedP == oset(10L),
+        evictedP.isEmpty,
+        retainedProcessed.isEmpty,
+        retainedActions.isEmpty,
+        evictedProcessed == oset(10L),
+        evictedActions.getOrElse(producer, Nil) == List(pendingAction)
+      )
+  }
+
   private def mkCurrencySnapshotWithProcessed(
     ordinal: Long,
     processed: SortedSet[SnapshotOrdinal]
