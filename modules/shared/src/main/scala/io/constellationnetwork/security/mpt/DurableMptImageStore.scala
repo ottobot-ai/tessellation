@@ -22,12 +22,7 @@ import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.storage.durable.{
-  DurableAtomicWriter,
-  DurableFileError,
-  DurableFileOps,
-  DurableWriteHook
-}
+import io.constellationnetwork.storage.durable.{DurableAtomicWriter, DurableFileError, DurableFileOps, DurableWriteHook}
 
 import scodec.bits.ByteVector
 
@@ -37,9 +32,10 @@ import scodec.bits.ByteVector
   * finalization, or recovery consumes it yet. In particular, this component does not close ROOT-002/003/004, does not make finality
   * publication transactional, and does not activate exact-parent branch rejection.
   *
-  * An image becomes active only after [[publish]] installs its receipt as the active manifest. Preparing an image never changes that
-  * manifest. Images are never deleted here, so the preceding generation remains available after a failed prepare or publish. Retention and
-  * cutoff belong to a later transaction design, not this primitive.
+  * Before reversible-publication initialization, an image becomes active only after [[publish]] installs its receipt as the legacy active
+  * manifest. After explicit initialization, the additive publication journal owns selection and may point to a verified image or explicit
+  * pristine state. Preparing an image never changes either selector. Images are never deleted here, so preceding generations remain
+  * available after a failed prepare or publication. Retention and cutoff belong to a later transaction design, not this primitive.
   *
   * The compare-and-set and reader-serialization guarantees apply while one live store resource exclusively owns its directory through the
   * lifetime OS lock. The caller must create `directory` and durably install that directory entry in its parent before constructing this
@@ -47,7 +43,8 @@ import scodec.bits.ByteVector
   * pristine state from loss of a previously published active manifest, and distinguishes missing required artifacts from other read
   * failures. Runtime wiring still requires an active-era semantic verifier for every physical key/value, authentication of the supplied
   * exact anchor against hash-bound finality state, and one recoverable intent spanning every finality sink. The raw root rebuild, supplied
-  * era labels, and self-consistent manifest do not establish those external facts.
+  * era labels, and self-consistent manifest/journal do not authenticate a publication revision, authorize a rollback, or establish those
+  * external facts.
   */
 trait DurableMptImageStore[F[_]] {
 
@@ -69,6 +66,25 @@ trait DurableMptImageStore[F[_]] {
     * [[DurableMptImageError.GenerationConflict]].
     */
   def publish(receipt: MptImageReceipt, expectedPrior: Option[MptImagePointer]): F[Unit]
+
+  /** Durably initialize the additive reversible-publication journal from the exact authenticated legacy active receipt.
+    *
+    * Initialization never infers state from a corrupt or missing legacy artifact. Once initialized, the journal owns active-image selection
+    * and legacy [[publish]] is rejected. The legacy manifest and image encodings remain unchanged.
+    */
+  def initializeActivePublication(expectedLegacy: Option[MptImageReceipt]): F[MptActivePublication]
+
+  /** Atomically replace the exact journal state.
+    *
+    * `target.revision` must be exactly one greater than `expectedBefore.revision`. A durable retry which observes `target` already active
+    * is idempotent; every other state must equal `expectedBefore` in full or the transition fails. This recovery primitive may select any
+    * independently verified prepared image, including a lower image generation, or explicit pristine `None`. It does not decide whether a
+    * rollback is authorized or whether either snapshot is canonical.
+    */
+  def transitionActive(expectedBefore: MptActivePublication, target: MptActivePublication): F[Unit]
+
+  /** Return the exact initialized publication state after verifying the journal, marker, and any referenced image. */
+  def activePublication: F[Option[MptActivePublication]]
 
   /** Return the active receipt only after its manifest and image have both been verified. */
   def activeReceipt: F[Option[MptImageReceipt]]
@@ -144,6 +160,10 @@ final case class MptImageReceipt(
   def pointer: MptImagePointer = MptImagePointer.fromReceipt(this)
 }
 
+final case class MptPublicationRevision(value: Long)
+
+final case class MptActivePublication(revision: MptPublicationRevision, image: Option[MptImageReceipt])
+
 sealed abstract class DurableMptImageError(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
 
 sealed trait MptImageArtifactRef
@@ -151,6 +171,8 @@ sealed trait MptImageArtifactRef
 object MptImageArtifactRef {
   case object ActiveManifest extends MptImageArtifactRef
   case object InitializationMarker extends MptImageArtifactRef
+  case object ActivePublication extends MptImageArtifactRef
+  case object PublicationInitializationMarker extends MptImageArtifactRef
   final case class Image(imageId: MptImageId) extends MptImageArtifactRef
 }
 
@@ -174,7 +196,11 @@ object DurableMptImageError {
 
   final case class CorruptManifest(message0: String, cause0: Throwable = null) extends DurableMptImageError(message0, cause0)
 
-  final case class CorruptInitializationMarker(message0: String, cause0: Throwable = null)
+  final case class CorruptInitializationMarker(message0: String, cause0: Throwable = null) extends DurableMptImageError(message0, cause0)
+
+  final case class CorruptPublication(message0: String, cause0: Throwable = null) extends DurableMptImageError(message0, cause0)
+
+  final case class CorruptPublicationInitializationMarker(message0: String, cause0: Throwable = null)
       extends DurableMptImageError(message0, cause0)
 
   final case class ReceiptManifestMismatch(expected: MptImageReceipt, active: MptImageReceipt)
@@ -185,6 +211,50 @@ object DurableMptImageError {
 
   final case class CompareAndSetConflict(expected: Option[MptImagePointer], actual: Option[MptImagePointer])
       extends DurableMptImageError(s"MPT image manifest compare-and-set conflict: expected=$expected actual=$actual")
+
+  final case class InvalidPublicationRevision(revision: MptPublicationRevision)
+      extends DurableMptImageError(s"MPT publication revision must be non-negative, got ${revision.value}")
+
+  final case class NonConsecutivePublicationRevision(
+    expectedBefore: MptPublicationRevision,
+    target: MptPublicationRevision
+  ) extends DurableMptImageError(
+        s"MPT publication revision must advance by one: before=${expectedBefore.value} target=${target.value}"
+      )
+
+  final case class PublicationRevisionExhausted(revision: MptPublicationRevision)
+      extends DurableMptImageError(s"MPT publication revision is exhausted at ${revision.value}")
+
+  final case class PublicationCompareAndSetConflict(expected: MptActivePublication, actual: MptActivePublication)
+      extends DurableMptImageError(s"MPT active-publication compare-and-set conflict: expected=$expected actual=$actual")
+
+  final case class PublicationInitializationConflict(
+    expectedLegacy: Option[MptImageReceipt],
+    actualLegacy: Option[MptImageReceipt]
+  ) extends DurableMptImageError(
+        s"MPT publication initialization does not match the legacy active receipt: expected=$expectedLegacy actual=$actualLegacy"
+      )
+
+  final case class PublicationJournalAlreadyInitialized(actual: MptActivePublication)
+      extends DurableMptImageError(s"MPT active-publication journal is already initialized at $actual")
+
+  case object PublicationJournalNotInitialized extends DurableMptImageError("MPT active-publication journal is not initialized")
+
+  final case class PublicationJournalOwnsActiveState(actual: MptActivePublication)
+      extends DurableMptImageError(s"MPT active-publication journal owns active image selection at $actual")
+
+  final case class LegacyPublicationDisagreement(publication: MptActivePublication, legacy: MptImageReceipt)
+      extends DurableMptImageError(
+        s"MPT active-publication journal disagrees with the residual legacy manifest: publication=$publication legacy=$legacy"
+      )
+
+  final case class PublicationRecoveryFailed(publishFailure: Throwable, recoveryFailure: Throwable)
+      extends DurableMptImageError(
+        s"MPT active-publication write failed and the prior journal could not be restored: ${publishFailure.getMessage}",
+        recoveryFailure
+      ) {
+    addSuppressed(publishFailure)
+  }
 
   final case class GenerationConflict(generation: Long, active: MptImageReceipt, candidate: MptImageReceipt)
       extends DurableMptImageError(
@@ -278,13 +348,17 @@ object DurableMptImageStore {
 
 private[mpt] object DurableMptImageLayout {
   val ActiveManifestName: String = "active.manifest"
+  val ActivePublicationName: String = "active.publication"
   val InitializationMarkerName: String = ".initialized"
+  val PublicationInitializationMarkerName: String = ".active-publication.initialized"
   val ImagesDirectoryName: String = "images"
   val OwnerLockName: String = ".owner.lock"
 
   def images(directory: Path): Path = directory.resolve(ImagesDirectoryName)
   def activeManifest(directory: Path): Path = directory.resolve(ActiveManifestName)
+  def activePublication(directory: Path): Path = directory.resolve(ActivePublicationName)
   def initializationMarker(directory: Path): Path = directory.resolve(InitializationMarkerName)
+  def publicationInitializationMarker(directory: Path): Path = directory.resolve(PublicationInitializationMarkerName)
   def ownerLock(directory: Path): Path = directory.resolve(OwnerLockName)
   def image(directory: Path, imageId: MptImageId): Path = images(directory).resolve(s"${imageId.value.value}.mpti")
 }
@@ -295,6 +369,8 @@ private[mpt] object MptImageArtifact {
   case object Manifest extends MptImageArtifact
   case object ManifestRecovery extends MptImageArtifact
   case object InitializationMarker extends MptImageArtifact
+  case object Publication extends MptImageArtifact
+  case object PublicationInitializationMarker extends MptImageArtifact
 }
 
 trait MptImageRootVerifier[F[_]] {
@@ -330,7 +406,9 @@ private final class LiveDurableMptImageStore[F[_]: Async](
   import MptImageArtifact._
 
   private val activeManifestPath = DurableMptImageLayout.activeManifest(directory)
+  private val activePublicationPath = DurableMptImageLayout.activePublication(directory)
   private val initializationMarkerPath = DurableMptImageLayout.initializationMarker(directory)
+  private val publicationInitializationMarkerPath = DurableMptImageLayout.publicationInitializationMarker(directory)
   private val atomicWriter = new DurableAtomicWriter[F](fileOps)
 
   def prepare(
@@ -369,6 +447,8 @@ private final class LiveDurableMptImageStore[F[_]: Async](
   def publish(receipt: MptImageReceipt, expectedPrior: Option[MptImagePointer]): F[Unit] =
     publishMutex.permit.use { _ =>
       for {
+        publication <- readOptionalPublication
+        _ <- publication.traverse_(state => Async[F].raiseError[Unit](PublicationJournalOwnsActiveState(state)))
         _ <- validateReceiptShape(receipt)
         _ <- readImage(receipt)
         prior <- readOptionalManifest
@@ -380,12 +460,38 @@ private final class LiveDurableMptImageStore[F[_]: Async](
       } yield ()
     }
 
-  def activeReceipt: F[Option[MptImageReceipt]] = publishMutex.permit.use(_ => activeReceiptUnlocked)
+  def initializeActivePublication(expectedLegacy: Option[MptImageReceipt]): F[MptActivePublication] =
+    publishMutex.permit.use(_ => initializeActivePublicationUnlocked(expectedLegacy))
+
+  def transitionActive(expectedBefore: MptActivePublication, target: MptActivePublication): F[Unit] =
+    publishMutex.permit.use { _ =>
+      for {
+        _ <- validatePublicationShape(expectedBefore)
+        _ <- validatePublicationShape(target)
+        _ <- validatePublicationTransition(expectedBefore, target)
+        actual <- readOptionalPublication.flatMap(_.liftTo[F](PublicationJournalNotInitialized))
+        _ <- checkLegacyAgreement(actual)
+        _ <-
+          if (actual == target) cleanupLegacyArtifacts(target)
+          else if (actual != expectedBefore) Async[F].raiseError(PublicationCompareAndSetConflict(expectedBefore, actual))
+          else
+            target.image.traverse_(readImage) >>
+              cleanupLegacyArtifacts(actual) >>
+              publishPublication(target, actual.some, ensureMarker = false)
+      } yield ()
+    }
+
+  def activePublication: F[Option[MptActivePublication]] =
+    publishMutex.permit.use { _ =>
+      readOptionalPublication.flatTap(_.traverse_(checkLegacyAgreement))
+    }
+
+  def activeReceipt: F[Option[MptImageReceipt]] = publishMutex.permit.use(_ => selectedActiveReceiptUnlocked)
 
   def read(receipt: MptImageReceipt): F[SortedMap[Hex, ByteVector]] =
     publishMutex.permit.use { _ =>
       for {
-        active <- activeReceiptUnlocked.flatMap(
+        active <- selectedActiveReceiptUnlocked.flatMap(
           _.liftTo[F](MissingArtifact(MptImageArtifactRef.ActiveManifest, activeManifestPath))
         )
         _ <- Async[F].raiseUnless(active == receipt)(ReceiptManifestMismatch(receipt, active))
@@ -393,10 +499,62 @@ private final class LiveDurableMptImageStore[F[_]: Async](
       } yield entries
     }
 
-  private def activeReceiptUnlocked: F[Option[MptImageReceipt]] =
+  private def selectedActiveReceiptUnlocked: F[Option[MptImageReceipt]] =
+    readOptionalPublication.flatMap {
+      case Some(publication) => checkLegacyAgreement(publication).as(publication.image)
+      case None              => activeLegacyReceiptUnlocked
+    }
+
+  private def activeLegacyReceiptUnlocked: F[Option[MptImageReceipt]] =
     readOptionalManifest.flatMap(
       _.traverse(receipt => readRequiredInitializationMarker >> readImage(receipt).as(receipt))
     )
+
+  private def initializeActivePublicationUnlocked(expectedLegacy: Option[MptImageReceipt]): F[MptActivePublication] =
+    for {
+      _ <- expectedLegacy.traverse_(validateReceiptShape)
+      rawPublication <- readOptionalPublicationRaw
+      markerExists <- readOptionalPublicationInitializationMarker
+      publication <- (rawPublication, markerExists) match {
+        case (None, true) =>
+          Async[F].raiseError[MptActivePublication](
+            MissingArtifact(MptImageArtifactRef.ActivePublication, activePublicationPath)
+          )
+        case (None, false)           => initializeFromLegacy(expectedLegacy)
+        case (Some(existing), true)  => resumeInitializedPublication(existing, expectedLegacy, ensureMarker = false)
+        case (Some(existing), false) => resumeInitializedPublication(existing, expectedLegacy, ensureMarker = true)
+      }
+    } yield publication
+
+  private def initializeFromLegacy(expectedLegacy: Option[MptImageReceipt]): F[MptActivePublication] =
+    for {
+      actualLegacy <- activeLegacyReceiptUnlocked
+      _ <- Async[F].raiseUnless(actualLegacy == expectedLegacy)(
+        PublicationInitializationConflict(expectedLegacy, actualLegacy)
+      )
+      target = MptActivePublication(MptPublicationRevision(0L), actualLegacy)
+      _ <- publishPublication(target, None, ensureMarker = true)
+      _ <- cleanupLegacyArtifacts(target)
+    } yield target
+
+  private def resumeInitializedPublication(
+    existing: MptActivePublication,
+    expectedLegacy: Option[MptImageReceipt],
+    ensureMarker: Boolean
+  ): F[MptActivePublication] =
+    for {
+      _ <- validatePublicationShape(existing)
+      _ <- existing.image.traverse_(readImage)
+      _ <-
+        if (existing.revision.value != 0L) Async[F].raiseError[Unit](PublicationJournalAlreadyInitialized(existing))
+        else
+          Async[F].raiseUnless(existing.image == expectedLegacy)(
+            PublicationInitializationConflict(expectedLegacy, existing.image)
+          )
+      _ <- checkLegacyAgreement(existing)
+      _ <- Async[F].whenA(ensureMarker)(ensurePublicationInitializationMarker(applyFaults = true))
+      _ <- cleanupLegacyArtifacts(existing)
+    } yield existing
 
   private def publishManifest(receipt: MptImageReceipt, prior: Option[MptImageReceipt]): F[Unit] = {
     val bytes = MptImageEncoding.encodeManifest(receipt)
@@ -429,6 +587,63 @@ private final class LiveDurableMptImageStore[F[_]: Async](
           fileOps.forceDirectory(directory)
     }
 
+  private def publishPublication(
+    target: MptActivePublication,
+    prior: Option[MptActivePublication],
+    ensureMarker: Boolean
+  ): F[Unit] = {
+    val bytes = MptImageEncoding.encodePublication(target)
+
+    Async[F].uncancelable { _ =>
+      (durableAtomicWrite(
+        activePublicationPath,
+        bytes,
+        Publication,
+        path => verifyPublicationAt(target, path),
+        applyFaults = true
+      ) >> Async[F].whenA(ensureMarker)(ensurePublicationInitializationMarker(applyFaults = true))).handleErrorWith { publishFailure =>
+        restorePriorPublication(prior).attempt.flatMap {
+          case Right(_)              => Async[F].raiseError(publishFailure)
+          case Left(recoveryFailure) => Async[F].raiseError(PublicationRecoveryFailed(publishFailure, recoveryFailure))
+        }
+      }
+    }
+  }
+
+  private def restorePriorPublication(prior: Option[MptActivePublication]): F[Unit] =
+    prior match {
+      case Some(publication) =>
+        durableAtomicWrite(
+          activePublicationPath,
+          MptImageEncoding.encodePublication(publication),
+          Publication,
+          path => verifyPublicationAt(publication, path),
+          applyFaults = false
+        ) >> ensurePublicationInitializationMarker(applyFaults = false)
+      case None =>
+        fileOps.deleteIfExists(publicationInitializationMarkerPath) >>
+          fileOps.forceDirectory(directory) >>
+          fileOps.deleteIfExists(activePublicationPath) >>
+          fileOps.forceDirectory(directory)
+    }
+
+  private def cleanupLegacyArtifacts(publication: MptActivePublication): F[Unit] =
+    checkLegacyAgreement(publication) >>
+      fileOps.deleteIfExists(activeManifestPath) >>
+      fileOps.forceDirectory(directory) >>
+      fileOps.deleteIfExists(initializationMarkerPath) >>
+      fileOps.forceDirectory(directory)
+
+  private def checkLegacyAgreement(publication: MptActivePublication): F[Unit] =
+    readOptionalLegacyManifestRaw.flatMap {
+      case None => Async[F].unit
+      case Some(legacy) =>
+        readRequiredInitializationMarker >>
+          validateReceiptShape(legacy) >>
+          readImage(legacy) >>
+          Async[F].raiseUnless(publication.image.contains(legacy))(LegacyPublicationDisagreement(publication, legacy))
+    }
+
   private def validatePublication(
     active: Option[MptImageReceipt],
     candidate: MptImageReceipt,
@@ -445,6 +660,23 @@ private final class LiveDurableMptImageStore[F[_]: Async](
       case _ =>
         val actual = active.map(_.pointer)
         Async[F].raiseUnless(actual == expectedPrior)(CompareAndSetConflict(expectedPrior, actual))
+    }
+
+  private def validatePublicationShape(publication: MptActivePublication): F[Unit] =
+    validatePublicationRevision(publication.revision) >> publication.image.traverse_(validateReceiptShape)
+
+  private def validatePublicationRevision(revision: MptPublicationRevision): F[Unit] =
+    Async[F].raiseWhen(revision.value < 0L)(InvalidPublicationRevision(revision))
+
+  private def nextPublicationRevision(revision: MptPublicationRevision): F[MptPublicationRevision] =
+    if (revision.value == Long.MaxValue) Async[F].raiseError(PublicationRevisionExhausted(revision))
+    else Async[F].pure(MptPublicationRevision(revision.value + 1L))
+
+  private def validatePublicationTransition(expectedBefore: MptActivePublication, target: MptActivePublication): F[Unit] =
+    nextPublicationRevision(expectedBefore.revision).flatMap { expectedTargetRevision =>
+      Async[F].raiseUnless(target.revision == expectedTargetRevision)(
+        NonConsecutivePublicationRevision(expectedBefore.revision, target.revision)
+      )
     }
 
   private def readImage(receipt: MptImageReceipt): F[SortedMap[Hex, ByteVector]] = {
@@ -506,9 +738,21 @@ private final class LiveDurableMptImageStore[F[_]: Async](
       )
     }
 
+  private def verifyPublicationAt(publication: MptActivePublication, path: Path): F[Unit] =
+    readRequiredPublication(path).flatMap { decoded =>
+      Async[F].raiseUnless(decoded == publication)(
+        CorruptPublication(s"MPT active-publication read-back mismatch: expected=$publication actual=$decoded")
+      )
+    }
+
   private def readManifestRaw(path: Path): F[MptImageReceipt] =
     fileOps.openInput(path).use { stream =>
       Async[F].blocking(MptImageEncoding.decodeManifest(stream)).flatMap(Async[F].fromEither)
+    }
+
+  private def readPublicationRaw(path: Path): F[MptActivePublication] =
+    fileOps.openInput(path).use { stream =>
+      Async[F].blocking(MptImageEncoding.decodePublication(stream)).flatMap(Async[F].fromEither)
     }
 
   private def readInitializationMarkerRaw(path: Path): F[Unit] =
@@ -516,8 +760,16 @@ private final class LiveDurableMptImageStore[F[_]: Async](
       Async[F].blocking(MptImageEncoding.decodeInitializationMarker(stream)).flatMap(Async[F].fromEither)
     }
 
+  private def readPublicationInitializationMarkerRaw(path: Path): F[Unit] =
+    fileOps.openInput(path).use { stream =>
+      Async[F].blocking(MptImageEncoding.decodePublicationInitializationMarker(stream)).flatMap(Async[F].fromEither)
+    }
+
   private def readRequiredManifest(path: Path): F[MptImageReceipt] =
     readRequiredArtifact(MptImageArtifactRef.ActiveManifest, path)(readManifestRaw(path))
+
+  private def readRequiredPublication(path: Path): F[MptActivePublication] =
+    readRequiredArtifact(MptImageArtifactRef.ActivePublication, path)(readPublicationRaw(path))
 
   private def readRequiredInitializationMarker: F[Unit] =
     readRequiredArtifact(MptImageArtifactRef.InitializationMarker, initializationMarkerPath)(
@@ -535,6 +787,21 @@ private final class LiveDurableMptImageStore[F[_]: Async](
         )
     }
 
+  private def readOptionalPublicationInitializationMarker: F[Boolean] =
+    readPublicationInitializationMarkerRaw(publicationInitializationMarkerPath).as(true).handleErrorWith {
+      case _: NoSuchFileException        => Async[F].pure(false)
+      case _: FileNotFoundException      => Async[F].pure(false)
+      case failure: DurableMptImageError => Async[F].raiseError(failure)
+      case failure =>
+        Async[F].raiseError(
+          ArtifactReadFailed(
+            MptImageArtifactRef.PublicationInitializationMarker,
+            publicationInitializationMarkerPath,
+            failure
+          )
+        )
+    }
+
   private def ensureInitializationMarker(applyFaults: Boolean): F[Unit] =
     readOptionalInitializationMarker.flatMap {
       case true => Async[F].unit
@@ -543,17 +810,72 @@ private final class LiveDurableMptImageStore[F[_]: Async](
           initializationMarkerPath,
           MptImageEncoding.encodeInitializationMarker,
           InitializationMarker,
-          path =>
-            readRequiredArtifact(MptImageArtifactRef.InitializationMarker, path)(readInitializationMarkerRaw(path)),
+          path => readRequiredArtifact(MptImageArtifactRef.InitializationMarker, path)(readInitializationMarkerRaw(path)),
           applyFaults
         )
     }
 
+  private def ensurePublicationInitializationMarker(applyFaults: Boolean): F[Unit] =
+    readOptionalPublicationInitializationMarker.flatMap {
+      case true => Async[F].unit
+      case false =>
+        durableAtomicWrite(
+          publicationInitializationMarkerPath,
+          MptImageEncoding.encodePublicationInitializationMarker,
+          PublicationInitializationMarker,
+          path =>
+            readRequiredArtifact(MptImageArtifactRef.PublicationInitializationMarker, path)(
+              readPublicationInitializationMarkerRaw(path)
+            ),
+          applyFaults
+        )
+    }
+
+  private def readOptionalPublication: F[Option[MptActivePublication]] =
+    for {
+      publication <- readOptionalPublicationRaw
+      markerExists <- readOptionalPublicationInitializationMarker
+      verified <- (publication, markerExists) match {
+        case (None, false) => Async[F].pure(Option.empty[MptActivePublication])
+        case (None, true) =>
+          Async[F].raiseError[Option[MptActivePublication]](
+            MissingArtifact(MptImageArtifactRef.ActivePublication, activePublicationPath)
+          )
+        case (Some(_), false) =>
+          Async[F].raiseError[Option[MptActivePublication]](
+            MissingArtifact(
+              MptImageArtifactRef.PublicationInitializationMarker,
+              publicationInitializationMarkerPath
+            )
+          )
+        case (Some(value), true) =>
+          validatePublicationShape(value) >> value.image.traverse_(readImage) >> Async[F].pure(value.some)
+      }
+    } yield verified
+
+  private def readOptionalPublicationRaw: F[Option[MptActivePublication]] =
+    readPublicationRaw(activePublicationPath).map(_.some).handleErrorWith {
+      case _: NoSuchFileException        => Async[F].pure(None)
+      case _: FileNotFoundException      => Async[F].pure(None)
+      case failure: DurableMptImageError => Async[F].raiseError(failure)
+      case failure =>
+        Async[F].raiseError(ArtifactReadFailed(MptImageArtifactRef.ActivePublication, activePublicationPath, failure))
+    }
+
+  private def readOptionalLegacyManifestRaw: F[Option[MptImageReceipt]] =
+    readManifestRaw(activeManifestPath).map(_.some).handleErrorWith {
+      case _: NoSuchFileException        => Async[F].pure(None)
+      case _: FileNotFoundException      => Async[F].pure(None)
+      case failure: DurableMptImageError => Async[F].raiseError(failure)
+      case failure =>
+        Async[F].raiseError(ArtifactReadFailed(MptImageArtifactRef.ActiveManifest, activeManifestPath, failure))
+    }
+
   private def readOptionalManifest: F[Option[MptImageReceipt]] =
     readManifestRaw(activeManifestPath).flatTap(validateReceiptShape).map(_.some).handleErrorWith {
-      case failure: NoSuchFileException  => missingManifestOrPristine(failure)
+      case failure: NoSuchFileException   => missingManifestOrPristine(failure)
       case failure: FileNotFoundException => missingManifestOrPristine(failure)
-      case failure: DurableMptImageError => Async[F].raiseError(failure)
+      case failure: DurableMptImageError  => Async[F].raiseError(failure)
       case failure =>
         Async[F].raiseError(ArtifactReadFailed(MptImageArtifactRef.ActiveManifest, activeManifestPath, failure))
     }
@@ -676,12 +998,19 @@ private[mpt] object MptImageEncoding {
   private val ImageMagic = "TNMPTIM2".getBytes(StandardCharsets.US_ASCII)
   private val ManifestMagic = "TNMPTMN2".getBytes(StandardCharsets.US_ASCII)
   private val InitializationMagic = "TNMPTIN2".getBytes(StandardCharsets.US_ASCII)
+  private val PublicationMagic = "TNMPTAP1".getBytes(StandardCharsets.US_ASCII)
+  private val PublicationInitializationMagic = "TNMPTPI1".getBytes(StandardCharsets.US_ASCII)
+  private val PublicationFormatVersion = 1
   private val HashBytes = 32
   val ImageHeaderBytes: Long = ImageMagic.length.toLong + 4L + 8L + (5L * HashBytes) + 8L + 4L
   private val ManifestPayloadBytes = ManifestMagic.length + 4 + 8 + (7 * HashBytes) + 8 + 4
   private val ManifestBytes = ManifestPayloadBytes + HashBytes
   private val InitializationPayloadBytes = InitializationMagic.length + 4
   private val InitializationBytes = InitializationPayloadBytes + HashBytes
+  private val PublicationBasePayloadBytes = PublicationMagic.length + 4 + 8 + 1
+  private val PublicationMaximumBytes = PublicationBasePayloadBytes + 4 + ManifestBytes + HashBytes
+  private val PublicationInitializationPayloadBytes = PublicationInitializationMagic.length + 4
+  private val PublicationInitializationBytes = PublicationInitializationPayloadBytes + HashBytes
   private val ImageIdDomain = "tessellation-nakamoto/mpt-image-id/v2\u0000".getBytes(StandardCharsets.UTF_8)
 
   final case class DecodedImage(
@@ -815,6 +1144,37 @@ private[mpt] object MptImageEncoding {
     payload ++ Hash.sha256DigestFromBytes(payload).toByteArray
   }
 
+  def encodePublication(publication: MptActivePublication): Array[Byte] = {
+    val output = new ByteArrayOutputStream(PublicationMaximumBytes)
+    val data = new DataOutputStream(output)
+    try {
+      data.write(PublicationMagic)
+      data.writeInt(PublicationFormatVersion)
+      data.writeLong(publication.revision.value)
+      publication.image match {
+        case None => data.writeByte(0)
+        case Some(receipt) =>
+          val manifest = encodeManifest(receipt)
+          data.writeByte(1)
+          data.writeInt(manifest.length)
+          data.write(manifest)
+      }
+      data.flush()
+      val payload = output.toByteArray
+      output.write(Hash.sha256DigestFromBytes(payload).toByteArray)
+      output.toByteArray
+    } finally data.close()
+  }
+
+  def encodePublicationInitializationMarker: Array[Byte] = {
+    val payload = ByteBuffer
+      .allocate(PublicationInitializationPayloadBytes)
+      .put(PublicationInitializationMagic)
+      .putInt(PublicationFormatVersion)
+      .array()
+    payload ++ Hash.sha256DigestFromBytes(payload).toByteArray
+  }
+
   def decodeInitializationMarker(source: InputStream): Either[DurableMptImageError, Unit] =
     try {
       val input = new DataInputStream(source)
@@ -837,6 +1197,83 @@ private[mpt] object MptImageEncoding {
         Left(CorruptInitializationMarker(s"Invalid MPT image initialization marker: ${failure.getMessage}", failure))
       case NonFatal(failure) =>
         Left(CorruptInitializationMarker(s"Unable to decode MPT image initialization marker: ${failure.getMessage}", failure))
+    }
+
+  def decodePublication(source: InputStream): Either[DurableMptImageError, MptActivePublication] =
+    try {
+      val bounded = new CountingBoundedInputStream(source, PublicationMaximumBytes.toLong, "publication bytes")
+      val digest = MessageDigest.getInstance("SHA-256")
+      val digesting = new DigestInputStream(bounded, digest)
+      val input = new DataInputStream(digesting)
+
+      requireMagic(input, PublicationMagic, "active publication")
+      val version = input.readInt()
+      if (version != PublicationFormatVersion) throw new IOException(s"Unsupported active-publication version $version")
+      val revision = input.readLong()
+      if (revision < 0L) throw new IOException(s"Negative active-publication revision $revision")
+      val image = input.readUnsignedByte() match {
+        case 0 => None
+        case 1 =>
+          val manifestLength = input.readInt()
+          if (manifestLength != ManifestBytes)
+            throw new IOException(s"Invalid embedded manifest length $manifestLength, expected $ManifestBytes")
+          val manifestBytes = readExact(input, manifestLength)
+          decodeManifest(new ByteArrayInputStream(manifestBytes)) match {
+            case Right(receipt) => receipt.some
+            case Left(failure)  => throw new IOException("Invalid embedded MPT image manifest", failure)
+          }
+        case tag => throw new IOException(s"Invalid active-publication image option tag $tag")
+      }
+
+      digesting.on(false)
+      val expectedChecksum = readExact(input, HashBytes)
+      val actualChecksum = digest.digest()
+      if (!Arrays.equals(expectedChecksum, actualChecksum)) throw new IOException("Active-publication checksum mismatch")
+      if (input.read() != -1) throw new IOException("Trailing active-publication bytes")
+      Right(MptActivePublication(MptPublicationRevision(revision), image))
+    } catch {
+      case failure: ImageLimitExceeded => Left(failure)
+      case failure: EOFException       => Left(CorruptPublication("Truncated MPT active publication", failure))
+      case failure: IOException        => Left(CorruptPublication(s"Invalid MPT active publication: ${failure.getMessage}", failure))
+      case NonFatal(failure) => Left(CorruptPublication(s"Unable to decode MPT active publication: ${failure.getMessage}", failure))
+    }
+
+  def decodePublicationInitializationMarker(source: InputStream): Either[DurableMptImageError, Unit] =
+    try {
+      val input = new DataInputStream(source)
+      val bytes = readExact(input, PublicationInitializationBytes)
+      if (input.read() != -1) throw new IOException("Trailing publication-initialization-marker bytes")
+      val payload = Arrays.copyOf(bytes, PublicationInitializationPayloadBytes)
+      val expectedChecksum = Arrays.copyOfRange(bytes, PublicationInitializationPayloadBytes, PublicationInitializationBytes)
+      val actualChecksum = Hash.sha256DigestFromBytes(payload).toByteArray
+      if (!Arrays.equals(expectedChecksum, actualChecksum))
+        throw new IOException("Publication-initialization-marker checksum mismatch")
+
+      val decoded = new DataInputStream(new ByteArrayInputStream(payload))
+      requireMagic(decoded, PublicationInitializationMagic, "publication initialization marker")
+      val version = decoded.readInt()
+      if (version != PublicationFormatVersion)
+        throw new IOException(s"Unsupported publication-initialization-marker version $version")
+      if (decoded.available() != 0)
+        throw new IOException(s"Trailing ${decoded.available()} publication-initialization-marker bytes")
+      Right(())
+    } catch {
+      case failure: EOFException =>
+        Left(CorruptPublicationInitializationMarker("Truncated MPT publication initialization marker", failure))
+      case failure: IOException =>
+        Left(
+          CorruptPublicationInitializationMarker(
+            s"Invalid MPT publication initialization marker: ${failure.getMessage}",
+            failure
+          )
+        )
+      case NonFatal(failure) =>
+        Left(
+          CorruptPublicationInitializationMarker(
+            s"Unable to decode MPT publication initialization marker: ${failure.getMessage}",
+            failure
+          )
+        )
     }
 
   def decodeManifest(source: InputStream): Either[DurableMptImageError, MptImageReceipt] =

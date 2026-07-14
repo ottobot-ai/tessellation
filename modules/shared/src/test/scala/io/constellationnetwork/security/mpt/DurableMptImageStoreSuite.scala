@@ -593,6 +593,427 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     }
   }
 
+  test("publication-journal initialization requires the exact legacy receipt and then owns active selection") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        for {
+          before <- store.activePublication
+          initial <- prepare(store, 0L, ordinal0, entries("publication-init"))
+          _ <- store.publish(initial, None)
+          manifestPath = DurableMptImageLayout.activeManifest(directory)
+          manifestBefore <- IO.blocking(Files.readAllBytes(manifestPath))
+          wrongExpected <- store.initializeActivePublication(None).attempt
+          manifestAfterFailure <- IO.blocking(Files.readAllBytes(manifestPath))
+          initialized <- store.initializeActivePublication(initial.some)
+          repeated <- store.initializeActivePublication(initial.some)
+          publication <- store.activePublication
+          active <- store.activeReceipt
+          legacyManifestExists <- IO.blocking(Files.exists(manifestPath))
+          legacyMarkerExists <- IO.blocking(Files.exists(DurableMptImageLayout.initializationMarker(directory)))
+          publicationExists <- IO.blocking(Files.isRegularFile(DurableMptImageLayout.activePublication(directory)))
+          publicationMarkerExists <- IO.blocking(
+            Files.isRegularFile(DurableMptImageLayout.publicationInitializationMarker(directory))
+          )
+          next <- prepare(store, 1L, ordinal1, entries("publication-legacy-rejected"))
+          legacyPublish <- store.publish(next, initial.pointer.some).attempt
+        } yield
+          expect.all(
+            before.isEmpty,
+            wrongExpected.left.exists(_.isInstanceOf[PublicationInitializationConflict]),
+            java.util.Arrays.equals(manifestBefore, manifestAfterFailure),
+            initialized == MptActivePublication(MptPublicationRevision(0L), initial.some),
+            repeated == initialized,
+            publication.contains(initialized),
+            active.contains(initial),
+            !legacyManifestExists,
+            !legacyMarkerExists,
+            publicationExists,
+            publicationMarkerExists,
+            legacyPublish.left.exists(_.isInstanceOf[PublicationJournalOwnsActiveState])
+          )
+      }.flatMap { liveResult =>
+        makeStore(directory).use { restarted =>
+          (restarted.activePublication, restarted.activeReceipt).mapN { (publication, active) =>
+            liveResult && expect.all(publication.exists(_.revision == MptPublicationRevision(0L)), active.nonEmpty)
+          }
+        }
+      }
+    }
+  }
+
+  test("publication revision permits exact lower-generation rollback and durable explicit pristine restoration") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val lowValues = entries("publication-low")
+      val highValues = entries("publication-high")
+
+      makeStore(directory).use { store =>
+        for {
+          initial <- store.initializeActivePublication(None)
+          low <- prepare(store, 2L, ordinal0, lowValues)
+          high <- prepare(store, 10L, ordinal1, highValues)
+          highState = MptActivePublication(MptPublicationRevision(1L), high.some)
+          _ <- store.transitionActive(initial, highState)
+          lowState = MptActivePublication(MptPublicationRevision(2L), low.some)
+          _ <- store.transitionActive(highState, lowState)
+          _ <- store.transitionActive(highState, lowState)
+          loadedLow <- store.read(low)
+          pristine = MptActivePublication(MptPublicationRevision(3L), None)
+          _ <- store.transitionActive(lowState, pristine)
+          activeAfterPristine <- store.activeReceipt
+          publicationAfterPristine <- store.activePublication
+        } yield
+          expect.all(
+            high.generation > low.generation,
+            loadedLow.toMap == lowValues,
+            activeAfterPristine.isEmpty,
+            publicationAfterPristine.contains(pristine)
+          ) -> (pristine, high, highValues)
+      }.flatMap {
+        case (beforeRestart, (pristine, high, highValues0)) =>
+          makeStore(directory).use { restarted =>
+            val restored = MptActivePublication(MptPublicationRevision(4L), high.some)
+            for {
+              booted <- restarted.activePublication
+              _ <- restarted.transitionActive(pristine, restored)
+              loaded <- restarted.read(high)
+            } yield beforeRestart && expect.all(booted.contains(pristine), loaded.toMap == highValues0)
+          }
+      }
+    }
+  }
+
+  test("publication transitions reject nonconsecutive revisions, stale exact state, and exhausted revision space") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        for {
+          initial <- store.initializeActivePublication(None)
+          left <- prepare(store, 7L, ordinal0, entries("publication-cas-left"))
+          right <- prepare(store, 8L, ordinal1, entries("publication-cas-right"))
+          gap = MptActivePublication(MptPublicationRevision(2L), left.some)
+          gapFailure <- store.transitionActive(initial, gap).attempt
+          selected = MptActivePublication(MptPublicationRevision(1L), left.some)
+          _ <- store.transitionActive(initial, selected)
+          staleTarget = MptActivePublication(MptPublicationRevision(1L), right.some)
+          staleFailure <- store.transitionActive(initial, staleTarget).attempt
+          exhausted = MptActivePublication(MptPublicationRevision(Long.MaxValue), left.some)
+          exhaustedFailure <- store.transitionActive(exhausted, exhausted).attempt
+          active <- store.activePublication
+        } yield
+          expect.all(
+            gapFailure.left.exists(_.isInstanceOf[NonConsecutivePublicationRevision]),
+            staleFailure.left.exists(_.isInstanceOf[PublicationCompareAndSetConflict]),
+            exhaustedFailure.left.exists(_.isInstanceOf[PublicationRevisionExhausted]),
+            active.contains(selected)
+          )
+      }
+    }
+  }
+
+  test("the publication mutex permits exactly one conflicting transition from the same exact state") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        for {
+          initial <- store.initializeActivePublication(None)
+          left <- prepare(store, 30L, ordinal0, entries("publication-race-left"))
+          right <- prepare(store, 31L, ordinal1, entries("publication-race-right"))
+          candidates = List(left, right).map(receipt => MptActivePublication(MptPublicationRevision(1L), receipt.some))
+          results <- candidates.parTraverse(target => store.transitionActive(initial, target).attempt)
+          active <- store.activePublication
+        } yield
+          expect.all(
+            results.count(_.isRight) == 1,
+            results.count(_.left.exists(_.isInstanceOf[PublicationCompareAndSetConflict])) == 1,
+            active.exists(candidates.contains)
+          )
+      }
+    }
+  }
+
+  test("publication initialization never infers state from missing legacy data or a missing initialized journal") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { missingLegacyDirectory =>
+      tempDir.use { missingPublicationDirectory =>
+        tempDir.use { disagreementDirectory =>
+          for {
+            legacyReceipt <- makeStore(missingLegacyDirectory).use { store =>
+              prepare(store, 0L, ordinal0, entries("publication-missing-legacy")).flatTap(store.publish(_, None))
+            }
+            _ <- IO.blocking(Files.delete(DurableMptImageLayout.activeManifest(missingLegacyDirectory)))
+            missingLegacy <- makeStore(missingLegacyDirectory)
+              .use(_.initializeActivePublication(legacyReceipt.some))
+              .attempt
+            _ <- makeStore(missingPublicationDirectory).use(_.initializeActivePublication(None))
+            _ <- IO.blocking(Files.delete(DurableMptImageLayout.activePublication(missingPublicationDirectory)))
+            missingPublication <- makeStore(missingPublicationDirectory).use(_.activeReceipt).attempt
+            rogue <- makeStore(disagreementDirectory).use { store =>
+              for {
+                _ <- store.initializeActivePublication(None)
+                receipt <- prepare(store, 0L, ordinal0, entries("publication-disagreement"))
+              } yield receipt
+            }
+            _ <- IO
+              .blocking(
+                Files.write(DurableMptImageLayout.activeManifest(disagreementDirectory), MptImageEncoding.encodeManifest(rogue))
+              )
+              .void
+            _ <- IO
+              .blocking(
+                Files.write(
+                  DurableMptImageLayout.initializationMarker(disagreementDirectory),
+                  MptImageEncoding.encodeInitializationMarker
+                )
+              )
+              .void
+            disagreement <- makeStore(disagreementDirectory).use(_.activeReceipt).attempt
+          } yield {
+            val missingLegacyMatches = missingLegacy.left.exists {
+              case MissingArtifact(MptImageArtifactRef.ActiveManifest, path, _) =>
+                path == DurableMptImageLayout.activeManifest(missingLegacyDirectory)
+              case _ => false
+            }
+            val missingPublicationMatches = missingPublication.left.exists {
+              case MissingArtifact(MptImageArtifactRef.ActivePublication, path, _) =>
+                path == DurableMptImageLayout.activePublication(missingPublicationDirectory)
+              case _ => false
+            }
+
+            expect.all(
+              missingLegacyMatches,
+              missingPublicationMatches,
+              disagreement.left.exists(_.isInstanceOf[LegacyPublicationDisagreement])
+            )
+          }
+        }
+      }
+    }
+  }
+
+  test("publication compensation crash prefixes resume only from an exact journal or clean legacy ownership") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { journalOnlyDirectory =>
+      tempDir.use { cleanLegacyDirectory =>
+        tempDir.use { mismatchDirectory =>
+          tempDir.use { corruptDirectory =>
+            for {
+              journalOnlyLegacy <- makeStore(journalOnlyDirectory).use { store =>
+                prepare(store, 0L, ordinal0, entries("compensation-journal-only")).flatTap(store.publish(_, None))
+              }
+              journalOnly = MptActivePublication(MptPublicationRevision(0L), journalOnlyLegacy.some)
+              _ <- IO.blocking(
+                Files.write(
+                  DurableMptImageLayout.activePublication(journalOnlyDirectory),
+                  MptImageEncoding.encodePublication(journalOnly)
+                )
+              ).void
+              missingMarker <- makeStore(journalOnlyDirectory).use(_.activeReceipt).attempt
+              resumed <- makeStore(journalOnlyDirectory).use { store =>
+                for {
+                  initialized <- store.initializeActivePublication(journalOnlyLegacy.some)
+                  active <- store.activeReceipt
+                } yield initialized == journalOnly && active.contains(journalOnlyLegacy)
+              }
+              cleanLegacy <- makeStore(cleanLegacyDirectory).use { store =>
+                prepare(store, 0L, ordinal0, entries("compensation-clean-legacy")).flatTap(store.publish(_, None))
+              }
+              cleanInitialized <- makeStore(cleanLegacyDirectory).use(_.initializeActivePublication(cleanLegacy.some))
+              mismatch <- makeStore(mismatchDirectory).use { store =>
+                for {
+                  legacy <- prepare(store, 0L, ordinal0, entries("compensation-mismatch-legacy"))
+                  _ <- store.publish(legacy, None)
+                  other <- prepare(store, 9L, ordinal1, entries("compensation-mismatch-other"))
+                } yield legacy -> other
+              }
+              (mismatchLegacy, mismatchOther) = mismatch
+              _ <- IO.blocking(
+                Files.write(
+                  DurableMptImageLayout.activePublication(mismatchDirectory),
+                  MptImageEncoding.encodePublication(
+                    MptActivePublication(MptPublicationRevision(0L), mismatchOther.some)
+                  )
+                )
+              ).void
+              mismatchResult <- makeStore(mismatchDirectory)
+                .use(_.initializeActivePublication(mismatchLegacy.some))
+                .attempt
+              mismatchLegacyIntact <- IO.blocking(
+                Files.isRegularFile(DurableMptImageLayout.activeManifest(mismatchDirectory)) &&
+                  Files.isRegularFile(DurableMptImageLayout.initializationMarker(mismatchDirectory))
+              )
+              corruptLegacy <- makeStore(corruptDirectory).use { store =>
+                prepare(store, 0L, ordinal0, entries("compensation-corrupt")).flatTap(store.publish(_, None))
+              }
+              corruptBytes = MptImageEncoding
+                .encodePublication(MptActivePublication(MptPublicationRevision(0L), corruptLegacy.some))
+                .clone()
+              _ = corruptBytes(corruptBytes.length - 1) = (corruptBytes.last ^ 1).toByte
+              _ <- IO.blocking(
+                Files.write(DurableMptImageLayout.activePublication(corruptDirectory), corruptBytes)
+              ).void
+              corruptResult <- makeStore(corruptDirectory)
+                .use(_.initializeActivePublication(corruptLegacy.some))
+                .attempt
+            } yield {
+              val missingMarkerMatches = missingMarker.left.exists {
+                case MissingArtifact(MptImageArtifactRef.PublicationInitializationMarker, path, _) =>
+                  path == DurableMptImageLayout.publicationInitializationMarker(journalOnlyDirectory)
+                case _ => false
+              }
+
+              expect.all(
+                missingMarkerMatches,
+                resumed,
+                cleanInitialized.image.contains(cleanLegacy),
+                mismatchResult.left.exists(_.isInstanceOf[PublicationInitializationConflict]),
+                mismatchLegacyIntact,
+                corruptResult.left.exists(_.isInstanceOf[CorruptPublication])
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("cancellation after publication-journal rename cannot expose an unverified intermediate state") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      TestControl.executeEmbed {
+        for {
+          prepared <- makeStore(directory).use { healthy =>
+            for {
+              initial <- healthy.initializeActivePublication(None)
+              receipt <- prepare(healthy, 40L, ordinal0, entries("publication-cancel"))
+            } yield initial -> MptActivePublication(MptPublicationRevision(1L), receipt.some)
+          }
+          (initial, target) = prepared
+          fired <- Ref.of[IO, Boolean](false)
+          entered <- Deferred[IO, Unit]
+          release <- Deferred[IO, Unit]
+          result <- DurableMptImageStore
+            .resourceWith[IO](
+              directory,
+              DurableFileOps.nio[IO],
+              new BarrierOnce(after(AtomicMove, Publication), fired, entered, release, None),
+              codecEra,
+              rootVerifier,
+              limits
+            )
+            .use { blocked =>
+              for {
+                publisher <- blocked.transitionActive(initial, target).start
+                _ <- entered.get
+                cancelDone <- Deferred[IO, Unit]
+                canceler <- publisher.cancel.guarantee(cancelDone.complete(()).void).start
+                _ <- IO.cede
+                cancelBeforeRelease <- cancelDone.tryGet
+                _ <- release.complete(())
+                _ <- canceler.joinWithNever
+                _ <- publisher.join
+                active <- blocked.activePublication
+                retry <- blocked.transitionActive(initial, target).attempt
+              } yield
+                expect.all(
+                  cancelBeforeRelease.isEmpty,
+                  active.contains(target),
+                  retry == Right(())
+                )
+            }
+        } yield result
+      }
+    }
+  }
+
+  test("every publication-journal write stage restores the exact prior publication") { res =>
+    implicit val (json, hasher) = res
+
+    val points = DurableWriteStage.ordered.flatMap(stage => List(before(stage, Publication), after(stage, Publication)))
+
+    points.traverse { point =>
+      tempDir.use { directory =>
+        for {
+          prepared <- makeStore(directory).use { healthy =>
+            for {
+              initial <- healthy.initializeActivePublication(None)
+              receipt <- prepare(healthy, 20L, ordinal0, entries(s"publication-write-$point"))
+            } yield initial -> MptActivePublication(MptPublicationRevision(1L), receipt.some)
+          }
+          (initial, target) = prepared
+          failed <- storeWithFault(directory, point).use(_.transitionActive(initial, target).attempt)
+          recovered <- makeStore(directory).use { healthy =>
+            (healthy.activePublication, healthy.activeReceipt).mapN { (publication, active) =>
+              publication.contains(initial) && active.isEmpty
+            }
+          }
+          temporary <- temporaryArtifacts(directory)
+        } yield failed.isLeft && recovered && temporary.isEmpty
+      }
+    }.map(results => expect(results.forall(identity)))
+  }
+
+  test("every publication-initialization-marker write stage restores the exact legacy publication") { res =>
+    implicit val (json, hasher) = res
+
+    val points = DurableWriteStage.ordered.flatMap { stage =>
+      List(before(stage, PublicationInitializationMarker), after(stage, PublicationInitializationMarker))
+    }
+
+    points.traverse { point =>
+      tempDir.use { directory =>
+        for {
+          legacy <- makeStore(directory).use { healthy =>
+            prepare(healthy, 0L, ordinal0, entries(s"publication-marker-$point")).flatTap(healthy.publish(_, None))
+          }
+          failed <- storeWithFault(directory, point).use(_.initializeActivePublication(legacy.some).attempt)
+          recovered <- makeStore(directory).use { healthy =>
+            (healthy.activePublication, healthy.activeReceipt).mapN { (publication, active) =>
+              publication.isEmpty && active.contains(legacy)
+            }
+          }
+          temporary <- temporaryArtifacts(directory)
+        } yield failed.isLeft && recovered && temporary.isEmpty
+      }
+    }.map(results => expect(results.forall(identity)))
+  }
+
+  test("publication journal and marker reject checksummed invalid tags and corruption") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      for {
+        _ <- makeStore(directory).use(_.initializeActivePublication(None))
+        publicationPath = DurableMptImageLayout.activePublication(directory)
+        markerPath = DurableMptImageLayout.publicationInitializationMarker(directory)
+        originalPublication <- IO.blocking(Files.readAllBytes(publicationPath))
+        invalidTagPayload = originalPublication.dropRight(32)
+        _ = invalidTagPayload(20) = 2.toByte
+        invalidTag = invalidTagPayload ++ Hash.sha256DigestFromBytes(invalidTagPayload).toByteArray
+        _ <- IO.blocking(Files.write(publicationPath, invalidTag)).void
+        invalidTagResult <- makeStore(directory).use(_.activePublication).attempt
+        _ <- IO.blocking(Files.write(publicationPath, originalPublication)).void
+        originalMarker <- IO.blocking(Files.readAllBytes(markerPath))
+        corruptMarker = originalMarker.clone()
+        _ = corruptMarker(corruptMarker.length - 1) = (corruptMarker.last ^ 1).toByte
+        _ <- IO.blocking(Files.write(markerPath, corruptMarker)).void
+        corruptMarkerResult <- makeStore(directory).use(_.activePublication).attempt
+      } yield
+        expect.all(
+          invalidTagResult.left.exists(_.isInstanceOf[CorruptPublication]),
+          corruptMarkerResult.left.exists(_.isInstanceOf[CorruptPublicationInitializationMarker])
+        )
+    }
+  }
+
   test("the publish mutex permits exactly one of two conflicting same-generation publications") { res =>
     implicit val (json, hasher) = res
 
