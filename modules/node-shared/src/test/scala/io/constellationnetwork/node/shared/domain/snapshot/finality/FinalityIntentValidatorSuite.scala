@@ -385,6 +385,64 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       artifact(FinalityArtifactKind.CoreBatch, seed)
     )
 
+  /** Rebind every transition-dependent and intent-scoped identity after replacing the template's Advance shape. Fork-choice validity
+    * remains external; this helper proves only that the closed batch schema is cross-field constructible.
+    */
+  private def rebindTransition(
+    template: CoreFixture,
+    selection: CanonicalSelectionToken,
+    transitionShape: TransitionShape,
+    transition: IntentId => CoreTransition,
+    qualificationScope: OperationalQualificationScope,
+    qualification: IntentId => OperationalQualification,
+    paths: List[PathDraft]
+  ): CoreFixture = {
+    val transitionDigest = FinalityIdentity.transitionDigest(transitionShape).fold(throw _, identity)
+    val placeholder = IntentId(hash("rebound-placeholder-intent"))
+    val provisionalEffectScope = template.manifest.scope.copy(
+      intent = placeholder,
+      transitionDigest = transitionDigest
+    )
+    val provisionalCommands = template.commands.map { command =>
+      val rebound = command.copy(
+        scope = provisionalEffectScope,
+        payload = command.payload.copy(intentId = placeholder)
+      )
+      rebound.copy(effectId = FinalityIdentity.effectId(rebound.identityPreimage).fold(throw _, identity))
+    }
+    val scope = template.batch.scope.copy(
+      selection = selection,
+      transition = transitionShape,
+      qualification = qualificationScope,
+      effects = plan(template.manifest.previous, provisionalCommands)
+    )
+    val intentId = FinalityIdentity.intentId(scope).fold(throw _, identity)
+    val effectScope = provisionalEffectScope.copy(intent = intentId)
+    val commands = provisionalCommands.map { command =>
+      command.copy(
+        scope = effectScope,
+        payload = command.payload.copy(intentId = intentId)
+      )
+    }
+    val exactManifest = manifest(effectScope, template.manifest.previous, commands)
+    val manifestPointer = FinalityIdentity.effectManifestPointer(exactManifest).fold(throw _, identity)
+    val prepared = template.batch.prepared.copy(
+      semanticState = template.batch.prepared.semanticState.copy(intentId = intentId),
+      authenticatedAnchor = template.batch.prepared.authenticatedAnchor.copy(intentId = intentId)
+    )
+    val batch = FinalityCoreBatch(
+      intentId,
+      scope,
+      ScopedArtifactRef(intentId, selection.decision.evidence),
+      transition(intentId),
+      qualification(intentId),
+      prepared,
+      manifestPointer
+    )
+
+    CoreFixture(batch, exactManifest, paths.map(resolve(intentId, _)), commands, template.context)
+  }
+
   pureTest("core validation requires the exact complete resolved path multiset") {
     val target = state(10L, "path-target", hash("path-parent"))
     val fixture = buildCore(List(target))
@@ -832,6 +890,116 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       validateResolvedCorePaths(replacementBatch, resolved(replacementBatch, replacementLineage)).isValid,
       violations(validateResolvedCorePaths(oldBranchBatch, resolved(oldBranchBatch, oldLineage)))
         .exists(_.path == "batch.scope.selection.lineage")
+    )
+  }
+
+  pureTest("a full ForkChoiceReplacement batch is cross-field constructible without asserting winner semantics") {
+    val mrca = state(45L, "full-replacement-mrca", hash("full-replacement-parent"))
+    val old1 = child(mrca, "full-replacement-old-1")
+    val old2 = child(old1, "full-replacement-old-2")
+    val new1 = child(mrca, "full-replacement-new-1")
+    val new2 = child(new1, "full-replacement-new-2")
+    val selectedTip = child(new2, "full-replacement-selected-tip")
+    val priorFixture = buildCore(List(old2))
+    val priorReleased = released(priorFixture)
+    val lineage = path(PathRole.CanonicalLineage, List(new2, selectedTip))
+    val orphaned = path(PathRole.Orphaned, List(old1, old2))
+    val adopted = path(PathRole.Adopted, List(new1, new2))
+    val template = buildCore(
+      lineage.entries,
+      previous = Some(priorReleased -> priorFixture),
+      attemptNumber = 1L
+    )
+    val selection = template.batch.scope.selection.copy(
+      branchRevision = CanonicalBranchRevision(nonNeg(1L)),
+      lineage = lineage.commitment
+    )
+    val transitionShape = TransitionShape.ForkChoiceReplacement(mrca, orphaned.commitment, adopted.commitment)
+    val qualificationScope = template.batch.scope.qualification
+    val fixture = rebindTransition(
+      template,
+      selection,
+      transitionShape,
+      intentId =>
+        CoreTransition.ForkChoiceReplacement(
+          mrca,
+          PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest)),
+          PathManifestRef(adopted.commitment, ScopedArtifactRef(intentId, adopted.commitment.manifest))
+        ),
+      qualificationScope,
+      intentId =>
+        OperationalQualification.DecidedAttestationTWeight(
+          qualificationScope.operationalTarget,
+          qualificationScope.qualifyingDescendant,
+          None,
+          ScopedArtifactRef(intentId, qualificationScope.evidence)
+        ),
+      List(lineage, orphaned, adopted)
+    )
+
+    expect.all(
+      validateCoreBatch(priorFixture.batch, priorFixture.manifest, priorFixture.paths, priorFixture.context).isValid,
+      validateReleasedCore(priorFixture.batch, priorReleased).isValid,
+      validateCoreBatch(fixture.batch, fixture.manifest, fixture.paths, fixture.context).isValid
+    )
+  }
+
+  pureTest(
+    "a full inherited ForkChoiceRollbackToOperationalMrca batch is cross-field constructible without asserting winner semantics"
+  ) {
+    val mrca = state(50L, "full-rollback-mrca", hash("full-rollback-parent"))
+    val old1 = child(mrca, "full-rollback-old-1")
+    val old2 = child(old1, "full-rollback-old-2")
+    val old3 = child(old2, "full-rollback-old-3")
+    val replacement = child(mrca, "full-rollback-replacement")
+    val priorLineage = List(old2, old3)
+    val priorFixture = buildCore(priorLineage, qualificationEntries = Some(priorLineage))
+    val priorReleased = released(priorFixture)
+    val lineage = path(PathRole.CanonicalLineage, List(mrca, replacement))
+    val orphaned = path(PathRole.Orphaned, List(old1, old2))
+    val closure = path(PathRole.OperationalAncestorClosure, List(mrca, old1, old2, old3))
+    val template = buildCore(
+      lineage.entries,
+      previous = Some(priorReleased -> priorFixture),
+      attemptNumber = 1L
+    )
+    val selection = template.batch.scope.selection.copy(
+      branchRevision = CanonicalBranchRevision(nonNeg(1L)),
+      lineage = lineage.commitment
+    )
+    val transitionShape = TransitionShape.ForkChoiceRollbackToOperationalMrca(mrca, orphaned.commitment)
+    val previousQualification = priorReleased.payload.qualification
+    val qualificationScope = OperationalQualificationScope(
+      previousQualification.scope.rail,
+      mrca,
+      previousQualification.qualifyingDescendant,
+      Some(closure.commitment),
+      previousQualification.evidence.artifact
+    )
+    val fixture = rebindTransition(
+      template,
+      selection,
+      transitionShape,
+      intentId =>
+        CoreTransition.ForkChoiceRollbackToOperationalMrca(
+          mrca,
+          PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest))
+        ),
+      qualificationScope,
+      intentId =>
+        OperationalQualification.DecidedAttestationTWeight(
+          mrca,
+          previousQualification.qualifyingDescendant,
+          Some(PathManifestRef(closure.commitment, ScopedArtifactRef(intentId, closure.commitment.manifest))),
+          ScopedArtifactRef(intentId, previousQualification.evidence.artifact)
+        ),
+      List(lineage, orphaned, closure)
+    )
+
+    expect.all(
+      validateCoreBatch(priorFixture.batch, priorFixture.manifest, priorFixture.paths, priorFixture.context).isValid,
+      validateReleasedCore(priorFixture.batch, priorReleased).isValid,
+      validateCoreBatch(fixture.batch, fixture.manifest, fixture.paths, fixture.context).isValid
     )
   }
 

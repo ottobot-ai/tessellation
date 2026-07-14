@@ -15,6 +15,8 @@ import io.constellationnetwork.node.shared.infrastructure.metrics.NoOpMetrics
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.nakamoto.ChainTip
+import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfOutput}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -275,6 +277,99 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     hash: Hash
   )
 
+  private final case class StrictCycleNode(
+    name: String,
+    ordinal: Long,
+    slot: Long,
+    parent: Option[String],
+    vrf: Byte,
+    uniqueEpoch: Long
+  )
+
+  private final case class SignedStrictCycleNode(
+    signed: Signed[GlobalIncrementalSnapshot],
+    context: GlobalSnapshotInfo,
+    tip: ChainTip
+  )
+
+  private val strictCycleNodes = List(
+    StrictCycleNode("g", 0L, 0L, None, 0x40.toByte, 1L),
+    StrictCycleNode("x1", 1L, 1L, Some("g"), 0x10.toByte, 2L),
+    StrictCycleNode("x2", 2L, 2L, Some("x1"), 0x11.toByte, 3L),
+    StrictCycleNode("a1", 3L, 20L, Some("x2"), 0x20.toByte, 4L),
+    StrictCycleNode("a2", 4L, 30L, Some("a1"), 0x21.toByte, 5L),
+    StrictCycleNode("a", 5L, 40L, Some("a2"), 0x22.toByte, 6L),
+    StrictCycleNode("b1", 3L, 3L, Some("x2"), 0x30.toByte, 7L),
+    StrictCycleNode("b", 4L, 4L, Some("b1"), 0x31.toByte, 8L),
+    StrictCycleNode("c1", 1L, 1L, Some("g"), 0x50.toByte, 9L),
+    StrictCycleNode("c2", 2L, 5L, Some("c1"), 0x51.toByte, 10L),
+    StrictCycleNode("c3", 3L, 9L, Some("c2"), 0x52.toByte, 11L),
+    StrictCycleNode("c", 4L, 20L, Some("c3"), 0x53.toByte, 12L)
+  )
+
+  private def mkSignedStrictCycle(
+    implicit H: Hasher[IO],
+    S: SecurityProvider[IO],
+    j: JsonSerializer[IO]
+  ): IO[Map[String, SignedStrictCycleNode]] =
+    for {
+      templatePair <- mkGenesis
+      (template, context) = templatePair
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      built <- strictCycleNodes.foldLeftM[IO, Map[String, SignedStrictCycleNode]](Map.empty) { (acc, node) =>
+        val parentHash = node.parent.flatMap(acc.get).fold(Hash.empty)(_.tip.hash)
+        val value = template.value.copy(
+          ordinal = SnapshotOrdinal.unsafeApply(node.ordinal),
+          lastSnapshotHash = parentHash,
+          epochProgress = EpochProgress(NonNegLong.unsafeFrom(node.uniqueEpoch))
+        )
+
+        Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](value, keyPair).flatMap { signed =>
+          signed.toHashed[IO].map { hashed =>
+            val tip = ChainTip(
+              hashed.hash,
+              Slot(NonNegLong.unsafeFrom(node.slot)),
+              node.ordinal,
+              parentHash,
+              VrfOutput(Hex(List.fill(64)(f"${node.vrf & 0xff}%02x").mkString))
+            )
+            acc.updated(node.name, SignedStrictCycleNode(signed, context, tip))
+          }
+        }
+      }
+    } yield built
+
+  private def mkStrictCycleChainStore(
+    implicit hs: HasherSelector[IO]
+  ): IO[NakamotoChainStore.NakamotoChainStoreAlgebra[IO]] =
+    for {
+      stakeRegistry <- StakeRegistry.equalWeight[IO]
+      _ <- stakeRegistry.updateValidators(Set(pid("self")))
+      tipTracker <- TipTracker.make[IO](stakeRegistry)
+      finalizedRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
+      settledRef <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal.MinValue)
+      chainStoreRef <- Ref.of[IO, Option[NakamotoChainStore.NakamotoChainStoreAlgebra[IO]]](None)
+      chainSelection = ChainSelection.make[IO](
+        tipTracker,
+        tip => chainStoreRef.get.flatMap(_.traverse(_.tipFor(tip.parentHash)).map(_.flatten)),
+        kLookback = 3L,
+        sWindow = 10L,
+        maxAncestorDepth = 100L,
+        settledOrdinalReader = Some(settledRef.get.map(_.value.value)),
+        bandDensityReorgEnabled = true
+      )
+      chainStore <- NakamotoChainStore.make[IO](
+        stubStorage,
+        chainSelection,
+        tipTracker,
+        finalizedRef,
+        settledRef,
+        NakamotoChainStore.DefaultKeepDepthBehindFinalized,
+        bandDensityReorgEnabled = true
+      )
+      _ <- chainStoreRef.set(Some(chainStore))
+    } yield chainStore
+
   /** Build snapshots whose signed ordinal and signed parent hash match the chain-store metadata. The older `seedChainOfLength` fixture is
     * intentionally metadata-only and must not be used to prove exact signed ancestry.
     */
@@ -327,6 +422,51 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
           }
       }
       .map(_._1)
+
+  /** Store/control-flow witness under a synthetic enabled k/s configuration only: the bodies bind signed ordinal/parent ancestry and every
+    * schedule is parent-first, but this deliberately bypasses NakamotoSnapshotValidator and therefore does not prove
+    * VRF/KES/eta/era-valid network admission or divergence under a shipped environment configuration.
+    */
+  test("activation blocker: parent-first signed-ancestry store schedules over one strict frontier leave three different best tips") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    val schedules = List(
+      List("g", "x1", "x2", "a1", "a2", "a", "b1", "b", "c1", "c2", "c3", "c"),
+      List("g", "x1", "x2", "a1", "a2", "a", "b1", "c1", "c2", "c3", "b", "c"),
+      List("g", "x1", "x2", "a1", "a2", "b1", "b", "c1", "c2", "c3", "c", "a")
+    )
+
+    def run(
+      nodes: Map[String, SignedStrictCycleNode],
+      schedule: List[String]
+    ): IO[Hash] =
+      for {
+        chainStore <- mkStrictCycleChainStore
+        stored <- schedule.traverse { name =>
+          val node = nodes(name)
+          chainStore
+            .store(
+              node.signed,
+              node.context,
+              node.tip.ordinal,
+              node.tip.slot.value.value,
+              node.tip.parentHash,
+              node.tip.vrfOutput.toBytes
+            )
+        }
+        _ <- IO.raiseUnless(stored.forall(identity))(new IllegalStateException("strict-cycle schedule was not fully stored"))
+        best <- chainStore.bestTip.flatMap(_.liftTo[IO](new IllegalStateException("strict-cycle store has no best tip")))
+      } yield best.hash
+
+    for {
+      nodes <- mkSignedStrictCycle
+      winners <- schedules.traverse(run(nodes, _))
+    } yield expect.same(List(nodes("c").tip.hash, nodes("b").tip.hash, nodes("a").tip.hash), winners)
+  }
 
   test("divergentRefuseCount starts at 0 and divergentRefuseSample is None") { res =>
     implicit val (_, _, _, h, _) = res

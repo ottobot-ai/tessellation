@@ -35,7 +35,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-21 | Greenfield runtime starts with one canonical `ScodecV1` era at new-chain ordinal 0. Existing-network migration work is deferred, while prior data already on disk remains readable according to an explicit historical-read contract. Undeployed fork schemas are not retained. |
 | L-22 | Tower eligibility is a required protocol feature, but enabling it is multi-stage. Snapshot-carried trial/tower state and `smtRoot` must be independently reproduced and verified by every GL0 recipient, durable across restart, and branch-aware across density reorgs before proofs are treated as security evidence. Replacing `NotComputed` alone is forbidden. |
 | L-23 | Exact-parent state uses an immutable captured parent generation plus compare-and-set at commit; a stale session retries or defers and never blocks GL0 finality indefinitely. Locally viable branch generations are retained only within bounded policy; history beyond that bound is accepted only through exact authenticated reconstruction, otherwise the node enters `RecoveryRequired`. Finality durability uses one idempotent intent journal coordinating the existing overlay, chain store, tracker, outbox, watermarks, projections, and other sinks; it does not require migrating every sink into one database transaction. No exact-parent guard activates until the verified base anchor, descendant-preserving fold, authenticated restart/reorg recovery, and recoverable finality-intent transition land as one coherent unit. |
-| L-24 | GL0 fork choice over three or more valid tines is an objective total-frontier function: the same cutoff-complete published valid frontier and branch-authenticated parameters produce the same canonical head independently of candidate enumeration, gossip arrival schedule, restart, or prior local incumbent. A stateful pairwise incumbent tournament cannot authorize canonical selection or Phase 2. O-15 remains open for cutoff/bounded-diffusion and late-reveal semantics, cycle resolution, exact `k1` metric/equality, objective tie, evidence/verifier, validator/store witnesses, and security/liveness proof. |
+| L-24 | GL0 fork choice over three or more valid tines is an objective total-frontier function: the same cutoff-complete published valid frontier and branch-authenticated parameters produce the same canonical head independently of candidate enumeration, gossip arrival schedule, restart, or prior local incumbent. A stateful pairwise incumbent tournament cannot authorize canonical selection or Phase 2. O-15 remains open for cutoff/bounded-diffusion and late-reveal semantics, cycle resolution, exact `k1` metric/equality, objective tie, evidence/verifier, complete validator-backed admission and corrected-store convergence witnesses, and security/liveness proof. |
 
 Implementation status for L-15A is **OPEN**. The current currency incremental
 contains the `globalSnapshotSync` proof hash and accepted `globalSnapshotSyncs`
@@ -404,15 +404,19 @@ pairwise comparator is commutative but not transitive. A regression witness over
 three structurally connected `ChainTip` tines has `A >tk B`, `B >bg C`, and
 `C >bg A`; every deep edge is a strict density win, so the cycle does not depend
 on the open VRF/hash tie rule. Three list permutations return three different
-`selectBest` winners (`ChainSelectionSuite.scala:191-226`). This unit witness does not
-authenticate complete snapshots, VRF/KES eligibility, or historical parameter
-eras; a validator-backed integration witness remains mandatory. `selectBest` is
-currently called only by tests. Source inspection shows that live
-`NakamotoChainStore.store` compares arriving alternates with the current incumbent
-through `shouldSwitch`, but legal parent-before-child store-level permutations
-have not yet reproduced the three outcomes; that live divergence is an inference,
-not a completed RED (`ChainSelection.scala:119-159`;
-`NakamotoChainStore.scala:437-464`). No live
+`selectBest` winners (`ChainSelectionSuite.scala:191-226`). The bare `ChainTip`
+witness does not authenticate complete snapshots, VRF/KES eligibility, or
+historical parameter eras. A store-boundary regression under a synthetic enabled
+`k`/`s` configuration now signs the ordinal and parent linkage, feeds the same
+frontier through three parent-before-child schedules, and leaves
+`NakamotoChainStore` at best tips C, B, and A
+(`NakamotoChainStoreSuite.scala:280-372,427-469`). This converts the production
+store class/control-flow tournament from a source inference into a direct
+store-path reproduction. It still invokes `store` directly with synthetic
+caller-supplied slot/VRF metadata
+and shared context and does not exercise a shipped environment configuration, so
+a full validator-backed active-configuration admission witness remains mandatory.
+No live
 fork-choice source may mint `CanonicalSelectionToken`, authorize `FinalityGate`,
 or release Phase-2 state from this tournament. The objective property is settled.
 

@@ -185,15 +185,21 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **OPEN frontier implementation/proof blocker:** a strict-preference three-cycle
     over structurally connected comparator inputs has `A >tk B`, `B >bg C`, and
     `C >bg A`, so list permutation changes the left-fold winner without relying on
-    the open tie rule (`ChainSelectionSuite.scala:191-226`). A full snapshot/VRF/KES/era
-    validation witness remains required. `selectBest` has no live caller; source
-    inspection shows arrival-by-arrival `NakamotoChainStore.shouldSwitch` has the
-    same incumbent-tournament risk, but a store-level legal-arrival reproduction
-    remains open (`ChainSelection.scala:119-159`; `NakamotoChainStore.scala:437-464`).
-    O-15 has ratified objective total-frontier semantics, but cutoff/bounded-diffusion
-    and late-reveal semantics, cycle resolution, exact `k1` metric/equality,
-    objective tie, evidence/verifier, validator/store witnesses, and the
-    security/liveness proof remain open. Current `ForkChoiceDecision` carries one unscoped opaque artifact
+    the open tie rule (`ChainSelectionSuite.scala:191-226`). The analogous
+    arrival-by-arrival `NakamotoChainStore.shouldSwitch` tournament is now
+    reproduced at the store boundary under a synthetic enabled `k`/`s`
+    configuration: three parent-before-child schedules over the same signed
+    ordinal/parent-linked frontier leave best tips C, B, and A
+    (`NakamotoChainStoreSuite.scala:280-372,427-469`;
+    `ChainSelection.scala:119-159`; `NakamotoChainStore.scala:437-464`). This test
+    invokes `store` directly with synthetic slot/VRF metadata, does not pass full
+    snapshot/VRF/KES/historical-era admission, and does not exercise a shipped
+    environment configuration, so that validator-backed active-configuration
+    witness remains required. O-15 still needs cutoff/bounded-diffusion and
+    late-reveal semantics, cycle resolution, exact `k1` metric/equality,
+    objective tie, evidence/verifier, a complete admission witness,
+    corrected-store convergence, and the security/liveness proof. Current
+    `ForkChoiceDecision` carries one unscoped opaque artifact
     pointer; `FinalityCoreBatch.selectionEvidence` separately carries the
     intent-scoped locator and validation requires exact pointer equality. Neither
     asserts an unproved Tk/Bg/transition form;
@@ -202,6 +208,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `FinalityBaseCodecs.scala:96-119,178-179`;
     `FinalityIntentValidator.scala:59-120,748-761`). Close those gates and
     FIN-D-001A before minting canonical-selection evidence.
+  - Full positive successor fixtures now construct and completely validate both
+    replacement transition shapes from a valid released predecessor. This closes
+    only the cross-field schema-constructibility test gap; the fixtures do not
+    assert winner semantics or runtime readiness
+    (`FinalityIntentValidatorSuite.scala:388-444,896-1004`).
   - **OPEN boundary blocker:** when the bounded live walk finds the true MRCA over
     consecutive tines it reports maximum post-MRCA suffix length, but production
     supplies `kLookback = k1 + 1` and density engages only

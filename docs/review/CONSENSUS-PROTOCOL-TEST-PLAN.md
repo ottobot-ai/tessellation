@@ -202,12 +202,14 @@ The current `FinalityReferenceModel` is also component scaffolding, not FIN-D-00
 it accepts an already-selected canonical tip and checks only the shallow/deep rule
 tag before modeling replacement (`FinalityReferenceModel.scala:7-11,97-100,217-313`).
 `ChainSelectionSuite` contains both the current tie-assisted regression and a
-strict-density three-cycle. These are structurally connected comparator inputs,
-not complete validated snapshots. `selectBest` has no live caller. Production's
-arrival-by-arrival `NakamotoChainStore.shouldSwitch` path has the same source-level
-incumbent-tournament risk, but a legal parent-before-child store-level reproduction
-is still required (`ChainSelection.scala:119-159`;
-`NakamotoChainStore.scala:437-464`).
+strict-density three-cycle. `NakamotoChainStoreSuite` now reproduces the
+corresponding store-path defect under a synthetic enabled `k`/`s` configuration
+with signed ordinal/parent linkage: three parent-before-child schedules over the
+same frontier leave best tips C, B, and A
+(`NakamotoChainStoreSuite.scala:280-372,427-469`). This closes the direct
+store/control-flow RED, not FIN-D-001A: it calls `store` with synthetic
+slot/VRF/context, does not pass full snapshot/VRF/KES/historical-era admission,
+and does not exercise a shipped environment configuration.
 
 The current dark `ForkChoiceDecision` is not FIN-D-001A evidence. It carries an
 opaque `ImmutableArtifactPointer`, deliberately without a Tk/Bg or transition-form
@@ -218,8 +220,10 @@ era (`FinalityCore.scala:120-138,353-364`;
 `FinalityBaseCodecs.scala:96-119,178-179`;
 `FinalityIntentValidator.scala:59-120,748-761`).
 FIN-D-001A remains RED until O-15 closes cutoff/reveal semantics, cycle resolution,
-exact metric/tie, canonical evidence and its independent verifier,
-validator/store witnesses, and the security/liveness argument.
+exact metric/tie, canonical evidence and its independent verifier, a complete
+validator-backed active-configuration admission witness, corrected-store
+convergence under every required schedule/restart/duplication trace, and the
+security/liveness argument.
 
 The closed `PublicationRestoration` variants and current codec/validator tests
 prove only part of FIN-W-003's data contract: the schema validates one exact plan
@@ -239,13 +243,14 @@ activation gates (`FinalityCore.scala:395-460`;
 `FinalityCoordinatorKernel.scala:72-154`;
 `FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
 
-Full positive `validateCoreBatch` fixtures for `ForkChoiceReplacement` and
-`ForkChoiceRollbackToOperationalMrca` remain absent. Current geometry coverage
-calls the intentionally partial `validateResolvedCorePaths`, while the evidence
-binding test filters selected violation paths without proving the whole batch valid
-(`FinalityIntentValidator.scala:124-269`;
-`FinalityIntentValidatorSuite.scala:734-875`). This is a test gate, not evidence
-that either transition is activation-ready.
+Full positive `validateCoreBatch` fixtures now construct both
+`ForkChoiceReplacement` and inherited `ForkChoiceRollbackToOperationalMrca` from
+a valid prior batch/released core and validate the complete successor batch
+(`FinalityIntentValidatorSuite.scala:388-444,896-1004`). This closes the
+cross-field schema-constructibility test gap only. The fixtures deliberately do
+not assert winner semantics; they do not authenticate the opaque fork-choice
+evidence, prove the selected frontier, execute or durably apply either transition,
+or make either transition activation-ready.
 
 ### 4.3 Serialization, protocol era, and cryptography
 

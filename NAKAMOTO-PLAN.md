@@ -231,10 +231,19 @@ path on the current root shape.
   models exact MRCA replacement; it does not compute the winner
   (`FinalityReferenceModel.scala:7-11,97-100,217-313`). The strict three-tine
   comparator counterexample blocks canonical-selection authority until O-15's
-  algorithm/evidence/proof gate and FIN-D-001A close. The production store's
-  arrival-by-arrival `shouldSwitch` path is the same source-level risk, but still
-  needs its own legal-arrival integration reproduction
-  (`ChainSelectionSuite.scala:158-226`; `NakamotoChainStore.scala:437-464`).
+  algorithm/evidence/proof gate and FIN-D-001A close. The production store
+  class/control-flow risk is now a completed store-boundary RED under a synthetic
+  enabled `k`/`s` configuration: `NakamotoChainStoreSuite` constructs
+  snapshots whose signatures bind ordinal and parent hash, inserts one strict
+  frontier under three parent-before-child schedules, and observes final best
+  tips C, B, and A (`NakamotoChainStoreSuite.scala:280-372,427-469`;
+  `NakamotoChainStore.scala:437-464`). The test calls
+  `NakamotoChainStore.store` directly with synthetic caller-supplied slot/VRF
+  metadata and shared test context; it does not pass normal snapshot, VRF/KES,
+  historical eta/registry, or era admission, and it is not a shipped-environment
+  configuration witness. A complete validator-backed, active-configuration
+  admission witness and corrected-store convergence test remain required before
+  FIN-D-001A can close.
   `ForkChoiceDecision` currently carries one unscoped opaque artifact pointer;
   the batch separately supplies an intent-scoped locator which must equal it. It
   deliberately asserts no unproved Tk/Bg/transition form;
@@ -242,6 +251,11 @@ path on the current root shape.
   verifier exists (`FinalityCore.scala:120-138,353-364`;
   `FinalityBaseCodecs.scala:96-119,178-179`;
   `FinalityIntentValidator.scala:59-120,748-761`).
+- Full positive successor fixtures now construct and completely validate both
+  replacement transition shapes from a valid released predecessor. This proves
+  cross-field schema constructibility only, not winner semantics, authenticated
+  fork-choice evidence, durable execution, or activation readiness
+  (`FinalityIntentValidatorSuite.scala:388-444,896-1004`).
 - Resolve the source-proven `k1` boundary mismatch before activation. When the
   bounded walk finds the true MRCA over consecutive tines, it reports maximum
   post-MRCA suffix length, while production passes `k1 + 1` and
