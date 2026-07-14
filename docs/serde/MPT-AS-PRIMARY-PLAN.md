@@ -22,7 +22,7 @@ This plan consolidates (a) the design direction validated by industry research, 
 |---|---|---|
 | **3a** scodec values in MptStore | **DONE** | `MptStore` get/insert/sync/update are all parameterized on `ImmutableCodec[V]` (scodec-backed `ByteVector`), **not** circe — `MptStore.scala:44-75`, encode via `ImmutableCodec[V].immutableBytes` at `:145-146`. Scaladoc `:36-37`: "Values are encoded via the canonical `ImmutableCodec[V]` typeclass (scodec-backed, byte-exact) … this replaces the earlier circe-based encoding." Typeclass: `serde/ImmutableCodec.scala:26-31`. Parity suite present: `shared/.../serde/JsonScodecParitySuite.scala`. **Note:** the serve/sync seam (`syncFromGlobalSnapshotInfo`, `currencySnapshotEntryBytes`) still mixes circe (`.asJson`) for some partitions inside `GlobalStateConverter` — the *store value codec* is scodec; the *global-state encoder* is not uniformly scodec. 3a as scoped (value layer) is done. |
 | **3b** historical proof wiring | **NOT STARTED (as scoped)** | No `def proofAt(ordinal, key)` on `MptStore` (signatures at `MptStore.scala:44-75` — no `proofAt`). `MptUndoJournal.unapplyTo` still not consumed for proof-at-ordinal. The provers exist (pre-existing) but the per-ordinal proof API the plan specifies is unwired. (Light-client SMT proof work — `LightClientSmt.scala` — is a separate track, not this `MptStore.proofAt`.) |
-| **3c** remove GSI materialization on accept | **PARTIAL** | LANDED: signed `mptRoot` now derives from MPT overlay bytes, G1–G5 readers route reads through the MPT, sidecar + syncView exclusion, per-MG unroll. REMAINS: accept still materializes the `GlobalSnapshotInfo` case class; serve/follow/persist are still GSI-blob-authoritative. See the **3c split** below. |
+| **3c** remove GSI materialization on accept | **PARTIAL** | At the **2026-06-17 historical checkpoint**: signed `mptRoot` derived from MPT overlay bytes, G1–G5 readers routed reads through the MPT, the then-live root-filter experiments had landed, and per-MG unroll had landed. The root-filter description is superseded by the 2026-07-13 correction below. REMAINS: accept still materialized the `GlobalSnapshotInfo` case class; serve/follow/persist were still GSI-blob-authoritative. See the **3c split** below. |
 | **3d** snap-sync export/import | **NOT STARTED** | No `exportFlat`/`importFlat` on `MptStore` (`MptStore.scala:44-75`). Followers bootstrap by pulling the GSI blob + re-encoding it locally (`StateChannel.ensureMptInitialized` → `syncFromGlobalSnapshotInfo`), not via a dedicated snap-sync dump protocol. |
 | **3e** benchmark + pruning tuning | **NOT STARTED** | No reproduction of the Phase 0 accept() CPU measurement under the new path on this branch; the 65% target is unverified. |
 
@@ -38,20 +38,49 @@ This plan consolidates (a) the design direction validated by industry research, 
   - **G4** `0e2931a2d`/`fc79eec28` — `BlockAcceptanceContext.fromMpt` / `AllowSpendBlockAcceptanceContext.fromMpt` / `TokenLockBlockAcceptanceContext.fromMpt`, wired in `BlockAcceptanceCoordinatorManager.scala:75,93`.
   - **G5** `1eb828522`/`c34bc5ee0` — reward + node-parameters readers: `DelegatedStakeStateManager`, `NodeCollateralStateManager`, `UpdateNodeParametersStateReader`; `GlobalDelegatedRewardsDistributor` / `RewardsInfoCalculator` migrated.
   - (Each SHA pair is the same commit reachable under two refs — `git show --stat` is identical for both.)
-- **Sidecar + globalSnapshotSyncView exclusion from consensus roots.**
-  - `85be66a6a`/`353dcabfb` — path-dependent `SystemNamespace` sidecars (`ActiveAddressIndex`, expiry buckets, `03…` prefix) excluded from the global `mptRoot` (#116). Helper `GlobalStateKey.nonSystemNamespaceEntries` / `isSystemNamespaceHex`; the global root is `makeParallelFromBytes(nonSystemNamespaceEntries(...))` (`GlobalSnapshotInfo.scala:314,385-390`).
-  - `f46bc7666` + `df19cef76` — **LANDED then REVERTED.** These two excluded observation-dependent `globalSnapshotSyncView` (`MgGlobalSnapshotSyncView`, fieldId 32; a per-peer `Signed[GlobalSnapshotSync]` map the producer accumulates under the full committee while a re-deriving node sees only the 2/3 signers — so honest nodes hold different field-32 byte sets) from the per-MG `infoRoot` (`f46bc7666`, removed it from `infoSubFields`) and the global `mptRoot` (`df19cef76`, via a `consensusRootEntries` helper). **Both were backed out by `9b416f736` (2026-06-16, "revert: back out session consensus-root + catch-up changes for fork-storm isolation")** after cluster metrics showed a reorg storm (fork_count peak 7, chain_quality≈0); the revert message explicitly notes it reverts `f46bc7666 + df19cef76 + fb742e92e` to baseline `de1ea0432`. **Current-HEAD ground truth:** `MgGlobalSnapshotSyncView` IS back in `infoSubFields` (`GlobalStateKey.scala:283`), the `consensusRootEntries` helper is **deleted** (no live definition), and both the global root (`GlobalSnapshotInfo.scala:314`) and `sidecarFreeMptRoot` (`:389`) use `nonSystemNamespaceEntries` — which does **not** filter field 32. So field 32 is currently folded into **both** roots. The only exclusion that survives on HEAD is the SystemNamespace-sidecar one (`85be66a6a`/`353dcabfb`); the syncView exclusion is NOT active. This is a live non-determinism source the revert deliberately re-accepted to isolate a separate fork-storm — directly relevant to the resync-verify drift below.
+- **Historical root-filter sequence, superseded by the 2026-07-13 complete-root correction.**
+  - **Historical (2026-06):** `85be66a6a`/`353dcabfb` excluded the `03…`
+    `SystemNamespace` active-address and expiry entries from the global `mptRoot` as
+    “sidecars.” That classification was unsafe: those entries are authoritative inputs to
+    economic materialization and expiry/refund transitions, so two maps could authenticate the
+    same root and execute different state. The live root contract now retains every
+    `SystemNamespace` entry; the old root-exclusion rule is not a supported compatibility mode.
+  - **Historical (2026-06):** `f46bc7666` + `df19cef76` excluded observation-dependent
+    `globalSnapshotSyncView` (`MgGlobalSnapshotSyncView`, field 32) from the per-MG `infoRoot` and
+    global root, then `9b416f736` reverted both while isolating a fork storm. This records the
+    commit sequence; it is not current behavior.
+  - **Current worktree (2026-07-13):** `GlobalStateKey.consensusRootEntries` retains all
+    `SystemNamespace` economic indexes and excludes only field 32;
+    `GlobalSnapshotInfo.consensusMptRoot` is the shared global verification helper. Field-32
+    exclusion is temporary containment, not a safety proof. GL0 checkpoint replay consumes the
+    prior `CurrencySnapshotInfo.globalSnapshotSyncView`, but the signed incremental binds only its
+    proof hash and accepted delta, not the exact full-view replay preimage or explicit ML0 operator
+    population. `ECO-F32` is therefore HIGH, CONFIRMED, and OPEN. The fix order is: carry and verify
+    the exact optional signed/root-bound replay witness (preserving `None` vs `Some(empty)`), then
+    remove field 32 from every GL0 MPT/diff/load/reorg path while retaining it in ML0 state.
 - **Per-MG unroll of `CurrencySnapshotInfo`.** The fieldId-6 blob is replaced by 8 per-entry `Mg*` partitions (fieldIds 25–32); see `docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md` (now marked LANDED). Decision (b): `activeAllowSpends` deliberately stays in fieldId-7, **not** an `MgActiveAllowSpends`, so it is **not** in the per-MG `infoRoot` union (`GlobalStateConverter.scala:1188-1190`).
 
 **REMAINS (the half-finished part — 3c END-STATE never reached):**
 
 - **`accept()` still materializes the `GlobalSnapshotInfo` case class.** `GlobalSnapshotAcceptanceManager.buildGlobalSnapshotInfo` constructs `val baseInfo = GlobalSnapshotInfo(...)` (`GlobalSnapshotAcceptanceManager.scala:1220,1250`), called at `:2271`. The plan's "accept emits a delta, MPT is the state" was not reached — the GSI is still built and returned every ordinal.
 - **Serve path still ships the GSI blob.** `GlobalL0Service.LatestSnapshotTuple = (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)` (`GlobalL0Service.scala:41`); `pullLatestSnapshotFromPeer` → `l0GlobalSnapshotClient.getLatest` returns `(snapshot, state)` where `state` is the GSI (`:380-387`). The **gl0 serving side** responds with snapshot+state over `GlobalFollowRoutes.scala` / `StateChannelRoutes.scala` (`snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo]`). MPT bytes are **not** served; the follower receives the GSI and rebuilds.
-- **Followers re-encode the GSI instead of rebuilding from served bytes.** ml0: `StateChannel.ensureMptInitialized` → `mptStore.syncFromGlobalSnapshotInfo(state, ordinal)` (`StateChannel.scala:172-173`; converter at `GlobalStateConverter.scala:1791`), then verify `sidecarFreeMptRoot(entries) === signed mptRoot` (`StateChannel.scala:256-260`). cl1: same shape — `syncFromGlobalSnapshotInfo(canonicalState, …)` then `getRootHashForOrdinal === signedRoot` (`CurrencySnapshotProcessor.scala:190-194`; note cl1 uses `getRootHashForOrdinal`, correct there because the per-MG currency MPT has no `SystemNamespace` sidecars, whereas the global ml0 store does → ml0 must use `sidecarFreeMptRoot`).
+- **Historical 2026-06-17 follower behavior:** ml0 `StateChannel.ensureMptInitialized` re-encoded
+  the GSI through `syncFromGlobalSnapshotInfo`, then compared
+  `consensusMptRoot(entries) === signed mptRoot`; cl1 used its per-MG
+  `getRootHashForOrdinal === signedRoot`. This paragraph records the state when the plan was
+  reconciled, not the later signed-byte/bootstrap work. For global maps, the live helper includes
+  every `SystemNamespace` economic index and filters only field 32.
 - **Persistence is GSI-authoritative.** `StateChannel.persistGlobalSnapshot` writes `GlobalSnapshotWithState(snapshot.signed, state)` (`StateChannel.scala:175-178`) — the GSI blob is the persisted source of truth, not MPT bytes.
 - **GlobalStateReader accessors incomplete + remaining read-sites unmigrated.** G1–G5 migrated specific consensus reads; the broad scatter-gather of `.info.<field>` read-sites is not fully retired. No `GlobalSnapshotInfo.from(mptStore, ordinal)` **derivation-only** helper exists (the `GlobalSnapshotInfo` companion at `GlobalSnapshotInfo.scala:213` has no `from(mptStore)`/`fromMpt`) — so the plan's "GSI becomes a derived view, hot paths skip it" end-state was **not** reached. `GlobalStateReader.fromMptStore` is a *parallel* reader used by G1–G5, **not** a flip that makes the GSI derived.
 
-**The active bug this half-finished state causes (verified):** the ml0 resync-to-canonical verify-gate fails deterministically per ordinal — `recomputed = sidecarFreeMptRoot(syncFromGlobalSnapshotInfo(servedInfo)) ≠ signed mptRoot` — because the served `info` and the signed overlay-MPT have drifted. Code: `StateChannel.scala:256-268` (the gate + the `"gl0 served GSI inconsistent with its OWN signed mptRoot"` error at `:265-268`); cl1 analogue `CurrencySnapshotProcessor.scala:190-208`. Prime suspects: (1) the fieldId-7 `activeAllowSpends` (in the global root, but its unrolled form is excluded from the per-MG `infoRoot` union — decision (b)); (2) the **observation-dependent `MgGlobalSnapshotSyncView` (field 32)** which — since `9b416f736` reverted its exclusion — is folded into both roots even though honest nodes legitimately hold different field-32 byte sets (the very reason `df19cef76` had tried to exclude it). Per `[[project_currency_allowspend_nondeterministic_retention]]` the activeAllowSpends retention split is an open run-`bw4p1wzha` blocker, consistent with suspect (1). Root cause is structural: as long as the **served byte source (GSI re-encode) and the signed byte source (producer overlay `p.entries`) are two different encoders**, any field handled asymmetrically between them drifts. Closing the REMAINS items (serve/rebuild from the SAME MPT bytes the producer signed) is what eliminates this class of gate failure.
+**Historical bug at the 2026-06-17 checkpoint (verified then):** the ml0
+resync-to-canonical gate could derive
+`consensusMptRoot(syncFromGlobalSnapshotInfo(servedInfo)) != signed mptRoot` because the served GSI
+and signed overlay MPT were different encoders. Field 7 and the then-changing field-32 policy were
+prime suspects. The durable lesson remains: recovery must verify and load the exact signed byte map,
+not reconstruct a second candidate and treat equal-looking typed state as byte equality. Current
+field-32 exclusion does not close `ECO-F32`: replay still needs an exact signed/root-bound full-view
+witness before GL0 can remove that mirror safely.
 
 ### Greenfield note
 
@@ -131,7 +160,7 @@ Pick option 1 as primary, fall back to option 2 if the root isn't cached.
 
 ### 3c. Remove `GlobalSnapshotInfo` materialization on accept path (2-3 weeks)
 
-> **STATUS 2026-06-17: PARTIAL.** The *signed-root-from-MPT*, G1–G5 readers, sidecar/syncView exclusion, and per-MG unroll all LANDED on `feature/serde-typeclass-shim`. What REMAINS: accept still materializes the GSI case class; serve/follow/persist are still GSI-blob-authoritative; followers re-encode the served GSI rather than rebuilding from served MPT bytes; no `GlobalSnapshotInfo.from(mptStore, ordinal)` derivation-only flip. See **"Status as of 2026-06-17 (reconciliation) → Phase 3c split"** near the top for the full LANDED/REMAINS breakdown + the active resync-verify-gate bug this half-finished state causes. The bullets below are the **original plan**; they are NOT all done.
+> **HISTORICAL STATUS 2026-06-17: PARTIAL.** The *signed-root-from-MPT*, G1–G5 readers, then-live root-filter experiments, and per-MG unroll had landed on `feature/serde-typeclass-shim`. The root-filter claims are superseded by the 2026-07-13 complete-root correction near the top. At that checkpoint, accept still materialized the GSI case class; serve/follow/persist were still GSI-blob-authoritative; followers re-encoded the served GSI rather than rebuilding from served MPT bytes; and no `GlobalSnapshotInfo.from(mptStore, ordinal)` derivation-only flip existed. The bullets below are the **original plan**; they are NOT all done.
 
 The "MPT is the state" change.
 

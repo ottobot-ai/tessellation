@@ -105,25 +105,32 @@
   committee choose a `executionBaseOrdinal` deep enough that honest followers permanently fail-closed?
 
 ### INV-SAFETY-005: Consensus root is a pure function of consensus-pinned state (field-32 lesson)
-- **Statement:** the signed global `mptRoot` (and the per-MG root) must exclude every
-  observation-dependent field, so identical committed state yields a byte-identical root on every
-  node regardless of what each node observed.
-- **Upheld by:** global root computed over `GlobalStateKey.consensusRootEntries(entries)` which drops
-  the observation-dependent `MgGlobalSnapshotSyncView` (fieldId 32) —
-  `GlobalSnapshotInfo.scala:314,380-389`; per-MG root `currencySnapshotMgRoot` "DELIBERATELY excludes
-  `MgGlobalSnapshotSyncView` (fieldId 32)" — `GlobalStateConverter.scala:1332-1340`.
-- **Fault model:** a regression that re-admits an obs-dependent field into the root (the field-32
-  regression, 2026-06-17) → honest nodes fork on identical data; non-determinism in map/set ordering
-  or IEEE-754 (mitigated by exact `Ratio`, `ldd.scala:14`, `TipTracker.scala:24-26`).
-- **Confidence:** **Holds** (as currently written) — but this is the single highest-value target.
-- **Reasoning:** the exclusion is explicit and centralized in `consensusRootEntries` /
-  `currencySnapshotMgRoot`, and this is exactly the field-32 regression the memory flags. The
-  standing risk is a *different* obs-dependent input leaking into the root (the June storm was a
-  path-dependent `smtRoot` in the `===`, not a field-set bug). The principle "consensus root = pure
-  fn of consensus-pinned state" is enforced field-by-field, so the attack is to find a field or a
-  hashing path that is path/observation-dependent and still inside the root — a `Some(empty)`-vs-`None`
-  ambiguity, a SystemNamespace sidecar (`GlobalStateConverter.scala:318`), or a non-canonical
-  encoding.
+- **Statement:** every byte that can change deterministic consensus execution must be committed by
+  the signed root or supplied through an equally exact signed/root-bound replay witness. An
+  observation-dependent value cannot be both root-invisible and consumed by replay. Identical
+  committed inputs must produce byte-identical roots and decisions.
+- **Enforced portion:** `GlobalStateKey.consensusRootEntries` retains every `SystemNamespace`
+  active-address and expiry index because they drive economic materialization and expiry/refund
+  transitions; `GlobalSnapshotInfo.consensusMptRoot` hashes that complete economic entry set. The
+  only stored partition currently filtered is `MgGlobalSnapshotSyncView` (field 32) —
+  `GlobalStateKey.scala:505-541`; `GlobalSnapshotInfo.scala:319-330,386-397`.
+- **Open violation (`ECO-F32`):** GL0 checkpoint replay reads the prior
+  `CurrencySnapshotInfo.globalSnapshotSyncView`, while pinned peer backfill strips field 32 and
+  reconstruction can turn its absence into `Some(empty)`. The signed currency incremental carries
+  the resulting proof hash and accepted delta, not the exact full-view preimage or explicit ML0
+  operator population needed to reproduce it — `PinnedCurrencyInfoReader.scala:146-156,341-380`;
+  `ShardCheckpointWiring.scala:263-314`; `GlobalStateConverter.scala:1691-1803`;
+  `currency.scala:52-61,96-114,222-240`.
+- **Fault model:** node L replays from a locally staged nonempty field-32 view while node B
+  root-verifies a backfill under the same signed GL0 root, strips field 32, and reconstructs an empty
+  view. L can reproduce and sign the next currency proof while B derives a different result and
+  refuses or disputes it, preventing execution quorum or freezing that metagraph. A root filter has
+  contained the old direct global-root fork but has not made the replay input reproducible.
+- **Confidence:** **VIOLATED — HIGH, CONFIRMED, OPEN.** Carry an exact optional full-view witness and
+  explicit ML0 operator population in the signed/root-bound framework replay artifact; preserve
+  `None` versus `Some(empty)` and verify the view against
+  `CurrencySnapshotStateProof.globalSnapshotSync`. Missing material defers and cannot slash. Only
+  then remove field 32 from every GL0 MPT/diff/load/reorg path while retaining it in ML0 state.
 
 ### INV-SAFETY-006: The committee signature binds the whole claim (ShardCheckpointSigPreimageV2)
 - **Statement:** a relayer/committee must not be able to alter the diff base, the state delta, the

@@ -8,6 +8,12 @@
 > Unverifiable statements are marked `UNVERIFIED`. Memory notes were treated as **hypotheses** and
 > re-checked against source; where they were stale, that is called out.
 
+> **Current root-contract correction (2026-07-13):**
+> `GlobalSnapshotInfo.consensusMptRoot` includes every `SystemNamespace` economic
+> index and excludes only field 32. The latter remains a HIGH confirmed open
+> defect because checkpoint replay consumes the prior sync view without an exact
+> signed/root-bound replay witness; it is not safe non-consensus metadata.
+
 ---
 
 ## 1. What the workstream is
@@ -52,7 +58,7 @@ circe/kryo path gated by ordinal, with kryo as legacy backward-read.
 
 | Slice | What it is | State | Evidence |
 |---|---|---|---|
-| **3c-A** | Serve the signed MPT byte map; followers `loadBytes` verbatim + verify `sidecarFreeMptRoot === signed mptRoot` by construction; delete the `syncFromGlobalSnapshotInfo` re-encode on follow/resync/catch-up | **DONE — end-to-end incl. the gl0↔gl0 catch-up gate** | see §2.3 |
+| **3c-A** | Serve the signed MPT byte map; followers `loadBytes` verbatim + verify `consensusMptRoot === signed mptRoot` by construction; delete the `syncFromGlobalSnapshotInfo` re-encode on follow/resync/catch-up | **DONE — end-to-end incl. the gl0↔gl0 catch-up gate** | see §2.3 |
 | **3c-B** | Stop `accept()` materializing GSI as authoritative; emit a delta, make the returned GSI a `from(mptStore, ordinal)` projection | **NOT DONE** | `accept()` still calls `buildGlobalSnapshotInfo` (`GlobalSnapshotAcceptanceManager.scala:1606`, constructor `:1636`, call site `:2861`). No `GlobalSnapshotInfo.from(mptStore, ordinal)` projection exists (grep: only `fromGlobalSnapshotInfo` V1/V2 converter at `GlobalSnapshotInfo.scala:124`). |
 | **3c-C** | Complete branch-aware `GlobalStateReaderOps` accessors + repoint `info.<field>` read-sites onto MPT getters | **PARTIAL** | `GlobalStateReaderOps.scala:35-98` still has only the same ~10 getters the plan listed (`getBalance`, `getDelegatedStakes`, `getNodeCollaterals`, `getActiveTokenLocks`, `getCurrencySnapshotInfo`, `getLast*` …). The plan's gap list (`getTxRef`, `getActiveAllowSpends`, `getTokenLockRef`, `getPriceRecord`, `getUpdateNodeParameters`, `getMetagraphSyncData`, `historicalStakeSnapshots`) is still **absent**. ~98 raw `info.<field>` read-site hits remain in main (incl. schema definitions) across `RewardsInfoCalculator`, `ShardCheckpointWiring`, `StateChannelValidator`, `ChangeSet`, `GlobalSnapshotAcceptanceManager`, `CurrencySnapshotCreator`, … (grep, non-test). |
 | **3c-D** | MPT bytes authoritative on disk; GSI side-files (`GlobalSnapshotWithState`) derived, with on-disk read-compat | **PARTIAL** | Signed byte store IS persisted + retained (`mpt_snapshot_info_signed`, `ContiguousOrdinalCutoff` depth k₂ — `GlobalSnapshotConsensus.scala:401-404`). But `/latest/combined` still serves the `[snapshot, GSI]` pair (`SnapshotRoutes.scala:135,140`) and `GlobalSnapshotWithState` is still a live persisted type (`GlobalSnapshotWithStateDeltas.scala:20`, `GlobalSnapshotsWithStateLocalFileSystemStorage.scala:38`). The re-derive-on-load / drop-legacy migration is not done. |
@@ -168,7 +174,7 @@ currency state, **not** the global GSI. Its pinned-base reader and its verify ga
   `PinnedCurrencyInfoReader.make(signedBytesStore, …)` where `signedBytesStore` is
   `<mptSnapshotInfoPath>_signed`, contiguous, retained to k₂ (`GlobalSnapshotConsensus.scala:401-404,566-576`).
 - **Shared verify primitive.** Track-1's PIN-2 gate is 3c-A's gate verbatim:
-  `GlobalSnapshotInfo.sidecarFreeMptRoot(bytes) === snap.stateProof.mptRoot`
+  `GlobalSnapshotInfo.consensusMptRoot(bytes) === snap.stateProof.mptRoot`
   (`PinnedCurrencyInfoReader.scala:207-213`; byte-contract §1 line 133).
 - **Shared deep-revert source.** Track-3's k₂ deep revert (`MptOverlay.revertToOrdinal`) reads the
   same store via `setDeepStateReader(signedBytesStore.readState)` (`GlobalSnapshotConsensus.scala:415`).
@@ -197,7 +203,7 @@ Most of this workstream is **mechanical, not frontier**. 3c-C (fill reader gette
 `info.<field>` sites), 3c-E (type-param threading), and the kryo removal are Sonnet-grade rename/
 migration work behind parity suites. But three questions genuinely need frontier reasoning:
 
-1. **Does a byte-verbatim `loadBytes` + `sidecarFreeMptRoot === signed` gate actually make the
+1. **Does a byte-verbatim `loadBytes` + `consensusMptRoot === signed` gate actually make the
    follower verify tautological on *honest* input across *every* path — and fail-closed on dishonest
    input — including under MultiBranch/reorg?** The enabler (`0b3358a4c`) persists accept-time
    `postBytes` so the served file reproduces the signed root under MultiBranch; the memory

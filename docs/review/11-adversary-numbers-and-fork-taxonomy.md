@@ -279,24 +279,34 @@ Eight real divergences this project hit. Each hash `git`-verified on `feature/co
 - **Symptom:** ml0/cl1 resync `recomputed ≠ signed` (deterministic per ordinal); shard checkpoints
   `signers=1` (committee members compute different per-MG roots → no aggregation); shard buffer
   climb → data-with-fee fork.
-- **Root cause:** `globalSnapshotSyncView` (`MgGlobalSnapshotSyncView`, fieldId 32) is
-  **observation-dependent** — the producer accumulates it under the *full* committee, a re-deriving
-  gl0 verifier under only the 2/3 signers (#259) → honest nodes hold *different* per-peer maps → the
-  consensus root is non-deterministic **by construction**. **Regression:** isolation revert
-  **`9b416f736`** (2026-06-16, "back out session consensus-root + catch-up changes for fork-storm
-  isolation") backed out the prior exclusion fix **and was never un-reverted** → field 32 back in
-  the root → a live data-with-fee fork.
-- **Fix:** **`dc2790dea`** + **`ffd5b3754`** (both 2026-06-17) — exclude field 32 **symmetrically**
-  from the per-MG `infoSubFields` *and* the global `consensusRootEntries`. It stays stored + diffed +
-  reconstructed (gl0's mirror unchanged); the metagraph's own `CurrencySnapshotInfo.stateProof`
-  still commits to it. *(Memory description names the fixes as `f46bc7666`/`df19cef76`; those are the
-  same-content cherry-picks that landed on-branch as `dc2790dea`/`ffd5b3754` — cite the on-branch
-  hashes.)*
-- **Fault class:** **consensus-root impurity** (same class as FORK-001, different field) **+
-  regression-via-revert** (an isolation revert silently re-introduced a fixed determinism bug).
-- **Still-relevant risk:** **HIGH.** The "observation-dependent field must LEAVE the root but stay
-  stored" principle recurs across sidecars, sync views, receipts. The regression-via-revert is a
-  *process* risk: isolation reverts can un-fix determinism without anyone noticing until it forks.
+- **Root cause, first failure:** `globalSnapshotSyncView`
+  (`MgGlobalSnapshotSyncView`, fieldId 32) is observation-dependent. The ML0 producer validates it
+  under its full facilitator population, while replay currently derives that population from the
+  artifact proof subset (`CurrencySnapshotValidator.scala:56-70`;
+  `GlobalSnapshotSyncValidator.scala:65-67`). Including the resulting per-peer map in the GL0/per-MG
+  root therefore made honest roots diverge. Isolation revert **`9b416f736`** (2026-06-16) restored
+  that old root inclusion and reproduced the live fork.
+- **Historical containment:** **`dc2790dea`** + **`ffd5b3754`** (2026-06-17) excluded field 32 from
+  both per-MG `infoSubFields` and global `consensusRootEntries`. That stopped the immediate root
+  inclusion regression. *(The same-content hashes cited elsewhere as `f46bc7666`/`df19cef76` are
+  cherry-picks; the on-branch hashes are authoritative.)*
+- **Root cause, remaining failure (ECO-F32):** exclusion did **not** make the field dispensable.
+  GL0 still writes, removes, and reconstructs it (`GlobalStateConverter.scala:1362-1393,1691-1725,1735-1803`),
+  and shard execution seeds replay from that reconstructed prior (`ShardCheckpointWiring.scala:263-314`).
+  A locally staged base retains a nonempty view, while root-verified peer backfill strips field 32
+  (`PinnedCurrencyInfoReader.scala:341-380`) and reconstruction turns absence into `Some(empty)`.
+  The incremental carries only `CurrencySnapshotStateProof.globalSnapshotSync` plus accepted
+  `globalSnapshotSyncs`, not the full view preimage (`currency.scala:52-61,222-240`). Two nodes can
+  therefore authenticate the same GL0 root and derive different replay proofs/signing outcomes.
+- **Fault class:** **root-invisible consensus replay input** plus the historical
+  **consensus-root impurity/regression-via-revert**. "Leave the root but stay stored" is not a safe
+  invariant when replay consumes the stored value.
+- **Status/fix:** **HIGH, CONFIRMED, OPEN.** First carry a signed/root-bound exact optional full-view
+  replay witness at every required checkpoint-window boundary, bind the explicit ML0 operator
+  population, preserve `None` versus `Some(empty)`, and verify the preimage against
+  `CurrencySnapshotStateProof.globalSnapshotSync`. Missing material defers and cannot slash. Only
+  then remove field 32 from every GL0 MPT/diff/load/reorg path while retaining it in ML0
+  `CurrencySnapshotInfo`.
 
 ### FORK-005: data-with-fee — gl0 can't re-derive metagraph balances
 - **Symptom:** a data-application fee credited on ml0 (`/currency/.../balance = 100`) **never

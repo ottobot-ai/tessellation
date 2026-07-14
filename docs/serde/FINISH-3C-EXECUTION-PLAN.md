@@ -19,7 +19,7 @@ On-disk state DOES need read-compat — called out explicitly in the persistence
 
 | Concern | State today | Citation |
 |---|---|---|
-| Sign the root from MPT bytes | **DONE.** Proof's `mptRoot` derives from `p.entries` (producer's own byte map), sidecar-free. | `GlobalSnapshotInfo.scala:255-257` → `mptStateProofFromBytes:288-377`, `userEntries` line 314, global root 322-323; recompute helper `sidecarFreeMptRoot:385-390` |
+| Sign the root from MPT bytes | **DONE.** Proof's `mptRoot` derives from `p.entries` (producer's own byte map) after the one consensus filter: retain every `SystemNamespace` economic index and exclude field 32. | `GlobalSnapshotInfo.mptStateProofFromBytes`; `GlobalStateKey.consensusRootEntries`; recompute helper `GlobalSnapshotInfo.consensusMptRoot` |
 | `accept()` builds the GSI case class | **NOT done** — still constructs and returns the full `GlobalSnapshotInfo`. | `GlobalSnapshotAcceptanceManager.scala` (GSAM); read-sites grep below |
 | Serve | **GSI is the side-state.** `/latest/combined[/stream]` returns the JSON pair `[snapshot, GSI]`. | route `SnapshotRoutes.scala:135,146`; reader `FinalizedSnapshotReader.scala:62-67,87-97`; client decode `SnapshotClient.scala:62-84` |
 | Rebuild on followers (**the drift site**) | **NOT done** — follower re-encodes the served GSI via `syncFromGlobalSnapshotInfo`, then verifies a *recomputed* root against the signed root. Re-encode can diverge ⇒ `recomputed ≠ signed`, deterministic per ordinal. | `StateChannel.scala:172-173, 252-261`; converter `GlobalStateConverter.scala:1791`; other rebuild sites grep below |
@@ -43,7 +43,15 @@ what keeps the whole effort off the snapshot hardfork surface.
   through it. (Helper to add — master plan 3c, `MPT-AS-PRIMARY-PLAN.md:91`.)
 - **Single trust anchor = signed `stateProof.mptRoot`.** Already true (the produce/sign path);
   this plan stops *every other path* from re-deriving an independent root that can disagree with it.
-- **Determinism rule (do not regress):** the global root is `makeParallelFromBytes(nonSystemNamespaceEntries(entries))` — the `03…` SystemNamespace sidecars are excluded (`GlobalSnapshotInfo.scala:307-314, 379-390`). Any new "store the bytes" path MUST round-trip those same `entries` so the sidecar-free recompute is unchanged.
+- **Determinism rule (current worktree, 2026-07-13; do not regress):** the global root is
+  `makeParallelFromBytes(consensusRootEntries(entries))`. Every `03…` `SystemNamespace`
+  active-address and expiry index is a consensus transition input and is included. Field 32
+  (`MgGlobalSnapshotSyncView`) is the only excluded stored partition. That exclusion is temporary
+  containment, not proof that the field is irrelevant: checkpoint replay consumes the prior view,
+  while the signed currency incremental does not carry its exact full preimage. `ECO-F32` is HIGH,
+  CONFIRMED, and OPEN until a signed/root-bound exact optional replay witness plus the explicit ML0
+  operator population is verified and field 32 is removed from every GL0 write/diff/load/reorg path.
+  Any new byte-store path must round-trip the complete consensus entry set exactly.
 
 ---
 
@@ -86,20 +94,20 @@ signed root:
 StateChannel.scala:252-261   (ml0 resyncToCanonical)
   ensureMptInitialized(ord, GSI)            // = mptStore.syncFromGlobalSnapshotInfo(GSI, ord)   :172-173
   afterBytes      = mptStore.underlying.entries
-  recomputedRoot  = GlobalSnapshotInfo.sidecarFreeMptRoot(afterBytes)
+  recomputedRoot  = GlobalSnapshotInfo.consensusMptRoot(afterBytes)
   signedRoot      = canonicalSnapshot.signed.value.stateProof.mptRoot
   if (recomputedRoot === signedRoot) adopt  else re-pull / idle
 ```
 
 The recompute is over bytes produced by **re-encoding the GSI** (`syncFromGlobalSnapshotInfo`,
 `GlobalStateConverter.scala:1791`). That re-encode is a *different* byte path than the producer's
-own `p.entries` that was actually signed — any field whose serialized shape, sidecar maintenance,
+own `p.entries` that was actually signed — any field whose serialized shape, index maintenance,
 expiry-index, or present-only `Some/None` lifting differs by a byte makes
 `recomputed ≠ signed`, deterministically, at the same ordinal (the data-with-fee fork; the same
 "version disease" as `[[reference_sharded_mirror_version_model]]`).
 
 **Fix:** serve the bytes that were signed and store them verbatim. Then `afterBytes` == the signed
-byte map, and `sidecarFreeMptRoot(afterBytes) === signedRoot` holds **by construction** — no
+byte map, and `consensusMptRoot(afterBytes) === signedRoot` holds **by construction** — no
 re-encode, no drift.
 
 ### 3c-A.2 The two halves already exist
@@ -152,7 +160,7 @@ the EXACT SAME verify gate:
 
 ```scala
 afterBytes     <- sharedStorages.mptStore.underlying.entries
-recomputedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
+recomputedRoot <- GlobalSnapshotInfo.consensusMptRoot[F](afterBytes).map(_.some)
 signedRoot      = canonicalSnapshot.signed.value.stateProof.mptRoot
 // now recomputedRoot === signedRoot holds by construction
 ```
@@ -164,9 +172,9 @@ storage refs still need (`setForRecovery(snapshot, GSI)`) is obtained ONCE via
 **alongside** the bytes and pass it straight through — additive, no re-encode on the verify path).
 
 **(d) Same swap at the other rebuild+verify sites** (identical shape, all currently re-encode):
-- `currency-l1/.../CurrencySnapshotProcessor.scala:190-194` (cl1 NotNext resync; note this one uses
-  `getRootHashForOrdinal` not `sidecarFreeMptRoot` — fold both onto `sidecarFreeMptRoot` for the
-  apples-to-apples compare while here).
+- `currency-l1/.../CurrencySnapshotProcessor.scala:190-194` (cl1 NotNext resync; this per-MG store
+  uses `getRootHashForOrdinal`, while global-state maps use `consensusMptRoot`; both must compare the
+  exact entry set defined by their respective signed roots).
 - `dag-l1/.../GlobalSnapshotAlignment.scala:224` and `dag-l1/.../SnapshotProcessor.scala:131,178,218,271` (gl1/dl1 follow).
 - `node-shared/.../GlobalL0Service.scala:352` (`stateProofValidation` — this one rebuilds to *validate*; once bytes are the input it validates the served bytes directly).
 
@@ -178,7 +186,7 @@ storage refs still need (`setForRecovery(snapshot, GSI)`) is obtained ONCE via
   `dag-l1/SnapshotProcessor.scala`, `GlobalL0Service.scala`. A thin `MptStore.loadBytes` on
   `MptStore.scala` (wrapping `clear`+`insertBytes`+`commit`).
 - **Unit tests:** (i) round-trip — sign bytes via `mptStateProofFromBytes`, store via `loadBytes`,
-  assert `sidecarFreeMptRoot(entries) === proof.mptRoot` (extends the existing
+  assert `consensusMptRoot(entries) === proof.mptRoot` (extends the existing
   `BalanceProofCrossLangSuite` / parity-suite pattern in `node-shared` test). (ii) negative — a
   one-byte-mutated served map ⇒ gate fails ⇒ re-pull (assert no adopt). (iii) the existing GSAM /
   producer parity suites must stay green (no change to the sign path).
@@ -355,12 +363,13 @@ slice 3 (the gated trust-branch in `createContext`) is prep, awaiting sign-off.
 
 ## 9. Top 3 risks
 
-1. **Determinism of the served byte map (3c-A).** If gl0 serves bytes that include or exclude the
-   `03…` SystemNamespace sidecars differently from what `sidecarFreeMptRoot` strips, the gate breaks
-   the other way. Mitigation: serve `MptStateStorage.readState` (the exact persisted signed map) and
-   keep the recompute on `nonSystemNamespaceEntries` (`GlobalSnapshotInfo.scala:314, 385-390`); add the
-   round-trip unit test (§3c-A.4-i) as a CI gate. The sidecars are append-only/path-dependent
-   (`GlobalSnapshotInfo.scala:307-313`) — never let them into the *signed-root* comparison.
+1. **Determinism and completeness of the served byte map (3c-A).** A served map that omits or
+   substitutes any `03…` `SystemNamespace` active-address/expiry index must fail the signed-root
+   gate: those indexes drive economic materialization and expiry/refund decisions and are now
+   root-owned state. Mitigation: serve `MptStateStorage.readState` (the exact persisted signed map),
+   recompute with `consensusMptRoot`, and keep the complete-root mutation/parity suite as a CI gate.
+   Field 32 is filtered only as the temporary `ECO-F32` containment described in §1; it cannot be
+   converted to a synthetic empty replay input.
 2. **`accept()` delta parity (3c-B).** A faithful `GlobalSnapshotInfo.from(mptStore, ordinal)` is the
    crux; any field the readers reconstruct imperfectly (Some/None present-only lifting, empty-vs-absent
    maps — cf. the V1/V2 `toGlobalSnapshotInfo` Option dance, `GlobalSnapshotInfo.scala:50-70`) silently

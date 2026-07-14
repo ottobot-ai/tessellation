@@ -162,9 +162,22 @@ Exact final fields depend on the payload-lane decision. Do not restore:
 
 Every key writable by the diff must be covered by the verified per-MG root. The
 current root covers field 5 plus seven MG partitions 25-31, but excludes economic
-active allow-spends field 7 and observation metadata field 32. The target complete
-root must add active allow-spends. Approved field-32 observation metadata remains
-outside both root and diff and cannot be written by a checkpoint.
+active allow-spends field 7 and field 32. The target complete economic root must
+add active allow-spends. Field 32 is ML0-owned replay state: ML0 retains the exact
+optional `globalSnapshotSyncView` in `CurrencySnapshotInfo`, whose state proof
+hashes it, but GL0 must not store it as an unrooted writable mirror.
+
+That GL0 mirror cannot be removed first. The current currency incremental carries
+only `CurrencySnapshotStateProof.globalSnapshotSync` plus the accepted
+`globalSnapshotSyncs` delta, not the full view preimage. Before removal, the
+checkpoint's signed/root-bound framework replay input must carry the exact optional
+full-view witness for every required window boundary and the explicit ML0 operator
+population used to validate sync entries. `None` and `Some(empty)` are distinct.
+Every producer, execution signer, watchtower, and exceptional adjudicator verifies
+the witness against the state-proof hash and replays under that same population;
+missing or mismatched material defers and cannot slash. Only after this gate passes
+is field 32 removed from every GL0 MPT, diff, load, and reorg path. It remains in
+ML0 `CurrencySnapshotInfo`.
 
 ## Current source gap
 
@@ -181,6 +194,14 @@ outside both root and diff and cannot be written by a checkpoint.
   diff adoption and positive watchtower coverage land.
 - the signed checkpoint binds an execution-base ordinal but not the exact Phase-2
   hash/root or network/genesis/era/parameter domain.
+- field 32 remains writable, removable, and reconstructible in GL0. Pinned peer
+  backfill strips it to the global root entry set, while a locally staged base can
+  retain it. `ShardCheckpointWiring.reExecDerivationAtPinnedBase` consumes the
+  resulting prior `CurrencySnapshotInfo`; reconstruction turns missing field 32
+  into `Some(empty)`. The current binary's proof hash plus accepted delta cannot
+  reconstruct a nonempty prior, and replay derives the ML0 facilitator population
+  from the artifact proof subset instead of a separately bound full population.
+  ECO-F32 is therefore HIGH and OPEN, not an unused-metadata cleanup.
 - the current `numShards > 1` activation gate still makes the one-shard economic
   configuration bypass the target committee/diff/watchtower path.
 
@@ -200,6 +221,14 @@ target.
 7. A colluding execution threshold is caught by an assigned watchtower before the
    owner-approved release boundary.
 8. `numShards=1` and `numShards=K` produce identical economic writes and roots.
+9. A node with locally staged field-32 bytes and a node that root-verifies a
+   field-32-stripped backfill reproduce the identical framework result from the
+   exact replay witness. Missing/wrong witness, wrong ML0 operator population, and
+   `None`/`Some(empty)` substitution prevent signing and cannot create slash
+   evidence.
+10. After witness activation, every GL0 diff, peer/disk load, shallow/deep reorg,
+    and reconstruction rejects or omits field 32, while ML0 state proof generation
+    still commits the exact optional view.
 
 ## Locked follow-up decisions
 
@@ -209,8 +238,11 @@ target.
    coverage threshold, deadline, and availability fallback remain parameter work,
    not an alternate release rule.
 3. Every framework-economic field, including active allow-spends, is in the complete
-   per-MG root and diff. Approved field-32 observation metadata is outside both and
-   is not writable through the checkpoint.
+   per-MG root and diff. Field 32 remains ML0-owned `CurrencySnapshotInfo` state,
+   hash-bound through its state proof. The exact view preimage and explicit ML0
+   operator population become signed/root-bound replay inputs before field 32 is
+   removed from all GL0 MPT/diff/load/reorg paths; it is never writable through the
+   checkpoint diff.
 4. The checkpoint binds and retains the exact signed currency incrementals needed
    for replay. Custom application data uses content-addressed commitments/chunks.
    Retention lasts through the maximum challenge, Phase-2 recovery, and downstream

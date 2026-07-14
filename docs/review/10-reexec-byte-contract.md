@@ -1,10 +1,13 @@
 # The Re-Exec ↔ Byte-Diff Byte-Identity Contract (Track-1)
 
 > **HISTORICAL, SUPERSEDED PRE-FIX CONTRACT.** The adopter/byte-diff architecture
-> specified below is abandoned and must not be implemented or retained for
-> compatibility. GL0 must independently re-execute framework-defined CL1
-> economics before canonical use; a committee root or byte diff is only a claim.
-> This file remains solely as evidence of an earlier design. See
+> described below is evidence, not a compatibility requirement. The current
+> target is committee replay-before-sign: the producer and every execution signer
+> reproduce the exact framework result; a noncommittee GL0 node verifies the
+> execution certificate, namespace/base/continuity, applies the certified diff,
+> and recomputes the root; assigned watchtowers replay as the collusion backstop.
+> A root or diff without replay-backed execution signatures is only a claim. This
+> file remains solely as evidence of an earlier implementation/design state. See
 > [`../../AGENTS.md`](../../AGENTS.md), ADR-0016, and ADR-0017.
 > References below to deleted delta/adoption documents are historical evidence
 > recoverable with `git show 725b25b:<path>`, not dangling design dependencies.
@@ -139,7 +142,7 @@ at `ordinal` on this node's chain, `:88-93`), then both funnel through `withVeri
   (`:192-193`, `:219-222`). This ties the base to a specific snapshot on this node's canonical chain.
 - **Level 2 — mptRoot reproduction.** Require `snap.stateProof.mptRoot` present (`:194-198`); read the
   version-retained state bytes at `ordinal` from `byteStore.readState(ordinal)` (`:200`); require
-  `GlobalSnapshotInfo.sidecarFreeMptRoot(bytes) === snap.stateProof.mptRoot` (`:207-213`) — else
+  `GlobalSnapshotInfo.consensusMptRoot(bytes) === snap.stateProof.mptRoot` (`:207-213`) — else
   hard-reject. This proves the retained bytes reproduce the committed root before any reconstruction runs.
 
 `None` (a clean verify with no state, OR any reject) is indistinguishable by design and is NEVER a HEAD
@@ -186,6 +189,15 @@ This is a Hasher/MPT root over `ImmutableCodec` bytes — **NOT** `Hasher.hash` 
 same helper backs all THREE PIN-1 sites (producer, adopter, proof service) so bytes are identical by
 construction (`GlobalStateConverter.scala:1374-1379`).
 
+**ECO-F32 is not closed by this exclusion.** `ShardCheckpointWiring` supplies the full prior
+`CurrencySnapshotInfo` to framework replay, so replay consumes `globalSnapshotSyncView` even though
+PIN-1 and the global `mptRoot` omit field 32. A locally staged base can retain a nonempty view while a
+root-verified peer backfill strips it and reconstruction produces `Some(empty)`. The signed
+incremental binds only `CurrencySnapshotStateProof.globalSnapshotSync` plus accepted sync deltas, not
+the exact optional full-view preimage or explicit ML0 operator population. This is HIGH, CONFIRMED,
+and OPEN: the signed/root-bound replay artifact must carry those exact inputs before field 32 is
+removed from every GL0 MPT/diff/load/reorg path.
+
 ### 2.3 What "byte-identical" is actually checked
 
 The comparison is a single `Hash` equality: adopter's `recomputed === attestedRoot`
@@ -206,8 +218,10 @@ source — smtRoot-blind consensus compare + revert k2-freeze") resolved the res
 fork storm by making the consensus re-derivation `===` compare **smtRoot-blind**
 (`smtRootBlind`, `GlobalSnapshotConsensusFunctions.scala:286-295`) rather than by making the value
 deterministic. `smtRoot` is NOT part of any per-MG currency root, so it does not affect adopt-vs-re-exec
-per-MG byte-identity — but it is the canonical precedent that **a path-dependent value must be excluded
-from any determinism-gated compare**, exactly mirrored by the field-32 exclusion in §2.2.
+per-MG byte-identity — but it is the canonical precedent that **a path-dependent value must not enter
+a determinism-gated compare without an exact reproducible preimage**. The field-32 filter in §2.2
+prevents a direct root fork, but §2.2's ECO-F32 gap proves that exclusion alone is insufficient when
+framework replay still consumes the value.
 
 ---
 
@@ -413,10 +427,15 @@ Concrete things to try to make **adopt ≠ re-exec** (or adopt a value no honest
    `Some(nonEmpty)` in its stateProof; check whether GAP-1's `sp.<field>.isDefined` compare
    (`:1174-1186`) actually catches the mismatch or whether the reconstructed `Some(empty)` slips through.
 
-6. **fieldId-32 sync-view leverage.** field-32 is excluded from the PIN-1 root (`:1339-1340`) and from the
-   consensus root (`GlobalStateKey.scala:517-535`) but STILL diffed/reconstructed/stored. Try to make the
-   ADOPTED `CurrencySnapshotInfo.globalSnapshotSyncView` differ from an honest re-exec's while both roots
-   still match — then find a downstream consumer that reads the stored sync-view and forks on it.
+6. **fieldId-32 sync-view leverage — CONFIRMED as ECO-F32.** Field 32 is excluded from PIN-1
+   (`:1339-1340`) and the global consensus root (`GlobalStateKey.scala:520-541`) but remains
+   diffed/reconstructed/stored. The downstream consumer is framework checkpoint replay:
+   `ShardCheckpointWiring.priorState` reads the prior `CurrencySnapshotInfo` and passes it to
+   `processCurrencySnapshots` (`ShardCheckpointWiring.scala:263-314`). Reproduce the concrete RED
+   case: one node replays a locally staged nonempty view; another verifies a peer map under the same
+   signed root, strips field 32, reconstructs `Some(empty)`, and derives a different proof/signing
+   outcome. Closure requires the exact optional replay witness and explicit ML0 population described
+   in §2.2; missing data defers and cannot slash.
 
 7. **Wire-shape / preimage manipulation.** Since `executionBaseOrdinal` is in `ShardCheckpointSigPreimageV2`
    (`ShardCheckpoint.scala:135-145`) and proto field 11 (`sidecar.proto:212`), try a checkpoint where the
@@ -453,7 +472,7 @@ Concrete things to try to make **adopt ≠ re-exec** (or adopt a value no honest
 | Diff apply (`reconstructInfoFromDiff`) | `ChangeSet.scala:151-172` |
 | Diff compute (`currencyInfoChangeSet`) | `ChangeSet.scala:101-113` |
 | PIN-1 root (`currencySnapshotMgRoot`) | `GlobalStateConverter.scala:1384-1389` |
-| field-32 exclusion | `GlobalStateConverter.scala:1339-1340` |
+| field-32 temporary root exclusion / ECO-F32 | `GlobalStateConverter.scala:1339-1340`; `GlobalStateKey.scala:520-541` |
 | 2-level pin | `PinnedCurrencyInfoReader.scala:186-223` |
 | Signed preimage V2 | `ShardCheckpoint.scala:135-145` |
 | `executionBaseOrdinal` semantics | `ShardCheckpoint.scala:56-65` |

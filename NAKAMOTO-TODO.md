@@ -74,19 +74,66 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **Gate:** `ARCH-001..003`, `SIG-001..005`.
 
 - [ ] **STOP-THE-LINE - complete rooted state and key-aware reads**
-  - The signed global `mptRoot` currently excludes `SystemNamespace` active and
-    expiry indices that GSAM, raw load, and reorg paths consume. This is
-    `ECO-IDX-01` (CRITICAL, confirmed) and `ECO-IDX-02` (HIGH, confirmed), not
-    non-consensus cache cleanup. Stake/committee eligibility, tower activation,
-    ordinary checkpoint diff adoption, and economic deployment must remain
-    deployment-disabled until this entire checklist closes. This is a release
+  - [x] **System-index root ownership (`ECO-IDX-01/02`):** the current worktree
+    roots every `SystemNamespace` active-address/expiry entry, maintains owner
+    indices for `LastCurrencySnapshotsProofs` and `MetagraphSyncData`, and makes
+    known exact-key index/target reads fail closed. Expiry consumers require the
+    bucket epoch to equal the decoded target's expiry, and the currency union
+    rejects simultaneous legacy field-3 and incremental field-5 arms.
+    `GlobalMptRootCompletenessSuite` covers the four System labels; strict
+    read/RMW/replay suites cover malformed, absent-target, wrong-epoch bucket,
+    and dual-arm cases. This closes the original
+    same-root/different-System-index exploit, not `ROOT-008`, `ROOT-009`, or the
+    full `from(mpt, ordinal, era)` projection.
+  - [ ] **Fail closed on unavailable proposal-parent state:** MultiBranch point,
+    prefix, root, and raw-byte reads currently stop at a missing requested branch
+    or ancestor and compose against the finalized base. The fallback mechanism
+    is confirmed; a reachable eviction/unknown-parent economic mismatch remains
+    OPEN and PLAUSIBLE. First persist a root-verified base
+    `(hash, ordinal, mptRoot)`, then make checkout/read return typed
+    `ParentStateUnavailable` before mutation. Never heal the gap from GSI or the
+    current finalized base. Gates: `SMT-02`, `SLASH-02`, `E9-BRANCH`.
+  - [ ] **Root the expiry parameter (`ECO-IDX-03`):** the node-local
+    `WithdrawalTimeLimit` currently changes rooted collateral-withdrawal expiry
+    bytes for the same logical state. Resolve it from canonical active-era state
+    and reject local/join mismatch.
+  - Field 32 is still excluded while GL0 writes/reconstructs it and checkpoint
+    replay consumes it; local staged and root-verified stripped-backfill bases can
+    therefore derive different state proofs (`ECO-F32`, HIGH, confirmed).
+    Stake/committee eligibility, tower activation, ordinary checkpoint diff
+    adoption, and economic deployment must remain deployment-disabled until this
+    entire checklist closes. This is a release
     gate, not a claim that every unsafe runtime path already has a hard-coded
     kill switch.
-  - [ ] **1. Complete root ownership:** replace root-excluded path-dependent
-    indices with canonical rooted key-carrying indices or derive them only from
-    rooted records. No writable unrooted value may influence consensus; field 32
-    remains non-consensus observation metadata outside both the GL0 root and the
-    GL0 diff/write set. Gate: `ECO-IDX-01`, `ROOT-007`.
+  - [ ] **1. Complete root and replay-witness ownership:** preserve the landed
+    rooted System indices, exact expiry-epoch checks, and exclusive field-3/
+    field-5 currency union; bind `WithdrawalTimeLimit` as active-era canonical
+    rooted protocol state. The current local environment map changes rooted
+    node-collateral-withdrawal expiry keys for the same GSI
+    (`GlobalStateConverter.scala:822-847`; `dag-l0/Main.scala:108-114`;
+    `MptFieldCoverageSuite.scala:325-377`). No local fallback may influence a
+    consensus root.
+    - [ ] **1A. Field-32 replay witness:** carry the exact optional full
+      `globalSnapshotSyncView` preimage needed at every checkpoint window
+      boundary, plus the explicit ML0 operator population used for sync
+      validation, in the signed/root-bound framework replay input. Preserve
+      `None` versus `Some(empty)` and verify the preimage against
+      `CurrencySnapshotStateProof.globalSnapshotSync`; a missing/mismatched
+      witness defers and cannot slash. The current binary's hash plus accepted
+      sync delta is insufficient. Gates: `ECO-F32`, `ROOT-010`, `SHARD-E-006`.
+    - [ ] **1B. Remove the GL0 mirror:** only after 1A is green, remove field 32
+      from every GL0 MPT/diff/load/reorg path and reject it at those boundaries.
+      Retain it in ML0 `CurrencySnapshotInfo` and its state proof. Gate:
+      `DIFF-003`, `ROOT-010`.
+    - The System-index slice of `ROOT-007` is landed; full `ROOT-007` remains
+      open for every other writable field, including field 32 and the rooted
+      protocol-parameter contract. Gate: `ECO-IDX-03`, `ROOT-007`.
+    - [x] Optional `GlobalSnapshotStateProof` slot presence is derived only from
+      authenticated byte partitions. `None` and `Some(empty)` GSI shapes produce
+      one proof (`GlobalSnapshotInfo.scala:302-388`;
+      `OptionShapeStateProofCanonicalizationSuite.scala:20-123`). This does not
+      relax `ROOT-010`: its future field-32 replay witness must preserve the
+      semantic distinction explicitly.
   - [ ] **2. Shared strict reader:** extend the strict point-read primitive landed
     in `41c19903d` to point, prefix, and raw enumeration. Return typed
     absent/present/malformed results with physical key/path and exact bytes;
@@ -101,8 +148,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `WT-010`, `ECON-G-002`.
   - [ ] **4. Raw recovery and tower:** exact-snapshot/root-verify network, disk,
     and deep-reorg maps; strip non-consensus derived bytes and rebuild them only
-    from rooted state (`ECO-IDX-02`, `ROOT-009`). Make malformed tower/SMT durable
-    keys reject the whole load instead of disappearing (`STOR-02`, `REC-004`).
+    from rooted state (`ROOT-009`). `ECO-IDX-02`'s root-invisible System-index
+    asymmetry is closed; `BR-02` peer-GSI binding, `BR-05` staged atomic install,
+    and the broader recovery matrix remain open. After 1A/1B, field 32 is rejected
+    from GL0 recovery rather than synthesized as an empty replay input. Make
+    malformed tower/SMT durable keys reject the whole load instead of disappearing
+    (`STOR-02`, `REC-004`).
   - [ ] **5. Integrated qualification:** prove identical GSAM decisions/root from
     identical rooted state under every sidecar mutation, then exercise restart,
     compaction, density reorg/recovery, and shard counts 1/2/K. Include expiry,
@@ -410,11 +461,33 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **Gate:** `DIFF-*`, `SHARD-E-003/004`, `SHARD-C-004/005`,
     `XMG-001..005B`, `XMG-007/008/010/012/013`, `ECON-F-002/003`,
     `ECON-REF-001`, `ECON-BAL-002/003`, `ECON-G-002`, `ROOT-006..009`,
-    `PERM-005`, `WT-008/008A/010`, `ECO-IDX-01/02`, and `MPT-01..06`.
+    `PERM-005`, `WT-008/008A/010`, `ECO-IDX-03`, and `MPT-01..06`. Preserve the
+    closed `ECO-IDX-01/02` regression corpus.
 
 - [ ] **E10 PARTIAL - downstream exact-hash rebase and historical recovery**
   - E9 owns exact-origin/CAS validity before the security cutover. Carry the same
     exact Phase-2 refs through downstream delivery, rollback, and recovery.
+  - [ ] **Bootstrap/recovery stop-line (`BR-01..BR-05`), in dependency order:**
+    - [ ] P6 exposes exact FinalityGate Phase-2
+      `(ordinal,hash,parent,stateRoot,evidence)`; P11 transport binds the canonical
+      selected-era full proof and content-addressed state payload/projection proofs
+      to that reference as one bundle. No caller may combine a finalized ordinal
+      with a separate latest/best-tip fetch.
+    - [ ] P1/P10 validate the complete ordinal-selected proof and bind every GSI/
+      typed projection to the same bundle bytes. `mptRoot` presence does not choose
+      the era; persisted bytes do not authenticate a separately supplied GSI.
+    - [ ] P7/P10/P11 supply complete exact ML0 bytes, including native partitions,
+      and only an explicitly enumerated, signed/proved GL1 consumed-field slice. A
+      failed root/proof candidate enters `RecoveryRequired`; it never degrades to
+      plain GSI re-encode.
+    - [ ] P11 stages and verifies the entire bundle, then atomically installs MPT,
+      exact snapshot anchor, projections, balances/references, cursors, and markers.
+      Mismatch, cancellation, exception, and crash preserve the prior generation.
+    - [ ] Close only after `BOOT-001..005` and `REC-005` pass for cold join, disk,
+      peer, catch-up, and density-reorg recovery. The current narrow rebuilt-root
+      guards are PARTIAL and do not close any BR finding.
+  - `BR-06` is cross-referenced to open `ECO-F32`/`ROOT-010`; do not duplicate it
+    or treat a root-only check as its replay-witness closure.
   - Bind every MPT base to a root-verified `(snapshotHash, ordinal, mptRoot)` and
     acquire one exact-parent session for all reads, replay, writes, and commit.
     Unknown/evicted hashes and incomplete ancestry enter typed recovery; they
@@ -434,8 +507,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters
     `RecoveryRequired`; it never falls back to receiver live head.
-  - **Gate:** `XMG-006`, `FOLLOW-001..005`, `REC-*` including `REC-004`,
-    `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02`, `GROWTH-001`.
+  - **Gate:** `BOOT-001..005`, `XMG-006`, `FOLLOW-001..005`, `REC-*` including
+    `REC-004/005`, `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02`,
+    `GROWTH-001`.
 
 - [ ] **E11 SCAFFOLD ONLY - exceptional replay, adjudication, and slashing**
   - Accept only assigned, bonded, rate/resource-limited exact-data challenges.

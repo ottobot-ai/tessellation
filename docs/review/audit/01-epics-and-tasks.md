@@ -8,6 +8,12 @@
 > sequence is
 > [`../CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`](../CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md).
 
+> **Current root-contract correction (2026-07-13):** every `SystemNamespace`
+> economic index participates in `consensusMptRoot`; only field 32 is currently
+> filtered. Field-32 exclusion is not closure because framework replay consumes
+> the prior view without an exact signed/root-bound replay witness (`ECO-F32`,
+> HIGH, CONFIRMED, OPEN).
+
 **Branch** `feature/committee-state-diff` · **HEAD** `21933559c` · **Date** 2026-07-07
 **Inputs:** `00-audit-findings.md` (2 Critical · 10 High · 8 Medium · 2 Low · 2 test-gaps), the
 invariant→test coverage matrix, and the four confirmed stakeholder directives (fraud-proofs
@@ -74,7 +80,7 @@ plus S02, and removes the landmine under the band flag (D03/D04).
 
 | Task | Acceptance criteria (anchored on DoD) | Verify |
 |---|---|---|
-| **1.1** Route **all 17** rebuild sites (E9-03 inventory: reorg `NSD:2144`, realign `:3366`, catch-up `:3499`, deep-catch-up GSI fallback `:247`, restart `Main.scala:430/486/593`, download `Download.scala:523`, `GlobalSnapshotTraverse.scala:125`, `SnapshotDownloadStorage.scala:110`, + 7 follower sites) through byte-faithful `loadBytes` + `sidecarFreeMptRoot === signedRoot` (the `NSD:224-240` shape), **verify-before-write** (today's `:247` fallback is destructive-then-detect). **Delete** the follower GSI fallbacks the 3c-A byte route already covers. Each site gets a named (byte-source, gate) per the §9.0 design note — incl. the reorg-branch byte-availability problem (E9-04). | After any reorg/restart/catch-up, fieldId-33/34 byte-identical to pre-rebuild; rebuilt `sidecarFreeMptRoot === signed`; numShards=1 byte-identical (DoD-2). | Unit + e2e reorg |
+| **1.1** Route **all 17** rebuild sites (E9-03 inventory: reorg `NSD:2144`, realign `:3366`, catch-up `:3499`, deep-catch-up GSI fallback `:247`, restart `Main.scala:430/486/593`, download `Download.scala:523`, `GlobalSnapshotTraverse.scala:125`, `SnapshotDownloadStorage.scala:110`, + 7 follower sites) through byte-faithful `loadBytes` + `consensusMptRoot === signedRoot` (the `NSD:224-240` shape), **verify-before-write** (today's `:247` fallback is destructive-then-detect). **Delete** the follower GSI fallbacks the 3c-A byte route already covers. Each site gets a named (byte-source, gate) per the §9.0 design note — incl. the reorg-branch byte-availability problem (E9-04). | After any reorg/restart/catch-up, fieldId-33/34 byte-identical to pre-rebuild; rebuilt `consensusMptRoot === signed`; numShards=1 byte-identical (DoD-2). | Unit + e2e reorg |
 | **1.2** ~~Add GSI fields~~ — **STRUCK (E9-03):** anti-aligned with GSI elimination; emergency-only. | — | — |
 | **1.2′ (was E9-02)** Replace catch-up/realign **Gate-2** (`NSD:185-191`, `forGlobal(None)` GSI-only recompute) with a served-signed-bytes comparison; make the GSI fallback fail-closed-before-write. | (RED today) catch-up + reward-realign of an ordinal with non-empty fieldId-33 **succeeds** at numShards>1. | Weaver + catch-up e2e |
 | **1.3** Make every rebuild site **fail-closed** on a post-rebuild root mismatch (stall → Rebootstrap), never silently proceed. | Injected root mismatch → node stalls + metric; no divergent-root commit. | Unit |

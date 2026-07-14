@@ -85,24 +85,67 @@ to end.
 
 ### Stop-the-line complete-root program (`OPEN`, blocks economic activation)
 
-The current global `mptRoot` excludes `SystemNamespace` active/expiry indices
-that GSAM and recovery paths nevertheless consume. A peer, disk image, or reorg
-load can therefore vary consensus inputs without changing the signed root
-(`ECO-IDX-01`, CRITICAL; `ECO-IDX-02`, HIGH). This is not a cache-hygiene issue.
+The original `ECO-IDX-01/02` defect is closed in the current worktree:
+`GlobalStateKey.consensusRootEntries` retains every `SystemNamespace`
+active-address and expiry entry, `consensusMptRoot` hashes that exact set, and
+known index/target reads fail closed on malformed bytes, absent indexed targets,
+currency addresses carrying both field-3 and field-5 union arms, or an expiry
+bucket whose epoch disagrees with the target-derived expiry
+(`GlobalStateKey.scala:508-544`;
+`GlobalSnapshotInfo.scala:318-329,392-403`; `StrictMptRead.scala:18-37,66-127`;
+`GlobalStateReaderOps.scala:164-245`; `AllowSpendStateManager.scala:358-432`;
+`TokenLockStateManager.scala:383-454`; `NodeCollateralStateManager.scala:124-198`).
+The canonical index projection and incremental writer now include owner indices
+for `LastCurrencySnapshotsProofs` and `MetagraphSyncData`
+(`GlobalStateConverter.scala:724-856,2920-2974`). This closes only the former
+same-root/System-index asymmetry; it does not close the shared prefix grammar,
+full MPT-to-GSI projection, bootstrap binding, or transactional installation.
+
+Exact-target failure is not exact-parent failure. MultiBranch reads still stop
+when the requested branch or an ancestor is absent from `pendingRef` and compose
+the surviving delta with the mutable finalized base
+(`MptOverlay.scala:772-847,1255-1283`). The fallback mechanism is confirmed; a
+reachable unknown/evicted
+parent with divergent base producing an economic mismatch remains OPEN and
+PLAUSIBLE. After landing a root-verified persisted base anchor, checkout and
+every point/prefix/root/raw-byte read must return a typed
+`ParentStateUnavailable` before reads or writes. A GSI, strict target decoder, or
+finalized-base fallback must never heal missing proposal-parent state.
+
+One new rooted-state determinism defect remains: the node-local
+`delegatedStaking.withdrawalTimeLimit` determines the rooted node-collateral-
+withdrawal expiry key. Two nodes can rebuild the same logical GSI into different
+roots (`GlobalStateConverter.scala:822-847`; `dag-l0/Main.scala:108-114`;
+`MptFieldCoverageSuite.scala:325-377`; `ECO-IDX-03`, HIGH, OPEN). The active-era
+value must be canonical rooted protocol state, not a local fallback.
+Separately, field 32 is excluded from that root but remains a writable GL0 mirror
+and a confirmed input to framework checkpoint replay. A local staged base and a
+root-verified backfilled base can therefore recreate different currency state
+proofs at the same signed root (`ECO-F32`, HIGH).
 Until the following sequence closes, runtime stake eligibility, tower
 activation, ordinary checkpoint diff adoption, and every economic deployment
 must remain deployment-disabled. Nonactivating schema, model, and RED-test work
 may continue; this is a release gate, not a claim that every unsafe runtime path
 already has a hard-coded kill switch.
 
-1. **Freeze complete root ownership.** Give every value that can influence a
-   transition, eligibility decision, expiry, slash, or recovery result one
-   canonical key grammar and root ownership. Replace root-excluded,
-   path-dependent active/expiry sidecars with canonical rooted key-carrying
-   indices or derive them only from rooted records; no consensus path may read
-   an unrooted writable cache. Pure field-32 observation metadata remains
-   outside both the GL0 root and the GL0 diff/write set and cannot influence a
-   transition. Gate: `ECO-IDX-01`, `ROOT-007`.
+1. **Finish complete root and replay-witness ownership.** Preserve the landed
+   `ECO-IDX-01/02` invariant: every System index is rooted and every indexed
+   exact-key target fails closed, expiry buckets bind the target-derived epoch,
+   and field-3/field-5 currency union arms are mutually exclusive. Root the
+   active-era `WithdrawalTimeLimit` and
+   use that value for production, replay, rebuild, recovery, and join validation
+   (`ECO-IDX-03`). Do not generalize this exact-key closure to `ROOT-008` prefix
+   reconstruction or to `ROOT-009` recovery atomicity. Field 32 is ML0-owned
+   replay state, not a GL0 economic leaf, but it cannot simply be stripped: the
+   `CurrencySnapshotStateProof.globalSnapshotSync` plus the accepted sync delta,
+   not the full preimage. First bind an exact optional full-view witness for every
+   checkpoint window boundary, including the explicit ML0 operator population,
+   into the signed/root-bound framework replay input; preserve `None` versus
+   `Some(empty)` and verify the full view against the state-proof hash. Missing or
+   mismatched material defers and cannot slash. Only after that gate passes,
+   delete field 32 from every GL0 MPT, diff, load, and reorg path while retaining
+   it in ML0 `CurrencySnapshotInfo`. Gates: `ECO-IDX-03`, `ECO-F32`, `ROOT-007`,
+   `ROOT-010`, `SHARD-E-006`.
 2. **Land one strict key-aware reader.** Point, prefix, and raw reads return
    typed absent/present/malformed results with the physical MPT key/path and
    exact immutable value bytes. Decoding never drops an entry; reconstruction
@@ -121,8 +164,13 @@ already has a hard-coded kill switch.
 4. **Harden raw recovery and tower state.** Network sync, persisted restore, and
    deep-reorg loads accept only an exact snapshot-bound complete root. Any
    non-consensus derived bytes are stripped and deterministically rebuilt from
-   rooted state, never preserved as peer/disk authority (`ECO-IDX-02`,
-   `ROOT-009`). Malformed tower/SMT durable keys fail the whole load instead of
+   rooted state, never preserved as peer/disk authority (`ROOT-009`). The former
+   root-invisible System-index variation is closed by `ECO-IDX-02`; this step
+   remains open for exact bundle/projection binding (`BR-02`), preflighted atomic
+   installation (`BR-05`), and every non-System recovery input. After the
+   replay-witness migration, field 32 is rejected from
+   every GL0 load rather than converted to a synthetic empty replay input.
+   Malformed tower/SMT durable keys fail the whole load instead of
    disappearing during decode (`STOR-02`, `REC-004`).
 5. **Qualify the integrated state machine.** Run GSAM differential tests from
    identical rooted bytes with every sidecar omission/substitution, then
@@ -146,6 +194,10 @@ path on the current root shape.
 
 - Replace ordinal watermarks with durable exact `(ordinal, hash, parent,
   stateRoot, evidence)` phase state and replacement events.
+- FinalityGate exposes the exact Phase-2 identity/evidence. Bootstrap transport
+  binds the selected-era complete proof and content-addressed state payload/
+  projections to that reference as one bundle. Never combine a finalized ordinal
+  observation with a separate latest/best-tip state fetch.
 - Implement/validate the real K/alpha/beta Avalanche/Snowball cascade as the
   optimistic Phase-2 rail and `k1` depth as its Nakamoto fallback. Neither rail
   validates economics.
@@ -157,7 +209,7 @@ path on the current root shape.
   and downstream outbox. Missing history triggers authenticated recovery before
   comparison/mutation.
 - Gates: `FIN-M-*`, `FIN-D-*` revised for retention-only `k2`, `FIN-W-*`,
-  `FIN-S-*`, `FOLLOW-001`, `REC-001`/`REC-002`.
+  `FIN-S-*`, `BOOT-001`, `FOLLOW-001`, `REC-001`/`REC-002`.
 
 ### E2 - Historical validator, stake, eta, and key evidence (`PARTIAL`)
 
@@ -514,8 +566,9 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   `XMG-007`/`008`/`010`/`012`/`013`, `ECON-F-002`/`003`, `ECON-REF-001`,
   `ECON-BAL-002`/`003`, `ECON-G-002`, `ROOT-006` through `ROOT-009`,
   `PERM-005`, `SHARD-C-004`/`005`, `WT-008`/`008A`/`010`, and
-  conservation/replay tests from S2. `ECO-IDX-01/02` and `MPT-01..06` are
-  mandatory stop-the-line findings, not optional hardening.
+  conservation/replay tests from S2. Preserve the closed `ECO-IDX-01/02`
+  regressions; `ECO-IDX-03` and `MPT-01..06` remain mandatory stop-the-line
+  findings, not optional hardening.
 
 ### E10 - Downstream exact-hash rebase and historical-read recovery (`PARTIAL`)
 
@@ -525,6 +578,15 @@ delivery, rollback, and recovery.
 
 - Downstream APIs and durable events carry exact Phase-2 `(ordinal,hash,root)`
   identities and historical proof material, never a monotone ordinal watermark.
+- Cold ML0/GL1 bootstrap consumes one bundle anchored to the exact Phase-2
+  identity/evidence resolved by FinalityGate. The selected-era full proof,
+  complete ML0 byte image, GL1's explicitly enumerated signed/proved consumed-
+  field slice, and every typed projection all bind the same `(ordinal,hash,root)`;
+  persisted bytes cannot authenticate a separate peer GSI.
+- Validate the complete bundle into staging before any mutation, then publish the
+  MPT image, snapshot anchor, balances/references, projections, cursors, and
+  recovery markers through one durable transaction. Verification failure,
+  cancellation, or crash preserves the previous complete generation.
 - Density replacement reverses dependent checkpoint anchors, mirrors, settlement,
   nullifiers, and deliveries, then re-follows/rebases from the exact replacement.
 - Historical-view recovery verifies the same exact-origin and nondecreasing-ref
@@ -545,8 +607,13 @@ delivery, rollback, and recovery.
   lock, bounded streaming decode, era-bound hashing, exact snapshot identity,
   immutable in-session capture, and one recoverable finality intent spanning every
   sink. This primitive alone is not ROOT-002/003/004 completion.
-- Gates: `XMG-006`, `FOLLOW-001` through `FOLLOW-005`, `REC-*` including
-  `REC-004`, `MEMPOOL-001`, `ROOT-002` through `ROOT-005`, `ROOT-009`,
+- The current direct rebuilt-root guards do not close `BR-01` through `BR-05`:
+  exact Phase-2 selection, state/projection binding, proof-era validation,
+  complete fresh-join payloads, and transactional installation remain open.
+  `BR-06` is the existing `ECO-F32` witness defect, not a separate closure.
+- Gates: `BOOT-001` through `BOOT-005`, `XMG-006`, `FOLLOW-001` through
+  `FOLLOW-005`, `REC-*` including `REC-004`/`REC-005`, `MEMPOOL-001`,
+  `ROOT-002` through `ROOT-005`, `ROOT-009`,
   `STOR-02`, and `GROWTH-001`.
 
 ### E11 - Exceptional challenge replay and sound slashing (`SCAFFOLD ONLY`)

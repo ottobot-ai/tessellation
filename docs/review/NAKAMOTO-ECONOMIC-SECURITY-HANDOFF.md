@@ -15,6 +15,42 @@
 > the useful diff and regressed to universal GL0 currency recreation. Do not
 > restore `authoritative*`/`AdoptFromSignedFields`, and do not treat universal
 > recreation as the target. See the current ADR-0017 and consensus lifecycle.
+>
+> **Current root-contract correction (2026-07-13):** every
+> `SystemNamespace` active-address and expiry index participates in
+> `consensusMptRoot`; only field 32 is filtered. Field-32 exclusion is temporary
+> containment, not economic closure: framework replay consumes the prior view,
+> so an exact signed/root-bound optional replay witness and explicit ML0 operator
+> population must land before GL0 removes the mirror (`ECO-F32`, HIGH, OPEN).
+> The original `ECO-IDX-01/02` same-root System-index defects are closed narrowly:
+> root selection is enforced at `GlobalStateKey.scala:508-544` and
+> `GlobalSnapshotInfo.scala:318-329,392-403`; typed malformed/absent/inconsistent
+> failures are defined at `StrictMptRead.scala:18-37,66-127`; exact indexed targets
+> fail closed, expiry buckets must match the target-derived epoch, and the
+> currency union rejects simultaneous legacy field-3 and incremental field-5
+> arms at `GlobalStateReaderOps.scala:164-245`,
+> `AllowSpendStateManager.scala:358-432`, `TokenLockStateManager.scala:383-454`,
+> and `NodeCollateralStateManager.scala:124-198`. Owner indices for
+> `LastCurrencySnapshotsProofs` and `MetagraphSyncData` are maintained at
+> `GlobalStateConverter.scala:724-856,1265-1275,2920-2962`.
+> This is not full E9-01/ROOT-008/ROOT-009 closure. The complete
+> `from(mpt, ordinal, era)` projection is still absent, prefix parsers remain open,
+> and bootstrap still has unbound-GSI and nontransactional-install findings
+> (`BR-02`, `BR-05`). The node-local `WithdrawalTimeLimit` also changes rooted
+> collateral-withdrawal expiry bytes (`GlobalStateConverter.scala:822-847`;
+> `dag-l0/Main.scala:108-114`; `MptFieldCoverageSuite.scala:325-377`), so
+> `ECO-IDX-03` is HIGH, CONFIRMED, and OPEN.
+> A separate exact-parent residual is also open: MultiBranch reads treat an
+> absent requested branch or ancestor as a reason to compose against the mutable
+> finalized base (`MptOverlay.scala:772-847,1255-1283`). The mechanism is
+> confirmed; a reachable unknown/evicted-parent economic mismatch remains
+> PLAUSIBLE. A root-verified persisted base anchor must precede typed
+> `ParentStateUnavailable` failure across checkout and every point/prefix/root/raw
+> read. Neither GSI nor finalized base may heal missing proposal-parent state.
+> Optional global proof slots are now selected from authenticated byte-partition
+> presence alone (`GlobalSnapshotInfo.scala:302-388`); this byte-canonical proof
+> shape must not be confused with ROOT-010's future semantic field-32 witness,
+> where `None` and `Some(empty)` remain distinct replay inputs.
 
 **Purpose.** Give an external reviewer (Codex) a self-contained, line-anchored map of the execution-sharding + economic-security architecture so they can double-check our mental model *against the code* before we spend more cycles. Every non-trivial claim below carries a `file:line`. The canonical design decisions are **`docs/adr/0016`** (execution-sharding re-exec + cross-shard) and **`docs/adr/0017`** (committee re-execution is the primary economic-validity gate — the fix for the §4 defect); this doc is the *evidence* behind them.
 
@@ -118,7 +154,7 @@ The gl0 accept path reads cross-shard values off gl0's own consensus-pinned **fi
 Three fixes make the sharded-currency-mirror byte-faithful so adopters reconstruct the committee's per-MG root:
 - **Diff-base-pin** — producer diffs against a version-retained pinned prior, never the live store: `ShardCheckpointWiring.scala:196-218` ("deliberately NO live-store fast path"), execution-base = signed store's latest `:234-235`, producer reads pinned prior `:328-335` (fail-closed if unresolvable).
 - **Stage-on-adopt** — adopted root-verified bytes staged into the signed byte store (closes fail-close "holes"): `SnapshotLeaderLoop.scala:189` (`stageAdoptedPostBytes`), finalize-sink promote `:717-733` (`case None => unit` = the "Absent ⇒ skip"), 3 adopt sites `NakamotoSyncDaemon.scala:2249,3515,3675`.
-- **Read-time backfill** — on a pinned-read miss, fetch peer bytes, **strip to `consensusRootEntries`**, verify `sidecarFreeMptRoot === committed stateProof.mptRoot`, persist+serve only on match else fail-closed: `PinnedCurrencyInfoReader.scala:360,369,370-371,374-377,381,386`. Wired gl0-only: `GlobalSnapshotConsensus.scala:577-595,706`.
+- **Read-time backfill** — on a pinned-read miss, fetch peer bytes, **strip to `consensusRootEntries`**, verify `consensusMptRoot === committed stateProof.mptRoot`, persist+serve only on match else fail-closed: `PinnedCurrencyInfoReader.scala:360,369,370-371,374-377,381,386`. Wired gl0-only: `GlobalSnapshotConsensus.scala:577-595,706`. This proves the imported global entry set, but it also strips field 32; without the `ECO-F32` replay witness, a nonempty locally staged prior and a stripped backfill can still recreate different currency proofs.
 
 ---
 

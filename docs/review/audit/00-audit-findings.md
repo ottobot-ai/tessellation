@@ -7,6 +7,16 @@
 > open. Current invariants are in [`../../../AGENTS.md`](../../../AGENTS.md),
 > ADR-0016, and ADR-0017.
 
+> **Current root-contract correction (2026-07-13):** every `SystemNamespace`
+> active-address and expiry index is economic transition state and participates in
+> `consensusMptRoot`; it is not a root-excluded sidecar. Field 32 is the only
+> currently excluded stored partition. That is temporary containment:
+> `globalSnapshotSyncView` is consumed by checkpoint replay without an exact
+> signed/root-bound full-view witness, so `ECO-F32` is HIGH, CONFIRMED, and OPEN.
+> This narrowly closes ECO-IDX-01/02, not ROOT-008/009 or full E9-01 projection.
+> `WithdrawalTimeLimit` remains node-local while selecting rooted collateral-
+> withdrawal expiry bytes, so ECO-IDX-03 is HIGH, CONFIRMED, and OPEN.
+
 > **Status: Fleet complete (2026-07-07).** Eight adversarial Fable agents landed; every load-bearing
 > `file:line` was re-grounded at source by the orchestrator before promotion. Branch
 > `feature/committee-state-diff`, HEAD `21933559c`. **Board: 3 Critical · 13 High · 9 Medium · 2 Low ·
@@ -115,13 +125,13 @@ result is **FINDING-S01** (a flag-independent cross-shard double-spend).
 - **Scope:** `numShards > 1`. **Flag containment:** NONE — independent of `band-density-reorg-enabled` and of `revertToOrdinal`; live in the always-reorgable `(k₁,head]` region and on plain restart.
 - **Confidence:** High on mechanism (all four legs read at source); Medium on which manifestation dominates live.
 - **Location (VERIFIED @ HEAD 21933559c):**
-  - fieldId 33 `ConsumedAllowSpends` is **in the signed consensus root** — `GlobalStateKey.scala:291` + scaladoc `:283-289` ("`consensusRootEntries` keeps it … belongs in the consensus global `mptRoot`"), folded by `sidecarFreeMptRoot` (`GlobalSnapshotInfo.scala:388-390`).
+  - fieldId 33 `ConsumedAllowSpends` is **in the signed consensus root** — `GlobalStateKey.scala:291` + scaladoc `:283-289` ("`consensusRootEntries` keeps it … belongs in the consensus global `mptRoot`"), folded by `consensusMptRoot` (`GlobalSnapshotInfo.scala:388-390`).
   - `GlobalSnapshotInfo` has **no** field for 33 or 34 — full 18-field list `GlobalSnapshotInfo.scala:143-171` (the `activeAllowSpends` at `:149` is fieldId-7, the *owner* set, a different partition).
   - `syncFromGlobalSnapshotInfo` does `store.clear` (`GlobalStateConverter.scala:2134`) then `store.build` re-inserting only GSI-native partitions (`:2208`) → 33/34 never re-inserted.
-  - The reorg self-heal calls it **ungated** (no `sidecarFreeMptRoot === signedRoot` re-check): `NakamotoSyncDaemon.scala:2136-2154` (`:2144`). Same ungated rebuild at reward-realign `:3366`, catch-up `:3499`, node restart `dag-l0/Main.scala:430/486/593`, download `Download.scala:523`.
+  - The reorg self-heal calls it **ungated** (no `consensusMptRoot === signedRoot` re-check): `NakamotoSyncDaemon.scala:2136-2154` (`:2144`). Same ungated rebuild at reward-realign `:3366`, catch-up `:3499`, node restart `dag-l0/Main.scala:430/486/593`, download `Download.scala:523`.
   - Contrast: the **byte-faithful** catch-up preserves 33 verbatim and IS root-gated (`NakamotoSyncDaemon.scala:224-240`) — the reorg/restart paths were never migrated to it. The consume writes only the marker and never removes the allow-spend from the owner's active mirror (`AllowSpendConsumeHandler.scala:34-57`; gl0 must-not-mutate: `ConsumedAllowSpendStateManager.scala:46-79`).
 - **Attack (no attacker needed for the wipe):** (1) cross-shard-consume an allow-spend at a finalized common-prefix ordinal → destination credited, fieldId-33 marker written, allow-spend **stays** in the owner's active set (owner is on another shard). (2) *Any* tip reorg in `(k₁,head]` — or a coordinated restart/download — rebuilds base via `:2144`, wiping the marker although step 1 is canonical history. (3) A second cross-shard spend re-consumes the same allow-spend: spent-set empty **and** allow-spend still active → both checks pass → **accepted** → the reservation pays out twice. Two manifestations: (a) root impurity → self-fork (certain when 33/34 ≠ ∅ at a rebuild); (b) double-spend when a quorum wipes together (what a common reorg causes) — commits cluster-wide before divergence is detectable.
-- **Proposed direction (minimal — NOT Track-2):** route the reorg/restart/realign rebuilds through the existing byte-faithful `loadBytes` + `sidecarFreeMptRoot === signedRoot` gate so 33/34 survive verbatim; or add `consumedAllowSpends`/`slashings` fields to `GlobalSnapshotInfo`. **At minimum** gate these rebuilds on the root so they fail-closed (silent double-spend → detectable stall → Rebootstrap). This is the codebase's own `feedback_eliminate_globalsnapshotinfo` direction.
+- **Proposed direction (minimal — NOT Track-2):** route the reorg/restart/realign rebuilds through the existing byte-faithful `loadBytes` + `consensusMptRoot === signedRoot` gate so 33/34 survive verbatim; or add `consumedAllowSpends`/`slashings` fields to `GlobalSnapshotInfo`. **At minimum** gate these rebuilds on the root so they fail-closed (silent double-spend → detectable stall → Rebootstrap). This is the codebase's own `feedback_eliminate_globalsnapshotinfo` direction.
 
 ## FINDING-S02 — Watchtower `Slashings` ledger (fieldId 34) is wiped by the same GSI-rebuild paths → slash evasion
 - **Severity:** High · **Category:** Safety (slashing integrity) · **Scope:** `numShards > 1` · **Confidence:** High (same verified mechanism as S01).
@@ -132,7 +142,7 @@ result is **FINDING-S01** (a flag-independent cross-shard double-spend).
 - **Severity:** High · **Category:** Liveness (systematic catch-up denial at the sharding cutover) · **Scope:** `numShards > 1` · **Confidence:** High (mechanism is a direct corollary of the verified S01 fact; end-to-end repro untested).
 - **Location (VERIFIED @ HEAD 21933559c):** `verifyCatchUpSnapshot` Gate-2 uses `StateProofValidator.forGlobal[F](None)` (`NakamotoSyncDaemon.scala:185-187`) — "rebuild the state proof from the carried GSI (no producer ⇒ pure, no live-store access)" (`:183-184`) — and returns `RejectedStateProofMismatch` on any diff (`:190`). It is the only `forGlobal(None)` site in main. Consumers: reward-realign (`:3344→:3366`) and gossip catch-up (`:3445→:3499`). GSI has no fieldId-33/34 (`GlobalSnapshotInfo.scala:143-171`), both consensus-root-load-bearing (`GlobalStateKey.scala:283-291,309-316`).
 - **Failure scenario:** at `numShards>1`, the first cross-shard consume or slash makes the signed `mptRoot` cover a non-empty 33/34 partition; Gate-2's GSI-only recompute can never reproduce it → **every honest snapshot thereafter is rejected**, so any node that falls behind can never deep-catch-up or reward-realign until the marker prunes. So the *gated* rebuild sites don't wipe (unlike S01) — they **wedge**. Worse, Gate-2's stated security argument ("the only state an attacker can install is bound to a validly-signed snapshot", `:151-154`) inverts — it rejects *honest* state — so operators are tempted to bypass the gate.
-- **Proposed direction:** Gate-2 must compare against served signed bytes (`sidecarFreeMptRoot(bytes) === signed mptRoot`, the `seedMptByteFaithful` fast path `:224-240`), never a GSI re-encode; the GSI fallback (`:241-260`) is destructive-then-detect (clobbers the live MPT, *then* returns false) and must become fail-closed-before-write. Fold into EPIC-1.1 (this is why EPIC-1 must enumerate all rebuild sites, not just the ungated ones).
+- **Proposed direction:** Gate-2 must compare against served signed bytes (`consensusMptRoot(bytes) === signed mptRoot`, the `seedMptByteFaithful` fast path `:224-240`), never a GSI re-encode; the GSI fallback (`:241-260`) is destructive-then-detect (clobbers the live MPT, *then* returns false) and must become fail-closed-before-write. Fold into EPIC-1.1 (this is why EPIC-1 must enumerate all rebuild sites, not just the ungated ones).
 
 ## FINDING-B1 — Sub-quorum `reExecPath` false-slashes an honest committee (100%) off a live-base re-derivation, with no pinned backstop and no empty-root filter
 - **Severity:** High · **Reachability:** Medium (sub-quorum / degraded-liveness path only) · **Category:** Safety (honest-validator slashing + cluster split) · **Confidence:** High (crux read at source).
@@ -219,10 +229,28 @@ result is **FINDING-S01** (a flag-independent cross-shard double-spend).
 - **Why largely safe:** the k₁ margin closes the common case (a leader adopts only if finalized base ≥ `executionBaseOrdinal`, forcing `executionBaseOrdinal ≤ N − k₁`; an in-sync follower's finalized base ≈ N − k₁ also adopts). Defer/drop then only fires on genuinely lagging nodes, where defer→re-offer→self-heal is intended.
 - **Residual (could NOT prove safe):** no explicit floor guarantees `executionBaseOrdinal ≤ N − k₁ − (finalized-tip jitter)`. A checkpoint whose `executionBaseOrdinal` sits at the finalization frontier + normal cross-node finalized-tip spread could split adopt-vs-defer at the same ordinal (the FORK-001 storm signature). **Direction:** add a monitored embed-time assertion `executionBaseOrdinal + k₁ ≤ N`.
 
-## FINDING-R02 — field-32 `globalSnapshotSyncView` is stored unverified (absent from both roots AND the GAP-1 verify set) — safe-by-exclusion today, latent
-- **Severity:** Low-Medium · **Category:** Safety-latent · **Confidence:** High on the gap; High that it is safe today.
-- **Location (VERIFIED @ HEAD 21933559c):** field-32 is reconstructed into `CurrencySnapshotInfo.globalSnapshotSyncView` (`GlobalStateConverter.scala:1468,1481`), excluded from the per-MG root (`:1339-1340`), the global root (`GlobalStateKey.scala:532-534`), and the pinned-byte verify (`PinnedCurrencyInfoReader.scala:207`, `sidecarFreeMptRoot`); the GAP-1 verify list (`GlobalSnapshotAcceptanceManager.scala:1143-1189`) does **not** include it. So a Byzantine committee's adopted diff can carry any field-32 and every honest node stores it unverified.
-- **Why safe today:** no gl0 consensus consumer folds the stored field-32 mirror into a compared value (its consumers read the metagraph's own self-committed info; the cross-shard reader uses fieldId-18, not 32). **Residual:** the moment any future reader folds gl0's field-32 mirror into a root it forks (the FORK-004 mechanism). **Direction:** bind field-32 in the GAP-1 skip-or-verify logic for defense-in-depth.
+## FINDING-R02 / ECO-F32 — field-32 is root-invisible but consumed by framework replay
+- **Severity:** **High** · **Category:** Safety / deterministic execution · **Confidence:** High; source-confirmed and OPEN.
+- **Location (current worktree, 2026-07-13):** field 32 is reconstructed into
+  `CurrencySnapshotInfo.globalSnapshotSyncView` but excluded from the per-MG root and global
+  `consensusMptRoot` (`GlobalStateConverter.scala:1362-1393,1691-1803`;
+  `GlobalStateKey.scala:520-541`). Pinned peer backfill filters to `consensusRootEntries`, so it
+  strips field 32 before persisting/reconstructing (`PinnedCurrencyInfoReader.scala:341-380`). GL0
+  checkpoint replay then reads the prior `CurrencySnapshotInfo` and passes it to
+  `processCurrencySnapshots` (`ShardCheckpointWiring.scala:263-314`). The signed incremental carries
+  only `CurrencySnapshotStateProof.globalSnapshotSync` and accepted sync deltas, not the exact prior
+  full-view preimage or explicit ML0 operator population (`currency.scala:52-61,96-114,222-240`).
+- **Failure scenario:** node L has locally staged execution-base bytes containing a nonempty field-32
+  view and reproduces the next currency state proof. Node B misses that base, accepts a peer map under
+  the same signed GL0 root, strips field 32, reconstructs `Some(empty)`, and derives a different
+  proof/root. L can sign while B refuses or disputes, preventing execution quorum or freezing that
+  metagraph. Root exclusion prevents a direct global-root fork but does not make a consumed replay
+  input reproducible.
+- **Direction:** first bind an exact optional full-view replay witness and explicit ML0 operator
+  population into the signed/root-bound framework artifact; preserve `None` versus `Some(empty)` and
+  verify the witness against `CurrencySnapshotStateProof.globalSnapshotSync`. Missing material
+  defers and cannot slash. Only then remove field 32 from every GL0 MPT/diff/load/reorg path while
+  retaining it in ML0 `CurrencySnapshotInfo`.
 
 ## Note — cross-shard `emittedReceipts` are consensus-inert (dead accumulator / functional gap)
 `consumeReceipts` folds receipts into `pendingCrossShardWrites` (`MetagraphSyncManager.scala:177-182`) but that `Ref` is **never read** by `acceptMetagraphSyncData` (`:102-130`); its only reader is the test inspector (`:288`). So `emittedReceipts` have no consensus effect today — the promised Slice-13 drain is unwired. This is a **functional gap** (cross-shard sync-data writes never land), not a fork (a never-read Ref can't diverge a root). Track as an unbuilt-mechanism item, not a safety finding.
@@ -301,8 +329,8 @@ invariant→test matrix and the SDLC process catalog are folded into `01-epics-a
 | GAP-1 `lastMessages` fund/control effect | **G01** (address squatting, Med) promoted; drain vector via consume is **read-only** (G03) — narrowed FINDING-001. |
 | Base-independence red-team | **B1** (reExecPath false-slash, High) + **B2** (produce/createContext base split, Med); refined FINDING-003 (watchtower rail is pinned-safe). |
 | Spend-before-finality × band-revert | **S01** (Critical, flag-independent double-spend) + **S02** (High) + **S03**≡D03. The band-revert was *not* the hole; the GSI-rebuild wipe is. |
-| Consensus-root purity sweep | **R01** (follower live-base fraud-proof verdict → root-impurity fork, High, verified — the sharp form of B2) + **R03** (no `executionBaseOrdinal+k₁≤N` floor, Med) + **R02** (field-32 unverified, latent) + inert-receipts functional gap. Re-confirmed `smtRootBlind` intact in code. |
-| **Audit-extension: serde** | **E9-02** (catch-up Gate-2 GSI-only recompute → wedge, High, verified) + E9-04 (deleting the re-encode closes S01 *structurally*; EPIC-1.1 = slice-1 of GSI-elim; **strike EPIC-1.2**) + E9-03 (17 rebuild sites, not 6) + E9-05 (#23 closable now via `pinnedReaderAt` — the third base-pinning leg) + E9-01 (3c-B parity: 3 fields non-reconstructible). → `01-epics-and-tasks.md` EPIC-9-SERDE. |
+| Consensus-root purity sweep | **R01** (follower live-base fraud-proof verdict → root-impurity fork, High, verified — the sharp form of B2) + **R03** (no `executionBaseOrdinal+k₁≤N` floor, Med) + **R02/ECO-F32** (field-32 root-invisible replay input, High, confirmed, open) + inert-receipts functional gap. Re-confirmed `smtRootBlind` intact in code. |
+| **Audit-extension: serde** | **E9-02** (catch-up Gate-2 GSI-only recompute → wedge, High, verified) + E9-04 (deleting the re-encode closes S01 *structurally*; EPIC-1.1 = slice-1 of GSI-elim; **strike EPIC-1.2**) + E9-03 (17 rebuild sites, not 6) + E9-05 (#23 closable now via `pinnedReaderAt` — the third base-pinning leg) + E9-01 (full `from(mpt, ordinal, era)` parity remains open). Current `GlobalStateConverter.scala:724-856,1265-1275,2920-2962` adds owner indices for `lastCurrencySnapshotsProofs` and `metagraphSyncData`; those are prerequisites, not a complete projection or independent every-field/absence-shape proof. → `01-epics-and-tasks.md` EPIC-9-SERDE. |
 | **Audit-extension: hardfork** | H01 (cross-shard reachable via `gl0Local` — packet doc stale; verified) + H04 (roots-only deletes the state the teeth read → teeth blind; EPIC-4 prerequisite) + H02 (no activation-ordinal mechanism) + H03 (genesis-window + absence-proofs absent) + H05 (EPIC-1/2/3/4/8.1 confirmed as roots-only preconditions). → EPIC-9-HARDFORK. |
 | **Audit-extension: networking** | **F1** (dual-`Subscribe` race drops shard checkpoints, Critical, verified) + **F2** (dead fraud-proof transport, High, verified) + F3 (ChainSync serve DoS, High) + F4–F8 robustness + F10 (pull recovery is LANDED — packet stale). → EPIC-9-NET. |
 | densityCompare + k₂ deep-revert | **D01** (Med TOCTOU) + **D02** (High cross-node) + **D03** (High shelf-ware) + **D04** (High-when-wired). |
