@@ -580,7 +580,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     Slf4jLoggerBundle.makeUnsafe[IO].flatMap { loggerBundle =>
       GlobalSnapshotAcceptanceManager
         .make[IO](
-          FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty),
+          FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty),
           MetagraphsSyncConfig(PosInt(100)),
           AppEnvironment.Dev,
           blockAcceptanceManager = mockBlockAcceptanceManager,

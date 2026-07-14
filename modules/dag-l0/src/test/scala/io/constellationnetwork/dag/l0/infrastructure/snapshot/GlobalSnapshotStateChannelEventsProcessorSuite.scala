@@ -141,7 +141,7 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
       _ <- lastGlobalSnapshotStorage.setInitial(initialGlobalSnapshot, initialGlobalInfo)
 
       currencySnapshotAcceptanceManager <- CurrencySnapshotAcceptanceManager.make(
-        FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty),
+        FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty),
         Dev,
         LastGlobalSnapshotsSyncConfig(NonNegLong(2L), PosInt(10)),
         BlockAcceptanceManager.make[IO](validators.currencyBlockValidator, Hasher.forKryo[IO]),

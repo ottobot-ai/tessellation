@@ -11,6 +11,7 @@ import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.swap._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.{Hashed, Hasher}
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.addressSetImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
@@ -26,7 +27,9 @@ trait SpendTransactionBalanceManager[F[_]] {
     currentBalances: SortedMap[Address, Balance],
     allGlobalAllowSpends: SortedMap[Address, List[Hashed[AllowSpend]]],
     globalSpendTransactions: List[SpendTransaction]
-  )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
+  )(implicit hasher: Hasher[F]): F[
+    Either[SpendTransactionBalanceManager.SpendTransactionBalanceError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]
+  ]
 
   /** Materialize the full `address → Balance` view via the `ActiveAddressIndex` sidecar. The Balance value type doesn't carry the address,
     * so we recover the keyset from the sidecar partition and `getMany` each entry. Used by GSAM to source the prior-ordinal `balances` map
@@ -37,6 +40,16 @@ trait SpendTransactionBalanceManager[F[_]] {
 
 object SpendTransactionBalanceManager {
 
+  sealed trait SpendTransactionBalanceError extends Product with Serializable
+  final case class BalanceArithmeticFailure(address: Address, error: BalanceArithmeticError) extends SpendTransactionBalanceError
+  final case class ReferencedAllowSpendNotFound(source: Address, allowSpendRef: Hash) extends SpendTransactionBalanceError
+  final case class ReferencedAllowSpendAlreadyConsumed(source: Address, allowSpendRef: Hash) extends SpendTransactionBalanceError
+  final case class SpendAmountExceedsAllowSpend(
+    allowSpendRef: Hash,
+    allowed: SwapAmount,
+    attempted: SwapAmount
+  ) extends SpendTransactionBalanceError
+
   def make[F[_]: Async](reader: GlobalStateReader[F]): SpendTransactionBalanceManager[F] =
     new SpendTransactionBalanceManager[F] {
 
@@ -44,59 +57,124 @@ object SpendTransactionBalanceManager {
         currentBalances: SortedMap[Address, Balance],
         allGlobalAllowSpends: SortedMap[Address, List[Hashed[AllowSpend]]],
         globalSpendTransactions: List[SpendTransaction]
-      )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]] =
-        globalSpendTransactions.foldM[F, Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]](
-          Right((currentBalances, SortedMap.empty[Address, Balance]))
-        ) {
-          case (Left(err), _) =>
-            (Left(err): Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]).pure[F]
-          case (Right((balances, balancesDelta)), spendTransaction) =>
-            val destinationAddress = spendTransaction.destination
-            val sourceAddress = spendTransaction.source
-            val addressAllowSpends = allGlobalAllowSpends.getOrElse(sourceAddress, List.empty)
-            val spendTransactionAmount = SwapAmount.toAmount(spendTransaction.amount)
+      )(implicit hasher: Hasher[F]): F[
+        Either[SpendTransactionBalanceError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]
+      ] = {
+        type AllowSpendIndex = SortedMap[Address, Map[Hash, Hashed[AllowSpend]]]
+        type ConsumedReference = (Address, Hash)
+        type SettlementState =
+          (SortedMap[Address, Balance], SortedMap[Address, Balance], AllowSpendIndex, Set[ConsumedReference])
 
-            readBalance(destinationAddress, balances).flatMap { currentDestinationBalance =>
-              spendTransaction.allowSpendRef.flatMap(ref => addressAllowSpends.find(_.hash === ref)) match {
-                case Some(allowSpend) =>
-                  val sourceAllowSpendAddress = allowSpend.source
-                  val balanceToReturnToAddress = allowSpend.amount.value.value - spendTransactionAmount.value.value
+        val initialAllowSpendIndex: AllowSpendIndex =
+          allGlobalAllowSpends.view.mapValues(_.iterator.map(hashed => hashed.hash -> hashed).toMap).to(SortedMap)
 
-                  readBalance(sourceAllowSpendAddress, balances).map { currentSourceBalance =>
-                    for {
-                      updatedDestinationBalance <- currentDestinationBalance.plus(spendTransactionAmount)
-                      updatedSourceBalance <- currentSourceBalance.plus(
-                        Amount(NonNegLong.from(balanceToReturnToAddress).getOrElse(NonNegLong.MinValue))
-                      )
-                    } yield
-                      (
-                        balances
-                          .updated(destinationAddress, updatedDestinationBalance)
-                          .updated(sourceAllowSpendAddress, updatedSourceBalance),
-                        balancesDelta
-                          .updated(destinationAddress, updatedDestinationBalance)
-                          .updated(sourceAllowSpendAddress, updatedSourceBalance)
-                      )
+        globalSpendTransactions
+          .foldM[F, Either[SpendTransactionBalanceError, SettlementState]](
+            Right((currentBalances, SortedMap.empty[Address, Balance], initialAllowSpendIndex, Set.empty[ConsumedReference]))
+          ) {
+            case (Left(err), _) =>
+              (Left(err): Either[SpendTransactionBalanceError, SettlementState]).pure[F]
+            case (Right((balances, balancesDelta, remainingAllowSpends, consumedAllowSpendRefs)), spendTransaction) =>
+              val destinationAddress = spendTransaction.destination
+              val sourceAddress = spendTransaction.source
+              val spendTransactionAmount = SwapAmount.toAmount(spendTransaction.amount)
+
+              spendTransaction.allowSpendRef match {
+                case Some(allowSpendRef) =>
+                  val consumedReference = sourceAddress -> allowSpendRef
+                  remainingAllowSpends.getOrElse(sourceAddress, Map.empty).get(allowSpendRef) match {
+                    case None if consumedAllowSpendRefs.contains(consumedReference) =>
+                      (Left(ReferencedAllowSpendAlreadyConsumed(sourceAddress, allowSpendRef)): Either[
+                        SpendTransactionBalanceError,
+                        SettlementState
+                      ]).pure[F]
+
+                    case None =>
+                      (Left(ReferencedAllowSpendNotFound(sourceAddress, allowSpendRef)): Either[
+                        SpendTransactionBalanceError,
+                        SettlementState
+                      ]).pure[F]
+
+                    case Some(allowSpend) =>
+                      NonNegLong.from(allowSpend.amount.value.value - spendTransactionAmount.value.value) match {
+                        case Left(_) =>
+                          (Left(SpendAmountExceedsAllowSpend(allowSpendRef, allowSpend.amount, spendTransaction.amount)): Either[
+                            SpendTransactionBalanceError,
+                            SettlementState
+                          ]).pure[F]
+
+                        case Right(balanceToReturnToAddress) =>
+                          val sourceAllowSpendAddress = allowSpend.source
+                          readBalance(destinationAddress, balances).flatMap { currentDestinationBalance =>
+                            currentDestinationBalance.plus(spendTransactionAmount) match {
+                              case Left(error) =>
+                                (Left(BalanceArithmeticFailure(destinationAddress, error)): Either[
+                                  SpendTransactionBalanceError,
+                                  SettlementState
+                                ]).pure[F]
+
+                              case Right(updatedDestinationBalance) =>
+                                val balancesAfterDestination = balances.updated(destinationAddress, updatedDestinationBalance)
+
+                                readBalance(sourceAllowSpendAddress, balancesAfterDestination).map { currentSourceBalance =>
+                                  currentSourceBalance
+                                    .plus(Amount(balanceToReturnToAddress))
+                                    .leftMap(BalanceArithmeticFailure(sourceAllowSpendAddress, _))
+                                    .map { updatedSourceBalance =>
+                                      val remainingForSource = remainingAllowSpends.getOrElse(sourceAddress, Map.empty) - allowSpendRef
+                                      val updatedAllowSpendIndex =
+                                        if (remainingForSource.nonEmpty) remainingAllowSpends.updated(sourceAddress, remainingForSource)
+                                        else remainingAllowSpends - sourceAddress
+
+                                      (
+                                        balancesAfterDestination.updated(sourceAllowSpendAddress, updatedSourceBalance),
+                                        balancesDelta
+                                          .updated(destinationAddress, updatedDestinationBalance)
+                                          .updated(sourceAllowSpendAddress, updatedSourceBalance),
+                                        updatedAllowSpendIndex,
+                                        consumedAllowSpendRefs + consumedReference
+                                      )
+                                    }
+                                }
+                            }
+                          }
+                      }
                   }
 
                 case None =>
-                  readBalance(sourceAddress, balances).map { currentSourceBalance =>
-                    for {
-                      updatedDestinationBalance <- currentDestinationBalance.plus(spendTransactionAmount)
-                      updatedSourceBalance <- currentSourceBalance.minus(spendTransactionAmount)
-                    } yield
-                      (
-                        balances
-                          .updated(destinationAddress, updatedDestinationBalance)
-                          .updated(sourceAddress, updatedSourceBalance),
-                        balancesDelta
-                          .updated(destinationAddress, updatedDestinationBalance)
-                          .updated(sourceAddress, updatedSourceBalance)
-                      )
-                  }
+                  if (sourceAddress === destinationAddress)
+                    readBalance(sourceAddress, balances).map { currentSourceBalance =>
+                      currentSourceBalance
+                        .minus(spendTransactionAmount)
+                        .leftMap(BalanceArithmeticFailure(sourceAddress, _))
+                        .as((balances, balancesDelta, remainingAllowSpends, consumedAllowSpendRefs))
+                    }
+                  else
+                    (readBalance(destinationAddress, balances), readBalance(sourceAddress, balances)).mapN {
+                      (currentDestinationBalance, currentSourceBalance) =>
+                        for {
+                          updatedDestinationBalance <- currentDestinationBalance
+                            .plus(spendTransactionAmount)
+                            .leftMap(BalanceArithmeticFailure(destinationAddress, _))
+                          updatedSourceBalance <- currentSourceBalance
+                            .minus(spendTransactionAmount)
+                            .leftMap(BalanceArithmeticFailure(sourceAddress, _))
+                        } yield
+                          (
+                            balances
+                              .updated(destinationAddress, updatedDestinationBalance)
+                              .updated(sourceAddress, updatedSourceBalance),
+                            balancesDelta
+                              .updated(destinationAddress, updatedDestinationBalance)
+                              .updated(sourceAddress, updatedSourceBalance),
+                            remainingAllowSpends,
+                            consumedAllowSpendRefs
+                          )
+                    }
               }
-            }
-        }
+          }
+          .map(_.map { case (balances, deltas, _, _) => (balances, deltas) })
+      }
 
       private def readBalance(address: Address, deltas: SortedMap[Address, Balance]): F[Balance] =
         deltas.get(address) match {

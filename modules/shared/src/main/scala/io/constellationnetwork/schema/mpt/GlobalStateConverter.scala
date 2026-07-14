@@ -1531,6 +1531,81 @@ object GlobalStateConverter {
     }
   }
 
+  type ActiveAllowSpendsByScope = SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]
+
+  private type ValidatedActiveAllowSpendEntry = (Option[Address], Address, SortedSet[Signed[AllowSpend]])
+
+  /** Validate and decode field-7 entries from their one-way MPT keys.
+    *
+    * The value must carry enough structure to reproduce the exact key under which it was stored. Iteration is sorted by actual hex key so
+    * corrupt states with more than one bad entry fail identically on every node.
+    */
+  private def validateActiveAllowSpendEntries[F[_]: Sync: Hasher](
+    entries: Map[Hex, SortedSet[Signed[AllowSpend]]],
+    requiredScope: Option[Option[Address]]
+  ): F[List[ValidatedActiveAllowSpendEntry]] = {
+    def corrupt[A](message: String): F[A] =
+      Sync[F].raiseError(new IllegalStateException(s"Corrupt active allow-spends partition: $message"))
+
+    entries.toList.sortBy(_._1.value).traverse {
+      case (actualKey, set) if set.isEmpty =>
+        corrupt[ValidatedActiveAllowSpendEntry](s"empty set at key=${actualKey.value}")
+
+      case (actualKey, set) =>
+        val embeddedScopes = set.iterator.map(_.value.currencyId.map(_.value)).toSet
+        val embeddedSources = set.iterator.map(_.value.source).toSet
+
+        if (embeddedScopes.size =!= 1 || embeddedSources.size =!= 1)
+          corrupt[ValidatedActiveAllowSpendEntry](s"mixed scope/source at key=${actualKey.value}")
+        else {
+          val scope = embeddedScopes.head
+          val source = embeddedSources.head
+
+          requiredScope match {
+            case Some(required) if scope =!= required =>
+              corrupt[ValidatedActiveAllowSpendEntry](
+                s"unexpected scope at key=${actualKey.value} expected=$required actual=$scope"
+              )
+            case _ =>
+              GlobalStateKey
+                .toHex[F](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, scope, source))
+                .flatMap { expectedKey =>
+                  if (actualKey === expectedKey) (scope, source, set).pure[F]
+                  else
+                    corrupt[ValidatedActiveAllowSpendEntry](
+                      s"key/value mismatch actual=${actualKey.value} expected=${expectedKey.value}"
+                    )
+                }
+          }
+        }
+    }
+  }
+
+  /** Materialize every global and per-metagraph active-allow-spend bucket after validating each entry against its canonical MPT key. */
+  def materializeActiveAllowSpendEntries[F[_]: Sync: Hasher](
+    entries: Map[Hex, SortedSet[Signed[AllowSpend]]]
+  ): F[ActiveAllowSpendsByScope] =
+    validateActiveAllowSpendEntries[F](entries, requiredScope = None).flatMap { validated =>
+      validated
+        .foldLeft(SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]) {
+          case (acc, (scope, source, set)) =>
+            val scoped = acc.getOrElse(scope, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
+            acc.updated(scope, scoped.updated(source, set))
+        }
+        .pure[F]
+    }
+
+  /** Materialize one metagraph's field-7 entries. Every value must embed exactly `Some(metagraphAddress)`; a prefix match by itself is not
+    * authority for the currency lane.
+    */
+  def materializeMetagraphActiveAllowSpendEntries[F[_]: Sync: Hasher](
+    metagraphAddress: Address,
+    entries: Map[Hex, SortedSet[Signed[AllowSpend]]]
+  ): F[SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+    validateActiveAllowSpendEntries[F](entries, requiredScope = Some(Some(metagraphAddress))).flatMap { validated =>
+      SortedMap.from(validated.map { case (_, source, set) => source -> set }).pure[F]
+    }
+
   /** Standalone reconstruction (the inverse of [[infoEntryBytes]]) over any [[CurrencyInfoMpt]] — see the `MptStoreReadOps`
     * `reconstructCurrencySnapshotInfo` scaladoc for the per-field / Option-emptiness / fieldId-7 contract.
     */
@@ -1553,10 +1628,10 @@ object GlobalStateConverter {
       activeTokenLocks <- scan[Address, SortedSet[Signed[TokenLock]]](MgActiveTokenLocks)
       lastMessages <- scan[MessageType, Signed[CurrencyMessage]](MgLastMessages)
       globalSyncView <- scan[PeerId, Signed[GlobalSnapshotSync]](MgGlobalSnapshotSyncView)
-      activeAllowSpends <- GlobalStateKey
+      activeAllowSpendEntries <- GlobalStateKey
         .hypergraphFieldPrefix[F](ActiveAllowSpends, metagraphAddress.some)
         .flatMap(reader.getAllForPrefix[SortedSet[Signed[AllowSpend]]])
-        .map(e => SortedMap.from(e.values.toList.flatMap(s => s.headOption.map(_.value.source -> s))))
+      activeAllowSpends <- materializeMetagraphActiveAllowSpendEntries[F](metagraphAddress, activeAllowSpendEntries)
     } yield
       CurrencySnapshotInfo(
         lastTxRefs = lastTxRefs,

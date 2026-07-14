@@ -8,11 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency._
 import io.constellationnetwork.node.shared.domain.block.processing._
-import io.constellationnetwork.node.shared.domain.swap.block.{
-  AllowSpendBlockAcceptanceContext,
-  AllowSpendBlockAcceptanceManager,
-  AllowSpendBlockAcceptanceResult
-}
+import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -101,10 +97,12 @@ class BlockAcceptanceOpsManager[F[_]: Async: Parallel](
     snapshotOrdinal: SnapshotOrdinal,
     initialTxRef: AllowSpendReference,
     shouldPerformMetagraphSpecificValidations: Boolean,
-    lastUnsyncGlobalSnapshotOrdinal: SnapshotOrdinal,
-    fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal,
     lastSyncGlobalSnapshotEpochProgress: EpochProgress
   )(implicit hasher: Hasher[F]): F[AllowSpendBlockAcceptanceResult] = {
+    val expectedCurrencyId = CurrencyId(lastSnapshotContext.address)
+    val (validLaneBlocks, invalidLaneBlocks) = blocksForAcceptance.sorted.partition(
+      BlockAcceptanceOpsManager.isValidMetagraphAllowSpendBlock(_, expectedCurrencyId)
+    )
     val context = AllowSpendBlockAcceptanceContext.fromStaticData(
       lastSnapshotContext.snapshotInfo.balances,
       lastSnapshotContext.snapshotInfo.lastAllowSpendRefs.getOrElse(Map.empty),
@@ -112,19 +110,19 @@ class BlockAcceptanceOpsManager[F[_]: Async: Parallel](
       initialTxRef
     )
 
-    val maybeEpochProgress =
-      if (lastUnsyncGlobalSnapshotOrdinal > fixingAllowSpendAndTokenLockValidation)
+    allowSpendBlockAcceptanceManager
+      .acceptBlocksIteratively(
+        validLaneBlocks,
+        context,
+        snapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations,
         lastSyncGlobalSnapshotEpochProgress.some
-      else
-        none
-
-    allowSpendBlockAcceptanceManager.acceptBlocksIteratively(
-      blocksForAcceptance,
-      context,
-      snapshotOrdinal,
-      shouldPerformMetagraphSpecificValidations,
-      maybeEpochProgress
-    )
+      )
+      .map { result =>
+        result.copy(
+          notAccepted = result.notAccepted ++ invalidLaneBlocks.map(_ -> InvalidMetagraphAllowSpendLane(expectedCurrencyId))
+        )
+      }
   }
 
   def acceptTransactionRefs(
@@ -167,6 +165,12 @@ class BlockAcceptanceOpsManager[F[_]: Async: Parallel](
 }
 
 object BlockAcceptanceOpsManager {
+  private[currency] def isValidMetagraphAllowSpendBlock(
+    block: Signed[AllowSpendBlock],
+    expectedCurrencyId: CurrencyId
+  ): Boolean =
+    block.value.transactions.forall(_.currencyId.contains(expectedCurrencyId))
+
   private[currency] def isValidMetagraphTokenLockBlock(
     block: Signed[TokenLockBlock],
     expectedCurrencyId: CurrencyId

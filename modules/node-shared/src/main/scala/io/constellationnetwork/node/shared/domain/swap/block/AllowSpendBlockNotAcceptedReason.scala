@@ -4,7 +4,7 @@ import cats.data.NonEmptyList
 
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.BalanceArithmeticError
-import io.constellationnetwork.schema.swap.{AllowSpendOrdinal, AllowSpendReference}
+import io.constellationnetwork.schema.swap.{AllowSpendOrdinal, AllowSpendReference, CurrencyId}
 import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.{eqv, show}
@@ -21,6 +21,8 @@ object AllowSpendBlockNotAcceptedReason {
   def isPermanent(reason: AllowSpendBlockNotAcceptedReason): Boolean = reason match {
     case RejectedAllowSpend(_, _: ParentOrdinalBelowLastTxOrdinal) => true
     case RejectedAllowSpend(_, _: ParentHashNotEqLastTxHash)       => true
+    case InvalidGlobalAllowSpendLane                               => true
+    case _: InvalidMetagraphAllowSpendLane                         => true
     case _                                                         => false
   }
 }
@@ -33,6 +35,12 @@ case class ValidationFailed(reasons: NonEmptyList[AllowSpendBlockValidationError
 
 @derive(eqv, show)
 case class RejectedAllowSpend(tx: AllowSpendReference, reason: AllowSpendRejectionReason) extends AllowSpendBlockRejectionReason
+
+@derive(eqv, show)
+case object InvalidGlobalAllowSpendLane extends AllowSpendBlockRejectionReason
+
+@derive(eqv, show)
+case class InvalidMetagraphAllowSpendLane(expectedCurrencyId: CurrencyId) extends AllowSpendBlockRejectionReason
 
 @derive(eqv, show)
 sealed trait AllowSpendBlockAwaitReason extends AllowSpendBlockNotAcceptedReason

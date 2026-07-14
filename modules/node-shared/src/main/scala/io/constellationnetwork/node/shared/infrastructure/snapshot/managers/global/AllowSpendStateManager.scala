@@ -115,9 +115,9 @@ trait AllowSpendStateManager[F[_]] {
     * fieldId=ActiveAllowSpends)` across all contract scopes. Replaces `lastSnapshotContext.activeAllowSpends` reads in the GSAM hot path so
     * the accept pipeline no longer depends on the inbound GSI carrying that field.
     *
-    * Both dimensions of the outer map are recovered from the value: `head.value.currencyId.map(_.value)` for the contract scope (None =
-    * DAG-global, Some(addr) = metagraph-scoped) and `head.value.source` for the user. Every member of a per-key SortedSet shares one
-    * `(currencyId, source)` pair by construction, so taking the head is safe.
+    * Both dimensions of the outer map are recovered from the value only after validating that the set is nonempty, every member carries one
+    * identical `(currencyId, source)` pair, and the key derived from that pair exactly equals the scanned MPT key. A malformed entry raises
+    * deterministic corruption instead of being silently omitted or reclassified by its value.
     */
   def materializeActiveAllowSpendsFromMpt(
     implicit hasher: Hasher[F]
@@ -467,15 +467,8 @@ object AllowSpendStateManager {
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveAllowSpends)
         entries <- reader.getAllForPrefix[SortedSet[Signed[AllowSpend]]](prefix)
-      } yield
-        entries.values.toList
-          .mapFilter(set => set.headOption.map(h => (h.value.currencyId.map(_.value), h.value.source, set)))
-          .filter(_._3.nonEmpty)
-          .foldLeft(SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]) {
-            case (acc, (contract, source, set)) =>
-              val inner = acc.getOrElse(contract, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
-              acc.updated(contract, inner.updated(source, set))
-          }
+        result <- ActiveAllowSpendMptMaterializer.materialize[F](entries)
+      } yield result
 
     def materializeLastAllowSpendRefsFromMpt(
       implicit hasher: Hasher[F]

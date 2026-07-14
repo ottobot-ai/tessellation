@@ -678,7 +678,7 @@ object SpendActionValidatorSuite extends MutableIOSuite {
     } yield expect(forward === reversed)
   }
 
-  test("reserves no-ref self-destination spends because balance application debits them") { res =>
+  test("no-ref self-transfers prove funds but do not reserve a nonexistent debit") { res =>
     implicit val (_, hs, sp) = res
 
     val validator = SpendActionValidator.make[IO]
@@ -688,16 +688,17 @@ object SpendActionValidatorSuite extends MutableIOSuite {
       source = sourceKey.getPublic.toAddress
       firstAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(60L), source, source)))
       secondAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(60L), source, source)))
+      overdrawnAction = SpendAction(NonEmptyList.one(SpendTransaction(none, none, SwapAmount(101L), source, source)))
       balances = Map(none[Address] -> SortedMap(source -> Balance(NonNegLong(100L))))
       (accepted, rejected) <- validator.validateReturningAcceptedAndRejected(
-        Map(source -> List(firstAction, secondAction)),
+        Map(source -> List(firstAction, secondAction, overdrawnAction)),
         SortedMap.empty,
         balances
       )
     } yield
       expect.all(
-        accepted.get(source).contains(List(firstAction)),
-        rejected.get(source).exists(_.map(_._1) === List(secondAction))
+        accepted.get(source).contains(List(firstAction, secondAction)),
+        rejected.get(source).exists(_.map(_._1) === List(overdrawnAction))
       )
   }
 }

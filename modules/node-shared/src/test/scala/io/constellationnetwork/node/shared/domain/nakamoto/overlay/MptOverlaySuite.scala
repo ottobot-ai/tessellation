@@ -15,6 +15,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.serde.codecs.StringCodec._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -494,6 +495,26 @@ object MptOverlaySuite extends MutableIOSuite {
         !fromBranch.contains(hexDrop),
         fromBase.contains(hexKeep),
         fromBase.contains(hexDrop) // base view (unknown branch id) sees both
+      )
+  }
+
+  test("multi-branch: getAllForPrefix fails closed on an undecodable matching branch upsert") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+      key = gskBalance(702)
+      hex <- GlobalStateKey.toHex[IO](key)
+      prefix <- GlobalStateKey.hypergraphFieldPrefix[IO](GlobalStateFieldId.Balances)
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[String](key, "x")
+      _ <- overlay.commit(handle, branchA, ordinal)
+      pointRead <- overlay.get[Balance](branchA, key)
+      prefixRead <- overlay.getAllForPrefix[Balance](branchA, prefix).attempt
+    } yield
+      expect.all(
+        pointRead.isEmpty,
+        prefixRead.left.exists(e => e.getMessage.contains("undecodable bytes") && e.getMessage.contains(hex.value))
       )
   }
 

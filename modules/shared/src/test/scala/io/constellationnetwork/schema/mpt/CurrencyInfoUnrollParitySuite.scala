@@ -175,12 +175,12 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
   private def freshStore(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[MptStore[IO, GlobalStateKey]] =
     InMemoryMerklePatriciaProducer.make[IO]().flatMap(p => MptStore.make[IO, GlobalStateKey](p, GlobalStateKey.toHex[IO]))
 
-  private def mkAllowSpend(source: Address, label: String): Signed[AllowSpend] =
+  private def mkAllowSpend(source: Address, label: String, currencyId: Option[CurrencyId]): Signed[AllowSpend] =
     Signed(
       AllowSpend(
         source = source,
         destination = source,
-        currencyId = None,
+        currencyId = currencyId,
         amount = SwapAmount(PosLong(100L)),
         fee = AllowSpendFee(NonNegLong(0L)),
         parent = AllowSpendReference(AllowSpendOrdinal(NonNegLong(0L)), testHash(s"as-parent-$label")),
@@ -203,7 +203,7 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       lastMessages = SortedMap[MessageType, Signed[CurrencyMessage]](MessageType.Staking -> mkCurrencyMessage(holder, mgAddr)).some,
       lastFeeTxRefs = SortedMap(holder -> TransactionReference(TransactionOrdinal(NonNegLong(2L)), testHash("csi-fee"))).some,
       lastAllowSpendRefs = SortedMap(holder -> AllowSpendReference(AllowSpendOrdinal(NonNegLong(3L)), testHash("csi-as"))).some,
-      activeAllowSpends = SortedMap(holder -> SortedSet(mkAllowSpend(holder, "x"))).some,
+      activeAllowSpends = SortedMap(holder -> SortedSet(mkAllowSpend(holder, "x", CurrencyId(mgAddr).some))).some,
       globalSnapshotSyncView = Some(SortedMap.empty),
       lastTokenLockRefs = SortedMap(holder -> TokenLockReference(TokenLockOrdinal(NonNegLong(4L)), testHash("csi-tlr"))).some,
       activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x"))).some
@@ -255,5 +255,60 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       _ <- writeUnrolledInfo(store, mgAddr, info)
       reconstructed <- store.reconstructCurrencySnapshotInfo(mgAddr)
     } yield expect(clue(reconstructed) == clue(info))
+  }
+
+  test("per-metagraph reconstruction rejects an active allow-spend stored under the wrong source key") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mgAddr <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      valueSource <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      keySource <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      store <- freshStore
+      value = mkAllowSpend(valueSource, "wrong-key", CurrencyId(mgAddr).some)
+      _ <- store.insert(GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, mgAddr.some, keySource), SortedSet(value))
+      result <- store.reconstructCurrencySnapshotInfo(mgAddr).attempt
+    } yield expect(result.left.exists(_.getMessage.contains("key/value mismatch")))
+  }
+
+  test("per-metagraph reconstruction rejects an active allow-spend with a non-matching embedded scope") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mgAddr <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      store <- freshStore
+      value = mkAllowSpend(source, "wrong-scope", none)
+      _ <- store.insert(GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, mgAddr.some, source), SortedSet(value))
+      result <- store.reconstructCurrencySnapshotInfo(mgAddr).attempt
+    } yield expect(result.left.exists(_.getMessage.contains("unexpected scope")))
+  }
+
+  test("per-metagraph reconstruction rejects an empty active allow-spend set") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mgAddr <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      store <- freshStore
+      _ <- store.insert(
+        GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, mgAddr.some, source),
+        SortedSet.empty[Signed[AllowSpend]]
+      )
+      result <- store.reconstructCurrencySnapshotInfo(mgAddr).attempt
+    } yield expect(result.left.exists(_.getMessage.contains("empty set")))
+  }
+
+  test("per-metagraph reconstruction rejects an active allow-spend set with mixed embedded sources") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      mgAddr <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      sourceA <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      sourceB <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      store <- freshStore
+      values = SortedSet(
+        mkAllowSpend(sourceA, "mixed-a", CurrencyId(mgAddr).some),
+        mkAllowSpend(sourceB, "mixed-b", CurrencyId(mgAddr).some)
+      )
+      _ <- store.insert(GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, mgAddr.some, sourceA), values)
+      result <- store.reconstructCurrencySnapshotInfo(mgAddr).attempt
+    } yield expect(result.left.exists(_.getMessage.contains("mixed scope/source")))
   }
 }

@@ -35,7 +35,6 @@ trait BlockAcceptanceCoordinatorManager[F[_]] {
     blocksForAcceptance: List[Signed[AllowSpendBlock]],
     lastSnapshotContext: GlobalSnapshotInfo,
     snapshotOrdinal: SnapshotOrdinal,
-    fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal,
     epochProgress: EpochProgress
   )(implicit hasher: Hasher[F]): F[AllowSpendBlockAcceptanceResult]
 
@@ -85,32 +84,28 @@ object BlockAcceptanceCoordinatorManager {
       blocksForAcceptance: List[Signed[AllowSpendBlock]],
       lastSnapshotContext: GlobalSnapshotInfo,
       snapshotOrdinal: SnapshotOrdinal,
-      fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal,
       epochProgress: EpochProgress
     )(implicit hasher: Hasher[F]): F[AllowSpendBlockAcceptanceResult] = {
+      val (nativeBlocks, invalidLaneBlocks) = blocksForAcceptance.sorted.partition(_.value.transactions.forall(_.currencyId.isEmpty))
       // §G4: balances + lastAllowSpendRefs sourced from the branch-aware MPT reader.
       val context = AllowSpendBlockAcceptanceContext.fromMpt[F](
         reader,
         collateral,
         AllowSpendReference.empty
       )
-      if (snapshotOrdinal > fixingAllowSpendAndTokenLockValidation) {
-        allowSpendBlockAcceptanceManager.acceptBlocksIteratively(
-          blocksForAcceptance,
+      allowSpendBlockAcceptanceManager
+        .acceptBlocksIteratively(
+          nativeBlocks,
           context,
           snapshotOrdinal,
           shouldPerformMetagraphSpecificValidations = true,
           epochProgress.some
         )
-      } else {
-        allowSpendBlockAcceptanceManager.acceptBlocksIteratively(
-          blocksForAcceptance,
-          context,
-          snapshotOrdinal,
-          shouldPerformMetagraphSpecificValidations = true,
-          none
-        )
-      }
+        .map { result =>
+          result.copy(
+            notAccepted = result.notAccepted ++ invalidLaneBlocks.map(_ -> InvalidGlobalAllowSpendLane)
+          )
+        }
     }
 
     def acceptTokenLockBlocks(

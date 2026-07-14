@@ -256,11 +256,6 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       .getOrElse(environment, SnapshotOrdinal.MinValue)
     updatedLastSyncGlobalFromPeersInConsensus = fieldsAddedOrdinals.updatedLastSyncGlobalFromPeersInConsensus
       .getOrElse(environment, SnapshotOrdinal.MinValue)
-    fixingAllowSpendExpiration = fieldsAddedOrdinals.fixingAllowSpendExpiration
-      .getOrElse(environment, SnapshotOrdinal.MinValue)
-    fixingAllowSpendAndTokenLockValidation = fieldsAddedOrdinals.fixingAllowSpendAndTokenLockValidation
-      .getOrElse(environment, SnapshotOrdinal.MinValue)
-
     acceptanceBlocksResult <- blockOps.acceptBlocks(
       blocksForAcceptance,
       lastSnapshotContext,
@@ -430,9 +425,6 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         snapshotOrdinal,
         initialAllowSpendRef,
         shouldPerformMetagraphSpecificValidations,
-        // Track-1 I-PIN (Step-1): feature-activation gate keyed off the RECORDED `globalSyncView` (see acceptTokenLockBlocks above).
-        globalSyncView.ordinal,
-        fixingAllowSpendAndTokenLockValidation,
         lastGlobalSnapshotEpochProgress
       )
     ).parMapN((tokenLock, allowSpend) => (tokenLock, allowSpend))
@@ -553,10 +545,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       lastGlobalSnapshotEpochProgress,
       incomingCurrencyAllowSpends,
       lastActiveAllowSpends,
-      metagraphIdSpendTransactions,
-      // Track-1 I-PIN (Step-1): allow-spend expiration feature gate keyed off the RECORDED `globalSyncView`, not the node-local head.
-      globalSyncView.ordinal,
-      fixingAllowSpendExpiration
+      metagraphIdSpendTransactions
     )
 
     updatedBalancesByAllowSpends <- allowSpendOps
@@ -565,10 +554,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         updatedBalancesByTokenLocks,
         incomingCurrencyAllowSpends,
         lastActiveAllowSpends,
-        metagraphIdSpendTransactions,
-        // Track-1 I-PIN (Step-1): allow-spend expiration feature gate keyed off the RECORDED `globalSyncView` (see above).
-        globalSyncView.ordinal,
-        fixingAllowSpendExpiration
+        metagraphIdSpendTransactions
       )
       .flatMap {
         case Right(balances) => balances.pure[F]
@@ -582,14 +568,14 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         allowSpends.toList.traverse(_.toHashed).map(hashedAllowSpends => address -> hashedAllowSpends)
     }.map(_.toSortedMap)
 
-    updatedBalancesBySpendTransactions = allowSpendOps.updateCurrencyBalancesBySpendTransactions(
-      updatedBalancesByAllowSpends,
-      allActiveCurrencyAllowSpends,
-      metagraphIdSpendTransactions
-    ) match {
-      case Right(balances) => balances
-      case Left(error)     => throw new RuntimeException(s"Balance arithmetic error updating balances by spend transactions: $error")
-    }
+    updatedBalancesBySpendTransactions <- allowSpendOps
+      .updateCurrencyBalancesBySpendTransactions(
+        updatedBalancesByAllowSpends,
+        allActiveCurrencyAllowSpends,
+        metagraphIdSpendTransactions
+      )
+      .leftMap(error => new RuntimeException(s"Invalid allow-spend settlement: ${error.message}"))
+      .liftTo[F]
 
     updatedAllowSpendsCleaned = updatedAllowSpends.filter { case (_, allowSpends) => allowSpends.nonEmpty }
     updatedActiveTokenLocksCleaned = updatedActiveTokenLocks.filter { case (_, tokenLocks) => tokenLocks.nonEmpty }
@@ -634,10 +620,7 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
         .filterExpiredAllowSpends(
           lastActiveAllowSpends,
           lastGlobalSnapshotEpochProgress,
-          metagraphIdSpendTransactions,
-          // Track-1 I-PIN (Step-1): allow-spend expiration feature gate keyed off the RECORDED `globalSyncView`, not the node-local head.
-          globalSyncView.ordinal,
-          fixingAllowSpendExpiration
+          metagraphIdSpendTransactions
         )
         .flatMap(allowSpendOps.emitAllowSpendsExpired),
       tokenLockOps.emitTokenUnlocks(acceptedTokenUnlocks, expiredTokenLocks)

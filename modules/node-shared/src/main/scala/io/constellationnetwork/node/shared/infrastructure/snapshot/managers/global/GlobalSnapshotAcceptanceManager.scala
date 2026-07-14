@@ -302,6 +302,38 @@ object GlobalSnapshotAcceptanceManager {
         Option.when(retained.nonEmpty)(producer -> retained)
     }
 
+  private[global] def filterNativeAllowSpendsForEpoch(
+    activeAllowSpends: SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]],
+    epochProgress: EpochProgress
+  ): SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]] =
+    activeAllowSpends.get(None).fold(activeAllowSpends) { nativeAllowSpends =>
+      activeAllowSpends.updated(
+        None,
+        nativeAllowSpends.view.mapValues(_.filter(_.lastValidEpochProgress >= epochProgress)).to(SortedMap)
+      )
+    }
+
+  private[global] def nativeConsumedAllowSpendRefs(
+    settledSpendActions: SortedMap[Address, List[SpendAction]]
+  ): SortedSet[Hash] =
+    SortedSet.from(
+      settledSpendActions.valuesIterator
+        .flatMap(_.iterator)
+        .flatMap(_.spendTransactions.toList.iterator)
+        .filter(_.currencyId.isEmpty)
+        .flatMap(_.allowSpendRef)
+    )
+
+  private[global] final case class NativeAllowSpendTerminalOverlap(refs: SortedSet[Hash]) extends NoStackTrace
+
+  private[global] def ensureNativeAllowSpendTerminalDisjointness(
+    consumedRefs: SortedSet[Hash],
+    expiredRefs: SortedSet[Hash]
+  ): Either[NativeAllowSpendTerminalOverlap, Unit] = {
+    val overlap = consumedRefs.intersect(expiredRefs)
+    Either.cond(overlap.isEmpty, (), NativeAllowSpendTerminalOverlap(overlap))
+  }
+
   private case object InvalidMerkleTree extends NoStackTrace
 
   /** One upheld invalid-state-proof dispute surfaced from `adoptShardCheckpoints` — the durable-slash request the accept path applies. The
@@ -1180,15 +1212,13 @@ object GlobalSnapshotAcceptanceManager {
           epochProgress: EpochProgress,
           allowSpendBlocksForAcceptance: List[Signed[AllowSpendBlock]],
           tokenLockBlocksForAcceptance: List[Signed[TokenLockBlock]],
-          lastSnapshotContext: GlobalSnapshotInfo,
-          fixingAllowSpendAndTokenLockValidation: SnapshotOrdinal
+          lastSnapshotContext: GlobalSnapshotInfo
         )(implicit hasher: Hasher[F]): F[(AllowSpendBlockAcceptanceResult, TokenLockBlockAcceptanceResult)] =
           for {
             allowSpend <- blockAcceptanceCoordinatorManager.acceptAllowSpendBlocks(
               allowSpendBlocksForAcceptance,
               lastSnapshotContext,
               ordinal,
-              fixingAllowSpendAndTokenLockValidation,
               epochProgress
             )
             tokenLock <- blockAcceptanceCoordinatorManager.acceptTokenLockBlocks(
@@ -1720,9 +1750,6 @@ object GlobalSnapshotAcceptanceManager {
           val tessellation3MigrationStartingOrdinal = fieldsAddedOrdinals.tessellation3Migration
             .getOrElse(environment, SnapshotOrdinal.MinValue)
 
-          val fixingAllowSpendAndTokenLockValidation = fieldsAddedOrdinals.fixingAllowSpendAndTokenLockValidation
-            .getOrElse(environment, SnapshotOrdinal.MinValue)
-
           // Phase J: serialize accept() across the GSAM instance with `acceptMutex`. The dynamic
           // branch-aware reader closes over `branchTipRef.get`; without this lock, a concurrent
           // accept() (e.g. the consensus FSM running validateArtifact while SnapshotLeaderLoop
@@ -1830,8 +1857,7 @@ object GlobalSnapshotAcceptanceManager {
                     epochProgress,
                     allowSpendBlocksForAcceptance,
                     tokenLockBlocksForAcceptance,
-                    lastSnapshotContext,
-                    fixingAllowSpendAndTokenLockValidation
+                    lastSnapshotContext
                   )
 
                 acceptedGlobalAllowSpends = allowSpendBlockAcceptanceResult.accepted.flatMap(_.value.transactions.toList)
@@ -2395,7 +2421,7 @@ object GlobalSnapshotAcceptanceManager {
                   epochProgress,
                   spendActions,
                   pricingUpdates,
-                  lastActiveAllowSpends,
+                  filterNativeAllowSpendsForEpoch(lastActiveAllowSpends, epochProgress),
                   effectiveCurrencyBalances,
                   globalBalances,
                   lastSnapshotContext,
@@ -2464,6 +2490,13 @@ object GlobalSnapshotAcceptanceManager {
                 crossShardMarkers = crossShardEngineResult.markers
                 settledSpendActions: SortedMap[Address, List[SpendAction]] =
                   pruneRejectedSpendActions(capacityCheckedSpendActions, crossShardEngineResult.rejected.toSet)
+                consumedNativeAllowSpendRefs = nativeConsumedAllowSpendRefs(settledSpendActions)
+                expiredNativeAllowSpendRefs <- expiredAllowSpendsHoisted.valuesIterator.flatten.toList
+                  .traverse(_.toHashed.map(_.hash))
+                  .map(hashes => SortedSet.from[Hash](hashes))
+                _ <- Async[F].fromEither(
+                  ensureNativeAllowSpendTerminalDisjointness(consumedNativeAllowSpendRefs, expiredNativeAllowSpendRefs)
+                )
                 _ <- Async[F].whenA(
                   capacityRejectedSpendTransactionCount > 0 || crossShardMarkers.nonEmpty || crossShardEngineResult.rejected.nonEmpty
                 )(
@@ -2685,7 +2718,7 @@ object GlobalSnapshotAcceptanceManager {
                 )
                 (updatedBalancesBySpendTransactions, updatedBalancesBySpendTransactionsDeltas) <- Async[F].fromEither(
                   spendTxBalancesResult
-                    .leftMap(err => new RuntimeException(s"Balance arithmetic error updating balances by spend transactions: $err"))
+                    .leftMap(err => new RuntimeException(s"Spend-transaction balance application error: $err"))
                 )
 
                 MerkleTreeResult(_, updatedLastCurrencySnapshotProofs) <- buildMerkleTreeAndProofs(

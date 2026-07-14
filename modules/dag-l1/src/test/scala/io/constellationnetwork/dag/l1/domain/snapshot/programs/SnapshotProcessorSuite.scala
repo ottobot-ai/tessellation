@@ -214,8 +214,6 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                       Map.empty,
                       Map.empty,
                       Map.empty,
-                      Map.empty,
-                      Map.empty,
                       Map.empty
                     ),
                     Dev,
@@ -296,8 +294,6 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                 GlobalSnapshotAcceptanceManager
                   .make(
                     FieldsAddedOrdinals(
-                      Map.empty,
-                      Map.empty,
                       Map.empty,
                       Map.empty,
                       Map.empty,

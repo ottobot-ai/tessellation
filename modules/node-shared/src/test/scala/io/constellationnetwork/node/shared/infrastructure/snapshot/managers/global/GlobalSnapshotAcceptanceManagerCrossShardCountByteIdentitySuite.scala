@@ -389,8 +389,6 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
             Map.empty,
             Map.empty,
             Map.empty,
-            Map.empty,
-            Map.empty,
             Map.empty
           ),
           MetagraphsSyncConfig(PosInt(100)),

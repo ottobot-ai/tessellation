@@ -588,8 +588,6 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
                       Map.empty,
                       Map.empty,
                       Map.empty,
-                      Map.empty,
-                      Map.empty,
                       Map.empty
                     ),
                     MetagraphsSyncConfig(PosInt(100)),

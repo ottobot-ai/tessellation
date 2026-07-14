@@ -100,6 +100,27 @@ object MptPrefixScanSuite extends MutableIOSuite {
     }
   }
 
+  test("getAllForPrefix fails closed on an undecodable matched value while point get remains optional") { implicit res =>
+    implicit val (hs, js) = res
+    val _ = js
+    hs.withCurrent { implicit hasher =>
+      for {
+        producer <- InMemoryMerklePatriciaProducer.make[IO]()
+        store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+        key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr1)
+        hex <- GlobalStateKey.toHex[IO](key)
+        _ <- producer.insertBytes(Map(hex -> Array[Byte](1))).flatMap(_.liftTo[IO])
+        prefix <- GlobalStateKey.hypergraphFieldPrefix[IO](GlobalStateFieldId.Balances)
+        pointRead <- store.get[String](key)
+        prefixRead <- store.getAllForPrefix[String](prefix).attempt
+      } yield
+        expect.all(
+          pointRead.isEmpty,
+          prefixRead.left.exists(e => e.getMessage.contains("undecodable bytes") && e.getMessage.contains(hex.value))
+        )
+    }
+  }
+
   test("hypergraphFieldPrefix with contract scopes to that contract only") { implicit res =>
     implicit val (hs, js) = res
     val _ = js

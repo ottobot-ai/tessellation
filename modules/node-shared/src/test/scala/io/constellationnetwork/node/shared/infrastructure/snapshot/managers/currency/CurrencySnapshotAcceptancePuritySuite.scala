@@ -107,12 +107,12 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
 
   // Gate 1 lever (precondition #5): all-empty ⇒ every threshold is MinValue ⇒ the field-gating head-leak is INERT.
   private val allEmptyFieldsAddedOrdinals: FieldsAddedOrdinals =
-    FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty)
+    FieldsAddedOrdinals(Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty, Map.empty)
 
   // Gate 2: the REAL mainnet activation ordinals verbatim from `modules/node-shared/src/main/resources/application.conf`
   // (`fields-added-ordinals` block), so the head-ordinal-driven field-gating (`snapshotOrdinalToCheckFields` vs
-  // `tessellation3Migration`, `metagraphSyncData`, `updatingCombineFunctionSpendActions`, `fixingAllowSpend*`) is exercised at production
-  // thresholds. The GREEN baseline picks head/anchor ordinals ABOVE every boundary so emission is head-invariant today.
+  // `tessellation3Migration`, `metagraphSyncData`, `updatingCombineFunctionSpendActions`) is exercised at production thresholds. The GREEN
+  // baseline picks head/anchor ordinals ABOVE every field-emission boundary so emission is head-invariant today.
   private val mainnetFieldsAddedOrdinals: FieldsAddedOrdinals =
     FieldsAddedOrdinals(
       tessellation3Migration = Map(Mainnet -> ord(4409045L)),
@@ -122,8 +122,6 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
       updatedLastSyncGlobalOrder = Map(Mainnet -> ord(4915254L)),
       updatedLastSyncGlobalFromPeersInConsensus = Map(Mainnet -> ord(4915254L)),
       updatingCombineFunctionSpendActions = Map(Mainnet -> ord(4957662L)),
-      fixingAllowSpendExpiration = Map(Mainnet -> ord(5033174L)),
-      fixingAllowSpendAndTokenLockValidation = Map(Mainnet -> ord(5058096L)),
       setSumFix = Map(Mainnet -> ord(9999999L))
     )
 
@@ -355,7 +353,7 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
   ) { res =>
     implicit val (h, j, ks, sp) = res
 
-    // Anchor + both heads sit ABOVE every mainnet activation boundary (max boundary = fixingAllowSpendAndTokenLockValidation = 5058096,
+    // Anchor + both heads sit ABOVE every mainnet field-emission boundary (latest = updatingCombineFunctionSpendActions = 4957662,
     // below setSumFix = 9999999). numShards=1 ⇒ no cross-shard SpendActions exist, so this is the pre-sharding baseline.
     val g2AnchorOrdinal = ord(5100000L)
     val g2HeadAOrdinal = ord(5100050L)

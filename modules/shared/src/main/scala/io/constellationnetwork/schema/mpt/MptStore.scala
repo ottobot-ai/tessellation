@@ -185,6 +185,20 @@ object MptStore {
             logger.warn(s"MptStore.deserializeBytes: scodec decode failed: $err") >> none[V].pure[F]
         }
 
+    private def deserializePrefixBytes[V: ImmutableCodec](hex: Hex, bytes: Array[Byte]): F[V] =
+      if (bytes == null || bytes.isEmpty)
+        Async[F].raiseError(
+          new IllegalStateException(s"MptStore.getAllForPrefix: null/empty bytes at hex=${hex.value}")
+        )
+      else
+        scodec.bits.ByteVector.view(bytes).fromImmutableBytes[V] match {
+          case Right(v) => v.pure[F]
+          case Left(err) =>
+            Async[F].raiseError(
+              new IllegalStateException(s"MptStore.getAllForPrefix: undecodable bytes at hex=${hex.value}: $err")
+            )
+        }
+
     override def get[V: ImmutableCodec](key: K): F[Option[V]] =
       for {
         hex <- toHex(key)
@@ -221,12 +235,12 @@ object MptStore {
 
     override def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
       producer.entriesWithPrefix(prefix).flatMap { matched =>
-        matched.toList.traverseFilter {
-          case (hex, bytes) if bytes != null && bytes.nonEmpty =>
-            deserializeBytes[V](bytes).map(_.map(hex -> _))
-          case (hex, _) =>
-            logger.warn(s"MptStore.getAllForPrefix: Found null/empty bytes for hex=$hex") >> none[(Hex, V)].pure[F]
-        }.map(_.toMap)
+        matched.toList
+          .sortBy(_._1.value)
+          .traverse {
+            case (hex, bytes) => deserializePrefixBytes[V](hex, bytes).map(hex -> _)
+          }
+          .map(_.toMap)
       }
 
     override def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =

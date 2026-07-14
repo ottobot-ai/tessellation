@@ -251,10 +251,10 @@ object SpendActionValidator {
             case ((validationsAcc, reservationsAcc), spendTransaction) =>
               validateAllowSpendRef(spendTransaction, activeAllowSpends, allBalances, currencyId, reservationsAcc).map { validation =>
                 val updatedReservations = validation match {
-                  case Valid(validTransaction) if validTransaction.allowSpendRef.isEmpty =>
-                    // Reserve the gross debit. The balance appliers write the source debit last when source == destination, so a self-transfer
-                    // is still a debit. Referenced-transfer credits and incoming destinations were not part of the validator's prior balance
-                    // view and must not make a later no-ref spend self-funding within this batch.
+                  case Valid(validTransaction)
+                      if validTransaction.allowSpendRef.isEmpty && validTransaction.source =!= validTransaction.destination =>
+                    // Reserve only a real debit. A no-reference self-transfer proves the source can cover the amount but has net delta zero.
+                    // Referenced-transfer credits and incoming destinations must not make a later no-ref spend self-funding within this batch.
                     val key = balanceReservationKey(validTransaction, currencyId)
                     reservationsAcc.updated(
                       key,

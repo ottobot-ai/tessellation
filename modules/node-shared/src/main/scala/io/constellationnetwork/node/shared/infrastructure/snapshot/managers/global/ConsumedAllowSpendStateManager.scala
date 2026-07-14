@@ -166,15 +166,8 @@ object ConsumedAllowSpendStateManager {
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveAllowSpends)
         entries <- reader.getAllForPrefix[SortedSet[Signed[AllowSpend]]](prefix)
-      } yield
-        entries.values.toList
-          .mapFilter(set => set.headOption.map(h => (h.value.currencyId.map(_.value), h.value.source, set)))
-          .filter(_._3.nonEmpty)
-          .foldLeft(SortedMap.empty[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]) {
-            case (acc, (contract, source, set)) =>
-              val inner = acc.getOrElse(contract, SortedMap.empty[Address, SortedSet[Signed[AllowSpend]]])
-              acc.updated(contract, inner.updated(source, set))
-          }
+        result <- ActiveAllowSpendMptMaterializer.materialize[F](entries)
+      } yield result
 
     def classifyCrossShardConsumes(
       acceptedSpendActions: SortedMap[Address, List[SpendAction]],

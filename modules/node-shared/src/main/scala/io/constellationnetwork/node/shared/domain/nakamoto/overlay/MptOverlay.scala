@@ -778,8 +778,8 @@ object MptOverlay {
           merged = mergedChain(branch, pending)
           filteredUpserts = merged.upserts.filter { case (hex, _) => hex.value.startsWith(prefix.value) }
           filteredRemovals = merged.removals.filter(_.value.startsWith(prefix.value))
-          decoded <- filteredUpserts.toList.traverseFilter {
-            case (hex, bytes) => deserializeBytes[V](bytes).map(_.map(hex -> _))
+          decoded <- filteredUpserts.toList.sortBy(_._1.value).traverse {
+            case (hex, bytes) => deserializePrefixBytes[V](hex, bytes).map(hex -> _)
           }
         } yield (baseEntries -- filteredRemovals) ++ decoded.toMap
 
@@ -1203,6 +1203,20 @@ object MptOverlay {
           scodec.bits.ByteVector.view(bytes).fromImmutableBytes[V] match {
             case Right(v)  => v.some.pure[F]
             case Left(err) => logger.warn(s"MptOverlay.deserializeBytes: scodec decode failed: $err") >> none[V].pure[F]
+          }
+
+      private def deserializePrefixBytes[V: ImmutableCodec](hex: Hex, bytes: Array[Byte]): F[V] =
+        if (bytes == null || bytes.isEmpty)
+          Async[F].raiseError(
+            new IllegalStateException(s"MptOverlay.getAllForPrefix: null/empty bytes at hex=${hex.value}")
+          )
+        else
+          scodec.bits.ByteVector.view(bytes).fromImmutableBytes[V] match {
+            case Right(v) => v.pure[F]
+            case Left(err) =>
+              Async[F].raiseError(
+                new IllegalStateException(s"MptOverlay.getAllForPrefix: undecodable bytes at hex=${hex.value}: $err")
+              )
           }
     }
 
