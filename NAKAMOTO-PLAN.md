@@ -83,6 +83,63 @@ to end.
 - Gate: `ARCH-001` through `ARCH-003`, `SIG-001` through `SIG-005`; repository
   search rejects a target global BFT lifecycle.
 
+### Stop-the-line complete-root program (`OPEN`, blocks economic activation)
+
+The current global `mptRoot` excludes `SystemNamespace` active/expiry indices
+that GSAM and recovery paths nevertheless consume. A peer, disk image, or reorg
+load can therefore vary consensus inputs without changing the signed root
+(`ECO-IDX-01`, CRITICAL; `ECO-IDX-02`, HIGH). This is not a cache-hygiene issue.
+Until the following sequence closes, runtime stake eligibility, tower
+activation, ordinary checkpoint diff adoption, and every economic deployment
+must remain deployment-disabled. Nonactivating schema, model, and RED-test work
+may continue; this is a release gate, not a claim that every unsafe runtime path
+already has a hard-coded kill switch.
+
+1. **Freeze complete root ownership.** Give every value that can influence a
+   transition, eligibility decision, expiry, slash, or recovery result one
+   canonical key grammar and root ownership. Replace root-excluded,
+   path-dependent active/expiry sidecars with canonical rooted key-carrying
+   indices or derive them only from rooted records; no consensus path may read
+   an unrooted writable cache. Pure field-32 observation metadata remains
+   outside both the GL0 root and the GL0 diff/write set and cannot influence a
+   transition. Gate: `ECO-IDX-01`, `ROOT-007`.
+2. **Land one strict key-aware reader.** Point, prefix, and raw reads return
+   typed absent/present/malformed results with the physical MPT key/path and
+   exact immutable value bytes. Decoding never drops an entry; reconstruction
+   recomputes the expected key from the decoded identity/scope and compares it
+   with the physical key before returning a value. The strict point-read
+   primitive landed in `41c19903d`; the shared prefix/raw contract remains open.
+   Gate: `ROOT-008`.
+3. **Migrate key-blind consumers in parallel after step 2.** Close the six
+   source-confirmed parser families: `MPT-01` Mg* value-only reconstruction,
+   `MPT-02` consumed-allow-spend physical nullifier keys, `MPT-03` stake and
+   collateral scope/keys, `MPT-04` token-lock value/head selection, `MPT-05`
+   slash/cooldown keys, and `MPT-06` price/parameter keys. Their parser defects
+   are confirmed; end-to-end malicious ingress remains PLAUSIBLE until the RED
+   integration vectors reproduce it. Gates: `XMG-013`, `PERM-005`, `WT-010`,
+   `ECON-G-002`.
+4. **Harden raw recovery and tower state.** Network sync, persisted restore, and
+   deep-reorg loads accept only an exact snapshot-bound complete root. Any
+   non-consensus derived bytes are stripped and deterministically rebuilt from
+   rooted state, never preserved as peer/disk authority (`ECO-IDX-02`,
+   `ROOT-009`). Malformed tower/SMT durable keys fail the whole load instead of
+   disappearing during decode (`STOR-02`, `REC-004`).
+5. **Qualify the integrated state machine.** Run GSAM differential tests from
+   identical rooted bytes with every sidecar omission/substitution, then
+   restart, compaction, density unwind/refold, authenticated recovery, and
+   `numShards=1`, `2`, and `K` parity. Root, decisions, expiry, stake/committee
+   eligibility, slash/cooldown, checkpoint adoption, and supply must match
+   exactly before any blocked activation gate can close.
+
+The HTTP subtree-proof path has an additional field-7 residual. Commit
+`41c19903d` binds the structured proof key, raw value, terminal-leaf digest, and
+canonical field-25 `MgBalances` reads, but the served per-MG checkpoint root is
+built from field 5 plus fields 25-31 and excludes field-7 active allow-spends.
+The route therefore cannot yet provide a checkpoint-rooted field-7 membership
+proof. Root field 7 in the applicable complete commitment, or prove it against
+the exact Phase-2 GL0 complete root; do not activate the HTTP cross-shard read
+path on the current root shape.
+
 ### E1 - Hash-bound finality, density selection, and atomic reorg (`PARTIAL`)
 
 **Depends on:** E0. **Can run with:** E2 and supporting tracks S1-S3.
@@ -104,7 +161,8 @@ to end.
 
 ### E2 - Historical validator, stake, eta, and key evidence (`PARTIAL`)
 
-**Depends on:** E0 and canonical identity primitives from S1.
+**Depends on:** E0, complete-root steps 1-2, and canonical identity primitives
+from S1. Runtime stake/committee eligibility also depends on steps 3-5.
 
 - Derive eta-period-N eligibility from the exact candidate branch: the atomic
   key/authorized-roster/stake view from N-2, eta evidence from N-1, and the
@@ -279,7 +337,8 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
 
 ### E3 - Portable NiPoPoW tower (`SCAFFOLD ONLY`)
 
-**Depends on:** E1, E2, E2K, and S1. **Must precede:** permissionless proof claims.
+**Depends on:** E1, E2, E2K, S1, and all complete-root steps. **Must precede:**
+permissionless proof claims.
 
 - Put branch-bound, per-level trial state and last-hit links in the signed
   snapshot certificate. Producer computes it; every recipient independently
@@ -298,7 +357,8 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
 
 ### E4 - Replayable checkpoint schema and complete root (`PLANNED`)
 
-**Depends on:** E0, E1 exact Phase-2 refs, E2/E2K identities, S1-S3.
+**Depends on:** E0, E1 exact Phase-2 refs, E2/E2K identities, S1-S3, and
+complete-root steps 1-3. Diff adoption remains blocked through step 5.
 
 - Define one strict Scodec checkpoint preimage binding network/genesis/era/
   parameters, shard/epoch/roster, parent/ordinal/duty, exact Phase-2 base hash and
@@ -430,10 +490,32 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
   commitment, and atomic balance/head update. Serialize the outer binary fee and
   every other global-balance writer in the same checkpoint-wide reservation
   kernel.
+- The reservation kernel is one typed ledger over `(currency scope,address)` for
+  transfers, framework/data fees, rewards, allow-spends, token locks, mandatory
+  GL0 SpendActions, and slash bounties. It atomically rolls back a failed
+  multi-address claim, rejects projected values outside the balance domain, and
+  requires final application to equal the projected map. Exact Phase-2 GL0 inbox
+  claims precede conflicting ML0-local claims.
+- Preserve the closed narrow regressions: an allow-spend never credits destination
+  before consume (ECO-20), a token-lock replacement release belongs to one exact
+  consuming operation at the exact candidate epoch (ECO-21), allow-spend references
+  have one terminal winner and typed one-shot settlement (ECO-22), lane identity
+  rejects the whole malformed block (ECO-23), and field-7 reconstruction fails
+  closed on key/value mismatch (SMT-04).
+- Complete the shared compiler before cutover: exact post-class projected arithmetic
+  rejects destination overflow before application (ECO-24). ECO-25 is fixed in
+  `41c19903d`: local cross-shard no-ref reads use strict exact-byte field-25
+  `MgBalances` entries, bind the embedded account, and fail closed on malformed
+  committed bytes. This does not close the HTTP field-7 proof/root residual in
+  the stop-the-line program. Shard execution signatures cover the final
+  checkpoint-wide outer-fee/global-intent reservation result.
 - `numShards=1`, `2`, and `K` use the identical transition function.
 - Gates: `SHARD-E-003`/`004`, `DIFF-*`, `XMG-001` through `XMG-005B`,
-  `XMG-007`/`008`/`010`, `ECON-F-002`/`003`, `ECON-REF-001`,
-  `SHARD-C-004`/`005`, `WT-008`/`008A`, and conservation/replay tests from S2.
+  `XMG-007`/`008`/`010`/`012`/`013`, `ECON-F-002`/`003`, `ECON-REF-001`,
+  `ECON-BAL-002`/`003`, `ECON-G-002`, `ROOT-006` through `ROOT-009`,
+  `PERM-005`, `SHARD-C-004`/`005`, `WT-008`/`008A`/`010`, and
+  conservation/replay tests from S2. `ECO-IDX-01/02` and `MPT-01..06` are
+  mandatory stop-the-line findings, not optional hardening.
 
 ### E10 - Downstream exact-hash rebase and historical-read recovery (`PARTIAL`)
 
@@ -457,8 +539,15 @@ delivery, rollback, and recovery.
   anchor, descendant-retention, recovery, and finality-orchestration slice; a
   narrow guard alone reaches normal restart/finality paths after partial external
   mutation and is not mergeable.
-- Gates: `XMG-006`, `FOLLOW-001` through `FOLLOW-005`, `REC-*`, `MEMPOOL-001`,
-  `ROOT-002` through `ROOT-004`, and `GROWTH-001`.
+- Build durability dark first: immutable copied/sorted MPT images, independent root
+  rebuild, forced atomic image/manifest publication, digest/readback, and monotone
+  generation CAS. Runtime activation additionally requires a lifetime OS ownership
+  lock, bounded streaming decode, era-bound hashing, exact snapshot identity,
+  immutable in-session capture, and one recoverable finality intent spanning every
+  sink. This primitive alone is not ROOT-002/003/004 completion.
+- Gates: `XMG-006`, `FOLLOW-001` through `FOLLOW-005`, `REC-*` including
+  `REC-004`, `MEMPOOL-001`, `ROOT-002` through `ROOT-005`, `ROOT-009`,
+  `STOR-02`, and `GROWTH-001`.
 
 ### E11 - Exceptional challenge replay and sound slashing (`SCAFFOLD ONLY`)
 

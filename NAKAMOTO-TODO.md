@@ -73,6 +73,46 @@ criteria are in `NAKAMOTO-PLAN.md`.
     dependency, and closing commit.
   - **Gate:** `ARCH-001..003`, `SIG-001..005`.
 
+- [ ] **STOP-THE-LINE - complete rooted state and key-aware reads**
+  - The signed global `mptRoot` currently excludes `SystemNamespace` active and
+    expiry indices that GSAM, raw load, and reorg paths consume. This is
+    `ECO-IDX-01` (CRITICAL, confirmed) and `ECO-IDX-02` (HIGH, confirmed), not
+    non-consensus cache cleanup. Stake/committee eligibility, tower activation,
+    ordinary checkpoint diff adoption, and economic deployment must remain
+    deployment-disabled until this entire checklist closes. This is a release
+    gate, not a claim that every unsafe runtime path already has a hard-coded
+    kill switch.
+  - [ ] **1. Complete root ownership:** replace root-excluded path-dependent
+    indices with canonical rooted key-carrying indices or derive them only from
+    rooted records. No writable unrooted value may influence consensus; field 32
+    remains non-consensus observation metadata outside both the GL0 root and the
+    GL0 diff/write set. Gate: `ECO-IDX-01`, `ROOT-007`.
+  - [ ] **2. Shared strict reader:** extend the strict point-read primitive landed
+    in `41c19903d` to point, prefix, and raw enumeration. Return typed
+    absent/present/malformed results with physical key/path and exact bytes;
+    require decoded identity/scope to reproduce the physical key. Never omit a
+    matched malformed entry. Gate: `ROOT-008`.
+  - [ ] **3. Parallel consumer migrations:** after step 2, independently close
+    `MPT-01` Mg* value-only reconstruction; `MPT-02` consumed-allow-spend
+    physical nullifier keys; `MPT-03` stake/collateral scope and keys; `MPT-04`
+    token-lock value/head selection; `MPT-05` slash/cooldown keys; and `MPT-06`
+    price/parameter keys. The parser defects are confirmed; malicious ingress is
+    PLAUSIBLE pending end-to-end RED reproduction. Gates: `XMG-013`, `PERM-005`,
+    `WT-010`, `ECON-G-002`.
+  - [ ] **4. Raw recovery and tower:** exact-snapshot/root-verify network, disk,
+    and deep-reorg maps; strip non-consensus derived bytes and rebuild them only
+    from rooted state (`ECO-IDX-02`, `ROOT-009`). Make malformed tower/SMT durable
+    keys reject the whole load instead of disappearing (`STOR-02`, `REC-004`).
+  - [ ] **5. Integrated qualification:** prove identical GSAM decisions/root from
+    identical rooted state under every sidecar mutation, then exercise restart,
+    compaction, density reorg/recovery, and shard counts 1/2/K. Include expiry,
+    stake/committee eligibility, slash/cooldown, checkpoint adoption, and supply.
+  - **HTTP field-7 residual:** `41c19903d` fixes proof-envelope key/value/leaf
+    binding and the local field-25 `MgBalances` path, but the served per-MG root
+    still covers field 5 plus fields 25-31, not active allow-spends field 7.
+    Root field 7 in the applicable complete commitment or prove it against the
+    exact Phase-2 GL0 complete root before activating HTTP cross-shard reads.
+
 ### Wave 1 - Parallel models and shared contracts
 
 - [ ] **E1 PARTIAL - hash-bound finality, density, and atomic reorg**
@@ -85,6 +125,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **Gate:** `FIN-M-*`, revised `FIN-D-*`, `FIN-W-*`, `FIN-S-*`, `REC-*`.
 
 - [ ] **E2 PARTIAL - historical N-2 stake/registry and N-1 eta evidence**
+  - Runtime eligibility additionally depends on every stop-the-line
+    complete-root step; a root-invisible roster/stake/index is not authority.
   - Replace receiver-current filtering with branch-bound historical roots.
   - Root the permissionless GL0 operator roster and its Sybil-resistance rule;
     key registration alone is not eligibility. Every period-N draw resolves the
@@ -241,6 +283,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
 ### Wave 2 - Finality evidence and checkpoint contracts
 
 - [ ] **E3 SCAFFOLD ONLY - signed tower state, consensus SMT, portable proof**
+  - Activation depends on every stop-the-line complete-root step, including
+    strict durable tower/SMT key decoding and reorg recovery.
   - Put per-level trial state and last-hit links in branch-bound signed snapshots;
     every receiver independently reproduces them.
   - Verify consensus SMT transitions and historical eligibility on produce,
@@ -252,6 +296,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **Gate:** `ROOT-001`, `LIGHT-001`, `SER-*`, `CRYPTO-001`, proof/reorg vectors.
 
 - [ ] **E4 PLANNED - replayable checkpoint schema and complete root**
+  - Schema work depends on complete-root steps 1-3; ordinary diff adoption
+    remains blocked until integrated step 5 closes.
   - Bind exact Phase-2 base, network/genesis/era/parameters, shard/roster/parent/
     duty, and complete ordered signed inputs.
   - Bind per-MG `preRoot/preVersion`, canonical byte diff,
@@ -342,10 +388,29 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - Serialize outer state-channel binary fees and every other global-balance write
     in the checkpoint-wide GL0 reservation kernel; per-MG roots alone cannot
     resolve a payer shared across metagraphs.
+  - Use one typed balance ledger keyed by `(currency scope,address)` across
+    transfers, fees, rewards, allow-spends, token locks, mandatory GL0
+    SpendActions, and slash bounties. Atomic multi-address claims either reserve
+    completely or leave no state; final application must equal the projected map.
+    ML0 applies exact Phase-2 GL0 inbox work before conflicting local CL1 work.
+  - Preserve the closed narrow regressions: allow-spend admission never credits
+    destination (ECO-20), a token-lock replacement release is consumed by one exact
+    operation at the exact candidate epoch (ECO-21), allow-spend settlement has one
+    terminal winner and typed one-shot references (ECO-22), lane identity rejects
+    whole malformed blocks (ECO-23), and field-7 reconstruction fails closed on
+    key/value mismatch (SMT-04).
+  - Keep the remaining work explicit: one exact post-class projected ledger must
+    reject destination overflow before application (ECO-24). ECO-25 is fixed in
+    `41c19903d`: local cross-shard no-ref reads use strict exact-byte field-25
+    `MgBalances`, bind the embedded account, and reject malformed committed
+    bytes. This does not close the HTTP field-7 proof/root residual above.
+    Execution signatures bind the final checkpoint-wide outer-fee/global-intent
+    result, not isolated MG roots.
   - Require identical economics at shard counts 1, 2, and K.
   - **Gate:** `DIFF-*`, `SHARD-E-003/004`, `SHARD-C-004/005`,
-    `XMG-001..005B`, `XMG-007/008/010`, `ECON-F-002/003`, `ECON-REF-001`,
-    and `WT-008/008A`.
+    `XMG-001..005B`, `XMG-007/008/010/012/013`, `ECON-F-002/003`,
+    `ECON-REF-001`, `ECON-BAL-002/003`, `ECON-G-002`, `ROOT-006..009`,
+    `PERM-005`, `WT-008/008A/010`, `ECO-IDX-01/02`, and `MPT-01..06`.
 
 - [ ] **E10 PARTIAL - downstream exact-hash rebase and historical recovery**
   - E9 owns exact-origin/CAS validity before the security cutover. Carry the same
@@ -359,11 +424,18 @@ criteria are in `NAKAMOTO-PLAN.md`.
     descendant retention, explicit `RecoveryRequired`, and finality-sink
     preflight/coordination. Unknown rejection alone halts the current normal path
     after the tip tracker, chain store, and outbox may already have advanced.
+  - Land the storage work dark before activation: immutable copied/sorted images,
+    independent root rebuild, forced atomic publication, digest/readback, and
+    monotone generation CAS. Then add lifetime OS directory ownership, bounded
+    streaming decode, era-bound hashing, exact snapshot anchoring, immutable
+    capture inside the session, and one durable multi-sink finality intent. The
+    image store alone closes none of `ROOT-002..004`.
   - Density replacement reverses anchors, mirrors, settlement/nullifiers, and
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters
     `RecoveryRequired`; it never falls back to receiver live head.
-  - **Gate:** `XMG-006`, `FOLLOW-001..005`, `REC-*`, `MEMPOOL-001`, `GROWTH-001`.
+  - **Gate:** `XMG-006`, `FOLLOW-001..005`, `REC-*` including `REC-004`,
+    `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02`, `GROWTH-001`.
 
 - [ ] **E11 SCAFFOLD ONLY - exceptional replay, adjudication, and slashing**
   - Accept only assigned, bonded, rate/resource-limited exact-data challenges.

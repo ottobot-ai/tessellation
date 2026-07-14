@@ -75,8 +75,12 @@ The plan begins from these source-proven gaps:
 | Global blind-sign type boundary | `NakamotoSyncDaemon.emitTipAttestation` accepts and signs naked tip hash/slot/ordinal inputs, and the best-tip ticker calls it directly (`NakamotoSyncDaemon.scala:2864-2931`; `SnapshotLeaderLoop.scala:1119-1149`). | Global optimistic signing also needs an authenticated-and-locally-executed capability, not caller-order discipline. |
 | Operator consensus keys | One atomic public KES+VRF registry, rooted long-term-signed genesis pairs/runtime histories, an `inclusionPeriod + 2`/N-2 activation model, and exact-hash historical view adapter exist. This is a period-index lookback, not a claim of two fully elapsed durations after intra-period inclusion. Production still uses the period-zero-only `ActiveOperatorConsensusKeys`; the historical resolver and rooted roster are not production-wired. `StakeRegistry`/`SharedServices` still admit receiver-local seedlist/current-state population inputs. O-11 proposes, but has not ratified, one branch-bound historical value co-locating the authorized population with its raw weights; no type, field, codec, or authorization rule is frozen. The runtime cert lacks explicit network/genesis/era domain and containing-hash/root witnesses, and acceptance rejects cross-operator collisions but permits same-owner full-pair reuse or a successive complete record in which only one key changes. Atomicity requires both active keys to come from one record; whether either key may remain unchanged across records is an owner decision. Local rotation is also absent: VRF secrets derive from the long-term identity and `OperationalKeyMaker` holds one destructively evolving KES secret (`KesRegistrationCert.scala:94-104`; `KesRegistrationCertValidator.scala:198-209`; `KesRegistrationCertAcceptanceManager.scala:128-153`; `ActiveOperatorConsensusKeys.scala:14-43`; `HistoricalOperatorConsensusKeyRegistry.scala:111-203`; `LocalOperatorKeyPairGate.scala:110-123,174-185`; `OperationalKeyMaker.scala:9-20,37-90`). | Unregistered period-zero grinding is blocked, but runtime rotation needs a domain/witness schema, a ratified same-owner reuse/rotation policy, atomic future KES+VRF secret provisioning, and exact-record selection in addition to public resolver wiring. Registration is not membership. O-11 must first select the Sybil/backing/lifecycle rule and canonical boundary ownership; O-12 must freeze the N-2 common-prefix/secret-deletion/recovery rule. |
 | Eta history | Live production/receipt reject incomplete or empty mature-period source ranges. `EtaStateManager.getEtaAt` bypasses receiver-current MPT state and ambient caching; both production GSAMs pass the exact parent, and admission walks the exact Phase-2 anchor (`EtaStateManager.scala:60-64,121-141,174-198`; `GlobalSnapshotAcceptanceManager.scala:1331-1353`; `SharedServices.scala:105-110,443`; `GlobalSnapshotConsensus.scala:480-502,697,1435-1477`). The residual ambient path is shard committee/producer/attester eta (`SharedServices.scala:305-308`; `GlobalSnapshotConsensus.scala:1736-1797,1913-1931`). | Bind exact Phase-2 `(ordinal,hash,mptRoot)` into `ShardCheckpoint`; use `getEtaAt` for every committee draw and proof. Until then sibling-local eta can split identical checkpoint validation. A complete-empty source also needs one explicit portable rule distinct from unavailable history. |
-| Tower verifier safety cut | Every suffix and level-chain occurrence resolves the current atomic period-zero pair, verifies the VRF proof over the header's exact carried `eta || slot` bytes, compares its derived/carried output, and ignores sender `activePoolSize`; every otherwise-valid nonempty proof then returns historical eligibility unavailable (`TowerVerifier.scala:125-147,199-258,344-350`). | Direct forged proof/output and claimed-pool authority are closed. The carried eta is only cryptographic self-consistency, not canonical historical randomness. Portable verification remains disabled until exact branch-historical registry/roster/stake/eta witnesses and authenticated tower/SMT inclusion exist. |
-| Root coverage | Current per-MG root covers field 5 plus seven Mg partitions 25-31, but excludes economic active allow-spends field 7 and observation metadata field 32 (`GlobalStateConverter.scala:1183-1185,1326-1355`; `GlobalStateKey.scala:308-325`). | A restored diff needs a complete root/write-scope contract and an explicit field-32 classification. |
+| Tower verifier safety cut | Every suffix and level-chain occurrence resolves the current atomic period-zero pair, verifies the VRF proof over the header's exact carried `eta || slot` bytes, compares its derived/carried output, and ignores sender `activePoolSize`. Snapshot, attestation, and tower consumers share the predecessor-indexed artifact-period rule, including the `R-1/R/R+1` boundary. Every otherwise-valid nonempty proof then returns historical eligibility unavailable (`EtaCalculation.scala:36-47`; `TowerVerifier.scala:125-147,199-258,344-360`). | Direct forged proof/output, claimed-pool authority, and the one-snapshot-early tower rotation bug are closed. The carried eta is only cryptographic self-consistency, not canonical historical randomness. Portable verification remains disabled until exact branch-historical registry/roster/stake/eta witnesses and authenticated tower/SMT inclusion exist. |
+| Root coverage | Current per-MG root covers field 5 plus seven Mg partitions 25-31, but excludes economic active allow-spends field 7 and observation metadata field 32 (`GlobalStateConverter.scala:1183-1185,1326-1355`; `GlobalStateKey.scala:308-325`). Root computation also excludes `SystemNamespace` active/expiry indices even though economic transition code reads them (ECO-IDX-01). | A restored diff needs a complete root/write-scope contract. Field 32 is observation metadata outside both the GL0 root and GL0 diff/write set. Every transition input is either canonical rooted state or a deterministic derivative rebuilt from rooted records inside the same exact-parent session; a root-invisible writable cache is never authority. |
+| Physical MPT key grammar | Multiple rooted partitions reconstruct logical maps from `entries.values`, embedded fields, or `headOption` without proving that each actual physical key equals the canonical key derived from the decoded value. This affects Mg fields, consumed-allow-spend nullifiers, stake/collateral, token locks, slash/cooldown state, price state, and node parameters (MPT-01 through MPT-06; representative Mg path `GlobalStateConverter.scala:1617-1629`). | A valid root can authenticate a semantically misplaced or duplicate logical record. Every parser must retain `(physicalKey,rawValue)`, strictly decode, recompute the canonical key/scope, reject mismatch and duplicate logical identity, and only then construct a typed map. |
+| Root-invisible restore input | Raw peer, persisted-disk, and deep-reorg loads can preserve or omit `SystemNamespace` entries while verifying a root that deliberately excludes them (ECO-IDX-02; `GlobalStateKey.scala:505-530`; `MptOverlay.scala:1104-1124`). | Network, restart, and reorg paths can authenticate the same root over different future economic inputs. Strip all root-invisible bytes at the boundary and rebuild permitted derivatives from root-verified canonical records, or fail before mutation. |
+| MPT persistence ordering | `MptStore` starts one detached persist fiber per sync/commit and advances its in-memory ordinal immediately. Each fiber later reads mutable producer state, writes directly in place, and applies a cutoff keyed by its caller ordinal (`MptStore.scala:146-155,328-348`; `FileSystemMerklePatriciaProducer.scala:283-292`; `MptStateStorage.scala:78-84`). | A delayed persist for N can label N+1 bytes as N and delete an already-written N+1 image. E9-BRANCH needs immutable capture, serialized durable publication, and a receipt-backed watermark before runtime activation. |
+| Durable tower/SMT key parsing | Tower and historical-SMT enumeration converts malformed durable keys to `None` and silently drops them (`MptTowerStore.scala:121-132`; `HistoricalCommitmentSmtStore.scala:170-180`, STOR-02). | Restart/recovery can omit authenticated history instead of reporting corruption. Durable enumeration must reject the entire image and enter authenticated recovery; it cannot filter malformed or noncanonical keys. |
 | Retained `smtRoot` | Audit SMT-01 found followers do not verify this signed historical commitment. | Tower support requires it to become reproducible and load-bearing on produce/follow/restart/bootstrap before eligibility is enabled. |
 | Serde | MPT values use scodec, but ordinary signing/hashing still has JSON/Kryo paths and the era registry is not the production authority. | Scodec migration is not complete. |
 | Derived eta period | `NakamotoConfig.etaRotationSnapshots` uses `math.round(3.1d * k1)` (`config/types.scala:163-168`). | Replace consensus `Double` with an exact ratified integer/rational formula and cross-language vectors. |
@@ -108,6 +112,8 @@ The plan begins from these source-proven gaps:
 | SER-1 | Every active consensus object has one bounded canonical Scodec representation and a signed domain. | Genesis manifest and strict codecs. |
 | ERA-1 | Greenfield starts `ScodecV1` at ordinal 0; future upgrades use an exact Phase-2 hash-bound era schedule. | Genesis and protocol-era state. |
 | STATE-1 | Canonical MPT bytes plus exact branch/checkpoint/finality journals are authority; GSI/cache/peer choice never is. | Typed state APIs and production denylist. |
+| STATE-2 | Every consensus-readable MPT entry proves `actualPhysicalKey == canonicalKey(decodedValue,scope)` before its value can enter a map, set, nullifier, weight, cooldown, price, or parameter view. | One strict physical-entry parser family used by live, replay, proof, and recovery paths. |
+| STATE-3 | Root-invisible indices and caches are never accepted as transition inputs from memory, peer, disk, or reorg bytes. A required derivative is rebuilt deterministically from root-authenticated records or the transition stops. | Complete-root contract, exact-parent derived-index builder, and verified recovery loader. |
 | REC-1 | Restart, reorg, catch-up, and bootstrap reproduce exact bytes or stop before mutation. | Verify-before-write recovery. |
 | DA-1 | All bytes required to execute, challenge, roll back, or serve remain authenticated and available through the maximum required horizon. | Content commitments, bounded fetch, signer/watchtower retention. |
 | CFG-1 | Consensus parameters, committee derivation, resource limits, and era are genesis/finalized state, never receiver-local configuration. | Canonical parameter hash bound into artifacts. |
@@ -141,12 +147,15 @@ waiver.
 | FIN-11 (fixed regression) | E6/E14 | CRYPTO, SIG |
 | ECO-02, ECO-03, ECO-04, ECO-06, ECO-18 | E2/E6/E9 | ECON-A/C/F/G/R, WT, XMG |
 | ECO-05 | E2/E9/E10 | ECON-R, XMG, FOLLOW |
-| ECO-10 through ECO-17 | E2/E9 | ECON-D/C/O/B/F/G, XMG |
-| SHARD-01 through SHARD-10 | E4/E6/E8/E10 | SHARD-C/E/S, FOLLOW, REC |
-| SMT-01, SMT-02, SMT-03 | E1/E9/E11 | ROOT, SER, REC |
+| ECO-10 through ECO-17, ECO-20 through ECO-25 | E2/E9 | ECON-D/C/O/B/F/G, XMG |
+| ECO-IDX-01, ECO-IDX-02 | E1/E9/E11 | ROOT, REC, XMG, PERM |
+| MPT-01 through MPT-06 | E1/E2/E6/E9/E11 | ROOT, XMG, PERM, WT, ECON-G, REC |
+| STOR-02 | E4/E11 | TOWER, ROOT, REC |
+| SHARD-01 through SHARD-11 | E4/E6/E8/E10 | SHARD-C/E/S, FOLLOW, REC |
+| SMT-01 through SMT-04 | E1/E9/E11 | ROOT, SER, REC |
 | SER-01, SER-02, SER-03 | E1/E5/E13 | SER, ERA, LANE, DA, REC |
 | NET-01, NET-02A, NET-03 through NET-10 | E12, with domain/size schemas in E1/E5 | NET, RESOURCE, DA, REC |
-| ECO-01, ECO-07, ECO-08, ECO-09, NET-02 (fixed regressions) | E2/E7/E9/E12/E14 as applicable | dedicated exploit regression plus differential/qualification suites |
+| ECO-01, ECO-07, ECO-08, ECO-09, ECO-20 through ECO-23, ECO-25, SMT-04, NET-02 (fixed regressions) | E2/E7/E9/E12/E14 as applicable | dedicated exploit regression plus differential/qualification suites |
 
 MEDIUM ECO-14/ECO-16 and NET-08/09/10 remain included because they affect
 consensus economics or the permissionless security boundary.
@@ -364,7 +373,7 @@ can choose a far-future valid window and, if it obtains the mandatory replay
 signatures, strand the shard behind that parent slot. A receiver-wall-clock check
 would create asymmetric validity and is not an acceptable repair.
 
-SHARD-10/SHARD-C-011 capture that duty validation currently consumes local HOCON `staircaseDeltaSlots`.
+SHARD-11/SHARD-C-011 capture that duty validation currently consumes local HOCON `staircaseDeltaSlots`.
 Identical artifacts can therefore select different scheduled peers under
 configuration skew. The delta and its parameter hash must be rooted in the same
 proposal-parent/genesis consensus context as the roster and eta before this is a
@@ -384,6 +393,9 @@ not close E8.3, E8.4, or ordinary zero-replay adoption.
 |---|---|
 | E9.1 | Ordinary GL0 checkpoint acceptance verifies duty/roster/execution certificate, the separately domain-separated positive replay coverage assignment/signatures/threshold, continuity, exact canonical Phase-2 base/origin refs, scope, and absence of a pending authenticated mismatch; compare-and-sets each signed pre-root/version against the proposal-parent mirror, applies diff, and recomputes root with zero ML0 recreation. |
 | E9.2 | Canonically merge native GL1 writes, per-MG diffs, global framework intents, rewards/slashes/config changes, GL0 protocol corrections, and custom commitments. Conflicting keys or invalid roots reject atomically. |
+| E9.2A | One typed balance ledger keyed by `(currency scope,address)` compiles transfers, framework/data fees, rewards, allow-spend reservation/release, token-lock reservation/unlock/replacement, mandatory GL0 SpendActions, and slash bounties. It reserves atomically in canonical operation order, rolls back a rejected multi-address operation, rejects projected values outside `[0,Long.MaxValue]`, and makes final application prove equality with the projected map. GL0 and ML0 use the same kernel; mandatory Phase-2 GL0 inbox work precedes conflicting ML0-local work. |
+| E9.2B | Admission and application have identical operation semantics. Preserve the fixed no-destination-credit (ECO-20), one-shot replacement release (ECO-21), allow-spend terminal/reference (ECO-22), exact-lane (ECO-23), canonical cross-shard field-25 balance proof (ECO-25, fixed at `41c19903d`), and field-7 reconstruction (SMT-04) regressions. Complete exact post-class projected arithmetic (ECO-24). Checkpoint execution signatures bind checkpoint-wide outer-fee/global-intent reservation, not isolated per-MG roots. |
+| E9.2C | Freeze and implement the complete-root/physical-key contract before checkpoint composition activates. Any active/expiry index read by a transition is canonical rooted state or is rebuilt inside the exact-parent session from strictly key-bound rooted records. Mg entries, nullifiers, stake/collateral, token locks, slash/cooldown state, price state, and parameters reject physical-key/value mismatch, duplicate logical identity, mixed scope, lossy `headOption`, and value-only reconstruction before producing a typed view. |
 | E9.3 | Per-MG diff cannot write global nullifier/inbox or another MG. Every GL0 node runs one pure global intent conflict/settlement kernel. |
 | E9.4 | Define signed authorization/consume identities and permanent replay keys. Network/genesis/era/type replay and proof-container malleability reject. |
 | E9.4A | Replace inherited data-application fee replay semantics. A domain-separated fee consumes the rooted per-MG/source field-27 parent, binds exact available opaque bytes or a ratified chunk manifest, and atomically updates balance plus head. Exact fee/custom-item cardinality rejects extras, duplicates, and partial acceptance. |
@@ -404,14 +416,34 @@ ordinary diff adoption, then restart/reorg/compaction and shard-count parity.
 Neither slice may ship as a node-local cache, bounded history window, optional
 field default, or ML0-authoritative override.
 
+The narrow ECO-20 through ECO-23, ECO-25, and SMT-04 regressions are landed. ECO-25
+closed at `41c19903d`: the GL0-local cross-shard balance path reads canonical field
+25, preserves exact committed bytes, distinguishes absent from malformed storage,
+and binds the embedded account. E9 remains planned because those repairs do not
+supply the shared cross-class ledger, checkpoint diff adoption, global
+conflict/nullifier kernel, exact destination projection (ECO-24), or the complete
+root/key/recovery contract (ECO-IDX-01/02 and MPT-01 through MPT-06).
+
 #### E9 immediate build lanes and join order
 
 | Lane | Ordered work | May run in parallel with | Join gate |
 |---|---|---|---|
+| E9-STATE | (1) Freeze the complete root/write set and classify each `SystemNamespace` index as canonical rooted state or a nonauthoritative derivative. (2) Land one strict `(physicalKey,rawValue) -> typedEntry` grammar and migrate Mg fields, consumed-allow-spend nullifiers, stake/collateral, token locks, slash/cooldown state, price state, and parameters without value-only reconstruction. (3) Strip root-invisible bytes from peer/disk/reorg loads and rebuild permitted derivatives from the verified exact parent. (4) Make malformed durable tower/SMT keys fail the whole image into recovery. (5) qualify live/replay/signer/watchtower/adopter/restart/reorg parity. | Pure DLV/FEE/economic oracles and E7 checkpoint schema work against the frozen root/key interface. Runtime E9-GLOBAL and E9-BRANCH activation cannot proceed independently. | ROOT-007/008/009, XMG-013, PERM-005, WT-010, ECON-G-002, REC-004, and zero consensus read of unrooted imported bytes. |
 | E9-DLV | O-13 decisions; pure delivery oracle/RED traces; active cursor/delivery codecs and rooted leaves; GL0 append/ack kernel; ML0 cursor/inbox execution; restart/reorg/compaction. | E9-FEE and exact-base recovery design until shared schema integration. | XMG-004/005/005B/006/008 plus codec/root parity. |
 | E9-FEE | O-14 decisions; pure fee oracle/RED traces; domain-separated parented fee codec; field-27 atomic balance/head kernel; exact opaque-byte/manifest bijection; producer/signer/watchtower integration. | E9-DLV and DA retention work until shared balance/reservation integration. | ECON-F-002/003, ECON-REF-001, ECON-C-001, shard-count parity. |
-| E9-GLOBAL | Checkpoint-wide ordering/reservation over outer binary fees, native writes, global intents, rewards, slashes, and protocol corrections; compare-and-set every per-MG mirror version; ordinary GL0 diff adoption. | Pure DLV/FEE models and E7/E8 checkpoint format work. | ECO-10 residual closed; XMG-002/003/007/008 and ECON-O-001. |
+| E9-GLOBAL | Checkpoint-wide ordering/reservation over outer binary fees, native writes, global intents, rewards, slashes, and protocol corrections; compare-and-set every per-MG mirror version; ordinary GL0 diff adoption. Preserve ECO-20 through ECO-23, ECO-25, and SMT-04 while closing ECO-24. | Pure DLV/FEE models and E7/E8 checkpoint format work; active integration waits for the E9-STATE root/key grammar. | ECO-10 residual closed; ECON-BAL-002/003, XMG-002/003/007/008/012/013, ROOT-006/007/008, and ECON-O-001. |
 | E9-BRANCH | Verified MPT base-anchor identity, exact-parent sessions, descendant-preserving finalization, scratch candidate validation, crash-safe anchor persistence, and authenticated recovery. | Pure economic models and schema review. | No consensus read can fall back from an unavailable hash to base; branch/restart/reorg model parity. |
+
+The HTTP cross-shard proof path has a separate unresolved field-7 root mismatch.
+`SpendActionValidator` asks for `ActiveAllowSpends` field 7, but the proof service
+rebuilds `currencySnapshotMgEntries`, whose per-MG root explicitly excludes field 7.
+Before committee cross-shard execution can use HTTP proofs, E9-STATE/E7 must freeze
+one of two explicit constructions: include the metagraph-scoped field-7 leaves in
+the signed complete per-MG root and proof entry set, or verify them against the
+signed complete global root. Decoder success, a self-claimed root, or the repaired
+GL0-local field-25 balance read cannot substitute for that proof. Until this joins,
+the route is serve-only infrastructure, not evidence that cross-shard allow-spend
+execution is complete.
 
 E9-BRANCH is one activation unit, not a sequence of independently enabled guards.
 Today a successful fold deletes pending descendants, restart restores no
@@ -422,11 +454,23 @@ external mutation. The verified anchor, descendant retention, exact session,
 explicit `RecoveryRequired` state, and preflighted finality transaction must be
 available before the fail-closed guard becomes active.
 
+The first dark implementation slice is an immutable local MPT image store: copied
+and sorted bytes, independent root rebuild, versioned deterministic encoding,
+content digest, forced atomic image/manifest publication, verified readback, and
+generation CAS. It has no runtime caller and closes none of ROOT-002/003/004 by
+itself. Activation additionally requires one lifetime OS ownership lock for the
+store directory, bounded streaming decode, an era-bound root builder, exact
+canonical `(snapshotHash,ordinal,mptRoot)` anchoring, and the durable multi-sink
+finality intent. Multiple live store instances are forbidden until ownership is
+enforced.
+
 The lanes join before activation in this order: freeze O-13/O-14 and protocol
-bounds; freeze canonical schemas/domains; land atomic DLV and FEE kernels over one
-exact-parent session; integrate checkpoint-wide global ordering; migrate every
-execution signer and watchtower; enable ordinary certified-diff adoption; then run
-crash, density-reorg, deep-recovery, and `numShards=1/2/K` qualification. Work from
+bounds; freeze the complete root, physical key grammar, and canonical
+schemas/domains; land E9-STATE strict parsers plus root-invisible-load normalization;
+land atomic DLV and FEE kernels over one exact-parent session; resolve the field-7
+proof anchor; integrate checkpoint-wide global ordering; migrate every execution
+signer and watchtower; enable ordinary certified-diff adoption; then run crash,
+density-reorg, deep-recovery, and `numShards=1/2/K` qualification. Work from
 different lanes may merge earlier only when its active behavior is unreachable;
 there is no partial economic-security activation.
 
@@ -456,6 +500,7 @@ there is no partial economic-security activation.
 | E11.5 | Crash injection at every write boundary and long reorg/catch-up/bootstrap reproduce exact roots and capability state. Phase-2 data retains through every configured challenge, DA, downstream acknowledgement, and recovery dependency; production capacity is tested at recommended `k2`, while a node retaining less enters authenticated recovery sooner. Expiry never becomes validity or fork-choice truth. |
 | E11.6 | Production-source denylist reports zero GSI authority/fallback references. APIs project from canonical MPT and hash-bound finality state. |
 | E11.7 | Followers/restart/bootstrap verify every retained signed state commitment, including `smtRoot`, against reproduced canonical state; any commitment not made load-bearing under E1.9 is removed. |
+| E11.8 | Peer, persisted-disk, reorg, catch-up, and bootstrap loaders accept only the complete rooted entry set, never preserve root-invisible indices as authority, rebuild any permitted derivative from strictly key-bound canonical records, and fail the whole image on malformed/noncanonical durable MPT, tower, or SMT keys. Clean replay and every recovery path produce byte-identical typed state, roots, and next-transition results. |
 
 ### E12 - Bounded permissionless transport and bootstrap
 
@@ -494,7 +539,7 @@ there is no partial economic-security activation.
 | Q4 Execution shards | Every signer replays; ordinary adopters do not; malformed diff/root/threshold/base rejects; watchtower collusion test satisfies release rule. |
 | Q5 Cross-MG | Concurrent double-consume, cancel/expiry races, acknowledgement loss, P2 reorg, and shard-count differential yield one exact result. |
 | Q6 Lanes/DA | Currency and currency-with-data progress together; custom application output cannot synthesize economics; explicit signed commitment-bound fees reject on mismatch/replay; withholding/recovery/retention are bounded. |
-| Q7 State/recovery | GSI production denylist is zero; crash/reorg/catch-up/bootstrap reproduce exact roots or halt before mutation. |
+| Q7 State/recovery | GSI production denylist is zero; complete-root and strict physical-key grammars pass; peer/disk/reorg bytes cannot inject root-invisible transition inputs; crash/reorg/catch-up/bootstrap reproduce exact typed state and roots or halt before mutation. |
 | Q8 Serde/era | Cross-language vectors, strict negative corpus, ordinal-0 ScodecV1, and test-only future era transition pass. |
 | Q9 Permissionless | Join/exit/unbond/slash, weak-subjectivity bootstrap, eclipse/flood/resource, and light-client tests pass. |
 | Q10 Migration | Snapshot-to-genesis reproduction and conservation report pass before a public fork is attempted. |

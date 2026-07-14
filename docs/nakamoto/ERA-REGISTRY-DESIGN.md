@@ -65,9 +65,9 @@ This was **never migrated to scodec** even though the serde *write path* is alre
 
 ### A.3 Schema era — `Era` / `FieldsAddedOrdinals` (`config/types.scala`)
 
-- **`FieldsAddedOrdinals`** — `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:26-37`. A record of `Map[AppEnvironment, SnapshotOrdinal]` gates, one per schema migration (`tessellation3Migration`, `tessellation301Migration`, `metagraphSyncData`, `updatingCombineFunctionSpendActions`, `fixingAllowSpendExpiration`, `setSumFix`, …). Populated from HOCON `fields-added-ordinals { … }` (`application.conf:165-224`), per-env.
-- **`Era`** — `types.scala:42-60`. *"Typed predicate over per-environment migration gates. Resolves a `FieldsAddedOrdinals` field for the active `AppEnvironment` once at construction, then collapses repeated `ordinal < <gate>StartingOrdinal` checks into named methods."* Methods: `atOrAfterTess3` / `beforeTess3` / `atOrAfterTess301` / `atOrAfterMetagraphSync`, and the field-shaping combinators `postTess3[A](ordinal)(value): Option[A]` etc. (`:52-59`) — "the shape behind the 12 nullable post-tess3 fields in the GSI."
-- **`Era.fromConfig(env, fieldsAddedOrdinals)`** — `types.scala:62-68`. Resolves the per-env ordinals once. Consumed at e.g. `GlobalSnapshotAcceptanceManager.scala:1260`: `val era = Era.fromConfig(environment, fieldsAddedOrdinals)`.
+- **`FieldsAddedOrdinals`** — `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:27-35`. A record of `Map[AppEnvironment, SnapshotOrdinal]` gates, one per surviving schema migration (`tessellation3Migration`, `tessellation301Migration`, `metagraphSyncData`, `updatingCombineFunctionSpendActions`, `setSumFix`, …). Populated from HOCON `fields-added-ordinals { … }` (`application.conf:165-214`), per-env.
+- **`Era`** — `types.scala:41-59`. *"Typed predicate over per-environment migration gates. Resolves a `FieldsAddedOrdinals` field for the active `AppEnvironment` once at construction, then collapses repeated `ordinal < <gate>StartingOrdinal` checks into named methods."* Methods: `atOrAfterTess3` / `beforeTess3` / `atOrAfterTess301` / `atOrAfterMetagraphSync`, and the field-shaping combinators `postTess3[A](ordinal)(value): Option[A]` etc. (`:46-58`) — "the shape behind the 12 nullable post-tess3 fields in the GSI."
+- **`Era.fromConfig(env, fieldsAddedOrdinals)`** — `types.scala:61-67`. Resolves the per-env ordinals once. Consumed at e.g. `GlobalSnapshotAcceptanceManager.scala:1260`: `val era = Era.fromConfig(environment, fieldsAddedOrdinals)`.
 
 This is *already* a per-ordinal "what shape is the data at N" — i.e. a schema era. It is just keyed by named boolean predicates rather than a range list, and is a separate type from `SerdeEra`.
 
@@ -249,8 +249,8 @@ Bug-relevant payoff (portable, cross-language-verifiable consensus hash) lands a
 - `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala:1258,1260` (ordinal-selected hasher + Era at MPT accept)
 
 **Schema era:**
-- `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:26-37` (FieldsAddedOrdinals), `:42-68` (Era / fromConfig)
-- `modules/node-shared/src/main/resources/application.conf:165-224` (`fields-added-ordinals`), `:57-69` (`last-kryo-hash-ordinal`, `last-legacy-state-proof-ordinal`)
+- `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:27-35` (FieldsAddedOrdinals), `:41-67` (Era / fromConfig)
+- `modules/node-shared/src/main/resources/application.conf:165-214` (`fields-added-ordinals`), `:57-69` (`last-kryo-hash-ordinal`, `last-legacy-state-proof-ordinal`)
 
 **State-proof-format era (the fourth mechanism):**
 - `modules/shared/src/main/scala/io/constellationnetwork/schema/StateProofSelector.scala:8-39` (esp. `:12-16` — why it is separate from the hash scheme)
