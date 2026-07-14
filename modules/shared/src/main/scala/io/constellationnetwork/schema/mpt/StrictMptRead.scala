@@ -3,6 +3,8 @@ package io.constellationnetwork.schema.mpt
 import cats.MonadThrow
 import cats.syntax.all._
 
+import scala.util.control.NonFatal
+
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.serde.ImmutableCodec
 
@@ -12,6 +14,20 @@ import scodec.bits.ByteVector
   * whose stored bytes exist but cannot be decoded as the requested type.
   */
 sealed trait StrictMptRead[+V] extends Product with Serializable
+
+/** One physical MPT entry decoded without discarding its observed key or exact stored bytes.
+  *
+  * Prefix scans never synthesize [[StrictMptRead.Absent]] entries: every value here names a physical key returned by the underlying state
+  * view. The read remains an ADT so malformed, empty, and null storage cannot disappear during reconstruction.
+  */
+final case class StrictMptEntry[+V](physicalKey: Hex, read: StrictMptRead[V])
+
+/** One physical MPT entry captured without interpreting its value schema.
+  *
+  * `None` means the producer returned a null byte array for an existing key. A non-null array, including an empty array, is copied into an
+  * owned [[ByteVector]]. Semantic validation decides whether those bytes are legal for the physical partition.
+  */
+final case class StrictMptRawEntry(physicalKey: Hex, rawBytes: Option[ByteVector])
 
 object StrictMptRead {
 
@@ -38,30 +54,54 @@ object StrictMptRead {
 
   case object Absent extends StrictMptRead[Nothing]
 
-  /** Successfully decoded value plus a defensive copy of the exact bytes committed by the MPT. */
-  final case class Present[V](value: V, rawBytes: Array[Byte]) extends StrictMptRead[V]
+  /** Successfully decoded value plus an immutable copy of the exact bytes committed by the MPT. */
+  final case class Present[V](value: V, rawBytes: ByteVector) extends StrictMptRead[V]
 
-  /** Stored bytes existed but were null, empty, or undecodable. Non-null bytes are retained as a defensive copy for diagnostics. */
-  final case class Malformed(reason: String, rawBytes: Option[Array[Byte]]) extends StrictMptRead[Nothing]
+  /** Stored bytes existed but were null, empty, or undecodable. Non-null bytes are retained immutably for diagnostics. */
+  final case class Malformed(reason: String, rawBytes: Option[ByteVector]) extends StrictMptRead[Nothing]
 
-  /** Decode one stored value without collapsing malformed storage into absence. Every non-null byte array returned to the caller is copied.
+  /** Decode one stored value without collapsing malformed storage into absence. Every non-null value is copied into an immutable byte vector.
     */
   def fromStoredBytes[V: ImmutableCodec](bytes: Array[Byte]): StrictMptRead[V] =
     if (bytes eq null) Malformed("null stored bytes", None)
     else {
-      val copied = bytes.clone()
+      val copied = ByteVector.view(bytes.clone())
 
       if (copied.isEmpty) Malformed("empty stored bytes", Some(copied))
       else
-        ImmutableCodec[V].fromImmutableBytes(ByteVector.view(copied)) match {
-          case Right(value) => Present(value, copied)
-          case Left(error)  => Malformed(s"undecodable stored bytes: $error", Some(copied))
+        try
+          ImmutableCodec[V].fromImmutableBytes(copied) match {
+            case Right(value) => Present(value, copied)
+            case Left(error)  => Malformed(s"undecodable stored bytes: $error", Some(copied))
+          }
+        catch {
+          case NonFatal(error) =>
+            val detail = Option(error.getMessage).filter(_.nonEmpty).fold(error.getClass.getName) { message =>
+              s"${error.getClass.getName}: $message"
+            }
+            Malformed(s"decoder threw: $detail", Some(copied))
         }
     }
 
   /** Decode an optional raw entry without collapsing present-but-malformed bytes into absence. */
   def fromOptionalStoredBytes[V: ImmutableCodec](bytes: Option[Array[Byte]]): StrictMptRead[V] =
     bytes.fold[StrictMptRead[V]](Absent)(fromStoredBytes[V])
+
+  /** Decode every supplied physical entry in deterministic key order.
+    *
+    * No matched entry is omitted. Every retained byte array is defensively copied by [[fromStoredBytes]].
+    */
+  def decodeEntries[V: ImmutableCodec](entries: Map[Hex, Array[Byte]]): List[StrictMptEntry[V]] =
+    entries.toList.sortBy(_._1.value).map {
+      case (physicalKey, bytes) => StrictMptEntry(physicalKey, fromStoredBytes[V](bytes))
+    }
+
+  /** Capture uninterpreted physical entries in deterministic key order with owned immutable bytes. */
+  def captureRawEntries(entries: Map[Hex, Array[Byte]]): List[StrictMptRawEntry] =
+    entries.toList.sortBy(_._1.value).map {
+      case (physicalKey, bytes) =>
+        StrictMptRawEntry(physicalKey, Option(bytes).map(value => ByteVector.view(value.clone())))
+    }
 
   /** Resolve an authenticated point read for a read-modify-write. Only true absence selects `ifAbsent`; malformed committed bytes are a
     * hard error so no mutation can be derived from a synthetic empty prior.

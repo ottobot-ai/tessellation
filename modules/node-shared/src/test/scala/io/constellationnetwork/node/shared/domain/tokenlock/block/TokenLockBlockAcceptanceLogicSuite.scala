@@ -126,13 +126,16 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
 
       def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
         get[V](key).map {
-          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value).toArray)
+          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value))
           case None        => StrictMptRead.Absent
         }
 
       def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] = Map.empty[GlobalStateKey, V].pure[IO]
 
       def getAllForPrefix[V: ImmutableCodec](prefix: Hex): IO[Map[Hex, V]] = Map.empty[Hex, V].pure[IO]
+      def getAllForPrefixStrict[V: ImmutableCodec](
+        prefix: Hex
+      ): IO[List[io.constellationnetwork.schema.mpt.StrictMptEntry[V]]] = List.empty.pure[IO]
     }
 
   test("only a replacement referenced by the current block releases capacity and final application matches admission") { res =>

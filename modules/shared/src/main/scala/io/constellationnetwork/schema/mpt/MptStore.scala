@@ -50,6 +50,16 @@ trait MptStore[F[_], K] {
     * (AllowSpend/TokenLock/etc.) or pair this with a rooted address index.
     */
   def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
+
+  /** Strict physical prefix scan. Unlike [[getAllForPrefix]], this never drops or throws away a matched malformed value and never loses the
+    * actual physical key. Results are ordered lexicographically by physical key and retain defensive copies of the exact stored bytes.
+    */
+  def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]]
+
+  /** Uninterpreted counterpart to [[getAllForPrefixStrict]]. This copies only matching producer values and retains their original physical
+    * keys so branch overlays can merge a bounded prefix before decoding.
+    */
+  def rawEntriesForPrefixStrict(prefix: Hex): F[List[StrictMptRawEntry]]
   def insert[V: ImmutableCodec](key: K, value: V): F[Unit]
   def insert[V: ImmutableCodec](entries: Map[K, V]): F[Unit]
   def remove(key: K): F[Unit]
@@ -82,6 +92,11 @@ trait MptStore[F[_], K] {
     */
   def allEntriesAsBytes: F[Map[Hex, Array[Byte]]]
 
+  /** Deterministic, defensively copied raw enumeration for semantic validators and recovery preflight. This is data, not proof that any
+    * key, value, root, branch, or snapshot is valid.
+    */
+  def allEntriesStrict: F[List[StrictMptRawEntry]]
+
   /** Load a pre-signed hex-keyed byte map VERBATIM at `ordinal` — the 3c-A "MPT is the state" primitive
     * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). Unlike [[sync]]/[[syncFull]], which re-encode a typed `Map[K,V]` through the
     * per-field `ImmutableCodec`, this stores the exact bytes that were signed (no re-encode). So a follower that loads gl0's served
@@ -111,7 +126,9 @@ trait MptStore[F[_], K] {
     *   - `MptTxAction.Commit` keeps the mutations
     *   - `MptTxAction.Rollback` restores the savepoint If the body raises an error, mutations are rolled back and the error is re-raised.
     *
-    * The whole bracket runs under `withExclusiveLock` so concurrent transactions serialize.
+    * The bracket is caller-serialized. Production snapshot paths use their snapshot semaphore; callers outside that boundary must wrap this
+    * call in [[withExclusiveLock]]. Some current callers already hold that non-reentrant lock, so this method cannot also acquire it until
+    * lock ownership is unified at one entry boundary.
     *
     * Use this instead of bare `savepoint`/`restore` for any compound operation that may keep OR discard its mutations depending on a
     * post-mutation outcome (e.g. validating an incoming artifact whose acceptance depends on whether it wins ChainSelection).
@@ -203,8 +220,7 @@ object MptStore {
     override def get[V: ImmutableCodec](key: K): F[Option[V]] =
       for {
         hex <- toHex(key)
-        entries <- producer.entries
-        bytesOpt = entries.get(hex)
+        bytesOpt <- producer.entry(hex)
         result <- bytesOpt match {
           case Some(bytes) if bytes != null && bytes.nonEmpty =>
             deserializeBytes[V](bytes)
@@ -218,15 +234,15 @@ object MptStore {
     override def getStrict[V: ImmutableCodec](key: K): F[StrictMptRead[V]] =
       for {
         hex <- toHex(key)
-        entries <- producer.entries
-      } yield entries.get(hex).fold[StrictMptRead[V]](StrictMptRead.Absent)(StrictMptRead.fromStoredBytes[V])
+        bytesOpt <- producer.entry(hex)
+      } yield bytesOpt.fold[StrictMptRead[V]](StrictMptRead.Absent)(StrictMptRead.fromStoredBytes[V])
 
     override def getMany[V: ImmutableCodec](keys: List[K]): F[Map[K, V]] =
       if (keys.isEmpty) Map.empty[K, V].pure[F]
       else
         for {
           hexKeys <- keys.parTraverse(k => toHex(k).map(k -> _))
-          entries <- producer.entries
+          entries <- producer.entriesForKeys(hexKeys.iterator.map(_._2).toSet)
           results <- hexKeys.traverseFilter {
             case (k, hex) =>
               entries.get(hex) match {
@@ -249,6 +265,12 @@ object MptStore {
           }
           .map(_.toMap)
       }
+
+    override def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      producer.entriesWithPrefix(prefix).map(StrictMptRead.decodeEntries[V])
+
+    override def rawEntriesForPrefixStrict(prefix: Hex): F[List[StrictMptRawEntry]] =
+      producer.entriesWithPrefix(prefix).map(StrictMptRead.captureRawEntries)
 
     override def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =
       for {
@@ -281,11 +303,11 @@ object MptStore {
     override def contains(key: K): F[Boolean] =
       for {
         hex <- toHex(key)
-        entries <- producer.entries
-      } yield entries.contains(hex)
+        entry <- producer.entry(hex)
+      } yield entry.isDefined
 
     override def isEmpty: F[Boolean] =
-      producer.entries.map(_.isEmpty)
+      producer.entryCount.map(_ == 0)
 
     override def clear: F[Unit] =
       logger.info("[MptStore] Clearing store") >> producer.clear
@@ -301,8 +323,7 @@ object MptStore {
           clear >> lastSyncedOrdinalRef.set(Some(ordinal))
       } else
         for {
-          currentEntries <- producer.entries
-          currentSize = currentEntries.size
+          currentSize <- producer.entryCount
           _ <-
             logger
               .warn(
@@ -378,6 +399,9 @@ object MptStore {
 
     override def allEntriesAsBytes: F[Map[Hex, Array[Byte]]] = producer.entries
 
+    override def allEntriesStrict: F[List[StrictMptRawEntry]] =
+      producer.entries.map(StrictMptRead.captureRawEntries)
+
     override def loadPersisted(ordinal: SnapshotOrdinal): F[Boolean] =
       producer match {
         case p: StatefulWithPersistenceMerklePatriciaProducer[F] =>
@@ -410,11 +434,9 @@ object MptStore {
         }
 
     override def withTransaction[A](body: F[(A, MptTxAction)]): F[A] =
-      // Caller-serialized: the body may call other MPT methods that internally take their own
-      // serialization (syncFrom*, syncFull). If we wrapped the bracket in `withExclusiveLock` the
-      // nested re-acquisition would deadlock the same non-reentrant semaphore. Production callers
-      // (onSlotWon, handleSnapshot) already serialize through `snapshotSemaphore`; HTTP-side
-      // callers (HistoricalMptProofService) wrap the call site with `withExclusiveLock` themselves.
+      // Caller-serialized. Production callers use `snapshotSemaphore`; HTTP-side callers such as
+      // HistoricalMptProofService already wrap this method with `withExclusiveLock`. Acquiring that
+      // non-reentrant semaphore again here would deadlock until lock ownership moves to one boundary.
       savepoint.flatMap { sp =>
         body.attempt.flatMap {
           case Right((a, MptTxAction.Commit))   => a.pure[F]

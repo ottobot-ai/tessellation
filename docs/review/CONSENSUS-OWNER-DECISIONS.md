@@ -78,6 +78,20 @@ only an already-decided `T_weight` attestation or canonical depth-`k1` result, b
 does not yet authenticate either. Phase 2 remains density-reorgable, `k2` remains
 retention/recovery policy, and no global BFT proposal/vote/lock/QC path is permitted.
 
+The live metagraph-admission adapter is also an activation blocker, not an interim
+authority: it combines a monotone ordinal watermark with a separate current-best-tip
+walk and can therefore mint `Phase2CurrencyBinaryContext` for a density replacement
+that has not independently qualified. It must be deleted in favor of the exact
+branch-revision authority above. The new strict MPT prefix/raw enumeration API is
+only lossless parser plumbing; it does not close `ROOT-008` or mint that authority.
+Its nibble-prefix comparison deliberately surfaces upper/lower case aliases, but
+consensus use remains blocked until one whole-image pass rejects every
+noncanonical, invalid, odd-length, or aliased physical key before partitioning.
+This is a stop-the-line requirement, not normalization policy: MPT-07 reproduced
+an infinite full build and incremental raw-map/root divergence for case aliases.
+`ROOT-011` must reject the complete candidate before root construction or live
+mutation and the builder must independently terminate with a typed collision error.
+
 ## Open decision gates
 
 These are the remaining choices that cannot safely be hidden inside an

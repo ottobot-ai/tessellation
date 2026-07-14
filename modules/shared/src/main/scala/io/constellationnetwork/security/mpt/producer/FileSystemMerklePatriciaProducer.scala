@@ -45,6 +45,9 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
   private val BatchSize = 5000
   private val MaxCacheSize = 50
 
+  private def copyEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    FileSystemMerklePatriciaProducer.copyEntries(entries)
+
   override def getProver: F[MerklePatriciaSingleInclusionProver[F]] =
     build.flatMap {
       case Right(trie) => parallelProducer.getProver(trie)
@@ -52,7 +55,22 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
     }
 
   override def entries: F[Map[Hex, Array[Byte]]] =
-    stateRef.get
+    stateRef.get.map(copyEntries)
+
+  override def entry(key: Hex): F[Option[Array[Byte]]] =
+    stateRef.get.map(_.get(key).map(FileSystemMerklePatriciaProducer.copyBytes))
+
+  override def entriesForKeys(keys: Set[Hex]): F[Map[Hex, Array[Byte]]] =
+    stateRef.get.map { entries =>
+      keys.iterator.flatMap(key => entries.get(key).map(bytes => key -> FileSystemMerklePatriciaProducer.copyBytes(bytes))).toMap
+    }
+
+  override def entryCount: F[Int] = stateRef.get.map(_.size)
+
+  override def entriesWithPrefix(prefix: Hex): F[Map[Hex, Array[Byte]]] =
+    stateRef.get.map(entries =>
+      copyEntries(entries.filter { case (key, _) => StatefulMerklePatriciaProducer.hasNibblePrefix(key, prefix) })
+    )
 
   def entriesAsJson: F[Map[Hex, Json]] =
     stateRef.get.flatMap { state =>
@@ -216,13 +234,15 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
 
   def insertBytes(data: Map[Hex, Array[Byte]]): F[Either[MerklePatriciaError, Unit]] =
     if (data.isEmpty) ().asRight[MerklePatriciaError].pure[F]
-    else
+    else {
+      val owned = copyEntries(data)
       for {
-        _ <- logger.debug(s"[MPT] Inserting ${data.size} byte entries")
-        _ <- stateRef.update(_ ++ data)
-        _ <- pendingRemovesRef.update(_.filterNot(data.contains))
-        _ <- pendingInsertsRef.update(_ ++ data)
+        _ <- logger.debug(s"[MPT] Inserting ${owned.size} byte entries")
+        _ <- stateRef.update(_ ++ owned)
+        _ <- pendingRemovesRef.update(_.filterNot(owned.contains))
+        _ <- pendingInsertsRef.update(_ ++ owned)
       } yield ().asRight[MerklePatriciaError]
+    }
 
   override def update[A: Encoder](key: Hex, value: A): F[Either[MerklePatriciaError, Unit]] =
     stateRef.get.flatMap { state =>
@@ -299,7 +319,7 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
         case Some(state) =>
           for {
             _ <- logger.info(s"[MPT] Found ${state.size} entries")
-            _ <- stateRef.set(state)
+            _ <- stateRef.set(copyEntries(state))
             _ <- trieRef.set(None)
             _ <- pendingInsertsRef.set(Map.empty)
             _ <- pendingRemovesRef.set(List.empty)
@@ -321,7 +341,7 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
         for {
           _ <- logger.info("[MPT] Building from provided data")
           data <- buildData
-          _ <- stateRef.set(data)
+          _ <- stateRef.set(copyEntries(data))
           _ <- trieRef.set(None)
           _ <- pendingInsertsRef.set(Map.empty)
           _ <- pendingRemovesRef.set(List.empty)
@@ -360,12 +380,18 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
 
 object FileSystemMerklePatriciaProducer {
 
+  private[producer] def copyBytes(bytes: Array[Byte]): Array[Byte] =
+    if (bytes eq null) null else bytes.clone()
+
+  private[producer] def copyEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    entries.iterator.map { case (key, bytes) => key -> copyBytes(bytes) }.toMap
+
   def make[F[_]: Async: Parallel: Hasher: JsonSerializer](
     path: Path,
     initial: Map[Hex, Array[Byte]] = Map.empty
   ): F[FileSystemMerklePatriciaProducer[F]] =
     for {
-      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](initial)
+      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
       pendingRemovesRef <- Ref.of[F, List[Hex]](List.empty)
@@ -389,7 +415,7 @@ object FileSystemMerklePatriciaProducer {
     initial: Map[Hex, Array[Byte]]
   ): F[FileSystemMerklePatriciaProducer[F]] =
     for {
-      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](initial)
+      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
       pendingRemovesRef <- Ref.of[F, List[Hex]](List.empty)

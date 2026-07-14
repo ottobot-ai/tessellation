@@ -592,7 +592,7 @@ object Mocks {
     info: GlobalSnapshotInfo
   ): io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F] = {
     import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-    import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRead}
+    import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptEntry, StrictMptRead}
     import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
     import io.constellationnetwork.security.hex.Hex
     import io.constellationnetwork.serde.ImmutableCodec
@@ -611,7 +611,7 @@ object Mocks {
 
       def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] =
         get[V](key).map {
-          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value).toArray)
+          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value))
           case None        => StrictMptRead.Absent
         }
 
@@ -620,6 +620,9 @@ object Mocks {
 
       def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
         Async[F].pure(Map.empty)
+
+      def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+        Async[F].pure(List.empty)
     }
   }
 

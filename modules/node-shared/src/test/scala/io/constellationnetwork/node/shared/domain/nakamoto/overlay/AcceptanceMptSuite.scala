@@ -90,7 +90,7 @@ object AcceptanceMptSuite extends MutableIOSuite {
       expect.all(
         legacy.isEmpty,
         malformed match {
-          case StrictMptRead.Malformed(_, Some(rawBytes)) => rawBytes.toList == garbage.toList
+          case StrictMptRead.Malformed(_, Some(rawBytes)) => rawBytes.toArray.toList == garbage.toList
           case _                                          => false
         },
         absent == StrictMptRead.Absent
@@ -124,11 +124,71 @@ object AcceptanceMptSuite extends MutableIOSuite {
     } yield
       expect.all(
         strict match {
-          case StrictMptRead.Present(decoded, rawBytes) => decoded == value && rawBytes.toList == expectedBytes
+          case StrictMptRead.Present(decoded, rawBytes) => decoded == value && rawBytes.toArray.toList == expectedBytes
           case _                                        => false
         },
         base == StrictMptRead.Absent
       )
+  }
+
+  test("strict prefix scan merges raw branch removals and upserts before decoding") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        underlying = store,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = Set.empty[BranchId].pure[IO]
+      )
+      malformedKey = gskBalance(10)
+      retainedKey = gskBalance(11)
+      childKey = gskBalance(12)
+      malformedHex <- GlobalStateKey.toHex[IO](malformedKey)
+      retainedHex <- GlobalStateKey.toHex[IO](retainedKey)
+      childHex <- GlobalStateKey.toHex[IO](childKey)
+      prefix <- GlobalStateKey.hypergraphFieldPrefix[IO](GlobalStateFieldId.Balances)
+      _ <- store.underlying.insertBytes(Map(malformedHex -> Array[Byte](0x7f))).flatMap(_.liftTo[IO])
+      _ <- store.insert[Balance](retainedKey, Balance(NonNegLong(41L)))
+      handle <- overlay.checkout(parentP)
+      _ <- handle.remove(malformedKey)
+      _ <- handle.insert[Balance](childKey, Balance(NonNegLong(42L)))
+      _ <- overlay.commit(handle, childTip, ordinal)
+      parentEntries <- overlay.getAllForPrefixStrict[Balance](parentP, prefix)
+      childEntries <- overlay.getAllForPrefixStrict[Balance](childTip, prefix)
+      rawChild <- overlay.allEntriesAsBytes(childTip)
+      _ = rawChild(childHex)(0) = (rawChild(childHex)(0) ^ 0xff).toByte
+      childAfterRawOutputMutation <- overlay.getAllForPrefixStrict[Balance](childTip, prefix)
+    } yield {
+      val parentByKey = parentEntries.map(entry => entry.physicalKey -> entry.read).toMap
+      val childByKey = childEntries.map(entry => entry.physicalKey -> entry.read).toMap
+      val childAfterMutationByKey = childAfterRawOutputMutation.map(entry => entry.physicalKey -> entry.read).toMap
+
+      expect.all(
+        parentByKey.get(malformedHex).exists(_.isInstanceOf[StrictMptRead.Malformed]),
+        parentByKey.get(retainedHex).exists {
+          case StrictMptRead.Present(value, _) => value == Balance(NonNegLong(41L))
+          case _                               => false
+        },
+        !parentByKey.contains(childHex),
+        !childByKey.contains(malformedHex),
+        childByKey.get(retainedHex).exists {
+          case StrictMptRead.Present(value, _) => value == Balance(NonNegLong(41L))
+          case _                               => false
+        },
+        childByKey.get(childHex).exists {
+          case StrictMptRead.Present(value, _) => value == Balance(NonNegLong(42L))
+          case _                               => false
+        },
+        childAfterMutationByKey.get(childHex).exists {
+          case StrictMptRead.Present(value, _) => value == Balance(NonNegLong(42L))
+          case _                               => false
+        },
+        childEntries.map(_.physicalKey) == childEntries.map(_.physicalKey).sortBy(_.value)
+      )
+    }
   }
 
   test("passthrough algebra: writes flow through to MptStore on commit") { res =>

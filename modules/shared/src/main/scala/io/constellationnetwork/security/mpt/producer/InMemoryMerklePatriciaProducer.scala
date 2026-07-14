@@ -28,6 +28,9 @@ class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializ
   private val parallelProducer: ParallelMerklePatriciaProducer[F] = ParallelMerklePatriciaProducer[F]
   private val MaxCacheSize = 50
 
+  private def copyEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    InMemoryMerklePatriciaProducer.copyEntries(entries)
+
   override def getProver: F[MerklePatriciaSingleInclusionProver[F]] =
     build.flatMap {
       case Right(trie) => parallelProducer.getProver(trie)
@@ -35,7 +38,22 @@ class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializ
     }
 
   override def entries: F[Map[Hex, Array[Byte]]] =
-    stateRef.get
+    stateRef.get.map(copyEntries)
+
+  override def entry(key: Hex): F[Option[Array[Byte]]] =
+    stateRef.get.map(_.get(key).map(InMemoryMerklePatriciaProducer.copyBytes))
+
+  override def entriesForKeys(keys: Set[Hex]): F[Map[Hex, Array[Byte]]] =
+    stateRef.get.map { entries =>
+      keys.iterator.flatMap(key => entries.get(key).map(bytes => key -> InMemoryMerklePatriciaProducer.copyBytes(bytes))).toMap
+    }
+
+  override def entryCount: F[Int] = stateRef.get.map(_.size)
+
+  override def entriesWithPrefix(prefix: Hex): F[Map[Hex, Array[Byte]]] =
+    stateRef.get.map(entries =>
+      copyEntries(entries.filter { case (key, _) => StatefulMerklePatriciaProducer.hasNibblePrefix(key, prefix) })
+    )
 
   override def build: F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
     for {
@@ -152,10 +170,11 @@ class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializ
   override def insertBytes(data: Map[Hex, Array[Byte]]): F[Either[MerklePatriciaError, Unit]] =
     if (data.isEmpty) ().asRight[MerklePatriciaError].pure[F]
     else {
+      val owned = copyEntries(data)
       for {
-        _ <- stateRef.update(_ ++ data)
-        _ <- pendingRemovesRef.update(_.filterNot(data.contains))
-        _ <- pendingInsertsRef.update(_ ++ data)
+        _ <- stateRef.update(_ ++ owned)
+        _ <- pendingRemovesRef.update(_.filterNot(owned.contains))
+        _ <- pendingInsertsRef.update(_ ++ owned)
       } yield ().asRight[MerklePatriciaError]
     }
 
@@ -244,11 +263,17 @@ class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializ
 
 object InMemoryMerklePatriciaProducer {
 
+  private[producer] def copyBytes(bytes: Array[Byte]): Array[Byte] =
+    if (bytes eq null) null else bytes.clone()
+
+  private[producer] def copyEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+    entries.iterator.map { case (key, bytes) => key -> copyBytes(bytes) }.toMap
+
   def make[F[_]: Async: Hasher: Parallel: JsonSerializer](
     initial: Map[Hex, Array[Byte]] = Map.empty
   ): F[InMemoryMerklePatriciaProducer[F]] =
     for {
-      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](initial)
+      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
       pendingRemovesRef <- Ref.of[F, List[Hex]](List.empty)

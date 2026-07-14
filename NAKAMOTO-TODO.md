@@ -142,11 +142,25 @@ criteria are in `NAKAMOTO-PLAN.md`.
       `OptionShapeStateProofCanonicalizationSuite.scala:20-123`). This does not
       relax `ROOT-010`: its future field-32 replay witness must preserve the
       semantic distinction explicitly.
-  - [ ] **2. Shared strict reader:** extend the strict point-read primitive landed
-    in `41c19903d` to point, prefix, and raw enumeration. Return typed
-    absent/present/malformed results with physical key/path and exact bytes;
-    require decoded identity/scope to reproduce the physical key. Never omit a
-    matched malformed entry. Gate: `ROOT-008`.
+  - [ ] **2. Shared strict reader:** the strict point-read primitive landed in
+    `41c19903d`, and the shared store/overlay/reader boundary now also exposes
+    deterministic physical-key prefix and raw enumeration. It retains null,
+    empty, and undecodable values in immutable byte vectors, preserves upper/lower
+    case aliases for the same nibble prefix, and merges only matching branch
+    removals/upserts before decoding (`StrictMptRead.scala`, `MptStore.scala`,
+    `MptOverlay.scala`; `StrictMptEnumerationSuite.scala`,
+    `AcceptanceMptSuite.scala`). This is nonauthoritative transport plumbing only:
+    it does not prove exact-parent availability, branch identity, root, snapshot,
+    or Phase 2.
+    - [ ] Complete `ROOT-008`: define one bounded semantic grammar per partition,
+      first reject every noncanonical/invalid/aliased physical key from the whole
+      image, then consume all bytes, derive identity/scope from the value,
+      reproduce the physical key exactly, and reject duplicate logical identities
+      before any map/set construction. Never omit a matched malformed entry.
+    - [ ] Close `MPT-07`/`ROOT-011` before raw recovery or parser migration:
+      preflight the complete candidate before build/live mutation; reject aliases
+      and terminal/prefix collisions without normalization; make the builder fail
+      boundedly on any nonshrinking group; preserve the prior image on rejection.
   - [ ] **3. Parallel consumer migrations:** after step 2, independently close
     `MPT-01` Mg* value-only reconstruction; `MPT-02` consumed-allow-spend
     physical nullifier keys; `MPT-03` stake/collateral scope and keys; `MPT-04`
@@ -535,8 +549,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - Require identical economics at shard counts 1, 2, and K.
   - **Gate:** `DIFF-*`, `SHARD-E-003/004`, `SHARD-C-004/005`,
     `XMG-001..005B`, `XMG-007/008/010/012/013`, `ECON-F-002/003`,
-    `ECON-REF-001`, `ECON-BAL-002/003`, `ECON-G-002`, `ROOT-006..009`,
-    `PERM-005`, `WT-008/008A/010`, `ECO-IDX-03`, and `MPT-01..06`. Preserve the
+    `ECON-REF-001`, `ECON-BAL-002/003`, `ECON-G-002`, `ROOT-006..009/011`,
+    `PERM-005`, `WT-008/008A/010`, `ECO-IDX-03`, and `MPT-01..07`. Preserve the
     closed `ECO-IDX-01/02` regression corpus.
 
 - [ ] **E10 PARTIAL - downstream exact-hash rebase and historical recovery**

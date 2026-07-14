@@ -1719,6 +1719,7 @@ object GlobalStateConverter {
     */
   trait CurrencyInfoReader[F[_]] {
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]]
   }
 
   /** Minimal read+write capability over the unrolled per-metagraph `CurrencySnapshotInfo` partitions, shared by BOTH the `MptStore` writers
@@ -1735,6 +1736,8 @@ object GlobalStateConverter {
   object CurrencyInfoMpt {
     def fromMptStore[F[_]](store: MptStore[F, GlobalStateKey]): CurrencyInfoMpt[F] = new CurrencyInfoMpt[F] {
       def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
+      def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+        store.getAllForPrefixStrict[V](prefix)
       def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]): F[Unit] = store.insert[V](entries)
       def remove(keys: List[GlobalStateKey]): F[Unit] = store.remove(keys)
     }

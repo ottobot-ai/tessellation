@@ -3,7 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect.kernel.Sync
 import cats.syntax.all._
 
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, StrictMptRead}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, StrictMptEntry, StrictMptRead}
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.serde.ImmutableCodec
 
@@ -16,6 +16,7 @@ trait GlobalStateReader[F[_]] {
   def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]]
   def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]]
   def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
+  def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]]
 }
 
 object GlobalStateReader {
@@ -29,6 +30,8 @@ object GlobalStateReader {
     def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] = store.getStrict[V](key)
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] = store.getMany[V](keys)
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      store.getAllForPrefixStrict[V](prefix)
   }
 
   /** Branch-aware reader bound to a specific `parent`. Routes every read to `overlay.get(parent, ...)`, so under MultiBranch the
@@ -64,6 +67,8 @@ object GlobalStateReader {
         }
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
       currentParent.flatMap(p => overlay.getAllForPrefix[V](p, prefix))
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      currentParent.flatMap(p => overlay.getAllForPrefixStrict[V](p, prefix))
   }
 
   /** GL0 HTTP / read-path constructor (#117/#118 Phase 2). Reads at the chain's current best tip so callers see the canonical
@@ -99,6 +104,8 @@ object GlobalStateReader {
       cats.Applicative[F].pure(Map.empty)
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
       cats.Applicative[F].pure(Map.empty)
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      cats.Applicative[F].pure(List.empty)
   }
 }
 
@@ -157,6 +164,9 @@ object AcceptanceMpt {
 
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
       overlay.getAllForPrefix[V](parent, prefix)
+
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      overlay.getAllForPrefixStrict[V](parent, prefix)
 
     def insert[V: ImmutableCodec](key: GlobalStateKey, value: V): F[Unit] = handle.insert(key, value)
     def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]): F[Unit] = handle.insert(entries)

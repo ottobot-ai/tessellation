@@ -179,7 +179,7 @@ object ShardSubtreeProofClient {
           reader
             .getStrict[SortedSet[Signed[AllowSpend]]](key)
             .map {
-              case Present(set, rawBytes) if set.nonEmpty => present(rawBytes)
+              case Present(set, rawBytes) if set.nonEmpty => present(rawBytes.toArray)
               case Present(_, _) | Malformed(_, _)        => unavailable
               case Absent                                 => absent
             }
@@ -190,7 +190,7 @@ object ShardSubtreeProofClient {
               reader
                 .getStrict[(Address, Balance)](key)
                 .map {
-                  case Present((embeddedAccount, _), rawBytes) if embeddedAccount === account => present(rawBytes)
+                  case Present((embeddedAccount, _), rawBytes) if embeddedAccount === account => present(rawBytes.toArray)
                   case Present(_, _) | Malformed(_, _)                                        => unavailable
                   case Absent                                                                 => absent
                 }

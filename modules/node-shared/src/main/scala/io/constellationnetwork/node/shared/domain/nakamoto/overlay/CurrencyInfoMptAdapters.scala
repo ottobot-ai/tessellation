@@ -1,7 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.{CurrencyInfoMpt, CurrencyInfoReader}
-import io.constellationnetwork.schema.mpt.GlobalStateKey
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, StrictMptEntry}
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.serde.ImmutableCodec
 
@@ -19,6 +19,8 @@ object CurrencyInfoMptAdapters {
     */
   def readerFor[F[_]](reader: GlobalStateReader[F]): CurrencyInfoReader[F] = new CurrencyInfoReader[F] {
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = reader.getAllForPrefix[V](prefix)
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      reader.getAllForPrefixStrict[V](prefix)
   }
 
   /** Read+write: an `AcceptanceMpt[F]` is `GlobalStateReader` (prefix scan) + `GlobalStateWriter` (`insert(Map)` / `remove(List)`), so it
@@ -26,6 +28,8 @@ object CurrencyInfoMptAdapters {
     */
   def mptFor[F[_]](acceptanceMpt: AcceptanceMpt[F]): CurrencyInfoMpt[F] = new CurrencyInfoMpt[F] {
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = acceptanceMpt.getAllForPrefix[V](prefix)
+    def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
+      acceptanceMpt.getAllForPrefixStrict[V](prefix)
     def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]): F[Unit] = acceptanceMpt.insert[V](entries)
     def remove(keys: List[GlobalStateKey]): F[Unit] = acceptanceMpt.remove(keys)
   }

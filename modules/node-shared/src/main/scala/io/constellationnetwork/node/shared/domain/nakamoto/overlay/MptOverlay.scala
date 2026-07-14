@@ -9,12 +9,12 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.mpt.{MptStore, MptTxAction, StrictMptRead}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.MerklePatriciaTrie
-import io.constellationnetwork.security.mpt.producer.MerklePatriciaError
+import io.constellationnetwork.security.mpt.producer.{MerklePatriciaError, StatefulMerklePatriciaProducer}
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.implicits._
 
@@ -209,6 +209,12 @@ trait MptOverlay[F[_], K] {
     */
   def getAllForPrefix[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[Map[Hex, V]]
 
+  /** Branch-view prefix scan which retains every nibble-prefix-matched physical key and malformed value in deterministic key order. This
+    * parser does not prove that `branch` exists; exact-parent availability and whole-image physical-key grammar validation remain separate
+    * activation gates.
+    */
+  def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]]
+
   /** Build the per-branch trie at `ordinal`. Multi-branch: takes the on-disk base trie at `ordinal` and applies the chain's merged
     * `ChangeSet` via `MerklePatriciaTrie.withChanges`. Passthrough: ignores `branch`, delegates to `MptStore.build`.
     */
@@ -221,6 +227,11 @@ trait MptOverlay[F[_], K] {
     * pending writes in the parent's chain aren't folded into base yet.
     */
   def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]]
+
+  /** Defensively copied raw branch-view enumeration. Multi-branch capture is serialized against overlay mutation, but not against callers
+    * that bypass the overlay and mutate the base store directly. This does not authenticate branch identity, root, or finality.
+    */
+  def allEntriesStrict(branch: BranchId): F[List[StrictMptRawEntry]]
 
   /** Read all entries as raw `Map[Hex, Array[Byte]]` including a checked-out handle's pending writes (i.e. the post-write view BEFORE
     * `commit` registers them in the overlay). Multi-branch: equivalent to `allEntriesAsBytes(handle.parent)` merged with handle's
@@ -461,8 +472,14 @@ object MptOverlay {
       def getAllForPrefix[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[Map[Hex, V]] =
         underlying.getAllForPrefix[V](prefix)
 
+      def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]] =
+        underlying.getAllForPrefixStrict[V](prefix)
+
       def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
         underlying.allEntriesAsBytes
+
+      def allEntriesStrict(branch: BranchId): F[List[StrictMptRawEntry]] =
+        underlying.allEntriesStrict
 
       def allEntriesAsBytesWithHandle(handle: BranchHandle[F, K], ordinal: SnapshotOrdinal): F[Map[Hex, Array[Byte]]] =
         // Passthrough: handle writes already landed in `underlying` (PassthroughHandle delegates directly).
@@ -649,6 +666,9 @@ object MptOverlay {
 
       private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
 
+      private def copyRawEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
+        entries.iterator.map { case (key, bytes) => key -> (if (bytes eq null) null else bytes.clone()) }.toMap
+
       def base: MptStore[F, K] = underlying
       def parentChildTree: ParentChildTree[F] = pcTree
 
@@ -798,12 +818,32 @@ object MptOverlay {
           baseEntries <- underlying.getAllForPrefix[V](prefix)
           pending <- pendingRef.get
           merged = mergedChain(branch, pending)
-          filteredUpserts = merged.upserts.filter { case (hex, _) => hex.value.startsWith(prefix.value) }
-          filteredRemovals = merged.removals.filter(_.value.startsWith(prefix.value))
+          filteredUpserts = merged.upserts.filter { case (hex, _) => StatefulMerklePatriciaProducer.hasNibblePrefix(hex, prefix) }
+          filteredRemovals = merged.removals.filter(StatefulMerklePatriciaProducer.hasNibblePrefix(_, prefix))
           decoded <- filteredUpserts.toList.sortBy(_._1.value).traverse {
             case (hex, bytes) => deserializePrefixBytes[V](hex, bytes).map(hex -> _)
           }
         } yield (baseEntries -- filteredRemovals) ++ decoded.toMap
+
+      def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]] =
+        mutex.permit.use { _ =>
+          for {
+            baseEntries <- underlying.rawEntriesForPrefixStrict(prefix)
+            pending <- pendingRef.get
+            merged = mergedChain(branch, pending)
+            baseMap = baseEntries.iterator.map {
+              case StrictMptRawEntry(key, bytes) => key -> bytes.fold[Array[Byte]](null)(_.toArray)
+            }.toMap
+            filteredUpserts = merged.upserts.filter {
+              case (key, _) =>
+                StatefulMerklePatriciaProducer.hasNibblePrefix(key, prefix)
+            }
+            filteredRemovals = merged.removals.filter(StatefulMerklePatriciaProducer.hasNibblePrefix(_, prefix))
+            branchEntries = filteredUpserts.foldLeft(baseMap -- filteredRemovals) {
+              case (entries, (key, value)) => entries.updated(key, value)
+            }
+          } yield StrictMptRead.decodeEntries[V](branchEntries)
+        }
 
       def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
         underlying.build(ordinal).flatMap {
@@ -819,12 +859,18 @@ object MptOverlay {
             }
         }
 
-      def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
+      private def allEntriesAsBytesUnlocked(branch: BranchId): F[Map[Hex, Array[Byte]]] =
         for {
           baseEntries <- underlying.allEntriesAsBytes
           pending <- pendingRef.get
           merged = mergedChain(branch, pending)
-        } yield (baseEntries -- merged.removals) ++ merged.upserts
+        } yield copyRawEntries((baseEntries -- merged.removals) ++ merged.upserts)
+
+      def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
+        mutex.permit.use(_ => allEntriesAsBytesUnlocked(branch))
+
+      def allEntriesStrict(branch: BranchId): F[List[StrictMptRawEntry]] =
+        allEntriesAsBytes(branch).map(StrictMptRead.captureRawEntries)
 
       def allEntriesAsBytesWithHandle(handle: BranchHandle[F, K], ordinal: SnapshotOrdinal): F[Map[Hex, Array[Byte]]] = {
         // Same type-cast pattern as `commit` — checkout always returns a MultiBranchHandle in this impl, so the
@@ -836,15 +882,17 @@ object MptOverlay {
               s"Multi-branch overlay received a non-MultiBranchHandle in allEntriesAsBytesWithHandle: ${other.getClass.getName}"
             )
         }
-        for {
-          baseEntries <- underlying.allEntriesAsBytes
-          pending <- pendingRef.get
-          parentMerged = mergedChain(mb.parent, pending)
-          handleChanges <- mb.accRef.get
-          // Chronological compose: parent's accumulated chain first, then handle's local pending writes on top.
-          // `merge` enforces "later wins" + strips upsert/removal overlap.
-          combined = parentMerged.merge(handleChanges)
-        } yield (baseEntries -- combined.removals) ++ combined.upserts
+        mutex.permit.use { _ =>
+          for {
+            baseEntries <- underlying.allEntriesAsBytes
+            pending <- pendingRef.get
+            parentMerged = mergedChain(mb.parent, pending)
+            handleChanges <- mb.accRef.get
+            // Chronological compose: parent's accumulated chain first, then handle's local pending writes on top.
+            // `merge` enforces "later wins" + strips upsert/removal overlap.
+            combined = parentMerged.merge(handleChanges)
+          } yield copyRawEntries((baseEntries -- combined.removals) ++ combined.upserts)
+        }
       }
 
       def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
@@ -1188,18 +1236,20 @@ object MptOverlay {
         *   - keys present in base before the fold → reverse `upserts` (restore the pre-fold value)
         *   - keys absent in base before the fold → reverse `removals` (drop the now-inserted entry)
         *
-        * The base view is materialized as `producer.entries` which is `stateRef.get` — an in-memory snapshot, so this is O(|touched|) after
-        * the O(1) Ref read (no I/O). Called inside `mutex.permit` (finalizeBranch holds it) so the captured view is consistent with the
-        * upcoming `foldRaw` write.
+        * The producer copies only the touched values, so capture is O(|touched|) after one in-memory lookup pass and does not clone the
+        * complete global image while `finalizeBranch` holds `mutex.permit`. The captured view is consistent with the upcoming `foldRaw`
+        * write for callers that respect overlay-owned base mutation.
         */
-      private def captureReverseDelta(forward: ChangeSet): F[ChangeSet] =
-        underlying.underlying.entries.map { current =>
-          val touched = forward.upserts.keySet ++ forward.removals
+      private def captureReverseDelta(forward: ChangeSet): F[ChangeSet] = {
+        val touched = forward.upserts.keySet ++ forward.removals
+
+        underlying.underlying.entriesForKeys(touched).map { current =>
           val (presentBefore, absentBefore) = touched.partition(current.contains)
           val reverseUpserts: Map[Hex, Array[Byte]] = presentBefore.iterator.map(k => k -> current(k)).toMap
           val reverseRemovals: Set[Hex] = absentBefore.filter(forward.upserts.contains)
           ChangeSet(reverseUpserts, reverseRemovals)
         }
+      }
 
       /** Replay `undoJournalRef[ord]` against base and drop the entry. Returns `true` if an entry existed and was applied, `false` if no
         * entry was present at that ordinal. Idempotent: a second call at the same ord is a NoOp.

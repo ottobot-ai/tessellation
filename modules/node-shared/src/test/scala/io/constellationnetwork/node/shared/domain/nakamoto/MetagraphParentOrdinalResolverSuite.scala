@@ -58,12 +58,15 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
 
       def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
         get[V](key).map {
-          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value).toArray)
+          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value))
           case None        => StrictMptRead.Absent
         }
 
       def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] = IO.pure(Map.empty)
       def getAllForPrefix[V: ImmutableCodec](prefix: Hex): IO[Map[Hex, V]] = IO.pure(Map.empty)
+      def getAllForPrefixStrict[V: ImmutableCodec](
+        prefix: Hex
+      ): IO[List[io.constellationnetwork.schema.mpt.StrictMptEntry[V]]] = IO.pure(List.empty)
     }
 
   private def mkIncrementalSnapshot(ordinal: Long, globalSyncView: Option[GlobalSyncView])(

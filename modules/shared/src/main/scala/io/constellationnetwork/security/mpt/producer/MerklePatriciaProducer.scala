@@ -1,8 +1,8 @@
 package io.constellationnetwork.security.mpt.producer
 
+import cats.Parallel
 import cats.effect.Async
 import cats.syntax.functor._
-import cats.{Functor, Parallel}
 
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
@@ -39,20 +39,31 @@ trait ProducerSavepoint[F[_]] {
 }
 
 trait StatefulMerklePatriciaProducer[F[_]] {
+
+  /** Defensively copied full state image. Callers cannot mutate producer state through returned byte arrays. */
   def entries: F[Map[Hex, Array[Byte]]]
 
-  /** All entries whose hex key starts with `prefix`. Default impl filters `entries` in memory; the in-memory and filesystem backends both
-    * hold full state in a `Ref`, so this is a linear scan with prefix comparison (~O(N) over total entries, no I/O). Designed for
-    * materializing per-field views like `(networkNamespace=Hypergraph, fieldId=LastAllowSpendRefs, no contract)` without an external
-    * address set.
+  /** Defensively copied point read. */
+  def entry(key: Hex): F[Option[Array[Byte]]]
+
+  /** Defensively copied selected-key read. */
+  def entriesForKeys(keys: Set[Hex]): F[Map[Hex, Array[Byte]]]
+
+  /** Entry count without requiring callers to retain the state image. */
+  def entryCount: F[Int]
+
+  /** Defensively copied entries whose nibble path starts with `prefix`. The comparison deliberately treats upper- and lower-case hex as the
+    * same trie path, while retaining each original physical key in the result. This prevents a noncanonical case alias from disappearing
+    * before whole-image grammar validation can reject it. The in-memory and filesystem backends filter their internal `Ref` directly, so
+    * this is a linear scan (~O(N) over total entries, no I/O) but copies only matched values. Designed for materializing per-field views
+    * like `(networkNamespace=Hypergraph, fieldId=LastAllowSpendRefs, no contract)` without an external address set.
     *
     * Note: under the current `GlobalStateKey.toHex` encoding the user-namespace is a one-way hash of the address, so consumers cannot
     * recover addresses from the returned hex keys directly. Consumers that need `Map[Address, V]` either (a) decode the value when it
     * embeds `source: Address` (AllowSpend/TokenLock/etc.), or (b) maintain a sidecar address index — same pattern as the expiry-index
     * partitions.
     */
-  def entriesWithPrefix(prefix: Hex)(implicit F: Functor[F]): F[Map[Hex, Array[Byte]]] =
-    entries.map(_.filter { case (k, _) => k.value.startsWith(prefix.value) })
+  def entriesWithPrefix(prefix: Hex): F[Map[Hex, Array[Byte]]]
 
   def build: F[Either[MerklePatriciaError, MerklePatriciaTrie]]
 
@@ -86,6 +97,22 @@ trait StatefulMerklePatriciaProducer[F[_]] {
     * this exact state.
     */
   def savepoint: F[ProducerSavepoint[F]]
+}
+
+object StatefulMerklePatriciaProducer {
+
+  /** Trie-path prefix comparison. Physical key spelling remains untouched so a later complete grammar pass can reject uppercase,
+    * odd-length, invalid, or aliased keys rather than silently normalizing them.
+    */
+  def hasNibblePrefix(key: Hex, prefix: Hex): Boolean = {
+    val keyValue = key.value
+    val prefixValue = prefix.value
+
+    keyValue.length >= prefixValue.length && prefixValue.indices.forall { index =>
+      val expected = Character.digit(prefixValue.charAt(index), 16)
+      expected >= 0 && Character.digit(keyValue.charAt(index), 16) == expected
+    }
+  }
 }
 
 trait StatefulWithPersistenceMerklePatriciaProducer[F[_]] extends StatefulMerklePatriciaProducer[F] {

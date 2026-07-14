@@ -171,11 +171,21 @@ already has a hard-coded kill switch.
    `ROOT-010`, `SHARD-E-006`.
 2. **Land one strict key-aware reader.** Point, prefix, and raw reads return
    typed absent/present/malformed results with the physical MPT key/path and
-   exact immutable value bytes. Decoding never drops an entry; reconstruction
+   exact immutable copied value bytes. Decoding never drops an entry; reconstruction
    recomputes the expected key from the decoded identity/scope and compares it
    with the physical key before returning a value. The strict point-read
-   primitive landed in `41c19903d`; the shared prefix/raw contract remains open.
-   Gate: `ROOT-008`.
+   primitive landed in `41c19903d`. Deterministic, defensively copied physical
+   prefix/raw enumeration is now present at the shared store, overlay, and reader
+   boundaries, including retained null/empty/malformed values, nibble-equivalent
+   case aliases, and prefix-only branch-view merge tests. This foundation is
+   deliberately nonauthoritative: exact-parent capture, root/snapshot/Phase-2
+   binding, whole-image canonical physical-key preflight, bounded per-partition
+   decoding, physical-key reproduction, scope checks, and duplicate-logical-
+   identity rejection remain open. Case-distinct aliases also reproduce an
+   infinite full build and mutation-history-dependent incremental roots
+   (`MPT-07`); complete candidate preflight and bounded builder collision failure
+   are required before any raw load or parser migration. Gates: `ROOT-008`,
+   `ROOT-011`.
 3. **Migrate key-blind consumers in parallel after step 2.** Close the six
    source-confirmed parser families: `MPT-01` Mg* value-only reconstruction,
    `MPT-02` consumed-allow-spend physical nullifier keys, `MPT-03` stake and
@@ -652,10 +662,10 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
 - `numShards=1`, `2`, and `K` use the identical transition function.
 - Gates: `SHARD-E-003`/`004`, `DIFF-*`, `XMG-001` through `XMG-005B`,
   `XMG-007`/`008`/`010`/`012`/`013`, `ECON-F-002`/`003`, `ECON-REF-001`,
-  `ECON-BAL-002`/`003`, `ECON-G-002`, `ROOT-006` through `ROOT-009`,
+  `ECON-BAL-002`/`003`, `ECON-G-002`, `ROOT-006` through `ROOT-009`, `ROOT-011`,
   `PERM-005`, `SHARD-C-004`/`005`, `WT-008`/`008A`/`010`, and
   conservation/replay tests from S2. Preserve the closed `ECO-IDX-01/02`
-  regressions; `ECO-IDX-03` and `MPT-01..06` remain mandatory stop-the-line
+  regressions; `ECO-IDX-03` and `MPT-01..07` remain mandatory stop-the-line
   findings, not optional hardening.
 
 ### E10 - Downstream exact-hash rebase and historical-read recovery (`PARTIAL`)
