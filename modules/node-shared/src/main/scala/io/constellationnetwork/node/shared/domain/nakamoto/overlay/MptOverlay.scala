@@ -14,7 +14,7 @@ import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.MerklePatriciaTrie
-import io.constellationnetwork.security.mpt.producer.{MerklePatriciaError, StatefulMerklePatriciaProducer}
+import io.constellationnetwork.security.mpt.producer._
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.implicits._
 
@@ -72,9 +72,8 @@ object RevertOutcome {
     */
   final case class Shallow(undoStepsApplied: Int) extends RevertOutcome
 
-  /** DEEP path: the fork ordinal was below the in-memory RAM window (the journal could not reach it), so the base was rebuilt from the
-    * disk-retained signed bytes at the fork ordinal — `deleteAbove(fork)` + `loadBytes(readState(fork))`. `baseEntriesLoaded` counts the
-    * entries in the loaded byte map. Requires the disk tier (Track-3 S2 contiguous `signedBytesStore` to k₂) to hold `fork`.
+  /** Reserved for ROOT-009's authenticated DEEP recovery capability. The current ordinal-only byte reader cannot produce this outcome.
+    * `baseEntriesLoaded` will count entries installed only after the exact canonical hash and MPT root have been verified.
     */
   final case class Deep(baseEntriesLoaded: Int) extends RevertOutcome
 
@@ -84,9 +83,9 @@ object RevertOutcome {
   case object NoOp extends RevertOutcome
 }
 
-/** Fail-closed error raised by `MptOverlay.revertToOrdinal` when the fork ordinal is reachable via NEITHER the in-memory undo journal (the
-  * journal has been pruned below it) NOR the disk tier (the contiguous signed-bytes store no longer retains `forkOrdinal` — it is deeper
-  * than k₂, or the deep reader is unwired). Raising (rather than silently under-reverting to the nearest reachable ordinal) is deliberate:
+/** Fail-closed error raised by `MptOverlay.revertToOrdinal` when the fork ordinal is not reachable through the in-memory undo journal and
+  * no authenticated deep-recovery capability can reconstruct it. Merely finding bytes by ordinal is insufficient. Raising (rather than
+  * silently under-reverting to the nearest reachable ordinal) is deliberate:
   * a base that reverted LESS than requested would re-fold the denser branch onto a mismatched anchor and silently diverge — the exact
   * consensus-safety hazard S4 exists to prevent.
   */
@@ -98,6 +97,32 @@ final case class RevertGapError(
       s"MptOverlay.revertToOrdinal: cannot reach fork ordinal=${forkOrdinal.value.value} " +
         s"(current base tip=${currentTip.map(_.value.value).map(_.toString).getOrElse("none")}); $reason. " +
         s"Failing closed rather than under-reverting."
+    )
+
+/** Fail-closed error raised when a different canonical is presented for an ordinal whose prior canonical is still recorded but whose undo
+  * record is unavailable. Applying the replacement directly to the current base would retain keys written only by the rejected canonical.
+  * The caller must first restore the authenticated common-parent state through the ordinary recovery path.
+  */
+final case class FinalizationUndoGapError(
+  ordinal: SnapshotOrdinal,
+  previousCanonical: BranchId,
+  replacementCanonical: BranchId
+) extends RuntimeException(
+      s"MptOverlay.finalizeBranch: cannot replace canonical=${previousCanonical.value.value} with " +
+        s"canonical=${replacementCanonical.value.value} at ordinal=${ordinal.value.value}: prior undo record is unavailable. " +
+        s"Failing closed until authenticated parent-state recovery completes."
+    )
+
+/** Fail-closed error raised when a caller tries to finalize below either the explicit retained-history floor or the MPT base's persisted
+  * ordinal. The absence of both `finalizedRef` and its undo record cannot be interpreted as a first finalization; authenticated deep
+  * recovery must reconstruct the parent state and install the corresponding history boundary.
+  */
+final case class FinalizationHistoryPrunedError(
+  ordinal: SnapshotOrdinal,
+  retainedFromOrdinal: SnapshotOrdinal
+) extends RuntimeException(
+      s"MptOverlay.finalizeBranch: ordinal=${ordinal.value.value} is below the retained overlay-history floor=" +
+        s"${retainedFromOrdinal.value.value}. RecoveryRequired: refusing to interpret pruned history as an unfinalized ordinal."
     )
 
 /** Mutable handle for accumulating writes against a checked-out branch.
@@ -291,27 +316,23 @@ trait MptOverlay[F[_], K] {
     * Breaks the all-or-nothing finality contract (`finalizeBranch` walks `pendingRef`+`undoJournalRef` consistently) — the prefix `unsafe_`
     * signals callers must hold the mutex-equivalent (production paused, no in-flight commits) before invoking.
     *
-    * Multi-branch: clears all four Refs. Passthrough: no-op (no per-branch state to reset).
+    * Multi-branch: clears branch, finalized-marker, and undo-journal state but retains the monotone history floor. Passthrough: no-op.
     */
   def unsafe_reset: F[Unit]
 
-  /** Track-3 S4 revert-executor. Revert the on-disk base to the state as of `forkOrdinal` so a denser branch (deep density reorg in the
-    * `(k₂, k₁]` band, S3) can be re-folded onto it. This method ONLY reverts the base + clears pending overlay state; the RE-FOLD itself is
-    * performed by the caller re-driving the denser branch's snapshots through the ordinary `commit` / `finalizeBranch` fold path, so the
-    * follower-verified consensus `mptRoot` matches by construction (no bespoke re-apply).
+  /** Track-3 S4 revert-executor. Revert the on-disk base to `forkOrdinal` so a denser branch can be re-folded through ordinary
+    * `commit` / `finalizeBranch`. k₂ is only a local retention recommendation, not a fork-choice or finality floor.
     *
     * Two disjoint mechanical paths, chosen by whether `forkOrdinal` is reachable from the IN-MEMORY reverse-delta journal:
     *   - '''SHALLOW''' — `forkOrdinal` is within the bounded RAM `undoJournalRef` window (Heap-leak Fix A keeps it to the operational k₁):
     *     replay the per-ordinal reverse deltas for every ordinal above `forkOrdinal` in DESCENDING (LIFO) order via the byte-deterministic
     *     `applyUndoAt`. Descending order is load-bearing — each reverse delta was captured against the base at ITS OWN fold.
-    *   - '''DEEP''' — `forkOrdinal` is below the RAM window (journal pruned, cannot reach): rebuild the base from the disk tier — prune the
-    *     producer's on-disk state above `forkOrdinal` (`deleteAbove`), read the disk-retained signed bytes at `forkOrdinal` (Track-3 S2's
-    *     contiguous `signedBytesStore` to k₂), and load them VERBATIM as the base (`loadBytes`, same primitive follower resync uses, so the
-    *     recomputed root equals the signed root by construction).
+    *   - '''DEEP''' — `forkOrdinal` is below the RAM window. The current ordinal-only reader always fails closed because it cannot bind
+    *     retained bytes to the exact canonical `(ordinal, hash, mptRoot)`. ROOT-009 must provide that authenticated capability before this
+    *     path may replace base state.
     *
-    * '''Fail-closed''': if `forkOrdinal` is reachable via NEITHER path (journal pruned below it AND the disk tier no longer retains it —
-    * deeper than k₂ or the deep reader is unwired), this raises [[RevertGapError]] rather than silently under-reverting to the nearest
-    * reachable ordinal (which would re-fold onto a mismatched anchor and diverge).
+    * '''Fail-closed''': if the journal cannot reach `forkOrdinal` and authenticated reconstruction is unavailable, this raises
+    * [[RevertGapError]] rather than under-reverting or trusting ordinal-indexed bytes.
     *
     * After reverting, `pendingRef` is cleared and `lastCommittedBranchRef` is reset (mirroring the finalize reorg-replace arms) so the
     * subsequent re-fold starts from a clean overlay, and the base-revert hook (eta `forgetUncommitted`) fires. Runs under the same mutex as
@@ -396,11 +417,9 @@ object MptOverlay {
     pcTree: ParentChildTree[F],
     toHex: K => F[Hex],
     bestTipsFn: F[Set[BranchId]],
-    // Track-3 S4 DEEP revert-executor source: the disk tier that retains the signed per-ordinal byte map CONTIGUOUSLY to k₂ (production =
-    // `signedBytesStore.readState`, wired post-construction from `GlobalSnapshotConsensus`). `revertToOrdinal(fork)` uses it when `fork`
-    // is below the RAM undo-journal window. `None` = "no deep tier" (a below-window revert fails closed), which keeps the passthrough /
-    // follower / test wiring byte-identical to before S4. (`Option` rather than a defaulted function because a default value cannot see the
-    // method's own `Async[F]` implicit — the concrete "always-None" reader is materialized below where `Async` is in scope.)
+    // Legacy ROOT-009 input inventory: this ordinal-only reader may locate retained bytes but cannot authenticate their canonical hash or
+    // MPT root, so the current deep path always rejects before mutation. ROOT-009 must replace it with a hash/root-bound capability.
+    // `Option` remains to keep current wiring explicit while that replacement is implemented.
     deepStateReader: Option[SnapshotOrdinal => F[Option[Map[Hex, Array[Byte]]]]] = None,
     // Track-3 S4 base-revert hook: fired inside every base-reverting overlay path (`revertToOrdinal` + the finalize reorg-replace arms).
     // Production wiring passes `etaStateManager.forgetUncommitted` (deferred, set post-construction from `SharedServices`) so a reverted
@@ -541,10 +560,19 @@ object MptOverlay {
     private def encode[V: ImmutableCodec](v: V): Array[Byte] =
       ImmutableCodec[V].immutableBytes(v).toArray
 
+    private def validateKey(key: Hex): F[Unit] =
+      PhysicalTrieKeyValidator.validateKey(key).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+
+    private def validateCandidateKeys(keys: Iterable[Hex]): F[Unit] =
+      PhysicalTrieKeyValidator.validateKeys(keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+
+    private def validateOperationKeys(keys: Iterable[Hex]): F[Unit] =
+      PhysicalTrieKeyValidator.validateEachKey(keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+
     def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =
       toHex(key).flatMap { hex =>
         val bytes = encode(value)
-        accRef.update(cs => ChangeSet(cs.upserts.updated(hex, bytes), cs.removals - hex))
+        validateKey(hex) >> accRef.update(cs => ChangeSet(cs.upserts.updated(hex, bytes), cs.removals - hex))
       }
 
     def insert[V: ImmutableCodec](entries: Map[K, V]): F[Unit] =
@@ -552,12 +580,13 @@ object MptOverlay {
       else
         entries.toList.traverse { case (k, v) => toHex(k).map(_ -> encode(v)) }.flatMap { hexed =>
           val newPairs = hexed.toMap
-          accRef.update(cs => ChangeSet(cs.upserts ++ newPairs, cs.removals -- newPairs.keySet))
+          validateCandidateKeys(hexed.map(_._1)) >>
+            accRef.update(cs => ChangeSet(cs.upserts ++ newPairs, cs.removals -- newPairs.keySet))
         }
 
     def remove(key: K): F[Unit] =
       toHex(key).flatMap { hex =>
-        accRef.update(cs => ChangeSet(cs.upserts - hex, cs.removals + hex))
+        validateKey(hex) >> accRef.update(cs => ChangeSet(cs.upserts - hex, cs.removals + hex))
       }
 
     def remove(keys: List[K]): F[Unit] =
@@ -565,7 +594,7 @@ object MptOverlay {
       else
         keys.traverse(toHex).flatMap { hexes =>
           val toRemove = hexes.toSet
-          accRef.update(cs => ChangeSet(cs.upserts -- toRemove, cs.removals ++ toRemove))
+          validateOperationKeys(hexes) >> accRef.update(cs => ChangeSet(cs.upserts -- toRemove, cs.removals ++ toRemove))
         }
 
     def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
@@ -574,6 +603,8 @@ object MptOverlay {
         removeHexed <- toRemove.toList.traverse(toHex)
         upMap = upsertHexed.toMap
         rmSet = removeHexed.toSet
+        _ <- validateCandidateKeys(upsertHexed.map(_._1))
+        _ <- validateOperationKeys(removeHexed)
         // Apply removals first then upserts — matches `MerklePatriciaTrie.withChanges` ordering, so a key
         // present in BOTH `toUpsert` and `toRemove` ends up upserted (consistent with `MptStore.update`).
         _ <- accRef.update { cs =>
@@ -631,8 +662,11 @@ object MptOverlay {
         // "Base may still hold rejected writes" leak documented in #121 / iter19. In-memory
         // per node — local-only state, not consensus-visible.
         Ref.of[F, SortedMap[Long, ChangeSet]](SortedMap.empty[Long, ChangeSet]),
+        // Monotone lower bound of retained overlay history. Once `pruneBelow(N)` removes finalized/undo evidence below N,
+        // a later finalize below N must enter recovery rather than treating absent refs as a first finalization.
+        Ref.of[F, Option[Long]](none[Long]),
         Semaphore[F](1)
-      ).mapN { (pendingRef, finalizedRef, lastCommittedBranchRef, undoJournalRef, mutex) =>
+      ).mapN { (pendingRef, finalizedRef, lastCommittedBranchRef, undoJournalRef, prunedHistoryFloorRef, mutex) =>
         new Impl[F, K](
           underlying,
           pcTree,
@@ -641,6 +675,7 @@ object MptOverlay {
           finalizedRef,
           lastCommittedBranchRef,
           undoJournalRef,
+          prunedHistoryFloorRef,
           mutex,
           maxPendingBranches,
           bestTipsFn,
@@ -657,6 +692,7 @@ object MptOverlay {
       finalizedRef: Ref[F, Map[SnapshotOrdinal, BranchId]],
       lastCommittedBranchRef: Ref[F, Option[BranchId]],
       undoJournalRef: Ref[F, SortedMap[Long, ChangeSet]],
+      prunedHistoryFloorRef: Ref[F, Option[Long]],
       mutex: Semaphore[F],
       maxPendingBranches: Int,
       bestTipsFn: F[Set[BranchId]],
@@ -668,6 +704,17 @@ object MptOverlay {
 
       private def copyRawEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
         entries.iterator.map { case (key, bytes) => key -> (if (bytes eq null) null else bytes.clone()) }.toMap
+
+      private def validateCandidate(entries: Map[Hex, Array[Byte]]): F[Unit] =
+        PhysicalTrieKeyValidator.validateKeys(entries.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+
+      private def validateChanges(baseKeys: Set[Hex], changes: ChangeSet): F[Unit] =
+        for {
+          _ <- PhysicalTrieKeyValidator.validateEachKey(changes.removals).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+          _ <- PhysicalTrieKeyValidator
+            .validateInsertion(baseKeys -- changes.removals, changes.upserts.keys)
+            .fold(_.raiseError[F, Unit], _ => Async[F].unit)
+        } yield ()
 
       def base: MptStore[F, K] = underlying
       def parentChildTree: ParentChildTree[F] = pcTree
@@ -690,6 +737,10 @@ object MptOverlay {
         mutex.permit.use { _ =>
           for {
             changes <- handle.accRef.get
+            baseKeys <- underlying.underlying.physicalKeys
+            pending <- pendingRef.get
+            parentChanges = mergedChain(handle.parent, pending)
+            _ <- validateChanges(baseKeys, parentChanges.merge(changes))
             _ <- pendingRef.update(_.updated(childTip, BranchEntry(handle.parent, changes, ordinal)))
             // Track this commit as the most-recent. Read by `evictIfOverCap` so the just-committed
             // branch and its ancestors are protected even when the external `bestTipsFn` lags.
@@ -846,17 +897,28 @@ object MptOverlay {
         }
 
       def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
-        underlying.build(ordinal).flatMap {
-          case Left(err) => Async[F].pure(Left(err): Either[MerklePatriciaError, MerklePatriciaTrie])
-          case Right(baseTrie) =>
-            pendingRef.get.flatMap { pending =>
-              val merged = mergedChain(branch, pending)
-              if (merged.isEmpty) Async[F].pure(Right(baseTrie): Either[MerklePatriciaError, MerklePatriciaTrie])
-              else
-                baseTrie
-                  .withChanges[F](merged.upserts, merged.removals)
-                  .map(t => Right(t): Either[MerklePatriciaError, MerklePatriciaTrie])
+        mutex.permit.use { _ =>
+          for {
+            baseKeys <- underlying.underlying.physicalKeys
+            pending <- pendingRef.get
+            merged = mergedChain(branch, pending)
+            _ <- validateChanges(baseKeys, merged)
+            baseResult <- underlying.build(ordinal)
+            result <- baseResult match {
+              case Left(err) => Async[F].pure(Left(err): Either[MerklePatriciaError, MerklePatriciaTrie])
+              case Right(baseTrie) if merged.isEmpty =>
+                Async[F].pure(Right(baseTrie): Either[MerklePatriciaError, MerklePatriciaTrie])
+              case Right(baseTrie) =>
+                baseTrie.withChanges[F](merged.upserts, merged.removals).attempt.map {
+                  case Right(trie)                      => Right(trie)
+                  case Left(error: MerklePatriciaError) => Left(error)
+                  case Left(error)                      => Left(OperationError(error.getMessage))
+                }
             }
+          } yield result
+        }.handleError {
+          case error: MerklePatriciaError => Left(error)
+          case error                      => Left(OperationError(error.getMessage))
         }
 
       private def allEntriesAsBytesUnlocked(branch: BranchId): F[Map[Hex, Array[Byte]]] =
@@ -897,8 +959,17 @@ object MptOverlay {
 
       def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
         mutex.permit.use { _ =>
-          finalizedRef.get.flatMap { finalized =>
-            finalized.get(ordinal) match {
+          (prunedHistoryFloorRef.get, underlying.lastPersistedOrdinal).mapN {
+            case (Some(prunedFloor), Some(baseAnchor)) => Some(prunedFloor.max(baseAnchor.value.value))
+            case (Some(prunedFloor), None)             => Some(prunedFloor)
+            case (None, Some(baseAnchor))              => Some(baseAnchor.value.value)
+            case (None, None)                          => none[Long]
+          }.flatMap {
+            case Some(floor) if ordinal.value.value < floor =>
+              FinalizationHistoryPrunedError(ordinal, SnapshotOrdinal.unsafeApply(floor)).raiseError[F, FinalizationOutcome]
+            case _ =>
+              finalizedRef.get.flatMap { finalized =>
+                finalized.get(ordinal) match {
               case Some(prev) if prev.value === canonical.value =>
                 // Already finalized at exactly this (ordinal, hash); nothing to do.
                 FinalizationOutcome.NoOp.pure[F].widen[FinalizationOutcome]
@@ -911,9 +982,9 @@ object MptOverlay {
                 // post-reorg truth, fold its pending chain (idempotent under MultiBranch when the prior
                 // finalization already cleared pending), and update the finalizedRef. The fold may overwrite
                 // base entries the prior canonical wrote — that is correct: the new canonical is the new state
-                // at this ordinal, and base must reflect it. NakamotoSyncDaemon (gl0 leader path) cannot hit
-                // this case because depth-k confirmation precludes a different-hash re-finalization at the
-                // same ord; it remains an internal-consistency bug there if this branch ever fires on gl0.
+                // at this ordinal, and base must reflect it. GL0 Phase-2 state remains density-reorgable, so
+                // the global path can legitimately reach this replacement path and must retain/recover the
+                // exact old undo plus replacement inputs before changing base.
                 pendingRef.get.flatMap { pending =>
                   pending.get(canonical) match {
                     case None =>
@@ -940,57 +1011,64 @@ object MptOverlay {
                         if (droppedCount > 0)
                           pendingRef.set(Map.empty) >> lastCommittedBranchRef.set(none)
                         else Async[F].unit
-                      for {
-                        // #121: Replay the previous canonical's undo entry to revert base to its pre-`ordinal` state.
-                        // This plugs the "Base may still hold rejected writes" leak: prior versions of this code path
-                        // dropped pending but left the prior fold's writes in base, contaminating subsequent reads at
-                        // `parentTip=canonical` (overlay walks pending→empty→base, sees the rejected bytes).
-                        undoApplied <- applyUndoAt(ordinal.value.value, ordinal)
-                        _ <- cleanup
-                        // Track-3 S4: base just reverted (prior canonical's fold undone) — drop the stale eta walk cache
-                        // so the adopted canonical's eta re-derives over the reverted chain (bootstrap-equivalence).
-                        _ <- onBaseRevert
-                        _ <- finalizedRef.update(_.updated(ordinal, canonical))
-                        _ <-
-                          if (droppedCount > 0)
-                            logger.warn(
-                              s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                                s"new=${canonical.value} — canonical NOT in pending; dropped $droppedCount " +
-                                s"orphan fork branch(es) from pendingRef + reset lastCommittedBranchRef. " +
-                                s"Undo applied=$undoApplied (base reverted to pre-ord state). " +
-                                s"Caller still needs to resync base via syncFromGlobalSnapshotInfo to apply " +
-                                s"the new canonical's deltas."
-                            )
-                          else
-                            logger.info(
-                              s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                                s"new=${canonical.value} (pending already empty, no fold needed). " +
-                                s"Undo applied=$undoApplied."
-                            )
-                      } yield
-                        if (droppedCount > 0) FinalizationOutcome.Folded(0, droppedCount): FinalizationOutcome
-                        else FinalizationOutcome.NoOp: FinalizationOutcome
+                      val undoGap = FinalizationUndoGapError(ordinal, prev, canonical)
+                      Async[F].uncancelable { poll =>
+                        for {
+                          undoAvailable <- undoJournalRef.get.map(_.contains(ordinal.value.value))
+                          _ <- if (undoAvailable) Async[F].unit else undoGap.raiseError[F, Unit]
+                          // Cache invalidation is safe to perform before the base mutation: a failed/canceled undo merely forces
+                          // re-derivation. Once the undo commits, cancellation stays masked through every overlay marker update.
+                          _ <- onBaseRevert
+                          // #121: Replay the previous canonical's undo entry to revert base to its pre-`ordinal` state.
+                          // This plugs the "Base may still hold rejected writes" leak: prior versions of this code path
+                          // dropped pending but left the prior fold's writes in base, contaminating subsequent reads at
+                          // `parentTip=canonical` (overlay walks pending→empty→base, sees the rejected bytes).
+                          undoApplied <- poll(applyUndoAt(ordinal.value.value, ordinal))
+                          _ <- if (undoApplied) Async[F].unit else undoGap.raiseError[F, Unit]
+                          _ <- cleanup
+                          _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                          _ <-
+                            if (droppedCount > 0)
+                              logger.warn(
+                                s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                  s"new=${canonical.value} — canonical NOT in pending; dropped $droppedCount " +
+                                  s"orphan fork branch(es) from pendingRef + reset lastCommittedBranchRef. " +
+                                  s"Undo applied=$undoApplied (base reverted to pre-ord state). " +
+                                  s"Caller still needs to resync base via syncFromGlobalSnapshotInfo to apply " +
+                                  s"the new canonical's deltas."
+                              )
+                            else
+                              logger.info(
+                                s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                  s"new=${canonical.value} (pending already empty, no fold needed). " +
+                                  s"Undo applied=$undoApplied."
+                              )
+                        } yield
+                          if (droppedCount > 0) FinalizationOutcome.Folded(0, droppedCount): FinalizationOutcome
+                          else FinalizationOutcome.NoOp: FinalizationOutcome
+                      }
                     case Some(_) =>
                       val merged = mergedChain(canonical, pending)
                       val droppedCount = pending.size - countAncestors(canonical, pending)
-                      for {
-                        // #121: Revert prior canonical's writes from base before folding the new canonical.
-                        // Without this, keys that the OLD canonical wrote but the NEW canonical doesn't touch
-                        // would retain the OLD canonical's bytes after the fold, causing silent state divergence.
-                        undoApplied <- applyUndoAt(ordinal.value.value, ordinal)
-                        // Track-3 S4: prior canonical's writes just reverted from base — drop the stale eta walk cache
-                        // so the new canonical's eta re-derives over the reverted-then-refolded chain (bootstrap-equivalence).
-                        _ <- onBaseRevert
-                        _ <- foldIntoBase(merged, ordinal)
-                        _ <- pendingRef.set(Map.empty)
-                        _ <- lastCommittedBranchRef.set(none)
-                        _ <- finalizedRef.update(_.updated(ordinal, canonical))
-                        _ <- logger.info(
-                          s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                            s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount " +
-                            s"undoApplied=$undoApplied"
-                        )
-                      } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                      Async[F].uncancelable { poll =>
+                        for {
+                          // Track-3 S4: prior canonical's writes just reverted from base — drop the stale eta walk cache
+                          // before the coordinated replacement so a hook failure cannot split old/new base state. A later transaction
+                          // failure only causes harmless cache re-derivation.
+                          _ <- onBaseRevert
+                          // Undo the old canonical and apply the new canonical under ONE producer savepoint/commit. The new undo record is
+                          // published before this cancelable boundary returns, so an error cannot expose a pre-ordinal half-state.
+                          undoApplied <- poll(replaceFinalizedBase(merged, ordinal, prev, canonical))
+                          _ <- pendingRef.set(Map.empty)
+                          _ <- lastCommittedBranchRef.set(none)
+                          _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                          _ <- logger.info(
+                            s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                              s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount " +
+                              s"undoApplied=$undoApplied"
+                          )
+                        } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                      }
                   }
                 }
               case None =>
@@ -1005,24 +1083,27 @@ object MptOverlay {
                     case Some(_) =>
                       val merged = mergedChain(canonical, pending)
                       val droppedCount = pending.size - countAncestors(canonical, pending)
-                      for {
-                        _ <- foldIntoBase(merged, ordinal)
-                        _ <- pendingRef.set(Map.empty)
-                        // pendingRef cleared → any prior `lastCommittedBranchRef` now points at a branch
-                        // that's no longer in pending (its ancestor walk yields zero protection per the
-                        // "branch not in pending" leaf in walkAncestorsInPending). Reset to None so a
-                        // future commit can re-establish the protection cleanly. Same rationale as the
-                        // reorg-replace `case Some` arm above (#116).
-                        _ <- lastCommittedBranchRef.set(none)
-                        _ <- finalizedRef.update(_.updated(ordinal, canonical))
-                        _ <- logger.info(
-                          s"[MptOverlay] Finalized branch=${canonical.value} at ordinal=$ordinal: " +
-                            s"keysApplied=${merged.size} branchesDropped=$droppedCount"
-                        )
-                      } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                      Async[F].uncancelable { poll =>
+                        for {
+                          _ <- poll(foldIntoBase(merged, ordinal))
+                          _ <- pendingRef.set(Map.empty)
+                          // pendingRef cleared → any prior `lastCommittedBranchRef` now points at a branch
+                          // that's no longer in pending (its ancestor walk yields zero protection per the
+                          // "branch not in pending" leaf in walkAncestorsInPending). Reset to None so a
+                          // future commit can re-establish the protection cleanly. Same rationale as the
+                          // reorg-replace `case Some` arm above (#116).
+                          _ <- lastCommittedBranchRef.set(none)
+                          _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                          _ <- logger.info(
+                            s"[MptOverlay] Finalized branch=${canonical.value} at ordinal=$ordinal: " +
+                              s"keysApplied=${merged.size} branchesDropped=$droppedCount"
+                          )
+                        } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                      }
                   }
                 }
-            }
+                }
+              }
           }
         }
 
@@ -1042,33 +1123,39 @@ object MptOverlay {
         // Single shared mutex with commit/finalize so the prune is consistent with concurrent fold operations.
         mutex.permit.use { _ =>
           val ordValue = ord.value.value
-          for {
-            preCounts <- (undoJournalRef.get, finalizedRef.get).tupled.map {
-              case (uj, fz) => (uj.size, fz.size)
-            }
-            (preUndo, preFinalized) = preCounts
-            // `rangeFrom` on `SortedMap[Long, _]` returns the sub-map of entries with key >= `ordValue`,
-            // i.e. drops all entries strictly below the archival watermark. O(log n) under TreeMap.
-            _ <- undoJournalRef.update(journal => journal.rangeFrom(ordValue))
-            _ <- finalizedRef.update(_.filter { case (k, _) => k.value.value >= ordValue })
-            postCounts <- (undoJournalRef.get, finalizedRef.get).tupled.map {
-              case (uj, fz) => (uj.size, fz.size)
-            }
-            (postUndo, postFinalized) = postCounts
-            droppedUndo = preUndo - postUndo
-            droppedFinalized = preFinalized - postFinalized
-            _ <-
-              if (droppedUndo > 0 || droppedFinalized > 0)
-                logger.info(
-                  s"OVERLAY-PRUNE-BELOW ord=$ordValue pre=$preUndo undoJournal entries / $preFinalized finalized entries " +
-                    s"post=$postUndo undoJournal entries / $postFinalized finalized entries " +
-                    s"(dropped undo=$droppedUndo, finalized=$droppedFinalized)"
-                )
-              else
-                logger.debug(
-                  s"OVERLAY-PRUNE-BELOW ord=$ordValue no-op (already pruned: $preUndo undoJournal, $preFinalized finalized)"
-                )
-          } yield ()
+          Async[F].uncancelable { _ =>
+            for {
+              preCounts <- (undoJournalRef.get, finalizedRef.get).tupled.map {
+                case (uj, fz) => (uj.size, fz.size)
+              }
+              (preUndo, preFinalized) = preCounts
+              _ <- prunedHistoryFloorRef.update {
+                case Some(current) => Some(current.max(ordValue))
+                case None          => Some(ordValue)
+              }
+              // `rangeFrom` on `SortedMap[Long, _]` returns the sub-map of entries with key >= `ordValue`,
+              // i.e. drops all entries strictly below the archival watermark. O(log n) under TreeMap.
+              _ <- undoJournalRef.update(journal => journal.rangeFrom(ordValue))
+              _ <- finalizedRef.update(_.filter { case (k, _) => k.value.value >= ordValue })
+              postCounts <- (undoJournalRef.get, finalizedRef.get).tupled.map {
+                case (uj, fz) => (uj.size, fz.size)
+              }
+              (postUndo, postFinalized) = postCounts
+              droppedUndo = preUndo - postUndo
+              droppedFinalized = preFinalized - postFinalized
+              _ <-
+                if (droppedUndo > 0 || droppedFinalized > 0)
+                  logger.info(
+                    s"OVERLAY-PRUNE-BELOW ord=$ordValue pre=$preUndo undoJournal entries / $preFinalized finalized entries " +
+                      s"post=$postUndo undoJournal entries / $postFinalized finalized entries " +
+                      s"(dropped undo=$droppedUndo, finalized=$droppedFinalized)"
+                  )
+                else
+                  logger.debug(
+                    s"OVERLAY-PRUNE-BELOW ord=$ordValue no-op (already pruned: $preUndo undoJournal, $preFinalized finalized)"
+                  )
+            } yield ()
+          }
         }
 
       def journalSizes: F[MptOverlay.JournalSizes] =
@@ -1079,10 +1166,11 @@ object MptOverlay {
         }
 
       def unsafe_reset: F[Unit] =
-        // P-11 re-bootstrap reset (task #141). Wipes ALL in-memory overlay state so the
-        // post-reset path starts fresh: a future `commit` will register a new pending branch
-        // against an empty pending map; a future `finalizeBranch` will see no prior canonical
-        // at any ord (no idempotency conflict, no reorg-replace path). Base `MptStore` is
+        // P-11 re-bootstrap reset (task #141). Wipes branch and journal state so the
+        // post-reset path starts fresh above the retained-history floor: a future `commit` will register a new pending branch
+        // against an empty pending map; a future `finalizeBranch` at-or-above the floor will see no prior canonical
+        // (no idempotency conflict, no reorg-replace path). The monotone pruned-history floor is deliberately retained, so
+        // reset cannot reinterpret missing historical evidence as a first finalization. Base `MptStore` is
         // NOT touched here — caller resyncs base via `syncFromGlobalSnapshotInfo` once the
         // canonical chain head is known.
         //
@@ -1120,26 +1208,26 @@ object MptOverlay {
                 // band (contiguous down to forkLong+1); otherwise the journal was pruned below the fork → DEEP.
                 val needed: Seq[Long] = (forkLong + 1L) to tip
                 if (needed.forall(journal.contains)) {
-                  // SHALLOW: replay the per-ordinal reverse deltas DESCENDING (LIFO). Each was captured against the
-                  // base at ITS OWN fold, so descending order is load-bearing. `applyUndoAt` consumes (removes) each
-                  // journal entry it replays and commits at `forkOrdinal`, so after the loop the base state AND its
-                  // persisted-ordinal label are exactly `forkOrdinal`, and no journal entry above the fork survives.
+                  // SHALLOW: stage every per-ordinal reverse delta DESCENDING (LIFO) in one transaction. Each was captured against the
+                  // base at ITS OWN fold, so descending order is load-bearing. One final build/commit publishes `forkOrdinal`; only then
+                  // are all consumed journal entries removed, so interruption cannot label an intermediate state as the fork.
                   val descending = journal.keySet.filter(_ > forkLong).toList.sorted.reverse
                   for {
-                    _ <- descending.traverse_(o => applyUndoAt(o, forkOrdinal))
-                    _ <- postRevertCleanup(forkLong)
+                    replayed <- applyUndoRange(descending, forkOrdinal, forkLong)
                     _ <- logger.info(
-                      s"[MptOverlay] SHALLOW revert to ordinal=$forkLong: replayed ${descending.size} RAM undo-journal " +
+                      s"[MptOverlay] SHALLOW revert to ordinal=$forkLong: replayed $replayed RAM undo-journal " +
                         s"reverse-delta(s) descending from tip=$tip. Base reverted; pending cleared for re-fold."
                     )
-                  } yield RevertOutcome.Shallow(descending.size): RevertOutcome
+                  } yield RevertOutcome.Shallow(replayed): RevertOutcome
                 } else
                   deepRevert(forkOrdinal, forkLong, tipOpt)
               case other =>
                 // Base already at-or-below the fork — nothing above the fork to revert. Still clear pending overlay
                 // state + drop the eta cache so an idempotent second call / a redundant caller lands cleanly.
                 for {
+                  _ <- undoJournalRef.update(_.rangeTo(forkLong))
                   _ <- postRevertCleanup(forkLong)
+                  _ <- underlying.deleteAbove(forkOrdinal)
                   _ <- logger.debug(
                     s"[MptOverlay] revertToOrdinal($forkLong) NoOp: base tip=${other.map(_.toString).getOrElse("none")} " +
                       s"at-or-below fork (nothing above fork to revert). Pending cleared."
@@ -1149,11 +1237,9 @@ object MptOverlay {
           } yield outcome
         }
 
-      /** DEEP path of `revertToOrdinal`: the RAM journal cannot reach `forkOrdinal`, so rebuild the base from the disk tier. Prune the
-        * producer's on-disk state above the fork, read the disk-retained signed bytes at the fork (Track-3 S2's contiguous
-        * `signedBytesStore` to k₂ in production, via the injected `deepStateReader`), and load them VERBATIM (`loadBytes` — same primitive
-        * follower resync uses, so the recomputed root equals the signed root by construction). Fail closed if the disk tier no longer
-        * retains the fork.
+      /** DEEP path of `revertToOrdinal`: the RAM journal cannot reach `forkOrdinal`. The current reader is keyed only by ordinal and cannot
+        * prove the exact canonical `(ordinal, hash, mptRoot)`, so even physically valid retained bytes fail closed before base mutation.
+        * ROOT-009 must replace this raw reader with an authenticated recovery capability before deep reconstruction can be enabled.
         */
       private def deepRevert(
         forkOrdinal: SnapshotOrdinal,
@@ -1161,34 +1247,42 @@ object MptOverlay {
         tipOpt: Option[SnapshotOrdinal]
       ): F[RevertOutcome] =
         deepStateReader(forkOrdinal).flatMap {
-          case Some(state) =>
-            for {
-              _ <- underlying.deleteAbove(forkOrdinal)
-              _ <- underlying.loadBytes(state, forkOrdinal)
-              // The RAM journal entries above the fork are now stale (base was rebuilt from disk, not unwound), so drop
-              // them; entries at-or-below the fork stay as valid undo info for any subsequent shallower revert.
-              _ <- undoJournalRef.update(_.rangeTo(forkLong))
-              _ <- postRevertCleanup(forkLong)
-              _ <- logger.info(
-                s"[MptOverlay] DEEP revert to ordinal=$forkLong: RAM journal could not reach it; rebuilt base from " +
-                  s"${state.size} disk-retained signed entries (deleteAbove + loadBytes). Pending cleared for re-fold."
-              )
-            } yield RevertOutcome.Deep(state.size): RevertOutcome
-          case None =>
+          case Some(state) if state.isEmpty =>
             logger.error(
-              s"[MptOverlay] revertToOrdinal($forkLong) GAP: fork ordinal is below the RAM undo-journal window AND " +
-                s"absent from the disk-retained signed-bytes tier (deeper than k₂ or deep reader unwired). Failing closed."
+              s"[MptOverlay] revertToOrdinal($forkLong) GAP: retained fork image is empty and no authenticated empty-root " +
+                s"contract is available. Failing closed."
             ) >>
               (RevertGapError(
                 forkOrdinal,
                 tipOpt,
-                "fork ordinal reachable via neither the RAM undo journal nor the disk signed-bytes tier"
+                "retained fork image is empty and cannot be authenticated by this raw-byte reader"
+              ): Throwable).raiseError[F, RevertOutcome]
+          case Some(state) =>
+            validateCandidate(state) >>
+              logger.error(
+                s"[MptOverlay] revertToOrdinal($forkLong) GAP: retained image has ${state.size} entries, but the raw " +
+                  s"ordinal-only reader cannot authenticate the exact canonical hash and mptRoot. Failing closed before base mutation."
+              ) >>
+              (RevertGapError(
+                forkOrdinal,
+                tipOpt,
+                "retained image exists but the ordinal-only reader cannot authenticate its canonical hash and mptRoot"
+              ): Throwable).raiseError[F, RevertOutcome]
+          case None =>
+            logger.error(
+              s"[MptOverlay] revertToOrdinal($forkLong) GAP: fork ordinal is below the RAM undo-journal window and " +
+                s"no retained candidate bytes are available for future authenticated recovery. Failing closed."
+            ) >>
+              (RevertGapError(
+                forkOrdinal,
+                tipOpt,
+                "fork ordinal is reachable through neither the RAM undo journal nor an authenticated recovery capability"
               ): Throwable).raiseError[F, RevertOutcome]
         }
 
-      /** Common tail for every `revertToOrdinal` arm: clear pending overlay state so the re-fold starts clean (mirroring the finalize
-        * reorg-replace arms), drop finalized markers strictly above the fork (so the re-fold re-finalizes those ordinals via the clean
-        * `case None` path rather than a spurious reorg-replace), and fire the base-revert hook (eta `forgetUncommitted`).
+      /** Common tail for successful shallow/no-op `revertToOrdinal` arms: clear pending overlay state so the re-fold starts clean, drop
+        * finalized markers strictly above the fork, and fire the base-revert hook (eta `forgetUncommitted`). A failed raw deep candidate
+        * never reaches this method.
         */
       private def postRevertCleanup(forkLong: Long): F[Unit] =
         pendingRef.set(Map.empty) >>
@@ -1199,37 +1293,68 @@ object MptOverlay {
       /** Atomically apply the merged chain delta to the underlying base store.
         *
         * The bracket via `MptStore.withTransaction` ensures partial application cannot persist: if any of the producer-level operations
-        * (remove → insertBytes → commit) fails, the savepoint restores the base to its pre-call state. This is the partition-atomicity
-        * contract from #56.4.5: a single `finalizeBranch` writes either ALL partitions' deltas (rooted System indices + user fields) or
-        * NONE.
+        * (`replaceBytes` → commit) fails, the savepoint restores the base to its pre-call state. This is the partition-atomicity contract
+        * from #56.4.5: a single `finalizeBranch` writes either ALL partitions' deltas (rooted System indices + user fields) or NONE.
         *
-        * `Rethrow.rethrow` on the producer-level `Either` results lifts a `MerklePatriciaError` into `F` so the transaction rolls back
+        * `Rethrow.rethrow` on the producer-level `Either` result lifts a `MerklePatriciaError` into `F` so the transaction rolls back
         * rather than swallowing the failure (the legacy `.void` would have left the base half-applied without surfacing the error).
         *
-        * The `foldRaw` overload writes a delta to base without journaling — used by `applyUndoAt` to replay a captured reverse delta (which
-        * would otherwise recurse forever, journaling reversals of reversals). The public `foldIntoBase` wraps it with `captureReverseDelta`
-        * + `undoJournalRef` writes to enable atomic rollback on reorg-replace finality (#121).
+        * The `foldRaw` overload writes a delta to base without journaling. `applyUndoAt` and `applyUndoRange` use it (or its underlying
+        * transaction) to replay captured reverse deltas without recursively journaling reversals of reversals. `foldIntoBase` wraps it with
+        * `captureReverseDelta` + a cancellation-masked `undoJournalRef` write for reorg-replace finality (#121).
         */
       private def foldIntoBase(merged: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] =
-        for {
-          reverse <- captureReverseDelta(merged)
-          _ <- foldRaw(merged, ordinal)
-          _ <- undoJournalRef.update(_.updated(ordinal.value.value, reverse))
-        } yield ()
+        captureReverseDelta(merged).flatMap { reverse =>
+          Async[F].uncancelable { poll =>
+            poll(foldRaw(merged, ordinal)) >> undoJournalRef.update(_.updated(ordinal.value.value, reverse))
+          }
+        }
 
       private def foldRaw(delta: ChangeSet, ordinal: SnapshotOrdinal): F[Unit] =
         underlying.withTransaction {
           val producer = underlying.underlying
           for {
-            _ <-
-              if (delta.removals.nonEmpty) producer.remove(delta.removals.toList).rethrow
-              else Async[F].unit
-            _ <-
-              if (delta.upserts.nonEmpty) producer.insertBytes(delta.upserts).rethrow
-              else Async[F].unit
+            _ <- producer.replaceBytes(delta.upserts, delta.removals.toList).rethrow
             _ <- underlying.commit(ordinal)
           } yield ((), MptTxAction.Commit)
         }
+
+      /** Replace a previously finalized canonical at one ordinal without exposing the intermediate pre-ordinal base.
+        *
+        * The old reverse delta and the new forward delta are staged under one producer savepoint and one final commit. The reverse delta
+        * for the new canonical is captured after the old canonical has been undone, so it restores the actual common parent state. On
+        * failure or cancellation `MptStore.withTransaction` restores the old canonical image. Once the transaction succeeds, publication
+        * of the replacement undo record is cancellation-masked before this method returns.
+        */
+      private def replaceFinalizedBase(
+        merged: ChangeSet,
+        ordinal: SnapshotOrdinal,
+        previousCanonical: BranchId,
+        replacementCanonical: BranchId
+      ): F[Boolean] = {
+        val ord = ordinal.value.value
+
+        undoJournalRef.get.map(_.get(ord)).flatMap {
+          case None =>
+            FinalizationUndoGapError(ordinal, previousCanonical, replacementCanonical).raiseError[F, Boolean]
+          case Some(oldReverse) =>
+            Async[F].uncancelable { poll =>
+              val replace = underlying.withTransaction {
+                val producer = underlying.underlying
+                for {
+                  _ <- producer.replaceBytes(oldReverse.upserts, oldReverse.removals.toList).rethrow
+                  newReverse <- captureReverseDelta(merged)
+                  _ <- producer.replaceBytes(merged.upserts, merged.removals.toList).rethrow
+                  _ <- underlying.commit(ordinal)
+                } yield (newReverse, MptTxAction.Commit: MptTxAction)
+              }
+
+              poll(replace).flatMap { newReverse =>
+                undoJournalRef.update(_.updated(ord, newReverse)).as(true)
+              }
+            }
+        }
+      }
 
       /** Read the current base state for the keys touched by `forward` and build a `ChangeSet` whose application to base would undo
         * `forward`'s effect:
@@ -1258,16 +1383,53 @@ object MptOverlay {
         * may or may not be locally registered in `pendingRef`) is folded or simply recorded.
         */
       private def applyUndoAt(ord: Long, contextOrdinal: SnapshotOrdinal): F[Boolean] =
-        undoJournalRef.modify { journal =>
-          journal.get(ord) match {
-            case Some(reverse) => (journal - ord, Some(reverse))
-            case None          => (journal, None)
-          }
-        }.flatMap {
+        undoJournalRef.get.map(_.get(ord)).flatMap {
           case Some(reverse) if !reverse.isEmpty =>
-            foldRaw(reverse, contextOrdinal).as(true)
-          case Some(_) => true.pure[F] // empty reverse was journaled (degenerate case); count as applied
-          case None    => false.pure[F]
+            Async[F].uncancelable { poll =>
+              poll(foldRaw(reverse, contextOrdinal)) >> undoJournalRef.update(_ - ord).as(true)
+            }
+          case Some(_) =>
+            undoJournalRef.update(_ - ord).as(true) // empty reverse was journaled (degenerate case); count as applied
+          case None => false.pure[F]
+        }
+
+      /** Replay a contiguous descending undo band in one MPT transaction and publish the fork ordinal only after every reverse delta has
+        * staged successfully. Cache invalidation runs before the transaction; after it commits, cancellation stays masked while the undo
+        * journal and branch markers are advanced to the same fork. A durable `deleteAbove` failure can leave surplus files, but cannot
+        * leave a replayable undo band over an already-reverted base. Durable publication remains STOR-01/ROOT-009.
+        */
+      private def applyUndoRange(
+        descending: List[Long],
+        forkOrdinal: SnapshotOrdinal,
+        forkLong: Long
+      ): F[Int] =
+        undoJournalRef.get.flatMap { journal =>
+          descending.traverse { ord =>
+            journal
+              .get(ord)
+              .toRight(new IllegalStateException(s"Missing undo-journal entry for ordinal=$ord during shallow revert"))
+              .liftTo[F]
+              .tupleLeft(ord)
+          }.flatMap { steps =>
+            Async[F].uncancelable { poll =>
+              val restoreBand = underlying.withTransaction {
+                steps.traverse_ {
+                  case (_, reverse) if reverse.isEmpty => Async[F].unit
+                  case (_, reverse) =>
+                    underlying.underlying.replaceBytes(reverse.upserts, reverse.removals.toList).rethrow
+                } >> underlying.commit(forkOrdinal) >>
+                  (((), MptTxAction.Commit: MptTxAction)).pure[F]
+              }
+
+              poll(onBaseRevert) >>
+                poll(restoreBand) >>
+                undoJournalRef.update(_ -- descending) >>
+                pendingRef.set(Map.empty) >>
+                lastCommittedBranchRef.set(none) >>
+                finalizedRef.update(_.filter { case (o, _) => o.value.value <= forkLong }) >>
+                underlying.deleteAbove(forkOrdinal).as(steps.size)
+            }
+          }
         }
 
       private def deserializeBytes[V: ImmutableCodec](bytes: Array[Byte]): F[Option[V]] =

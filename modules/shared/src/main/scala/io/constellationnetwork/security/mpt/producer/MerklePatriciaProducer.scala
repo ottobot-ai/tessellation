@@ -43,6 +43,9 @@ trait StatefulMerklePatriciaProducer[F[_]] {
   /** Defensively copied full state image. Callers cannot mutate producer state through returned byte arrays. */
   def entries: F[Map[Hex, Array[Byte]]]
 
+  /** Immutable physical-key snapshot without copying stored values. */
+  def physicalKeys: F[Set[Hex]]
+
   /** Defensively copied point read. */
   def entry(key: Hex): F[Option[Array[Byte]]]
 
@@ -87,6 +90,7 @@ trait StatefulMerklePatriciaProducer[F[_]] {
 
   def insert[A: Encoder](data: Map[Hex, A]): F[Either[MerklePatriciaError, Unit]]
   def insertBytes(data: Map[Hex, Array[Byte]]): F[Either[MerklePatriciaError, Unit]]
+  def replaceBytes(upserts: Map[Hex, Array[Byte]], removals: List[Hex]): F[Either[MerklePatriciaError, Unit]]
   def update[A: Encoder](key: Hex, value: A): F[Either[MerklePatriciaError, Unit]]
   def remove(keys: List[Hex]): F[Either[MerklePatriciaError, Unit]]
   def clear: F[Unit]
@@ -143,3 +147,35 @@ object MerklePatriciaProducer {
 sealed trait MerklePatriciaError extends Throwable
 case class InvalidData(message: String) extends MerklePatriciaError
 case class OperationError(message: String) extends MerklePatriciaError
+
+sealed trait PhysicalTrieKeyError extends MerklePatriciaError
+
+final case class OddLengthPhysicalTrieKey(key: Hex) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie key must contain whole bytes (even hex length): ${key.value}"
+}
+
+final case class InvalidDigitPhysicalTrieKey(key: Hex, index: Int, digit: Char) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie key contains invalid hex digit '$digit' at index $index: ${key.value}"
+}
+
+final case class NonCanonicalPhysicalTrieKey(key: Hex, canonical: Hex) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie key is not canonical lowercase hex: ${key.value}; canonical=${canonical.value}"
+}
+
+final case class DuplicatePhysicalTriePath(path: Hex, first: Hex, second: Hex) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie keys resolve to the same nibble path ${path.value}: ${first.value}, ${second.value}"
+}
+
+final case class TerminalPhysicalTrieKeyCollision(terminal: Hex, descendant: Hex) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie key ${terminal.value} is a terminal prefix of ${descendant.value}"
+}
+
+final case class NonShrinkingPhysicalTrieGroup(depth: Int, terminal: Hex, conflicting: Hex) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie group cannot shrink at nibble depth $depth: terminal=${terminal.value}, conflicting=${conflicting.value}"
+}

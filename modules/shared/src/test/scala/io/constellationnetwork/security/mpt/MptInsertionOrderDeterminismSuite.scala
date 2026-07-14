@@ -811,26 +811,6 @@ object MptInsertionOrderDeterminismSuite extends MutableIOSuite {
 
       _ <- IO.println(s"[VAR-LEN] Bulk: $bulkRoot, Incremental (base+inc): ${incTrie.rootHash}, Match: ${bulkRoot == incTrie.rootHash}")
 
-      // Also test with prefix keys (where one key is a prefix of another)
-      prefixEntries: Map[Hex, Array[Byte]] = Map(
-        Hex("aabb") -> """{"prefix":1}""".getBytes("UTF-8"),
-        Hex("aabbccdd") -> """{"prefix":2}""".getBytes("UTF-8"),
-        Hex("aabbccddeeff") -> """{"prefix":3}""".getBytes("UTF-8")
-      )
-      prefixBulk <- parallelProducer.createFromBytes(prefixEntries)
-      prefixHashEntries <- prefixEntries.toList.traverse {
-        case (hex, bytes) => Hasher[IO].hashBytes(bytes).map(hash => (hex, hash))
-      }
-      prefixSorted = prefixHashEntries.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
-      // Build with first entry as base, then incremental
-      prefixBaseMap = Map(prefixSorted.head._1 -> prefixEntries(prefixSorted.head._1))
-      prefixBaseTrie <- parallelProducer.createFromBytes(prefixBaseMap)
-      prefixIncRoot <- IncrementalTrieOps.insertMultiple[IO](prefixBaseTrie.rootNode, prefixSorted.tail)
-      prefixIncTrie = MerklePatriciaTrie(prefixIncRoot)
-
-      _ <- IO.println(
-        s"[PREFIX] Bulk: ${prefixBulk.rootHash}, Incremental (base+inc): ${prefixIncTrie.rootHash}, Match: ${prefixBulk.rootHash == prefixIncTrie.rootHash}"
-      )
-    } yield expect(bulkRoot == incTrie.rootHash).and(expect(prefixBulk.rootHash == prefixIncTrie.rootHash))
+    } yield expect(bulkRoot == incTrie.rootHash)
   }
 }

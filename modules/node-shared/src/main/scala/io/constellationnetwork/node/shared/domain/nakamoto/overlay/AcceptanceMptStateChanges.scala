@@ -219,7 +219,8 @@ object AcceptanceMptStateChanges {
       _ <- mpt.insert[Signed[CurrencyIncrementalSnapshot]](currency._1)
       // fieldId-6 monolithic blob REPLACED by the unrolled per-entry `Mg*` partitions (UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN §6):
       // for each MG, reconstruct the prior info from the branch-aware overlay view (the same `getAllForPrefix` the writer accumulates
-      // into), then upsert the 8 `Mg*` entries + remove dropped ones via the shared `writeCurrencyInfo` (byte-identical to `infoEntryBytes`).
+      // into), then upsert all eight serialized `Mg*` partitions (seven rooted fields plus the transitional root-excluded sync view) and
+      // remove dropped entries via the shared `writeCurrencyInfo` (byte-identical to `infoEntryBytes`).
       // Does NOT touch fieldId-5 (above) nor activeAllowSpends/fieldId-7 (the `removedAllowSpendKeys` path).
       _ <- currency._2.traverse_ {
         case (metagraphAddr, newInfo) =>

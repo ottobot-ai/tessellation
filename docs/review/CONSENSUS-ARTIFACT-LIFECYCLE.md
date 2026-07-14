@@ -272,19 +272,40 @@ reject a valid density winner.
 read-only facade. Evidence validation is separate from the crash-consistent
 coordinator that applies the resulting transition.
 
+**Proposed O-16 contract, not ratified:** if O-16 is accepted, a verified exact P2
+query would mint only a local, purpose-scoped, non-serializable lease over the
+exact released core, qualification/current-chain evidence, MPT/semantic/anchor
+readbacks, and persisted lineage revision. Acquisition would use two short
+coordinator operations around unlocked immutable artifact verification; the
+second operation would compare-and-set the complete captured descriptor before
+minting. Long replay, DA, network, signature, and committee waits would run
+without holding finality or MPT locks. Immediately before an authority-bearing
+consumer mutation, `commitIfCurrent` would recheck the exact release and lineage
+and order an idempotent scoped sink command. Under the recommended V1 choice, a
+density replacement would invalidate every old-lineage permit and all derived
+cache/tally/queue/shard-buffer authority; raw bounded bytes could remain only for
+fresh verification. Pure descendant extension could preserve an exact-ancestor
+use after recheck, while a current-head use would reacquire when the P2 head
+advances. The proposed contract and unresolved owner choices are in
+`P6-FIN14-PHASE2-CONSUMER-LEASE.md` and O-16. None of this is live authority today.
+
 ### 4.4 Capabilities governed by the gadget
 
 `FinalityGate` is consulted by consensus and state transitions, not only HTTP:
 
 - exact operational serving and same-ordinal replacement;
-- metagraph `globalSyncView` validation;
-- shard execution-base and committee-epoch derivation;
-- checkpoint hard-anchor advancement;
+- metagraph `globalSyncView` validation, binary admission, tally/cache authority,
+  and shard-buffer insertion;
+- shard execution-base and committee-epoch derivation, execution signing,
+  assigned-watchtower replay, and challenge adjudication;
+- checkpoint inclusion and hard-anchor advancement;
 - binary confirmation, requeue, and retention;
-- cross-metagraph origin eligibility;
+- cross-metagraph origin eligibility and settlement reads;
+- exact historical contexts used for optimistic sampling and tower eligibility;
+- tower/light-proof serving and protocol-level GL0 correction;
 - follower adoption, rollback, and rebase;
 - MPT fold/undo retention and verified deep recovery;
-- operational APIs and downstream event delivery.
+- operational APIs, exact bootstrap serving, and downstream event delivery.
 
 Inbound state-channel bytes may be staged while the GL0 head is ahead of P2.
 Before execution, signing, or inclusion, every referenced base must resolve to an

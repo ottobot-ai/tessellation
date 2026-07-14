@@ -16,7 +16,7 @@ import scodec.Codec
 import shapeless.{::, HNil}
 
 /** Canonical scodec codec for `ConsumedAllowSpend` — the value record of the cross-shard single-use SPENT-SET
-  * (`GlobalStateFieldId.ConsumedAllowSpends`, fieldId 33). 7-field record.
+  * (`GlobalStateFieldId.ConsumedAllowSpends`, fieldId 33). 8-field record.
   *
   * Wire layout (declared field order):
   *   - allowSpendHash : Hash (variable, length-prefixed)

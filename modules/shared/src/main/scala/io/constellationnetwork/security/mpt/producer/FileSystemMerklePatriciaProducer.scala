@@ -48,6 +48,39 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
   private def copyEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
     FileSystemMerklePatriciaProducer.copyEntries(entries)
 
+  private def stageChanges(
+    byteEntries: Map[Hex, Array[Byte]],
+    removals: List[Hex]
+  ): F[Either[MerklePatriciaError, Unit]] =
+    Async[F].uncancelable { _ =>
+      stateRef
+        .modify[Either[MerklePatriciaError, Unit]] { current =>
+          val retainedKeys = current.keySet -- removals
+          (for {
+            _ <- PhysicalTrieKeyValidator.validateEachKey(removals)
+            _ <- PhysicalTrieKeyValidator.validateInsertion(retainedKeys, byteEntries.keys)
+          } yield ()) match {
+            case Left(error) => current -> Left(error)
+            case Right(_) =>
+              val candidate = byteEntries.foldLeft(current -- removals) {
+                case (entries, (key, value)) => entries.updated(key, value)
+              }
+              candidate -> Right(())
+          }
+        }
+        .flatMap {
+          case Left(error) => (error: MerklePatriciaError).asLeft[Unit].pure[F]
+          case Right(_) =>
+            val effectiveRemovals = removals.filterNot(byteEntries.contains)
+            (pendingRemovesRef.update(existing => (existing.filterNot(byteEntries.contains) ++ effectiveRemovals).distinct) >>
+              pendingInsertsRef.update { existing =>
+                byteEntries.foldLeft(existing -- effectiveRemovals) {
+                  case (entries, (key, value)) => entries.updated(key, value)
+                }
+              }).as(().asRight[MerklePatriciaError])
+        }
+    }
+
   override def getProver: F[MerklePatriciaSingleInclusionProver[F]] =
     build.flatMap {
       case Right(trie) => parallelProducer.getProver(trie)
@@ -56,6 +89,9 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
 
   override def entries: F[Map[Hex, Array[Byte]]] =
     stateRef.get.map(copyEntries)
+
+  override def physicalKeys: F[Set[Hex]] =
+    stateRef.get.map(_.keySet)
 
   override def entry(key: Hex): F[Option[Array[Byte]]] =
     stateRef.get.map(_.get(key).map(FileSystemMerklePatriciaProducer.copyBytes))
@@ -159,6 +195,8 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
             _ <- pendingRemovesRef.set(List.empty)
             _ <- logger.info(s"[MPT] Full build completed")
           } yield trie.asRight[MerklePatriciaError]
+        case Left(e: MerklePatriciaError) =>
+          e.asLeft[MerklePatriciaTrie].pure[F]
         case Left(e) =>
           (OperationError(e.getMessage): MerklePatriciaError).asLeft[MerklePatriciaTrie].pure[F]
       }
@@ -227,44 +265,41 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
         byteEntries <- data.toList.traverse {
           case (k, v) => JsonSerializer[F].serialize(v.asJson).map(k -> _)
         }.map(_.toMap)
-        _ <- stateRef.update(_ ++ byteEntries)
-        _ <- pendingRemovesRef.update(_.filterNot(byteEntries.contains))
-        _ <- pendingInsertsRef.update(_ ++ byteEntries)
-      } yield ().asRight[MerklePatriciaError]
+        result <- stageChanges(byteEntries, List.empty)
+      } yield result
 
   def insertBytes(data: Map[Hex, Array[Byte]]): F[Either[MerklePatriciaError, Unit]] =
     if (data.isEmpty) ().asRight[MerklePatriciaError].pure[F]
     else {
       val owned = copyEntries(data)
-      for {
-        _ <- logger.debug(s"[MPT] Inserting ${owned.size} byte entries")
-        _ <- stateRef.update(_ ++ owned)
-        _ <- pendingRemovesRef.update(_.filterNot(owned.contains))
-        _ <- pendingInsertsRef.update(_ ++ owned)
-      } yield ().asRight[MerklePatriciaError]
+      logger.debug(s"[MPT] Inserting ${owned.size} byte entries") >> stageChanges(owned, List.empty)
     }
 
+  override def replaceBytes(
+    upserts: Map[Hex, Array[Byte]],
+    removals: List[Hex]
+  ): F[Either[MerklePatriciaError, Unit]] =
+    if (upserts.isEmpty && removals.isEmpty) ().asRight[MerklePatriciaError].pure[F]
+    else stageChanges(copyEntries(upserts), removals)
+
   override def update[A: Encoder](key: Hex, value: A): F[Either[MerklePatriciaError, Unit]] =
-    stateRef.get.flatMap { state =>
-      if (!state.contains(key))
-        (OperationError(s"Key not found: $key"): MerklePatriciaError).asLeft[Unit].pure[F]
-      else
-        for {
-          bytes <- JsonSerializer[F].serialize(value.asJson)
-          _ <- stateRef.update(_ + (key -> bytes))
-          _ <- pendingInsertsRef.update(_ + (key -> bytes))
-        } yield ().asRight[MerklePatriciaError]
+    PhysicalTrieKeyValidator.validateKey(key) match {
+      case Left(error) => (error: MerklePatriciaError).asLeft[Unit].pure[F]
+      case Right(_) =>
+        stateRef.get.flatMap { state =>
+          if (!state.contains(key))
+            (OperationError(s"Key not found: $key"): MerklePatriciaError).asLeft[Unit].pure[F]
+          else
+            for {
+              bytes <- JsonSerializer[F].serialize(value.asJson)
+              _ <- stateRef.update(_ + (key -> bytes))
+              _ <- pendingInsertsRef.update(_ + (key -> bytes))
+            } yield ().asRight[MerklePatriciaError]
+        }
     }
 
   override def remove(keys: List[Hex]): F[Either[MerklePatriciaError, Unit]] =
-    if (keys.isEmpty) ().asRight[MerklePatriciaError].pure[F]
-    else
-      for {
-        _ <- logger.debug(s"[MPT] Removing ${keys.size} entries")
-        _ <- stateRef.update(_ -- keys)
-        _ <- pendingInsertsRef.update(_ -- keys)
-        _ <- pendingRemovesRef.update(existing => (existing ++ keys).distinct)
-      } yield ().asRight[MerklePatriciaError]
+    logger.debug(s"[MPT] Removing ${keys.size} entries").whenA(keys.nonEmpty) >> replaceBytes(Map.empty, keys)
 
   override def clear: F[Unit] =
     logger.info("[MPT] Clearing state") >>
@@ -276,39 +311,34 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
       lastBuiltOrdinalRef.set(None)
 
   override def buildHexMap(data: Map[GlobalStateKey, Json]): F[Map[Hex, Array[Byte]]] =
-    if (data.size <= BatchSize)
-      data.toList.parTraverse {
-        case (key, value) =>
-          for {
-            hex <- GlobalStateKey.toHex[F](key)
-            bytes <- JsonSerializer[F].serialize(value)
-          } yield hex -> bytes
-      }.map(_.toMap)
-    else {
-      // Process all batches in parallel and combine at the end
-      // This avoids O(n) map concatenation per batch
-      val batches = data.toList.grouped(BatchSize).toList
-      batches.parTraverse { batch =>
-        batch.parTraverse {
-          case (key, value) =>
-            for {
-              hex <- GlobalStateKey.toHex[F](key)
-              bytes <- JsonSerializer[F].serialize(value)
-            } yield hex -> bytes
-        }
-      }
-        .map(_.flatten.toMap)
-    }
+    (if (data.size <= BatchSize)
+       data.toList.parTraverse {
+         case (key, value) =>
+           for {
+             hex <- GlobalStateKey.toHex[F](key)
+             bytes <- JsonSerializer[F].serialize(value)
+           } yield hex -> bytes
+       }
+     else {
+       val batches = data.toList.grouped(BatchSize).toList
+       batches.parTraverse { batch =>
+         batch.parTraverse {
+           case (key, value) =>
+             for {
+               hex <- GlobalStateKey.toHex[F](key)
+               bytes <- JsonSerializer[F].serialize(value)
+             } yield hex -> bytes
+         }
+       }.map(_.flatten)
+     }).flatMap(PhysicalTrieKeyValidator.materializeEntries(_).liftTo[F])
 
   override def persist(ordinal: SnapshotOrdinal): F[Unit] =
     for {
       state <- stateRef.get
-      _ <-
-        if (state.nonEmpty)
-          // Never prune other recovery generations after this write reports failure. This ordering does not make the legacy direct
-          // overwrite crash-safe; durable image publication is a separate migration.
-          storage.writeState(ordinal, state) >> applyCutoff(ordinal)
-        else logger.warn(s"[MPT] Cannot persist: no state")
+      // An empty image is still a real state generation. Skipping it can resurrect an older non-empty image on restart.
+      // Never prune other recovery generations after this write reports failure. This ordering does not make the legacy direct
+      // overwrite crash-safe; durable image publication is a separate migration.
+      _ <- storage.writeState(ordinal, state) >> applyCutoff(ordinal)
     } yield ()
 
   override def load(ordinal: SnapshotOrdinal): F[Boolean] =
@@ -317,14 +347,18 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
 
       loaded <- storage.readState(ordinal).flatMap {
         case Some(state) =>
-          for {
-            _ <- logger.info(s"[MPT] Found ${state.size} entries")
-            _ <- stateRef.set(copyEntries(state))
-            _ <- trieRef.set(None)
-            _ <- pendingInsertsRef.set(Map.empty)
-            _ <- pendingRemovesRef.set(List.empty)
-            _ <- logger.info(s"[MPT] State loaded")
-          } yield true
+          PhysicalTrieKeyValidator.validateKeys(state.keys) match {
+            case Left(error) => error.raiseError[F, Boolean]
+            case Right(_) =>
+              for {
+                _ <- logger.info(s"[MPT] Found ${state.size} entries")
+                _ <- stateRef.set(copyEntries(state))
+                _ <- trieRef.set(None)
+                _ <- pendingInsertsRef.set(Map.empty)
+                _ <- pendingRemovesRef.set(List.empty)
+                _ <- logger.info(s"[MPT] State loaded")
+              } yield true
+          }
 
         case None =>
           logger.info(s"[MPT] No state found for ordinal=$ordinal") >> false.pure[F]
@@ -341,6 +375,7 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
         for {
           _ <- logger.info("[MPT] Building from provided data")
           data <- buildData
+          _ <- PhysicalTrieKeyValidator.validateKeys(data.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
           _ <- stateRef.set(copyEntries(data))
           _ <- trieRef.set(None)
           _ <- pendingInsertsRef.set(Map.empty)
@@ -391,6 +426,7 @@ object FileSystemMerklePatriciaProducer {
     initial: Map[Hex, Array[Byte]] = Map.empty
   ): F[FileSystemMerklePatriciaProducer[F]] =
     for {
+      _ <- PhysicalTrieKeyValidator.validateKeys(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
       stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
@@ -415,6 +451,7 @@ object FileSystemMerklePatriciaProducer {
     initial: Map[Hex, Array[Byte]]
   ): F[FileSystemMerklePatriciaProducer[F]] =
     for {
+      _ <- PhysicalTrieKeyValidator.validateKeys(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
       stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)

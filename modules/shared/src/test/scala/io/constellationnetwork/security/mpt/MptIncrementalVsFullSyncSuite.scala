@@ -624,25 +624,23 @@ object MptIncrementalVsFullSyncSuite extends MutableIOSuite with Checkers {
       producer1 <- InMemoryMerklePatriciaProducer.make[IO]()
       store1 <- MptStore.make[IO, GlobalStateKey](producer1, GlobalStateKey.toHex[IO])
       _ <- store1.syncFromGlobalSnapshotInfo(info, ordinal)
-      trie1 <- store1.build(ordinal)
-      root1 = trie1.map(_.rootHash)
+      trie1 <- store1.build(ordinal).rethrow
+      root1 = trie1.rootHash
 
       // Get entries from underlying producer
       entries1 <- producer1.entries
 
       // Build second MPT from extracted entries
       producer2 <- InMemoryMerklePatriciaProducer.make[IO]()
-      _ <- producer2.insertBytes(entries1)
-      trie2 <- producer2.buildForOrdinal(ordinal)
-      root2 = trie2.map(_.rootHash)
+      _ <- producer2.replaceBytes(entries1, List.empty).rethrow
+      trie2 <- producer2.buildForOrdinal(ordinal).rethrow
+      root2 = trie2.rootHash
 
       _ <- IO.println(s"[DEBUG] Original MPT root: $root1")
       _ <- IO.println(s"[DEBUG] Rebuilt from entries MPT root: $root2")
       _ <- IO.println(s"[DEBUG] Entries count: ${entries1.size}")
     } yield
       expect.all(
-        root1.isRight,
-        root2.isRight,
         root1 == root2
       )
   }

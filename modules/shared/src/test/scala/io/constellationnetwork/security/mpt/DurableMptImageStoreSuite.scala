@@ -206,6 +206,47 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     }
   }
 
+  test("prepare rejects terminal-colliding keys before an injected root verifier or active publication changes") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val valid = entries("physical-key-preflight")
+      val invalid = Map(
+        Hex("aa") -> ByteVector(1),
+        Hex("aa00") -> ByteVector(2)
+      )
+
+      for {
+        fixedRoot <- rootOf(valid)
+        verifierCalls <- Ref.of[IO, Int](0)
+        permissiveVerifier = new MptImageRootVerifier[IO] {
+          val rootEra: MptImageRootEra = DurableMptImageStoreSuite.rootEra
+          def rebuild(entries: Vector[(Hex, ByteVector)]): IO[MptRoot] = verifierCalls.update(_ + 1).as(fixedRoot)
+        }
+        result <- DurableMptImageStore.resource[IO](directory, codecEra, permissiveVerifier, limits).use { store =>
+          val anchor0 = GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), fixedRoot)
+          val anchor1 = GlobalSnapshotStateRef(ordinal1, snapshotHash(ordinal1), parentHash(ordinal1), fixedRoot)
+
+          for {
+            receipt <- store.prepare(0L, anchor0, valid)
+            _ <- store.publish(receipt, None)
+            before <- store.activeReceipt
+            callsBefore <- verifierCalls.get
+            rejected <- store.prepare(1L, anchor1, invalid).attempt
+            callsAfter <- verifierCalls.get
+            after <- store.activeReceipt
+          } yield
+            expect.all(
+              rejected.swap.exists(_.isInstanceOf[InvalidEntry]),
+              callsAfter == callsBefore,
+              before.contains(receipt),
+              after == before
+            )
+        }
+      } yield result
+    }
+  }
+
   test("prepare captures aliased bytes before the independent root verifier runs") { res =>
     implicit val (json, hasher) = res
 

@@ -212,8 +212,9 @@ object ShardCheckpointWiring {
     * '''Diff base = `S(N)` from the adopted, chain-linked best-tip (PIN-4 — NOT empty-prior, NOT the undo journal).''' The committee +
     * every verifier are gl0 nodes that ALREADY adopted checkpoint N (the chain-link guard enforces in-order adoption), so `S(N)` — the
     * prior checkpoint's cumulative per-MG currency state — is already in their overlay best-tip. `priorStateReader` is exactly that
-    * best-tip `GlobalStateReader`; `S(N)` is reconstructed from it via [[GlobalStateConverter.reconstructCurrencyInfoFrom]] (8 `Mg*` +
-    * fieldId-7 allow-spends) and the fieldId-5 incremental. Snapshots execute IN ORDER (chain-link), so cumulative state, allow-spends, and
+    * best-tip `GlobalStateReader`; `S(N)` is reconstructed from it via [[GlobalStateConverter.reconstructCurrencyInfoFrom]] (all eight
+    * serialized `Mg*` fields, including the transitional root-excluded sync view, plus fieldId-7 allow-spends) and the fieldId-5
+    * incremental. Snapshots execute IN ORDER (chain-link), so cumulative state, allow-spends, and
     * token-locks accumulate. The per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only.
     *
     * '''Derivation.''' Runs the SAME full recreation as the global adopter, with finalized global-snapshot lookup, and seeds

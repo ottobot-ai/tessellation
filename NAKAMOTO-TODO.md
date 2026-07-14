@@ -152,15 +152,37 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `AcceptanceMptSuite.scala`). This is nonauthoritative transport plumbing only:
     it does not prove exact-parent availability, branch identity, root, snapshot,
     or Phase 2.
-    - [ ] Complete `ROOT-008`: define one bounded semantic grammar per partition,
+    - [ ] Complete `ROOT-008`: define one bounded structural grammar per partition,
       first reject every noncanonical/invalid/aliased physical key from the whole
       image, then consume all bytes, derive identity/scope from the value,
       reproduce the physical key exactly, and reject duplicate logical identities
       before any map/set construction. Never omit a matched malformed entry.
+      - Design packet: `docs/review/ROOT-008-GL0-PARTITION-GRAMMAR.md` inventories
+        every physical ID 0-34, current carrier/codec, target shape, semantic
+        identity, relational checks, and root ownership. This is design evidence,
+        not implementation closure.
+      - [ ] **OWNER REVIEW O-17/R008-01..07:** retired IDs 3/6/21 and
+        post-witness 32; field-20
+        period-bearing value; field-23 peer-bearing value; concrete consensus
+        resource limits plus permanent nullifier/slash growth; economic set-member
+        identities; and token-lock currency scope. Do not freeze or activate the
+        target schema before these decisions.
+      - [ ] Generate and pass `ROOT-008-F00..F34` across producer, signer,
+        adopter, restart, catch-up, reorg, bootstrap, and offline import.
+      - [ ] Replace field-34 canonical JSON with one frozen scodec value codec;
+        no live fork-only compatibility decoder.
     - [ ] Close `MPT-07`/`ROOT-011` before raw recovery or parser migration:
       preflight the complete candidate before build/live mutation; reject aliases
       and terminal/prefix collisions without normalization; make the builder fail
       boundedly on any nonshrinking group; preserve the prior image on rejection.
+      - **PARTIAL IN WORKTREE:** generic full/incremental producers, typed-key
+        materialization, stateful mutation, disk/wire map decode, overlay commit/
+        build/fold/reorg, and durable image capture now enforce the physical grammar;
+        public incremental operations are canonically ordered and focused prior-state
+        regressions exist. Do not mark the finding closed.
+      - [ ] Add duplicate-member-preserving and consensus-bounded raw transport;
+        pinned/network/disk/reorg integration plus production-scale tests; ROOT-005
+        mutation ownership; and ROOT-009/BR-05 authenticated staged installation.
   - [ ] **3. Parallel consumer migrations:** after step 2, independently close
     `MPT-01` Mg* value-only reconstruction; `MPT-02` consumed-allow-spend
     physical nullifier keys; `MPT-03` stake/collateral scope and keys; `MPT-04`
@@ -626,6 +648,20 @@ criteria are in `NAKAMOTO-PLAN.md`.
     MPT publisher, follower, or service path calls it, so L-23 remains open.
     Exact per-hash P0/P1 state and the optimistic K/alpha/beta decision cascade are
     not implemented by this durability slice.
+  - [ ] **P6-FIN14-A DESIGNED / OWNER REVIEW REQUIRED - exact Phase-2 consumer
+    lease and invalidation.** The nonactivating packet at
+    `docs/review/P6-FIN14-PHASE2-CONSUMER-LEASE.md` defines a package-minted,
+    exhaustively purpose-scoped local lease, two short acquisition operations
+    around unlocked immutable verification, descendant-extension versus lineage-
+    replacement revisions, short `commitIfCurrent`, generation-scoped admission/
+    cache/tally/shard-buffer derivatives, and `FOLLOW-008A..P`. It explicitly
+    forbids holding finality/MPT/chain locks across image validation, committee
+    polling, or replay. P6 owns the lease kernel; P8 owns shard/admission consumers,
+    P10 followers/economic reads, P11 serving/recovery, and P7 only the exact diff/
+    root/checkpoint interfaces. Do not add a live issuer until O-16A..F is ratified
+    and O-15/O-01, exact released-core evidence and MPT/semantic/anchor readback,
+    ROOT gates, durable consumer effect ordering, and the complete RED matrix close.
+    An opaque wrapper around the current Boolean is still FIN-14.
   - Before activation, add authenticated finality-evidence/fork-choice authority and
     hold/recheck the exact branch revision through publication; package-own the
     MPT-plus-semantic-plus-anchor readback capability that may advance
@@ -642,7 +678,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters
     `RecoveryRequired`; it never falls back to receiver live head.
-  - **Gate:** `BOOT-001..005`, `XMG-006`, `FOLLOW-001..005`, `REC-*` including
+  - **Gate:** `BOOT-001..005`, `XMG-006`, `FOLLOW-001..007` plus
+    `FOLLOW-008A..P`, `REC-*` including
     `REC-004/005`, `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02`,
     `GROWTH-001`.
 

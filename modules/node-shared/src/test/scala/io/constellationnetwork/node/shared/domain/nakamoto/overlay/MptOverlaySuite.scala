@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
-import cats.effect.{IO, Ref, Resource}
+import cats.effect.{Deferred, IO, Ref, Resource}
 import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -14,11 +14,12 @@ import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.security.mpt.producer.{InMemoryMerklePatriciaProducer, TerminalPhysicalTrieKeyCollision}
 import io.constellationnetwork.serde.codecs.StringCodec._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import eu.timepit.refined.types.numeric.NonNegLong
+import io.circe.Encoder
 import weaver.MutableIOSuite
 
 /** Tests for `MptOverlay.passthrough` (#56.2) and `MptOverlay.make(enabled=true)` multi-branch impl (#56.4).
@@ -266,6 +267,34 @@ object MptOverlaySuite extends MutableIOSuite {
       // Multi-branch isolates pre-commit writes — store sees nothing yet.
       directRead <- store.get[Balance](key)
     } yield expect(directRead.isEmpty)
+  }
+
+  test("multi-branch commit rejects a physical prefix collision before publishing the branch") { res =>
+    implicit val (h, _, js) = res
+    val initial = Map(Hex("aa") -> Array[Byte](1))
+
+    for {
+      producer <- InMemoryMerklePatriciaProducer.make[IO](initial)
+      store <- MptStore.make[IO, Hex](producer, _.pure[IO])
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, Hex](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        store,
+        pcTree,
+        _.pure[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[String](Hex("aa00"), "collision")
+      rejected <- overlay.commit(handle, branchA, ordinal).attempt
+      baseAfter <- store.allEntriesAsBytes
+      branchAfter <- overlay.allEntriesAsBytes(branchA)
+    } yield
+      expect.all(
+        rejected == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+        sameBytes(baseAfter, initial),
+        sameBytes(branchAfter, initial)
+      )
   }
 
   // ============================================================
@@ -1030,7 +1059,95 @@ object MptOverlaySuite extends MutableIOSuite {
         )
   }
 
-  test("multi-branch: finalizeBranch on an unknown branch is a NoOp (idempotency entry recorded)") { res =>
+  test("multi-branch: reorg-replace canonical-not-in-pending fails closed when the prior undo is missing") { res =>
+    implicit val (h, _, js) = res
+    val seed = gskBalance(3020)
+    val oldKey = gskBalance(3021)
+
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      _ <- store.insert[Balance](seed, Balance(NonNegLong(1L)))
+
+      oldHandle <- overlay.checkout(parentP)
+      _ <- oldHandle.insert[Balance](oldKey, Balance(NonNegLong(11L)))
+      _ <- overlay.commit(oldHandle, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      // This replacement has no local payload and consumes branchA's undo, leaving the parent base.
+      _ <- overlay.finalizeBranch(branchB, ordinal)
+      baseBeforeGap <- snapshotBytes(store)
+      sizesBeforeGap <- overlay.journalSizes
+
+      rejected <- overlay.finalizeBranch(branchC, ordinal).attempt
+      baseAfterGap <- snapshotBytes(store)
+      sizesAfterGap <- overlay.journalSizes
+
+      // Recovery explicitly resets overlay history after restoring/confirming the parent image.
+      _ <- overlay.unsafe_reset
+      retriedAfterRecovery <- overlay.finalizeBranch(branchC, ordinal)
+    } yield
+      expect.all(
+        rejected match {
+          case Left(_: FinalizationUndoGapError) => true
+          case _                                 => false
+        },
+        sameBytes(baseAfterGap, baseBeforeGap),
+        sizesAfterGap == sizesBeforeGap,
+        retriedAfterRecovery == FinalizationOutcome.NoOp
+      )
+  }
+
+  test("multi-branch: reorg-replace canonical-in-pending preserves base and refs when the prior undo is missing") { res =>
+    implicit val (h, _, js) = res
+    val seed = gskBalance(3030)
+    val oldKey = gskBalance(3031)
+    val replacementKey = gskBalance(3032)
+    val replacementValue = Balance(NonNegLong(33L))
+
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      _ <- store.insert[Balance](seed, Balance(NonNegLong(1L)))
+
+      oldHandle <- overlay.checkout(parentP)
+      _ <- oldHandle.insert[Balance](oldKey, Balance(NonNegLong(22L)))
+      _ <- overlay.commit(oldHandle, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchB, ordinal) // consumes the only undo at this ordinal
+
+      replacementHandle <- overlay.checkout(parentP)
+      _ <- replacementHandle.insert[Balance](replacementKey, replacementValue)
+      _ <- overlay.commit(replacementHandle, branchC, ordinal)
+      baseBeforeGap <- snapshotBytes(store)
+      sizesBeforeGap <- overlay.journalSizes
+
+      rejected <- overlay.finalizeBranch(branchC, ordinal).attempt
+      baseAfterGap <- snapshotBytes(store)
+      sizesAfterGap <- overlay.journalSizes
+      pendingAfterGap <- overlay.get[Balance](branchC, replacementKey)
+
+      _ <- overlay.unsafe_reset
+      recoveredHandle <- overlay.checkout(parentP)
+      _ <- recoveredHandle.insert[Balance](replacementKey, replacementValue)
+      _ <- overlay.commit(recoveredHandle, branchC, ordinal)
+      retriedAfterRecovery <- overlay.finalizeBranch(branchC, ordinal)
+      replacementAfterRecovery <- store.get[Balance](replacementKey)
+    } yield
+      expect.all(
+        rejected match {
+          case Left(_: FinalizationUndoGapError) => true
+          case _                                 => false
+        },
+        sameBytes(baseAfterGap, baseBeforeGap),
+        sizesAfterGap == sizesBeforeGap,
+        pendingAfterGap.contains(replacementValue),
+        retriedAfterRecovery == FinalizationOutcome.Folded(1, 0),
+        replacementAfterRecovery.contains(replacementValue)
+      )
+  }
+
+  test("multi-branch: unknown first finalization is idempotent but a different hash fails without an undo") { res =>
     implicit val (h, _, js) = res
     for {
       pair <- mkMultiBranch
@@ -1040,13 +1157,16 @@ object MptOverlaySuite extends MutableIOSuite {
       r1 <- overlay.finalizeBranch(branchA, ordinal)
       // Re-finalizing same (ordinal, branchA) — still NoOp.
       r2 <- overlay.finalizeBranch(branchA, ordinal)
-      // Re-finalizing same ordinal with DIFFERENT canonical reorg-replaces: NoOp because nothing pending.
-      reorg <- overlay.finalizeBranch(branchB, ordinal)
+      // No fold occurred, so there is no authenticated undo record proving the pre-ordinal base for a different hash.
+      reorg <- overlay.finalizeBranch(branchB, ordinal).attempt
     } yield
       expect.all(
         r1 == FinalizationOutcome.NoOp,
         r2 == FinalizationOutcome.NoOp,
-        reorg == FinalizationOutcome.NoOp
+        reorg match {
+          case Left(_: FinalizationUndoGapError) => true
+          case _                                 => false
+        }
       )
   }
 
@@ -1540,16 +1660,11 @@ object MptOverlaySuite extends MutableIOSuite {
   // #139 — legacy T_depth2 local-retention prune of overlay history (not a protocol phase)
   // ============================================================
   //
-  // Contract: `pruneBelow(ord)` drops in-memory accumulators whose entries are strictly below `ord`.
-  // Pruning is purely a memory bound — production code paths produce identical `mptRoot`s before
-  // and after — and irreversible (entries at depth > k₂ ≈ 65536 cannot be reorg'd in practice).
-  //
-  // Observable signals:
-  //   - `finalizedRef`: a finalize that previously hit the reorg-replace path (entry present) hits
-  //     the no-prior-finality path (`case None`) after pruning — observable via `FinalizationOutcome`.
-  //   - `undoJournalRef`: a reorg-replace with canonical-not-in-pending used to UNDO the prior
-  //     canonical's writes via the journal entry; after pruning, no undo replay happens — observable
-  //     via reads of the prior canonical's keys (they remain in base).
+  // Contract: `pruneBelow(ord)` drops in-memory finalized and undo entries strictly below `ord` and
+  // advances a monotone retained-history floor. k₂ is a local retention recommendation, not a
+  // fork-choice or finality floor: a later finalize below the retained floor must fail closed with
+  // `FinalizationHistoryPrunedError`, without mutating base or overlay markers. Authenticated ROOT-009
+  // reconstruction owns reopening history below that floor; `unsafe_reset` cannot lower it.
 
   test("pruneBelow on Passthrough is a no-op (and does not throw)") { res =>
     implicit val (h, _, js) = res
@@ -1609,21 +1724,29 @@ object MptOverlaySuite extends MutableIOSuite {
 
       // Prune below ord2 — drops ord1's journal entry, keeps ord2's.
       _ <- overlay.pruneBelow(pruneAt)
+      baseAfterPrune <- overlay.allEntriesAsBytes(parentP)
+      sizesAfterPrune <- overlay.journalSizes
 
-      // Reorg-replace at ord1 (canonical-not-in-pending) — without the journal entry, branchA's
-      // base write is NOT undone (the undo replay finds nothing to apply).
-      _ <- overlay.finalizeBranch(branchB, ord1)
-      readOrd1AfterReorg <- overlay.get[Balance](parentP, losingKeyOrd1)
+      // The prior ordinal's canonical marker and undo were both pruned. It must not be reinterpreted
+      // as an unseen first finalization: reject before touching base or any overlay marker.
+      rejectedOrd1 <- overlay.finalizeBranch(branchB, ord1).attempt
+      baseAfterRejectedOrd1 <- overlay.allEntriesAsBytes(parentP)
+      sizesAfterRejectedOrd1 <- overlay.journalSizes
 
-      // Reorg-replace at ord2 — journal entry preserved, branchC's base write IS undone.
+      // The floor itself remains eligible. Its retained journal entry can safely undo branchC.
       _ <- overlay.finalizeBranch(branchD, ord2)
       readOrd2AfterReorg <- overlay.get[Balance](parentP, losingKeyOrd2)
     } yield
       expect.all(
         readOrd1Pre.contains(losingValOrd1),
         readOrd2Pre.contains(losingValOrd2),
-        // Below-prune ordinal: undo journal entry was pruned → branchA's write survives in base.
-        readOrd1AfterReorg.contains(losingValOrd1),
+        rejectedOrd1 match {
+          case Left(FinalizationHistoryPrunedError(rejectedOrdinal, retainedFromOrdinal)) =>
+            rejectedOrdinal == ord1 && retainedFromOrdinal == pruneAt
+          case _ => false
+        },
+        sameBytes(baseAfterRejectedOrd1, baseAfterPrune),
+        sizesAfterRejectedOrd1 == sizesAfterPrune,
         // At-or-above-prune ordinal: undo journal entry preserved → branchC's write is undone.
         readOrd2AfterReorg.isEmpty
       )
@@ -1644,23 +1767,26 @@ object MptOverlaySuite extends MutableIOSuite {
       key10 = gskBalance(8201)
       val10 = Balance(NonNegLong(100L))
 
-      // Finalize at ord5 and ord10 — both journal entries exist.
+      // Finalize at the retained floor and prune. Replacing that exact ordinal remains safe because
+      // its canonical marker and undo entry are retained.
       hA <- overlay.checkout(parentP)
       _ <- hA.insert[Balance](key5, val5)
       _ <- overlay.commit(hA, branchA, ord5)
       _ <- overlay.finalizeBranch(branchA, ord5)
 
+      _ <- overlay.pruneBelow(pruneAt)
+
+      _ <- overlay.finalizeBranch(branchB, ord5)
+      readKey5 <- overlay.get[Balance](parentP, key5)
+
+      // A later ordinal above the floor is also eligible and independently retains its undo.
       hC <- overlay.checkout(parentP)
       _ <- hC.insert[Balance](key10, val10)
       _ <- overlay.commit(hC, branchC, ord10)
       _ <- overlay.finalizeBranch(branchC, ord10)
 
-      // Prune at ord5 — entries at key=5 and key=10 both retained (rangeFrom is inclusive on `ord`).
+      // Re-pruning at ord5 is idempotent and keeps ord10's entry.
       _ <- overlay.pruneBelow(pruneAt)
-
-      // Both undo entries should still fire on reorg-replace.
-      _ <- overlay.finalizeBranch(branchB, ord5)
-      readKey5 <- overlay.get[Balance](parentP, key5)
 
       _ <- overlay.finalizeBranch(branchD, ord10)
       readKey10 <- overlay.get[Balance](parentP, key10)
@@ -1710,7 +1836,7 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
-  test("pruneBelow with a future ord (beyond current chain) drops everything") { res =>
+  test("pruneBelow with a future ord rejects stale finalization and retains a monotone floor across reset") { res =>
     implicit val (h, _, js) = res
     for {
       pair <- mkMultiBranch
@@ -1733,21 +1859,97 @@ object MptOverlaySuite extends MutableIOSuite {
 
       // Prune everything below the future watermark.
       _ <- overlay.pruneBelow(pruneAt)
+      // A later lower prune request cannot lower the retained-history floor.
+      _ <- overlay.pruneBelow(ord5)
+      baseAfterPrune <- overlay.allEntriesAsBytes(parentP)
+      sizesAfterPrune <- overlay.journalSizes
 
-      // Re-finalize a different canonical at ord1 — finalizedRef[ord1] was pruned, so this is
-      // the NO-PRIOR-FINALITY path (case None) — branch never registered → NoOp.
-      reorgOrd1 <- overlay.finalizeBranch(branchB, ord1)
+      // Both the canonical marker and undo are absent below the retained floor. Reject rather than
+      // silently accepting this as a first finalization.
+      rejectedOrd5 <- overlay.finalizeBranch(branchD, ord5).attempt
+      rejectedOrd1 <- overlay.finalizeBranch(branchB, ord1).attempt
+      baseAfterRejectedOrd1 <- overlay.allEntriesAsBytes(parentP)
+      sizesAfterRejectedOrd1 <- overlay.journalSizes
 
-      // No undo entries left → branchA's and branchC's writes remain in base after their respective
-      // reorg-replace attempts.
-      readKey1 <- overlay.get[Balance](parentP, gskBalance(8400))
-      readKey5 <- overlay.get[Balance](parentP, gskBalance(8401))
+      // A local overlay reset is not authenticated history reconstruction and therefore cannot lower
+      // the monotone floor or make the same stale ordinal eligible.
+      _ <- overlay.unsafe_reset
+      rejectedAfterReset <- overlay.finalizeBranch(branchB, ord1).attempt
+      baseAfterResetRejection <- overlay.allEntriesAsBytes(parentP)
     } yield
       expect.all(
-        reorgOrd1 == FinalizationOutcome.NoOp,
-        // With everything pruned the undo journal cannot fire — base writes survive.
-        readKey1.contains(Balance(NonNegLong(1L))),
-        readKey5.contains(Balance(NonNegLong(5L)))
+        rejectedOrd5 match {
+          case Left(FinalizationHistoryPrunedError(rejectedOrdinal, retainedFromOrdinal)) =>
+            rejectedOrdinal == ord5 && retainedFromOrdinal == pruneAt
+          case _ => false
+        },
+        rejectedOrd1 match {
+          case Left(FinalizationHistoryPrunedError(rejectedOrdinal, retainedFromOrdinal)) =>
+            rejectedOrdinal == ord1 && retainedFromOrdinal == pruneAt
+          case _ => false
+        },
+        sameBytes(baseAfterRejectedOrd1, baseAfterPrune),
+        sizesAfterRejectedOrd1 == sizesAfterPrune,
+        rejectedAfterReset match {
+          case Left(FinalizationHistoryPrunedError(rejectedOrdinal, retainedFromOrdinal)) =>
+            rejectedOrdinal == ord1 && retainedFromOrdinal == pruneAt
+          case _ => false
+        },
+        sameBytes(baseAfterResetRejection, baseAfterPrune)
+      )
+  }
+
+  test("a fresh MultiBranch overlay rejects finalization below the persisted base anchor") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      firstTree <- ParentChildTree.make[IO]
+      firstOverlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        store,
+        firstTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+
+      ord1 = SnapshotOrdinal(NonNegLong(1L))
+      ord5 = SnapshotOrdinal(NonNegLong(5L))
+      key = gskBalance(8450)
+      value = Balance(NonNegLong(5L))
+
+      handle <- firstOverlay.checkout(parentP)
+      _ <- handle.insert[Balance](key, value)
+      _ <- firstOverlay.commit(handle, branchA, ord5)
+      _ <- firstOverlay.finalizeBranch(branchA, ord5)
+      baseBeforeRestart <- snapshotBytes(store)
+
+      // A fresh overlay simulates process-local overlay state loss while retaining the MPT base and
+      // its persisted ordinal. Its RAM prune floor starts empty; the base anchor must still close the gap.
+      restartedTree <- ParentChildTree.make[IO]
+      restartedOverlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        store,
+        restartedTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      sizesBefore <- restartedOverlay.journalSizes
+      rejected <- restartedOverlay.finalizeBranch(branchB, ord1).attempt
+      baseAfterRejected <- snapshotBytes(store)
+      sizesAfter <- restartedOverlay.journalSizes
+
+      // The exact persisted base ordinal remains eligible; the guard is strictly below the anchor.
+      sameOrdinal <- restartedOverlay.finalizeBranch(branchC, ord5)
+    } yield
+      expect.all(
+        rejected match {
+          case Left(FinalizationHistoryPrunedError(rejectedOrdinal, retainedFromOrdinal)) =>
+            rejectedOrdinal == ord1 && retainedFromOrdinal == ord5
+          case _ => false
+        },
+        sameBytes(baseAfterRejected, baseBeforeRestart),
+        sizesAfter == sizesBefore,
+        sameOrdinal == FinalizationOutcome.NoOp
       )
   }
 
@@ -1975,6 +2177,47 @@ object MptOverlaySuite extends MutableIOSuite {
 
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(n))
 
+  /** Blocks exactly one byte-hash after `armed` becomes true. Used to cancel a shallow revert after every reverse delta has reached the
+    * producer but before its single final build can publish the fork root.
+    */
+  private final class OneShotBlockingHasher(
+    delegate: Hasher[IO],
+    armed: Ref[IO, Boolean],
+    entered: Deferred[IO, Unit]
+  ) extends Hasher[IO] {
+
+    private def blockOnce: IO[Unit] =
+      armed.modify {
+        case true  => false -> true
+        case false => false -> false
+      }.flatMap(shouldBlock => (entered.complete(()).void >> IO.never[Unit]).whenA(shouldBlock))
+
+    def hash[A: Encoder](data: A): IO[Hash] = delegate.hash(data)
+    def hashBytes(bytes: Array[Byte]): IO[Hash] = blockOnce >> delegate.hashBytes(bytes)
+    def compare[A: Encoder](data: A, expectedHash: Hash): IO[Boolean] = delegate.compare(data, expectedHash)
+    def getLogic(ordinal: SnapshotOrdinal): HashLogic = delegate.getLogic(ordinal)
+    def prefixedHash[A: Encoder](data: A, prefix: Array[Byte]): IO[Hash] = delegate.prefixedHash(data, prefix)
+  }
+
+  private final class OneShotFailingHasher(
+    delegate: Hasher[IO],
+    armed: Ref[IO, Boolean],
+    failure: Throwable
+  ) extends Hasher[IO] {
+
+    private def failOnce: IO[Unit] =
+      armed.modify {
+        case true  => false -> true
+        case false => false -> false
+      }.flatMap(shouldFail => failure.raiseError[IO, Unit].whenA(shouldFail))
+
+    def hash[A: Encoder](data: A): IO[Hash] = delegate.hash(data)
+    def hashBytes(bytes: Array[Byte]): IO[Hash] = failOnce >> delegate.hashBytes(bytes)
+    def compare[A: Encoder](data: A, expectedHash: Hash): IO[Boolean] = delegate.compare(data, expectedHash)
+    def getLogic(ordinal: SnapshotOrdinal): HashLogic = delegate.getLogic(ordinal)
+    def prefixedHash[A: Encoder](data: A, prefix: Array[Byte]): IO[Hash] = delegate.prefixedHash(data, prefix)
+  }
+
   // Compare two raw byte maps for structural (byte-level) equality — `Array[Byte]` has reference
   // equality, so `==` on the maps is NOT sufficient. This is the byte-determinism assertion primitive.
   private def sameBytes(a: Map[Hex, Array[Byte]], b: Map[Hex, Array[Byte]]): Boolean =
@@ -2020,6 +2263,179 @@ object MptOverlaySuite extends MutableIOSuite {
         onBaseRevert = Some(onRevertRef.update(_ + 1))
       )
     } yield (store, overlay)
+
+  test("atomicity: initial finalize cancellation restores base and retry publishes a correct undo") { res =>
+    val (delegateHasher, _, json) = res
+    implicit val js: JsonSerializer[IO] = json
+    val seed = gskBalance(39000)
+    val target = gskBalance(39001)
+
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      entered <- Deferred[IO, Unit]
+      result <- {
+        implicit val blockingHasher: Hasher[IO] = new OneShotBlockingHasher(delegateHasher, armed, entered)
+
+        for {
+          pair <- mkMultiBranch
+          (store, overlay) = pair
+          _ <- store.insert[Balance](seed, Balance(NonNegLong(1L)))
+          baseBefore <- snapshotBytes(store)
+
+          handle <- overlay.checkout(parentP)
+          _ <- handle.insert[Balance](target, Balance(NonNegLong(11L)))
+          _ <- overlay.commit(handle, branchA, ordinal)
+          journalBefore <- overlay.journalSizes
+
+          _ <- armed.set(true)
+          finalizing <- overlay.finalizeBranch(branchA, ordinal).start
+          _ <- entered.get
+          staged <- snapshotBytes(store)
+          _ <- finalizing.cancel
+
+          afterCancel <- snapshotBytes(store)
+          journalAfterCancel <- overlay.journalSizes
+          pendingAfterCancel <- overlay.get[Balance](branchA, target)
+
+          retried <- overlay.finalizeBranch(branchA, ordinal)
+          afterRetry <- store.get[Balance](target)
+
+          // A later different-hash finalization consumes the retry's undo record. If cancellation or retry
+          // recorded the staged state as the preimage, target would remain in base here.
+          _ <- overlay.finalizeBranch(branchB, ordinal)
+          afterUndo <- snapshotBytes(store)
+        } yield
+          expect.all(
+            !sameBytes(staged, baseBefore),
+            sameBytes(afterCancel, baseBefore),
+            journalAfterCancel == journalBefore,
+            pendingAfterCancel.contains(Balance(NonNegLong(11L))),
+            retried == FinalizationOutcome.Folded(1, 0),
+            afterRetry.contains(Balance(NonNegLong(11L))),
+            sameBytes(afterUndo, baseBefore)
+          )
+      }
+    } yield result
+  }
+
+  test("atomicity: reorg replacement cancellation restores old canonical and old undo, then retry converges") { res =>
+    val (delegateHasher, _, json) = res
+    implicit val js: JsonSerializer[IO] = json
+    val seed = gskBalance(39100)
+    val shared = gskBalance(39101)
+    val oldOnly = gskBalance(39102)
+    val oldShared = Balance(NonNegLong(21L))
+    val oldExclusive = Balance(NonNegLong(22L))
+    val replacementShared = Balance(NonNegLong(31L))
+
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      entered <- Deferred[IO, Unit]
+      result <- {
+        implicit val blockingHasher: Hasher[IO] = new OneShotBlockingHasher(delegateHasher, armed, entered)
+
+        for {
+          pair <- mkMultiBranch
+          (store, overlay) = pair
+          _ <- store.insert[Balance](seed, Balance(NonNegLong(1L)))
+
+          oldHandle <- overlay.checkout(parentP)
+          _ <- oldHandle.insert[Balance](shared, oldShared)
+          _ <- oldHandle.insert[Balance](oldOnly, oldExclusive)
+          _ <- overlay.commit(oldHandle, branchA, ordinal)
+          _ <- overlay.finalizeBranch(branchA, ordinal)
+          oldBase <- snapshotBytes(store)
+
+          replacementHandle <- overlay.checkout(parentP)
+          _ <- replacementHandle.insert[Balance](shared, replacementShared)
+          _ <- overlay.commit(replacementHandle, branchB, ordinal)
+          oldJournal <- overlay.journalSizes
+
+          _ <- armed.set(true)
+          replacing <- overlay.finalizeBranch(branchB, ordinal).start
+          _ <- entered.get
+          staged <- snapshotBytes(store)
+          _ <- replacing.cancel
+
+          afterCancel <- snapshotBytes(store)
+          journalAfterCancel <- overlay.journalSizes
+          oldSharedAfterCancel <- store.get[Balance](shared)
+          oldOnlyAfterCancel <- store.get[Balance](oldOnly)
+
+          retried <- overlay.finalizeBranch(branchB, ordinal)
+          sharedAfterRetry <- store.get[Balance](shared)
+          oldOnlyAfterRetry <- store.get[Balance](oldOnly)
+
+          // Consume the replacement's undo to prove retry journaled the parent preimage, not the old or staged image.
+          _ <- overlay.finalizeBranch(branchC, ordinal)
+          afterReplacementUndo <- store.get[Balance](shared)
+          seedAfterReplacementUndo <- store.get[Balance](seed)
+        } yield
+          expect.all(
+            !sameBytes(staged, oldBase),
+            sameBytes(afterCancel, oldBase),
+            journalAfterCancel == oldJournal,
+            oldSharedAfterCancel.contains(oldShared),
+            oldOnlyAfterCancel.contains(oldExclusive),
+            retried == FinalizationOutcome.Folded(1, 0),
+            sharedAfterRetry.contains(replacementShared),
+            oldOnlyAfterRetry.isEmpty,
+            afterReplacementUndo.isEmpty,
+            seedAfterReplacementUndo.contains(Balance(NonNegLong(1L)))
+          )
+      }
+    } yield result
+  }
+
+  test("atomicity: reorg replacement build failure restores old canonical and remains retryable") { res =>
+    val (delegateHasher, _, json) = res
+    implicit val js: JsonSerializer[IO] = json
+    val seed = gskBalance(39200)
+    val oldOnly = gskBalance(39201)
+    val replacementOnly = gskBalance(39202)
+    val injected = new RuntimeException("injected replacement hash failure")
+
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      result <- {
+        implicit val failingHasher: Hasher[IO] = new OneShotFailingHasher(delegateHasher, armed, injected)
+
+        for {
+          pair <- mkMultiBranch
+          (store, overlay) = pair
+          _ <- store.insert[Balance](seed, Balance(NonNegLong(1L)))
+
+          oldHandle <- overlay.checkout(parentP)
+          _ <- oldHandle.insert[Balance](oldOnly, Balance(NonNegLong(41L)))
+          _ <- overlay.commit(oldHandle, branchA, ordinal)
+          _ <- overlay.finalizeBranch(branchA, ordinal)
+          oldBase <- snapshotBytes(store)
+
+          replacementHandle <- overlay.checkout(parentP)
+          _ <- replacementHandle.insert[Balance](replacementOnly, Balance(NonNegLong(42L)))
+          _ <- overlay.commit(replacementHandle, branchB, ordinal)
+          oldJournal <- overlay.journalSizes
+
+          _ <- armed.set(true)
+          failed <- overlay.finalizeBranch(branchB, ordinal).attempt
+          afterFailure <- snapshotBytes(store)
+          journalAfterFailure <- overlay.journalSizes
+
+          retried <- overlay.finalizeBranch(branchB, ordinal)
+          oldAfterRetry <- store.get[Balance](oldOnly)
+          replacementAfterRetry <- store.get[Balance](replacementOnly)
+        } yield
+          expect.all(
+            failed.isLeft,
+            sameBytes(afterFailure, oldBase),
+            journalAfterFailure == oldJournal,
+            retried == FinalizationOutcome.Folded(1, 0),
+            oldAfterRetry.isEmpty,
+            replacementAfterRetry.contains(Balance(NonNegLong(42L)))
+          )
+      }
+    } yield result
+  }
 
   test("S4 SHALLOW: revertToOrdinal replays the RAM undo journal to a BYTE-IDENTICAL base; re-fold reproduces; idempotent") { res =>
     implicit val (h, _, js) = res
@@ -2073,7 +2489,72 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
-  test("S4 DEEP: below-window revert rebuilds a BYTE-IDENTICAL base from disk readState; re-fold reproduces; hook fires") { res =>
+  test("S4 SHALLOW: cancellation during the single final build restores the complete tip and retains the undo band") { res =>
+    val (delegateHasher, _, json) = res
+    implicit val js: JsonSerializer[IO] = json
+    val target = gskBalance(40501)
+    val genesis = gskBalance(40500)
+
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      entered <- Deferred[IO, Unit]
+      result <- {
+        implicit val blockingHasher: Hasher[IO] = new OneShotBlockingHasher(delegateHasher, armed, entered)
+
+        for {
+          pair <- mkMultiBranch
+          (store, overlay) = pair
+          _ <- store.insert[Balance](genesis, Balance(NonNegLong(1L)))
+          _ <- foldAt(overlay, bid('1'), 1L, target, Balance(NonNegLong(11L)))
+          _ <- foldAt(overlay, bid('2'), 2L, target, Balance(NonNegLong(22L)))
+          _ <- foldAt(overlay, bid('3'), 3L, target, Balance(NonNegLong(33L)))
+          baseAt3 <- snapshotBytes(store)
+          rootAt3 <- store.build(ord(3L)).rethrow.map(_.rootHash)
+
+          _ <- foldAt(overlay, bid('4'), 4L, target, Balance(NonNegLong(44L)))
+          _ <- foldAt(overlay, bid('5'), 5L, target, Balance(NonNegLong(55L)))
+          baseAt5 <- snapshotBytes(store)
+          rootAt5 <- store.build(ord(5L)).rethrow.map(_.rootHash)
+          journalBefore <- overlay.journalSizes
+          syncedBefore <- store.lastPersistedOrdinal
+
+          _ <- armed.set(true)
+          reverting <- overlay.revertToOrdinal(ord(3L)).start
+          _ <- entered.get
+          stagedBeforeBuild <- snapshotBytes(store)
+          _ <- reverting.cancel
+
+          afterCancel <- snapshotBytes(store)
+          rootAfterCancel <- store.build(ord(5L)).rethrow.map(_.rootHash)
+          journalAfterCancel <- overlay.journalSizes
+          syncedAfterCancel <- store.lastPersistedOrdinal
+
+          retried <- overlay.revertToOrdinal(ord(3L))
+          afterRetry <- snapshotBytes(store)
+          rootAfterRetry <- store.build(ord(3L)).rethrow.map(_.rootHash)
+          journalAfterRetry <- overlay.journalSizes
+          syncedAfterRetry <- store.lastPersistedOrdinal
+        } yield expect.all(
+          // Both reverse writes were staged before the one final build blocked.
+          sameBytes(stagedBeforeBuild, baseAt3),
+          // Cancellation rolls state, trie caches, ordinal bookkeeping, and journal consumption back to tip@5.
+          sameBytes(afterCancel, baseAt5),
+          rootAfterCancel == rootAt5,
+          journalAfterCancel == journalBefore,
+          syncedBefore.contains(ord(5L)),
+          syncedAfterCancel == syncedBefore,
+          // The retained band remains retryable and lands exactly on the fork state/root.
+          retried == RevertOutcome.Shallow(2),
+          sameBytes(afterRetry, baseAt3),
+          rootAfterRetry == rootAt3,
+          journalAfterRetry.undoJournal == journalBefore.undoJournal - 2,
+          syncedAfterRetry.contains(ord(3L))
+        )
+      }
+    } yield result
+  }
+
+  test("S4 DEEP: an ordinal-only retained image cannot reopen pruned history or mutate base") { res =>
     implicit val (h, _, js) = res
     val k1 = gskBalance(41001)
     val k2 = gskBalance(41002)
@@ -2091,43 +2572,34 @@ object MptOverlaySuite extends MutableIOSuite {
       _ <- foldAt(overlay, bid('2'), 2L, k2, Balance(NonNegLong(22L)))
       // Capture the disk-retained signed bytes at the (deep) fork ordinal 2 — the S2 contiguous tier analog.
       baseAt2 <- snapshotBytes(store)
-      rootAt2 <- store.build(ord(2L)).map(_.toOption.map(_.rootHash))
       _ <- diskRef.update(_.updated(2L, baseAt2))
 
       _ <- foldAt(overlay, bid('3'), 3L, k3, Balance(NonNegLong(33L)))
       _ <- foldAt(overlay, bid('4'), 4L, k4, Balance(NonNegLong(44L)))
       _ <- foldAt(overlay, bid('5'), 5L, k5, Balance(NonNegLong(55L)))
-      baseAt5 <- snapshotBytes(store)
 
       // Simulate the RAM window bound: prune the in-memory journal below 4, so ordinal 3 (needed to walk
-      // back to fork 2) is gone → the shallow path can't reach fork 2 → DEEP disk path.
+      // back to fork 2) is gone. The retained reader is ordinal-only and therefore cannot prove the
+      // exact canonical hash/root required to authorize a DEEP base replacement.
       _ <- overlay.pruneBelow(ord(4L))
-      outcome <- overlay.revertToOrdinal(ord(2L))
+      baseBefore <- snapshotBytes(store)
+      journalsBefore <- overlay.journalSizes
+      persistedBefore <- store.lastPersistedOrdinal
+      attempted <- overlay.revertToOrdinal(ord(2L)).attempt
+      baseAfter <- snapshotBytes(store)
+      journalsAfter <- overlay.journalSizes
+      persistedAfter <- store.lastPersistedOrdinal
       revertCount <- onRevertRef.get
-      afterRevert <- snapshotBytes(store)
-      rootAfterRevert <- store.build(ord(2L)).map(_.toOption.map(_.rootHash))
-
-      // Re-fold the denser branch (ords 3,4,5) → reproduces the byte-identical dense base.
-      _ <- foldAt(overlay, bid('c'), 3L, k3, Balance(NonNegLong(33L)))
-      _ <- foldAt(overlay, bid('d'), 4L, k4, Balance(NonNegLong(44L)))
-      _ <- foldAt(overlay, bid('e'), 5L, k5, Balance(NonNegLong(55L)))
-      afterRefold <- snapshotBytes(store)
-
-      // Idempotent: revert to 2 again (the re-fold repopulated the journal, so this lands via the SHALLOW path
-      // this time) → base@2, then an immediate repeat is a NoOp with an unchanged base.
-      _ <- overlay.revertToOrdinal(ord(2L))
-      idemBase <- snapshotBytes(store)
-      idemSecond <- overlay.revertToOrdinal(ord(2L))
-      idemAfter <- snapshotBytes(store)
     } yield
       expect.all(
-        outcome == RevertOutcome.Deep(baseAt2.size),
-        revertCount >= 1, // onBaseRevert (eta forgetUncommitted) hook fired
-        sameBytes(afterRevert, baseAt2), // byte-identical disk-rebuilt base
-        rootAfterRevert == rootAt2,
-        sameBytes(afterRefold, baseAt5), // re-fold reproduces the byte-identical dense base
-        idemSecond == RevertOutcome.NoOp,
-        sameBytes(idemAfter, idemBase)
+        attempted match {
+          case Left(_: RevertGapError) => true
+          case _                       => false
+        },
+        sameBytes(baseAfter, baseBefore),
+        journalsAfter == journalsBefore,
+        persistedAfter == persistedBefore,
+        revertCount == 0
       )
   }
 
@@ -2158,6 +2630,68 @@ object MptOverlaySuite extends MutableIOSuite {
         },
         // Fail-closed means NO under-revert: the base is untouched by the aborted attempt.
         sameBytes(baseAfter, baseBefore)
+      )
+  }
+
+  test("S4 DEEP: an empty retained image fails closed without clearing the current base") { res =>
+    implicit val (h, _, js) = res
+
+    for {
+      diskRef <- Ref.of[IO, Map[Long, Map[Hex, Array[Byte]]]](Map(1L -> Map.empty))
+      onRevertRef <- Ref.of[IO, Int](0)
+      pair <- mkMultiBranchDeep(diskRef, onRevertRef)
+      (store, overlay) = pair
+      _ <- store.insert[Balance](gskBalance(42400), Balance(NonNegLong(1L)))
+      _ <- foldAt(overlay, bid('1'), 1L, gskBalance(42401), Balance(NonNegLong(11L)))
+      _ <- foldAt(overlay, bid('2'), 2L, gskBalance(42402), Balance(NonNegLong(22L)))
+      _ <- foldAt(overlay, bid('3'), 3L, gskBalance(42403), Balance(NonNegLong(33L)))
+      before <- snapshotBytes(store)
+      syncedBefore <- store.lastPersistedOrdinal
+
+      _ <- overlay.pruneBelow(ord(3L))
+      journalAfterPrune <- overlay.journalSizes
+      rejected <- overlay.revertToOrdinal(ord(1L)).attempt
+
+      after <- snapshotBytes(store)
+      journalAfter <- overlay.journalSizes
+      syncedAfter <- store.lastPersistedOrdinal
+      revertCount <- onRevertRef.get
+    } yield
+      expect.all(
+        rejected match {
+          case Left(_: RevertGapError) => true
+          case _                       => false
+        },
+        sameBytes(after, before),
+        journalAfter == journalAfterPrune,
+        syncedAfter == syncedBefore,
+        revertCount == 0
+      )
+  }
+
+  test("S4 DEEP: malformed physical keys fail before base replacement or revert cleanup") { res =>
+    implicit val (h, _, js) = res
+    val malformed = Map(Hex("aa") -> Array[Byte](1), Hex("aa00") -> Array[Byte](2))
+
+    for {
+      diskRef <- Ref.of[IO, Map[Long, Map[Hex, Array[Byte]]]](Map(1L -> malformed))
+      onRevertRef <- Ref.of[IO, Int](0)
+      pair <- mkMultiBranchDeep(diskRef, onRevertRef)
+      (store, overlay) = pair
+      _ <- store.insert[Balance](gskBalance(42500), Balance(NonNegLong(1L)))
+      _ <- foldAt(overlay, bid('1'), 1L, gskBalance(42501), Balance(NonNegLong(11L)))
+      _ <- foldAt(overlay, bid('2'), 2L, gskBalance(42502), Balance(NonNegLong(22L)))
+      _ <- foldAt(overlay, bid('3'), 3L, gskBalance(42503), Balance(NonNegLong(33L)))
+      before <- snapshotBytes(store)
+      _ <- overlay.pruneBelow(ord(3L))
+      rejected <- overlay.revertToOrdinal(ord(1L)).attempt
+      after <- snapshotBytes(store)
+      revertCount <- onRevertRef.get
+    } yield
+      expect.all(
+        rejected == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+        sameBytes(after, before),
+        revertCount == 0
       )
   }
 

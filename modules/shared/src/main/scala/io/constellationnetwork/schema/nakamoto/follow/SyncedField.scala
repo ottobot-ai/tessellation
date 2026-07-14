@@ -16,6 +16,7 @@ import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, GlobalSnapshotStateProof}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
@@ -93,7 +94,7 @@ sealed trait SyncedField {
   def fieldRoot[F[_]: Async: Parallel: Hasher: JsonSerializer](m: SortedMap[Address, V]): F[Hash] =
     m.toList.traverse {
       case (a, v) => GlobalStateKey.toHex[F](GlobalStateKey.hypergraph(fieldId, a)).map(_ -> codec.immutableBytes(v).toArray)
-    }.map(_.toMap).flatMap(GlobalStateConverter.fieldRootFromBytes[F])
+    }.flatMap(PhysicalTrieKeyValidator.materializeEntries(_).liftTo[F]).flatMap(GlobalStateConverter.fieldRootFromBytes[F])
 }
 
 object SyncedField {

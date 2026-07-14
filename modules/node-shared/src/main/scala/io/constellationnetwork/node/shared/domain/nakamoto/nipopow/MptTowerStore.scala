@@ -101,7 +101,7 @@ object MptTowerStore {
             parseOrdinalFromHex(hex).exists(_.value.value < keepFrom.value.value)
           }
           _ <- logger.debug(s"[MptTowerStore] Pruning ${toRemove.size} entries below ordinal=$keepFrom").whenA(toRemove.nonEmpty)
-          _ <- store.underlying.remove(toRemove).void.whenA(toRemove.nonEmpty)
+          _ <- store.underlying.remove(toRemove).rethrow.whenA(toRemove.nonEmpty)
         } yield ()
     }
   }

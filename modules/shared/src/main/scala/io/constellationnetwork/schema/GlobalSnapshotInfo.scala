@@ -31,7 +31,7 @@ import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.mpt.MerklePatriciaTrie
-import io.constellationnetwork.security.mpt.producer.StatefulMerklePatriciaProducer
+import io.constellationnetwork.security.mpt.producer.{PhysicalTrieKeyValidator, StatefulMerklePatriciaProducer}
 import io.constellationnetwork.security.signature.Signed
 
 import derevo.cats.{eqv, show}
@@ -285,7 +285,8 @@ object GlobalSnapshotInfo {
       entries.toList.parTraverse {
         case (k, v) => io.constellationnetwork.schema.mpt.GlobalStateKey.toHex[F](k).map(_ -> v)
       }
-        .flatMap(pairs => mptStateProofFromBytes[F](pairs.toMap))
+        .flatMap(pairs => PhysicalTrieKeyValidator.materializeEntries(pairs).liftTo[F])
+        .flatMap(mptStateProofFromBytes[F])
     }
 
   /** Build an MPT state proof from a pre-computed byte map, sharing the per-field-root + GlobalSnapshotStateProof shape with
@@ -335,7 +336,8 @@ object GlobalSnapshotInfo {
             // depend on which path produced it.
             io.constellationnetwork.schema.mpt.GlobalStateConverter.fieldRootFromBytes[F](fieldEntries).tupleLeft(fieldId)
         },
-        // infoRoot = UNION over the 8 unrolled `Mg*` infoSubFields (replaces the old single fieldId-6 lookup). Computed from the SAME
+        // infoRoot = UNION over the seven deterministic unrolled `Mg*` infoSubFields (replaces the old single fieldId-6 lookup). Computed
+        // from the SAME
         // `entries` (via `perFieldGrouping`) as the global mptRoot, so it stays consistent with mptRoot; byte-identical to the follower's
         // `currencySnapshotFieldRoots` recompute by the round-trip + parity contracts (docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md).
         io.constellationnetwork.schema.mpt.GlobalStateConverter.fieldRootFromBytes[F](
@@ -362,7 +364,8 @@ object GlobalSnapshotInfo {
         lastTxRefsProof = fieldRoot(FId.LastTxRefs),
         balancesProof = fieldRoot(FId.Balances),
         // SIGNED currency-snapshots per-field roots: `incrementalRoot` from the `perField` map (fieldId 5, still a single partition) +
-        // `currencyInfoRoot` = the UNION over the 8 unrolled `Mg*` infoSubFields computed above (the fieldId-6 blob is gone). `Some` iff the
+        // `currencyInfoRoot` = the UNION over the seven deterministic unrolled `Mg*` infoSubFields computed above (the fieldId-6 blob is
+        // gone). `Some` iff the
         // authenticated currency partitions are non-empty. Byte-identical to the follower's
         // `GlobalStateConverter.currencySnapshotFieldRoots` recompute (same `fieldRootFromBytes` path, same union). This is field 4.
         lastCurrencySnapshotsProof =

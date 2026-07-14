@@ -41,10 +41,10 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 trait GlobalL0Service[F[_]] {
   type LatestSnapshotTuple = (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)
 
-  /** 3c-A — the latest finalized snapshot, its GSI, AND (when gl0 served them) gl0's SIGNED MPT byte map at that ordinal
-    * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). When present, the byte map is what gl0 actually signed; a follower stores it
-    * VERBATIM via `MptStore.loadBytes`, so its `consensusMptRoot(entries) === signed mptRoot` verify gate holds BY CONSTRUCTION (no
-    * `syncFromGlobalSnapshotInfo` re-encode → no `recomputed ≠ signed` drift). The GSI rides along ONLY for `setForRecovery`; never
+  /** 3c-A — the latest finalized snapshot, its GSI, AND (when gl0 served them) gl0's claimed signed MPT byte map at that ordinal
+    * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). A follower stores the byte map VERBATIM via `MptStore.loadBytes`, then independently
+    * recomputes `consensusMptRoot(entries)` and requires equality with the authenticated snapshot's signed `mptRoot`. Byte fidelity avoids
+    * `syncFromGlobalSnapshotInfo` re-encoding drift; it is not authentication. The GSI rides along ONLY for `setForRecovery`; never
     * re-derive the root from it. Same majority-peer resolution as [[pullLatestSnapshot]].
     *
     * The bytes are `Option`: the served byte file (`mpt_snapshot_info/<ordinal>`, dense-but-log-pruned) may be ABSENT at the served
@@ -410,9 +410,9 @@ object GlobalL0Service {
       ): F[Boolean] =
         // 3c-A: load the SIGNED byte map VERBATIM (no `syncFromGlobalSnapshotInfo` re-encode), then validate. The validator
         // uses the stateful producer which requires the trie to be built at the correct ordinal; `loadBytes` does that
-        // (clear→insert→build→commit). Since the stored bytes ARE what was signed, the validator's recomputed root matches
-        // the snapshot's signed `stateProof.mptRoot` by construction on honest input — a corrupt/truncated transfer still
-        // fails here. The GSI `info` is the validator's expected-state input only; it is never re-encoded into the store.
+        // (clear→insert→build→commit). The validator must still compare the recomputed root with the authenticated snapshot's signed
+        // `stateProof.mptRoot`; corrupt, truncated, stale, or mis-associated bytes fail here. The GSI `info` is the validator's
+        // expected-state input only; it is never re-encoded into the store.
         mptStore.loadBytes(entries, snapshot.ordinal) >>
           validator
             .validate(snapshot, info)

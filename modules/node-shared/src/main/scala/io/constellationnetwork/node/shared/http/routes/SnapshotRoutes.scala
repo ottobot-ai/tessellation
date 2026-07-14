@@ -159,7 +159,7 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
           // finalized ordinal, read VERBATIM (no re-encode). Finality-gated identically to `/latest/combined` via the reader; `None`
           // (→ NotFound) when no servable snapshot exists, the signed byte file for that ordinal is absent, or on non-global layers
           // (the reader returns `None` when it has no MPT byte store). A follower loads the third element through `MptStore.loadBytes`,
-          // so its `consensusMptRoot(entries) === signed mptRoot` verify gate passes by construction.
+          // recomputes the consensus root, and requires equality with the authenticated snapshot's signed root.
           whenNodeReady {
             finalizedReader.latestMptEntriesResponse.flatMap {
               case Some(resp) => resp.pure[F]

@@ -172,11 +172,12 @@ object MptCrossPathDeterminismSuite extends MutableIOSuite with Checkers {
       replay <- GlobalStateConverter.toAccumulatorHexDelta[IO](slice.toAccumulator, Map.empty[Hex, Array[Byte]])
       (upserts, removes) = replay
       producer <- InMemoryMerklePatriciaProducer.make[IO]()
-      _ <- producer.insertBytes(upserts).void
-      _ <- producer.remove(removes.toList)
-      trie <- producer.buildForOrdinal(ordinal)
+      _ <- producer.replaceBytes(upserts, removes.toList).rethrow
       bytes <- producer.entries
-    } yield (trie.toOption.map(_.rootHash), bytes)
+      root <-
+        if (bytes.isEmpty) none[MptRoot].pure[IO]
+        else producer.buildForOrdinal(ordinal).rethrow.map(_.rootHash.some)
+    } yield (root, bytes)
 
   /** Compare two `Map[Hex, Array[Byte]]` for byte-equal entry agreement. Since `Array[Byte]` does not have a structural equality, we
     * normalise to `Map[Hex, Vector[Byte]]` before comparing.

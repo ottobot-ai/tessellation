@@ -81,7 +81,7 @@ import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.StatefulMerklePatriciaProducer
+import io.constellationnetwork.security.mpt.producer.{PhysicalTrieKeyValidator, StatefulMerklePatriciaProducer}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoImmutableCodec
@@ -2972,7 +2972,7 @@ object GlobalSnapshotAcceptanceManager {
                     GlobalStateKey
                       .toHex[F](key)
                       .map(hex => hex -> InvalidStateProofSlashedReader.entryCodec.immutableBytes(entry).toArray)
-                }.map(_.toMap)
+                }.flatMap(PhysicalTrieKeyValidator.materializeEntries(_).liftTo[F])
 
                 // ATOMIC CROSS-SHARD MESSAGE SETTLEMENT — marker WRITE (generic engine). Every registered handler's nullifier markers (their
                 // partitions are NOT carried by `StateChangesAccumulator`) are written DIRECTLY through the same branch-aware writer algebra

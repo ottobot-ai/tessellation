@@ -9,7 +9,7 @@ import scala.annotation.tailrec
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.{MerklePatriciaProducer, ParallelMerklePatriciaProducer}
+import io.constellationnetwork.security.mpt.producer.{MerklePatriciaProducer, ParallelMerklePatriciaProducer, PhysicalTrieKeyValidator}
 
 import io.circe._
 import io.circe.syntax._
@@ -38,20 +38,30 @@ final case class MerklePatriciaTrie(rootNode: MerklePatriciaNode) {
     upserts: Map[Hex, Array[Byte]],
     removes: Set[Hex]
   ): F[MerklePatriciaTrie] = {
-    val sortedRemoves = removes.toList.sortBy(hex => CompactNibblePath.fromHexString(hex.value))
+    val existingKeys = MerklePatriciaTrie.collectLeafNodesWithPaths(this).iterator.map(_._1).toSet
+    val retainedKeys = existingKeys -- removes
 
-    for {
-      afterRemoves <-
-        if (sortedRemoves.isEmpty) rootNode.pure[F]
-        else IncrementalTrieOps.removeMultiple[F](rootNode, sortedRemoves)
-      hashedInserts <- upserts.toList.traverse {
-        case (hex, bytes) => Hasher[F].hashBytes(bytes).map(hash => (hex, hash))
-      }
-      sortedInserts = hashedInserts.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
-      afterUpserts <-
-        if (sortedInserts.isEmpty) afterRemoves.pure[F]
-        else IncrementalTrieOps.insertMultiple[F](afterRemoves, sortedInserts)
-    } yield MerklePatriciaTrie(afterUpserts)
+    (for {
+      _ <- PhysicalTrieKeyValidator.validateEachKey(removes)
+      _ <- PhysicalTrieKeyValidator.validateInsertion(retainedKeys, upserts.keys)
+    } yield ()) match {
+      case Left(error) => error.raiseError[F, MerklePatriciaTrie]
+      case Right(_) =>
+        val sortedRemoves = removes.toList.sortBy(hex => CompactNibblePath.fromHexString(hex.value))
+
+        for {
+          afterRemoves <-
+            if (sortedRemoves.isEmpty) rootNode.pure[F]
+            else IncrementalTrieOps.removeMultiple[F](rootNode, sortedRemoves)
+          hashedInserts <- upserts.toList.traverse {
+            case (hex, bytes) => Hasher[F].hashBytes(bytes).map(hash => (hex, hash))
+          }
+          sortedInserts = hashedInserts.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+          afterUpserts <-
+            if (sortedInserts.isEmpty) afterRemoves.pure[F]
+            else IncrementalTrieOps.insertMultiple[F](afterRemoves, sortedInserts)
+        } yield MerklePatriciaTrie(afterUpserts)
+    }
   }
 }
 

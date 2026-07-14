@@ -485,6 +485,115 @@ This gate does not reopen L-02 through L-05. GL0 remains Nakamoto/Taktikos/LDD
 without global BFT machinery; Phase 2 remains `T_weight OR k1`, density-reorgable;
 and `k2` remains retention/recovery policy only.
 
+### O-16 Exact Phase-2 consumer lease and invalidation
+
+**PROPOSED, NOT RATIFIED.** `FIN-14` requires more than replacing the ordinal
+watermark with an exact-ref query. A consumer can verify a valid exact P2 anchor,
+wait for committee work, and then mutate after a density replacement. The proposed
+local `CanonicalPhase2Lease` therefore binds the complete exact ref, released-core
+generation, qualification and fork-choice evidence, MPT/semantic/anchor readbacks,
+purpose, and a persisted lineage revision. It is package-minted,
+non-serializable, non-portable, and usable only through a short
+`commitIfCurrent`; no finality/MPT/chain lock is held across network, DA, replay,
+signature, or committee waits. Portable evidence remains separately verified.
+
+Acquisition is proposed as two short coordinator operations around unlocked
+immutable verification. The first captures a complete descriptor of revisions,
+lineage, target, evidence/readback pointers, purpose policy, and sink revision. The
+second compare-and-sets that same descriptor after snapshot, evidence, MPT,
+semantic, and anchor verification. Holding a coordinator/finality lock across
+complete-image verification is forbidden, while a single pre-verification read is
+insufficient because it leaves the `FOLLOW-008C` race.
+
+The recommended revision rule uses `CanonicalBranchRevision` for every selection
+mutation and a separate monotone `CanonicalLineageRevision` for any
+rollback/replacement/recovery that removes or substitutes a previously canonical
+hash. Pure descendant extension may preserve an exact-ancestor use after a final
+recheck. Every replacement invalidates all old-generation permits; even a target
+that survives below the MRCA must be reacquired. This deliberately prevents ABA
+reuse and avoids requiring a complete selective dependency graph in V1.
+
+Owner review must freeze the new choices and confirm that the packet represents
+the locked constraints accurately:
+
+- **O-16A - replacement invalidation:** conservative all-lease invalidation on
+  replacement versus selective orphan-only
+  invalidation;
+- **O-16B - exhaustive purpose policy:** explicit, closed purpose cases for binary
+  admission/confirmation/requeue, shard execution, checkpoint inclusion/anchor,
+  assigned-watchtower replay,
+  challenge adjudication, cross-metagraph settlement/economic reads, historical
+  registry contexts used by optimistic sampling and tower eligibility, tower proof
+  serving, protocol correction,
+  follower adoption, operational/bootstrap serving, retention/recovery, and event
+  delivery; for each, freeze
+  still-canonical exact-ancestor versus current-P2-head behavior without reopening
+  L-19's signed historical-reference rule;
+- **O-16C - attestation reuse:** whether raw signed admission attestations may be
+  reverified and reindexed after a
+  target-surviving replacement (recommended), while prior counts/thresholds may
+  never transfer;
+- **O-16D - historical age:** whether exact historical P2 references have a
+  consensus age bound beyond
+  operation-specific expiry and authenticated data availability; local wall clock
+  or HOCON cannot decide validity;
+- **O-16E - effect-journal conformance:** conformance to L-23's already locked
+  idempotent effect-journal boundary for
+  admission/cache/tally/shard-buffer commit and inverse/requeue; and
+- **O-16F - signed scope schema:** the active-era signed
+  full-ref/registry/parameter/purpose shape replacing the
+  current incomplete `GlobalSyncView` consumer scope.
+
+The exact-ancestor rule and effect-journal strategy are conformance checks, not
+open alternatives to L-19 or L-23.
+
+The exact contract, current-source interleavings, invalidation inventory, and
+`FOLLOW-008A` through `FOLLOW-008P` matrix are in
+`P6-FIN14-PHASE2-CONSUMER-LEASE.md`. No live lease issuer may land before O-16 is
+ratified and O-15, O-01, released-core readback, ROOT semantic/image gates, and
+consumer effect ordering are independently verified. Wrapping the current Boolean
+adapter in an opaque type is explicitly forbidden.
+
+### O-17 ROOT-008 GL0 partition grammar
+
+**PROPOSED, NOT RATIFIED.** `ROOT-008` owns canonical physical placement, one
+active-era value codec per field, logical identity/scope reproduction, bounded
+decoding, and structural/index/population relations. It does not replace the P2
+economic oracle or the O-07/ECON-G authorization, conservation, backing, replay,
+and transition rules. Both gates must pass before a structurally valid image can
+be used as canonical economic state.
+
+Owner review must freeze these exact anchors before schema activation:
+
+- **O-17/R008-01 - retired ID lifecycle:** recommend deleting physical IDs 3, 6,
+  and 21 from active GL0, deleting 32 after ROOT-010 witness parity, retaining
+  numeric gaps, and handling upstream-v4 disk history only through an offline
+  typed import rather than live fork-only compatibility decoders.
+- **O-17/R008-02 - field-20 self-authentication:** recommend storing
+  `(EtaPeriod, HistoricalStakeSnapshot)` so the leaf reproduces its physical key.
+- **O-17/R008-03 - field-23 self-authentication:** recommend storing
+  `(PeerId, KesRegistrationReference)` and separately proving the pointer's exact
+  unique match in field 22.
+- **O-17/R008-04 - resource and persistent-growth contract:** approve measured,
+  versioned per-image/field/value/member budgets and a non-halting permanent
+  nullifier/slash growth strategy. A finite state-size cap cannot silently make a
+  valid chain stop once permanent nullifiers reach it; authenticated compaction or
+  an accumulator requires its own exact-once proof and `GROWTH-001` test plan.
+- **O-17/R008-05 - set-member identity:** recommend canonical unsigned
+  event/content-reference hashes for economic-event uniqueness and the signed
+  domain/reference identity for KES records.
+- **O-17/R008-06 - token-lock currency scope:** freeze the field-8/field-30
+  relationship among `TokenLock.currencyId`, the global partition, and the network
+  metagraph; the parser cannot infer it.
+- **O-17/R008-07 - field-32 deletion gate:** confirm exact optional full-view
+  witness parity, `None` versus `Some(empty)`, explicit ML0 population, and
+  staged/backfill/restart/reorg behavior before deleting field 32 at every GL0
+  boundary. This is a conformance gate on locked L-15A, not an option to retain an
+  unrooted writable field.
+
+The complete inventory, recommendations, and generated-test contract are in
+`ROOT-008-GL0-PARTITION-GRAMMAR.md`.
+
 ## Change rule
 
 Changing a locked answer or resolving an open gate requires one coherent change

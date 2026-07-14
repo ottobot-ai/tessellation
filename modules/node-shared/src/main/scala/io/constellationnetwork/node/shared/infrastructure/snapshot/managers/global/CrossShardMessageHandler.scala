@@ -15,6 +15,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs.byteArrayImmutableCodec
 
 /** Local `scala.math.Ordering[GlobalStateKey]` (derived from its `cats.Order`) so the per-type nullifier markers can be carried in a
@@ -150,8 +151,9 @@ object CrossShardMessageEngine {
         // Store the pre-encoded bytes through the `Array[Byte]` passthrough codec (byte-identical to a typed `insert[T]`).
         _ <- mpt.insert[Array[Byte]](markers.toMap)(byteArrayImmutableCodec)
         // Hex-keyed byte view for the #107 verify-replay fold (SAME `toHex` the writer used ⇒ identical bytes to `postBytes`).
-        replay <- markers.toList.traverse {
+        replayPairs <- markers.toList.traverse {
           case (key, bytes) => GlobalStateKey.toHex[F](key).map(hex => hex -> bytes)
         }
+        replay <- PhysicalTrieKeyValidator.materializeEntries(replayPairs).liftTo[F]
       } yield SortedMap.from(replay)
 }

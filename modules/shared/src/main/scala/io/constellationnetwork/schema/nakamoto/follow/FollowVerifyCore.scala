@@ -20,6 +20,7 @@ import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.MerklePatriciaCommitment
+import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
 import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaRangeProof
 import io.constellationnetwork.security.mpt.verifier.{MerklePatriciaRangeVerifier, MerklePatriciaVerificationError}
 import io.constellationnetwork.security.signature.Signed
@@ -461,7 +462,7 @@ object FollowVerifyCore {
       post.toList.traverse {
         case (addr, value) =>
           GlobalStateKey.toHex[F](GlobalStateKey.hypergraph(field, addr)).map(_ -> ImmutableCodec[V].immutableBytes(value).toArray)
-      }.map(_.toMap)
+      }.flatMap(PhysicalTrieKeyValidator.materializeEntries(_).liftTo[F])
 
     // (c)+(d): recompute each field's subtree root via gl0's shared callable and match the signed root. Carries the
     // post-state map forward on success so assemble can wrap it without re-applying. Short-circuits on first mismatch.

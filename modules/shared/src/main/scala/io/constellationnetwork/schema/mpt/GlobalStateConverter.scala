@@ -32,7 +32,7 @@ import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal, Stat
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.{MerklePatriciaError, StatefulMerklePatriciaProducer}
+import io.constellationnetwork.security.mpt.producer.{MerklePatriciaError, PhysicalTrieKeyValidator, StatefulMerklePatriciaProducer}
 import io.constellationnetwork.security.mpt.{MerklePatriciaTrie, MptRoot}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
@@ -55,6 +55,13 @@ import io.circe.{Encoder, Json}
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object GlobalStateConverter {
+
+  private def materializePhysicalEntries[F[_]: Async, V](entries: Iterable[(Hex, V)]): F[Map[Hex, V]] =
+    PhysicalTrieKeyValidator.materializeEntries(entries).liftTo[F]
+
+  private def toPhysicalEntries[F[_]: Async: Parallel: Hasher, V](entries: Iterable[(GlobalStateKey, V)]): F[Map[Hex, V]] =
+    entries.toList.parTraverse { case (key, value) => GlobalStateKey.toHex[F](key).map(_ -> value) }
+      .flatMap(materializePhysicalEntries[F, V])
 
   private def strictValueOrElse[F[_]: Async, V](
     read: F[StrictMptRead[V]],
@@ -342,9 +349,8 @@ object GlobalStateConverter {
           (hexUp, hexRem) = hexDelta
           result <- mptStore.withTransaction {
             for {
-              _ <- mptStore.underlying.remove(hexRem.toList).whenA(hexRem.nonEmpty)
-              _ <- mptStore.underlying.insertBytes(hexUp).whenA(hexUp.nonEmpty)
-              _ <- mptStore.underlying.buildForOrdinal(ordinal)
+              _ <- mptStore.underlying.replaceBytes(hexUp, hexRem.toList).rethrow
+              _ <- mptStore.underlying.buildForOrdinal(ordinal).rethrow
               // Recompute the same canonical consensus root as the signed `mptRoot`. It includes every
               // SystemNamespace economic index and excludes only field-32 observation state.
               afterBytes <- mptStore.underlying.entries
@@ -1208,7 +1214,7 @@ object GlobalStateConverter {
   )(implicit stateProofSelector: StateProofSelector): F[(Map[Hex, Array[Byte]], Set[Hex])] =
     for {
       typedUpserts <- toAccumulatorBytesDelta[F](acc)
-      upsertsHex <- typedUpserts.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
+      upsertsHex <- toPhysicalEntries[F, Array[Byte]](typedUpserts)
       removalKeys <- toAccumulatorRemovalKeys[F](acc)
       removalsHex <- removalKeys.toList.parTraverse(GlobalStateKey.toHex[F]).map(_.toSet)
       asExp <- replayExpiryIndexDelta[F, AllowSpendExpiryKey](
@@ -1308,10 +1314,14 @@ object GlobalStateConverter {
           preSyncBytes.keySet.filter(isMgEntry) -- upsertsHex.keySet.filter(isMgEntry)
         }
       }.map(_.flatten.toSet)
+      combinedUpserts <- materializePhysicalEntries[F, Array[Byte]](
+        upsertsHex.toList ++ asExp._1.toList ++ tlExp._1.toList ++ ncwExp._1.toList ++ asAddrIdx._1.toList ++ tlAddrIdx._1.toList ++
+          txAddrIdx._1.toList ++ balAddrIdx._1.toList ++ scHashesAddrIdx._1.toList ++ currSnapsAddrIdx._1.toList ++
+          currProofsAddrIdx._1.toList ++ metagraphSyncAddrIdx._1.toList ++ tlbAddrPairIdx._1.toList
+      )
     } yield
       (
-        upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++
-          scHashesAddrIdx._1 ++ currSnapsAddrIdx._1 ++ currProofsAddrIdx._1 ++ metagraphSyncAddrIdx._1 ++ tlbAddrPairIdx._1,
+        combinedUpserts,
         removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++
           scHashesAddrIdx._2 ++ currSnapsAddrIdx._2 ++ currProofsAddrIdx._2 ++ metagraphSyncAddrIdx._2 ++ tlbAddrPairIdx._2 ++
           infoRemovalsHex
@@ -1476,14 +1486,15 @@ object GlobalStateConverter {
     if (fieldEntries.isEmpty) Hash.empty.pure[F]
     else MerklePatriciaTrie.makeParallelFromBytes[F](fieldEntries).map(_.rootHash.value)
 
-  /** Emit the UNROLLED per-entry MPT key→bytes for ONE metagraph's `CurrencySnapshotInfo` — the 8 `Mg*` sub-field partitions that REPLACE
-    * the monolithic fieldId-6 blob (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). One entry per account / holder / messageType
-    * / peer, keyed `metagraphEntry(mgAddr, MgXxx, key)`; each value carries its own typed entry key `(key, value)` because `toHex` HASHES
-    * the entry key (lossy), so reconstruction recovers the logical key from the value via a prefix scan.
+  /** Emit the UNROLLED per-entry MPT key→bytes for ONE metagraph's `CurrencySnapshotInfo` — the eight serialized `Mg*` sub-field partitions
+    * that REPLACE the monolithic fieldId-6 blob (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). One entry per account / holder /
+    * messageType / peer, keyed `metagraphEntry(mgAddr, MgXxx, key)`; each value carries its own typed entry key `(key, value)` because
+    * `toHex` HASHES the entry key (lossy), so reconstruction recovers the logical key from the value via a prefix scan.
     *
     * '''`activeAllowSpends` is NOT emitted here''' — it stays in the fieldId-7 `ActiveAllowSpends` partition (written from the GSI's
-    * top-level `activeAllowSpends`, already per-MG unrolled + read cross-shard by `SpendActionValidator`). So `infoRoot` covers these 8
-    * sub-fields; `activeAllowSpends` is committed separately via the fieldId-7 `activeAllowSpends` state-proof slot.
+    * top-level `activeAllowSpends`, already per-MG unrolled + read cross-shard by `SpendActionValidator`). `infoRoot` covers the seven
+    * deterministic [[GlobalStateFieldId.infoSubFields]] entries; the eighth serialized field is the transitional, root-excluded
+    * `MgGlobalSnapshotSyncView`. `activeAllowSpends` is committed separately via the fieldId-7 state-proof slot.
     *
     * '''Single source of truth.''' This is the ONE encoder for the unrolled info bytes; every writer (full-state bytes/JSON, bootstrap
     * seed, incremental delta, overlay) routes through it so the bytes — and therefore `infoRoot` — are byte-identical on every path
@@ -1575,8 +1586,9 @@ object GlobalStateConverter {
     * in lockstep with this method.
     *
     * `lastCurrencySnapshots` SPLITS into the signed `GlobalSnapshotStateProof` field-4 slot `lastCurrencySnapshotsProof`
-    * (`CurrencySnapshotMptRoots`): `incrementalRoot` (fieldId 5) + `infoRoot` (the UNION over the 8 `Mg*` `infoSubFields`); both are also
-    * covered transitively by the global `mptRoot`. This callable exists so the follower can recompute those bytes byte-identically to gl0.
+    * (`CurrencySnapshotMptRoots`): `incrementalRoot` (fieldId 5) + `infoRoot` (the UNION over the seven `Mg*` `infoSubFields`); both are
+    * also covered transitively by the global `mptRoot`. This callable exists so the follower can recompute those bytes byte-identically to
+    * gl0.
     */
   def currencySnapshotEntryBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
     data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
@@ -1601,12 +1613,12 @@ object GlobalStateConverter {
 
   }
 
-  /** The pair of MPT subtree roots for a `lastCurrencySnapshots` map: `incrementalRoot` (fieldId 5) and `infoRoot` (the UNION over the 8
-    * `Mg*` `infoSubFields`), computed by encoding via [[currencySnapshotEntryBytes]] (gl0's exact producer bytes), grouping by `fieldId`,
-    * hexing the keys, and routing each group through [[fieldRootFromBytes]] — the SAME callable that backs every other per-field root.
-    * Empty info ⇒ `infoRoot = Hash.empty` (the [[fieldRootFromBytes]] empty convention). Used by the follow verifier to recompute-match the
-    * cl1/dl1-consumed `lastCurrencySnapshots` field deterministically. The union grouping MUST stay identical to the producer-side
-    * `GlobalSnapshotInfo.stateProofBuilder` / `mptStateProofFromBytes` infoRoot computation.
+  /** The pair of MPT subtree roots for a `lastCurrencySnapshots` map: `incrementalRoot` (fieldId 5) and `infoRoot` (the UNION over the
+    * seven `Mg*` `infoSubFields`), computed by encoding via [[currencySnapshotEntryBytes]] (gl0's exact producer bytes), grouping by
+    * `fieldId`, hexing the keys, and routing each group through [[fieldRootFromBytes]] — the SAME callable that backs every other per-field
+    * root. Empty info ⇒ `infoRoot = Hash.empty` (the [[fieldRootFromBytes]] empty convention). Used by the follow verifier to
+    * recompute-match the cl1/dl1-consumed `lastCurrencySnapshots` field deterministically. The union grouping MUST stay identical to the
+    * producer-side `GlobalSnapshotInfo.stateProofBuilder` / `mptStateProofFromBytes` infoRoot computation.
     */
   def currencySnapshotFieldRoots[F[_]: Async: Parallel: Hasher: JsonSerializer](
     data: SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
@@ -1615,8 +1627,7 @@ object GlobalStateConverter {
   ): F[(Hash, Hash)] =
     currencySnapshotEntryBytes[F](data).flatMap { typed =>
       def rootForFields(pred: GlobalStateFieldId => Boolean): F[Hash] =
-        typed.toList.filter { case (k, _) => pred(k.fieldId) }.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
-          .map(_.toMap)
+        toPhysicalEntries[F, Array[Byte]](typed.filter { case (k, _) => pred(k.fieldId) })
           .flatMap(fieldRootFromBytes[F])
       (
         rootForFields(_ == GlobalStateFieldId.LastIncrementalCurrencySnapshots),
@@ -1625,8 +1636,8 @@ object GlobalStateConverter {
     }
 
   /** True iff a `GlobalStateKey.fieldId` belongs to the per-MG shard-checkpoint commitment ([[currencySnapshotMgEntries]] /
-    * [[currencySnapshotMgRoot]]): the fieldId-5 incremental PLUS the 8 `infoSubFields` `Mg*` partitions — i.e. the SAME field set the flat
-    * `(incrementalRoot, infoRoot)` pair covered (`incrementalRoot` = fieldId-5, `infoRoot` = UNION over `infoSubFields`). DELIBERATELY
+    * [[currencySnapshotMgRoot]]): the fieldId-5 incremental PLUS the seven `infoSubFields` `Mg*` partitions — i.e. the SAME field set the
+    * flat `(incrementalRoot, infoRoot)` pair covered (`incrementalRoot` = fieldId-5, `infoRoot` = UNION over `infoSubFields`). DELIBERATELY
     * excludes `MgGlobalSnapshotSyncView` (fieldId 32): it is NOT in `infoSubFields` and is observation-dependent (the producer accumulates
     * it under the full committee, a re-deriving verifier under only the 2/3 signers — #259/cause-2), so folding it into the consensus root
     * makes the root non-deterministic across nodes and re-froze the sharded per-MG adoption. Keeping the field set identical to
@@ -1637,7 +1648,7 @@ object GlobalStateConverter {
 
   /** The hex-keyed component entries committed by the per-MG shard-checkpoint root ([[currencySnapshotMgRoot]]). Encodes via
     * [[currencySnapshotEntryBytes]] (gl0's EXACT producer bytes — the single byte source `currencySnapshotFieldRoots` also uses), hexes
-    * each key through `GlobalStateKey.toHex`, and keeps ONLY the [[isCurrencyMgCommitmentField]] entries (fieldId-5 incremental + the 8
+    * each key through `GlobalStateKey.toHex`, and keeps ONLY the [[isCurrencyMgCommitmentField]] entries (fieldId-5 incremental + the seven
     * `infoSubFields` `Mg*` sub-fields; field-32 sync-view dropped for determinism). Each surviving entry is a distinct full-length MPT key
     * — one leaf per `(metagraphAddr, subField, account)` plus the per-MG incremental — so the resulting trie is COMPONENT-ADDRESSABLE: a
     * single account in a single field is an independently-provable leaf.
@@ -1652,10 +1663,7 @@ object GlobalStateConverter {
     implicit stateProofSelector: StateProofSelector
   ): F[Map[Hex, Array[Byte]]] =
     currencySnapshotEntryBytes[F](data).flatMap { typed =>
-      typed.toList.filter { case (k, _) => isCurrencyMgCommitmentField(k.fieldId) }.parTraverse {
-        case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v)
-      }
-        .map(_.toMap)
+      toPhysicalEntries[F, Array[Byte]](typed.filter { case (k, _) => isCurrencyMgCommitmentField(k.fieldId) })
     }
 
   /** PIN-1 component-addressable per-MG shard-checkpoint root: the `rootHash` of a standalone MPT built from [[currencySnapshotMgEntries]]
@@ -1696,8 +1704,7 @@ object GlobalStateConverter {
     currencySnapshotEntryBytes[F](data).flatMap { typed =>
       val entries = typed.toList
       def rootFor(pred: GlobalStateFieldId => Boolean): F[Hash] =
-        entries.filter { case (k, _) => pred(k.fieldId) }.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
-          .map(_.toMap)
+        toPhysicalEntries[F, Array[Byte]](entries.filter { case (k, _) => pred(k.fieldId) })
           .flatMap(fieldRootFromBytes[F])
       def cnt(pred: GlobalStateFieldId => Boolean): Int = entries.count { case (k, _) => pred(k.fieldId) }
       for {
@@ -1891,10 +1898,11 @@ object GlobalStateConverter {
     } yield pureRem ++ msgRem ++ syncRem
   }
 
-  /** Write one MG's unrolled `CurrencySnapshotInfo`: upsert the 8 `Mg*` partitions (typed inserts — byte-identical to [[infoEntryBytes]]
-    * via the same codecs; unchanged entries are MPT no-ops) and remove the dropped entries ([[infoRemovalKeys]] vs `priorInfo`). Does NOT
-    * touch `activeAllowSpends` (fieldId-7, the existing accumulator path) nor the incremental (fieldId-5). The SINGLE typed write path for
-    * `applyStateChanges` / `syncFromStateChanges` / `syncFromGlobalSnapshotInfo`.
+  /** Write one MG's unrolled `CurrencySnapshotInfo`: upsert all eight serialized `Mg*` partitions (the seven `infoRoot` fields plus the
+    * transitional root-excluded sync view; typed inserts are byte-identical to [[infoEntryBytes]] via the same codecs; unchanged entries
+    * are MPT no-ops) and remove the dropped entries ([[infoRemovalKeys]] vs `priorInfo`). Does NOT touch `activeAllowSpends` (fieldId-7,
+    * the existing accumulator path) nor the incremental (fieldId-5). The SINGLE typed write path for `applyStateChanges` /
+    * `syncFromStateChanges` / `syncFromGlobalSnapshotInfo`.
     */
   def writeCurrencyInfo[F[_]: Sync: Hasher](
     metagraphAddress: Address,
@@ -1970,8 +1978,9 @@ object GlobalStateConverter {
           mptRoot <-
             if (kvPairs.isEmpty) MptRoot(Hash.empty).pure[F]
             else
-              kvPairs.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
-                .flatMap(pairs => MerklePatriciaTrie.makeParallelFromBytes[F](pairs.toMap).map(_.rootHash))
+              toPhysicalEntries[F, Array[Byte]](kvPairs)
+                .flatMap(MerklePatriciaTrie.makeParallelFromBytes[F])
+                .map(_.rootHash)
         } yield mptRoot
 
       /** Per-fieldId MPT root over the same key+value bytes as the global root. For each `fieldId` present in the input, builds a separate
@@ -1985,8 +1994,7 @@ object GlobalStateConverter {
           grouped = kvPairs.groupBy(_._1.fieldId).toList
           perField <- grouped.parTraverse {
             case (fieldId, entries) =>
-              entries.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }
-                .flatMap(pairs => fieldRootFromBytes[F](pairs.toMap).tupleLeft(fieldId))
+              toPhysicalEntries[F, Array[Byte]](entries).flatMap(fieldRootFromBytes[F](_).tupleLeft(fieldId))
           }
         } yield perField.toMap
     }
@@ -2007,14 +2015,14 @@ object GlobalStateConverter {
             }
 
           if (kvPairs.size <= BatchSize)
-            convertBatch(kvPairs.toList).map(_.toMap)
+            convertBatch(kvPairs.toList).flatMap(materializePhysicalEntries[F, Json])
           else
             kvPairs.toList
               .grouped(BatchSize)
               .toList
-              .foldLeftM(Map.empty[Hex, Json]) { (acc, batch) =>
-                convertBatch(batch).map(acc ++ _) <* Async[F].cede
-              }
+              .traverse(batch => convertBatch(batch) <* Async[F].cede)
+              .map(_.flatten)
+              .flatMap(materializePhysicalEntries[F, Json])
         }
 
         def buildMptRoot(hexMap: Map[Hex, Json]): F[MptRoot] =
@@ -2372,7 +2380,7 @@ object GlobalStateConverter {
                 case (hex, _) => GlobalStateKey.fieldIdFromHex(hex).exists(GlobalStateFieldId.mptNativeConsensusFields.contains)
               })
               gsiBytes <- toAllStateKeyValueBytes[F](info)
-              gsiHex <- gsiBytes.toList.parTraverse { case (k, v) => GlobalStateKey.toHex[F](k).map(_ -> v) }.map(_.toMap)
+              gsiHex <- toPhysicalEntries[F, Array[Byte]](gsiBytes)
               // Key sets are disjoint by construction: `gsiHex` never contains an mptNative fieldId (the GSI has no field for them)
               // and `preserved` contains ONLY mptNative fieldIds — so `++` is a pure union, no overwrites.
               withPreserved = gsiHex ++ preserved
@@ -2392,8 +2400,8 @@ object GlobalStateConverter {
 
       /** ROOT-VERIFIED byte-faithful reload of the node's OWN persisted MPT at `snapshotOrdinal` — the preferred local restart seed
         * (FINDING-S01 completion). The persisted byte map carries the MPT-native consensus partitions (`ConsumedAllowSpends` 33 /
-        * `Slashings` 34) verbatim — the partitions a from-GSI rebuild structurally cannot reconstruct — so a node restarting with its own
-        * persisted MPT reproduces the signed `stateProof.mptRoot` BY CONSTRUCTION and does not need to re-bootstrap from a peer.
+        * `Slashings` 34) verbatim — the partitions a from-GSI rebuild structurally cannot reconstruct. The node keeps that local seed only
+        * after recomputing its consensus root and matching the supplied signed root, so a matching seed needs no peer re-bootstrap.
         *
         * Semantics: load the persisted state (if any), recompute the consensus root, and keep the load ONLY when it equals `signedMptRoot`.
         * On no-persistence / nothing-persisted / root mismatch (stale or corrupt bytes) the pre-call store state is restored via savepoint
@@ -2652,7 +2660,8 @@ object GlobalStateConverter {
           _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
           _ <- store.insert[Balance](balances)
           _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
-          // Unrolled per-metagraph info — the 8 `Mg*` partitions replace the monolithic fieldId-6 blob. `store.clear` above leaves an
+          // Unrolled per-metagraph info — all eight serialized `Mg*` partitions replace the monolithic fieldId-6 blob; only the seven
+          // deterministic `infoSubFields` participate in `infoRoot`. `store.clear` above leaves an
           // empty store, so the reconstructed prior is empty ⇒ no removals; the upserts are the full info per MG.
           _ <- currency._2.traverse_ {
             case (metagraphAddr, newInfo) =>
@@ -2689,7 +2698,8 @@ object GlobalStateConverter {
           // exactly as the byte-faithful `loadBytes` path would carry them. Keys cannot collide with any GSI-derived insert
           // (disjoint fieldIds).
           _ <- store.underlying.insertBytes(preservedMptNative).flatMap(_.liftTo[F]).whenA(preservedMptNative.nonEmpty)
-          _ <- store.build(snapshotOrdinal).void
+          empty <- store.isEmpty
+          _ <- store.build(snapshotOrdinal).rethrow.unlessA(empty)
         } yield ()
       }
 

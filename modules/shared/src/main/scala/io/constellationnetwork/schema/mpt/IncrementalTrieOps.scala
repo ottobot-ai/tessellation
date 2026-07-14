@@ -71,8 +71,12 @@ object IncrementalTrieOps {
     dataDigest: Hash
   ): F[MerklePatriciaNode] =
     if (depth >= path.length) {
-      // Key exhausted at branch - rebuild branch (unusual case)
-      MerklePatriciaNode.Branch.fromByteKeys(branch.internalPaths).widen
+      if (branch.internalPaths.isEmpty)
+        MerklePatriciaNode.Leaf.fromCompact[F](CompactNibblePath.empty, dataDigest).widen
+      else
+        Async[F].raiseError(
+          new IllegalArgumentException("Cannot insert a terminal physical trie key above an existing branch")
+        )
     } else {
       val nibbleValue = path.get(depth)
       branch.getChild(nibbleValue) match {

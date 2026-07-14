@@ -33,16 +33,18 @@ class ParallelMerklePatriciaProducer[F[_]: Hasher: Async: Parallel: JsonSerializ
   /** Create trie from pre-serialized bytes. Hashes are computed during node construction.
     */
   def createFromBytes(data: Map[Hex, Array[Byte]]): F[MerklePatriciaTrie] =
-    if (data.isEmpty) {
-      MerklePatriciaNode.Branch.empty[F].map(MerklePatriciaTrie(_))
-    } else {
-      for {
-        _ <- logger.info(s"[MPT] Creating trie from ${data.size} entries")
-        entries <- Async[F].blocking(prepareAndSortBytes(data))
-        dataHashes <- batchComputeDataHashes(entries)
-        root <- buildTree(entries, dataHashes, 0, entries.length, 0)
-        _ <- logger.info(s"[MPT] Created trie")
-      } yield MerklePatriciaTrie(root)
+    PhysicalTrieKeyValidator.validateKeys(data.keys) match {
+      case Left(error) => error.raiseError[F, MerklePatriciaTrie]
+      case Right(_) if data.isEmpty =>
+        MerklePatriciaNode.Branch.empty[F].map(MerklePatriciaTrie(_))
+      case Right(_) =>
+        for {
+          _ <- logger.info(s"[MPT] Creating trie from ${data.size} entries")
+          entries <- Async[F].blocking(prepareAndSortBytes(data))
+          dataHashes <- batchComputeDataHashes(entries)
+          root <- buildTree(entries, dataHashes, 0, entries.length, 0)
+          _ <- logger.info(s"[MPT] Created trie")
+        } yield MerklePatriciaTrie(root)
     }
 
   def create[A: Encoder](data: Map[Hex, A]): F[MerklePatriciaTrie] =
@@ -63,51 +65,72 @@ class ParallelMerklePatriciaProducer[F[_]: Hasher: Async: Parallel: JsonSerializ
     data: Map[Hex, A]
   ): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
     if (data.isEmpty) current.asRight[MerklePatriciaError].pure[F]
-    else {
-      (for {
-        // Convert to bytes and compute hashes
-        entries <- data.toList.parTraverse {
-          case (hex, value) =>
-            for {
-              bytes <- JsonSerializer[F].serialize(value)
-              hash <- Hasher[F].hashBytes(bytes)
-            } yield (hex, hash)
-        }
-        // Apply incremental inserts
-        newRoot <- IncrementalTrieOps.insertMultiple[F](current.rootNode, entries)
-      } yield MerklePatriciaTrie(newRoot).asRight[MerklePatriciaError])
-        .handleError(e => (OperationError(e.getMessage): MerklePatriciaError).asLeft)
-    }
+    else
+      validateInsertCandidate(current, data.keys) match {
+        case Left(error) => (error: MerklePatriciaError).asLeft[MerklePatriciaTrie].pure[F]
+        case Right(_) =>
+          (for {
+            // Convert to bytes and compute hashes
+            entries <- data.toList.parTraverse {
+              case (hex, value) =>
+                for {
+                  bytes <- JsonSerializer[F].serialize(value)
+                  hash <- Hasher[F].hashBytes(bytes)
+                } yield (hex, hash)
+            }
+            sortedEntries = entries.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+            // Apply incremental inserts
+            newRoot <- IncrementalTrieOps.insertMultiple[F](current.rootNode, sortedEntries)
+          } yield MerklePatriciaTrie(newRoot).asRight[MerklePatriciaError])
+            .handleError(e => (OperationError(e.getMessage): MerklePatriciaError).asLeft)
+      }
 
   def insertFromBytes(
     current: MerklePatriciaTrie,
     data: Map[Hex, Array[Byte]]
   ): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
     if (data.isEmpty) current.asRight[MerklePatriciaError].pure[F]
-    else {
-      (for {
-        // Compute hashes for byte data
-        entries <- data.toList.parTraverse {
-          case (hex, bytes) =>
-            Hasher[F].hashBytes(bytes).map(hash => (hex, hash))
-        }
-        // Apply incremental inserts
-        newRoot <- IncrementalTrieOps.insertMultiple[F](current.rootNode, entries)
-      } yield MerklePatriciaTrie(newRoot).asRight[MerklePatriciaError])
-        .handleError(e => (OperationError(e.getMessage): MerklePatriciaError).asLeft)
-    }
+    else
+      validateInsertCandidate(current, data.keys) match {
+        case Left(error) => (error: MerklePatriciaError).asLeft[MerklePatriciaTrie].pure[F]
+        case Right(_) =>
+          (for {
+            // Compute hashes for byte data
+            entries <- data.toList.parTraverse {
+              case (hex, bytes) =>
+                Hasher[F].hashBytes(bytes).map(hash => (hex, hash))
+            }
+            sortedEntries = entries.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+            // Apply incremental inserts
+            newRoot <- IncrementalTrieOps.insertMultiple[F](current.rootNode, sortedEntries)
+          } yield MerklePatriciaTrie(newRoot).asRight[MerklePatriciaError])
+            .handleError(e => (OperationError(e.getMessage): MerklePatriciaError).asLeft)
+      }
 
   def remove(
     current: MerklePatriciaTrie,
     keys: List[Hex]
   ): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
     if (keys.isEmpty) current.asRight[MerklePatriciaError].pure[F]
-    else {
-      IncrementalTrieOps
-        .removeMultiple[F](current.rootNode, keys)
-        .map(newRoot => MerklePatriciaTrie(newRoot).asRight[MerklePatriciaError])
-        .handleError(e => (OperationError(e.getMessage): MerklePatriciaError).asLeft)
-    }
+    else
+      PhysicalTrieKeyValidator.validateEachKey(keys) match {
+        case Left(error) => (error: MerklePatriciaError).asLeft[MerklePatriciaTrie].pure[F]
+        case Right(_) =>
+          val sortedKeys = keys.sortBy(hex => CompactNibblePath.fromHexString(hex.value))
+          IncrementalTrieOps
+            .removeMultiple[F](current.rootNode, sortedKeys)
+            .map(newRoot => MerklePatriciaTrie(newRoot).asRight[MerklePatriciaError])
+            .handleError(e => (OperationError(e.getMessage): MerklePatriciaError).asLeft)
+      }
+
+  private def currentPhysicalKeys(current: MerklePatriciaTrie): List[Hex] =
+    MerklePatriciaTrie.collectLeafNodesWithPaths(current).map(_._1)
+
+  private def validateInsertCandidate(
+    current: MerklePatriciaTrie,
+    insertKeys: Iterable[Hex]
+  ): Either[PhysicalTrieKeyError, Unit] =
+    PhysicalTrieKeyValidator.validateInsertion(currentPhysicalKeys(current).toSet, insertKeys)
 
   private def prepareAndSortBytes(data: Map[Hex, Array[Byte]]): Array[(CompactNibblePath, Array[Byte])] = {
     val dataArray = data.toArray
@@ -193,36 +216,39 @@ class ParallelMerklePatriciaProducer[F[_]: Hasher: Async: Parallel: JsonSerializ
     start: Int,
     end: Int,
     depth: Int
-  ): F[MerklePatriciaNode] = {
-    val groups = findGroups(entries, start, end, depth)
+  ): F[MerklePatriciaNode] =
+    ParallelMerklePatriciaProducer.ensureGroupProgress(entries, start, end, depth) match {
+      case Left(error) => error.raiseError[F, MerklePatriciaNode]
+      case Right(_) =>
+        val groups = findGroups(entries, start, end, depth)
 
-    if (groups.length == 1) {
-      val (nibbleValue, gs, ge) = groups(0)
-      buildTree(entries, dataHashes, gs, ge, depth + 1).flatMap { child =>
-        createSingleGroupNode(nibbleValue, child)
-      }
-    } else {
-      val useParallel = depth <= ParallelDepthThreshold || groups.length >= 4
-
-      val buildChildren: F[List[(Nibble, MerklePatriciaNode)]] =
-        if (useParallel) {
-          groups.toList.parTraverse {
-            case (nibbleValue, gs, ge) =>
-              buildTree(entries, dataHashes, gs, ge, depth + 1).map(Nibble.unsafe(nibbleValue) -> _)
+        if (groups.length == 1) {
+          val (nibbleValue, gs, ge) = groups(0)
+          buildTree(entries, dataHashes, gs, ge, depth + 1).flatMap { child =>
+            createSingleGroupNode(nibbleValue, child)
           }
         } else {
-          groups.toList.traverse {
-            case (nibbleValue, gs, ge) =>
-              buildTree(entries, dataHashes, gs, ge, depth + 1).map(Nibble.unsafe(nibbleValue) -> _)
+          val useParallel = depth <= ParallelDepthThreshold || groups.length >= 4
+
+          val buildChildren: F[List[(Nibble, MerklePatriciaNode)]] =
+            if (useParallel) {
+              groups.toList.parTraverse {
+                case (nibbleValue, gs, ge) =>
+                  buildTree(entries, dataHashes, gs, ge, depth + 1).map(Nibble.unsafe(nibbleValue) -> _)
+              }
+            } else {
+              groups.toList.traverse {
+                case (nibbleValue, gs, ge) =>
+                  buildTree(entries, dataHashes, gs, ge, depth + 1).map(Nibble.unsafe(nibbleValue) -> _)
+              }
+            }
+
+          buildChildren.flatMap { children =>
+            // Sort by nibble value for deterministic branch construction
+            MerklePatriciaNode.Branch(children.sortBy(_._1.value).toMap).widen
           }
         }
-
-      buildChildren.flatMap { children =>
-        // Sort by nibble value for deterministic branch construction
-        MerklePatriciaNode.Branch(children.sortBy(_._1.value).toMap).widen
-      }
     }
-  }
 
   @inline private def findGroups(
     entries: Array[(CompactNibblePath, Array[Byte])],
@@ -265,6 +291,33 @@ class ParallelMerklePatriciaProducer[F[_]: Hasher: Async: Parallel: JsonSerializ
 }
 
 object ParallelMerklePatriciaProducer {
+  private[mpt] def ensureGroupProgress(
+    entries: Array[(CompactNibblePath, Array[Byte])],
+    start: Int,
+    end: Int,
+    depth: Int
+  ): Either[NonShrinkingPhysicalTrieGroup, Unit] = {
+    var terminalIndex = -1
+    var index = start
+
+    while (index < end && terminalIndex < 0) {
+      if (entries(index)._1.length <= depth) terminalIndex = index
+      index += 1
+    }
+
+    if (terminalIndex < 0 || end - start <= 1) Right(())
+    else {
+      val conflictingIndex = if (terminalIndex == start) start + 1 else start
+      Left(
+        NonShrinkingPhysicalTrieGroup(
+          depth,
+          entries(terminalIndex)._1.toHex,
+          entries(conflictingIndex)._1.toHex
+        )
+      )
+    }
+  }
+
   def apply[F[_]: Hasher: Async: Parallel: JsonSerializer]: ParallelMerklePatriciaProducer[F] =
     new ParallelMerklePatriciaProducer[F]()
 }

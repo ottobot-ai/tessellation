@@ -23,6 +23,7 @@ import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
 import io.constellationnetwork.storage.durable.{DurableAtomicWriter, DurableFileError, DurableFileOps, DurableWriteHook}
 
 import scodec.bits.ByteVector
@@ -976,6 +977,9 @@ private final class LiveDurableMptImageStore[F[_]: Async](
   private def capture(entries: Map[Hex, ByteVector]): F[Vector[(Hex, ByteVector)]] =
     for {
       _ <- ensureLimit("entry count", limits.maxEntries.toLong, entries.size.toLong)
+      _ <- PhysicalTrieKeyValidator
+        .validateKeys(entries.keys)
+        .fold(error => Async[F].raiseError[Unit](InvalidEntry(error.getMessage)), _ => Async[F].unit)
       _ <- entries.toVector.traverse_ {
         case (key, value) =>
           validateKey(key) >>

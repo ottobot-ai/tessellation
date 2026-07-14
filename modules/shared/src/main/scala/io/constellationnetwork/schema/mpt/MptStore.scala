@@ -2,6 +2,7 @@ package io.constellationnetwork.schema.mpt
 
 import cats.Parallel
 import cats.effect.std.Semaphore
+import cats.effect.syntax.all._
 import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
@@ -97,20 +98,20 @@ trait MptStore[F[_], K] {
     */
   def allEntriesStrict: F[List[StrictMptRawEntry]]
 
-  /** Load a pre-signed hex-keyed byte map VERBATIM at `ordinal` — the 3c-A "MPT is the state" primitive
+  /** Load a claimed hex-keyed byte map VERBATIM at `ordinal` — the 3c-A "MPT is the state" primitive
     * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). Unlike [[sync]]/[[syncFull]], which re-encode a typed `Map[K,V]` through the
     * per-field `ImmutableCodec`, this stores the exact bytes that were signed (no re-encode). So a follower that loads gl0's served
-    * `stateProof`-bytes and recomputes `GlobalSnapshotInfo.consensusMptRoot(entries)` obtains the producer's signed `mptRoot` BY
-    * CONSTRUCTION — eliminating the `recomputed ≠ signed` drift the `syncFromGlobalSnapshotInfo` re-encode path exhibits. Mirrors
-    * [[syncFull]]'s clear→insert→persist→build→bookkeep tail, minus the codec round-trip.
+    * `stateProof` bytes can recompute the root over those exact bytes without a codec round-trip. This method does not authenticate the
+    * bytes, prove the claimed root, or make a replacement crash-atomic; callers must verify the rebuilt root and artifact lineage before
+    * adoption.
     */
   def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal): F[Unit]
 
   /** Byte-faithful reload of the node's OWN persisted MPT state at `ordinal` — the boot/download counterpart of [[loadBytes]] (FINDING-S01
     * completion). The persisted byte map is exactly what the producer held when it persisted at that ordinal — including the MPT-native
-    * consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34) that a from-GSI rebuild cannot reconstruct — so a successful load
-    * reproduces the signed `stateProof.mptRoot` BY CONSTRUCTION on an uncorrupted store. Returns `false` (store untouched) when the
-    * producer has no persistence backend or nothing is persisted at `ordinal`; callers that hold the signed root should verify via
+    * consensus partitions (`ConsumedAllowSpends` 33 / `Slashings` 34) that a from-GSI rebuild cannot reconstruct. A successful load
+    * preserves those bytes but does not authenticate their snapshot lineage or prove a claimed root. Returns `false` (store untouched) when
+    * the producer has no persistence backend or nothing is persisted at `ordinal`; callers that hold the signed root must verify via
     * `syncFromPersistedMptVerified` (GlobalStateConverter syntax), which restores the pre-load state on a root mismatch.
     */
   def loadPersisted(ordinal: SnapshotOrdinal): F[Boolean]
@@ -178,19 +179,25 @@ object MptStore {
     private def encode[V: ImmutableCodec](v: V): Array[Byte] =
       ImmutableCodec[V].immutableBytes(v).toArray
 
+    private def validatePhysicalKeys(keys: Iterable[Hex]): F[Unit] =
+      PhysicalTrieKeyValidator.validateKeys(keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+
+    private def materializeHexEntries(entries: List[(Hex, Array[Byte])]): F[Map[Hex, Array[Byte]]] =
+      PhysicalTrieKeyValidator.materializeEntries(entries).liftTo[F]
+
     private def toHexEntries[V: ImmutableCodec](data: Map[K, V]): F[Map[Hex, Array[Byte]]] =
       if (data.isEmpty) Map.empty[Hex, Array[Byte]].pure[F]
       else if (data.size <= BatchSize) {
         data.toList.parTraverse {
           case (k, v) => toHex(k).map(_ -> encode(v))
-        }.map(_.toMap)
+        }.flatMap(materializeHexEntries)
       } else {
         val batches = data.toList.grouped(BatchSize).toList
         batches.parTraverse { batch =>
           batch.parTraverse {
             case (k, v) => toHex(k).map(_ -> encode(v))
           }
-        }.map(_.flatten.toMap)
+        }.map(_.flatten).flatMap(materializeHexEntries)
       }
 
     private def deserializeBytes[V: ImmutableCodec](bytes: Array[Byte]): F[Option[V]] =
@@ -275,7 +282,7 @@ object MptStore {
     override def insert[V: ImmutableCodec](key: K, value: V): F[Unit] =
       for {
         hex <- toHex(key)
-        _ <- producer.insertBytes(Map(hex -> encode(value))).void
+        _ <- producer.insertBytes(Map(hex -> encode(value))).rethrow
       } yield ()
 
     override def insert[V: ImmutableCodec](data: Map[K, V]): F[Unit] =
@@ -283,13 +290,13 @@ object MptStore {
       else
         for {
           entries <- toHexEntries(data)
-          _ <- producer.insertBytes(entries).void
+          _ <- producer.insertBytes(entries).rethrow
         } yield ()
 
     override def remove(key: K): F[Unit] =
       for {
         hex <- toHex(key)
-        _ <- producer.remove(List(hex)).void
+        _ <- producer.remove(List(hex)).rethrow
       } yield ()
 
     override def remove(keys: List[K]): F[Unit] =
@@ -297,7 +304,7 @@ object MptStore {
       else
         for {
           hexKeys <- keys.parTraverse(toHex)
-          _ <- producer.remove(hexKeys).void
+          _ <- producer.remove(hexKeys).rethrow
         } yield ()
 
     override def contains(key: K): F[Boolean] =
@@ -318,10 +325,13 @@ object MptStore {
     override def syncFull[V: ImmutableCodec](newState: Map[K, V], ordinal: SnapshotOrdinal): F[Unit] =
       // Caller-serialized — see `withTransaction` comment. Bootstrap / download paths are
       // single-fiber; in-flight production paths serialize via `snapshotSemaphore`.
-      if (newState.isEmpty) {
-        logger.info("[MptStore] Empty sync, skipping") >>
-          clear >> lastSyncedOrdinalRef.set(Some(ordinal))
-      } else
+      if (newState.isEmpty)
+        withTransaction {
+          logger.info("[MptStore] Empty sync, clearing") >>
+            clear >> persistAsync(ordinal) >> lastSyncedOrdinalRef.set(Some(ordinal)) >>
+            (((), MptTxAction.Commit: MptTxAction)).pure[F]
+        }
+      else
         for {
           currentSize <- producer.entryCount
           _ <-
@@ -332,38 +342,46 @@ object MptStore {
               )
               .whenA(currentSize > 0 && newState.size < currentSize)
           _ <- logger.info(s"[MptStore] Full sync with ${newState.size} entries (was $currentSize)")
-          _ <- clear
           newEntries <- toHexEntries(newState)
-          _ <- producer.insertBytes(newEntries).void
-          _ <- persistAsync(ordinal)
-          _ <- build(ordinal)
-          _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+          _ <- validatePhysicalKeys(newEntries.keys)
+          _ <- withTransaction {
+            for {
+              _ <- clear
+              _ <- producer.insertBytes(newEntries).rethrow
+              _ <- build(ordinal).rethrow
+              _ <- persistAsync(ordinal)
+              _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+            } yield ((), MptTxAction.Commit: MptTxAction)
+          }
         } yield ()
 
     override def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal): F[Unit] =
-      // 3c-A: store the SIGNED byte map verbatim — same clear→insert→persist→build→bookkeep tail as `syncFull`, but the input is the
-      // already-encoded `(Hex → bytes)` map (NO `toHexEntries` codec round-trip). `producer.insertBytes(...).void` matches `syncFull`;
-      // a partial/corrupt load is caught downstream by the follower's `consensusMptRoot(entries) === signed mptRoot` verify gate.
+      // Store the supplied byte map verbatim, without a codec round-trip. Physical grammar is checked before replacement and producer/build
+      // failure restores the in-memory savepoint. Authentication and claimed-root comparison remain mandatory caller responsibilities.
       if (entries.isEmpty)
-        logger.info(s"[MptStore] loadBytes empty at ordinal=$ordinal, clearing") >>
-          clear >> lastSyncedOrdinalRef.set(Some(ordinal))
+        withTransaction {
+          logger.info(s"[MptStore] loadBytes empty at ordinal=$ordinal, clearing") >>
+            clear >> persistAsync(ordinal) >> lastSyncedOrdinalRef.set(Some(ordinal)) >>
+            (((), MptTxAction.Commit: MptTxAction)).pure[F]
+        }
       else
         for {
-          _ <- logger.info(s"[MptStore] loadBytes ${entries.size} signed entries VERBATIM at ordinal=$ordinal (no re-encode)")
-          _ <- clear
-          _ <- producer.insertBytes(entries).void
-          _ <- persistAsync(ordinal)
-          _ <- build(ordinal).void
-          _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+          _ <- logger.info(s"[MptStore] loadBytes ${entries.size} claimed entries VERBATIM at ordinal=$ordinal (no re-encode)")
+          _ <- validatePhysicalKeys(entries.keys)
+          _ <- withTransaction {
+            for {
+              _ <- clear
+              _ <- producer.insertBytes(entries).rethrow
+              _ <- build(ordinal).rethrow
+              _ <- persistAsync(ordinal)
+              _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+            } yield ((), MptTxAction.Commit: MptTxAction)
+          }
         } yield ()
 
     override def syncFullIfNeeded[V: ImmutableCodec](newState: => F[Map[K, V]], ordinal: SnapshotOrdinal): F[Unit] =
-      lastSyncedOrdinalRef.modify { lastOrdinal =>
-        val needsSync = lastOrdinal.forall(_ =!= ordinal)
-        if (needsSync) (Some(ordinal), true)
-        else (lastOrdinal, false)
-      }.flatMap { needsSync =>
-        if (needsSync) newState.flatMap(syncFull(_, ordinal))
+      lastSyncedOrdinalRef.get.flatMap { lastOrdinal =>
+        if (lastOrdinal.forall(_ =!= ordinal)) newState.flatMap(syncFull(_, ordinal))
         else logger.debug(s"[MptStore] Skipping sync, already synced at ordinal $ordinal")
       }
 
@@ -373,16 +391,20 @@ object MptStore {
         for {
           _ <- logger.debug(s"[MptStore] Incremental sync with ${updates.size} entries at ordinal=$ordinal")
           _ <- insert(updates)
+          _ <- build(ordinal).rethrow
           _ <- persistAsync(ordinal)
-          _ <- build(ordinal).void
           _ <- lastSyncedOrdinalRef.set(Some(ordinal))
         } yield ()
 
     override def commit(ordinal: SnapshotOrdinal): F[Unit] =
       for {
         _ <- logger.debug(s"[MptStore] Commit at ordinal=$ordinal")
-        _ <- persistAsync(ordinal)
-        _ <- build(ordinal).void
+        entryCount <- producer.entryCount
+        _ <-
+          if (entryCount == 0)
+            logger.debug(s"[MptStore] Empty commit at ordinal=$ordinal; persisting an empty image without building a trie") >>
+              persistAsync(ordinal)
+          else build(ordinal).rethrow.void >> persistAsync(ordinal)
         _ <- lastSyncedOrdinalRef.set(Some(ordinal))
       } yield ()
 
@@ -390,10 +412,13 @@ object MptStore {
       lastSyncedOrdinalRef.get
 
     override def update[V: ImmutableCodec](toUpsert: Map[K, V], toRemove: Set[K]): F[Unit] =
-      for {
-        _ <- remove(toRemove.toList)
-        _ <- insert(toUpsert)
-      } yield ()
+      if (toUpsert.isEmpty && toRemove.isEmpty) Async[F].unit
+      else
+        for {
+          upserts <- toHexEntries(toUpsert)
+          removals <- toRemove.toList.parTraverse(toHex)
+          _ <- producer.replaceBytes(upserts, removals).rethrow
+        } yield ()
 
     override def underlying: StatefulMerklePatriciaProducer[F] = producer
 
@@ -405,11 +430,16 @@ object MptStore {
     override def loadPersisted(ordinal: SnapshotOrdinal): F[Boolean] =
       producer match {
         case p: StatefulWithPersistenceMerklePatriciaProducer[F] =>
-          p.load(ordinal).flatTap { loaded =>
-            // Same build + last-synced bookkeeping tail as `loadBytes`, minus `persistAsync` (the bytes just came FROM disk).
-            (logger.info(s"[MptStore] loadPersisted: restored persisted state at ordinal=$ordinal VERBATIM (no re-encode)") >>
-              build(ordinal).void >>
-              lastSyncedOrdinalRef.set(Some(ordinal))).whenA(loaded)
+          withTransaction {
+            p.load(ordinal).flatMap { loaded =>
+              // Same build + last-synced bookkeeping tail as `loadBytes`, minus persistence (the bytes came from disk).
+              (for {
+                _ <- logger.info(s"[MptStore] loadPersisted: restored persisted state at ordinal=$ordinal VERBATIM (no re-encode)")
+                empty <- isEmpty
+                _ <- build(ordinal).rethrow.unlessA(empty)
+                _ <- lastSyncedOrdinalRef.set(Some(ordinal))
+              } yield ()).whenA(loaded).as((loaded, MptTxAction.Commit: MptTxAction))
+            }
           }
         case _ =>
           false.pure[F]
@@ -437,11 +467,13 @@ object MptStore {
       // Caller-serialized. Production callers use `snapshotSemaphore`; HTTP-side callers such as
       // HistoricalMptProofService already wrap this method with `withExclusiveLock`. Acquiring that
       // non-reentrant semaphore again here would deadlock until lock ownership moves to one boundary.
-      savepoint.flatMap { sp =>
-        body.attempt.flatMap {
-          case Right((a, MptTxAction.Commit))   => a.pure[F]
-          case Right((a, MptTxAction.Rollback)) => sp.restore.as(a)
-          case Left(err)                        => sp.restore >> err.raiseError[F, A]
+      Async[F].uncancelable { poll =>
+        savepoint.flatMap { sp =>
+          poll(body).onCancel(sp.restore).attempt.flatMap {
+            case Right((a, MptTxAction.Commit))   => a.pure[F]
+            case Right((a, MptTxAction.Rollback)) => sp.restore.as(a)
+            case Left(err)                        => sp.restore >> err.raiseError[F, A]
+          }
         }
       }
 

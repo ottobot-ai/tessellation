@@ -186,6 +186,25 @@ already has a hard-coded kill switch.
    (`MPT-07`); complete candidate preflight and bounded builder collision failure
    are required before any raw load or parser migration. Gates: `ROOT-008`,
    `ROOT-011`.
+   A partial worktree slice now enforces generic physical grammar across full and
+   public incremental producers, typed-key materialization, stateful mutation,
+   disk/wire maps, overlays, and durable images; it also canonically orders public
+   incremental operations and restores the in-memory savepoint on replacement
+   build failure. ROOT-011 remains open for duplicate-member-preserving bounded
+   transport, integration/scale tests, ROOT-005 mutation ownership, and ROOT-009/
+   BR-05 authenticated crash-atomic installation.
+   The exhaustive target field manifest, physical shapes, codecs, identity/scope
+   rules, structural/index/population relations, root ownership, and unresolved
+   owner choices
+   are in `docs/review/ROOT-008-GL0-PARTITION-GRAMMAR.md`. `ROOT-008` parser and
+   RED work for final rooted fields may proceed alongside `ROOT-010`, but the
+   target manifest has no GL0 field-32 lane and cannot activate until witness
+   parity permits field-32 deletion. Numeric resource limits, retired-ID policy,
+   field-20/23 self-authentication, set identities, and token-lock currency scope
+   require owner review at O-17/R008-01..07 before schema freeze. ROOT-008 proves
+   physical placement, codec/identity, and structural/population relations; it
+   composes with, but does not replace, O-07/ECON-G economic authorization,
+   conservation, backing, replay protection, and transition validity.
 3. **Migrate key-blind consumers in parallel after step 2.** Close the six
    source-confirmed parser families: `MPT-01` Mg* value-only reconstruction,
    `MPT-02` consumed-allow-spend physical nullifier keys, `MPT-03` stake and
@@ -674,7 +693,8 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
 for the security cutover; E10 carries those exact refs through downstream
 delivery, rollback, and recovery.
 
-- Downstream APIs and durable events carry exact Phase-2 `(ordinal,hash,root)`
+- Downstream APIs and durable events carry exact Phase-2
+  `(ordinal,hash,parentHash,mptRoot)`
   identities and historical proof material, never a monotone ordinal watermark.
 - Cold ML0/GL1 bootstrap consumes one bundle anchored to the exact Phase-2
   identity/evidence resolved by FinalityGate. The selected-era full proof,
@@ -738,6 +758,22 @@ delivery, rollback, and recovery.
   followers, and serving; this is a partial nonactivating prerequisite, not L-23
   completion. It does not yet implement exact per-hash P0/P1 tracking or the
   optimistic K/alpha/beta decision cascade.
+- P6-FIN14-A now has a proposed, nonactivating exact-consumer contract in
+  `docs/review/P6-FIN14-PHASE2-CONSUMER-LEASE.md`. It separates portable evidence
+  from a package-minted local lease, uses two short acquisition operations around
+  unlocked immutable verification, distinguishes descendant extension from
+  lineage replacement, and requires a short `commitIfCurrent` plus generation-
+  scoped invalidation for admission caches, attestations/tallies, queues, shard
+  buffers, replay/signing, inclusion, reads, and followers. Its purpose registry
+  explicitly covers admission, execution, watchtower/challenge, settlement,
+  optimistic/tower contexts, correction, followers, serving, and event delivery;
+  no generic economic-read scope can authorize another effect. No finality/MPT/
+  chain lock may span image verification, committee polling, or replay. P6 owns
+  the kernel, with P8/P10/P11 owning their consumer adapters and P7 supplying exact
+  checkpoint/state interfaces. O-16A..F owner review, O-15/O-01, exact released-
+  core readback, ROOT semantic/image gates, and consumer effect ordering block any
+  live issuer. Wrapping the current watermark/best-tip Boolean in an opaque type
+  does not close FIN-14.
 - Activation requires an authenticated evidence/fork-choice capability and an exact
   branch-revision hold through durable publication; MPT, semantic-state, and anchor
   compare-and-set readback before `CoreApplied`/`Released`; objective restoration;
@@ -754,7 +790,8 @@ delivery, rollback, and recovery.
   complete fresh-join payloads, and transactional installation remain open.
   `BR-06` is the existing `ECO-F32` witness defect, not a separate closure.
 - Gates: `BOOT-001` through `BOOT-005`, `XMG-006`, `FOLLOW-001` through
-  `FOLLOW-005`, `REC-*` including `REC-004`/`REC-005`, `MEMPOOL-001`,
+  `FOLLOW-007`, `FOLLOW-008A` through `FOLLOW-008P`, `REC-*` including
+  `REC-004`/`REC-005`, `MEMPOOL-001`,
   `ROOT-002` through `ROOT-005`, `ROOT-009`,
   `STOR-02`, and `GROWTH-001`.
 

@@ -1,6 +1,6 @@
 package io.constellationnetwork.security.mpt
 
-import cats.effect.{IO, Resource}
+import cats.effect.{Deferred, IO, Resource}
 import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect._
@@ -8,14 +8,21 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore, MptTxAction}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.security.mpt.producer.{
+  InMemoryMerklePatriciaProducer,
+  MerklePatriciaError,
+  ProducerSavepoint,
+  StatefulMerklePatriciaProducer
+}
+import io.constellationnetwork.security.mpt.prover.MerklePatriciaSingleInclusionProver
 import io.constellationnetwork.serde.codecs.StringCodec._
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.auto._
+import io.circe.{Encoder, Json}
 import weaver.MutableIOSuite
 
 object MptStoreSavepointSuite extends MutableIOSuite {
@@ -35,6 +42,35 @@ object MptStoreSavepointSuite extends MutableIOSuite {
         )
       }
     }
+
+  private final class BlockingClearProducer(
+    delegate: StatefulMerklePatriciaProducer[IO],
+    clearEntered: Deferred[IO, Unit]
+  ) extends StatefulMerklePatriciaProducer[IO] {
+
+    def entries: IO[Map[Hex, Array[Byte]]] = delegate.entries
+    def physicalKeys: IO[Set[Hex]] = delegate.physicalKeys
+    def entry(key: Hex): IO[Option[Array[Byte]]] = delegate.entry(key)
+    def entriesForKeys(keys: Set[Hex]): IO[Map[Hex, Array[Byte]]] = delegate.entriesForKeys(keys)
+    def entryCount: IO[Int] = delegate.entryCount
+    def entriesWithPrefix(prefix: Hex): IO[Map[Hex, Array[Byte]]] = delegate.entriesWithPrefix(prefix)
+    def build: IO[Either[MerklePatriciaError, MerklePatriciaTrie]] = delegate.build
+    def buildForOrdinal(ordinal: SnapshotOrdinal): IO[Either[MerklePatriciaError, MerklePatriciaTrie]] =
+      delegate.buildForOrdinal(ordinal)
+    def getRootHashForOrdinal(ordinal: SnapshotOrdinal): IO[Option[MptRoot]] = delegate.getRootHashForOrdinal(ordinal)
+    def getCurrentRootHash: IO[Option[MptRoot]] = delegate.getCurrentRootHash
+    def getLastBuiltOrdinal: IO[Option[SnapshotOrdinal]] = delegate.getLastBuiltOrdinal
+    def insert[A: Encoder](data: Map[Hex, A]): IO[Either[MerklePatriciaError, Unit]] = delegate.insert(data)
+    def insertBytes(data: Map[Hex, Array[Byte]]): IO[Either[MerklePatriciaError, Unit]] = delegate.insertBytes(data)
+    def replaceBytes(upserts: Map[Hex, Array[Byte]], removals: List[Hex]): IO[Either[MerklePatriciaError, Unit]] =
+      delegate.replaceBytes(upserts, removals)
+    def update[A: Encoder](key: Hex, value: A): IO[Either[MerklePatriciaError, Unit]] = delegate.update(key, value)
+    def remove(keys: List[Hex]): IO[Either[MerklePatriciaError, Unit]] = delegate.remove(keys)
+    def clear: IO[Unit] = delegate.clear >> clearEntered.complete(()).void >> IO.never[Unit]
+    def getProver: IO[MerklePatriciaSingleInclusionProver[IO]] = delegate.getProver
+    def buildHexMap(data: Map[GlobalStateKey, Json]): IO[Map[Hex, Array[Byte]]] = delegate.buildHexMap(data)
+    def savepoint: IO[ProducerSavepoint[IO]] = delegate.savepoint
+  }
 
   test("savepoint captures and restores producer state correctly") { implicit res =>
     implicit val (hs, js) = res
@@ -184,6 +220,94 @@ object MptStoreSavepointSuite extends MutableIOSuite {
         afterMutation2.contains("value2"),
         afterRestore1.contains("value1"),
         afterRestore2.isEmpty // key2 should be gone after restore
+      )
+  }
+
+  test("MptStore transaction restores its savepoint when canceled after mutation") { implicit res =>
+    implicit val (_, js) = res
+    implicit val hasher: Hasher[IO] = Hasher.forJson[IO]
+    val initial = Hex("aa")
+    val transient = Hex("bb")
+    val initialOrdinal = SnapshotOrdinal.unsafeApply(10L)
+    val transientOrdinal = SnapshotOrdinal.unsafeApply(11L)
+
+    for {
+      producer <- InMemoryMerklePatriciaProducer.make[IO](Map(initial -> "initial".getBytes("UTF-8")))
+      store <- MptStore.make[IO, Hex](producer, _.pure[IO])
+      _ <- store.commit(initialOrdinal)
+      rootBefore <- producer.getCurrentRootHash
+      lastBuiltBefore <- producer.getLastBuiltOrdinal
+      syncedBefore <- store.lastPersistedOrdinal
+      mutationPublished <- Deferred[IO, Unit]
+      fiber <- store
+        .withTransaction[Unit](
+          store.insert(transient, "transient") >>
+            store.commit(transientOrdinal) >>
+            mutationPublished.complete(()).void >>
+            IO.never[(Unit, MptTxAction)]
+        )
+        .start
+      _ <- mutationPublished.get
+      during <- store.allEntriesAsBytes
+      rootDuring <- producer.getCurrentRootHash
+      syncedDuring <- store.lastPersistedOrdinal
+      _ <- fiber.cancel
+      after <- store.allEntriesAsBytes
+      rootAfter <- producer.getCurrentRootHash
+      transientCachedRootAfter <- producer.getRootHashForOrdinal(transientOrdinal)
+      lastBuiltAfter <- producer.getLastBuiltOrdinal
+      syncedAfter <- store.lastPersistedOrdinal
+    } yield
+      expect.all(
+        rootBefore.nonEmpty,
+        lastBuiltBefore.contains(initialOrdinal),
+        syncedBefore.contains(initialOrdinal),
+        during.contains(transient),
+        rootDuring.exists(root => rootBefore.forall(_ != root)),
+        syncedDuring.contains(transientOrdinal),
+        after.keySet == Set(initial),
+        new String(after(initial), "UTF-8") == "initial",
+        rootAfter == rootBefore,
+        transientCachedRootAfter.isEmpty,
+        lastBuiltAfter == lastBuiltBefore,
+        syncedAfter == syncedBefore
+      )
+  }
+
+  test("MptStore empty load restores the complete prior state when canceled during clear") { implicit res =>
+    implicit val (_, js) = res
+    implicit val hasher: Hasher[IO] = Hasher.forJson[IO]
+    val initial = Hex("cc")
+    val initialOrdinal = SnapshotOrdinal.unsafeApply(20L)
+    val emptyOrdinal = SnapshotOrdinal.unsafeApply(21L)
+
+    for {
+      clearEntered <- Deferred[IO, Unit]
+      delegate <- InMemoryMerklePatriciaProducer.make[IO](Map(initial -> "retained".getBytes("UTF-8")))
+      producer = new BlockingClearProducer(delegate, clearEntered)
+      store <- MptStore.make[IO, Hex](producer, _.pure[IO])
+      _ <- store.commit(initialOrdinal)
+      rootBefore <- producer.getCurrentRootHash
+      lastBuiltBefore <- producer.getLastBuiltOrdinal
+      syncedBefore <- store.lastPersistedOrdinal
+
+      loading <- store.loadBytes(Map.empty, emptyOrdinal).start
+      _ <- clearEntered.get
+      during <- store.allEntriesAsBytes
+      _ <- loading.cancel
+
+      after <- store.allEntriesAsBytes
+      rootAfter <- producer.getCurrentRootHash
+      lastBuiltAfter <- producer.getLastBuiltOrdinal
+      syncedAfter <- store.lastPersistedOrdinal
+    } yield
+      expect.all(
+        during.isEmpty,
+        after.keySet == Set(initial),
+        new String(after(initial), "UTF-8") == "retained",
+        rootAfter == rootBefore,
+        lastBuiltAfter == lastBuiltBefore,
+        syncedAfter == syncedBefore
       )
   }
 }

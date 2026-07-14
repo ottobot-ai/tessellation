@@ -67,16 +67,15 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
       wProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       wStore <- MptStore.make[IO, GlobalStateKey](wProducer, GlobalStateKey.toHex[IO])
       _ <- wStore.syncFromStateChanges(acc, ord)
-      wTrie <- wStore.build(ord)
-      wRoot = wTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      wTrie <- wStore.build(ord).rethrow
+      wRoot = wTrie.rootHash.value.show
       wBytes <- wStore.allEntriesAsBytes
 
       replay <- GlobalStateConverter.toAccumulatorHexDelta[IO](acc, Map.empty[Hex, Array[Byte]])
       rProducer <- InMemoryMerklePatriciaProducer.make[IO]()
-      _ <- rProducer.insertBytes(replay._1).void
-      _ <- rProducer.remove(replay._2.toList)
-      rTrie <- rProducer.buildForOrdinal(ord)
-      rRoot = rTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      _ <- rProducer.replaceBytes(replay._1, replay._2.toList).rethrow
+      rTrie <- rProducer.buildForOrdinal(ord).rethrow
+      rRoot = rTrie.rootHash.value.show
       rBytes <- rProducer.entries
     } yield
       expect.all(
@@ -98,16 +97,15 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
       wProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       wStore <- MptStore.make[IO, GlobalStateKey](wProducer, GlobalStateKey.toHex[IO])
       _ <- wStore.syncFromStateChanges(acc, ord)
-      wTrie <- wStore.build(ord)
-      wRoot = wTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      wTrie <- wStore.build(ord).rethrow
+      wRoot = wTrie.rootHash.value.show
       wBytes <- wStore.allEntriesAsBytes
 
       replay <- GlobalStateConverter.toAccumulatorHexDelta[IO](acc, Map.empty[Hex, Array[Byte]])
       rProducer <- InMemoryMerklePatriciaProducer.make[IO]()
-      _ <- rProducer.insertBytes(replay._1).void
-      _ <- rProducer.remove(replay._2.toList)
-      rTrie <- rProducer.buildForOrdinal(ord)
-      rRoot = rTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      _ <- rProducer.replaceBytes(replay._1, replay._2.toList).rethrow
+      rTrie <- rProducer.buildForOrdinal(ord).rethrow
+      rRoot = rTrie.rootHash.value.show
       rBytes <- rProducer.entries
     } yield
       expect.all(
@@ -129,16 +127,15 @@ object ActiveAddressIndexSuite extends MutableIOSuite {
       wProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       wStore <- MptStore.make[IO, GlobalStateKey](wProducer, GlobalStateKey.toHex[IO])
       _ <- wStore.syncFromStateChanges(acc, ord)
-      wTrie <- wStore.build(ord)
-      wRoot = wTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      wTrie <- wStore.build(ord).rethrow
+      wRoot = wTrie.rootHash.value.show
       wBytes <- wStore.allEntriesAsBytes
 
       replay <- GlobalStateConverter.toAccumulatorHexDelta[IO](acc, Map.empty[Hex, Array[Byte]])
       rProducer <- InMemoryMerklePatriciaProducer.make[IO]()
-      _ <- rProducer.insertBytes(replay._1).void
-      _ <- rProducer.remove(replay._2.toList)
-      rTrie <- rProducer.buildForOrdinal(ord)
-      rRoot = rTrie.toOption.map(_.rootHash.value.show).getOrElse("none")
+      _ <- rProducer.replaceBytes(replay._1, replay._2.toList).rethrow
+      rTrie <- rProducer.buildForOrdinal(ord).rethrow
+      rRoot = rTrie.rootHash.value.show
       rBytes <- rProducer.entries
     } yield
       expect.all(

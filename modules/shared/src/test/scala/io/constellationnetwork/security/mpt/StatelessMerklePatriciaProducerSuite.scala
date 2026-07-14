@@ -156,7 +156,7 @@ object StatelessMerklePatriciaProducerSuite extends MutableIOSuite {
         initialTrie <- producer.create(entries.toMap)
         initialRoot = initialTrie.rootNode.digest
 
-        nonExistentKey = Hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF")
+        nonExistentKey = Hex("ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff")
         updatedTrieEither <- producer.remove(initialTrie, List(nonExistentKey))
         updatedTrie <- IO.fromEither(updatedTrieEither)
       } yield expect(updatedTrie.rootNode.digest == initialRoot)

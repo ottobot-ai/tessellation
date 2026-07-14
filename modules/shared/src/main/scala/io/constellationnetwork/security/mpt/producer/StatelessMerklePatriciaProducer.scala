@@ -43,88 +43,94 @@ class StatelessMerklePatriciaProducer[F[_]: Hasher: Async] extends MerklePatrici
 
   /** Create a trie with external data storage from bytes. */
   def createWithDataFromBytes(data: Map[Hex, Array[Byte]]): F[MerklePatriciaTrieWithData] =
-    NonEmptyList.fromList(data.toList) match {
-      case Some(nel) =>
-        for {
-          dataStoreRef <- Ref.of[F, Map[Hash, Array[Byte]]](Map.empty)
+    PhysicalTrieKeyValidator.validateKeys(data.keys) match {
+      case Left(error) => error.raiseError[F, MerklePatriciaTrieWithData]
+      case Right(_) =>
+        val sortedEntries = data.toList.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+        NonEmptyList.fromList(sortedEntries) match {
+          case Some(nel) =>
+            for {
+              dataStoreRef <- Ref.of[F, Map[Hash, Array[Byte]]](Map.empty)
 
-          (hPath, hDataBytes) = nel.head
-          hDataDigest <- Hasher[F].hashBytes(hDataBytes)
-          _ <- dataStoreRef.update(_ + (hDataDigest -> hDataBytes))
+              (hPath, hDataBytes) = nel.head
+              hDataDigest <- Hasher[F].hashBytes(hDataBytes)
+              _ <- dataStoreRef.update(_ + (hDataDigest -> hDataBytes))
 
-          initialNode <- MerklePatriciaNode.Leaf.fromCompact[F](
-            CompactNibblePath.fromHexString(hPath.value),
-            hDataDigest
-          )
+              initialNode <- MerklePatriciaNode.Leaf.fromCompact[F](
+                CompactNibblePath.fromHexString(hPath.value),
+                hDataDigest
+              )
 
-          sortedTail = nel.tail.sortBy(_._1.value.length)
+              resultNode <- nel.tail.zipWithIndex
+                .foldM[F, MerklePatriciaNode](initialNode) {
+                  case (acc, ((path, bytes), idx)) =>
+                    val compactPath = CompactNibblePath.fromHexString(path.value)
+                    val work = for {
+                      dataDigest <- Hasher[F].hashBytes(bytes)
+                      _ <- dataStoreRef.update(_ + (dataDigest -> bytes))
+                      result <- insertWithDigest(acc, compactPath, dataDigest).flatMap {
+                        case Left(err)   => err.raiseError[F, MerklePatriciaNode]
+                        case Right(node) => node.pure[F]
+                      }
+                    } yield result
 
-          resultNode <- sortedTail.zipWithIndex
-            .foldM[F, MerklePatriciaNode](initialNode) {
-              case (acc, ((path, bytes), idx)) =>
-                val compactPath = CompactNibblePath.fromHexString(path.value)
-                val work = for {
-                  dataDigest <- Hasher[F].hashBytes(bytes)
-                  _ <- dataStoreRef.update(_ + (dataDigest -> bytes))
-                  result <- insertWithDigest(acc, compactPath, dataDigest).flatMap {
-                    case Left(err)   => err.raiseError[F, MerklePatriciaNode]
-                    case Right(node) => node.pure[F]
-                  }
-                } yield result
+                    if (idx % yieldEveryN == 0) Async[F].cede *> work <* Async[F].cede
+                    else work
+                }
 
-                if (idx % yieldEveryN == 0) Async[F].cede *> work <* Async[F].cede
-                else work
-            }
+              finalDataStore <- dataStoreRef.get
+            } yield MerklePatriciaTrieWithData(MerklePatriciaTrie(resultNode), finalDataStore)
 
-          finalDataStore <- dataStoreRef.get
-        } yield MerklePatriciaTrieWithData(MerklePatriciaTrie(resultNode), finalDataStore)
-
-      case None => new RuntimeException("Empty data provided").raiseError
+          case None => new RuntimeException("Empty data provided").raiseError
+        }
     }
 
   /** Create a trie with external data storage. */
   def createWithData[A: Encoder](data: Map[Hex, A]): F[MerklePatriciaTrieWithData] =
-    NonEmptyList.fromList(data.toList) match {
-      case Some(nel) =>
-        for {
-          dataStoreRef <- Ref.of[F, Map[Hash, Array[Byte]]](Map.empty)
+    PhysicalTrieKeyValidator.validateKeys(data.keys) match {
+      case Left(error) => error.raiseError[F, MerklePatriciaTrieWithData]
+      case Right(_) =>
+        val sortedEntries = data.toList.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+        NonEmptyList.fromList(sortedEntries) match {
+          case Some(nel) =>
+            for {
+              dataStoreRef <- Ref.of[F, Map[Hash, Array[Byte]]](Map.empty)
 
-          (hPath, hData) = nel.head
-          hDataJson = hData.asJson
-          hDataBytes <- Async[F].delay(hDataJson.noSpaces.getBytes("UTF-8"))
-          hDataDigest <- Hasher[F].hash(hDataJson)
-          _ <- dataStoreRef.update(_ + (hDataDigest -> hDataBytes))
+              (hPath, hData) = nel.head
+              hDataJson = hData.asJson
+              hDataBytes <- Async[F].delay(hDataJson.noSpaces.getBytes("UTF-8"))
+              hDataDigest <- Hasher[F].hash(hDataJson)
+              _ <- dataStoreRef.update(_ + (hDataDigest -> hDataBytes))
 
-          initialNode <- MerklePatriciaNode.Leaf.fromCompact[F](
-            CompactNibblePath.fromHexString(hPath.value),
-            hDataDigest
-          )
+              initialNode <- MerklePatriciaNode.Leaf.fromCompact[F](
+                CompactNibblePath.fromHexString(hPath.value),
+                hDataDigest
+              )
 
-          sortedTail = nel.tail.sortBy(_._1.value.length)
+              resultNode <- nel.tail.zipWithIndex
+                .foldM[F, MerklePatriciaNode](initialNode) {
+                  case (acc, ((path, value), idx)) =>
+                    val compactPath = CompactNibblePath.fromHexString(path.value)
+                    val valueJson = value.asJson
+                    val work = for {
+                      dataDigest <- Hasher[F].hash(valueJson)
+                      dataBytes <- Async[F].delay(valueJson.noSpaces.getBytes("UTF-8"))
+                      _ <- dataStoreRef.update(_ + (dataDigest -> dataBytes))
+                      result <- insertWithDigest(acc, compactPath, dataDigest).flatMap {
+                        case Left(err)   => err.raiseError[F, MerklePatriciaNode]
+                        case Right(node) => node.pure[F]
+                      }
+                    } yield result
 
-          resultNode <- sortedTail.zipWithIndex
-            .foldM[F, MerklePatriciaNode](initialNode) {
-              case (acc, ((path, value), idx)) =>
-                val compactPath = CompactNibblePath.fromHexString(path.value)
-                val valueJson = value.asJson
-                val work = for {
-                  dataDigest <- Hasher[F].hash(valueJson)
-                  dataBytes <- Async[F].delay(valueJson.noSpaces.getBytes("UTF-8"))
-                  _ <- dataStoreRef.update(_ + (dataDigest -> dataBytes))
-                  result <- insertWithDigest(acc, compactPath, dataDigest).flatMap {
-                    case Left(err)   => err.raiseError[F, MerklePatriciaNode]
-                    case Right(node) => node.pure[F]
-                  }
-                } yield result
+                    if (idx % yieldEveryN == 0) Async[F].cede *> work <* Async[F].cede
+                    else work
+                }
 
-                if (idx % yieldEveryN == 0) Async[F].cede *> work <* Async[F].cede
-                else work
-            }
+              finalDataStore <- dataStoreRef.get
+            } yield MerklePatriciaTrieWithData(MerklePatriciaTrie(resultNode), finalDataStore)
 
-          finalDataStore <- dataStoreRef.get
-        } yield MerklePatriciaTrieWithData(MerklePatriciaTrie(resultNode), finalDataStore)
-
-      case None => new RuntimeException("Empty data provided").raiseError
+          case None => new RuntimeException("Empty data provided").raiseError
+        }
     }
 
   def createFromBytes(data: Map[Hex, Array[Byte]]): F[MerklePatriciaTrie] =
@@ -140,18 +146,28 @@ class StatelessMerklePatriciaProducer[F[_]: Hasher: Async] extends MerklePatrici
     if (data.isEmpty) {
       current.asRight[MerklePatriciaError].pure[F]
     } else {
-      insertMultiple(current.rootNode, data.toList)
-        .map(_.map(MerklePatriciaTrie(_)))
-        .handleError(e => OperationError(e.getMessage).asLeft[MerklePatriciaTrie])
+      PhysicalTrieKeyValidator.validateInsertion(currentPhysicalKeys(current), data.keys) match {
+        case Left(error) => (error: MerklePatriciaError).asLeft[MerklePatriciaTrie].pure[F]
+        case Right(_) =>
+          val sortedEntries = data.toList.sortBy { case (hex, _) => CompactNibblePath.fromHexString(hex.value) }
+          insertMultiple(current.rootNode, sortedEntries)
+            .map(_.map(MerklePatriciaTrie(_)))
+            .handleError(e => OperationError(e.getMessage).asLeft[MerklePatriciaTrie])
+      }
     }
 
   def remove(current: MerklePatriciaTrie, data: List[Hex]): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
     if (data.isEmpty) {
       current.asRight[MerklePatriciaError].pure[F]
     } else {
-      removeMultiple(current.rootNode, data)
-        .map(_.map(MerklePatriciaTrie(_)))
-        .handleError(e => OperationError(e.getMessage).asLeft[MerklePatriciaTrie])
+      PhysicalTrieKeyValidator.validateEachKey(data) match {
+        case Left(error) => (error: MerklePatriciaError).asLeft[MerklePatriciaTrie].pure[F]
+        case Right(_) =>
+          val sortedPaths = data.sortBy(hex => CompactNibblePath.fromHexString(hex.value))
+          removeMultiple(current.rootNode, sortedPaths)
+            .map(_.map(MerklePatriciaTrie(_)))
+            .handleError(e => OperationError(e.getMessage).asLeft[MerklePatriciaTrie])
+      }
     }
 
   def removeWithData(
@@ -161,17 +177,25 @@ class StatelessMerklePatriciaProducer[F[_]: Hasher: Async] extends MerklePatrici
     if (paths.isEmpty) {
       current.asRight[MerklePatriciaError].pure[F]
     } else {
-      val digestsToRemove = paths.flatMap { path =>
-        findLeafDigest(current.trie.rootNode, CompactNibblePath.fromHexString(path.value))
-      }.toSet
+      PhysicalTrieKeyValidator.validateEachKey(paths) match {
+        case Left(error) => (error: MerklePatriciaError).asLeft[MerklePatriciaTrieWithData].pure[F]
+        case Right(_) =>
+          val sortedPaths = paths.sortBy(hex => CompactNibblePath.fromHexString(hex.value))
+          val digestsToRemove = sortedPaths.flatMap { path =>
+            findLeafDigest(current.trie.rootNode, CompactNibblePath.fromHexString(path.value))
+          }.toSet
 
-      removeMultiple(current.trie.rootNode, paths)
-        .map(_.map { node =>
-          val newDataStore = current.dataStore -- digestsToRemove
-          MerklePatriciaTrieWithData(MerklePatriciaTrie(node), newDataStore)
-        })
-        .handleError(e => OperationError(e.getMessage).asLeft)
+          removeMultiple(current.trie.rootNode, sortedPaths)
+            .map(_.map { node =>
+              val newDataStore = current.dataStore -- digestsToRemove
+              MerklePatriciaTrieWithData(MerklePatriciaTrie(node), newDataStore)
+            })
+            .handleError(e => OperationError(e.getMessage).asLeft)
+      }
     }
+
+  private def currentPhysicalKeys(current: MerklePatriciaTrie): Set[Hex] =
+    MerklePatriciaTrie.collectLeafNodesWithPaths(current).iterator.map(_._1).toSet
 
   private def findLeafDigest(node: MerklePatriciaNode, path: CompactNibblePath): Option[Hash] =
     node match {

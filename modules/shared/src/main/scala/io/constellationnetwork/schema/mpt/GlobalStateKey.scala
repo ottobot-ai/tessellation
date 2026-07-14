@@ -246,11 +246,12 @@ object GlobalStateFieldId {
     * monolithic `LastCurrencySnapshotInfo` blob (fieldId 6): instead of one `metagraph(mgAddr, LastCurrencySnapshotInfo) ->
     * CurrencySnapshotInfo` key per MG (O(N) rewrite on any change), each `CurrencySnapshotInfo` field becomes per-ENTRY keys under the MG's
     * own `MetagraphNamespace` — `metagraphEntry(mgAddr, MgXxx, entryKey) -> value` — so the per-ordinal MPT diff and the committee
-    * state-diff are O(changed entries), not O(N) (scalability is the primary driver — the blob is a state-diff dead-end). The 8 sub-fields
-    * cover all of `CurrencySnapshotInfo` EXCEPT `activeAllowSpends`, which stays in the existing `ActiveAllowSpends` (fieldId 7)
+    * state-diff are O(changed entries), not O(N) (scalability is the primary driver — the blob is a state-diff dead-end). Eight serialized
+    * sub-fields cover all of `CurrencySnapshotInfo` EXCEPT `activeAllowSpends`, which stays in the existing `ActiveAllowSpends` (fieldId 7)
     * metagraph-scope partition (already per-MG unrolled, already read cross-shard by `SpendActionValidator`). `infoRoot` (in
-    * `CurrencySnapshotMptRoots`) is the single MPT root over the UNION of these 8 sub-field partitions (producer + follower compute it
-    * identically via `currencySnapshotEntryBytes`).
+    * `CurrencySnapshotMptRoots`) commits only the seven deterministic fields in [[infoSubFields]]. The eighth, `MgGlobalSnapshotSyncView`
+    * (fieldId 32), remains a transitional replay input that is deliberately root-excluded pending the signed replay-witness replacement
+    * described below.
     */
   case object MgBalances extends GlobalStateFieldId { def toInt: Int = 25 }
   case object MgLastTxRefs extends GlobalStateFieldId { def toInt: Int = 26 }

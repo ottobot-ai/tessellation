@@ -37,7 +37,7 @@ import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
 /** Step-2 guard for `docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`: the unrolled per-metagraph `CurrencySnapshotInfo` `infoRoot`
-  * (the union over the 8 `Mg*` infoSubFields) is byte-identical across the THREE paths that compute it:
+  * (the union over the seven deterministic `Mg*` `infoSubFields`) is byte-identical across the THREE paths that compute it:
   *   - producer `GlobalSnapshotInfo.mptStateProofFromBytes` — union from the actual `entries` (`perFieldGrouping`),
   *   - follower `GlobalStateConverter.currencySnapshotFieldRoots` — union from the SHARED `currencySnapshotEntryBytes` encoder. These are
   *     DIFFERENT code paths; this suite proves they agree (the I2 split-safety invariant — the consensus-critical core of step 2).
@@ -79,9 +79,9 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       testProofs
     )
 
-  /** A `CurrencySnapshotInfo` populating 6 of the 8 unrolled `infoSubFields` (the Address-keyed ones; the two hashed-key fields
-    * `lastMessages`/`globalSnapshotSyncView` need signing fixtures and are covered by the step-3 round-trip). `activeAllowSpends` is left
-    * `None` — it stays in fieldId-7, NOT an `infoSubField`, so it does not contribute to `infoRoot`.
+  /** A `CurrencySnapshotInfo` populating six of the eight serialized unrolled fields: all six Address-keyed fields. The two hashed-key
+    * fields, `lastMessages` and root-excluded `globalSnapshotSyncView`, need signing fixtures and are covered by the step-3 round-trip.
+    * `activeAllowSpends` is left `None` — it stays in fieldId-7, NOT an `infoSubField`, so it does not contribute to `infoRoot`.
     */
   private def richInfo(holder: Address): CurrencySnapshotInfo =
     CurrencySnapshotInfo(
@@ -209,8 +209,9 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x"))).some
     )
 
-  /** Write the unrolled storage for one MG: the 8 `Mg*` partitions (mirrors `infoEntryBytes`) + the fieldId-7 metagraph-scope
-    * `ActiveAllowSpends`. Uses the SAME tuple codecs the encoder uses, so the stored bytes equal `currencySnapshotEntryBytes`'s.
+  /** Write the unrolled storage for one MG: all eight serialized `Mg*` partitions (seven `infoRoot` fields plus the root-excluded sync
+    * view; mirrors `infoEntryBytes`) + the fieldId-7 metagraph-scope `ActiveAllowSpends`. Uses the SAME tuple codecs the encoder uses, so
+    * the stored bytes equal `currencySnapshotEntryBytes`'s.
     */
   private def writeUnrolledInfo(store: MptStore[IO, GlobalStateKey], mgAddr: Address, info: CurrencySnapshotInfo)(
     implicit h: Hasher[IO]

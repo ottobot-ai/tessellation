@@ -7,6 +7,7 @@ import io.constellationnetwork.cutoff.{LogarithmicOrdinalCutoff, OrdinalCutoff}
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
 import io.constellationnetwork.storage.SerializableLocalFileSystemStorage
 
 import fs2.io.file.Path
@@ -29,10 +30,7 @@ class MptStateStorage[F[_]: Async: JsonSerializer](
       Json.obj(map.toList.sortBy(_._1.value).map { case (hex, bytes) => hex.value -> bytes.asJson }: _*)
     }
 
-  implicit val stateDecoder: Decoder[Map[Hex, Array[Byte]]] =
-    Decoder.instance { cursor =>
-      cursor.as[Map[String, Array[Byte]]].map(_.map { case (k, v) => Hex(k) -> v })
-    }
+  implicit val stateDecoder: Decoder[Map[Hex, Array[Byte]]] = MptStateStorage.mptEntriesDecoder
 
   override def deserializeFallback(bytes: Array[Byte]): Either[Throwable, Map[Hex, Array[Byte]]] =
     io.circe.parser
@@ -41,11 +39,18 @@ class MptStateStorage[F[_]: Async: JsonSerializer](
 
   private def toName(ordinal: SnapshotOrdinal): String = ordinal.value.value.toString
 
+  override def write(fileName: String, state: Map[Hex, Array[Byte]]): F[Unit] =
+    PhysicalTrieKeyValidator.validateKeys(state.keys).fold(_.raiseError[F, Unit], _ => super.write(fileName, state))
+
   def writeState(ordinal: SnapshotOrdinal, state: Map[Hex, Array[Byte]]): F[Unit] =
     write(toName(ordinal), state)
 
   def readState(ordinal: SnapshotOrdinal): F[Option[Map[Hex, Array[Byte]]]] =
-    read(toName(ordinal))
+    readBytes(toName(ordinal))
+      .flatMap(_.traverse(bytes => JsonSerializer[F].deserialize[Map[Hex, Array[Byte]]](bytes).flatMap(_.liftTo[F])))
+      .flatTap(
+        _.traverse_(state => PhysicalTrieKeyValidator.validateKeys(state.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit))
+      )
 
   def exists(ordinal: SnapshotOrdinal): F[Boolean] =
     exists(toName(ordinal))
@@ -90,8 +95,8 @@ object MptStateStorage {
   /** Shared Circe codec for the MPT byte map `Map[Hex, Array[Byte]]` — the 3c-A wire contract. The gl0 serve route (`/latest/combined/
     * mpt-entries`) encodes the signed entries with this; the follower client decodes them with this; so producer↔follower wire bytes are
     * codec-identical to the on-disk persisted form (`stateEncoder`/`stateDecoder` use the same shape — hex-string key, Circe's native
-    * `Array[Byte]` JSON-number-array value, sorted by hex for determinism). Loading the decoded map via `MptStore.loadBytes` then makes a
-    * follower's `consensusMptRoot(store) === signed mptRoot` hold BY CONSTRUCTION. See `docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A.
+    * `Array[Byte]` JSON-number-array value, sorted by hex for determinism). Loading the decoded map via `MptStore.loadBytes` preserves
+    * those bytes; the caller must still authenticate the artifact and compare the recomputed consensus root with its signed root.
     */
   implicit val mptEntriesEncoder: Encoder[Map[Hex, Array[Byte]]] =
     Encoder.instance { map =>
@@ -100,7 +105,13 @@ object MptStateStorage {
 
   implicit val mptEntriesDecoder: Decoder[Map[Hex, Array[Byte]]] =
     Decoder.instance { cursor =>
-      cursor.as[Map[String, Array[Byte]]].map(_.map { case (k, v) => Hex(k) -> v })
+      cursor.as[Map[String, Array[Byte]]].flatMap { decoded =>
+        val entries = decoded.iterator.map { case (key, value) => Hex(key) -> value }.toMap
+        PhysicalTrieKeyValidator
+          .validateKeys(entries.keys)
+          .leftMap(error => io.circe.DecodingFailure(error.getMessage, cursor.history))
+          .as(entries)
+      }
     }
 
   def make[F[_]: Async: JsonSerializer](path: Path): F[MptStateStorage[F]] =
