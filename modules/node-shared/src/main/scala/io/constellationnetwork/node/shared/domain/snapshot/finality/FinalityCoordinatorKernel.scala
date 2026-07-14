@@ -1,10 +1,12 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality
 
 import cats.data.NonEmptyChain
+import cats.effect.Async
+import cats.syntax.all._
 
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreCodecs.finalityCoreBatchPayloadCodec
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator._
-import io.constellationnetwork.security.mpt.MptActivePublication
+import io.constellationnetwork.security.mpt.{MptActivePublication, VerifiedActiveMptPublication}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
@@ -51,11 +53,11 @@ sealed trait FinalityCoordinatorMutation extends Product with Serializable {
   def preparedBundle: Option[PreparedCoreBundle]
 }
 
-/** Pure construction boundary for the local finality coordinator journal.
+/** Validated construction boundary for the local finality coordinator journal.
   *
-  * This kernel never chooses a branch, decides finality, creates evidence, votes, or performs I/O. It constructs only the closed
-  * coordinator mutation graph and returns a result after the canonical identity and cross-field validators pass. `RecoveryRequired` has no
-  * exit operation here.
+  * This kernel never chooses a branch, decides finality, creates evidence, or votes. Pure transition entry points construct only the closed
+  * coordinator mutation graph after canonical identity and cross-field validation. The private initialization path additionally consumes a
+  * verified MPT lease and persists the mutation before returning. `RecoveryRequired` has no exit operation here.
   */
 object FinalityCoordinatorKernel {
   import FinalityCoordinatorKernelError._
@@ -69,12 +71,12 @@ object FinalityCoordinatorKernel {
     preparedBundle: Option[PreparedCoreBundle]
   ) extends FinalityCoordinatorMutation
 
-  /** Initialize from a supplied MPT publication cursor.
+  /** Raw construction used only by the package-owned effectful bootstrap boundary.
     *
-    * Activation must restrict this call to a package-owned exact-readback capability; structural validation alone cannot prove MPT
-    * provenance.
+    * Object-private visibility prevents production or test callers from supplying a publication cursor. Bootstrap must enter through
+    * [[FinalityCoordinatorBootstrap]].
     */
-  def initialize(initialPublication: MptActivePublication): Result = {
+  private def initializeMutation(initialPublication: MptActivePublication): Result = {
     val draft = CoordinatorHead(
       revision = HeadRevision(NonNegLong.MinValue),
       lastAttempt = None,
@@ -88,6 +90,26 @@ object FinalityCoordinatorKernel {
 
     seal(None, draft, CoordinatorMutationKind.Initialized, None, None)
   }
+
+  /** Consume an exact store-minted publication lease and install the derived initial coordinator before returning.
+    *
+    * Neither the raw publication nor the initialization mutation crosses this boundary. The caller must already hold the MPT publication
+    * lease; [[FinalityCoordinatorBootstrap]] owns that lock ordering.
+    */
+  private[finality] def initializeDurably[F[_]: Async](
+    verifiedPublication: VerifiedActiveMptPublication[F],
+    finality: FinalityDurableStore[F]
+  ): F[Unit] =
+    for {
+      activePublication <- verifiedPublication.read
+      mutation <- Async[F].fromEither(
+        initializeMutation(activePublication).leftMap(FinalityCoordinatorBootstrapError.KernelRejected)
+      )
+      installed <- finality.initializeCoordinator(mutation)
+    } yield installed match {
+      case FinalityDurableCasResult.Installed(_)        => ()
+      case FinalityDurableCasResult.AlreadyInstalled(_) => ()
+    }
 
   def prepare(
     before: CoordinatorHead,

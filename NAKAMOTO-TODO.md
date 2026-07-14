@@ -231,13 +231,19 @@ criteria are in `NAKAMOTO-PLAN.md`.
     prepare; rewind, wrong-image, substituted-plan, substituted-claim, and stale
     publication contexts reject. `ForkChoiceOrphanClaim` is not true-MRCA or
     target-exclusion proof. The durable store rejects restoration mutations, and no
-    live executor, branch hold, or `RestoredAbandoned` authority exists. Coordinator
-    initialization still accepts a raw publication cursor; replace it with a
-    package-owned exact-MPT-readback capability before activation
+    live executor, branch hold, or `RestoredAbandoned` authority exists. The dark
+    coordinator bootstrap now accepts only a store-minted lease, installs fresh state
+    under the MPT publication mutex, requires exact full-publication equality on
+    restart, and enters typed absorbing recovery on mismatch. Its
+    `LocalPublicationBound` result is not semantic, canonical-Phase-2, or continuing
+    transition authority. Before activation, make publication transition part of one
+    coordinator-owned MPT-plus-semantic-plus-anchor transaction and wire it live
     (`FinalityCore.scala:395-460`; `FinalityCoordinatorState.scala:68-76,99-136`;
-    `FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
-    `FinalityCoordinatorKernel.scala:72-154`;
-    `FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
+    `FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1364-1442,1461-1608`;
+    `FinalityCoordinatorKernel.scala:74-112`;
+    `FinalityCoordinatorBootstrap.scala:9-84`;
+    `DurableMptImageStore.scala:87-97,177-182,542-552`;
+    `FinalityDurableStore.scala:293-319,1209-1230,1357-1363,1652-1656`).
   - Remove absolute `k1`/`k2` refusal; recover authenticated history before a
     comparison that crosses local retention.
   - Atomically unwind/refold MPT, phases, shard anchors, binary tracking, tower

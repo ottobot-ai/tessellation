@@ -8,8 +8,9 @@ import java.security.{DigestInputStream, MessageDigest}
 import java.util.Arrays
 
 import cats.Parallel
-import cats.effect.{Async, Resource}
+import cats.effect.{Async, Ref, Resource}
 import cats.effect.std.Semaphore
+import cats.effect.syntax.all._
 import cats.syntax.all._
 import cats.~>
 
@@ -46,7 +47,7 @@ import scodec.bits.ByteVector
   * era labels, and self-consistent manifest/journal do not authenticate a publication revision, authorize a rollback, or establish those
   * external facts.
   */
-trait DurableMptImageStore[F[_]] {
+sealed trait DurableMptImageStore[F[_]] {
 
   /** Capture, independently rebuild, exact-anchor/era bind, encode, force, atomically install, and read-back verify an inactive image.
     *
@@ -85,6 +86,15 @@ trait DurableMptImageStore[F[_]] {
 
   /** Return the exact initialized publication state after verifying the journal, marker, and any referenced image. */
   def activePublication: F[Option[MptActivePublication]]
+
+  /** Run `use` while holding the publication mutex with a store-minted witness of the exact initialized local publication.
+    *
+    * The witness is minted only after verifying the publication journal, initialization marker, any residual legacy selector, and any
+    * referenced image. It proves local durable readback only: it does not authenticate canonicality, authorize a transition, or verify the
+    * semantic meaning of MPT entries. The witness is lease-scoped; effectful readback fails with [[DurableMptImageError.LeaseExpired]]
+    * after `use` returns or is canceled. `use` must not re-enter this store because the publication mutex is not reentrant.
+    */
+  def withVerifiedActivePublication[A](use: VerifiedActiveMptPublication[F] => F[A]): F[A]
 
   /** Return the active receipt only after its manifest and image have both been verified. */
   def activeReceipt: F[Option[MptImageReceipt]]
@@ -163,6 +173,13 @@ final case class MptImageReceipt(
 final case class MptPublicationRevision(value: Long)
 
 final case class MptActivePublication(revision: MptPublicationRevision, image: Option[MptImageReceipt])
+
+/** A store-minted, lease-scoped witness of an exact locally verified active publication.
+  *
+  * This final non-case type has no Scala-visible constructor or `copy`. It is a wiring capability, not a sandbox against code already
+  * executing inside the validator JVM. See [[DurableMptImageStore.withVerifiedActivePublication]].
+  */
+final class VerifiedActiveMptPublication[F[_]] private (val read: F[MptActivePublication])
 
 sealed abstract class DurableMptImageError(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
 
@@ -248,6 +265,8 @@ object DurableMptImageError {
         s"MPT active-publication journal disagrees with the residual legacy manifest: publication=$publication legacy=$legacy"
       )
 
+  case object LeaseExpired extends DurableMptImageError("The verified MPT active-publication lease has expired")
+
   final case class PublicationRecoveryFailed(publishFailure: Throwable, recoveryFailure: Throwable)
       extends DurableMptImageError(
         s"MPT active-publication write failed and the prior journal could not be restored: ${publishFailure.getMessage}",
@@ -326,7 +345,15 @@ object DurableMptImageStore {
       _ <- Resource.eval(fileOps.forceDirectory(imagesDirectory))
       _ <- Resource.eval(fileOps.forceDirectory(directory))
       mutex <- Resource.eval(Semaphore[F](1L))
-    } yield new LiveDurableMptImageStore[F](directory, fileOps, faults, codecEra, rootVerifier, limits, mutex)
+    } yield VerifiedActiveMptPublication.liveStore[F](
+      directory,
+      fileOps,
+      faults,
+      codecEra,
+      rootVerifier,
+      limits,
+      mutex
+    )
   }
 
   private def adaptDurableResource[F[_]: Async, A](resource: Resource[F, A]): Resource[F, A] =
@@ -393,6 +420,31 @@ object MptImageRootVerifier {
     }
 }
 
+object VerifiedActiveMptPublication {
+  private[mpt] def liveStore[F[_]: Async](
+    directory: Path,
+    fileOps: DurableFileOps[F],
+    faults: DurableWriteHook[F, MptImageArtifact],
+    codecEra: MptImageCodecEra,
+    rootVerifier: MptImageRootVerifier[F],
+    limits: MptImageReadLimits,
+    publishMutex: Semaphore[F]
+  ): DurableMptImageStore[F] = {
+    val mint = (readEffect: F[MptActivePublication]) => new VerifiedActiveMptPublication[F](readEffect)
+
+    new LiveDurableMptImageStore[F](
+      directory,
+      fileOps,
+      faults,
+      codecEra,
+      rootVerifier,
+      limits,
+      publishMutex,
+      mint
+    )
+  }
+}
+
 private final class LiveDurableMptImageStore[F[_]: Async](
   directory: Path,
   fileOps: DurableFileOps[F],
@@ -400,7 +452,8 @@ private final class LiveDurableMptImageStore[F[_]: Async](
   codecEra: MptImageCodecEra,
   rootVerifier: MptImageRootVerifier[F],
   limits: MptImageReadLimits,
-  publishMutex: Semaphore[F]
+  publishMutex: Semaphore[F],
+  mintVerified: F[MptActivePublication] => VerifiedActiveMptPublication[F]
 ) extends DurableMptImageStore[F] {
   import DurableMptImageError._
   import MptImageArtifact._
@@ -484,6 +537,18 @@ private final class LiveDurableMptImageStore[F[_]: Async](
   def activePublication: F[Option[MptActivePublication]] =
     publishMutex.permit.use { _ =>
       readOptionalPublication.flatTap(_.traverse_(checkLegacyAgreement))
+    }
+
+  def withVerifiedActivePublication[A](use: VerifiedActiveMptPublication[F] => F[A]): F[A] =
+    publishMutex.permit.use { _ =>
+      for {
+        publication <- readOptionalPublication
+          .flatMap(_.liftTo[F](PublicationJournalNotInitialized))
+          .flatTap(checkLegacyAgreement)
+        state <- Ref.of[F, Option[MptActivePublication]](publication.some)
+        lease = mintVerified(state.get.flatMap(_.liftTo[F](LeaseExpired)))
+        result <- Async[F].defer(use(lease)).guarantee(state.set(None))
+      } yield result
     }
 
   def activeReceipt: F[Option[MptImageReceipt]] = publishMutex.permit.use(_ => selectedActiveReceiptUnlocked)

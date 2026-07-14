@@ -121,7 +121,8 @@ The canonical index projection and incremental writer now include owner indices
 for `LastCurrencySnapshotsProofs` and `MetagraphSyncData`
 (`GlobalStateConverter.scala:724-856,2920-2974`). This closes only the former
 same-root/System-index asymmetry; it does not close the shared prefix grammar,
-full MPT-to-GSI projection, bootstrap binding, or transactional installation.
+full MPT-to-GSI projection, authenticated bootstrap/activation binding, or
+transactional installation.
 
 Exact-target failure is not exact-parent failure. MultiBranch reads still stop
 when the requested branch or an ancestor is absent from `pendingRef` and compose
@@ -273,13 +274,24 @@ path on the current root shape.
   receipt cannot substitute its plan or orphan claim. The claim is not proof of a
   true MRCA or target exclusion. This is codec/validator modeling only: the durable
   store rejects restoration mutations and no live executor, branch hold, or release
-  capability exists. Initialization also still accepts a raw caller-supplied MPT
-  publication cursor; activation requires a package-owned exact-readback capability
-  that proves its provenance (`FinalityCore.scala:395-460`;
+  capability exists. The raw initialization bypass is now closed in the runtime-dark
+  store boundary: a store-minted, lease-scoped capability verifies the initialized
+  publication journal, marker, residual legacy agreement, and referenced image while
+  holding the MPT publication mutex; coordinator initialization consumes and durably
+  installs its mutation before returning. Both durable store interfaces are sealed,
+  so package code cannot substitute a capturing implementation. Existing Running
+  state requires complete publication equality, and mismatch appends an exact typed `PublicationMismatch`
+  recovery record. `LocalPublicationBound` proves only that local durable equality
+  during the lease. It does not authenticate Phase-2 canonicality, validate MPT entry
+  semantics, or prevent the still-public `transitionActive` from changing MPT state
+  after the lease. Activation therefore still requires one coordinator-owned
+  MPT-plus-semantic-plus-anchor transaction and live wiring (`FinalityCore.scala:395-460`;
   `FinalityCoordinatorState.scala:68-76,99-136`;
-  `FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
-  `FinalityCoordinatorKernel.scala:72-154`;
-  `FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
+  `FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1364-1442,1461-1608`;
+  `FinalityCoordinatorKernel.scala:74-112`;
+  `FinalityCoordinatorBootstrap.scala:9-84`;
+  `DurableMptImageStore.scala:87-97,177-182,542-552`;
+  `FinalityDurableStore.scala:293-319,1209-1230,1357-1363,1652-1656`).
 - Add one crash-consistent reorg transaction covering chain head, MPT branch,
   Phase-2 refs, checkpoint anchors, binary confirmation/requeue, tower caches,
   and downstream outbox. Missing history triggers authenticated recovery before

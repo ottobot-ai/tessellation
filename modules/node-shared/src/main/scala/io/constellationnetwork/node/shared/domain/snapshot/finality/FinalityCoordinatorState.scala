@@ -62,6 +62,11 @@ object RecoveryReason {
     * branch.
     */
   final case class StartupDependencyFailure(reasonDigest: Hash) extends RecoveryReason
+
+  /** The exact verified MPT publication observed at startup differed from the coordinator's frozen `RecoveryRecord.publication`.
+    * `reasonDigest` is derived from both complete canonical Scodec publications under a dedicated domain.
+    */
+  final case class PublicationMismatch(observed: MptActivePublication, reasonDigest: Hash) extends RecoveryReason
 }
 
 /** Immutable, content-addressed detail for a fail-closed coordinator stop. */

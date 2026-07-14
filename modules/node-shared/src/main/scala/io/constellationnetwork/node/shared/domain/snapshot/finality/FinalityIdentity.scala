@@ -16,6 +16,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityEffe
 }
 import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.mpt.MptActivePublication
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import scodec.bits.ByteVector
@@ -65,6 +66,7 @@ object FinalityIdentity {
   private val EffectIdempotencyDomain = "tessellation/finality/v1/effect-idempotency-key"
   private val AuditIdDomain = "tessellation/finality/v1/audit-id"
   private val RecoveryIdDomain = "tessellation/finality/v1/recovery-id"
+  private val PublicationMismatchDomain = "tessellation/finality/v1/startup-publication-mismatch"
   private val TransitionDomain = "tessellation/finality/v1/transition"
   private val PathSeedDomain = "tessellation/finality/v1/path-seed"
   private val PathEntryDomain = "tessellation/finality/v1/path-entry"
@@ -195,6 +197,16 @@ object FinalityIdentity {
     recoveryPointer(record).flatMap { expected =>
       Either.cond(expected == pointer, (), RecoveryPointerMismatch(expected, pointer))
     }
+
+  /** Commit to the complete coordinator and verified-active MPT cursors without ambiguous concatenation. */
+  def publicationMismatchDigest(
+    coordinatorPublication: MptActivePublication,
+    observedPublication: MptActivePublication
+  ): Either[FinalityIdentityError, Hash] =
+    for {
+      coordinatorBytes <- encode("CoordinatorMptActivePublication", mptActivePublicationCodec, coordinatorPublication)
+      observedBytes <- encode("ObservedMptActivePublication", mptActivePublicationCodec, observedPublication)
+    } yield domainHash(PublicationMismatchDomain, coordinatorBytes, observedBytes)
 
   /** Streaming accumulator for a framing-independent oldest-to-newest path root. */
   final case class PathEntriesAccumulator private (entryCount: Long, private val rolling: Hash) {

@@ -93,6 +93,12 @@ object FinalityCoordinatorCodecs {
   private val startupDependencyFailureCodec: Codec[RecoveryReason.StartupDependencyFailure] =
     requiredHashCodec.xmap(RecoveryReason.StartupDependencyFailure(_), _.reasonDigest)
 
+  private val publicationMismatchCodec: Codec[RecoveryReason.PublicationMismatch] =
+    (mptActivePublicationCodec :: requiredHashCodec).xmap[RecoveryReason.PublicationMismatch](
+      { case observed :: reasonDigest :: HNil => RecoveryReason.PublicationMismatch(observed, reasonDigest) },
+      value => value.observed :: value.reasonDigest :: HNil
+    )
+
   implicit val recoveryReasonCodec: Codec[RecoveryReason] =
     discriminated[RecoveryReason]
       .by(uint8)
@@ -107,6 +113,7 @@ object FinalityCoordinatorCodecs {
       .typecase(9, unknownEffectCodec)
       .typecase(10, journalCorruptionCodec)
       .typecase(11, startupDependencyFailureCodec)
+      .typecase(12, publicationMismatchCodec)
 
   implicit val effectsIndexCodec: Codec[EffectsIndex] =
     (strictOption(effectManifestPointerCodec) :: strictOption(releaseGenerationCodec)).xmap[EffectsIndex](

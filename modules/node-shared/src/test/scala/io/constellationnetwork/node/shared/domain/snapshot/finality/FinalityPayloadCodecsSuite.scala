@@ -8,7 +8,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoor
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreCodecs._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityEffectCodecs._
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.mpt.{MptActivePublication, MptImageId, MptPublicationRevision}
+import io.constellationnetwork.security.mpt._
 import io.constellationnetwork.serde.codecs.Primitives
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => rawHashCodec}
 
@@ -204,6 +204,45 @@ object FinalityPayloadCodecsSuite extends FunSuite {
       recoveryReasonCodec.decodeValue(validBits).toEither.toOption.contains(valid),
       recoveryReasonCodec.encode(zero).toEither.isLeft,
       recoveryReasonCodec.encode(uppercase).toEither.isLeft
+    )
+  }
+
+  test("publication mismatch is appended at tag 12 and binds the exact observed publication") {
+    val digest = FinalityIdentity.publicationMismatchDigest(expectedPublication, targetPublication).fold(throw _, identity)
+    val valid = RecoveryReason.PublicationMismatch(targetPublication, digest)
+    val validBits = encoded(recoveryReasonCodec, valid)
+
+    expect.all(
+      validBits.toByteVector.headOption.contains(0x0c.toByte),
+      recoveryReasonCodec.decodeValue(validBits).toEither.toOption.contains(valid),
+      recoveryReasonCodec.encode(valid.copy(reasonDigest = Hash.empty)).toEither.isLeft,
+      roundTripsAndRejectsTrailing(recoveryReasonCodec.complete, valid)
+    )
+  }
+
+  test("publication mismatch identity binds field order and every active-publication receipt field") {
+    def digest(expected: MptActivePublication, observed: MptActivePublication): Hash =
+      FinalityIdentity.publicationMismatchDigest(expected, observed).fold(throw _, identity)
+
+    val baseline = digest(expectedPublication, targetPublication)
+    val observedVariants = List(
+      targetPublication.copy(revision = MptPublicationRevision(targetPublication.revision.value + 1L)),
+      targetPublication.copy(image = None),
+      targetPublication.copy(image = Some(imageReceipt.copy(formatVersion = imageReceipt.formatVersion + 1))),
+      targetPublication.copy(image = Some(imageReceipt.copy(generation = imageReceipt.generation + 1L))),
+      targetPublication.copy(image = Some(imageReceipt.copy(imageId = MptImageId(hash(230))))),
+      targetPublication.copy(image = Some(imageReceipt.copy(anchor = priorState))),
+      targetPublication.copy(image = Some(imageReceipt.copy(codecEra = MptImageCodecEra(hash(231))))),
+      targetPublication.copy(image = Some(imageReceipt.copy(rootEra = MptImageRootEra(hash(232))))),
+      targetPublication.copy(image = Some(imageReceipt.copy(digest = MptImageDigest(hash(233))))),
+      targetPublication.copy(image = Some(imageReceipt.copy(entryCount = imageReceipt.entryCount + 1)))
+    )
+
+    expect.all(
+      digest(targetPublication, expectedPublication) != baseline,
+      digest(expectedPublication.copy(revision = MptPublicationRevision(29L)), targetPublication) != baseline,
+      digest(expectedPublication.copy(image = Some(imageReceipt)), targetPublication) != baseline,
+      observedVariants.forall(digest(expectedPublication, _) != baseline)
     )
   }
 

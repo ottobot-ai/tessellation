@@ -53,10 +53,19 @@ followers, or serving. It therefore neither selects Phase 2 nor makes any econom
 state usable. Exact per-hash P0/P1 state and the optimistic K/alpha/beta decision
 cascade remain unimplemented here.
 
+The local coordinator bootstrap now closes the raw-publication initialization bypass:
+only a store-minted, expiring MPT lease can create and durably consume the initial
+mutation through sealed durable-store implementations, exact full-publication
+equality is required for an existing Running head, and a mismatch records the exact
+observation in absorbing recovery. Its status is
+`LocalPublicationBound`, not node readiness. This proves local durable equality only
+while the MPT mutex is held; it does not prove semantic validity or canonical Phase-2
+anchoring, and it does not yet own subsequent MPT publication transitions.
+
 Activation remains blocked on authenticated finality-evidence/fork-choice
 authorization, holding and rechecking the exact branch revision through durable
-publication, and a package-owned MPT-plus-semantic-plus-anchor readback capability
-before `CoreApplied` or `Released`. Objective restoration, an effect executor with
+publication, and a coordinator-owned MPT-plus-semantic-plus-anchor transaction before
+`CoreApplied` or `Released`. Objective restoration, an effect executor with
 sink readback provenance and an explicit dependency DAG, `RetentionMature`
 authority before pruning, bounded streaming validation for arbitrary-depth paths,
 and a long-history audit-journal checkpoint/accumulator also do not exist. The

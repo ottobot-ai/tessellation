@@ -552,13 +552,24 @@ publication context, and exercise restore -> retire -> next prepare. The orphan
 claim still does not prove true MRCA or target exclusion. This does not execute or
 durably persist restoration: the durable store rejects every restoration mutation,
 the kernel exposes no restoration authority, and semantic/anchor readbacks remain
-unverified. Coordinator initialization also accepts a raw caller-supplied MPT
-publication cursor; activation requires a package-owned exact-readback capability
-instead of treating structural cursor equality as provenance
+unverified. Raw caller-supplied coordinator initialization has been removed. The
+runtime-dark bootstrap now acquires a store-minted, expiring capability after exact
+journal/marker/image/legacy readback, holds the MPT publication mutex through finality
+head initialization or recovery CAS, and requires full publication equality. Both
+durable store interfaces are sealed against a substitute mutation-capturing
+implementation. A mismatch retains the exact observed publication plus its
+canonically derived digest
+in typed absorbing recovery. The result is deliberately `LocalPublicationBound`, not
+`Ready`: it proves neither active-era MPT semantics nor canonical Phase-2 anchoring,
+and public `transitionActive` can still move MPT state after the lease. This closes
+the raw-initializer bypass only; live activation still requires one coordinator-owned
+MPT-plus-semantic-plus-anchor transaction
 (`FinalityCore.scala:395-460`; `FinalityCoordinatorState.scala:68-76,99-136`;
-`FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
-`FinalityCoordinatorKernel.scala:72-154`;
-`FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
+`FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1364-1442,1461-1608`;
+`FinalityCoordinatorKernel.scala:74-112`;
+`FinalityCoordinatorBootstrap.scala:9-84`;
+`DurableMptImageStore.scala:87-97,177-182,542-552`;
+`FinalityDurableStore.scala:293-319,1209-1230,1357-1363,1652-1656`).
 
 This remains an open, nonactivating prerequisite. Authenticated evidence and
 fork-choice authorization, a branch-revision hold through publication,

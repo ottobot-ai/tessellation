@@ -328,8 +328,20 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
   private def auditIsDerived(mutation: FinalityCoordinatorMutation): Boolean =
     FinalityIdentity.auditPointer(mutation.audit).toOption.exists(pointer => mutation.head.auditTail.contains(pointer))
 
-  private def initialized: FinalityCoordinatorMutation =
-    success(FinalityCoordinatorKernel.initialize(fixture.batch.prepared.expectedBefore))
+  private def initializedHead: CoordinatorHead = {
+    val draft = CoordinatorHead(
+      revision = HeadRevision(nonNeg(0L)),
+      lastAttempt = None,
+      mode = CoordinatorMode.Running,
+      released = None,
+      active = None,
+      publication = fixture.batch.prepared.expectedBefore,
+      effects = EffectsIndex(None, None),
+      auditTail = None
+    )
+    val audit = CoordinatorAuditRecord(CoordinatorMutationKind.Initialized, None, draft.commitment, None)
+    draft.copy(auditTail = FinalityIdentity.auditPointer(audit).toOption)
+  }
 
   private def prepared(initial: CoordinatorHead, value: Fixture): FinalityCoordinatorMutation =
     success(
@@ -342,17 +354,12 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
       )
     )
 
-  test("initialize and prepare derive every pointer and return complete durability prerequisites") {
+  test("prepare derives every pointer and returns complete durability prerequisites") {
     val value = fixture
-    val init = initialized
-    val prepare = prepared(init.head, value)
+    val prepare = prepared(initializedHead, value)
     val bundle = prepare.preparedBundle.get
 
     expect.all(
-      init.audit.mutation == CoordinatorMutationKind.Initialized,
-      init.head.revision.value.value == 0L,
-      init.head.publication == value.batch.prepared.expectedBefore,
-      auditIsDerived(init),
       prepare.audit.mutation == CoordinatorMutationKind.Prepared,
       prepare.head.revision.value.value == 1L,
       auditIsDerived(prepare),
@@ -373,7 +380,11 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
 
   test("mutation construction and unverified state-changing entry points are unavailable to callers") {
     illTyped("""FinalityCoordinatorMutation(null, null, None, None)""")
-    illTyped("""FinalityCoordinatorKernel.initialize(null).toOption.get.copy(head = null)""")
+    illTyped("""FinalityCoordinatorKernel.initialize(null)""")
+    illTyped("""FinalityCoordinatorKernel.initializeMutation(null)""")
+    illTyped("""new VerifiedActiveMptPublication[Option](None)""")
+    illTyped("""new VerifiedActiveMptPublication[Option](None) {}""")
+    illTyped("""null.asInstanceOf[VerifiedActiveMptPublication[Option]].copy(read = None)""")
     illTyped("""FinalityCoordinatorKernel.coreApplied(null, null)""")
     illTyped("""FinalityCoordinatorKernel.release(null, null, null)""")
     illTyped("""FinalityCoordinatorKernel.restorationStarted(null, null)""")
@@ -385,7 +396,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
 
   test("recovery entry derives its immutable record, freezes core state, and is absorbing") {
     val value = fixture
-    val prepare = prepared(initialized.head, value)
+    val prepare = prepared(initializedHead, value)
     val reason = RecoveryReason.UnknownCore(hash(400))
     val recovery = success(FinalityCoordinatorKernel.enterRecovery(prepare.head, reason))
     val record = recovery.recoveryRecord.get
@@ -415,11 +426,32 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     )
   }
 
+  test("publication-mismatch recovery requires an unequal exact observation and its derived digest") {
+    val before = initializedHead
+    val observed = fixture.batch.prepared.targetPublication
+    val digest = FinalityIdentity.publicationMismatchDigest(before.publication, observed).fold(throw _, identity)
+    val valid = FinalityCoordinatorKernel.enterRecovery(before, RecoveryReason.PublicationMismatch(observed, digest))
+    val wrongDigest = FinalityCoordinatorKernel.enterRecovery(
+      before,
+      RecoveryReason.PublicationMismatch(observed, hash(499))
+    )
+    val equalPublication = FinalityCoordinatorKernel.enterRecovery(
+      before,
+      RecoveryReason.PublicationMismatch(before.publication, digest)
+    )
+
+    expect.all(
+      valid.isRight,
+      wrongDigest.swap.toOption.exists(_.isInstanceOf[ValidationFailed]),
+      equalPublication.swap.toOption.exists(_.isInstanceOf[ValidationFailed])
+    )
+  }
+
   test("prepare rejects a batch whose canonical intent identity does not match its scope") {
     val value = fixture
     val invalid = value.batch.copy(intentId = IntentId(hash(500)))
     val result = FinalityCoordinatorKernel.prepare(
-      initialized.head,
+      initializedHead,
       invalid,
       value.manifest,
       value.paths,
@@ -431,7 +463,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
 
   test("prepare binds the complete prior release and previous-effect origin to the current head") {
     val value = fixture
-    val releasedHead = initialized.head.copy(
+    val releasedHead = initializedHead.copy(
       released = Some(value.released),
       publication = value.released.payload.receipt.activePublication,
       effects = EffectsIndex(Some(value.batch.effectManifest), Some(value.batch.scope.generation))
@@ -492,8 +524,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
   }
 
   test("exhausted revisions fail without constructing a head") {
-    val init = initialized
-    val exhausted = init.head.copy(revision = HeadRevision(nonNeg(Long.MaxValue)))
+    val exhausted = initializedHead.copy(revision = HeadRevision(nonNeg(Long.MaxValue)))
     val recoveryAtExhaustion = FinalityCoordinatorKernel.enterRecovery(
       exhausted,
       RecoveryReason.JournalCorruption(hash(520))

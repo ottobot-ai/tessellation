@@ -1357,11 +1357,11 @@ object FinalityIntentValidator {
         check(record.publication == before.publication, "recoveryRecord.publication", "must preserve the frozen prior head value"),
         check(record.effects == before.effects, "recoveryRecord.effects", "must preserve the frozen prior head value"),
         check(record.priorAudit == before.auditTail, "recoveryRecord.priorAudit", "must equal the prior head audit tail"),
-        validateRecoveryReason(record.reason)
+        validateRecoveryReason(record.publication, record.reason)
       )
     )
 
-  private def validateRecoveryReason(reason: RecoveryReason): ValidationResult[Unit] =
+  private def validateRecoveryReason(expectedPublication: MptActivePublication, reason: RecoveryReason): ValidationResult[Unit] =
     reason match {
       case RecoveryReason.UnknownCanonicality(target, missingHash) =>
         combine(
@@ -1421,6 +1421,24 @@ object FinalityIntentValidator {
         validateHash(observedDigest, "recoveryRecord.reason.observedDigest", rejectZero = true)
       case RecoveryReason.StartupDependencyFailure(reasonDigest) =>
         validateHash(reasonDigest, "recoveryRecord.reason.reasonDigest", rejectZero = true)
+      case RecoveryReason.PublicationMismatch(observed, reasonDigest) =>
+        combine(
+          List(
+            validatePublication(observed, "recoveryRecord.reason.observed"),
+            check(
+              observed != expectedPublication,
+              "recoveryRecord.reason.observed",
+              "must differ in full from the coordinator publication frozen in the recovery record"
+            ),
+            validateHash(reasonDigest, "recoveryRecord.reason.reasonDigest", rejectZero = true),
+            checkDerived(
+              FinalityIdentity.publicationMismatchDigest(expectedPublication, observed),
+              reasonDigest,
+              "recoveryRecord.reason.reasonDigest",
+              "must equal the canonical framed digest of the frozen coordinator and observed active publications"
+            )
+          )
+        )
     }
 
   private def validateCoreBatchPointer(pointer: FinalityCoreBatchPointer, path: String): ValidationResult[Unit] =

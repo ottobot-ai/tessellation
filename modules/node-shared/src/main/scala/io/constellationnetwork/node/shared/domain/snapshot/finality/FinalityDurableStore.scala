@@ -290,7 +290,7 @@ object FinalityDurableCasResult {
   final case class AlreadyInstalled[A](value: A) extends FinalityDurableCasResult[A]
 }
 
-trait FinalityDurableStore[F[_]] {
+sealed trait FinalityDurableStore[F[_]] {
   def putArtifact(pointer: ImmutableArtifactPointer, bytes: ByteVector): F[Unit]
   def readArtifact(pointer: ImmutableArtifactPointer): F[ByteVector]
 

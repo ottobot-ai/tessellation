@@ -643,6 +643,165 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     }
   }
 
+  test("verified publication lease rejects an uninitialized journal without invoking the callback") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        for {
+          invoked <- Ref.of[IO, Boolean](false)
+          result <- store.withVerifiedActivePublication(_ => invoked.set(true)).attempt
+          callbackInvoked <- invoked.get
+        } yield
+          expect.all(
+            result.left.exists(_ == PublicationJournalNotInitialized),
+            !callbackInvoked
+          )
+      }
+    }
+  }
+
+  test("verified publication lease exposes exact pristine and image publication readback") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        for {
+          pristine <- store.initializeActivePublication(None)
+          pristineReadback <- store.withVerifiedActivePublication(_.read)
+          receipt <- prepare(store, 12L, ordinal0, entries("verified-publication-image"))
+          image = MptActivePublication(MptPublicationRevision(1L), receipt.some)
+          _ <- store.transitionActive(pristine, image)
+          imageReadback <- store.withVerifiedActivePublication(_.read)
+        } yield expect.all(pristineReadback == pristine, imageReadback == image)
+      }
+    }
+  }
+
+  test("verified publication lease rejects effectful readback after the callback returns, fails, or is canceled") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        var synchronouslyCaptured = Option.empty[VerifiedActiveMptPublication[IO]]
+
+        for {
+          _ <- store.initializeActivePublication(None)
+          returnedToken <- store.withVerifiedActivePublication(token => IO.pure(token))
+          returnedResult <- returnedToken.read.attempt
+          synchronousResult <- store
+            .withVerifiedActivePublication[Unit] { token =>
+              synchronouslyCaptured = token.some
+              throw new IllegalStateException("lease callback threw synchronously")
+            }
+            .attempt
+          synchronousToken <- synchronouslyCaptured.liftTo[IO](
+            new IllegalStateException("The synchronously failed verified-publication callback did not capture its lease")
+          )
+          synchronousRead <- synchronousToken.read.attempt
+          failedCapture <- Ref.of[IO, Option[VerifiedActiveMptPublication[IO]]](None)
+          failed <- store
+            .withVerifiedActivePublication { token =>
+              failedCapture.set(token.some) >> IO.raiseError[Unit](new IllegalStateException("lease callback failed"))
+            }
+            .attempt
+          failedToken <- failedCapture.get.flatMap(
+            _.liftTo[IO](new IllegalStateException("The failed verified-publication callback did not capture its lease"))
+          )
+          failedResult <- failedToken.read.attempt
+          captured <- Ref.of[IO, Option[VerifiedActiveMptPublication[IO]]](None)
+          entered <- Deferred[IO, Unit]
+          callback <- store
+            .withVerifiedActivePublication { token =>
+              captured.set(token.some) >> entered.complete(()).void >> IO.never[Unit]
+            }
+            .start
+          _ <- entered.get
+          _ <- callback.cancel
+          canceledToken <- captured.get.flatMap(
+            _.liftTo[IO](new IllegalStateException("The canceled verified-publication callback did not capture its lease"))
+          )
+          canceledResult <- canceledToken.read.attempt
+        } yield
+          expect.all(
+            returnedResult.left.exists(_ == LeaseExpired),
+            synchronousResult.left.exists(_.getMessage == "lease callback threw synchronously"),
+            synchronousRead.left.exists(_ == LeaseExpired),
+            failed.left.exists(_.getMessage == "lease callback failed"),
+            failedResult.left.exists(_ == LeaseExpired),
+            canceledResult.left.exists(_ == LeaseExpired)
+          )
+      }
+    }
+  }
+
+  test("verified publication lease fails closed on a corrupt referenced image without invoking the callback") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      makeStore(directory).use { store =>
+        for {
+          pristine <- store.initializeActivePublication(None)
+          receipt <- prepare(store, 13L, ordinal0, entries("verified-publication-corrupt-image"))
+          image = MptActivePublication(MptPublicationRevision(1L), receipt.some)
+          _ <- store.transitionActive(pristine, image)
+          imagePath = DurableMptImageLayout.image(directory, receipt.imageId)
+          imageBytes <- IO.blocking(Files.readAllBytes(imagePath))
+          corruptImageBytes = imageBytes.clone()
+          _ = corruptImageBytes(corruptImageBytes.length - 1) = (corruptImageBytes.last ^ 1).toByte
+          _ <- IO.blocking(Files.write(imagePath, corruptImageBytes)).void
+          invoked <- Ref.of[IO, Boolean](false)
+          result <- store.withVerifiedActivePublication(_ => invoked.set(true)).attempt
+          callbackInvoked <- invoked.get
+        } yield
+          expect.all(
+            result.left.exists(_.isInstanceOf[CorruptImage]),
+            !callbackInvoked
+          )
+      }
+    }
+  }
+
+  test("verified publication lease blocks a publication transition until its callback completes") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      TestControl.executeEmbed {
+        makeStore(directory).use { store =>
+          for {
+            pristine <- store.initializeActivePublication(None)
+            receipt <- prepare(store, 14L, ordinal0, entries("verified-publication-lease"))
+            image = MptActivePublication(MptPublicationRevision(1L), receipt.some)
+            leaseEntered <- Deferred[IO, Unit]
+            releaseLease <- Deferred[IO, Unit]
+            lease <- store
+              .withVerifiedActivePublication { token =>
+                leaseEntered.complete(()).void >> token.read.flatTap(_ => releaseLease.get)
+              }
+              .start
+            _ <- leaseEntered.get
+            transitionStarted <- Deferred[IO, Unit]
+            transitionDone <- Deferred[IO, Unit]
+            transition <- (transitionStarted.complete(()).void >> store.transitionActive(pristine, image))
+              .guarantee(transitionDone.complete(()).void)
+              .start
+            _ <- transitionStarted.get
+            _ <- IO.cede
+            transitionBeforeRelease <- transitionDone.tryGet
+            leasedPublication <- releaseLease.complete(()) >> lease.joinWithNever
+            _ <- transition.joinWithNever
+            active <- store.activePublication
+          } yield
+            expect.all(
+              transitionBeforeRelease.isEmpty,
+              leasedPublication == pristine,
+              active.contains(image)
+            )
+        }
+      }
+    }
+  }
+
   test("publication revision permits exact lower-generation rollback and durable explicit pristine restoration") { res =>
     implicit val (json, hasher) = res
 

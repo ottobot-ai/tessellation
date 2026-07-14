@@ -235,13 +235,26 @@ The `ForkChoiceOrphanClaim` is structurally constrained but does not prove true
 MRCA or target exclusion. The durable store rejects restoration mutations and
 there is no live executor, branch hold, fault injection, semantic/anchor receipt
 verifier, or public `RestoredAbandoned` authority, so FIN-W-003 and FIN-W-001 remain
-open. Coordinator initialization also accepts a raw publication cursor; a
-package-owned exact-MPT-readback capability and stale-cursor rejection test remain
-activation gates (`FinalityCore.scala:395-460`;
+open. The raw initialization route is now gone. `DurableMptImageStoreSuite` proves
+that the store-minted publication lease verifies durable journal state, expires on
+return/error/cancellation, rejects corrupt referenced images before callback, and
+blocks concurrent publication transitions. `FinalityCoordinatorBootstrapSuite`
+proves no-write failure on uninitialized/corrupt MPT, exact fresh/idempotent binding,
+typed mismatch recovery, absorbing recovery preservation, no effect-outbox creation,
+and MPT-mutex retention through the finality head write. Kernel/codec tests reject a
+raw initializer, validate exact mismatch identity, and retain closed tag 12. These
+tests close local durable bootstrap provenance only. Semantic/Phase-2 anchoring,
+coordinator ownership of every later `transitionActive`, combined mismatch-recovery
+crash/cancellation injection, and live wiring remain activation gates
+(`FinalityCore.scala:395-460`;
 `FinalityCoordinatorState.scala:68-76,99-136`;
-`FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
-`FinalityCoordinatorKernel.scala:72-154`;
-`FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
+`FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1364-1442,1461-1608`;
+`FinalityCoordinatorKernel.scala:74-112`;
+`FinalityCoordinatorBootstrap.scala:9-84`;
+`DurableMptImageStore.scala:87-97,177-182,542-552`;
+`DurableMptImageStoreSuite.scala:646-803`;
+`FinalityCoordinatorBootstrapSuite.scala:58-192`;
+`FinalityDurableStore.scala:293-319,1209-1230,1357-1363,1652-1656`).
 
 Full positive `validateCoreBatch` fixtures now construct both
 `ForkChoiceReplacement` and inherited `ForkChoiceRollbackToOperationalMrca` from
