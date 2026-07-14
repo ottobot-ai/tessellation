@@ -15,9 +15,17 @@ import scala.jdk.CollectionConverters._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.storage.durable.{
+  DurableFileOps,
+  DurableWriteBoundary,
+  DurableWriteEvent,
+  DurableWriteHook,
+  DurableWriteStage
+}
 
 import scodec.bits.ByteVector
 import weaver.MutableIOSuite
@@ -25,7 +33,8 @@ import weaver.MutableIOSuite
 object DurableMptImageStoreSuite extends MutableIOSuite {
   import DurableMptImageError._
   import MptImageArtifact._
-  import MptImageFaultPoint._
+  import DurableWriteBoundary._
+  import DurableWriteStage._
 
   type Res = (JsonSerializer[IO], Hasher[IO])
 
@@ -80,7 +89,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     values: Map[Hex, ByteVector]
   )(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): IO[MptImageReceipt] =
     rootOf(values).flatMap { root =>
-      store.prepare(generation, MptImageAnchor(snapshotHash(ordinal), parentHash(ordinal), ordinal, root), values)
+      store.prepare(generation, GlobalSnapshotStateRef(ordinal, snapshotHash(ordinal), parentHash(ordinal), root), values)
     }
 
   private def deleteRecursive(path: Path): Unit =
@@ -93,8 +102,24 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   private def tempDir: Resource[IO, Path] =
     Resource.make(IO.blocking(Files.createTempDirectory("durable-mpt-image")))(path => IO.blocking(deleteRecursive(path)))
 
-  private final class FailOnce(point: MptImageFaultPoint, fired: Ref[IO, Boolean], failure: Throwable) extends MptImageFaultInjector[IO] {
-    def before(actual: MptImageFaultPoint): IO[Unit] =
+  private def temporaryArtifacts(directory: Path): IO[List[Path]] =
+    IO.blocking {
+      val stream = Files.walk(directory)
+      try stream.iterator().asScala.filter(_.getFileName.toString.endsWith(".tmp")).toList
+      finally stream.close()
+    }
+
+  private type FaultPoint = DurableWriteEvent[MptImageArtifact]
+
+  private def before(stage: DurableWriteStage, artifact: MptImageArtifact): FaultPoint =
+    DurableWriteEvent(artifact, stage, Before)
+
+  private def after(stage: DurableWriteStage, artifact: MptImageArtifact): FaultPoint =
+    DurableWriteEvent(artifact, stage, After)
+
+  private final class FailOnce(point: FaultPoint, fired: Ref[IO, Boolean], failure: Throwable)
+      extends DurableWriteHook[IO, MptImageArtifact] {
+    def onEvent(actual: FaultPoint): IO[Unit] =
       if (actual != point) IO.unit
       else
         fired.modify {
@@ -104,13 +129,13 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   }
 
   private final class BarrierOnce(
-    point: MptImageFaultPoint,
+    point: FaultPoint,
     fired: Ref[IO, Boolean],
     entered: Deferred[IO, Unit],
     release: Deferred[IO, Unit],
     failure: Option[Throwable]
-  ) extends MptImageFaultInjector[IO] {
-    def before(actual: MptImageFaultPoint): IO[Unit] =
+  ) extends DurableWriteHook[IO, MptImageArtifact] {
+    def onEvent(actual: FaultPoint): IO[Unit] =
       if (actual != point) IO.unit
       else
         fired.modify {
@@ -133,12 +158,12 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
 
   private def storeWithFault(
     directory: Path,
-    point: MptImageFaultPoint
+    point: FaultPoint
   )(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): Resource[IO, DurableMptImageStore[IO]] =
     Resource.eval(Ref.of[IO, Boolean](false)).flatMap { fired =>
       DurableMptImageStore.resourceWith[IO](
         directory,
-        DurableMptImageFileOps.nio[IO],
+        DurableFileOps.nio[IO],
         new FailOnce(point, fired, new IOException(s"injected $point")),
         codecEra,
         rootVerifier,
@@ -160,7 +185,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
       makeStore(directory).use { store =>
         for {
           expectedRoot <- rootOf(independent)
-          anchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, expectedRoot)
+          anchor = GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), expectedRoot)
           first <- store.prepare(0L, anchor, aliased)
           second <- store.prepare(0L, anchor, independent.toList.reverse.toMap)
           beforePublish <- store.activeReceipt
@@ -196,7 +221,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
         release <- Deferred[IO, Unit]
         verifier = new BlockingRootVerifier(rootVerifier, entered, release)
         result <- DurableMptImageStore.resource[IO](directory, codecEra, verifier, limits).use { store =>
-          val anchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, expectedRoot)
+          val anchor = GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), expectedRoot)
           for {
             preparing <- store.prepare(0L, anchor, aliased).start
             _ <- entered.get
@@ -223,12 +248,13 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
       makeStore(directory).use { store =>
         for {
           root <- rootOf(values)
-          anchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, root)
+          anchor = GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), root)
           receipt <- store.prepare(0L, anchor, values)
-          sibling <- store.prepare(0L, anchor.copy(snapshotHash = alternateHash), values)
+          sibling <- store.prepare(0L, anchor.copy(hash = alternateHash), values)
           childOfOtherParent <- store.prepare(0L, anchor.copy(parentHash = alternateHash), values)
           sameHashesOtherOrdinal <- store.prepare(0L, anchor.copy(ordinal = ordinal1), values)
-          wrongSnapshot <- store.publish(receipt.copy(anchor = anchor.copy(snapshotHash = alternateHash)), None).attempt
+          reservedSnapshot <- store.publish(receipt.copy(anchor = anchor.copy(hash = Hash.empty)), None).attempt
+          wrongSnapshot <- store.publish(receipt.copy(anchor = anchor.copy(hash = alternateHash)), None).attempt
           wrongParent <- store.publish(receipt.copy(anchor = anchor.copy(parentHash = alternateHash)), None).attempt
           wrongOrdinal <- store.publish(receipt.copy(anchor = anchor.copy(ordinal = ordinal1)), None).attempt
           wrongCodec <- store
@@ -249,6 +275,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
             receipt.digest != childOfOtherParent.digest,
             receipt.imageId != sameHashesOtherOrdinal.imageId,
             receipt.digest != sameHashesOtherOrdinal.digest,
+            reservedSnapshot.left.exists(_.isInstanceOf[CorruptManifest]),
             wrongSnapshot.left.exists(_.isInstanceOf[CorruptImage]),
             wrongParent.left.exists(_.isInstanceOf[CorruptImage]),
             wrongOrdinal.left.exists(_.isInstanceOf[CorruptImage]),
@@ -375,7 +402,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
 
     tempDir.use { failureDirectory =>
       tempDir.use { cancellationDirectory =>
-        val delegate = DurableMptImageFileOps.nio[IO]
+        val delegate = DurableFileOps.nio[IO]
         val injected = new IOException("injected constructor failure")
         val failingOps = new DelegatingFileOps(delegate) {
           override def createDirectories(path: Path): IO[Unit] = IO.raiseError(injected)
@@ -386,7 +413,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
             .resourceWith[IO](
               failureDirectory,
               failingOps,
-              MptImageFaultInjector.noop[IO],
+              DurableWriteHook.noop[IO, MptImageArtifact],
               codecEra,
               rootVerifier,
               limits
@@ -402,7 +429,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
             .resourceWith[IO](
               cancellationDirectory,
               blockingOps,
-              MptImageFaultInjector.noop[IO],
+              DurableWriteHook.noop[IO, MptImageArtifact],
               codecEra,
               rootVerifier,
               limits
@@ -438,7 +465,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
       def attemptPrepare(readLimits0: MptImageReadLimits, values: Map[Hex, ByteVector]): IO[Either[Throwable, MptImageReceipt]] =
         makeStoreWithLimits(directory, readLimits0).use { store =>
           rootOf(values).flatMap { root =>
-            store.prepare(0L, MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, root), values).attempt
+            store.prepare(0L, GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), root), values).attempt
           }
         }
 
@@ -474,18 +501,19 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           def rebuild(entries: Vector[(Hex, ByteVector)]): IO[MptRoot] = IO.raiseError(buildFailure)
         }
 
-        val wrongAnchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, MptRoot(Hash.empty))
+        val wrongAnchor = GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), MptRoot(Hash.empty))
+        val reservedAnchor = wrongAnchor.copy(hash = Hash.empty)
 
         for {
           wrongResult <- makeStore(wrongRootDirectory).use { store =>
-            (store.prepare(0L, wrongAnchor, values).attempt, store.activeReceipt).tupled
+            (store.prepare(0L, wrongAnchor, values).attempt, store.prepare(0L, reservedAnchor, values).attempt, store.activeReceipt).tupled
           }
-          (wrong, wrongActive) = wrongResult
+          (wrong, reserved, wrongActive) = wrongResult
           failedResult <- DurableMptImageStore
             .resourceWith[IO](
               buildFailureDirectory,
-              DurableMptImageFileOps.nio[IO],
-              MptImageFaultInjector.noop[IO],
+              DurableFileOps.nio[IO],
+              DurableWriteHook.noop[IO, MptImageArtifact],
               codecEra,
               failingBuilder,
               limits
@@ -497,6 +525,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
         } yield
           expect.all(
             wrong.left.exists(_.isInstanceOf[RootMismatch]),
+            reserved.left.exists(_.isInstanceOf[InvalidAnchor]),
             wrongActive.isEmpty,
             failed == Left(buildFailure),
             failedActive.isEmpty
@@ -589,13 +618,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   test("every image write stage fails closed without changing the prior active generation") { res =>
     implicit val (json, hasher) = res
 
-    val points = List(
-      Write(Image),
-      ForceFile(Image),
-      AtomicMove(Image),
-      ForceDirectory(Image),
-      ReadBack(Image)
-    )
+    val points = DurableWriteStage.ordered.flatMap(stage => List(before(stage, Image), after(stage, Image)))
 
     points.traverse { point =>
       tempDir.use { directory =>
@@ -608,7 +631,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           candidateRoot <- rootOf(candidateValues)
           result <- storeWithFault(directory, point).use { failing =>
             failing
-              .prepare(1L, MptImageAnchor(snapshotHash(ordinal1), parentHash(ordinal1), ordinal1, candidateRoot), candidateValues)
+              .prepare(1L, GlobalSnapshotStateRef(ordinal1, snapshotHash(ordinal1), parentHash(ordinal1), candidateRoot), candidateValues)
               .attempt
           }
           validPrior <- makeStore(directory).use { restarted =>
@@ -616,7 +639,8 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
               active.contains(initial) && loaded.toMap == initialValues
             }
           }
-        } yield result.isLeft && validPrior
+          temporary <- temporaryArtifacts(directory)
+        } yield result.isLeft && validPrior && temporary.isEmpty
       }
     }.map(results => expect(results.forall(identity)))
   }
@@ -624,13 +648,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   test("every manifest write stage restores the prior bootable generation on failure") { res =>
     implicit val (json, hasher) = res
 
-    val points = List(
-      Write(Manifest),
-      ForceFile(Manifest),
-      AtomicMove(Manifest),
-      ForceDirectory(Manifest),
-      ReadBack(Manifest)
-    )
+    val points = DurableWriteStage.ordered.flatMap(stage => List(before(stage, Manifest), after(stage, Manifest)))
 
     points.traverse { point =>
       tempDir.use { directory =>
@@ -658,13 +676,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   test("every initialization-marker write stage rolls back the first publication") { res =>
     implicit val (json, hasher) = res
 
-    val points = List(
-      Write(InitializationMarker),
-      ForceFile(InitializationMarker),
-      AtomicMove(InitializationMarker),
-      ForceDirectory(InitializationMarker),
-      ReadBack(InitializationMarker)
-    )
+    val points = DurableWriteStage.ordered.flatMap(stage => List(before(stage, InitializationMarker), after(stage, InitializationMarker)))
 
     points.traverse { point =>
       tempDir.use { directory =>
@@ -705,8 +717,8 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           result <- DurableMptImageStore
             .resourceWith[IO](
               directory,
-              DurableMptImageFileOps.nio[IO],
-              new BarrierOnce(ReadBack(Manifest), fired, entered, release, Some(injectedFailure)),
+              DurableFileOps.nio[IO],
+              new BarrierOnce(before(ReadBack, Manifest), fired, entered, release, Some(injectedFailure)),
               codecEra,
               rootVerifier,
               limits
@@ -768,8 +780,8 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           result <- DurableMptImageStore
             .resourceWith[IO](
               directory,
-              DurableMptImageFileOps.nio[IO],
-              new BarrierOnce(ForceDirectory(Manifest), fired, entered, release, None),
+              DurableFileOps.nio[IO],
+              new BarrierOnce(after(AtomicMove, Manifest), fired, entered, release, None),
               codecEra,
               rootVerifier,
               limits
@@ -820,7 +832,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
         manifestBefore <- IO.blocking(Files.readAllBytes(manifestPath))
         priorImagePath = DurableMptImageLayout.image(directory, initial.imageId)
         _ <- IO.blocking(Files.write(priorImagePath, Array[Byte](1, 2, 3))).void
-        result <- storeWithFault(directory, Write(Manifest)).use(_.publish(candidate, Some(initial.pointer)).attempt)
+        result <- storeWithFault(directory, before(Write, Manifest)).use(_.publish(candidate, Some(initial.pointer)).attempt)
         manifestAfter <- IO.blocking(Files.readAllBytes(manifestPath))
       } yield
         expect.all(
@@ -834,7 +846,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     implicit val (json, hasher) = res
 
     tempDir.use { directory =>
-      val delegate = DurableMptImageFileOps.nio[IO]
+      val delegate = DurableFileOps.nio[IO]
       val unsupported = new DelegatingFileOps(delegate) {
         override def atomicMoveReplace(source: Path, target: Path): IO[Unit] =
           IO.raiseError(new AtomicMoveNotSupportedException(source.toString, target.toString, "injected"))
@@ -844,7 +856,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
         .resourceWith[IO](
           directory,
           unsupported,
-          MptImageFaultInjector.noop[IO],
+          DurableWriteHook.noop[IO, MptImageArtifact],
           codecEra,
           rootVerifier,
           limits
@@ -854,7 +866,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           for {
             root <- rootOf(values)
             result <- store
-              .prepare(0L, MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, root), values)
+              .prepare(0L, GlobalSnapshotStateRef(ordinal0, snapshotHash(ordinal0), parentHash(ordinal0), root), values)
               .attempt
             active <- store.activeReceipt
           } yield expect.all(result.left.exists(_.isInstanceOf[AtomicMoveRequired]), active.isEmpty)
@@ -931,7 +943,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           tempDir.use { failedReadDirectory =>
             val readFailure = new IOException("injected artifact read failure")
             val manifestPath = DurableMptImageLayout.activeManifest(failedReadDirectory)
-            val failingFileOps = new DelegatingFileOps(DurableMptImageFileOps.nio[IO]) {
+            val failingFileOps = new DelegatingFileOps(DurableFileOps.nio[IO]) {
               override def openInput(path: Path): Resource[IO, InputStream] =
                 if (path == manifestPath) Resource.eval(IO.raiseError(readFailure))
                 else super.openInput(path)
@@ -954,7 +966,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
                 .resourceWith[IO](
                   failedReadDirectory,
                   failingFileOps,
-                  MptImageFaultInjector.noop[IO],
+                  DurableWriteHook.noop[IO, MptImageArtifact],
                   codecEra,
                   rootVerifier,
                   limits
@@ -1025,7 +1037,7 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     }
   }
 
-  private class DelegatingFileOps(delegate: DurableMptImageFileOps[IO]) extends DurableMptImageFileOps[IO] {
+  private class DelegatingFileOps(delegate: DurableFileOps[IO]) extends DurableFileOps[IO] {
     def acquireExclusiveLock(path: Path): Resource[IO, Unit] = delegate.acquireExclusiveLock(path)
     def createDirectories(path: Path): IO[Unit] = delegate.createDirectories(path)
     def createTempFile(directory: Path, prefix: String, suffix: String): IO[Path] = delegate.createTempFile(directory, prefix, suffix)

@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.domain.snapshot.finality.model
 import io.constellationnetwork.node.shared.domain.snapshot.finality.model.FinalityReferenceModel._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.mpt.MptRoot
 
 import weaver.SimpleIOSuite
 
@@ -21,7 +22,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   private def ord(value: Long): SnapshotOrdinal = SnapshotOrdinal.unsafeApply(value)
 
   private def ref(value: Long, char: Char, parent: Hash, rootChar: Char): SnapshotRef =
-    SnapshotRef(ord(value), hash(char), parent, hash(rootChar))
+    SnapshotRef(ord(value), hash(char), parent, MptRoot(hash(rootChar)))
 
   private val genesis = ref(0L, 'a', Hash.empty, '0')
   private val a1 = ref(1L, '1', genesis.hash, 'b')
@@ -31,7 +32,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   private val a5 = ref(5L, '9', a4.hash, 'f')
   private val a6 = ref(6L, 'e', a5.hash, '7')
   // Hash.empty is 64 zeroes and is the ancestry root sentinel, so never use it as a fixture's snapshot hash.
-  private val a7 = SnapshotRef(ord(7L), Hash("01" * 32), a6.hash, hash('8'))
+  private val a7 = SnapshotRef(ord(7L), Hash("01" * 32), a6.hash, MptRoot(hash('8')))
   private val a8 = ref(8L, '7', a7.hash, '9')
   private val a9 = ref(9L, 'f', a8.hash, '0')
 

@@ -2,7 +2,6 @@ package io.constellationnetwork.security.mpt
 
 import java.io._
 import java.nio.ByteBuffer
-import java.nio.channels.{FileChannel, OverlappingFileLockException}
 import java.nio.charset.StandardCharsets
 import java.nio.file._
 import java.security.{DigestInputStream, MessageDigest}
@@ -12,15 +11,23 @@ import cats.Parallel
 import cats.effect.{Async, Resource}
 import cats.effect.std.Semaphore
 import cats.syntax.all._
+import cats.~>
 
 import scala.collection.immutable.SortedMap
 import scala.util.control.NonFatal
 
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.storage.durable.{
+  DurableAtomicWriter,
+  DurableFileError,
+  DurableFileOps,
+  DurableWriteHook
+}
 
 import scodec.bits.ByteVector
 
@@ -51,7 +58,7 @@ trait DurableMptImageStore[F[_]] {
     */
   def prepare(
     generation: Long,
-    anchor: MptImageAnchor,
+    anchor: GlobalSnapshotStateRef,
     entries: Map[Hex, ByteVector]
   ): F[MptImageReceipt]
 
@@ -118,13 +125,6 @@ object MptImageReadLimits {
     from(limits.maxImageBytes, limits.maxEntries, limits.maxKeyBytes, limits.maxValueBytes).void
 }
 
-final case class MptImageAnchor(
-  snapshotHash: Hash,
-  parentHash: Hash,
-  ordinal: SnapshotOrdinal,
-  mptRoot: MptRoot
-)
-
 final case class MptImagePointer(imageId: MptImageId, digest: MptImageDigest)
 
 object MptImagePointer {
@@ -135,7 +135,7 @@ final case class MptImageReceipt(
   formatVersion: Int,
   generation: Long,
   imageId: MptImageId,
-  anchor: MptImageAnchor,
+  anchor: GlobalSnapshotStateRef,
   codecEra: MptImageCodecEra,
   rootEra: MptImageRootEra,
   digest: MptImageDigest,
@@ -234,12 +234,12 @@ object DurableMptImageStore {
     rootVerifier: MptImageRootVerifier[F],
     limits: MptImageReadLimits
   ): Resource[F, DurableMptImageStore[F]] =
-    resourceWith(directory, DurableMptImageFileOps.nio[F], MptImageFaultInjector.noop[F], codecEra, rootVerifier, limits)
+    resourceWith(directory, DurableFileOps.nio[F], DurableWriteHook.noop[F, MptImageArtifact], codecEra, rootVerifier, limits)
 
   private[mpt] def resourceWith[F[_]: Async](
     directory: Path,
-    fileOps: DurableMptImageFileOps[F],
-    faults: MptImageFaultInjector[F],
+    fileOps: DurableFileOps[F],
+    faults: DurableWriteHook[F, MptImageArtifact],
     codecEra: MptImageCodecEra,
     rootVerifier: MptImageRootVerifier[F],
     limits: MptImageReadLimits
@@ -251,13 +251,29 @@ object DurableMptImageStore {
       _ <- Resource.eval(Async[F].fromEither(MptImageReadLimits.validate(limits)))
       rootExists <- Resource.eval(fileOps.isDirectory(directory))
       _ <- Resource.eval(Async[F].raiseUnless(rootExists)(DurableMptImageError.RootDirectoryMustExist(directory)))
-      _ <- fileOps.acquireExclusiveLock(lockPath)
+      _ <- adaptDurableResource(fileOps.acquireExclusiveLock(lockPath))
       _ <- Resource.eval(fileOps.createDirectories(imagesDirectory))
       _ <- Resource.eval(fileOps.forceDirectory(imagesDirectory))
       _ <- Resource.eval(fileOps.forceDirectory(directory))
       mutex <- Resource.eval(Semaphore[F](1L))
     } yield new LiveDurableMptImageStore[F](directory, fileOps, faults, codecEra, rootVerifier, limits, mutex)
   }
+
+  private def adaptDurableResource[F[_]: Async, A](resource: Resource[F, A]): Resource[F, A] =
+    resource.mapK(new (F ~> F) {
+      def apply[B](effect: F[B]): F[B] = adaptDurableEffect(effect)
+    })
+
+  private[mpt] def adaptDurableEffect[F[_]: Async, A](effect: F[A]): F[A] =
+    effect.adaptError { case error: DurableFileError => toMptError(error) }
+
+  private def toMptError(error: DurableFileError): Throwable =
+    error match {
+      case DurableFileError.DirectoryAlreadyOwned(path)      => DurableMptImageError.DirectoryAlreadyOwned(path)
+      case DurableFileError.DirectoryLockFailed(path, cause) => DurableMptImageError.DirectoryLockFailed(path, cause)
+      case DurableFileError.AtomicMoveRequired(path, cause)  => DurableMptImageError.AtomicMoveRequired(path, cause)
+      case other                                             => other
+    }
 }
 
 private[mpt] object DurableMptImageLayout {
@@ -281,25 +297,6 @@ private[mpt] object MptImageArtifact {
   case object InitializationMarker extends MptImageArtifact
 }
 
-private[mpt] sealed trait MptImageFaultPoint
-private[mpt] object MptImageFaultPoint {
-  final case class Write(artifact: MptImageArtifact) extends MptImageFaultPoint
-  final case class ForceFile(artifact: MptImageArtifact) extends MptImageFaultPoint
-  final case class AtomicMove(artifact: MptImageArtifact) extends MptImageFaultPoint
-  final case class ForceDirectory(artifact: MptImageArtifact) extends MptImageFaultPoint
-  final case class ReadBack(artifact: MptImageArtifact) extends MptImageFaultPoint
-}
-
-private[mpt] trait MptImageFaultInjector[F[_]] {
-  def before(point: MptImageFaultPoint): F[Unit]
-}
-
-private[mpt] object MptImageFaultInjector {
-  def noop[F[_]: Async]: MptImageFaultInjector[F] = new MptImageFaultInjector[F] {
-    def before(point: MptImageFaultPoint): F[Unit] = Async[F].unit
-  }
-}
-
 trait MptImageRootVerifier[F[_]] {
 
   /** Local persistence/root-algorithm identifier only. This does not prove that entry keys and values obey the advertised consensus schema.
@@ -320,109 +317,10 @@ object MptImageRootVerifier {
     }
 }
 
-private[mpt] trait DurableMptImageFileOps[F[_]] {
-  def acquireExclusiveLock(path: Path): Resource[F, Unit]
-  def createDirectories(path: Path): F[Unit]
-  def createTempFile(directory: Path, prefix: String, suffix: String): F[Path]
-  def write(path: Path, bytes: Array[Byte]): F[Unit]
-  def forceFile(path: Path): F[Unit]
-  def atomicMoveReplace(source: Path, target: Path): F[Unit]
-  def forceDirectory(path: Path): F[Unit]
-  def openInput(path: Path): Resource[F, InputStream]
-  def isDirectory(path: Path): F[Boolean]
-  def deleteIfExists(path: Path): F[Unit]
-}
-
-private[mpt] object DurableMptImageFileOps {
-  def nio[F[_]: Async]: DurableMptImageFileOps[F] = new DurableMptImageFileOps[F] {
-    def acquireExclusiveLock(path: Path): Resource[F, Unit] =
-      Resource.make {
-        Async[F].blocking {
-          val channel = FileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.WRITE)
-
-          def closeAfterFailure(failure: Throwable): Unit =
-            try channel.close()
-            catch { case NonFatal(closeFailure) => failure.addSuppressed(closeFailure) }
-
-          try {
-            val lock =
-              try channel.tryLock()
-              catch { case _: OverlappingFileLockException => null }
-
-            if (lock eq null) throw DurableMptImageError.DirectoryAlreadyOwned(path)
-            else channel -> lock
-          } catch {
-            case failure: DurableMptImageError =>
-              closeAfterFailure(failure)
-              throw failure
-            case NonFatal(failure) =>
-              val typed = DurableMptImageError.DirectoryLockFailed(path, failure)
-              closeAfterFailure(typed)
-              throw typed
-          }
-        }
-      } {
-        case (channel, lock) =>
-          Async[F].blocking {
-            var releaseFailure: Throwable = null
-            try lock.release()
-            catch { case NonFatal(failure) => releaseFailure = failure }
-            try channel.close()
-            catch {
-              case NonFatal(failure) if releaseFailure ne null => releaseFailure.addSuppressed(failure)
-              case NonFatal(failure)                           => releaseFailure = failure
-            }
-            if (releaseFailure ne null) throw DurableMptImageError.DirectoryLockFailed(path, releaseFailure)
-          }
-      }.void
-
-    def createDirectories(path: Path): F[Unit] = Async[F].blocking(Files.createDirectories(path)).void
-
-    def createTempFile(directory: Path, prefix: String, suffix: String): F[Path] =
-      Async[F].blocking(Files.createTempFile(directory, prefix, suffix))
-
-    def write(path: Path, bytes: Array[Byte]): F[Unit] = Async[F].blocking {
-      val channel = FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)
-      try {
-        val buffer = ByteBuffer.wrap(bytes)
-        while (buffer.hasRemaining) channel.write(buffer)
-      } finally channel.close()
-    }
-
-    def forceFile(path: Path): F[Unit] = Async[F].blocking {
-      val channel = FileChannel.open(path, StandardOpenOption.WRITE)
-      try channel.force(true)
-      finally channel.close()
-    }
-
-    def atomicMoveReplace(source: Path, target: Path): F[Unit] =
-      Async[F]
-        .blocking(Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING))
-        .void
-        .adaptError {
-          case error: java.nio.file.AtomicMoveNotSupportedException =>
-            DurableMptImageError.AtomicMoveRequired(target, error)
-        }
-
-    def forceDirectory(path: Path): F[Unit] = Async[F].blocking {
-      val channel = FileChannel.open(path, StandardOpenOption.READ)
-      try channel.force(true)
-      finally channel.close()
-    }
-
-    def openInput(path: Path): Resource[F, InputStream] =
-      Resource.make(Async[F].blocking(Files.newInputStream(path, StandardOpenOption.READ)))(stream => Async[F].blocking(stream.close()))
-
-    def isDirectory(path: Path): F[Boolean] = Async[F].blocking(Files.isDirectory(path))
-
-    def deleteIfExists(path: Path): F[Unit] = Async[F].blocking(Files.deleteIfExists(path)).void
-  }
-}
-
 private final class LiveDurableMptImageStore[F[_]: Async](
   directory: Path,
-  fileOps: DurableMptImageFileOps[F],
-  faults: MptImageFaultInjector[F],
+  fileOps: DurableFileOps[F],
+  faults: DurableWriteHook[F, MptImageArtifact],
   codecEra: MptImageCodecEra,
   rootVerifier: MptImageRootVerifier[F],
   limits: MptImageReadLimits,
@@ -430,14 +328,14 @@ private final class LiveDurableMptImageStore[F[_]: Async](
 ) extends DurableMptImageStore[F] {
   import DurableMptImageError._
   import MptImageArtifact._
-  import MptImageFaultPoint._
 
   private val activeManifestPath = DurableMptImageLayout.activeManifest(directory)
   private val initializationMarkerPath = DurableMptImageLayout.initializationMarker(directory)
+  private val atomicWriter = new DurableAtomicWriter[F](fileOps)
 
   def prepare(
     generation: Long,
-    anchor: MptImageAnchor,
+    anchor: GlobalSnapshotStateRef,
     entries: Map[Hex, ByteVector]
   ): F[MptImageReceipt] =
     for {
@@ -652,7 +550,7 @@ private final class LiveDurableMptImageStore[F[_]: Async](
     }
 
   private def readOptionalManifest: F[Option[MptImageReceipt]] =
-    readManifestRaw(activeManifestPath).map(_.some).handleErrorWith {
+    readManifestRaw(activeManifestPath).flatTap(validateReceiptShape).map(_.some).handleErrorWith {
       case failure: NoSuchFileException  => missingManifestOrPristine(failure)
       case failure: FileNotFoundException => missingManifestOrPristine(failure)
       case failure: DurableMptImageError => Async[F].raiseError(failure)
@@ -684,23 +582,8 @@ private final class LiveDurableMptImageStore[F[_]: Async](
     verify: Path => F[A],
     applyFaults: Boolean
   ): F[A] = {
-    def fault(point: MptImageFaultPoint): F[Unit] = if (applyFaults) faults.before(point) else Async[F].unit
-
-    fileOps.createTempFile(target.getParent, s".${target.getFileName.toString}.", ".tmp").flatMap { temporary =>
-      val operation =
-        for {
-          _ <- fault(Write(artifact)) >> fileOps.write(temporary, bytes)
-          _ <- fault(ForceFile(artifact)) >> fileOps.forceFile(temporary)
-          _ <- fault(AtomicMove(artifact)) >> fileOps
-            .atomicMoveReplace(temporary, target)
-            .adaptError { case error: java.nio.file.AtomicMoveNotSupportedException => AtomicMoveRequired(target, error) }
-          _ <- fault(ForceDirectory(artifact)) >> fileOps.forceDirectory(target.getParent)
-          _ <- fault(ReadBack(artifact))
-          verified <- verify(target)
-        } yield verified
-
-      Async[F].guarantee(operation, fileOps.deleteIfExists(temporary).handleError(_ => ()))
-    }
+    val hook = if (applyFaults) faults else DurableWriteHook.noop[F, MptImageArtifact]
+    DurableMptImageStore.adaptDurableEffect(atomicWriter.replace(target, bytes, artifact, hook)(verify))
   }
 
   private def capture(entries: Map[Hex, ByteVector]): F[Vector[(Hex, ByteVector)]] =
@@ -751,16 +634,20 @@ private final class LiveDurableMptImageStore[F[_]: Async](
       _ <- ensureLimit("entry count", limits.maxEntries.toLong, receipt.entryCount.toLong)
       _ <- validateReceiptHash("image id", receipt.imageId.value)
       _ <- validateReceiptHash("image digest", receipt.digest.value)
-      _ <- validateReceiptHash("snapshot hash", receipt.anchor.snapshotHash)
+      _ <- validateReceiptHash("snapshot hash", receipt.anchor.hash)
+      _ <- Async[F].raiseWhen(receipt.anchor.hash == Hash.empty)(
+        CorruptManifest("Hash.empty is reserved and cannot identify an MPT image snapshot")
+      )
       _ <- validateReceiptHash("parent hash", receipt.anchor.parentHash)
       _ <- validateReceiptHash("MPT root", receipt.anchor.mptRoot.value)
       _ <- validateReceiptHash("codec era", receipt.codecEra.value)
       _ <- validateReceiptHash("root era", receipt.rootEra.value)
     } yield ()
 
-  private def validateAnchor(anchor: MptImageAnchor): F[Unit] =
+  private def validateAnchor(anchor: GlobalSnapshotStateRef): F[Unit] =
     for {
-      _ <- validateAnchorHash("snapshot hash", anchor.snapshotHash)
+      _ <- validateAnchorHash("snapshot hash", anchor.hash)
+      _ <- Async[F].raiseWhen(anchor.hash == Hash.empty)(InvalidAnchor("Hash.empty is reserved and cannot identify an MPT image snapshot"))
       _ <- validateAnchorHash("parent hash", anchor.parentHash)
       _ <- validateAnchorHash("MPT root", anchor.mptRoot.value)
     } yield ()
@@ -799,7 +686,7 @@ private[mpt] object MptImageEncoding {
 
   final case class DecodedImage(
     generation: Long,
-    anchor: MptImageAnchor,
+    anchor: GlobalSnapshotStateRef,
     codecEra: MptImageCodecEra,
     rootEra: MptImageRootEra,
     entries: SortedMap[Hex, ByteVector]
@@ -814,7 +701,7 @@ private[mpt] object MptImageEncoding {
 
   def encodeImage(
     generation: Long,
-    anchor: MptImageAnchor,
+    anchor: GlobalSnapshotStateRef,
     codecEra: MptImageCodecEra,
     rootEra: MptImageRootEra,
     entries: Vector[(Hex, ByteVector)]
@@ -825,7 +712,7 @@ private[mpt] object MptImageEncoding {
       data.write(ImageMagic)
       data.writeInt(DurableMptImageStore.CurrentFormatVersion)
       data.writeLong(generation)
-      data.write(hashBytes(anchor.snapshotHash))
+      data.write(hashBytes(anchor.hash))
       data.write(hashBytes(anchor.parentHash))
       data.writeLong(anchor.ordinal.value.value)
       data.write(hashBytes(anchor.mptRoot.value))
@@ -885,7 +772,7 @@ private[mpt] object MptImageEncoding {
         index += 1
       }
       if (input.read() != -1) throw new IOException("Trailing image bytes")
-      val anchor = MptImageAnchor(snapshotHash, parentHash, SnapshotOrdinal.unsafeApply(ordinalValue), root)
+      val anchor = GlobalSnapshotStateRef(SnapshotOrdinal.unsafeApply(ordinalValue), snapshotHash, parentHash, root)
       val image = DecodedImage(generation, anchor, codecEra, rootEra, entries)
       val imageDigest = MptImageDigest(Hash(Hex.fromBytes(digest.digest()).value))
       Right(DecodedImageFile(image, imageDigest))
@@ -904,7 +791,7 @@ private[mpt] object MptImageEncoding {
       data.writeInt(DurableMptImageStore.CurrentFormatVersion)
       data.writeLong(receipt.generation)
       data.write(hashBytes(receipt.imageId.value))
-      data.write(hashBytes(receipt.anchor.snapshotHash))
+      data.write(hashBytes(receipt.anchor.hash))
       data.write(hashBytes(receipt.anchor.parentHash))
       data.writeLong(receipt.anchor.ordinal.value.value)
       data.write(hashBytes(receipt.anchor.mptRoot.value))
@@ -981,7 +868,7 @@ private[mpt] object MptImageEncoding {
       val count = input.readInt()
       if (count < 0) throw new IOException(s"Negative entry count $count")
       if (input.available() != 0) throw new IOException(s"Trailing ${input.available()} manifest bytes")
-      val anchor = MptImageAnchor(snapshotHash, parentHash, SnapshotOrdinal.unsafeApply(ordinalValue), root)
+      val anchor = GlobalSnapshotStateRef(SnapshotOrdinal.unsafeApply(ordinalValue), snapshotHash, parentHash, root)
       Right(MptImageReceipt(version, generation, imageId, anchor, codecEra, rootEra, digest, count))
     } catch {
       case failure: ImageLimitExceeded => Left(failure)

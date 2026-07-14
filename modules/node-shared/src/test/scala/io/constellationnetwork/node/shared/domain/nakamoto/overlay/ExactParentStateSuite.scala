@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ParentStateError._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.ParentStateUnavailableReason._
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.mpt.MptRoot
 
@@ -15,13 +16,15 @@ object ExactParentStateSuite extends SimpleIOSuite {
   private def branch(n: Int): BranchId = BranchId(Hash(f"$n%064x"))
   private def root(n: Int): MptRoot = MptRoot(Hash(f"${10000 + n}%064x"))
 
-  private def state(ordinal: Long, id: Int, parentId: Int, rootId: Int = -1): SnapshotStateRef =
-    SnapshotStateRef(
+  private def state(ordinal: Long, id: Int, parentId: Int, rootId: Int = -1): GlobalSnapshotStateRef =
+    GlobalSnapshotStateRef(
       SnapshotOrdinal.unsafeApply(ordinal),
-      branch(id),
-      branch(parentId),
+      branch(id).value,
+      branch(parentId).value,
       root(if (rootId < 0) id else rootId)
     )
+
+  private def key(ref: GlobalSnapshotStateRef): BranchId = BranchId(ref.hash)
 
   private val base = state(10L, 10, 9)
 
@@ -37,7 +40,7 @@ object ExactParentStateSuite extends SimpleIOSuite {
 
     expect(
       result.left.exists {
-        case ParentStateUnavailable(`requested`, missing, RequestedParentMissing) => missing == requested.branch
+        case ParentStateUnavailable(`requested`, missing, RequestedParentMissing) => missing == key(requested)
         case _                                                                    => false
       }
     )
@@ -46,12 +49,12 @@ object ExactParentStateSuite extends SimpleIOSuite {
   pureTest("missing middle ancestor identifies the exact missing hash") {
     val middle = state(11L, 11, 10)
     val requested = state(12L, 12, 11)
-    val result = ExactParentResolver.resolve(base, Map(requested.branch -> requested), requested, limit)
+    val result = ExactParentResolver.resolve(base, Map(key(requested) -> requested), requested, limit)
 
     expect(
       result.left.exists {
         case ParentStateUnavailable(`requested`, missing, MissingAncestorOf(child)) =>
-          missing == middle.branch && child == requested
+          missing == key(middle) && child == requested
         case _ => false
       }
     )
@@ -61,7 +64,7 @@ object ExactParentStateSuite extends SimpleIOSuite {
     val a11 = state(11L, 11, 10)
     val a12 = state(12L, 12, 11)
     val a13 = state(13L, 13, 12)
-    val pending = Vector(a13, a11, a12).map(ref => ref.branch -> ref).toMap
+    val pending = Vector(a13, a11, a12).map(ref => key(ref) -> ref).toMap
 
     val result = ExactParentResolver.resolve(base, pending, a13, limit)
 
@@ -71,14 +74,14 @@ object ExactParentStateSuite extends SimpleIOSuite {
   pureTest("same hash with different exact identity rejects") {
     val stored = state(11L, 11, 10)
     val requested = stored.copy(mptRoot = root(999))
-    val result = ExactParentResolver.resolve(base, Map(stored.branch -> stored), requested, limit)
+    val result = ExactParentResolver.resolve(base, Map(key(stored) -> stored), requested, limit)
 
     expect(result.left.toOption.contains(ParentStateMismatch(requested, stored)))
   }
 
   pureTest("ordinal discontinuity rejects before a lineage is returned") {
     val requested = state(12L, 12, 10)
-    val result = ExactParentResolver.resolve(base, Map(requested.branch -> requested), requested, limit)
+    val result = ExactParentResolver.resolve(base, Map(key(requested) -> requested), requested, limit)
 
     expect(result.left.toOption.contains(OrdinalDiscontinuity(base, requested)))
   }
@@ -88,8 +91,8 @@ object ExactParentStateSuite extends SimpleIOSuite {
     val a = state(12L, 12, 11)
     val b = state(11L, 11, 12)
 
-    val selfResult = ExactParentResolver.resolve(base, Map(self.branch -> self), self, limit)
-    val cycleResult = ExactParentResolver.resolve(base, Map(a.branch -> a, b.branch -> b), a, limit)
+    val selfResult = ExactParentResolver.resolve(base, Map(key(self) -> self), self, limit)
+    val cycleResult = ExactParentResolver.resolve(base, Map(key(a) -> a, key(b) -> b), a, limit)
 
     expect(selfResult.left.exists(_.isInstanceOf[AncestryCycle]))
       .and(expect(cycleResult.left.exists(_.isInstanceOf[AncestryCycle])))
@@ -98,15 +101,15 @@ object ExactParentStateSuite extends SimpleIOSuite {
   pureTest("pending map key must equal the stored snapshot hash on the requested path") {
     val requested = state(11L, 11, 10)
     val misindexed = state(11L, 12, 10)
-    val result = ExactParentResolver.resolve(base, Map(requested.branch -> misindexed), requested, limit)
+    val result = ExactParentResolver.resolve(base, Map(key(requested) -> misindexed), requested, limit)
 
-    expect(result.left.toOption.contains(PendingIndexMismatch(requested.branch, misindexed)))
+    expect(result.left.toOption.contains(PendingIndexMismatch(key(requested), misindexed)))
   }
 
   pureTest("Hash.empty and non-canonical identities reject at the structural boundary") {
-    val reserved = base.copy(branch = BranchId.base)
-    val badBase = base.copy(branch = BranchId(Hash("not-a-hash")))
-    val badRequested = state(11L, 11, 10).copy(parent = BranchId(Hash("ABC")))
+    val reserved = base.copy(hash = Hash.empty)
+    val badBase = base.copy(hash = Hash("not-a-hash"))
+    val badRequested = state(11L, 11, 10).copy(parentHash = Hash("ABC"))
 
     expect(ExactParentResolver.resolve(reserved, Map.empty, reserved, limit).left.toOption.contains(ReservedBaseSentinel(reserved)))
       .and(
@@ -132,7 +135,7 @@ object ExactParentStateSuite extends SimpleIOSuite {
     val requested = state(12L, 12, 11)
     val result = ExactParentResolver.resolve(
       base,
-      Map(sentinelParent.branch -> sentinelParent, requested.branch -> requested),
+      Map(key(sentinelParent) -> sentinelParent, key(requested) -> requested),
       requested,
       limit
     )
@@ -141,8 +144,8 @@ object ExactParentStateSuite extends SimpleIOSuite {
   }
 
   pureTest("pending state cannot shadow the supplied base hash") {
-    val shadow = base.copy(parent = branch(8))
-    val result = ExactParentResolver.resolve(base, Map(base.branch -> shadow), base, limit)
+    val shadow = base.copy(parentHash = branch(8).value)
+    val result = ExactParentResolver.resolve(base, Map(key(base) -> shadow), base, limit)
 
     expect(result.left.toOption.contains(PendingBaseCollision(base, shadow)))
   }
@@ -150,19 +153,20 @@ object ExactParentStateSuite extends SimpleIOSuite {
   pureTest("lineage traversal is explicitly bounded") {
     val a11 = state(11L, 11, 10)
     val a12 = state(12L, 12, 11)
-    val pending = Map(a11.branch -> a11, a12.branch -> a12)
+    val pending = Map(key(a11) -> a11, key(a12) -> a12)
 
     val invalid = ExactParentResolver.resolve(base, pending, a12, maxSteps = 0)
     val exhausted = ExactParentResolver.resolve(base, pending, a12, maxSteps = 1)
 
-    expect.same(Left(InvalidLineageLimit(0)), invalid)
+    expect
+      .same(Left(InvalidLineageLimit(0)), invalid)
       .and(expect(exhausted.left.exists(_.isInstanceOf[LineageLimitExceeded])))
   }
 
   pureTest("an unrelated malformed sibling cannot poison a valid requested path") {
     val requested = state(11L, 11, 10)
     val malformedSibling = state(11L, 12, 10).copy(mptRoot = MptRoot(Hash("BAD")))
-    val pending = Map(requested.branch -> requested, malformedSibling.branch -> malformedSibling)
+    val pending = Map(key(requested) -> requested, key(malformedSibling) -> malformedSibling)
 
     val result = ExactParentResolver.resolve(base, pending, requested, limit)
 

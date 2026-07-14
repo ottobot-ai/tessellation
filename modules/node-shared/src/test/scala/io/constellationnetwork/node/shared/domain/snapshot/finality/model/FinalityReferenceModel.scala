@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality.model
 
 import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
 
 /** Pure executable specification for the target hash-bound GL0 finality gadget.
@@ -11,12 +12,8 @@ import io.constellationnetwork.security.hash.Hash
   */
 object FinalityReferenceModel {
 
-  final case class SnapshotRef(
-    ordinal: SnapshotOrdinal,
-    hash: Hash,
-    parentHash: Hash,
-    stateRoot: Hash
-  )
+  type SnapshotRef = GlobalSnapshotStateRef
+  val SnapshotRef: GlobalSnapshotStateRef.type = GlobalSnapshotStateRef
 
   final case class Weight(numerator: BigInt, denominator: BigInt) {
     require(numerator >= 0, "weight numerator must be non-negative")
@@ -192,20 +189,20 @@ object FinalityReferenceModel {
   def step(state: State, command: Command): Either[ModelError, StepResult] =
     state.mode match {
       case recovery: Mode.RecoveryRequired => Left(ModelError.Halted(recovery))
-      case Mode.Running                    =>
+      case Mode.Running =>
         command match {
           case Command.ObserveExecutedCandidate(ref) => observe(state, ref)
-          case Command.SelectCanonical(ref, rule)     => selectCanonical(state, ref, rule)
-          case Command.QualifyPhase2(ref, evidence)   => qualifyPhase2(state, ref, evidence)
-          case Command.MarkRetentionMature(ref)       => markRetentionMature(state, ref)
+          case Command.SelectCanonical(ref, rule)    => selectCanonical(state, ref, rule)
+          case Command.QualifyPhase2(ref, evidence)  => qualifyPhase2(state, ref, evidence)
+          case Command.MarkRetentionMature(ref)      => markRetentionMature(state, ref)
         }
     }
 
   private def observe(state: State, ref: SnapshotRef): Either[ModelError, StepResult] =
     state.candidates.get(ref.hash) match {
       case Some(existing) if existing != ref => Left(ModelError.HashCollision(existing, ref))
-      case Some(_)                            => Right(StepResult(state, Nil))
-      case None                               =>
+      case Some(_)                           => Right(StepResult(state, Nil))
+      case None =>
         Right(
           StepResult(
             state.copy(
@@ -342,7 +339,7 @@ object FinalityReferenceModel {
             }
             val nextHead = state.phase2Head match {
               case Some(current) if current.ordinal.value.value > ref.ordinal.value.value => current
-              case _                                                                       => ref
+              case _                                                                      => ref
             }
             Right(
               StepResult(
@@ -375,9 +372,9 @@ object FinalityReferenceModel {
     evidence match {
       case Phase2Evidence.Optimistic(value) =>
         value.decidedRef == ref &&
-          value.parameters == state.parameters.avalanche &&
-          value.decidedWeight >= state.parameters.avalanche.decidedWeightThreshold
-      case Phase2Evidence.Depth             => canonicalDepth(state, ref).exists(_ >= state.parameters.k1)
+        value.parameters == state.parameters.avalanche &&
+        value.decidedWeight >= state.parameters.avalanche.decidedWeightThreshold
+      case Phase2Evidence.Depth => canonicalDepth(state, ref).exists(_ >= state.parameters.k1)
     }
 
   private def canonicalDepth(state: State, ref: SnapshotRef): Option[Long] =
