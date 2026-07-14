@@ -48,8 +48,8 @@ import weaver.MutableIOSuite
 /** Correct-by-construction guard for the ml0 resync verify gate (`recomputedRoot === signed mptRoot` in
   * `currency-l0/.../StateChannel.resyncToCanonical`): for the SAME logical post-state, the cumulative incremental writer
   * (`MptStore.syncFromStateChanges` — the producer's signed root) and the from-GSI rebuild (`MptStore.syncFromGlobalSnapshotInfo` — ml0's
-  * bootstrap/recovery seeding) MUST land the same MPT root (read via `getRootHashForOrdinal`, the FULL in-store root the gate compares —
-  * SystemIndex/ActiveAddressIndex partitions included, exactly as the producer signs over `overlay.allEntriesAsBytesWithHandle`).
+  * bootstrap/recovery seeding) MUST land the same raw MPT root for this field-32-free fixture. SystemIndex/ActiveAddressIndex partitions
+  * are included, exactly as the producer signs over `consensusRootEntries(overlay.allEntriesAsBytesWithHandle)`.
   *
   * If the two paths diverge for ANY partition, ml0's rebuilt base ≠ the producer's signed base; the gate rejects gl0's GSI (prod: 94×
   * reject / 114× idle on the §3 NIPoPoW `historicalStakeSnapshots` partition, which `syncFromGlobalSnapshotInfo` was silently NOT writing).
@@ -360,6 +360,25 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
       root <- store.underlying.getRootHashForOrdinal(ord)
     } yield root
 
+  private def producerIndependentBytes(
+    info: GlobalSnapshotInfo
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[Map[Hex, Array[Byte]]] =
+    GlobalStateConverter.toAllStateKeyValueBytes[IO](info).flatMap {
+      _.toList.parTraverse { case (key, value) => GlobalStateKey.toHex[IO](key).map(_ -> value) }.map(_.toMap)
+    }
+
+  private def rebuildBytes(
+    info: GlobalSnapshotInfo
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[Map[Hex, Array[Byte]]] =
+    for {
+      store <- freshStore
+      _ <- store.syncFromGlobalSnapshotInfo(info, ord)
+      bytes <- store.allEntriesAsBytes
+    } yield bytes
+
+  private def entriesEqual(left: Map[Hex, Array[Byte]], right: Map[Hex, Array[Byte]]): Boolean =
+    left.keySet == right.keySet && left.forall { case (key, value) => right.get(key).exists(_.sameElements(value)) }
+
   test("FULL post-state (every partition, incl. historicalStakeSnapshots): incremental writer root === from-GSI rebuild root") { res =>
     implicit val (h, sp, js) = res
     for {
@@ -372,6 +391,46 @@ object RebuildVsProducerBytesAllPartitionsParitySuite extends MutableIOSuite {
         clue(incremental).isDefined,
         clue(rebuilt).isDefined,
         clue(incremental) === clue(rebuilt)
+      )
+  }
+
+  test("toAllStateKeyValueBytes === from-GSI rebuild raw bytes, including every SystemNamespace index") { res =>
+    implicit val (h, sp, js) = res
+    import GlobalStateFieldId._
+
+    val activeAddressFields = List(
+      LastAllowSpendRefs,
+      LastTokenLockRefs,
+      LastTxRefs,
+      Balances,
+      LastStateChannelSnapshotHashes,
+      LastCurrencySnapshots,
+      LastCurrencySnapshotsProofs,
+      MetagraphSyncData,
+      TokenLockBalances
+    )
+    val expiryKeys = List(
+      SystemNamespaceLabel.ExpiryIndexAllowSpends -> EpochProgress(NonNegLong(500L)),
+      SystemNamespaceLabel.ExpiryIndexAllowSpends -> EpochProgress(NonNegLong(600L)),
+      SystemNamespaceLabel.ExpiryIndexTokenLocks -> EpochProgress(NonNegLong(700L)),
+      SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals -> EpochProgress(NonNegLong(300L))
+    )
+
+    for {
+      acc <- fullyPopulatedAccumulator
+      info = applyAccumulatorToGSI(GlobalSnapshotInfo.empty, acc)
+      projected <- producerIndependentBytes(info)
+      rebuilt <- rebuildBytes(info)
+      activeKeys <- activeAddressFields.traverse(GlobalStateKey.activeAddressIndexKey[IO])
+      expiryIndexKeys <- expiryKeys.traverse { case (label, epoch) => GlobalStateKey.expiryIndexKey[IO](label, epoch) }
+      expectedSystemKeys <- (activeKeys ++ expiryIndexKeys).traverse(GlobalStateKey.toHex[IO])
+      projectedSystem = projected.filter { case (key, _) => GlobalStateKey.isSystemNamespaceHex(key) }
+      rebuiltSystem = rebuilt.filter { case (key, _) => GlobalStateKey.isSystemNamespaceHex(key) }
+    } yield
+      expect.all(
+        projectedSystem.keySet == expectedSystemKeys.toSet,
+        entriesEqual(projectedSystem, rebuiltSystem),
+        entriesEqual(projected, rebuilt)
       )
   }
 

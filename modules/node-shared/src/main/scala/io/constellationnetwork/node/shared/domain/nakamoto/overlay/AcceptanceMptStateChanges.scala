@@ -42,15 +42,16 @@ import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.
 
 /** Writer-algebra companion to `GlobalStateConverter.syncFromStateChanges`.
   *
-  * Mirrors that method's per-field insert order, sidecar maintenance, and removal-key derivation, but routes every mutation through
-  * `AcceptanceMpt[F]` (i.e. through the overlay's `BranchHandle`) instead of writing directly to `MptStore`. Under
+  * Mirrors that method's per-field insert order, rooted consensus-index maintenance, and removal-key derivation, but routes every mutation
+  * through `AcceptanceMpt[F]` (i.e. through the overlay's `BranchHandle`) instead of writing directly to `MptStore`. Under
   * `MptOverlay.OverlayMode.Passthrough` the bytes land immediately in the underlying `MptStore` and the per-key/per-root parity contract
   * from `GsamWritePathParitySuite` (#107) preserves byte-equivalence with the legacy writer. Under `MptOverlay.OverlayMode.MultiBranch` the
   * mutations accumulate in a per-branch `ChangeSet` and are folded into the base by `MptOverlay.finalizeBranch`.
   *
-  * '''Sidecar reads''': `applyActiveAddressIndexDelta` / `applyAddressPairIndexDelta` / `applySystemIndexDelta` are read-modify-write on
-  * the sidecar partition. Reads go through `mpt.get` — branch-aware — so a multi-branch view sees the parent branch's sidecar state, not
-  * the finalized base. Writes route through `mpt.insert`/`mpt.remove`, accumulating in the same branch-local handle.
+  * '''Consensus-index reads''': `applyActiveAddressIndexDelta` / `applyAddressPairIndexDelta` / `applySystemIndexDelta` are
+  * read-modify-write on the rooted System partition. Reads go through `mpt.getStrict` — branch-aware and decode-strict — so a multi-branch
+  * view sees the parent branch's index state, not the finalized base. Writes route through `mpt.insert`/`mpt.remove`, accumulating in the
+  * same branch-local handle.
   */
 object AcceptanceMptStateChanges {
 
@@ -203,6 +204,10 @@ object AcceptanceMptStateChanges {
       }.map(_.toMap)
 
     for {
+      // Fail before staging any branch mutation when a rooted System index is present but undecodable. The RMW helpers repeat the strict
+      // read at their write site; this preflight gives applyStateChanges an all-or-nothing malformed-input boundary even for callers that
+      // inspect or accidentally reuse a failed handle.
+      _ <- preflightSystemIndexReads(mpt, acc)
       keysToRemove <- toRemovalKeys
       // Remove stale keys first — same as the legacy syncFromStateChanges (line 1597).
       _ <- if (keysToRemove.nonEmpty) mpt.remove(keysToRemove.toList) else Async[F].unit
@@ -277,6 +282,18 @@ object AcceptanceMptStateChanges {
         acc.lastCurrencySnapshots.keySet.toSet,
         Set.empty
       )
+      _ <- applyActiveAddressIndexDeltaViaMpt[F](
+        mpt,
+        LastCurrencySnapshotsProofs,
+        acc.lastCurrencySnapshotsProofs.keySet.toSet,
+        Set.empty
+      )
+      _ <- applyActiveAddressIndexDeltaViaMpt[F](
+        mpt,
+        MetagraphSyncData,
+        acc.metagraphSyncData.keySet.toSet,
+        Set.empty
+      )
       _ <- applyAddressPairIndexDeltaViaMpt[F](
         mpt,
         TokenLockBalances,
@@ -288,9 +305,85 @@ object AcceptanceMptStateChanges {
     } yield ()
   }
 
+  private def preflightSystemIndexReads[F[_]: Async: Hasher](
+    mpt: AcceptanceMpt[F],
+    acc: StateChangesAccumulator
+  ): F[Unit] = {
+    import GlobalStateFieldId._
+
+    def activeAddress(fieldId: GlobalStateFieldId, touched: Boolean): F[Unit] =
+      if (!touched) Async[F].unit
+      else
+        for {
+          key <- GlobalStateKey.activeAddressIndexKey[F](fieldId)
+          hexKey <- GlobalStateKey.toHex[F](key)
+          _ <- StrictMptRead
+            .valueOrElseF(
+              mpt.getStrict[SortedSet[Address]](key),
+              SortedSet.empty[Address],
+              s"overlay preflight ActiveAddressIndex(fieldId=${fieldId.toInt})",
+              hexKey
+            )
+            .void
+        } yield ()
+
+    def addressPairs(touched: Boolean): F[Unit] =
+      if (!touched) Async[F].unit
+      else
+        for {
+          key <- GlobalStateKey.activeAddressIndexKey[F](TokenLockBalances)
+          hexKey <- GlobalStateKey.toHex[F](key)
+          _ <- StrictMptRead
+            .valueOrElseF(
+              mpt.getStrict[SortedSet[(Address, Address)]](key),
+              SortedSet.empty[(Address, Address)],
+              s"overlay preflight ActiveAddressIndexPair(fieldId=${TokenLockBalances.toInt})",
+              hexKey
+            )
+            .void
+        } yield ()
+
+    def expiry[K: Order](
+      label: SystemNamespaceLabel,
+      delta: SystemIndexDelta[K]
+    )(implicit codec: ImmutableCodec[SortedSet[K]]): F[Unit] = delta match {
+      case eb: SystemIndexDelta.EpochBucket[K] =>
+        implicit val ordering: Ordering[K] = Order[K].toOrdering
+        eb.touchedEpochs.toList.traverse_ { epoch =>
+          for {
+            key <- GlobalStateKey.expiryIndexKey[F](label, epoch)
+            hexKey <- GlobalStateKey.toHex[F](key)
+            _ <- StrictMptRead
+              .valueOrElseF(
+                mpt.getStrict[SortedSet[K]](key),
+                SortedSet.empty[K],
+                s"overlay preflight ExpiryIndex(label=${label.canonicalName},epoch=${epoch.value.value})",
+                hexKey
+              )
+              .void
+          } yield ()
+        }
+    }
+
+    for {
+      _ <- expiry(SystemNamespaceLabel.ExpiryIndexAllowSpends, acc.allowSpendExpiryIndex)
+      _ <- expiry(SystemNamespaceLabel.ExpiryIndexTokenLocks, acc.tokenLockExpiryIndex)
+      _ <- expiry(SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, acc.nodeCollateralWithdrawalExpiryIndex)
+      _ <- activeAddress(LastAllowSpendRefs, acc.lastAllowSpendRefs.nonEmpty)
+      _ <- activeAddress(LastTokenLockRefs, acc.lastTokenLockRefs.nonEmpty)
+      _ <- activeAddress(LastTxRefs, acc.lastTxRefs.nonEmpty)
+      _ <- activeAddress(Balances, acc.balances.nonEmpty)
+      _ <- activeAddress(LastStateChannelSnapshotHashes, acc.lastStateChannelSnapshotHashes.nonEmpty)
+      _ <- activeAddress(LastCurrencySnapshots, acc.lastCurrencySnapshots.nonEmpty)
+      _ <- activeAddress(LastCurrencySnapshotsProofs, acc.lastCurrencySnapshotsProofs.nonEmpty)
+      _ <- activeAddress(MetagraphSyncData, acc.metagraphSyncData.nonEmpty)
+      _ <- addressPairs(acc.tokenLockBalances.nonEmpty || acc.removedTokenLockBalanceKeys.nonEmpty)
+    } yield ()
+  }
+
   /** `ActiveAddressIndex` partition RMW for `fieldId`, against the writer-algebra. Mirrors
     * `GlobalStateConverter.applyActiveAddressIndexDelta` exactly — the ONLY difference is the read source (overlay branch view via
-    * `mpt.get`) and the write source (handle accumulation via `mpt.insert` / `mpt.remove`).
+    * `mpt.getStrict`) and the write source (handle accumulation via `mpt.insert` / `mpt.remove`).
     */
   private def applyActiveAddressIndexDeltaViaMpt[F[_]: Async: Hasher](
     mpt: AcceptanceMpt[F],
@@ -302,7 +395,13 @@ object AcceptanceMptStateChanges {
     else
       GlobalStateKey.activeAddressIndexKey[F](fieldId).flatMap { key =>
         for {
-          existing <- mpt.get[SortedSet[Address]](key).map(_.getOrElse(SortedSet.empty[Address]))
+          hexKey <- GlobalStateKey.toHex[F](key)
+          existing <- StrictMptRead.valueOrElseF(
+            mpt.getStrict[SortedSet[Address]](key),
+            SortedSet.empty[Address],
+            s"overlay ActiveAddressIndex(fieldId=${fieldId.toInt})",
+            hexKey
+          )
           merged = (existing ++ added) -- removed
           _ <-
             if (merged.isEmpty && existing.nonEmpty) mpt.remove(key)
@@ -322,7 +421,13 @@ object AcceptanceMptStateChanges {
     else
       GlobalStateKey.activeAddressIndexKey[F](fieldId).flatMap { key =>
         for {
-          existing <- mpt.get[SortedSet[(Address, Address)]](key).map(_.getOrElse(SortedSet.empty[(Address, Address)]))
+          hexKey <- GlobalStateKey.toHex[F](key)
+          existing <- StrictMptRead.valueOrElseF(
+            mpt.getStrict[SortedSet[(Address, Address)]](key),
+            SortedSet.empty[(Address, Address)],
+            s"overlay ActiveAddressIndexPair(fieldId=${fieldId.toInt})",
+            hexKey
+          )
           merged = (existing ++ added) -- removed
           _ <-
             if (merged.isEmpty && existing.nonEmpty) mpt.remove(key)
@@ -341,17 +446,32 @@ object AcceptanceMptStateChanges {
     case eb: SystemIndexDelta.EpochBucket[K] =>
       implicit val ordering: Ordering[K] = Order[K].toOrdering
       val _ = (ordering, codec) // implicit binders below resolve via context-bound + this method's `codec` param
-      eb.touchedEpochs.toList.traverse_ { (epoch: EpochProgress) =>
-        val toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
-        val toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
+      // Resolve every touched bucket before staging any write, so one malformed bucket cannot leave an earlier bucket partially changed.
+      eb.touchedEpochs.toList.traverse { (epoch: EpochProgress) =>
         GlobalStateKey.expiryIndexKey[F](label, epoch).flatMap { key =>
-          mpt.get[SortedSet[K]](key).map(_.getOrElse(SortedSet.empty[K])).flatMap { existing =>
-            val merged = (existing ++ toAdd) -- toRemove
-            if (merged.isEmpty && existing.nonEmpty) mpt.remove(key)
-            else if (merged.nonEmpty && merged != existing) mpt.insert[SortedSet[K]](key, merged)
-            else Async[F].unit
+          GlobalStateKey.toHex[F](key).flatMap { hexKey =>
+            StrictMptRead
+              .valueOrElseF(
+                mpt.getStrict[SortedSet[K]](key),
+                SortedSet.empty[K],
+                s"overlay ExpiryIndex(label=${label.canonicalName},epoch=${epoch.value.value})",
+                hexKey
+              )
+              .map { existing =>
+                val toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
+                val toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
+                (key, existing, (existing ++ toAdd) -- toRemove)
+              }
           }
         }
       }
+        .flatMap(
+          _.traverse_ {
+            case (key, existing, merged) =>
+              if (merged.isEmpty && existing.nonEmpty) mpt.remove(key)
+              else if (merged.nonEmpty && merged != existing) mpt.insert[SortedSet[K]](key, merged)
+              else Async[F].unit
+          }
+        )
   }
 }

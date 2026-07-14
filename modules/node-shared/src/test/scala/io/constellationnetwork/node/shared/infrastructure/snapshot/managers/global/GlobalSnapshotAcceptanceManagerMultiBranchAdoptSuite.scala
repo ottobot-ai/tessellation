@@ -611,9 +611,9 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     }
   }
 
-  /** A `GlobalSnapshotInfo` whose `lastCurrencySnapshots` already contains `mg -> Right((inc, gsiInfo))`. The GSAM unions this with the
-    * MPT-derived prior (the #113 per-address fallback) — but the MPT (branch/base) is the authoritative source for our seeded MG, so the
-    * branch-vs-base divergence is what `priorInfoOf` reads. We still populate it so the keyset/fallback path is exercised consistently.
+  /** A `GlobalSnapshotInfo` whose `lastCurrencySnapshots` already contains `mg -> Right((inc, gsiInfo))`. The rooted branch-aware MPT is
+    * the sole authority for the seeded MG, so the branch-vs-base divergence is what `priorInfoOf` reads; this GSI value cannot heal a
+    * missing or malformed indexed target.
     */
   private def gsiWith(
     mg: Address,

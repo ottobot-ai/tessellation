@@ -690,7 +690,7 @@ object SnapshotLeaderLoop {
         // 3c-A enabler: mirror the promote+watermark-prune for the SIGNED byte map. Promote the finalized hash's staged
         // signed bytes into the served signed-bytes store at `ordinal`; watermark-prune the rest (keep only entries
         // strictly above the finalized tip — drains `finalizedHash` + dead forks). Only a FINALIZED branch's signed
-        // bytes ever reach the store, so a follower's `sidecarFreeMptRoot(served) === signed mptRoot` holds by
+        // bytes ever reach the store, so a follower's `consensusMptRoot(served) === signed mptRoot` holds by
         // construction. Absent (this node didn't stage this hash) ⇒ skip; the follower's byte route 404s and falls
         // back to the legacy GSI path (best-effort transport, never an incorrect adopt).
         pendingPostBytesRef.modify { staged =>

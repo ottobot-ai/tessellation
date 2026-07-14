@@ -33,7 +33,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   1. the resolved snapshot's hash ≠ `expectedGlobalSnapshotHash` (we're on a fork, or it's not the pinned snapshot);
   *   1. the pinned snapshot carries no committed `stateProof.mptRoot` (BFT / pre-MPT — nothing to byte-verify against);
   *   1. no version-retained state bytes at `ordinal` (evicted by the backing store's retention — see below);
-  *   1. the retained bytes' consensus `sidecarFreeMptRoot` ≠ the pinned snapshot's `stateProof.mptRoot` (bytes do not reproduce the pinned
+  *   1. the retained bytes' consensus `consensusMptRoot` ≠ the pinned snapshot's `stateProof.mptRoot` (bytes do not reproduce the pinned
   *      committed root).
   *
   * A `None` from a clean verify (the metagraph simply had no reconstructible state at the verified anchor) is indistinguishable from a
@@ -144,15 +144,16 @@ object PinnedCurrencyInfoReader {
     * the READ-time seam catches all of them by construction.
     *
     * '''Determinism contract (why a peer fetch cannot poison the fold).''' The fetch result is ONLY accepted when
-    * `sidecarFreeMptRoot(fetched) === the LOCALLY-resolved pinned snapshot's committed stateProof.mptRoot` — the identical check retained
+    * `consensusMptRoot(fetched) === the LOCALLY-resolved pinned snapshot's committed stateProof.mptRoot` — the identical check retained
     * store bytes must pass at read time. Before staging, the map is STRIPPED to `GlobalStateKey.consensusRootEntries` (exactly the entry
-    * set the root commits), so the staged map is a PURE FUNCTION of the committed root (Merkle-collision-resistance): every honest node
-    * backfilling the same ordinal from ANY peer stages the byte-identical map, and no root-excluded (SystemNamespace / field-32 syncView)
-    * peer byte ever persists or serves. No pinned-reader consumer reads a root-excluded key (`reconstructPerMgInfo` reads the unrolled
-    * `Mg*`/fieldId-5/7 partitions, `reconstructMetagraphSyncData` fieldId-18, `reExecDerivationAtPinnedBase` the currency partitions), so a
-    * stripped map reconstructs identically to a locally-staged one. A fetch failure / wrong-root response / in-flight duplicate stays
-    * FAIL-CLOSED (`AnchorUnreadable` — defer), never a live-base substitute, never a slash — the exact contract the unreadable path already
-    * has; the backfill only makes MORE pinned reads SUCCEED, never bypasses verification.
+    * set the root commits), so every retained SystemNamespace economic index is root-bound and field-32 sync-view bytes cannot be imported
+    * as peer authority.
+    *
+    * '''ECO-F32 limitation.''' `reExecDerivationAtPinnedBase` does consume the prior `CurrencySnapshotInfo.globalSnapshotSyncView`, so a
+    * stripped backfill is not equivalent to a locally staged map when that view was nonempty. The target currency lane must carry the exact
+    * replay witness bound to `CurrencySnapshotStateProof.globalSnapshotSync`; until then, a missing field-32 preimage is an unreadable
+    * replay base and must defer rather than synthesize `Some(empty)`. A fetch failure / wrong-root response / in-flight duplicate likewise
+    * stays FAIL-CLOSED (`AnchorUnreadable`), never a live-base substitute and never slash evidence.
     *
     * '''No self-reference.''' The transport is a plain HTTP by-ordinal pull (`/global-snapshots/<ord>/mpt-entries`); it performs NO pinned
     * read itself, so backfilling N can never recurse into a pinned miss at N.
@@ -230,8 +231,8 @@ object PinnedCurrencyInfoReader {
     * @param backfill
     *   optional read-time HOLE healer (see [[PinnedByteBackfill]]). When `byteStore.readState(ordinal)` MISSES but the pinned snapshot at
     *   `ordinal` (and thus its committed `stateProof.mptRoot`) IS locally resolvable, fetch a candidate byte map from a peer, verify
-    *   `sidecarFreeMptRoot(fetched) === the pinned root`, STRIP to `GlobalStateKey.consensusRootEntries`, persist into `byteStore`, and
-    *   serve the read — healing the hole for every subsequent read. Any failure keeps the exact pre-backfill fail-closed behavior
+    *   `consensusMptRoot(fetched) === the pinned root`, STRIP to `GlobalStateKey.consensusRootEntries`, persist into `byteStore`, and serve
+    *   the read — healing the hole for every subsequent read. Any failure keeps the exact pre-backfill fail-closed behavior
     *   (`AnchorUnreadable`, store untouched). `None` (the default — all pre-existing wirings) = behavior byte-identical to before this
     *   parameter existed. gl0 wires it ONLY for the reader over the SIGNED byte store (`GlobalSnapshotConsensus.gl0PinnedReader`).
     */
@@ -360,7 +361,7 @@ object PinnedCurrencyInfoReader {
                           // STRIP to the consensus entry set FIRST: the root is computed exactly over `consensusRootEntries`, so the
                           // verify below covers every byte we would persist — no root-excluded peer byte can survive.
                           val stripped = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(fetched)
-                          GlobalSnapshotInfo.sidecarFreeMptRoot[F](stripped).flatMap { fetchedRoot =>
+                          GlobalSnapshotInfo.consensusMptRoot[F](stripped).flatMap { fetchedRoot =>
                             if (fetchedRoot =!= expectedMptRoot)
                               // Peer bytes do NOT reproduce the locally-pinned committed root (fork / corrupt / stale peer) —
                               // hard-reject and leave the store UNTOUCHED (never stage unverified bytes).
@@ -381,7 +382,7 @@ object PinnedCurrencyInfoReader {
                       }
                   }
                 case Some(bytes) =>
-                  GlobalSnapshotInfo.sidecarFreeMptRoot[F](bytes).flatMap { computedRoot =>
+                  GlobalSnapshotInfo.consensusMptRoot[F](bytes).flatMap { computedRoot =>
                     if (computedRoot =!= expectedMptRoot)
                       // Retained bytes do NOT reproduce the pinned snapshot's committed root (wrong branch / corrupt) — hard-reject.
                       logger.debug(

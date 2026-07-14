@@ -93,7 +93,7 @@ object GsiRebuildPersistedLoadSuite extends MutableIOSuite {
       _ <- producer.persist(ord2)
 
       entriesBefore <- store.allEntriesAsBytes
-      signedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesBefore)
+      signedRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesBefore)
     } yield (Fixture(gsi, store, producer, consumedHex, slashHex, markerBytes, slashBytes), signedRoot, entriesBefore)
 
   test(
@@ -114,13 +114,13 @@ object GsiRebuildPersistedLoadSuite extends MutableIOSuite {
 
         adopted <- f.store.syncFromPersistedMptVerified(ord2, signedRoot.some)
         entriesAfter <- f.store.allEntriesAsBytes
-        rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+        rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
       } yield
         expect.all(
           emptyAtBoot,
           !gsiAdopted,
           adopted,
-          // the wedge-closure: the reloaded store's sidecar-free root EQUALS the signed root
+          // the wedge-closure: the reloaded store's consensus root EQUALS the signed root
           rootAfter === signedRoot,
           // 33/34 survived the restart VERBATIM
           entriesAfter.get(f.consumedHex).exists(_.sameElements(f.markerBytes)),
@@ -143,12 +143,12 @@ object GsiRebuildPersistedLoadSuite extends MutableIOSuite {
           gsi3 = GlobalSnapshotInfo.empty
           _ <- f.store.syncFromGlobalSnapshotInfo(gsi3, ord3)
           preCallEntries <- f.store.allEntriesAsBytes
-          preCallRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](preCallEntries)
+          preCallRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](preCallEntries)
 
           bogus = Hash("ff" * 32)
           adopted <- f.store.syncFromPersistedMptVerified(ord2, bogus.some)
           entriesAfter <- f.store.allEntriesAsBytes
-          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+          rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
         } yield
           expect.all(
             !adopted,

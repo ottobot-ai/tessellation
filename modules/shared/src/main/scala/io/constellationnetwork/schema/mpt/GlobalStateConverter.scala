@@ -53,9 +53,16 @@ import io.constellationnetwork.serde.codecs.instances.TransactionReferenceCodec.
 import io.circe.syntax.EncoderOps
 import io.circe.{Encoder, Json}
 import org.typelevel.log4cats.slf4j.Slf4jLogger
-import scodec.bits.ByteVector
 
 object GlobalStateConverter {
+
+  private def strictValueOrElse[F[_]: Async, V](
+    read: F[StrictMptRead[V]],
+    ifAbsent: => V,
+    context: => String,
+    physicalKey: Hex
+  ): F[V] =
+    StrictMptRead.valueOrElseF(read, ifAbsent, context, physicalKey)
 
   case class StateChangesAccumulator(
     lastStateChannelSnapshotHashes: SortedMap[Address, Hash] = SortedMap.empty,
@@ -236,9 +243,9 @@ object GlobalStateConverter {
     )
   }
 
-  /** The exact O(changes) sidecar/index keys `toAccumulatorHexDelta`'s replay reads back from the store: the touched expiry-index epoch
-    * buckets (from the accumulator's three `SystemIndexDelta`s) and the active-address / address-pair index entries for the fields whose
-    * keyset this ordinal touched. Returns the HEX keys; the caller reads ONLY these from the store (no full-state scan).
+  /** The exact O(changes) rooted consensus-index keys `toAccumulatorHexDelta`'s replay reads back from the store: the touched expiry-index
+    * epoch buckets (from the accumulator's three `SystemIndexDelta`s) and the active-address / address-pair index entries for the fields
+    * whose keyset this ordinal touched. Returns the HEX keys; the caller reads ONLY these from the store (no full-state scan).
     *
     * Keep in lockstep with `toAccumulatorHexDelta` — every key it `preSyncBytes.get(_)`s for must appear here, or the replayed bucket/index
     * bytes silently diverge from the in-store sync and the recomputed root mismatches (which the verify gate then rejects, falling back to
@@ -253,9 +260,19 @@ object GlobalStateConverter {
           eb.touchedEpochs.toList.traverse(epoch => GlobalStateKey.expiryIndexKey[F](label, epoch))
       }
 
-    // Active-address-index fields whose keyset this ordinal touched (additive — refs/balances/etc. that don't embed their address).
+    // Active-address-index fields whose keyset this ordinal touched. These accumulator fields are additive/overwrite-only; none has a
+    // removal channel, so the index delta adds touched addresses and never invents deletion semantics.
     val activeAddressIndexFields: List[GlobalStateFieldId] =
-      List(LastAllowSpendRefs, LastTokenLockRefs, LastTxRefs, Balances, LastStateChannelSnapshotHashes, LastCurrencySnapshots)
+      List(
+        LastAllowSpendRefs,
+        LastTokenLockRefs,
+        LastTxRefs,
+        Balances,
+        LastStateChannelSnapshotHashes,
+        LastCurrencySnapshots,
+        LastCurrencySnapshotsProofs,
+        MetagraphSyncData
+      )
 
     val touchedActiveAddressFields: List[GlobalStateFieldId] = activeAddressIndexFields.filter {
       case LastAllowSpendRefs             => acc.lastAllowSpendRefs.nonEmpty
@@ -264,6 +281,8 @@ object GlobalStateConverter {
       case Balances                       => acc.balances.nonEmpty
       case LastStateChannelSnapshotHashes => acc.lastStateChannelSnapshotHashes.nonEmpty
       case LastCurrencySnapshots          => acc.lastCurrencySnapshots.nonEmpty
+      case LastCurrencySnapshotsProofs    => acc.lastCurrencySnapshotsProofs.nonEmpty
+      case MetagraphSyncData              => acc.metagraphSyncData.nonEmpty
       case _                              => false
     }
 
@@ -288,8 +307,8 @@ object GlobalStateConverter {
     *
     * Given the prior GSI (ml0's `lastState`), the per-ordinal `delta`, the signed snapshot's claimed `signedMptRoot` for `N`, and `N`:
     *
-    *   1. Builds `candidateGSI = applyAccumulatorToGSI(prior, delta)` (the typed GSI ml0 would keep). 2. Reads ONLY the O(changes)
-    *      sidecar/index keys the hex-delta replay needs (`changeSetPreSyncHexKeys`) from the store as `preSyncBytes`. 3. Derives `(hexUp,
+    *   1. Builds `candidateGSI = applyAccumulatorToGSI(prior, delta)` (the typed GSI ml0 would keep). 2. Reads ONLY the O(changes) rooted
+    *      consensus-index keys the hex-delta replay needs (`changeSetPreSyncHexKeys`) from the store as `preSyncBytes`. 3. Derives `(hexUp,
     *      hexRem) = toAccumulatorHexDelta(delta, preSyncBytes)` — the SAME typed→hex derivation the producer uses. 4. Inside
     *      `mptStore.withTransaction`: applies `hexRem` then `hexUp` to the producer incrementally, builds at `N` to get `newRoot`, and — if
     *      `Some(newRoot) === signedMptRoot` — yields `(Some(candidateGSI), Commit)`; otherwise `(None, Rollback)`.
@@ -326,12 +345,10 @@ object GlobalStateConverter {
               _ <- mptStore.underlying.remove(hexRem.toList).whenA(hexRem.nonEmpty)
               _ <- mptStore.underlying.insertBytes(hexUp).whenA(hexUp.nonEmpty)
               _ <- mptStore.underlying.buildForOrdinal(ordinal)
-              // `expectedRoot` (the signed `mptRoot`) excludes path-dependent SystemNamespace sidecars
-              // (`GlobalSnapshotInfo.mptStateProofFromBytes`); `getRootHashForOrdinal` is the producer's root over
-              // ALL stored bytes (sidecars included). Recompute sidecar-free so this replay-parity gate compares
-              // apples-to-apples — otherwise every ChangeSet replay would mismatch and fall back.
+              // Recompute the same canonical consensus root as the signed `mptRoot`. It includes every
+              // SystemNamespace economic index and excludes only field-32 observation state.
               afterBytes <- mptStore.underlying.entries
-              newRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes)
+              newRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.consensusMptRoot[F](afterBytes)
               matches = newRoot === expectedRoot
               out <-
                 if (matches)
@@ -366,7 +383,13 @@ object GlobalStateConverter {
     else
       GlobalStateKey.activeAddressIndexKey[F](fieldId).flatMap { key =>
         for {
-          existing <- store.get[SortedSet[Address]](key).map(_.getOrElse(SortedSet.empty[Address]))
+          hexKey <- GlobalStateKey.toHex[F](key)
+          existing <- strictValueOrElse(
+            store.getStrict[SortedSet[Address]](key),
+            SortedSet.empty[Address],
+            s"ActiveAddressIndex(fieldId=${fieldId.toInt})",
+            hexKey
+          )
           merged = (existing ++ added) -- removed
           _ <-
             if (merged.isEmpty && existing.nonEmpty) store.remove(key)
@@ -389,9 +412,13 @@ object GlobalStateConverter {
     else
       GlobalStateKey.activeAddressIndexKey[F](fieldId).flatMap { key =>
         for {
-          existing <- store
-            .get[SortedSet[(Address, Address)]](key)
-            .map(_.getOrElse(SortedSet.empty[(Address, Address)]))
+          hexKey <- GlobalStateKey.toHex[F](key)
+          existing <- strictValueOrElse(
+            store.getStrict[SortedSet[(Address, Address)]](key),
+            SortedSet.empty[(Address, Address)],
+            s"ActiveAddressIndexPair(fieldId=${fieldId.toInt})",
+            hexKey
+          )
           merged = (existing ++ added) -- removed
           _ <-
             if (merged.isEmpty && existing.nonEmpty) store.remove(key)
@@ -412,20 +439,101 @@ object GlobalStateConverter {
     case eb: SystemIndexDelta.EpochBucket[K] if eb.isEmpty => Async[F].unit
     case eb: SystemIndexDelta.EpochBucket[K] =>
       implicit val ordering: Ordering[K] = Order[K].toOrdering
-      eb.touchedEpochs.toList.traverse_ { epoch =>
+      // Resolve every touched bucket before writing any of them. A later malformed bucket must not leave earlier buckets partially updated.
+      eb.touchedEpochs.toList.traverse { epoch =>
         GlobalStateKey.expiryIndexKey[F](label, epoch).flatMap { key =>
-          for {
-            existing <- store.get[SortedSet[K]](key).map(_.getOrElse(SortedSet.empty[K]))
-            toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
-            toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
-            merged = (existing ++ toAdd) -- toRemove
-            _ <-
+          GlobalStateKey.toHex[F](key).flatMap { hexKey =>
+            strictValueOrElse(
+              store.getStrict[SortedSet[K]](key),
+              SortedSet.empty[K],
+              s"ExpiryIndex(label=${label.canonicalName},epoch=${epoch.value.value})",
+              hexKey
+            ).map { existing =>
+              val toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
+              val toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
+              (key, existing, (existing ++ toAdd) -- toRemove)
+            }
+          }
+        }
+      }
+        .flatMap(
+          _.traverse_ {
+            case (key, existing, merged) =>
               if (merged.isEmpty && existing.nonEmpty) store.remove(key)
               else if (merged.nonEmpty && merged != existing) store.insert[SortedSet[K]](key, merged)
               else Async[F].unit
+          }
+        )
+  }
+
+  private def preflightSystemIndexReads[F[_]: Async: Hasher](
+    store: MptStore[F, GlobalStateKey],
+    acc: StateChangesAccumulator
+  ): F[Unit] = {
+    import GlobalStateFieldId._
+
+    def activeAddress(fieldId: GlobalStateFieldId, touched: Boolean): F[Unit] =
+      if (!touched) Async[F].unit
+      else
+        for {
+          key <- GlobalStateKey.activeAddressIndexKey[F](fieldId)
+          hexKey <- GlobalStateKey.toHex[F](key)
+          _ <- strictValueOrElse(
+            store.getStrict[SortedSet[Address]](key),
+            SortedSet.empty[Address],
+            s"sync preflight ActiveAddressIndex(fieldId=${fieldId.toInt})",
+            hexKey
+          ).void
+        } yield ()
+
+    def addressPairs(touched: Boolean): F[Unit] =
+      if (!touched) Async[F].unit
+      else
+        for {
+          key <- GlobalStateKey.activeAddressIndexKey[F](TokenLockBalances)
+          hexKey <- GlobalStateKey.toHex[F](key)
+          _ <- strictValueOrElse(
+            store.getStrict[SortedSet[(Address, Address)]](key),
+            SortedSet.empty[(Address, Address)],
+            s"sync preflight ActiveAddressIndexPair(fieldId=${TokenLockBalances.toInt})",
+            hexKey
+          ).void
+        } yield ()
+
+    def expiry[K: Order](
+      label: SystemNamespaceLabel,
+      delta: SystemIndexDelta[K]
+    )(implicit codec: ImmutableCodec[SortedSet[K]]): F[Unit] = delta match {
+      case eb: SystemIndexDelta.EpochBucket[K] =>
+        implicit val ordering: Ordering[K] = Order[K].toOrdering
+        eb.touchedEpochs.toList.traverse_ { epoch =>
+          for {
+            key <- GlobalStateKey.expiryIndexKey[F](label, epoch)
+            hexKey <- GlobalStateKey.toHex[F](key)
+            _ <- strictValueOrElse(
+              store.getStrict[SortedSet[K]](key),
+              SortedSet.empty[K],
+              s"sync preflight ExpiryIndex(label=${label.canonicalName},epoch=${epoch.value.value})",
+              hexKey
+            ).void
           } yield ()
         }
-      }
+    }
+
+    for {
+      _ <- expiry(SystemNamespaceLabel.ExpiryIndexAllowSpends, acc.allowSpendExpiryIndex)
+      _ <- expiry(SystemNamespaceLabel.ExpiryIndexTokenLocks, acc.tokenLockExpiryIndex)
+      _ <- expiry(SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, acc.nodeCollateralWithdrawalExpiryIndex)
+      _ <- activeAddress(LastAllowSpendRefs, acc.lastAllowSpendRefs.nonEmpty)
+      _ <- activeAddress(LastTokenLockRefs, acc.lastTokenLockRefs.nonEmpty)
+      _ <- activeAddress(LastTxRefs, acc.lastTxRefs.nonEmpty)
+      _ <- activeAddress(Balances, acc.balances.nonEmpty)
+      _ <- activeAddress(LastStateChannelSnapshotHashes, acc.lastStateChannelSnapshotHashes.nonEmpty)
+      _ <- activeAddress(LastCurrencySnapshots, acc.lastCurrencySnapshots.nonEmpty)
+      _ <- activeAddress(LastCurrencySnapshotsProofs, acc.lastCurrencySnapshotsProofs.nonEmpty)
+      _ <- activeAddress(MetagraphSyncData, acc.metagraphSyncData.nonEmpty)
+      _ <- addressPairs(acc.tokenLockBalances.nonEmpty || acc.removedTokenLockBalanceKeys.nonEmpty)
+    } yield ()
   }
 
   private def convertRequiredHypergraph[F[_]: Sync: Parallel, A: Encoder](
@@ -613,6 +721,141 @@ object GlobalStateConverter {
       else Left(new IllegalStateException(s"Duplicate keys found: expected $expectedSize entries but got ${merged.size}"))
     }.flatMap(_.liftTo[F])
 
+  private final case class GlobalSnapshotSystemIndexEntries(
+    activeAddressIndexes: Map[GlobalStateKey, SortedSet[Address]],
+    tokenLockBalanceAddressPairs: Map[GlobalStateKey, SortedSet[(Address, Address)]],
+    allowSpendExpiryBuckets: Map[GlobalStateKey, SortedSet[AllowSpendExpiryKey]],
+    tokenLockExpiryBuckets: Map[GlobalStateKey, SortedSet[TokenLockExpiryKey]],
+    nodeCollateralWithdrawalExpiryBuckets: Map[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]]
+  )
+
+  /** Canonical SystemNamespace projection derivable from a GlobalSnapshotInfo. Both the producer-independent byte projection and the store
+    * rebuild consume this exact typed entry set, so key selection, empty-bucket omission, and bucket contents cannot drift between the two
+    * paths.
+    */
+  private def globalSnapshotSystemIndexEntries[F[_]: Async: Parallel: Hasher](
+    info: GlobalSnapshotInfo,
+    withdrawalTimeLimit: Option[EpochProgress]
+  ): F[GlobalSnapshotSystemIndexEntries] = {
+    import GlobalStateFieldId._
+
+    val activeAddressIndexesF: F[Map[GlobalStateKey, SortedSet[Address]]] = {
+      val sets: List[(GlobalStateFieldId, SortedSet[Address])] = List(
+        LastAllowSpendRefs -> info.lastAllowSpendRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet)),
+        LastTokenLockRefs -> info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet)),
+        LastTxRefs -> info.lastTxRefs.keySet.to(SortedSet),
+        Balances -> info.balances.keySet.to(SortedSet),
+        LastStateChannelSnapshotHashes -> info.lastStateChannelSnapshotHashes.keySet.to(SortedSet),
+        LastCurrencySnapshots -> info.lastCurrencySnapshots.keySet.to(SortedSet),
+        LastCurrencySnapshotsProofs -> info.lastCurrencySnapshotsProofs.keySet.to(SortedSet),
+        MetagraphSyncData -> info.metagraphSyncData.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))
+      )
+
+      sets
+        .filter(_._2.nonEmpty)
+        .parTraverse {
+          case (fieldId, addresses) => GlobalStateKey.activeAddressIndexKey[F](fieldId).map(_ -> addresses)
+        }
+        .map(_.toMap)
+    }
+
+    val tokenLockBalanceAddressPairsF: F[Map[GlobalStateKey, SortedSet[(Address, Address)]]] = {
+      val pairs = info.tokenLockBalances.fold(SortedSet.empty[(Address, Address)])(_.iterator.flatMap {
+        case (metagraphId, balances) => balances.keysIterator.map(holder => metagraphId -> holder)
+      }.to(SortedSet))
+
+      if (pairs.isEmpty) Map.empty[GlobalStateKey, SortedSet[(Address, Address)]].pure[F]
+      else GlobalStateKey.activeAddressIndexKey[F](TokenLockBalances).map(k => Map(k -> pairs))
+    }
+
+    val allowSpendExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[AllowSpendExpiryKey]]] = {
+      val active = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
+        case (metagraphId, bySource) =>
+          bySource.toList.flatMap { case (source, spends) => spends.toList.map(spend => (metagraphId, source, spend)) }
+      }
+
+      active.parTraverse {
+        case (metagraphId, source, spend) =>
+          spend.toHashed.map(hashed => spend.lastValidEpochProgress -> AllowSpendExpiryKey(metagraphId, source, hashed.hash))
+      }.flatMap { entries =>
+        entries
+          .groupMap(_._1)(_._2)
+          .view
+          .mapValues(_.to(SortedSet))
+          .toMap
+          .toList
+          .parTraverse {
+            case (epoch, bucket) =>
+              GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, epoch).map(_ -> bucket)
+          }
+          .map(_.toMap)
+      }
+    }
+
+    val tokenLockExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[TokenLockExpiryKey]]] = {
+      val active = info.activeTokenLocks.toList.flatMap(_.toList).flatMap {
+        case (source, locks) => locks.toList.map(source -> _)
+      }
+
+      active.parTraverse {
+        case (source, lock) =>
+          lock.unlockEpoch.traverse { epoch =>
+            lock.toHashed.map(hashed => epoch -> TokenLockExpiryKey(source, hashed.hash))
+          }
+      }
+        .map(_.flatten)
+        .flatMap { entries =>
+          entries
+            .groupMap(_._1)(_._2)
+            .view
+            .mapValues(_.to(SortedSet))
+            .toMap
+            .toList
+            .parTraverse {
+              case (epoch, bucket) =>
+                GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexTokenLocks, epoch).map(_ -> bucket)
+            }
+            .map(_.toMap)
+        }
+    }
+
+    val nodeCollateralWithdrawalExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]]] =
+      withdrawalTimeLimit.fold(Map.empty[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]].pure[F]) { limit =>
+        val pending = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).flatMap {
+          case (source, withdrawals) => withdrawals.toList.map(source -> _)
+        }
+
+        pending.parTraverse {
+          case (source, withdrawal) =>
+            withdrawal.event.toHashed.map { hashed =>
+              (withdrawal.createdAt |+| limit) -> NodeCollateralWithdrawalExpiryKey(source, hashed.hash)
+            }
+        }.flatMap { entries =>
+          entries
+            .groupMap(_._1)(_._2)
+            .view
+            .mapValues(_.to(SortedSet))
+            .toMap
+            .toList
+            .parTraverse {
+              case (epoch, bucket) =>
+                GlobalStateKey
+                  .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, epoch)
+                  .map(_ -> bucket)
+            }
+            .map(_.toMap)
+        }
+      }
+
+    (
+      activeAddressIndexesF,
+      tokenLockBalanceAddressPairsF,
+      allowSpendExpiryBucketsF,
+      tokenLockExpiryBucketsF,
+      nodeCollateralWithdrawalExpiryBucketsF
+    ).mapN(GlobalSnapshotSystemIndexEntries.apply)
+  }
+
   /** Typed scodec-encoded entries for a `GlobalSnapshotInfo`. Each field is encoded via its canonical `ImmutableCodec`, matching the bytes
     * the MptStore writes on `insert[V]` for that type. Used by `mptStateProof` so that the verification root matches the in-store root
     * (previously computed from JSON-via-JsonSerializer bytes, which produced a different root than the scodec-typed store).
@@ -707,47 +950,6 @@ object GlobalStateConverter {
         case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
       }
 
-    // Allow-spend expiry index: one bucket per `lastValidEpochProgress` with the set of records expiring at that epoch.
-    val allowSpendExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = {
-      val flat = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
-        case (mid, innerMap) => innerMap.toList.flatMap { case (addr, set) => set.toList.map(s => (mid, addr, s)) }
-      }
-      flat.parTraverse {
-        case (mid, addr, s) => s.toHashed.map(h => (s.lastValidEpochProgress, AllowSpendExpiryKey(mid, addr, h.hash)))
-      }.flatMap { entries =>
-        val byEpoch: Map[EpochProgress, SortedSet[AllowSpendExpiryKey]] =
-          entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
-        byEpoch.toList.parTraverse {
-          case (epoch, bucket) =>
-            GlobalStateKey
-              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, epoch)
-              .map(k => k -> enc[SortedSet[AllowSpendExpiryKey]](bucket))
-        }
-      }
-    }
-
-    // Node-collateral-withdrawal expiry index: expiry = `createdAt + withdrawalTimeLimit`. Skipped entirely when the limit isn't provided.
-    val nodeCollateralWithdrawalExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = withdrawalTimeLimit match {
-      case None => List.empty[(GlobalStateKey, Array[Byte])].pure[F]
-      case Some(limit) =>
-        val flat = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).flatMap {
-          case (addr, set) => set.toList.map(w => (addr, w))
-        }
-        flat.parTraverse {
-          case (addr, w) =>
-            w.event.toHashed.map(h => (w.createdAt |+| limit, NodeCollateralWithdrawalExpiryKey(addr, h.hash)))
-        }.flatMap { entries =>
-          val byEpoch: Map[EpochProgress, SortedSet[NodeCollateralWithdrawalExpiryKey]] =
-            entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
-          byEpoch.toList.parTraverse {
-            case (epoch, bucket) =>
-              GlobalStateKey
-                .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, epoch)
-                .map(k => k -> enc[SortedSet[NodeCollateralWithdrawalExpiryKey]](bucket))
-          }
-        }
-    }
-
     // §3 NIPoPoW S0 historical stake snapshots: one entry per stored eta-period (retention cap = 4).
     // Each entry's value is the scodec-encoded `HistoricalStakeSnapshot` — the combined stake +
     // eta record (Path 1, heap-leak workstream). Covered by `mptRoot` and gets its own per-field
@@ -788,43 +990,18 @@ object GlobalStateConverter {
             .map(_ -> enc[GenesisOperatorConsensusKey](record)(genesisOperatorKeyImmutable))
       }
 
-    // Token-lock expiry index: one bucket per `unlockEpoch` (records with `None` unlock aren't indexed).
-    val tokenLockExpiryIndexF: F[List[(GlobalStateKey, Array[Byte])]] = {
-      val flat = info.activeTokenLocks.toList.flatMap(_.toList).flatMap {
-        case (addr, set) => set.toList.map(l => (addr, l))
-      }
-      flat.parTraverse {
-        case (addr, l) =>
-          l.unlockEpoch match {
-            case Some(epoch) =>
-              l.toHashed.map[Option[(EpochProgress, TokenLockExpiryKey)]](h => Some((epoch, TokenLockExpiryKey(addr, h.hash))))
-            case None => Option.empty[(EpochProgress, TokenLockExpiryKey)].pure[F]
-          }
-      }.map(_.flatten).flatMap { entries =>
-        val byEpoch: Map[EpochProgress, SortedSet[TokenLockExpiryKey]] =
-          entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
-        byEpoch.toList.parTraverse {
-          case (epoch, bucket) =>
-            GlobalStateKey
-              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexTokenLocks, epoch)
-              .map(k => k -> enc[SortedSet[TokenLockExpiryKey]](bucket))
-        }
-      }
-    }
-
     // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo) per
     // metagraph address. Delegated to the shared `currencySnapshotEntryBytes` so the producer and the gl1-style follow
     // verifier (`FollowVerifyCore` / `GlobalStateConverter.currencySnapshotFieldRoots`) encode these bytes through ONE code
     // path — byte-identity by construction, not by two implementations kept in lockstep.
     val currencyEntriesF = currencySnapshotEntryBytes[F](info.lastCurrencySnapshots)
+    val systemIndexEntriesF = globalSnapshotSystemIndexEntries[F](info, withdrawalTimeLimit)
 
     (
       currencyEntriesF,
       updateNodeParametersF,
       priceStateF,
-      allowSpendExpiryIndexF,
-      tokenLockExpiryIndexF,
-      nodeCollateralWithdrawalExpiryIndexF,
+      systemIndexEntriesF,
       historicalStakeSnapshotsF,
       kesRegistrationCertsF,
       lastKesRegistrationRefsF,
@@ -834,14 +1011,26 @@ object GlobalStateConverter {
         currencyEntries,
         unpEntries,
         priceEntries,
-        allowSpendExpiryEntries,
-        tokenLockExpiryEntries,
-        ncwExpiryEntries,
+        systemIndexes,
         histStakeEntries,
         kesCertEntries,
         kesRefEntries,
         genesisKeyEntries
       ) =>
+        val systemEntries: Iterable[(GlobalStateKey, Array[Byte])] =
+          systemIndexes.activeAddressIndexes.iterator.map { case (key, addresses) => key -> enc[SortedSet[Address]](addresses) }.toList ++
+            systemIndexes.tokenLockBalanceAddressPairs.iterator.map {
+              case (key, pairs) => key -> enc[SortedSet[(Address, Address)]](pairs)
+            }.toList ++
+            systemIndexes.allowSpendExpiryBuckets.iterator.map {
+              case (key, bucket) => key -> enc[SortedSet[AllowSpendExpiryKey]](bucket)
+            }.toList ++
+            systemIndexes.tokenLockExpiryBuckets.iterator.map {
+              case (key, bucket) => key -> enc[SortedSet[TokenLockExpiryKey]](bucket)
+            }.toList ++
+            systemIndexes.nodeCollateralWithdrawalExpiryBuckets.iterator.map {
+              case (key, bucket) => key -> enc[SortedSet[NodeCollateralWithdrawalExpiryKey]](bucket)
+            }.toList
         val all: Iterable[(GlobalStateKey, Array[Byte])] =
           stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
             activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
@@ -849,7 +1038,7 @@ object GlobalStateConverter {
             activeDelegatedStakes ++ delegatedStakesWithdrawals ++
             activeNodeCollaterals ++ nodeCollateralWithdrawals ++
             metagraphSyncData ++ currencyEntries ++ unpEntries ++ priceEntries ++
-            allowSpendExpiryEntries ++ tokenLockExpiryEntries ++ ncwExpiryEntries ++
+            systemEntries ++
             histStakeEntries ++ kesCertEntries ++ kesRefEntries ++ genesisKeyEntries
         all.toMap
     }
@@ -1073,6 +1262,18 @@ object GlobalStateConverter {
         Set.empty,
         preSyncBytes
       )
+      currProofsAddrIdx <- replayActiveAddressIndexDelta[F](
+        GlobalStateFieldId.LastCurrencySnapshotsProofs,
+        acc.lastCurrencySnapshotsProofs.keySet.toSet,
+        Set.empty,
+        preSyncBytes
+      )
+      metagraphSyncAddrIdx <- replayActiveAddressIndexDelta[F](
+        GlobalStateFieldId.MetagraphSyncData,
+        acc.metagraphSyncData.keySet.toSet,
+        Set.empty,
+        preSyncBytes
+      )
       tlbAddrPairIdx <- replayAddressPairIndexDelta[F](
         GlobalStateFieldId.TokenLockBalances,
         acc.tokenLockBalances.iterator.flatMap {
@@ -1110,14 +1311,15 @@ object GlobalStateConverter {
     } yield
       (
         upsertsHex ++ asExp._1 ++ tlExp._1 ++ ncwExp._1 ++ asAddrIdx._1 ++ tlAddrIdx._1 ++ txAddrIdx._1 ++ balAddrIdx._1 ++
-          scHashesAddrIdx._1 ++ currSnapsAddrIdx._1 ++ tlbAddrPairIdx._1,
+          scHashesAddrIdx._1 ++ currSnapsAddrIdx._1 ++ currProofsAddrIdx._1 ++ metagraphSyncAddrIdx._1 ++ tlbAddrPairIdx._1,
         removalsHex ++ asExp._2 ++ tlExp._2 ++ ncwExp._2 ++ asAddrIdx._2 ++ tlAddrIdx._2 ++ txAddrIdx._2 ++ balAddrIdx._2 ++
-          scHashesAddrIdx._2 ++ currSnapsAddrIdx._2 ++ tlbAddrPairIdx._2 ++ infoRemovalsHex
+          scHashesAddrIdx._2 ++ currSnapsAddrIdx._2 ++ currProofsAddrIdx._2 ++ metagraphSyncAddrIdx._2 ++ tlbAddrPairIdx._2 ++
+          infoRemovalsHex
       )
 
-  /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
-    * adds/removes, decide upsert / remove / no-op the same way the in-store sync does. Skip-on-noop matches the writer so the resulting
-    * `(prevBytes -- removes) ++ upserts` equals the post-sync entry set bit-for-bit.
+  /** Mirror of `applyActiveAddressIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync consensus-index entry,
+    * apply adds/removes, decide upsert / remove / no-op the same way the in-store sync does. Skip-on-noop matches the writer so the
+    * resulting `(prevBytes -- removes) ++ upserts` equals the post-sync entry set bit-for-bit.
     */
   private def replayActiveAddressIndexDelta[F[_]: Async: Hasher](
     fieldId: GlobalStateFieldId,
@@ -1131,12 +1333,15 @@ object GlobalStateConverter {
       for {
         key <- GlobalStateKey.activeAddressIndexKey[F](fieldId)
         hexKey <- GlobalStateKey.toHex[F](key)
+        existing <- StrictMptRead
+          .valueOrElse(
+            StrictMptRead.fromOptionalStoredBytes[SortedSet[Address]](preSyncBytes.get(hexKey)),
+            SortedSet.empty[Address],
+            s"verify-replay ActiveAddressIndex(fieldId=${fieldId.toInt})",
+            hexKey
+          )
+          .liftTo[F]
       } yield {
-        val existing: SortedSet[Address] = preSyncBytes.get(hexKey) match {
-          case Some(bytes) =>
-            addressSetImmutableCodec.fromImmutableBytes(ByteVector.view(bytes)).getOrElse(SortedSet.empty[Address])
-          case None => SortedSet.empty[Address]
-        }
         val merged: SortedSet[Address] = (existing ++ added) -- removed
         if (merged.isEmpty && existing.nonEmpty)
           (Map.empty[Hex, Array[Byte]], Set(hexKey))
@@ -1146,9 +1351,9 @@ object GlobalStateConverter {
           (Map.empty[Hex, Array[Byte]], Set.empty[Hex])
       }
 
-  /** Mirror of `applyAddressPairIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync sidecar entry, apply
-    * adds/removes, decide upsert / remove / no-op identically to the in-store writer so `(prevBytes -- removes) ++ upserts` matches the
-    * post-sync entry set bit-for-bit.
+  /** Mirror of `applyAddressPairIndexDelta`'s read-modify-write for the verify replay path. Decode the pre-sync consensus-index entry,
+    * apply adds/removes, decide upsert / remove / no-op identically to the in-store writer so `(prevBytes -- removes) ++ upserts` matches
+    * the post-sync entry set bit-for-bit.
     */
   private def replayAddressPairIndexDelta[F[_]: Async: Hasher](
     fieldId: GlobalStateFieldId,
@@ -1162,14 +1367,15 @@ object GlobalStateConverter {
       for {
         key <- GlobalStateKey.activeAddressIndexKey[F](fieldId)
         hexKey <- GlobalStateKey.toHex[F](key)
+        existing <- StrictMptRead
+          .valueOrElse(
+            StrictMptRead.fromOptionalStoredBytes[SortedSet[(Address, Address)]](preSyncBytes.get(hexKey)),
+            SortedSet.empty[(Address, Address)],
+            s"verify-replay ActiveAddressIndexPair(fieldId=${fieldId.toInt})",
+            hexKey
+          )
+          .liftTo[F]
       } yield {
-        val existing: SortedSet[(Address, Address)] = preSyncBytes.get(hexKey) match {
-          case Some(bytes) =>
-            addressPairSetImmutableCodec
-              .fromImmutableBytes(ByteVector.view(bytes))
-              .getOrElse(SortedSet.empty[(Address, Address)])
-          case None => SortedSet.empty[(Address, Address)]
-        }
         val merged: SortedSet[(Address, Address)] = (existing ++ added) -- removed
         if (merged.isEmpty && existing.nonEmpty)
           (Map.empty[Hex, Array[Byte]], Set(hexKey))
@@ -1196,12 +1402,15 @@ object GlobalStateConverter {
         for {
           key <- GlobalStateKey.expiryIndexKey[F](label, epoch)
           hexKey <- GlobalStateKey.toHex[F](key)
+          existing <- StrictMptRead
+            .valueOrElse(
+              StrictMptRead.fromOptionalStoredBytes[SortedSet[K]](preSyncBytes.get(hexKey)),
+              SortedSet.empty[K],
+              s"verify-replay ExpiryIndex(label=${label.canonicalName},epoch=${epoch.value.value})",
+              hexKey
+            )
+            .liftTo[F]
         } yield {
-          val existing: SortedSet[K] = preSyncBytes.get(hexKey) match {
-            case Some(bytes) =>
-              codec.fromImmutableBytes(ByteVector.view(bytes)).getOrElse(SortedSet.empty[K])
-            case None => SortedSet.empty[K]
-          }
           val toAdd = eb.adds.getOrElse(epoch, Set.empty[K])
           val toRemove = eb.removes.getOrElse(epoch, Set.empty[K])
           val merged: SortedSet[K] = (existing ++ toAdd) -- toRemove
@@ -1930,73 +2139,118 @@ object GlobalStateConverter {
         store
           .get[MetagraphSyncDataInfo](GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, metagraphAddress))
 
-      /** Materialize the full `Address → Hash` view of `lastStateChannelSnapshotHashes` via the `ActiveAddressIndex` sidecar.
-        * Metagraph-keyed fields hash the address into the partition key, so we recover the keyset from the sidecar and `getMany` the
-        * values; the returned map's `K` preserves the original `MetagraphNamespace(addr)` so we pattern-match the address back out.
+      /** Materialize the full `Address → Hash` view of `lastStateChannelSnapshotHashes` via the rooted `ActiveAddressIndex`.
+        * Metagraph-keyed fields hash the address into the partition key, so the index supplies the keyset and every indexed target must be
+        * present and decodable in the same authenticated view.
         */
       def getAllLastStateChannelSnapshotHashes(
         implicit H: Hasher[F]
       ): F[SortedMap[Address, Hash]] =
         for {
           indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastStateChannelSnapshotHashes)
-          addrSet <- store.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-          keys = addrSet.toList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastStateChannelSnapshotHashes))
-          values <- store.getMany[Hash](keys)
-        } yield
-          SortedMap.from(values.toList.flatMap {
-            case (key, h) =>
-              key.networkNamespace match {
-                case MetagraphNamespace(addr) => List(addr -> h)
-                case _                        => Nil
-              }
-          })
+          indexHex <- GlobalStateKey.toHex[F](indexKey)
+          addrSet <- StrictMptRead.valueOrElseF(
+            store.getStrict[SortedSet[Address]](indexKey),
+            SortedSet.empty[Address],
+            "materialize LastStateChannelSnapshotHashes ActiveAddressIndex",
+            indexHex
+          )
+          entries <- addrSet.toList.traverse { addr =>
+            val targetKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastStateChannelSnapshotHashes)
+            for {
+              targetHex <- GlobalStateKey.toHex[F](targetKey)
+              value <- StrictMptRead.requirePresentF(
+                store.getStrict[Hash](targetKey),
+                s"materialize LastStateChannelSnapshotHashes indexed target(address=$addr)",
+                targetHex
+              )
+            } yield addr -> value
+          }
+        } yield SortedMap.from(entries)
 
       /** Materialize the full `lastCurrencySnapshots` view. The value is `Either[Signed[CurrencySnapshot],
-        * (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` — Left and Right are stored in disjoint partitions per address, so
-        * for each metagraph address we try the Left partition first and fall back to the Right pair. The address keyset is sourced from the
-        * `ActiveAddressIndex` sidecar tracking `LastCurrencySnapshots` (covers both modes since both populations mark the same address).
+        * (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` — Left and Right are stored in disjoint partitions per address and
+        * exactly one may be present. The address keyset is sourced from the rooted `ActiveAddressIndex` tracking `LastCurrencySnapshots`
+        * (covers both modes since both populations mark the same address).
         */
       def getAllLastCurrencySnapshots(
         implicit H: Hasher[F]
       ): F[SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]] =
         for {
           indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastCurrencySnapshots)
-          addrSet <- store.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-          addrList = addrSet.toList
-          leftKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots))
-          incKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
-          lefts <- store.getMany[Signed[CurrencySnapshot]](leftKeys)
-          incs <- store.getMany[Signed[CurrencyIncrementalSnapshot]](incKeys)
+          indexHex <- GlobalStateKey.toHex[F](indexKey)
+          addrSet <- StrictMptRead.valueOrElseF(
+            store.getStrict[SortedSet[Address]](indexKey),
+            SortedSet.empty[Address],
+            "materialize LastCurrencySnapshots ActiveAddressIndex",
+            indexHex
+          )
           // Right-arm info is RECONSTRUCTED from the unrolled `Mg*` partitions (per-MG, hence the traverse — the O(MGs)×O(entries)
           // materialization cost is the tracked lazy-reads follow-up; see UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md §11).
-          entries <- addrList.traverse { addr =>
+          entries <- addrSet.toList.traverse { addr =>
             val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
             val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
-            lefts.get(leftKey) match {
-              case Some(snap) =>
-                Option(
-                  addr -> Left(snap): (
-                    Address,
-                    Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
-                  )
-                ).pure[F]
-              case None =>
-                incs.get(incKey) match {
-                  case Some(inc) =>
-                    reconstructCurrencySnapshotInfo(addr).map(info =>
-                      Option(
-                        addr -> Right((inc, info)): (
-                          Address,
-                          Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
-                        )
-                      )
+            for {
+              leftHex <- GlobalStateKey.toHex[F](leftKey)
+              incHex <- GlobalStateKey.toHex[F](incKey)
+              left <- StrictMptRead.toOptionF(
+                store.getStrict[Signed[CurrencySnapshot]](leftKey),
+                s"materialize LastCurrencySnapshots left arm(address=$addr)",
+                leftHex
+              )
+              incremental <- StrictMptRead.toOptionF(
+                store.getStrict[Signed[CurrencyIncrementalSnapshot]](incKey),
+                s"materialize LastCurrencySnapshots right arm(address=$addr)",
+                incHex
+              )
+              entry <- (left, incremental) match {
+                case (Some(_), Some(_)) =>
+                  Async[F].raiseError[
+                    (
+                      Address,
+                      Either[
+                        Signed[CurrencySnapshot],
+                        (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                      ]
                     )
-                  case None =>
-                    none[(Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)])].pure[F]
-                }
-            }
+                  ](
+                    StrictMptRead.InconsistentConsensusMptIndex(
+                      s"materialize LastCurrencySnapshots dual arms(address=$addr)",
+                      incHex,
+                      s"both legacy full-snapshot key=$leftHex and incremental key=$incHex are present"
+                    )
+                  )
+                case (Some(snapshot), None) =>
+                  (addr -> (Left(snapshot): Either[
+                    Signed[CurrencySnapshot],
+                    (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                  ])).pure[F]
+                case (None, Some(inc)) =>
+                  reconstructCurrencySnapshotInfo(addr).map(info =>
+                    addr -> (Right((inc, info)): Either[
+                      Signed[CurrencySnapshot],
+                      (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                    ])
+                  )
+                case (None, None) =>
+                  Async[F].raiseError[
+                    (
+                      Address,
+                      Either[
+                        Signed[CurrencySnapshot],
+                        (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                      ]
+                    )
+                  ](
+                    StrictMptRead.MissingConsensusMptValue(
+                      s"materialize LastCurrencySnapshots neither arm(address=$addr)",
+                      incHex
+                    )
+                  )
+              }
+            } yield entry
           }
-        } yield SortedMap.from(entries.flatten)
+        } yield SortedMap.from(entries)
 
       def getUpdateNodeParameters(
         id: Id
@@ -2005,7 +2259,7 @@ object GlobalStateConverter {
 
       /** Materialize the full `Id → (Signed[UpdateNodeParameters], SnapshotOrdinal)` view via prefix-scan. The MPT key is a hash of the
         * `Id`, but the signed value carries the signer's `Id` in `proofs.head.id`, which by GSAM convention matches the map's keying `Id`.
-        * No sidecar needed.
+        * No reverse index is needed.
         */
       def getAllUpdateNodeParameters(
         implicit H: Hasher[F]
@@ -2023,7 +2277,15 @@ object GlobalStateConverter {
         label: SystemNamespaceLabel,
         epoch: EpochProgress
       )(implicit H: Hasher[F], C: ImmutableCodec[SortedSet[K]]): F[Option[SortedSet[K]]] =
-        GlobalStateKey.expiryIndexKey[F](label, epoch).flatMap(store.get[SortedSet[K]])
+        for {
+          key <- GlobalStateKey.expiryIndexKey[F](label, epoch)
+          hexKey <- GlobalStateKey.toHex[F](key)
+          bucket <- StrictMptRead.toOptionF(
+            store.getStrict[SortedSet[K]](key),
+            s"read ExpiryIndex(label=${label.canonicalName},epoch=${epoch.value.value})",
+            hexKey
+          )
+        } yield bucket
     }
 
     implicit class MptStoreGlobalSnapshotOps[F[_]: Async: Parallel: Hasher: JsonSerializer](
@@ -2072,7 +2334,7 @@ object GlobalStateConverter {
         * returns `false`: there is nothing sound to verify against.
         *
         * @return
-        *   `true` iff local state was rebuilt AND its sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ NOTHING was written.
+        *   `true` iff local state was rebuilt AND its consensus root equals `signedMptRoot`; `false` ⇒ NOTHING was written.
         */
       def syncFromGlobalSnapshotInfoVerified(
         info: GlobalSnapshotInfo,
@@ -2088,7 +2350,7 @@ object GlobalStateConverter {
         * distinguish a successful local persisted-state reconstruction from a fail-closed no-write result. It is deliberately private: a
         * consensus or peer-recovery caller must replay transitions and cannot use a self-consistent GSI/root tuple as authority.
         *
-        * `Some(bytes)` iff the store was rebuilt and `sidecarFreeMptRoot(bytes) === signedMptRoot` (the exact candidate — GSI entries ∪
+        * `Some(bytes)` iff the store was rebuilt and `consensusMptRoot(bytes) === signedMptRoot` (the exact candidate — GSI entries ∪
         * preserved 33/34, or GSI alone — that reproduced the signed root); `None` ⇒ NOTHING was written, identical to the Boolean `false`.
         */
       private def syncFromGlobalSnapshotInfoVerifiedBytes(
@@ -2111,12 +2373,12 @@ object GlobalStateConverter {
               // Key sets are disjoint by construction: `gsiHex` never contains an mptNative fieldId (the GSI has no field for them)
               // and `preserved` contains ONLY mptNative fieldIds — so `++` is a pure union, no overwrites.
               withPreserved = gsiHex ++ preserved
-              rootWith <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](withPreserved)
+              rootWith <- io.constellationnetwork.schema.GlobalSnapshotInfo.consensusMptRoot[F](withPreserved)
               adopted <-
                 if (rootWith === expected)
                   syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = true).as(withPreserved.some)
                 else
-                  io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](gsiHex).flatMap { rootWithout =>
+                  io.constellationnetwork.schema.GlobalSnapshotInfo.consensusMptRoot[F](gsiHex).flatMap { rootWithout =>
                     if (rootWithout === expected)
                       syncFromGlobalSnapshotInfoImpl(info, snapshotOrdinal, preserveMptNative = false).as(gsiHex.some)
                     else
@@ -2130,14 +2392,14 @@ object GlobalStateConverter {
         * `Slashings` 34) verbatim — the partitions a from-GSI rebuild structurally cannot reconstruct — so a node restarting with its own
         * persisted MPT reproduces the signed `stateProof.mptRoot` BY CONSTRUCTION and does not need to re-bootstrap from a peer.
         *
-        * Semantics: load the persisted state (if any), recompute the sidecar-free consensus root, and keep the load ONLY when it equals
-        * `signedMptRoot`. On no-persistence / nothing-persisted / root mismatch (stale or corrupt bytes) the pre-call store state is
-        * restored via savepoint and `false` is returned — callers then fall back to [[syncFromGlobalSnapshotInfoVerified]] (and fail
-        * closed, or degrade per the site's documented contract, when that also cannot reproduce the signed root). `signedMptRoot = None`
-        * (pre-MPT legacy snapshot) returns `false` without touching disk: there is nothing sound to verify against.
+        * Semantics: load the persisted state (if any), recompute the consensus root, and keep the load ONLY when it equals `signedMptRoot`.
+        * On no-persistence / nothing-persisted / root mismatch (stale or corrupt bytes) the pre-call store state is restored via savepoint
+        * and `false` is returned — callers then fall back to [[syncFromGlobalSnapshotInfoVerified]] (and fail closed, or degrade per the
+        * site's documented contract, when that also cannot reproduce the signed root). `signedMptRoot = None` (pre-MPT legacy snapshot)
+        * returns `false` without touching disk: there is nothing sound to verify against.
         *
         * @return
-        *   `true` iff the persisted bytes were loaded AND their sidecar-free consensus root equals `signedMptRoot`; `false` ⇒ the store is
+        *   `true` iff the persisted bytes were loaded AND their consensus root equals `signedMptRoot`; `false` ⇒ the store is
         *   byte-identical to its pre-call state.
         */
       def syncFromPersistedMptVerified(
@@ -2154,7 +2416,7 @@ object GlobalStateConverter {
                 if (!loaded) false.pure[F]
                 else
                   store.underlying.entries
-                    .flatMap(io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](_))
+                    .flatMap(io.constellationnetwork.schema.GlobalSnapshotInfo.consensusMptRoot[F](_))
                     .flatMap { loadedRoot =>
                       if (loadedRoot === expected) true.pure[F]
                       else sp.restore.as(false)
@@ -2359,74 +2621,6 @@ object GlobalStateConverter {
             case (peerId, record) => GlobalStateKey.genesisOperatorKey[F](peerId).map(_ -> record)
           }.map(_.toMap)
 
-        // Reconstruct the allow-spend expiry index from `info.activeAllowSpends`: each active record contributes one entry in
-        // `index[lastValidEpochProgress]`. Buckets are `SortedSet[AllowSpendExpiryKey]`; empty buckets are omitted entirely.
-        val allowSpendExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[AllowSpendExpiryKey]]] = {
-          val flat = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
-            case (mid, innerMap) => innerMap.toList.flatMap { case (addr, set) => set.toList.map(s => (mid, addr, s)) }
-          }
-          flat.parTraverse {
-            case (mid, addr, s) =>
-              s.toHashed.map(h => (s.lastValidEpochProgress, AllowSpendExpiryKey(mid, addr, h.hash)))
-          }.flatMap { entries =>
-            val byEpoch: Map[EpochProgress, SortedSet[AllowSpendExpiryKey]] =
-              entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
-            byEpoch.toList.parTraverse {
-              case (epoch, bucket) =>
-                GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, epoch).map(_ -> bucket)
-            }
-              .map(_.toMap)
-          }
-        }
-
-        // Reconstruct the node-collateral-withdrawal expiry index. Expiry = `createdAt + withdrawalTimeLimit`; skipped when the caller
-        // didn't provide `withdrawalTimeLimit` (test contexts that don't exercise the index).
-        val nodeCollateralWithdrawalExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]]] =
-          withdrawalTimeLimit match {
-            case None => Map.empty[GlobalStateKey, SortedSet[NodeCollateralWithdrawalExpiryKey]].pure[F]
-            case Some(limit) =>
-              val flat = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).flatMap {
-                case (addr, set) => set.toList.map(w => (addr, w))
-              }
-              flat.parTraverse {
-                case (addr, w) =>
-                  w.event.toHashed.map(h => (w.createdAt |+| limit, NodeCollateralWithdrawalExpiryKey(addr, h.hash)))
-              }.flatMap { entries =>
-                val byEpoch: Map[EpochProgress, SortedSet[NodeCollateralWithdrawalExpiryKey]] =
-                  entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
-                byEpoch.toList.parTraverse {
-                  case (epoch, bucket) =>
-                    GlobalStateKey
-                      .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, epoch)
-                      .map(_ -> bucket)
-                }.map(_.toMap)
-              }
-          }
-
-        // Reconstruct the token-lock expiry index. Only records with `unlockEpoch.isDefined` contribute — records with `None` unlock
-        // never expire and aren't indexed.
-        val tokenLockExpiryBucketsF: F[Map[GlobalStateKey, SortedSet[TokenLockExpiryKey]]] = {
-          val flat = info.activeTokenLocks.toList.flatMap(_.toList).flatMap {
-            case (addr, set) => set.toList.map(l => (addr, l))
-          }
-          flat.parTraverse {
-            case (addr, l) =>
-              l.unlockEpoch match {
-                case Some(epoch) =>
-                  l.toHashed.map[Option[(EpochProgress, TokenLockExpiryKey)]](h => Some((epoch, TokenLockExpiryKey(addr, h.hash))))
-                case None => Option.empty[(EpochProgress, TokenLockExpiryKey)].pure[F]
-              }
-          }.map(_.flatten).flatMap { entries =>
-            val byEpoch: Map[EpochProgress, SortedSet[TokenLockExpiryKey]] =
-              entries.groupMap(_._1)(_._2).view.mapValues(_.to(SortedSet)).toMap
-            byEpoch.toList.parTraverse {
-              case (epoch, bucket) =>
-                GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexTokenLocks, epoch).map(_ -> bucket)
-            }
-              .map(_.toMap)
-          }
-        }
-
         // We avoid per-field `sync` (each would trigger its own trie build). Instead: clear,
         // insert each typed batch, then build once at the end.
         // Caller-serialized — see MptStore.withTransaction. Local bootstrap/restart reconstruction is single-fiber; accept() callers run
@@ -2446,9 +2640,7 @@ object GlobalStateConverter {
           currency <- buildCurrencySnapshotEntries
           updateNodeParametersEntries <- updateNodeParametersEntriesF
           priceStateEntries <- priceStateEntriesF
-          allowSpendExpiryBuckets <- allowSpendExpiryBucketsF
-          tokenLockExpiryBuckets <- tokenLockExpiryBucketsF
-          nodeCollateralWithdrawalExpiryBuckets <- nodeCollateralWithdrawalExpiryBucketsF
+          systemIndexes <- globalSnapshotSystemIndexEntries[F](info, withdrawalTimeLimit)
           historicalStakeEntries <- historicalStakeEntriesF
           kesRegistrationCertEntries <- kesRegistrationCertEntriesF
           lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
@@ -2484,44 +2676,12 @@ object GlobalStateConverter {
           _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
           _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
           _ <- store.insert[GenesisOperatorConsensusKey](genesisOperatorKeyEntries)
-          _ <- store.insert[SortedSet[AllowSpendExpiryKey]](allowSpendExpiryBuckets)
-          _ <- store.insert[SortedSet[TokenLockExpiryKey]](tokenLockExpiryBuckets)
-          _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](nodeCollateralWithdrawalExpiryBuckets)
-          // ActiveAddressIndex bootstrap: rebuild from `info.<field>.keySet` for the indexed fields. Must mirror the
-          // delta-path maintenance in `syncFromStateChanges` so a node that bootstraps via `syncFromGlobalSnapshotInfo`
-          // converges to the same mptRoot as one that processed every ordinal incrementally.
-          activeAddressIndexEntries <- {
-            val sets: List[(GlobalStateFieldId, SortedSet[Address])] = List(
-              (LastAllowSpendRefs, info.lastAllowSpendRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
-              (LastTokenLockRefs, info.lastTokenLockRefs.fold(SortedSet.empty[Address])(_.keySet.to(SortedSet))),
-              (LastTxRefs, info.lastTxRefs.keySet.to(SortedSet)),
-              (Balances, info.balances.keySet.to(SortedSet)),
-              (LastStateChannelSnapshotHashes, info.lastStateChannelSnapshotHashes.keySet.to(SortedSet)),
-              (LastCurrencySnapshots, info.lastCurrencySnapshots.keySet.to(SortedSet))
-            )
-            sets
-              .filter(_._2.nonEmpty)
-              .parTraverse {
-                case (fieldId, addrSet) =>
-                  GlobalStateKey.activeAddressIndexKey[F](fieldId).map(_ -> addrSet)
-              }
-              .map(_.toMap)
-          }
-          _ <- store.insert[SortedSet[Address]](activeAddressIndexEntries)
-          // Address-pair index bootstrap for `tokenLockBalances`. Mirrors the delta-path writer in
-          // `syncFromStateChanges` so bootstrap and incremental paths converge to the same mptRoot.
-          tokenLockBalancePairs: SortedSet[(Address, Address)] =
-            info.tokenLockBalances.fold(SortedSet.empty[(Address, Address)])(_.iterator.flatMap {
-              case (mid, inner) => inner.keysIterator.map(h => (mid, h))
-            }.to(SortedSet))
-          addressPairIndexEntries <-
-            if (tokenLockBalancePairs.isEmpty)
-              Map.empty[GlobalStateKey, SortedSet[(Address, Address)]].pure[F]
-            else
-              GlobalStateKey
-                .activeAddressIndexKey[F](TokenLockBalances)
-                .map(k => Map(k -> tokenLockBalancePairs))
-          _ <- store.insert[SortedSet[(Address, Address)]](addressPairIndexEntries)
+          _ <- store.insert[SortedSet[Address]](systemIndexes.activeAddressIndexes)
+          _ <- store.insert[SortedSet[(Address, Address)]](systemIndexes.tokenLockBalanceAddressPairs)
+          _ <- store.insert[SortedSet[AllowSpendExpiryKey]](systemIndexes.allowSpendExpiryBuckets)
+          _ <- store.insert[SortedSet[TokenLockExpiryKey]](systemIndexes.tokenLockExpiryBuckets)
+          _ <- store
+            .insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](systemIndexes.nodeCollateralWithdrawalExpiryBuckets)
           // FINDING-S01: restore the MPT-native consensus partitions captured above — raw bytes, verbatim (no codec round-trip),
           // exactly as the byte-faithful `loadBytes` path would carry them. Keys cannot collide with any GSI-derived insert
           // (disjoint fieldIds).
@@ -2701,6 +2861,9 @@ object GlobalStateConverter {
 
         for {
           t0 <- Async[F].monotonic.map(_.toMillis)
+          // Validate every touched rooted System index before mutating any partition. A malformed index is authenticated corrupt state,
+          // not absence; fail before the first remove/insert even when this legacy writer is called without an outer transaction.
+          _ <- preflightSystemIndexReads(store, acc)
           keysToRemove <- toRemovalGlobalStateKeys
 
           _ <- syncLogger.debug(
@@ -2782,9 +2945,9 @@ object GlobalStateConverter {
             acc.nodeCollateralWithdrawalExpiryIndex
           )
 
-          // ActiveAddressIndex maintenance — pilot scope: ref-maps that don't carry an address in their value type.
-          // Refs only grow (never removed), so `removed = empty`. Adds = the keyset of this ordinal's delta. The
-          // verify replay path mirrors this in `replayActiveAddressIndexDelta` so `expectedBytes == storeBytes`.
+          // ActiveAddressIndex maintenance for address-keyed values that cannot recover their owner from value bytes. These accumulator
+          // fields are additive/overwrite-only (no removal channels), so `removed = empty`. The verify replay path mirrors every call in
+          // `replayActiveAddressIndexDelta` so `expectedBytes == storeBytes`.
           _ <- applyActiveAddressIndexDelta[F](store, LastAllowSpendRefs, acc.lastAllowSpendRefs.keySet.toSet, Set.empty)
           _ <- applyActiveAddressIndexDelta[F](store, LastTokenLockRefs, acc.lastTokenLockRefs.keySet.toSet, Set.empty)
           _ <- applyActiveAddressIndexDelta[F](store, LastTxRefs, acc.lastTxRefs.keySet.toSet, Set.empty)
@@ -2801,9 +2964,21 @@ object GlobalStateConverter {
             acc.lastCurrencySnapshots.keySet.toSet,
             Set.empty
           )
+          _ <- applyActiveAddressIndexDelta[F](
+            store,
+            LastCurrencySnapshotsProofs,
+            acc.lastCurrencySnapshotsProofs.keySet.toSet,
+            Set.empty
+          )
+          _ <- applyActiveAddressIndexDelta[F](
+            store,
+            MetagraphSyncData,
+            acc.metagraphSyncData.keySet.toSet,
+            Set.empty
+          )
           // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Adds come from this
-          // ordinal's deltas; removes come from the manager's pair-shaped `removedTokenLockBalanceKeys` so the
-          // sidecar prunes in lock-step with the actual MPT entry deletes (otherwise materialize keeps re-reading
+          // ordinal's deltas; removes come from the manager's pair-shaped `removedTokenLockBalanceKeys`, so the
+          // rooted consensus index prunes in lock-step with the actual MPT entry deletes (otherwise materialize keeps re-reading
           // the stale pair and the diff loop re-emits the same removal every ordinal).
           _ <- applyAddressPairIndexDelta[F](
             store,

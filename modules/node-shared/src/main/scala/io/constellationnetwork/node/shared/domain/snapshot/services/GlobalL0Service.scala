@@ -43,7 +43,7 @@ trait GlobalL0Service[F[_]] {
 
   /** 3c-A — the latest finalized snapshot, its GSI, AND (when gl0 served them) gl0's SIGNED MPT byte map at that ordinal
     * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). When present, the byte map is what gl0 actually signed; a follower stores it
-    * VERBATIM via `MptStore.loadBytes`, so its `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate holds BY CONSTRUCTION (no
+    * VERBATIM via `MptStore.loadBytes`, so its `consensusMptRoot(entries) === signed mptRoot` verify gate holds BY CONSTRUCTION (no
     * `syncFromGlobalSnapshotInfo` re-encode → no `recomputed ≠ signed` drift). The GSI rides along ONLY for `setForRecovery`; never
     * re-derive the root from it. Same majority-peer resolution as [[pullLatestSnapshot]].
     *
@@ -164,7 +164,7 @@ object GlobalL0Service {
 
       // 3c-A — fetch the SIGNED MPT byte map (+ snapshot + GSI) from a majority-aligned peer when one is configured, else a
       // random peer (same resolution rationale as `getChangeSetSince`: a majority peer's finalized state holds the served
-      // bytes for the ordinal the follower is converging to). The consumer's `sidecarFreeMptRoot(entries) === signed mptRoot`
+      // bytes for the ordinal the follower is converging to). The consumer's `consensusMptRoot(entries) === signed mptRoot`
       // verify gate is the safety backstop — a peer serving bytes inconsistent with its own signed root is caught there and
       // re-pulled, never adopted. The snapshot signature is checked here (`toHashedWithSignatureCheck`) exactly as the
       // snapshot-only pull does.

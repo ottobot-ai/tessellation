@@ -89,17 +89,17 @@ case class GlobalSnapshotStateProof(
   lastStateChannelSnapshotHashesProof: Hash,
   lastTxRefsProof: Hash,
   balancesProof: Hash,
-  /** SIGNED per-field MPT root(s) for the `lastCurrencySnapshots` GSI field (the cl1/dl1-consumed 6th follow field). `Some` once any
-    * metagraph currency snapshot is present in the GSI (`info.lastCurrencySnapshots.nonEmpty`), `None` on an empty currency map / legacy-V1
-    * paths. Holds BOTH currency MPT partition roots — `incrementalRoot` (`GlobalStateFieldId.LastIncrementalCurrencySnapshots`, fieldId 5)
-    * and `infoRoot` (`GlobalStateFieldId.LastCurrencySnapshotInfo`, fieldId 6) — computed from the SAME byte map (and thus the same
-    * `fieldRootFromBytes` path) as every other per-field root, so it is byte-identical producer-vs-follower and ALSO transitively covered
-    * by `mptRoot`. Unlike `smtRoot`, this IS reproducible on the GSI-derived rebuild paths (it derives from `info.lastCurrencySnapshots`
-    * alone), so it is INCLUDED in the `StateProofValidator` `===` (not excluded via `StateProofComparison`). It gives the cl1/dl1
-    * `lastCurrencySnapshots` follow-verify a TRUE signed anchor (recompute-vs-signed, symmetric with the five uniform-`Hash` fields)
-    * instead of the prior recompute-vs-producer-claimed-map guard. This reuses the slot that held the legacy pre-MPT `Option[MerkleRoot]`
-    * (a separate-Merkle-tree currency root, still present on [[GlobalSnapshotStateProofV1]]); on V2 it is now the live signed
-    * currency-field root.
+  /** SIGNED per-field MPT root(s) for the `lastCurrencySnapshots` GSI field (the cl1/dl1-consumed 6th follow field). `Some` iff the
+    * authenticated MPT byte map contains a currency-snapshot partition entry; `None` on empty-state / legacy-V1 paths. Holds BOTH currency
+    * MPT partition roots — `incrementalRoot` (`GlobalStateFieldId.LastIncrementalCurrencySnapshots`, fieldId 5) and `infoRoot`
+    * (`GlobalStateFieldId.LastCurrencySnapshotInfo`, fieldId 6) — computed from the SAME byte map (and thus the same `fieldRootFromBytes`
+    * path) as every other per-field root, so it is byte-identical producer-vs-follower and ALSO transitively covered by `mptRoot`. Unlike
+    * `smtRoot`, this IS reproducible on the GSI-derived rebuild paths (it derives from `info.lastCurrencySnapshots` alone), so it is
+    * INCLUDED in the `StateProofValidator` `===` (not excluded via `StateProofComparison`). It gives the cl1/dl1 `lastCurrencySnapshots`
+    * follow-verify a TRUE signed anchor (recompute-vs-signed, symmetric with the five uniform-`Hash` fields) instead of the prior
+    * recompute-vs-producer-claimed-map guard. This reuses the slot that held the legacy pre-MPT `Option[MerkleRoot]` (a
+    * separate-Merkle-tree currency root, still present on [[GlobalSnapshotStateProofV1]]); on V2 it is now the live signed currency-field
+    * root.
     */
   lastCurrencySnapshotsProof: Option[CurrencySnapshotMptRoots],
   activeAllowSpends: Option[Hash],

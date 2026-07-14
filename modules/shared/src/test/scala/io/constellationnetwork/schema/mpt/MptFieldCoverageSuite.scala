@@ -321,6 +321,62 @@ object MptFieldCoverageSuite extends MutableIOSuite {
       )
   }
 
+  test("RED: node-local withdrawal limits split the consensus root for the same logical state") { res =>
+    implicit val (h, sp, js) = res
+    val limitA = EpochProgress(NonNegLong(200L))
+    val limitB = EpochProgress(NonNegLong(201L))
+    val ordinal = SnapshotOrdinal(NonNegLong(1L))
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      source = kp.getPublic.toAddress
+      createdAt = EpochProgress(NonNegLong(50L))
+      createEvent = UpdateNodeCollateral.Create(
+        source = source,
+        nodeId = kp.getPublic.toId.toPeerId,
+        amount = io.constellationnetwork.schema.nodeCollateral.NodeCollateralAmount(NonNegLong(1_000_000L)),
+        tokenLockRef = testHash("tl-ref-local-config-split")
+      )
+      withdrawal = PendingNodeCollateralWithdrawal(
+        event = Signed(createEvent, testProofs),
+        acceptedOrdinal = ordinal,
+        createdAt = createdAt
+      )
+      info = GlobalSnapshotInfo.empty.copy(
+        nodeCollateralWithdrawals = SortedMap(source -> SortedSet(withdrawal)).some
+      )
+
+      storeA <- mkEmptyMptStore
+      _ <- storeA.syncFromGlobalSnapshotInfo(info, ordinal)(
+        globalStateProofSelector,
+        WithdrawalTimeLimit.some(limitA)
+      )
+      rootA <- storeA.underlying.getRootHashForOrdinal(ordinal)
+      bucketA <- storeA.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        createdAt |+| limitA
+      )
+
+      storeB <- mkEmptyMptStore
+      _ <- storeB.syncFromGlobalSnapshotInfo(info, ordinal)(
+        globalStateProofSelector,
+        WithdrawalTimeLimit.some(limitB)
+      )
+      rootB <- storeB.underlying.getRootHashForOrdinal(ordinal)
+      bucketB <- storeB.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        createdAt |+| limitB
+      )
+    } yield
+      expect.all(
+        rootA.isDefined,
+        rootB.isDefined,
+        rootA != rootB,
+        bucketA.exists(_.nonEmpty),
+        bucketB.exists(_.nonEmpty)
+      )
+  }
+
   test("node-collateral-withdrawal expiry index: rebuild with None withdrawalTimeLimit skips indexing") { res =>
     implicit val (h, sp, js) = res
     for {

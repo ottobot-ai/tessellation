@@ -503,16 +503,16 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
       delta <- GlobalStateConverter.toAccumulatorHexDelta[IO](accNext, preSyncBytes)
       (deltaUpserts, deltaRemoves) = delta
       expectedBytes = (preSyncBytes -- deltaRemoves) ++ deltaUpserts
-      postNonSys = GlobalStateKey.nonSystemNamespaceEntries(postBytes).view.mapValues(_.toVector).toMap
-      replNonSys = GlobalStateKey.nonSystemNamespaceEntries(expectedBytes).view.mapValues(_.toVector).toMap
+      postConsensus = GlobalStateKey.consensusRootEntries(postBytes).view.mapValues(_.toVector).toMap
+      replConsensus = GlobalStateKey.consensusRootEntries(expectedBytes).view.mapValues(_.toVector).toMap
     } yield {
       // Keys the replay KEEPS but the (correct) incremental writer dropped — must be empty.
-      val staleInReplay = replNonSys.keySet -- postNonSys.keySet
-      val missingInReplay = postNonSys.keySet -- replNonSys.keySet
+      val staleInReplay = replConsensus.keySet -- postConsensus.keySet
+      val missingInReplay = postConsensus.keySet -- replConsensus.keySet
       expect.all(
         clue(staleInReplay).isEmpty,
         clue(missingInReplay).isEmpty,
-        clue(replNonSys) == clue(postNonSys)
+        clue(replConsensus) == clue(postConsensus)
       )
     }
   }

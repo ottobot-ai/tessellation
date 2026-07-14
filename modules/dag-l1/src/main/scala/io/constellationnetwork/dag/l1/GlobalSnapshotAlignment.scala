@@ -253,13 +253,13 @@ class GlobalSnapshotAlignment[F[
                   }
             }
         }
-        // DIAG: recompute sidecar-free (apples-to-apples with the signed `stateProof.mptRoot`), NOT `getRootHashForOrdinal`
-        // (which includes the path-dependent SystemNamespace sidecars). With the verbatim `loadBytes` this equals the
+        // DIAG: recompute the canonical consensus root (apples-to-apples with the signed `stateProof.mptRoot`).
+        // With the verbatim `loadBytes` this equals the
         // signed root by construction on honest input.
         afterBytes <- sharedStorages.mptStore.underlying.entries
-        postSyncRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes)
+        postSyncRoot <- GlobalSnapshotInfo.consensusMptRoot[F](afterBytes)
         _ <- logger.info(
-          s"DL1 #117 DIAG post-load sidecar-free mptRoot=${postSyncRoot.show.take(12)} at ord=${canonicalSnapshot.ordinal.show} " +
+          s"DL1 #117 DIAG post-load consensus mptRoot=${postSyncRoot.show.take(12)} at ord=${canonicalSnapshot.ordinal.show} " +
             s"(signed=${canonicalSnapshot.signed.value.stateProof.mptRoot.map(_.show.take(12)).getOrElse("none")})"
         )
         _ <- sharedStorages.lastGlobalSnapshot.setForRecovery(canonicalSnapshot, canonicalState)

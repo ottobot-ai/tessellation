@@ -30,8 +30,8 @@ import weaver.MutableIOSuite
   * `pruneStagedPostBytesAtOrBelow`) — the same functions `onSlotWon` / the validator / `recordFinalizedAccumulator` now call — plus the
   * `MptStateStorage` round-trip, to pin two properties compilation can't:
   *   1. '''reorg-replace''' — only the finalized branch's bytes survive a finalize tick; same-ordinal forks + below-tip dead forks are
-  *      dropped. 2. '''persisted bytes reproduce the signed `mptRoot`''' — `sidecarFreeMptRoot(readBack) === mptStateProofFromBytes(info,
-  *      bytes).mptRoot`, so a follower's verify gate passes BY CONSTRUCTION on the served signed bytes.
+  *      dropped. 2. '''persisted bytes reproduce the signed `mptRoot`''' — `consensusMptRoot(readBack) ===
+  *      mptStateProofFromBytes(bytes).mptRoot`, so a follower's verify gate passes BY CONSTRUCTION on the served signed bytes.
   *
   * The capture-equals-signed-postBytes property (the overlay handle view at the stage site == GSAM's signed bytes) is the same-handle
   * invariant verified at the seam + proven by the sharded e2e; it requires the full MultiBranch overlay + accept pipeline and is out of
@@ -107,24 +107,23 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
     )
   }
 
-  test("persisted bytes reproduce the signed mptRoot: sidecarFreeMptRoot(readBack) === mptStateProofFromBytes(info, bytes).mptRoot") {
-    res =>
-      implicit val (h, _, j, store) = res
-      for {
-        gsiAndBytes <- userBytes
-        (gsi, signedBytes) = gsiAndBytes
-        // The producer's signed global root (the trust anchor the follower verifies against).
-        signedRoot <- GlobalSnapshotInfo.mptStateProofFromBytes[IO](gsi, signedBytes).map(_.mptRoot)
-        // The enabler writes the SIGNED bytes verbatim to the served store at the finalized ordinal; the follower reads them back.
-        _ <- store.writeState(ord(42L), signedBytes)
-        readBack <- store.readState(ord(42L))
-        recomputed <- readBack.traverse(GlobalSnapshotInfo.sidecarFreeMptRoot[IO])
-      } yield
-        expect(readBack.isDefined) &&
-          expect.same(readBack.map(_.keySet), Some(signedBytes.keySet)) && // store round-trips the byte set losslessly
-          expect(signedRoot.isDefined) &&
-          // the served store's recompute equals the producer's SIGNED mptRoot — the follower verify gate passes BY CONSTRUCTION
-          expect.same(recomputed, signedRoot)
+  test("persisted bytes reproduce the signed mptRoot: consensusMptRoot(readBack) === mptStateProofFromBytes(bytes).mptRoot") { res =>
+    implicit val (h, _, j, store) = res
+    for {
+      gsiAndBytes <- userBytes
+      (_, signedBytes) = gsiAndBytes
+      // The producer's signed global root (the trust anchor the follower verifies against).
+      signedRoot <- GlobalSnapshotInfo.mptStateProofFromBytes[IO](signedBytes).map(_.mptRoot)
+      // The enabler writes the SIGNED bytes verbatim to the served store at the finalized ordinal; the follower reads them back.
+      _ <- store.writeState(ord(42L), signedBytes)
+      readBack <- store.readState(ord(42L))
+      recomputed <- readBack.traverse(GlobalSnapshotInfo.consensusMptRoot[IO])
+    } yield
+      expect(readBack.isDefined) &&
+        expect.same(readBack.map(_.keySet), Some(signedBytes.keySet)) && // store round-trips the byte set losslessly
+        expect(signedRoot.isDefined) &&
+        // the served store's recompute equals the producer's SIGNED mptRoot — the follower verify gate passes BY CONSTRUCTION
+        expect.same(recomputed, signedRoot)
   }
 
   // Track-3 S2 (disk-backed k₂ retention). Two properties compilation can't pin:
@@ -139,7 +138,7 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
   // retained regression below proves `pinnedReaderAt` fails closed at that ordinal while neighboring retained states remain readable.
 
   /** A distinct GSI (one balance keyed off `seed`) + the EXACT hex byte map `syncFromGlobalSnapshotInfoVerifiedBytes` verifies/returns
-    * (`toAllStateKeyValueBytes`), + its sidecar-free consensus root (what the snapshot at that ordinal commits as `stateProof.mptRoot`).
+    * (`toAllStateKeyValueBytes`), plus its consensus root (what the snapshot at that ordinal commits as `stateProof.mptRoot`).
     */
   private def gsiFixture(
     seed: Long
@@ -150,7 +149,7 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
     for {
       typed <- GlobalStateConverter.toAllStateKeyValueBytes[IO](gsi)
       bytes <- typed.toList.traverse { case (k, v) => GlobalStateKey.toHex[IO](k).map(_ -> v) }.map(_.toMap)
-      root <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](bytes)
+      root <- GlobalSnapshotInfo.consensusMptRoot[IO](bytes)
     } yield (gsi, bytes, root)
   }
 

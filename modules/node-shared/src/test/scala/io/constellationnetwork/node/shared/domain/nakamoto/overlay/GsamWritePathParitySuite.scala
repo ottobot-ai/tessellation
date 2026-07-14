@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
 import cats.Show
+import cats.data.NonEmptyList
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
 
@@ -8,6 +9,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.merkletree.{Proof, ProofEntry}
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -16,6 +18,7 @@ import io.constellationnetwork.schema.generators._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -225,6 +228,22 @@ object GsamWritePathParitySuite extends MutableIOSuite with Checkers {
       bytes <- store.allEntriesAsBytes
     } yield (trie.toOption.map(_.rootHash), bytes)
 
+  private def buildAccumulatorViaAlgebraPassthrough(acc: StateChangesAccumulator, ordinal: SnapshotOrdinal)(
+    implicit hasher: Hasher[IO],
+    j: JsonSerializer[IO]
+  ): IO[(Option[MptRoot], Map[Hex, Array[Byte]])] =
+    for {
+      store <- freshStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay = MptOverlay.passthrough[IO, GlobalStateKey](store, pcTree)
+      handle <- overlay.checkout(parentBranch)
+      mpt = AcceptanceMpt.fromOverlay[IO](overlay, parentBranch, handle)
+      _ <- AcceptanceMptStateChanges.applyStateChanges[IO](mpt, acc)
+      _ <- overlay.commit(handle, childBranch, ordinal)
+      rootRes <- overlay.buildRoot(childBranch, ordinal)
+      bytes <- store.allEntriesAsBytes
+    } yield (rootRes.toOption.map(_.rootHash), bytes)
+
   // ============================================================
   // Property tests — paths must agree on root + per-key bytes
   // ============================================================
@@ -328,6 +347,35 @@ object GsamWritePathParitySuite extends MutableIOSuite with Checkers {
         a._2.isEmpty,
         f._2.isEmpty,
         g._2.isEmpty
+      )
+  }
+
+  test("currency-proof and metagraph-sync owner indexes match the direct writer") { res =>
+    implicit val (j, h, _) = res
+    val ordinal = SnapshotOrdinal(NonNegLong(101L))
+    val proofOwner = Address.fromBytes("currency-proof-owner".getBytes("UTF-8"))
+    val syncOwner = Address.fromBytes("metagraph-sync-owner".getBytes("UTF-8"))
+    val proof = Proof(NonEmptyList.one(ProofEntry(testHash("proof-target"), Right(testHash("proof-sibling")))))
+    val acc = StateChangesAccumulator(
+      lastCurrencySnapshotsProofs = SortedMap(proofOwner -> proof),
+      metagraphSyncData = SortedMap(syncOwner -> MetagraphSyncDataInfo.empty)
+    )
+
+    for {
+      directStore <- freshStore
+      _ <- directStore.syncFromStateChanges(acc, ordinal)
+      directTrie <- directStore.build(ordinal)
+      directBytes <- directStore.allEntriesAsBytes
+      algebra <- buildAccumulatorViaAlgebraPassthrough(acc, ordinal)
+      proofIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshotsProofs)
+      syncIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.MetagraphSyncData)
+      proofIndexHex <- GlobalStateKey.toHex[IO](proofIndex)
+      syncIndexHex <- GlobalStateKey.toHex[IO](syncIndex)
+    } yield
+      expect.all(
+        directTrie.toOption.map(_.rootHash) == algebra._1,
+        bytesEntriesEq(directBytes, algebra._2),
+        directBytes.keySet.intersect(Set(proofIndexHex, syncIndexHex)) == Set(proofIndexHex, syncIndexHex)
       )
   }
 }

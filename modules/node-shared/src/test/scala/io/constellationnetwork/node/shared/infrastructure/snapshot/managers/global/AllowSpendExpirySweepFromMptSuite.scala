@@ -22,6 +22,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.{Signed, signature}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.allowSpendExpiryKeySetImmutableCodec
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
@@ -54,6 +55,9 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
 
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
+  private def sameBytes(left: Map[Hex, Array[Byte]], right: Map[Hex, Array[Byte]]): Boolean =
+    left.keySet == right.keySet && left.forall { case (key, bytes) => right.get(key).exists(_.sameElements(bytes)) }
 
   private def mkAllowSpend(source: Address, dest: Address, expireAt: EpochProgress, label: String): Signed[AllowSpend] =
     Signed(
@@ -315,6 +319,124 @@ object AllowSpendExpirySweepFromMptSuite extends MutableIOSuite {
         clue(allRemovedKeys).contains(expectedKey),
         // No incoming allow-spends → the `adds` side is empty.
         clue(allAddedKeys).isEmpty
+      )
+  }
+
+  test("FromMpt sweep rejects an absent active target at its exact physical key without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val expiry = EpochProgress(NonNegLong(100L))
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      destination <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      allowSpend = mkAllowSpend(source, destination, expiry, "absent-target")
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(allowSpend)))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      _ <- store.remove(targetKey)
+      before <- store.allEntriesAsBytes
+      result <- AllowSpendStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredGlobalAllowSpendsViaIndexFromMpt(expiry, EpochProgress(NonNegLong(101L)))
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                   => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("FromMpt sweep rejects a malformed active target at its exact physical key without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val expiry = EpochProgress(NonNegLong(100L))
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      destination <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      allowSpend = mkAllowSpend(source, destination, expiry, "malformed-target")
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(allowSpend)))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      _ <- store.underlying.insertBytes(Map(targetHex -> Array[Byte](0x7f))).flatMap(_.liftTo[IO])
+      before <- store.allEntriesAsBytes
+      result <- AllowSpendStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredGlobalAllowSpendsViaIndexFromMpt(expiry, EpochProgress(NonNegLong(101L)))
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MalformedConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                     => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("FromMpt sweep rejects a bucket hash absent from the decoded active target without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val expiry = EpochProgress(NonNegLong(100L))
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      destination <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      allowSpend = mkAllowSpend(source, destination, expiry, "inconsistent-target")
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(allowSpend)))
+      bucketKey <- GlobalStateKey.expiryIndexKey[IO](SystemNamespaceLabel.ExpiryIndexAllowSpends, expiry)
+      wrongKey = AllowSpendExpiryKey(None, source, testHash("wrong-expiry-hash"))
+      _ <- store.insert[SortedSet[AllowSpendExpiryKey]](bucketKey, SortedSet(wrongKey))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      before <- store.allEntriesAsBytes
+      result <- AllowSpendStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredGlobalAllowSpendsViaIndexFromMpt(expiry, EpochProgress(NonNegLong(101L)))
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.InconsistentConsensusMptIndex) => error.physicalKey == targetHex
+          case _                                                        => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("FromMpt sweep rejects a forged earlier bucket for an active allow-spend without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val forgedExpiry = EpochProgress(NonNegLong(100L))
+    val actualExpiry = EpochProgress(NonNegLong(101L))
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      destination <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      allowSpend = mkAllowSpend(source, destination, actualExpiry, "forged-earlier-bucket")
+      hashed <- allowSpend.toHashed
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(allowSpend)))
+      forgedBucketKey <- GlobalStateKey.expiryIndexKey[IO](SystemNamespaceLabel.ExpiryIndexAllowSpends, forgedExpiry)
+      forgedIndexKey = AllowSpendExpiryKey(None, source, hashed.hash)
+      _ <- store.insert[SortedSet[AllowSpendExpiryKey]](forgedBucketKey, SortedSet(forgedIndexKey))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      before <- store.allEntriesAsBytes
+      result <- AllowSpendStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredGlobalAllowSpendsViaIndexFromMpt(forgedExpiry, actualExpiry)
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.InconsistentConsensusMptIndex) => error.physicalKey == targetHex
+          case _                                                        => false
+        },
+        sameBytes(before, after)
       )
   }
 }

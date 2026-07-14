@@ -65,7 +65,7 @@ object SystemNamespaceLabel {
   /** Reverse-lookup partition: per `GlobalStateFieldId`, holds a `SortedSet[Address]` of every address with an active entry in that field.
     * Lets consumers materialize a `Map[Address, V]` for fields whose value type doesn't carry the address (refs, balances) — the
     * prefix-scan primitive only recovers addresses from values that embed a `source: Address`, so address-keyed maps with reference-only
-    * values need this sidecar to be reverse-lookable.
+    * values need this rooted consensus index to be reverse-lookable.
     */
   case object ActiveAddressIndex extends SystemNamespaceLabel { val canonicalName = "active-address-index" }
 
@@ -276,11 +276,11 @@ object GlobalStateFieldId {
     *
     * '''Why hypergraph-namespaced (DAG-scoped), not system-namespaced.''' This is consensus-load-bearing single-use state read cross-shard
     * by the spend path — the exact role `ActiveAllowSpends` already plays — so it belongs in the consensus global `mptRoot`
-    * ([[consensusRootEntries]] keeps it; it is neither a path-dependent `SystemNamespace` sidecar nor an observation-dependent `Mg*`
-    * sub-field). WIRED at `numShards > 1` (2026-06-29): the producer writes the spent-marker at the gl0 fold
-    * (`CrossShardMessageEngine.write`, `GlobalSnapshotAcceptanceManager` ~:3089) and the consumer reads it via
-    * `ConsumedAllowSpendStateManager.materializeConsumedAllowSpendsFromMpt` — absence-checked and written atomically in the same snapshot.
-    * INERT at `numShards = 1` (never written ⇒ empty ⇒ `mptRoot` byte-identical to the pre-sharding path).
+    * ([[consensusRootEntries]] keeps it; it is not the observation-dependent field-32 `Mg*` sub-field). WIRED at `numShards > 1`
+    * (2026-06-29): the producer writes the spent-marker at the gl0 fold (`CrossShardMessageEngine.write`, `GlobalSnapshotAcceptanceManager`
+    * ~:3089) and the consumer reads it via `ConsumedAllowSpendStateManager.materializeConsumedAllowSpendsFromMpt` — absence-checked and
+    * written atomically in the same snapshot. INERT at `numShards = 1` (never written ⇒ empty ⇒ `mptRoot` byte-identical to the
+    * pre-sharding path).
     */
   case object ConsumedAllowSpends extends GlobalStateFieldId { def toInt: Int = 33 }
 
@@ -302,9 +302,9 @@ object GlobalStateFieldId {
     *
     * '''Why hypergraph-namespaced (DAG-scoped), not system-namespaced.''' This is consensus-load-bearing slash state read by the active-set
     * cooldown gate + the double-slash guard — the same consensus role as `ActiveDelegatedStakes` — so it belongs in the consensus global
-    * `mptRoot` ([[consensusRootEntries]] keeps it; it is neither a path-dependent `SystemNamespace` sidecar nor an observation-dependent
-    * `Mg*` sub-field). It is written ONLY on the upheld-dispute sink in `GlobalSnapshotAcceptanceManager`, which is reachable only at
-    * `numShards > 1`; at `numShards = 1` the partition stays empty, so the `mptRoot` is byte-identical to the pre-slash path.
+    * `mptRoot` ([[consensusRootEntries]] keeps it; it is not the observation-dependent field-32 `Mg*` sub-field). It is written ONLY on the
+    * upheld-dispute sink in `GlobalSnapshotAcceptanceManager`, which is reachable only at `numShards > 1`; at `numShards = 1` the partition
+    * stays empty, so the `mptRoot` is byte-identical to the pre-slash path.
     */
   case object Slashings extends GlobalStateFieldId { def toInt: Int = 34 }
 
@@ -316,9 +316,12 @@ object GlobalStateFieldId {
     * `globalSnapshotSyncView` is OBSERVATION-DEPENDENT: the metagraph producer accumulates it under the FULL consensus committee, a
     * re-deriving gl0 verifier (and the currency-layer follower) under only the 2/3 signers (#259), so honest nodes hold DIFFERENT per-peer
     * maps. That observation-dependent drift cannot participate in the globally recreated per-MG root: honest nodes could otherwise derive
-    * different roots from identical economic inputs and freeze the MG out of GL0 adoption. GL0 does NOT consume a metagraph's view of
-    * gl0-syncs, so the field is excluded from this root. The metagraph's OWN `CurrencySnapshotInfo.stateProof` still commits to it
-    * independently. See `ShardCheckpointWiring.reExecDerivationAtPinnedBase`.
+    * different roots from identical economic inputs and freeze the MG out of GL0 adoption.
+    *
+    * '''ECO-F32: this exclusion is containment, not proof that the field is unused.''' GL0 shard replay consumes the prior
+    * `CurrencySnapshotInfo`, including this view. The target signed currency lane must therefore bind the exact optional full-view replay
+    * witness and its ML0 operator population before GL0 removes field 32 from every MPT/diff/load path. The metagraph's own
+    * `CurrencySnapshotInfo.stateProof` continues to commit it. See `ShardCheckpointWiring.reExecDerivationAtPinnedBase`.
     */
   val infoSubFields: Set[GlobalStateFieldId] =
     Set(
@@ -502,35 +505,23 @@ object GlobalStateKey {
       GlobalStateKey(SystemNamespace(label), GlobalStateFieldId.SystemIndex, EmptyNamespace, HashNamespace(h))
     }
 
-  /** Hex prefix that every `SystemNamespace` (sidecar) entry carries: the `PKTSystem` keyType byte `0x03` serialized as `"03"` at offset 0
-    * (see `PartitionKeyType.PKTSystem` and `toHex`). Sidecar partitions — `ActiveAddressIndex`, the AllowSpend / TokenLock / NodeCollateral
-    * expiry buckets — are the ONLY partitions under this prefix; all user-field partitions are `00`/`01`/`02`.
+  /** Hex prefix that every `SystemNamespace` consensus-index entry carries: the `PKTSystem` keyType byte `0x03` serialized as `"03"` at
+    * offset 0 (see `PartitionKeyType.PKTSystem` and `toHex`). `ActiveAddressIndex` and the AllowSpend / TokenLock / NodeCollateral expiry
+    * buckets are the only partitions under this prefix; all user-field partitions are `00`/`01`/`02`.
     */
   val systemNamespaceHexPrefix: String = "03"
 
-  /** True iff `hex` is a `SystemNamespace` (sidecar) entry. O(1) prefix check — no fieldId parse.
+  /** True iff `hex` is a `SystemNamespace` consensus-index entry. O(1) prefix check — no fieldId parse.
     *
-    * '''Consensus contract''': sidecar entries are local read-acceleration indices, NOT consensus state. The `ActiveAddressIndex` partition
-    * in particular is maintained '''append-only''' on the incremental accept path (`applyActiveAddressIndexDelta` is always called with
-    * `removed = Set.empty`), so its contents are a function of the per-ordinal delta '''history''', not of the current KV state — two
-    * honest nodes that processed different (but equivalent-final) ordinal streams accumulate different index sets, and a rebuild from
-    * current keysets yields yet another value. Folding such a path-dependent partition into the consensus global `mptRoot` makes the root
-    * non-deterministic across nodes (surfaces as `stateProof[mptRoot]`-only divergence: every per-field proof matches because sidecars have
-    * no per-field proof slot, but the global root differs). The global root MUST therefore exclude every `SystemNamespace` entry — use
-    * `nonSystemNamespaceEntries` at every consensus-root computation site.
+    * These entries are transition inputs: address indices drive complete economic-state materialization and expiry buckets drive
+    * reservation release/refund decisions. They therefore belong to the canonical global `mptRoot`; a peer, disk image, or reorg base may
+    * not vary them independently of the signed root. `consensusRootEntries` retains every `SystemNamespace` entry.
     */
   def isSystemNamespaceHex(hex: Hex): Boolean =
     hex.value.startsWith(systemNamespaceHexPrefix)
 
-  /** Drop every `SystemNamespace` (sidecar) entry from a hex-keyed byte map. The surviving entries are exactly the user-field partitions
-    * that constitute the consensus state. Apply this immediately before any global-`mptRoot` `makeParallelFromBytes` so the root is a pure
-    * function of the user-field KV set (see `isSystemNamespaceHex`).
-    */
-  def nonSystemNamespaceEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
-    entries.filterNot { case (hex, _) => isSystemNamespaceHex(hex) }
-
-  /** The entry set that constitutes the CONSENSUS global `mptRoot`: [[nonSystemNamespaceEntries]] (drop path-dependent SystemNamespace
-    * sidecars) MINUS the observation-dependent per-metagraph `MgGlobalSnapshotSyncView` (fieldId 32).
+  /** The entry set that constitutes the CONSENSUS global `mptRoot`: every stored canonical entry, including all `SystemNamespace` economic
+    * indices, MINUS the observation-dependent per-metagraph `MgGlobalSnapshotSyncView` (fieldId 32).
     *
     * '''Why also drop field 32.''' `globalSnapshotSyncView` is a per-peer `Signed[GlobalSnapshotSync]` map the metagraph producer
     * accumulates under the FULL consensus committee, whereas a re-deriving gl0 node sees only the 2/3 signers (#259 / cause-2). Honest
@@ -539,13 +530,16 @@ object GlobalStateKey {
     * matches). Folding it into the consensus root makes the root non-deterministic across nodes: it froze the sharded per-MG adoption (the
     * cause-2 ADOPT-VERIFY freeze, since fixed by excluding it from `infoSubfields`) AND — because the producer commits `mptRoot` from the
     * overlay `postBytes` while the Tier-3 catch-up gate re-encodes from `info.allStateEntriesAsBytes` — it makes a lagging node's catch-up
-    * stateProof check ALWAYS mismatch on `mptRoot`, wedging recovery forever. gl0 never consumes a metagraph's view of gl0-syncs, so the
-    * field stays STORED + diffed + reconstructed (the mirror is unchanged) but leaves the consensus root. The metagraph's OWN
-    * `CurrencySnapshotInfo.stateProof` still commits to it. Apply at EVERY global-`mptRoot` site (producer + follower + catch-up + the #107
-    * self-check) so producer and verifier compute the byte-identical root. See `infoSubFields`.
+    * stateProof check ALWAYS mismatch on `mptRoot`, wedging recovery forever.
+    *
+    * '''ECO-F32 containment gap.''' Shard replay currently consumes the exact prior `CurrencySnapshotInfo`, whose own state proof commits
+    * to this map. Excluding field 32 from the global root therefore does NOT make it dispensable: a backfill that strips it cannot
+    * reproduce arbitrary-base currency replay. The target schema carries a root-bound exact replay witness in the signed currency lane,
+    * verifies it against `CurrencySnapshotStateProof.globalSnapshotSync`, then removes field 32 from every GL0 write/diff/load path. Until
+    * that lands, field 32 remains an open root-invisible-state defect; it must not be described as an unused cache. See `infoSubFields`.
     */
   def consensusRootEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
-    nonSystemNamespaceEntries(entries).filterNot {
+    entries.filterNot {
       case (hex, _) => fieldIdFromHex(hex).contains(GlobalStateFieldId.MgGlobalSnapshotSyncView)
     }
 

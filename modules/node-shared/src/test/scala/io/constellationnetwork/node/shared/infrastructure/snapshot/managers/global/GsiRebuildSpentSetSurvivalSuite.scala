@@ -33,13 +33,13 @@ import weaver.MutableIOSuite
 /** FINDING-S01 regression — local GSI reconstruction must not wipe MPT-native consensus partitions.
   *
   * `ConsumedAllowSpends` (fieldId 33, the cross-shard single-use spent-set / nullifier) and `Slashings` (fieldId 34) are IN the signed
-  * consensus root (`GlobalStateKey.consensusRootEntries` keeps them; `GlobalSnapshotInfo.sidecarFreeMptRoot` folds them), but
+  * consensus root (`GlobalStateKey.consensusRootEntries` keeps them; `GlobalSnapshotInfo.consensusMptRoot` folds them), but
   * `GlobalSnapshotInfo` has NO case-class field for either partition. A local `syncFromGlobalSnapshotInfo` reconstruction that clears the
   * store and repopulates only GSI-native partitions would therefore drop 33/34:
   *
   *   1. the spent-set marker written at a FINALIZED ordinal vanishes ⇒ the SAME cross-shard allow-spend passes the W3d absence check again
   *      (a flag-independent cross-shard DOUBLE-SPEND), and
-  *   1. the rebuilt store's sidecar-free root no longer equals the signed `stateProof.mptRoot` ⇒ the node self-forks on its next stateProof
+  *   1. the rebuilt store's consensus root no longer equals the signed `stateProof.mptRoot` ⇒ the node self-forks on its next stateProof
   *      comparison.
   *
   * Scope is `numShards > 1` (both partitions are structurally empty at `numShards = 1`, which the identity test pins).
@@ -162,7 +162,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
 
   /** Settle + write the FIRST cross-shard consume at the finalized ordinal (the GSAM fold write: marker inserted with the canonical
     * `ConsumedAllowSpend` codec at `consumedAllowSpendKey`, plus a raw fieldId-34 `Slashings` entry through the same store), and return the
-    * sidecar-free consensus root the producer would SIGN over that state.
+    * consensus root the producer would SIGN over that state.
     */
   private def consumeAndFinalize(f: Fixture)(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[Hash] =
     for {
@@ -177,7 +177,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       // A fieldId-34 Slashings ledger entry at the same finalized ordinal (raw bytes — preservation is a bytes-level contract).
       _ <- f.store.underlying.insertBytes(Map(f.slashingsHex -> Array[Byte](1, 2, 3, 4))).flatMap(_.liftTo[IO])
       _ <- f.store.commit(ord2)
-      signedRoot <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+      signedRoot <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
     } yield signedRoot
 
   // ───────────────────────────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
 
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
       entriesAfter <- f.store.allEntriesAsBytes
-      rebuiltRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+      rebuiltRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
 
       // The SECOND consume of the SAME allow-spend, post-rebuild (the cross-shard double-spend replay). The owner mirror still
       // holds AS (it is GSI-native and legitimately survives the rebuild), so ONLY the spent-set stands between this replay
@@ -214,7 +214,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
         spentAfter.contains(f.asHash),
         // (2) the Slashings (fieldId 34) entry survives the rebuild
         entriesAfter.contains(f.slashingsHex),
-        // (3) the rebuilt sidecar-free root still equals the locally persisted signed consensus root
+        // (3) the rebuilt consensus root still equals the locally persisted signed root
         rebuiltRoot === signedRoot,
         // (4) replay of the same allow-spend is rejected because the spent-set survived
         replay.newMarkers.isEmpty,
@@ -230,9 +230,9 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
     implicit val (h, sp, js) = res
     for {
       f <- mkFixture // fixture writes nothing to 33/34 until consumeAndFinalize — spent-set empty here, as at numShards=1
-      rootBefore <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+      rootBefore <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
       _ <- f.store.syncFromGlobalSnapshotInfo(f.gsi, ord2)
-      rootAfter <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+      rootAfter <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
       spent <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
@@ -252,7 +252,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       signedRoot <- consumeAndFinalize(f)
       rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, signedRoot.some)
       entriesAfter <- f.store.allEntriesAsBytes
-      rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+      rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
@@ -273,12 +273,12 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       freshProducer <- InMemoryMerklePatriciaProducer.make[IO]()
       freshStore <- MptStore.make[IO, GlobalStateKey](freshProducer, GlobalStateKey.toHex[IO])
       _ <- freshStore.syncFromGlobalSnapshotInfo(f.gsi, ord2)
-      targetRoot <- freshStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+      targetRoot <- freshStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
       // The current store did consume (stale local markers that must not survive reconstruction to the persisted target).
       _ <- consumeAndFinalize(f)
       rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, targetRoot.some)
       entriesAfter <- f.store.allEntriesAsBytes
-      rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+      rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
@@ -297,7 +297,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       bogus = Hash("ff".padTo(64, 'f').take(64))
       rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, bogus.some)
       entriesAfter <- f.store.allEntriesAsBytes
-      rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+      rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
       spentAfter <- f.mgr.materializeConsumedAllowSpendsFromMpt
     } yield
       expect.all(
@@ -315,7 +315,7 @@ object GsiRebuildSpentSetSurvivalSuite extends MutableIOSuite {
       f <- mkFixture
       signedRoot <- consumeAndFinalize(f)
       rebuilt <- f.store.syncFromGlobalSnapshotInfoVerified(f.gsi, ord2, none[Hash])
-      rootAfter <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+      rootAfter <- f.store.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
     } yield
       expect.all(
         !rebuilt,

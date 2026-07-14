@@ -288,7 +288,7 @@ object NakamotoSyncDaemon {
     * by-ordinal `/global-snapshots/<ord>/mpt-entries` route. Consumed by `PinnedCurrencyInfoReader.PinnedByteBackfill` to heal HOLES in the
     * local signed store at a stamped shard-checkpoint `executionBaseOrdinal`.
     *
-    * TRANSPORT-ONLY, deliberately UNVERIFIED here: the pinned reader verifies `sidecarFreeMptRoot(fetched) === its OWN locally-committed
+    * TRANSPORT-ONLY, deliberately UNVERIFIED here: the pinned reader verifies `consensusMptRoot(fetched) === its OWN locally-committed
     * `stateProof.mptRoot@ordinal`` before anything is staged or served. Byte integrity comes from that root gate, not the transport. Tries
     * up to `maxPeers` responsive peers (sorted by peer id for stable behavior — the VERIFIED outcome is peer-independent, root-determined)
     * with a per-try `perPeerTimeout` so a hung peer cannot stall the accept fold; a peer without the ordinal 404s and the next is tried.

@@ -7,7 +7,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRead}
 import io.constellationnetwork.schema.transaction.{Transaction, TransactionReference}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
@@ -21,9 +21,9 @@ trait TransactionReferenceManager[F[_]] {
     acceptedTransactions: SortedSet[Signed[Transaction]]
   ): F[SortedMap[Address, TransactionReference]]
 
-  /** Materialize the full `address → TransactionReference` view via the `ActiveAddressIndex` sidecar. The reference value type doesn't
-    * carry the address, so we recover the keyset from the sidecar partition and `getMany` each entry. Used by GSAM to source the
-    * prior-ordinal `lastTxRefs` map without consulting `lastSnapshotContext`.
+  /** Materialize the full `address → TransactionReference` view via the rooted `ActiveAddressIndex`. The reference value type doesn't carry
+    * the address, so the index supplies the keyset and every indexed target must be present and decodable in the same authenticated view.
+    * Used by GSAM to source the prior-ordinal `lastTxRefs` map without consulting `lastSnapshotContext`.
     */
   def materializeLastTxRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TransactionReference]]
 }
@@ -50,14 +50,24 @@ object TransactionReferenceManager {
     def materializeLastTxRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TransactionReference]] =
       for {
         indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastTxRefs)
-        addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-        addrList = addrSet.toList
-        keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, addr))
-        values <- reader.getMany[TransactionReference](keys)
-      } yield
-        SortedMap.from(addrList.flatMap { addr =>
-          val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, addr)
-          values.get(key).map(addr -> _)
-        })
+        indexHex <- GlobalStateKey.toHex[F](indexKey)
+        addrSet <- StrictMptRead.valueOrElseF(
+          reader.getStrict[SortedSet[Address]](indexKey),
+          SortedSet.empty[Address],
+          "materialize LastTxRefs ActiveAddressIndex",
+          indexHex
+        )
+        entries <- addrSet.toList.traverse { addr =>
+          val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, addr)
+          for {
+            targetHex <- GlobalStateKey.toHex[F](targetKey)
+            value <- StrictMptRead.requirePresentF(
+              reader.getStrict[TransactionReference](targetKey),
+              s"materialize LastTxRefs indexed target(address=$addr)",
+              targetHex
+            )
+          } yield addr -> value
+        }
+      } yield SortedMap.from(entries)
   }
 }

@@ -47,7 +47,7 @@ trait MptStore[F[_], K] {
 
   /** Decoded view of `producer.entriesWithPrefix(prefix)`. Returns `Map[Hex, V]` rather than `Map[K, V]` because the key encoding (`toHex`)
     * is one-way for hashed-component namespaces — consumers that need `Map[Address, V]` either decode the value's `source` field
-    * (AllowSpend/TokenLock/etc.) or pair this with a sidecar address index.
+    * (AllowSpend/TokenLock/etc.) or pair this with a rooted address index.
     */
   def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
   def insert[V: ImmutableCodec](key: K, value: V): F[Unit]
@@ -85,7 +85,7 @@ trait MptStore[F[_], K] {
   /** Load a pre-signed hex-keyed byte map VERBATIM at `ordinal` — the 3c-A "MPT is the state" primitive
     * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). Unlike [[sync]]/[[syncFull]], which re-encode a typed `Map[K,V]` through the
     * per-field `ImmutableCodec`, this stores the exact bytes that were signed (no re-encode). So a follower that loads gl0's served
-    * `stateProof`-bytes and recomputes `GlobalSnapshotInfo.sidecarFreeMptRoot(entries)` obtains the producer's signed `mptRoot` BY
+    * `stateProof`-bytes and recomputes `GlobalSnapshotInfo.consensusMptRoot(entries)` obtains the producer's signed `mptRoot` BY
     * CONSTRUCTION — eliminating the `recomputed ≠ signed` drift the `syncFromGlobalSnapshotInfo` re-encode path exhibits. Mirrors
     * [[syncFull]]'s clear→insert→persist→build→bookkeep tail, minus the codec round-trip.
     */
@@ -322,7 +322,7 @@ object MptStore {
     override def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal): F[Unit] =
       // 3c-A: store the SIGNED byte map verbatim — same clear→insert→persist→build→bookkeep tail as `syncFull`, but the input is the
       // already-encoded `(Hex → bytes)` map (NO `toHexEntries` codec round-trip). `producer.insertBytes(...).void` matches `syncFull`;
-      // a partial/corrupt load is caught downstream by the follower's `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate.
+      // a partial/corrupt load is caught downstream by the follower's `consensusMptRoot(entries) === signed mptRoot` verify gate.
       if (entries.isEmpty)
         logger.info(s"[MptStore] loadBytes empty at ordinal=$ordinal, clearing") >>
           clear >> lastSyncedOrdinalRef.set(Some(ordinal))

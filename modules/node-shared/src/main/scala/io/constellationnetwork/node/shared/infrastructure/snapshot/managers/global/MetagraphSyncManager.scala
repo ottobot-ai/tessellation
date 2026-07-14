@@ -22,7 +22,7 @@ case class MetagraphSyncAcceptanceResult(
 
 trait MetagraphSyncManager[F[_]] {
   def acceptMetagraphSyncData(
-    lastSnapshotContext: GlobalSnapshotInfo,
+    existingData: SortedMap[Address, MetagraphSyncDataInfo],
     incomingCurrencySnapshots: SortedMap[Address, List[CurrencySnapshotWithState]],
     globalSnapshotsProcessed: Map[Address, List[GlobalSnapshotsProcessed]],
     acceptedSpendActions: Map[Address, List[SpendAction]],
@@ -52,14 +52,13 @@ object MetagraphSyncManager {
       new MetagraphSyncManager[F] {
 
         def acceptMetagraphSyncData(
-          lastSnapshotContext: GlobalSnapshotInfo,
+          existingData: SortedMap[Address, MetagraphSyncDataInfo],
           incomingCurrencySnapshots: SortedMap[Address, List[CurrencySnapshotWithState]],
           globalSnapshotsProcessed: Map[Address, List[GlobalSnapshotsProcessed]],
           acceptedSpendActions: Map[Address, List[SpendAction]],
           currentGlobalOrdinal: SnapshotOrdinal,
           currentGlobalEpochProgress: EpochProgress
-        ): F[MetagraphSyncAcceptanceResult] = {
-          val existingData = lastSnapshotContext.metagraphSyncData.getOrElse(SortedMap.empty[Address, MetagraphSyncDataInfo])
+        ): F[MetagraphSyncAcceptanceResult] =
           for {
             (updatedFromSnapshots, snapshotDeltas) <- updateFromCurrencySnapshots(
               existingData,
@@ -79,7 +78,6 @@ object MetagraphSyncManager {
             val mergedDeltas = snapshotDeltas ++ spendActionDeltas
             MetagraphSyncAcceptanceResult(updatedFromSpendActions, mergedDeltas)
           }
-        }
 
         private def updateFromCurrencySnapshots(
           existingData: SortedMap[Address, MetagraphSyncDataInfo],

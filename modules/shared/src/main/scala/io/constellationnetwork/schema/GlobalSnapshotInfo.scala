@@ -259,14 +259,14 @@ object GlobalSnapshotInfo {
             case Some(p) =>
               // Keep the producer's per-ordinal trie warm (its root-hash cache feeds downstream reads), but DERIVE
               // the consensus proof from the producer's OWN byte map (`p.entries`, straight from the MPT store) —
-              // NOT from `info.allStateEntriesAsBytes`. `mptStateProofFromBytes` excludes the path-dependent
-              // SystemNamespace sidecars (`GlobalStateKey.isSystemNamespaceHex`), so download/traverse/sync compute a
-              // byte-identical, deterministic global root to the one the accept path bakes into the signed artifact.
-              // `info` is used ONLY for the present-only per-field Option lifting (exactly as the accept path passes
-              // `gsi` to the same helper) — never as a byte source. `p.entries` is already `Hex`-keyed, so no toHex.
+              // NOT from `info.allStateEntriesAsBytes`. `mptStateProofFromBytes` commits every economic SystemNamespace
+              // index and excludes only field-32 observation metadata, so download/traverse/sync compute a byte-identical
+              // global root to the one the accept path bakes into the signed artifact.
+              // Optional proof presence is derived from these authenticated bytes, never from the accompanying GSI's
+              // `Option` shape. `p.entries` is already `Hex`-keyed, so no toHex.
               p.buildForOrdinal(ordinal).flatMap {
                 case Left(err) => err.raiseError[F, GlobalSnapshotStateProof]
-                case Right(_)  => p.entries.flatMap(bytes => mptStateProofFromBytes[F](info, bytes))
+                case Right(_)  => p.entries.flatMap(mptStateProofFromBytes[F])
               }
             case None =>
               mptStateProof[F](info)
@@ -285,30 +285,29 @@ object GlobalSnapshotInfo {
       entries.toList.parTraverse {
         case (k, v) => io.constellationnetwork.schema.mpt.GlobalStateKey.toHex[F](k).map(_ -> v)
       }
-        .flatMap(pairs => mptStateProofFromBytes[F](info, pairs.toMap))
+        .flatMap(pairs => mptStateProofFromBytes[F](pairs.toMap))
     }
 
   /** Build an MPT state proof from a pre-computed byte map, sharing the per-field-root + GlobalSnapshotStateProof shape with
     * `mptStateProof[F](info)`. Used when the byte source is NOT `info.allStateEntriesAsBytes` — specifically GSAM's accept() pipeline under
     * `OverlayMode.MultiBranch`, where the proof's `mptRoot` must reflect the post-write overlay+handle view (base + parent chain +
     * uncommitted handle accumulator), not the producer's stale per-ordinal root nor a fresh GSI re-encode that may diverge from the
-    * actually-committed bytes under sidecar/expiry-index drift.
+    * actually-committed bytes under projection/expiry-index drift.
     *
     * Caller is responsible for ensuring `entries` matches the consensus-relevant post-acceptance state. The parity gate (#107) is the
-    * byte-equivalence contract between `info.allStateEntriesAsBytes` and overlay-derived bytes.
+    * byte-equivalence contract between `info.allStateEntriesAsBytes` and overlay-derived bytes. This API deliberately accepts no GSI or
+    * local protocol configuration: the aggregate root, per-field roots, and every optional proof slot are canonical projections of the
+    * authenticated byte map alone.
     */
   def mptStateProofFromBytes[F[_]: Parallel: Async: Hasher: JsonSerializer](
-    info: GlobalSnapshotInfo,
     entries: Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]
-  )(
-    implicit stateProofSelector: StateProofSelector,
-    withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalSnapshotStateProof] = {
     val FId = io.constellationnetwork.schema.mpt.GlobalStateFieldId
 
     // Group hex-keyed entries by `fieldId` parsed from the network-namespace prefix
-    // (`GlobalStateKey.fieldIdFromHex`). Entries with malformed prefixes are dropped — they
-    // wouldn't survive the producer's typed encoding either, so they can't influence consensus.
+    // (`GlobalStateKey.fieldIdFromHex`). A malformed prefix has no exposed per-field proof slot, but it still participates in the
+    // aggregate consensus root unless it is the explicitly excluded field-32 encoding. Ingress/recovery and typed RMW paths must reject
+    // malformed physical keys/values; omission from this grouping is not authorization to ignore them.
     val perFieldGrouping
       : Map[io.constellationnetwork.schema.mpt.GlobalStateFieldId, Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]] =
       entries.toList.flatMap {
@@ -316,14 +315,9 @@ object GlobalSnapshotInfo {
           io.constellationnetwork.schema.mpt.GlobalStateKey.fieldIdFromHex(hex).map(fid => fid -> (hex -> bytes))
       }.groupMap(_._1)(_._2).view.mapValues(_.toMap).toMap
 
-    // Consensus determinism (fork-recovery mptRoot storm fix): the global root must be a pure function of the
-    // user-field KV state. SystemNamespace sidecar entries (ActiveAddressIndex, expiry buckets) are local
-    // read-acceleration indices with no per-field proof slot; the ActiveAddressIndex partition is maintained
-    // append-only on the accept path, so its contents are path-dependent (a function of the delta history, not
-    // the current state) and differ across nodes that processed different-but-equivalent ordinal streams or that
-    // rebuilt from current keysets. Folding them into the global root produced `stateProof[mptRoot]`-only
-    // divergence. Excluding every `03…` entry makes the root deterministic. See `GlobalStateKey.isSystemNamespaceHex`.
-    val userEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(entries)
+    // The global root commits every economic SystemNamespace index. Field-32 observation metadata is the sole
+    // currently root-excluded partition; ECO-F32 separately removes it from the GL0 diff/write set.
+    val consensusEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(entries)
 
     for {
       // Compute the global mptRoot and per-fieldId subtree roots in parallel from the same byte map.
@@ -332,7 +326,7 @@ object GlobalSnapshotInfo {
       // Each subtree root is the rootHash of an MPT built from only that fieldId's entries — gives
       // the case class's per-field Option[Hash] slots a well-defined, verifiable value (instead of None).
       results <- (
-        io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[F](userEntries).map(_.rootHash),
+        io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[F](consensusEntries).map(_.rootHash),
         perFieldGrouping.toList.parTraverse {
           case (fieldId, fieldEntries) =>
             // Shared per-field root computation — keep in lockstep with the producer path
@@ -354,33 +348,40 @@ object GlobalSnapshotInfo {
       def fieldRoot(id: io.constellationnetwork.schema.mpt.GlobalStateFieldId): Hash =
         perField.getOrElse(id, Hash.empty)
 
+      def hasFieldEntries(id: io.constellationnetwork.schema.mpt.GlobalStateFieldId): Boolean =
+        perFieldGrouping.get(id).exists(_.nonEmpty)
+
+      def optionalFieldRoot(id: io.constellationnetwork.schema.mpt.GlobalStateFieldId): Option[Hash] =
+        Option.when(hasFieldEntries(id))(fieldRoot(id))
+
+      val hasCurrencySnapshotEntries =
+        hasFieldEntries(FId.LastIncrementalCurrencySnapshots) || FId.infoSubFields.exists(hasFieldEntries)
+
       GlobalSnapshotStateProof(
         lastStateChannelSnapshotHashesProof = fieldRoot(FId.LastStateChannelSnapshotHashes),
         lastTxRefsProof = fieldRoot(FId.LastTxRefs),
         balancesProof = fieldRoot(FId.Balances),
         // SIGNED currency-snapshots per-field roots: `incrementalRoot` from the `perField` map (fieldId 5, still a single partition) +
         // `currencyInfoRoot` = the UNION over the 8 unrolled `Mg*` infoSubFields computed above (the fieldId-6 blob is gone). `Some` iff the
-        // currency map is non-empty (matches the `info.<field>.map(_ => …)` present-only convention). Byte-identical to the follower's
+        // authenticated currency partitions are non-empty. Byte-identical to the follower's
         // `GlobalStateConverter.currencySnapshotFieldRoots` recompute (same `fieldRootFromBytes` path, same union). This is field 4.
         lastCurrencySnapshotsProof =
-          if (info.lastCurrencySnapshots.isEmpty) None
+          if (!hasCurrencySnapshotEntries) None
           else Some(CurrencySnapshotMptRoots(fieldRoot(FId.LastIncrementalCurrencySnapshots), currencyInfoRoot)),
-        activeAllowSpends = info.activeAllowSpends.map(_ => fieldRoot(FId.ActiveAllowSpends)),
-        activeTokenLocks = info.activeTokenLocks.map(_ => fieldRoot(FId.ActiveTokenLocks)),
-        tokenLockBalances = info.tokenLockBalances.map(_ => fieldRoot(FId.TokenLockBalances)),
-        lastAllowSpendRefs = info.lastAllowSpendRefs.map(_ => fieldRoot(FId.LastAllowSpendRefs)),
-        lastTokenLockRefs = info.lastTokenLockRefs.map(_ => fieldRoot(FId.LastTokenLockRefs)),
-        updateNodeParameters = info.updateNodeParameters.map(_ => fieldRoot(FId.UpdateNodeParameters)),
-        activeDelegatedStakes = info.activeDelegatedStakes.map(_ => fieldRoot(FId.ActiveDelegatedStakes)),
-        delegatedStakesWithdrawals = info.delegatedStakesWithdrawals.map(_ => fieldRoot(FId.DelegatedStakesWithdrawals)),
-        activeNodeCollaterals = info.activeNodeCollaterals.map(_ => fieldRoot(FId.ActiveNodeCollaterals)),
-        nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.map(_ => fieldRoot(FId.NodeCollateralWithdrawals)),
-        priceState = info.priceState.map(_ => fieldRoot(FId.PriceState)),
+        activeAllowSpends = optionalFieldRoot(FId.ActiveAllowSpends),
+        activeTokenLocks = optionalFieldRoot(FId.ActiveTokenLocks),
+        tokenLockBalances = optionalFieldRoot(FId.TokenLockBalances),
+        lastAllowSpendRefs = optionalFieldRoot(FId.LastAllowSpendRefs),
+        lastTokenLockRefs = optionalFieldRoot(FId.LastTokenLockRefs),
+        updateNodeParameters = optionalFieldRoot(FId.UpdateNodeParameters),
+        activeDelegatedStakes = optionalFieldRoot(FId.ActiveDelegatedStakes),
+        delegatedStakesWithdrawals = optionalFieldRoot(FId.DelegatedStakesWithdrawals),
+        activeNodeCollaterals = optionalFieldRoot(FId.ActiveNodeCollaterals),
+        nodeCollateralWithdrawals = optionalFieldRoot(FId.NodeCollateralWithdrawals),
+        priceState = optionalFieldRoot(FId.PriceState),
         lastGlobalSnapshotsWithCurrency = None,
         mptRoot = Some(mptRoot.value),
-        historicalStakeSnapshots =
-          if (info.historicalStakeSnapshots.isEmpty) None
-          else Some(fieldRoot(FId.HistoricalStakeSnapshots)),
+        historicalStakeSnapshots = optionalFieldRoot(FId.HistoricalStakeSnapshots),
         // smtRoot intentionally None on this byte-rebuild path — see the producer-path note above. GSAM's accept() overrides it with the
         // maintained store's cutoff-root after calling this helper (smtRoot is set on the returned proof, not derived from `entries`).
         smtRoot = None
@@ -388,13 +389,13 @@ object GlobalSnapshotInfo {
     }
   }
 
-  /** Recompute the consensus global `mptRoot` from a hex-keyed byte map, EXCLUDING the path-dependent SystemNamespace sidecars AND the
-    * observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`) — the EXACT global-root computation
+  /** Recompute the consensus global `mptRoot` from a hex-keyed byte map, INCLUDING every SystemNamespace economic index and excluding the
+    * observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`) — the exact global-root computation
     * `mptStateProofFromBytes` performs (`makeParallelFromBytes(consensusRootEntries(...))`). Use at every adopt/verify site that compares a
     * locally-rebuilt store root against a signed `stateProof.mptRoot`, so the comparison stays apples-to-apples. Keep in lockstep with the
-    * `userEntries` global-root line in `mptStateProofFromBytes`.
+    * `consensusEntries` global-root line in `mptStateProofFromBytes`.
     */
-  def sidecarFreeMptRoot[F[_]: Async: Parallel: Hasher: JsonSerializer](
+  def consensusMptRoot[F[_]: Async: Parallel: Hasher: JsonSerializer](
     entries: Map[io.constellationnetwork.security.hex.Hex, Array[Byte]]
   ): F[Hash] =
     io.constellationnetwork.security.mpt.MerklePatriciaTrie

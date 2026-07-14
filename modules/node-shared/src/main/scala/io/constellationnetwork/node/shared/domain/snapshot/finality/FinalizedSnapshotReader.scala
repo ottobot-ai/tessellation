@@ -42,10 +42,10 @@ trait FinalizedSnapshotReader[F[_], S <: Snapshot, SI <: SnapshotInfo[_]] {
     * map at that same finalized ordinal, as the JSON triple `[ Signed[S], SI, Map[Hex, Array[Byte]] ]`. Finality-gated identically to
     * [[latestCombinedResponse]]: it resolves the SAME servable ordinal (finalized, or the most recent checkpoint at-or-below finalized) and
     * appends the signed byte map read VERBATIM from `MptStateStorage.readState(thatOrdinal)` — the exact bytes gl0 signed, never a
-    * re-encode. So a follower that loads the third element via `MptStore.loadBytes` obtains `sidecarFreeMptRoot(entries) === signed
-    * mptRoot` BY CONSTRUCTION (the drift the `syncFromGlobalSnapshotInfo` re-encode path exhibited). `None` when no servable combined
-    * snapshot exists yet, OR when the signed byte file for the resolved ordinal is absent (e.g. MPT cutoff pruned it) — in both cases the
-    * route returns the same not-servable status as `/latest/combined`. GLOBAL-only: implementations without an `MptStateStorage` (BFT /
+    * re-encode. So a follower that loads the third element via `MptStore.loadBytes` obtains `consensusMptRoot(entries) === signed mptRoot`
+    * BY CONSTRUCTION (the drift the `syncFromGlobalSnapshotInfo` re-encode path exhibited). `None` when no servable combined snapshot
+    * exists yet, OR when the signed byte file for the resolved ordinal is absent (e.g. MPT cutoff pruned it) — in both cases the route
+    * returns the same not-servable status as `/latest/combined`. GLOBAL-only: implementations without an `MptStateStorage` (BFT /
     * non-global layers) return `None`, leaving their routes byte-identical.
     */
   def latestMptEntriesResponse: F[Option[Response[F]]]
@@ -148,7 +148,7 @@ object FinalizedSnapshotReader {
 
     // 3c-A: append the signed MPT byte map to the SAME finalized combined pair `/latest/combined` serves. Build the
     // `[snapshot, state, entries]` triple at a SINGLE ordinal so the follower's `loadBytes(entries, ord)` →
-    // `sidecarFreeMptRoot === snapshot.stateProof.mptRoot` holds by construction. Reads the checkpoint file's raw JSON
+    // `consensusMptRoot === snapshot.stateProof.mptRoot` holds by construction. Reads the checkpoint file's raw JSON
     // (the 2-array `[snapshot, state]` — `fileStorage` holds Encoders only, so we splice the JSON verbatim rather than
     // re-encode S/SI) and `byteStore.readState(thatSameOrdinal)`. `None` when either file is absent at `ordinal`.
     def buildTripleAt(byteStore: MptStateStorage[F], ordinal: SnapshotOrdinal): F[Option[Response[F]]] =

@@ -88,7 +88,7 @@ abstract class SnapshotClient[
   /** 3c-A — fetch gl0's SIGNED MPT byte map at its latest finalized ordinal alongside the snapshot + its GSI
     * (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A). The route returns the JSON triple `[ Signed[snapshot], snapshotInfo (GSI), Map[Hex,
     * Array[Byte]] ]`. A follower loads the third element VERBATIM via `MptStore.loadBytes` (no re-encode), so its
-    * `sidecarFreeMptRoot(entries) === signed mptRoot` verify gate passes BY CONSTRUCTION — eliminating the `recomputed ≠ signed` drift the
+    * `consensusMptRoot(entries) === signed mptRoot` verify gate passes BY CONSTRUCTION — eliminating the `recomputed ≠ signed` drift the
     * `syncFromGlobalSnapshotInfo` re-encode path exhibits. The GSI is carried through ONLY for `setForRecovery` (do NOT re-derive the root
     * from it). Mirrors [[getLatest]]'s stream decode with a third element decoded by `MptStateStorage.mptEntriesDecoder` (the shared
     * byte-map codec anchor).

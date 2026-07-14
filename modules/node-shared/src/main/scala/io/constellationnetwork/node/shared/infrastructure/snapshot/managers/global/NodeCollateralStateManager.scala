@@ -39,10 +39,9 @@ trait NodeCollateralStateManager[F[_]] {
   /** Index-driven sweep of expired NC withdrawals.
     *
     * Sweeps the NC-withdrawal expiry index for buckets `[previousEpochProgress + 1 .. epochProgress]` — the range covering withdrawals
-    * whose expiry epoch (`createdAt + withdrawalTimeLimit`) fell into the past since the previous accept. The bucket keys already encode
-    * the expiry epoch, so `withdrawalTimeLimit` is not passed here — the index was maintained using the same config at write-time, so its
-    * contents are authoritative. Resolves each expiring key's hash via `mptStore.getNodeCollateralWithdrawals(addr)` instead of iterating
-    * an in-memory full map.
+    * whose expiry epoch (`createdAt + withdrawalTimeLimit`) fell into the past since the previous accept. Each bucket epoch is checked
+    * against that target-derived expiry before the withdrawal can expire; the rooted index is not independently authoritative. Resolves
+    * each expiring key's hash via `mptStore.getNodeCollateralWithdrawals(addr)` instead of iterating an in-memory full map.
     *
     * Note the sweep bounds differ from AllowSpend/TokenLock: NC's legacy predicate is `<=` (expiry_epoch <= currentEpoch), so the delta
     * window is `(prevEpoch, curEpoch]` — inclusive upper bound, exclusive lower. The other two are `<` so the window is `[prevEpoch,
@@ -50,7 +49,8 @@ trait NodeCollateralStateManager[F[_]] {
     */
   def findExpiredWithdrawalsViaIndexFromMpt(
     previousEpochProgress: EpochProgress,
-    epochProgress: EpochProgress
+    epochProgress: EpochProgress,
+    withdrawalTimeLimit: EpochProgress
   )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]]
 
   def getUpdatedCreateNodeCollaterals(
@@ -108,11 +108,7 @@ object NodeCollateralStateManager {
       val existingWithdrawals =
         lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty[Address, SortedSet[PendingNodeCollateralWithdrawal]])
 
-      // `withdrawalTimeLimit` is unused on the MPT path: the expiry epoch was baked into the index keys at write-time
-      // using the same config, so the bucket window alone is authoritative. Retained on the trait signature for callers.
-      val _ = withdrawalTimeLimit
-
-      findExpiredWithdrawalsViaIndexFromMpt(previousEpochProgress, epochProgress).map { expiredWithdrawals =>
+      findExpiredWithdrawalsViaIndexFromMpt(previousEpochProgress, epochProgress, withdrawalTimeLimit).map { expiredWithdrawals =>
         // NB: `SortedMap.flatMap { case (a, ws) => ws.map(w => (a, w)) }` would build a `Map` keyed by `a`,
         // dropping all but one `(a, w)` per address. Use `.iterator.flatMap` so the result preserves every pair.
         val expiredPairs: Set[(Address, PendingNodeCollateralWithdrawal)] =
@@ -127,7 +123,8 @@ object NodeCollateralStateManager {
 
     def findExpiredWithdrawalsViaIndexFromMpt(
       previousEpochProgress: EpochProgress,
-      epochProgress: EpochProgress
+      epochProgress: EpochProgress,
+      withdrawalTimeLimit: EpochProgress
     )(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] = {
       val fromL = previousEpochProgress.value.value + 1L
       val toL = epochProgress.value.value
@@ -139,27 +136,62 @@ object NodeCollateralStateManager {
 
         for {
           buckets <- epochs.traverse { e =>
-            GlobalStateKey
-              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, e)
-              .flatMap(reader.get[SortedSet[NodeCollateralWithdrawalExpiryKey]])
-              .map(_.getOrElse(SortedSet.empty[NodeCollateralWithdrawalExpiryKey]))
+            for {
+              key <- GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals, e)
+              hexKey <- GlobalStateKey.toHex[F](key)
+              bucket <- StrictMptRead.valueOrElseF(
+                reader.getStrict[SortedSet[NodeCollateralWithdrawalExpiryKey]](key),
+                SortedSet.empty[NodeCollateralWithdrawalExpiryKey],
+                s"sweep ExpiryIndex(label=${SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals.canonicalName},epoch=${e.value.value})",
+                hexKey
+              )
+            } yield e -> bucket
           }
-          allKeys = buckets.flatten.toSet
-          byAddress = allKeys.groupBy(_.address)
-          resolved <- byAddress.toList.traverse {
-            case (addr, expiryKeys) =>
-              reader
-                .get[SortedSet[PendingNodeCollateralWithdrawal]](
-                  GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, addr)
+          indexedKeys = buckets.flatMap { case (bucketEpoch, bucket) => bucket.toList.map(bucketEpoch -> _) }
+          byAddress = indexedKeys.groupBy(_._2.address)
+          resolved <- byAddress.toList.sortBy(_._1).traverse {
+            case (addr, indexedExpiryKeys) =>
+              val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, addr)
+              val expectedEpochsByHash = indexedExpiryKeys.groupMap(_._2.hash)(_._1).view.mapValues(_.toSet).toMap
+              val expectedHashes = expectedEpochsByHash.keySet
+              for {
+                targetHex <- GlobalStateKey.toHex[F](targetKey)
+                addrSet <- StrictMptRead.requirePresentF(
+                  reader.getStrict[SortedSet[PendingNodeCollateralWithdrawal]](targetKey),
+                  s"expiry target NodeCollateralWithdrawals(address=$addr)",
+                  targetHex
                 )
-                .flatMap { addrSetOpt =>
-                  val addrSet = addrSetOpt.getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal])
-                  val expectedHashes = expiryKeys.map(_.hash)
-                  addrSet.toList.traverse(w => w.event.toHashed.map(h => (h.hash, w))).map { hashed =>
-                    val matched = hashed.collect { case (h, w) if expectedHashes.contains(h) => w }.to(SortedSet)
-                    addr -> matched
-                  }
-                }
+                hashed <- addrSet.toList.traverse(w => w.event.toHashed.map(h => (h.hash, w)))
+                actualHashes = hashed.iterator.map(_._1).toSet
+                missingHashes = expectedHashes -- actualHashes
+                wrongEpochs = hashed.collect {
+                  case (hash, withdrawal)
+                      if expectedEpochsByHash.contains(hash) &&
+                        expectedEpochsByHash(hash) != Set(withdrawal.createdAt |+| withdrawalTimeLimit) =>
+                    val indexed = expectedEpochsByHash(hash).toList.map(_.value.value).sorted.mkString("/")
+                    val actual = (withdrawal.createdAt |+| withdrawalTimeLimit).value.value
+                    s"${hash.value}:indexed=$indexed,actual=$actual"
+                }.sorted
+                _ <- Async[F]
+                  .raiseError[Unit](
+                    StrictMptRead.InconsistentConsensusMptIndex(
+                      s"expiry target NodeCollateralWithdrawals(address=$addr)",
+                      targetHex,
+                      s"bucket hashes absent from decoded target: ${missingHashes.toList.map(_.value).sorted.mkString(",")}"
+                    )
+                  )
+                  .whenA(missingHashes.nonEmpty)
+                _ <- Async[F]
+                  .raiseError[Unit](
+                    StrictMptRead.InconsistentConsensusMptIndex(
+                      s"expiry target NodeCollateralWithdrawals(address=$addr)",
+                      targetHex,
+                      s"bucket epoch differs from target expiry: ${wrongEpochs.mkString(",")}"
+                    )
+                  )
+                  .whenA(wrongEpochs.nonEmpty)
+                matched = hashed.collect { case (h, w) if expectedHashes.contains(h) => w }.to(SortedSet)
+              } yield addr -> matched
           }
         } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
       }

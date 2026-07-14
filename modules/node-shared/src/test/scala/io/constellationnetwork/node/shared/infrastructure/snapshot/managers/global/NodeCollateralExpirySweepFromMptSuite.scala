@@ -14,7 +14,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalTimeLimit}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -22,6 +22,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.{Signed, signature}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.nodeCollateralWithdrawalExpiryKeySetImmutableCodec
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -30,7 +31,7 @@ import weaver.MutableIOSuite
 /** Spec assertions for the surviving MPT-backed NC-withdrawal expiry sweep.
   *
   * After the legacy in-memory `findExpiredWithdrawalsViaIndex(map)` was deleted, this suite asserts
-  * `findExpiredWithdrawalsViaIndexFromMpt(prev, curr)` directly. NC differs from AllowSpend/TokenLock:
+  * `findExpiredWithdrawalsViaIndexFromMpt(prev, curr, limit)` directly. NC differs from AllowSpend/TokenLock:
   *
   *   1. Expiry predicate is `<=` (createdAt + WTL <= curr), so the sweep window is `(prev .. curr]` — `fromL = prev + 1`, `toL = curr` —
   *      inclusive upper, exclusive lower. 2. The expiry epoch is derived (`createdAt + withdrawalTimeLimit`) rather than stored in the
@@ -59,6 +60,9 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
 
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
+  private def sameBytes(left: Map[Hex, Array[Byte]], right: Map[Hex, Array[Byte]]): Boolean =
+    left.keySet == right.keySet && left.forall { case (key, bytes) => right.get(key).exists(_.sameElements(bytes)) }
 
   private def mkWithdrawal(
     source: Address,
@@ -126,7 +130,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
 
-      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch)
+      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch, withdrawalTimeLimit)
       indexPairs <- toAddressHashPairs(index)
 
       expectedHashed <- wExpired.event.toHashed
@@ -150,7 +154,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       currentEpoch = EpochProgress(NonNegLong(500L))
       prevEpoch = EpochProgress(NonNegLong(100L))
 
-      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch)
+      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch, withdrawalTimeLimit)
       indexPairs <- toAddressHashPairs(index)
     } yield expect(indexPairs.isEmpty)
   }
@@ -172,7 +176,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       currentEpoch = EpochProgress(NonNegLong(300L))
       prevEpoch = EpochProgress.MinValue
 
-      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch)
+      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch, withdrawalTimeLimit)
       indexPairs <- toAddressHashPairs(index)
 
       expectedHashed <- wBoundary.event.toHashed
@@ -197,7 +201,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       mgr = NodeCollateralStateManager.make[IO](GlobalStateReader.fromMptStore(store))
 
       sameEpoch = EpochProgress(NonNegLong(200L))
-      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(sameEpoch, sameEpoch)
+      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(sameEpoch, sameEpoch, withdrawalTimeLimit)
       indexPairs <- toAddressHashPairs(index)
     } yield expect(indexPairs.isEmpty)
   }
@@ -271,7 +275,7 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       prevEpoch = EpochProgress(NonNegLong(200L))
       currentEpoch = EpochProgress(NonNegLong(215L))
 
-      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch)
+      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch, withdrawalTimeLimit)
       indexPairs <- toAddressHashPairs(index)
 
       hashedAt201 <- w201.event.toHashed
@@ -308,8 +312,82 @@ object NodeCollateralExpirySweepFromMptSuite extends MutableIOSuite {
       prevEpoch = EpochProgress(NonNegLong(200L))
       currentEpoch = EpochProgress(NonNegLong(300L))
 
-      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch)
+      index <- mgr.findExpiredWithdrawalsViaIndexFromMpt(prevEpoch, currentEpoch, withdrawalTimeLimit)
       indexPairs <- toAddressHashPairs(index)
     } yield expect(indexPairs.isEmpty)
+  }
+
+  test("FromMpt sweep rejects an absent withdrawal target at its exact physical key without mutation") { res =>
+    implicit val (h, sp, js) = res
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = keyPair.getPublic.toAddress
+      peer = keyPair.getPublic.toId.toPeerId
+      withdrawal = mkWithdrawal(source, peer, EpochProgress(NonNegLong(50L)), "absent-target")
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(withdrawal)))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      _ <- store.remove(targetKey)
+      before <- store.allEntriesAsBytes
+      result <- NodeCollateralStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredWithdrawalsViaIndexFromMpt(
+          EpochProgress(NonNegLong(149L)),
+          EpochProgress(NonNegLong(150L)),
+          withdrawalTimeLimit
+        )
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                   => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("FromMpt sweep rejects a valid withdrawal hash indexed at the wrong expiry epoch without mutation") { res =>
+    implicit val (h, sp, js) = res
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = keyPair.getPublic.toAddress
+      peer = keyPair.getPublic.toId.toPeerId
+      // createdAt=50 and WTL=100 make epoch 150 the only valid expiry bucket.
+      withdrawal = mkWithdrawal(source, peer, EpochProgress(NonNegLong(50L)), "wrong-expiry-epoch")
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(withdrawal)))
+      hashed <- withdrawal.event.toHashed
+      forgedEpoch = EpochProgress(NonNegLong(149L))
+      forgedBucketKey <- GlobalStateKey.expiryIndexKey[IO](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        forgedEpoch
+      )
+      _ <- store.insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](
+        forgedBucketKey,
+        SortedSet(NodeCollateralWithdrawalExpiryKey(source, hashed.hash))
+      )
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      before <- store.allEntriesAsBytes
+      result <- NodeCollateralStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredWithdrawalsViaIndexFromMpt(
+          EpochProgress(NonNegLong(148L)),
+          forgedEpoch,
+          withdrawalTimeLimit
+        )
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.InconsistentConsensusMptIndex) => error.physicalKey == targetHex
+          case _                                                        => false
+        },
+        sameBytes(before, after)
+      )
   }
 }

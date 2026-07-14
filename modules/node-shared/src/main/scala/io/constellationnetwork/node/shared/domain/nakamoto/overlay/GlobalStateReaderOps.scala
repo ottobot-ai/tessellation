@@ -3,13 +3,13 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedSet
+import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
-import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
 import io.constellationnetwork.schema.tokenLock.TokenLock
@@ -104,5 +104,144 @@ object GlobalStateReaderOps {
       reader.get[Signed[CurrencySnapshot]](
         GlobalStateKey.metagraph(metagraphAddress, GlobalStateFieldId.LastCurrencySnapshots)
       )
+
+    /** Materialize the rooted state-channel-tip map. Every address named by the index must have one decodable target in this exact reader
+      * view; callers must fail/defer on an index/target gap instead of healing it from a GSI or another branch.
+      */
+    def materializeLastStateChannelSnapshotHashes(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, Hash]] =
+      for {
+        indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+        indexHex <- GlobalStateKey.toHex[F](indexKey)
+        addresses <- StrictMptRead.valueOrElseF(
+          reader.getStrict[SortedSet[Address]](indexKey),
+          SortedSet.empty[Address],
+          "materialize LastStateChannelSnapshotHashes ActiveAddressIndex",
+          indexHex
+        )
+        entries <- addresses.toList.traverse { address =>
+          val targetKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastStateChannelSnapshotHashes)
+          for {
+            targetHex <- GlobalStateKey.toHex[F](targetKey)
+            value <- StrictMptRead.requirePresentF(
+              reader.getStrict[Hash](targetKey),
+              s"materialize LastStateChannelSnapshotHashes indexed target(address=$address)",
+              targetHex
+            )
+          } yield address -> value
+        }
+      } yield SortedMap.from(entries)
+
+    /** Materialize the rooted metagraph-sync acknowledgement state. The index and every target are read from the same branch view, so a
+      * stale `GlobalSnapshotInfo` cannot become an alternate authority for pending economic acknowledgements.
+      */
+    def materializeMetagraphSyncData(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, MetagraphSyncDataInfo]] =
+      for {
+        indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.MetagraphSyncData)
+        indexHex <- GlobalStateKey.toHex[F](indexKey)
+        addresses <- StrictMptRead.valueOrElseF(
+          reader.getStrict[SortedSet[Address]](indexKey),
+          SortedSet.empty[Address],
+          "materialize MetagraphSyncData ActiveAddressIndex",
+          indexHex
+        )
+        entries <- addresses.toList.traverse { address =>
+          val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, address)
+          for {
+            targetHex <- GlobalStateKey.toHex[F](targetKey)
+            value <- StrictMptRead.requirePresentF(
+              reader.getStrict[MetagraphSyncDataInfo](targetKey),
+              s"materialize MetagraphSyncData indexed target(address=$address)",
+              targetHex
+            )
+          } yield address -> value
+        }
+      } yield SortedMap.from(entries)
+
+    /** Materialize the rooted currency-snapshot union. Both physical arms are decoded strictly so malformed bytes in either partition
+      * cannot be hidden by the other arm. Exactly one arm must be present: a legacy Left arm or the canonical incremental Right arm. Dual
+      * presence and an indexed address with neither arm are authenticated index/target inconsistencies and fail closed.
+      */
+    def materializeLastCurrencySnapshots(
+      implicit hasher: Hasher[F]
+    ): F[SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]] =
+      for {
+        indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastCurrencySnapshots)
+        indexHex <- GlobalStateKey.toHex[F](indexKey)
+        addresses <- StrictMptRead.valueOrElseF(
+          reader.getStrict[SortedSet[Address]](indexKey),
+          SortedSet.empty[Address],
+          "materialize LastCurrencySnapshots ActiveAddressIndex",
+          indexHex
+        )
+        entries <- addresses.toList.traverse { address =>
+          val leftKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastCurrencySnapshots)
+          val incrementalKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+          for {
+            leftHex <- GlobalStateKey.toHex[F](leftKey)
+            incrementalHex <- GlobalStateKey.toHex[F](incrementalKey)
+            left <- StrictMptRead.toOptionF(
+              reader.getStrict[Signed[CurrencySnapshot]](leftKey),
+              s"materialize LastCurrencySnapshots left arm(address=$address)",
+              leftHex
+            )
+            incremental <- StrictMptRead.toOptionF(
+              reader.getStrict[Signed[CurrencyIncrementalSnapshot]](incrementalKey),
+              s"materialize LastCurrencySnapshots right arm(address=$address)",
+              incrementalHex
+            )
+            entry <- (left, incremental) match {
+              case (Some(_), Some(_)) =>
+                Async[F].raiseError[
+                  (
+                    Address,
+                    Either[
+                      Signed[CurrencySnapshot],
+                      (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                    ]
+                  )
+                ](
+                  StrictMptRead.InconsistentConsensusMptIndex(
+                    s"materialize LastCurrencySnapshots dual arms(address=$address)",
+                    incrementalHex,
+                    s"both legacy full-snapshot key=$leftHex and incremental key=$incrementalHex are present"
+                  )
+                )
+              case (Some(snapshot), None) =>
+                (address -> (Left(snapshot): Either[
+                  Signed[CurrencySnapshot],
+                  (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                ])).pure[F]
+              case (None, Some(inc)) =>
+                GlobalStateConverter
+                  .reconstructCurrencyInfoFrom[F](address, CurrencyInfoMptAdapters.readerFor(reader))
+                  .map(info =>
+                    address -> (Right((inc, info)): Either[
+                      Signed[CurrencySnapshot],
+                      (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                    ])
+                  )
+              case (None, None) =>
+                Async[F].raiseError[
+                  (
+                    Address,
+                    Either[
+                      Signed[CurrencySnapshot],
+                      (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)
+                    ]
+                  )
+                ](
+                  StrictMptRead.MissingConsensusMptValue(
+                    s"materialize LastCurrencySnapshots neither arm(address=$address)",
+                    incrementalHex
+                  )
+                )
+            }
+          } yield entry
+        }
+      } yield SortedMap.from(entries)
   }
 }

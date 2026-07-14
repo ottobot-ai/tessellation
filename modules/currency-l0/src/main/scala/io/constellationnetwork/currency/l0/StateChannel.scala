@@ -218,7 +218,7 @@ object StateChannel {
     // 3c-A — store gl0's SIGNED MPT byte map VERBATIM at `ordinal` (`docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A).
     // Unlike `ensureMptInitialized`, which re-encodes a GSI through the per-field codecs (a DIFFERENT byte path than the
     // producer's own `p.entries` that was actually signed), this is the exact bytes gl0 signed — so after this the resync
-    // verify gate `sidecarFreeMptRoot(store.entries) === signed mptRoot` holds BY CONSTRUCTION (no re-encode, no drift). A
+    // verify gate `consensusMptRoot(store.entries) === signed mptRoot` holds BY CONSTRUCTION (no re-encode, no drift). A
     // genuinely corrupt/truncated transfer is still caught by that gate (the only failure mode left). `loadBytes` does the
     // clear→insert→persist→build→bookkeep tail without the codec round-trip.
     def ensureMptFromSignedBytes(ordinal: SnapshotOrdinal, entries: Map[Hex, Array[Byte]]): F[Unit] =
@@ -336,13 +336,12 @@ object StateChannel {
                       .whenA(!adopted)
                   }
             }
-            // The signed global `mptRoot` excludes path-dependent SystemNamespace sidecars
-            // (`GlobalSnapshotInfo.mptStateProofFromBytes`); recompute the rebuilt store's root sidecar-free
-            // (NOT `getRootHashForOrdinal`, which includes them) so this resync gate matches the signed root. With the
+            // Recompute the canonical consensus root, which commits every SystemNamespace economic index and excludes only
+            // the temporary field-32 replay mirror. The raw store root includes field 32 and cannot be compared directly. With the
             // verbatim `loadBytes` above this now passes BY CONSTRUCTION on honest input, but the gate STAYS — it still
             // catches a corrupt/truncated transfer (re-pull/idle, never adopt).
             afterBytes <- sharedStorages.mptStore.underlying.entries
-            recomputedRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
+            recomputedRoot <- io.constellationnetwork.schema.GlobalSnapshotInfo.consensusMptRoot[F](afterBytes).map(_.some)
             signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
             result <-
               if (recomputedRoot === signedRoot)

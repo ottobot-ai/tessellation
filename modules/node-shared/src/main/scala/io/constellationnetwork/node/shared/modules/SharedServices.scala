@@ -430,7 +430,6 @@ object SharedServices {
         cfg.delegatedStaking.withdrawalTimeLimit.getOrElse(cfg.environment, EpochProgress.MinValue),
         storages.mptOverlay,
         loggerBundle,
-        maintainNodeCollateralWithdrawalExpiryIndex = true,
         // §3 NIPoPoW S0.4: the eta-rotation period R. Read at GSAM construction so the boundary-write check
         // (`ord % R == R - 1`) inside accept() is deterministic across all nodes. R is now DERIVED in
         // `NakamotoConfig` as `round(3.03·k₁)` from the single `nakamoto.confirmation-depth-k` knob (no longer a

@@ -13,7 +13,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -51,6 +51,9 @@ object TransactionReferenceManagerParitySuite extends MutableIOSuite {
 
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
+  private def sameBytes(left: Map[Hex, Array[Byte]], right: Map[Hex, Array[Byte]]): Boolean =
+    left.keySet == right.keySet && left.forall { case (key, bytes) => right.get(key).exists(_.sameElements(bytes)) }
 
   override def sharedResource: Resource[IO, Res] =
     for {
@@ -176,6 +179,58 @@ object TransactionReferenceManagerParitySuite extends MutableIOSuite {
       expect.all(
         mapA.isEmpty,
         mapB.isEmpty
+      )
+  }
+
+  test("materializeLastTxRefsFromMpt: rooted index with absent target fails at the exact target without mutation") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      address = kp.getPublic.toAddress
+      refs = SortedMap(address -> TransactionReference(TransactionOrdinal(3L), testHash("absent-target")))
+      store <- mkMptStoreWith(refs)
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, address)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      _ <- store.remove(targetKey)
+      before <- store.allEntriesAsBytes
+      result <- TransactionReferenceManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .materializeLastTxRefsFromMpt
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                   => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("materializeLastTxRefsFromMpt: rooted index with malformed target fails at the exact target without mutation") { res =>
+    implicit val (h, sp, js) = res
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      address = kp.getPublic.toAddress
+      refs = SortedMap(address -> TransactionReference(TransactionOrdinal(3L), testHash("malformed-target")))
+      store <- mkMptStoreWith(refs)
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTxRefs, address)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      _ <- store.underlying.insertBytes(Map(targetHex -> Array[Byte](0x7f))).flatMap(_.liftTo[IO])
+      before <- store.allEntriesAsBytes
+      result <- TransactionReferenceManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .materializeLastTxRefsFromMpt
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MalformedConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                     => false
+        },
+        sameBytes(before, after)
       )
   }
 }

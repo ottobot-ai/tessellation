@@ -91,7 +91,7 @@ object MptStateStorage {
     * mpt-entries`) encodes the signed entries with this; the follower client decodes them with this; so producer↔follower wire bytes are
     * codec-identical to the on-disk persisted form (`stateEncoder`/`stateDecoder` use the same shape — hex-string key, Circe's native
     * `Array[Byte]` JSON-number-array value, sorted by hex for determinism). Loading the decoded map via `MptStore.loadBytes` then makes a
-    * follower's `sidecarFreeMptRoot(store) === signed mptRoot` hold BY CONSTRUCTION. See `docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A.
+    * follower's `consensusMptRoot(store) === signed mptRoot` hold BY CONSTRUCTION. See `docs/serde/FINISH-3C-EXECUTION-PLAN.md` §3c-A.
     */
   implicit val mptEntriesEncoder: Encoder[Map[Hex, Array[Byte]]] =
     Encoder.instance { map =>

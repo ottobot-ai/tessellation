@@ -26,6 +26,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.RegistrationEvaluationContext
 import io.constellationnetwork.node.shared.domain.nakamoto.kes._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofClient
 import io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashManager.SlashedRegistryEntry
@@ -471,11 +472,6 @@ object GlobalSnapshotAcceptanceManager {
     withdrawalTimeLimit: EpochProgress,
     overlay: MptOverlay[F, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
-    // When true, accept() emits adds/removes for the node-collateral-withdrawal expiry index. Requires the same
-    // `Some(withdrawalTimeLimit)` to also be passed to every `syncFromGlobalSnapshotInfo` / `toAllStateKeyValueBytes`
-    // in the node's production paths — otherwise rebuild-path and delta-path mptRoots diverge. Default false until
-    // that threading lands.
-    maintainNodeCollateralWithdrawalExpiryIndex: Boolean = false,
     // §3 NIPoPoW S0.4: number of snapshots per eta-rotation period. At every boundary ordinal (`ord % R == R - 1`)
     // accept() captures `NodeStakeAggregator.snapshotFromMpt` (the §G2 MPT-primary path; byte-equivalent to the previous
     // `EpochStakeSnapshotter.snapshot(builtInfo)` GSI walk) into `historicalStakeSnapshots[currentPeriod]` and prunes
@@ -601,13 +597,10 @@ object GlobalSnapshotAcceptanceManager {
   ): F[GlobalSnapshotAcceptanceManager[F]] = {
     val publisher: LocalEventsPublisher[F] = localEventsPublisher.getOrElse(LocalEventsPublisher.noop[F])
     // Establish the WithdrawalTimeLimit implicit from the explicit constructor param so that the rebuild paths
-    // (`syncFromGlobalSnapshotInfo`, `stateProofBuilder` → `mptStateProof`) see the same limit the accept path uses
-    // to compute expiry-index buckets. Gated by the feature flag until the threading below lands everywhere.
+    // (`syncFromGlobalSnapshotInfo`, `stateProofBuilder` -> `mptStateProof`) see the same limit the accept path uses
+    // to compute the rooted expiry-index buckets. This is consensus behavior, not a construction-site feature flag.
     implicit val withdrawalTimeLimitCtx: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
-      if (maintainNodeCollateralWithdrawalExpiryIndex)
-        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(withdrawalTimeLimit)
-      else
-        io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.none
+      io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(withdrawalTimeLimit)
     // `mptStore` is the underlying base — used by the LegacyFormat path's `builder.buildProof`
     // (which reads from the producer attached to the base store), and as the source-of-truth for
     // verify-replay's pre-state byte snapshot. Per-manager prior-state reads are routed through
@@ -1924,7 +1917,7 @@ object GlobalSnapshotAcceptanceManager {
 
                 // Source prior-ordinal `updateNodeParameters` from the MPT instead of `lastSnapshotContext.updateNodeParameters`.
                 // The MPT key is a hash of the `Id`, but the signed value carries the signer's `Id` in `proofs.head.id`,
-                // which by GSAM convention matches the map's keying `Id`. No sidecar needed; prefix-scan + value-decode.
+                // which by GSAM convention matches the map's keying `Id`. No reverse index is needed; prefix-scan + value-decode.
                 // Phase J: route through `mpt` (branch-aware) so prior reads see the parent branch's pending writes
                 // under MultiBranch — `mptStore` is base-only and would miss any not-yet-folded entries.
                 priorUpdateNodeParameters <- {
@@ -1942,9 +1935,9 @@ object GlobalSnapshotAcceptanceManager {
                   case (block, _) => block.value.transactions.toSortedSet
                 }.toSortedSet
 
-                // Source prior-ordinal `balances` from the MPT instead of `lastSnapshotContext.balances`. The
-                // ActiveAddressIndex sidecar (maintained on both delta and bootstrap paths) carries the keyset; we
-                // `getMany` the values. Read happens before `syncFromStateChanges` so the MPT still reflects the
+                // Source prior-ordinal `balances` from the MPT instead of `lastSnapshotContext.balances`. The rooted
+                // ActiveAddressIndex (maintained on both delta and bootstrap paths) supplies the keyset; every indexed
+                // target is required in the same view. Read happens before `syncFromStateChanges` so the MPT still reflects the
                 // prior ordinal's state. Used here for the early `updatedGlobalBalances` and below for the final
                 // GSI's `balances` field.
                 priorBalances <- spendTransactionBalanceManager.materializeAllBalancesFromMpt
@@ -1953,117 +1946,26 @@ object GlobalSnapshotAcceptanceManager {
 
                 // Source prior `lastStateChannelSnapshotHashes` from the MPT instead of `lastSnapshotContext`. The
                 // `LastStateChannelSnapshotHashes` partition is metagraph-keyed and the value (`Hash`) doesn't carry the
-                // address; the `ActiveAddressIndex` sidecar tracks the keyset, and `getMany` preserves the original
-                // `MetagraphNamespace(addr)` for pattern-match recovery. Read here (before
+                // address; the rooted `ActiveAddressIndex` supplies the keyset, and every indexed target must resolve
+                // in the same authenticated branch view. Read here (before
                 // `processStateChannelEvents`) so the StateChannelAcceptanceManager can be GSI-free.
                 // Phase J: route through `mpt` (branch-aware) — `mptStore` is base-only.
                 //
-                // #113 fallback: under MultiBranch, a transient chain-walk race (e.g. a sibling-branch eviction
-                // dropping an ancestor that held the index sidecar's latest write) can return an empty `addrSet`
-                // for one accept() call even when the keyset is fully populated in `lastSnapshotContext`. We union
-                // the GSI keyset in defensively so the materialized priors stay byte-equivalent across nodes.
-                // Under Passthrough this union is a no-op (MPT addrSet always equals GSI keyset). Under
-                // steady-state MultiBranch it's also a no-op for the same reason — the union only adds keys when
-                // MPT is transiently behind. Logged at warn when the union actually grows the keyset, so the
-                // diagnostic is visible without flooding logs in steady state.
-                priorLastStateChannelSnapshotHashes <- {
-                  import io.constellationnetwork.schema.mpt.PartitionNamespace.MetagraphNamespace
-                  for {
-                    indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastStateChannelSnapshotHashes)
-                    mptAddrSet <- mpt.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-                    gsiAddrSet = lastSnapshotContext.lastStateChannelSnapshotHashes.keySet.to(SortedSet)
-                    addrSet = mptAddrSet ++ gsiAddrSet
-                    _ <-
-                      if (addrSet.size > mptAddrSet.size)
-                        loggerBundle.app.warn(
-                          s"#113 priorLastStateChannelSnapshotHashes: MPT addrSet=${mptAddrSet.size} GSI keyset=${gsiAddrSet.size} " +
-                            s"union=${addrSet.size} ord=$ordinal — using GSI fallback for ${addrSet.size - mptAddrSet.size} addr(s)"
-                        )
-                      else Async[F].unit
-                    keys = addrSet.toList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastStateChannelSnapshotHashes))
-                    values <- mpt.getMany[Hash](keys)
-                    mptResult = SortedMap.from(values.toList.flatMap {
-                      case (key, h) =>
-                        key.networkNamespace match {
-                          case MetagraphNamespace(addr) => List(addr -> h)
-                          case _                        => Nil
-                        }
-                    })
-                    // For addresses where MPT had no value (e.g., the entry lives only in lastSnapshotContext
-                    // because the index race lost the write), fall back to the GSI's hash. Under steady-state
-                    // this branch never fires: every key in addrSet has an MPT value.
-                    result = lastSnapshotContext.lastStateChannelSnapshotHashes.foldLeft(mptResult) {
-                      case (acc, (addr, h)) => if (acc.contains(addr)) acc else acc.updated(addr, h)
-                    }
-                  } yield result
-                }
-
+                // The rooted index and every indexed target must resolve in the same branch-aware MPT view. A gap is authenticated
+                // corrupt state (or an unavailable branch) and fails/defer; `lastSnapshotContext` is not an alternate authority.
+                priorLastStateChannelSnapshotHashes <- mpt.materializeLastStateChannelSnapshotHashes
                 // Source prior `lastCurrencySnapshots` from the MPT instead of `lastSnapshotContext`. The
                 // `Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]` value
                 // spans 3 metagraph-keyed partitions; we read the keyset from `LastCurrencySnapshots`'s
-                // `ActiveAddressIndex` sidecar (which marks any address with either mode), then per-address try Left
+                // rooted `ActiveAddressIndex` (which marks any address with either mode), then per-address try Left
                 // before falling back to the Right pair. Read here (before `processStateChannelEvents`) so the
                 // StateChannelEventsProcessor can be GSI-free — `getFeeAddresses` and the `initialState` lookup
                 // both consume this materialized map.
                 // Phase J: route through `mpt` (branch-aware) — `mptStore` is base-only.
                 //
-                // #113 fallback: same defensive union pattern as priorLastStateChannelSnapshotHashes. When the
-                // MPT chain walk returns an empty `addrSet` due to a transient MultiBranch race, we union the
-                // GSI keyset and per-address fall back to the GSI value so the metagraph entry doesn't drop out
-                // of the prior map. Without this, `currencySnapshotsDeltas` for the subsequent ord would only
-                // see new SC events, and the `processStateChannelEvents` validation would treat the metagraph
-                // as having no prior history — slowing or breaking the state-channel pipeline that cl1 listens
-                // on for balance updates (root cause of L0-token reverse balance non-settlement).
-                priorLastCurrencySnapshots <- {
-                  for {
-                    indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastCurrencySnapshots)
-                    mptAddrSet <- mpt.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-                    gsiAddrSet = lastSnapshotContext.lastCurrencySnapshots.keySet.to(SortedSet)
-                    addrSet = mptAddrSet ++ gsiAddrSet
-                    _ <-
-                      if (addrSet.size > mptAddrSet.size)
-                        loggerBundle.app.warn(
-                          s"#113 priorLastCurrencySnapshots: MPT addrSet=${mptAddrSet.size} GSI keyset=${gsiAddrSet.size} " +
-                            s"union=${addrSet.size} ord=$ordinal — using GSI fallback for ${addrSet.size - mptAddrSet.size} addr(s)"
-                        )
-                      else Async[F].unit
-                    addrList = addrSet.toList
-                    leftKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots))
-                    incKeys = addrList.map(addr => GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots))
-                    lefts <- mpt.getMany[Signed[CurrencySnapshot]](leftKeys)
-                    incs <- mpt.getMany[Signed[CurrencyIncrementalSnapshot]](incKeys)
-                    // fieldId-6 (`LastCurrencySnapshotInfo`) is no longer a single blob — the `CurrencySnapshotInfo` for the Right
-                    // arm is reconstructed from the unrolled `Mg*` per-entry partitions via `reconstructCurrencyInfoFrom` (branch-aware
-                    // `mpt` reader). The Left (genesis) arm still reads fieldId-3, and the fieldId-5 incremental read is unchanged. A
-                    // metagraph with no fieldId-5 incremental has no currency state → emit nothing and let the GSI fallback below cover
-                    // it. Reconstruction is `F`, so the per-address build is a `flatTraverse`.
-                    infoReader = CurrencyInfoMptAdapters.mptFor(mpt)
-                    mptEntries <- addrList.flatTraverse { addr =>
-                      val leftKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastCurrencySnapshots)
-                      val incKey = GlobalStateKey.metagraph(addr, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
-                      lefts.get(leftKey) match {
-                        case Some(snap) =>
-                          Async[F].pure(List(addr -> (Left(snap): StateChannelAcceptanceResult.CurrencySnapshotWithState)))
-                        case None =>
-                          incs.get(incKey) match {
-                            case Some(inc) =>
-                              GlobalStateConverter
-                                .reconstructCurrencyInfoFrom[F](addr, infoReader)
-                                .map(info => List(addr -> (Right((inc, info)): StateChannelAcceptanceResult.CurrencySnapshotWithState)))
-                            case None =>
-                              Async[F].pure(List.empty[(Address, StateChannelAcceptanceResult.CurrencySnapshotWithState)])
-                          }
-                      }
-                    }
-                    mptResult = SortedMap.from(mptEntries)
-                    // Per-address fallback: if MPT has no value but the GSI does, use the GSI's value.
-                    // Steady-state this loop is a no-op (every addrSet member has an MPT value).
-                    result = lastSnapshotContext.lastCurrencySnapshots.foldLeft(mptResult) {
-                      case (acc, (addr, v)) => if (acc.contains(addr)) acc else acc.updated(addr, v)
-                    }
-                  } yield result
-                }
-
+                // Currency Left/Right targets obey the same rooted branch-view contract. Both arms decode strictly; neither-arm is an
+                // error. GSI values cannot heal an index/target gap.
+                priorLastCurrencySnapshots <- mpt.materializeLastCurrencySnapshots
                 // Axis 1a (#259 token-lock stall fix). Sharding gate: the shard-checkpoint ADOPT path only fires when
                 // (a) the manager was wired with `shardingConfig.numShards > 1` AND `shardCheckpointAcceptanceManager.isDefined`,
                 // AND (b) the caller actually supplied a non-empty `shardCheckpoints` map for this ord. All three conditions
@@ -2235,10 +2137,10 @@ object GlobalSnapshotAcceptanceManager {
                   acceptedTransactions
                 )
 
-                // Source prior-ordinal `lastTxRefs` from the MPT instead of `lastSnapshotContext.lastTxRefs`. The
-                // ActiveAddressIndex sidecar (maintained on both delta and bootstrap paths) carries the keyset; we
-                // `getMany` the values. Read happens before `syncFromStateChanges` so the MPT still reflects the
-                // prior ordinal's state.
+                // Source prior-ordinal `lastTxRefs` from the MPT instead of `lastSnapshotContext.lastTxRefs`. The rooted
+                // ActiveAddressIndex (maintained on both delta and bootstrap paths) supplies the keyset; every indexed
+                // target is required in the same authenticated view. Read happens before `syncFromStateChanges` so the
+                // MPT still reflects the prior ordinal's state.
                 priorLastTxRefs <- transactionReferenceManager.materializeLastTxRefsFromMpt
 
                 // Use SortedMap to guarantee deterministic iteration order for downstream processing.
@@ -2316,19 +2218,18 @@ object GlobalSnapshotAcceptanceManager {
                   .toSortedMap
 
                 // Prospective pending set for this exact acceptance. `currencySnapshots` already contains the globally re-executed owner
-                // state, while `lastSnapshotContext.metagraphSyncData` still contains ordinals acknowledged by an owner snapshot accepted in
-                // this same round. Remove only those canonical in-band acknowledgements before deriving effective balances, so the overlay
+                // state. The prior acknowledgement queue is materialized from the rooted branch-aware MPT; `lastSnapshotContext` is not an
+                // alternate authority. Remove only canonical in-band acknowledgements before deriving effective balances, so the overlay
                 // applies while the owner has not processed a SpendAction and retires atomically when the owner's recreated raw balance does.
+                priorMetagraphSyncData <- mpt.materializeMetagraphSyncData
                 pendingGlobalChangeOrdinals =
-                  lastSnapshotContext.metagraphSyncData.fold(Map.empty[Address, SortedSet[SnapshotOrdinal]]) { syncDataByMetagraph =>
-                    syncDataByMetagraph.iterator.map {
-                      case (metagraphId, syncData) =>
-                        metagraphId -> MetagraphSyncManager.pendingAfterAcknowledgements(
-                          syncData.unappliedGlobalChangeOrdinals,
-                          globalSnapshotsProcessed.getOrElse(metagraphId, List.empty)
-                        )
-                    }.toMap
-                  }
+                  priorMetagraphSyncData.iterator.map {
+                    case (metagraphId, syncData) =>
+                      metagraphId -> MetagraphSyncManager.pendingAfterAcknowledgements(
+                        syncData.unappliedGlobalChangeOrdinals,
+                        globalSnapshotsProcessed.getOrElse(metagraphId, List.empty)
+                      )
+                  }.toMap
 
                 lastActiveAllowSpends <- allowSpendStateManager.materializeActiveAllowSpendsFromMpt
 
@@ -2799,7 +2700,7 @@ object GlobalSnapshotAcceptanceManager {
 
                 MetagraphSyncAcceptanceResult(updatedAcceptedMetagraphSyncData, metagraphSyncDataDeltas) <- metagraphSyncManager
                   .acceptMetagraphSyncData(
-                    lastSnapshotContext,
+                    priorMetagraphSyncData,
                     incomingCurrencySnapshots,
                     globalSnapshotsProcessed,
                     settledSpendActions,
@@ -2858,16 +2759,13 @@ object GlobalSnapshotAcceptanceManager {
                   .to(SortedMap)
 
                 nodeCollateralWithdrawalExpiryIndexDelta <-
-                  if (maintainNodeCollateralWithdrawalExpiryIndex)
-                    nodeCollateralStateManager.materializeNodeCollateralWithdrawalsFromMpt.flatMap { priorWithdrawals =>
-                      computeNodeCollateralWithdrawalExpiryIndexDelta(
-                        priorWithdrawals,
-                        updatedWithdrawNodeCollateralsCleaned,
-                        withdrawalTimeLimit
-                      )
-                    }
-                  else
-                    SystemIndexDelta.empty[NodeCollateralWithdrawalExpiryKey].pure[F]
+                  nodeCollateralStateManager.materializeNodeCollateralWithdrawalsFromMpt.flatMap { priorWithdrawals =>
+                    computeNodeCollateralWithdrawalExpiryIndexDelta(
+                      priorWithdrawals,
+                      updatedWithdrawNodeCollateralsCleaned,
+                      withdrawalTimeLimit
+                    )
+                  }
 
                 stateChangesAccumulator = StateChangesAccumulator(
                   lastStateChannelSnapshotHashes = sCSnapshotHashes.toSortedMap,
@@ -3044,7 +2942,7 @@ object GlobalSnapshotAcceptanceManager {
                 }
                 // Route the accumulator's deltas through the writer algebra: `mpt.insert / mpt.remove`
                 // accumulate in the branch handle (Passthrough → straight to base; MultiBranch →
-                // per-branch ChangeSet). Field/insert order, sidecar maintenance and removal-key
+                // per-branch ChangeSet). Field/insert order, rooted consensus-index maintenance and removal-key
                 // derivation mirror legacy `mptStore.syncFromStateChanges` byte-for-byte —
                 // `GsamWritePathParitySuite` (#107) is the regression contract.
                 _ <- AcceptanceMptStateChanges.applyStateChanges[F](mpt, stateChangesAccumulator)
@@ -3130,7 +3028,7 @@ object GlobalSnapshotAcceptanceManager {
                 isMptFormat = globalStateProofSelector.select(ordinal) == MerklePatriciaFormat
                 incrementalProof <-
                   if (isMptFormat)
-                    GlobalSnapshotInfo.mptStateProofFromBytes[F](gsi, postBytes)
+                    GlobalSnapshotInfo.mptStateProofFromBytes[F](postBytes)
                   else
                     builder.buildProof(gsi, ordinal)
                 incrementalRoot = incrementalProof.mptRoot.map(_.show).getOrElse("none")
@@ -3162,10 +3060,10 @@ object GlobalSnapshotAcceptanceManager {
                       // (always at numShards=1) ⇒ no-op.
                       expectedBytes =
                         ((preSyncBytes -- deltaRemoves) ++ deltaUpserts) ++ slashingsReplayBytes ++ consumedAllowSpendReplayBytes
-                      // The consensus global root excludes SystemNamespace sidecars (path-dependent ActiveAddressIndex / expiry buckets)
-                      // AND the observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`).
-                      // `incrementalProof.mptRoot` is computed over that same set; the independent verify-replay must drop the same entries
-                      // before rebuilding so a clean writer yields MATCH (a true writer bug on user fields still surfaces DIVERGED).
+                      // The consensus global root commits every SystemNamespace economic index and excludes only the
+                      // observation-dependent `MgGlobalSnapshotSyncView` (`GlobalStateKey.consensusRootEntries`).
+                      // `incrementalProof.mptRoot` is computed over that same set; the independent verify-replay must use the same entries
+                      // before rebuilding so a clean writer yields MATCH (a true writer bug still surfaces DIVERGED).
                       verifyEntries = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(expectedBytes)
                       verifyTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie
                         .makeParallelFromBytes[F](verifyEntries)
@@ -3186,9 +3084,10 @@ object GlobalSnapshotAcceptanceManager {
                           // [WRITER-DIVERGE-DIAG] Name the diverging field(s) + per-key byte shape so any future writer-vs-replay gap is
                           // pinned to the exact encoder immediately (incr=absent ⇒ writer removed it / repl=absent ⇒ replay kept it),
                           // not just the opaque roots. (This is how the run-372/435 `MgActiveTokenLocks` removal asymmetry was proven.)
-                          val diagPostNonSys = io.constellationnetwork.schema.mpt.GlobalStateKey.nonSystemNamespaceEntries(postBytes)
-                          val diagDivergedKeys = (diagPostNonSys.keySet ++ verifyEntries.keySet)
-                            .filter(k => diagPostNonSys.get(k).map(_.toList) != verifyEntries.get(k).map(_.toList))
+                          val diagPostConsensus =
+                            io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(postBytes)
+                          val diagDivergedKeys = (diagPostConsensus.keySet ++ verifyEntries.keySet)
+                            .filter(k => diagPostConsensus.get(k).map(_.toList) != verifyEntries.get(k).map(_.toList))
                           val diagByField = diagDivergedKeys.toList
                             .groupBy(k =>
                               io.constellationnetwork.schema.mpt.GlobalStateKey.fieldIdFromHex(k).map(_.toString).getOrElse("UNKNOWN")
@@ -3199,7 +3098,7 @@ object GlobalSnapshotAcceptanceManager {
                             .take(6)
                             .map { k =>
                               val fid = io.constellationnetwork.schema.mpt.GlobalStateKey.fieldIdFromHex(k).map(_.toString).getOrElse("?")
-                              s"${k.value.take(18)}{f=$fid,incr=${diagPostNonSys.get(k).fold("absent")(b => s"${b.length}b")}," +
+                              s"${k.value.take(18)}{f=$fid,incr=${diagPostConsensus.get(k).fold("absent")(b => s"${b.length}b")}," +
                                 s"repl=${verifyEntries.get(k).fold("absent")(b => s"${b.length}b")}}"
                             }
                             .mkString(" ")

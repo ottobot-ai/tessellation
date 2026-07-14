@@ -49,8 +49,9 @@ case class TokenLockAcceptanceDeltas(
   *
   * `removedKeys` is a `Set[(metagraphAddr, holderAddr)]` — pairs whose balance entry was present in the prior MPT state but is absent from
   * the post-accept full state. Pair shape mirrors the actual MPT key (`GlobalStateKey.hypergraph(TokenLockBalances, mid, holder)`), so the
-  * syncFromStateChanges removal targets a real key and the address-pair sidecar can prune the same pair. Using a mid-only `Set[Address]`
-  * would target nothing and the entry would persist forever, surfacing as gl1 verify-replay mptRoot drift on every sc-event ordinal.
+  * syncFromStateChanges removal targets a real key and the rooted address-pair index can prune the same pair. Using a mid-only
+  * `Set[Address]` would target nothing and the entry would persist forever, surfacing as gl1 verify-replay mptRoot drift on every sc-event
+  * ordinal.
   */
 case class TokenLockBalanceResult(
   fullState: SortedMap[Address, SortedMap[Address, Balance]],
@@ -199,15 +200,15 @@ trait TokenLockStateManager[F[_]] {
     */
   def materializeActiveTokenLocksFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]]
 
-  /** Materialize the full `address → TokenLockReference` view via the `ActiveAddressIndex` sidecar. The reference value type doesn't carry
-    * `source: Address`, so prefix-scan can't recover keys; instead we read the address set from the sidecar and batch point-read values.
+  /** Materialize the full `address → TokenLockReference` view via the rooted `ActiveAddressIndex`. The reference value type doesn't carry
+    * `source: Address`, so prefix-scan can't recover keys; the index supplies the keyset and every indexed target must be present and
+    * decodable in the same authenticated view.
     */
   def materializeLastTokenLockRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TokenLockReference]]
 
-  /** Materialize the nested `metagraphAddr → holderAddr → Balance` view from the address-pair sidecar partition. `Balance` carries no
-    * source so we read the `(metagraphAddr, holderAddr)` pairs from the sidecar, batch point-read each pair's balance, then group by
-    * metagraphAddr. The sidecar is append-only at the writer; pairs whose underlying entry has been removed return `None` and are filtered
-    * out here.
+  /** Materialize the nested `metagraphAddr → holderAddr → Balance` view from the rooted address-pair consensus-index partition. `Balance`
+    * carries no source, so the index supplies the `(metagraphAddr, holderAddr)` pairs and every indexed target must be present and
+    * decodable in the same authenticated view before the values are grouped by metagraph address.
     */
   def materializeTokenLockBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedMap[Address, Balance]]]
 }
@@ -393,24 +394,62 @@ object TokenLockStateManager {
 
           for {
             buckets <- epochs.traverse { e =>
-              GlobalStateKey
-                .expiryIndexKey[F](io.constellationnetwork.schema.mpt.SystemNamespaceLabel.ExpiryIndexTokenLocks, e)
-                .flatMap(reader.get[SortedSet[TokenLockExpiryKey]])
-                .map(_.getOrElse(SortedSet.empty[TokenLockExpiryKey]))
+              for {
+                key <- GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexTokenLocks, e)
+                hexKey <- GlobalStateKey.toHex[F](key)
+                bucket <- StrictMptRead.valueOrElseF(
+                  reader.getStrict[SortedSet[TokenLockExpiryKey]](key),
+                  SortedSet.empty[TokenLockExpiryKey],
+                  s"sweep ExpiryIndex(label=${SystemNamespaceLabel.ExpiryIndexTokenLocks.canonicalName},epoch=${e.value.value})",
+                  hexKey
+                )
+              } yield e -> bucket
             }
-            allKeys = buckets.flatten.toSet
-            byAddress = allKeys.groupBy(_.address)
-            resolved <- byAddress.toList.traverse {
-              case (addr, expiryKeys) =>
-                reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr)).flatMap {
-                  addrSetOpt =>
-                    val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[TokenLock]])
-                    val expectedHashes = expiryKeys.map(_.hash)
-                    addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
-                      val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
-                      addr -> matched
-                    }
-                }
+            indexedKeys = buckets.flatMap { case (bucketEpoch, bucket) => bucket.toList.map(bucketEpoch -> _) }
+            byAddress = indexedKeys.groupBy(_._2.address)
+            resolved <- byAddress.toList.sortBy(_._1).traverse {
+              case (addr, indexedExpiryKeys) =>
+                val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr)
+                val expectedEpochsByHash = indexedExpiryKeys.groupMap(_._2.hash)(_._1).view.mapValues(_.toSet).toMap
+                val expectedHashes = expectedEpochsByHash.keySet
+                for {
+                  targetHex <- GlobalStateKey.toHex[F](targetKey)
+                  addrSet <- StrictMptRead.requirePresentF(
+                    reader.getStrict[SortedSet[Signed[TokenLock]]](targetKey),
+                    s"expiry target ActiveTokenLocks(address=$addr)",
+                    targetHex
+                  )
+                  hashed <- addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s)))
+                  actualHashes = hashed.iterator.map(_._1).toSet
+                  missingHashes = expectedHashes -- actualHashes
+                  wrongEpochs = hashed.collect {
+                    case (hash, lock)
+                        if expectedEpochsByHash.contains(hash) &&
+                          expectedEpochsByHash(hash) != lock.value.unlockEpoch.toSet =>
+                      val indexed = expectedEpochsByHash(hash).toList.map(_.value.value).sorted.mkString("/")
+                      val actual = lock.value.unlockEpoch.fold("none")(_.value.value.toString)
+                      s"${hash.value}:indexed=$indexed,actual=$actual"
+                  }.sorted
+                  _ <- Async[F]
+                    .raiseError[Unit](
+                      StrictMptRead.InconsistentConsensusMptIndex(
+                        s"expiry target ActiveTokenLocks(address=$addr)",
+                        targetHex,
+                        s"bucket hashes absent from decoded target: ${missingHashes.toList.map(_.value).sorted.mkString(",")}"
+                      )
+                    )
+                    .whenA(missingHashes.nonEmpty)
+                  _ <- Async[F]
+                    .raiseError[Unit](
+                      StrictMptRead.InconsistentConsensusMptIndex(
+                        s"expiry target ActiveTokenLocks(address=$addr)",
+                        targetHex,
+                        s"bucket epoch differs from target expiry: ${wrongEpochs.mkString(",")}"
+                      )
+                    )
+                    .whenA(wrongEpochs.nonEmpty)
+                  matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+                } yield addr -> matched
             }
           } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
         }
@@ -835,39 +874,56 @@ object TokenLockStateManager {
       def materializeLastTokenLockRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TokenLockReference]] =
         for {
           indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastTokenLockRefs)
-          addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-          addrList = addrSet.toList
-          keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, addr))
-          values <- reader.getMany[TokenLockReference](keys)
-        } yield
-          SortedMap.from(addrList.flatMap { addr =>
-            val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, addr)
-            values.get(key).map(addr -> _)
-          })
+          indexHex <- GlobalStateKey.toHex[F](indexKey)
+          addrSet <- StrictMptRead.valueOrElseF(
+            reader.getStrict[SortedSet[Address]](indexKey),
+            SortedSet.empty[Address],
+            "materialize LastTokenLockRefs ActiveAddressIndex",
+            indexHex
+          )
+          entries <- addrSet.toList.traverse { addr =>
+            val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, addr)
+            for {
+              targetHex <- GlobalStateKey.toHex[F](targetKey)
+              value <- StrictMptRead.requirePresentF(
+                reader.getStrict[TokenLockReference](targetKey),
+                s"materialize LastTokenLockRefs indexed target(address=$addr)",
+                targetHex
+              )
+            } yield addr -> value
+          }
+        } yield SortedMap.from(entries)
 
       def materializeTokenLockBalancesFromMpt(
         implicit hasher: Hasher[F]
       ): F[SortedMap[Address, SortedMap[Address, Balance]]] =
         for {
           indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.TokenLockBalances)
-          pairSet <- reader
-            .get[SortedSet[(Address, Address)]](indexKey)
-            .map(_.getOrElse(SortedSet.empty[(Address, Address)]))
-          pairList = pairSet.toList
-          keys = pairList.map { case (mid, holder) => GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, mid, holder) }
-          values <- reader.getMany[Balance](keys)
-        } yield {
-          val flat = pairList.flatMap {
+          indexHex <- GlobalStateKey.toHex[F](indexKey)
+          pairSet <- StrictMptRead.valueOrElseF(
+            reader.getStrict[SortedSet[(Address, Address)]](indexKey),
+            SortedSet.empty[(Address, Address)],
+            "materialize TokenLockBalances ActiveAddressIndex pair set",
+            indexHex
+          )
+          flat <- pairSet.toList.traverse {
             case (mid, holder) =>
-              val k = GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, mid, holder)
-              values.get(k).map(bal => (mid, holder, bal))
+              val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, mid, holder)
+              for {
+                targetHex <- GlobalStateKey.toHex[F](targetKey)
+                value <- StrictMptRead.requirePresentF(
+                  reader.getStrict[Balance](targetKey),
+                  s"materialize TokenLockBalances indexed target(metagraph=$mid,holder=$holder)",
+                  targetHex
+                )
+              } yield (mid, holder, value)
           }
+        } yield
           flat
             .groupBy(_._1)
             .view
             .mapValues(entries => SortedMap.from(entries.map { case (_, h, b) => h -> b }))
             .filter { case (_, inner) => inner.nonEmpty }
             .to(SortedMap)
-        }
     }
 }

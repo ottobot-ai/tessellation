@@ -214,7 +214,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
     for {
       baseBytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](mgState(mg, baseIncremental, baseInfo))
-      baseRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](baseBytes)
+      baseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](baseBytes)
       byteStore <- MptStateStorage.make[IO](dir)
       _ <- byteStore.writeState(executionBase, baseBytes)
       pinnedSnap <- mkHashed(executionBase, Some(baseRoot))

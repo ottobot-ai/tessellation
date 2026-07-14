@@ -3,17 +3,31 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
+import scala.collection.immutable.{SortedMap, SortedSet}
+
+import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay.OverlayMode
-import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
+import io.constellationnetwork.schema.{GlobalStateProofSelector, SnapshotOrdinal}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
+  addressSetImmutableCodec,
+  signedCurrencyIncrementalSnapshotImmutableCodec,
+  signedCurrencySnapshotImmutableCodec
+}
+import io.constellationnetwork.serde.codecs.instances.MetagraphSyncDataInfoCodec.{immutableCodec => metagraphSyncDataImmutableCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -28,6 +42,9 @@ import weaver.MutableIOSuite
   *   - `finalized` ignores overlay entirely — reads only what the base `MptStore` holds.
   */
 object GlobalStateReaderSuite extends MutableIOSuite {
+
+  implicit val globalStateProofSelector: GlobalStateProofSelector =
+    GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(Long.MaxValue)))
 
   type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
 
@@ -63,6 +80,9 @@ object GlobalStateReaderSuite extends MutableIOSuite {
 
   private def gskBalance(seed: Int): GlobalStateKey =
     GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr(seed))
+
+  private def sameBytes(left: Map[Hex, Array[Byte]], right: Map[Hex, Array[Byte]]): Boolean =
+    left.keySet == right.keySet && left.forall { case (key, bytes) => right.get(key).exists(_.sameElements(bytes)) }
 
   private val ordinal: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
   private val tipA: BranchId = BranchId(Hash("a" * 64))
@@ -134,5 +154,172 @@ object GlobalStateReaderSuite extends MutableIOSuite {
       reader = GlobalStateReader.finalized[IO](store)
       read <- reader.get[Balance](key)
     } yield expect(read.contains(Balance(NonNegLong(5L))))
+  }
+
+  test("state-channel map: rooted index with absent target fails at the exact target and cannot be healed outside the MPT") { res =>
+    implicit val (h, _, js) = res
+    val address = addr(10)
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      targetKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastStateChannelSnapshotHashes)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      before <- store.allEntriesAsBytes
+      result <- GlobalStateReader
+        .finalized[IO](store)
+        .materializeLastStateChannelSnapshotHashes
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                   => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("currency union: rooted index with neither arm fails at the exact incremental target without mutation") { res =>
+    implicit val (h, _, js) = res
+    val address = addr(11)
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      incrementalKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+      incrementalHex <- GlobalStateKey.toHex[IO](incrementalKey)
+      before <- store.allEntriesAsBytes
+      result <- GlobalStateReader.finalized[IO](store).materializeLastCurrencySnapshots.attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == incrementalHex
+          case _                                                   => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("currency union: malformed left arm fails at its exact physical key without mutation") { res =>
+    implicit val (h, _, js) = res
+    val address = addr(12)
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      leftKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastCurrencySnapshots)
+      leftHex <- GlobalStateKey.toHex[IO](leftKey)
+      _ <- store.underlying.insertBytes(Map(leftHex -> Array[Byte](0x7f))).flatMap(_.liftTo[IO])
+      before <- store.allEntriesAsBytes
+      result <- GlobalStateReader.finalized[IO](store).materializeLastCurrencySnapshots.attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MalformedConsensusMptValue) => error.physicalKey == leftHex
+          case _                                                     => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("currency union: malformed incremental arm fails at its exact physical key without mutation") { res =>
+    implicit val (h, _, js) = res
+    val address = addr(13)
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      incrementalKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+      incrementalHex <- GlobalStateKey.toHex[IO](incrementalKey)
+      _ <- store.underlying.insertBytes(Map(incrementalHex -> Array[Byte](0x7f))).flatMap(_.liftTo[IO])
+      before <- store.allEntriesAsBytes
+      result <- GlobalStateReader.finalized[IO](store).materializeLastCurrencySnapshots.attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MalformedConsensusMptValue) => error.physicalKey == incrementalHex
+          case _                                                     => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("currency union: simultaneous legacy and incremental arms fail closed without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val address = addr(16)
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      full = CurrencySnapshot.mkGenesis(Map.empty, None, None)
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      signedFull <- Signed.forAsyncHasher[IO, CurrencySnapshot](full, keyPair)
+      incremental <- CurrencyIncrementalSnapshot.fromCurrencySnapshot[IO](full)
+      signedIncremental = Signed(incremental, signedFull.proofs)
+      leftKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastCurrencySnapshots)
+      incrementalKey = GlobalStateKey.metagraph(address, GlobalStateFieldId.LastIncrementalCurrencySnapshots)
+      incrementalHex <- GlobalStateKey.toHex[IO](incrementalKey)
+      _ <- store.insert[Signed[CurrencySnapshot]](leftKey, signedFull)
+      _ <- store.insert[Signed[CurrencyIncrementalSnapshot]](incrementalKey, signedIncremental)
+      before <- store.allEntriesAsBytes
+      readerResult <- GlobalStateReader.finalized[IO](store).materializeLastCurrencySnapshots.attempt
+      storeResult <- store.getAllLastCurrencySnapshots.attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        readerResult match {
+          case Left(error: StrictMptRead.InconsistentConsensusMptIndex) => error.physicalKey == incrementalHex
+          case _                                                        => false
+        },
+        storeResult match {
+          case Left(error: StrictMptRead.InconsistentConsensusMptIndex) => error.physicalKey == incrementalHex
+          case _                                                        => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("metagraph-sync map: rooted index materializes the exact authenticated targets") { res =>
+    implicit val (h, _, js) = res
+    val address = addr(14)
+    val expected = MetagraphSyncDataInfo.empty
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.MetagraphSyncData)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      _ <- store.insert[MetagraphSyncDataInfo](GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, address), expected)
+      result <- GlobalStateReader.finalized[IO](store).materializeMetagraphSyncData
+    } yield expect.same(result, SortedMap(address -> expected))
+  }
+
+  test("metagraph-sync map: rooted index with absent target fails at the exact target") { res =>
+    implicit val (h, _, js) = res
+    val address = addr(15)
+
+    for {
+      store <- mkStore
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.MetagraphSyncData)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(address))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, address)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      result <- GlobalStateReader.finalized[IO](store).materializeMetagraphSyncData.attempt
+    } yield
+      expect(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                   => false
+        }
+      )
   }
 }

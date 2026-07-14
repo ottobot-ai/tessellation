@@ -194,9 +194,9 @@ object CurrencySnapshotProcessor {
                             // 3c-A: pull gl0's SIGNED MPT byte map (+ snapshot + GSI) and store the bytes VERBATIM via
                             // `loadBytes` (no `syncFromGlobalSnapshotInfo` re-encode → no `recomputed ≠ signed` drift). The
                             // GSI rides along ONLY for `setForRecovery`. The verify gate STAYS as the corruption backstop;
-                            // it is folded onto `sidecarFreeMptRoot` (the SAME sidecar-free recompute the signed root uses)
-                            // instead of `getRootHashForOrdinal` (which includes the path-dependent SystemNamespace
-                            // sidecars), so the compare is apples-to-apples with the signed `stateProof.mptRoot`.
+                            // it is folded onto `consensusMptRoot` (the same canonical recompute the signed root uses)
+                            // instead of `getRootHashForOrdinal` (which includes the temporarily root-excluded field-32
+                            // replay mirror), so the compare is apples-to-apples with the signed `stateProof.mptRoot`.
                             canonical <- l0Service.pullLatestMptEntries
                             (canonicalSnapshot, canonicalState, canonicalEntries) = canonical
                             canonicalRef = SnapshotReference.fromHashedSnapshot(canonicalSnapshot)
@@ -236,7 +236,7 @@ object CurrencySnapshotProcessor {
                             // cache so getEta re-derives over the canonical chain (bootstrap-equivalence).
                             _ <- etaForgetUncommitted
                             afterBytes <- mptStore.underlying.entries
-                            recomputedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
+                            recomputedRoot <- GlobalSnapshotInfo.consensusMptRoot[F](afterBytes).map(_.some)
                             signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
                             result <-
                               if (recomputedRoot === signedRoot)
@@ -398,7 +398,7 @@ object CurrencySnapshotProcessor {
       // `getLastIncrementalCurrencySnapshot`). The adopted state is already
       // (1) finality-gated (#122 — `pullLatestMptEntries` is gl0's depth-k-finalized signed store) and
       // (2) verified-by-construction: `loadBytes` stores the signed bytes verbatim and the seed asserts
-      //     `sidecarFreeMptRoot(entries) === signed stateProof.mptRoot` (the corruption backstop). The currency binaries themselves are
+      //     `consensusMptRoot(entries) === signed stateProof.mptRoot` (the corruption backstop). The currency binaries themselves are
       //     metagraph-signature-checked in `fetchCurrencySnapshots` (`toHashedWithSignatureCheck`).
       // So cl1's follower currency state is no longer re-computed but trusted-and-adopted from the signed-bytes MPT, exactly as the
       // global cutover (and symmetric with how ml0/dl1 already loadBytes on the resync path).
@@ -468,7 +468,7 @@ object CurrencySnapshotProcessor {
       // PURE MPT-AS-PRIMARY seed (3c-A): populate the global MPT for the currency adopt from gl0's SIGNED MPT BYTES — NEVER from a
       // materialized `GlobalSnapshotInfo` (`syncFromGlobalSnapshotInfo`). Pulls gl0's finalized `(snapshot, GSI, signed-byte-map)` via
       // `pullLatestMptEntries` and, when the bytes are served, stores them VERBATIM with `loadBytes` so the recomputed
-      // `sidecarFreeMptRoot(entries)` equals the producer's signed `mptRoot` BY CONSTRUCTION (no re-encode drift). The signed byte map is
+      // `consensusMptRoot(entries)` equals the producer's signed `mptRoot` BY CONSTRUCTION (no re-encode drift). The signed byte map is
       // gl0's FULL `mpt_snapshot_info_signed/<ordinal>` store — it includes the per-MG `Mg*` currency partitions + the fieldId-5
       // `LastIncrementalCurrencySnapshots` signed snapshot — so `getCurrencySnapshotInfo` / `getLastIncrementalCurrencySnapshot` read it back
       // after `loadBytes`. Returns the canonical ordinal that was loaded on success; `None` when the MPT was NOT seeded this tick, in which
@@ -498,7 +498,7 @@ object CurrencySnapshotProcessor {
                 for {
                   _ <- mptStore.loadBytes(bytes, canonicalSnapshot.ordinal)
                   afterBytes <- mptStore.underlying.entries
-                  recomputedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[F](afterBytes).map(_.some)
+                  recomputedRoot <- GlobalSnapshotInfo.consensusMptRoot[F](afterBytes).map(_.some)
                   signedRoot = canonicalSnapshot.signed.value.stateProof.mptRoot
                   result <-
                     if (recomputedRoot === signedRoot)

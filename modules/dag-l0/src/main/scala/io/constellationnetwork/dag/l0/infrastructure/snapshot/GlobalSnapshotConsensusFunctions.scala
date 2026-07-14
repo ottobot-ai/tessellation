@@ -914,7 +914,7 @@ object GlobalSnapshotConsensusFunctions {
         // `allEntriesAsBytesWithHandle(handle, ordinal)` `accept()` derived the signed `mptRoot` from (GSAM:postBytes)
         // — BEFORE `overlay.commit` below registers the branch. Staged keyed by `currentSnapshotHash` after the commit;
         // only the FINALIZED hash's bytes are promoted to the served signed-bytes store, so a follower's
-        // `sidecarFreeMptRoot(served)` reproduces the signed root BY CONSTRUCTION (the finalize-time `mpt_snapshot_info`
+        // `consensusMptRoot(served)` reproduces the signed root BY CONSTRUCTION (the finalize-time `mpt_snapshot_info`
         // re-fold can diverge under MultiBranch — the 3c-A gap this closes).
         stagedPostBytes <- overlay.allEntriesAsBytesWithHandle(overlayHandle, currentOrdinal)
         _ <- overlay.commit(

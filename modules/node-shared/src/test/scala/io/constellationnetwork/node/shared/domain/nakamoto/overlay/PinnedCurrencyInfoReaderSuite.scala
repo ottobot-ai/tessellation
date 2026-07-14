@@ -46,8 +46,8 @@ import weaver.MutableIOSuite
   *      ordinal is rejected; no HEAD fallback).
   *   1. EVICTED/MISSING BYTES — snapshot + hash pin OK, but no retained state bytes at the anchor ⇒ `None` (retention doesn't reach the
   *      depth; NO head fallback).
-  *   1. ROOT-MISMATCH — snapshot + hash pin OK, bytes retained, but the pinned snapshot's committed `mptRoot` ≠ `sidecarFreeMptRoot(bytes)`
-  *      ⇒ `None` (retained bytes don't reproduce the pinned committed root).
+  *   1. ROOT-MISMATCH — snapshot + hash pin OK, bytes retained, but the pinned snapshot's committed `mptRoot` ≠ `consensusMptRoot(bytes)` ⇒
+  *      `None` (retained bytes don't reproduce the pinned committed root).
   *   1. NO SNAPSHOT — nothing resolvable at the anchor ordinal ⇒ `None`.
   */
 object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
@@ -175,7 +175,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
       SortedMap(mg -> Right((mkSignedIncremental(5L), infoWithBalances(account -> 100L, addr("pinned-acct-2") -> 250L))))
     for {
       bytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](state)
-      root <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](bytes)
+      root <- GlobalSnapshotInfo.consensusMptRoot[IO](bytes)
       producer <- InMemoryMerklePatriciaProducer.make[IO](bytes)
       store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
       oracle <- GlobalStateReader.fromMptStore[IO](store).getCurrencySnapshotInfo(mg)
@@ -520,7 +520,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     Files[IO].tempDirectory.use { dir =>
       for {
         boe <- buildBytesAndOracle
-        (bytes, root, _) = boe
+        (_, root, _) = boe
         // Adversarial/stale peer state: OTHER content (different balances ⇒ different consensus root).
         wrongState = SortedMap(
           mg -> (Right((mkSignedIncremental(5L), infoWithBalances(account -> 666L))): Either[
@@ -529,9 +529,9 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
           ])
         )
         wrongBytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](wrongState)
-        wrongBytesRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](wrongBytes)
+        wrongBytesRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](wrongBytes)
         byteStore <- MptStateStorage.make[IO](dir) // hole at the anchor
-        pinned <- mkHashed(227L, Some(root)) // the LOCAL committed root pins `bytes`, not `wrongBytes`
+        pinned <- mkHashed(227L, Some(root)) // the local committed fixture root does not authorize `wrongBytes`
         resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
         backfill = backfillOf(_ => wrongBytes.some.pure[IO])
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfill))
@@ -546,32 +546,27 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
   }
 
-  test(
-    "BACKFILL STRIP: root-excluded peer entries (SystemNamespace sidecars) never persist — the staged map is exactly " +
-      "consensusRootEntries(fetched), a pure function of the committed root"
-  ) { res =>
+  test("BACKFILL ROOT BINDING: a changed SystemNamespace entry changes the root and the store remains untouched") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
         boe <- buildBytesAndOracle
-        (bytes, root, oracle) = boe
-        // A malicious/rich peer response: the honest consensus bytes PLUS a SystemNamespace sidecar entry (hex prefix "03" —
-        // excluded from the consensus root, so it would ride along UNVERIFIED if not stripped).
+        (bytes, root, _) = boe
+        // A malicious/rich peer response: honest consensus bytes plus an attacker-chosen SystemNamespace entry.
+        // SystemNamespace indices are economic state and must be committed, not stripped as a cache.
         poisonKey = Hex("03" + "ab" * 24)
         fetched = bytes + (poisonKey -> Array[Byte](1, 2, 3))
-        fetchedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](fetched)
+        fetchedRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](fetched)
         byteStore <- MptStateStorage.make[IO](dir)
         pinned <- mkHashed(227L, Some(root))
         resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfillOf(_ => fetched.some.pure[IO])))
         got <- reader.readAtOrdinalVerified(ord(227L), mg)
         persisted <- byteStore.readState(ord(227L))
-        expectedStripped = GlobalStateKey.consensusRootEntries(fetched)
       } yield
-        expect(fetchedRoot === root) && // the sidecar entry is invisible to the root — the heal itself proceeds
-          expect(got == PinnedAnchorRead.AnchorVerified(oracle)) &&
-          expect(persisted.exists(m => !m.contains(poisonKey))) && // the UNVERIFIED sidecar byte never persisted
-          expect(persisted.exists(_.keySet == expectedStripped.keySet)) // staged map == the root-committed entry set
+        expect(fetchedRoot =!= root) &&
+          expect(got == PinnedAnchorRead.AnchorUnreadable) &&
+          expect(persisted.isEmpty)
     }
   }
 

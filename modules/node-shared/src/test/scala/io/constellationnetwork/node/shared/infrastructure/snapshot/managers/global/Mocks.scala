@@ -87,7 +87,9 @@ object Mocks {
         io.constellationnetwork.schema.nakamoto.EtaPeriod,
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId
       ) => IO[Hash]
-    ] = None
+    ] = None,
+    forcedNodeCollateralAcceptanceResult: Option[UpdateNodeCollateralAcceptanceResult] = None,
+    lastLegacyStateProofOrdinal: SnapshotOrdinal = SnapshotOrdinal(Long.MaxValue)
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {
     // Create mock dependencies for testing
     val mockBlockAcceptanceManager = new BlockAcceptanceManager[IO] {
@@ -245,12 +247,16 @@ object Mocks {
         ordinal: SnapshotOrdinal,
         delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
       ): IO[UpdateNodeCollateralAcceptanceResult] =
-        UpdateNodeCollateralAcceptanceResult(
-          acceptedCreates = SortedMap.empty,
-          notAcceptedCreates = List.empty,
-          acceptedWithdrawals = SortedMap.empty,
-          notAcceptedWithdrawals = List.empty
-        ).pure[IO]
+        forcedNodeCollateralAcceptanceResult
+          .getOrElse(
+            UpdateNodeCollateralAcceptanceResult(
+              acceptedCreates = SortedMap.empty,
+              notAcceptedCreates = List.empty,
+              acceptedWithdrawals = SortedMap.empty,
+              notAcceptedWithdrawals = List.empty
+            )
+          )
+          .pure[IO]
     }
 
     val mockSpendActionValidator = new SpendActionValidator[IO] {
@@ -304,7 +310,7 @@ object Mocks {
 
     // Create the manager with mock dependencies
     implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
-    implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal(Long.MaxValue))
+    implicit val globalStateProofSelector: GlobalStateProofSelector = GlobalStateProofSelector(lastLegacyStateProofOrdinal)
     // `NoOpMetrics` instead of `Metrics.forAsync[IO]` — the production constructor binds `LogbackMetrics()`,
     // which holds a JVM-global slf4j singleton handle. Weaver runs tests in parallel and the LogbackMetrics
     // initialization races inside the same sbt JVM (only one binding succeeds; the rest CCE

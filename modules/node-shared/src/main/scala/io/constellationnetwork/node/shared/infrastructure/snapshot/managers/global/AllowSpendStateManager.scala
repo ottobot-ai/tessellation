@@ -123,8 +123,9 @@ trait AllowSpendStateManager[F[_]] {
     implicit hasher: Hasher[F]
   ): F[SortedMap[Option[Address], SortedMap[Address, SortedSet[Signed[AllowSpend]]]]]
 
-  /** Materialize the full `address → AllowSpendReference` view via the `ActiveAddressIndex` sidecar. The reference value type doesn't carry
-    * `source: Address`, so prefix-scan can't recover keys; instead we read the address set from the sidecar and batch point-read values.
+  /** Materialize the full `address → AllowSpendReference` view via the rooted `ActiveAddressIndex`. The reference value type doesn't carry
+    * `source: Address`, so prefix-scan can't recover keys; the index supplies the keyset and every indexed target must be present and
+    * decodable in the same authenticated view.
     */
   def materializeLastAllowSpendRefsFromMpt(
     implicit hasher: Hasher[F]
@@ -368,26 +369,65 @@ object AllowSpendStateManager {
 
         for {
           buckets <- epochs.traverse { e =>
-            GlobalStateKey
-              .expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
-              .flatMap(reader.get[SortedSet[AllowSpendExpiryKey]])
-              .map(_.getOrElse(SortedSet.empty[AllowSpendExpiryKey]))
+            for {
+              key <- GlobalStateKey.expiryIndexKey[F](SystemNamespaceLabel.ExpiryIndexAllowSpends, e)
+              hexKey <- GlobalStateKey.toHex[F](key)
+              bucket <- StrictMptRead.valueOrElseF(
+                reader.getStrict[SortedSet[AllowSpendExpiryKey]](key),
+                SortedSet.empty[AllowSpendExpiryKey],
+                s"sweep ExpiryIndex(label=${SystemNamespaceLabel.ExpiryIndexAllowSpends.canonicalName},epoch=${e.value.value})",
+                hexKey
+              )
+            } yield e -> bucket
           }
           // Filter to global-only (metagraphId = None) and group by address.
-          allKeys = buckets.flatten.toSet.filter(_.metagraphId.isEmpty)
-          byAddress = allKeys.groupBy(_.address)
-          resolved <- byAddress.toList.traverse {
-            case (addr, expiryKeys) =>
-              reader
-                .get[SortedSet[Signed[AllowSpend]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, addr))
-                .flatMap { addrSetOpt =>
-                  val addrSet = addrSetOpt.getOrElse(SortedSet.empty[Signed[AllowSpend]])
-                  val expectedHashes = expiryKeys.map(_.hash)
-                  addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s))).map { hashed =>
-                    val matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
-                    addr -> matched
-                  }
-                }
+          indexedKeys = buckets.flatMap {
+            case (bucketEpoch, bucket) =>
+              bucket.toList.collect { case key if key.metagraphId.isEmpty => bucketEpoch -> key }
+          }
+          byAddress = indexedKeys.groupBy(_._2.address)
+          resolved <- byAddress.toList.sortBy(_._1).traverse {
+            case (addr, indexedExpiryKeys) =>
+              val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, None, addr)
+              val expectedEpochsByHash = indexedExpiryKeys.groupMap(_._2.hash)(_._1).view.mapValues(_.toSet).toMap
+              val expectedHashes = expectedEpochsByHash.keySet
+              for {
+                targetHex <- GlobalStateKey.toHex[F](targetKey)
+                addrSet <- StrictMptRead.requirePresentF(
+                  reader.getStrict[SortedSet[Signed[AllowSpend]]](targetKey),
+                  s"expiry target ActiveAllowSpends(address=$addr,scope=global)",
+                  targetHex
+                )
+                hashed <- addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s)))
+                actualHashes = hashed.iterator.map(_._1).toSet
+                missingHashes = expectedHashes -- actualHashes
+                wrongEpochs = hashed.collect {
+                  case (hash, spend)
+                      if expectedEpochsByHash.contains(hash) &&
+                        expectedEpochsByHash(hash) != Set(spend.value.lastValidEpochProgress) =>
+                    val indexed = expectedEpochsByHash(hash).toList.map(_.value.value).sorted.mkString("/")
+                    s"${hash.value}:indexed=$indexed,actual=${spend.value.lastValidEpochProgress.value.value}"
+                }.sorted
+                _ <- Async[F]
+                  .raiseError[Unit](
+                    StrictMptRead.InconsistentConsensusMptIndex(
+                      s"expiry target ActiveAllowSpends(address=$addr,scope=global)",
+                      targetHex,
+                      s"bucket hashes absent from decoded target: ${missingHashes.toList.map(_.value).sorted.mkString(",")}"
+                    )
+                  )
+                  .whenA(missingHashes.nonEmpty)
+                _ <- Async[F]
+                  .raiseError[Unit](
+                    StrictMptRead.InconsistentConsensusMptIndex(
+                      s"expiry target ActiveAllowSpends(address=$addr,scope=global)",
+                      targetHex,
+                      s"bucket epoch differs from target expiry: ${wrongEpochs.mkString(",")}"
+                    )
+                  )
+                  .whenA(wrongEpochs.nonEmpty)
+                matched = hashed.collect { case (h, s) if expectedHashes.contains(h) => s }.to(SortedSet)
+              } yield addr -> matched
           }
         } yield SortedMap.from(resolved).filter(_._2.nonEmpty)
       }
@@ -475,14 +515,24 @@ object AllowSpendStateManager {
     ): F[SortedMap[Address, AllowSpendReference]] =
       for {
         indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.LastAllowSpendRefs)
-        addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-        addrList = addrSet.toList
-        keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr))
-        values <- reader.getMany[AllowSpendReference](keys)
-      } yield
-        SortedMap.from(addrList.flatMap { addr =>
-          val key = GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr)
-          values.get(key).map(addr -> _)
-        })
+        indexHex <- GlobalStateKey.toHex[F](indexKey)
+        addrSet <- StrictMptRead.valueOrElseF(
+          reader.getStrict[SortedSet[Address]](indexKey),
+          SortedSet.empty[Address],
+          "materialize LastAllowSpendRefs ActiveAddressIndex",
+          indexHex
+        )
+        entries <- addrSet.toList.traverse { addr =>
+          val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.LastAllowSpendRefs, addr)
+          for {
+            targetHex <- GlobalStateKey.toHex[F](targetKey)
+            value <- StrictMptRead.requirePresentF(
+              reader.getStrict[AllowSpendReference](targetKey),
+              s"materialize LastAllowSpendRefs indexed target(address=$addr)",
+              targetHex
+            )
+          } yield addr -> value
+        }
+      } yield SortedMap.from(entries)
   }
 }

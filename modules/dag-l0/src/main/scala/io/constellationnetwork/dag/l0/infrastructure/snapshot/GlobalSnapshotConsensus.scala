@@ -586,7 +586,7 @@ object GlobalSnapshotConsensus {
       // holed on gl0-0/gl0-1 ⇒ `pinned ANCHOR ... unreadable` ×106/×101). The backfill pulls the signed byte map for the EXACT missing
       // ordinal from up to `nakamoto.pinned-backfill-max-peers` peers via the by-ordinal `/global-snapshots/<ord>/mpt-entries` route
       // (session-less; integrity comes from the locally committed root gate, not the transport); the reader then
-      // verifies `sidecarFreeMptRoot(fetched) === the LOCALLY-committed stateProof.mptRoot@ord`, strips to `consensusRootEntries`
+      // verifies `consensusMptRoot(fetched) === the LOCALLY-committed stateProof.mptRoot@ord`, strips to `consensusRootEntries`
       // (staged map = pure function of the committed root), and persists. Fetch failure / wrong root ⇒ the exact pre-existing
       // fail-closed defer. In-flight per-ordinal dedup bounds network amplification when many per-MG reads miss the same base.
       gl0PinnedBackfill <- io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader.PinnedByteBackfill
@@ -691,9 +691,6 @@ object GlobalSnapshotConsensus {
             .getOrElse(sharedCfg.environment, EpochProgress.MinValue),
           mptOverlay,
           loggerBundle,
-          // `maintainNodeCollateralWithdrawalExpiryIndex` left at default (false) here to preserve
-          // existing behavior of this construction site — the SharedServices GSAM sets it to true,
-          // but reconciling the two flags is out of scope for the Path 1 fix.
           etaRotationSnapshots = sharedCfg.nakamoto.etaRotationSnapshots(sharedCfg.environment).value,
           etaForPeriod = Some(etaForPeriodAtParentCallback),
           localEventsPublisher = Some(localEventsPublisher),

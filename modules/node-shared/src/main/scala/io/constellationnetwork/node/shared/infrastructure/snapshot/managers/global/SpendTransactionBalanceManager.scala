@@ -9,7 +9,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.SpendTransaction
 import io.constellationnetwork.schema.balance.{Amount, Balance, BalanceArithmeticError}
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRead}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.{Hashed, Hasher}
@@ -31,9 +31,9 @@ trait SpendTransactionBalanceManager[F[_]] {
     Either[SpendTransactionBalanceManager.SpendTransactionBalanceError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]
   ]
 
-  /** Materialize the full `address → Balance` view via the `ActiveAddressIndex` sidecar. The Balance value type doesn't carry the address,
-    * so we recover the keyset from the sidecar partition and `getMany` each entry. Used by GSAM to source the prior-ordinal `balances` map
-    * without consulting `lastSnapshotContext`.
+  /** Materialize the full `address → Balance` view via the rooted `ActiveAddressIndex`. The Balance value type doesn't carry the address,
+    * so the index supplies the keyset and every indexed target must be present and decodable in the same authenticated view. Used by GSAM
+    * to source the prior-ordinal `balances` map without consulting `lastSnapshotContext`.
     */
   def materializeAllBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, Balance]]
 }
@@ -186,14 +186,24 @@ object SpendTransactionBalanceManager {
       def materializeAllBalancesFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, Balance]] =
         for {
           indexKey <- GlobalStateKey.activeAddressIndexKey[F](GlobalStateFieldId.Balances)
-          addrSet <- reader.get[SortedSet[Address]](indexKey).map(_.getOrElse(SortedSet.empty[Address]))
-          addrList = addrSet.toList
-          keys = addrList.map(addr => GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr))
-          values <- reader.getMany[Balance](keys)
-        } yield
-          SortedMap.from(addrList.flatMap { addr =>
-            val key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr)
-            values.get(key).map(addr -> _)
-          })
+          indexHex <- GlobalStateKey.toHex[F](indexKey)
+          addrSet <- StrictMptRead.valueOrElseF(
+            reader.getStrict[SortedSet[Address]](indexKey),
+            SortedSet.empty[Address],
+            "materialize Balances ActiveAddressIndex",
+            indexHex
+          )
+          entries <- addrSet.toList.traverse { addr =>
+            val targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr)
+            for {
+              targetHex <- GlobalStateKey.toHex[F](targetKey)
+              value <- StrictMptRead.requirePresentF(
+                reader.getStrict[Balance](targetKey),
+                s"materialize Balances indexed target(address=$addr)",
+                targetHex
+              )
+            } yield addr -> value
+          }
+        } yield SortedMap.from(entries)
     }
 }

@@ -2187,7 +2187,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
   //
   // The GSI has NO field for the MPT-native consensus partitions (`ConsumedAllowSpends` fieldId 33 / `Slashings` fieldId
   // 34 — non-empty at numShards > 1), so the old bare `syncFromGlobalSnapshotInfo` at the bootstrap / forced-re-download
-  // seed committed a mirror whose sidecar-free root diverges from the snapshot's SIGNED `stateProof.mptRoot` whenever the
+  // seed committed a mirror whose consensus root diverges from the snapshot's SIGNED `stateProof.mptRoot` whenever the
   // local 33/34 content differs from the target's — the follower follow-verify wedge (its recomputed proof never equals
   // the signed root again). The seed now reconciles {GSI ∪ preserved 33/34, GSI alone} against the SIGNED root BEFORE
   // writing (`syncFromGlobalSnapshotInfoVerified`); legacy snapshots (`mptRoot = None`) keep the plain preserving rebuild
@@ -2220,7 +2220,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           throwawayProducer <- InMemoryMerklePatriciaProducer.make[IO]()
           throwawayStore <- MptStore.make[IO, GlobalStateKey](throwawayProducer, GlobalStateKey.toHex[IO])
           _ <- throwawayStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal10)
-          signedRoot <- throwawayStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+          signedRoot <- throwawayStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
 
           // The follower's live mirror BEFORE the forced re-download: it previously followed byte-faithfully, so it holds
           // 33/34 markers (written at ordinals the canonical chain has since reconciled away).
@@ -2236,7 +2236,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           processingResult <- snapshotProcessor.process((hashedSnapshot, snapshotInfo).asLeft[Hashed[GlobalIncrementalSnapshot]])
 
           entriesAfter <- mptStore.allEntriesAsBytes
-          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+          rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
         } yield
           expect.all(
             processingResult == DownloadPerformed(SnapshotReference.fromHashedSnapshot(hashedSnapshot), Set.empty, Set.empty),
@@ -2272,7 +2272,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           _ <- throwawayStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal10)
           _ <- throwawayStore.underlying.insertBytes(Map(consumedHex -> markerBytes, slashHex -> slashBytes)).flatMap(_.liftTo[IO])
           _ <- throwawayStore.build(snapshotOrdinal10).void
-          signedRoot <- throwawayStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.sidecarFreeMptRoot[IO](_))
+          signedRoot <- throwawayStore.allEntriesAsBytes.flatMap(GlobalSnapshotInfo.consensusMptRoot[IO](_))
 
           _ <- mptStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal9)
           _ <- mptStore.underlying.insertBytes(Map(consumedHex -> markerBytes, slashHex -> slashBytes)).flatMap(_.liftTo[IO])
@@ -2286,7 +2286,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           processingResult <- snapshotProcessor.process((hashedSnapshot, snapshotInfo).asLeft[Hashed[GlobalIncrementalSnapshot]])
 
           entriesAfter <- mptStore.allEntriesAsBytes
-          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+          rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
         } yield
           expect.all(
             processingResult == DownloadPerformed(SnapshotReference.fromHashedSnapshot(hashedSnapshot), Set.empty, Set.empty),
@@ -2317,7 +2317,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           throwawayStore <- MptStore.make[IO, GlobalStateKey](throwawayProducer, GlobalStateKey.toHex[IO])
           _ <- throwawayStore.syncFromGlobalSnapshotInfo(snapshotInfo, snapshotOrdinal10)
           referenceEntries <- throwawayStore.allEntriesAsBytes
-          signedRoot <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](referenceEntries)
+          signedRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](referenceEntries)
 
           hashedSnapshot <- forAsyncHasher(
             generateSnapshot(peerId).copy(stateProof = generateSnapshot(peerId).stateProof.copy(mptRoot = signedRoot.some)),
@@ -2328,7 +2328,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           processingResult <- snapshotProcessor.process((hashedSnapshot, snapshotInfo).asLeft[Hashed[GlobalIncrementalSnapshot]])
 
           entriesAfter <- mptStore.allEntriesAsBytes
-          rootAfter <- GlobalSnapshotInfo.sidecarFreeMptRoot[IO](entriesAfter)
+          rootAfter <- GlobalSnapshotInfo.consensusMptRoot[IO](entriesAfter)
         } yield
           expect.all(
             processingResult == DownloadPerformed(SnapshotReference.fromHashedSnapshot(hashedSnapshot), Set.empty, Set.empty),

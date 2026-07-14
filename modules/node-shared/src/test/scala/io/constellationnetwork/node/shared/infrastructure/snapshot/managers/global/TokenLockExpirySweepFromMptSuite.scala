@@ -14,7 +14,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -22,6 +22,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.{Signed, signature}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.tokenLockExpiryKeySetImmutableCodec
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
@@ -54,6 +55,9 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
 
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
+
+  private def sameBytes(left: Map[Hex, Array[Byte]], right: Map[Hex, Array[Byte]]): Boolean =
+    left.keySet == right.keySet && left.forall { case (key, bytes) => right.get(key).exists(_.sameElements(bytes)) }
 
   private def mkTokenLock(source: Address, unlockAt: Option[EpochProgress], label: String): Signed[TokenLock] =
     Signed(
@@ -343,6 +347,64 @@ object TokenLockExpirySweepFromMptSuite extends MutableIOSuite {
         resultE.exists {
           case (_, deltas) => deltas.get(addr1).map(_.value.value) == Some(200L)
         }
+      )
+  }
+
+  test("FromMpt sweep rejects an absent active target at its exact physical key without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val expiry = EpochProgress(NonNegLong(100L))
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      tokenLock = mkTokenLock(source, Some(expiry), "absent-target")
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(tokenLock)))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      _ <- store.remove(targetKey)
+      before <- store.allEntriesAsBytes
+      result <- TokenLockStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredGlobalTokenLocksViaIndexFromMpt(expiry, EpochProgress(NonNegLong(101L)))
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.MissingConsensusMptValue) => error.physicalKey == targetHex
+          case _                                                   => false
+        },
+        sameBytes(before, after)
+      )
+  }
+
+  test("FromMpt sweep rejects a forged earlier bucket for an active token lock without mutation") { res =>
+    implicit val (h, sp, js) = res
+    val forgedExpiry = EpochProgress(NonNegLong(100L))
+    val actualExpiry = EpochProgress(NonNegLong(101L))
+
+    for {
+      source <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
+      tokenLock = mkTokenLock(source, Some(actualExpiry), "forged-earlier-bucket")
+      hashed <- tokenLock.toHashed
+      store <- mkSeededMptStore(SortedMap(source -> SortedSet(tokenLock)))
+      forgedBucketKey <- GlobalStateKey.expiryIndexKey[IO](SystemNamespaceLabel.ExpiryIndexTokenLocks, forgedExpiry)
+      forgedIndexKey = TokenLockExpiryKey(source, hashed.hash)
+      _ <- store.insert[SortedSet[TokenLockExpiryKey]](forgedBucketKey, SortedSet(forgedIndexKey))
+      targetKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, source)
+      targetHex <- GlobalStateKey.toHex[IO](targetKey)
+      before <- store.allEntriesAsBytes
+      result <- TokenLockStateManager
+        .make[IO](GlobalStateReader.fromMptStore(store))
+        .findExpiredGlobalTokenLocksViaIndexFromMpt(forgedExpiry, actualExpiry)
+        .attempt
+      after <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        result match {
+          case Left(error: StrictMptRead.InconsistentConsensusMptIndex) => error.physicalKey == targetHex
+          case _                                                        => false
+        },
+        sameBytes(before, after)
       )
   }
 }
