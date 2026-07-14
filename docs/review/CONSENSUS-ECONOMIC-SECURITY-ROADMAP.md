@@ -475,13 +475,46 @@ available before the fail-closed guard becomes active.
 
 The first dark implementation slice is an immutable local MPT image store: copied
 and sorted bytes, independent root rebuild, versioned deterministic encoding,
-content digest, forced atomic image/manifest publication, verified readback, and
-generation CAS. It has no runtime caller and closes none of ROOT-002/003/004 by
-itself. Activation additionally requires one lifetime OS ownership lock for the
-store directory, bounded streaming decode, an era-bound root builder, exact
-canonical `(snapshotHash,ordinal,mptRoot)` anchoring, and the durable multi-sink
-finality intent. Multiple live store instances are forbidden until ownership is
-enforced.
+content digest, forced atomic image/manifest publication, verified readback,
+generation CAS, lifetime OS directory ownership, bounded streaming decode, and
+typed missing-artifact recovery. It has no runtime caller and closes none of
+ROOT-002/003/004 by itself. Activation additionally requires an active-era
+whole-image physical-key/value verifier inseparable from the root algorithm, exact
+FinalityGate-authenticated
+`(snapshotHash,parentHash,ordinal,mptRoot)` anchoring, and the durable multi-sink
+finality intent. A caller-supplied era label or self-consistent manifest is not
+authentication.
+
+The accompanying pure exact-parent resolver proves only a canonically encoded,
+ordinal-contiguous, cycle-free structural reference path to the supplied base. It rejects
+unknown/missing ancestry, reserved/noncanonical identities, and a pending entry
+that shadows the base hash. It is deliberately named `ResolvedParentLineage`, not
+an execution session: no replay session exists until one atomic overlay read
+captures the complete parent byte image plus the pending/base mutation generation.
+The generation comparison must occur inside the eventual commit CAS; a separate
+check followed by mutation is a TOCTOU bug.
+
+The dark chain-store ancestry walk is bounded and resolves exact hash-addressed
+bytes before consulting an ordinal fallback. A fallback sibling at the requested
+ordinal is typed incomplete and can never substitute for the requested hash. The
+walk currently hashes only when the live current-hasher logic agrees with the
+ordinal-selected JSON/Kryo logic and otherwise returns `HashEraUnavailable`; this
+avoids inventing a second identity inside one recovery helper. It is not the future
+Scodec migration. Before another hash-codec era activates, snapshot identity must
+migrate atomically across leader, sync, KES, overlay, gossip, storage, and recovery,
+using a canonical era identifier stronger than coarse `HashLogic`. Separately,
+live chain-store admission still accepts caller-supplied ordinal, parent, slot, and
+VRF metadata alongside the signed snapshot; deriving and checking those fields at
+admission remains an active-path hardening task.
+
+The next dark slice is one durable finality-intent journal over the existing sinks.
+Its immutable batch binds the prior exact released state, an advance or density
+replacement, the complete ordered exact snapshot range, terminal state artifacts,
+and either already-decided `T_weight` attestation evidence or canonical depth-`k1`
+evidence. Recoverable stages make the hash-bound release and subsequent at-least-once
+notifications idempotent. The journal records a result made by the optimistic or
+Nakamoto rail; it cannot decide one, legitimize the current one-round cumulative-
+weight shortcut, or add proposal/vote/lock/QC semantics to GL0.
 
 The lanes join before activation in this order: freeze O-13/O-14 and protocol
 bounds; freeze the complete root, physical key grammar, and canonical
@@ -711,10 +744,15 @@ root/phase/slash sink.
 
 1. Propagate the locked decisions and remaining open gates into ADR-0016/0017,
    the artifact lifecycle, test plan, and architecture drift guard.
-2. Resolve only the remaining parameter/recovery gates O-01 through O-10; runtime
-   work must not invent answers.
-3. Run P0/P1/P2/PF/P5/P6 in parallel: decisions/RED ledger, serde vectors,
-   economic oracle, finality model, stake/evidence model, and transport RED corpus.
+2. Resolve the remaining owner gates O-01 through O-14; runtime work must not
+   invent answers. L-23 already fixes the exact-parent concurrency, bounded
+   retention/recovery, and cross-sink durability strategy, but its runtime gates
+   remain open.
+3. Run the named decisions/RED-ledger, serde-vector, economic-oracle,
+   finality-model, stake/evidence-model, and transport-RED workstreams in
+   parallel. Packet numbers are local to this roadmap; delegations must include
+   the document and packet name because the protocol test plan uses a different
+   packet numbering scheme.
 4. Freeze the complete root/write set, GL0 correction shape, and checkpoint
    preimage in P4.
 5. Implement P7 hash-bound Phase-2, density/deep recovery, and tower/SMT

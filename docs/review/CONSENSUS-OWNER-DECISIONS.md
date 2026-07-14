@@ -1,7 +1,7 @@
 # Consensus Owner Decision Register
 
 **Status:** Active. Runtime packets may not silently choose an `OPEN` item.
-**Updated:** 2026-07-13
+**Updated:** 2026-07-14
 
 This register uses project phases only where the owner has ratified them:
 Phase 0 `Pending`, Phase 1 `Provisional`, and Phase 2 `Operational`. `k2` is a
@@ -34,11 +34,28 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-20 | Every touched metagraph uses compare-and-set: its signed `preRoot` and version must equal the GL0 proposal parent's current framework-mirror root/version before composition. Otherwise the checkpoint defers/rebases; intervening mirror state is never overwritten. |
 | L-21 | Greenfield runtime starts with one canonical `ScodecV1` era at new-chain ordinal 0. Existing-network migration work is deferred, while prior data already on disk remains readable according to an explicit historical-read contract. Undeployed fork schemas are not retained. |
 | L-22 | Tower eligibility is a required protocol feature, but enabling it is multi-stage. Snapshot-carried trial/tower state and `smtRoot` must be independently reproduced and verified by every GL0 recipient, durable across restart, and branch-aware across density reorgs before proofs are treated as security evidence. Replacing `NotComputed` alone is forbidden. |
+| L-23 | Exact-parent state uses an immutable captured parent generation plus compare-and-set at commit; a stale session retries or defers and never blocks GL0 finality indefinitely. Locally viable branch generations are retained only within bounded policy; history beyond that bound is accepted only through exact authenticated reconstruction, otherwise the node enters `RecoveryRequired`. Finality durability uses one idempotent intent journal coordinating the existing overlay, chain store, tracker, outbox, watermarks, projections, and other sinks; it does not require migrating every sink into one database transaction. No exact-parent guard activates until the verified base anchor, descendant-preserving fold, authenticated restart/reorg recovery, and recoverable finality-intent transition land as one coherent unit. |
 
 Implementation status for L-15A is **OPEN**. The current currency incremental
 contains the `globalSnapshotSync` proof hash and accepted `globalSnapshotSyncs`
 delta, not the exact full-view preimage, while GL0 still writes, reconstructs,
 and strips field 32 on different storage paths (ECO-F32).
+
+Implementation status for L-23 is **OPEN**. The immutable MPT image store and
+pure branch reference/lineage models are nonactivating prerequisites. The dark
+image store now has lifetime directory ownership, bounded streaming decode, and
+typed missing-artifact recovery, but still lacks an active-era semantic key/value
+verifier and FinalityGate anchor authentication. The bounded exact chain walk and
+structural lineage result are recovery/continuity prerequisites, not a replay
+session: they capture neither exact parent bytes nor the overlay mutation
+generation. Cross-era walking currently fails closed until canonical snapshot
+identity is migrated end to end, and live chain-store admission still trusts
+parallel caller metadata instead of deriving it from signed content. Live overlay
+reads still conflate an unavailable parent/ancestor with the mutable finalized
+base, successful folds still discard pending descendants, and global finality has
+no durable intent and publishes sinks in a crash-splittable order. L-23 settles the
+implementation strategy; it does not close `SMT-02`, `ROOT-002..005`, or
+`E9-BRANCH`.
 
 ## Open decision gates
 

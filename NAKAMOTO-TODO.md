@@ -493,16 +493,44 @@ criteria are in `NAKAMOTO-PLAN.md`.
     Unknown/evicted hashes and incomplete ancestry enter typed recovery; they
     never fall through to base. Finalizing an unknown branch cannot mutate base
     or markers, and finalizing an ancestor retains canonical descendants.
+  - **Owner decision locked (L-23):** an exact-parent session captures one
+    immutable generation and commits through generation CAS/retry; viable branch
+    generations have bounded local retention with authenticated reconstruction or
+    `RecoveryRequired` beyond it; one durable idempotent finality-intent journal
+    coordinates the existing sinks. This settles the strategy, not the
+    `ROOT-002..005` implementation gates.
   - Activate those branch guards only with authenticated restart binding,
     descendant retention, explicit `RecoveryRequired`, and finality-sink
     preflight/coordination. Unknown rejection alone halts the current normal path
     after the tip tracker, chain store, and outbox may already have advanced.
-  - Land the storage work dark before activation: immutable copied/sorted images,
-    independent root rebuild, forced atomic publication, digest/readback, and
-    monotone generation CAS. Then add lifetime OS directory ownership, bounded
-    streaming decode, era-bound hashing, exact snapshot anchoring, immutable
-    capture inside the session, and one durable multi-sink finality intent. The
-    image store alone closes none of `ROOT-002..004`.
+  - The dark image store now supplies immutable copied/sorted images, independent
+    root rebuild, forced atomic publication, digest/readback, monotone generation
+    CAS, lifetime OS directory ownership, bounded streaming decode, and typed
+    missing-artifact recovery. Before activation add an active-era whole-image
+    physical-key/value verifier inseparable from the root algorithm,
+    FinalityGate-authenticated exact snapshot anchoring, immutable capture inside
+    the session, and one durable multi-sink finality intent. A supplied era label
+    or self-consistent manifest is not authentication. The image store alone closes
+    none of `ROOT-002..004`.
+  - The dark structural resolver returns `ResolvedParentLineage`, not an execution
+    session. Mint the latter only while atomically copying the complete exact-parent
+    bytes and the whole overlay mutation generation; compare that generation inside
+    the commit CAS. Pending rekey/discard/replacement with an unchanged durable base
+    must stale the capture.
+  - The dark chain-store walk is bounded and exact-hash first; ordinal fallback can
+    only establish absence or return a typed same-ordinal sibling mismatch. It
+    fails closed with `HashEraUnavailable` where current and ordinal-selected
+    JSON/Kryo logic differ. Before any Scodec/hash-era activation, land one atomic
+    canonical-identity migration across every producer, verifier, KES, overlay,
+    gossip, storage, and recovery path, using a discriminator stronger than the
+    current coarse `HashLogic`.
+  - [ ] Harden live chain-store admission so ordinal, parent hash, slot, and VRF
+    metadata are derived from and checked against the authenticated signed snapshot;
+    the dark ancestry walk is detection/recovery infrastructure, not that boundary.
+  - [ ] Land the dark durable finality-intent ADT/codec/store and pure recovery
+    machine. Evidence is only an already-decided `T_weight` attestation or canonical
+    depth-`k1` result; the journal must not turn today's cumulative-weight optimistic
+    shortcut into a valid decision or introduce a BFT vote/lock/QC path.
   - Density replacement reverses anchors, mirrors, settlement/nullifiers, and
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters

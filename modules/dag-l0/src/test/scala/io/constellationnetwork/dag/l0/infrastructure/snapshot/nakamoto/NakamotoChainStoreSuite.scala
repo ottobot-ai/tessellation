@@ -269,6 +269,39 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         }
     }
 
+  private final case class LinkedSnapshot(
+    signed: Signed[GlobalIncrementalSnapshot],
+    context: GlobalSnapshotInfo,
+    hash: Hash
+  )
+
+  /** Build snapshots whose signed ordinal and signed parent hash match the chain-store metadata. The older `seedChainOfLength` fixture is
+    * intentionally metadata-only and must not be used to prove exact signed ancestry.
+    */
+  private def mkSignedLinkedChain(length: Int)(
+    implicit H: Hasher[IO],
+    S: SecurityProvider[IO],
+    j: JsonSerializer[IO]
+  ): IO[List[LinkedSnapshot]] =
+    for {
+      templatePair <- mkGenesis
+      (template, context) = templatePair
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      result <- (1 to length).toList.foldLeftM[IO, (List[LinkedSnapshot], Hash)]((Nil, Hash.empty)) {
+        case ((acc, parentHash), ordinal) =>
+          val value = template.value.copy(
+            ordinal = SnapshotOrdinal.unsafeApply(ordinal.toLong),
+            lastSnapshotHash = parentHash,
+            epochProgress = EpochProgress(NonNegLong.unsafeFrom(ordinal.toLong))
+          )
+          Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](value, keyPair).flatMap { signed =>
+            signed.toHashed[IO].map { hashed =>
+              (acc :+ LinkedSnapshot(signed, context, hashed.hash), hashed.hash)
+            }
+          }
+      }
+    } yield result._1
+
   /** Seed a chain of `n` distinct-hash snapshots at ordinals 1..n into `chainStore`, parent-linked left-to-right. Returns the hash at each
     * ordinal. The actual chain-linking via `parentHash` isn't tied to any production semantics here — we just need `byHash` populated;
     * `chainStore`'s canonical-walk in `finalize` follows the parent chain so we link each new store to the prior.
@@ -772,22 +805,17 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, diskRef, diskByHashRef) = r
-      pair <- mkGenesis
-      (s1, _) = pair
-      h1 <- s1.toHashed[IO]
+      item <- mkSignedLinkedChain(7).map(_.last)
       // DON'T store in chainStore (so byHash misses). DO put on disk so the fallback engages.
-      _ <- diskRef.update(_.updated(SnapshotOrdinal(NonNegLong.unsafeFrom(7L)), s1))
-      _ <- diskByHashRef.update(_.updated(h1.hash, s1))
-      preInMem <- chainStore.get(h1.hash)
-      // The actual ordinal in s1 is the genesis incremental ord = 1 (from `mkGenesis`).
-      // But for `getWithOrdinalFallback`, the disk lookup is by the caller-supplied `expectedOrdinal`
-      // — we placed the snapshot on disk under ordinal=7 so that's the expected ordinal here.
-      out <- chainStore.getWithOrdinalFallback(h1.hash, expectedOrdinal = 7L)
+      _ <- diskRef.update(_.updated(item.signed.value.ordinal, item.signed))
+      _ <- diskByHashRef.update(_.updated(item.hash, item.signed))
+      preInMem <- chainStore.get(item.hash)
+      out <- chainStore.getWithOrdinalFallback(item.hash, expectedOrdinal = 7L)
     } yield
       expect.all(
         preInMem.isEmpty, // byHash miss confirmed
         out.isDefined, // disk fallback succeeded
-        out.exists(_.hash === h1.hash) // returned entry's hash matches request
+        out.exists(_.hash === item.hash) // returned entry's hash matches request
       )
   }
 
@@ -800,16 +828,31 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, diskRef, _) = r
-      // Disk holds snapshot A at ordinal=5 (a different chain's ordinal-5 view).
-      pairA <- mkGenesis
-      (sA, _) = pairA
-      // Caller asks for snapshot B's hash with expectedOrdinal=5 — disk returns A, hash differs.
-      pairB <- mkAltSnapshot
-      (sB, _) = pairB
-      hB <- sB.toHashed[IO]
-      _ <- diskRef.update(_.updated(SnapshotOrdinal(NonNegLong.unsafeFrom(5L)), sA))
-      out <- chainStore.getWithOrdinalFallback(hB.hash, expectedOrdinal = 5L)
+      itemA <- mkSignedLinkedChain(5).map(_.last)
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      signedB <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        itemA.signed.value.copy(epochProgress = EpochProgress(NonNegLong.unsafeFrom(999L))),
+        keyPair
+      )
+      hashedB <- signedB.toHashed[IO]
+      _ <- diskRef.update(_.updated(itemA.signed.value.ordinal, itemA.signed))
+      out <- chainStore.getWithOrdinalFallback(hashedB.hash, expectedOrdinal = 5L)
     } yield expect.same(None, out) // hash-verify rejects the disk's different-chain snapshot
+  }
+
+  test("getWithOrdinalFallback: wrong embedded ordinal is rejected before hashing") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, diskRef, _) = r
+      item <- mkSignedLinkedChain(1).map(_.head)
+      _ <- diskRef.update(_.updated(SnapshotOrdinal.unsafeApply(5L), item.signed))
+      out <- chainStore.getWithOrdinalFallback(item.hash, expectedOrdinal = 5L)
+    } yield expect.same(None, out)
   }
 
   test("getWithOrdinalFallback: in-memory miss AND disk miss returns None") { res =>
@@ -841,6 +884,454 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     } yield expect.same(None, out)
   }
 
+  test("walkBackExact: proves a complete signed, contiguous in-memory ancestry path") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStore()
+      (chainStore, _, _, _) = r
+      chain <- mkSignedLinkedChain(3)
+      _ <- chain.traverse_ { item =>
+        chainStore
+          .store(
+            item.signed,
+            item.context,
+            item.signed.value.ordinal.value.value,
+            item.signed.value.ordinal.value.value,
+            item.signed.value.lastSnapshotHash,
+            Array.empty
+          )
+          .void
+      }
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(chain.last.hash, chain.last.signed.value.ordinal),
+        chain.head.signed.value.ordinal,
+        maxSteps = 3
+      )
+    } yield
+      result match {
+        case Right(NakamotoChainStore.ExactWalkResult.Complete(path)) =>
+          expect.same(chain.reverse.map(_.hash).toVector, path.map(_.position.hash))
+        case other => failure(s"expected complete exact ancestry, got $other")
+      }
+  }
+
+  test("walkBackExact: cross-era reconstruction rejects until canonical identity migrates end to end") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    val historicalHash = Hash("66" * 32)
+    val historicalHasher = new Hasher[IO] {
+      def hash[A: io.circe.Encoder](data: A): IO[Hash] = IO.pure(historicalHash)
+      def hashBytes(bytes: Array[Byte]): IO[Hash] = IO.pure(historicalHash)
+      def compare[A: io.circe.Encoder](data: A, expectedHash: Hash): IO[Boolean] = IO.pure(expectedHash === historicalHash)
+      def getLogic(ordinal: SnapshotOrdinal): HashLogic = KryoHash
+      def prefixedHash[A: io.circe.Encoder](data: A, prefix: Array[Byte]): IO[Hash] = IO.pure(historicalHash)
+    }
+    implicit val hs: HasherSelector[IO] = new HasherSelector[IO] {
+      def getCurrent: Hasher[IO] = h
+      def getForOrdinal(ordinal: SnapshotOrdinal): Hasher[IO] =
+        if (ordinal == SnapshotOrdinal.unsafeApply(1L)) historicalHasher else h
+    }
+
+    for {
+      r <- mkChainStore()
+      (chainStore, _, _, _) = r
+      item <- mkSignedLinkedChain(1).map(_.head)
+      stored <- chainStore.store(
+        item.signed,
+        item.context,
+        ordinal = 1L,
+        slot = 1L,
+        parentHash = Hash.empty,
+        vrfOutput = Array.empty
+      )
+      storedByHistoricalHash <- chainStore.get(historicalHash)
+      storedByCurrentHash <- chainStore.get(item.hash)
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(item.hash, SnapshotOrdinal.unsafeApply(1L)),
+        SnapshotOrdinal.unsafeApply(1L),
+        maxSteps = 1
+      )
+    } yield
+      expect(stored) &&
+        expect(storedByHistoricalHash.isEmpty) &&
+        expect(storedByCurrentHash.nonEmpty) &&
+        expect.same(
+          Left(
+            NakamotoChainStore.ExactWalkError.HashEraUnavailable(
+              NakamotoChainStore.ExactWalkPosition(item.hash, SnapshotOrdinal.unsafeApply(1L)),
+              JsonHash,
+              KryoHash
+            )
+          ),
+          result
+        )
+  }
+
+  test("walkBackExact: content hashing failures remain inside the typed result") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    val failure = new IllegalStateException("historical hash codec failed")
+    val failingHasher = new Hasher[IO] {
+      def hash[A: io.circe.Encoder](data: A): IO[Hash] = IO.raiseError(failure)
+      def hashBytes(bytes: Array[Byte]): IO[Hash] = IO.raiseError(failure)
+      def compare[A: io.circe.Encoder](data: A, expectedHash: Hash): IO[Boolean] = IO.raiseError(failure)
+      def getLogic(ordinal: SnapshotOrdinal): HashLogic = JsonHash
+      def prefixedHash[A: io.circe.Encoder](data: A, prefix: Array[Byte]): IO[Hash] = IO.raiseError(failure)
+    }
+    implicit val hs: HasherSelector[IO] = new HasherSelector[IO] {
+      def getCurrent: Hasher[IO] = failingHasher
+      def getForOrdinal(ordinal: SnapshotOrdinal): Hasher[IO] = failingHasher
+    }
+
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      item <- mkSignedLinkedChain(1).map(_.head)
+      _ <- diskByHashRef.set(Map(item.hash -> item.signed))
+      position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
+      result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
+    } yield expect.same(
+      Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(position, failure.getMessage)),
+      result
+    )
+  }
+
+  test("walkBackExact: hash selector failures remain inside the typed result") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    val failure = new IllegalStateException("hash era selector failed")
+    implicit val hs: HasherSelector[IO] = new HasherSelector[IO] {
+      def getCurrent: Hasher[IO] = throw failure
+      def getForOrdinal(ordinal: SnapshotOrdinal): Hasher[IO] = h
+    }
+
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      item <- mkSignedLinkedChain(1).map(_.head)
+      _ <- diskByHashRef.set(Map(item.hash -> item.signed))
+      position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
+      result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
+    } yield expect.same(
+      Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(position, failure.getMessage)),
+      result
+    )
+  }
+
+  test("walkBackExact: exact-hash disk record wins over a same-ordinal sibling") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, diskRef, diskByHashRef) = r
+      chain <- mkSignedLinkedChain(1)
+      original = chain.head
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      siblingSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        original.signed.value.copy(epochProgress = EpochProgress(NonNegLong.unsafeFrom(999L))),
+        keyPair
+      )
+      siblingHashed <- siblingSigned.toHashed[IO]
+      ordinal = original.signed.value.ordinal
+      _ <- diskRef.set(Map(ordinal -> siblingSigned))
+      _ <- diskByHashRef.set(Map(original.hash -> original.signed))
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(original.hash, ordinal),
+        ordinal,
+        maxSteps = 1
+      )
+    } yield
+      result match {
+        case Right(NakamotoChainStore.ExactWalkResult.Complete(path)) =>
+          expect.same(Vector(original.hash), path.map(_.position.hash)) &&
+          expect(original.hash =!= siblingHashed.hash)
+        case other => failure(s"expected exact hash-addressed record, got $other")
+      }
+  }
+
+  test("walkBackExact: ordinal fallback reports a sibling as incomplete, never complete") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, diskRef, _) = r
+      chain <- mkSignedLinkedChain(1)
+      requested = chain.head
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      siblingSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        requested.signed.value.copy(epochProgress = EpochProgress(NonNegLong.unsafeFrom(999L))),
+        keyPair
+      )
+      siblingHashed <- siblingSigned.toHashed[IO]
+      ordinal = requested.signed.value.ordinal
+      _ <- diskRef.set(Map(ordinal -> siblingSigned))
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(requested.hash, ordinal),
+        ordinal,
+        maxSteps = 1
+      )
+    } yield
+      expect.same(
+        Right(
+          NakamotoChainStore.ExactWalkResult.Incomplete(
+            Vector.empty,
+            NakamotoChainStore.ExactWalkPosition(requested.hash, ordinal),
+            NakamotoChainStore.ExactWalkIncompleteReason.SiblingAtOrdinal(siblingHashed.hash)
+          )
+        ),
+        result
+      )
+  }
+
+  test("walkBackExact: unknown start is incomplete and cannot substitute the ordinal record") { res =>
+    val (_, _, _, h, _) = res
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    val position = NakamotoChainStore.ExactWalkPosition(Hash("22" * 32), SnapshotOrdinal.unsafeApply(7L))
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, _) = r
+      result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
+    } yield
+      expect.same(
+        Right(
+          NakamotoChainStore.ExactWalkResult.Incomplete(
+            Vector.empty,
+            position,
+            NakamotoChainStore.ExactWalkIncompleteReason.NotFound
+          )
+        ),
+        result
+      )
+  }
+
+  test("walkBackExact: a missing middle ancestor returns the exact missing hash and ordinal") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStore()
+      (chainStore, _, _, _) = r
+      chain <- mkSignedLinkedChain(3)
+      child = chain.last
+      _ <- chainStore.store(
+        child.signed,
+        child.context,
+        child.signed.value.ordinal.value.value,
+        child.signed.value.ordinal.value.value,
+        child.signed.value.lastSnapshotHash,
+        Array.empty
+      )
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(child.hash, child.signed.value.ordinal),
+        chain.head.signed.value.ordinal,
+        maxSteps = 3
+      )
+    } yield
+      result match {
+        case Right(NakamotoChainStore.ExactWalkResult.Incomplete(path, missing, reason)) =>
+          expect.same(Vector(child.hash), path.map(_.position.hash)) &&
+          expect.same(chain(1).hash, missing.hash) &&
+          expect.same(SnapshotOrdinal.unsafeApply(2L), missing.ordinal) &&
+          expect.same(NakamotoChainStore.ExactWalkIncompleteReason.NotFound, reason)
+        case other => failure(s"expected incomplete exact ancestry, got $other")
+      }
+  }
+
+  test("walkBackExact: rejects caller metadata that disagrees with signed ordinal or parent") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    val wrongParent = Hash("33" * 32)
+    for {
+      ordinalStoreFixture <- mkChainStore()
+      (ordinalStore, _, _, _) = ordinalStoreFixture
+      parentStoreFixture <- mkChainStore()
+      (parentStore, _, _, _) = parentStoreFixture
+      chain <- mkSignedLinkedChain(1)
+      item = chain.head
+      _ <- ordinalStore.store(item.signed, item.context, 2L, 2L, item.signed.value.lastSnapshotHash, Array.empty)
+      ordinalResult <- ordinalStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(item.hash, SnapshotOrdinal.unsafeApply(2L)),
+        SnapshotOrdinal.unsafeApply(2L),
+        maxSteps = 1
+      )
+      _ <- parentStore.store(item.signed, item.context, 1L, 1L, wrongParent, Array.empty)
+      parentResult <- parentStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(item.hash, SnapshotOrdinal.unsafeApply(1L)),
+        SnapshotOrdinal.unsafeApply(1L),
+        maxSteps = 1
+      )
+    } yield
+      expect(
+        ordinalResult.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.SignedOrdinalMismatch])
+      ) &&
+        expect(parentResult.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.StoredParentMismatch]))
+  }
+
+  test("walkBackExact: rejects wrong bytes returned by the exact hash index") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    val requestedHash = Hash("44" * 32)
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      chain <- mkSignedLinkedChain(1)
+      item = chain.head
+      _ <- diskByHashRef.set(Map(requestedHash -> item.signed))
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(requestedHash, item.signed.value.ordinal),
+        item.signed.value.ordinal,
+        maxSteps = 1
+      )
+    } yield expect(result.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.ExactHashContentMismatch]))
+  }
+
+  test("walkBackExact: rejects non-canonical requested hashes and signed parents") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    val ordinal = SnapshotOrdinal.unsafeApply(1L)
+    val nonCanonical = Hash("ABC")
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      invalidRequested <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(nonCanonical, ordinal),
+        ordinal,
+        maxSteps = 1
+      )
+      chain <- mkSignedLinkedChain(1)
+      template = chain.head
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      invalidParentSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        template.signed.value.copy(lastSnapshotHash = nonCanonical),
+        keyPair
+      )
+      invalidParentHashed <- invalidParentSigned.toHashed[IO]
+      _ <- diskByHashRef.set(Map(invalidParentHashed.hash -> invalidParentSigned))
+      invalidParent <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(invalidParentHashed.hash, ordinal),
+        ordinal,
+        maxSteps = 1
+      )
+    } yield
+      expect.same(
+        Left(
+          NakamotoChainStore.ExactWalkError.NonCanonicalSnapshotHash(
+            NakamotoChainStore.ExactWalkPosition(nonCanonical, ordinal),
+            NakamotoChainStore.ExactWalkHashRole.Requested,
+            nonCanonical
+          )
+        ),
+        invalidRequested
+      ) &&
+        expect(
+          invalidParent.left.toOption.contains(
+            NakamotoChainStore.ExactWalkError.NonCanonicalSnapshotHash(
+              NakamotoChainStore.ExactWalkPosition(invalidParentHashed.hash, ordinal),
+              NakamotoChainStore.ExactWalkHashRole.SignedParent,
+              nonCanonical
+            )
+          )
+        )
+  }
+
+  test("walkBackExact: rejects ordinal discontinuity and over-budget requests") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    for {
+      r <- mkChainStore()
+      (chainStore, _, _, _) = r
+      chain <- mkSignedLinkedChain(1)
+      parent = chain.head
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      childSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        parent.signed.value.copy(
+          ordinal = SnapshotOrdinal.unsafeApply(3L),
+          lastSnapshotHash = parent.hash,
+          epochProgress = EpochProgress(NonNegLong.unsafeFrom(3L))
+        ),
+        keyPair
+      )
+      childHashed <- childSigned.toHashed[IO]
+      _ <- chainStore.store(parent.signed, parent.context, 1L, 1L, Hash.empty, Array.empty)
+      _ <- chainStore.store(childSigned, parent.context, 3L, 3L, parent.hash, Array.empty)
+      start = NakamotoChainStore.ExactWalkPosition(childHashed.hash, SnapshotOrdinal.unsafeApply(3L))
+      discontinuity <- chainStore.walkBackExact(start, SnapshotOrdinal.unsafeApply(1L), maxSteps = 3)
+      overBudget <- chainStore.walkBackExact(start, SnapshotOrdinal.unsafeApply(1L), maxSteps = 2)
+      aboveStart <- chainStore.walkBackExact(start, SnapshotOrdinal.unsafeApply(4L), maxSteps = 1)
+      invalidBudget <- chainStore.walkBackExact(start, SnapshotOrdinal.unsafeApply(3L), maxSteps = 0)
+    } yield
+      expect(discontinuity.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.StoredOrdinalMismatch])) &&
+        expect(overBudget.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.RequiredStepsExceedLimit])) &&
+        expect(aboveStart.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.TargetAboveStart])) &&
+        expect.same(Left(NakamotoChainStore.ExactWalkError.InvalidMaxSteps(0)), invalidBudget)
+  }
+
+  test("walkBackExact: detects a repeated content-addressed parent before a second read") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    val repeatedHash = Hash("55" * 32)
+    val constantHasher = new Hasher[IO] {
+      def hash[A: io.circe.Encoder](data: A): IO[Hash] = IO.pure(repeatedHash)
+      def hashBytes(bytes: Array[Byte]): IO[Hash] = IO.pure(repeatedHash)
+      def compare[A: io.circe.Encoder](data: A, expectedHash: Hash): IO[Boolean] = IO.pure(expectedHash === repeatedHash)
+      def getLogic(ordinal: SnapshotOrdinal): HashLogic = JsonHash
+      def prefixedHash[A: io.circe.Encoder](data: A, prefix: Array[Byte]): IO[Hash] = IO.pure(repeatedHash)
+    }
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(constantHasher)
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      template <- mkSignedLinkedChain(1).map(_.head)
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      cyclicSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        template.signed.value.copy(
+          ordinal = SnapshotOrdinal.unsafeApply(2L),
+          lastSnapshotHash = repeatedHash,
+          epochProgress = EpochProgress(NonNegLong.unsafeFrom(2L))
+        ),
+        keyPair
+      )
+      _ <- diskByHashRef.set(Map(repeatedHash -> cyclicSigned))
+      result <- chainStore.walkBackExact(
+        NakamotoChainStore.ExactWalkPosition(repeatedHash, SnapshotOrdinal.unsafeApply(2L)),
+        SnapshotOrdinal.unsafeApply(1L),
+        maxSteps = 2
+      )
+    } yield expect(result.left.toOption.exists(_.isInstanceOf[NakamotoChainStore.ExactWalkError.CycleDetected]))
+  }
+
   test("vrfOutputsForPeriod: walks across the Fix B eviction boundary via disk fallback") { res =>
     val (_, _, j, h, sp) = res
     implicit val jSer: JsonSerializer[IO] = j
@@ -868,23 +1359,22 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       r <- mkChainStoreWithDisk(keepDepthBehindFinalized = keepDepth)
       (chainStore, _, diskRef, diskByHashRef) = r
       // Seed 10 stores with non-empty vrfOutput so collectVrfOutputsForPeriod can pick them up.
-      hashes <- (1 to 10).toList
-        .foldLeftM[IO, (List[Hash], Hash)]((List.empty[Hash], Hash.empty)) {
-          case ((acc, parent), ord) =>
-            mkSnapshotWithEpoch(epoch = ord.toLong).flatMap {
-              case (signed, ctx) =>
-                signed.toHashed[IO].flatMap { hashed =>
-                  // vrfOutput = the ord byte repeated 32 times — distinct per ord, non-empty.
-                  val vrf = Array.fill[Byte](32)(ord.toByte)
-                  chainStore
-                    .store(signed, ctx, ordinal = ord.toLong, slot = ord.toLong, parentHash = parent, vrfOutput = vrf) >>
-                    // Mirror to disk so post-eviction fallback works.
-                    diskRef.update(_.updated(SnapshotOrdinal(NonNegLong.unsafeFrom(ord.toLong)), signed)) >>
-                    diskByHashRef.update(_.updated(hashed.hash, signed)).as((acc :+ hashed.hash, hashed.hash))
-                }
-            }
-        }
-        .map(_._1)
+      chain <- mkSignedLinkedChain(10)
+      hashes <- chain.traverse { item =>
+        val ordinal = item.signed.value.ordinal.value.value
+        val vrf = Array.fill[Byte](32)(ordinal.toByte)
+        chainStore
+          .store(
+            item.signed,
+            item.context,
+            ordinal = ordinal,
+            slot = ordinal,
+            parentHash = item.signed.value.lastSnapshotHash,
+            vrfOutput = vrf
+          ) >>
+          diskRef.update(_.updated(item.signed.value.ordinal, item.signed)) >>
+          diskByHashRef.update(_.updated(item.hash, item.signed)).as(item.hash)
+      }
       completeBeforeEviction <- chainStore.vrfOutputRangeForPeriodFrom(
         period = 1L,
         etaRotationSnapshots = etaRotation,
@@ -901,11 +1391,10 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       lowestPresent <- chainStore.get(hashes(6)).map(_.isDefined) // ord 7
       ord6Absent <- chainStore.get(hashes(5)).map(_.isEmpty) // ord 6 (below floor)
       // The walk: bestTip (ord 10) → walks back through in-memory entries down to ord 7 (kept).
-      // Then ord 7's parentHash resolves via getWithOrdinalFallback to disk's ord 6. After that
-      // disk-recovered entry has parentHash=Hash.empty (signed.lastSnapshotHash for the test
-      // fixture), so the next hop attempts `getWithOrdinalFallback(Hash.empty, 5)` and fails the
-      // hash-verify (disk's ord 5 hash != Hash.empty), terminating the walk. Period 1 covers
-      // ords [6, 9].
+      // Then ord 7's signed parent resolves through the exact linked disk record at ord 6.
+      // That proves the eviction-boundary lookup itself worked. The disk fixture has no slot
+      // certificate, so ord 6 lacks mandatory rho evidence and the range correctly remains
+      // incomplete rather than silently treating ancestry alone as eta completeness.
       incompleteAfterEviction <- chainStore.vrfOutputRangeForPeriodFrom(
         period = 1L,
         etaRotationSnapshots = etaRotation,

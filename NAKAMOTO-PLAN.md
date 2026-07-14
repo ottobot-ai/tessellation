@@ -597,16 +597,44 @@ delivery, rollback, and recovery.
   a finalized prefix retains canonical descendants. Restart restores the anchor
   before production, and global finality stages overlay, chain, tracker, outbox,
   watermarks, and projections through one recoverable transition.
+- The owner-ratified session strategy is immutable parent-state capture plus a
+  generation compare-and-set at commit; a stale session retries or defers instead
+  of holding a lock across replay. Locally viable branch generations are retained
+  only within bounded policy; older state requires authenticated reconstruction or
+  `RecoveryRequired`. Cross-sink durability uses one idempotent finality-intent
+  journal over the existing stores rather than an all-sinks database rewrite.
 - Exact-parent/unknown-branch rejection is activated only with that complete
   anchor, descendant-retention, recovery, and finality-orchestration slice; a
   narrow guard alone reaches normal restart/finality paths after partial external
   mutation and is not mergeable.
-- Build durability dark first: immutable copied/sorted MPT images, independent root
-  rebuild, forced atomic image/manifest publication, digest/readback, and monotone
-  generation CAS. Runtime activation additionally requires a lifetime OS ownership
-  lock, bounded streaming decode, era-bound hashing, exact snapshot identity,
-  immutable in-session capture, and one recoverable finality intent spanning every
-  sink. This primitive alone is not ROOT-002/003/004 completion.
+- The dark image store now has immutable copied/sorted MPT images, independent root
+  rebuild, forced atomic image/manifest publication, digest/readback, monotone
+  generation CAS, lifetime OS directory ownership, bounded streaming decode, and
+  typed missing-artifact recovery. Runtime activation still requires an active-era
+  whole-image physical-key/value verifier bound to the actual root algorithm,
+  FinalityGate-authenticated exact snapshot identity, immutable in-session capture,
+  and one recoverable finality intent spanning every sink. A caller-supplied era
+  label and self-consistent manifest are insufficient. This primitive alone is not
+  ROOT-002/003/004 completion.
+- Keep structural ancestry separate from an execution session. The dark
+  `ResolvedParentLineage` may prove exact reference continuity, but the session is
+  minted only by atomically copying the complete parent byte image and the whole
+  overlay mutation generation. The same atomic commit compares that generation;
+  no check-then-use generation test is accepted as CAS.
+- The dark bounded chain-store ancestry walk resolves an exact hash before any
+  ordinal fallback and rejects a same-ordinal sibling. It uses the live canonical
+  hasher only when its coarse JSON/Kryo logic agrees with the ordinal-selected
+  logic; a boundary returns typed `HashEraUnavailable`. Before Scodec or another
+  hash-codec era activates, replace that coarse discriminator and migrate snapshot
+  identity atomically across leader, sync, KES, overlay, gossip, storage, and
+  recovery. Chain-store admission must also derive ordinal, parent, slot, and VRF
+  metadata from the authenticated signed snapshot instead of trusting parallel
+  caller arguments.
+- Build the finality-intent journal dark before changing either live finality rail.
+  It records only an already-decided `T_weight` attestation or canonical depth-`k1`
+  result, binds the complete exact snapshot range and terminal state artifacts, and
+  makes hash-bound release plus later notifications idempotently recoverable. It
+  creates no proposal, vote, lock, certificate, or BFT decision path.
 - The current direct rebuilt-root guards do not close `BR-01` through `BR-05`:
   exact Phase-2 selection, state/projection binding, proof-era validation,
   complete fresh-join payloads, and transactional installation remain open.

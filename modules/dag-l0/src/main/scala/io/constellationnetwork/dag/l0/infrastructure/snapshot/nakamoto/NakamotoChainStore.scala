@@ -11,7 +11,7 @@ import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.{Hashed, Hasher, HasherSelector}
+import io.constellationnetwork.security.{Hashed, HashLogic, Hasher, HasherSelector}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -63,6 +63,62 @@ object NakamotoChainStore {
       missingHash: Hash,
       expectedOrdinal: Option[Long]
     ) extends VrfOutputRange
+  }
+
+  final case class ExactWalkPosition(hash: Hash, ordinal: SnapshotOrdinal)
+
+  final case class ExactWalkLink(position: ExactWalkPosition, parentHash: Hash)
+
+  sealed trait ExactWalkIncompleteReason extends Product with Serializable
+
+  object ExactWalkIncompleteReason {
+    case object NotFound extends ExactWalkIncompleteReason
+    final case class SiblingAtOrdinal(foundHash: Hash) extends ExactWalkIncompleteReason
+  }
+
+  sealed trait ExactWalkHashRole extends Product with Serializable
+
+  object ExactWalkHashRole {
+    case object Requested extends ExactWalkHashRole
+    case object Stored extends ExactWalkHashRole
+    case object StoredParent extends ExactWalkHashRole
+    case object SignedParent extends ExactWalkHashRole
+    case object Rehashed extends ExactWalkHashRole
+  }
+
+  sealed trait ExactWalkResult extends Product with Serializable {
+    def pathNewestFirst: Vector[ExactWalkLink]
+  }
+
+  object ExactWalkResult {
+    final case class Complete(pathNewestFirst: Vector[ExactWalkLink]) extends ExactWalkResult
+    final case class Incomplete(
+      pathNewestFirst: Vector[ExactWalkLink],
+      missing: ExactWalkPosition,
+      reason: ExactWalkIncompleteReason
+    ) extends ExactWalkResult
+  }
+
+  sealed trait ExactWalkError extends Product with Serializable
+
+  object ExactWalkError {
+    final case class InvalidMaxSteps(maxSteps: Int) extends ExactWalkError
+    final case class TargetAboveStart(start: ExactWalkPosition, target: SnapshotOrdinal) extends ExactWalkError
+    final case class RequiredStepsExceedLimit(required: BigInt, maxSteps: Int) extends ExactWalkError
+    final case class StepLimitExceeded(next: ExactWalkPosition, maxSteps: Int) extends ExactWalkError
+    final case class ReservedSnapshotHash(position: ExactWalkPosition) extends ExactWalkError
+    final case class NonCanonicalSnapshotHash(expected: ExactWalkPosition, role: ExactWalkHashRole, hash: Hash) extends ExactWalkError
+    final case class PrematureChainRoot(at: ExactWalkLink, target: SnapshotOrdinal) extends ExactWalkError
+    final case class CycleDetected(repeated: ExactWalkPosition, pathNewestFirst: Vector[ExactWalkLink]) extends ExactWalkError
+    final case class StoredHashMismatch(expected: ExactWalkPosition, storedHash: Hash) extends ExactWalkError
+    final case class StoredOrdinalMismatch(expected: ExactWalkPosition, storedOrdinal: Long) extends ExactWalkError
+    final case class SignedOrdinalMismatch(expected: ExactWalkPosition, signedOrdinal: SnapshotOrdinal) extends ExactWalkError
+    final case class StoredParentMismatch(expected: ExactWalkPosition, storedParent: Hash, signedParent: Hash) extends ExactWalkError
+    final case class ExactHashContentMismatch(expected: ExactWalkPosition, actualHash: Hash) extends ExactWalkError
+    final case class HashEraUnavailable(expected: ExactWalkPosition, currentLogic: HashLogic, ordinalLogic: HashLogic)
+        extends ExactWalkError
+    final case class ContentHashFailed(expected: ExactWalkPosition, cause: String) extends ExactWalkError
+    final case class StorageReadFailed(expected: ExactWalkPosition, lookup: String, cause: String) extends ExactWalkError
   }
 
   trait NakamotoChainStoreAlgebra[F[_]] {
@@ -145,6 +201,17 @@ object NakamotoChainStore {
 
     /** Walk the canonical chain from `startHash` backward to find the hash at the given ordinal. */
     def walkBackTo(startHash: Hash, targetOrdinal: Long): F[Option[Hash]]
+
+    /** Prove a bounded, contiguous content-addressed ancestry path without changing the live canonical walk. Missing exact bytes are an
+      * `Incomplete` availability result. Invalid requests, corrupt hash-addressed bytes, and metadata which disagrees with the signed
+      * snapshot are typed errors and never fall back to a same-ordinal sibling. This proves stored value ancestry; it does not replace
+      * signature, execution, or state-root validation at snapshot intake.
+      */
+    def walkBackExact(
+      start: ExactWalkPosition,
+      targetOrdinal: SnapshotOrdinal,
+      maxSteps: Int
+    ): F[Either[ExactWalkError, ExactWalkResult]]
 
     /** Find a snapshot by ordinal in the in-memory store (scans all entries, not just canonical chain). */
     def getByOrdinal(ordinal: Long): F[Option[StoredSnapshot]]
@@ -489,6 +556,13 @@ object NakamotoChainStore {
                 HasherSelector[F].withCurrent { implicit hasher =>
                   underlyingStorage.get(ord).flatMap {
                     case None => Async[F].pure(None: Option[StoredSnapshot])
+                    case Some(signedSnap) if signedSnap.value.ordinal =!= ord =>
+                      logger
+                        .warn(
+                          s"getWithOrdinalFallback rejected ordinal-file mismatch: requested=$expectedOrdinal " +
+                            s"embedded=${signedSnap.value.ordinal.value.value}"
+                        )
+                        .as(None)
                     case Some(signedSnap) =>
                       signedSnap.toHashed[F].flatMap { hashed: Hashed[GlobalIncrementalSnapshot] =>
                         if (hashed.hash =!= hash)
@@ -802,6 +876,182 @@ object NakamotoChainStore {
                 }
             }
           }
+
+        def walkBackExact(
+          start: ExactWalkPosition,
+          targetOrdinal: SnapshotOrdinal,
+          maxSteps: Int
+        ): F[Either[ExactWalkError, ExactWalkResult]] = {
+          import ExactWalkError._
+          import ExactWalkHashRole._
+          import ExactWalkIncompleteReason._
+          import ExactWalkResult._
+
+          final case class LookupCandidate(
+            signed: Signed[GlobalIncrementalSnapshot],
+            stored: Option[StoredSnapshot],
+            isOrdinalFallback: Boolean
+          )
+
+          type LookupResult = Either[ExactWalkError, Either[ExactWalkIncompleteReason, ExactWalkLink]]
+
+          def readFailure(position: ExactWalkPosition, lookup: String, error: Throwable): ExactWalkError =
+            StorageReadFailed(
+              position,
+              lookup,
+              Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getName)
+            )
+
+          def renderCause(error: Throwable): String =
+            Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getName)
+
+          def rehash(expected: ExactWalkPosition, signed: Signed[GlobalIncrementalSnapshot]): F[Either[ExactWalkError, Hash]] =
+            Async[F]
+              .delay {
+                val selector = HasherSelector[F]
+                val currentHasher = selector.getCurrent
+                val currentLogic = currentHasher.getLogic(expected.ordinal)
+                val ordinalLogic = selector.getForOrdinal(expected.ordinal).getLogic(expected.ordinal)
+                (currentHasher, currentLogic, ordinalLogic)
+              }
+              .attempt
+              .flatMap {
+                case Left(error) =>
+                  Async[F].pure(Left(ContentHashFailed(expected, renderCause(error))))
+                case Right((_, currentLogic, ordinalLogic)) if currentLogic != ordinalLogic =>
+                  Async[F].pure(Left(HashEraUnavailable(expected, currentLogic, ordinalLogic)))
+                case Right((currentHasher, _, _)) =>
+                  implicit val hasher: Hasher[F] = currentHasher
+                  signed.toHashed[F].map(_.hash).attempt.map {
+                    case Right(hash) => Right(hash)
+                    case Left(error) => Left(ContentHashFailed(expected, renderCause(error)))
+                  }
+              }
+
+          def isCanonicalSnapshotHash(hash: Hash): Boolean = {
+            val value = hash.value
+            value.length == 64 && value.forall(c => c >= '0' && c <= '9' || c >= 'a' && c <= 'f')
+          }
+
+          def validate(
+            expected: ExactWalkPosition,
+            candidate: LookupCandidate
+          ): F[LookupResult] = {
+            val signedOrdinal = candidate.signed.value.ordinal
+            val signedParent = candidate.signed.value.lastSnapshotHash
+
+            val metadataError = candidate.stored match {
+              case Some(stored) if !isCanonicalSnapshotHash(stored.hash) =>
+                Some(NonCanonicalSnapshotHash(expected, Stored, stored.hash))
+              case Some(stored) if stored.hash =!= expected.hash =>
+                Some(StoredHashMismatch(expected, stored.hash))
+              case Some(stored) if stored.ordinal =!= expected.ordinal.value.value =>
+                Some(StoredOrdinalMismatch(expected, stored.ordinal))
+              case _ if signedOrdinal =!= expected.ordinal =>
+                Some(SignedOrdinalMismatch(expected, signedOrdinal))
+              case Some(stored) if !isCanonicalSnapshotHash(stored.parentHash) =>
+                Some(NonCanonicalSnapshotHash(expected, StoredParent, stored.parentHash))
+              case _ if !isCanonicalSnapshotHash(signedParent) =>
+                Some(NonCanonicalSnapshotHash(expected, SignedParent, signedParent))
+              case Some(stored) if stored.parentHash =!= signedParent =>
+                Some(StoredParentMismatch(expected, stored.parentHash, signedParent))
+              case _ => None
+            }
+
+            metadataError match {
+              case Some(error) => Async[F].pure(Left(error))
+              case None =>
+                rehash(expected, candidate.signed).map {
+                  case Left(error) => Left(error)
+                  case Right(actualHash) if !isCanonicalSnapshotHash(actualHash) =>
+                    Left(NonCanonicalSnapshotHash(expected, Rehashed, actualHash))
+                  case Right(actualHash) if actualHash =!= expected.hash && candidate.isOrdinalFallback =>
+                    Right(Left(SiblingAtOrdinal(actualHash)))
+                  case Right(actualHash) if actualHash =!= expected.hash =>
+                    Left(ExactHashContentMismatch(expected, actualHash))
+                  case Right(_) =>
+                    Right(Right(ExactWalkLink(expected, signedParent)))
+                }
+            }
+          }
+
+          def lookup(
+            inMemory: Map[Hash, StoredSnapshot],
+            expected: ExactWalkPosition
+          ): F[LookupResult] =
+            inMemory.get(expected.hash) match {
+              case Some(stored) =>
+                validate(expected, LookupCandidate(stored.signedSnapshot, stored.some, isOrdinalFallback = false))
+              case None =>
+                underlyingStorage.get(expected.hash).attempt.flatMap {
+                  case Left(error) =>
+                    Async[F].pure(Left(readFailure(expected, "hash", error)))
+                  case Right(Some(signed)) =>
+                    validate(expected, LookupCandidate(signed, none, isOrdinalFallback = false))
+                  case Right(None) =>
+                    underlyingStorage.get(expected.ordinal).attempt.flatMap {
+                      case Left(error) =>
+                        Async[F].pure(Left(readFailure(expected, "ordinal", error)))
+                      case Right(Some(signed)) =>
+                        validate(expected, LookupCandidate(signed, none, isOrdinalFallback = true))
+                      case Right(None) =>
+                        Async[F].pure(Right(Left(NotFound)))
+                    }
+                }
+            }
+
+          val startValue = BigInt(start.ordinal.value.value)
+          val targetValue = BigInt(targetOrdinal.value.value)
+          val requiredSteps = startValue - targetValue + 1
+
+          if (maxSteps <= 0)
+            Async[F].pure(Left(InvalidMaxSteps(maxSteps)))
+          else if (targetValue > startValue)
+            Async[F].pure(Left(TargetAboveStart(start, targetOrdinal)))
+          else if (requiredSteps > BigInt(maxSteps))
+            Async[F].pure(Left(RequiredStepsExceedLimit(requiredSteps, maxSteps)))
+          else
+            stateRef.get.flatMap { capturedState =>
+              def go(
+                current: ExactWalkPosition,
+                pathOldestFirst: List[ExactWalkLink],
+                visited: Set[Hash],
+                steps: Int
+              ): F[Either[ExactWalkError, ExactWalkResult]] =
+                if (steps >= maxSteps)
+                  Async[F].pure(Left(StepLimitExceeded(current, maxSteps)))
+                else if (current.hash === Hash.empty)
+                  Async[F].pure(Left(ReservedSnapshotHash(current)))
+                else if (!isCanonicalSnapshotHash(current.hash))
+                  Async[F].pure(Left(NonCanonicalSnapshotHash(current, Requested, current.hash)))
+                else if (visited.contains(current.hash))
+                  Async[F].pure(Left(CycleDetected(current, pathOldestFirst.reverse.toVector)))
+                else
+                  lookup(capturedState.byHash, current).flatMap {
+                    case Left(error) =>
+                      Async[F].pure(Left(error))
+                    case Right(Left(reason)) =>
+                      Async[F].pure(Right(Incomplete(pathOldestFirst.reverse.toVector, current, reason)))
+                    case Right(Right(link)) =>
+                      val nextPath = link :: pathOldestFirst
+                      if (current.ordinal == targetOrdinal)
+                        Async[F].pure(Right(Complete(nextPath.reverse.toVector)))
+                      else if (current.ordinal.value.value == 0L || link.parentHash === Hash.empty)
+                        Async[F].pure(Left(PrematureChainRoot(link, targetOrdinal)))
+                      else {
+                        val parentOrdinal = SnapshotOrdinal.unsafeApply(current.ordinal.value.value - 1L)
+                        go(
+                          ExactWalkPosition(link.parentHash, parentOrdinal),
+                          nextPath,
+                          visited + current.hash,
+                          steps + 1
+                        )
+                      }
+                  }
+
+              go(start, Nil, Set.empty, 0)
+            }
+        }
 
         def getByOrdinal(ordinal: Long): F[Option[StoredSnapshot]] =
           stateRef.get.map(_.byHash.values.find(_.ordinal == ordinal))

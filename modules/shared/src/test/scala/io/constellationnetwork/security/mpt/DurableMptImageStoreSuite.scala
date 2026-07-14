@@ -1,6 +1,7 @@
 package io.constellationnetwork.security.mpt
 
-import java.io.IOException
+import java.io.{IOException, InputStream}
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.{AtomicMoveNotSupportedException, Files, Path}
 
@@ -33,6 +34,11 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
 
   private val ordinal0 = SnapshotOrdinal.unsafeApply(40L)
   private val ordinal1 = SnapshotOrdinal.unsafeApply(41L)
+  private val codecEra = MptImageCodecEra(Hash.fromBytes("scodec-v1".getBytes(StandardCharsets.UTF_8)))
+  private val rootEra = MptImageRootEra(Hash.fromBytes("test-mpt-root-v1".getBytes(StandardCharsets.UTF_8)))
+  private val limits = MptImageReadLimits
+    .from(maxImageBytes = 1024L * 1024L, maxEntries = 1000, maxKeyBytes = 1024, maxValueBytes = 256 * 1024)
+    .fold(throw _, identity)
 
   private def key(label: String): Hex = Hex(Hash.fromBytes(label.getBytes(StandardCharsets.UTF_8)).value)
 
@@ -46,13 +52,36 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   private def rootOf(values: Map[Hex, ByteVector])(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): IO[MptRoot] =
     MerklePatriciaTrie.makeParallelFromBytes[IO](values.iterator.map { case (k, v) => k -> v.toArray }.toMap).map(_.rootHash)
 
+  private def snapshotHash(ordinal: SnapshotOrdinal): Hash =
+    Hash.fromBytes(s"snapshot-${ordinal.value.value}".getBytes(StandardCharsets.UTF_8))
+
+  private def parentHash(ordinal: SnapshotOrdinal): Hash =
+    Hash.fromBytes(s"parent-${ordinal.value.value}".getBytes(StandardCharsets.UTF_8))
+
+  private def rootVerifier(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): MptImageRootVerifier[IO] =
+    MptImageRootVerifier.consensus[IO](rootEra)
+
+  private def makeStore(directory: Path)(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): Resource[IO, DurableMptImageStore[IO]] =
+    DurableMptImageStore.resource[IO](directory, codecEra, rootVerifier, limits)
+
+  private def makeStoreWithLimits(
+    directory: Path,
+    readLimits: MptImageReadLimits
+  )(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): Resource[IO, DurableMptImageStore[IO]] =
+    DurableMptImageStore.resource[IO](directory, codecEra, rootVerifier, readLimits)
+
+  private def readLimits(maxImageBytes: Long, maxEntries: Int, maxKeyBytes: Int, maxValueBytes: Int): MptImageReadLimits =
+    MptImageReadLimits.from(maxImageBytes, maxEntries, maxKeyBytes, maxValueBytes).fold(throw _, identity)
+
   private def prepare(
     store: DurableMptImageStore[IO],
     generation: Long,
     ordinal: SnapshotOrdinal,
     values: Map[Hex, ByteVector]
   )(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): IO[MptImageReceipt] =
-    rootOf(values).flatMap(store.prepare(generation, ordinal, _, values))
+    rootOf(values).flatMap { root =>
+      store.prepare(generation, MptImageAnchor(snapshotHash(ordinal), parentHash(ordinal), ordinal, root), values)
+    }
 
   private def deleteRecursive(path: Path): Unit =
     if (Files.exists(path)) {
@@ -64,17 +93,14 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   private def tempDir: Resource[IO, Path] =
     Resource.make(IO.blocking(Files.createTempDirectory("durable-mpt-image")))(path => IO.blocking(deleteRecursive(path)))
 
-  private final class FailOnce(point: MptImageFaultPoint, fired: Ref[IO, Boolean], failure: Throwable)
-      extends MptImageFaultInjector[IO] {
+  private final class FailOnce(point: MptImageFaultPoint, fired: Ref[IO, Boolean], failure: Throwable) extends MptImageFaultInjector[IO] {
     def before(actual: MptImageFaultPoint): IO[Unit] =
       if (actual != point) IO.unit
       else
-        fired
-          .modify {
-            case false => true -> IO.raiseError[Unit](failure)
-            case true  => true -> IO.unit
-          }
-          .flatten
+        fired.modify {
+          case false => true -> IO.raiseError[Unit](failure)
+          case true  => true -> IO.unit
+        }.flatten
   }
 
   private final class BarrierOnce(
@@ -87,28 +113,38 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     def before(actual: MptImageFaultPoint): IO[Unit] =
       if (actual != point) IO.unit
       else
-        fired
-          .modify {
-            case false =>
-              true -> (entered.complete(()).void >> release.get >> failure.fold(IO.unit)(IO.raiseError[Unit]))
-            case true => true -> IO.unit
-          }
-          .flatten
+        fired.modify {
+          case false =>
+            true -> (entered.complete(()).void >> release.get >> failure.fold(IO.unit)(IO.raiseError[Unit]))
+          case true => true -> IO.unit
+        }.flatten
+  }
+
+  private final class BlockingRootVerifier(
+    delegate: MptImageRootVerifier[IO],
+    entered: Deferred[IO, Unit],
+    release: Deferred[IO, Unit]
+  ) extends MptImageRootVerifier[IO] {
+    val rootEra: MptImageRootEra = delegate.rootEra
+
+    def rebuild(entries: Vector[(Hex, ByteVector)]): IO[MptRoot] =
+      entered.complete(()).void >> release.get >> delegate.rebuild(entries)
   }
 
   private def storeWithFault(
     directory: Path,
     point: MptImageFaultPoint
-  )(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): IO[DurableMptImageStore[IO]] =
-    for {
-      fired <- Ref.of[IO, Boolean](false)
-      store <- DurableMptImageStore.makeWith[IO](
+  )(implicit hasher: Hasher[IO], json: JsonSerializer[IO]): Resource[IO, DurableMptImageStore[IO]] =
+    Resource.eval(Ref.of[IO, Boolean](false)).flatMap { fired =>
+      DurableMptImageStore.resourceWith[IO](
         directory,
         DurableMptImageFileOps.nio[IO],
         new FailOnce(point, fired, new IOException(s"injected $point")),
-        MptImageRootBuilder.consensus[IO]
+        codecEra,
+        rootVerifier,
+        limits
       )
-    } yield store
+    }
 
   test("prepare is deterministic, copies aliased input, and never changes the active manifest") { res =>
     implicit val (json, hasher) = res
@@ -121,24 +157,129 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
       val aliased = Map(firstKey -> ByteVector.view(a), secondKey -> ByteVector.view(b))
       val independent = aliased.iterator.map { case (k, v) => k -> ByteVector.view(v.toArray.clone()) }.toMap
 
+      makeStore(directory).use { store =>
+        for {
+          expectedRoot <- rootOf(independent)
+          anchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, expectedRoot)
+          first <- store.prepare(0L, anchor, aliased)
+          second <- store.prepare(0L, anchor, independent.toList.reverse.toMap)
+          beforePublish <- store.activeReceipt
+          _ <- IO { a(0) = 99; b(2) = 88 }
+          _ <- store.publish(first, None)
+          loaded <- store.read(first)
+          callerCopy = loaded(firstKey).toArray
+          _ <- IO { callerCopy(0) = 77 }
+          loadedAgain <- store.read(first)
+        } yield
+          expect.all(
+            first == second,
+            beforePublish.isEmpty,
+            loaded.toMap == independent,
+            loadedAgain.toMap == independent
+          )
+      }
+    }
+  }
+
+  test("prepare captures aliased bytes before the independent root verifier runs") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val aliasedBytes = Array[Byte](10, 20, 30)
+      val entryKey = key("capture-before-verify")
+      val aliased = Map(entryKey -> ByteVector.view(aliasedBytes))
+      val expected = Map(entryKey -> ByteVector.view(aliasedBytes.clone()))
+
+      val testResource = for {
+        expectedRoot <- rootOf(expected)
+        entered <- Deferred[IO, Unit]
+        release <- Deferred[IO, Unit]
+        verifier = new BlockingRootVerifier(rootVerifier, entered, release)
+        result <- DurableMptImageStore.resource[IO](directory, codecEra, verifier, limits).use { store =>
+          val anchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, expectedRoot)
+          for {
+            preparing <- store.prepare(0L, anchor, aliased).start
+            _ <- entered.get
+            _ <- IO { aliasedBytes(0) = 99 }
+            _ <- release.complete(())
+            receipt <- preparing.joinWithNever
+            _ <- store.publish(receipt, None)
+            loaded <- store.read(receipt)
+          } yield expect(loaded.toMap == expected)
+        }
+      } yield result
+
+      testResource
+    }
+  }
+
+  test("image identity binds snapshot, parent, ordinal, codec era, and root era") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val values = entries("anchor-binding")
+      val alternateHash = Hash.fromBytes("alternate-anchor".getBytes(StandardCharsets.UTF_8))
+
+      makeStore(directory).use { store =>
+        for {
+          root <- rootOf(values)
+          anchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, root)
+          receipt <- store.prepare(0L, anchor, values)
+          sibling <- store.prepare(0L, anchor.copy(snapshotHash = alternateHash), values)
+          childOfOtherParent <- store.prepare(0L, anchor.copy(parentHash = alternateHash), values)
+          sameHashesOtherOrdinal <- store.prepare(0L, anchor.copy(ordinal = ordinal1), values)
+          wrongSnapshot <- store.publish(receipt.copy(anchor = anchor.copy(snapshotHash = alternateHash)), None).attempt
+          wrongParent <- store.publish(receipt.copy(anchor = anchor.copy(parentHash = alternateHash)), None).attempt
+          wrongOrdinal <- store.publish(receipt.copy(anchor = anchor.copy(ordinal = ordinal1)), None).attempt
+          wrongCodec <- store
+            .publish(receipt.copy(codecEra = MptImageCodecEra(alternateHash)), None)
+            .attempt
+          wrongRootEra <- store
+            .publish(receipt.copy(rootEra = MptImageRootEra(alternateHash)), None)
+            .attempt
+          active <- store.activeReceipt
+        } yield
+          expect.all(
+            receipt.anchor == anchor,
+            receipt.codecEra == codecEra,
+            receipt.rootEra == rootEra,
+            receipt.imageId != sibling.imageId,
+            receipt.digest != sibling.digest,
+            receipt.imageId != childOfOtherParent.imageId,
+            receipt.digest != childOfOtherParent.digest,
+            receipt.imageId != sameHashesOtherOrdinal.imageId,
+            receipt.digest != sameHashesOtherOrdinal.digest,
+            wrongSnapshot.left.exists(_.isInstanceOf[CorruptImage]),
+            wrongParent.left.exists(_.isInstanceOf[CorruptImage]),
+            wrongOrdinal.left.exists(_.isInstanceOf[CorruptImage]),
+            wrongCodec.left.exists(_.isInstanceOf[CorruptImage]),
+            wrongRootEra.left.exists(_.isInstanceOf[CorruptImage]),
+            active.isEmpty
+          )
+      }
+    }
+  }
+
+  test("restart rejects a manifest under a different configured codec or root verifier era") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val otherCodecEra = MptImageCodecEra(Hash.fromBytes("other-codec-era".getBytes(StandardCharsets.UTF_8)))
+      val otherRootEra = MptImageRootEra(Hash.fromBytes("other-root-era".getBytes(StandardCharsets.UTF_8)))
+
       for {
-        store <- DurableMptImageStore.make[IO](directory)
-        expectedRoot <- rootOf(independent)
-        first <- store.prepare(0L, ordinal0, expectedRoot, aliased)
-        second <- store.prepare(0L, ordinal0, expectedRoot, independent.toList.reverse.toMap)
-        beforePublish <- store.activeReceipt
-        _ <- IO { a(0) = 99; b(2) = 88 }
-        _ <- store.publish(first, None)
-        loaded <- store.read(first)
-        callerCopy = loaded(firstKey).toArray
-        _ <- IO { callerCopy(0) = 77 }
-        loadedAgain <- store.read(first)
+        _ <- makeStore(directory).use { store =>
+          prepare(store, 0L, ordinal0, entries("configured-era")).flatMap(store.publish(_, None))
+        }
+        wrongCodec <- DurableMptImageStore.resource[IO](directory, otherCodecEra, rootVerifier, limits).use(_.activeReceipt).attempt
+        wrongRoot <- DurableMptImageStore
+          .resource[IO](directory, codecEra, MptImageRootVerifier.consensus[IO](otherRootEra), limits)
+          .use(_.activeReceipt)
+          .attempt
       } yield
         expect.all(
-          first == second,
-          beforePublish.isEmpty,
-          loaded.toMap == independent,
-          loadedAgain.toMap == independent
+          wrongCodec.left.exists(_.isInstanceOf[CorruptImage]),
+          wrongRoot.left.exists(_.isInstanceOf[CorruptImage])
         )
     }
   }
@@ -149,14 +290,49 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     tempDir.use { directory =>
       val values = entries("restart")
       for {
-        store <- DurableMptImageStore.make[IO](directory)
-        receipt <- prepare(store, 0L, ordinal0, values)
-        _ <- store.publish(receipt, None)
-        _ <- store.publish(receipt, Some(MptImagePointer(MptImageId(Hash.empty), MptImageDigest(Hash.empty))))
-        restarted <- DurableMptImageStore.make[IO](directory)
-        active <- restarted.activeReceipt
-        loaded <- restarted.read(receipt)
-      } yield expect.all(active.contains(receipt), loaded.toMap == values)
+        receipt <- makeStore(directory).use { store =>
+          prepare(store, 0L, ordinal0, values).flatTap { prepared =>
+            store.publish(prepared, None) >>
+              store.publish(prepared, Some(MptImagePointer(MptImageId(Hash.empty), MptImageDigest(Hash.empty))))
+          }
+        }
+        result <- makeStore(directory).use { restarted =>
+          (restarted.activeReceipt, restarted.read(receipt)).mapN { (active, loaded) =>
+            expect.all(active.contains(receipt), loaded.toMap == values)
+          }
+        }
+      } yield result
+    }
+  }
+
+  test("a published store never treats a missing active manifest as pristine") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      for {
+        initial <- makeStore(directory).use { store =>
+          prepare(store, 0L, ordinal0, entries("initialized-history")).flatTap(store.publish(_, None))
+        }
+        markerExists <- IO.blocking(Files.isRegularFile(DurableMptImageLayout.initializationMarker(directory)))
+        _ <- IO.blocking(Files.delete(DurableMptImageLayout.activeManifest(directory)))
+        results <- makeStore(directory).use { store =>
+          for {
+            active <- store.activeReceipt.attempt
+            replacement <- prepare(store, 0L, ordinal0, entries("forged-new-history"))
+            reset <- store.publish(replacement, None).attempt
+          } yield active -> reset
+        }
+        (active, reset) = results
+      } yield {
+        def isMissingActiveManifest(result: Either[Throwable, _]): Boolean =
+          result.left.exists {
+            case MissingArtifact(MptImageArtifactRef.ActiveManifest, path, _) =>
+              path == DurableMptImageLayout.activeManifest(directory)
+            case _ => false
+          }
+
+        expect.all(markerExists, isMissingActiveManifest(active), isMissingActiveManifest(reset), initial.generation == 0L)
+      }
     }
   }
 
@@ -166,9 +342,122 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     tempDir.use { parent =>
       val missing = parent.resolve("missing-root")
       for {
-        result <- DurableMptImageStore.make[IO](missing).attempt
+        result <- makeStore(missing).use(_ => IO.unit).attempt
         exists <- IO.blocking(Files.exists(missing))
       } yield expect.all(result.left.exists(_.isInstanceOf[RootDirectoryMustExist]), !exists)
+    }
+  }
+
+  test("the store owns its directory for the Resource lifetime and leaves a reusable lock file") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      for {
+        contended <- makeStore(directory).use { _ =>
+          makeStore(directory).use(_ => IO.unit).attempt
+        }
+        lockPath = DurableMptImageLayout.ownerLock(directory)
+        lockExistsAfterRelease <- IO.blocking(Files.isRegularFile(lockPath))
+        reacquired <- makeStore(directory).use(_ => IO.unit).attempt
+        lockStillExists <- IO.blocking(Files.isRegularFile(lockPath))
+      } yield
+        expect.all(
+          contended.left.exists(_.isInstanceOf[DirectoryAlreadyOwned]),
+          lockExistsAfterRelease,
+          reacquired == Right(()),
+          lockStillExists
+        )
+    }
+  }
+
+  test("constructor failure and cancellation release directory ownership") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { failureDirectory =>
+      tempDir.use { cancellationDirectory =>
+        val delegate = DurableMptImageFileOps.nio[IO]
+        val injected = new IOException("injected constructor failure")
+        val failingOps = new DelegatingFileOps(delegate) {
+          override def createDirectories(path: Path): IO[Unit] = IO.raiseError(injected)
+        }
+
+        for {
+          failed <- DurableMptImageStore
+            .resourceWith[IO](
+              failureDirectory,
+              failingOps,
+              MptImageFaultInjector.noop[IO],
+              codecEra,
+              rootVerifier,
+              limits
+            )
+            .use(_ => IO.unit)
+            .attempt
+          reopenedAfterFailure <- makeStore(failureDirectory).use(_ => IO.unit).attempt
+          entered <- Deferred[IO, Unit]
+          blockingOps = new DelegatingFileOps(delegate) {
+            override def createDirectories(path: Path): IO[Unit] = entered.complete(()).void >> IO.never
+          }
+          allocating <- DurableMptImageStore
+            .resourceWith[IO](
+              cancellationDirectory,
+              blockingOps,
+              MptImageFaultInjector.noop[IO],
+              codecEra,
+              rootVerifier,
+              limits
+            )
+            .use(_ => IO.unit)
+            .start
+          _ <- entered.get
+          _ <- allocating.cancel
+          reopenedAfterCancellation <- makeStore(cancellationDirectory).use(_ => IO.unit).attempt
+        } yield
+          expect.all(
+            failed == Left(injected),
+            reopenedAfterFailure == Right(()),
+            reopenedAfterCancellation == Right(())
+          )
+      }
+    }
+  }
+
+  test("prepare enforces entry, key, value, and aggregate limits before publication") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val oneKey = key("bounded-entry")
+      val oneEntry = Map(oneKey -> ByteVector.view(Array[Byte](1, 2, 3)))
+      val exactImageBytes = MptImageEncoding.ImageHeaderBytes + 8L + oneKey.value.length.toLong + 3L
+      val exactLimits = readLimits(exactImageBytes, maxEntries = 1, maxKeyBytes = oneKey.value.length, maxValueBytes = 3)
+      val aggregateTooSmall = readLimits(exactImageBytes - 1L, maxEntries = 1, maxKeyBytes = oneKey.value.length, maxValueBytes = 3)
+      val countLimits = readLimits(1024L * 1024L, maxEntries = 1, maxKeyBytes = 1024, maxValueBytes = 1024)
+      val keyLimits = readLimits(1024L * 1024L, maxEntries = 10, maxKeyBytes = 2, maxValueBytes = 1024)
+      val valueLimits = readLimits(1024L * 1024L, maxEntries = 10, maxKeyBytes = 1024, maxValueBytes = 2)
+
+      def attemptPrepare(readLimits0: MptImageReadLimits, values: Map[Hex, ByteVector]): IO[Either[Throwable, MptImageReceipt]] =
+        makeStoreWithLimits(directory, readLimits0).use { store =>
+          rootOf(values).flatMap { root =>
+            store.prepare(0L, MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, root), values).attempt
+          }
+        }
+
+      for {
+        exact <- attemptPrepare(exactLimits, oneEntry)
+        aggregate <- attemptPrepare(aggregateTooSmall, oneEntry)
+        count <- attemptPrepare(countLimits, entries("limit-count"))
+        keyFailure <- attemptPrepare(keyLimits, oneEntry)
+        valueFailure <- attemptPrepare(valueLimits, oneEntry)
+        active <- makeStore(directory).use(_.activeReceipt)
+      } yield
+        expect.all(
+          exact.isRight,
+          aggregate.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          count.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          keyFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          valueFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          active.isEmpty
+        )
     }
   }
 
@@ -179,22 +468,32 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
       tempDir.use { buildFailureDirectory =>
         val values = entries("root-failure")
         val buildFailure = new IOException("independent rebuild failed")
-        val failingBuilder = new MptImageRootBuilder[IO] {
+        val failingBuilder = new MptImageRootVerifier[IO] {
+          val rootEra: MptImageRootEra = DurableMptImageStoreSuite.rootEra
+
           def rebuild(entries: Vector[(Hex, ByteVector)]): IO[MptRoot] = IO.raiseError(buildFailure)
         }
 
+        val wrongAnchor = MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, MptRoot(Hash.empty))
+
         for {
-          store <- DurableMptImageStore.make[IO](wrongRootDirectory)
-          wrong <- store.prepare(0L, ordinal0, MptRoot(Hash.empty), values).attempt
-          wrongActive <- store.activeReceipt
-          failingStore <- DurableMptImageStore.makeWith[IO](
-            buildFailureDirectory,
-            DurableMptImageFileOps.nio[IO],
-            MptImageFaultInjector.noop[IO],
-            failingBuilder
-          )
-          failed <- failingStore.prepare(0L, ordinal0, MptRoot(Hash.empty), values).attempt
-          failedActive <- failingStore.activeReceipt
+          wrongResult <- makeStore(wrongRootDirectory).use { store =>
+            (store.prepare(0L, wrongAnchor, values).attempt, store.activeReceipt).tupled
+          }
+          (wrong, wrongActive) = wrongResult
+          failedResult <- DurableMptImageStore
+            .resourceWith[IO](
+              buildFailureDirectory,
+              DurableMptImageFileOps.nio[IO],
+              MptImageFaultInjector.noop[IO],
+              codecEra,
+              failingBuilder,
+              limits
+            )
+            .use { failingStore =>
+              (failingStore.prepare(0L, wrongAnchor, values).attempt, failingStore.activeReceipt).tupled
+            }
+          (failed, failedActive) = failedResult
         } yield
           expect.all(
             wrong.left.exists(_.isInstanceOf[RootMismatch]),
@@ -210,28 +509,58 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     implicit val (json, hasher) = res
 
     tempDir.use { directory =>
-      for {
-        store <- DurableMptImageStore.make[IO](directory)
-        invalidInitial <- prepare(store, 4L, SnapshotOrdinal.unsafeApply(44L), entries("cas-invalid-initial"))
-        initialGenerationFailure <- store.publish(invalidInitial, None).attempt
-        initial <- prepare(store, 0L, ordinal0, entries("cas-initial"))
-        _ <- store.publish(initial, None)
-        next <- prepare(store, 1L, ordinal1, entries("cas-next"))
-        wrongCas <- store.publish(next, None).attempt
-        stillInitial <- store.activeReceipt
-        _ <- store.publish(next, Some(initial.pointer))
-        conflicting <- prepare(store, 1L, ordinal1, entries("cas-conflict"))
-        conflict <- store.publish(conflicting, Some(next.pointer)).attempt
-        skipped <- prepare(store, 3L, SnapshotOrdinal.unsafeApply(43L), entries("cas-skipped"))
-        gap <- store.publish(skipped, Some(next.pointer)).attempt
-      } yield
-        expect.all(
-          initialGenerationFailure.left.exists(_.isInstanceOf[InitialGenerationMustBeZero]),
-          wrongCas.left.exists(_.isInstanceOf[CompareAndSetConflict]),
-          stillInitial.contains(initial),
-          conflict.left.exists(_.isInstanceOf[GenerationConflict]),
-          gap.left.exists(_.isInstanceOf[NonConsecutiveGeneration])
-        )
+      makeStore(directory).use { store =>
+        for {
+          invalidInitial <- prepare(store, 4L, SnapshotOrdinal.unsafeApply(44L), entries("cas-invalid-initial"))
+          initialGenerationFailure <- store.publish(invalidInitial, None).attempt
+          initial <- prepare(store, 0L, ordinal0, entries("cas-initial"))
+          _ <- store.publish(initial, None)
+          next <- prepare(store, 1L, ordinal1, entries("cas-next"))
+          wrongCas <- store.publish(next, None).attempt
+          stillInitial <- store.activeReceipt
+          _ <- store.publish(next, Some(initial.pointer))
+          conflicting <- prepare(store, 1L, ordinal1, entries("cas-conflict"))
+          conflict <- store.publish(conflicting, Some(next.pointer)).attempt
+          skipped <- prepare(store, 3L, SnapshotOrdinal.unsafeApply(43L), entries("cas-skipped"))
+          gap <- store.publish(skipped, Some(next.pointer)).attempt
+        } yield
+          expect.all(
+            initialGenerationFailure.left.exists(_.isInstanceOf[InitialGenerationMustBeZero]),
+            wrongCas.left.exists(_.isInstanceOf[CompareAndSetConflict]),
+            stillInitial.contains(initial),
+            conflict.left.exists(_.isInstanceOf[GenerationConflict]),
+            gap.left.exists(_.isInstanceOf[NonConsecutiveGeneration])
+          )
+      }
+    }
+  }
+
+  test("an old generation cannot overwrite or delete the newer active generation") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val nextValues = entries("stale-next")
+
+      makeStore(directory).use { store =>
+        for {
+          initial <- prepare(store, 0L, ordinal0, entries("stale-initial"))
+          _ <- store.publish(initial, None)
+          next <- prepare(store, 1L, ordinal1, nextValues)
+          _ <- store.publish(next, Some(initial.pointer))
+          stale <- store.publish(initial, Some(next.pointer)).attempt
+          active <- store.activeReceipt
+          loaded <- store.read(next)
+          initialStillExists <- IO.blocking(Files.exists(DurableMptImageLayout.image(directory, initial.imageId)))
+          nextStillExists <- IO.blocking(Files.exists(DurableMptImageLayout.image(directory, next.imageId)))
+        } yield
+          expect.all(
+            stale.left.exists(_.isInstanceOf[NonConsecutiveGeneration]),
+            active.contains(next),
+            loaded.toMap == nextValues,
+            initialStillExists,
+            nextStillExists
+          )
+      }
     }
   }
 
@@ -239,20 +568,21 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     implicit val (json, hasher) = res
 
     tempDir.use { directory =>
-      for {
-        store <- DurableMptImageStore.make[IO](directory)
-        initial <- prepare(store, 0L, ordinal0, entries("race-initial"))
-        _ <- store.publish(initial, None)
-        left <- prepare(store, 1L, ordinal1, entries("race-left"))
-        right <- prepare(store, 1L, ordinal1, entries("race-right"))
-        results <- List(left, right).parTraverse(receipt => store.publish(receipt, Some(initial.pointer)).attempt)
-        active <- store.activeReceipt
-      } yield
-        expect.all(
-          results.count(_.isRight) == 1,
-          results.count(_.left.exists(_.isInstanceOf[GenerationConflict])) == 1,
-          active.exists(receipt => receipt == left || receipt == right)
-        )
+      makeStore(directory).use { store =>
+        for {
+          initial <- prepare(store, 0L, ordinal0, entries("race-initial"))
+          _ <- store.publish(initial, None)
+          left <- prepare(store, 1L, ordinal1, entries("race-left"))
+          right <- prepare(store, 1L, ordinal1, entries("race-right"))
+          results <- List(left, right).parTraverse(receipt => store.publish(receipt, Some(initial.pointer)).attempt)
+          active <- store.activeReceipt
+        } yield
+          expect.all(
+            results.count(_.isRight) == 1,
+            results.count(_.left.exists(_.isInstanceOf[GenerationConflict])) == 1,
+            active.exists(receipt => receipt == left || receipt == right)
+          )
+      }
     }
   }
 
@@ -272,16 +602,21 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
         val initialValues = entries(s"image-prior-$point")
         val candidateValues = entries(s"image-candidate-$point")
         for {
-          healthy <- DurableMptImageStore.make[IO](directory)
-          initial <- prepare(healthy, 0L, ordinal0, initialValues)
-          _ <- healthy.publish(initial, None)
+          initial <- makeStore(directory).use { healthy =>
+            prepare(healthy, 0L, ordinal0, initialValues).flatTap(healthy.publish(_, None))
+          }
           candidateRoot <- rootOf(candidateValues)
-          failing <- storeWithFault(directory, point)
-          result <- failing.prepare(1L, ordinal1, candidateRoot, candidateValues).attempt
-          restarted <- DurableMptImageStore.make[IO](directory)
-          active <- restarted.activeReceipt
-          loaded <- restarted.read(initial)
-        } yield result.isLeft && active.contains(initial) && loaded.toMap == initialValues
+          result <- storeWithFault(directory, point).use { failing =>
+            failing
+              .prepare(1L, MptImageAnchor(snapshotHash(ordinal1), parentHash(ordinal1), ordinal1, candidateRoot), candidateValues)
+              .attempt
+          }
+          validPrior <- makeStore(directory).use { restarted =>
+            (restarted.activeReceipt, restarted.read(initial)).mapN { (active, loaded) =>
+              active.contains(initial) && loaded.toMap == initialValues
+            }
+          }
+        } yield result.isLeft && validPrior
       }
     }.map(results => expect(results.forall(identity)))
   }
@@ -301,16 +636,49 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
       tempDir.use { directory =>
         val initialValues = entries(s"manifest-prior-$point")
         for {
-          healthy <- DurableMptImageStore.make[IO](directory)
-          initial <- prepare(healthy, 0L, ordinal0, initialValues)
-          _ <- healthy.publish(initial, None)
-          candidate <- prepare(healthy, 1L, ordinal1, entries(s"manifest-candidate-$point"))
-          failing <- storeWithFault(directory, point)
-          result <- failing.publish(candidate, Some(initial.pointer)).attempt
-          restarted <- DurableMptImageStore.make[IO](directory)
-          active <- restarted.activeReceipt
-          loaded <- restarted.read(initial)
-        } yield result.isLeft && active.contains(initial) && loaded.toMap == initialValues
+          prepared <- makeStore(directory).use { healthy =>
+            for {
+              initial <- prepare(healthy, 0L, ordinal0, initialValues)
+              _ <- healthy.publish(initial, None)
+              candidate <- prepare(healthy, 1L, ordinal1, entries(s"manifest-candidate-$point"))
+            } yield initial -> candidate
+          }
+          (initial, candidate) = prepared
+          result <- storeWithFault(directory, point).use(_.publish(candidate, Some(initial.pointer)).attempt)
+          validPrior <- makeStore(directory).use { restarted =>
+            (restarted.activeReceipt, restarted.read(initial)).mapN { (active, loaded) =>
+              active.contains(initial) && loaded.toMap == initialValues
+            }
+          }
+        } yield result.isLeft && validPrior
+      }
+    }.map(results => expect(results.forall(identity)))
+  }
+
+  test("every initialization-marker write stage rolls back the first publication") { res =>
+    implicit val (json, hasher) = res
+
+    val points = List(
+      Write(InitializationMarker),
+      ForceFile(InitializationMarker),
+      AtomicMove(InitializationMarker),
+      ForceDirectory(InitializationMarker),
+      ReadBack(InitializationMarker)
+    )
+
+    points.traverse { point =>
+      tempDir.use { directory =>
+        for {
+          receipt <- makeStore(directory).use(prepare(_, 0L, ordinal0, entries(s"marker-$point")))
+          failed <- storeWithFault(directory, point).use(_.publish(receipt, None).attempt)
+          recovered <- makeStore(directory).use { store =>
+            for {
+              beforeRetry <- store.activeReceipt
+              _ <- store.publish(receipt, None)
+              afterRetry <- store.activeReceipt
+            } yield beforeRetry.isEmpty && afterRetry.contains(receipt)
+          }
+        } yield failed.isLeft && recovered
       }
     }.map(results => expect(results.forall(identity)))
   }
@@ -318,95 +686,121 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   test("a reader cannot observe a renamed candidate while verification and recovery are pending") { res =>
     implicit val (json, hasher) = res
 
-    tempDir.use { directory => TestControl.executeEmbed {
-      val injectedFailure = new IOException("post-rename read-back failed")
-      val initialValues = entries("reader-barrier-initial")
-      for {
-        healthy <- DurableMptImageStore.make[IO](directory)
-        initial <- prepare(healthy, 0L, ordinal0, initialValues)
-        _ <- healthy.publish(initial, None)
-        candidate <- prepare(healthy, 1L, ordinal1, entries("reader-barrier-candidate"))
-        fired <- Ref.of[IO, Boolean](false)
-        entered <- Deferred[IO, Unit]
-        release <- Deferred[IO, Unit]
-        blocked <- DurableMptImageStore.makeWith[IO](
-          directory,
-          DurableMptImageFileOps.nio[IO],
-          new BarrierOnce(ReadBack(Manifest), fired, entered, release, Some(injectedFailure)),
-          MptImageRootBuilder.consensus[IO]
-        )
-        publisher <- blocked.publish(candidate, Some(initial.pointer)).attempt.start
-        _ <- entered.get
-        readerStarted <- Deferred[IO, Unit]
-        readerDone <- Deferred[IO, Unit]
-        reader <- (readerStarted.complete(()).void >> blocked.activeReceipt)
-          .guarantee(readerDone.complete(()).void)
-          .start
-        _ <- readerStarted.get
-        dataReaderStarted <- Deferred[IO, Unit]
-        dataReaderDone <- Deferred[IO, Unit]
-        dataReader <- (dataReaderStarted.complete(()).void >> blocked.read(initial))
-          .guarantee(dataReaderDone.complete(()).void)
-          .start
-        _ <- dataReaderStarted.get
-        _ <- IO.cede
-        readerBeforeRecovery <- readerDone.tryGet
-        dataReaderBeforeRecovery <- dataReaderDone.tryGet
-        _ <- release.complete(())
-        publishResult <- publisher.joinWithNever
-        readResult <- reader.joinWithNever
-        dataReadResult <- dataReader.joinWithNever
-      } yield
-        expect.all(
-          readerBeforeRecovery.isEmpty,
-          dataReaderBeforeRecovery.isEmpty,
-          publishResult == Left(injectedFailure),
-          readResult.contains(initial),
-          dataReadResult.toMap == initialValues
-        )
-    }}
+    tempDir.use { directory =>
+      TestControl.executeEmbed {
+        val injectedFailure = new IOException("post-rename read-back failed")
+        val initialValues = entries("reader-barrier-initial")
+        for {
+          prepared <- makeStore(directory).use { healthy =>
+            for {
+              initial <- prepare(healthy, 0L, ordinal0, initialValues)
+              _ <- healthy.publish(initial, None)
+              candidate <- prepare(healthy, 1L, ordinal1, entries("reader-barrier-candidate"))
+            } yield initial -> candidate
+          }
+          (initial, candidate) = prepared
+          fired <- Ref.of[IO, Boolean](false)
+          entered <- Deferred[IO, Unit]
+          release <- Deferred[IO, Unit]
+          result <- DurableMptImageStore
+            .resourceWith[IO](
+              directory,
+              DurableMptImageFileOps.nio[IO],
+              new BarrierOnce(ReadBack(Manifest), fired, entered, release, Some(injectedFailure)),
+              codecEra,
+              rootVerifier,
+              limits
+            )
+            .use { blocked =>
+              for {
+                publisher <- blocked.publish(candidate, Some(initial.pointer)).attempt.start
+                _ <- entered.get
+                readerStarted <- Deferred[IO, Unit]
+                readerDone <- Deferred[IO, Unit]
+                reader <- (readerStarted.complete(()).void >> blocked.activeReceipt)
+                  .guarantee(readerDone.complete(()).void)
+                  .start
+                _ <- readerStarted.get
+                dataReaderStarted <- Deferred[IO, Unit]
+                dataReaderDone <- Deferred[IO, Unit]
+                dataReader <- (dataReaderStarted.complete(()).void >> blocked.read(initial))
+                  .guarantee(dataReaderDone.complete(()).void)
+                  .start
+                _ <- dataReaderStarted.get
+                _ <- IO.cede
+                readerBeforeRecovery <- readerDone.tryGet
+                dataReaderBeforeRecovery <- dataReaderDone.tryGet
+                _ <- release.complete(())
+                publishResult <- publisher.joinWithNever
+                readResult <- reader.joinWithNever
+                dataReadResult <- dataReader.joinWithNever
+              } yield
+                expect.all(
+                  readerBeforeRecovery.isEmpty,
+                  dataReaderBeforeRecovery.isEmpty,
+                  publishResult == Left(injectedFailure),
+                  readResult.contains(initial),
+                  dataReadResult.toMap == initialValues
+                )
+            }
+        } yield result
+      }
+    }
   }
 
   test("cancellation after manifest rename cannot interrupt force and read-back publication") { res =>
     implicit val (json, hasher) = res
 
-    tempDir.use { directory => TestControl.executeEmbed {
-      for {
-        healthy <- DurableMptImageStore.make[IO](directory)
-        initial <- prepare(healthy, 0L, ordinal0, entries("cancel-initial"))
-        _ <- healthy.publish(initial, None)
-        candidate <- prepare(healthy, 1L, ordinal1, entries("cancel-candidate"))
-        fired <- Ref.of[IO, Boolean](false)
-        entered <- Deferred[IO, Unit]
-        release <- Deferred[IO, Unit]
-        blocked <- DurableMptImageStore.makeWith[IO](
-          directory,
-          DurableMptImageFileOps.nio[IO],
-          new BarrierOnce(ForceDirectory(Manifest), fired, entered, release, None),
-          MptImageRootBuilder.consensus[IO]
-        )
-        publisher <- blocked.publish(candidate, Some(initial.pointer)).start
-        _ <- entered.get
-        cancelStarted <- Deferred[IO, Unit]
-        cancelDone <- Deferred[IO, Unit]
-        canceler <- (cancelStarted.complete(()).void >> publisher.cancel)
-          .guarantee(cancelDone.complete(()).void)
-          .start
-        _ <- cancelStarted.get
-        _ <- IO.cede
-        cancelBeforeRelease <- cancelDone.tryGet
-        _ <- release.complete(())
-        _ <- canceler.joinWithNever
-        _ <- publisher.join
-        active <- blocked.activeReceipt
-        retry <- blocked.publish(candidate, Some(initial.pointer)).attempt
-      } yield
-        expect.all(
-          cancelBeforeRelease.isEmpty,
-          active.contains(candidate),
-          retry == Right(())
-        )
-    }}
+    tempDir.use { directory =>
+      TestControl.executeEmbed {
+        for {
+          prepared <- makeStore(directory).use { healthy =>
+            for {
+              initial <- prepare(healthy, 0L, ordinal0, entries("cancel-initial"))
+              _ <- healthy.publish(initial, None)
+              candidate <- prepare(healthy, 1L, ordinal1, entries("cancel-candidate"))
+            } yield initial -> candidate
+          }
+          (initial, candidate) = prepared
+          fired <- Ref.of[IO, Boolean](false)
+          entered <- Deferred[IO, Unit]
+          release <- Deferred[IO, Unit]
+          result <- DurableMptImageStore
+            .resourceWith[IO](
+              directory,
+              DurableMptImageFileOps.nio[IO],
+              new BarrierOnce(ForceDirectory(Manifest), fired, entered, release, None),
+              codecEra,
+              rootVerifier,
+              limits
+            )
+            .use { blocked =>
+              for {
+                publisher <- blocked.publish(candidate, Some(initial.pointer)).start
+                _ <- entered.get
+                cancelStarted <- Deferred[IO, Unit]
+                cancelDone <- Deferred[IO, Unit]
+                canceler <- (cancelStarted.complete(()).void >> publisher.cancel)
+                  .guarantee(cancelDone.complete(()).void)
+                  .start
+                _ <- cancelStarted.get
+                _ <- IO.cede
+                cancelBeforeRelease <- cancelDone.tryGet
+                _ <- release.complete(())
+                _ <- canceler.joinWithNever
+                _ <- publisher.join
+                active <- blocked.activeReceipt
+                retry <- blocked.publish(candidate, Some(initial.pointer)).attempt
+              } yield
+                expect.all(
+                  cancelBeforeRelease.isEmpty,
+                  active.contains(candidate),
+                  retry == Right(())
+                )
+            }
+        } yield result
+      }
+    }
   }
 
   test("publish verifies the prior image before attempting any manifest mutation") { res =>
@@ -414,16 +808,19 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
 
     tempDir.use { directory =>
       for {
-        healthy <- DurableMptImageStore.make[IO](directory)
-        initial <- prepare(healthy, 0L, ordinal0, entries("prior-verification-initial"))
-        _ <- healthy.publish(initial, None)
-        candidate <- prepare(healthy, 1L, ordinal1, entries("prior-verification-candidate"))
+        prepared <- makeStore(directory).use { healthy =>
+          for {
+            initial <- prepare(healthy, 0L, ordinal0, entries("prior-verification-initial"))
+            _ <- healthy.publish(initial, None)
+            candidate <- prepare(healthy, 1L, ordinal1, entries("prior-verification-candidate"))
+          } yield initial -> candidate
+        }
+        (initial, candidate) = prepared
         manifestPath = DurableMptImageLayout.activeManifest(directory)
         manifestBefore <- IO.blocking(Files.readAllBytes(manifestPath))
         priorImagePath = DurableMptImageLayout.image(directory, initial.imageId)
         _ <- IO.blocking(Files.write(priorImagePath, Array[Byte](1, 2, 3))).void
-        failing <- storeWithFault(directory, Write(Manifest))
-        result <- failing.publish(candidate, Some(initial.pointer)).attempt
+        result <- storeWithFault(directory, Write(Manifest)).use(_.publish(candidate, Some(initial.pointer)).attempt)
         manifestAfter <- IO.blocking(Files.readAllBytes(manifestPath))
       } yield
         expect.all(
@@ -443,18 +840,149 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           IO.raiseError(new AtomicMoveNotSupportedException(source.toString, target.toString, "injected"))
       }
 
-      for {
-        store <- DurableMptImageStore.makeWith[IO](
+      DurableMptImageStore
+        .resourceWith[IO](
           directory,
           unsupported,
           MptImageFaultInjector.noop[IO],
-          MptImageRootBuilder.consensus[IO]
+          codecEra,
+          rootVerifier,
+          limits
         )
-        values = entries("atomic-required")
-        root <- rootOf(values)
-        result <- store.prepare(0L, ordinal0, root, values).attempt
-        active <- store.activeReceipt
-      } yield expect.all(result.left.exists(_.isInstanceOf[AtomicMoveRequired]), active.isEmpty)
+        .use { store =>
+          val values = entries("atomic-required")
+          for {
+            root <- rootOf(values)
+            result <- store
+              .prepare(0L, MptImageAnchor(snapshotHash(ordinal0), parentHash(ordinal0), ordinal0, root), values)
+              .attempt
+            active <- store.activeReceipt
+          } yield expect.all(result.left.exists(_.isInstanceOf[AtomicMoveRequired]), active.isEmpty)
+        }
+    }
+  }
+
+  test("streaming decode rejects forged allocation lengths and bytes beyond configured bounds") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { directory =>
+      val values = entries("stream-limits")
+
+      def replacingInt(bytes: Array[Byte], offset: Int, value: Int): Array[Byte] = {
+        val result = bytes.clone()
+        ByteBuffer.wrap(result).putInt(offset, value)
+        result
+      }
+
+      for {
+        receipt <- makeStore(directory).use { store =>
+          prepare(store, 0L, ordinal0, values).flatTap(store.publish(_, None))
+        }
+        imagePath = DurableMptImageLayout.image(directory, receipt.imageId)
+        manifestPath = DurableMptImageLayout.activeManifest(directory)
+        originalImage <- IO.blocking(Files.readAllBytes(imagePath))
+        originalManifest <- IO.blocking(Files.readAllBytes(manifestPath))
+        countOffset = MptImageEncoding.ImageHeaderBytes.toInt - 4
+        keyLengthOffset = MptImageEncoding.ImageHeaderBytes.toInt
+        firstKeyLength = ByteBuffer.wrap(originalImage).getInt(keyLengthOffset)
+        valueLengthOffset = keyLengthOffset + 4 + firstKeyLength
+        exactFileLimits = readLimits(
+          originalImage.length.toLong,
+          maxEntries = 100,
+          maxKeyBytes = 128,
+          maxValueBytes = originalImage.length
+        )
+        _ <- IO.blocking(Files.write(imagePath, replacingInt(originalImage, countOffset, Int.MaxValue))).void
+        countFailure <- makeStore(directory).use(_.activeReceipt).attempt
+        _ <- IO.blocking(Files.write(imagePath, replacingInt(originalImage, keyLengthOffset, Int.MaxValue))).void
+        keyFailure <- makeStore(directory).use(_.activeReceipt).attempt
+        _ <- IO.blocking(Files.write(imagePath, replacingInt(originalImage, valueLengthOffset, Int.MaxValue))).void
+        valueFailure <- makeStore(directory).use(_.activeReceipt).attempt
+        remainingAfterValueLength = originalImage.length - valueLengthOffset - 4
+        _ <- IO
+          .blocking(
+            Files.write(imagePath, replacingInt(originalImage, valueLengthOffset, remainingAfterValueLength + 1))
+          )
+          .void
+        aggregateDeclaredLengthFailure <- makeStoreWithLimits(directory, exactFileLimits).use(_.activeReceipt).attempt
+        _ <- IO.blocking(Files.write(imagePath, originalImage ++ Array[Byte](1))).void
+        trailingImageFailure <- makeStoreWithLimits(directory, exactFileLimits).use(_.activeReceipt).attempt
+        _ <- IO.blocking(Files.write(imagePath, originalImage)).void
+        _ <- IO.blocking(Files.write(manifestPath, originalManifest ++ Array[Byte](1))).void
+        trailingManifestFailure <- makeStore(directory).use(_.activeReceipt).attempt
+      } yield
+        expect.all(
+          countFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          keyFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          valueFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          aggregateDeclaredLengthFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          trailingImageFailure.left.exists(_.isInstanceOf[ImageLimitExceeded]),
+          trailingManifestFailure.left.exists(_.isInstanceOf[ImageLimitExceeded])
+        )
+    }
+  }
+
+  test("artifact reads distinguish pristine absence, missing required artifacts, and other I/O failures") { res =>
+    implicit val (json, hasher) = res
+
+    tempDir.use { virginDirectory =>
+      tempDir.use { missingImageDirectory =>
+        tempDir.use { missingManifestDirectory =>
+          tempDir.use { failedReadDirectory =>
+            val readFailure = new IOException("injected artifact read failure")
+            val manifestPath = DurableMptImageLayout.activeManifest(failedReadDirectory)
+            val failingFileOps = new DelegatingFileOps(DurableMptImageFileOps.nio[IO]) {
+              override def openInput(path: Path): Resource[IO, InputStream] =
+                if (path == manifestPath) Resource.eval(IO.raiseError(readFailure))
+                else super.openInput(path)
+            }
+
+            for {
+              virgin <- makeStore(virginDirectory).use(_.activeReceipt)
+              missingImageReceipt <- makeStore(missingImageDirectory).use { store =>
+                prepare(store, 0L, ordinal0, entries("missing-image")).flatTap(store.publish(_, None))
+              }
+              missingImagePath = DurableMptImageLayout.image(missingImageDirectory, missingImageReceipt.imageId)
+              _ <- IO.blocking(Files.delete(missingImagePath))
+              missingImage <- makeStore(missingImageDirectory).use(_.activeReceipt).attempt
+              missingManifestReceipt <- makeStore(missingManifestDirectory).use { store =>
+                prepare(store, 0L, ordinal0, entries("missing-manifest")).flatTap(store.publish(_, None))
+              }
+              _ <- IO.blocking(Files.delete(DurableMptImageLayout.activeManifest(missingManifestDirectory)))
+              missingManifest <- makeStore(missingManifestDirectory).use(_.read(missingManifestReceipt)).attempt
+              failedRead <- DurableMptImageStore
+                .resourceWith[IO](
+                  failedReadDirectory,
+                  failingFileOps,
+                  MptImageFaultInjector.noop[IO],
+                  codecEra,
+                  rootVerifier,
+                  limits
+                )
+                .use(_.activeReceipt)
+                .attempt
+            } yield {
+              val imageErrorMatches = missingImage.left.exists {
+                case MissingArtifact(MptImageArtifactRef.Image(imageId), path, _) =>
+                  imageId == missingImageReceipt.imageId && path == missingImagePath
+                case _ => false
+              }
+              val manifestErrorMatches = missingManifest.left.exists {
+                case MissingArtifact(MptImageArtifactRef.ActiveManifest, path, _) =>
+                  path == DurableMptImageLayout.activeManifest(missingManifestDirectory)
+                case _ => false
+              }
+              val readErrorMatches = failedRead.left.exists {
+                case ArtifactReadFailed(MptImageArtifactRef.ActiveManifest, path, cause) =>
+                  path == manifestPath && cause == readFailure
+                case _ => false
+              }
+
+              expect.all(virgin.isEmpty, imageErrorMatches, manifestErrorMatches, readErrorMatches)
+            }
+          }
+        }
+      }
     }
   }
 
@@ -464,32 +992,28 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
     tempDir.use { imageDirectory =>
       tempDir.use { manifestDirectory =>
         for {
-          imageStore <- DurableMptImageStore.make[IO](imageDirectory)
-          imageReceipt <- prepare(imageStore, 0L, ordinal0, entries("corrupt-image"))
-          _ <- imageStore.publish(imageReceipt, None)
+          imageReceipt <- makeStore(imageDirectory).use { imageStore =>
+            prepare(imageStore, 0L, ordinal0, entries("corrupt-image")).flatTap(imageStore.publish(_, None))
+          }
           imagePath = DurableMptImageLayout.image(imageDirectory, imageReceipt.imageId)
           originalImage <- IO.blocking(Files.readAllBytes(imagePath))
           corruptImageBytes = originalImage.clone()
           _ = corruptImageBytes(corruptImageBytes.length - 1) = (corruptImageBytes.last ^ 1).toByte
           _ <- IO.blocking(Files.write(imagePath, corruptImageBytes)).void
-          corruptImageRestart <- DurableMptImageStore.make[IO](imageDirectory)
-          corruptImage <- corruptImageRestart.activeReceipt.attempt
+          corruptImage <- makeStore(imageDirectory).use(_.activeReceipt).attempt
           _ <- IO.blocking(Files.write(imagePath, originalImage.take(3))).void
-          truncatedImageRestart <- DurableMptImageStore.make[IO](imageDirectory)
-          truncatedImage <- truncatedImageRestart.activeReceipt.attempt
-          manifestStore <- DurableMptImageStore.make[IO](manifestDirectory)
-          manifestReceipt <- prepare(manifestStore, 0L, ordinal0, entries("corrupt-manifest"))
-          _ <- manifestStore.publish(manifestReceipt, None)
+          truncatedImage <- makeStore(imageDirectory).use(_.activeReceipt).attempt
+          _ <- makeStore(manifestDirectory).use { manifestStore =>
+            prepare(manifestStore, 0L, ordinal0, entries("corrupt-manifest")).flatTap(manifestStore.publish(_, None))
+          }
           manifestPath = DurableMptImageLayout.activeManifest(manifestDirectory)
           originalManifest <- IO.blocking(Files.readAllBytes(manifestPath))
           corruptManifestBytes = originalManifest.clone()
           _ = corruptManifestBytes(12) = (corruptManifestBytes(12) ^ 1).toByte
           _ <- IO.blocking(Files.write(manifestPath, corruptManifestBytes)).void
-          corruptManifestRestart <- DurableMptImageStore.make[IO](manifestDirectory)
-          corruptManifest <- corruptManifestRestart.activeReceipt.attempt
+          corruptManifest <- makeStore(manifestDirectory).use(_.activeReceipt).attempt
           _ <- IO.blocking(Files.write(manifestPath, originalManifest.take(3))).void
-          truncatedManifestRestart <- DurableMptImageStore.make[IO](manifestDirectory)
-          truncatedManifest <- truncatedManifestRestart.activeReceipt.attempt
+          truncatedManifest <- makeStore(manifestDirectory).use(_.activeReceipt).attempt
         } yield
           expect.all(
             corruptImage.left.exists(_.isInstanceOf[CorruptImage]),
@@ -502,14 +1026,14 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
   }
 
   private class DelegatingFileOps(delegate: DurableMptImageFileOps[IO]) extends DurableMptImageFileOps[IO] {
+    def acquireExclusiveLock(path: Path): Resource[IO, Unit] = delegate.acquireExclusiveLock(path)
     def createDirectories(path: Path): IO[Unit] = delegate.createDirectories(path)
     def createTempFile(directory: Path, prefix: String, suffix: String): IO[Path] = delegate.createTempFile(directory, prefix, suffix)
     def write(path: Path, bytes: Array[Byte]): IO[Unit] = delegate.write(path, bytes)
     def forceFile(path: Path): IO[Unit] = delegate.forceFile(path)
     def atomicMoveReplace(source: Path, target: Path): IO[Unit] = delegate.atomicMoveReplace(source, target)
     def forceDirectory(path: Path): IO[Unit] = delegate.forceDirectory(path)
-    def readAllBytes(path: Path): IO[Array[Byte]] = delegate.readAllBytes(path)
-    def exists(path: Path): IO[Boolean] = delegate.exists(path)
+    def openInput(path: Path): Resource[IO, InputStream] = delegate.openInput(path)
     def isDirectory(path: Path): IO[Boolean] = delegate.isDirectory(path)
     def deleteIfExists(path: Path): IO[Unit] = delegate.deleteIfExists(path)
   }

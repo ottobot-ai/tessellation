@@ -196,6 +196,11 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSourceSuite extends Simpl
     ): IO[NakamotoChainStore.VrfOutputRange] = unexpected("vrfOutputRangeForPeriodFrom")
     def finalize(hash: Hash, ordinal: Long): IO[Unit] = unexpected("finalize")
     def walkBackTo(startHash: Hash, targetOrdinal: Long): IO[Option[Hash]] = unexpected("walkBackTo")
+    def walkBackExact(
+      start: NakamotoChainStore.ExactWalkPosition,
+      targetOrdinal: SnapshotOrdinal,
+      maxSteps: Int
+    ): IO[Either[NakamotoChainStore.ExactWalkError, NakamotoChainStore.ExactWalkResult]] = unexpected("walkBackExact")
     def getByOrdinal(ordinal: Long): IO[Option[NakamotoChainStore.StoredSnapshot]] = unexpected("getByOrdinal")
     def size: IO[Int] = unexpected("size")
     def tree: ParentChildTree[IO] = throw new AssertionError("historical registry view source called forbidden chain-store method: tree")
