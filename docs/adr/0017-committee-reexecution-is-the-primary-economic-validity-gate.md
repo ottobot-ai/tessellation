@@ -60,7 +60,7 @@ The deterministic staircase producer:
 
 The preimage binds at least network, genesis, protocol era/parameter hash, shard,
 execution epoch/roster, shard parent, shard ordinal, slot/duty, exact Phase-2 base
-`(ordinal,hash,stateRoot)`, complete ordered inputs or their availability-bound
+`(ordinal,hash,parentHash,mptRoot)`, complete ordered inputs or their availability-bound
 commitment, per-MG diffs, per-MG roots, and custom-data commitments.
 
 ### 2. Committee replay-before-sign

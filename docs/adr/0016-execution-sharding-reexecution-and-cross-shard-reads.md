@@ -108,7 +108,7 @@ framework operation resolves its source authorization against an exact canonical
 GL0 Phase-2 reference:
 
 ```text
-GlobalSnapshotRef(ordinal, hash, stateRoot)
+GlobalSnapshotStateRef(ordinal, hash, parentHash, mptRoot)
 ```
 
 Phase 0/1, a local best tip, an ordinal without its hash/root, a committee-only

@@ -192,8 +192,8 @@ path on the current root shape.
 
 **Depends on:** E0. **Can run with:** E2 and supporting tracks S1-S3.
 
-- Replace ordinal watermarks with durable exact `(ordinal, hash, parent,
-  stateRoot, evidence)` phase state and replacement events.
+- Replace ordinal watermarks with durable exact `(ordinal, hash, parentHash,
+  mptRoot, evidence)` phase state and replacement events.
 - FinalityGate exposes the exact Phase-2 identity/evidence. Bootstrap transport
   binds the selected-era complete proof and content-addressed state payload/
   projections to that reference as one bundle. Never combine a finalized ordinal
@@ -324,7 +324,7 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    never a substitute. Gate: owner-ratified O-11 plus `KEYREG-013`, `PERM-*`, and
    `PARAM-001` RED vectors.
 3. **K2 - Make the branch-historical view load-bearing.** Resolve period `N` from
-   the authenticated candidate-parent `(ordinal, hash, stateRoot)`, using the
+   the authenticated candidate-parent `(ordinal, hash, parentHash, mptRoot)`, using the
    exact `N-2` paired-key/roster/stake view and `N-1` eta evidence. A sibling with
    the same ordinal, a view whose hash is correct but whose decoded registry/root
    belongs to another branch, receiver-current state, or missing history must
@@ -352,7 +352,7 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    `KEYREG-015`.
 5. **K4 - Bind exact Phase-2 references.** Currency binaries and shard checkpoints
    bind every execution base/anchor needed for key, eta, roster, and stake lookup
-   as exact `(ordinal, hash, stateRoot)` Phase-2 evidence. Proposal, replay signing,
+   as exact `(ordinal, hash, parentHash, mptRoot)` Phase-2 evidence. Proposal, replay signing,
    GL0 acceptance, reorg, and fraud adjudication use those references rather than
    a receiver head or ordinal. A same-ordinal wrong hash or root is a mandatory RED
    rejection. Gates: `KEYREG-006`, `KEYREG-007`, `KEYREG-010`, `SHARD-E-003A`,
@@ -630,11 +630,27 @@ delivery, rollback, and recovery.
   recovery. Chain-store admission must also derive ordinal, parent, slot, and VRF
   metadata from the authenticated signed snapshot instead of trusting parallel
   caller arguments.
-- Build the finality-intent journal dark before changing either live finality rail.
-  It records only an already-decided `T_weight` attestation or canonical depth-`k1`
-  result, binds the complete exact snapshot range and terminal state artifacts, and
-  makes hash-bound release plus later notifications idempotently recoverable. It
-  creates no proposal, vote, lock, certificate, or BFT decision path.
+- The first dark L-23 durability slice has landed without changing either live
+  finality rail. ScodecV1 ADTs/codecs, canonical identities, structural validators,
+  and sealed mutation authority permit only initialization, a validated `Prepared`
+  intent, or entry into absorbing `RecoveryRequired`. A checksummed coordinator,
+  audit, artifact, and outbox store provides exact compare-and-set, durable
+  readback, bounded restart validation, and fail-closed recovery. It remains
+  unwired from `FinalityGate`, fork choice, GL0 consensus, MPT publication,
+  followers, and serving; this is a partial nonactivating prerequisite, not L-23
+  completion. It does not yet implement exact per-hash P0/P1 tracking or the
+  optimistic K/alpha/beta decision cascade.
+- Activation requires an authenticated evidence/fork-choice capability and an exact
+  branch-revision hold through durable publication; MPT, semantic-state, and anchor
+  compare-and-set readback before `CoreApplied`/`Released`; objective restoration;
+  a package-owned effect executor whose receipts prove sink readback and enforce an
+  explicit dependency DAG plus `RetentionMature` before pruning; bounded streaming
+  validation of arbitrary-depth paths; and a long-history audit-journal checkpoint
+  or accumulator. No public caller may mint those state transitions from structural
+  receipts. The only modeled qualification rails are an already-decided `T_weight`
+  attestation or canonical depth-`k1`, but the dark store does not authenticate
+  either. Phase 2 remains density-reorgable, `k2` remains retention/recovery policy,
+  and no proposal, vote, lock, certificate, or BFT decision path is introduced.
 - The current direct rebuilt-root guards do not close `BR-01` through `BR-05`:
   exact Phase-2 selection, state/projection binding, proof-era validation,
   complete fresh-join payloads, and transactional installation remain open.

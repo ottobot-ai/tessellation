@@ -114,7 +114,7 @@ eligible         = population keys intersect active paired records
 ```
 
 The input authority is an authenticated candidate parent `(ordinal, hash,
-stateRoot)`, not just an ordinal. The output binds the source periods, MPT/root
+parentHash, mptRoot)`, not just an ordinal. The output binds the source periods, MPT/root
 witnesses, exact operator map, weights, active records, and derived KES steps.
 Missing history returns unavailable/recovery. A same-ordinal sibling, current
 seedlist/stake, observed peers, receiver head, or candidate-carried key is never a
@@ -195,7 +195,7 @@ hash/state root or a registry-root witness. `CanonicalEligibleOperatorSet` adds
 the requested parent hash/ordinal and the pair/roster/stake intersection, but it
 also lacks an explicit state-root witness. The algebra is therefore a useful
 in-process model over an already authenticated `GlobalSnapshotInfo`, not yet the
-portable exact `(ordinal,hash,stateRoot)` capability required by the target.
+portable exact `(ordinal,hash,parentHash,mptRoot)` capability required by the target.
 Key-registry membership alone, a receiver-local peer list, or a live stake map is
 never a substitute.
 

@@ -103,7 +103,7 @@ replacement, and orphan requeue are owned by the durable FinalityGate transactio
 
 The scheduled producer:
 
-1. resolves an exact canonical Phase-2 GL0 base `(ordinal,hash,stateRoot)`;
+1. resolves an exact canonical Phase-2 GL0 base `(ordinal,hash,parentHash,mptRoot)`;
 2. derives the anchored execution roster/epoch and validates its staircase duty;
 3. takes a deterministic bounded fair window from assigned metagraph queues while
    preserving each MG's exact parent order;

@@ -469,7 +469,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     exact Phase-2 refs through downstream delivery, rollback, and recovery.
   - [ ] **Bootstrap/recovery stop-line (`BR-01..BR-05`), in dependency order:**
     - [ ] P6 exposes exact FinalityGate Phase-2
-      `(ordinal,hash,parent,stateRoot,evidence)`; P11 transport binds the canonical
+      `(ordinal,hash,parentHash,mptRoot,evidence)`; P11 transport binds the canonical
       selected-era full proof and content-addressed state payload/projection proofs
       to that reference as one bundle. No caller may combine a finalized ordinal
       with a separate latest/best-tip fetch.
@@ -527,10 +527,28 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - [ ] Harden live chain-store admission so ordinal, parent hash, slot, and VRF
     metadata are derived from and checked against the authenticated signed snapshot;
     the dark ancestry walk is detection/recovery infrastructure, not that boundary.
-  - [ ] Land the dark durable finality-intent ADT/codec/store and pure recovery
-    machine. Evidence is only an already-decided `T_weight` attestation or canonical
-    depth-`k1` result; the journal must not turn today's cumulative-weight optimistic
-    shortcut into a valid decision or introduce a BFT vote/lock/QC path.
+  - [ ] **L-23 PARTIAL - finish the dark durable finality-intent boundary and wire it
+    only after its authorization gates close.** ScodecV1 ADTs/codecs, canonical
+    identities, structural validators, and a sealed kernel that can initialize,
+    persist a validated `Prepared` intent, or enter absorbing `RecoveryRequired`
+    have landed. The checksummed coordinator/audit/outbox store performs exact
+    compare-and-set, durable readback, bounded restart validation, and fail-closed
+    recovery. It is dark: no live `FinalityGate`, fork choice, snapshot consensus,
+    MPT publisher, follower, or service path calls it, so L-23 remains open.
+    Exact per-hash P0/P1 state and the optimistic K/alpha/beta decision cascade are
+    not implemented by this durability slice.
+  - Before activation, add authenticated finality-evidence/fork-choice authority and
+    hold/recheck the exact branch revision through publication; package-own the
+    MPT-plus-semantic-plus-anchor readback capability that may advance
+    `CoreApplied`/`Released`; prove objective restoration; and implement the effect
+    executor with sink readback provenance, dependency DAG, and `RetentionMature`
+    pruning authority. Replace materialized arbitrary-depth path validation with a
+    bounded streaming verifier and add a long-history audit-journal checkpoint/
+    accumulator before the bounded startup walk can become an availability limit.
+    The schema represents only an already-decided `T_weight`
+    attestation or canonical depth-`k1` result, but does not yet authenticate either;
+    it must never legitimize today's cumulative-weight shortcut or introduce a global
+    BFT vote/lock/QC path.
   - Density replacement reverses anchors, mirrors, settlement/nullifiers, and
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters

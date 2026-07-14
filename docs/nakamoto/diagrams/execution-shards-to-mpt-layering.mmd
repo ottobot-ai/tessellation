@@ -14,7 +14,7 @@ flowchart TB
 
     GL0 --> EXEC["all GL0: execute native GL1 +<br/>global cross-MG settlement kernel"]
     GL0 --> APPLY["ordinary noncommittee GL0: verify execution threshold,<br/>exact base and pre-root CAS, continuity, and namespace;<br/>apply scoped diff and recompute root"]
-    EXEC --> MPT["canonical global MPT<br/>P2 operational / P3 archival"]
+    EXEC --> MPT["canonical global MPT<br/>P2 operational and density-reorgable<br/>k2 is retention/recovery only"]
     APPLY --> MPT
     MPT -.->|"exact Phase-2 state"| GL1
     MPT -.->|"exact Phase-2 state"| ML0

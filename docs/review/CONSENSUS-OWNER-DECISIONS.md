@@ -16,7 +16,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-03 | Avalanche/Snowball is only the optimistic GL0 Phase-2 finality rail. It does not validate economics and does not create a BFT lock or commit certificate. Phase 2 is reached by decided-attestation `T_weight` **or** canonical `k1` depth. `T_count` is removed or made non-authoritative. |
 | L-04 | Within the `k1` comparison window, valid GL0 tines use the ratified Taktikos `maxvalid-tk` rule. Beyond `k1`, valid competing tines use the Ouroboros Genesis-family `maxvalid-bg` density rule from the true common ancestor. Phase-2 state remains density-reorgable. |
 | L-05 | `k2 = 100 * k1` remains a recommended retention, proof-service, and automatic rollback horizon. It is not an absolute fork-choice, pruning, or finality floor. If the true common ancestor is older than locally retained state, a node must not guess or choose socially; it stops production, fetches authenticated history/state, and resumes only after objective chain comparison and verified reconstruction. |
-| L-06 | Metagraphs and checkpoint execution reference only exact canonical Phase-2 `(ordinal, hash, stateRoot)` GL0 state. Inbound binaries may stage while the live GL0 head is ahead, but execution and global reads never use an unqualified live head. |
+| L-06 | Metagraphs and checkpoint execution reference only exact canonical Phase-2 `(ordinal, hash, parentHash, mptRoot)` GL0 state. Inbound binaries may stage while the live GL0 head is ahead, but execution and global reads never use an unqualified live head. |
 | L-07 | Every execution-committee signer independently replays the exact ordered framework inputs at the exact signed Phase-2 base and signs only when its byte-identical diff, extracted intents, and resulting root match. Missing inputs mean defer/no-sign. |
 | L-08 | Ordinary noncommittee GL0 nodes verify the distinct execution `kQuorum`, exact base, scope, continuity, diff, and resulting root, then adopt the diff without recreating the ordinary currency snapshot. Shard depth never substitutes for missing replay signatures. |
 | L-09 | Deterministically assigned noncommittee watchtower replay provides the execution-threshold collusion backstop. Positive required replay coverage precedes GL0 inclusion eligibility. A valid challenge triggers exceptional bounded universal GL0 replay of the exact retained base and inputs; the replay result, not the assertion, decides rollback/slash. |
@@ -41,21 +41,32 @@ contains the `globalSnapshotSync` proof hash and accepted `globalSnapshotSyncs`
 delta, not the exact full-view preimage, while GL0 still writes, reconstructs,
 and strips field 32 on different storage paths (ECO-F32).
 
-Implementation status for L-23 is **OPEN**. The immutable MPT image store and
-pure branch reference/lineage models are nonactivating prerequisites. The dark
-image store now has lifetime directory ownership, bounded streaming decode, and
-typed missing-artifact recovery, but still lacks an active-era semantic key/value
-verifier and FinalityGate anchor authentication. The bounded exact chain walk and
-structural lineage result are recovery/continuity prerequisites, not a replay
-session: they capture neither exact parent bytes nor the overlay mutation
-generation. Cross-era walking currently fails closed until canonical snapshot
-identity is migrated end to end, and live chain-store admission still trusts
-parallel caller metadata instead of deriving it from signed content. Live overlay
-reads still conflate an unavailable parent/ancestor with the mutable finalized
-base, successful folds still discard pending descendants, and global finality has
-no durable intent and publishes sinks in a crash-splittable order. L-23 settles the
-implementation strategy; it does not close `SMT-02`, `ROOT-002..005`, or
-`E9-BRANCH`.
+Implementation status for L-23 is **OPEN / PARTIAL**. The first dark durability
+slice now contains ScodecV1 finality ADTs/codecs, canonical identities, structural
+validators, and sealed mutation authority that permits only initialization, a
+validated `Prepared` intent, or entry into absorbing `RecoveryRequired`. Its
+checksummed coordinator/artifact/audit/outbox store uses exact compare-and-set,
+durable readback, bounded restart validation, and fail-closed recovery. None of it
+is wired to the live `FinalityGate`, fork choice, GL0 consensus, MPT publication,
+followers, or serving. It therefore neither selects Phase 2 nor makes any economic
+state usable. Exact per-hash P0/P1 state and the optimistic K/alpha/beta decision
+cascade remain unimplemented here.
+
+Activation remains blocked on authenticated finality-evidence/fork-choice
+authorization, holding and rechecking the exact branch revision through durable
+publication, and a package-owned MPT-plus-semantic-plus-anchor readback capability
+before `CoreApplied` or `Released`. Objective restoration, an effect executor with
+sink readback provenance and an explicit dependency DAG, `RetentionMature`
+authority before pruning, bounded streaming validation for arbitrary-depth paths,
+and a long-history audit-journal checkpoint/accumulator also do not exist. The
+immutable MPT image store and pure branch lineage models remain nonactivating
+prerequisites: they still lack FinalityGate-authenticated anchoring and a complete
+active-era semantic verifier/session boundary. Live overlay, chain-store admission,
+fold, and multi-sink publication defects remain open. L-23 does not close `SMT-02`,
+`ROOT-002..005`, `E9-BRANCH`, or any live finality test gate. The schema represents
+only an already-decided `T_weight` attestation or canonical depth-`k1` result, but
+does not yet authenticate either. Phase 2 remains density-reorgable, `k2` remains
+retention/recovery policy, and no global BFT proposal/vote/lock/QC path is permitted.
 
 ## Open decision gates
 
@@ -213,7 +224,7 @@ intersection of the boundary population and active paired records. This paragrap
 does not freeze a Scala type, field number, codec, or authorization predicate.
 
 **Required lookup invariant.** Regardless of the eventual encoding, a period-`N`
-consumer resolves one exact candidate-parent `(ordinal, hash, stateRoot)` capability:
+consumer resolves one exact candidate-parent `(ordinal, hash, parentHash, mptRoot)` capability:
 
 - population and raw stake/weight from that branch's `N-2` boundary;
 - the active atomic KES+VRF pair whose record is present in the same `N-2` prefix;

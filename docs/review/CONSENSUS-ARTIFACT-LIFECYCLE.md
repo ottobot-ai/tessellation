@@ -220,34 +220,27 @@ That is an ordinal watermark and cannot represent same-ordinal hash replacement.
 The target is one durable exact-ref/branch-aware state machine:
 
 ```scala
-final case class GlobalSnapshotRef(
-  ordinal: SnapshotOrdinal,
-  hash: Hash,
-  parentHash: Hash,
-  stateRoot: Hash
-)
-
 trait FinalityGate[F[_]] {
   def submit(command: FinalityCommand): F[FinalityTransition]
-  def statusOf(ref: GlobalSnapshotRef): F[SnapshotStatus]
-  def canonicalPhase2: F[Option[GlobalSnapshotRef]]
-  def requireCanonicalAtLeast(ref: GlobalSnapshotRef, phase: SnapshotPhase): F[Unit]
-  def retentionStatus(ref: GlobalSnapshotRef): F[RetentionStatus]
+  def statusOf(ref: GlobalSnapshotStateRef): F[SnapshotStatus]
+  def canonicalPhase2: F[Option[GlobalSnapshotStateRef]]
+  def requireCanonicalAtLeast(ref: GlobalSnapshotStateRef, phase: SnapshotPhase): F[Unit]
+  def retentionStatus(ref: GlobalSnapshotStateRef): F[RetentionStatus]
   def events: Stream[F, FinalityEvent]
 }
 
 sealed trait FinalityEvent
-final case class Advanced(ref: GlobalSnapshotRef, phase: SnapshotPhase) extends FinalityEvent
-final case class Phase2Reorg(oldHead: GlobalSnapshotRef,
-                             newHead: GlobalSnapshotRef,
-                             commonAncestor: GlobalSnapshotRef) extends FinalityEvent
-final case class RecoveryRequired(commonAncestor: Option[GlobalSnapshotRef],
-                                  competingTip: GlobalSnapshotRef) extends FinalityEvent
+final case class Advanced(ref: GlobalSnapshotStateRef, phase: SnapshotPhase) extends FinalityEvent
+final case class Phase2Reorg(oldHead: GlobalSnapshotStateRef,
+                             newHead: GlobalSnapshotStateRef,
+                             commonAncestor: GlobalSnapshotStateRef) extends FinalityEvent
+final case class RecoveryRequired(commonAncestor: Option[GlobalSnapshotStateRef],
+                                  competingTip: GlobalSnapshotStateRef) extends FinalityEvent
 
 sealed trait SnapshotStatus
 final case class Canonical(phase: SnapshotPhase) extends SnapshotStatus
 final case class Orphaned(was: SnapshotPhase,
-                          replacement: Option[GlobalSnapshotRef]) extends SnapshotStatus
+                          replacement: Option[GlobalSnapshotStateRef]) extends SnapshotStatus
 
 sealed trait FinalityCommand
 final case class ObserveExecutedCandidate(candidate: AuthenticatedExecutedSnapshot)
@@ -450,7 +443,7 @@ binaries. One checkpoint may therefore contain `MG-A=[100,101,102]`,
 
 - network, genesis, protocol era and parameter hash;
 - shard, execution epoch/roster, parent, ordinal, slot/duty;
-- exact Phase-2 refs `(ordinal,hash,stateRoot)` used by the ordered binaries;
+- exact Phase-2 refs `(ordinal,hash,parentHash,mptRoot)` used by the ordered binaries;
 - exact ordered signed ML0 binaries required for framework replay, plus
   availability-bound content hashes/chunks for isolated custom payload bytes;
 - for every touched MG, signed pre-root/version, complete ordered input segment,

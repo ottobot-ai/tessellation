@@ -91,7 +91,7 @@ The plan begins from these source-proven gaps:
 | ID | Invariant | Enforcement boundary |
 |---|---|---|
 | SIG-1 | No state-validity signature is emitted without local reproduction of the exact signed result. | Typed verified capabilities at global attestation and shard execution-signature APIs. |
-| FIN-1 | P0/P1/P2 belongs to exact `(ordinal,hash,parent,stateRoot)`, never an ordinal alone. | Hash-bound `FinalityGate` state and APIs. |
+| FIN-1 | P0/P1/P2 belongs to exact `(ordinal,hash,parentHash,mptRoot)`, never an ordinal alone. | Hash-bound `FinalityGate` state and APIs. |
 | FIN-2 | P2 is reached only by the ratified optimistic trigger or canonical `k1` depth fallback. | Pure finality transition kernel. |
 | FIN-3 | A P2 hash may be orphaned by the valid chain selected under `maxvalid-tk` within `k1` or `maxvalid-bg` beyond `k1`; replacement emits one durable rollback event. | Fork-choice comparator, true-MRCA/revert transaction, downstream outbox. |
 | FIN-4 | `k2` affects retained rollback/proof availability only. A fork older than local retention causes verified history/state acquisition and a production halt until objective comparison/reconstruction succeeds; it is not refused because of age. | Retention policy, authenticated archive fetch, recovery coordinator, and production gate. |
@@ -246,7 +246,7 @@ E2.9 and owner gate O-07 remain open.
 
 | Task | Exit evidence |
 |---|---|
-| E3.1 | Specify exact Phase-0 `Pending`, Phase-1 `Provisional`, and Phase-2 `Operational` transitions over `(ordinal,hash,parent,stateRoot)` and the capability/rollback matrix. Phase-2 conflicts are reversible. `k2` is modeled only as retained-state availability. |
+| E3.1 | Specify exact Phase-0 `Pending`, Phase-1 `Provisional`, and Phase-2 `Operational` transitions over `(ordinal,hash,parentHash,mptRoot)` and the capability/rollback matrix. Phase-2 conflicts are reversible. `k2` is modeled only as retained-state availability. |
 | E3.2 | Implement an independent K/alpha/beta Snowball/Snowman reference cascade with authenticated uniform sampling, ancestor preference, emit-once, stale/replay rejection, `N<K`, eclipse, and adaptive faults. |
 | E3.3 | Specify the owner-approved predicate `P2 = decided-attestation T_weight OR canonical k1 depth`; remove/subsume `T_count`. No global BFT round, lock, or quorum certificate is introduced. |
 | E3.4 | Model valid-tine `maxvalid-tk` selection within `k1`, Genesis-family `maxvalid-bg` selection beyond `k1`, true MRCA discovery, and the unavailable-local-history state. Prove comparator symmetry/commutativity or produce counterexamples. No ordinal-age floor may override the objective comparison. |
@@ -507,14 +507,26 @@ live chain-store admission still accepts caller-supplied ordinal, parent, slot, 
 VRF metadata alongside the signed snapshot; deriving and checking those fields at
 admission remains an active-path hardening task.
 
-The next dark slice is one durable finality-intent journal over the existing sinks.
-Its immutable batch binds the prior exact released state, an advance or density
-replacement, the complete ordered exact snapshot range, terminal state artifacts,
-and either already-decided `T_weight` attestation evidence or canonical depth-`k1`
-evidence. Recoverable stages make the hash-bound release and subsequent at-least-once
-notifications idempotent. The journal records a result made by the optimistic or
-Nakamoto rail; it cannot decide one, legitimize the current one-round cumulative-
-weight shortcut, or add proposal/vote/lock/QC semantics to GL0.
+The first dark L-23 finality-durability slice has landed for eventual coordination
+of the existing sinks. Its ScodecV1 ADTs/codecs, canonical identities, structural
+validators, sealed initialize/prepare/recovery kernel, and checksummed
+coordinator/artifact/audit/outbox store provide exact compare-and-set, durable
+readback, bounded restart validation, and absorbing `RecoveryRequired`. It is not
+wired to `FinalityGate`,
+fork choice, GL0 consensus, MPT publication, followers, or serving, and cannot
+advance `CoreApplied` or `Released` through public authority. It also does not
+implement exact per-hash P0/P1 state or the optimistic K/alpha/beta cascade.
+
+This remains an open, nonactivating prerequisite. Authenticated evidence and
+fork-choice authorization, a branch-revision hold through publication,
+MPT-plus-semantic-plus-anchor readback authority, objective restoration, a sink
+executor with readback-proven receipts and an explicit dependency DAG,
+`RetentionMature` pruning authority, streaming arbitrary-depth path validation,
+and a long-history audit-journal checkpoint/accumulator are still absent. The
+schema represents only an already-decided `T_weight` attestation or canonical
+depth-`k1` result, but does not authenticate either. It cannot decide one,
+legitimize the current cumulative-weight shortcut, make `k2` a finality floor, or
+add proposal/vote/lock/QC semantics to GL0.
 
 The lanes join before activation in this order: freeze O-13/O-14 and protocol
 bounds; freeze the complete root, physical key grammar, and canonical
@@ -534,13 +546,13 @@ there is no partial economic-security activation.
 
 | Task | Exit evidence |
 |---|---|
-| E10.1 | GL1, ML0, CL1, and DL1 follow exact P2 `(ordinal,hash,stateRoot)` and verify replacement events. Bare monotone ordinal polling is removed from consensus-bearing alignment. |
+| E10.1 | GL1, ML0, CL1, and DL1 follow exact P2 `(ordinal,hash,parentHash,mptRoot)` and verify replacement events. Bare monotone ordinal polling is removed from consensus-bearing alignment. |
 | E10.2 | A metagraph binary's `globalSyncView` and checkpoint execution context must be exact canonical P2 before replay/sign/inclusion and obey E7.7's equality or historical-context rule. Inbound staging may remain ahead. |
 | E10.3 | On P2 density reorg, downstream rolls back/rebases by the ratified rule, invalidates orphan-base checkpoints/binaries, and re-follows without duplicate effects. |
 | E10.4 | CL1 adopts canonical GL0 return state; it does not replay or override the downstream result. ML0 retains local BFT authority only over its own candidate history. |
 | E10.5 | Operational APIs label Phase 2 as reversible and expose exact hash/evidence. Archival APIs expose retained history/proof availability without claiming a stronger protocol phase. External consumers choose and document their own risk boundary. |
 | E10.6 | ML0 reorg handling follows the owner-selected rewind/rebase/new-epoch rule. Currency-with-data applications prove deterministic retained rollback/rebase; noninvertible external effects remain an explicit integrator risk decision. |
-| E10.7 | FinalityGate exposes exact Phase-2 `(ordinal,hash,parent,stateRoot,evidence)`. Bootstrap transport binds the selected-era complete state proof and content-addressed state payload/projection proofs to that exact reference as one bundle. A cold follower verifies the whole bundle as one identity; it never combines a finalized ordinal from one response with latest/best-tip state from another. |
+| E10.7 | FinalityGate exposes exact Phase-2 `(ordinal,hash,parentHash,mptRoot,evidence)`. Bootstrap transport binds the selected-era complete state proof and content-addressed state payload/projection proofs to that exact reference as one bundle. A cold follower verifies the whole bundle as one identity; it never combines a finalized ordinal from one response with latest/best-tip state from another. |
 
 ### E11 - MPT-primary state, GSI deletion, and exact recovery
 
