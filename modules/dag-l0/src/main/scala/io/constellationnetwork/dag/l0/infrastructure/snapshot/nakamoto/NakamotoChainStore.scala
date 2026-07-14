@@ -441,6 +441,13 @@ object NakamotoChainStore {
                             persistLinear(stored) >>
                             logger.debug(s"Chain extended to ordinal=$ordinal slot=$slot").as(true)
                         } else {
+                          // TRANSITIONAL CONSENSUS GAP: this arrival-by-arrival incumbent comparison is not
+                          // an objective best-of-frontier operation. The mixed maxvalid-tk/maxvalid-bg binary
+                          // relation can cycle across three structurally connected comparator inputs, so different
+                          // gossip arrival orders can
+                          // leave honest nodes on different incumbents even after they know the same frontier.
+                          // No canonical-selection/finality evidence may be minted from this result until the
+                          // protocol defines and validates an order-independent frontier rule.
                           chainSelection.shouldSwitch(currentTip, newTip).flatMap {
                             case true =>
                               // CASE 2: real reorg — different branch wins

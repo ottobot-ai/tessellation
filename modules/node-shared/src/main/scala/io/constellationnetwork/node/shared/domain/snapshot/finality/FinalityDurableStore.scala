@@ -1,15 +1,18 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality
 
-import java.nio.channels.Channels
 import java.nio.ByteBuffer
+import java.nio.channels.Channels
 import java.nio.charset.StandardCharsets
+import java.nio.file._
 import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.{FileAlreadyExistsException, Files, LinkOption, NoSuchFileException, Path, StandardOpenOption}
 import java.util.Arrays
 
 import cats.effect.std.Semaphore
 import cats.effect.{Async, Ref, Resource}
 import cats.syntax.all._
+
+import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
 
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{
   finalityDomainCodec,
@@ -47,21 +50,12 @@ import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityInte
 }
 import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.storage.durable.{
-  DurableAtomicWriter,
-  DurableFileOps,
-  DurableWriteBoundary,
-  DurableWriteEvent,
-  DurableWriteHook,
-  DurableWriteStage
-}
+import io.constellationnetwork.security.mpt.MptActivePublication
+import io.constellationnetwork.storage.durable._
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import scodec.Codec
 import scodec.bits.ByteVector
-
-import scala.jdk.CollectionConverters._
-import scala.util.control.NonFatal
 
 final case class FinalityDurableStoreLimits(
   maxCoordinatorHeadBytes: Long,
@@ -126,8 +120,7 @@ object FinalityDurableStoreLimits {
   }
 }
 
-sealed abstract class FinalityDurableStoreError(message: String, cause: Throwable = null)
-    extends RuntimeException(message, cause)
+sealed abstract class FinalityDurableStoreError(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
 
 object FinalityDurableStoreError {
   final case class InvalidLimits(detail: String) extends FinalityDurableStoreError(s"Invalid finality durable-store limits: $detail")
@@ -135,8 +128,7 @@ object FinalityDurableStoreError {
   final case class InvalidIdentifier(label: String, value: String)
       extends FinalityDurableStoreError(s"$label is not canonical fixed-width lowercase hexadecimal: $value")
 
-  final case class InvalidDomain(detail: String)
-      extends FinalityDurableStoreError(s"Invalid configured finality domain: $detail")
+  final case class InvalidDomain(detail: String) extends FinalityDurableStoreError(s"Invalid configured finality domain: $detail")
 
   final case class UnsafePath(path: Path)
       extends FinalityDurableStoreError(s"Finality store path escapes or aliases the configured root: $path")
@@ -167,11 +159,9 @@ object FinalityDurableStoreError {
         s"Finality durable transition failed structural validation: ${violations.map(v => s"${v.path}: ${v.invariant}").mkString("; ")}"
       )
 
-  final case class CoordinatorNotInitialized()
-      extends FinalityDurableStoreError("Finality coordinator head is not initialized")
+  final case class CoordinatorNotInitialized() extends FinalityDurableStoreError("Finality coordinator head is not initialized")
 
-  final case class EffectOutboxNotInitialized()
-      extends FinalityDurableStoreError("Finality effect outbox head is not initialized")
+  final case class EffectOutboxNotInitialized() extends FinalityDurableStoreError("Finality effect outbox head is not initialized")
 
   final case class CoordinatorCompareAndSetConflict(
     expected: Option[Hash],
@@ -188,7 +178,7 @@ object FinalityDurableStoreError {
 
   final case class RestorationProtocolNotDurable()
       extends FinalityDurableStoreError(
-        "Restoration is disabled until ObjectiveOrphanCause has objective fork-choice verification and an exact durable restoration bundle"
+        "Restoration is disabled until ForkChoiceOrphanClaim has objective fork-choice verification and an exact durable restoration bundle"
       )
 
   final case class MissingEffectReceipt(manifest: EffectManifestPointer, effectId: EffectId)
@@ -225,15 +215,12 @@ object FinalityDurableWriteArtifact {
 
 final case class StructurallyBoundCoreBatch(pointer: FinalityCoreBatchPointer, batch: FinalityCoreBatch)
 
-/** Startup result after checksums, exact identities, and the complete audit chain
-  * have been resolved. In `Running`, current released/core-batch payloads, paths,
-  * and effect dependencies are also resolved. In absorbing `RecoveryRequired`,
-  * those optional dependency fields deliberately remain empty because their
-  * absence or corruption may be the recorded reason recovery was entered.
+/** Startup result after checksums, exact identities, and the complete audit chain have been resolved. In `Running`, current
+  * released/core-batch payloads, paths, and effect dependencies are also resolved. In absorbing `RecoveryRequired`, those optional
+  * dependency fields deliberately remain empty because their absence or corruption may be the recorded reason recovery was entered.
   *
-  * This is durability verification, not finality authorization. Before activation,
-  * the coordinator must still run `validateCoreBatch` with resolved paths, prior
-  * context, effect semantics, current branch selection, and exact MPT readback.
+  * This is durability verification, not finality authorization. Before activation, the coordinator must still run `validateCoreBatch` with
+  * resolved paths, prior context, effect semantics, current branch selection, and exact MPT readback.
   */
 final case class DurablyVerifiedCoordinatorHead private[finality] (
   value: CoordinatorHead,
@@ -514,21 +501,20 @@ private final class FinalityDurableLayout(root: Path) {
 
   private def artifactKindDirectory(kind: FinalityArtifactKind): String =
     kind match {
-      case FinalityArtifactKind.CoreBatch                    => "01-core-batch"
-      case FinalityArtifactKind.ReleasedCoreRecord           => "02-released-core"
-      case FinalityArtifactKind.PathManifest                 => "03-path-manifest"
-      case FinalityArtifactKind.PathChunk                    => "04-path-chunk"
+      case FinalityArtifactKind.CoreBatch                   => "01-core-batch"
+      case FinalityArtifactKind.ReleasedCoreRecord          => "02-released-core"
+      case FinalityArtifactKind.PathManifest                => "03-path-manifest"
+      case FinalityArtifactKind.PathChunk                   => "04-path-chunk"
       case FinalityArtifactKind.DecidedAttestationEvidence  => "05-decided-attestation"
-      case FinalityArtifactKind.DepthK1Evidence              => "06-depth-k1"
-      case FinalityArtifactKind.DensityDecisionEvidence      => "07-density-decision"
-      case FinalityArtifactKind.CanonicalSelectionEvidence   => "08-canonical-selection"
-      case FinalityArtifactKind.PreparedSemanticState        => "09-prepared-semantic"
-      case FinalityArtifactKind.AuthenticatedTargetAnchor    => "10-authenticated-target"
-      case FinalityArtifactKind.AppliedSemanticStateReceipt  => "11-applied-semantic"
-      case FinalityArtifactKind.AuthenticatedAnchorReceipt   => "12-authenticated-anchor"
-      case FinalityArtifactKind.PriorSemanticStateReceipt    => "13-prior-semantic"
-      case FinalityArtifactKind.PriorAnchorReceipt           => "14-prior-anchor"
-      case FinalityArtifactKind.EffectPayload                => "15-effect-payload"
+      case FinalityArtifactKind.DepthK1Evidence             => "06-depth-k1"
+      case FinalityArtifactKind.ForkChoiceDecisionEvidence  => "08-fork-choice-decision"
+      case FinalityArtifactKind.PreparedSemanticState       => "09-prepared-semantic"
+      case FinalityArtifactKind.AuthenticatedTargetAnchor   => "10-authenticated-target"
+      case FinalityArtifactKind.AppliedSemanticStateReceipt => "11-applied-semantic"
+      case FinalityArtifactKind.AuthenticatedAnchorReceipt  => "12-authenticated-anchor"
+      case FinalityArtifactKind.PriorSemanticStateReceipt   => "13-prior-semantic"
+      case FinalityArtifactKind.PriorAnchorReceipt          => "14-prior-anchor"
+      case FinalityArtifactKind.EffectPayload               => "15-effect-payload"
     }
 
   private def hex(label: String, hash: Hash): String = {
@@ -645,13 +631,13 @@ private final class LiveFinalityDurableStore[F[_]: Async](
           if (name == ".lock") true
           else if (allowedDirectories.contains(name))
             !Files.isSymbolicLink(path) &&
-              Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) &&
-              isEmptyDirectory(path)
+            Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS) &&
+            isEmptyDirectory(path)
           else
             name.startsWith(".store.initialized.") &&
-              name.endsWith(".tmp") &&
-              !Files.isSymbolicLink(path) &&
-              Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
+            name.endsWith(".tmp") &&
+            !Files.isSymbolicLink(path) &&
+            Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)
         }
       finally entries.close()
     }
@@ -844,9 +830,8 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       )
     } yield manifest
 
-  /** Structural persistence only. This does not prove sink CAS/readback
-    * provenance. A package-owned sink executor must be the sole caller before
-    * effect delivery is activated.
+  /** Structural persistence only. This does not prove sink CAS/readback provenance. A package-owned sink executor must be the sole caller
+    * before effect delivery is activated.
     */
   private[finality] def persistStructurallyValidatedEffectReceipt(
     coordinator: DurablyVerifiedCoordinatorHead,
@@ -998,8 +983,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       loadCurrent.flatMap {
         case Some(actual) if actual.value == next =>
           verifyAlreadyInstalled(actual, mutation).as(AlreadyInstalled(actual))
-        case Some(actual)
-            if actual.payloadDigest == expected.payloadDigest && actual.value == expected.value =>
+        case Some(actual) if actual.payloadDigest == expected.payloadDigest && actual.value == expected.value =>
           actual.value.mode match {
             case _: CoordinatorMode.RecoveryRequired => Async[F].raiseError(RecoveryModeIsAbsorbing())
             case CoordinatorMode.Running =>
@@ -1040,9 +1024,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
   ): F[Option[DurablyVerifiedEffectOutboxHead]] =
     outboxMutex.permit.use { _ =>
       ensureCurrentCoordinator(coordinator, requireRunning = true) >>
-        loadEffectOutboxUnlocked(coordinator).flatTap(_ =>
-          ensureCurrentCoordinator(coordinator, requireRunning = true)
-        )
+        loadEffectOutboxUnlocked(coordinator).flatTap(_ => ensureCurrentCoordinator(coordinator, requireRunning = true))
     }
 
   def initializeEffectOutbox(
@@ -1166,7 +1148,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       )
       result <- chunk.next match {
         case Some(_) => Async[F].pure(Left(updated))
-        case None => finishPath(intentId, commitment, updated, folded._2).map(Right(_))
+        case None    => finishPath(intentId, commitment, updated, folded._2).map(Right(_))
       }
     } yield result
   }
@@ -1204,13 +1186,14 @@ private final class LiveFinalityDurableStore[F[_]: Async](
         )
       )
       first <- state.firstPointer.liftTo[F](InvalidPath("path has no first chunk"))
-    } yield VerifiedStoredPath(
-      intentId = intentId,
-      commitment = commitment,
-      firstChunk = first,
-      chunkCount = state.chunks,
-      encodedChunkBytes = state.encodedBytes
-    )
+    } yield
+      VerifiedStoredPath(
+        intentId = intentId,
+        commitment = commitment,
+        firstChunk = first,
+        chunkCount = state.chunks,
+        encodedChunkBytes = state.encodedBytes
+      )
 
   private def ensureAdjacent(before: GlobalSnapshotStateRef, after: GlobalSnapshotStateRef): F[Unit] =
     Async[F].raiseUnless(
@@ -1220,10 +1203,8 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       InvalidPath(s"noncontiguous entries: before=$before after=$after")
     )
 
-  /** This store proves durability and exact identity only. The live coordinator
-    * must still compare `scope.selection.branchRevision` with fork choice
-    * immediately before release; no filesystem transaction can supply that
-    * volatile canonical-branch CAS.
+  /** This store proves durability and exact identity only. The live coordinator must still compare `scope.selection.branchRevision` with
+    * fork choice immediately before release; no filesystem transaction can supply that volatile canonical-branch CAS.
     */
   private def persistMutationDependencies(
     before: CoordinatorHead,
@@ -1244,8 +1225,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
         mutation.head.released
           .liftTo[F](IdentityMismatch("released mutation", "new head has no released core"))
           .flatMap(putReleasedCore)
-      case (CoordinatorMutationKind.RestorationStarted, None) |
-          (CoordinatorMutationKind.RestoredAbandoned, None) |
+      case (CoordinatorMutationKind.RestorationStarted, None) | (CoordinatorMutationKind.RestoredAbandoned, None) |
           (CoordinatorMutationKind.AbandonedRetired, None) =>
         Async[F].raiseError(RestorationProtocolNotDurable())
       case _ => Async[F].unit
@@ -1302,7 +1282,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       )(
         IdentityMismatch("prepared mutation", s"headActive=$active bundle=${bundle.pointer}/${bundle.batch.scope}")
       )
-      context <- coreValidationContext(before.released)
+      context <- coreValidationContext(before.released, before.publication)
       _ <- validate(
         FinalityIntentValidator.validateCoreBatch(
           bundle.batch,
@@ -1335,30 +1315,28 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       path.chunks.traverse_(chunk => putPathChunk(chunk.artifact, chunk.value))
   }
 
-  private def coreValidationContext(prior: Option[ReleasedCore]): F[CoreValidationContext] =
+  private def coreValidationContext(
+    prior: Option[ReleasedCore],
+    currentPublication: MptActivePublication
+  ): F[CoreValidationContext] =
     prior
       .traverse(released =>
         readEffectManifest(released.payload.effectManifest).map(manifest =>
           PreviousEffectManifest(released.payload.effectManifest, manifest)
         )
       )
-      .map(previous => CoreValidationContext(prior, previous))
+      .map(previous => CoreValidationContext(prior, previous, currentPublication))
 
   private def verifyBatchArtifactClosure(
     batch: FinalityCoreBatch,
     manifest: FinalityEffectManifest
   ): F[Unit] = {
-    val transitionEvidence = batch.transition match {
-      case _: CoreTransition.Advance => Nil
-      case value: CoreTransition.DensityReplacement => value.densityDecision.artifact :: Nil
-      case value: CoreTransition.DensityRollbackToOperationalMrca => value.densityDecision.artifact :: Nil
-    }
     val artifacts =
       batch.selectionEvidence.artifact ::
         batch.qualification.evidence.artifact ::
         batch.prepared.semanticState.artifact ::
         batch.prepared.authenticatedAnchor.artifact ::
-        transitionEvidence ::: effectCommands(manifest).map(_.payload.artifact)
+        effectCommands(manifest).map(_.payload.artifact)
 
     requireDomain("core batch", batch.scope.domain) >>
       requireDomain("effect manifest", manifest.scope.domain) >>
@@ -1369,9 +1347,9 @@ private final class LiveFinalityDurableStore[F[_]: Async](
   private def corePathCommitments(batch: FinalityCoreBatch): List[PathCommitment] = {
     val transition = batch.transition match {
       case value: CoreTransition.Advance => value.adopted.commitment :: Nil
-      case value: CoreTransition.DensityReplacement =>
+      case value: CoreTransition.ForkChoiceReplacement =>
         value.orphaned.commitment :: value.adopted.commitment :: Nil
-      case value: CoreTransition.DensityRollbackToOperationalMrca => value.orphaned.commitment :: Nil
+      case value: CoreTransition.ForkChoiceRollbackToOperationalMrca => value.orphaned.commitment :: Nil
     }
     batch.scope.selection.lineage :: transition ::: batch.qualification.ancestorClosure.toList.map(_.commitment)
   }
@@ -1436,7 +1414,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
 
   private def loadCoordinatorStartupUnlocked: F[Option[DurablyVerifiedCoordinatorHead]] =
     loadCoordinatorFromDiskUnlocked(None, verifyFullAudit = true).flatMap {
-      case None => Async[F].pure(None)
+      case None          => Async[F].pure(None)
       case Some(journal) =>
         // The journal/audit chain is valid, but a Running head is not authority
         // until every current dependency is also verified. The temporary cache
@@ -1472,15 +1450,14 @@ private final class LiveFinalityDurableStore[F[_]: Async](
             journal.value,
             RecoveryReason.StartupDependencyFailure(startupDependencyFailureDigest(journal, failure))
           )
-          .leftMap(error =>
-            IdentityMismatch("startup dependency recovery mutation", error.toString)
-          )
+          .leftMap(error => IdentityMismatch("startup dependency recovery mutation", error.toString))
       )
       installed <- compareAndSetCoordinator(journal, mutation)
-    } yield installed match {
-      case Installed(value)        => value
-      case AlreadyInstalled(value) => value
-    }
+    } yield
+      installed match {
+        case Installed(value)        => value
+        case AlreadyInstalled(value) => value
+      }
 
   private def startupDependencyFailureDigest(
     journal: DurablyVerifiedCoordinatorHead,
@@ -1514,9 +1491,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
     }
 
   private def loadCoordinatorJournalUnlocked: F[Option[DurablyVerifiedCoordinatorHead]] =
-    headCache.get.flatMap(cached =>
-      loadCoordinatorFromDiskUnlocked(cached, verifyFullAudit = false)
-    )
+    headCache.get.flatMap(cached => loadCoordinatorFromDiskUnlocked(cached, verifyFullAudit = false))
 
   private def loadCoordinatorFromDiskUnlocked(
     cached: Option[DurablyVerifiedCoordinatorHead],
@@ -1528,7 +1503,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       result <- (marker, raw) match {
         case (None, None) =>
           cached match {
-            case None        => Async[F].pure(None)
+            case None    => Async[F].pure(None)
             case Some(_) => Async[F].raiseError(Missing(CoordinatorHeadEnvelope, layout.coordinatorHead))
           }
         case (Some(_), None) =>
@@ -1611,7 +1586,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       audit <- readAudit(pointer)
       _ <- rejectUndurableAuditMutation(audit.mutation)
       recovery <- current.mode match {
-        case CoordinatorMode.Running => Async[F].pure(Option.empty[RecoveryRecord])
+        case CoordinatorMode.Running                  => Async[F].pure(Option.empty[RecoveryRecord])
         case CoordinatorMode.RecoveryRequired(record) => readRecovery(record).map(_.some)
       }
       _ <- validate(
@@ -1644,7 +1619,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
             audit <- readAudit(scan.pointer)
             _ <- rejectUndurableAuditMutation(audit.mutation)
             recovery <- scan.expected.mode match {
-              case CoordinatorMode.Running => Async[F].pure(Option.empty[RecoveryRecord])
+              case CoordinatorMode.Running                  => Async[F].pure(Option.empty[RecoveryRecord])
               case CoordinatorMode.RecoveryRequired(record) => readRecovery(record).map(_.some)
             }
             before = audit.before.map(commitment => coordinatorHead(commitment, audit.priorAudit))
@@ -1676,9 +1651,9 @@ private final class LiveFinalityDurableStore[F[_]: Async](
 
   private def rejectUndurableAuditMutation(mutation: CoordinatorMutationKind): F[Unit] =
     mutation match {
-      case CoordinatorMutationKind.RestorationStarted |
-          CoordinatorMutationKind.RestoredAbandoned |
-          CoordinatorMutationKind.AbandonedRetired => Async[F].raiseError(RestorationProtocolNotDurable())
+      case CoordinatorMutationKind.RestorationStarted | CoordinatorMutationKind.RestoredAbandoned |
+          CoordinatorMutationKind.AbandonedRetired =>
+        Async[F].raiseError(RestorationProtocolNotDurable())
       case _ => Async[F].unit
     }
 
@@ -1761,6 +1736,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       commitment.mode,
       commitment.released,
       commitment.active,
+      commitment.publication,
       commitment.effects,
       audit
     )
@@ -1771,8 +1747,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
   )(operation: F[A]): F[A] =
     headMutex.permit.use { _ =>
       loadCoordinatorUnlocked.flatMap {
-        case Some(actual)
-            if actual.payloadDigest == expected.payloadDigest && actual.value == expected.value =>
+        case Some(actual) if actual.payloadDigest == expected.payloadDigest && actual.value == expected.value =>
           if (requireRunning)
             actual.value.mode match {
               case CoordinatorMode.Running             => operation
@@ -2033,7 +2008,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
             case None => current.generation.value.value == 0L && value.previous.isEmpty
             case Some(pointer) =>
               BigInt(current.generation.value.value) == BigInt(pointer.generation.value.value) + 1 &&
-                value.previous.contains(pointer)
+              value.previous.contains(pointer)
           }
           Async[F].raiseUnless(contiguous)(
             IdentityMismatch(
@@ -2144,8 +2119,8 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       _ <- ensureDirectory(target.getParent)
       existing <- targetStatus(target)
       _ <- existing match {
-        case TargetStatus.Missing => installImmutable(target, kind, payload, envelope, maxPayloadBytes)
-        case TargetStatus.Regular => verifyImmutable(target, kind, payload, maxPayloadBytes)
+        case TargetStatus.Missing          => installImmutable(target, kind, payload, envelope, maxPayloadBytes)
+        case TargetStatus.Regular          => verifyImmutable(target, kind, payload, maxPayloadBytes)
         case TargetStatus.Unsafe(fileType) => Async[F].raiseError(UnsafeFile(target, fileType))
       }
     } yield ()
@@ -2173,7 +2148,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
               at(artifact, ForceDirectory)(fileOps.forceDirectory(target.getParent)) >>
                 at(artifact, ReadBack)(verifyImmutable(target, kind, payload, maxPayloadBytes))
             case Left(_: FileAlreadyExistsException) => verifyImmutable(target, kind, payload, maxPayloadBytes)
-            case Left(error) => Async[F].raiseError[Unit](AtomicImmutableInstallRequired(target, error))
+            case Left(error)                         => Async[F].raiseError[Unit](AtomicImmutableInstallRequired(target, error))
           }
         }
 
@@ -2204,26 +2179,23 @@ private final class LiveFinalityDurableStore[F[_]: Async](
     maxPayloadBytes: Long
   ): F[Option[Array[Byte]]] =
     targetStatus(path).flatMap {
-      case TargetStatus.Missing => Async[F].pure(None)
+      case TargetStatus.Missing          => Async[F].pure(None)
       case TargetStatus.Unsafe(fileType) => Async[F].raiseError(UnsafeFile(path, fileType))
       case TargetStatus.Regular =>
-        Async[F]
-          .blocking {
-            val channel = Files.newByteChannel(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)
-            val input = Channels.newInputStream(channel)
-            try FinalityDurableEnvelope.decode(input, kind, maxPayloadBytes)
-            finally input.close()
-          }
-          .flatMap {
-            case Right(decoded) => Async[F].pure[Option[Array[Byte]]](Some(decoded.payload))
-            case Left(error) =>
-              Async[F].raiseError[Option[Array[Byte]]](Corrupt(kind, path, error.getMessage, error))
-          }
-          .adaptError {
-            case error: FinalityDurableStoreError => error
-            case _: NoSuchFileException           => Missing(kind, path)
-            case NonFatal(error)                  => Corrupt(kind, path, error.getMessage, error)
-          }
+        Async[F].blocking {
+          val channel = Files.newByteChannel(path, StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS)
+          val input = Channels.newInputStream(channel)
+          try FinalityDurableEnvelope.decode(input, kind, maxPayloadBytes)
+          finally input.close()
+        }.flatMap {
+          case Right(decoded) => Async[F].pure[Option[Array[Byte]]](Some(decoded.payload))
+          case Left(error) =>
+            Async[F].raiseError[Option[Array[Byte]]](Corrupt(kind, path, error.getMessage, error))
+        }.adaptError {
+          case error: FinalityDurableStoreError => error
+          case _: NoSuchFileException           => Missing(kind, path)
+          case NonFatal(error)                  => Corrupt(kind, path, error.getMessage, error)
+        }
     }
 
   private def targetStatus(path: Path): F[TargetStatus] =
@@ -2243,7 +2215,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
   private def rejectUnsafeExisting(path: Path): F[Unit] =
     targetStatus(path).flatMap {
       case TargetStatus.Missing | TargetStatus.Regular => Async[F].unit
-      case TargetStatus.Unsafe(fileType)                => Async[F].raiseError(UnsafeFile(path, fileType))
+      case TargetStatus.Unsafe(fileType)               => Async[F].raiseError(UnsafeFile(path, fileType))
     }
 
   private def ensureDirectories(paths: List[Path]): F[Unit] = paths.traverse_(ensureDirectory)
@@ -2312,8 +2284,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       ensureCurrentCoordinator(coordinator, requireRunning = true) >>
         loadEffectOutboxUnlocked(coordinator).flatMap {
           case Some(actual) if actual.value == next => Async[F].pure(AlreadyInstalled(actual))
-          case Some(actual)
-              if actual.payloadDigest == expected.payloadDigest && actual.value == expected.value =>
+          case Some(actual) if actual.payloadDigest == expected.payloadDigest && actual.value == expected.value =>
             for {
               completions <- resolveEffectCompletions(
                 expected.value.cursor,

@@ -3,12 +3,8 @@ package io.constellationnetwork.node.shared.domain.snapshot.finality
 import cats.data.NonEmptyChain
 
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreCodecs.finalityCoreBatchPayloadCodec
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator.{
-  CoreValidationContext,
-  ResolvedPathManifest,
-  ValidationResult,
-  Violation
-}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator._
+import io.constellationnetwork.security.mpt.MptActivePublication
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
@@ -25,11 +21,15 @@ object FinalityCoordinatorKernelError {
     expected: Option[EffectManifestPointer],
     actual: Option[EffectManifestPointer]
   ) extends FinalityCoordinatorKernelError
+  final case class CoreContextPublicationMismatch(
+    expected: MptActivePublication,
+    actual: MptActivePublication
+  ) extends FinalityCoordinatorKernelError
   final case class RevisionExhausted(revision: HeadRevision) extends FinalityCoordinatorKernelError
 }
 
-/** Exact validated prepare inputs and the internally derived batch pointer.
-  * Every field must be persisted before the prepared coordinator head is installed.
+/** Exact validated prepare inputs and the internally derived batch pointer. Every field must be persisted before the prepared coordinator
+  * head is installed.
   */
 final case class PreparedCoreBundle(
   batch: FinalityCoreBatch,
@@ -40,11 +40,9 @@ final case class PreparedCoreBundle(
 
 /** Read-only output of one pure coordinator-head mutation.
   *
-  * Construction is sealed inside [[FinalityCoordinatorKernel]] so callers cannot
-  * bypass transition validation with a public constructor or `copy`. The audit
-  * record and optional recovery record are immutable prerequisites for installing
-  * `head`. `preparedBundle` is present only for `Prepared` and holds every exact
-  * validated artifact which must be durable before the head CAS.
+  * Construction is sealed inside [[FinalityCoordinatorKernel]] so callers cannot bypass transition validation with a public constructor or
+  * `copy`. The audit record and optional recovery record are immutable prerequisites for installing `head`. `preparedBundle` is present
+  * only for `Prepared` and holds every exact validated artifact which must be durable before the head CAS.
   */
 sealed trait FinalityCoordinatorMutation extends Product with Serializable {
   def head: CoordinatorHead
@@ -55,10 +53,9 @@ sealed trait FinalityCoordinatorMutation extends Product with Serializable {
 
 /** Pure construction boundary for the local finality coordinator journal.
   *
-  * This kernel never chooses a branch, decides finality, creates evidence, votes,
-  * or performs I/O. It constructs only the closed coordinator mutation graph and
-  * returns a result after the canonical identity and cross-field validators pass.
-  * `RecoveryRequired` has no exit operation here.
+  * This kernel never chooses a branch, decides finality, creates evidence, votes, or performs I/O. It constructs only the closed
+  * coordinator mutation graph and returns a result after the canonical identity and cross-field validators pass. `RecoveryRequired` has no
+  * exit operation here.
   */
 object FinalityCoordinatorKernel {
   import FinalityCoordinatorKernelError._
@@ -72,13 +69,19 @@ object FinalityCoordinatorKernel {
     preparedBundle: Option[PreparedCoreBundle]
   ) extends FinalityCoordinatorMutation
 
-  def initialize: Result = {
+  /** Initialize from a supplied MPT publication cursor.
+    *
+    * Activation must restrict this call to a package-owned exact-readback capability; structural validation alone cannot prove MPT
+    * provenance.
+    */
+  def initialize(initialPublication: MptActivePublication): Result = {
     val draft = CoordinatorHead(
       revision = HeadRevision(NonNegLong.MinValue),
       lastAttempt = None,
       mode = CoordinatorMode.Running,
       released = None,
       active = None,
+      publication = initialPublication,
       effects = EffectsIndex(None, None),
       auditTail = None
     )
@@ -105,6 +108,11 @@ object FinalityCoordinatorKernel {
         actualPreviousEffects == expectedPreviousEffects,
         (),
         CoreContextEffectsMismatch(expectedPreviousEffects, actualPreviousEffects): FinalityCoordinatorKernelError
+      )
+      _ <- Either.cond(
+        context.currentPublication == before.publication,
+        (),
+        CoreContextPublicationMismatch(before.publication, context.currentPublication): FinalityCoordinatorKernelError
       )
       _ <- validated(FinalityIntentValidator.validateCoreBatch(batch, effectManifest, resolvedPaths, context))
       artifact <- identity(
@@ -137,11 +145,11 @@ object FinalityCoordinatorKernel {
       )
     } yield result
 
-  // CoreApplied, Released, and objective-restoration states remain representable
-  // on disk for recovery and audit. No kernel entry point may mint them until a
-  // package-owned durable runtime supplies opaque capabilities proving the exact
-  // MPT/semantic/anchor CAS readback and holds the selected branch revision
-  // through the coordinator-head CAS.
+  // CoreApplied and Released remain representable in durable records for recovery
+  // and audit. Restoration stages are schema-only and the durable store rejects
+  // them. No kernel entry point may mint any of these states until a package-owned
+  // runtime supplies opaque capabilities proving the exact MPT/semantic/anchor CAS
+  // readback and holds the selected branch revision through the coordinator-head CAS.
 
   def enterRecovery(before: CoordinatorHead, reason: RecoveryReason): Result =
     for {
@@ -151,6 +159,7 @@ object FinalityCoordinatorKernel {
         lastAttempt = before.lastAttempt,
         released = before.released,
         active = before.active,
+        publication = before.publication,
         effects = before.effects,
         reason = reason,
         priorAudit = before.auditTail

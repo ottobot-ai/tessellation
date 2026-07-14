@@ -155,6 +155,101 @@ object ChainSelectionSuite extends SimpleIOSuite {
         expect.same(tipB.hash, result.get.hash)
   }
 
+  test("regression witness: mixed tk/bg selectBest is permutation-sensitive across three connected candidate tines") {
+    // Pairwise commutativity is not enough for a canonical frontier. With kLookback=2 and sWindow=5:
+    //   A <tk B (B is longer), B <tk C (C is longer), but C <bg A (equal density, lower A VRF wins).
+    // The resulting cycle makes the left-fold in selectBest depend on candidate arrival order. This test
+    // intentionally records the activation blocker; no portable canonical-selection evidence may be minted
+    // from selectBest until the protocol defines and proves a deterministic frontier rule.
+    val g = tip("cycle-g", 0L, 0L, "cycle-root", 0x40)
+    val a = tip("cycle-a", 1L, 1L, "cycle-g", 0x01)
+    val b1 = tip("cycle-b1", 2L, 1L, "cycle-g", 0x20)
+    val b = tip("cycle-b", 4L, 2L, "cycle-b1", 0x30)
+    val c1 = tip("cycle-c1", 6L, 2L, "cycle-b1", 0x31)
+    val c = tip("cycle-c", 10L, 3L, "cycle-c1", 0x50)
+    val graph = List(g, a, b1, b, c1, c)
+
+    for {
+      cs <- graphSelection(graph, kLookback = 2L, sWindow = 5L)
+      ab <- cs.compare(a, b)
+      bc <- cs.compare(b, c)
+      ca <- cs.compare(c, a)
+      abc <- cs.selectBest(List(a, b, c))
+      bca <- cs.selectBest(List(b, c, a))
+      cab <- cs.selectBest(List(c, a, b))
+    } yield
+      expect.all(
+        ab.hash == b.hash,
+        bc.hash == c.hash,
+        ca.hash == a.hash,
+        abc.exists(_.hash == c.hash),
+        bca.exists(_.hash == a.hash),
+        cab.exists(_.hash == b.hash)
+      )
+  }
+
+  test("activation blocker: strict tk/bg preferences form a permutation-sensitive three-cycle") {
+    // This cycle does not depend on the current VRF/hash equality tiebreak. With k=3 and s=10:
+    // A beats B by maxvalid-tk length, B beats C by strictly greater MRCA-window density,
+    // and C beats A by strictly greater MRCA-window density.
+    val g = tip("strict-cycle-g", 0L, 0L, "strict-cycle-root", 0x40)
+    val x1 = tip("strict-cycle-x1", 1L, 1L, "strict-cycle-g", 0x10)
+    val x2 = tip("strict-cycle-x2", 2L, 2L, "strict-cycle-x1", 0x11)
+    val a1 = tip("strict-cycle-a1", 20L, 3L, "strict-cycle-x2", 0x20)
+    val a2 = tip("strict-cycle-a2", 30L, 4L, "strict-cycle-a1", 0x21)
+    val a = tip("strict-cycle-a", 40L, 5L, "strict-cycle-a2", 0x22)
+    val b1 = tip("strict-cycle-b1", 3L, 3L, "strict-cycle-x2", 0x30)
+    val b = tip("strict-cycle-b", 4L, 4L, "strict-cycle-b1", 0x31)
+    val c1 = tip("strict-cycle-c1", 1L, 1L, "strict-cycle-g", 0x50)
+    val c2 = tip("strict-cycle-c2", 5L, 2L, "strict-cycle-c1", 0x51)
+    val c3 = tip("strict-cycle-c3", 9L, 3L, "strict-cycle-c2", 0x52)
+    val c = tip("strict-cycle-c", 20L, 4L, "strict-cycle-c3", 0x53)
+    val graph = List(g, x1, x2, a1, a2, a, b1, b, c1, c2, c3, c)
+
+    for {
+      cs <- graphSelection(graph, kLookback = 3L, sWindow = 10L)
+      ab <- cs.compare(a, b)
+      bc <- cs.compare(b, c)
+      ca <- cs.compare(c, a)
+      abc <- cs.selectBest(List(a, b, c))
+      bca <- cs.selectBest(List(b, c, a))
+      cab <- cs.selectBest(List(c, a, b))
+    } yield
+      expect.all(
+        ab.hash == a.hash,
+        bc.hash == b.hash,
+        ca.hash == c.hash,
+        abc.exists(_.hash == c.hash),
+        bca.exists(_.hash == a.hash),
+        cab.exists(_.hash == b.hash)
+      )
+  }
+
+  test("activation blocker: production k1-plus-one lookback keeps a depth k1-plus-one fork on maxvalid-tk") {
+    // The walk's forkDepth is the maximum post-MRCA suffix length. For k1=2 this fork has depth 3.
+    // The sparse three-block tine wins maxvalid-tk by length; the dense two-block tine wins maxvalid-bg.
+    // Production derives kLookback=k1+1 and compare uses bg only when depth > kLookback, so it returns
+    // the sparse tine at depth k1+1. Passing kLookback=k1 yields the ratified "beyond k1" density result.
+    val g = tip("boundary-g", 0L, 0L, "boundary-root", 0x40)
+    val sparse1 = tip("boundary-sparse-1", 10L, 1L, "boundary-g", 0x20)
+    val sparse2 = tip("boundary-sparse-2", 20L, 2L, "boundary-sparse-1", 0x21)
+    val sparse3 = tip("boundary-sparse-3", 30L, 3L, "boundary-sparse-2", 0x22)
+    val dense1 = tip("boundary-dense-1", 1L, 1L, "boundary-g", 0x30)
+    val dense2 = tip("boundary-dense-2", 2L, 2L, "boundary-dense-1", 0x31)
+    val graph = List(g, sparse1, sparse2, sparse3, dense1, dense2)
+
+    for {
+      productionBoundary <- graphSelection(graph, kLookback = 3L, sWindow = 5L)
+      ratifiedBoundary <- graphSelection(graph, kLookback = 2L, sWindow = 5L)
+      productionWinner <- productionBoundary.compare(sparse3, dense2)
+      ratifiedWinner <- ratifiedBoundary.compare(sparse3, dense2)
+    } yield
+      expect.all(
+        productionWinner.hash == sparse3.hash,
+        ratifiedWinner.hash == dense2.hash
+      )
+  }
+
   test("shouldSwitch: returns true when candidate has higher ordinal (structural)") {
     val current = tip("current", 10, 100, "parent", 0x50)
     val candidate = tip("candidate", 11, 101, "current", 0x50)

@@ -57,13 +57,13 @@ private[finality] object FinalityCodecFixtures {
     )
 
   val selectionEvidenceArtifact: ImmutableArtifactPointer =
-    artifact(FinalityArtifactKind.CanonicalSelectionEvidence, 110)
+    artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, 110)
   val selection: CanonicalSelectionToken =
     CanonicalSelectionToken(
       CanonicalBranchRevision(nonNeg(12L)),
       targetState,
       targetState,
-      selectionEvidenceArtifact,
+      ForkChoiceDecision(selectionEvidenceArtifact),
       pathCommitment
     )
 
@@ -274,6 +274,7 @@ private[finality] object FinalityCodecFixtures {
       Some(attempt),
       Some(releasedCore),
       Some(activeCore),
+      targetPublication,
       effectsIndex,
       RecoveryReason.EffectConflict(
         EffectKind.TowerIndexReconciliation,
@@ -290,6 +291,7 @@ private[finality] object FinalityCodecFixtures {
       CoordinatorMode.RecoveryRequired(recoveryPointer),
       Some(releasedCore),
       Some(activeCore),
+      targetPublication,
       effectsIndex,
       Some(auditPointer)
     )

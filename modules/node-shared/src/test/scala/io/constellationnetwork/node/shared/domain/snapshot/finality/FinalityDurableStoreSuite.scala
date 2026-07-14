@@ -1,50 +1,28 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality
 
 import java.io.InputStream
-import java.nio.file.{Files => NioFiles, LinkOption, Path, StandardOpenOption}
+import java.nio.file.{Files => NioFiles, _}
 
 import cats.data.NonEmptyList
 import cats.effect.IO
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{
-  pathChunkPayloadCodec,
-  pathManifestPayloadCodec
-}
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator.{
-  CoreValidationContext,
-  PreviousEffectManifest,
-  ResolvedPathChunk,
-  ResolvedPathManifest
-}
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableCasResult.{
-  AlreadyInstalled,
-  Installed
-}
+import scala.jdk.CollectionConverters._
+import scala.reflect.ClassTag
+
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{pathChunkPayloadCodec, pathManifestPayloadCodec}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCodecFixtures._
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableCasResult.{AlreadyInstalled, Installed}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableEnvelopeKind.ImmutableArtifact
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableStoreError._
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCodecFixtures.{
-  finalityDomain,
-  hash,
-  nonNeg,
-  state
-}
-import io.constellationnetwork.storage.durable.{
-  DurableFileOps,
-  DurableWriteBoundary,
-  DurableWriteEvent,
-  DurableWriteHook,
-  DurableWriteStage
-}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator._
 import io.constellationnetwork.security.mpt._
+import io.constellationnetwork.storage.durable._
 
 import fs2.io.file.Files
 import scodec.bits.ByteVector
 import shapeless.test.illTyped
 import weaver.SimpleIOSuite
-
-import scala.jdk.CollectionConverters._
-import scala.reflect.ClassTag
 
 object FinalityDurableStoreSuite extends SimpleIOSuite {
 
@@ -73,6 +51,13 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
   private def kernel[A](result: Either[FinalityCoordinatorKernelError, A]): A =
     result.fold(error => throw new IllegalStateException(error.toString), identity)
 
+  private def initialCoordinatorMutation: FinalityCoordinatorMutation =
+    kernel(
+      FinalityCoordinatorKernel.initialize(
+        MptActivePublication(MptPublicationRevision(0L), None)
+      )
+    )
+
   private def casValue[A](result: FinalityDurableCasResult[A]): A =
     result match {
       case Installed(value)        => value
@@ -86,8 +71,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
     root: Path,
     domain: FinalityDomain = finalityDomain,
     limits: FinalityDurableStoreLimits = FinalityDurableStoreLimits.default,
-    hook: DurableWriteHook[IO, FinalityDurableWriteArtifact] =
-      DurableWriteHook.noop[IO, FinalityDurableWriteArtifact]
+    hook: DurableWriteHook[IO, FinalityDurableWriteArtifact] = DurableWriteHook.noop[IO, FinalityDurableWriteArtifact]
   ) =
     FinalityDurableStore.make[IO](root, domain, limits, DurableFileOps.nio[IO], hook)
 
@@ -97,7 +81,9 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       else {
         val paths = NioFiles.walk(root)
         try
-          paths.iterator().asScala
+          paths
+            .iterator()
+            .asScala
             .filter(path =>
               NioFiles.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) &&
                 path.getFileName.toString != ".lock"
@@ -259,7 +245,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
     val attempt = IntentAttempt(nonNeg(generationNumber))
     val lineage = path(PathRole.CanonicalLineage, NonEmptyList.one(target))
     val adopted = path(PathRole.Adopted, NonEmptyList.one(target))
-    val selectionEvidence = rawArtifact(FinalityArtifactKind.CanonicalSelectionEvidence, seedBase + 100)
+    val selectionEvidence = rawArtifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, seedBase + 100)
     val qualificationEvidence = rawArtifact(FinalityArtifactKind.DecidedAttestationEvidence, seedBase + 101)
     val semanticState = rawArtifact(FinalityArtifactKind.PreparedSemanticState, seedBase + 102)
     val authenticatedAnchor = rawArtifact(FinalityArtifactKind.AuthenticatedTargetAnchor, seedBase + 103)
@@ -338,7 +324,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         CanonicalBranchRevision(nonNeg(generationNumber + 1L)),
         target,
         target,
-        selectionEvidence.pointer,
+        ForkChoiceDecision(selectionEvidence.pointer),
         lineage._1
       ),
       transition = transitionShape,
@@ -442,7 +428,8 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         commandData.map(_._2) ++ List(semanticReceipt, anchorReceipt)
     val context = CoreValidationContext(
       prior.map(_.released),
-      prior.map(value => PreviousEffectManifest(previousManifest.get, value.manifest))
+      prior.map(value => PreviousEffectManifest(previousManifest.get, value.manifest)),
+      expectedPublication
     )
 
     EconomicFixture(
@@ -556,10 +543,11 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         before <- persistedFiles(root)
         reopened <- store(root, wrongDomain).use(_ => IO.unit).attempt
         after <- persistedFiles(root)
-      } yield expect.all(
-        errorIs[IdentityMismatch](reopened),
-        before == after
-      )
+      } yield
+        expect.all(
+          errorIs[IdentityMismatch](reopened),
+          before == after
+        )
     }
   }
 
@@ -579,11 +567,12 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         reopened <- store(root).use(_ => IO.unit).attempt
         after <- persistedFiles(root)
         markerExists <- IO.blocking(NioFiles.exists(marker, LinkOption.NOFOLLOW_LINKS))
-      } yield expect.all(
-        errorIs[Missing](reopened),
-        !markerExists,
-        before == after
-      )
+      } yield
+        expect.all(
+          errorIs[Missing](reopened),
+          !markerExists,
+          before == after
+        )
     }
   }
 
@@ -609,20 +598,21 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         expected <- store(root).use { durable =>
           for {
-            initial <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+            initial <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
             prepared <- prepareFixture(durable, initial, fixture)
           } yield prepared
         }
         restored <- store(root).use(_.coordinatorHead.map(_.get))
-      } yield expect.all(
-        expected.value.active.exists(_.batch.intentId == fixture.batch.intentId),
-        expected.activeBatch.exists(_.batch == fixture.batch),
-        expected.latestEffectManifest.isEmpty,
-        restored.value == expected.value,
-        restored.payloadDigest == expected.payloadDigest,
-        restored.activeBatch == expected.activeBatch,
-        restored.latestEffectManifest == expected.latestEffectManifest
-      )
+      } yield
+        expect.all(
+          expected.value.active.exists(_.batch.intentId == fixture.batch.intentId),
+          expected.activeBatch.exists(_.batch == fixture.batch),
+          expected.latestEffectManifest.isEmpty,
+          restored.value == expected.value,
+          restored.payloadDigest == expected.payloadDigest,
+          restored.activeBatch == expected.activeBatch,
+          restored.latestEffectManifest == expected.latestEffectManifest
+        )
     }
   }
 
@@ -642,7 +632,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
 
       store(root).use { durable =>
         for {
-          initial <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+          initial <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
           _ <- putRawArtifacts(durable, fixture)
           _ <- writeLocator(
             pathLocator(root, fixture.batch.intentId, resolved.commitment.manifest.id, 0L),
@@ -674,7 +664,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
 
       store(root).use { durable =>
         for {
-          initial <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+          initial <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
           _ <- putRawArtifacts(durable, fixture)
           _ <- writeLocator(batchLocatorPath(root, fixture.batch.intentId), wrongPayload)
           mutation = kernel(
@@ -704,7 +694,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
   test("coordinator CAS rejects a stale exact head while initialization remains idempotent") {
     Files[IO].tempDirectory.use { temporary =>
       val root = temporary.toNioPath.resolve("finality")
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
 
       store(root).use { durable =>
         for {
@@ -731,12 +721,13 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
           )
           installedRecovery <- durable.compareAndSetCoordinator(installed, recoveryA)
           rejectedCoordinatorCas <- durable.compareAndSetCoordinator(installed, recoveryB).attempt
-        } yield expect.all(
-          retry.isInstanceOf[AlreadyInstalled[_]],
-          outboxRetry.isInstanceOf[AlreadyInstalled[_]],
-          installedRecovery.isInstanceOf[Installed[_]],
-          errorIs[CoordinatorCompareAndSetConflict](rejectedCoordinatorCas)
-        )
+        } yield
+          expect.all(
+            retry.isInstanceOf[AlreadyInstalled[_]],
+            outboxRetry.isInstanceOf[AlreadyInstalled[_]],
+            installedRecovery.isInstanceOf[Installed[_]],
+            errorIs[CoordinatorCompareAndSetConflict](rejectedCoordinatorCas)
+          )
       }
     }
   }
@@ -744,7 +735,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
   test("restart reconstructs an initialized coordinator and empty outbox from exact durable records") {
     Files[IO].tempDirectory.use { temporary =>
       val root = temporary.toNioPath.resolve("finality")
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val emptyOutbox = FinalityEffectOutboxHead(
         EffectOutboxRevision(nonNeg(0L)),
         EffectOutboxCursor(None, None)
@@ -765,12 +756,13 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
             outbox <- durable.effectOutboxHead(coordinator).map(_.get)
           } yield coordinator -> outbox
         }
-      } yield expect.all(
-        restored._1.value == expected._1.value,
-        restored._1.payloadDigest == expected._1.payloadDigest,
-        restored._1.audit == initialized.audit,
-        restored._2 == expected._2
-      )
+      } yield
+        expect.all(
+          restored._1.value == expected._1.value,
+          restored._1.payloadDigest == expected._1.payloadDigest,
+          restored._1.audit == initialized.audit,
+          restored._2 == expected._2
+        )
     }
   }
 
@@ -798,7 +790,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         result <- store(root).use { durable =>
           for {
-            initial <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+            initial <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
             prepared <- prepareFixture(durable, initial, fixture)
             outbox <- durable.initializeEffectOutbox(prepared, emptyOutbox).map(casValue)
             brokenRead <- destroyAndProbe(durable, fixture, prepared)
@@ -810,14 +802,15 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
             current <- durable.coordinatorHead
             initializeRejected <- durable.initializeEffectOutbox(recovered, emptyOutbox).attempt
             casRejected <- durable.compareAndSetEffectOutbox(recovered, outbox, nextOutbox).attempt
-          } yield (
-            brokenRead,
-            cached.exists(_.value == prepared.value),
-            recovered,
-            current,
-            initializeRejected,
-            casRejected
-          )
+          } yield
+            (
+              brokenRead,
+              cached.exists(_.value == prepared.value),
+              recovered,
+              current,
+              initializeRejected,
+              casRejected
+            )
         }
         restarted <- store(root).use(_.coordinatorHead)
       } yield
@@ -852,15 +845,16 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         corrupt <- exercise(
           corruptRoot,
           (durable, fixture, _) =>
-            (IO.blocking(
-              NioFiles.write(
-                effectManifestPath(corruptRoot, fixture.batch.effectManifest),
-                Array[Byte](1, 2, 3),
-                StandardOpenOption.TRUNCATE_EXISTING
+            (IO
+              .blocking(
+                NioFiles.write(
+                  effectManifestPath(corruptRoot, fixture.batch.effectManifest),
+                  Array[Byte](1, 2, 3),
+                  StandardOpenOption.TRUNCATE_EXISTING
+                )
               )
-            ).void >> durable.readEffectManifest(fixture.batch.effectManifest).void).attempt,
-          (fixture, _) =>
-            RecoveryReason.CorruptEffectManifest(fixture.batch.effectManifest, hash(820)),
+              .void >> durable.readEffectManifest(fixture.batch.effectManifest).void).attempt,
+          (fixture, _) => RecoveryReason.CorruptEffectManifest(fixture.batch.effectManifest, hash(820)),
           errorIs[Corrupt]
         )
       } yield expect.all(missing, corrupt)
@@ -874,7 +868,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         running <- store(root).use { durable =>
           for {
-            initial <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+            initial <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
             prepared <- prepareFixture(durable, initial, fixture)
           } yield prepared
         }
@@ -912,8 +906,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         missing <- exercise(
           base.resolve("missing-core-at-startup"),
-          (root, _, running) =>
-            IO.blocking(NioFiles.delete(coreBatchArtifactPath(root, running.value.active.get.batch)))
+          (root, _, running) => IO.blocking(NioFiles.delete(coreBatchArtifactPath(root, running.value.active.get.batch)))
         )
         corrupt <- exercise(
           base.resolve("corrupt-manifest-at-startup"),
@@ -944,7 +937,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         installed <- store(root).use { durable =>
           for {
-            running <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+            running <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
             outbox <- durable.initializeEffectOutbox(running, emptyOutbox).map(casValue)
             mutation = kernel(
               FinalityCoordinatorKernel.enterRecovery(
@@ -1005,7 +998,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         running <- store(root).use { durable =>
           for {
-            coordinator <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+            coordinator <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
             _ <- durable.initializeEffectOutbox(coordinator, emptyOutbox)
           } yield coordinator
         }
@@ -1062,7 +1055,8 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
                       _: FinalityDurableWriteArtifact.CoordinatorHead,
                       DurableWriteStage.AtomicMove,
                       observedBoundary
-                    ) if observedBoundary == boundary => IO.raiseError(SimulatedCrash)
+                    ) if observedBoundary == boundary =>
+                  IO.raiseError(SimulatedCrash)
                 case _ => IO.unit
               }
           }
@@ -1070,7 +1064,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
           for {
             running <- store(root).use { durable =>
               for {
-                initial <- durable.initializeCoordinator(kernel(FinalityCoordinatorKernel.initialize)).map(casValue)
+                initial <- durable.initializeCoordinator(initialCoordinatorMutation).map(casValue)
                 prepared <- prepareFixture(durable, initial, fixture)
               } yield prepared
             }
@@ -1092,7 +1086,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
     Files[IO].tempDirectory.use { temporary =>
       val root = temporary.toNioPath.resolve("finality")
       val fixture = economicFixture()
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val oldestAudit = initialized.head.auditTail.get
       val emptyOutbox = FinalityEffectOutboxHead(
         EffectOutboxRevision(nonNeg(0L)),
@@ -1117,30 +1111,32 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
               )
             )
             next <- durable.compareAndSetCoordinator(prepared, recovery).map(casValue)
-          } yield (
-            firstHead.exists(_.value == prepared.value),
-            secondHead.exists(_.value == prepared.value),
-            firstOutbox.contains(expectedOutbox),
-            secondOutbox.contains(expectedOutbox),
-            next.value.mode.isInstanceOf[CoordinatorMode.RecoveryRequired]
-          )
+          } yield
+            (
+              firstHead.exists(_.value == prepared.value),
+              secondHead.exists(_.value == prepared.value),
+              firstOutbox.contains(expectedOutbox),
+              secondOutbox.contains(expectedOutbox),
+              next.value.mode.isInstanceOf[CoordinatorMode.RecoveryRequired]
+            )
         }
         restart <- store(root).use(_ => IO.unit).attempt
-      } yield expect.all(
-        live._1,
-        live._2,
-        live._3,
-        live._4,
-        live._5,
-        errorIs[Missing](restart)
-      )
+      } yield
+        expect.all(
+          live._1,
+          live._2,
+          live._3,
+          live._4,
+          live._5,
+          errorIs[Missing](restart)
+        )
     }
   }
 
   test("runtime caches never hide deletion of either mutable head") {
     Files[IO].tempDirectory.use { temporary =>
       val root = temporary.toNioPath.resolve("finality")
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val emptyOutbox = FinalityEffectOutboxHead(
         EffectOutboxRevision(nonNeg(0L)),
         EffectOutboxCursor(None, None)
@@ -1156,10 +1152,11 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
           missingOutbox <- durable.effectOutboxHead(coordinator).attempt
           _ <- IO.blocking(NioFiles.delete(root.resolve("coordinator.head")))
           missingCoordinator <- durable.coordinatorHead.attempt
-        } yield expect.all(
-          errorIs[Missing](missingOutbox),
-          errorIs[Missing](missingCoordinator)
-        )
+        } yield
+          expect.all(
+            errorIs[Missing](missingOutbox),
+            errorIs[Missing](missingCoordinator)
+          )
       }
     }
   }
@@ -1172,10 +1169,11 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         result <- store(root, limits = invalid).use(_ => IO.unit).attempt
         exists <- IO.blocking(NioFiles.exists(root, LinkOption.NOFOLLOW_LINKS))
-      } yield expect.all(
-        errorIs[InvalidLimits](result),
-        !exists
-      )
+      } yield
+        expect.all(
+          errorIs[InvalidLimits](result),
+          !exists
+        )
     }
   }
 
@@ -1204,7 +1202,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
 
   test("restart rejects a missing or corrupt audit tail and a missing recovery record") {
     def missingAudit(root: Path): IO[Boolean] = {
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val pointer = initialized.head.auditTail.get
       for {
         _ <- store(root).use(_.initializeCoordinator(initialized).void)
@@ -1214,7 +1212,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
     }
 
     def corruptAudit(root: Path): IO[Boolean] = {
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val pointer = initialized.head.auditTail.get
       for {
         _ <- store(root).use(_.initializeCoordinator(initialized).void)
@@ -1224,7 +1222,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
     }
 
     def missingRecovery(root: Path): IO[Boolean] = {
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       for {
         pointer <- store(root).use { durable =>
           for {
@@ -1257,7 +1255,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
   test("startup audit traversal obeys the configured recovery work bound") {
     Files[IO].tempDirectory.use { temporary =>
       val root = temporary.toNioPath.resolve("finality")
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val bounded = FinalityDurableStoreLimits.default.copy(maxAuditTraversalRecords = 1L)
 
       for {
@@ -1292,17 +1290,20 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       for {
         _ <- store(root).use { durable =>
           durable.putArtifact(fixture.commitment.manifest, ByteVector.view(manifestBytes)) >>
-            fixture.chunks.traverse_ { case (chunk, bytes) =>
-              writeLocator(
-                pathLocator(root, fixture.intentId, fixture.commitment.manifest.id, chunk.chunkIndex.value),
-                bytes
-              )
+            fixture.chunks.traverse_ {
+              case (chunk, bytes) =>
+                writeLocator(
+                  pathLocator(root, fixture.intentId, fixture.commitment.manifest.id, chunk.chunkIndex.value),
+                  bytes
+                )
             } >> durable.verifyStoredPath(fixture.intentId, fixture.commitment).void
         }
         bounded = FinalityDurableStoreLimits.default.copy(maxPathTraversalChunks = 1L)
-        result <- store(root, limits = bounded).use(
-          _.verifyStoredPath(fixture.intentId, fixture.commitment)
-        ).attempt
+        result <- store(root, limits = bounded)
+          .use(
+            _.verifyStoredPath(fixture.intentId, fixture.commitment)
+          )
+          .attempt
       } yield expect(errorIs[PathTraversalLimitExceeded](result))
     }
   }
@@ -1364,17 +1365,18 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         }
         targetResult <- store(targetRoot).use(_.putArtifact(pointer, bytes)).attempt
         outsideBytes <- IO.blocking(NioFiles.readAllBytes(outsideFile))
-      } yield expect.all(
-        errorIs[UnsafeDirectory](ancestorResult),
-        errorIs[UnsafeFile](targetResult),
-        outsideBytes.sameElements(Array[Byte](9, 8, 7))
-      )
+      } yield
+        expect.all(
+          errorIs[UnsafeDirectory](ancestorResult),
+          errorIs[UnsafeFile](targetResult),
+          outsideBytes.sameElements(Array[Byte](9, 8, 7))
+        )
     }
   }
 
   test("every immutable-audit and mutable-head crash boundary restarts from the last visible head") {
     Files[IO].tempDirectory.use { temporary =>
-      val initialized = kernel(FinalityCoordinatorKernel.initialize)
+      val initialized = initialCoordinatorMutation
       val boundaries = List(DurableWriteBoundary.Before, DurableWriteBoundary.After)
       val cases = for {
         artifact <- List("audit", "head")
@@ -1402,9 +1404,9 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
 
           val headBecameVisible =
             artifact == "head" && (stage match {
-              case DurableWriteStage.AtomicMove    => boundary == DurableWriteBoundary.After
+              case DurableWriteStage.AtomicMove                                  => boundary == DurableWriteBoundary.After
               case DurableWriteStage.ForceDirectory | DurableWriteStage.ReadBack => true
-              case _ => false
+              case _                                                             => false
             })
 
           for {
@@ -1412,9 +1414,9 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
             restored <- store(root).use(_.coordinatorHead)
           } yield {
             val crashObserved = crashed.left.toOption.exists {
-              case SimulatedCrash => true
+              case SimulatedCrash                                                      => true
               case AtomicImmutableInstallRequired(_, cause) if cause == SimulatedCrash => true
-              case _ => false
+              case _                                                                   => false
             }
             val valid =
               crashObserved &&

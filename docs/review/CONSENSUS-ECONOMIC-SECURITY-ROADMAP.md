@@ -67,6 +67,8 @@ The plan begins from these source-proven gaps:
 | Fast trigger | `T_weight` reads that transitional margin, while the state-changing sink ignores it and still calls the legacy cumulative-2/3 path (`FinalityTrigger.scala:176-207`; `SnapshotLeaderLoop.scala:1271-1299`). | Current behavior is neither the intended optimistic gadget nor one coherent trigger rail. |
 | Invented `k2` floor | `SettledOrdinalTracker` and the density-band flag currently turn an ordinal projection into a branch-rewrite floor. | This does not implement the ratified retention-only `k2`; fork choice, retained recovery state, and service policy must be separated. |
 | Density recovery | Density selection/revert code exists but is disabled by default, currently refuses sufficiently deep forks, and current sinks are not all reversible. | Genesis-family comparison and Phase-2 recovery are incomplete. |
+| Multi-tine frontier | On complete, true-MRCA-resolved histories the mixed pairwise comparator is commutative but not transitive. Structurally connected bare `ChainTip` inputs form a strict-preference cycle `A >tk B`, `B >bg C`, `C >bg A`, so three permutations produce different `selectBest` winners without using the open tie rule (`ChainSelectionSuite.scala:191-226`). The unit test bypasses full snapshot/VRF/KES/era validation. `selectBest` has no live caller; the analogous `NakamotoChainStore.store` arrival tournament is a source-path inference pending legal-arrival reproduction (`ChainSelection.scala:119-159`; `NakamotoChainStore.scala:437-464`). | The papers specify incumbent folds, not a total frontier order. L-24 ratifies an objective result once nodes share the same cutoff-complete published valid frontier and branch-authenticated parameters. O-15 still requires cutoff/reveal semantics, cycle resolution, exact metric/tie, evidence/verifier, validator/store witnesses, and a security/liveness proof. No live fork-choice path may authorize `FinalityGate` before those gates pass. |
+| Fork-depth boundary | When the bounded walk resolves a true MRCA over consecutive tines it reports maximum post-MRCA suffix length. Production derives and passes `kLookback = k1 + 1`, while comparison selects density only when `forkDepth > kLookback` (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`; `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`; `ChainSelectionSuite.scala:228-250`). The depth-`k1+1` witness therefore picks sparse/longer by Tk under production wiring but dense/shorter when the locked prose boundary is applied. | O-15 must freeze the distance metric and exact equality boundary before changing live consensus; retain the witness as an activation blocker. |
 | Checkpoint diff | `ShardDerivedStateDelta` currently carries roots and binaries, not a state diff (`ShardDerivedStateDelta.scala:17-31`). | Noncommittee verified diff adoption is unavailable. |
 | Embedded execution threshold | Intake and embedded verification now require valid distinct execution signers at `kQuorum`, and shard depth no longer substitutes; both paths still universally replay because the signed canonical diff/type boundary is absent. | Preserve the threshold while replacing caller-ordered signing with a typed replay capability and ordinary universal replay with verified diff apply only after the complete gates pass. |
 | Checkpoint domain/base | The signed checkpoint carries only `executionBaseOrdinal`, not the exact Phase-2 base hash/root, network/genesis, era, or parameter hash; its delta lacks pre-roots, diffs, extracted intents, and custom-lane commitments (`ShardCheckpoint.scala:58-67,80-90,104-112`; `ShardDerivedStateDelta.scala:17-31`). | Freeze and sign the complete preimage before replay signatures or diff adoption can be safe. |
@@ -93,7 +95,7 @@ The plan begins from these source-proven gaps:
 | SIG-1 | No state-validity signature is emitted without local reproduction of the exact signed result. | Typed verified capabilities at global attestation and shard execution-signature APIs. |
 | FIN-1 | P0/P1/P2 belongs to exact `(ordinal,hash,parentHash,mptRoot)`, never an ordinal alone. | Hash-bound `FinalityGate` state and APIs. |
 | FIN-2 | P2 is reached only by the ratified optimistic trigger or canonical `k1` depth fallback. | Pure finality transition kernel. |
-| FIN-3 | A P2 hash may be orphaned by the valid chain selected under `maxvalid-tk` within `k1` or `maxvalid-bg` beyond `k1`; replacement emits one durable rollback event. | Fork-choice comparator, true-MRCA/revert transaction, downstream outbox. |
+| FIN-3 | A P2 hash may be orphaned by the valid chain selected under `maxvalid-tk` within `k1` or `maxvalid-bg` beyond `k1`; replacement emits one durable rollback event. Selection from three or more tines is an objective total-frontier function: the same cutoff-complete published valid frontier and branch-authenticated parameters produce the same head independently of collection order, arrival schedule, restart, or prior incumbent. | O-15 cutoff/reveal, selector, metric/tie, evidence/verifier, witness, and proof gates; true-MRCA/revert transaction; downstream outbox. |
 | FIN-4 | `k2` affects retained rollback/proof availability only. A fork older than local retention causes verified history/state acquisition and a production halt until objective comparison/reconstruction succeeds; it is not refused because of age. | Retention policy, authenticated archive fetch, recovery coordinator, and production gate. |
 | FIN-5 | Global optimistic attestations are for authenticated, locally executed snapshots and are never economic validation or BFT commits. | Snapshot validation plus Snowball emitter. |
 | EXEC-1 | Producer and every execution signer reproduce exact input decisions, diff bytes, extracted intents, and complete root at the same P2 base. | Shared pure framework kernel and verified checkpoint capability. |
@@ -249,7 +251,7 @@ E2.9 and owner gate O-07 remain open.
 | E3.1 | Specify exact Phase-0 `Pending`, Phase-1 `Provisional`, and Phase-2 `Operational` transitions over `(ordinal,hash,parentHash,mptRoot)` and the capability/rollback matrix. Phase-2 conflicts are reversible. `k2` is modeled only as retained-state availability. |
 | E3.2 | Implement an independent K/alpha/beta Snowball/Snowman reference cascade with authenticated uniform sampling, ancestor preference, emit-once, stale/replay rejection, `N<K`, eclipse, and adaptive faults. |
 | E3.3 | Specify the owner-approved predicate `P2 = decided-attestation T_weight OR canonical k1 depth`; remove/subsume `T_count`. No global BFT round, lock, or quorum certificate is introduced. |
-| E3.4 | Model valid-tine `maxvalid-tk` selection within `k1`, Genesis-family `maxvalid-bg` selection beyond `k1`, true MRCA discovery, and the unavailable-local-history state. Prove comparator symmetry/commutativity or produce counterexamples. No ordinal-age floor may override the objective comparison. |
+| E3.4 | Model valid-tine `maxvalid-tk` selection within `k1`, Genesis-family `maxvalid-bg` selection beyond `k1`, true MRCA discovery, and the unavailable-local-history state. Pairwise symmetry is insufficient: retain the current three-tine non-transitivity/permutation counterexample, implement the ratified objective total-frontier property without silently inventing candidate order, and close O-15's cutoff/bounded-diffusion and late-reveal semantics, cycle-resolution selector, exact `k1` metric/equality, objective tie, portable evidence/verifier, validator/store witnesses, and security/liveness proof. No ordinal-age floor may override selection. |
 | E3.5 | Re-derive or explicitly accept `k1`, eta, K/alpha/beta/weight thresholds, and the `k2` retention recommendation under the actual Taktikos/LDD assumptions. Do not import a Praos bound without proof. |
 | E3.6 | Exhaustive small-network and stochastic large-network tests cover partitions, delay cliff, stale samples, equivocation, branch splits, restart, Phase-2 replacement, MRCA older than `k2`, authenticated reconstruction, and refusal to compare truncated asymmetric history. |
 | E3.7 | Specify portable `OperationalEvidence`: optimistic decided-attestation set/`T_weight` proof or an authenticated `k1` suffix proves historical qualification, not current canonicality. A permissionless follower/light client also verifies trusted genesis/cached canonical commitment, chain score/ancestry, stale-orphan status, and live replacement tracking. A single peer may provide a self-verifying proof but cannot make an unproved suffix canonical. |
@@ -516,6 +518,47 @@ wired to `FinalityGate`,
 fork choice, GL0 consensus, MPT publication, followers, or serving, and cannot
 advance `CoreApplied` or `Released` through public authority. It also does not
 implement exact per-hash P0/P1 state or the optimistic K/alpha/beta cascade.
+
+The accompanying pure reference model now represents generic exact-hash
+canonical replacement, true-MRCA orphan/adopt ranges, Phase-2 replacement, and
+the `maxvalid-tk`/`maxvalid-bg` boundary. It explicitly accepts a preselected
+winner and validates only which rule tag applies; it does not implement fork
+choice (`FinalityReferenceModel.scala:7-11,97-100,217-313`). The strict-density
+three-cycle over structurally connected comparator inputs proves why that
+boundary cannot be mistaken for a selector; full validator-backed tine validity
+remains an open integration gate (`ChainSelectionSuite.scala:191-226`). This is partial dark model work under
+E3.4, not fork-choice authorization. `ForkChoiceDecision` likewise carries only
+an opaque `ImmutableArtifactPointer`, deliberately without a Tk/Bg or
+transition-form assertion; current validation checks equality of one
+intent-scoped evidence locator with that token's pointer. No
+decoded header/tine/frontier/parameter-era evidence payload or verifier exists
+(`FinalityCore.scala:120-138,353-364`;
+`FinalityBaseCodecs.scala:96-119,178-179`;
+`FinalityIntentValidator.scala:59-120,748-761`).
+The objective total-frontier semantics are ratified; cutoff/bounded-diffusion and
+late-reveal semantics, cycle resolution, exact `k1` metric/equality, objective tie,
+evidence/verifier, validator/store witnesses, and security/liveness proof remain open.
+
+The current dark schema validates a monotone restoration plan and claimed receipt
+shape after an unreleased target is *claimed* orphaned. It does not prove that the
+target stayed unpublished or that an external MPT republish occurred.
+`PriorUnchanged` names the exact CAS prior; `AppliedTargetReverted` names the exact
+prior image at the next publication revision. `CoordinatorHead.publication` is a
+separate committed effective cursor,
+so the higher restored revision survives retirement/recovery and binds the next
+prepare. Terminal state cannot substitute its plan or `ForkChoiceOrphanClaim`.
+Tests reject revision rewind, wrong images, plan/claim substitution, and stale
+publication context, and exercise restore -> retire -> next prepare. The orphan
+claim still does not prove true MRCA or target exclusion. This does not execute or
+durably persist restoration: the durable store rejects every restoration mutation,
+the kernel exposes no restoration authority, and semantic/anchor readbacks remain
+unverified. Coordinator initialization also accepts a raw caller-supplied MPT
+publication cursor; activation requires a package-owned exact-readback capability
+instead of treating structural cursor equality as provenance
+(`FinalityCore.scala:395-460`; `FinalityCoordinatorState.scala:68-76,99-136`;
+`FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
+`FinalityCoordinatorKernel.scala:72-154`;
+`FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
 
 This remains an open, nonactivating prerequisite. Authenticated evidence and
 fork-choice authorization, a branch-revision hold through publication,

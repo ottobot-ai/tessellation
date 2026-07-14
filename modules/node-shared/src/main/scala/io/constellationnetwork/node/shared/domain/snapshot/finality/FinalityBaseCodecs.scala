@@ -17,8 +17,8 @@ import shapeless.{::, HNil}
 
 /** Shared canonical ScodecV1 codecs for greenfield finality payloads.
   *
-  * These codecs intentionally have no legacy decoder. Persisted top-level values
-  * are exposed as complete codecs by the core, effects, and coordinator objects.
+  * These codecs intentionally have no legacy decoder. Persisted top-level values are exposed as complete codecs by the core, effects, and
+  * coordinator objects.
   */
 private[finality] object FinalityBaseCodecs {
 
@@ -63,7 +63,7 @@ private[finality] object FinalityBaseCodecs {
 
       override def encode(value: Option[A]): Attempt[BitVector] =
         value match {
-          case None        => uint8.encode(0)
+          case None => uint8.encode(0)
           case Some(innerValue) =>
             for {
               tag <- uint8.encode(1)
@@ -102,8 +102,7 @@ private[finality] object FinalityBaseCodecs {
       .typecase(4, provide(FinalityArtifactKind.PathChunk))
       .typecase(5, provide(FinalityArtifactKind.DecidedAttestationEvidence))
       .typecase(6, provide(FinalityArtifactKind.DepthK1Evidence))
-      .typecase(7, provide(FinalityArtifactKind.DensityDecisionEvidence))
-      .typecase(8, provide(FinalityArtifactKind.CanonicalSelectionEvidence))
+      .typecase(8, provide(FinalityArtifactKind.ForkChoiceDecisionEvidence))
       .typecase(9, provide(FinalityArtifactKind.PreparedSemanticState))
       .typecase(10, provide(FinalityArtifactKind.AuthenticatedTargetAnchor))
       .typecase(11, provide(FinalityArtifactKind.AppliedSemanticStateReceipt))
@@ -115,8 +114,9 @@ private[finality] object FinalityBaseCodecs {
   implicit val immutableArtifactPointerCodec: Codec[ImmutableArtifactPointer] =
     (finalityArtifactKindCodec :: artifactEncodingCodec :: artifactIdCodec :: artifactDigestCodec :: Primitives.nonNegLongCodec)
       .xmap[ImmutableArtifactPointer](
-        { case kind :: encoding :: id :: digest :: byteLength :: HNil =>
-          ImmutableArtifactPointer(kind, encoding, id, digest, byteLength)
+        {
+          case kind :: encoding :: id :: digest :: byteLength :: HNil =>
+            ImmutableArtifactPointer(kind, encoding, id, digest, byteLength)
         },
         value => value.kind :: value.encoding :: value.id :: value.digest :: value.byteLength :: HNil
       )
@@ -154,8 +154,9 @@ private[finality] object FinalityBaseCodecs {
   implicit val pathCommitmentCodec: Codec[PathCommitment] =
     (pathSummaryCodec :: immutableArtifactPointerCodec :: requiredHashCodec)
       .xmap[PathCommitment](
-        { case summary :: manifest :: entriesRoot :: HNil =>
-          PathCommitment(summary, manifest, entriesRoot)
+        {
+          case summary :: manifest :: entriesRoot :: HNil =>
+            PathCommitment(summary, manifest, entriesRoot)
         },
         value => value.summary :: value.manifest :: value.entriesRoot :: HNil
       )
@@ -174,21 +175,25 @@ private[finality] object FinalityBaseCodecs {
       value => value.commitment :: value.manifest :: HNil
     )
 
+  implicit val forkChoiceDecisionCodec: Codec[ForkChoiceDecision] =
+    immutableArtifactPointerCodec.xmap(ForkChoiceDecision(_), _.evidence)
+
   implicit val canonicalSelectionTokenCodec: Codec[CanonicalSelectionToken] =
-    (canonicalBranchRevisionCodec :: globalSnapshotStateRefCodec :: globalSnapshotStateRefCodec :: immutableArtifactPointerCodec ::
+    (canonicalBranchRevisionCodec :: globalSnapshotStateRefCodec :: globalSnapshotStateRefCodec :: forkChoiceDecisionCodec ::
       pathCommitmentCodec).xmap[CanonicalSelectionToken](
-      { case branchRevision :: selectedTip :: operationalTarget :: decision :: lineage :: HNil =>
-        CanonicalSelectionToken(branchRevision, selectedTip, operationalTarget, decision, lineage)
+      {
+        case branchRevision :: selectedTip :: operationalTarget :: decision :: lineage :: HNil =>
+          CanonicalSelectionToken(branchRevision, selectedTip, operationalTarget, decision, lineage)
       },
-      value =>
-        value.branchRevision :: value.selectedTip :: value.operationalTarget :: value.decision :: value.lineage :: HNil
+      value => value.branchRevision :: value.selectedTip :: value.operationalTarget :: value.decision :: value.lineage :: HNil
     )
 
   implicit val pathChunkPointerCodec: Codec[PathChunkPointer] =
     (intentIdCodec :: artifactIdCodec :: Primitives.nonNegLongCodec :: immutableArtifactPointerCodec)
       .xmap[PathChunkPointer](
-        { case intentId :: manifestId :: chunkIndex :: artifact :: HNil =>
-          PathChunkPointer(intentId, manifestId, chunkIndex, artifact)
+        {
+          case intentId :: manifestId :: chunkIndex :: artifact :: HNil =>
+            PathChunkPointer(intentId, manifestId, chunkIndex, artifact)
         },
         value => value.intentId :: value.manifestId :: value.chunkIndex :: value.artifact :: HNil
       )
@@ -217,8 +222,9 @@ private[finality] object FinalityBaseCodecs {
   private val rawPathChunkCodec: Codec[PathChunk] =
     (intentIdCodec :: artifactIdCodec :: Primitives.nonNegLongCodec :: pathChunkEntriesCodec :: strictOption(pathChunkPointerCodec))
       .xmap[PathChunk](
-        { case intentId :: manifestId :: chunkIndex :: entries :: next :: HNil =>
-          PathChunk(intentId, manifestId, chunkIndex, entries, next)
+        {
+          case intentId :: manifestId :: chunkIndex :: entries :: next :: HNil =>
+            PathChunk(intentId, manifestId, chunkIndex, entries, next)
         },
         value => value.intentId :: value.manifestId :: value.chunkIndex :: value.entriesOldestFirst :: value.next :: HNil
       )
@@ -234,18 +240,19 @@ private[finality] object FinalityBaseCodecs {
   implicit val operationalQualificationScopeCodec: Codec[OperationalQualificationScope] =
     (operationalRailCodec :: globalSnapshotStateRefCodec :: globalSnapshotStateRefCodec :: strictOption(pathCommitmentCodec) ::
       immutableArtifactPointerCodec).xmap[OperationalQualificationScope](
-      { case rail :: target :: descendant :: closure :: evidence :: HNil =>
-        OperationalQualificationScope(rail, target, descendant, closure, evidence)
+      {
+        case rail :: target :: descendant :: closure :: evidence :: HNil =>
+          OperationalQualificationScope(rail, target, descendant, closure, evidence)
       },
-      value =>
-        value.rail :: value.operationalTarget :: value.qualifyingDescendant :: value.ancestorClosure :: value.evidence :: HNil
+      value => value.rail :: value.operationalTarget :: value.qualifyingDescendant :: value.ancestorClosure :: value.evidence :: HNil
     )
 
   private val decidedAttestationQualificationCodec: Codec[OperationalQualification.DecidedAttestationTWeight] =
     (globalSnapshotStateRefCodec :: globalSnapshotStateRefCodec :: strictOption(pathManifestRefCodec) :: scopedArtifactRefCodec)
       .xmap[OperationalQualification.DecidedAttestationTWeight](
-        { case target :: descendant :: closure :: evidence :: HNil =>
-          OperationalQualification.DecidedAttestationTWeight(target, descendant, closure, evidence)
+        {
+          case target :: descendant :: closure :: evidence :: HNil =>
+            OperationalQualification.DecidedAttestationTWeight(target, descendant, closure, evidence)
         },
         value => value.operationalTarget :: value.qualifyingDescendant :: value.ancestorClosure :: value.evidence :: HNil
       )
@@ -253,8 +260,9 @@ private[finality] object FinalityBaseCodecs {
   private val depthK1QualificationCodec: Codec[OperationalQualification.CanonicalDepthK1] =
     (globalSnapshotStateRefCodec :: globalSnapshotStateRefCodec :: strictOption(pathManifestRefCodec) :: scopedArtifactRefCodec)
       .xmap[OperationalQualification.CanonicalDepthK1](
-        { case target :: descendant :: closure :: evidence :: HNil =>
-          OperationalQualification.CanonicalDepthK1(target, descendant, closure, evidence)
+        {
+          case target :: descendant :: closure :: evidence :: HNil =>
+            OperationalQualification.CanonicalDepthK1(target, descendant, closure, evidence)
         },
         value => value.operationalTarget :: value.qualifyingDescendant :: value.ancestorClosure :: value.evidence :: HNil
       )
@@ -268,58 +276,62 @@ private[finality] object FinalityBaseCodecs {
   private val advanceShapeCodec: Codec[TransitionShape.Advance] =
     pathCommitmentCodec.xmap(TransitionShape.Advance(_), _.adopted)
 
-  private val densityReplacementShapeCodec: Codec[TransitionShape.DensityReplacement] =
-    (globalSnapshotStateRefCodec :: pathCommitmentCodec :: pathCommitmentCodec :: immutableArtifactPointerCodec)
-      .xmap[TransitionShape.DensityReplacement](
-        { case ancestor :: orphaned :: adopted :: decision :: HNil =>
-          TransitionShape.DensityReplacement(ancestor, orphaned, adopted, decision)
+  private val forkChoiceReplacementShapeCodec: Codec[TransitionShape.ForkChoiceReplacement] =
+    (globalSnapshotStateRefCodec :: pathCommitmentCodec :: pathCommitmentCodec)
+      .xmap[TransitionShape.ForkChoiceReplacement](
+        {
+          case ancestor :: orphaned :: adopted :: HNil =>
+            TransitionShape.ForkChoiceReplacement(ancestor, orphaned, adopted)
         },
-        value => value.commonAncestor :: value.orphaned :: value.adopted :: value.densityDecision :: HNil
+        value => value.commonAncestor :: value.orphaned :: value.adopted :: HNil
       )
 
-  private val densityRollbackShapeCodec: Codec[TransitionShape.DensityRollbackToOperationalMrca] =
-    (globalSnapshotStateRefCodec :: pathCommitmentCodec :: immutableArtifactPointerCodec)
-      .xmap[TransitionShape.DensityRollbackToOperationalMrca](
-        { case mrca :: orphaned :: decision :: HNil =>
-          TransitionShape.DensityRollbackToOperationalMrca(mrca, orphaned, decision)
+  private val forkChoiceRollbackShapeCodec: Codec[TransitionShape.ForkChoiceRollbackToOperationalMrca] =
+    (globalSnapshotStateRefCodec :: pathCommitmentCodec)
+      .xmap[TransitionShape.ForkChoiceRollbackToOperationalMrca](
+        {
+          case mrca :: orphaned :: HNil =>
+            TransitionShape.ForkChoiceRollbackToOperationalMrca(mrca, orphaned)
         },
-        value => value.operationalMrca :: value.orphaned :: value.densityDecision :: HNil
+        value => value.operationalMrca :: value.orphaned :: HNil
       )
 
   implicit val transitionShapeCodec: Codec[TransitionShape] =
     discriminated[TransitionShape]
       .by(uint8)
       .typecase(1, advanceShapeCodec)
-      .typecase(2, densityReplacementShapeCodec)
-      .typecase(3, densityRollbackShapeCodec)
+      .typecase(2, forkChoiceReplacementShapeCodec)
+      .typecase(3, forkChoiceRollbackShapeCodec)
 
   private val advanceTransitionCodec: Codec[CoreTransition.Advance] =
     pathManifestRefCodec.xmap(CoreTransition.Advance(_), _.adopted)
 
-  private val densityReplacementTransitionCodec: Codec[CoreTransition.DensityReplacement] =
-    (globalSnapshotStateRefCodec :: pathManifestRefCodec :: pathManifestRefCodec :: scopedArtifactRefCodec)
-      .xmap[CoreTransition.DensityReplacement](
-        { case ancestor :: orphaned :: adopted :: decision :: HNil =>
-          CoreTransition.DensityReplacement(ancestor, orphaned, adopted, decision)
+  private val forkChoiceReplacementTransitionCodec: Codec[CoreTransition.ForkChoiceReplacement] =
+    (globalSnapshotStateRefCodec :: pathManifestRefCodec :: pathManifestRefCodec)
+      .xmap[CoreTransition.ForkChoiceReplacement](
+        {
+          case ancestor :: orphaned :: adopted :: HNil =>
+            CoreTransition.ForkChoiceReplacement(ancestor, orphaned, adopted)
         },
-        value => value.commonAncestor :: value.orphaned :: value.adopted :: value.densityDecision :: HNil
+        value => value.commonAncestor :: value.orphaned :: value.adopted :: HNil
       )
 
-  private val densityRollbackTransitionCodec: Codec[CoreTransition.DensityRollbackToOperationalMrca] =
-    (globalSnapshotStateRefCodec :: pathManifestRefCodec :: scopedArtifactRefCodec)
-      .xmap[CoreTransition.DensityRollbackToOperationalMrca](
-        { case mrca :: orphaned :: decision :: HNil =>
-          CoreTransition.DensityRollbackToOperationalMrca(mrca, orphaned, decision)
+  private val forkChoiceRollbackTransitionCodec: Codec[CoreTransition.ForkChoiceRollbackToOperationalMrca] =
+    (globalSnapshotStateRefCodec :: pathManifestRefCodec)
+      .xmap[CoreTransition.ForkChoiceRollbackToOperationalMrca](
+        {
+          case mrca :: orphaned :: HNil =>
+            CoreTransition.ForkChoiceRollbackToOperationalMrca(mrca, orphaned)
         },
-        value => value.operationalMrca :: value.orphaned :: value.densityDecision :: HNil
+        value => value.operationalMrca :: value.orphaned :: HNil
       )
 
   implicit val coreTransitionCodec: Codec[CoreTransition] =
     discriminated[CoreTransition]
       .by(uint8)
       .typecase(1, advanceTransitionCodec)
-      .typecase(2, densityReplacementTransitionCodec)
-      .typecase(3, densityRollbackTransitionCodec)
+      .typecase(2, forkChoiceReplacementTransitionCodec)
+      .typecase(3, forkChoiceRollbackTransitionCodec)
 
   implicit val releasedCorePointerCodec: Codec[ReleasedCorePointer] =
     (releaseGenerationCodec :: intentIdCodec :: globalSnapshotStateRefCodec :: immutableArtifactPointerCodec)
@@ -385,7 +397,5 @@ private[finality] object FinalityBaseCodecs {
     )
 
   private def isCanonicalHash(hash: Hash): Boolean =
-    hash.value.length == 64 && hash.value.forall(character =>
-      character >= '0' && character <= '9' || character >= 'a' && character <= 'f'
-    )
+    hash.value.length == 64 && hash.value.forall(character => character >= '0' && character <= '9' || character >= 'a' && character <= 'f')
 }

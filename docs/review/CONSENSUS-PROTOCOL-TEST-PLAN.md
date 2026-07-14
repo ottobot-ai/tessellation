@@ -166,8 +166,10 @@ non-applicability proof in its manifest.
 | FIN-M-002 | Real K/alpha/beta cascade differential covers uniform sampling, ancestor preference, emit-once, stale/replayed/equivocating responses, `N<K`, churn rule, eclipse, and adaptive corruption. Delivery permutations with the same authenticated response set cannot produce opposing portable decisions. |
 | FIN-M-003 | Decided-attestation `T_weight` and `k1` fallback are exercised independently and concurrently. First qualifying evidence advances only the exact current canonical hash. `T_count` has no independent release path. |
 | FIN-M-004 | Small-network exhaustive exploration and large stochastic trials state the actual probabilistic safety/liveness bounds; no theorem from a different leader/finality construction is imported without an explicit transfer proof. |
-| FIN-D-001 | Forks within `k1` use `maxvalid-tk`; forks deeper than `k1` use `maxvalid-bg`, including forks deeper than `k2`. Sparse loses to dense; equal cases are deterministic and comparator order/arrival does not change the winner. |
-| FIN-D-002 | A P2 density replacement emits exact old/new/MRCA ranges, unwinds/refolds byte-identically, and can replace the hash at the same ordinal. |
+| FIN-D-001 | Every binary comparison uses the ratified boundary: forks within `k1` use `maxvalid-tk`; forks deeper than `k1` use `maxvalid-bg`, including forks deeper than `k2`. Sparse loses to dense under the deep rule. Generated pairs agree on the exact MRCA, `k1` distance, density window, and tie result selected under O-15. |
+| FIN-D-001A | Preserve the strict-preference comparator RED `A >tk B`, `B >bg C`, `C >bg A`, which does not depend on the current tie rule. Upgrade it to complete authenticated snapshots that pass VRF/KES/historical-era validation. Once every node has the same cutoff-complete published valid frontier and branch-authenticated parameters, every candidate permutation, prior incumbent, legal arrival schedule, restart, and gossip duplication must converge to the same head. Interim partial-frontier heads may differ; a late reveal triggers deterministic reselection. Independent implementations agree on the complete trace and result. |
+| FIN-D-001B | Preserve the depth-`k1+1` boundary witness where sparse/longer wins Tk and dense/shorter wins Bg. Ratification freezes the exact post-MRCA distance metric and `== k1` boundary; production config, reference model, evidence verifier, and runtime comparator must all select the same rule. |
+| FIN-D-002 | A P2 shallow/deep fork-choice replacement emits exact old/new/MRCA ranges, unwinds/refolds byte-identically, and can replace the hash at the same ordinal. |
 | FIN-D-003 | `k2`, retention status, pruning metadata, and local archive availability cannot reject or bias an objectively denser valid chain. Nodes with full history switch automatically; nodes missing history enter `RecoveryRequired` before production/serving/mutation. |
 | FIN-D-004 | Two productive partitions grow beyond `k2` and heal. Full-history nodes converge by the same density rule. Pruned nodes authenticate/fetch/rebuild and reach byte-identical state; manual recovery cannot choose the branch and asymmetric/truncated density comparison is forbidden. |
 | FIN-B-001 | Base Taktikos/LDD model and runtime agree on slot/ordinal/parent validity, VRF eligibility, eta, valid-only fork choice, and wrong-root rejection under equivocation, withholding, selfish production, and eta/key grinding schedules. Slot gap is derived from the exact retained parent certificate: forged transport/signed `parentSlot`, equal/decreasing slot, and a leader-built artifact that fails this gate reject before Ed25519/KES signing, local storage, fork choice, or attestation. |
@@ -176,16 +178,17 @@ non-applicability proof in its manifest.
 | FIN-B-004 | GL0 leader eligibility verifies only under the producer's exact active-era canonical registered VRF VK. The immediate gate uses the unique frozen-genesis record; the runtime gate uses the candidate-parent historical record from `KEYREG-*`. A producer-supplied replacement key, many freshly ground keys for one slot, wrong/missing/duplicate registration, stale-era key, or valid proof under an unregistered key rejects before chain storage/fork choice/attestation; the registered honest key passes independently on every node. |
 | FIN-W-001 | Crash before/after every finality journal, branch/MPT switch, shard-anchor, binary-confirmation, and outbox write yields the exact old transaction or exact new transaction. |
 | FIN-W-002 | Restart reconstructs exact canonical P2 refs, branch evidence, and retention metadata without resetting to ordinal zero or accepting peer-supplied phase as authority. Automatic unsafe clear/rebootstrap cannot run. |
+| FIN-W-003 | Objective abandonment before MPT publication proves the exact prior remained active. Abandonment after target publication restores the exact prior image at `targetRevision + 1`; revisions never rewind. Crash/cancellation at every boundary either resumes the same intent under a revalidated branch hold or enters recovery, and an abandoned target can never become `Released`. |
 | FIN-S-001 | Operational APIs/followers serve only exact canonical P2 refs. An old hash at a still-servable ordinal rejects after replacement; retention/archive APIs never imply irreversibility. |
 | FIN-S-001A | API/event schemas represent P2 as reversible operational state with exact hash, evidence kind, and replacement events across JSON/protobuf/sidecar round trips. No ordinal-only monotone `finalized` projection can authorize state. |
 | FIN-S-002 | Global optimistic attestation is emitted only for a fully authenticated locally executed snapshot and binds exact body/parent/root/era/parameters. |
-| FIN-S-003 | Independent ML0/GL1/light-client verifier accepts valid optimistic or depth historical qualification evidence only with the ratified anchor/current-chain proof, rejects wrong/stale/orphaned ref, registry, weight, signature, suffix, parameters, and a single eclipsing peer's valid private suffix, then follows a density replacement. |
+| FIN-S-003 | Independent ML0/GL1/light-client verifier accepts valid optimistic or depth historical qualification evidence only with the ratified anchor/current-chain proof, rejects wrong/stale/orphaned ref, registry, weight, signature, suffix, parameters, and a single eclipsing peer's valid private suffix, then follows a shallow or deep fork-choice replacement. |
 | TOWER-001 | Producer computes branch-carried tower eligibility and historical SMT update; every GL0 verifier independently reproduces both before snapshot acceptance/signing. Changing eligibility, path, leaf, or `smtRoot` rejects. |
 | TOWER-002 | Artifact equality, follow, catch-up, and bootstrap reject an arbitrary signed `smtRoot`; stripping/normalizing the field cannot make unequal artifacts equal. |
 | TOWER-003 | Empty/vacuous, truncated, duplicate, unordered, oversized, disconnected, missing-path, forged-tip, and no-progress proofs reject within hard resource bounds. |
 | TOWER-004 | N-2 stake, N-1 eta, active registry/KES/VRF key, period transition, parent/tower pointer, and signature are independently checked. Current-set substitution and uniform-probability approximation reject. |
 | TOWER-005 | One honest peer's complete proof verifies from trusted genesis or cached authenticated commitment. A peer can withhold freshness but cannot forge a heavier chain, state inclusion, or current canonicality. |
-| TOWER-006 | Tower/SMT stores survive crash/restart and every shallow/deep density replacement. Rebuilt canonical roots/proofs equal clean replay byte-for-byte; append-only stale-branch state is never served. |
+| TOWER-006 | Tower/SMT stores survive crash/restart and every shallow/deep fork-choice replacement. Rebuilt canonical roots/proofs equal clean replay byte-for-byte; append-only stale-branch state is never served. |
 | TOWER-007 | Proof comparison and `maxvalid-bg` agree on generated competing valid chains across era/eta boundaries and divergence beyond local `k2`; missing proof material enters recovery rather than defaulting to a local winner. |
 | LIFE-001 | Capability matrix rejects P0/P1 use, permits only reversible P2 actions, and applies positive watchtower coverage to every checkpoint-derived economic capability. External service confirmation policy cannot change protocol validity or canonical state. |
 
@@ -194,6 +197,55 @@ not FIN-M proof. `SnowballAccumulatorSuite` now contains the concrete arrival-or
 counterexample for the current sticky margin; it proves the implementation gap, not
 the target cascade. Tests asserting ordinal-only monotone finality must become RED
 fixtures for FIN-D-002/FIN-S-001.
+
+The current `FinalityReferenceModel` is also component scaffolding, not FIN-D-001A:
+it accepts an already-selected canonical tip and checks only the shallow/deep rule
+tag before modeling replacement (`FinalityReferenceModel.scala:7-11,97-100,217-313`).
+`ChainSelectionSuite` contains both the current tie-assisted regression and a
+strict-density three-cycle. These are structurally connected comparator inputs,
+not complete validated snapshots. `selectBest` has no live caller. Production's
+arrival-by-arrival `NakamotoChainStore.shouldSwitch` path has the same source-level
+incumbent-tournament risk, but a legal parent-before-child store-level reproduction
+is still required (`ChainSelection.scala:119-159`;
+`NakamotoChainStore.scala:437-464`).
+
+The current dark `ForkChoiceDecision` is not FIN-D-001A evidence. It carries an
+opaque `ImmutableArtifactPointer`, deliberately without a Tk/Bg or transition-form
+assertion; the validator binds one intent-scoped evidence locator to the selection
+token's pointer. It does not decode or verify the
+complete header/tine frontier, its completeness boundary, or its active parameter
+era (`FinalityCore.scala:120-138,353-364`;
+`FinalityBaseCodecs.scala:96-119,178-179`;
+`FinalityIntentValidator.scala:59-120,748-761`).
+FIN-D-001A remains RED until O-15 closes cutoff/reveal semantics, cycle resolution,
+exact metric/tie, canonical evidence and its independent verifier,
+validator/store witnesses, and the security/liveness argument.
+
+The closed `PublicationRestoration` variants and current codec/validator tests
+prove only part of FIN-W-003's data contract: the schema validates one exact plan
+and claimed receipt shape, but does not prove that the target stayed unpublished
+or that an external MPT republish occurred. The plan names either the unchanged
+prior or the prior image at a consecutive revision. The committed effective
+publication cursor survives restoration retirement and binds the next prepare.
+The `ForkChoiceOrphanClaim` is structurally constrained but does not prove true
+MRCA or target exclusion. The durable store rejects restoration mutations and
+there is no live executor, branch hold, fault injection, semantic/anchor receipt
+verifier, or public `RestoredAbandoned` authority, so FIN-W-003 and FIN-W-001 remain
+open. Coordinator initialization also accepts a raw publication cursor; a
+package-owned exact-MPT-readback capability and stale-cursor rejection test remain
+activation gates (`FinalityCore.scala:395-460`;
+`FinalityCoordinatorState.scala:68-76,99-136`;
+`FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
+`FinalityCoordinatorKernel.scala:72-154`;
+`FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
+
+Full positive `validateCoreBatch` fixtures for `ForkChoiceReplacement` and
+`ForkChoiceRollbackToOperationalMrca` remain absent. Current geometry coverage
+calls the intentionally partial `validateResolvedCorePaths`, while the evidence
+binding test filters selected violation paths without proving the whole batch valid
+(`FinalityIntentValidator.scala:124-269`;
+`FinalityIntentValidatorSuite.scala:734-875`). This is a test gate, not evidence
+that either transition is activation-ready.
 
 ### 4.3 Serialization, protocol era, and cryptography
 

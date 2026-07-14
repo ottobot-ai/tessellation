@@ -1,6 +1,6 @@
 # Nakamoto Consensus — Status & Remaining Work
 
-**Last updated:** 2026-07-13 (active epic decomposition)
+**Last updated:** 2026-07-14 (active epic decomposition)
 
 ---
 
@@ -69,6 +69,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `k1`, retention-only `k2`, single outstanding checkpoint, mandatory
     replay-backed `kQuorum`, positive watchtower coverage, and GL0-only protocol
     correction authority.
+  - Preserve the ratified O-15 objective total-frontier property before fork
+    choice can authorize `FinalityGate`: the same cutoff-complete published valid
+    frontier and branch-authenticated parameters must produce the same head
+    independently of candidate order, gossip arrival, restart, or prior incumbent.
+    Close the still-open cutoff/bounded-diffusion and late-reveal semantics,
+    cycle-resolution selector, frontier evidence and verifier, validator/store
+    witnesses, security/liveness proof, exact-`k1` metric/equality boundary, and
+    objective-tie design gates; do not hide any of them in a collection fold.
   - Assign every open CRITICAL/HIGH audit finding one owner, RED test, write set,
     dependency, and closing commit.
   - **Gate:** `ARCH-001..003`, `SIG-001..005`.
@@ -169,6 +177,56 @@ criteria are in `NAKAMOTO-PLAN.md`.
 - [ ] **E1 PARTIAL - hash-bound finality, density, and atomic reorg**
   - Replace ordinal-only phases with durable exact-hash/evidence state.
   - Implement/model the real K/alpha/beta optimistic cascade plus `k1` fallback.
+  - **Partial dark model only:** `FinalityReferenceModel` accepts an
+    already-selected winner, enforces the generic `maxvalid-tk`/`maxvalid-bg`
+    boundary, and models MRCA orphan/adopt plus Phase-2 replacement. It does not
+    select the winner or authorize live fork choice
+    (`FinalityReferenceModel.scala:7-11,97-100,217-313`).
+  - **OPEN frontier implementation/proof blocker:** a strict-preference three-cycle
+    over structurally connected comparator inputs has `A >tk B`, `B >bg C`, and
+    `C >bg A`, so list permutation changes the left-fold winner without relying on
+    the open tie rule (`ChainSelectionSuite.scala:191-226`). A full snapshot/VRF/KES/era
+    validation witness remains required. `selectBest` has no live caller; source
+    inspection shows arrival-by-arrival `NakamotoChainStore.shouldSwitch` has the
+    same incumbent-tournament risk, but a store-level legal-arrival reproduction
+    remains open (`ChainSelection.scala:119-159`; `NakamotoChainStore.scala:437-464`).
+    O-15 has ratified objective total-frontier semantics, but cutoff/bounded-diffusion
+    and late-reveal semantics, cycle resolution, exact `k1` metric/equality,
+    objective tie, evidence/verifier, validator/store witnesses, and the
+    security/liveness proof remain open. Current `ForkChoiceDecision` carries one unscoped opaque artifact
+    pointer; `FinalityCoreBatch.selectionEvidence` separately carries the
+    intent-scoped locator and validation requires exact pointer equality. Neither
+    asserts an unproved Tk/Bg/transition form;
+    it contains no decoded complete header/tine/frontier/era proof
+    (`FinalityCore.scala:120-138,353-364`;
+    `FinalityBaseCodecs.scala:96-119,178-179`;
+    `FinalityIntentValidator.scala:59-120,748-761`). Close those gates and
+    FIN-D-001A before minting canonical-selection evidence.
+  - **OPEN boundary blocker:** when the bounded live walk finds the true MRCA over
+    consecutive tines it reports maximum post-MRCA suffix length, but production
+    supplies `kLookback = k1 + 1` and density engages only
+    at `depth > kLookback`. The landed witness proves depth `k1 + 1` remains Tk.
+    Freeze O-15's exact metric/equality rule and close FIN-D-001B before changing
+    live consensus
+    (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
+    `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
+    `ChainSelectionSuite.scala:228-250`).
+  - **Partial dark restoration only:** the schema validates a closed
+    `PublicationRestoration` plan and claimed receipt shape; it does not prove that
+    the target stayed unpublished or that an external republish occurred. The plan
+    names either the exact unchanged CAS prior or the exact prior image at
+    `targetRevision + 1`. The committed
+    coordinator publication cursor survives retirement/recovery and binds the next
+    prepare; rewind, wrong-image, substituted-plan, substituted-claim, and stale
+    publication contexts reject. `ForkChoiceOrphanClaim` is not true-MRCA or
+    target-exclusion proof. The durable store rejects restoration mutations, and no
+    live executor, branch hold, or `RestoredAbandoned` authority exists. Coordinator
+    initialization still accepts a raw publication cursor; replace it with a
+    package-owned exact-MPT-readback capability before activation
+    (`FinalityCore.scala:395-460`; `FinalityCoordinatorState.scala:68-76,99-136`;
+    `FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
+    `FinalityCoordinatorKernel.scala:72-154`;
+    `FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
   - Remove absolute `k1`/`k2` refusal; recover authenticated history before a
     comparison that crosses local retention.
   - Atomically unwind/refold MPT, phases, shard anchors, binary tracking, tower

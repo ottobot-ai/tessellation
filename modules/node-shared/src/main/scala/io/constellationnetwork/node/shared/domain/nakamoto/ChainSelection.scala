@@ -45,10 +45,14 @@ trait ChainSelection[F[_]] {
     */
   def compare(tipA: ChainTip, tipB: ChainTip): F[ChainTip]
 
-  /** Select the best tip from a set of candidates.
+  /** Left-fold the binary comparator over candidates.
+    *
+    * This is not a set argmax. The mixed maxvalid-tk/maxvalid-bg relation is not transitive, so permutations of the same three-tip frontier
+    * can return different results. This method cannot authorize canonical-selection or finality evidence until the protocol defines an
+    * objective frontier rule.
     *
     * @return
-    *   Some(best) or None if candidates is empty
+    *   the arrival-ordered fold result, or None if candidates is empty
     */
   def selectBest(candidates: List[ChainTip]): F[Option[ChainTip]]
 

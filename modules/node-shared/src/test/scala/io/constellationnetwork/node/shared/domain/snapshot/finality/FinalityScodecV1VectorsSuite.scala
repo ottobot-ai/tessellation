@@ -90,20 +90,20 @@ object FinalityScodecV1VectorsSuite extends FunSuite {
       FrozenVector(
         "RecoveryRecordPayload",
         encode(recoveryRecordPayloadCodec, recoveryRecord),
-        9508,
-        "a92aa833b76e08f57602399511e55ac9bf781a794f7d748ecdad654f06abefe4"
+        9765,
+        "5aba40ef8417d55c373b50ae76d25a8a808316285b7a6a72eca7914d95c3917f"
       ),
       FrozenVector(
         "CoordinatorHeadPayload",
         encode(coordinatorHeadPayloadCodec, coordinatorHead),
-        9507,
-        "f61abb36572695f6bba55f43cbd6d2447dd5a3d86381aedda81949bf7036d4b8"
+        9764,
+        "7dd9633e95a7b23f5ec0f12cd999f32c523921d11c0b0ecffd41f68ff4a197c8"
       ),
       FrozenVector(
         "CoordinatorAuditRecordPayload",
         encode(coordinatorAuditRecordPayloadCodec, auditRecord),
-        18951,
-        "044405568bc29bbf73184b37d7a27b24906c60257e5ff02111398f477862466f"
+        19465,
+        "0bb1ce4c963798cd7d11a11f178e34aab670e726ce584e625c9d522fcec89bac"
       )
     )
 
@@ -111,8 +111,8 @@ object FinalityScodecV1VectorsSuite extends FunSuite {
   vectors.foreach { vector =>
     test(s"${vector.name} retains its frozen ScodecV1 length and digest") {
       expect.all(
-        vector.bytes.length == vector.expectedLength,
-        sha256(vector.bytes) == vector.expectedSha256
+        clue(vector.bytes.length) == vector.expectedLength,
+        clue(sha256(vector.bytes)) == vector.expectedSha256
       )
     }
   }

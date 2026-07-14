@@ -8,8 +8,8 @@ import io.constellationnetwork.security.mpt.{MptActivePublication, MptImageRecei
 
 import eu.timepit.refined.types.numeric.NonNegLong
 
-/** A release generation advances only when a new exact Phase-2 core is released.
-  * Retries of the same prospective release use distinct [[IntentAttempt]] values.
+/** A release generation advances only when a new exact Phase-2 core is released. Retries of the same prospective release use distinct
+  * [[IntentAttempt]] values.
   */
 final case class ReleaseGeneration(value: NonNegLong)
 
@@ -21,17 +21,16 @@ final case class HeadRevision(value: NonNegLong)
 
 /** Local fork-choice mutation token.
   *
-  * This is not consensus evidence and must never be transported as proof that a
-  * branch won. The future live fork-choice integration must compare-and-set this
-  * exact revision immediately before release; merely recording the token does not
-  * prevent a stale worker from releasing after canonical selection changes.
+  * This is not consensus evidence and must never be transported as proof that a branch won. The future live fork-choice integration must
+  * compare-and-set this exact revision immediately before release; merely recording the token does not prevent a stale worker from
+  * releasing after canonical selection changes.
   */
 final case class CanonicalBranchRevision(value: NonNegLong)
 
 /** Domain-separated hash of the canonical [[IntentScope]] bytes.
   *
-  * The scope contains only unscoped immutable commitments. Artifacts may
-  * therefore bind this identifier without making its preimage circular.
+  * The scope contains only unscoped immutable commitments. Artifacts may therefore bind this identifier without making its preimage
+  * circular.
   */
 final case class IntentId(value: Hash)
 
@@ -48,8 +47,7 @@ object FinalityArtifactKind {
   case object PathChunk extends FinalityArtifactKind
   case object DecidedAttestationEvidence extends FinalityArtifactKind
   case object DepthK1Evidence extends FinalityArtifactKind
-  case object DensityDecisionEvidence extends FinalityArtifactKind
-  case object CanonicalSelectionEvidence extends FinalityArtifactKind
+  case object ForkChoiceDecisionEvidence extends FinalityArtifactKind
   case object PreparedSemanticState extends FinalityArtifactKind
   case object AuthenticatedTargetAnchor extends FinalityArtifactKind
   case object AppliedSemanticStateReceipt extends FinalityArtifactKind
@@ -59,8 +57,7 @@ object FinalityArtifactKind {
   case object EffectPayload extends FinalityArtifactKind
 }
 
-/** Immutable content-addressed pointer. The pointed-to bytes are verified against
-  * both `id` and `digest` before they are interpreted.
+/** Immutable content-addressed pointer. The pointed-to bytes are verified against both `id` and `digest` before they are interpreted.
   */
 final case class ImmutableArtifactPointer(
   kind: FinalityArtifactKind,
@@ -84,9 +81,8 @@ object PathRole {
 
 /** Metadata for an oldest-to-newest contiguous snapshot path.
   *
-  * `entryCount` has no protocol history-window ceiling. The actual path is held
-  * in independently bounded chunks so a deep objective reorg is a recovery task,
-  * never an invalid fork-choice result.
+  * `entryCount` has no protocol history-window ceiling. The actual path is held in independently bounded chunks so a deep objective reorg
+  * is a recovery task, never an invalid fork-choice result.
   */
 final case class PathSummary(
   role: PathRole,
@@ -106,12 +102,10 @@ final case class PathCommitment(
 
 /** Canonical payload addressed by a `PathManifest` artifact.
   *
-  * `entriesRoot` commits to the canonical oldest-to-newest state-reference
-  * sequence, not to its local chunk framing. This keeps the manifest identity
-  * independent of chunk pointers which themselves bind the manifest ID, avoiding
-  * a content-address cycle. Recovery locates chunk zero by
-  * `(intentId, manifest.id, 0)`, follows contiguous `next` pointers through the
-  * unique terminal `None`, and requires exactly `summary.entryCount` entries.
+  * `entriesRoot` commits to the canonical oldest-to-newest state-reference sequence, not to its local chunk framing. This keeps the
+  * manifest identity independent of chunk pointers which themselves bind the manifest ID, avoiding a content-address cycle. Recovery
+  * locates chunk zero by `(intentId, manifest.id, 0)`, follows contiguous `next` pointers through the unique terminal `None`, and requires
+  * exactly `summary.entryCount` entries.
   */
 final case class PathManifestPayload(
   summary: PathSummary,
@@ -123,18 +117,23 @@ final case class PathManifestRef(commitment: PathCommitment, manifest: ScopedArt
   def summary: PathSummary = commitment.summary
 }
 
+/** The portable evidence commitment for one claimed fork-choice result.
+  *
+  * The evidence payload remains opaque until O-15 defines the objective frontier selector and its verifier. Merely decoding this wrapper
+  * does not establish canonicality or identify a pairwise maxvalid rule.
+  */
+final case class ForkChoiceDecision(evidence: ImmutableArtifactPointer)
+
 /** The local selection observed by the worker which prepared an intent.
   *
-  * `branchRevision` is a local compare-and-set guard, not portable finality
-  * proof. The decision and complete lineage commitment are part of the intent
-  * preimage, preventing a worker from substituting different branch evidence
-  * under the same intent identifier.
+  * `branchRevision` is a local compare-and-set guard, not portable finality proof. The decision and complete lineage commitment are part of
+  * the intent preimage, preventing a worker from substituting different branch evidence under the same intent identifier.
   */
 final case class CanonicalSelectionToken(
   branchRevision: CanonicalBranchRevision,
   selectedTip: GlobalSnapshotStateRef,
   operationalTarget: GlobalSnapshotStateRef,
-  decision: ImmutableArtifactPointer,
+  decision: ForkChoiceDecision,
   lineage: PathCommitment
 )
 
@@ -148,8 +147,8 @@ final case class PathChunkPointer(
 
 /** One oldest-to-newest piece of a manifest path.
   *
-  * Construction is intentionally public for canonical decoding. The pure
-  * validator must reject empty chunks and chunks larger than [[MaxEntries]].
+  * Construction is intentionally public for canonical decoding. The pure validator must reject empty chunks and chunks larger than
+  * [[MaxEntries]].
   */
 final case class PathChunk(
   intentId: IntentId,
@@ -172,9 +171,8 @@ object OperationalRail {
 
 /** Scope-independent qualification identity included in [[IntentScope]].
   *
-  * `ancestorClosure = None` is a direct qualification and requires the target to
-  * equal the qualifying snapshot. `Some(path)` proves that the operational target
-  * is an ancestor of the qualifying descendant on the selected tine.
+  * `ancestorClosure = None` is a direct qualification and requires the target to equal the qualifying snapshot. `Some(path)` proves that
+  * the operational target is an ancestor of the qualifying descendant on the selected tine.
   */
 final case class OperationalQualificationScope(
   rail: OperationalRail,
@@ -186,11 +184,9 @@ final case class OperationalQualificationScope(
 
 /** Exactly the two ratified Phase-2 qualification rails.
   *
-  * The evidence need not be freshly produced for the current transition. During
-  * density rollback, an MRCA retains operationality through the original rail's
-  * evidence plus `ancestorClosure`, even when the qualifying descendant is now on
-  * the orphaned suffix. This is inheritance of one of these two rails, not a third
-  * finality source.
+  * The evidence need not be freshly produced for the current transition. During fork-choice rollback, an MRCA retains operationality
+  * through the original rail's evidence plus `ancestorClosure`, even when the qualifying descendant is now on the orphaned suffix. This is
+  * inheritance of one of these two rails, not a third finality source.
   */
 sealed trait OperationalQualification extends Product with Serializable {
   def operationalTarget: GlobalSnapshotStateRef
@@ -240,20 +236,18 @@ sealed trait TransitionShape extends Product with Serializable
 object TransitionShape {
   final case class Advance(adopted: PathCommitment) extends TransitionShape
 
-  final case class DensityReplacement(
+  final case class ForkChoiceReplacement(
     commonAncestor: GlobalSnapshotStateRef,
     orphaned: PathCommitment,
-    adopted: PathCommitment,
-    densityDecision: ImmutableArtifactPointer
+    adopted: PathCommitment
   ) extends TransitionShape
 
-  /** Roll back to an already operational MRCA while the replacement suffix is
-    * still provisional. There is deliberately no adopted suffix in this shape.
+  /** Roll back to an already operational MRCA while the replacement suffix is still provisional. There is deliberately no adopted suffix in
+    * this shape.
     */
-  final case class DensityRollbackToOperationalMrca(
+  final case class ForkChoiceRollbackToOperationalMrca(
     operationalMrca: GlobalSnapshotStateRef,
-    orphaned: PathCommitment,
-    densityDecision: ImmutableArtifactPointer
+    orphaned: PathCommitment
   ) extends TransitionShape
 }
 
@@ -270,8 +264,8 @@ final case class FinalityDomain(networkId: Hash, genesisHash: Hash, protocolEra:
 
 /** Scope hashed to form [[IntentId]].
   *
-  * All referenced commitments are scope-independent immutable pointers. No
-  * [[ScopedArtifactRef]] appears here, so deriving `IntentId` is non-circular.
+  * All referenced commitments are scope-independent immutable pointers. No [[ScopedArtifactRef]] appears here, so deriving `IntentId` is
+  * non-circular.
   */
 final case class IntentScope(
   domain: FinalityDomain,
@@ -296,31 +290,28 @@ object CoreTransition {
     val shape: TransitionShape = TransitionShape.Advance(adopted.commitment)
   }
 
-  final case class DensityReplacement(
+  final case class ForkChoiceReplacement(
     commonAncestor: GlobalSnapshotStateRef,
     orphaned: PathManifestRef,
-    adopted: PathManifestRef,
-    densityDecision: ScopedArtifactRef
+    adopted: PathManifestRef
   ) extends CoreTransition {
     val shape: TransitionShape =
-      TransitionShape.DensityReplacement(commonAncestor, orphaned.commitment, adopted.commitment, densityDecision.artifact)
+      TransitionShape.ForkChoiceReplacement(commonAncestor, orphaned.commitment, adopted.commitment)
   }
 
-  /** Objective density selection moved Phase 2 back to the still-operational
-    * MRCA. A replacement suffix may later advance through a separate intent.
+  /** Objective fork choice moved Phase 2 back to the still-operational MRCA. A replacement suffix may later advance through a separate
+    * intent.
     */
-  final case class DensityRollbackToOperationalMrca(
+  final case class ForkChoiceRollbackToOperationalMrca(
     operationalMrca: GlobalSnapshotStateRef,
-    orphaned: PathManifestRef,
-    densityDecision: ScopedArtifactRef
+    orphaned: PathManifestRef
   ) extends CoreTransition {
     val shape: TransitionShape =
-      TransitionShape.DensityRollbackToOperationalMrca(operationalMrca, orphaned.commitment, densityDecision.artifact)
+      TransitionShape.ForkChoiceRollbackToOperationalMrca(operationalMrca, orphaned.commitment)
   }
 }
 
-/** Prepared exact target core. MPT publication revision is independent of the
-  * release generation and may not be inferred from it.
+/** Prepared exact target core. MPT publication revision is independent of the release generation and may not be inferred from it.
   */
 final case class PreparedCoreTarget(
   target: GlobalSnapshotStateRef,
@@ -359,8 +350,8 @@ final case class FinalityCoreBatchPointer(
   artifact: ImmutableArtifactPointer
 )
 
-/** Durable, scope-bound work needed to apply one already-decided finality change.
-  * This object never samples, votes, selects a branch, or decides finality.
+/** Durable, scope-bound work needed to apply one already-decided finality change. This object never samples, votes, selects a branch, or
+  * decides finality.
   */
 final case class FinalityCoreBatch(
   intentId: IntentId,
@@ -372,8 +363,7 @@ final case class FinalityCoreBatch(
   effectManifest: EffectManifestPointer
 )
 
-/** Verified result of the core mutation. Both semantic and anchor readback are
-  * required in addition to the exact active MPT publication.
+/** Verified result of the core mutation. Both semantic and anchor readback are required in addition to the exact active MPT publication.
   */
 final case class ReleasedCoreReceipt(
   intentId: IntentId,
@@ -387,10 +377,8 @@ final case class ReleasedCoreReceipt(
 
 /** Exact released-record payload hashed independently of its pointer.
   *
-  * Keeping the pointer outside this payload makes content addressing
-  * non-circular. `ReleasedCore.pointer.record` commits to the canonical bytes of
-  * this payload, while `ReleasedCore.record` is the intent-scoped wrapper around
-  * that same immutable pointer.
+  * Keeping the pointer outside this payload makes content addressing non-circular. `ReleasedCore.pointer.record` commits to the canonical
+  * bytes of this payload, while `ReleasedCore.record` is the intent-scoped wrapper around that same immutable pointer.
   */
 final case class ReleasedCoreRecordPayload(
   qualification: OperationalQualification,
@@ -404,8 +392,12 @@ final case class ReleasedCore(
   payload: ReleasedCoreRecordPayload
 )
 
-/** Verified evidence that an unreleased target lost canonicality objectively. */
-final case class ObjectiveOrphanCause(
+/** Structurally bound claim that an unreleased target lost canonicality.
+  *
+  * This value is not authority by itself. O-15's future verifier must decode the committed fork-choice evidence and prove the exact tines,
+  * true MRCA, and target exclusion before a runtime may use the claim to restore state.
+  */
+final case class ForkChoiceOrphanClaim(
   intentId: IntentId,
   supersededSelection: CanonicalSelectionToken,
   replacementSelection: CanonicalSelectionToken,
@@ -413,19 +405,39 @@ final case class ObjectiveOrphanCause(
   evidence: ScopedArtifactRef
 )
 
-/** Exact readback after restoring the prior publication (or pristine state). */
+/** Exact MPT publication transition selected for abandonment.
+  *
+  * `RestoringPrior` carries this as a plan; `RestoredAbandoned` repeats it in a receipt. The value does not prove that an external MPT
+  * mutation occurred.
+  */
+sealed trait PublicationRestoration extends Product with Serializable
+
+object PublicationRestoration {
+
+  /** The target was never published, so the exact CAS prior remains active. */
+  final case class PriorUnchanged(publication: MptActivePublication) extends PublicationRestoration
+
+  /** The target was active and the prior image was republished at the next revision. Publication revisions never rewind.
+    */
+  final case class AppliedTargetReverted(
+    transitionFrom: MptActivePublication,
+    restored: MptActivePublication
+  ) extends PublicationRestoration
+}
+
+/** Claimed readback locators after abandoning an unreleased target publication. A future runtime must independently verify all MPT,
+  * semantic, and anchor receipts before constructing this terminal state.
+  */
 final case class PriorCoreRestorationReceipt(
   intentId: IntentId,
-  beforeRestoration: MptActivePublication,
-  restoredPublication: MptActivePublication,
+  publication: PublicationRestoration,
   semanticReceipt: ScopedArtifactRef,
   authenticatedAnchorReceipt: ScopedArtifactRef
 )
 
-/** Durable progress of an unreleased core mutation.
+/** Modeled progress of an unreleased core mutation.
   *
-  * Release is a coordinator-head operation from `CoreApplied`; it is not a
-  * stage. Once restoration starts, the only legal terminal stage is
+  * Release is a coordinator-head operation from `CoreApplied`; it is not a stage. Once restoration starts, the only legal terminal stage is
   * `RestoredAbandoned`, so a restored target can never later be released.
   */
 sealed trait CoreStage extends Product with Serializable
@@ -433,8 +445,11 @@ sealed trait CoreStage extends Product with Serializable
 object CoreStage {
   case object Prepared extends CoreStage
   final case class CoreApplied(receipt: ReleasedCoreReceipt) extends CoreStage
-  final case class RestoringPrior(cause: ObjectiveOrphanCause) extends CoreStage
-  final case class RestoredAbandoned(cause: ObjectiveOrphanCause, receipt: PriorCoreRestorationReceipt) extends CoreStage
+  final case class RestoringPrior(
+    claim: ForkChoiceOrphanClaim,
+    publication: PublicationRestoration
+  ) extends CoreStage
+  final case class RestoredAbandoned(claim: ForkChoiceOrphanClaim, receipt: PriorCoreRestorationReceipt) extends CoreStage
 
   def canAdvance(from: CoreStage, to: CoreStage): Boolean =
     (from, to) match {
@@ -442,7 +457,7 @@ object CoreStage {
       case (Prepared, _: RestoringPrior)             => true
       case (_: CoreApplied, _: RestoringPrior)       => true
       case (_: RestoringPrior, _: RestoredAbandoned) => true
-      case _                                          => false
+      case _                                         => false
     }
 }
 

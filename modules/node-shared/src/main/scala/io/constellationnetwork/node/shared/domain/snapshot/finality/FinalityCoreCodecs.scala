@@ -43,8 +43,9 @@ object FinalityCoreCodecs {
   implicit val finalityCoreBatchPointerCodec: Codec[FinalityCoreBatchPointer] =
     (intentIdCodec :: intentAttemptCodec :: releaseGenerationCodec :: immutableArtifactPointerCodec)
       .xmap[FinalityCoreBatchPointer](
-        { case intentId :: attempt :: generation :: artifact :: HNil =>
-          FinalityCoreBatchPointer(intentId, attempt, generation, artifact)
+        {
+          case intentId :: attempt :: generation :: artifact :: HNil =>
+            FinalityCoreBatchPointer(intentId, attempt, generation, artifact)
         },
         value => value.intentId :: value.attempt :: value.generation :: value.artifact :: HNil
       )
@@ -87,8 +88,9 @@ object FinalityCoreCodecs {
   private val rawReleasedCoreRecordPayloadCodec: Codec[ReleasedCoreRecordPayload] =
     (operationalQualificationCodec :: releasedCoreReceiptCodec :: effectManifestPointerCodec)
       .xmap[ReleasedCoreRecordPayload](
-        { case qualification :: receipt :: effectManifest :: HNil =>
-          ReleasedCoreRecordPayload(qualification, receipt, effectManifest)
+        {
+          case qualification :: receipt :: effectManifest :: HNil =>
+            ReleasedCoreRecordPayload(qualification, receipt, effectManifest)
         },
         value => value.qualification :: value.receipt :: value.effectManifest :: HNil
       )
@@ -101,37 +103,57 @@ object FinalityCoreCodecs {
       value => value.pointer :: value.record :: value.payload :: HNil
     )
 
-  implicit val objectiveOrphanCauseCodec: Codec[ObjectiveOrphanCause] =
+  implicit val forkChoiceOrphanClaimCodec: Codec[ForkChoiceOrphanClaim] =
     (intentIdCodec :: canonicalSelectionTokenCodec :: canonicalSelectionTokenCodec :: globalSnapshotStateRefCodec ::
-      scopedArtifactRefCodec).xmap[ObjectiveOrphanCause](
-      { case intentId :: superseded :: replacement :: ancestor :: evidence :: HNil =>
-        ObjectiveOrphanCause(intentId, superseded, replacement, ancestor, evidence)
+      scopedArtifactRefCodec).xmap[ForkChoiceOrphanClaim](
+      {
+        case intentId :: superseded :: replacement :: ancestor :: evidence :: HNil =>
+          ForkChoiceOrphanClaim(intentId, superseded, replacement, ancestor, evidence)
       },
-      value =>
-        value.intentId :: value.supersededSelection :: value.replacementSelection :: value.commonAncestor :: value.evidence :: HNil
+      value => value.intentId :: value.supersededSelection :: value.replacementSelection :: value.commonAncestor :: value.evidence :: HNil
     )
 
+  private val priorUnchangedCodec: Codec[PublicationRestoration.PriorUnchanged] =
+    mptActivePublicationCodec.xmap(PublicationRestoration.PriorUnchanged(_), _.publication)
+
+  private val appliedTargetRevertedCodec: Codec[PublicationRestoration.AppliedTargetReverted] =
+    (mptActivePublicationCodec :: mptActivePublicationCodec).xmap[PublicationRestoration.AppliedTargetReverted](
+      {
+        case transitionFrom :: restored :: HNil =>
+          PublicationRestoration.AppliedTargetReverted(transitionFrom, restored)
+      },
+      value => value.transitionFrom :: value.restored :: HNil
+    )
+
+  implicit val publicationRestorationCodec: Codec[PublicationRestoration] =
+    discriminated[PublicationRestoration]
+      .by(uint8)
+      .typecase(1, priorUnchangedCodec)
+      .typecase(2, appliedTargetRevertedCodec)
+
   implicit val priorCoreRestorationReceiptCodec: Codec[PriorCoreRestorationReceipt] =
-    (intentIdCodec :: mptActivePublicationCodec :: mptActivePublicationCodec :: scopedArtifactRefCodec :: scopedArtifactRefCodec)
+    (intentIdCodec :: publicationRestorationCodec :: scopedArtifactRefCodec :: scopedArtifactRefCodec)
       .xmap[PriorCoreRestorationReceipt](
-        { case intentId :: before :: restored :: semantic :: anchor :: HNil =>
-          PriorCoreRestorationReceipt(intentId, before, restored, semantic, anchor)
+        {
+          case intentId :: publication :: semantic :: anchor :: HNil =>
+            PriorCoreRestorationReceipt(intentId, publication, semantic, anchor)
         },
-        value =>
-          value.intentId :: value.beforeRestoration :: value.restoredPublication :: value.semanticReceipt ::
-            value.authenticatedAnchorReceipt :: HNil
+        value => value.intentId :: value.publication :: value.semanticReceipt :: value.authenticatedAnchorReceipt :: HNil
       )
 
   private val coreAppliedCodec: Codec[CoreStage.CoreApplied] =
     releasedCoreReceiptCodec.xmap(CoreStage.CoreApplied(_), _.receipt)
 
   private val restoringPriorCodec: Codec[CoreStage.RestoringPrior] =
-    objectiveOrphanCauseCodec.xmap(CoreStage.RestoringPrior(_), _.cause)
+    (forkChoiceOrphanClaimCodec :: publicationRestorationCodec).xmap[CoreStage.RestoringPrior](
+      { case cause :: publication :: HNil => CoreStage.RestoringPrior(cause, publication) },
+      value => value.claim :: value.publication :: HNil
+    )
 
   private val restoredAbandonedCodec: Codec[CoreStage.RestoredAbandoned] =
-    (objectiveOrphanCauseCodec :: priorCoreRestorationReceiptCodec).xmap[CoreStage.RestoredAbandoned](
+    (forkChoiceOrphanClaimCodec :: priorCoreRestorationReceiptCodec).xmap[CoreStage.RestoredAbandoned](
       { case cause :: receipt :: HNil => CoreStage.RestoredAbandoned(cause, receipt) },
-      value => value.cause :: value.receipt :: HNil
+      value => value.claim :: value.receipt :: HNil
     )
 
   implicit val coreStageCodec: Codec[CoreStage] =

@@ -2,17 +2,9 @@ package io.constellationnetwork.node.shared.domain.snapshot.finality
 
 import cats.data.NonEmptyList
 
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{
-  pathChunkPayloadCodec,
-  pathManifestPayloadCodec
-}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{pathChunkPayloadCodec, pathManifestPayloadCodec}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoordinatorKernelError._
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator.{
-  CoreValidationContext,
-  PreviousEffectManifest,
-  ResolvedPathChunk,
-  ResolvedPathManifest
-}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
@@ -169,7 +161,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     val domain = FinalityDomain(hash(300), hash(301), hash(302))
     val lineage = path(PathRole.CanonicalLineage, NonEmptyList.one(target))
     val adopted = path(PathRole.Adopted, NonEmptyList.one(target))
-    val selectionEvidence = artifact(FinalityArtifactKind.CanonicalSelectionEvidence, 100)
+    val selectionEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, 100)
     val qualificationEvidence = artifact(FinalityArtifactKind.DecidedAttestationEvidence, 101)
     val semanticState = artifact(FinalityArtifactKind.PreparedSemanticState, 102)
     val authenticatedAnchor = artifact(FinalityArtifactKind.AuthenticatedTargetAnchor, 103)
@@ -238,7 +230,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
         CanonicalBranchRevision(nonNeg(1L)),
         target,
         target,
-        selectionEvidence,
+        ForkChoiceDecision(selectionEvidence),
         lineage.commitment
       ),
       transition = transitionShape,
@@ -324,7 +316,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
       batch,
       manifest,
       List(resolvePath(intentId, lineage), resolvePath(intentId, adopted)),
-      CoreValidationContext(None, None),
+      CoreValidationContext(None, None, expectedPublication),
       appliedReceipt,
       released
     )
@@ -336,7 +328,8 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
   private def auditIsDerived(mutation: FinalityCoordinatorMutation): Boolean =
     FinalityIdentity.auditPointer(mutation.audit).toOption.exists(pointer => mutation.head.auditTail.contains(pointer))
 
-  private def initialized: FinalityCoordinatorMutation = success(FinalityCoordinatorKernel.initialize)
+  private def initialized: FinalityCoordinatorMutation =
+    success(FinalityCoordinatorKernel.initialize(fixture.batch.prepared.expectedBefore))
 
   private def prepared(initial: CoordinatorHead, value: Fixture): FinalityCoordinatorMutation =
     success(
@@ -358,6 +351,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     expect.all(
       init.audit.mutation == CoordinatorMutationKind.Initialized,
       init.head.revision.value.value == 0L,
+      init.head.publication == value.batch.prepared.expectedBefore,
       auditIsDerived(init),
       prepare.audit.mutation == CoordinatorMutationKind.Prepared,
       prepare.head.revision.value.value == 1L,
@@ -379,7 +373,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
 
   test("mutation construction and unverified state-changing entry points are unavailable to callers") {
     illTyped("""FinalityCoordinatorMutation(null, null, None, None)""")
-    illTyped("""FinalityCoordinatorKernel.initialize.toOption.get.copy(head = null)""")
+    illTyped("""FinalityCoordinatorKernel.initialize(null).toOption.get.copy(head = null)""")
     illTyped("""FinalityCoordinatorKernel.coreApplied(null, null)""")
     illTyped("""FinalityCoordinatorKernel.release(null, null, null)""")
     illTyped("""FinalityCoordinatorKernel.restorationStarted(null, null)""")
@@ -412,6 +406,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
       record.lastAttempt == prepare.head.lastAttempt,
       record.released == prepare.head.released,
       record.active == prepare.head.active,
+      record.publication == prepare.head.publication,
       record.effects == prepare.head.effects,
       record.priorAudit == prepare.head.auditTail,
       auditIsDerived(recovery),
@@ -438,6 +433,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     val value = fixture
     val releasedHead = initialized.head.copy(
       released = Some(value.released),
+      publication = value.released.payload.receipt.activePublication,
       effects = EffectsIndex(Some(value.batch.effectManifest), Some(value.batch.scope.generation))
     )
     val substitutedPrior = value.released.copy(
@@ -452,12 +448,19 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     )
     val substitutedContext = CoreValidationContext(
       Some(substitutedPrior),
-      Some(PreviousEffectManifest(value.batch.effectManifest, value.manifest))
+      Some(PreviousEffectManifest(value.batch.effectManifest, value.manifest)),
+      releasedHead.publication
     )
     val wrongManifestPointer = value.batch.effectManifest.copy(id = EffectManifestId(hash(506)))
     val wrongEffectContext = CoreValidationContext(
       Some(value.released),
-      Some(PreviousEffectManifest(wrongManifestPointer, value.manifest))
+      Some(PreviousEffectManifest(wrongManifestPointer, value.manifest)),
+      releasedHead.publication
+    )
+    val wrongPublicationContext = CoreValidationContext(
+      Some(value.released),
+      Some(PreviousEffectManifest(value.batch.effectManifest, value.manifest)),
+      value.batch.prepared.expectedBefore
     )
     val substitutedResult = FinalityCoordinatorKernel.prepare(
       releasedHead,
@@ -473,10 +476,18 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
       value.paths,
       wrongEffectContext
     )
+    val wrongPublicationResult = FinalityCoordinatorKernel.prepare(
+      releasedHead,
+      value.batch,
+      value.manifest,
+      value.paths,
+      wrongPublicationContext
+    )
 
     expect.all(
       substitutedResult.swap.toOption.exists(_.isInstanceOf[CoreContextReleasedMismatch]),
-      wrongEffectResult.swap.toOption.exists(_.isInstanceOf[CoreContextEffectsMismatch])
+      wrongEffectResult.swap.toOption.exists(_.isInstanceOf[CoreContextEffectsMismatch]),
+      wrongPublicationResult.swap.toOption.exists(_.isInstanceOf[CoreContextPublicationMismatch])
     )
   }
 

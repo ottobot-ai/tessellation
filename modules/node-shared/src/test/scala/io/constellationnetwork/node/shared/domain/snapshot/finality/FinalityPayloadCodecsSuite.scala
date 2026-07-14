@@ -8,13 +8,13 @@ import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoor
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreCodecs._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityEffectCodecs._
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.mpt.{MptImageId, MptPublicationRevision}
+import io.constellationnetwork.security.mpt.{MptActivePublication, MptImageId, MptPublicationRevision}
 import io.constellationnetwork.serde.codecs.Primitives
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => rawHashCodec}
 
-import scodec.bits.{BitVector, ByteVector}
-import scodec.codecs.{int32, int64, uint16, uint8}
 import scodec.Codec
+import scodec.bits.{BitVector, ByteVector}
+import scodec.codecs._
 import weaver.FunSuite
 
 object FinalityPayloadCodecsSuite extends FunSuite {
@@ -118,15 +118,78 @@ object FinalityPayloadCodecsSuite extends FunSuite {
       rejectsTags(operationalQualificationCodec),
       rejectsTags(transitionShapeCodec),
       rejectsTags(coreTransitionCodec),
+      rejectsTags(publicationRestorationCodec),
       rejectsTags(coreStageCodec),
       rejectsTags(effectKindCodec),
       rejectsTags(terminalEffectReceiptPayloadCodec),
       rejectsTags(coordinatorMutationKindCodec),
       rejectsTags(recoveryReasonCodec),
       rejectsTags(coordinatorModeCodec),
+      rejects(finalityArtifactKindCodec.complete, encoded(uint8, 7)),
       (16 to 19).forall(tag => rejects(finalityArtifactKindCodec.complete, encoded(uint8, tag))),
       rejects(terminalEffectReceiptPayloadCodec, encoded(uint8, 3)),
       rejects(coordinatorMutationKindCodec.complete, encoded(uint8, 9))
+    )
+  }
+
+  test("fork-choice decision binds one opaque tag-8 evidence commitment") {
+    val decision = ForkChoiceDecision(selectionEvidenceArtifact)
+
+    expect.all(
+      roundTripsAndRejectsTrailing(forkChoiceDecisionCodec.complete, decision),
+      encoded(finalityArtifactKindCodec, FinalityArtifactKind.ForkChoiceDecisionEvidence).toByteVector.headOption.contains(8.toByte),
+      finalityArtifactKindCodec.decodeValue(encoded(uint8, 8)).toEither.toOption.contains(FinalityArtifactKind.ForkChoiceDecisionEvidence),
+      rejects(finalityArtifactKindCodec.complete, encoded(uint8, 7))
+    )
+  }
+
+  test("generic fork-choice replacement and rollback retain closed canonical transition tags") {
+    val orphaned = pathManifestRef.copy(
+      commitment = pathManifestRef.commitment.copy(
+        summary = pathManifestRef.summary.copy(role = PathRole.Orphaned)
+      )
+    )
+    val adopted = pathManifestRef.copy(
+      commitment = pathManifestRef.commitment.copy(
+        summary = pathManifestRef.summary.copy(role = PathRole.Adopted)
+      )
+    )
+    val replacement = CoreTransition.ForkChoiceReplacement(targetState, orphaned, adopted)
+    val rollback = CoreTransition.ForkChoiceRollbackToOperationalMrca(targetState, orphaned)
+
+    expect.all(
+      roundTripsAndRejectsTrailing(coreTransitionCodec.complete, replacement),
+      roundTripsAndRejectsTrailing(coreTransitionCodec.complete, rollback),
+      roundTripsAndRejectsTrailing(transitionShapeCodec.complete, replacement.shape),
+      roundTripsAndRejectsTrailing(transitionShapeCodec.complete, rollback.shape),
+      encoded(coreTransitionCodec, replacement).toByteVector.headOption.contains(2.toByte),
+      encoded(coreTransitionCodec, rollback).toByteVector.headOption.contains(3.toByte)
+    )
+  }
+
+  test("publication restoration variants round-trip with closed canonical tags") {
+    val priorUnchanged = PublicationRestoration.PriorUnchanged(expectedPublication)
+    val restored = MptActivePublication(
+      MptPublicationRevision(targetPublication.revision.value + 1L),
+      expectedPublication.image
+    )
+    val appliedTargetReverted = PublicationRestoration.AppliedTargetReverted(targetPublication, restored)
+    val cause = ForkChoiceOrphanClaim(
+      intentId,
+      selection,
+      selection,
+      targetState,
+      ScopedArtifactRef(intentId, selectionEvidenceArtifact)
+    )
+    val restoring = CoreStage.RestoringPrior(cause, appliedTargetReverted)
+
+    expect.all(
+      roundTripsAndRejectsTrailing(publicationRestorationCodec.complete, priorUnchanged),
+      roundTripsAndRejectsTrailing(publicationRestorationCodec.complete, appliedTargetReverted),
+      roundTripsAndRejectsTrailing(coreStageCodec.complete, restoring),
+      encoded(publicationRestorationCodec, priorUnchanged).toByteVector.headOption.contains(1.toByte),
+      encoded(publicationRestorationCodec, appliedTargetReverted).toByteVector.headOption.contains(2.toByte),
+      rejectsTags(publicationRestorationCodec)
     )
   }
 
@@ -239,7 +302,8 @@ object FinalityPayloadCodecsSuite extends FunSuite {
   }
 
   test("effect manifest and intent commitment retain all 18 fields in fixed tag order") {
-    val decodedManifest = finalityEffectManifestPayloadCodec.decodeValue(encoded(finalityEffectManifestPayloadCodec, effectManifest)).require
+    val decodedManifest =
+      finalityEffectManifestPayloadCodec.decodeValue(encoded(finalityEffectManifestPayloadCodec, effectManifest)).require
     val decodedScope = intentScopePayloadCodec.decodeValue(encoded(intentScopePayloadCodec, intentScope)).require
     val expectedIds = effectCommands.map(_.effectId)
     val encodedTags = effectKinds.map(kind => encoded(effectKindCodec, kind).toByteVector.head.toInt & 0xff)

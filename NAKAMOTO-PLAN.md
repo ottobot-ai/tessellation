@@ -38,6 +38,23 @@ A fork older than locally retained state requires authenticated recovery and
 replay before switching. It must not be silently rejected, locally scored over
 truncated history, or resolved by an operator choosing the winning branch.
 
+That binary short/deep rule does not yet define selection over a frontier of
+three or more fully validated tines. The primary Taktikos and Genesis algorithms
+specify stateful incumbent folds; they do not specify or prove an
+incumbent-independent total frontier order. Structurally connected bare
+`ChainTip` inputs form a strict-preference three-cycle without using the current
+tie rule, but they are not authenticated snapshots passing VRF/KES/era validation
+(`ChainSelectionSuite.scala:191-226`). Owner gate O-15 now ratifies objective
+total-frontier semantics: the same cutoff-complete published valid frontier and
+branch-authenticated parameters must produce the same head independently of
+candidate order, arrival schedule, restart, or prior incumbent. The exact
+cutoff/bounded-diffusion and late-reveal semantics, cycle-resolution selector,
+portable frontier evidence and verifier, validator/store witnesses, security and
+liveness proof, `k1` distance/equality boundary, and objective tie rule remain open
+before live fork choice can authorize
+`FinalityGate`. This is a Nakamoto fork-choice question; it does not permit
+global BFT voting, locks, QCs, or view changes.
+
 ## Completion loop
 
 Every task, including documentation and schema changes, follows the same loop:
@@ -74,6 +91,11 @@ to end.
 - Lock the exact-hash Phase-0/1/2 lifecycle, `k1` density boundary, retention-only
   `k2`, single-outstanding shard checkpoint, mandatory replay-backed `kQuorum`,
   positive watchtower eligibility, and protocol-level GL0 correction semantics.
+- Implement O-15's ratified objective total-frontier property and close its
+  cutoff/reveal, cycle-resolution selector, exact metric/tie, evidence/verifier,
+  validator/store witness, and security/liveness proof gates. Do not turn a
+  non-transitive mixed comparator into consensus through list/map/set iteration,
+  gossip arrival order, or a prior incumbent.
 - Freeze typed meanings for ML0 source signature, admission/custody receipt,
   execution signature, watchtower coverage/evidence, global optimistic
   attestation, and downstream Phase-2 reference. No type may substitute for
@@ -204,6 +226,46 @@ path on the current root shape.
 - Use `maxvalid-tk` for short forks and valid-only `maxvalid-bg` density selection
   beyond `k1`. Separate storage retention from fork-choice eligibility; `k2`
   never makes a less-dense chain valid or final by fiat.
+- Treat the present fork-choice reference model as partial dark scaffolding only.
+  It accepts a preselected winner, checks the generic shallow/deep rule tag, and
+  models exact MRCA replacement; it does not compute the winner
+  (`FinalityReferenceModel.scala:7-11,97-100,217-313`). The strict three-tine
+  comparator counterexample blocks canonical-selection authority until O-15's
+  algorithm/evidence/proof gate and FIN-D-001A close. The production store's
+  arrival-by-arrival `shouldSwitch` path is the same source-level risk, but still
+  needs its own legal-arrival integration reproduction
+  (`ChainSelectionSuite.scala:158-226`; `NakamotoChainStore.scala:437-464`).
+  `ForkChoiceDecision` currently carries one unscoped opaque artifact pointer;
+  the batch separately supplies an intent-scoped locator which must equal it. It
+  deliberately asserts no unproved Tk/Bg/transition form;
+  no decoded complete header/tine/frontier/parameter-era evidence payload or
+  verifier exists (`FinalityCore.scala:120-138,353-364`;
+  `FinalityBaseCodecs.scala:96-119,178-179`;
+  `FinalityIntentValidator.scala:59-120,748-761`).
+- Resolve the source-proven `k1` boundary mismatch before activation. When the
+  bounded walk finds the true MRCA over consecutive tines, it reports maximum
+  post-MRCA suffix length, while production passes `k1 + 1` and
+  density requires `depth > kLookback`; FIN-D-001B records the resulting divergent
+  Tk/Bg winner at depth `k1 + 1`
+  (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
+  `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
+  `ChainSelectionSuite.scala:228-250`).
+- Preserve the current dark monotone-restoration data contract. The schema validates
+  one exact plan and claimed receipt shape; it does not prove that the target stayed
+  unpublished or that an external MPT republish occurred. `PriorUnchanged` names the
+  exact CAS prior, while `AppliedTargetReverted` names the exact prior image at the
+  next publication revision. `CoordinatorHead.publication` independently retains that effective CAS
+  cursor through retirement, recovery, release, and the next prepare. The terminal
+  receipt cannot substitute its plan or orphan claim. The claim is not proof of a
+  true MRCA or target exclusion. This is codec/validator modeling only: the durable
+  store rejects restoration mutations and no live executor, branch hold, or release
+  capability exists. Initialization also still accepts a raw caller-supplied MPT
+  publication cursor; activation requires a package-owned exact-readback capability
+  that proves its provenance (`FinalityCore.scala:395-460`;
+  `FinalityCoordinatorState.scala:68-76,99-136`;
+  `FinalityIntentValidator.scala:891-925,1083-1275,1277-1288,1443-1590`;
+  `FinalityCoordinatorKernel.scala:72-154`;
+  `FinalityDurableStore.scala:1209-1230,1357-1363,1652-1656`).
 - Add one crash-consistent reorg transaction covering chain head, MPT branch,
   Phase-2 refs, checkpoint anchors, binary confirmation/requeue, tower caches,
   and downstream outbox. Missing history triggers authenticated recovery before
@@ -680,7 +742,7 @@ delivery, rollback, and recovery.
 
 - GL1/ML0/CL1/DL1 adopt exact canonical Phase-2 GL0 state. CL1 does not replay or
   override it on the return path.
-- A Phase-2 density replacement sends exact old/new/MRCA data. Shard anchors and
+- A Phase-2 shallow/deep fork-choice replacement sends exact old/new/MRCA data. Shard anchors and
   checkpoint windows roll back; orphaned binaries requeue once; ML0 uses its
   registered deterministic rewind/rebase contract or starts a new ML0 epoch.
 - Noninvertible external effects wait for the operator/integrator's declared risk

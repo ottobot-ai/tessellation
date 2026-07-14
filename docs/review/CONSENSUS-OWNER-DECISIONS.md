@@ -35,6 +35,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-21 | Greenfield runtime starts with one canonical `ScodecV1` era at new-chain ordinal 0. Existing-network migration work is deferred, while prior data already on disk remains readable according to an explicit historical-read contract. Undeployed fork schemas are not retained. |
 | L-22 | Tower eligibility is a required protocol feature, but enabling it is multi-stage. Snapshot-carried trial/tower state and `smtRoot` must be independently reproduced and verified by every GL0 recipient, durable across restart, and branch-aware across density reorgs before proofs are treated as security evidence. Replacing `NotComputed` alone is forbidden. |
 | L-23 | Exact-parent state uses an immutable captured parent generation plus compare-and-set at commit; a stale session retries or defers and never blocks GL0 finality indefinitely. Locally viable branch generations are retained only within bounded policy; history beyond that bound is accepted only through exact authenticated reconstruction, otherwise the node enters `RecoveryRequired`. Finality durability uses one idempotent intent journal coordinating the existing overlay, chain store, tracker, outbox, watermarks, projections, and other sinks; it does not require migrating every sink into one database transaction. No exact-parent guard activates until the verified base anchor, descendant-preserving fold, authenticated restart/reorg recovery, and recoverable finality-intent transition land as one coherent unit. |
+| L-24 | GL0 fork choice over three or more valid tines is an objective total-frontier function: the same cutoff-complete published valid frontier and branch-authenticated parameters produce the same canonical head independently of candidate enumeration, gossip arrival schedule, restart, or prior local incumbent. A stateful pairwise incumbent tournament cannot authorize canonical selection or Phase 2. O-15 remains open for cutoff/bounded-diffusion and late-reveal semantics, cycle resolution, exact `k1` metric/equality, objective tie, evidence/verifier, validator/store witnesses, and security/liveness proof. |
 
 Implementation status for L-15A is **OPEN**. The current currency incremental
 contains the `globalSnapshotSync` proof hash and accepted `globalSnapshotSyncs`
@@ -367,6 +368,95 @@ authorization, sequence, arithmetic, and conservation; it never treats ML0 custo
 execution output as economic authority. The outer `StateChannelSnapshotBinary.fee`
 is a separate global-balance operation and still requires E9's checkpoint-wide
 reservation kernel.
+
+### O-15 Multi-tine Taktikos/Genesis frontier semantics
+
+**RATIFIED PROPERTY; OPEN PROTOCOL AND PROOF GATE.** L-04 fixes the binary rule
+boundary: `maxvalid-tk` within `k1` and Genesis-family `maxvalid-bg` beyond `k1`.
+L-24 now fixes the multi-tine semantics: once two nodes have the same
+cutoff-complete published valid frontier and branch-authenticated parameters, they must
+produce the same canonical head independently of enumeration, prior arrival
+order, restart, and prior incumbent. Interim heads may differ before their
+published frontiers converge; a late valid reveal extends the frontier and
+requires deterministic reselection. This does not yet define the concrete
+objective selector or its portable declared-frontier evidence. No Nakamoto-only
+artifact can prove that an adversary has no unrevealed private tine.
+
+The primary sources do not supply a total frontier order. Taktikos Appendix A.1,
+Algorithm 1 initializes `C <- Cloc`, enumerates `C1..Cj`, and replaces the
+current incumbent only with a valid candidate that forks from that incumbent by
+at most `k` and is longer, or equal-length with a lower head slot. A deeper
+candidate and an exact tie leave the incumbent unchanged. Ouroboros Genesis
+section 3.2.4, Figure 7 likewise initializes `Cmax <- Cloc` and enumerates
+`C1..CM`; it applies strict longer-chain Condition A to a short pair and strict
+pairwise-MRCA density Condition B to a deep pair. Neither paper specifies the
+enumeration order, proves transitivity/permutation independence, or defines an
+incumbent-independent argmax. Sources: Schutza et al., *Ouroboros Taktikos*,
+Appendix A.1/Algorithm 1 ([DOI](https://doi.org/10.1007/978-981-99-8104-5_20),
+audited manuscript SHA-256
+`9cdb2218db703195483a31ac4ff467b6a28cd76a6d64368e90b616c9c7ad1db6`,
+pp. 22-23); Badertscher et al., *Ouroboros Genesis*, section 3.2.4/Figure 7
+([accepted manuscript](https://www.pure.ed.ac.uk/ws/portalfiles/portal/76645278/Ouroboros_Genesis.pdf),
+pp. 11-13).
+
+For complete histories where the true MRCA is resolved, the current mixed
+pairwise comparator is commutative but not transitive. A regression witness over
+three structurally connected `ChainTip` tines has `A >tk B`, `B >bg C`, and
+`C >bg A`; every deep edge is a strict density win, so the cycle does not depend
+on the open VRF/hash tie rule. Three list permutations return three different
+`selectBest` winners (`ChainSelectionSuite.scala:191-226`). This unit witness does not
+authenticate complete snapshots, VRF/KES eligibility, or historical parameter
+eras; a validator-backed integration witness remains mandatory. `selectBest` is
+currently called only by tests. Source inspection shows that live
+`NakamotoChainStore.store` compares arriving alternates with the current incumbent
+through `shouldSwitch`, but legal parent-before-child store-level permutations
+have not yet reproduced the three outcomes; that live divergence is an inference,
+not a completed RED (`ChainSelection.scala:119-159`;
+`NakamotoChainStore.scala:437-464`). No live
+fork-choice source may mint `CanonicalSelectionToken`, authorize `FinalityGate`,
+or release Phase-2 state from this tournament. The objective property is settled.
+
+The dark `ForkChoiceDecision` schema does not close this gate. It carries only an
+`ImmutableArtifactPointer`, deliberately without a Tk/Bg or transition-form tag
+that the objective selector cannot yet prove. Validation closes equality between
+one intent-scoped evidence locator and the selection token's pointer. It does not
+decode or verify complete headers, tines, frontier membership/completeness,
+parameter era, or the selected result (`FinalityCore.scala:120-138,353-364`;
+`FinalityBaseCodecs.scala:96-119,178-179`;
+`FinalityIntentValidator.scala:59-120,748-761`).
+
+The following design/proof work remains open and must land coherently:
+
+- **A - Selector:** define a total deterministic function over the complete valid
+  frontier that resolves mixed short/deep cycles without an incumbent or hidden
+  collection order. This is a new protocol construction, not a theorem inherited
+  from either cited paper.
+- **B - Frontier evidence:** define the bounded observation boundary and portable
+  evidence proving the exact candidate set, ancestry, validity, and parameters
+  supplied to the selector. Receiver-local peer visibility is not authority, and
+  no non-BFT artifact can prove that an adversary has not withheld another valid
+  tine. The protocol must define a cutoff plus bounded-diffusion assumption and
+  deterministic late-reveal reselection, or name another non-circular intake
+  commitment.
+- **C - Security and liveness:** prove or quantitatively bound chain quality,
+  common prefix, grinding/withholding leverage, and convergence for the chosen
+  cycle-resolution rule under the project's Taktikos/Genesis assumptions.
+- **D - `k1` distance:** freeze the exact short/deep metric and the `== k1`
+  boundary used for every pairwise fact supplied to the frontier selector. The
+  current bounded walk, when it resolves a true MRCA over consecutive tines,
+  returns maximum post-MRCA suffix length, but production passes
+  `kLookback = k1 + 1` and chooses density only for `depth > kLookback`;
+  therefore `depth = k1 + 1` still uses Tk, contrary to L-04's prose
+  (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
+  `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
+  `ChainSelectionSuite.scala:228-250`).
+- **E - Exact ties:** define an objective tie result. In particular, ratify or
+  reject the current lower-VRF then hash rule; it is not in either cited algorithm
+  and must be assessed for precomputation and grinding.
+
+This gate does not reopen L-02 through L-05. GL0 remains Nakamoto/Taktikos/LDD
+without global BFT machinery; Phase 2 remains `T_weight OR k1`, density-reorgable;
+and `k2` remains retention/recovery policy only.
 
 ## Change rule
 

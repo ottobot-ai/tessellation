@@ -3,22 +3,16 @@ package io.constellationnetwork.node.shared.domain.snapshot.finality
 import cats.data.ValidatedNec
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{
-  pathChunkPayloadCodec,
-  pathManifestPayloadCodec
-}
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreCodecs.releasedCoreRecordPayloadCodec
 import io.constellationnetwork.node.shared.domain.snapshot.finality.CoordinatorMode.{RecoveryRequired, Running}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.CoreTransition.{
   Advance,
-  DensityReplacement,
-  DensityRollbackToOperationalMrca
+  ForkChoiceReplacement,
+  ForkChoiceRollbackToOperationalMrca
 }
 import io.constellationnetwork.node.shared.domain.snapshot.finality.EffectKind._
-import io.constellationnetwork.node.shared.domain.snapshot.finality.OperationalQualification.{
-  CanonicalDepthK1,
-  DecidedAttestationTWeight
-}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{pathChunkPayloadCodec, pathManifestPayloadCodec}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreCodecs.releasedCoreRecordPayloadCodec
+import io.constellationnetwork.node.shared.domain.snapshot.finality.OperationalQualification.{CanonicalDepthK1, DecidedAttestationTWeight}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.PathRole._
 import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
@@ -26,9 +20,9 @@ import io.constellationnetwork.security.mpt.{DurableMptImageStore, MptActivePubl
 
 /** Pure cross-field validation for the dark greenfield ScodecV1 finality artifacts.
   *
-  * This validator does not load content-addressed artifacts or choose a branch. Callers must supply decoded payloads loaded from the claimed
-  * immutable locations. Every identity which can be derived from those payloads is recomputed here with the canonical active-era codecs;
-  * caller-supplied "derived" identities are never authority.
+  * This validator does not load content-addressed artifacts or choose a branch. Callers must supply decoded payloads loaded from the
+  * claimed immutable locations. Every identity which can be derived from those payloads is recomputed here with the canonical active-era
+  * codecs; caller-supplied "derived" identities are never authority.
   */
 object FinalityIntentValidator {
 
@@ -40,7 +34,8 @@ object FinalityIntentValidator {
 
   final case class CoreValidationContext(
     priorReleased: Option[ReleasedCore],
-    previousEffects: Option[PreviousEffectManifest]
+    previousEffects: Option[PreviousEffectManifest],
+    currentPublication: MptActivePublication
   )
 
   /** One decoded chunk paired with the exact immutable pointer by which it was loaded. */
@@ -74,26 +69,54 @@ object FinalityIntentValidator {
         validateHash(batch.scope.domain.networkId, "batch.scope.domain.networkId", rejectZero = true),
         validateHash(batch.scope.domain.genesisHash, "batch.scope.domain.genesisHash", rejectZero = true),
         validateHash(batch.scope.domain.protocolEra, "batch.scope.domain.protocolEra", rejectZero = true),
-        check(isExpectedGeneration(batch.scope.generation, context.priorReleased), "batch.scope.generation", "must be prior generation + 1, or zero initially"),
-        check(batch.scope.expectedPrior == context.priorReleased.map(_.pointer), "batch.scope.expectedPrior", "must name the exact authenticated prior release"),
+        check(
+          isExpectedGeneration(batch.scope.generation, context.priorReleased),
+          "batch.scope.generation",
+          "must be prior generation + 1, or zero initially"
+        ),
+        check(
+          batch.scope.expectedPrior == context.priorReleased.map(_.pointer),
+          "batch.scope.expectedPrior",
+          "must name the exact authenticated prior release"
+        ),
         check(batch.scope.target == batch.prepared.target, "batch.scope.target", "must equal the prepared target"),
-        check(batch.scope.selection.operationalTarget == batch.scope.target, "batch.scope.selection.operationalTarget", "must equal the release target"),
+        check(
+          batch.scope.selection.operationalTarget == batch.scope.target,
+          "batch.scope.selection.operationalTarget",
+          "must equal the release target"
+        ),
         check(batch.scope.transition == batch.transition.shape, "batch.scope.transition", "must equal the decoded transition commitment"),
-        check(batch.scope.qualification == batch.qualification.scope, "batch.scope.qualification", "must equal the decoded qualification commitment"),
-        check(batch.scope.prepared == batch.prepared.commitment, "batch.scope.prepared", "must equal every decoded prepared-core commitment"),
-        check(batch.scope.effects == effectManifest.commitment, "batch.scope.effects", "must equal the complete decoded 18-sink effect plan"),
+        check(
+          batch.scope.qualification == batch.qualification.scope,
+          "batch.scope.qualification",
+          "must equal the decoded qualification commitment"
+        ),
+        check(
+          batch.scope.prepared == batch.prepared.commitment,
+          "batch.scope.prepared",
+          "must equal every decoded prepared-core commitment"
+        ),
+        check(
+          batch.scope.effects == effectManifest.commitment,
+          "batch.scope.effects",
+          "must equal the complete decoded 18-sink effect plan"
+        ),
         validateScoped(
           batch.selectionEvidence,
           batch.intentId,
-          FinalityArtifactKind.CanonicalSelectionEvidence,
+          FinalityArtifactKind.ForkChoiceDecisionEvidence,
           "batch.selectionEvidence"
         ),
-        check(batch.selectionEvidence.artifact == batch.scope.selection.decision, "batch.selectionEvidence", "must be the exact selection-decision pointer committed by the scope"),
+        check(
+          batch.selectionEvidence.artifact == batch.scope.selection.decision.evidence,
+          "batch.selectionEvidence",
+          "must be the exact fork-choice evidence pointer committed by the selection decision"
+        ),
         validateSelection(batch.scope.selection, "batch.scope.selection"),
         validateResolvedCorePaths(batch, resolvedPaths),
         validateTransition(batch.intentId, batch.scope.target, batch.transition, context.priorReleased),
         validateQualification(batch.intentId, batch.scope.target, batch.qualification, batch.transition, context.priorReleased),
-        validatePrepared(batch.intentId, batch.prepared, context.priorReleased),
+        validatePrepared(batch.intentId, batch.prepared, context.currentPublication),
         validateEffectManifest(batch, effectManifest, context)
       )
     )
@@ -105,10 +128,11 @@ object FinalityIntentValidator {
   ): ValidationResult[Unit] = {
     val transitionCommitments = batch.transition match {
       case Advance(adopted)                                 => List(adopted.commitment)
-      case DensityReplacement(_, orphaned, adopted, _)      => List(orphaned.commitment, adopted.commitment)
-      case DensityRollbackToOperationalMrca(_, orphaned, _) => List(orphaned.commitment)
+      case ForkChoiceReplacement(_, orphaned, adopted)      => List(orphaned.commitment, adopted.commitment)
+      case ForkChoiceRollbackToOperationalMrca(_, orphaned) => List(orphaned.commitment)
     }
-    val expectedCommitments = batch.scope.selection.lineage :: transitionCommitments ::: batch.qualification.ancestorClosure.toList.map(_.commitment)
+    val expectedCommitments =
+      batch.scope.selection.lineage :: transitionCommitments ::: batch.qualification.ancestorClosure.toList.map(_.commitment)
     val actualCommitments = resolvedPaths.map(_.commitment)
     val expectedMultiplicity = expectedCommitments.groupBy(identity).map { case (commitment, values) => commitment -> values.size }
     val actualMultiplicity = actualCommitments.groupBy(identity).map { case (commitment, values) => commitment -> values.size }
@@ -133,7 +157,7 @@ object FinalityIntentValidator {
         (resolved(closureRef.commitment), resolved(batch.scope.selection.lineage)) match {
           case (Some(closure), Some(lineage)) =>
             batch.transition match {
-              case rollback: DensityRollbackToOperationalMrca =>
+              case rollback: ForkChoiceRollbackToOperationalMrca =>
                 resolved(rollback.orphaned.commitment) match {
                   case None => invalid("batch.resolvedPaths", "must resolve the rollback orphaned path")
                   case Some(orphaned) =>
@@ -154,9 +178,9 @@ object FinalityIntentValidator {
         }
     }
 
-    val densityPathSemantics = batch.transition match {
+    val forkChoicePathSemantics = batch.transition match {
       case _: Advance => validUnit
-      case replacement: DensityReplacement =>
+      case replacement: ForkChoiceReplacement =>
         (resolved(replacement.orphaned.commitment), resolved(replacement.adopted.commitment)) match {
           case (Some(orphaned), Some(adopted)) =>
             val orphanedEntries = entries(orphaned)
@@ -190,13 +214,13 @@ object FinalityIntentValidator {
                     case _                                  => false
                   },
                   "batch.transition.adopted.newest",
-                  "density replacement must select a different target hash, not re-release the orphaned target"
+                  "fork-choice replacement must select a different target hash, not re-release the orphaned target"
                 )
               )
             )
-          case _ => invalid("batch.resolvedPaths", "must resolve both density-replacement suffixes")
+          case _ => invalid("batch.resolvedPaths", "must resolve both fork-choice replacement suffixes")
         }
-      case rollback: DensityRollbackToOperationalMrca =>
+      case rollback: ForkChoiceRollbackToOperationalMrca =>
         (resolved(rollback.orphaned.commitment), resolved(batch.scope.selection.lineage)) match {
           case (Some(orphaned), Some(lineage)) =>
             val orphanedFirst = entries(orphaned).headOption
@@ -234,7 +258,7 @@ object FinalityIntentValidator {
           "must contain exactly the complete multiset of canonical lineage, transition paths, and optional qualification closure"
         ),
         qualificationLineage,
-        densityPathSemantics
+        forkChoicePathSemantics
       ) ++ resolvedChecks
     )
   }
@@ -266,15 +290,27 @@ object FinalityIntentValidator {
             "must equal the canonical pointer derived from the complete chunk payload"
           ),
           check(chunk.intentId == resolved.intentId, s"path.chunks[$index].intentId", "must equal the manifest intent"),
-          check(chunk.manifestId == resolved.commitment.manifest.id, s"path.chunks[$index].manifestId", "must equal the manifest artifact id"),
+          check(
+            chunk.manifestId == resolved.commitment.manifest.id,
+            s"path.chunks[$index].manifestId",
+            "must equal the manifest artifact id"
+          ),
           check(chunk.chunkIndex.value == index.toLong, s"path.chunks[$index].chunkIndex", "must be contiguous from zero"),
-          check(chunk.entriesOldestFirst.size <= PathChunk.MaxEntries, s"path.chunks[$index].entries", s"must contain at most ${PathChunk.MaxEntries} entries"),
+          check(
+            chunk.entriesOldestFirst.size <= PathChunk.MaxEntries,
+            s"path.chunks[$index].entries",
+            s"must contain at most ${PathChunk.MaxEntries} entries"
+          ),
           check(
             nextExpected.isEmpty || chunk.entriesOldestFirst.size == PathChunk.MaxEntries,
             s"path.chunks[$index].entries",
             s"every nonterminal chunk must use the canonical full framing of ${PathChunk.MaxEntries} entries"
           ),
-          check(chunk.next == expectedNext, s"path.chunks[$index].next", "must point exactly to the next resolved chunk, and the final chunk must terminate")
+          check(
+            chunk.next == expectedNext,
+            s"path.chunks[$index].next",
+            "must point exactly to the next resolved chunk, and the final chunk must terminate"
+          )
         )
     }
 
@@ -299,7 +335,11 @@ object FinalityIntentValidator {
           "must equal the canonical pointer derived from PathManifestPayload"
         ),
         check(chunks.nonEmpty, "path.chunks", "must resolve chunk zero and at least one chunk"),
-        check(BigInt(entries.size) == BigInt(resolved.commitment.summary.entryCount.value), "path.entries", "must contain exactly entryCount state refs"),
+        check(
+          BigInt(entries.size) == BigInt(resolved.commitment.summary.entryCount.value),
+          "path.entries",
+          "must contain exactly entryCount state refs"
+        ),
         check(entries.headOption.contains(resolved.commitment.summary.oldest), "path.entries.head", "must equal summary.oldest"),
         check(entries.lastOption.contains(resolved.commitment.summary.newest), "path.entries.last", "must equal summary.newest"),
         checkDerived(
@@ -337,36 +377,82 @@ object FinalityIntentValidator {
         check(released.pointer.intentId == batch.intentId, "released.pointer.intentId", "must equal the batch intent"),
         check(released.pointer.generation == batch.scope.generation, "released.pointer.generation", "must equal the batch generation"),
         check(released.pointer.target == batch.scope.target, "released.pointer.target", "must equal the batch target"),
-        check(released.payload.qualification == batch.qualification, "released.payload.qualification", "must equal the validated batch qualification"),
-        check(released.payload.effectManifest == batch.effectManifest, "released.payload.effectManifest", "must equal the pre-persisted effect manifest"),
+        check(
+          released.payload.qualification == batch.qualification,
+          "released.payload.qualification",
+          "must equal the validated batch qualification"
+        ),
+        check(
+          released.payload.effectManifest == batch.effectManifest,
+          "released.payload.effectManifest",
+          "must equal the pre-persisted effect manifest"
+        ),
         check(receipt.intentId == batch.intentId, "released.payload.receipt.intentId", "must equal the batch intent"),
         check(receipt.generation == batch.scope.generation, "released.payload.receipt.generation", "must equal the batch generation"),
         check(receipt.target == batch.scope.target, "released.payload.receipt.target", "must equal the exact batch target"),
-        check(receipt.beforePublication == batch.prepared.expectedBefore, "released.payload.receipt.beforePublication", "must read back the exact prepared CAS prior"),
-        check(receipt.activePublication == batch.prepared.targetPublication, "released.payload.receipt.activePublication", "must read back the exact prepared target publication"),
-        validateScoped(receipt.semanticReceipt, batch.intentId, FinalityArtifactKind.AppliedSemanticStateReceipt, "released.payload.receipt.semanticReceipt"),
-        validateScoped(receipt.authenticatedAnchorReceipt, batch.intentId, FinalityArtifactKind.AuthenticatedAnchorReceipt, "released.payload.receipt.authenticatedAnchorReceipt")
+        check(
+          receipt.beforePublication == batch.prepared.expectedBefore,
+          "released.payload.receipt.beforePublication",
+          "must read back the exact prepared CAS prior"
+        ),
+        check(
+          receipt.activePublication == batch.prepared.targetPublication,
+          "released.payload.receipt.activePublication",
+          "must read back the exact prepared target publication"
+        ),
+        validateScoped(
+          receipt.semanticReceipt,
+          batch.intentId,
+          FinalityArtifactKind.AppliedSemanticStateReceipt,
+          "released.payload.receipt.semanticReceipt"
+        ),
+        validateScoped(
+          receipt.authenticatedAnchorReceipt,
+          batch.intentId,
+          FinalityArtifactKind.AuthenticatedAnchorReceipt,
+          "released.payload.receipt.authenticatedAnchorReceipt"
+        )
       )
     )
   }
 
   def validateCoordinatorHead(head: CoordinatorHead): ValidationResult[CoordinatorHead] = {
     val releasedPointer = head.released.map(_.pointer)
-    val expectedEffects = head.released.map(released => EffectsIndex(released.payload.effectManifest.some, released.pointer.generation.some)).getOrElse(EffectsIndex(None, None))
+    val expectedEffects = head.released
+      .map(released => EffectsIndex(released.payload.effectManifest.some, released.pointer.generation.some))
+      .getOrElse(EffectsIndex(None, None))
 
     validateValue(
       head,
       List(
         validateEffectsIndex(head.effects, "head.effects"),
-        check(head.effects == expectedEffects, "head.effects", "must exactly index the latest released core, or be empty before the first release"),
+        validatePublication(head.publication, "head.publication"),
+        check(
+          head.effects == expectedEffects,
+          "head.effects",
+          "must exactly index the latest released core, or be empty before the first release"
+        ),
         check(head.released.isEmpty || head.lastAttempt.nonEmpty, "head.lastAttempt", "must be present after any release"),
         head.active.fold(validUnit)(validateActiveIntent),
         head.active.fold(validUnit) { active =>
           combine(
             List(
-              check(active.scope.expectedPrior == releasedPointer, "head.active.scope.expectedPrior", "must equal the current released core"),
-              check(isExpectedGeneration(active.scope.generation, head.released), "head.active.scope.generation", "must be current release generation + 1"),
-              check(head.lastAttempt.contains(active.scope.attempt), "head.lastAttempt", "must equal the active intent attempt")
+              check(
+                active.scope.expectedPrior == releasedPointer,
+                "head.active.scope.expectedPrior",
+                "must equal the current released core"
+              ),
+              check(
+                isExpectedGeneration(active.scope.generation, head.released),
+                "head.active.scope.generation",
+                "must be current release generation + 1"
+              ),
+              check(head.lastAttempt.contains(active.scope.attempt), "head.lastAttempt", "must equal the active intent attempt"),
+              check(
+                head.publication == stagePublication(active),
+                "head.publication",
+                "must equal the exact publication represented by the active core stage"
+              )
             )
           )
         }
@@ -420,13 +506,13 @@ object FinalityIntentValidator {
     val cursor = outbox.cursor
     val paired = cursor.completedThrough.isDefined == cursor.completedManifest.isDefined
     val withinHigh = (cursor.completedThrough, head.effects.highGeneration) match {
-      case (None, _)                    => true
-      case (Some(_), None)              => false
+      case (None, _)                     => true
+      case (Some(_), None)               => false
       case (Some(completed), Some(high)) => completed.value.value <= high.value.value
     }
     val exactTailAtHigh = (cursor.completedThrough, cursor.completedManifest, head.effects.highGeneration, head.effects.tail) match {
       case (Some(completed), Some(manifest), Some(high), Some(tail)) if completed == high => manifest == tail
-      case _                                                                               => true
+      case _                                                                              => true
     }
 
     validateValue(
@@ -435,9 +521,21 @@ object FinalityIntentValidator {
         validateEffectsIndex(head.effects, "head.effects"),
         check(paired, "outbox.cursor", "completedThrough and completedManifest must both be present or both be absent"),
         cursor.completedManifest.fold(validUnit)(pointer => validateEffectManifestPointer(pointer, "outbox.cursor.completedManifest")),
-        check(cursor.completedManifest.forall(pointer => cursor.completedThrough.contains(pointer.generation)), "outbox.cursor.completedManifest", "generation must equal completedThrough"),
-        check(withinHigh, "outbox.cursor.completedThrough", "cannot exceed the coordinator effect high generation or exist without effects"),
-        check(exactTailAtHigh, "outbox.cursor.completedManifest", "must equal the coordinator tail when completed through the high generation")
+        check(
+          cursor.completedManifest.forall(pointer => cursor.completedThrough.contains(pointer.generation)),
+          "outbox.cursor.completedManifest",
+          "generation must equal completedThrough"
+        ),
+        check(
+          withinHigh,
+          "outbox.cursor.completedThrough",
+          "cannot exceed the coordinator effect high generation or exist without effects"
+        ),
+        check(
+          exactTailAtHigh,
+          "outbox.cursor.completedManifest",
+          "must equal the coordinator tail when completed through the high generation"
+        )
       )
     )
   }
@@ -449,8 +547,8 @@ object FinalityIntentValidator {
     completions: List[CompletedEffectManifest]
   ): ValidationResult[FinalityEffectOutboxHead] = {
     val nondecreasing = (before.cursor.completedThrough, after.cursor.completedThrough) match {
-      case (None, _)                    => true
-      case (Some(_), None)              => false
+      case (None, _)                  => true
+      case (Some(_), None)            => false
       case (Some(old), Some(current)) => old.value.value <= current.value.value
     }
     val sameGenerationSameManifest =
@@ -468,7 +566,11 @@ object FinalityIntentValidator {
         validateOutbox(coordinator, after).void,
         check(next(before.revision.value.value, after.revision.value.value), "outbox.revision", "must advance by exactly one"),
         check(nondecreasing, "outbox.cursor.completedThrough", "cannot regress"),
-        check(sameGenerationSameManifest, "outbox.cursor.completedManifest", "cannot replace the manifest at an already completed generation"),
+        check(
+          sameGenerationSameManifest,
+          "outbox.cursor.completedManifest",
+          "cannot replace the manifest at an already completed generation"
+        ),
         check(cursorAdvanced, "outbox.cursor", "an outbox CAS must advance the completed cursor; no-op revisions are forbidden"),
         check(completions.nonEmpty, "outbox.completions", "cursor advancement requires exact completion evidence"),
         completionChecks
@@ -502,7 +604,11 @@ object FinalityIntentValidator {
             ),
             validateHash(applied.observedBefore.value, "effectReceipt.observedBefore", rejectZero = true),
             check(applied.observedBefore == command.expectedBefore, "effectReceipt.observedBefore", "must equal expectedBefore"),
-            check(applied.observedBeforeRevision == command.expectedRevision, "effectReceipt.observedBeforeRevision", "must equal expectedRevision"),
+            check(
+              applied.observedBeforeRevision == command.expectedRevision,
+              "effectReceipt.observedBeforeRevision",
+              "must equal expectedRevision"
+            ),
             check(applied.observedState == command.desiredAfter, "effectReceipt.observedState", "must equal desiredAfter"),
             check(applied.sinkRevision == command.desiredRevision, "effectReceipt.sinkRevision", "must equal desiredRevision")
           )
@@ -510,8 +616,16 @@ object FinalityIntentValidator {
       case already: AlreadyAppliedEffectReceipt =>
         combine(
           List(
-            check(already.observedState == command.desiredAfter, "effectReceipt.observedState", "must independently read back desiredAfter"),
-            check(already.sinkRevision == command.desiredRevision, "effectReceipt.sinkRevision", "must independently read back desiredRevision")
+            check(
+              already.observedState == command.desiredAfter,
+              "effectReceipt.observedState",
+              "must independently read back desiredAfter"
+            ),
+            check(
+              already.sinkRevision == command.desiredRevision,
+              "effectReceipt.sinkRevision",
+              "must independently read back desiredRevision"
+            )
           )
         )
     }
@@ -539,7 +653,11 @@ object FinalityIntentValidator {
           case (command, commandIndex) =>
             completed.receipts.find(_.effectId == command.effectId) match {
               case Some(receipt) => validateEffectReceipt(command, completed.pointer, receipt).void
-              case None          => invalid(s"outbox.completions[$index].receipts[$commandIndex]", "every one of the 18 commands requires an exact terminal receipt")
+              case None =>
+                invalid(
+                  s"outbox.completions[$index].receipts[$commandIndex]",
+                  "every one of the 18 commands requires an exact terminal receipt"
+                )
             }
         }
 
@@ -552,20 +670,44 @@ object FinalityIntentValidator {
             s"outbox.completions[$index].pointer",
             "must equal the canonical pointer derived from the exact manifest"
           ),
-          check(BigInt(completed.pointer.generation.value.value) == expectedGeneration, s"outbox.completions[$index].pointer.generation", "must be the next contiguous release generation"),
-          check(completed.manifest.scope.generation == completed.pointer.generation, s"outbox.completions[$index].manifest.scope.generation", "must equal the manifest pointer generation"),
-          check(completed.manifest.previous == expectedPrevious, s"outbox.completions[$index].manifest.previous", "must continue the exact immutable manifest chain"),
+          check(
+            BigInt(completed.pointer.generation.value.value) == expectedGeneration,
+            s"outbox.completions[$index].pointer.generation",
+            "must be the next contiguous release generation"
+          ),
+          check(
+            completed.manifest.scope.generation == completed.pointer.generation,
+            s"outbox.completions[$index].manifest.scope.generation",
+            "must equal the manifest pointer generation"
+          ),
+          check(
+            completed.manifest.previous == expectedPrevious,
+            s"outbox.completions[$index].manifest.previous",
+            "must continue the exact immutable manifest chain"
+          ),
           check(completed.receipts.size == commands.size, s"outbox.completions[$index].receipts", "must contain exactly 18 receipts"),
           check(receiptIds.distinct.size == receiptIds.size, s"outbox.completions[$index].receipts", "receipt effect ids must be unique"),
-          check(receiptIds.toSet == commandIds.toSet, s"outbox.completions[$index].receipts", "receipt ids must equal the complete 18-command id set")
+          check(
+            receiptIds.toSet == commandIds.toSet,
+            s"outbox.completions[$index].receipts",
+            "receipt ids must equal the complete 18-command id set"
+          )
         ) ++ receiptChecks
     }
 
     combine(
       List(
         check(expectedCount >= 0, "outbox.completions", "completed generation cannot regress"),
-        check(BigInt(completions.size) == expectedCount, "outbox.completions", "must prove every contiguous generation crossed by the cursor"),
-        check(expectedCount == 0 || completions.lastOption.map(_.pointer) == after.completedManifest, "outbox.cursor.completedManifest", "must equal the final completely receipted manifest")
+        check(
+          BigInt(completions.size) == expectedCount,
+          "outbox.completions",
+          "must prove every contiguous generation crossed by the cursor"
+        ),
+        check(
+          expectedCount == 0 || completions.lastOption.map(_.pointer) == after.completedManifest,
+          "outbox.cursor.completedManifest",
+          "must equal the final completely receipted manifest"
+        )
       ) ++ perManifest
     )
   }
@@ -594,17 +736,24 @@ object FinalityIntentValidator {
         validateHash(manifest.scope.transitionDigest, s"$path.scope.transitionDigest", rejectZero = true),
         validateStateRef(manifest.scope.target, s"$path.scope.target"),
         manifest.previous.fold(validUnit)(validateEffectManifestPointer(_, s"$path.previous")),
-        check(commands.map(_._3.effectId).distinct.size == commands.size, s"$path.effectIds", "all 18 canonically derived effect ids must be unique")
+        check(
+          commands.map(_._3.effectId).distinct.size == commands.size,
+          s"$path.effectIds",
+          "all 18 canonically derived effect ids must be unique"
+        )
       ) ++ commandChecks
     )
   }
+
+  private def validateForkChoiceDecision(decision: ForkChoiceDecision, path: String): ValidationResult[Unit] =
+    validateArtifact(decision.evidence, FinalityArtifactKind.ForkChoiceDecisionEvidence, s"$path.evidence")
 
   private def validateSelection(selection: CanonicalSelectionToken, path: String): ValidationResult[Unit] =
     combine(
       List(
         validateStateRef(selection.selectedTip, s"$path.selectedTip"),
         validateStateRef(selection.operationalTarget, s"$path.operationalTarget"),
-        validateArtifact(selection.decision, FinalityArtifactKind.CanonicalSelectionEvidence, s"$path.decision"),
+        validateForkChoiceDecision(selection.decision, s"$path.decision"),
         validatePathCommitment(selection.lineage, CanonicalLineage, s"$path.lineage"),
         check(selection.lineage.summary.oldest == selection.operationalTarget, s"$path.lineage.oldest", "must equal operationalTarget"),
         check(selection.lineage.summary.newest == selection.selectedTip, s"$path.lineage.newest", "must equal selectedTip")
@@ -626,30 +775,36 @@ object FinalityIntentValidator {
             prior.fold(validUnit)(released => validateSuffixAfter(released.pointer.target, adopted.summary, "batch.transition.adopted"))
           )
         )
-      case DensityReplacement(commonAncestor, orphaned, adopted, densityDecision) =>
+      case ForkChoiceReplacement(commonAncestor, orphaned, adopted) =>
         combine(
           List(
-            requirePrior(prior, "batch.transition", "density replacement requires an exact prior release"),
+            requirePrior(prior, "batch.transition", "fork-choice replacement requires an exact prior release"),
             validateStateRef(commonAncestor, "batch.transition.commonAncestor"),
             validatePathManifest(orphaned, intentId, Orphaned, "batch.transition.orphaned"),
             validatePathManifest(adopted, intentId, Adopted, "batch.transition.adopted"),
-            validateScoped(densityDecision, intentId, FinalityArtifactKind.DensityDecisionEvidence, "batch.transition.densityDecision"),
             validateSuffixAfter(commonAncestor, orphaned.summary, "batch.transition.orphaned"),
             validateSuffixAfter(commonAncestor, adopted.summary, "batch.transition.adopted"),
-            check(prior.exists(_.pointer.target == orphaned.summary.newest), "batch.transition.orphaned.newest", "must equal the prior released target"),
+            check(
+              prior.exists(_.pointer.target == orphaned.summary.newest),
+              "batch.transition.orphaned.newest",
+              "must equal the prior released target"
+            ),
             check(adopted.summary.newest == target, "batch.transition.adopted.newest", "must equal the replacement target")
           )
         )
-      case DensityRollbackToOperationalMrca(operationalMrca, orphaned, densityDecision) =>
+      case ForkChoiceRollbackToOperationalMrca(operationalMrca, orphaned) =>
         combine(
           List(
-            requirePrior(prior, "batch.transition", "density rollback requires an exact prior release"),
+            requirePrior(prior, "batch.transition", "fork-choice rollback requires an exact prior release"),
             validateStateRef(operationalMrca, "batch.transition.operationalMrca"),
             validatePathManifest(orphaned, intentId, Orphaned, "batch.transition.orphaned"),
-            validateScoped(densityDecision, intentId, FinalityArtifactKind.DensityDecisionEvidence, "batch.transition.densityDecision"),
             validateSuffixAfter(operationalMrca, orphaned.summary, "batch.transition.orphaned"),
             check(operationalMrca == target, "batch.transition.operationalMrca", "must equal the rollback release target"),
-            check(prior.exists(_.pointer.target == orphaned.summary.newest), "batch.transition.orphaned.newest", "must equal the prior released target")
+            check(
+              prior.exists(_.pointer.target == orphaned.summary.newest),
+              "batch.transition.orphaned.newest",
+              "must equal the prior released target"
+            )
           )
         )
     }
@@ -663,32 +818,60 @@ object FinalityIntentValidator {
   ): ValidationResult[Unit] = {
     val evidenceKind = qualification match {
       case _: DecidedAttestationTWeight => FinalityArtifactKind.DecidedAttestationEvidence
-      case _: CanonicalDepthK1           => FinalityArtifactKind.DepthK1Evidence
+      case _: CanonicalDepthK1          => FinalityArtifactKind.DepthK1Evidence
     }
     val closureChecks = qualification.ancestorClosure match {
       case None =>
-        check(qualification.operationalTarget == qualification.qualifyingDescendant, "batch.qualification.qualifyingDescendant", "direct qualification requires target == qualifying descendant")
+        check(
+          qualification.operationalTarget == qualification.qualifyingDescendant,
+          "batch.qualification.qualifyingDescendant",
+          "direct qualification requires target == qualifying descendant"
+        )
       case Some(closure) =>
         combine(
           List(
             validatePathManifest(closure, intentId, OperationalAncestorClosure, "batch.qualification.ancestorClosure"),
-            check(closure.summary.oldest == qualification.operationalTarget, "batch.qualification.ancestorClosure.oldest", "must equal the operational target"),
-            check(closure.summary.newest == qualification.qualifyingDescendant, "batch.qualification.ancestorClosure.newest", "must equal the qualifying descendant"),
-            check(qualification.operationalTarget != qualification.qualifyingDescendant, "batch.qualification.ancestorClosure", "must not redundantly encode a direct qualification")
+            check(
+              closure.summary.oldest == qualification.operationalTarget,
+              "batch.qualification.ancestorClosure.oldest",
+              "must equal the operational target"
+            ),
+            check(
+              closure.summary.newest == qualification.qualifyingDescendant,
+              "batch.qualification.ancestorClosure.newest",
+              "must equal the qualifying descendant"
+            ),
+            check(
+              qualification.operationalTarget != qualification.qualifyingDescendant,
+              "batch.qualification.ancestorClosure",
+              "must not redundantly encode a direct qualification"
+            )
           )
         )
     }
     val inheritedRollback = transition match {
-      case _: DensityRollbackToOperationalMrca if qualification.ancestorClosure.nonEmpty =>
+      case _: ForkChoiceRollbackToOperationalMrca if qualification.ancestorClosure.nonEmpty =>
         prior match {
           case None => invalid("batch.qualification", "inherited rollback qualification requires the prior released qualification")
           case Some(released) =>
             val previous = released.payload.qualification
             combine(
               List(
-                check(previous.scope.rail == qualification.scope.rail, "batch.qualification.rail", "inherited rollback must retain the original T_weight or k1 rail"),
-                check(previous.qualifyingDescendant == qualification.qualifyingDescendant, "batch.qualification.qualifyingDescendant", "inherited rollback must retain the original qualifying descendant"),
-                check(previous.evidence.artifact == qualification.evidence.artifact, "batch.qualification.evidence", "inherited rollback must retain the original rail evidence")
+                check(
+                  previous.scope.rail == qualification.scope.rail,
+                  "batch.qualification.rail",
+                  "inherited rollback must retain the original T_weight or k1 rail"
+                ),
+                check(
+                  previous.qualifyingDescendant == qualification.qualifyingDescendant,
+                  "batch.qualification.qualifyingDescendant",
+                  "inherited rollback must retain the original qualifying descendant"
+                ),
+                check(
+                  previous.evidence.artifact == qualification.evidence.artifact,
+                  "batch.qualification.evidence",
+                  "inherited rollback must retain the original rail evidence"
+                )
               )
             )
         }
@@ -708,19 +891,29 @@ object FinalityIntentValidator {
   private def validatePrepared(
     intentId: IntentId,
     prepared: PreparedCoreTarget,
-    prior: Option[ReleasedCore]
-  ): ValidationResult[Unit] = {
-    val expectedPriorPublication = prior.map(_.payload.receipt.activePublication)
-
+    currentPublication: MptActivePublication
+  ): ValidationResult[Unit] =
     combine(
       List(
         validateStateRef(prepared.target, "batch.prepared.target"),
         validateImageReceipt(prepared.preparedImage, prepared.target, "batch.prepared.preparedImage"),
         validatePublication(prepared.expectedBefore, "batch.prepared.expectedBefore"),
         validatePublication(prepared.targetPublication, "batch.prepared.targetPublication"),
-        check(next(prepared.expectedBefore.revision.value, prepared.targetPublication.revision.value), "batch.prepared.targetPublication.revision", "must be expectedBefore revision + 1"),
-        check(prepared.targetPublication.image.contains(prepared.preparedImage), "batch.prepared.targetPublication.image", "must select the exact prepared image"),
-        check(expectedPriorPublication.forall(_ == prepared.expectedBefore), "batch.prepared.expectedBefore", "must equal the prior released active publication"),
+        check(
+          next(prepared.expectedBefore.revision.value, prepared.targetPublication.revision.value),
+          "batch.prepared.targetPublication.revision",
+          "must be expectedBefore revision + 1"
+        ),
+        check(
+          prepared.targetPublication.image.contains(prepared.preparedImage),
+          "batch.prepared.targetPublication.image",
+          "must select the exact prepared image"
+        ),
+        check(
+          prepared.expectedBefore == currentPublication,
+          "batch.prepared.expectedBefore",
+          "must equal the coordinator's exact effective publication cursor"
+        ),
         validateScoped(prepared.semanticState, intentId, FinalityArtifactKind.PreparedSemanticState, "batch.prepared.semanticState"),
         validateScoped(
           prepared.authenticatedAnchor,
@@ -730,7 +923,6 @@ object FinalityIntentValidator {
         )
       )
     )
-  }
 
   private def validateEffectManifest(
     batch: FinalityCoreBatch,
@@ -748,13 +940,29 @@ object FinalityIntentValidator {
           check(command.scope == manifest.scope, s"effectManifest.$name.scope", "must equal the manifest scope"),
           check(command.kind == kind, s"effectManifest.$name.kind", s"must be $kind"),
           validateScoped(command.payload, batch.intentId, FinalityArtifactKind.EffectPayload, s"effectManifest.$name.payload"),
-          check(command.predecessor == priorCommand.map(_.effectId), s"effectManifest.$name.predecessor", "must name the immediately preceding command in this sink lane"),
+          check(
+            command.predecessor == priorCommand.map(_.effectId),
+            s"effectManifest.$name.predecessor",
+            "must name the immediately preceding command in this sink lane"
+          ),
           priorCommand.fold(validUnit) { prior =>
             combine(
               List(
-                check(command.expectedBefore == prior.desiredAfter, s"effectManifest.$name.expectedBefore", "must equal the preceding command desired state"),
-                check(command.expectedRevision == prior.desiredRevision, s"effectManifest.$name.expectedRevision", "must equal the preceding command desired revision"),
-                check(command.effectId != prior.effectId, s"effectManifest.$name.effectId", "canonical identity must not equal its predecessor")
+                check(
+                  command.expectedBefore == prior.desiredAfter,
+                  s"effectManifest.$name.expectedBefore",
+                  "must equal the preceding command desired state"
+                ),
+                check(
+                  command.expectedRevision == prior.desiredRevision,
+                  s"effectManifest.$name.expectedRevision",
+                  "must equal the preceding command desired revision"
+                ),
+                check(
+                  command.effectId != prior.effectId,
+                  s"effectManifest.$name.effectId",
+                  "canonical identity must not equal its predecessor"
+                )
               )
             )
           }
@@ -766,18 +974,42 @@ object FinalityIntentValidator {
       case (Some(released), Some(resolved)) =>
         combine(
           List(
-            check(resolved.pointer == released.payload.effectManifest, "effectManifest.previous", "resolved prior manifest must equal the prior released pointer"),
+            check(
+              resolved.pointer == released.payload.effectManifest,
+              "effectManifest.previous",
+              "resolved prior manifest must equal the prior released pointer"
+            ),
             checkVerified(
               FinalityIdentity.verifyEffectManifestPointer(resolved.pointer, resolved.manifest),
               "effectManifest.previous",
               "resolved prior manifest pointer must be canonically derived from its exact payload"
             ),
             validateCompletedManifestShape(resolved.manifest, "effectManifest.previous"),
-            check(resolved.manifest.scope.domain == batch.scope.domain, "effectManifest.previous.scope.domain", "must equal the current finality domain"),
-            check(resolved.manifest.scope.intent == released.pointer.intentId, "effectManifest.previous.scope.intent", "must equal the authenticated prior release intent"),
-            check(resolved.manifest.scope.target == released.pointer.target, "effectManifest.previous.scope.target", "must equal the authenticated prior release target"),
-            check(resolved.manifest.scope.generation == released.pointer.generation, "effectManifest.previous.scope.generation", "must equal the authenticated prior release generation"),
-            check(resolved.manifest.scope.generation == resolved.pointer.generation, "effectManifest.previous.generation", "resolved prior manifest generation must equal its pointer")
+            check(
+              resolved.manifest.scope.domain == batch.scope.domain,
+              "effectManifest.previous.scope.domain",
+              "must equal the current finality domain"
+            ),
+            check(
+              resolved.manifest.scope.intent == released.pointer.intentId,
+              "effectManifest.previous.scope.intent",
+              "must equal the authenticated prior release intent"
+            ),
+            check(
+              resolved.manifest.scope.target == released.pointer.target,
+              "effectManifest.previous.scope.target",
+              "must equal the authenticated prior release target"
+            ),
+            check(
+              resolved.manifest.scope.generation == released.pointer.generation,
+              "effectManifest.previous.scope.generation",
+              "must equal the authenticated prior release generation"
+            ),
+            check(
+              resolved.manifest.scope.generation == resolved.pointer.generation,
+              "effectManifest.previous.generation",
+              "resolved prior manifest generation must equal its pointer"
+            )
           )
         )
       case _ => invalid("effectManifest.previous", "prior release and resolved previous manifest must either both exist or both be absent")
@@ -792,11 +1024,19 @@ object FinalityIntentValidator {
           "batch.effectManifest",
           "must equal the canonical pointer derived from the exact 18-command manifest"
         ),
-        check(batch.effectManifest.generation == batch.scope.generation, "batch.effectManifest.generation", "must equal the release generation"),
+        check(
+          batch.effectManifest.generation == batch.scope.generation,
+          "batch.effectManifest.generation",
+          "must equal the release generation"
+        ),
         check(manifest.scope.intent == batch.intentId, "effectManifest.scope.intent", "must equal the batch intent"),
         check(manifest.scope.domain == batch.scope.domain, "effectManifest.scope.domain", "must equal the batch finality domain"),
         check(manifest.scope.generation == batch.scope.generation, "effectManifest.scope.generation", "must equal the release generation"),
-        check(manifest.scope.priorState == context.priorReleased.map(_.pointer.target), "effectManifest.scope.priorState", "must equal the exact prior released target"),
+        check(
+          manifest.scope.priorState == context.priorReleased.map(_.pointer.target),
+          "effectManifest.scope.priorState",
+          "must equal the exact prior released target"
+        ),
         checkDerived(
           FinalityIdentity.transitionDigest(batch.transition.shape),
           manifest.scope.transitionDigest,
@@ -806,7 +1046,11 @@ object FinalityIntentValidator {
         check(manifest.scope.target == batch.scope.target, "effectManifest.scope.target", "must equal the release target"),
         check(manifest.previous == priorPointer, "effectManifest.previous", "must equal the prior released effect manifest"),
         check(manifest.commitment == batch.scope.effects, "effectManifest", "must equal the exact plan committed by IntentScope"),
-        check(commands.map(_._3.effectId).distinct.size == commands.size, "effectManifest.effectIds", "all 18 canonically derived effect ids must be unique"),
+        check(
+          commands.map(_._3.effectId).distinct.size == commands.size,
+          "effectManifest.effectIds",
+          "all 18 canonically derived effect ids must be unique"
+        ),
         priorManifestChecks
       ) ++ laneChecks
     )
@@ -841,7 +1085,12 @@ object FinalityIntentValidator {
     val common = List(
       validateArtifact(active.batch.artifact, FinalityArtifactKind.CoreBatch, "head.active.batch.artifact"),
       validateHash(active.batch.intentId.value, "head.active.batch.intentId", rejectZero = true),
-      checkDerived(FinalityIdentity.intentId(scope), active.batch.intentId, "head.active.batch.intentId", "must equal IntentId(active.scope)"),
+      checkDerived(
+        FinalityIdentity.intentId(scope),
+        active.batch.intentId,
+        "head.active.batch.intentId",
+        "must equal IntentId(active.scope)"
+      ),
       check(active.batch.generation == scope.generation, "head.active.batch.generation", "must equal scope.generation"),
       check(active.batch.attempt == scope.attempt, "head.active.batch.attempt", "must equal scope.attempt")
     )
@@ -850,26 +1099,98 @@ object FinalityIntentValidator {
       case CoreStage.Prepared => validUnit
       case CoreStage.CoreApplied(receipt) =>
         validateStageReceipt(active.batch.intentId, scope, receipt, "head.active.stage.receipt")
-      case CoreStage.RestoringPrior(cause) => validateOrphanCause(active.batch.intentId, scope.selection, cause)
+      case CoreStage.RestoringPrior(cause, publication) =>
+        combine(
+          List(
+            validateOrphanClaim(active.batch.intentId, scope.selection, cause),
+            validatePublicationRestoration(scope, publication, "head.active.stage.restoration.publication")
+          )
+        )
       case CoreStage.RestoredAbandoned(cause, receipt) =>
         combine(
           List(
-            validateOrphanCause(active.batch.intentId, scope.selection, cause),
+            validateOrphanClaim(active.batch.intentId, scope.selection, cause),
             check(receipt.intentId == active.batch.intentId, "head.active.stage.restoration.intentId", "must equal the active intent"),
-            check(
-              receipt.beforeRestoration == scope.prepared.targetPublication || receipt.beforeRestoration == scope.prepared.expectedBefore,
-              "head.active.stage.restoration.beforeRestoration",
-              "must read either the applied target or the already-restored expected prior after crash uncertainty"
+            validatePublicationRestoration(scope, receipt.publication, "head.active.stage.restoration.publication"),
+            validateScoped(
+              receipt.semanticReceipt,
+              active.batch.intentId,
+              FinalityArtifactKind.PriorSemanticStateReceipt,
+              "head.active.stage.restoration.semanticReceipt"
             ),
-            check(receipt.restoredPublication == scope.prepared.expectedBefore, "head.active.stage.restoration.restoredPublication", "must equal the exact prior publication"),
-            validateScoped(receipt.semanticReceipt, active.batch.intentId, FinalityArtifactKind.PriorSemanticStateReceipt, "head.active.stage.restoration.semanticReceipt"),
-            validateScoped(receipt.authenticatedAnchorReceipt, active.batch.intentId, FinalityArtifactKind.PriorAnchorReceipt, "head.active.stage.restoration.authenticatedAnchorReceipt")
+            validateScoped(
+              receipt.authenticatedAnchorReceipt,
+              active.batch.intentId,
+              FinalityArtifactKind.PriorAnchorReceipt,
+              "head.active.stage.restoration.authenticatedAnchorReceipt"
+            )
           )
         )
     }
 
     combine(common :+ stage)
   }
+
+  private def validatePublicationRestoration(
+    scope: IntentScope,
+    publication: PublicationRestoration,
+    path: String
+  ): ValidationResult[Unit] =
+    publication match {
+      case PublicationRestoration.PriorUnchanged(prior) =>
+        combine(
+          List(
+            validatePublication(prior, s"$path.prior"),
+            check(
+              prior == scope.prepared.expectedBefore,
+              s"$path.prior",
+              "must equal the exact CAS prior when the target was never applied"
+            )
+          )
+        )
+      case PublicationRestoration.AppliedTargetReverted(transitionFrom, restored) =>
+        combine(
+          List(
+            validatePublication(transitionFrom, s"$path.transitionFrom"),
+            validatePublication(restored, s"$path.restored"),
+            check(
+              transitionFrom == scope.prepared.targetPublication,
+              s"$path.transitionFrom",
+              "must equal the exact applied target publication"
+            ),
+            check(
+              next(transitionFrom.revision.value, restored.revision.value),
+              s"$path.restored.revision",
+              "must advance exactly one revision without rewinding"
+            ),
+            check(
+              restored.image == scope.prepared.expectedBefore.image,
+              s"$path.restored.image",
+              "must restore the exact prior image at the new revision"
+            )
+          )
+        )
+    }
+
+  private def restorationStartPublication(publication: PublicationRestoration): MptActivePublication =
+    publication match {
+      case PublicationRestoration.PriorUnchanged(prior)                    => prior
+      case PublicationRestoration.AppliedTargetReverted(transitionFrom, _) => transitionFrom
+    }
+
+  private def restorationResultPublication(publication: PublicationRestoration): MptActivePublication =
+    publication match {
+      case PublicationRestoration.PriorUnchanged(prior)           => prior
+      case PublicationRestoration.AppliedTargetReverted(_, prior) => prior
+    }
+
+  private def stagePublication(active: ActiveCoreIntent): MptActivePublication =
+    active.stage match {
+      case CoreStage.Prepared                       => active.scope.prepared.expectedBefore
+      case CoreStage.CoreApplied(receipt)           => receipt.activePublication
+      case CoreStage.RestoringPrior(_, publication) => restorationStartPublication(publication)
+      case CoreStage.RestoredAbandoned(_, receipt)  => restorationResultPublication(receipt.publication)
+    }
 
   private def validateStageReceipt(
     intentId: IntentId,
@@ -883,29 +1204,72 @@ object FinalityIntentValidator {
         check(receipt.generation == scope.generation, s"$path.generation", "must equal scope.generation"),
         check(receipt.target == scope.target, s"$path.target", "must equal scope.target"),
         check(receipt.beforePublication == scope.prepared.expectedBefore, s"$path.beforePublication", "must equal the prepared CAS prior"),
-        check(receipt.activePublication == scope.prepared.targetPublication, s"$path.activePublication", "must equal the prepared publication target"),
+        check(
+          receipt.activePublication == scope.prepared.targetPublication,
+          s"$path.activePublication",
+          "must equal the prepared publication target"
+        ),
         validateScoped(receipt.semanticReceipt, intentId, FinalityArtifactKind.AppliedSemanticStateReceipt, s"$path.semanticReceipt"),
-        validateScoped(receipt.authenticatedAnchorReceipt, intentId, FinalityArtifactKind.AuthenticatedAnchorReceipt, s"$path.authenticatedAnchorReceipt")
+        validateScoped(
+          receipt.authenticatedAnchorReceipt,
+          intentId,
+          FinalityArtifactKind.AuthenticatedAnchorReceipt,
+          s"$path.authenticatedAnchorReceipt"
+        )
       )
     )
 
-  private def validateOrphanCause(
+  private def validateOrphanClaim(
     intentId: IntentId,
     selection: CanonicalSelectionToken,
-    cause: ObjectiveOrphanCause
+    cause: ForkChoiceOrphanClaim
   ): ValidationResult[Unit] =
     combine(
       List(
-        check(cause.intentId == intentId, "head.active.stage.cause.intentId", "must equal the active intent"),
-        check(cause.supersededSelection == selection, "head.active.stage.cause.supersededSelection", "must equal the intent's captured selection"),
-        validateSelection(cause.supersededSelection, "head.active.stage.cause.supersededSelection"),
-        validateSelection(cause.replacementSelection, "head.active.stage.cause.replacementSelection"),
-        validateStateRef(cause.commonAncestor, "head.active.stage.cause.commonAncestor"),
-        validateScopedOneOf(
+        check(cause.intentId == intentId, "head.active.stage.claim.intentId", "must equal the active intent"),
+        check(
+          cause.supersededSelection == selection,
+          "head.active.stage.claim.supersededSelection",
+          "must equal the intent's captured selection"
+        ),
+        validateSelection(cause.supersededSelection, "head.active.stage.claim.supersededSelection"),
+        validateSelection(cause.replacementSelection, "head.active.stage.claim.replacementSelection"),
+        check(
+          cause.replacementSelection.branchRevision.value.value > cause.supersededSelection.branchRevision.value.value,
+          "head.active.stage.claim.replacementSelection.branchRevision",
+          "must be newer than the superseded selection revision"
+        ),
+        check(
+          cause.replacementSelection.selectedTip.hash != cause.supersededSelection.selectedTip.hash,
+          "head.active.stage.claim.replacementSelection.selectedTip",
+          "must select a different tip hash"
+        ),
+        check(
+          cause.replacementSelection.operationalTarget.hash != cause.supersededSelection.operationalTarget.hash,
+          "head.active.stage.claim.replacementSelection.operationalTarget",
+          "must not retain the superseded target as its operational target; full ancestry exclusion remains external"
+        ),
+        check(
+          cause.replacementSelection.decision.evidence != cause.supersededSelection.decision.evidence,
+          "head.active.stage.claim.replacementSelection.decision",
+          "must carry a different fork-choice decision commitment"
+        ),
+        validateStateRef(cause.commonAncestor, "head.active.stage.claim.commonAncestor"),
+        check(
+          cause.commonAncestor.ordinal.value.value < selection.operationalTarget.ordinal.value.value,
+          "head.active.stage.claim.commonAncestor",
+          "must be strictly before the unreleased target; full MRCA and target-exclusion proof remains external"
+        ),
+        validateScoped(
           cause.evidence,
           intentId,
-          Set(FinalityArtifactKind.CanonicalSelectionEvidence, FinalityArtifactKind.DensityDecisionEvidence),
-          "head.active.stage.cause.evidence"
+          FinalityArtifactKind.ForkChoiceDecisionEvidence,
+          "head.active.stage.claim.evidence"
+        ),
+        check(
+          cause.evidence.artifact == cause.replacementSelection.decision.evidence,
+          "head.active.stage.claim.evidence",
+          "must equal the replacement selection's exact fork-choice evidence pointer"
         )
       )
     )
@@ -936,16 +1300,30 @@ object FinalityIntentValidator {
           case Running =>
             combine(
               List(
-                check(audit.mutation != CoordinatorMutationKind.RecoveryEntered, "audit.mutation", "must describe an ordinary running transition"),
+                check(
+                  audit.mutation != CoordinatorMutationKind.RecoveryEntered,
+                  "audit.mutation",
+                  "must describe an ordinary running transition"
+                ),
                 check(recoveryRecord.isEmpty, "recoveryRecord", "an ordinary running transition cannot append a recovery record")
               )
             )
           case required: RecoveryRequired =>
             combine(
               List(
-                check(audit.mutation == CoordinatorMutationKind.RecoveryEntered, "audit.mutation", "entering RecoveryRequired must use RecoveryEntered"),
-                check(sameCoreState(before, after), "head.mode", "entering recovery must freeze lastAttempt, released, active, and effects"),
-                recoveryRecord.fold[ValidationResult[Unit]](invalid("recoveryRecord", "entering RecoveryRequired requires the exact immutable recovery record"))(
+                check(
+                  audit.mutation == CoordinatorMutationKind.RecoveryEntered,
+                  "audit.mutation",
+                  "entering RecoveryRequired must use RecoveryEntered"
+                ),
+                check(
+                  sameCoreState(before, after),
+                  "head.mode",
+                  "entering recovery must freeze lastAttempt, released, active, publication, and effects"
+                ),
+                recoveryRecord.fold[ValidationResult[Unit]](
+                  invalid("recoveryRecord", "entering RecoveryRequired requires the exact immutable recovery record")
+                )(
                   validateRecoveryRecord(before, after, required, _)
                 )
               )
@@ -976,6 +1354,7 @@ object FinalityIntentValidator {
         check(record.lastAttempt == before.lastAttempt, "recoveryRecord.lastAttempt", "must preserve the frozen prior head value"),
         check(record.released == before.released, "recoveryRecord.released", "must preserve the frozen prior head value"),
         check(record.active == before.active, "recoveryRecord.active", "must preserve the frozen prior head value"),
+        check(record.publication == before.publication, "recoveryRecord.publication", "must preserve the frozen prior head value"),
         check(record.effects == before.effects, "recoveryRecord.effects", "must preserve the frozen prior head value"),
         check(record.priorAudit == before.auditTail, "recoveryRecord.priorAudit", "must equal the prior head audit tail"),
         validateRecoveryReason(record.reason)
@@ -997,7 +1376,11 @@ object FinalityIntentValidator {
           List(
             validateCoreBatchPointer(batch, "recoveryRecord.reason.batch"),
             validateHash(observedDigest, "recoveryRecord.reason.observedDigest", rejectZero = true),
-            check(observedDigest != batch.artifact.digest.value, "recoveryRecord.reason.observedDigest", "corrupt evidence must differ from the committed digest")
+            check(
+              observedDigest != batch.artifact.digest.value,
+              "recoveryRecord.reason.observedDigest",
+              "corrupt evidence must differ from the committed digest"
+            )
           )
         )
       case RecoveryReason.CoreConflict(expected, actual) =>
@@ -1017,7 +1400,11 @@ object FinalityIntentValidator {
           List(
             validateEffectManifestPointer(manifest, "recoveryRecord.reason.manifest"),
             validateHash(observedDigest, "recoveryRecord.reason.observedDigest", rejectZero = true),
-            check(observedDigest != manifest.digest.value, "recoveryRecord.reason.observedDigest", "corrupt evidence must differ from the committed digest")
+            check(
+              observedDigest != manifest.digest.value,
+              "recoveryRecord.reason.observedDigest",
+              "corrupt evidence must differ from the committed digest"
+            )
           )
         )
       case RecoveryReason.EffectConflict(_, expected, actual) =>
@@ -1061,29 +1448,77 @@ object FinalityIntentValidator {
             combine(
               List(
                 check(active.stage == CoreStage.Prepared, "head.active.stage", "a newly prepared intent must start at Prepared"),
+                check(
+                  after.publication == before.publication,
+                  "head.publication",
+                  "preparation must CAS the current effective publication cursor"
+                ),
                 check(after.released == before.released, "head.released", "preparation cannot change released core"),
                 check(after.effects == before.effects, "head.effects", "preparation cannot change effects index"),
                 check(after.lastAttempt.contains(active.scope.attempt), "head.lastAttempt", "must equal the new attempt"),
-                check(before.lastAttempt.forall(old => old.value.value < active.scope.attempt.value.value), "head.lastAttempt", "attempts must increase monotonically")
+                check(
+                  before.lastAttempt.forall(old => old.value.value < active.scope.attempt.value.value),
+                  "head.lastAttempt",
+                  "attempts must increase monotonically"
+                )
               )
             )
           case _ => invalid("head.active", "Prepared must install exactly one new active intent")
         }
-      case CoordinatorMutationKind.CoreApplied | CoordinatorMutationKind.RestorationStarted |
-          CoordinatorMutationKind.RestoredAbandoned =>
+      case CoordinatorMutationKind.CoreApplied | CoordinatorMutationKind.RestorationStarted | CoordinatorMutationKind.RestoredAbandoned =>
         (before.active, after.active) match {
           case (Some(old), Some(current)) =>
             val expectedKind = (old.stage, current.stage) match {
               case (_, _: CoreStage.CoreApplied)       => CoordinatorMutationKind.CoreApplied
               case (_, _: CoreStage.RestoringPrior)    => CoordinatorMutationKind.RestorationStarted
               case (_, _: CoreStage.RestoredAbandoned) => CoordinatorMutationKind.RestoredAbandoned
-              case _                                             => mutation
+              case _                                   => mutation
+            }
+            val restorationBinding = (old.stage, current.stage) match {
+              case (_: CoreStage.CoreApplied, CoreStage.RestoringPrior(_, _: PublicationRestoration.PriorUnchanged)) =>
+                invalid(
+                  "head.active.stage.restoration.publication",
+                  "restoration after CoreApplied must revert the exact applied target"
+                )
+              case (
+                    CoreStage.CoreApplied(receipt),
+                    CoreStage.RestoringPrior(_, PublicationRestoration.AppliedTargetReverted(transitionFrom, _))
+                  ) =>
+                check(
+                  transitionFrom == receipt.activePublication,
+                  "head.active.stage.restoration.publication.transitionFrom",
+                  "must equal the publication proven active by CoreApplied"
+                )
+              case (
+                    CoreStage.RestoringPrior(cause, publication),
+                    CoreStage.RestoredAbandoned(restoredCause, receipt)
+                  ) =>
+                combine(
+                  List(
+                    check(
+                      restoredCause == cause,
+                      "head.active.stage.claim",
+                      "must equal the exact claim that authorized restoration"
+                    ),
+                    check(
+                      receipt.publication == publication,
+                      "head.active.stage.restoration.publication",
+                      "must equal the exact restoration plan carried by RestoringPrior"
+                    )
+                  )
+                )
+              case _ => validUnit
             }
             combine(
               List(
-                check(old.batch == current.batch && old.scope == current.scope, "head.active", "stage advancement cannot replace the active intent"),
+                check(
+                  old.batch == current.batch && old.scope == current.scope,
+                  "head.active",
+                  "stage advancement cannot replace the active intent"
+                ),
                 check(CoreStage.canAdvance(old.stage, current.stage), "head.active.stage", "must follow the legal core-stage graph"),
                 check(mutation == expectedKind, "audit.mutation", "must name the exact stage transition"),
+                restorationBinding,
                 check(after.released == before.released, "head.released", "stage advancement cannot release state"),
                 check(after.effects == before.effects, "head.effects", "stage advancement cannot enqueue effects"),
                 check(after.lastAttempt == before.lastAttempt, "head.lastAttempt", "stage advancement cannot change attempt")
@@ -1094,16 +1529,21 @@ object FinalityIntentValidator {
       case CoordinatorMutationKind.AbandonedRetired =>
         combine(
           List(
-            check(before.active.exists(_.stage.isInstanceOf[CoreStage.RestoredAbandoned]), "head.active", "only RestoredAbandoned may be retired"),
+            check(
+              before.active.exists(_.stage.isInstanceOf[CoreStage.RestoredAbandoned]),
+              "head.active",
+              "only RestoredAbandoned may be retired"
+            ),
             check(after.active.isEmpty, "head.active", "retirement must clear the abandoned intent"),
+            check(after.publication == before.publication, "head.publication", "retirement must preserve the effective publication cursor"),
             check(after.released == before.released, "head.released", "retirement cannot change released state"),
             check(after.effects == before.effects, "head.effects", "retirement cannot change effects"),
             check(after.lastAttempt == before.lastAttempt, "head.lastAttempt", "retirement cannot change attempt")
           )
         )
-      case CoordinatorMutationKind.Released => validateReleaseMutation(before, after)
+      case CoordinatorMutationKind.Released        => validateReleaseMutation(before, after)
       case CoordinatorMutationKind.RecoveryEntered => validUnit
-      case CoordinatorMutationKind.Initialized => invalid("audit.mutation", "Initialized is valid only without a prior head")
+      case CoordinatorMutationKind.Initialized     => invalid("audit.mutation", "Initialized is valid only without a prior head")
     }
 
   private def validateReleaseMutation(before: CoordinatorHead, after: CoordinatorHead): ValidationResult[Unit] =
@@ -1111,28 +1551,49 @@ object FinalityIntentValidator {
       case (Some(active), Some(released)) =>
         val stageReceipt = active.stage match {
           case CoreStage.CoreApplied(receipt) => Some(receipt)
-          case _                    => None
+          case _                              => None
         }
         combine(
           List(
             check(stageReceipt.nonEmpty, "head.active.stage", "release is legal only from CoreApplied"),
             check(after.active.isEmpty, "head.active", "release must clear the active intent"),
             check(released.pointer.intentId == active.batch.intentId, "head.released.pointer.intentId", "must equal the active intent"),
-            check(released.pointer.generation == active.scope.generation, "head.released.pointer.generation", "must equal the active generation"),
+            check(
+              released.pointer.generation == active.scope.generation,
+              "head.released.pointer.generation",
+              "must equal the active generation"
+            ),
             check(released.pointer.target == active.scope.target, "head.released.pointer.target", "must equal the active target"),
             validateScoped(released.record, active.batch.intentId, FinalityArtifactKind.ReleasedCoreRecord, "head.released.record"),
             check(released.record.artifact == released.pointer.record, "head.released.record", "must wrap the released record pointer"),
-            check(released.payload.qualification.scope == active.scope.qualification, "head.released.payload.qualification", "must equal the active qualification commitment"),
-            check(released.payload.qualification.operationalTarget == active.scope.target, "head.released.payload.qualification.operationalTarget", "must equal the active target"),
+            check(
+              released.payload.qualification.scope == active.scope.qualification,
+              "head.released.payload.qualification",
+              "must equal the active qualification commitment"
+            ),
+            check(
+              released.payload.qualification.operationalTarget == active.scope.target,
+              "head.released.payload.qualification.operationalTarget",
+              "must equal the active target"
+            ),
             check(stageReceipt.contains(released.payload.receipt), "head.released.payload.receipt", "must equal the CoreApplied receipt"),
             check(
               released.payload.effectManifest.generation == active.scope.generation,
               "head.released.payload.effectManifest.generation",
               "must equal the active generation"
             ),
-            check(after.effects == EffectsIndex(released.payload.effectManifest.some, active.scope.generation.some), "head.effects", "must atomically enqueue the exact released effect manifest"),
+            check(
+              after.effects == EffectsIndex(released.payload.effectManifest.some, active.scope.generation.some),
+              "head.effects",
+              "must atomically enqueue the exact released effect manifest"
+            ),
+            check(after.publication == before.publication, "head.publication", "release must preserve the CoreApplied publication cursor"),
             check(after.lastAttempt == before.lastAttempt, "head.lastAttempt", "release cannot change attempt"),
-            check(active.scope.expectedPrior == before.released.map(_.pointer), "head.active.scope.expectedPrior", "must CAS the exact prior release")
+            check(
+              active.scope.expectedPrior == before.released.map(_.pointer),
+              "head.active.scope.expectedPrior",
+              "must CAS the exact prior release"
+            )
           )
         )
       case _ => invalid("head.released", "Released must replace CoreApplied with one exact released core")
@@ -1141,8 +1602,16 @@ object FinalityIntentValidator {
   private def validateEffectsIndex(index: EffectsIndex, path: String): ValidationResult[Unit] =
     combine(
       List(
-        check(index.tail.isDefined == index.highGeneration.isDefined, path, "tail and highGeneration must both be present or both be absent"),
-        check(index.tail.forall(tail => index.highGeneration.contains(tail.generation)), s"$path.tail", "tail generation must equal highGeneration"),
+        check(
+          index.tail.isDefined == index.highGeneration.isDefined,
+          path,
+          "tail and highGeneration must both be present or both be absent"
+        ),
+        check(
+          index.tail.forall(tail => index.highGeneration.contains(tail.generation)),
+          s"$path.tail",
+          "tail generation must equal highGeneration"
+        ),
         index.tail.fold(validUnit)(pointer => validateEffectManifestPointer(pointer, s"$path.tail"))
       )
     )
@@ -1186,7 +1655,11 @@ object FinalityIntentValidator {
   ): ValidationResult[Unit] =
     combine(
       List(
-        check(next(ancestor.ordinal.value.value, summary.oldest.ordinal.value.value), s"$path.oldest.ordinal", "must immediately follow the common/prior ancestor"),
+        check(
+          next(ancestor.ordinal.value.value, summary.oldest.ordinal.value.value),
+          s"$path.oldest.ordinal",
+          "must immediately follow the common/prior ancestor"
+        ),
         check(summary.oldest.parentHash == ancestor.hash, s"$path.oldest.parentHash", "must equal the common/prior ancestor hash")
       )
     )
@@ -1205,7 +1678,11 @@ object FinalityIntentValidator {
   private def validateImageReceipt(receipt: MptImageReceipt, target: GlobalSnapshotStateRef, path: String): ValidationResult[Unit] =
     combine(
       List(
-        check(receipt.formatVersion == DurableMptImageStore.CurrentFormatVersion, s"$path.formatVersion", "must use the active durable image format"),
+        check(
+          receipt.formatVersion == DurableMptImageStore.CurrentFormatVersion,
+          s"$path.formatVersion",
+          "must use the active durable image format"
+        ),
         check(receipt.generation >= 0L, s"$path.generation", "must be non-negative"),
         check(receipt.entryCount >= 0, s"$path.entryCount", "must be non-negative"),
         check(receipt.anchor == target, s"$path.anchor", "must equal the exact release target"),
@@ -1246,20 +1723,6 @@ object FinalityIntentValidator {
       )
     )
 
-  private def validateScopedOneOf(
-    ref: ScopedArtifactRef,
-    intentId: IntentId,
-    kinds: Set[FinalityArtifactKind],
-    path: String
-  ): ValidationResult[Unit] =
-    combine(
-      List(
-        check(ref.intentId == intentId, s"$path.intentId", "must equal the containing intent"),
-        check(kinds.contains(ref.artifact.kind), s"$path.artifact.kind", s"must be one of ${kinds.mkString(", ")}"),
-        validateArtifactShape(ref.artifact, s"$path.artifact")
-      )
-    )
-
   private def validateArtifact(pointer: ImmutableArtifactPointer, kind: FinalityArtifactKind, path: String): ValidationResult[Unit] =
     combine(
       List(
@@ -1287,7 +1750,9 @@ object FinalityIntentValidator {
     )
 
   private def validateHash(hash: Hash, path: String, rejectZero: Boolean): ValidationResult[Unit] = {
-    val canonical = hash.value.length == 64 && hash.value.forall(character => character >= '0' && character <= '9' || character >= 'a' && character <= 'f')
+    val canonical = hash.value.length == 64 && hash.value.forall(character =>
+      character >= '0' && character <= '9' || character >= 'a' && character <= 'f'
+    )
     combine(
       List(
         check(canonical, path, "must be canonical 32-byte lowercase hexadecimal"),
@@ -1331,7 +1796,8 @@ object FinalityIntentValidator {
   }
 
   private def sameCoreState(left: CoordinatorHead, right: CoordinatorHead): Boolean =
-    left.lastAttempt == right.lastAttempt && left.released == right.released && left.active == right.active && left.effects == right.effects
+    left.lastAttempt == right.lastAttempt && left.released == right.released && left.active == right.active &&
+      left.publication == right.publication && left.effects == right.effects
 
   private def next(before: Long, after: Long): Boolean =
     BigInt(after) == BigInt(before) + 1

@@ -248,9 +248,17 @@ final case class ObserveExecutedCandidate(candidate: AuthenticatedExecutedSnapsh
 final case class SubmitOptimisticEvidence(evidence: OptimisticEvidence)
     extends FinalityCommand
 final case class SubmitDepthEvidence(evidence: DepthEvidence) extends FinalityCommand
-final case class SubmitDensityDecision(decision: VerifiedDensityDecision)
+final case class SubmitForkChoiceDecision(decision: VerifiedForkChoiceDecision)
     extends FinalityCommand
 ```
+
+`VerifiedForkChoiceDecision` is a required capability, not a currently available
+implementation type. O-15 must close its cutoff/bounded-diffusion and late-reveal
+semantics, cycle-resolution selector, exact `k1` metric/equality, objective tie,
+portable evidence/verifier, validator/store witnesses, and security/liveness proof
+before this command can exist in the live kernel. It covers initial selection,
+canonical extension, and shallow/deep replacement; a density-only command is
+insufficient.
 
 The pure transition kernel owns canonical tip, the Phase-2 boundary, branch
 evidence, orphan status, and retention metadata. The coordinator commits the

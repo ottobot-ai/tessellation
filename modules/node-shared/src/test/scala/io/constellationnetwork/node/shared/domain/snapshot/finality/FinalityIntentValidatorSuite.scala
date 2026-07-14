@@ -1,13 +1,10 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality
 
-import scala.util.Try
-
 import cats.data.NonEmptyList
 
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{
-  pathChunkPayloadCodec,
-  pathManifestPayloadCodec
-}
+import scala.util.Try
+
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{pathChunkPayloadCodec, pathManifestPayloadCodec}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
@@ -153,21 +150,24 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
   private def buildCore(
     selectedEntries: List[GlobalSnapshotStateRef],
     qualificationEntries: Option[List[GlobalSnapshotStateRef]] = None,
-    previous: Option[(ReleasedCore, CoreFixture)] = None
+    previous: Option[(ReleasedCore, CoreFixture)] = None,
+    currentPublication: Option[MptActivePublication] = None,
+    attemptNumber: Long = 0L
   ): CoreFixture = {
     val target = selectedEntries.head
     val selectedTip = selectedEntries.last
     val lineage = path(PathRole.CanonicalLineage, selectedEntries)
     val adopted = path(PathRole.Adopted, List(target))
     val closure = qualificationEntries.map(path(PathRole.OperationalAncestorClosure, _))
-    val selectionEvidence = artifact(FinalityArtifactKind.CanonicalSelectionEvidence, s"selection-${selectedTip.hash.value}")
+    val selectionEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, s"selection-${selectedTip.hash.value}")
+    val selectionDecision = ForkChoiceDecision(selectionEvidence)
     val qualificationEvidence = artifact(FinalityArtifactKind.DecidedAttestationEvidence, s"qualification-${target.hash.value}")
     val semanticState = artifact(FinalityArtifactKind.PreparedSemanticState, s"semantic-${target.hash.value}")
     val authenticatedAnchor = artifact(FinalityArtifactKind.AuthenticatedTargetAnchor, s"anchor-${target.hash.value}")
     val placeholder = IntentId(hash("placeholder-intent"))
     val domain = FinalityDomain(hash("network"), hash("genesis"), hash("protocol-era"))
     val generation = ReleaseGeneration(nonNeg(previous.fold(0L)(_._1.pointer.generation.value.value + 1L)))
-    val attempt = IntentAttempt(nonNeg(0L))
+    val attempt = IntentAttempt(nonNeg(attemptNumber))
     val transitionShape = TransitionShape.Advance(adopted.commitment)
     val transitionDigest = FinalityIdentity.transitionDigest(transitionShape).fold(throw _, identity)
     val previousManifestPointer = previous.map(_._1.payload.effectManifest)
@@ -190,7 +190,9 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
         )
         draft.copy(effectId = FinalityIdentity.effectId(draft.identityPreimage).fold(throw _, identity))
     }
-    val expectedPublication = previous.fold(MptActivePublication(MptPublicationRevision(0L), None))(_._1.payload.receipt.activePublication)
+    val expectedPublication = currentPublication.getOrElse(
+      previous.fold(MptActivePublication(MptPublicationRevision(0L), None))(_._1.payload.receipt.activePublication)
+    )
     val image = MptImageReceipt(
       DurableMptImageStore.CurrentFormatVersion,
       generation.value.value,
@@ -214,7 +216,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       CanonicalBranchRevision(nonNeg(0L)),
       selectedTip,
       target,
-      selectionEvidence,
+      selectionDecision,
       lineage.commitment
     )
     val qualifyingDescendant = qualificationEntries.fold(target)(_.last)
@@ -239,7 +241,8 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
     val intentId = FinalityIdentity.intentId(scope).fold(throw _, identity)
     val effectScope = provisionalEffectScope.copy(intent = intentId)
-    val commands = provisionalCommands.map(command => command.copy(scope = effectScope, payload = command.payload.copy(intentId = intentId)))
+    val commands =
+      provisionalCommands.map(command => command.copy(scope = effectScope, payload = command.payload.copy(intentId = intentId)))
     val exactManifest = manifest(effectScope, previousManifestPointer, commands)
     val manifestPointer = FinalityIdentity.effectManifestPointer(exactManifest).fold(throw _, identity)
     val adoptedRef = PathManifestRef(adopted.commitment, ScopedArtifactRef(intentId, adopted.commitment.manifest))
@@ -270,7 +273,10 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val paths = List(resolve(intentId, lineage), resolve(intentId, adopted)) ++ closure.toList.map(resolve(intentId, _))
     val context = CoreValidationContext(
       previous.map(_._1),
-      previous.map { case (priorReleased, priorFixture) => PreviousEffectManifest(priorReleased.payload.effectManifest, priorFixture.manifest) }
+      previous.map {
+        case (priorReleased, priorFixture) => PreviousEffectManifest(priorReleased.payload.effectManifest, priorFixture.manifest)
+      },
+      expectedPublication
     )
     CoreFixture(batch, exactManifest, paths, commands, context)
   }
@@ -300,6 +306,85 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
   }
 
+  private def restoredHead(
+    fixture: CoreFixture,
+    publication: PublicationRestoration
+  ): CoordinatorHead = {
+    val batch = fixture.batch
+    val cause = restorationCause(fixture)
+    val receipt = restorationReceipt(fixture, publication)
+    val active = ActiveCoreIntent(
+      activeBatchPointer(fixture, "restored-core-batch"),
+      batch.scope,
+      CoreStage.RestoredAbandoned(cause, receipt)
+    )
+    val activePublication = publication match {
+      case PublicationRestoration.PriorUnchanged(prior)           => prior
+      case PublicationRestoration.AppliedTargetReverted(_, prior) => prior
+    }
+
+    CoordinatorHead(
+      HeadRevision(nonNeg(0L)),
+      Some(batch.scope.attempt),
+      CoordinatorMode.Running,
+      None,
+      Some(active),
+      activePublication,
+      EffectsIndex(None, None),
+      None
+    )
+  }
+
+  private def restorationCause(fixture: CoreFixture): ForkChoiceOrphanClaim = {
+    val batch = fixture.batch
+    val target = batch.scope.selection.operationalTarget
+    val commonAncestor = GlobalSnapshotStateRef(
+      SnapshotOrdinal.unsafeApply(target.ordinal.value.value - 1L),
+      target.parentHash,
+      hash("restoration-common-ancestor-parent"),
+      MptRoot(hash("restoration-common-ancestor-root"))
+    )
+    val replacementTip = state(target.ordinal.value.value, "restoration-replacement-tip", commonAncestor.hash)
+    val replacementLineage = path(
+      PathRole.CanonicalLineage,
+      List(commonAncestor, replacementTip)
+    )
+    val replacementEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, "restoration-cause")
+    val replacementSelection = batch.scope.selection.copy(
+      branchRevision = CanonicalBranchRevision(nonNeg(batch.scope.selection.branchRevision.value.value + 1L)),
+      selectedTip = replacementTip,
+      operationalTarget = commonAncestor,
+      decision = ForkChoiceDecision(replacementEvidence),
+      lineage = replacementLineage.commitment
+    )
+    ForkChoiceOrphanClaim(
+      batch.intentId,
+      batch.scope.selection,
+      replacementSelection,
+      commonAncestor,
+      ScopedArtifactRef(batch.intentId, replacementEvidence)
+    )
+  }
+
+  private def restorationReceipt(
+    fixture: CoreFixture,
+    publication: PublicationRestoration
+  ): PriorCoreRestorationReceipt =
+    PriorCoreRestorationReceipt(
+      fixture.batch.intentId,
+      publication,
+      ScopedArtifactRef(fixture.batch.intentId, artifact(FinalityArtifactKind.PriorSemanticStateReceipt, "restored-semantic")),
+      ScopedArtifactRef(fixture.batch.intentId, artifact(FinalityArtifactKind.PriorAnchorReceipt, "restored-anchor"))
+    )
+
+  private def activeBatchPointer(fixture: CoreFixture, seed: String): FinalityCoreBatchPointer =
+    FinalityCoreBatchPointer(
+      fixture.batch.intentId,
+      fixture.batch.scope.attempt,
+      fixture.batch.scope.generation,
+      artifact(FinalityArtifactKind.CoreBatch, seed)
+    )
+
   pureTest("core validation requires the exact complete resolved path multiset") {
     val target = state(10L, "path-target", hash("path-parent"))
     val fixture = buildCore(List(target))
@@ -314,6 +399,252 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       violations(omitted).exists(_.path == "batch.resolvedPaths"),
       violations(duplicated).exists(_.path == "batch.resolvedPaths"),
       violations(substituted).exists(_.path == "batch.resolvedPaths")
+    )
+  }
+
+  pureTest("Advance binds the exact scoped fork-choice evidence commitment") {
+    val initial = buildCore(List(state(11L, "initial-decision-target", hash("initial-decision-parent"))))
+    val priorReleased = released(initial)
+    val extension = buildCore(
+      List(child(initial.batch.scope.target, "extension-decision-target")),
+      previous = Some(priorReleased -> initial)
+    )
+    val unrelatedEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, "unrelated-scoped-decision")
+    val wrongScopedEvidence = initial.batch.copy(
+      selectionEvidence = ScopedArtifactRef(initial.batch.intentId, unrelatedEvidence)
+    )
+
+    expect.all(
+      validateCoreBatch(initial.batch, initial.manifest, initial.paths, initial.context).isValid,
+      validateCoreBatch(extension.batch, extension.manifest, extension.paths, extension.context).isValid,
+      violations(validateCoreBatch(wrongScopedEvidence, initial.manifest, initial.paths, initial.context))
+        .exists(_.path == "batch.selectionEvidence")
+    )
+  }
+
+  pureTest("restoration republishes the prior image at a consecutive revision after target application") {
+    val fixture = buildCore(List(state(12L, "restoration-target", hash("restoration-parent"))))
+    val prepared = fixture.batch.prepared
+    val restored = MptActivePublication(
+      MptPublicationRevision(prepared.targetPublication.revision.value + 1L),
+      prepared.expectedBefore.image
+    )
+    val valid = validateCoordinatorHead(
+      restoredHead(fixture, PublicationRestoration.AppliedTargetReverted(prepared.targetPublication, restored))
+    )
+    val rewound = validateCoordinatorHead(
+      restoredHead(fixture, PublicationRestoration.AppliedTargetReverted(prepared.targetPublication, prepared.expectedBefore))
+    )
+    val wrongImage = validateCoordinatorHead(
+      restoredHead(
+        fixture,
+        PublicationRestoration.AppliedTargetReverted(
+          prepared.targetPublication,
+          restored.copy(image = prepared.targetPublication.image)
+        )
+      )
+    )
+
+    expect.all(
+      valid.isValid,
+      violations(rewound).exists(_.path == "head.active.stage.restoration.publication.restored.revision"),
+      violations(wrongImage).exists(_.path == "head.active.stage.restoration.publication.restored.image")
+    )
+  }
+
+  pureTest("restoration before target application is an exact no-op at the CAS prior") {
+    val fixture = buildCore(List(state(13L, "restoration-noop-target", hash("restoration-noop-parent"))))
+    val prepared = fixture.batch.prepared
+    val valid = validateCoordinatorHead(
+      restoredHead(fixture, PublicationRestoration.PriorUnchanged(prepared.expectedBefore))
+    )
+    val advancedNoOp = validateCoordinatorHead(
+      restoredHead(
+        fixture,
+        PublicationRestoration.PriorUnchanged(
+          prepared.expectedBefore.copy(revision = MptPublicationRevision(prepared.expectedBefore.revision.value + 1L))
+        )
+      )
+    )
+
+    expect.all(
+      valid.isValid,
+      violations(advancedNoOp).exists(_.path == "head.active.stage.restoration.publication.prior")
+    )
+  }
+
+  pureTest("restoration stage carries one exact plan and terminal state cannot substitute its claim or publication") {
+    val fixture = buildCore(List(state(14L, "restoration-plan-target", hash("restoration-plan-parent"))))
+    val prepared = fixture.batch.prepared
+    val cause = restorationCause(fixture)
+    val restored = MptActivePublication(
+      MptPublicationRevision(prepared.targetPublication.revision.value + 1L),
+      prepared.expectedBefore.image
+    )
+    val noOpPlan = PublicationRestoration.PriorUnchanged(prepared.expectedBefore)
+    val revertPlan = PublicationRestoration.AppliedTargetReverted(prepared.targetPublication, restored)
+    val falseExtensionTip = child(fixture.batch.scope.target, "restoration-false-extension")
+    val falseExtensionEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, "restoration-false-extension-evidence")
+    val falseExtensionLineage = path(
+      PathRole.CanonicalLineage,
+      List(fixture.batch.scope.target, falseExtensionTip)
+    )
+    val falseExtensionCause = cause.copy(
+      replacementSelection = cause.replacementSelection.copy(
+        selectedTip = falseExtensionTip,
+        operationalTarget = fixture.batch.scope.target,
+        decision = ForkChoiceDecision(falseExtensionEvidence),
+        lineage = falseExtensionLineage.commitment
+      ),
+      commonAncestor = cause.commonAncestor,
+      evidence = ScopedArtifactRef(fixture.batch.intentId, falseExtensionEvidence)
+    )
+    val pointer = activeBatchPointer(fixture, "restoration-plan-core-batch")
+    val priorAudit = AuditPointer(
+      AuditRecordId(hash("restoration-plan-prior-audit-id")),
+      AuditRecordDigest(hash("restoration-plan-prior-audit-digest"))
+    )
+
+    def stagePublication(stage: CoreStage): MptActivePublication =
+      stage match {
+        case CoreStage.Prepared             => fixture.batch.prepared.expectedBefore
+        case CoreStage.CoreApplied(receipt) => receipt.activePublication
+        case CoreStage.RestoringPrior(_, plan) =>
+          plan match {
+            case PublicationRestoration.PriorUnchanged(prior)                    => prior
+            case PublicationRestoration.AppliedTargetReverted(transitionFrom, _) => transitionFrom
+          }
+        case CoreStage.RestoredAbandoned(_, receipt) =>
+          receipt.publication match {
+            case PublicationRestoration.PriorUnchanged(prior)           => prior
+            case PublicationRestoration.AppliedTargetReverted(_, prior) => prior
+          }
+      }
+
+    def head(stage: CoreStage): CoordinatorHead =
+      CoordinatorHead(
+        HeadRevision(nonNeg(0L)),
+        Some(fixture.batch.scope.attempt),
+        CoordinatorMode.Running,
+        None,
+        Some(ActiveCoreIntent(pointer, fixture.batch.scope, stage)),
+        stagePublication(stage),
+        EffectsIndex(None, None),
+        Some(priorAudit)
+      )
+
+    def transition(
+      before: CoordinatorHead,
+      stage: CoreStage,
+      mutation: CoordinatorMutationKind
+    ): (ValidationResult[CoordinatorHead], CoordinatorHead) = {
+      val afterWithoutAudit = before.copy(
+        revision = HeadRevision(nonNeg(before.revision.value.value + 1L)),
+        active = before.active.map(_.copy(stage = stage)),
+        publication = stagePublication(stage),
+        auditTail = None
+      )
+      val audit = CoordinatorAuditRecord(
+        mutation,
+        Some(before.commitment),
+        afterWithoutAudit.commitment,
+        before.auditTail
+      )
+      val after = afterWithoutAudit.copy(auditTail = Some(FinalityIdentity.auditPointer(audit).fold(throw _, identity)))
+
+      validateCoordinatorTransition(Some(before), after, audit) -> after
+    }
+
+    def retire(before: CoordinatorHead): (ValidationResult[CoordinatorHead], CoordinatorHead) = {
+      val afterWithoutAudit = before.copy(
+        revision = HeadRevision(nonNeg(before.revision.value.value + 1L)),
+        active = None,
+        auditTail = None
+      )
+      val audit = CoordinatorAuditRecord(
+        CoordinatorMutationKind.AbandonedRetired,
+        Some(before.commitment),
+        afterWithoutAudit.commitment,
+        before.auditTail
+      )
+      val after = afterWithoutAudit.copy(
+        auditTail = Some(FinalityIdentity.auditPointer(audit).fold(throw _, identity))
+      )
+
+      validateCoordinatorTransition(Some(before), after, audit) -> after
+    }
+
+    val preparedHead = head(CoreStage.Prepared)
+    val coreAppliedHead = head(CoreStage.CoreApplied(released(fixture).payload.receipt))
+    val (validNoOpStart, _) = transition(
+      preparedHead,
+      CoreStage.RestoringPrior(cause, noOpPlan),
+      CoordinatorMutationKind.RestorationStarted
+    )
+    val (falseExtensionStart, _) = transition(
+      preparedHead,
+      CoreStage.RestoringPrior(falseExtensionCause, noOpPlan),
+      CoordinatorMutationKind.RestorationStarted
+    )
+    val (validCrashUncertaintyStart, _) = transition(
+      preparedHead,
+      CoreStage.RestoringPrior(cause, revertPlan),
+      CoordinatorMutationKind.RestorationStarted
+    )
+    val (invalidNoOpAfterApply, _) = transition(
+      coreAppliedHead,
+      CoreStage.RestoringPrior(cause, noOpPlan),
+      CoordinatorMutationKind.RestorationStarted
+    )
+    val (validRevertStart, restoringHead) = transition(
+      coreAppliedHead,
+      CoreStage.RestoringPrior(cause, revertPlan),
+      CoordinatorMutationKind.RestorationStarted
+    )
+    val exactReceipt = restorationReceipt(fixture, revertPlan)
+    val (validFinish, restoredAppliedHead) = transition(
+      restoringHead,
+      CoreStage.RestoredAbandoned(cause, exactReceipt),
+      CoordinatorMutationKind.RestoredAbandoned
+    )
+    val (substitutedPlan, _) = transition(
+      restoringHead,
+      CoreStage.RestoredAbandoned(cause, restorationReceipt(fixture, noOpPlan)),
+      CoordinatorMutationKind.RestoredAbandoned
+    )
+    val (validRetirement, retiredHead) = retire(restoredAppliedHead)
+    val nextFixture = buildCore(
+      List(state(15L, "post-restoration-target", hash("post-restoration-parent"))),
+      currentPublication = Some(restored),
+      attemptNumber = 1L
+    )
+    val nextPreparation = FinalityCoordinatorKernel.prepare(
+      retiredHead,
+      nextFixture.batch,
+      nextFixture.manifest,
+      nextFixture.paths,
+      nextFixture.context
+    )
+    val substitutedCause = cause.copy(commonAncestor = child(cause.commonAncestor, "restoration-substituted-cause"))
+    val (wrongCause, _) = transition(
+      restoringHead,
+      CoreStage.RestoredAbandoned(substitutedCause, exactReceipt),
+      CoordinatorMutationKind.RestoredAbandoned
+    )
+
+    expect.all(
+      validNoOpStart.isValid,
+      violations(falseExtensionStart).exists(
+        _.path == "head.active.stage.claim.replacementSelection.operationalTarget"
+      ),
+      validCrashUncertaintyStart.isValid,
+      violations(invalidNoOpAfterApply).exists(_.path == "head.active.stage.restoration.publication"),
+      validRevertStart.isValid,
+      validFinish.isValid,
+      validRetirement.isValid,
+      nextPreparation.toOption.exists(_.head.publication == restored),
+      violations(substitutedPlan).exists(_.path == "head.active.stage.restoration.publication"),
+      violations(wrongCause).exists(_.path == "head.active.stage.claim")
     )
   }
 
@@ -365,10 +696,15 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     def rollbackBatch(closureDraft: PathDraft): FinalityCoreBatch = {
       val intentId = fixture.batch.intentId
       val evidence = fixture.batch.qualification.evidence
-      val selection = fixture.batch.scope.selection.copy(selectedTip = replacement, operationalTarget = mrca, lineage = lineage.commitment)
+      val selection = fixture.batch.scope.selection.copy(
+        selectedTip = replacement,
+        operationalTarget = mrca,
+        decision = ForkChoiceDecision(fixture.batch.selectionEvidence.artifact),
+        lineage = lineage.commitment
+      )
       val orphanedRef = PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest))
       val closureRef = PathManifestRef(closureDraft.commitment, ScopedArtifactRef(intentId, closureDraft.commitment.manifest))
-      val transition = CoreTransition.DensityRollbackToOperationalMrca(mrca, orphanedRef, fixture.batch.selectionEvidence)
+      val transition = CoreTransition.ForkChoiceRollbackToOperationalMrca(mrca, orphanedRef)
       val qualification = OperationalQualification.DecidedAttestationTWeight(mrca, closureDraft.entries.last, Some(closureRef), evidence)
       fixture.batch.copy(
         scope = fixture.batch.scope.copy(
@@ -395,7 +731,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
   }
 
-  pureTest("density replacement requires the exact immediate divergence and a different target") {
+  pureTest("fork-choice replacement requires the exact immediate divergence and a different target") {
     val mrca = state(35L, "replacement-mrca", hash("replacement-parent"))
     val old1 = child(mrca, "replacement-old-1")
     val old2 = child(old1, "replacement-old-2")
@@ -407,25 +743,27 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val adopted = path(PathRole.Adopted, List(new1, new2))
     val noOpAdopted = path(PathRole.Adopted, List(old1, old2))
     val lateDivergenceAdopted = path(PathRole.Adopted, List(old1, lateFork))
-    val densityEvidence = artifact(FinalityArtifactKind.DensityDecisionEvidence, "replacement-density-evidence")
+    val decisionEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, "replacement-fork-choice-evidence")
+    val decision = ForkChoiceDecision(decisionEvidence)
 
     def replacementBatch(adoptedDraft: PathDraft): (FinalityCoreBatch, PathDraft) = {
       val intentId = fixture.batch.intentId
       val target = adoptedDraft.entries.last
       val lineage = path(PathRole.CanonicalLineage, List(target))
-      val transition = CoreTransition.DensityReplacement(
+      val transition = CoreTransition.ForkChoiceReplacement(
         mrca,
         PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest)),
-        PathManifestRef(adoptedDraft.commitment, ScopedArtifactRef(intentId, adoptedDraft.commitment.manifest)),
-        ScopedArtifactRef(intentId, densityEvidence)
+        PathManifestRef(adoptedDraft.commitment, ScopedArtifactRef(intentId, adoptedDraft.commitment.manifest))
       )
       val selection = fixture.batch.scope.selection.copy(
         selectedTip = target,
         operationalTarget = target,
+        decision = decision,
         lineage = lineage.commitment
       )
       fixture.batch.copy(
         scope = fixture.batch.scope.copy(selection = selection, transition = transition.shape, target = target),
+        selectionEvidence = ScopedArtifactRef(intentId, decisionEvidence),
         transition = transition
       ) -> lineage
     }
@@ -450,7 +788,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
   }
 
-  pureTest("density rollback may stop at the MRCA but cannot follow the orphaned first child") {
+  pureTest("fork-choice rollback may stop at the MRCA but cannot follow the orphaned first child") {
     val mrca = state(38L, "rollback-selection-mrca", hash("rollback-selection-parent"))
     val old1 = child(mrca, "rollback-selection-old-1")
     val old2 = child(old1, "rollback-selection-old-2")
@@ -460,22 +798,24 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val atMrca = path(PathRole.CanonicalLineage, List(mrca))
     val replacementLineage = path(PathRole.CanonicalLineage, List(mrca, replacement))
     val oldLineage = path(PathRole.CanonicalLineage, List(mrca, old1, old2))
-    val densityEvidence = artifact(FinalityArtifactKind.DensityDecisionEvidence, "rollback-selection-density-evidence")
+    val decisionEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, "rollback-selection-fork-choice-evidence")
+    val decision = ForkChoiceDecision(decisionEvidence)
 
     def rollbackBatch(lineage: PathDraft): FinalityCoreBatch = {
       val intentId = fixture.batch.intentId
-      val transition = CoreTransition.DensityRollbackToOperationalMrca(
+      val transition = CoreTransition.ForkChoiceRollbackToOperationalMrca(
         mrca,
-        PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest)),
-        ScopedArtifactRef(intentId, densityEvidence)
+        PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest))
       )
       val selection = fixture.batch.scope.selection.copy(
         selectedTip = lineage.entries.last,
         operationalTarget = mrca,
+        decision = decision,
         lineage = lineage.commitment
       )
       fixture.batch.copy(
         scope = fixture.batch.scope.copy(selection = selection, transition = transition.shape, target = mrca),
+        selectionEvidence = ScopedArtifactRef(intentId, decisionEvidence),
         transition = transition
       )
     }
@@ -495,6 +835,44 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
   }
 
+  pureTest("replacement and rollback bind one scoped fork-choice evidence commitment") {
+    val fixture = buildCore(List(state(39L, "decision-binding-target", hash("decision-binding-parent"))))
+    val intentId = fixture.batch.intentId
+    val mrca = state(36L, "decision-binding-mrca", hash("decision-binding-mrca-parent"))
+    val orphaned = path(PathRole.Orphaned, List(child(mrca, "decision-binding-old")))
+    val adopted = path(PathRole.Adopted, List(child(mrca, "decision-binding-new")))
+    val orphanedRef = PathManifestRef(orphaned.commitment, ScopedArtifactRef(intentId, orphaned.commitment.manifest))
+    val adoptedRef = PathManifestRef(adopted.commitment, ScopedArtifactRef(intentId, adopted.commitment.manifest))
+    val evidence = fixture.batch.selectionEvidence.artifact
+    val otherEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, "decision-binding-other")
+    val decision = ForkChoiceDecision(evidence)
+
+    def withDecision(transition: CoreTransition, selectionDecision: ForkChoiceDecision): FinalityCoreBatch = {
+      val selection = fixture.batch.scope.selection.copy(decision = selectionDecision)
+      fixture.batch.copy(
+        scope = fixture.batch.scope.copy(selection = selection, transition = transition.shape),
+        transition = transition
+      )
+    }
+
+    def bindingViolations(batch: FinalityCoreBatch): List[Violation] =
+      violations(validateCoreBatch(batch, fixture.manifest, fixture.paths, fixture.context))
+        .filter(violation => violation.path == "batch.scope.selection.decision.evidence" || violation.path == "batch.selectionEvidence")
+
+    val replacement = CoreTransition.ForkChoiceReplacement(mrca, orphanedRef, adoptedRef)
+    val rollback = CoreTransition.ForkChoiceRollbackToOperationalMrca(mrca, orphanedRef)
+    val matchingReplacement = withDecision(replacement, decision)
+    val wrongEvidenceReplacement = withDecision(replacement, ForkChoiceDecision(otherEvidence))
+    val matchingRollback = withDecision(rollback, decision)
+
+    expect.all(
+      bindingViolations(matchingReplacement).isEmpty,
+      violations(validateCoreBatch(wrongEvidenceReplacement, fixture.manifest, fixture.paths, fixture.context))
+        .exists(_.path == "batch.selectionEvidence"),
+      bindingViolations(matchingRollback).isEmpty
+    )
+  }
+
   pureTest("scope, exact manifest pointer, and transition digest are independently enforced") {
     val target = state(40L, "scope-target", hash("scope-parent"))
     val fixture = buildCore(List(target))
@@ -505,11 +883,13 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val wrongDigestScope = fixture.manifest.scope.copy(transitionDigest = hash("wrong-transition-digest"))
     val wrongDigestCommands = fixture.commands.map(_.copy(scope = wrongDigestScope))
     val wrongDigestManifest = manifest(wrongDigestScope, None, wrongDigestCommands)
-    val substitutedPointer = fixture.batch.copy(effectManifest = EffectManifestPointer(
-      fixture.batch.scope.generation,
-      EffectManifestId(hash("substituted-manifest-id")),
-      EffectManifestDigest(hash("substituted-manifest-digest"))
-    ))
+    val substitutedPointer = fixture.batch.copy(effectManifest =
+      EffectManifestPointer(
+        fixture.batch.scope.generation,
+        EffectManifestId(hash("substituted-manifest-id")),
+        EffectManifestDigest(hash("substituted-manifest-digest"))
+      )
+    )
 
     val valid = validateCoreBatch(fixture.batch, fixture.manifest, fixture.paths, fixture.context)
     val scopeViolations = violations(validateCoreBatch(fixture.batch, wrongScopeManifest, fixture.paths, fixture.context))
@@ -639,7 +1019,11 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
         fixture.batch,
         fixture.manifest,
         fixture.paths,
-        CoreValidationContext(Some(impossiblePrior), Some(PreviousEffectManifest(fixture.batch.effectManifest, fixture.manifest)))
+        CoreValidationContext(
+          Some(impossiblePrior),
+          Some(PreviousEffectManifest(fixture.batch.effectManifest, fixture.manifest)),
+          fixture.batch.prepared.expectedBefore
+        )
       )
     )
 
@@ -657,6 +1041,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       CoordinatorMode.Running,
       None,
       None,
+      MptActivePublication(MptPublicationRevision(0L), None),
       EffectsIndex(None, None),
       Some(priorAudit)
     )
@@ -665,6 +1050,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       None,
       None,
       None,
+      before.publication,
       EffectsIndex(None, None),
       RecoveryReason.UnknownCore(hash("recovery-reason")),
       Some(priorAudit)
@@ -708,6 +1094,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       CoordinatorMode.Running,
       None,
       None,
+      MptActivePublication(MptPublicationRevision(0L), None),
       EffectsIndex(None, None),
       Some(priorAudit)
     )
@@ -718,16 +1105,19 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
         None,
         None,
         None,
+        before.publication,
         EffectsIndex(None, None),
         reason,
         Some(priorAudit)
       )
-      val recordPointer = FinalityIdentity.recoveryPointer(record).getOrElse(
-        RecoveryRecordPointer(
-          RecoveryRecordId(hash("invalid-startup-record-id")),
-          RecoveryRecordDigest(hash("invalid-startup-record-digest"))
+      val recordPointer = FinalityIdentity
+        .recoveryPointer(record)
+        .getOrElse(
+          RecoveryRecordPointer(
+            RecoveryRecordId(hash("invalid-startup-record-id")),
+            RecoveryRecordDigest(hash("invalid-startup-record-digest"))
+          )
         )
-      )
       val afterWithoutAudit = before.copy(
         revision = HeadRevision(nonNeg(1L)),
         mode = CoordinatorMode.RecoveryRequired(recordPointer),
@@ -774,6 +1164,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       CoordinatorMode.Running,
       None,
       Some(active),
+      exactReleased.payload.receipt.activePublication,
       EffectsIndex(None, None),
       Some(priorAudit)
     )
@@ -783,6 +1174,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
       CoordinatorMode.Running,
       Some(exactReleased),
       None,
+      exactReleased.payload.receipt.activePublication,
       EffectsIndex(Some(fixture.batch.effectManifest), Some(fixture.batch.scope.generation)),
       None
     )
