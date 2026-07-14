@@ -24,9 +24,9 @@ import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MerklePatriciaCommitment
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
-import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.MutableIOSuite
@@ -46,8 +46,9 @@ import weaver.MutableIOSuite
   *      component-addressable witness terminates at the committed PIN-1 root).
   *   1. '''Verify rejects wrong checkpoint hash''': tamper the proof's `shardCheckpointHash`; verify returns false.
   *   1. '''Verify rejects wrong root''': tamper the proof's `perMgMptRoot`; verify returns false.
-  *   1. '''Verify rejects tampered witness''': clear the witness; verify returns false (the witness no longer connects to the per-MG root —
-  *      stands in for tampered value bytes, which break the leaf commitment the same way).
+  *   1. '''Verify binds returned bytes''': substituted or missing value bytes reject even when the root witness itself is unchanged.
+  *   1. '''Verify binds structured key to path''': substituting either the structured key or the proof path rejects.
+  *   1. '''Verify requires one terminal leaf''': missing and duplicate leaf commitments reject.
   *   1. '''Non-membership''': generate proof for an account NOT in the MG state; generate returns None (v1 surfaces absence as None).
   *   1. '''Shard ownership mismatch''': request proof from shard 0 for an MG owned by a different shard; generate returns None.
   *
@@ -244,7 +245,9 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
           fixedEntries(mg, entries)
         )
 
-        proofOpt <- svc.generateProofForMetagraph(shardId, mg, mgBalanceKey(mg, account))
+        key = mgBalanceKey(mg, account)
+        keyHex <- GlobalStateKey.toHex[IO](key)
+        proofOpt <- svc.generateProofForMetagraph(shardId, mg, key)
         verifyResult <- proofOpt match {
           case Some(p) => svc.verifyProof(checkpoint, p)
           case None    => IO.pure(false)
@@ -252,6 +255,7 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
       } yield
         expect.all(
           proofOpt.isDefined,
+          proofOpt.flatMap(_.value).exists(_.toBytes.sameElements(entries(keyHex))),
           verifyResult
         )
   }
@@ -307,10 +311,10 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
   }
 
   // ===========================================================================
-  // Test 4: verify rejects tampered witness (stands in for tampered value bytes)
+  // Test 4: verify binds the returned value bytes to the terminal leaf digest
   // ===========================================================================
 
-  test("verify rejects when the proof's underlying MPT inclusion proof is tampered") { res =>
+  test("verify rejects substituted value bytes while the authenticated witness is unchanged") { res =>
     implicit val (h, _, js) = res
     val mg = addr("mg-tamper-value")
     val account = addr("user-tamper-value")
@@ -326,15 +330,109 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
       svc = ShardSubtreeProofService.make[IO](shardAssignment, fixedLookup(shardId, checkpoint), fixedEntries(mg, entries))
 
       proofOpt <- svc.generateProofForMetagraph(shardId, mg, mgBalanceKey(mg, account))
-      // Clear the witness — the witness chain no longer connects to the per-MG root. The value bytes are committed via the leaf's
-      // dataDigest hashed into the witness chain, so tampering the value (without re-deriving dataDigest) breaks the leaf the same way.
-      tampered = proofOpt.get.copy(mptProof = proofOpt.get.mptProof.copy(witness = List.empty))
+      tampered = proofOpt.get.copy(value = Hex.fromBytes("substituted-value".getBytes("UTF-8")).some)
       verifyResult <- svc.verifyProof(checkpoint, tampered)
     } yield expect.all(proofOpt.isDefined, !verifyResult)
   }
 
   // ===========================================================================
-  // Test 5: non-membership — generate returns None for an account not in the MG state
+  // Test 5: verify binds the structured key to the canonical proof path
+  // ===========================================================================
+
+  test("verify rejects structured-key and proof-path substitution") { res =>
+    implicit val (h, _, js) = res
+    val mg = addr("mg-tamper-key-path")
+    val account = addr("user-tamper-key-path")
+    val substitutedAccount = addr("user-substituted-key-path")
+    val inc = mkSignedIncremental(5L)
+    val info = infoWithBalances(account -> 123L, substitutedAccount -> 456L)
+    for {
+      re <- rootAndEntries(mg, inc, info)
+      (perMgRoot, entries) = re
+
+      shardId = ShardId.unsafeApply(0)
+      shardAssignment = ShardAssignment.make[IO](numShards = 1)
+      checkpoint = mkSigned(mkCheckpoint(shardId, SortedMap(mg -> perMgRoot)))
+      svc = ShardSubtreeProofService.make[IO](shardAssignment, fixedLookup(shardId, checkpoint), fixedEntries(mg, entries))
+
+      requestedKey = mgBalanceKey(mg, account)
+      substitutedKey = mgBalanceKey(mg, substitutedAccount)
+      substitutedPath <- GlobalStateKey.toHex[IO](substitutedKey)
+      proofOpt <- svc.generateProofForMetagraph(shardId, mg, requestedKey)
+      proof = proofOpt.get
+      keySubstitutionResult <- svc.verifyProof(checkpoint, proof.copy(key = substitutedKey))
+      pathSubstitutionResult <- svc.verifyProof(checkpoint, proof.copy(mptProof = proof.mptProof.copy(path = substitutedPath)))
+    } yield
+      expect.all(
+        proofOpt.isDefined,
+        !keySubstitutionResult,
+        !pathSubstitutionResult
+      )
+  }
+
+  // ===========================================================================
+  // Test 6: membership proofs require value bytes
+  // ===========================================================================
+
+  test("verify rejects a membership proof with no value bytes") { res =>
+    implicit val (h, _, js) = res
+    val mg = addr("mg-missing-value")
+    val account = addr("user-missing-value")
+    val inc = mkSignedIncremental(6L)
+    val info = infoWithBalances(account -> 123L)
+    for {
+      re <- rootAndEntries(mg, inc, info)
+      (perMgRoot, entries) = re
+
+      shardId = ShardId.unsafeApply(0)
+      shardAssignment = ShardAssignment.make[IO](numShards = 1)
+      checkpoint = mkSigned(mkCheckpoint(shardId, SortedMap(mg -> perMgRoot)))
+      svc = ShardSubtreeProofService.make[IO](shardAssignment, fixedLookup(shardId, checkpoint), fixedEntries(mg, entries))
+
+      proofOpt <- svc.generateProofForMetagraph(shardId, mg, mgBalanceKey(mg, account))
+      verifyResult <- svc.verifyProof(checkpoint, proofOpt.get.copy(value = None))
+    } yield expect.all(proofOpt.isDefined, !verifyResult)
+  }
+
+  // ===========================================================================
+  // Test 7: membership proofs require exactly one terminal leaf
+  // ===========================================================================
+
+  test("verify rejects missing and duplicate terminal leaf commitments") { res =>
+    implicit val (h, _, js) = res
+    val mg = addr("mg-invalid-leaf-witness")
+    val account = addr("user-invalid-leaf-witness")
+    val inc = mkSignedIncremental(7L)
+    val info = infoWithBalances(account -> 123L, addr("user-invalid-leaf-witness-2") -> 456L)
+    for {
+      re <- rootAndEntries(mg, inc, info)
+      (perMgRoot, entries) = re
+
+      shardId = ShardId.unsafeApply(0)
+      shardAssignment = ShardAssignment.make[IO](numShards = 1)
+      checkpoint = mkSigned(mkCheckpoint(shardId, SortedMap(mg -> perMgRoot)))
+      svc = ShardSubtreeProofService.make[IO](shardAssignment, fixedLookup(shardId, checkpoint), fixedEntries(mg, entries))
+
+      proofOpt <- svc.generateProofForMetagraph(shardId, mg, mgBalanceKey(mg, account))
+      proof = proofOpt.get
+      leaves = proof.mptProof.witness.collect { case leaf: MerklePatriciaCommitment.Leaf => leaf }
+      missingLeaf = proof.copy(
+        mptProof = proof.mptProof.copy(witness = proof.mptProof.witness.filterNot(_.isInstanceOf[MerklePatriciaCommitment.Leaf]))
+      )
+      duplicateLeaf = proof.copy(mptProof = proof.mptProof.copy(witness = leaves.head :: proof.mptProof.witness))
+      missingLeafResult <- svc.verifyProof(checkpoint, missingLeaf)
+      duplicateLeafResult <- svc.verifyProof(checkpoint, duplicateLeaf)
+    } yield
+      expect.all(
+        proofOpt.isDefined,
+        leaves.size === 1,
+        !missingLeafResult,
+        !duplicateLeafResult
+      )
+  }
+
+  // ===========================================================================
+  // Test 8: non-membership — generate returns None for an account not in the MG state
   // ===========================================================================
 
   test("non-membership: generate returns None for an account NOT in the MG state (v1 surfaces absence as None)") { res =>
@@ -359,7 +457,7 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
   }
 
   // ===========================================================================
-  // Test 6: shard ownership mismatch
+  // Test 9: shard ownership mismatch
   // ===========================================================================
 
   test("shard ownership mismatch: request proof from shard 0 for an MG that hashes to a different shard ⇒ None") { res =>

@@ -3,7 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect.kernel.Sync
 import cats.syntax.all._
 
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, StrictMptRead}
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.serde.ImmutableCodec
 
@@ -13,6 +13,7 @@ import io.constellationnetwork.serde.ImmutableCodec
   */
 trait GlobalStateReader[F[_]] {
   def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]]
+  def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]]
   def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]]
   def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
 }
@@ -25,6 +26,7 @@ object GlobalStateReader {
     */
   def fromMptStore[F[_]](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] = new GlobalStateReader[F] {
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = store.get[V](key)
+    def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] = store.getStrict[V](key)
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] = store.getMany[V](keys)
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
   }
@@ -52,6 +54,8 @@ object GlobalStateReader {
     import cats.syntax.functor._
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] =
       currentParent.flatMap(p => overlay.get[V](p, key))
+    def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] =
+      currentParent.flatMap(p => overlay.getStrict[V](p, key))
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
       if (keys.isEmpty) cats.Applicative[F].pure(Map.empty)
       else
@@ -89,6 +93,8 @@ object GlobalStateReader {
   /** Empty reader that always returns no values. Used by tests / wirings where no MPT is available — equivalent to "no prior state". */
   def empty[F[_]: cats.Applicative]: GlobalStateReader[F] = new GlobalStateReader[F] {
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = cats.Applicative[F].pure(None)
+    def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] =
+      cats.Applicative[F].pure(StrictMptRead.Absent)
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
       cats.Applicative[F].pure(Map.empty)
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] =
@@ -138,6 +144,9 @@ object AcceptanceMpt {
 
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] =
       overlay.get[V](parent, key)
+
+    def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] =
+      overlay.getStrict[V](parent, key)
 
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
       if (keys.isEmpty) Map.empty[GlobalStateKey, V].pure[F]

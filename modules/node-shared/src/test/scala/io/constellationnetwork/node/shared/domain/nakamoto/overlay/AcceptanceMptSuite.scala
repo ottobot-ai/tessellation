@@ -13,6 +13,7 @@ import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -68,6 +69,65 @@ object AcceptanceMptSuite extends MutableIOSuite {
         direct.contains(Balance(NonNegLong(7L))),
         viaAlgebra.contains(Balance(NonNegLong(7L))),
         direct == viaAlgebra
+      )
+  }
+
+  test("strict point read distinguishes malformed committed bytes from authenticated absence") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      malformedKey = gskBalance(7)
+      absentKey = gskBalance(8)
+      malformedHex <- GlobalStateKey.toHex[IO](malformedKey)
+      garbage = Array[Byte](0x7f)
+      _ <- store.underlying.insertBytes(Map(malformedHex -> garbage)).flatMap(_.liftTo[IO])
+      reader = GlobalStateReader.finalized[IO](store)
+
+      legacy <- reader.get[Balance](malformedKey)
+      malformed <- reader.getStrict[Balance](malformedKey)
+      absent <- reader.getStrict[Balance](absentKey)
+    } yield
+      expect.all(
+        legacy.isEmpty,
+        malformed match {
+          case StrictMptRead.Malformed(_, Some(rawBytes)) => rawBytes.toList == garbage.toList
+          case _                                          => false
+        },
+        absent == StrictMptRead.Absent
+      )
+  }
+
+  test("strict branch read returns the exact immutable bytes committed by a pending overlay") { res =>
+    implicit val (h, _, js) = res
+    for {
+      store <- mkStore
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        underlying = store,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = Set.empty[BranchId].pure[IO]
+      )
+      key = gskBalance(9)
+      value = Balance(NonNegLong(123L))
+      expectedBytes = ImmutableCodec[Balance].immutableBytes(value).toArray.toList
+
+      handle <- overlay.checkout(parentP)
+      mpt = AcceptanceMpt.fromOverlay[IO](overlay, parentP, handle)
+      _ <- mpt.insert[Balance](key, value)
+      _ <- overlay.commit(handle, childTip, ordinal)
+
+      reader = GlobalStateReader.fromOverlay[IO](overlay, childTip)
+      strict <- reader.getStrict[Balance](key)
+      base <- store.getStrict[Balance](key)
+    } yield
+      expect.all(
+        strict match {
+          case StrictMptRead.Present(decoded, rawBytes) => decoded == value && rawBytes.toList == expectedBytes
+          case _                                        => false
+        },
+        base == StrictMptRead.Absent
       )
   }
 

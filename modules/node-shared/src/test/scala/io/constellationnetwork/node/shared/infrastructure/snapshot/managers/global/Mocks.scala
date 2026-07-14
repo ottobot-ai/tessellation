@@ -586,7 +586,7 @@ object Mocks {
     info: GlobalSnapshotInfo
   ): io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F] = {
     import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-    import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+    import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRead}
     import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
     import io.constellationnetwork.security.hex.Hex
     import io.constellationnetwork.serde.ImmutableCodec
@@ -602,6 +602,12 @@ object Mocks {
             case _ => Async[F].pure(None)
           }
         } else Async[F].pure(None)
+
+      def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] =
+        get[V](key).map {
+          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value).toArray)
+          case None        => StrictMptRead.Absent
+        }
 
       def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] =
         keys.traverse(k => get[V](k).map(_.map(k -> _))).map(_.flatten.toMap)

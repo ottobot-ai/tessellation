@@ -29,11 +29,13 @@ import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaInclusionProof
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.serde.ImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.mgBalanceEntryImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedAllowSpendSetCodec
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
-import io.circe.syntax._
 import weaver.MutableIOSuite
 
 /** Slice 11 cross-shard coverage for [[SpendActionValidator]] — exercises the `ShardSubtreeProofClient`-aware constructor introduced by
@@ -59,9 +61,8 @@ import weaver.MutableIOSuite
   *     the fact. The mock doesn't run any verification — the production `ShardSubtreeProofClient.http` would, but the validator's contract
   *     here is to trust the client's return value and decode the bytes; tampering is exercised via "value bytes that decode to the wrong
   *     type", which the validator catches structurally.
-  *   - Real Circe encoding for the proof's value bytes: `SortedSet[Signed[AllowSpend]].asJson` serialized as UTF-8 — the same shape the
-  *     validator decodes via `io.circe.parser`. This gives end-to-end byte-fidelity coverage of the cross-shard wire path without dragging
-  *     in the full MPT-prover infrastructure (which is Slice 10's concern, separately covered).
+  *   - Real immutable encoding for proof values — the exact bytes committed by the MPT. This gives byte-fidelity coverage of the
+  *     cross-shard wire path without dragging in the full MPT-prover infrastructure (covered separately).
   */
 object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
 
@@ -115,10 +116,17 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
       shardCheckpointHash = Hash.empty,
       metagraphAddress = Address.fromBytes("sentinel".getBytes),
       perMgMptRoot = Hash.empty,
-      key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, Address.fromBytes("sentinel".getBytes)),
+      key = GlobalStateKey.metagraphEntry(
+        Address.fromBytes("sentinel-mg".getBytes),
+        GlobalStateFieldId.MgBalances,
+        Address.fromBytes("sentinel-account".getBytes)
+      ),
       value = value,
       mptProof = MerklePatriciaInclusionProof(path = Hex(""), witness = List.empty)
     )
+
+  private def immutableBytes[A: ImmutableCodec](value: A): Array[Byte] =
+    ImmutableCodec[A].immutableBytes(value).toArray
 
   // ===========================================================================
   // Helpers for finding a shard split that makes two addresses cross-shard
@@ -214,7 +222,7 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
       targetShardId <- shardAssignment.shardIdFor(targetMgAddr)
 
       // Build the proven SortedSet[Signed[AllowSpend]] that the proofClient will return as the
-      // proof's value bytes. The validator decodes via Circe and scans for the matching hash.
+      // proof's canonical immutable value bytes.
       // The AllowSpend.currencyId must reference targetMg so the SpendTransaction's currencyId
       // check passes (`allowSpend.currencyId =!= spendTransaction.currencyId` else InvalidCurrency).
       targetCurrencyId = CurrencyId(targetMgAddr)
@@ -230,7 +238,7 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
       )
       signedAllowSpend <- Signed.forAsyncHasher(allowSpend, keyPair1)
       hashedAllowSpend <- signedAllowSpend.toHashed
-      provenValue = SortedSet(signedAllowSpend).asJson.noSpaces.getBytes("UTF-8")
+      provenValue = immutableBytes(SortedSet(signedAllowSpend))
 
       callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
       proofClient = mkMockClient(
@@ -328,13 +336,12 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
       numShards <- findNumShardsSplitting(currentMgAddr, targetMgAddr)
       shardAssignment = ShardAssignment.make[IO](numShards)
 
-      // Garbage bytes — definitely not a valid JSON-encoded SortedSet[Signed[AllowSpend]]. The
-      // validator's Circe decode step rejects and surfaces CrossShardProofTampered. Stands in
+      // Garbage bytes — definitely not a valid immutable SortedSet[Signed[AllowSpend]]. The
+      // validator's codec rejects and surfaces CrossShardProofTampered. Stands in
       // for a malicious peer that returns structurally-valid proof bytes but the wrong type
       // (or just random bytes). A peer that returned bytes for, e.g., a `Balance` instead of
-      // an `AllowSpends` set would land in the same rejection: Circe decode fails because the
-      // expected shape is a JSON array of signed AllowSpends.
-      garbageBytes = "this is not valid AllowSpend JSON".getBytes("UTF-8")
+      // an `AllowSpends` set would land in the same typed-codec rejection.
+      garbageBytes = "this is not a valid AllowSpend encoding".getBytes("UTF-8")
 
       callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
       proofClient = mkMockClient(
@@ -452,9 +459,8 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
         calls.length === 1,
         calls.head.targetShardId === targetShardId,
         calls.head.metagraphAddress === targetMgAddr,
-        // The balance-check branch queries the (MG, currencyId) slot in the Balances partition,
-        // where `currencyId` is the validator's current MG.
-        calls.head.key === GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, targetMgAddr, currentMgAddr)
+        // The balance-check branch queries the canonical field-25 (MG, account) entry.
+        calls.head.key === GlobalStateKey.metagraphEntry(targetMgAddr, GlobalStateFieldId.MgBalances, currentMgAddr)
       )
   }
 
@@ -569,7 +575,7 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
       // M's ATTESTED per-MG balance for M′ AFTER the refund = exactly X (phantom): the only thing that
       // could fund the self-spend is the refund. Real spendable = X − X = 0.
       provenAttestedBalance = Balance(NonNegLong.unsafeFrom(x))
-      provenValue = provenAttestedBalance.asJson.noSpaces.getBytes("UTF-8")
+      provenValue = immutableBytes((mPrime, provenAttestedBalance))
 
       // The overlay closure REUSES ConsumedAllowSpendStateManager.effectiveCurrencyBalances verbatim,
       // closing over the finalized spent-set + the (post-expiry) epoch. Empty pinned map ⇒ epochFor(M)
@@ -608,11 +614,11 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
       resRaw <- rawValidator.validate(spendAction, activeAllowSpends, balances, mPrime)
     } yield
       expect.all(
-        // The cross-shard fetch DID happen, against M's shard + the (M, M′) Balances key.
+        // The cross-shard fetch DID happen, against M's shard + the canonical field-25 (M, M′) key.
         effectiveCalls.length === 1,
         effectiveCalls.head.targetShardId === targetShardId,
         effectiveCalls.head.metagraphAddress === m,
-        effectiveCalls.head.key === GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, m, mPrime),
+        effectiveCalls.head.key === GlobalStateKey.metagraphEntry(m, GlobalStateFieldId.MgBalances, mPrime),
         // Under the EFFECTIVE overlay (M′ effective balance = X − X = 0) ⇒ REJECTED for insufficient balance.
         resEffective.isInvalid,
         resEffective.toEither.left.exists(_.exists {
@@ -626,7 +632,53 @@ object SpendActionValidatorCrossShardSuite extends MutableIOSuite {
   }
 
   // ===========================================================================
-  // Test 9 (W3c numShards=1 IDENTITY): the cross-shard balance overlay seam is unreachable at
+  // Test 9: field-25 value-carries-key mismatch fails closed
+  // ===========================================================================
+
+  test("cross-shard MgBalances value with the wrong embedded account is rejected as tampered") { res =>
+    implicit val (_, hs, sp) = res
+
+    for {
+      currentMgKp <- KeyPairGenerator.makeKeyPair[IO]
+      targetMgKp <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKp <- KeyPairGenerator.makeKeyPair[IO]
+      currentMg = currentMgKp.getPublic.toAddress
+      targetMg = targetMgKp.getPublic.toAddress
+      destination = destinationKp.getPublic.toAddress
+
+      numShards <- findNumShardsSplitting(currentMg, targetMg)
+      shardAssignment = ShardAssignment.make[IO](numShards)
+      wrongValue = immutableBytes((targetMg, Balance(NonNegLong.unsafeFrom(100L))))
+
+      callsRef <- Ref.of[IO, List[FetchCall]](List.empty)
+      proofClient = mkMockClient(
+        callsRef,
+        _ => IO.pure(Some((Some(wrongValue), sentinelProof(Hex.fromBytes(wrongValue).some))))
+      )
+      validator = SpendActionValidator.make[IO](proofClient, shardAssignment)
+
+      spend = SpendTransaction(none[Hash], CurrencyId(targetMg).some, swapAmt(1L), currentMg, destination)
+      result <- validator.validate(
+        SpendAction(NonEmptyList.of(spend)),
+        SortedMap.empty,
+        Map.empty,
+        currentMg
+      )
+      calls <- callsRef.get
+    } yield
+      expect.all(
+        result.isInvalid,
+        result.toEither.left.exists(_.exists {
+          case CrossShardProofTampered(_) => true
+          case _                          => false
+        }),
+        calls.length === 1,
+        calls.head.key === GlobalStateKey.metagraphEntry(targetMg, GlobalStateFieldId.MgBalances, currentMg)
+      )
+  }
+
+  // ===========================================================================
+  // Test 10 (W3c numShards=1 IDENTITY): the cross-shard balance overlay seam is unreachable at
   //   numShards=1 — proofClient is never invoked and the result matches the same spend validated
   //   against the in-process attested balance, even when an overlay is wired. Byte-identical.
   // ===========================================================================

@@ -9,7 +9,7 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.mpt.{MptStore, MptTxAction}
+import io.constellationnetwork.schema.mpt.{MptStore, MptTxAction, StrictMptRead}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -196,6 +196,11 @@ trait MptOverlay[F[_], K] {
     * hit (upsert or removal); falls through to `MptStore.get` on miss. Passthrough: ignores `branch`, delegates to `MptStore.get`.
     */
   def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]]
+
+  /** Strict counterpart to [[get]] that preserves malformed stored bytes instead of collapsing them into absence. Pending upserts and base
+    * reads use the same decoder; an explicit pending removal is [[StrictMptRead.Absent]].
+    */
+  def getStrict[V: ImmutableCodec](branch: BranchId, key: K): F[StrictMptRead[V]]
 
   /** Prefix scan at a specific branch view. Multi-branch: composes base prefix-scan with the chain's accumulated upserts (decoded to V) and
     * removals (filtered to `prefix`). Passthrough: ignores `branch`, delegates to `MptStore.getAllForPrefix`.
@@ -447,6 +452,9 @@ object MptOverlay {
 
       def get[V: ImmutableCodec](branch: BranchId, key: K): F[Option[V]] =
         underlying.get(key)
+
+      def getStrict[V: ImmutableCodec](branch: BranchId, key: K): F[StrictMptRead[V]] =
+        underlying.getStrict(key)
 
       def getAllForPrefix[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[Map[Hex, V]] =
         underlying.getAllForPrefix[V](prefix)
@@ -768,6 +776,18 @@ object MptOverlay {
             case Some(None)        => none[V].pure[F]
             case Some(Some(bytes)) => deserializeBytes[V](bytes)
             case None              => underlying.get[V](key)
+          }
+        } yield out
+
+      def getStrict[V: ImmutableCodec](branch: BranchId, key: K): F[StrictMptRead[V]] =
+        for {
+          hex <- toHex(key)
+          pending <- pendingRef.get
+          chainResult = walkChainForKey(branch, hex, pending)
+          out <- chainResult match {
+            case Some(None)        => (StrictMptRead.Absent: StrictMptRead[V]).pure[F]
+            case Some(Some(bytes)) => StrictMptRead.fromStoredBytes[V](bytes).pure[F]
+            case None              => underlying.getStrict[V](key)
           }
         } yield out
 

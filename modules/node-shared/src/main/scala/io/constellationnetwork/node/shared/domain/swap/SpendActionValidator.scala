@@ -19,10 +19,13 @@ import io.constellationnetwork.schema.swap.AllowSpend
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.ImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.mgBalanceEntryImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedAllowSpendSetCodec
 
 import derevo.cats.{eqv, show}
 import derevo.derive
-import io.circe.parser
+import scodec.bits.ByteVector
 
 trait SpendActionValidator[F[_]] {
   def validate(
@@ -494,11 +497,9 @@ object SpendActionValidator {
       currencyId: Address,
       reservations: BalanceReservations
     ): F[SpendActionValidationErrorOr[SpendTransaction]] = {
-      // Cross-shard Balances lookup: ask shard Y to prove the Balance for `currencyId` under the
-      // Balances partition of metagraph M_y. (The `currencyId` here is the validator's current
-      // MG — the SpendAction's emitter — which is the address whose balance we check against the
-      // SpendAction's amount, per the no-allowSpendRef branch's semantics.)
-      val key = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, targetMg, currencyId)
+      // Cross-shard balance lookup: canonical per-metagraph balances are unrolled under field 25,
+      // keyed by (owner metagraph, account), with `(account, Balance)` as the committed value.
+      val key = GlobalStateKey.metagraphEntry(targetMg, GlobalStateFieldId.MgBalances, currencyId)
 
       // W3c proof-path inflation residual: the proven `balance` is the RAW committee-attested
       // `MgBalances[targetMg][currencyId]` value, which — once a cross-shard allow-spend targetMg never
@@ -520,13 +521,13 @@ object SpendActionValidator {
           ): SpendActionValidationError).invalidNec[SpendTransaction].pure[F]
 
         case Some((None, _)) =>
-          // Proof of non-membership → balance is 0 (absent key in the Balances partition is
+          // Proof of non-membership → balance is 0 (absent key in the MgBalances partition is
           // semantically the empty balance, matching the same-shard `getOrElse(_, Balance.empty)`).
           // The overlay still applies (a marker may CREDIT `currencyId` even with a 0 attested base).
           checkBalanceAndSource(spendTransaction, effectiveBalanceFor(Balance.empty), currencyId, reservations).pure[F]
 
         case Some((Some(valueBytes), _)) =>
-          decodeCrossShardBalance(valueBytes) match {
+          decodeCrossShardBalance(valueBytes, currencyId) match {
             case Left(err) =>
               (err: SpendActionValidationError).invalidNec[SpendTransaction].pure[F]
             case Right(balance) =>
@@ -594,9 +595,8 @@ object SpendActionValidator {
     }
 
     // -----------------------------------------------------------------------------------------
-    // Cross-shard decode helpers (Circe-based — the proven value bytes carry the canonical wire
-    // shape used by every other gl0 read path; we round-trip through the standard decoders so a
-    // tampered or wrong-type value surfaces as `CrossShardProofTampered`)
+    // Cross-shard decode helpers. Proof values are the canonical immutable bytes committed by the
+    // MPT; decoding a different type or a value-carries-key mismatch fails closed.
     // -----------------------------------------------------------------------------------------
 
     /** Decode the proven value bytes as `SortedSet[Signed[AllowSpend]]` — same shape as the leaf value of the in-process ActiveAllowSpends
@@ -606,25 +606,32 @@ object SpendActionValidator {
     private def decodeCrossShardAllowSpends(
       valueBytes: Array[Byte]
     ): F[Either[SpendActionValidationError, SortedSet[Signed[AllowSpend]]]] = {
-      val asString = new String(valueBytes, java.nio.charset.StandardCharsets.UTF_8)
-      val parsed = parser
-        .decode[SortedSet[Signed[AllowSpend]]](asString)
+      val parsed = ImmutableCodec[SortedSet[Signed[AllowSpend]]]
+        .fromImmutableBytes(ByteVector.view(valueBytes))
         .left
         .map(e => CrossShardProofTampered(s"could not decode cross-shard AllowSpends value: ${e.getMessage}"))
       (parsed: Either[SpendActionValidationError, SortedSet[Signed[AllowSpend]]]).pure[F]
     }
 
-    /** Decode the proven value bytes as a [[Balance]]. Same rejection semantics as [[decodeCrossShardAllowSpends]].
+    /** Decode the field-25 value as `(account, Balance)` and enforce the value-carries-key invariant.
       */
     private def decodeCrossShardBalance(
-      valueBytes: Array[Byte]
-    ): Either[SpendActionValidationError, Balance] = {
-      val asString = new String(valueBytes, java.nio.charset.StandardCharsets.UTF_8)
-      parser
-        .decode[Balance](asString)
+      valueBytes: Array[Byte],
+      expectedAccount: Address
+    ): Either[SpendActionValidationError, Balance] =
+      ImmutableCodec[(Address, Balance)]
+        .fromImmutableBytes(ByteVector.view(valueBytes))
         .left
         .map(e => CrossShardProofTampered(s"could not decode cross-shard Balance value: ${e.getMessage}"))
-    }
+        .flatMap {
+          case (embeddedAccount, balance) if embeddedAccount === expectedAccount => Right(balance)
+          case (embeddedAccount, _) =>
+            Left(
+              CrossShardProofTampered(
+                s"cross-shard MgBalances account mismatch: expected $expectedAccount, found $embeddedAccount"
+              )
+            )
+        }
 
     /** Reference classification of a `SpendTransaction.currencyId` against the validator's current MG. Same-shard reads use the in-process
       * map; cross-shard reads route through the proof client.
@@ -655,8 +662,8 @@ object SpendActionValidator {
   case class CrossShardProofUnavailable(error: String) extends SpendActionValidationError
 
   /** Slice 11 — cross-shard proof's value bytes failed to decode as the expected on-chain type (`SortedSet[Signed[AllowSpend]]` for
-    * ActiveAllowSpends; `Balance` for Balances). Defence-in-depth against a peer that returns a structurally-valid proof for a different
-    * type or fabricated bytes.
+    * ActiveAllowSpends; `(Address, Balance)` for MgBalances), or the value-carries-key account mismatched. Defence-in-depth against a peer
+    * that returns a structurally-valid proof for a different type or fabricated bytes.
     */
   case class CrossShardProofTampered(error: String) extends SpendActionValidationError
 

@@ -27,8 +27,8 @@ import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.mgBalanceEntryImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedAllowSpendSetCodec
-import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.auto._
@@ -167,13 +167,13 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
       shardAssignment = ShardAssignment.make[IO](numShards)
 
       // M's ATTESTED per-MG balance for M′ AFTER the refund = exactly X (phantom). Seed it into gl0's finalized
-      // mirror under the Balances partition (Some(M), M′) — the exact key validateBalanceCrossShard builds.
+      // mirror under the canonical unrolled MgBalances field-25 entry.
       x = 100L
       provenAttestedBalance = Balance(NonNegLong.unsafeFrom(x))
       storeAndReader <- mkFinalizedReader
       (store, reader) = storeAndReader
-      balanceKey = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, m.some, mPrime)
-      _ <- store.insert[Balance](balanceKey, provenAttestedBalance)
+      balanceKey = GlobalStateKey.metagraphEntry(m, GlobalStateFieldId.MgBalances, mPrime)
+      _ <- store.insert[(Address, Balance)](balanceKey, (mPrime, provenAttestedBalance))
 
       // The gl0-finalized ConsumedAllowSpends spent-set: M′'s earlier cross-shard consume of an allow-spend on M
       // (X=100, expiry E=200), now EXPIRED (live epoch 250 > 200) so M refunded M′ a phantom +X. Marker scope = M.
@@ -264,11 +264,11 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
       (store1, reader1) = sr1
       (store2, reader2) = sr2
       allowSpendKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, targetMgAddr.some, source)
-      balanceKey = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, targetMgAddr.some, source)
+      balanceKey = GlobalStateKey.metagraphEntry(targetMgAddr, GlobalStateFieldId.MgBalances, source)
       _ <- store1.insert[SortedSet[Signed[AllowSpend]]](allowSpendKey, SortedSet(signedAllowSpend))
       _ <- store2.insert[SortedSet[Signed[AllowSpend]]](allowSpendKey, SortedSet(signedAllowSpend))
-      _ <- store1.insert[Balance](balanceKey, Balance(NonNegLong(777L)))
-      _ <- store2.insert[Balance](balanceKey, Balance(NonNegLong(777L)))
+      _ <- store1.insert[(Address, Balance)](balanceKey, (source, Balance(NonNegLong(777L))))
+      _ <- store2.insert[(Address, Balance)](balanceKey, (source, Balance(NonNegLong(777L))))
 
       client1 = ShardSubtreeProofClient.gl0Local[IO](reader1)
       client2 = ShardSubtreeProofClient.gl0Local[IO](reader2)
@@ -283,11 +283,14 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
       asBytes2 = asRes2.flatMap(_._1).map(_.toList)
       balBytes1 = balRes1.flatMap(_._1).map(_.toList)
       balBytes2 = balRes2.flatMap(_._1).map(_.toList)
+      expectedAsBytes = signedAllowSpendSetCodec.immutableBytes(SortedSet(signedAllowSpend)).toArray.toList
+      expectedBalBytes =
+        mgBalanceEntryImmutableCodec.immutableBytes((source, Balance(NonNegLong(777L)))).toArray.toList
     } yield
       expect.all(
-        asBytes1.isDefined,
+        asBytes1.contains(expectedAsBytes),
         asBytes1 === asBytes2,
-        balBytes1.isDefined,
+        balBytes1.contains(expectedBalBytes),
         balBytes1 === balBytes2
       )
   }
@@ -305,14 +308,29 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
       targetShardId = ShardId(NonNegInt.unsafeFrom(0))
 
       storeAndReader <- mkFinalizedReader
-      (_, reader) = storeAndReader
+      (store, reader) = storeAndReader
       client = ShardSubtreeProofClient.gl0Local[IO](reader)
 
       // Supported partition, but the key is ABSENT in the (empty) mirror ⇒ proven absence: Some((None, _)).
       absentAllowSpendKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, mg.some, mg)
-      absentBalanceKey = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, mg.some, mg)
+      absentBalanceKey = GlobalStateKey.metagraphEntry(mg, GlobalStateFieldId.MgBalances, mg)
       absentAllowSpend <- client.fetchAndVerify(targetShardId, mg, absentAllowSpendKey)
       absentBalance <- client.fetchAndVerify(targetShardId, mg, absentBalanceKey)
+
+      // A structurally decodable field-25 value carrying a different account than the key is corrupt,
+      // not an absence. The local client must fail closed as unavailable.
+      wrongAccount = Address.fromBytes("wrong-mg-balance-account".getBytes("UTF-8"))
+      malformedKey = GlobalStateKey.metagraphEntry(mg, GlobalStateFieldId.MgBalances, mg)
+      _ <- store.insert[(Address, Balance)](malformedKey, (wrongAccount, Balance(NonNegLong(1L))))
+      malformed <- client.fetchAndVerify(targetShardId, mg, malformedKey)
+
+      // Raw bytes exist at this field-25 key but cannot decode as `(Address, Balance)`. A legacy typed point read
+      // collapsed this case to `None`, which the client then misreported as proven absence / zero balance.
+      undecodableAccount = Address.fromBytes("undecodable-mg-balance-account".getBytes("UTF-8"))
+      undecodableKey = GlobalStateKey.metagraphEntry(mg, GlobalStateFieldId.MgBalances, undecodableAccount)
+      undecodableHex <- GlobalStateKey.toHex[IO](undecodableKey)
+      _ <- store.underlying.insertBytes(Map(undecodableHex -> Array[Byte](0x7f))).flatMap(_.liftTo[IO])
+      undecodable <- client.fetchAndVerify(targetShardId, mg, undecodableKey)
 
       // A fieldId the validator never asks for ⇒ fail-closed unavailable: None.
       unsupportedKey = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, mg.some, mg)
@@ -323,6 +341,8 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
         absentAllowSpend.flatMap(_._1).isEmpty, // Some((None, _))
         absentBalance.isDefined,
         absentBalance.flatMap(_._1).isEmpty, // Some((None, _))
+        malformed.isEmpty,
+        undecodable.isEmpty,
         unsupported.isEmpty // None
       )
   }
@@ -349,8 +369,8 @@ object Gl0LocalShardSubtreeProofClientSuite extends MutableIOSuite {
         // It must NOT be consulted: the same-shard path reads the in-process attested balance (X) ⇒ ACCEPTED.
         storeAndReader <- mkFinalizedReader
         (store, reader) = storeAndReader
-        balanceKey = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, m.some, m)
-        _ <- store.insert[Balance](balanceKey, Balance.empty)
+        balanceKey = GlobalStateKey.metagraphEntry(m, GlobalStateFieldId.MgBalances, m)
+        _ <- store.insert[(Address, Balance)](balanceKey, (m, Balance.empty))
 
         proofClient = ShardSubtreeProofClient.gl0Local[IO](reader)
         validator = SpendActionValidator.make[IO](proofClient, shardAssignment)

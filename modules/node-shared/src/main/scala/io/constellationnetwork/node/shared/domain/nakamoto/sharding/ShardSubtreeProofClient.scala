@@ -13,6 +13,8 @@ import io.constellationnetwork.node.shared.http.p2p.PeerResponse
 import io.constellationnetwork.node.shared.http.p2p.middlewares.PeerAuthMiddleware
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.mpt.PartitionNamespace.{AddressNamespace, EmptyNamespace, MetagraphNamespace}
+import io.constellationnetwork.schema.mpt.StrictMptRead.{Absent, Malformed, Present}
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.peer.{P2PContext, Peer}
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
@@ -21,10 +23,9 @@ import io.constellationnetwork.security.SecurityProvider
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaInclusionProof
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.mgBalanceEntryImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedAllowSpendSetCodec
-import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
-import io.circe.syntax._
 import org.http4s.Method.POST
 import org.http4s.client.Client
 import org.http4s.{Request, Uri}
@@ -49,9 +50,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * '''Why `Array[Byte]` for the value rather than a typed `A`''':
   *   - The validator's consumer (`SpendActionValidator`) reads multiple disparate types (`AllowSpend` for ActiveAllowSpends partition,
-  *     `Balance` for the Balances partition). A typed client surface would force one trait method per type, which doesn't compose. The
-  *     wire-byte shape is uniform (JSON-encoded `Hex` on the wire per [[ShardSubtreeProof]]'s value field) and the validator decodes
-  *     per-call via its existing Circe decoders. This keeps the trait minimal and shard-protocol-agnostic.
+  *     `(Address, Balance)` for MgBalances). A typed client surface would force one trait method per type, which doesn't compose. The wire
+  *     shape is uniformly `Hex`-wrapped canonical immutable bytes, and the validator decodes the expected type per call.
   *
   * '''Greenfield rule''' (per `[[feedback-greenfield-no-wire-compat]]`): fresh trait for the cross-shard read consumer. No compat ceremony
   * with any pre-Slice-10 path (there isn't one).
@@ -106,8 +106,8 @@ object ShardSubtreeProofClient {
     *
     * '''Why a local read, not a peer fetch.''' gl0 is the GLOBAL mirror — it already holds the finalized state of EVERY shard's metagraphs
     * in its own MPT. The cross-shard value a `SpendActionValidator` needs (an `AllowSpend` set under `ActiveAllowSpends[targetMg][source]`,
-    * or a `Balance` under `Balances[targetMg][currencyId]`) is therefore readable directly from gl0's own consensus-pinned state — no
-    * committee round-trip required. The HTTP client ([[http]]) is the SHARD-COMMITTEE read path (one shard committee asking another's
+    * or an `(Address, Balance)` under `MgBalances[targetMg][account]`) is therefore readable directly from gl0's own consensus-pinned state
+    * — no committee round-trip required. The HTTP client ([[http]]) is the SHARD-COMMITTEE read path (one shard committee asking another's
     * prover); on the gl0 accept path a peer fetch would be NODE-LOCAL (network/peer-pick/cooldown) and its result feeds the consensus
     * `mptRoot`, which would FORK the cluster. This local reader eliminates that non-determinism: every gl0 node reads the SAME key off the
     * SAME consensus-pinned reader and gets the byte-identical value.
@@ -119,15 +119,17 @@ object ShardSubtreeProofClient {
     * value for the same key. NEVER pass a pending/best-tip/peer view here.
     *
     * '''Return semantics''' (per the trait contract):
-    *   - membership ⇒ `Some((Some(jsonBytes), selfProof))`. `jsonBytes` are the Circe-JSON encoding of the typed value
-    *     (`SortedSet[Signed[AllowSpend]]` for [[GlobalStateFieldId.ActiveAllowSpends]], `Balance` for [[GlobalStateFieldId.Balances]]) —
-    *     the EXACT shape `SpendActionValidator.decodeCrossShardAllowSpends` / `decodeCrossShardBalance` decode (UTF-8 JSON). The value is
-    *     read TYPED off the MPT and re-encoded as JSON so it round-trips through the validator's existing decoders verbatim.
+    *   - membership ⇒ `Some((Some(valueBytes), selfProof))`. `valueBytes` are the exact immutable-codec bytes committed by the MPT:
+    *     `SortedSet[Signed[AllowSpend]]` for [[GlobalStateFieldId.ActiveAllowSpends]], or `(Address, Balance)` for
+    *     [[GlobalStateFieldId.MgBalances]]. The strict point read returns the original leaf bytes rather than re-encoding a typed value, so
+    *     the local and HTTP proof paths use the same byte-exact protocol shape.
     *   - absent key ⇒ `Some((None, selfProof))`. gl0 holds all shards' state, so an absent key is a PROVEN absence at the finalized anchor
     *     (the validator treats it as "AllowSpend not found" / `Balance.empty`, identical to the same-shard `getOrElse` default) — NOT
     *     "couldn't fetch". This is the key difference from the HTTP client, whose `None` means "unavailable, retry".
+    *   - present but null, empty, undecodable, or structurally inconsistent value ⇒ `None` (unavailable). Malformed committed bytes are
+    *     never converted into authenticated absence or a zero balance.
     *   - unsupported `key.fieldId` (anything other than the two the validator reads) ⇒ `None` (unavailable). Defensive: the validator only
-    *     ever asks for `ActiveAllowSpends` / `Balances`, so this is unreachable in practice.
+    *     ever asks for `ActiveAllowSpends` / `MgBalances`, so this is unreachable in practice.
     *
     * '''The self proof is inert.''' The `SpendActionValidator` cross-shard paths consume ONLY the value bytes (the proof half of the tuple
     * is discarded — `case Some((Some(bytes), _))`); the validator re-decodes the bytes and re-applies the W3c effective-balance overlay
@@ -163,11 +165,6 @@ object ShardSubtreeProofClient {
       key: GlobalStateKey
     ): F[Option[(Option[Array[Byte]], ShardSubtreeProof)]] = {
 
-      // Encode the typed value as Circe JSON UTF-8 bytes — the EXACT shape the SpendActionValidator decodes
-      // (`io.circe.parser.decode[V](new String(bytes, UTF-8))`).
-      def jsonBytes[A: io.circe.Encoder](a: A): Array[Byte] =
-        a.asJson.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-
       def present(bytes: Array[Byte]): Option[(Option[Array[Byte]], ShardSubtreeProof)] =
         (bytes.some, selfProof(metagraphAddress, key, bytes.some)).some
 
@@ -180,19 +177,25 @@ object ShardSubtreeProofClient {
       key.fieldId match {
         case GlobalStateFieldId.ActiveAllowSpends =>
           reader
-            .get[SortedSet[Signed[AllowSpend]]](key)
+            .getStrict[SortedSet[Signed[AllowSpend]]](key)
             .map {
-              case Some(set) if set.nonEmpty => present(jsonBytes(set))
-              case _                         => absent
+              case Present(set, rawBytes) if set.nonEmpty => present(rawBytes)
+              case Present(_, _) | Malformed(_, _)        => unavailable
+              case Absent                                 => absent
             }
 
-        case GlobalStateFieldId.Balances =>
-          reader
-            .get[Balance](key)
-            .map {
-              case Some(balance) => present(jsonBytes(balance))
-              case None          => absent
-            }
+        case GlobalStateFieldId.MgBalances =>
+          key match {
+            case GlobalStateKey(MetagraphNamespace(owner), _, EmptyNamespace, AddressNamespace(account)) if owner === metagraphAddress =>
+              reader
+                .getStrict[(Address, Balance)](key)
+                .map {
+                  case Present((embeddedAccount, _), rawBytes) if embeddedAccount === account => present(rawBytes)
+                  case Present(_, _) | Malformed(_, _)                                        => unavailable
+                  case Absent                                                                 => absent
+                }
+            case _ => unavailable.pure[F]
+          }
 
         // The validator only ever asks for the two partitions above; anything else is unsupported ⇒ fail-closed unavailable.
         case _ => unavailable.pure[F]
@@ -234,10 +237,9 @@ object ShardSubtreeProofClient {
     *      for retry, the conservative outcome).
     *
     * '''Return semantics''' (per the trait contract):
-    *   - verify passes ⇒ `Some((proof.value.map(_.toBytes), proof))`. The value bytes ride alongside the proof on the wire (the serve side
-    *     populates `ShardSubtreeProof.value`); the consumer decodes them per-call. A membership proof whose serve side did not populate the
-    *     value surfaces as `Some((None, proof))` — proven-present-but-no-value, which the validator treats as "state not present" (the same
-    *     effect as an absent key).
+    *   - verify passes ⇒ `Some((Some(proof.value.toBytes), proof))`. Membership verification requires value bytes and binds their digest to
+    *     the unique authenticated leaf commitment before the consumer decodes them. A missing value fails verification; it is never exposed
+    *     as a proven absence.
     *   - any failure (no finalized anchor, no responsive peer, HTTP error, decode failure, verify=false) ⇒ `None`. This collapses the
     *     `CrossShardProofUnavailable` and `Tampered` cases into the single fail-closed `None` the trait specifies — refusing to validate
     *     beats validating against stale or fabricated state.

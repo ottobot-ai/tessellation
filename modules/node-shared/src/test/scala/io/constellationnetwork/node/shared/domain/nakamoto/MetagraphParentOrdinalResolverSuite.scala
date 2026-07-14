@@ -13,7 +13,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRead}
 import io.constellationnetwork.schema.{SnapshotOrdinal, SnapshotTips}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -54,6 +54,12 @@ object MetagraphParentOrdinalResolverSuite extends MutableIOSuite {
         key.fieldId match {
           case GlobalStateFieldId.LastStateChannelSnapshotHashes => IO.pure(tipHashOpt.asInstanceOf[Option[V]])
           case _                                                 => IO.pure(none[V])
+        }
+
+      def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
+        get[V](key).map {
+          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value).toArray)
+          case None        => StrictMptRead.Absent
         }
 
       def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] = IO.pure(Map.empty)

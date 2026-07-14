@@ -42,6 +42,7 @@ object MptTxAction {
   */
 trait MptStore[F[_], K] {
   def get[V: ImmutableCodec](key: K): F[Option[V]]
+  def getStrict[V: ImmutableCodec](key: K): F[StrictMptRead[V]]
   def getMany[V: ImmutableCodec](keys: List[K]): F[Map[K, V]]
 
   /** Decoded view of `producer.entriesWithPrefix(prefix)`. Returns `Map[Hex, V]` rather than `Map[K, V]` because the key encoding (`toHex`)
@@ -213,6 +214,12 @@ object MptStore {
             none[V].pure[F]
         }
       } yield result
+
+    override def getStrict[V: ImmutableCodec](key: K): F[StrictMptRead[V]] =
+      for {
+        hex <- toHex(key)
+        entries <- producer.entries
+      } yield entries.get(hex).fold[StrictMptRead[V]](StrictMptRead.Absent)(StrictMptRead.fromStoredBytes[V])
 
     override def getMany[V: ImmutableCodec](keys: List[K]): F[Map[K, V]] =
       if (keys.isEmpty) Map.empty[K, V].pure[F]

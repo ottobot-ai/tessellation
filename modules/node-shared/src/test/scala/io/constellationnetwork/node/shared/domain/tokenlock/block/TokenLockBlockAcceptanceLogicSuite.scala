@@ -18,7 +18,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.TokenUnlock
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRead}
 import io.constellationnetwork.schema.round.RoundId
 import io.constellationnetwork.schema.swap.CurrencyId
 import io.constellationnetwork.schema.tokenLock._
@@ -123,6 +123,12 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
 
       def get[V: ImmutableCodec](key: GlobalStateKey): IO[Option[V]] =
         Option.when(key == balanceKey)(sourceBalance.asInstanceOf[V]).pure[IO]
+
+      def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
+        get[V](key).map {
+          case Some(value) => StrictMptRead.Present(value, ImmutableCodec[V].immutableBytes(value).toArray)
+          case None        => StrictMptRead.Absent
+        }
 
       def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] = Map.empty[GlobalStateKey, V].pure[IO]
 
