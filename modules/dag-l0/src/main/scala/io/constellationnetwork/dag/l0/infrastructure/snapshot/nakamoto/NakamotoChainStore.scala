@@ -606,45 +606,34 @@ object NakamotoChainStore {
           stateRef.get.flatMap(_.byHash.get(hash) match {
             case some @ Some(_) => Async[F].pure(some)
             case None           =>
-              // In-memory miss — Fix B may have evicted this entry. Try disk via `SnapshotStorage`.
-              // SnapshotStorage indexes by ordinal; we use the caller-supplied `expectedOrdinal` to do
-              // the point read, then verify the returned snapshot's hash matches the requested `hash`.
-              // The hash-verify defends against forks: disk may hold an ordinal-N snapshot from a
-              // chain different from the one the caller is walking. Hash mismatch ⇒ None (caller's
-              // chain-walk treats this as broken and falls through to whatever non-canonical handling
-              // they want).
+              // Fix B may have evicted this entry from memory. Resolve the immutable hash index first;
+              // the ordinal index is only an availability fallback and must reproduce the requested
+              // hash exactly. A same-height sibling is never an ancestor substitute.
               if (expectedOrdinal < 0L) Async[F].pure(None)
               else {
                 val ord = SnapshotOrdinal(NonNegLong.unsafeFrom(expectedOrdinal))
                 HasherSelector[F].withCurrent { implicit hasher =>
-                  underlyingStorage.get(ord).flatMap {
-                    case None => Async[F].pure(None: Option[StoredSnapshot])
-                    case Some(signedSnap) if signedSnap.value.ordinal =!= ord =>
+                  def validateDiskSnapshot(
+                    signedSnap: Signed[GlobalIncrementalSnapshot],
+                    lookup: String
+                  ): F[Option[StoredSnapshot]] =
+                    if (signedSnap.value.ordinal =!= ord)
                       logger
                         .warn(
-                          s"getWithOrdinalFallback rejected ordinal-file mismatch: requested=$expectedOrdinal " +
+                          s"getWithOrdinalFallback rejected $lookup ordinal mismatch: requested=$expectedOrdinal " +
                             s"embedded=${signedSnap.value.ordinal.value.value}"
                         )
                         .as(None)
-                    case Some(signedSnap) =>
+                    else
                       signedSnap.toHashed[F].flatMap { hashed: Hashed[GlobalIncrementalSnapshot] =>
                         if (hashed.hash =!= hash)
-                          // Disk's ordinal-N snapshot is from a different chain than the caller is
-                          // walking. Don't return it — chain-walks must stay on their requested
-                          // chain or correctness breaks.
                           logger
                             .debug(
-                              s"getWithOrdinalFallback ordinal=$expectedOrdinal hashMismatch: " +
+                              s"getWithOrdinalFallback $lookup ordinal=$expectedOrdinal hashMismatch: " +
                                 s"requested=${hash.value.take(12)} disk=${hashed.hash.value.take(12)}"
                             )
                             .as(None)
                         else {
-                          // Reconstruct a `StoredSnapshot` from the on-disk record. The slot
-                          // certificate (when present) carries slot / parentSlot / vrfOutput; on
-                          // legacy / cert-less snapshots we synthesize zero defaults (those code
-                          // paths are pre-Nakamoto and won't be visited via this fallback under
-                          // production Nakamoto config). `parentHash` lives on the incremental
-                          // snapshot itself (`lastSnapshotHash`).
                           val signed = hashed.signed
                           val cert = signed.value.slotCertificate
                           val slot = cert.map(_.slot.value.value).getOrElse(0L)
@@ -678,6 +667,14 @@ object NakamotoChainStore {
                           )
                           Async[F].pure(Some(stored): Option[StoredSnapshot])
                         }
+                      }
+
+                  underlyingStorage.get(hash).flatMap {
+                    case Some(exact) => validateDiskSnapshot(exact, "hash-index")
+                    case None =>
+                      underlyingStorage.get(ord).flatMap {
+                        case Some(byOrdinal) => validateDiskSnapshot(byOrdinal, "ordinal-index")
+                        case None            => Async[F].pure(None: Option[StoredSnapshot])
                       }
                   }
                 }
