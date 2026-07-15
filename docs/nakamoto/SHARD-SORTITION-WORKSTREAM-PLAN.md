@@ -50,8 +50,9 @@ Duty determines who may propose. It never determines validity. The producer and
 every execution signer replay the included CL1 window before signing. Target
 ordinary noncommittee GL0 adopters require distinct execution quorum, compare the
 exact Phase-2 base/pre-root, apply the canonical scoped diff, and recompute its
-root; assigned watchtowers replay as the collusion backstop. Current universal
-adopter replay is a regression, not the target.
+root; assigned watchtowers replay as the collusion backstop. Current ordinary
+noncommittee GL0 replay of sharded CL1 checkpoints is a regression, not the
+target. Universal native GL1 execution and the global kernel remain.
 
 ## Enforcement Sites
 

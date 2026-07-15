@@ -2,9 +2,11 @@
 
 > **HISTORICAL, SUPERSEDED RESEARCH.** The survey is retained as background, but
 > its Tessellation recommendation is not the current protocol and must not be
-> implemented as authority. Current cross-shard economics settle through
-> consensus-pinned GL0 state, GL0 re-execution, and canonical single-use state as
-> specified by [`../../AGENTS.md`](../../AGENTS.md) and ADR-0016/ADR-0017.
+> implemented as authority. Current target cross-shard economics settle through
+> consensus-pinned GL0 state, replay-backed CL1 execution certificates, scoped
+> diff/root verification, universal GL0 execution of the global settlement
+> kernel, and canonical single-use state. Native GL1 execution also remains
+> universal. See [`../../AGENTS.md`](../../AGENTS.md) and ADR-0016/ADR-0017.
 
 **Status:** research document. Survey + recommendation. No code commitment.
 Written 2026-05-22 against `feature/serde-typeclass-shim`.

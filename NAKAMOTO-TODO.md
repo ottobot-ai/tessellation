@@ -20,8 +20,9 @@
 > and sign only an exact matching canonical byte diff/root. Ordinary noncommittee
 > GL0 nodes verify the execution threshold, apply the pinned-base diff, and
 > recompute the root; watchtowers replay as the collusion backstop. Commit
-> `c610a0740` regressed this target to universal GL0 recreation and must be repaired
-> selectively without restoring `authoritative*` fields. The failed shard design
+> `c610a0740` regressed this target to ordinary noncommittee GL0 recreation of
+> sharded CL1 checkpoints and must be repaired selectively without restoring
+> `authoritative*` fields. Universal native GL1 execution remains mandatory. The failed shard design
 > used secret stake-weighted VRF self-sortition and per-slot LDD leadership.
 > Current shard v1 uses public deterministic VK-hash membership, uniform `1/N`
 > over eligible GL0 operators, and hash-shuffled staircase producer duty.
@@ -556,7 +557,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - Producer and every signer reproduce decisions/diff/intents/root at the exact
     base; missing data/base/era means defer/no-sign.
   - Enforce distinct eligible `kQuorum`; no receipt/depth/best-tip substitute.
-  - Retain universal adopter replay until E9 closes.
+  - Retain ordinary-GL0 replay of sharded CL1 checkpoints until E9 closes.
+    Universal GL0 execution of native GL1/DAG-token transitions remains.
   - **Current landing:** the shard attestation emitter accepts only a sealed
     replay-minted `VerifiedShardCheckpoint`; rejected/mismatching intake cannot
     store/count/sign, replay-valid under-quorum intake can collect signatures, and
@@ -613,12 +615,20 @@ criteria are in `NAKAMOTO-PLAN.md`.
 ### Wave 4 - Global adoption and cross-metagraph settlement
 
 - [ ] **E9 PLANNED - verified GL0 diff adoption and global settlement kernel**
+  - **CONFIRMED blocker:** candidate replay still reads ambient/ordinal-only
+    authority at `CurrencySnapshotAcceptanceManager.scala:300-324,362,378-380,594-596`
+    and `GlobalSnapshotOpsManager.scala:46-50,122-134`. Replace these
+    with one candidate-parent-scoped exact artifact resolver plus hash/root-bound
+    historical state reader before claiming deterministic replay. Missing local
+    history enters recovery/defer; it is not artifact invalidity.
   - Verify quorum/base/continuity/pre-root/input/coverage/diff scope, apply the
     canonical diff, and recompute post-roots. Never install a claimed root.
   - Require exact canonical Phase-2 origin for every signed historical read,
     nondecreasing per-MG refs, and proposal-parent pre-root/version CAS before
     replay/sign/inclusion. Receiver live head and self-claimed roots never enter.
-  - Replace ordinary universal CL1 replay only after malformed-artifact gates pass.
+  - Replace ordinary noncommittee GL0 replay of sharded CL1 transitions only
+    after malformed-artifact gates pass. Preserve signer/watchtower replay and
+    universal native GL1/global-kernel execution.
   - Run one deterministic GL0 conflict/nullifier/settlement kernel over signed
     intents and atomically compose per-MG mirrors with GL0-owned overlays.
   - Replace bounded `GlobalSnapshotsProcessed` reconstruction with a rooted,
@@ -909,8 +919,9 @@ be the independent closer.
   is still the current root-only checkpoint, however; it does not bind/reproduce
   the target canonical diff, intents, or complete root. `verifyEmbedded` and GSAM
   still replay on every GL0 node. Add noncommittee diff apply; watchtower replay
-  remains the collusion backstop. Before removing universal
-  replay, embedded adoption must also enforce distinct `kQuorum` and the signed
+  remains the collusion backstop. Before removing this ordinary noncommittee GL0
+  replay of sharded CL1 checkpoints, embedded adoption must also enforce distinct
+  `kQuorum` and the signed
   checkpoint must bind exact Phase-2 hash/root plus network/genesis/era/parameters;
   neither holds today.
 - ⚠ **Global replay-before-attest type boundary partially contained** — raw

@@ -33,7 +33,8 @@ The original implementation violated the invariant:
 - watchtower replay happened after adoption.
 
 The first ADR revision correctly required every committee signer to replay. The
-later universal-replay amendment conflated two unrelated concepts:
+later ordinary-noncommittee universal replay amendment for sharded CL1
+checkpoints conflated two unrelated concepts:
 
 1. **forbidden authority overrides:** ML0-carried `authoritative*` cumulative
    fields and `AdoptFromSignedFields`, which could replace framework state; and
@@ -190,8 +191,10 @@ ML0 `CurrencySnapshotInfo`.
   checkpoints can collect signatures. The capability still proves the current
   root-only recreation, not the target diff/intents/complete-root result.
 - intake and `verifyEmbedded` now enforce distinct configured execution `kQuorum`;
-  current universal replay remains the temporary economic backstop until canonical
-  diff adoption and positive watchtower coverage land.
+  current ordinary-GL0 replay of sharded CL1 checkpoints remains the temporary
+  economic backstop until canonical diff adoption and positive watchtower
+  coverage land. This replacement never removes universal GL0 execution of
+  native GL1/DAG-token transitions.
 - the signed checkpoint binds an execution-base ordinal but not the exact Phase-2
   hash/root or network/genesis/era/parameter domain.
 - field 32 remains writable, removable, and reconstructible in GL0. Pinned peer
@@ -205,8 +208,9 @@ ML0 `CurrencySnapshotInfo`.
 - the current `numShards > 1` activation gate still makes the one-shard economic
   configuration bypass the target committee/diff/watchtower path.
 
-These facts prove neither the old blind-sign path nor universal replay is the
-target.
+These facts prove neither the old blind-sign path nor ordinary universal replay
+of sharded CL1 checkpoints is the target. Universal GL0 execution of native
+GL1/DAG-token transitions remains mandatory.
 
 ## Required tests
 

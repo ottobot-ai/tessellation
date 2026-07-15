@@ -2,8 +2,9 @@
 
 > **HISTORICAL PRE-FIX REVIEW PACKET.** This document is preserved as audit
 > evidence for the 2026-07-07 tree; it is not current architecture, a migration
-> plan, or a compatibility contract. In particular, byte-diff adoption,
-> committee-as-authority, and authoritative-push descriptions are superseded.
+> plan, or a compatibility contract. In particular, pre-fix unchecked/roots-only
+> byte-diff adoption, committee-as-authority, and authoritative-push descriptions
+> are superseded. Replay-certified, scoped diff adoption remains the target.
 > Revalidate every file/line claim against current source and use
 > [`../../AGENTS.md`](../../AGENTS.md), ADR-0016, and ADR-0017 as the design of
 > record.

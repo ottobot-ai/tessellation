@@ -13,6 +13,17 @@ that operator has authenticated the snapshot and locally reproduced its complete
 deterministic GL0 transition. A selected tip, a stored hash, successful decoding,
 or another operator's signature is not such proof.
 
+The complete GL0 transition always includes universal execution of native
+GL1/DAG-token inputs and the deterministic global cross-metagraph settlement
+kernel. For a sharded CL1 checkpoint, the target noncommittee GL0 transition is
+execution-certificate and positive-watchtower-coverage verification, scoped
+diff/root/compare-and-set adoption, and global-kernel execution; it is not
+ordinary currency recreation. Current ordinary noncommittee CL1 replay is a
+temporary backstop until that complete certified-diff path lands. A receipt must
+never be interpreted either as permission to stop universal GL1 execution or as
+a requirement to preserve ordinary noncommittee GL0 recreation of sharded CL1
+checkpoints.
+
 This is an input boundary for the Avalanche/Snowball optimistic Phase-2 rail. It
 is not economic validation by signature count, and it does not add a global BFT
 proposal, vote, lock, quorum certificate, commit certificate, or view change.

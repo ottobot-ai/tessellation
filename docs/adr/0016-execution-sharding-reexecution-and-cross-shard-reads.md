@@ -6,9 +6,11 @@ Date: 2026-07-10
 
 Accepted; corrected 2026-07-11 by owner clarification and ADR-0017.
 
-**Implementation status: BLOCKED.** Commit `c610a0740` changed ordinary GL0
-adoption from committee-produced byte diffs to universal currency recreation.
-That is not this decision. The forward repair is specified in ADR-0017.
+**Implementation status: BLOCKED.** Commit `c610a0740` changed ordinary
+noncommittee GL0 adoption from committee-produced byte diffs to full recreation
+of sharded CL1 framework transitions. That is not this decision. Universal GL0
+execution of native GL1/DAG-token transitions is unchanged and permanent. The
+forward repair is specified in ADR-0017.
 
 ## Context
 

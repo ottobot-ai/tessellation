@@ -78,6 +78,13 @@ Cross-references:
 
 ## §0 TL;DR
 
+> **SUPERSEDED SECTION.** The roots/quorum/slashing substitute described below is
+> rejected. Current validity requires producer and every execution signer to
+> replay, positive watchtower coverage before inclusion, and ordinary GL0
+> adopters to verify the certificate, scoped diff, compare-and-set base, and
+> recomputed root. Native GL1 and the global settlement kernel remain universally
+> executed by GL0.
+
 **Combined mitigation: Option A (VRF-sortition of operator keys to
 shards) as structural defence + Option C (out-of-band slashing /
 governance) as economic deterrent. Option B (per-shard attestation-set
@@ -359,6 +366,11 @@ is out of scope.
 **gl0 acceptance CPU**: one VRF-eligibility check per SC binary + one state-proof verification (verify `prev_root → applied_transitions → claimed_new_root` holds against the binary's embedded proof, NOT re-execute the transitions). At 3000 binaries per gl0 snapshot × (~10ms VRF + ~50ms proof verify) = 180s/snapshot — exceeds the 7s cadence. Mitigation: batched verification + cached committee assignments + parallelizable proof checks. Address in implementation phase A2.
 
 ### 2.7 gl0 simplification — removing universal currency re-validation
+
+> **SUPERSEDED SECTION.** "Sole re-executors" and trust-as-validity below are not
+> the target. Execution signers and watchtowers replay; ordinary noncommittee GL0
+> nodes verify and apply the replay-certified scoped diff and recompute its root.
+> Every GL0 node still executes native GL1 and the global settlement kernel.
 
 **This is the load-bearing structural change Option A enables.** Today gl0 re-executes every metagraph's currency-layer transitions inside the global pipeline (`SpendActionValidator` + `priorBalances` merge inside `GlobalSnapshotAcceptanceManager`). That re-execution is what makes "every gl0 operator must hold every metagraph's currency state" a current necessity — and is the implicit defence against captured-metagraph attacks (mint-from-thin-air). It is also what bounds throughput: currency re-validation is universal-replicated work that does not parallelize across shards.
 

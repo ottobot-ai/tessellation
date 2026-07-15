@@ -217,9 +217,11 @@ the lane opening. Client-facing finality speed lives in the ml0 countersign rail
     snapshot reaching Phase 2 releases its successor. The current honest-producer gate is partial because the checkpoint does not yet carry
     portable verifier-checkable Phase-2 parent-anchor evidence.
 
-**Safety:** committee membership and duty restrict who may propose, but neither signatures nor depth authorize economic state. Every GL0
-adopter must recreate each included CL1 transition at the signed finalized execution base before storing, attesting, selecting, or embedding
-the checkpoint. Watchtower slashing is defense in depth.
+**Safety correction:** committee membership and duty restrict who may propose, but neither signatures nor depth authorize economic state.
+For sharded CL1 checkpoints, the producer and every execution signer replay before signing, and assigned watchtowers replay. Ordinary
+noncommittee GL0 adopters verify the replay-backed execution certificate and positive coverage, apply the namespace-bounded diff, and
+recompute its root. Every GL0 validator separately executes native GL1/DAG-token transitions and the deterministic global
+conflict/nullifier/settlement kernel. This paragraph, not the superseded universal-CL1-recreation text, is the execution boundary.
 
 ### 5.8 High-traffic metagraphs — spreading levers (owner-reviewed 2026-06-12)
 

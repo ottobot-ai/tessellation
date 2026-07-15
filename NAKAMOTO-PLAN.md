@@ -70,8 +70,10 @@ Every task, including documentation and schema changes, follows the same loop:
 2. **RED:** add an exploit regression or independent model/oracle that fails on
    the baseline for the intended reason.
 3. **Implement:** make the smallest owned change behind typed boundaries. Do not
-   weaken current universal replay until its replay-certified replacement and
-   adoption checks are executable.
+   weaken the temporary ordinary-GL0 replay of sharded CL1 checkpoints until its
+   replay-certified diff replacement and adoption checks are executable. This
+   does not apply to native GL1/DAG-token transitions, which every GL0 node must
+   continue to execute.
 4. **Verify:** run focused unit/property tests, independent differential/model
    checks, restart/reorg tests, then multi-node tests at `numShards=1`, `2`, and
    `K`.
@@ -667,7 +669,9 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   capability. Missing base/body/era/data means defer/no-sign.
 - Require distinct eligible `kQuorum` signatures. Shard depth, receipt count,
   best-tip, and ancestor position never substitute for replay signatures.
-- Keep universal adopter replay until E9 diff adoption passes its complete gates.
+- Keep ordinary-GL0 replay of sharded CL1 checkpoints until E9 diff adoption
+  passes its complete gates. Universal GL0 execution of native GL1/DAG-token
+  transitions is permanent and is not part of this replacement.
 - Current landing: shard checkpoint signatures require a sealed
   `VerifiedShardCheckpoint` minted by intake replay, including for under-quorum
   ancestor closure across committee rotation. This capability currently proves
@@ -750,6 +754,16 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
 
 **Depends on:** E1, E4, E5, E8, and S2. **Security cutover point.**
 
+**Confirmed replay-authority blocker:** the historical-snapshot callback is not
+the sole input today. Currency replay can prefer ordinal-only `LastN` snapshots,
+reuse ordinal-keyed SpendAction/cache entries, and read the node's ambient
+combined global state for message inputs. A same-ordinal sibling can therefore
+change candidate validity even when the caller supplies an exact-parent lookup.
+E9 must first provide one candidate-parent-scoped artifact resolver and an exact
+hash/root-bound historical state reader, route every replay read through them,
+and enter `RecoveryRequired` on unavailable retained data. Local `k2` may bound
+work; it never makes an older reference invalid or changes fork choice.
+
 - Ordinary noncommittee GL0 nodes verify identities/quorum, exact base, parent/
   ordinal, pre-root/version, input commitments, the positive-coverage certificate
   and absence of a pending authenticated mismatch, diff namespace/canonicality,
@@ -759,8 +773,10 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   segment, and never use receiver live head, peer-local state, wall clock, or a
   self-claimed root. Compare-and-set every touched MG against proposal-parent
   mirror root/version before composition.
-- Only after those checks pass, replace ordinary universal CL1 recreation with
-  zero-recreation diff adoption. Never install a claimed root.
+- Only after those checks pass, replace ordinary noncommittee GL0 recreation of
+  sharded CL1 transitions with zero-recreation diff adoption. Never install a
+  claimed root. Producer/signers/watchtowers still replay, and native GL1 plus
+  the global kernel remain universally executed by GL0.
 - Every GL0 node runs the small deterministic global ordering/conflict/nullifier/
   settlement kernel over committee-extracted signed intents. Apply mirror diffs
   and GL0-owned settlement overlay atomically without letting either overwrite

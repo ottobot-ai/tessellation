@@ -1,7 +1,8 @@
 # Hierarchical Shard Checkpoints
 
-**Status:** Target shard design; implementation currently regressed to universal
-GL0 currency recreation. ADR-0016/0017 and
+**Status:** Target shard design; implementation currently regressed to ordinary
+noncommittee GL0 recreation of sharded CL1 transitions. Universal native GL1
+execution is not part of that regression. ADR-0016/0017 and
 `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` are normative.
 
 ## 1. Purpose and topology

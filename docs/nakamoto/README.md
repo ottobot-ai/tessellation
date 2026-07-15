@@ -45,15 +45,17 @@ normative files explicitly separate current source facts from target design.
 - `UNIFIED-CONSENSUS-ENGINE-DESIGN.md` - superseded for ML0. ML0 may remain BFT;
   never use this draft to add BFT machinery to GL0.
 - `CURRENCY-APP-TOKEN-ENFORCEMENT.md` - historical record of the rejected
-  universal-GL0 recreation regression, not the target execution model.
+  ordinary-noncommittee sharded-CL1 recreation regression, not the target
+  execution model.
 - `IMPLEMENTATION-PLAN-POST-VALIDATION.md`, session handoffs, forensic reports,
   flake/RCA notes, and `historical/` - evidence and history, not current work order.
 - `SHARD-CHECKPOINT-MONOTONICITY-DESIGN.md` and
   `SHARD-CHECKPOINT-CHAINSYNC-DESIGN.md` - forensic evidence only. Their
   configurable pipeline and shard-depth fallback language is retired.
 - Roots-only, `AdoptFromSignedFields`, direct shard-receipt, stake-weighted secret
-  execution-VRF, universal ordinary-GL0 CL1 replay, and GSI-authority directions
-  are retired. Do not implement them from an older note.
+  execution-VRF, ordinary-noncommittee full CL1 replay, and GSI-authority
+  directions are retired. Universal native GL1 and global-kernel execution are
+  not retired. Do not implement the rejected directions from an older note.
 
 ## Required vocabulary
 

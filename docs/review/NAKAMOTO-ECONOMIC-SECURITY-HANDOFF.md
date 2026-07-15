@@ -12,9 +12,11 @@
 > replay-before-sign, a canonical root-covered checkpoint byte diff,
 > noncommittee GL0 apply/root verification, and noncommittee watchtower replay.
 > Commit `c610a0740` removed the old blind-sign/quorum-adopt path but also removed
-> the useful diff and regressed to universal GL0 currency recreation. Do not
-> restore `authoritative*`/`AdoptFromSignedFields`, and do not treat universal
-> recreation as the target. See the current ADR-0017 and consensus lifecycle.
+> the useful diff and regressed to ordinary noncommittee GL0 recreation of
+> sharded CL1 checkpoints. Do not restore `authoritative*`/`AdoptFromSignedFields`,
+> and do not treat that recreation as the target. Universal native GL1 execution
+> and global-kernel execution remain mandatory. See the current ADR-0017 and
+> consensus lifecycle.
 >
 > **Current root-contract correction (2026-07-13):** every
 > `SystemNamespace` active-address and expiry index participates in

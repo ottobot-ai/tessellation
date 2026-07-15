@@ -1,7 +1,8 @@
 # 01 — Execution Roadmap (epics → tasks → DAG)
 
 > **HISTORICAL PRE-FIX ROADMAP.** This plan was written against `21933559c`
-> before universal GL0 replay replaced committee-root/diff adoption and before
+> before ordinary noncommittee GL0 replay of sharded CL1 checkpoints replaced
+> committee-root/diff adoption and before
 > the 2026-07-11 audit expanded the production blockers. Its priority order,
 > cutover gates, roots-only work, bounded-history replay proposal, finality patch,
 > and `smtRootBlind` test are not active instructions. The current finding-owned

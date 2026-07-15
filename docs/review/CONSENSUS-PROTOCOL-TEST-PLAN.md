@@ -6,9 +6,10 @@
 **Roadmap:** `CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`
 
 The current test suite is a regression baseline, not a proof of the target. Some
-tests encode universal GL0 recreation, ordinal-only finality, legacy attestation
-aggregation, or undeclared payload behavior. Such tests must first become RED
-counterexamples or be rewritten against the ratified lifecycle.
+tests encode ordinary noncommittee GL0 recreation of sharded CL1 checkpoints,
+ordinal-only finality, legacy attestation aggregation, or undeclared payload
+behavior. Such tests must first become RED counterexamples or be rewritten
+against the ratified lifecycle. Tests for universal native GL1 execution remain.
 
 ## 1. Security-closing packet contract
 
@@ -676,5 +677,6 @@ transitions did not occur.
 P13 has no authorship in P1-P12 closing changes. Release requires every enabled
 catalog test, zero unowned/open CRITICAL/HIGH findings, exactly one active GL0
 chain engine, zero blind state-signature APIs, zero universal ordinary-adopter CL1
-replay, zero GSI authority/fallback, one active ScodecV1 genesis era, and a source
+replay (while preserving universal native GL1/global-kernel execution), zero GSI
+authority/fallback, one active ScodecV1 genesis era, and a source
 re-audit of every sign/adopt/phase/serve/recover path.
