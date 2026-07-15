@@ -630,6 +630,43 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     } yield expect.same(true, result.isLeft)
   }
 
+  test("reflected lower execution receipts with a wrong issuer cannot expose payload") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    def instantiate(className: String, args: Array[AnyRef]): AnyRef = {
+      val constructor = Class.forName(className).getDeclaredConstructors.head
+      constructor.newInstance(args: _*).asInstanceOf[AnyRef]
+    }
+
+    for {
+      gscf <- mkGlobalSnapshotConsensusFunctions()
+      forgedReplay = instantiate(
+        "io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotConsensusFunctions$ReplayReceipt",
+        Array(null, null, new Object)
+      ).asInstanceOf[GlobalSnapshotReplayReceipt]
+      forgedReplayWithNullIssuer = instantiate(
+        "io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotConsensusFunctions$ReplayReceipt",
+        Array(null, null, null)
+      ).asInstanceOf[GlobalSnapshotReplayReceipt]
+      forgedProposal = instantiate(
+        "io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotConsensusFunctions$ProposalExecutionReceipt",
+        Array(null, null, Set.empty[Any].asInstanceOf[AnyRef], new Object)
+      ).asInstanceOf[GlobalSnapshotProposalExecutionReceipt]
+      forgedProposalWithNullIssuer = instantiate(
+        "io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotConsensusFunctions$ProposalExecutionReceipt",
+        Array(null, null, Set.empty[Any].asInstanceOf[AnyRef], null)
+      ).asInstanceOf[GlobalSnapshotProposalExecutionReceipt]
+    } yield
+      expect.all(
+        gscf.consumeReplayReceipt(null).isEmpty,
+        gscf.consumeReplayReceipt(forgedReplay).isEmpty,
+        gscf.consumeReplayReceipt(forgedReplayWithNullIssuer).isEmpty,
+        gscf.consumeProposalExecutionReceipt(null).isEmpty,
+        gscf.consumeProposalExecutionReceipt(forgedProposal).isEmpty,
+        gscf.consumeProposalExecutionReceipt(forgedProposalWithNullIssuer).isEmpty
+      )
+  }
+
   test("native GL1 blocks are independently accepted and executed by GL0 producer and follower paths") { res =>
     implicit val (_, j, h, sp, m) = res
 
@@ -653,7 +690,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
       lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
       signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
-      (artifact, producerContext, _) <- producer.createProposalArtifact(
+      producerReceipt <- producer.createProposalArtifactWithExecutionReceipt(
         SnapshotOrdinal.MinValue,
         signedLastArtifact,
         signedGenesis.value.info.toGlobalSnapshotInfo,
@@ -663,7 +700,12 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         Set.empty,
         _ => None.pure[IO]
       )
-      followerResult <- follower.validateArtifact(
+      wrongInstanceProducerExecution = follower.consumeProposalExecutionReceipt(producerReceipt)
+      producerExecution <- IO.fromOption(producer.consumeProposalExecutionReceipt(producerReceipt))(
+        new IllegalStateException("producer rejected its own execution receipt")
+      )
+      (artifact, producerContext, _) = producerExecution
+      followerResult <- follower.validateArtifactWithReplayReceipt(
         signedLastArtifact,
         signedGenesis.value.info.toGlobalSnapshotInfo,
         EventTrigger,
@@ -673,14 +715,18 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       )
       observedProducerCalls <- producerCalls.get
       observedFollowerCalls <- followerCalls.get
+      wrongInstanceFollowerContext = followerResult.toOption.flatMap(producer.consumeReplayReceipt).map(_._2)
+      followerContext = followerResult.toOption.flatMap(follower.consumeReplayReceipt).map(_._2)
     } yield
-      expect(isExpectedNativeBlockAcceptance(observedProducerCalls, block, SnapshotOrdinal.MinValue.next)) &&
+      expect(wrongInstanceProducerExecution.isEmpty) &&
+        expect(wrongInstanceFollowerContext.isEmpty) &&
+        expect(isExpectedNativeBlockAcceptance(observedProducerCalls, block, SnapshotOrdinal.MinValue.next)) &&
         expect(isExpectedNativeBlockAcceptance(observedFollowerCalls, block, SnapshotOrdinal.MinValue.next)) &&
         expect(artifact.blocks.exists(_.block == block)) &&
         expect(artifact.shardCheckpoints.isEmpty) &&
         expect(artifact.stateChannelSnapshots.isEmpty) &&
         expect.eql(reproducedBalances, producerContext.balances) &&
-        expect.eql(Some(reproducedBalances), followerResult.toOption.map(_._2.balances))
+        expect.eql(Some(reproducedBalances), followerContext.map(_.balances))
   }
 
   test("a GL0 follower rejects a leader artifact when native GL1 execution differs") { res =>
@@ -717,7 +763,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         Set.empty,
         _ => None.pure[IO]
       )
-      followerResult <- follower.validateArtifact(
+      followerResult <- follower.validateArtifactWithReplayReceipt(
         signedLastArtifact,
         signedGenesis.value.info.toGlobalSnapshotInfo,
         EventTrigger,

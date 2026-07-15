@@ -89,16 +89,16 @@ object SidecarRumorBridge {
               hasherSelector
                 .withCurrent(implicit hasher => signed.toHashed)
                 // tryOffer-DROP, not blocking offer (2026-06-10): the rumor queue is bounded. Blocking here would
-                // stall this GossipStream drain and migrate the backlog into GossipStream's own queue. Gossip is
-                // lossy + round-replayed (GossipRoundRunner re-pulls missing rumors from peers), so dropping an
-                // inbound PEER rumor under overload is correct and self-healing — never an OOM. (Local-produced
-                // rumors use blocking offer in Gossip.spread; those must not drop.)
+                // stall this GossipStream drain and migrate the backlog into GossipStream's own queue. Dropping an
+                // inbound PEER rumor bounds memory, but Nakamoto mode does not run the legacy pull-gossip rounds,
+                // so this path is lossy until durable retry/outbox recovery lands. (Local-produced rumors use a
+                // supervised blocking offer in Gossip.spread; those must not drop.)
                 .flatMap { hashed =>
                   rumorQueue.tryOffer(hashed).flatMap {
                     case true => Async[F].unit
                     case false =>
                       logger.warn(
-                        s"Rumor queue full — dropping inbound sidecar rumor (contentType=${rumor.contentType}); will re-replay via gossip rounds"
+                        s"Rumor queue full — dropping inbound sidecar rumor (contentType=${rumor.contentType}); Nakamoto transport retry is not guaranteed"
                       )
                   }
                 }

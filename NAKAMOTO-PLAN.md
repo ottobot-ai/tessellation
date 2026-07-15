@@ -27,11 +27,28 @@ different execution shards, with every effect mediated by the selected GL0
 snapshot chain:
 
 ```text
-CL1/DL1 -> ML0 signed binary -> GL0 admission/custody -> execution shard
-        -> replay-certified checkpoint -> positive watchtower coverage
-        -> GL0 diff adoption + global conflict/nullifier/settlement kernel
-        -> exact Phase-2 downstream state and reorg/rebase notifications
+native client -> GL1 -> universal GL0 native execution/validation
+
+CL1 framework lane -> ML0 signed currency envelope -> GL0 admission
+        -> execution shard replay-certified checkpoint
+        -> positive watchtower coverage -> GL0 diff adoption
+        -> global conflict/nullifier/settlement kernel
+
+DL1 custom lane -> ML0 signed data commitment/DA payload
+        -> GL0 admission + authenticated custody/availability/ordering only
+
+exact Phase-2 GL0 state -> downstream adoption + reorg/rebase notifications
 ```
+
+The sharded replay optimization applies only to ordinary noncommittee processing
+of CL1 framework transitions carried through ML0 checkpoints. It never applies to
+the direct GL1 path: every GL0 validator independently executes and validates
+native DAG-token transitions against the exact proposal parent. In the target,
+every GL0 validator also executes the deterministic global
+conflict/nullifier/settlement kernel; that kernel is E9 planned work, not a current
+claim. A `FrameworkCurrencyWithData` envelope follows both lanes: only its
+framework portion is replayed, while its isolated custom commitment remains DA
+carriage.
 
 GL0 consensus remains Nakamoto/Taktikos/LDD. Avalanche/Snowball is only the
 optimistic exact-hash Phase-2 rail. Do not introduce global proposal/vote/lock,
@@ -277,7 +294,7 @@ already has a hard-coded kill switch.
    rehashing or binding one immutable exact target. Provider remains `None`, so
    proof routes remain unavailable/503; this also unnecessarily disables the pure
    verifier route (`STOR-03`, contained dark, not closed;
-   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:1510-1514`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:1446-1456`;
    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/TowerCatchupCoordinator.scala:216-312,372-513`;
    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerFinalizer.scala:89-96,180-213`;
    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerProofBuilder.scala:96-103,148-166`;
@@ -297,7 +314,7 @@ already has a hard-coded kill switch.
    `modules/shared/src/main/scala/io/constellationnetwork/validator/StateProofComparison.scala:28-37,45-78`;
    `modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotStateProof.scala:124-130`;
    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala:282-299,353`;
-   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:692-694`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:715-717`;
    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/domain/snapshot/programs/Download.scala:368-381,607-622`;
    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala:61-72`;
    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotTraverse.scala:107-116,183-194`;
@@ -334,7 +351,7 @@ path on the current root shape.
 - Implement/validate the real K/alpha/beta Avalanche/Snowball cascade as the
   optimistic Phase-2 rail and `k1` depth as its Nakamoto fallback. Neither rail
   validates economics.
-- **Current containment (2026-07-14):** raw local GL0 attestation emitters,
+- **Current containment (2026-07-15):** raw local GL0 attestation emitters,
   receiver-invented producer evidence, periodic best-tip re-attestation, and the
   one-round cumulative-weight finalization sink are removed. Verified remote
   attestations and unfinished trigger/accumulator objects are telemetry only;
@@ -345,10 +362,18 @@ path on the current root shape.
   `RTA-RED-019` proves exact-hash depth progress with no attestations
   (`NakamotoChainStoreSuite.scala`). Typed store outcomes, internal mutation
   serialization, in-memory branch/lineage revisions, and exact selected-tip
-  finalization CAS have also landed. This is a temporary safety restriction, not
-  E1 completion: authenticated replay/preference capabilities, durable revisions
-  and publication/effect journals, the sampled exact-hash decision transcript,
-  and exact-hash `FinalityGate` activation remain open.
+  finalization CAS have also landed. Lower instance-issued proposal/replay
+  receipts now prove completion of the native-GL1-inclusive deterministic
+  transition and reject null/wrong-issuer results before payload access/effects in
+  the trusted unmodified JVM. Reflection after issuer extraction or hostile
+  in-process bytecode is not defended. They are not storage or signing authority: the producer
+  unwraps its lower receipt before certificate/eta decoration and signing, and the
+  receiver's lower result does not bind the outer envelope/KES evidence. This is a
+  temporary safety restriction, not E1 completion: the full
+  `AuthenticatedExecutedGlobalSnapshot`, `storeValidated`, exact-tip preference
+  capability, durable revisions and publication/effect journals, the sampled
+  exact-hash decision transcript, and exact-hash `FinalityGate` activation remain
+  open.
 - Use `maxvalid-tk` for short forks and valid-only `maxvalid-bg` density selection
   beyond `k1`. Separate storage retention from fork-choice eligibility; `k2`
   never makes a less-dense chain valid or final by fiat.
@@ -388,7 +413,7 @@ path on the current root shape.
   density requires `depth > kLookback`; FIN-D-001B records the resulting divergent
   Tk/Bg winner at depth `k1 + 1`
   (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
-  `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
+  `GlobalSnapshotConsensus.scala:979-994`; `ChainSelection.scala:161-175,187-240`;
   `ChainSelectionSuite.scala:228-250`).
 - Preserve the current dark monotone-restoration data contract. The schema validates
   one exact plan and claimed receipt shape; it does not prove that the target stayed
@@ -632,7 +657,7 @@ permissionless proof claims.
   `modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotStateProof.scala:124-130`;
   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotStorage.scala:100-125`;
   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalizedSnapshotReader.scala:145-169`;
-  `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:692-694,1510-1514`;
+  `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:715-717,1446-1456`;
   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/NipopowRoutes.scala:82-87`).
 - Do not flip `TowerEligibility.NotComputed` until producer/verifier parity and
   root verification are load-bearing.
@@ -775,8 +800,9 @@ work; it never makes an older reference invalid or changes fork choice.
   mirror root/version before composition.
 - Only after those checks pass, replace ordinary noncommittee GL0 recreation of
   sharded CL1 transitions with zero-recreation diff adoption. Never install a
-  claimed root. Producer/signers/watchtowers still replay, and native GL1 plus
-  the global kernel remain universally executed by GL0.
+  claimed root. Producer/signers/watchtowers still replay; native GL1 remains
+  universally executed by GL0, and this epic makes the target global kernel
+  universally executed.
 - Every GL0 node runs the small deterministic global ordering/conflict/nullifier/
   settlement kernel over committee-extracted signed intents. Apply mirror diffs
   and GL0-owned settlement overlay atomically without letting either overwrite
@@ -1055,18 +1081,59 @@ Hard fork migration is **deferred** — network can be force-forked. Stake-weigh
 
 ## Workstream (in order)
 
-### 1. Sidecar gossip — full migration  *(✅ code complete, runtime validation pending)*
-Ported event gossip and BFT consensus channels onto the Go libp2p sidecar via a single generic `Rumor` topic. Added Kademlia DHT for decentralized peer discovery. Runtime validation tracked in task #8.
+### 1. Sidecar gossip — full migration  *(⚠ focused containment/wiring tests green; runtime qualification pending)*
+Ported Tessellation event and generic rumor transport onto the Go libp2p sidecar
+via one `Rumor` topic. ML0 may carry its own BFT messages over that transport; GL0
+must not register the legacy BFT rumor families. Added Kademlia DHT for
+decentralized peer discovery. Runtime validation is tracked in task #8.
+
+**2026-07-15 correction:** at HEAD, GL0 constructed `gossipDaemon` but never called
+`startAsInitialValidator` or `startAsRegularValidator`. The inbound bridge fed the
+bounded rumor queue, but no `consumeRumors` fiber validated or dispatched its
+generic/event handlers. The dormant GL0 BFT command queue was therefore not
+remotely reachable; it was a latent hazard that would have become reachable if the
+consumer were started without first removing the six BFT handlers. The worktree
+orders the repair correctly: remove GL0 BFT handlers/queue, then start the
+Nakamoto consume-only daemon after bootstrap and immediately before `Ready` on
+both startup paths (`Main.scala:242-258,347-350,647-650`). The focused regression
+rejects all six GL0 BFT families, proves no queue/lifecycle construction, checks
+both startup paths, and preserves ML0 BFT
+(`GlobalLegacyBftIngressDisabledSuite.scala:26-82`; 8/8); the final combined
+receipt/BFT containment selection is green (35/35). Runtime rumor
+delivery/drain/reconnect and supervision/release qualification remains open, as
+does deletion of the dormant generic `Consensus` storage/routes compatibility
+shell.
+
+This does not prove overall sidecar startup ordering. `Main` allocates `Services`
+and its consensus resource before rollback/genesis/restart bootstrap
+(`Main.scala:196-225,331-350,647-650`; `Services.scala:257-306`). That allocation
+already starts `SidecarRumorBridge.receive` and the dedicated-topic
+`NakamotoSyncDaemon` (`GlobalSnapshotConsensus.scala:1121-1129,2192-2276`). The
+bridge therefore has a MEDIUM bounded-queue fill/drop window before the new
+generic consumer starts. More seriously, dedicated snapshot processing can race
+cold economic/roster/storage state, a pre-existing HIGH startup-order defect.
+Move both activation points behind one explicit bootstrap-ready capability, or
+define a bounded inert pre-bootstrap quarantine; never validate or mutate from
+that quarantine.
 
 **What landed:**
 - Sidecar `/tessellation/rumors/1.0.0` GossipSub topic + `PublishRumor` gRPC RPC
 - `SidecarRumorBridge`: outbound `publishFn` (wired into `Gossip.setSidecarPublishFn`) and inbound `receive` daemon (parses `Signed[RumorRaw]` JSON, recomputes hash, offers to `rumorQueue`)
-- Wired into `GlobalSnapshotConsensus` startup after `SidecarClient` allocation
-- `GossipDaemon.make` accepts `nakamotoMode: Boolean` — when true, skips legacy peer/common round runners (only `consumeRumors` runs)
+- Wired during `GlobalSnapshotConsensus` construction after `SidecarClient`
+  allocation; this is currently too early and is gated by the startup-order work
+  above
+- `GossipDaemon.make` accepts `nakamotoMode: Boolean` — when its start method is
+  invoked with `nakamotoMode=true`, it skips legacy peer/common round runners and
+  runs only `consumeRumors`. HEAD omitted that invocation; the worktree adds it
+  after removing GL0 BFT handlers.
 - Kademlia DHT in server mode in the Go sidecar; rendezvous-based discovery loop (`tessellation-nakamoto`); seedlist becomes bootstrap nodes
 - All four Scala modules compile; Go sidecar builds
 
-**Why this design wins:** because BFT consensus rumors and Tessellation events both flow through `Gossip.spread → rumorQueue → consumeRumors → RumorHandler.run`, the bridge plugs in at `Gossip.spread` (outbound) and `rumorQueue` (inbound). CL0 BFT messages get sidecar transport for free with zero CL0-side changes.
+**Intended transport flow:** Tessellation rumors follow
+`Gossip.spread -> rumorQueue -> consumeRumors -> RumorHandler.run`; the bridge
+plugs in at `Gossip.spread` outbound and `rumorQueue` inbound. ML0 may use this
+transport for its own BFT messages. GL0 must not register or dispatch the legacy
+BFT rumor families.
 
 ### 2. Genesis time as config param  *(✅ done)*
 Centralized into a single `nakamotoGenesisTimeMs: Long` val on `GlobalSnapshotConsensus`. Resolved once at process start, env override preserved (`NAKAMOTO_GENESIS_TIME_MS`), default falls back to system time for single-node dev. Per-cluster contract documented in scaladoc. Chain-derived genesis time deferred.

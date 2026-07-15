@@ -23,7 +23,7 @@ an owner response.
 | 1 | O-15 is not partly freeze-ready; the symmetric `max(post-MRCA suffix)` metric and the tie rule are not inherited from the papers. | **Accepted.** O-15 remains 🔴 across A–G, including D. The owner ratifies the single-common-anchor density/tower-evidence research direction, not an exact metric, tie, selector, or activation. |
 | 2 | Committee blind-signing is not the current defect; the signing path re-executes and root-compares before `VerifiedShardCheckpoint`. | **Accepted.** Re-exec model corrected in §1 from `AGENTS.md:39-82`. The live gap is *pre-inclusion watchtower coverage* + complete adopter binding, not blind-sign. |
 | 3 | The economic invariant was stated incompletely. | **Accepted.** §1 states the full chain: producer + every execution signer replay; adopter verifies cert + applies diff + **reproduces root**; watchtower backstop; admission never satisfies quorum. |
-| 4 | Certified-diff adoption was **not** owner-rejected — it is the target; only universal-replay and roots-only/authority adoption were rejected. | **Accepted.** v1 wrongly swept certified-diff adoption into "roots-only." Corrected throughout; `10-reexec-byte-contract.md` is the target contract, not superseded. |
+| 4 | Certified-diff adoption was **not** owner-rejected — it is the target; only ordinary-noncommittee universal CL1 replay and roots-only/authority adoption were rejected. Universal native GL1 execution was not rejected. | **Accepted.** v1 wrongly swept certified-diff adoption into "roots-only." The byte-identity obligation survives; the pre-fix APIs and authority claims preserved in `10-reexec-byte-contract.md` are historical evidence, not the current target contract. |
 | 5 | Dependency reversed: O-17 structural + O-07 semantic → valid tines → O-15 → O-16. O-17 is not blocked on O-15. | **Accepted.** Corrected in the summary and cross-cutting §. |
 | 6 | O-16 readiness overstated (A/C were recommendations; B/E are conformance; D/F need schema/era). | **Accepted.** The owner has since ratified A/C/F direction and B/E conformance; O-16 remains 🔴 because freshness, purpose inventory, schemas, and dependencies are not executable. |
 | 7 | O-17 is not "5/7 firm." | **Accepted.** The owner has since ratified the packet directions, including R008-06; O-17 remains 🔴 until identity, resource, codec, and proof gates close. ECO-F32 = HIGH. |
@@ -38,26 +38,33 @@ an owner response.
 
 ---
 
-## 1. The re-execution model (corrected, from `AGENTS.md:39-82`)
+## 1. The re-execution model (corrected, from `AGENTS.md`, Economic Authority)
 
 This is the invariant every answer is held to. Stated completely:
 
+- **Every GL0 validator** independently executes and validates direct native
+  GL1/DAG-token transitions against the exact global proposal parent. No shard
+  checkpoint, execution certificate, or CL1 diff can authorize or bypass that
+  path. The target additionally requires every GL0 validator to run the
+  deterministic global conflict/nullifier/settlement kernel. E9 and the live
+  `numShards <= 1` bypass make that a current gap, not a completed guarantee
+  (`GlobalSnapshotAcceptanceManager.scala:2372-2384`).
 - **Producer + every execution-committee signer** independently re-execute the exact ordered
   CL1 inputs at the same Phase-2 GL0 base; a signer signs **only** when its byte-identical
   canonical diff **and** resulting root match. Missing inputs ⇒ defer/no-sign
-  (`AGENTS.md:41-49`).
+  (`AGENTS.md`, Economic Authority).
 - **A noncommittee GL0 adopter** verifies the execution certificate, applies the
   namespace-bounded diff to the signed base, and **recomputes the root** — it does not blindly
-  install a claimed root, and it does not re-run ordinary CL1 (`AGENTS.md:44-46`). This is
+  install a claimed root, and it does not re-run ordinary CL1 (`AGENTS.md`, Economic Authority). This is
   **certified-diff adoption with adopter root reproduction** — the target model, not a rejected
   one.
 - **Watchtowers** are the noncommittee collusion backstop; **positive assigned replay coverage
   is required before GL0 inclusion**; its population/deadline/retry/bond/resource parameters are
-  **open (O-03)** (`AGENTS.md:58-60`).
+  **open (O-03)** (`AGENTS.md`, Economic Authority).
 - **ML0 / admission / DA** signatures authenticate input only and **can never satisfy execution
-  quorum** (`AGENTS.md:53-57`).
+  quorum** (`AGENTS.md`, Economic Authority).
 - **Forbidden:** `authoritative*`, `AdoptFromSignedFields`, and **roots-only economic adoption**
-  (adopting a claimed root without recomputing it) (`AGENTS.md:79-82`).
+  (adopting a claimed root without recomputing it) (`AGENTS.md`, Economic Authority).
 
 The distinction v1 missed: **roots-only adoption is forbidden; certified-diff adoption where the
 adopter recomputes the root is the target.** Both involve a diff; only one skips the recompute.
@@ -261,7 +268,7 @@ economic-authority one; consumption is re-executed.
 **partially landed as staged, production-dark components — including `MptTowerStore` (audit #10,
 `MptTowerStore.scala:104-115,264-275`).** The production GL0 resource explicitly sets the proof
 provider to `None`; the staged `TowerCatchupCoordinator`/`TowerFinalizer` are not attached to runtime
-finality or proof-serving authority (`GlobalSnapshotConsensus.scala:1510-1514`). Per-level pointers,
+finality or proof-serving authority (`GlobalSnapshotConsensus.scala:1446-1456`). Per-level pointers,
 L domain-separated VRF trials, MPT `(level,ordinal)`
 inclusion, weight-for-proofs-only, KES-gated verification are on record; N-2 registry / N-1 eta
 inputs match O-11/O-17. `[OWNER-RATIFIED DIRECTION / PARTIAL]`
@@ -557,20 +564,28 @@ ECO-F32 = HIGH.
    semantic validity → complete GL0 validation → valid tines → O-15 fork choice → exact-hash
    Phase-2 (T_weight OR k1) → O-16 consumer lease` (`O15-…:421-443`). O-17 parser work is **not**
    blocked on O-15.
-2. **Re-exec model (corrected, audit #2/#3/#4):** the committee re-executes and signs-on-match
-   today; certified-diff adoption with adopter root reproduction is the **target**; only
-   roots-only adoption is forbidden (§1). The live economic-enforcement gap is **pre-inclusion
-   watchtower coverage** (O-03), not blind-signing.
+2. **Re-exec model (corrected, audit #2/#3/#4):** the committee re-executes and
+   signs-on-match today; certified-diff adoption with adopter root reproduction is
+   the **target**; only roots-only adoption is forbidden (§1). Live gaps include
+   canonical diff/complete-root binding, exact pre-root/version and Phase-2-base
+   CAS, network/genesis/era/parameter domains, complete adopter verification, and
+   pre-inclusion positive watchtower coverage (O-03). Blind-signing is not the
+   current signer defect.
 3. **Severities (corrected, audit #13):** CRITICAL = ECO-04, ECO-05, ECO-18, SHARD-C-009. HIGH =
    FIN-14, SER-02, ECO-F32, SMT-01.
 4. **Parameters are protocol law, not local knobs (audit #9):** derive, test, and freeze O-01,
    O-03, and O-11 values per network (like `k1`), then root them so all nodes provably agree.
    `${?ENV}`-overridable HOCON cannot define artifact validity.
-5. **Provenance (audit #14):** every `path:line` here is at HEAD `ad13026d1`; *(memory)*-tagged
-   context is out-of-repo and not reproducible from committed source; it is not activation evidence.
+5. **Provenance (audit #14):** source citations were audited at historical commit
+   `ad13026d1`, not current HEAD; any moved line or changed implementation must be
+   revalidated before use as activation evidence. *(memory)*-tagged context is
+   out-of-repo and not reproducible from committed source.
 6. **Superseded docs** (do not cite as live): `SLASHING-DESIGN.md`, `COMMITTEE-SORTITION-DESIGN.md`
-   (stake-weighted). `10-reexec-byte-contract.md` is **not** superseded — it is the certified-diff
-   target contract.
+   (stake-weighted), and the pre-fix APIs and authority claims in `10-reexec-byte-contract.md`.
+   The byte-identity obligation documented there remains part of the certified-diff target, but the
+   ratified target contract is producer/every-signer replay, replay-certified
+   scoped-diff adoption with adopter root recomputation, and independent positive
+   watchtower replay coverage before inclusion.
 7. **Status reconciliation (O-04):** the owner direction is ratified; remaining rebase schema and
    retained-history work are engineering freeze gates in both the lifecycle and register.
 8. **Open engineering/research freeze gates:** O-01 finality implementation/parameters/proof;

@@ -10,7 +10,6 @@ import io.constellationnetwork.dag.l0.config.types._
 import io.constellationnetwork.dag.l0.domain.snapshot.ForkRecoveryService
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{Finished, GlobalConsensusOutcome}
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.ext.kryo._
@@ -18,8 +17,6 @@ import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationI
 import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.ext.pureconfig._
-import io.constellationnetwork.node.shared.infrastructure.consensus.state._
-import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
 import io.constellationnetwork.node.shared.infrastructure.genesis.{GenesisFS => GenesisLoader, L0GenesisLoader}
 import io.constellationnetwork.node.shared.infrastructure.gossip.event._
 import io.constellationnetwork.node.shared.infrastructure.gossip.{GossipDaemon, RumorHandlers}
@@ -205,7 +202,6 @@ object Main
           storages,
           nodeShared.sharedValidators,
           sharedResources.client,
-          sharedServices.session,
           nodeShared.seedlist,
           method.stateChannelAllowanceLists,
           nodeShared.nodeId,
@@ -259,7 +255,6 @@ object Main
       rumorHandler = RumorHandlers
         .make[IO](storages.cluster, services.localHealthcheck, sharedStorages.forkInfo)
         .handlers <+>
-        services.consensus.handler <+>
         eventRumorHandler
 
       forkRecoveryService = ForkRecoveryService.make[IO](
@@ -345,26 +340,13 @@ object Main
               NodeState.RollbackInProgress,
               NodeState.RollbackDone
             ) {
-              programs.rollbackLoader.load(hash, programs.download).flatMap {
-                case (snapshotInfo, snapshot) =>
-                  for {
-                    hashedSnapshot <- hasherSelector.withCurrent(implicit hasher => snapshot.toHashed[IO])
-                    _ <- services.consensus.manager.startFacilitatingAfterRollback(
-                      snapshot.ordinal,
-                      GlobalConsensusOutcome(
-                        snapshot.ordinal,
-                        Facilitators(List(nodeId)),
-                        RemovedFacilitators.empty,
-                        WithdrawnFacilitators.empty,
-                        EligibleFacilitators.empty,
-                        Finished(snapshot, snapshotInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
-                      )
-                    )
-                  } yield ()
-              }
+              programs.rollbackLoader.load(hash, programs.download).void
             } >>
             services.cluster.createSession >>
             services.session.createSession >>
+            // Bootstrap the economic state before collateral validation can consume inbound rumors.
+            // In Nakamoto mode this starts only the supervised local consumer, never the legacy HTTP gossip rounds.
+            gossipDaemon.startAsInitialValidator >>
             storages.node.setNodeState(NodeState.Ready)
 
         } else {
@@ -452,18 +434,6 @@ object Main
                                 sharedServices.operatorKeyRegistry,
                                 rootedGenesisOperatorKeys
                               )
-                              _ <- services.consensus.manager
-                                .startFacilitatingAfterRollback(
-                                  latestSnapshot.ordinal,
-                                  GlobalConsensusOutcome(
-                                    latestSnapshot.ordinal,
-                                    Facilitators(List(nodeId)),
-                                    RemovedFacilitators.empty,
-                                    WithdrawnFacilitators.empty,
-                                    EligibleFacilitators.empty,
-                                    Finished(latestSnapshot, latestInfo, EventTrigger, Candidates.empty, Hash.empty, hashedSnapshot.hash)
-                                  )
-                                )
                               _ <- logger.info(s"Recovered from disk at ordinal=$latestOrdinal")
                             } yield ()
                           }
@@ -606,25 +576,6 @@ object Main
                                                   )
                                                 )
                                                 .unlessA(rootedGenesisOperatorKeys === globalSnapshotInfo.genesisOperatorKeys)
-                                              _ <- services.consensus.manager
-                                                .startFacilitatingAfterRollback(
-                                                  signedFirstIncrementalSnapshot.ordinal,
-                                                  GlobalConsensusOutcome(
-                                                    signedFirstIncrementalSnapshot.ordinal,
-                                                    Facilitators(List(nodeId)),
-                                                    RemovedFacilitators.empty,
-                                                    WithdrawnFacilitators.empty,
-                                                    EligibleFacilitators.empty,
-                                                    Finished(
-                                                      signedFirstIncrementalSnapshot,
-                                                      globalSnapshotInfo,
-                                                      EventTrigger,
-                                                      Candidates.empty,
-                                                      Hash.empty,
-                                                      hashedSnapshot.hash
-                                                    )
-                                                  )
-                                                )
                                             } yield ()
                                         }
                                     }
@@ -693,6 +644,9 @@ object Main
                 }
               case None => IO.unit
             }) >>
+            // Bootstrap the economic state and validator roster before collateral validation can consume inbound rumors.
+            // In Nakamoto mode this starts only the supervised local consumer, never the legacy HTTP gossip rounds.
+            gossipDaemon.startAsInitialValidator >>
             storages.node.setNodeState(NodeState.Ready)
         }
       }).asResource

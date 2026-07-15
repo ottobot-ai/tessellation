@@ -254,7 +254,7 @@ object CatchUpVerificationSuite extends MutableIOSuite {
   private final case class ReplayNode(
     name: String,
     hash: Hash,
-    validation: NakamotoSnapshotValidator.ValidationResult
+    replayValid: Boolean
   )
 
   test("RTA-004: every failed authentication or replay result has zero authority effects") { _ =>
@@ -273,7 +273,7 @@ object CatchUpVerificationSuite extends MutableIOSuite {
       effects <- Ref.of[IO, List[String]](List.empty)
       committed <- failures.zipWithIndex.traverse {
         case (failure, index) =>
-          NakamotoSyncDaemon.commitReplayValidated[IO](failure) { _ =>
+          NakamotoSyncDaemon.commitReplayValidated[IO](failure) { (_, _) =>
             effects.update(
               _ ++ List(
                 s"store:$index",
@@ -361,29 +361,22 @@ object CatchUpVerificationSuite extends MutableIOSuite {
     } yield expect.all(invalid.isEmpty, valid.contains("signed"), cleanups == 1, signatures == 1)
   }
 
-  test("parent-missing snapshot is inert; fetched ancestry replays parent-first before write/store/attest") { res =>
-    implicit val (ks, j, h, sp, hs) = res
-
+  test("parent-missing snapshot is inert; buffered ancestry drains parent-first after modeled replay success") { _ =>
     val ancestorHash = Hash("a" * 64)
     val middleHash = Hash("b" * 64)
     val tipHash = Hash("c" * 64)
+    val ancestor = ReplayNode("ancestor", ancestorHash, replayValid = true)
+    val middle = ReplayNode("middle", middleHash, replayValid = true)
+    val tip = ReplayNode("tip", tipHash, replayValid = true)
 
     for {
-      keyPair <- KeyPairGenerator.makeKeyPair[IO]
-      info = mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L))))
-      snapshot <- mkSnapshot(info)
-      signed <- forAsyncHasher(snapshot, keyPair)
-      valid = NakamotoSnapshotValidator.Valid(signed, info): NakamotoSnapshotValidator.ValidationResult
-      ancestor = ReplayNode("ancestor", ancestorHash, valid)
-      middle = ReplayNode("middle", middleHash, valid)
-      tip = ReplayNode("tip", tipHash, valid)
       pending <- Ref.of[IO, Map[Hash, List[ReplayNode]]](Map.empty)
       events <- Ref.of[IO, List[String]](List.empty)
 
-      // The tip arrives first. Production buffers it before returning ParentBuffered; the Valid-only callback contains every economic
+      // The tip arrives first. Production buffers it before returning ParentBuffered; the post-replay callback contains every economic
       // side effect and must be unreachable for this result.
       _ <- NakamotoSyncDaemon.bufferPendingChild(middleHash, tip, pending)
-      parentlessCommitted <- NakamotoSyncDaemon.commitReplayValidated[IO](NakamotoSnapshotValidator.ParentBuffered) { _ =>
+      parentlessCommitted <- NakamotoSyncDaemon.commitReplayValidated[IO](NakamotoSnapshotValidator.ParentBuffered) { (_, _) =>
         events.update(_ ++ List("write:tip", "store:tip", "attest:tip"))
       }
       beforeAncestor <- events.get
@@ -395,12 +388,13 @@ object CatchUpVerificationSuite extends MutableIOSuite {
         def replay(node: ReplayNode): IO[Unit] =
           for {
             _ <- events.update(_ :+ s"validate:${node.name}")
-            committed <- NakamotoSyncDaemon.commitReplayValidated[IO](node.validation) { _ =>
-              events.update(_ :+ s"write:${node.name}") >>
-                events.update(_ :+ s"store:${node.name}") >>
-                events.update(_ :+ s"attest:${node.name}") >>
-                NakamotoSyncDaemon.drainBufferedChildren(node.hash, pending)(_ => IO.unit, replay)
-            }
+            committed <-
+              if (node.replayValid)
+                (events.update(_ :+ s"write:${node.name}") >>
+                  events.update(_ :+ s"store:${node.name}") >>
+                  events.update(_ :+ s"attest:${node.name}") >>
+                  NakamotoSyncDaemon.drainBufferedChildren(node.hash, pending)(_ => IO.unit, replay)).as(true)
+              else false.pure[IO]
             _ <- events.update(_ :+ s"reject:${node.name}").unlessA(committed)
           } yield ()
 
@@ -431,22 +425,15 @@ object CatchUpVerificationSuite extends MutableIOSuite {
       )
   }
 
-  test("invalid middle ancestor is not written/stored/attested and prevents descendant replay") { res =>
-    implicit val (ks, j, h, sp, hs) = res
-
+  test("modeled invalid middle ancestor prevents descendant buffer drain") { _ =>
     val ancestorHash = Hash("d" * 64)
     val middleHash = Hash("e" * 64)
     val tipHash = Hash("f" * 64)
+    val ancestor = ReplayNode("ancestor", ancestorHash, replayValid = true)
+    val middle = ReplayNode("middle", middleHash, replayValid = false)
+    val tip = ReplayNode("tip", tipHash, replayValid = true)
 
     for {
-      keyPair <- KeyPairGenerator.makeKeyPair[IO]
-      info = mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L))))
-      snapshot <- mkSnapshot(info)
-      signed <- forAsyncHasher(snapshot, keyPair)
-      valid = NakamotoSnapshotValidator.Valid(signed, info): NakamotoSnapshotValidator.ValidationResult
-      ancestor = ReplayNode("ancestor", ancestorHash, valid)
-      middle = ReplayNode("middle", middleHash, NakamotoSnapshotValidator.ContentMismatch("invalid transition"))
-      tip = ReplayNode("tip", tipHash, valid)
       pending <- Ref.of[IO, Map[Hash, List[ReplayNode]]](Map.empty)
       events <- Ref.of[IO, List[String]](List.empty)
       _ <- NakamotoSyncDaemon.bufferPendingChild(middleHash, tip, pending)
@@ -455,12 +442,13 @@ object CatchUpVerificationSuite extends MutableIOSuite {
         def replay(node: ReplayNode): IO[Unit] =
           for {
             _ <- events.update(_ :+ s"validate:${node.name}")
-            committed <- NakamotoSyncDaemon.commitReplayValidated[IO](node.validation) { _ =>
-              events.update(_ :+ s"write:${node.name}") >>
-                events.update(_ :+ s"store:${node.name}") >>
-                events.update(_ :+ s"attest:${node.name}") >>
-                NakamotoSyncDaemon.drainBufferedChildren(node.hash, pending)(_ => IO.unit, replay)
-            }
+            committed <-
+              if (node.replayValid)
+                (events.update(_ :+ s"write:${node.name}") >>
+                  events.update(_ :+ s"store:${node.name}") >>
+                  events.update(_ :+ s"attest:${node.name}") >>
+                  NakamotoSyncDaemon.drainBufferedChildren(node.hash, pending)(_ => IO.unit, replay)).as(true)
+              else false.pure[IO]
             _ <- events.update(_ :+ s"reject:${node.name}").unlessA(committed)
           } yield ()
 

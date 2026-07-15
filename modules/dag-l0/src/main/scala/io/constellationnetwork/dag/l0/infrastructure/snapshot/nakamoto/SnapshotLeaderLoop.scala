@@ -11,7 +11,6 @@ import scala.concurrent.duration._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay}
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
@@ -386,7 +385,7 @@ object SnapshotLeaderLoop {
     *   the old "2550 = 10·k₁" label was stale.)
     */
   def run[F[_]: Async: SecurityProvider: HasherSelector: JsonSerializer: Metrics](
-    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    consensusFns: GlobalSnapshotConsensusFunctions[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -1351,7 +1350,7 @@ object SnapshotLeaderLoop {
   /** Called when VRF lottery is won for a slot. Produces, signs, stores, and publishes a snapshot. */
   private def onSlotWon[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
     stateRef: Ref[F, LoopState],
-    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    consensusFns: GlobalSnapshotConsensusFunctions[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
@@ -1490,7 +1489,7 @@ object SnapshotLeaderLoop {
                   // chainStore write, Rollback so the canonical MPT is unchanged.
                   txOutcome <- mptStore.withTransaction {
                     for {
-                      result <- consensusFns.createProposalArtifact(
+                      executionReceipt <- consensusFns.createProposalArtifactWithExecutionReceipt(
                         lastKey = lastKey,
                         lastArtifact = lastSigned,
                         lastContext = lastContext,
@@ -1508,7 +1507,11 @@ object SnapshotLeaderLoop {
                               }
                           }
                       )
-                      (rawArtifact, context, returnedEvents) = result
+                      execution <- Async[F].fromOption(
+                        consensusFns.consumeProposalExecutionReceipt(executionReceipt),
+                        new IllegalStateException("GL0 proposal execution receipt was not minted by this consensus-functions instance")
+                      )
+                      (rawArtifact, context, returnedEvents) = execution
                       _ <- Metrics[F].recordDistribution("dag_nakamoto_events_returned", returnedEvents.size)
                       _ <- Metrics[F].recordDistribution("dag_nakamoto_events_accepted", eventSet.size - returnedEvents.size)
 

@@ -10,7 +10,10 @@ Accepted; restored and clarified 2026-07-11 by owner decision.
 must not be restored, but commit `c610a0740` overcorrected by deleting the
 checkpoint byte diff and making ordinary GL0 nodes replay CL1. The required repair
 is selective: keep replay-before-sign, restore a canonical diff, and make
-noncommittee adoption apply and verify that diff.
+noncommittee adoption apply and verify that diff. This repair applies only to the
+sharded CL1 path; every GL0 validator still independently executes and validates
+direct native GL1/DAG-token transitions. The target universal global settlement
+kernel is separate E9 work and is not complete today.
 
 ## Non-negotiable invariant
 
@@ -193,8 +196,8 @@ ML0 `CurrencySnapshotInfo`.
 - intake and `verifyEmbedded` now enforce distinct configured execution `kQuorum`;
   current ordinary-GL0 replay of sharded CL1 checkpoints remains the temporary
   economic backstop until canonical diff adoption and positive watchtower
-  coverage land. This replacement never removes universal GL0 execution of
-  native GL1/DAG-token transitions.
+  coverage land. This replacement never removes any GL0 validator's independent
+  execution and validation of direct native GL1/DAG-token transitions.
 - the signed checkpoint binds an execution-base ordinal but not the exact Phase-2
   hash/root or network/genesis/era/parameter domain.
 - field 32 remains writable, removable, and reconstructible in GL0. Pinned peer
@@ -209,8 +212,9 @@ ML0 `CurrencySnapshotInfo`.
   configuration bypass the target committee/diff/watchtower path.
 
 These facts prove neither the old blind-sign path nor ordinary universal replay
-of sharded CL1 checkpoints is the target. Universal GL0 execution of native
-GL1/DAG-token transitions remains mandatory.
+of sharded CL1 checkpoints is the target. Every GL0 validator's independent
+execution and validation of direct native GL1/DAG-token transitions remains
+mandatory.
 
 ## Required tests
 

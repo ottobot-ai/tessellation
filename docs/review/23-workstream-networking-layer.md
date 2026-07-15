@@ -124,6 +124,42 @@ partly stale — several TIER-1/2 items have since been fixed** (verified agains
 `ShardBinaryBuffer` now **evicts-finalized-first then rejects-new** rather than the audit's "no
 evict-on-finalize" (`ShardBinaryBuffer.scala:171,188-201`). The gaps that **remain**:
 
+**G0 — HEAD constructs the GL0 rumor consumer but never starts it.**
+`Main.scala` at HEAD `:259-325` assembles generic, legacy-consensus, and event
+handlers and calls `GossipDaemon.make`, but never invokes either start method.
+`SidecarRumorBridge.receive` still feeds the bounded queue
+(`SidecarRumorBridge.scala:60-105`), while `consumeRumors` is reachable only from
+those start methods (`GossipDaemon.scala:28-32,56-70,89-116`). Thus the legacy BFT
+queue was not a live remote DoS; all GL0 generic/event rumor handlers were inert
+instead. The worktree removes the six GL0 BFT handlers/queue, composes only the
+generic and event handlers (`Main.scala:242-258`), then starts the consume-only
+Nakamoto daemon after bootstrap and immediately before `Ready` on both startup
+paths (`Main.scala:347-350,647-650`). The focused six-family/no-queue/source
+regression is green and confirms ML0 BFT remains
+(`GlobalLegacyBftIngressDisabledSuite.scala:26-82`; 8/8); the broader final
+receipt/BFT containment selection is 35/35. Treat runtime queue
+drain, validation, handler delivery, reconnect, and supervision/release as the
+remaining integration qualification; delete the dormant generic `Consensus`
+storage/routes compatibility shell separately.
+
+**G0A — HIGH: dedicated Nakamoto topics start before GL0 bootstrap.**
+`Main` allocates `Services` and consensus before entering rollback/genesis/restart
+bootstrap (`Main.scala:196-225,331-350,647-650`; `Services.scala:257-306`).
+`GlobalSnapshotConsensus` supervises `NakamotoSyncDaemon` during that allocation
+(`GlobalSnapshotConsensus.scala:2192-2276`), and its snapshot worker immediately
+invokes validation against chain, roster, and economic services
+(`NakamotoSyncDaemon.scala:845-910,1243-1271`). An early peer snapshot can race
+cold state. Gate all dedicated-topic processing on an explicit bootstrap-ready
+capability or hold exact bounded input inert until readiness; test hostile early
+delivery and failed/restarted bootstrap.
+
+**G0B — MEDIUM: the generic bridge also precedes its consumer.**
+`SidecarRumorBridge.receive` starts during consensus construction
+(`GlobalSnapshotConsensus.scala:1121-1129`), but the new consumer starts only
+after bootstrap (`Main.scala:347-350,647-650`). The bounded rumor queue can still
+fill and drop during that interval. Move bridge activation behind readiness or
+specify and test bounded cold-start quarantine/release semantics.
+
 **G1 — the inbound gossip firehose funnels into ONE unbounded queue (the open TIER-1 audit item).**
 `GossipStream.scala:23` is still `Queue.unbounded[F, Option[GossipMessage]]`, and the gRPC `onNext`
 callback does a blocking `queue.offer(Some(value))` (`GossipStream.scala:40`) — so it **never applies
@@ -225,11 +261,15 @@ The networking layer **does** carry the multi-shard/multi-metagraph traffic: gos
 
 **The boundedness risk that scales with #shards × #metagraphs is real and specific:**
 
-1. In **v1 the shard committee is the full validator set**, so **every gl0 subscribes to every shard's
-   topics** — the sidecar *eagerly* joins shards `0..M-1` at startup (`gossip.go:311-328`,
+1. At the audited source baseline, **every gl0 subscribes to every shard's topics**
+   because the sidecar *eagerly* joins shards `0..M-1` at startup (`gossip.go:311-328`,
    `config.go:47-59`, driven by `NAKAMOTO_NUM_SHARDS`). The design's load-shedding payoff
    (`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md §6.4:736-738` — *"non-members don't subscribe … shed the
    network load"*) is **not realized yet**. Gossip fan-in therefore scales O(numShards) on every node.
+   This transport subscription is not execution membership or a requirement that
+   ordinary noncommittee GL0 nodes replay sharded CL1. Execution membership is the
+   separate public deterministic VK-hash subset; every GL0 validator still executes
+   the direct native GL1 path and global settlement kernel.
 2. That fan-in lands in a **single fixed 256-slot shared relay channel** (G5) — it does **not** grow
    with M. Per-envelope committee-verify cost is `K_S × 3` crypto (`design §11.1:1197-1200`), the CPU
    load the BLS aggregation (S4) targets.

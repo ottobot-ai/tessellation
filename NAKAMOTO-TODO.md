@@ -22,7 +22,11 @@
 > recompute the root; watchtowers replay as the collusion backstop. Commit
 > `c610a0740` regressed this target to ordinary noncommittee GL0 recreation of
 > sharded CL1 checkpoints and must be repaired selectively without restoring
-> `authoritative*` fields. Universal native GL1 execution remains mandatory. The failed shard design
+> `authoritative*` fields. Every GL0 node must continue executing and validating
+> native GL1/DAG-token transitions. The target also requires every GL0 node to run
+> the global conflict/nullifier/settlement kernel; that kernel remains E9 planned
+> work and the live `numShards <= 1` path bypasses shard processing. The failed
+> shard design
 > used secret stake-weighted VRF self-sortition and per-slot LDD leadership.
 > Current shard v1 uses public deterministic VK-hash membership, uniform `1/N`
 > over eligible GL0 operators, and hash-shuffled staircase producer duty.
@@ -229,7 +233,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     reads by ordinal then injects a tower hash without rehashing or binding one
     immutable exact target. Provider remains `None` and proof routes remain
     unavailable/503, including pure verification (`STOR-03`, contained dark, not closed;
-    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:1510-1514`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:1446-1456`;
     `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/TowerCatchupCoordinator.scala:216-312,372-513`;
     `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerFinalizer.scala:89-96,180-213`;
     `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerProofBuilder.scala:96-103,148-166`;
@@ -251,7 +255,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `modules/shared/src/main/scala/io/constellationnetwork/validator/StateProofComparison.scala:28-37,45-78`;
     `modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotStateProof.scala:124-130`;
     `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala:282-299,353`;
-    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:692-694,1510-1514`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:715-717,1446-1456`;
     `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/domain/snapshot/programs/Download.scala:368-381,607-622`;
     `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala:61-72`;
     `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotTraverse.scala:107-116,183-194`;
@@ -332,7 +336,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     Freeze O-15's exact metric/equality rule and close FIN-D-001B before changing
     live consensus
     (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
-    `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
+    `GlobalSnapshotConsensus.scala:979-994`; `ChainSelection.scala:161-175,187-240`;
     `ChainSelectionSuite.scala:228-250`).
   - **Partial dark restoration only:** the schema validates a closed
     `PublicationRestoration` plan and claimed receipt shape; it does not prove that
@@ -628,7 +632,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
     replay/sign/inclusion. Receiver live head and self-claimed roots never enter.
   - Replace ordinary noncommittee GL0 replay of sharded CL1 transitions only
     after malformed-artifact gates pass. Preserve signer/watchtower replay and
-    universal native GL1/global-kernel execution.
+    universal native GL1 execution; make the target global kernel universal as
+    part of this epic.
   - Run one deterministic GL0 conflict/nullifier/settlement kernel over signed
     intents and atomically compose per-MG mirrors with GL0-owned overlays.
   - Replace bounded `GlobalSnapshotsProcessed` reconstruction with a rooted,
@@ -912,18 +917,30 @@ be the independent closer.
   target. Such a migration is outside this plan and would require a new,
   owner-ratified ADR; it is not a gate on the current architecture.
 - ⚠ **Go↔JVM gossip transport for shard-checkpoint + fraud-proof legs** (`72f39d652`, F1/F2/F8); sidecar carries l1-block topics + self-delivery (`b0ca67908`).
-- 🔴 **RECURRING WEDGE / current e2e operational frontier (not the security dependency head) — metagraph committee-gate parent-ordinal resolution.** `MetagraphCommitteeGate` / `MetagraphParentOrdinalResolver` / `MetagraphOrphanBuffer`; resolver→None on GSI-tip-lag → orphan re-buffer loop. Prior fix "walk-finalized-not-bestTip" (`40d546761`) recurred; blocks the 2mg/2shard token-lock e2e. **Must be fixed WITHIN the re-exec model, after the active roadmap's security ordering is respected.**
+- ⚠ **Metagraph admission liveness requires fresh qualification.** The former
+  receiver-cadence/ordinal inference was replaced by decoding the signed currency
+  binary's ML0 continuity ordinal and independent exact GL0 `globalSyncView`
+  (`MetagraphParentOrdinalResolver.scala:18-90`; `07ef8dbb2`). The last reported
+  2mg/2shard orphan re-buffer wedge predates that change and must not be called a
+  current blocker without a fresh reproduction. The live exact-Phase-2 check is
+  still transitional: it combines an ordinal watermark with a separate best-tip
+  ancestry walk and mints no durable branch-revision lease
+  (`GlobalSnapshotConsensus.scala:1285-1300`). Replace it with the exact-hash
+  `FinalityGate` capability and rerun the multi-MG/multi-shard partition/restart
+  qualification.
 - ⚠ **CL1 replay-before-sign is type-gated; target result/adoption is missing** —
   the emitter now accepts only a sealed capability minted after `evaluate` replay,
   and the ancestor path independently replays before signing. The replayed object
   is still the current root-only checkpoint, however; it does not bind/reproduce
   the target canonical diff, intents, or complete root. `verifyEmbedded` and GSAM
-  still replay on every GL0 node. Add noncommittee diff apply; watchtower replay
-  remains the collusion backstop. Before removing this ordinary noncommittee GL0
-  replay of sharded CL1 checkpoints, embedded adoption must also enforce distinct
-  `kQuorum` and the signed
-  checkpoint must bind exact Phase-2 hash/root plus network/genesis/era/parameters;
-  neither holds today.
+  still run ordinary CL1 replay on every GL0 node. Add noncommittee diff apply;
+  watchtower replay remains the collusion backstop. Live `verifyForAdoption`
+  already enforces the distinct configured execution `kQuorum`. Before removing
+  this ordinary noncommittee GL0 replay, the checkpoint/adopter contract must also
+  bind and verify the canonical diff and complete result root, exact pre-root/
+  version and Phase-2 base hash/root, network/genesis/era/parameter domains, and
+  mandatory positive assigned watchtower coverage; those gates do not all hold
+  today.
 - ⚠ **Global replay-before-attest type boundary partially contained** — raw
   `emitAttestation`/`emitTipAttestation`, receiver-invented producer evidence,
   periodic best-tip signing, and the cumulative-weight finalization sink are
@@ -931,9 +948,15 @@ be the independent closer.
   attestations are telemetry only, and canonical `k1` depth is the sole live
   state-changing GL0 snapshot Phase-2 rail. Typed store outcomes, internal
   mutation serialization, in-memory branch/lineage revisions, and exact
-  selected-tip finalization CAS have landed. Still open: authenticated opaque
-  replay and exact-tip preference capabilities, durable revisions and
-  publication/effect journals, and the real sampled exact-hash Snowball rail.
+  selected-tip finalization CAS have landed. Lower instance-issued proposal/replay
+  receipts reject null/wrong-issuer results in the trusted unmodified JVM and are
+  consumed by the producer/receiver paths after complete native-GL1-inclusive
+  transition execution. Reflection after issuer extraction or hostile in-process
+  bytecode is not defended. They deliberately do not bind the producer's final decorated signed
+  body or the receiver's outer envelope/KES evidence and are accepted by no
+  store/preference/signing API. Still open: the full authenticated-executed
+  capability, `storeValidated`, exact-tip preference capability, durable revisions
+  and publication/effect journals, and the real sampled exact-hash Snowball rail.
 
 ---
 
@@ -950,7 +973,35 @@ consensus-economic roadmap for dependencies and release gates.
    a new-network ScodecV1 ordinal-0 genesis. Future post-genesis upgrades use the
    finalized hash/ordinal-bound `ProtocolEra` mechanism.
 
-2. ✅ ~~**Disable BFT Daemons in Nakamoto Mode**~~ (af15c077, bde17768, 5ec6ac46) — unchanged.
+2. ⚠ **GL0 BFT ingress containment landed; finish compatibility cleanup and rumor integration qualification.** At
+   HEAD, Nakamoto mode allocated the undrained unbounded legacy command queue and
+   registered six BFT handlers, but `Main` only constructed `gossipDaemon` and
+   never called either start method (`Main.scala` at HEAD `:259-325`). The legacy
+   queue therefore was not remotely reachable; retract the active heap-DoS claim.
+   The real baseline wiring defect was that `SidecarRumorBridge.receive` fed the
+   bounded shared rumor queue while no `GossipDaemon.consumeRumors` fiber validated
+   or dispatched generic/event rumors (`SidecarRumorBridge.scala:60-105`;
+   `GossipDaemon.scala:28-32,56-70,89-116`). The exact workflow impact remains an
+   integration question because dedicated Nakamoto topics use separate consumers.
+
+   The worktree applies the required order: remove the six GL0 BFT handlers and
+   `ConsensusEventLoop`, install no-queue fail-closed compatibility objects, then
+   start the consume-only Nakamoto gossip daemon after bootstrap and before
+   `Ready` (`Main.scala:242-258,347-350,647-650`;
+   `GlobalSnapshotConsensus.scala:74-115,2302-2310`). The focused six-family,
+   no-queue, startup-order, and ML0-preservation regression is green
+   (`GlobalLegacyBftIngressDisabledSuite.scala:26-82`; 8/8); the final combined
+   receipt/BFT containment selection is green (35/35). E4.8 still owns
+   deletion of the dormant generic `Consensus` storage/routes shell and GL0-only
+   compatibility/config/API surface. This does **not** make overall sidecar
+   startup safe: `Services` constructs consensus before `Main` bootstrap
+   (`Main.scala:196-225,331-350,647-650`; `Services.scala:257-306`), starting
+   `SidecarRumorBridge.receive` and `NakamotoSyncDaemon` early
+   (`GlobalSnapshotConsensus.scala:1121-1129,2192-2276`). E4.8A must close the
+   MEDIUM pre-consumer bounded-queue fill/drop window and runtime
+   delivery/drain/reconnect/supervision tests. E4.8B must close the pre-existing
+   HIGH dedicated-topic cold-state race with an explicit bootstrap-ready gate or
+   bounded inert quarantine. ML0 BFT remains.
 
 3. ♻⚠ **Metagraph consensus integration** — original framing ("CL0 needs the same
    VRF+LDD+attestation 1:1") is superseded. ML0 may retain BFT consensus; execution

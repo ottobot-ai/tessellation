@@ -1,6 +1,12 @@
 # Per-Metagraph Currency State MPT Layout
 
-**Status:** implemented. This document describes storage layout only. Committee-diff adoption was abandoned; GL0 recreates CL1 transitions.
+**Status:** implemented storage layout only. The current ordinary-adopter replay
+path is a temporary regression, not the target authority model. Target sharded CL1
+processing follows ADR-0017: producer and every execution signer replay, assigned
+watchtowers replay, and an ordinary noncommittee GL0 validator applies the
+replay-certified scoped diff and recomputes its root. This storage design does not
+alter universal native GL1 execution. The universal global settlement kernel is
+target E9 work and is not complete today.
 
 ## Layout
 
@@ -21,8 +27,14 @@ an O(N) blob.
 Metagraph-scoped `activeAllowSpends` remains in field id 7 because the cross-shard validator reads that partition directly. Incremental
 snapshots remain in field id 5 and genesis snapshots remain in field id 3.
 
-`infoSubFields` is exactly the eight `Mg*` partitions above. The currency `infoRoot` is one MPT root over their union, not a hash of eight
-independent roots. Producer, replay validator, byte-rebuild, bootstrap, and incremental-write paths must use the same key and value codecs.
+The serialized/storeable layout has all eight `Mg*` field ids above, but
+`infoSubFields` contains only the seven deterministic fields 25 through 31. The
+currency `infoRoot` is one MPT root over the union of those seven fields, not a
+hash of independent roots. Field 32 is currently excluded from both `infoRoot`
+and the aggregate consensus root even though it is writable; that is the open
+root-invisible-state defect, not approved mutable metadata. Producer, replay
+validator, byte-rebuild, bootstrap, and incremental-write paths must use the same
+key and value codecs.
 
 ## Invariants
 
@@ -30,8 +42,15 @@ independent roots. Producer, replay validator, byte-rebuild, bootstrap, and incr
 2. Full rebuild and incremental writes produce byte-identical entries and the same root.
 3. Removed accounts, references, messages, and locks delete their old MPT keys.
 4. `GlobalSnapshotStateProof` keeps the same logical currency-root fields; the committed key set is the unrolled layout.
-5. A shard checkpoint carries replay inputs and a root claim only. GL0 computes this root from locally recreated CL1 state and never applies
-   a committee-supplied MPT diff.
+5. The target shard checkpoint carries exact replay inputs, a canonical scoped
+   diff, signed pre-root/version, and its result root. Producer and every execution
+   signer independently reproduce the diff/root; positive assigned watchtower
+   replay coverage is mandatory before GL0 inclusion. An ordinary noncommittee
+   GL0 validator verifies the execution certificate, exact Phase-2 base,
+   pre-root/version compare-and-set, scope, continuity, domains, and coverage,
+   then applies the diff and recomputes the root. A claimed root is never installed
+   directly. Current every-adopter CL1 recreation remains only until that complete
+   adoption gate lands.
 
 ## Enforcement Sites
 

@@ -37,6 +37,14 @@ exact Phase-2 GL0 state -> GL1, ML0, CL1, DL1
 ## Economic Authority
 
 - GL0 is the canonical economic state machine.
+- Every GL0 validator independently executes and validates every direct native
+  GL1/DAG-token transition against the exact global proposal parent. A shard
+  checkpoint, execution certificate, replay receipt, CL1 diff, or signature
+  threshold can never authorize, replace, or bypass that native execution. The
+  target also requires every GL0 validator to execute the deterministic global
+  conflict/nullifier/settlement kernel. That kernel is not complete today: E9 is
+  planned, and the live `numShards <= 1` branch still bypasses shard processing
+  (`GlobalSnapshotAcceptanceManager.scala:2372-2384`).
 - GL0 enforces framework-defined CL1 transitions through execution sharding:
   the checkpoint producer and every execution-committee signer independently
   re-execute the exact ordered currency inputs at the same Phase-2 GL0 base.

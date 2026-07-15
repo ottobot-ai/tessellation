@@ -8,6 +8,12 @@
 > execution-shard membership is a different public deterministic VK-hash draw over
 > the post-cooldown eligible GL0 pool. `SHARD-SORTITION-WORKSTREAM-PLAN.md`,
 > ADR-0016, ADR-0017, and current source supersede the stake/Chernoff claims below.
+> References below to a committee attesting to state without execution are
+> obsolete blind state-validity semantics, not current admission/custody
+> semantics. Current admission or DA custody evidence must be separately typed and
+> can never satisfy execution validity. None of these paths removes any GL0
+> validator's independent execution of direct native GL1 transitions; the
+> universal global conflict/nullifier/settlement kernel remains target E9 work.
 
 ---
 

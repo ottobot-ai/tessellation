@@ -1,7 +1,20 @@
 # #259 redesign — metagraph followers trust finalized gl0 root + inclusion-prove reads
 
-**Status:** implementation in progress (slices 1–2 built on worktree branches, slice 3 gated for review).
+**Status:** historical superseded proposal; do not activate it as written. Phase 2
+is exact-hash-bound and density-reorgable, so downstream adoption requires the
+current exact-hash bundle/reorg contract. Downstream follower adoption is not GL0
+economic execution; roots-only economic adoption by an ordinary GL0 validator
+remains forbidden. Current follower and execution authority are defined by
+`../../AGENTS.md`, ADR-0016/0017, and
+`../review/CONSENSUS-ARTIFACT-LIFECYCLE.md`.
 **Date:** 2026-05-27. Supersedes the band-aid options in [259-HISTORICALSTAKE-VERIFIER-DIVERGENCE.md](259-HISTORICALSTAKE-VERIFIER-DIVERGENCE.md).
+
+The historical A4 shorthand below is preserved as part of this proposal's record;
+it is not current authority. Under the ratified architecture, only ordinary
+noncommittee recreation of replay-certified **sharded CL1** framework transitions
+is removed. Every GL0 validator still independently executes and validates direct
+native GL1/DAG-token transitions. The universal global
+conflict/nullifier/settlement kernel is target E9 work, not a live guarantee.
 
 ## ⚠️ DIAGNOSIS CORRECTED 2026-05-27 — the prior model below was INVERTED
 Live forensics on the running 8gl0+4mg cluster (run `numshards4-etafix-noargmax-v2`, eta-fix in place) show the **opposite** of what this doc originally claimed:
@@ -27,14 +40,26 @@ On the **follower** verify-replay path (NOT gl0 producers):
 ## Resolved decisions
 - **No full recompute; split the root obligation** — trust the top-level root, cross-check only consumed per-field roots.
 - **Read source = local MPT store** (delta-applied), remote fetch is cold-cache fallback only. Perf: removes the ~800K-entry per-ordinal full-GSI re-encode.
-- **New gl0 route `GlobalStateProofRoutes`**, anchored at the **finalized** snapshot's `mptRoot` (a finalized snapshot can't be orphaned → no proof staleness). Don't overload `ShardProofRoutes` (different anchor/ownership).
+- **Historical proposal: new gl0 route `GlobalStateProofRoutes`.** Any such proof
+  must be anchored to an exact Phase-2 `(ordinal, hash, mptRoot)`. Phase 2 is
+  density-reorgable, so orphaning that exact hash invalidates the proof lease and
+  every derived downstream read; an ordinal watermark alone cannot prevent proof
+  staleness. Don't overload `ShardProofRoutes` (different anchor/ownership).
 - **Migration: era-gate via typed HOCON** (`FieldsAddedOrdinals.followerTrustFinalizedRoot`, no `sys.env`). Below the gate = current recompute (byte-identical); at/after = trust+prove. Greenfield, but gated for safe A/B + rollback.
-- **No A4 hard fork** — changes follower verification only, not what gl0 commits. Orthogonal twin of A4 (which is gl0-stops-re-executing-metagraphs).
+- **Historical A4 shorthand retained** — the text below records the proposal as
+  written. It cannot be read as current authorization to remove universal native
+  GL1 execution or to skip the target global kernel.
 - **Complementary to ActiveAddressIndex `353dcabfb`** — that's a gl0-vs-gl0 sidecar-root divergence; still needed on the gl0 side, doesn't conflict.
 
 ## Slices
-1. **`TrustedGlobalStateReader` + `followerConsumedFieldIds`** (node-shared, pure add) — ✅ built (`4421bd506`, worktree). `verifyAgainst` binds the proof to the key (`proof.path === toHex(key)`).
-2. **gl0 `GlobalStateProofRoutes` + `GlobalStateProofService` + `GlobalStateProofClient` + `GlobalStateInclusionProof`** (dag-l0 + node-shared, pure add, finalized-anchored via a `ResolveFinalizedAnchor` callback → `FinalityGate.finalizedOrdinal`) — ✅ built (`3aef072ac`, worktree).
+1. **Historical worktree claim: `TrustedGlobalStateReader` +
+   `followerConsumedFieldIds`.** This document cited `4421bd506`; that claim is not
+   current-tree implementation evidence and must be re-audited before reuse.
+2. **Historical worktree claim: `GlobalStateProofRoutes` / service / client /
+   inclusion proof.** This document cited `3aef072ac` and an ordinal-only
+   `FinalityGate.finalizedOrdinal` callback. It is not current-tree implementation
+   evidence, and the anchor contract is invalid under density-reorgable Phase 2;
+   replacement work must bind exact ordinal/hash/root and reorg invalidation.
 3. **Gated follower trust-branch in `createContext`** (the core, consensus-critical) — ⏸ prep + bring for explicit sign-off before enabling. Removes the `19502c3a3` eta-adopt workaround.
 4. **Cold-cache fallback wiring** (followers, gated). ⚠️ **Blocker found in slice 2:** the `GlobalStateKey` Circe codec is **lossy for address-keyed keys** — `PartitionNamespace`'s decoder does `Address.fromBytes(s.getBytes)` (re-hashes the encoded address string rather than recovering it), so `AddressNamespace`/`MetagraphNamespace` keys (incl. **balances**) don't survive a JSON round-trip; `Hash`/`Hypergraph`/`Empty` namespaces round-trip cleanly. Remote balance proof-fetch needs a codec fix (or a restricted wire-key shape) first. The slice-3 core (per-field-proof cross-check + local reads) and steady-state reads are unaffected — this only gates remote *cold-cache* fetches of address-keyed entries.
 5. **Flip the gate (test env ordinal 0) + 8gl0+4mg+4shards e2e.**

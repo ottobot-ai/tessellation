@@ -1,10 +1,16 @@
 # Replay Before GL0 Tip Attestation
 
-**Status:** implementation packet; the first restrictive containment slice has
-landed in the current worktree. Raw local GL0 attestation emission and the
-receiver-local cumulative-weight finalization sink are removed. The remaining
-capability, lineage, journal, and real O-01 Avalanche/Snowball work is open. This
-containment does not make optimistic finality production-safe or active.
+**Status:** implementation packet; restrictive containment and the lower
+execution-receipt slice have landed in the current worktree. Raw local GL0
+attestation emission and the receiver-local cumulative-weight finalization sink
+are removed. GL0 proposal construction and follower recreation now return
+issuer-reference-checked receipts within the trusted unmodified JVM, and the
+receive path has no publicly constructible `Valid` success value. Those lower
+receipts do not bind the final
+decorated signed body, transport envelope, KES evidence, current preference, or
+finality. The authenticated-executed capability, `storeValidated`, durable
+lineage/projection journals, and real O-01 Avalanche/Snowball work remain open.
+This containment does not make optimistic finality production-safe or active.
 
 ## 1. Purpose and consensus role
 
@@ -13,9 +19,11 @@ that operator has authenticated the snapshot and locally reproduced its complete
 deterministic GL0 transition. A selected tip, a stored hash, successful decoding,
 or another operator's signature is not such proof.
 
-The complete GL0 transition always includes universal execution of native
-GL1/DAG-token inputs and the deterministic global cross-metagraph settlement
-kernel. For a sharded CL1 checkpoint, the target noncommittee GL0 transition is
+The current complete GL0 transition includes universal execution of native
+GL1/DAG-token inputs. The target additionally requires the deterministic global
+cross-metagraph settlement kernel, but that kernel is E9 work and the live
+`numShards <= 1` path bypasses it. For a sharded CL1 checkpoint, the target
+noncommittee GL0 transition is
 execution-certificate and positive-watchtower-coverage verification, scoped
 diff/root/compare-and-set adoption, and global-kernel execution; it is not
 ordinary currency recreation. Current ordinary noncommittee replay of **sharded
@@ -45,7 +53,8 @@ executed. It cannot:
 
 ## 2. Current source facts
 
-The received-snapshot path has the right operations but loses their provenance:
+The received-snapshot path now preserves lower replay provenance, but it does not
+yet preserve complete authenticated-executed provenance:
 
 1. The protobuf envelope is bound to the signed hash, ordinal, parent, signer,
    slot certificate, VRF proof/key, eta, and VRF output
@@ -54,24 +63,45 @@ The received-snapshot path has the right operations but loses their provenance:
    eligibility (`NakamotoSyncDaemon.scala:1366-1410`).
 3. KES is verified before replay and storage
    (`NakamotoSyncDaemon.scala:1412-1427`).
-4. `NakamotoSnapshotValidator.validate` verifies VRF, Ed25519, slot-certificate
-   lineage, and complete artifact recreation
-   (`NakamotoSnapshotValidator.scala:141-279`).
-5. `commitReplayValidated` permits storage and canonical effects only for
-   `Valid` (`NakamotoSyncDaemon.scala:352-364,1537-1604`).
+4. `GlobalSnapshotConsensusFunctions` allocates lower proposal/replay receipts
+   only after the complete native-GL1-inclusive transition function returns. In
+   the ordinary unmodified JVM path, consumption requires the private issuer
+   identity of that exact functions instance
+   (`GlobalSnapshotConsensusFunctions.scala:57-189`).
+5. `NakamotoSnapshotValidator.validate` verifies VRF, Ed25519, slot-certificate
+   lineage, and complete artifact recreation, consumes the lower replay receipt,
+   and mints a private replay-valid result bound to the object-global validator
+   issuer reference
+   (`NakamotoSnapshotValidator.scala:28-72,177-341`).
+6. `commitReplayValidated` delegates to the validator-owned issuer check before
+   exposing snapshot/context to storage and canonical effects
+   (`NakamotoSyncDaemon.scala:348-361,1529-1642`).
 
-That ordering is not yet encoded in an opaque execution capability. `Valid`
-remains publicly constructible (`NakamotoSnapshotValidator.scala:32-43`). The
-chain-store boundary has typed outcomes and an internally serialized selected-tip
-transition, but none is execution provenance. `BecameSelected` is only the fresh
-selection signal and still requires the exact branch+lineage canonical-effects
-CAS in RTA-006A. A raw `Duplicate` must never authorize a projection: only future
-`storeValidated` may insert a new receipt-backed validated entry after matching
-exact signed bytes, proofs hash, hash era, and the locally replayed context, then
-remove the matching physically separate recovery seed. It never upgrades a raw
-shared-map entry. The live raw `store` still accepts caller-supplied metadata,
-and revisions are neither durable nor signing authority. No current signing API
-consumes either result.
+This is a trusted-process type/provenance guard, not a cryptographic boundary
+against arbitrary in-process code. Reflection, `Unsafe`, an agent, or modified JVM
+bytecode can inspect private fields/constructors and recover or forge issuer-bound
+objects. Current adversarial tests prove only that public Scala construction and
+reflected values carrying null or wrong issuer references invoke zero effects;
+they do not prove resistance after issuer extraction. The positive outer-path test
+does cover `NakamotoSnapshotValidator.validate` through
+`consumeReplayValidated`, requiring the exact snapshot/context and exactly one
+callback (`GlobalSnapshotExecutionReceiptSuite`, “full snapshot validation mints
+one replay result carrying the exact snapshot and replayed context”).
+
+This is not yet the target `AuthenticatedExecutedGlobalSnapshot`. The lower
+producer receipt is consumed before certificate/eta decoration and signing, and
+the received result does not carry the outer envelope or KES evidence that the
+sole production caller checked immediately beforehand. No store, preference,
+finality, or signing API accepts either lower receipt. The chain-store boundary
+has typed outcomes and an internally serialized selected-tip transition, but no
+execution-provenance type. `BecameSelected` is only the fresh selection signal and
+still requires the exact branch+lineage canonical-effects CAS in RTA-006A. A raw
+`Duplicate` must never authorize a projection: only future `storeValidated` may
+insert a new receipt-backed validated entry after matching exact signed bytes,
+proofs hash, hash era, and the locally replayed context, then remove the matching
+physically separate recovery seed. It never upgrades a raw shared-map entry. The
+live raw `store` still accepts caller-supplied metadata, and revisions are neither
+durable nor signing authority. No current signing API consumes either result.
 
 The pre-containment implementation had three independent authority defects:
 
@@ -485,12 +515,20 @@ collapsed:
 - the chain store is the only current-preference minter; and
 - the optimistic emitter consumes only the latter.
 
-Do not merely rename public `NakamotoSnapshotValidator.Valid`. Its current public
-constructor and its exclusion of the outer envelope/KES gates would leave the
-boundary forgeable.
+The lower slice did not merely rename public `NakamotoSnapshotValidator.Valid`:
+that type is removed. Lower consensus-function receipts use a per-instance issuer
+reference; the outer replay-valid result uses the validator object's global issuer
+reference. Exact implementation/issuer checks precede payload access or effects
+in the ordinary unmodified JVM path. Tests currently close only public Scala
+construction and reflected null/wrong-issuer cases. They do not close reflection
+after issuer extraction, arbitrary in-process code, or a modified JVM. A positive
+full validator-to-consumer test now proves exact payload delivery and one callback,
+but not hostile-bytecode resistance. The slice deliberately does not claim the
+target authenticated-executed boundary because the outer envelope/KES checks and
+final signed producer body are not inside one minting operation.
 
-To avoid executing a state-mutating transition twice, add GL0-specific opaque
-execution receipts to `GlobalSnapshotConsensusFunctions`. The existing generic
+The landed lower GL0 execution receipts avoid executing a state-mutating
+transition twice. The existing generic
 `ConsensusFunctions` methods may continue serving non-Nakamoto callers, but the
 Nakamoto producer and validator paths must use receipt-returning methods whose
 private implementation is allocated only after `createProposalArtifact` or
@@ -620,15 +658,25 @@ staged landing rules are:
 
 ### Phase B - Opaque execution and authentication receipts
 
-- `GlobalSnapshotConsensusFunctions.scala`: add private-implementation,
-  receipt-returning producer and validator methods. Do not change economic
-  transition semantics.
-- `NakamotoSnapshotValidator.scala`: replace publicly constructible `Valid` as a
-  signing authority with the sealed authenticated-executed capability. Ensure
-  outer envelope, KES, registry, eta, parent, and replay gates are inside the
-  minting operation.
-- `NakamotoSyncDaemon.scala`: carry the exact receipt through
-  `commitReplayValidated`; no reconstruction from protobuf fields.
+**Partial:** lower issuer-reference-checked proposal and replay receipts are live,
+producer and validator paths consume them, and the public `Valid` result is removed. The
+full authenticated-executed capability remains open: bind the exact decorated
+signed bytes, proofs/hash era, envelope, KES/VRF/eta/registry evidence, exact
+parent/context/state root, and successful lower receipt into one issuer-owned
+object before any storage/preference/signing authority is granted.
+
+- **Landed lower boundary:** `GlobalSnapshotConsensusFunctions.scala` has
+  Scala-source-opaque, per-instance issuer-checked receipt-returning producer and
+  validator methods without changing economic transition semantics. This assumes
+  the validator JVM does not load hostile reflection/agent/modified bytecode.
+- **Open authenticated boundary:** `NakamotoSnapshotValidator.scala` no longer
+  exposes publicly constructible `Valid`, but the target sealed
+  authenticated-executed capability must still place outer envelope, KES,
+  registry, eta, parent, and replay gates inside one minting operation.
+- **Landed lower boundary:** `NakamotoSyncDaemon.scala` carries the validator-owned
+  replay result through `commitReplayValidated`; it does not reconstruct replay
+  success from protobuf fields. The future store boundary must consume the full
+  authenticated-executed capability, not this lower result.
 
 ### Phase C - Selected-tip revision and store outcomes
 
@@ -701,7 +749,7 @@ cannot authorize signing or satisfy Phase C.
   proposal cannot update canonical storage or attest.
 - `GlobalSnapshotConsensus.scala`: construct one shared emitter/capability service
   and inject it into the leader and receive paths. Current construction sites are
-  `GlobalSnapshotConsensus.scala:1935-2024,2280-2353`.
+  `GlobalSnapshotConsensus.scala:762-800,1848-1853,2192-2215`.
 
 ### Phase E - Real optimistic rail
 

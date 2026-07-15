@@ -1,8 +1,9 @@
 # Hierarchical Shard Checkpoints
 
 **Status:** Target shard design; implementation currently regressed to ordinary
-noncommittee GL0 recreation of sharded CL1 transitions. Universal native GL1
-execution is not part of that regression. ADR-0016/0017 and
+noncommittee GL0 recreation of sharded CL1 transitions. Every GL0 validator's
+independent execution and validation of direct native GL1/DAG-token transitions
+is permanent and not part of that regression. ADR-0016/0017 and
 `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` are normative.
 
 ## 1. Purpose and topology
@@ -17,6 +18,12 @@ DL1 custom data blocks -+                                  |
                                                            v
                                   staircase checkpoint -> GL0 snapshot
 ```
+
+The diagram scopes the shard path only. Native DAG-token blocks travel directly
+`GL1 -> GL0` and every GL0 validator executes and validates them against the exact
+proposal parent. The target also requires every GL0 validator to run the
+deterministic global conflict/nullifier/settlement kernel; that E9 kernel is not
+complete today. Neither responsibility is delegated to an execution shard.
 
 ML0 operators run metagraph consensus and sign the binary. A GL0 admission
 committee authenticates intake. A separate GL0 execution committee builds the

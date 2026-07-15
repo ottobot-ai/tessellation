@@ -7,9 +7,16 @@
 > replay before signing; ordinary noncommittee GL0 nodes require the distinct
 > execution threshold, compare-and-set the signed pre-root, apply the canonical
 > scoped diff, and recompute the root; assigned watchtowers replay as the collusion
-> backstop. `authoritative*` and `AdoptFromSignedFields` remain deleted.
+> backstop, and mandatory positive assigned replay coverage is required before GL0
+> inclusion. Removing ordinary noncommittee CL1 recreation never applies to
+> native GL1: every GL0 validator continues to execute and validate direct
+> DAG-token transitions. The universal global conflict/nullifier/settlement kernel
+> is target E9 work, not a current guarantee. `authoritative*` and
+> `AdoptFromSignedFields` remain deleted.
 
-**Status:** superseded historical record of current regression behavior.
+**Status:** superseded historical record. Current every-adopter CL1 recreation is
+temporary containment until the complete certified-diff/base/domain/watchtower
+adoption gate lands.
 
 ## Invariant
 
@@ -26,14 +33,14 @@ state, and supply effects.
 
 | State | GL0 guarantee |
 |---|---|
-| Framework CL1 economics | Universal deterministic recreation and exact artifact/root comparison |
-| Arbitrary DL1 application state | Metagraph-defined and proof-carried because GL0 does not have the application code |
+| Framework CL1 economics (historical rejected rule) | Universal deterministic recreation and exact artifact/root comparison |
+| Arbitrary DL1 application state | Authenticated commitment/DA carriage only; GL0 does not execute unknown application semantics |
 | Arbitrary non-currency state-channel bytes | Authenticated carriage only; they cannot directly authorize a CL1 economic mutation |
 
 The boundary is framework-defined versus application-defined. A data application cannot relabel token movement as custom state and bypass
 CL1 execution.
 
-## Required execution path
+## Historical rejected ordinary-adopter path
 
 1. Decode the included currency snapshot and cryptographically validate its signatures.
 2. Resolve its prior currency state at the checkpoint's signed `executionBaseOrdinal`.
@@ -43,8 +50,11 @@ CL1 execution.
 6. Compute the per-metagraph root from the recreated state and require it to equal the checkpoint root.
 7. Commit the recreated state, never a committee-carried replacement.
 
-The producer and committee run the same function before proposing/signing, but their work is not trusted by followers. Every GL0 adopter
-runs it again. Missing pinned data is a defer/reject, never a live-state fallback.
+Under the rejected regression, the producer and committee run the same function
+before proposing/signing, but every GL0 adopter runs it again. Target ordinary
+noncommittee adoption instead verifies the replay certificate and canonical diff,
+applies it at the exact base, and recomputes the root. Missing pinned data remains
+a defer/reject, never a live-state fallback.
 
 ## Removed authority paths
 
@@ -67,7 +77,9 @@ When GL0 has no registered deterministic framework reward implementation, the re
 supplying rewards that GL0 merely echoes. Supporting a reward policy requires registering equivalent deterministic code on every GL0 node
 behind an activation/version boundary.
 
-DL1 calculated state may remain proof-carried, but it cannot directly alter CL1 balances or supply.
+DL1 calculated state may remain commitment/DA-carried, but GL0 does not certify
+its unknown semantics and it cannot directly alter CL1 balances or supply. A
+future proof-verifier lane requires its own deterministic active-era verifier.
 
 ## Remaining production blockers
 

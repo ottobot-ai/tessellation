@@ -16,7 +16,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 
 | ID | Decision |
 |---|---|
-| L-01 | Topology remains `GL1 -> GL0` and `CL1/DL1 -> ML0 -> GL0`, with exact Phase-2 GL0 state flowing back downstream. |
+| L-01 | Topology remains `GL1 -> GL0` and `CL1/DL1 -> ML0 -> GL0`, with exact Phase-2 GL0 state flowing back downstream. Every GL0 validator independently executes and validates the direct native GL1/DAG-token transition against the exact proposal parent. Sharded CL1 diff adoption never authorizes, replaces, or bypasses that native execution. |
 | L-02 | GL0 consensus is Nakamoto/Taktikos/LDD chain consensus. No global proposal/vote/lock/QC/view-change BFT protocol is permitted. ML0 may retain BFT consensus for its small, well-connected metagraph validator set and remains subordinate to GL0. |
 | L-03 | Avalanche/Snowball is only the optimistic GL0 Phase-2 finality rail. It does not validate economics and does not create a BFT lock or commit certificate. Phase 2 is reached by decided-attestation `T_weight` **or** canonical `k1` depth. `T_count` is removed or made non-authoritative. |
 | L-04 | Within the `k1` comparison window, valid GL0 tines use the ratified Taktikos `maxvalid-tk` rule. Beyond `k1`, valid competing tines use the Ouroboros Genesis-family `maxvalid-bg` density rule from the true common ancestor. Phase-2 state remains density-reorgable. |
@@ -25,7 +25,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-07 | Every execution-committee signer independently replays the exact ordered framework inputs at the exact signed Phase-2 base and signs only when its byte-identical diff, extracted intents, and resulting root match. Missing inputs mean defer/no-sign. |
 | L-08 | Ordinary noncommittee GL0 nodes verify the distinct execution `kQuorum`, exact base, scope, continuity, diff, and resulting root, then adopt the diff without recreating the ordinary currency snapshot. Shard depth never substitutes for missing replay signatures. |
 | L-09 | Deterministically assigned noncommittee watchtower replay provides the execution-threshold collusion backstop. Positive required replay coverage precedes GL0 inclusion eligibility. A valid challenge triggers exceptional bounded universal GL0 replay of the exact retained base and inputs; the replay result, not the assertion, decides rollback/slash. |
-| L-10 | Per-metagraph diffs are namespace-confined. Every GL0 node executes the small deterministic global conflict/nullifier/settlement kernel over committee-extracted signed intents. No shard or metagraph writes another metagraph's namespace or the GL0-owned global settlement namespace directly. |
+| L-10 | Target: per-metagraph diffs are namespace-confined and every GL0 node executes the small deterministic global conflict/nullifier/settlement kernel over committee-extracted signed intents. No shard or metagraph writes another metagraph's namespace or the GL0-owned global settlement namespace directly. E9 remains planned and the live `numShards <= 1` path still bypasses shard processing. |
 | L-11 | One shard has at most one checkpoint whose exact containing GL0 snapshot has not reached Phase 2. That checkpoint may batch multiple metagraphs and a contiguous ordered list of binaries for each metagraph. Its successor is released only by the exact Phase-2 checkpoint hash, never tentative embedding or ordinal equality. Remove configurable checkpoint `pipelineDepth` and shard-depth validity fallback; staircase duty still selects the producer for the next checkpoint. |
 | L-12 | The binary-intake committee and execution committee are distinct draws over eligible GL0 operators. ML0 operators authenticate the metagraph binary but are not committee members by virtue of running ML0. Intake receipts can claim only authenticated source, checked parent/ordinal/envelope, durable custody, and availability; they never satisfy execution quorum. |
 | L-13 | Before emitting an intake/custody signature, a selected intake member verifies the exact binary's source signatures against the pinned metagraph operator registry/allowlist, derives parent and ordinal from authenticated state rather than a self-claim, applies deterministic envelope/resource checks, and stores the exact bytes durably. |
@@ -510,7 +510,7 @@ The following engineering/research freeze gates remain and must land coherently:
   `kLookback = k1 + 1` and chooses density only for `depth > kLookback`;
   therefore `depth = k1 + 1` still uses Tk, contrary to L-04's prose
   (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
-  `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
+  `GlobalSnapshotConsensus.scala:979-994`; `ChainSelection.scala:161-175,187-240`;
   `ChainSelectionSuite.scala:228-250`).
 - **E - Exact ties:** define and prove an objective tie result, or reject the current lower-VRF
   then hash rule; it is not in either cited algorithm

@@ -12,7 +12,6 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{DAGEvent, GlobalSnapshotEvent}
 import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
@@ -349,19 +348,16 @@ object NakamotoSyncDaemon {
       pending.updated(missingParent, pending.getOrElse(missingParent, List.empty) :+ child)
     }
 
-  /** Run storage, canonical writes, and attestation effects only after full replay validation returned [[NakamotoSnapshotValidator.Valid]].
-    * Non-valid results have no callback and therefore cannot reach those effects. Returns whether the callback ran so the caller can emit
-    * result-specific diagnostics without duplicating the validity gate.
+  /** Delegate to the validator-owned issuer check before exposing replayed payload to the current post-replay receive path. Envelope and
+    * KES gates still precede this helper at the sole production call site; replay alone is deliberately not an authenticated signing or
+    * preference capability.
     */
   private[nakamoto] def commitReplayValidated[F[_]: cats.Monad](
     result: NakamotoSnapshotValidator.ValidationResult
   )(
-    commit: NakamotoSnapshotValidator.Valid => F[Unit]
+    commit: (Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo) => F[Unit]
   ): F[Boolean] =
-    result match {
-      case valid: NakamotoSnapshotValidator.Valid => commit(valid).as(true)
-      case _                                      => false.pure[F]
-    }
+    NakamotoSnapshotValidator.consumeReplayValidated(result)(commit)
 
   /** Atomically remove children waiting on `storedHash`, then process them sequentially in insertion order. `processChild` is the normal
     * snapshot handler in production; a child that fails replay never stores and therefore never invokes another drain, leaving its
@@ -405,7 +401,7 @@ object NakamotoSyncDaemon {
     // Confirmation depth k₁ (Tier-2 vs Tier-3 gap boundary). Forwarded from `run`; sourced from
     // `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` (replaces the prior module-level sys.env read).
     confirmationDepthK: Long,
-    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    consensusFns: GlobalSnapshotConsensusFunctions[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
@@ -568,7 +564,7 @@ object NakamotoSyncDaemon {
     // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read; project rule: HOCON over scattered env reads).
     // Used as the Tier-2 (sequential walk-back) vs Tier-3 (full catch-up) gap boundary in `handleSnapshot`.
     confirmationDepthK: Long,
-    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    consensusFns: GlobalSnapshotConsensusFunctions[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
@@ -1264,7 +1260,7 @@ object NakamotoSyncDaemon {
     // Confirmation depth k₁ (Tier-2 vs Tier-3 gap boundary). Forwarded from `run`; sourced from
     // `sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value` (replaces the prior module-level sys.env read).
     confirmationDepthK: Long,
-    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    consensusFns: GlobalSnapshotConsensusFunctions[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
@@ -1534,9 +1530,9 @@ object NakamotoSyncDaemon {
             case _ =>
               Async[F].pure(NakamotoSnapshotValidator.PayloadMissing(snap.ordinal): NakamotoSnapshotValidator.ValidationResult)
           }
-      replayCommitted <- commitReplayValidated(validationResult) { valid =>
+      replayCommitted <- commitReplayValidated(validationResult) { (validSnapshot, validContext) =>
         for {
-          validHash <- HasherSelector[F].withCurrent(implicit h => valid.snapshot.toHashed[F].map(_.hash))
+          validHash <- HasherSelector[F].withCurrent(implicit h => validSnapshot.toHashed[F].map(_.hash))
           // Archive already-verified KES evidence before selection. A local evidence-write failure must not leave a newly selected
           // in-memory tip whose canonical projection was never attempted.
           _ <- SnapshotKesStorage.put[F](dataDir, validHash, snap.kesSignature.toByteArray)
@@ -1545,8 +1541,8 @@ object NakamotoSyncDaemon {
           storeOutcome <- Async[F].uncancelable { _ =>
             chainStore
               .store(
-                valid.snapshot,
-                valid.context,
+                validSnapshot,
+                validContext,
                 snap.ordinal,
                 snap.slot,
                 parentHash,
@@ -1667,9 +1663,7 @@ object NakamotoSyncDaemon {
           case invalid: NakamotoSnapshotValidator.Invalid =>
             Metrics[F].incrementCounter("dag_nakamoto_snapshots_rejected") >>
               logger.warn(s"❌ REJECTED snapshot slot=${snap.slot} ordinal=${snap.ordinal}: $invalid")
-          case _: NakamotoSnapshotValidator.Valid =>
-            // `commitReplayValidated` returns true for every Valid result unless its effect raises.
-            Async[F].unit
+          case _ => Async[F].unit
         }
       }
     } yield ()

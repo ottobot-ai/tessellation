@@ -21,36 +21,26 @@ import io.constellationnetwork.dag.l0.infrastructure.rewards.RewardsService
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{GlobalConsensusKind, GlobalConsensusOutcome}
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
-import io.constellationnetwork.json.{JsonBrotliBinarySerializer, JsonSerializer}
-import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.DefaultDelegatedRewardsConfigProvider
 import io.constellationnetwork.node.shared.config.types.SharedConfig
-import io.constellationnetwork.node.shared.domain.cluster.services.Session
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
-import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.{EtaSourceRange, EtaSourceUnavailable}
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardWindowContinuation
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
-import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.domain.statechannel.{FeeCalculator, FeeCalculatorConfig}
 import io.constellationnetwork.node.shared.domain.swap.block.AllowSpendBlockAcceptanceManager
 import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlockAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.block.processing.BlockAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.consensus._
-import io.constellationnetwork.node.shared.infrastructure.consensus.engine.{ConsensusCommand, ConsensusEventLoop, _}
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoTriggerDaemon
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.NakamotoTriggerDaemon.NakamotoTriggerState
-import io.constellationnetwork.node.shared.infrastructure.consensus.state._
+import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusManager
 import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
-import io.constellationnetwork.node.shared.infrastructure.gossip.event.EventGossipClient
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.node.shared.infrastructure.node.RestartService
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-import io.constellationnetwork.node.shared.infrastructure.snapshot._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   GlobalSnapshotAcceptanceManager,
   GlobalSnapshotStateChannelAcceptanceManager,
@@ -69,24 +59,60 @@ import io.constellationnetwork.security._
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
-import io.circe.Json
 import org.http4s.client.Client
 
 /** Factory and wiring surface for the Global L0 consensus runtime.
   *
-  * Wires together all components and starts the consensus background stream. Returns a Consensus instance with handler (for gossip),
-  * manager (external API), storage (state queries), and routes (HTTP endpoints).
+  * Wires together the Nakamoto consensus services. The returned generic [[Consensus]] value is a temporary route/storage compatibility
+  * shell; its legacy BFT handler and lifecycle manager are deliberately disabled and own no command queue.
   *
   * GL0 consensus is Nakamoto/Taktikos/LDD with VRF slot leadership and an exact-hash Phase-2 gadget. It must not run the inherited
-  * facility/proposal/vote/lock/QC/view-change BFT lifecycle. The generic [[Consensus]] return shape and dormant engine wiring are migration
-  * plumbing, not global consensus authority; ML0 may continue using the separate shared BFT engine.
-  *
-  * @see
-  *   ConsensusEventLoop for inherited plumbing that must remain outside the target GL0 lifecycle
-  * @see
-  *   NakamotoTriggerDaemon for VRF slot clock implementation
+  * facility/proposal/vote/lock/QC/view-change BFT lifecycle. ML0 may continue using the separate shared BFT engine.
   */
 object GlobalSnapshotConsensus {
+
+  final case class LegacyBftConsensusDisabled(operation: String)
+      extends IllegalStateException(s"Legacy BFT consensus operation '$operation' is disabled for Nakamoto GL0")
+
+  /** Compatibility implementation for the inherited `Consensus` return type. It fails closed and, critically, has no queue. */
+  private[snapshot] def disabledLegacyManager[F[_]: Async]: GlobalConsensusManager[F] =
+    new ConsensusManager[
+      F,
+      GlobalSnapshotEvent,
+      GlobalSnapshotKey,
+      GlobalSnapshotArtifact,
+      GlobalSnapshotContext,
+      GlobalSnapshotStatus,
+      GlobalConsensusOutcome,
+      GlobalConsensusKind
+    ] {
+      private def disabled(operation: String): F[Unit] =
+        Async[F].raiseError(LegacyBftConsensusDisabled(operation))
+
+      def registerForConsensus(observationKey: GlobalSnapshotKey): F[Unit] =
+        disabled("registerForConsensus")
+
+      def resetForRecovery: F[Unit] =
+        disabled("resetForRecovery")
+
+      def startFacilitatingAfterDownload(
+        key: GlobalSnapshotKey,
+        lastArtifact: io.constellationnetwork.security.signature.Signed[GlobalSnapshotArtifact],
+        lastContext: GlobalSnapshotContext,
+        isRecovery: Boolean
+      ): F[Unit] =
+        disabled("startFacilitatingAfterDownload")
+
+      def startFacilitatingAfterRollback(lastKey: GlobalSnapshotKey, initialOutcome: GlobalConsensusOutcome): F[Unit] =
+        disabled("startFacilitatingAfterRollback")
+
+      def withdrawFromConsensus: F[Unit] =
+        disabled("withdrawFromConsensus")
+    }
+
+  /** The compatibility `Consensus.handler` is not registered by GL0 Main and recognizes no rumor family. */
+  private[snapshot] def disabledLegacyHandler[F[_]: Async]: RumorHandler[F] =
+    cats.data.Kleisli(_ => cats.data.OptionT.none[F, Unit])
 
   // GL0 is Nakamoto-only. No env var check needed — the run-nakamoto CLI command
   // is the single source of truth. Tunables come from NAKAMOTO_* env vars below.
@@ -156,7 +182,7 @@ object GlobalSnapshotConsensus {
   def etaBytesToHash(bytes: Array[Byte]): io.constellationnetwork.security.hash.Hash =
     io.constellationnetwork.security.hash.Hash(bytes.map(b => f"$b%02x").mkString)
 
-  def make[F[_]: Async: Parallel: Random: JsonSerializer: HasherSelector: SecurityProvider: Metrics, R <: CliMethod](
+  def make[F[_]: Async: Parallel: JsonSerializer: HasherSelector: SecurityProvider: Metrics, R <: CliMethod](
     sharedCfg: SharedConfig,
     gossip: Gossip[F],
     selfId: PeerId,
@@ -174,10 +200,8 @@ object GlobalSnapshotConsensus {
     stateChannelAllowanceLists: Option[Map[Address, NonEmptySet[PeerId]]],
     feeConfigs: SortedMap[SnapshotOrdinal, FeeCalculatorConfig],
     client: Client[F],
-    session: Session[F],
     rewardsService: RewardsService[F],
     txHasher: Hasher[F],
-    restartService: RestartService[F, R],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
@@ -210,7 +234,6 @@ object GlobalSnapshotConsensus {
     // base-only and could miscalculate fees during finality stalls (#117 root cause).
     pendingReader: io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    eventGossipClient: EventGossipClient[F, GlobalSnapshotEvent],
     loggerBundle: LoggerBundle[F],
     rumorQueue: Queue[F, Hashed[RumorRaw]],
     // Transitional ordinal-only Phase-2 watermark updated after `chainStore.finalize`. The target
@@ -776,36 +799,6 @@ object GlobalSnapshotConsensus {
           fraudProofPool = fraudProofPool
         )
 
-      stateAdvancer =
-        GlobalSnapshotConsensusStateAdvancer.make(
-          appConfig.snapshot.consensus,
-          keyPair,
-          consensusStorage,
-          globalSnapshotStorage,
-          consensusFunctions,
-          gossip,
-          restartService,
-          nodeStorage,
-          appConfig.shared.leavingDelay,
-          lastNGlobalSnapshotStorage,
-          lastGlobalSnapshotStorage,
-          getGlobalSnapshotByOrdinalWithFallback,
-          clusterStorage,
-          eventMempool,
-          eventGossipClient,
-          loggerBundle,
-          mptStore
-        )
-
-      facilitatorSelector = FacilitatorSelector.make(
-        appConfig.snapshot.consensus.maxFacilitatorCount.map(_.value)
-      )
-
-      peerQualityTracker <- PeerQualityTracker.make[F].toResource
-
-      tcaFilter = TrailingCommonAncestorFilter.make[F]
-
-      // In Nakamoto mode, create state ref for VRF trigger daemon
       resolvedGenesisTimeMs <- {
         val configured = sharedCfg.nakamoto.genesisTimeMs.value
         if (configured > 0L) Async[F].pure(configured)
@@ -819,78 +812,6 @@ object GlobalSnapshotConsensus {
               )
           }
       }.toResource
-      nakamotoStateRef <- {
-        val genesisEta = sharedCfg.nakamoto.genesisEtaSeed.getBytes
-        Ref.of[F, NakamotoTriggerState](NakamotoTriggerState.initial(resolvedGenesisTimeMs, genesisEta)).map(Some(_))
-      }.toResource
-
-      stateCreator =
-        GlobalSnapshotConsensusStateCreator.make(
-          consensusFunctions,
-          consensusStorage,
-          gossip,
-          selfId,
-          seedlist,
-          facilitatorSelector,
-          appConfig.snapshot.consensus.deterministicConfigHash,
-          peerQualityTracker,
-          tcaFilter,
-          eventMempool,
-          nakamotoStateRef,
-          appConfig.snapshot.consensus.candidateAdmissionEnabled
-        )
-
-      stateRemover =
-        GlobalSnapshotConsensusStateRemover.make(
-          consensusStorage,
-          gossip
-        )
-
-      consensusOps = GlobalSnapshotConsensusOps.make
-
-      stateUpdater =
-        ConsensusStateUpdater.make(
-          stateAdvancer,
-          consensusStorage,
-          consensusOps
-        )
-
-      consensusClient = ConsensusClient.make[F, GlobalSnapshotKey, GlobalConsensusOutcome](client, session)
-
-      directPushFn = ConsensusDirectSender.makeDirectPushFn(clusterStorage, consensusClient)
-      _ <- gossip.setDirectPushFn(directPushFn).toResource
-
-      loop <-
-        ConsensusEventLoop
-          .build[
-            F,
-            GlobalSnapshotEvent,
-            GlobalSnapshotKey,
-            GlobalSnapshotArtifact,
-            GlobalSnapshotContext,
-            GlobalSnapshotStatus,
-            GlobalConsensusOutcome,
-            GlobalConsensusKind
-          ](
-            selfId,
-            consensusStorage,
-            stateCreator,
-            stateUpdater,
-            stateAdvancer,
-            stateRemover,
-            consensusOps,
-            nodeStorage,
-            clusterStorage,
-            consensusFunctions,
-            consensusClient,
-            appConfig.snapshot.consensus,
-            facilitatorSelector,
-            peerQualityTracker,
-            nakamotoMode = true
-          )
-          .toResource
-
-      handler = GlobalConsensusHandler.make(loop.queue)
 
       routes = new ConsensusRoutes[
         F,
@@ -901,9 +822,6 @@ object GlobalSnapshotConsensus {
         GlobalConsensusOutcome,
         GlobalConsensusKind
       ](consensusStorage, rumorQueue)
-
-      // Nakamoto GL0: no BFT consensus trigger or loop — slot clock handles production
-      triggerEvent = Async[F].unit
 
       // Nakamoto LDD + VRF config. `baseline`/`amplitude` arrive from HOCON as exact `Ratio` (parsed from
       // `"n/d"` strings — never Double), so the threshold computation is exact and reproducible across all
@@ -1198,8 +1116,8 @@ object GlobalSnapshotConsensus {
           // Gossip.spread is forwarded to the libp2p sidecar via PublishRumor. Inbound: rumors
           // received from the GossipSub mesh are deserialized back to Hashed[RumorRaw] and offered
           // to rumorQueue, where the existing GossipDaemon.consumeRumors pipeline validates and
-          // dispatches them via the registered RumorHandlers — meaning BFT consensus messages,
-          // Tessellation events, and any other rumor type ride sidecar transport for free.
+          // dispatches them through GL0's registered base/event handlers. Legacy global-BFT rumor
+          // families are deliberately unregistered and therefore cannot acquire consensus authority.
           _ <- gossip
             .setSidecarPublishFn(
               io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
@@ -2382,13 +2300,13 @@ object GlobalSnapshotConsensus {
         } yield ()
       }
       consensus = new Consensus(
-        handler,
+        disabledLegacyHandler[F],
         consensusStorage,
-        loop.manager,
+        disabledLegacyManager[F],
         routes,
         consensusFunctions,
-        Some(loop.healthRef),
-        Some(triggerEvent)
+        healthRef = None,
+        triggerEventConsensus = None
       )
     } yield consensus
 }

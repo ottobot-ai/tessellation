@@ -18,6 +18,12 @@ GL1 is the native DAG-token edge application and sends blocks directly to GL0. C
 snapshot consensus and submits the resulting signed state-channel binary to GL0. ML0 operators produce and sign that binary; they are not
 the GL0 admission or execution committee by virtue of operating ML0.
 
+Every GL0 validator independently executes and validates the direct GL1/DAG-token
+transition against the exact proposal parent. Execution-certificate/diff reuse is
+limited to the sharded CL1 path and cannot authorize or bypass native validation.
+The target also requires every GL0 validator to run the global
+conflict/nullifier/settlement kernel; that kernel remains E9 planned work.
+
 ## Binary Admission
 
 For each `(eta, metagraphAddress, parentHash)`, eligible GL0 operators independently run the secret-key admission VRF. The draw is uniform

@@ -5,7 +5,7 @@ import java.security.KeyPair
 import cats.Parallel
 import cats.data.NonEmptySet
 import cats.effect.kernel.{Async, Ref, Resource}
-import cats.effect.std.{Random, Supervisor}
+import cats.effect.std.Supervisor
 import cats.effect.syntax.all._
 import cats.syntax.applicative._
 import cats.syntax.flatMap._
@@ -20,7 +20,6 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot._
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.config.DefaultDelegatedRewardsConfigProvider
 import io.constellationnetwork.node.shared.config.types.SharedConfig
@@ -30,13 +29,11 @@ import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.healthcheck.LocalHealthcheck
 import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-import io.constellationnetwork.node.shared.domain.rewards.Rewards
-import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityGate
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.infrastructure.collateral.MptStoreCollateral
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
-import io.constellationnetwork.node.shared.infrastructure.gossip.event.{EventGossipClient, RecoveryPeerHint}
+import io.constellationnetwork.node.shared.infrastructure.gossip.event.RecoveryPeerHint
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
@@ -51,13 +48,12 @@ import io.constellationnetwork.security.{Hasher, HasherSelector, SecurityProvide
 import io.constellationnetwork.statechannel.StateChannelOutput
 
 import org.http4s.client.Client
-import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object Services {
 
   def make[F[
     _
-  ]: Async: FinalityGate: Parallel: Random: KryoSerializer: JsonSerializer: HasherSelector: SecurityProvider: Metrics: Supervisor, R <: CliMethod](
+  ]: Async: Parallel: JsonSerializer: HasherSelector: SecurityProvider: Metrics: Supervisor, R <: CliMethod](
     sharedCfg: SharedConfig,
     sharedServices: SharedServices[F, R],
     sharedStorages: SharedStorages[F],
@@ -65,7 +61,6 @@ object Services {
     storages: Storages[F],
     validators: SharedValidators[F],
     client: Client[F],
-    session: Session[F],
     seedlist: Option[Set[SeedlistEntry]],
     stateChannelAllowanceLists: Option[Map[Address, NonEmptySet[PeerId]]],
     selfId: PeerId,
@@ -180,8 +175,6 @@ object Services {
         )
       }.toResource
 
-      eventGossipClient = EventGossipClient.make[F, GlobalSnapshotEvent](client, session)
-
       // Sidecar client for libp2p GossipSub. Created here (rather than inside consensus)
       // so stateChannelService and HTTP routes can also publish — specifically, the
       // HTTP state-channel endpoint broadcasts received metagraph binaries to peer GL0s
@@ -281,10 +274,8 @@ object Services {
             stateChannelAllowanceLists,
             feeConfigs = cfg.shared.feeConfigs,
             client,
-            session,
             rewardsService,
             txHasher,
-            sharedServices.restart,
             sharedStorages.lastNGlobalSnapshot,
             sharedStorages.lastGlobalSnapshot,
             storages.globalSnapshot.getHashed,
@@ -295,7 +286,6 @@ object Services {
             sharedStorages.setDeepStateReader,
             pendingReader,
             eventMempoolService,
-            eventGossipClient,
             loggerBundle,
             queues.rumor,
             nakamotoFinalizedOrdinalRef,

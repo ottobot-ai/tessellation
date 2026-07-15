@@ -4,8 +4,6 @@ import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.infrastructure.snapshot._
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
-import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.EventTrigger
 import io.constellationnetwork.schema.nakamoto.slot.Slot
@@ -30,7 +28,49 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 object NakamotoSnapshotValidator {
 
   sealed abstract class ValidationResult
-  final case class Valid(snapshot: Signed[GlobalIncrementalSnapshot], context: GlobalSnapshotInfo) extends ValidationResult
+
+  private[this] val replayValidIssuer: AnyRef = new Object
+  private[this] val replayValidMinter = new ReplayValidMinter(replayValidIssuer)
+
+  private final class ReplayValidMinter(issuerValue: AnyRef) {
+    def mint(
+      snapshot: Signed[GlobalIncrementalSnapshot],
+      context: GlobalSnapshotInfo,
+      replayReceipt: GlobalSnapshotReplayReceipt
+    ): ValidationResult =
+      new ReplayValidResult(snapshot, context, replayReceipt, issuerValue)
+  }
+
+  private final class ReplayValidResult(
+    snapshotValue: Signed[GlobalIncrementalSnapshot],
+    contextValue: GlobalSnapshotInfo,
+    replayReceiptValue: GlobalSnapshotReplayReceipt,
+    issuerValue: AnyRef
+  ) extends ValidationResult {
+    private[nakamoto] def consume(
+      expectedIssuer: AnyRef
+    ): Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)] =
+      Option.when((issuerValue eq expectedIssuer) && replayReceiptValue != null)((snapshotValue, contextValue))
+  }
+
+  /** Fused consume boundary for replay-valid results.
+    *
+    * The success implementation is private and its JVM-visible constructor is not trusted. Exact-class matching plus an issuer-private
+    * reference nonce precedes all payload access and callback effects. This remains replay authority only: transport-envelope and KES
+    * checks are outside this minting boundary, so it cannot authorize optimistic signing or current-tip preference.
+    */
+  private[nakamoto] def consumeReplayValidated[F[_]: cats.Monad](
+    result: ValidationResult
+  )(
+    consume: (Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo) => F[Unit]
+  ): F[Boolean] =
+    result match {
+      case exact: ReplayValidResult =>
+        exact
+          .consume(replayValidIssuer)
+          .fold(false.pure[F]) { case (snapshot, context) => consume(snapshot, context).as(true) }
+      case _ => false.pure[F]
+    }
 
   sealed abstract class Invalid extends ValidationResult
   case object ParentNotFound extends Invalid
@@ -105,7 +145,7 @@ object NakamotoSnapshotValidator {
     operatorKeys: io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys,
     lddConfig: LddConfig,
     eligibilityChecker: EligibilityChecker[F],
-    consensusFns: ConsensusFunctions[F, GlobalSnapshotEvent, GlobalSnapshotKey, GlobalSnapshotArtifact, GlobalSnapshotContext],
+    consensusFns: GlobalSnapshotConsensusFunctions[F],
     lastSignedArtifact: Signed[GlobalIncrementalSnapshot],
     lastContext: GlobalSnapshotInfo,
     getByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
@@ -137,6 +177,7 @@ object NakamotoSnapshotValidator {
     val parentOrdinal = math.max(0L, signedSnapshot.ordinal.value.value - 1L)
     val artifactPeriod = EtaCalculation.globalSnapshotArtifactPeriod(signedSnapshot.ordinal.value.value, etaRotationSnapshots)
     val stakeLookbackPeriod: EtaPeriod = EtaCalculation.leaderStakeLookbackPeriod(parentOrdinal, etaRotationSnapshots)
+    val replayValidMinterForThisValidation = replayValidMinter
 
     for {
       // ── Step 1: VRF proof verification ──
@@ -233,7 +274,7 @@ object NakamotoSnapshotValidator {
                     // since createProposalArtifact doesn't populate them — producer adds them post-creation.
                     val strippedReceived = signedSnapshot.value.copy(slotCertificate = None, eta = None)
                     consensusFns
-                      .validateArtifact(
+                      .validateArtifactWithReplayReceipt(
                         lastSignedArtifact,
                         lastContext,
                         EventTrigger,
@@ -242,7 +283,7 @@ object NakamotoSnapshotValidator {
                         getByOrdinal
                       )
                       .flatMap {
-                        case Right((_, validatedContext)) =>
+                        case Right(replayReceipt) =>
                           // Content matches AND we have properly derived state (stateProof correct).
                           //
                           // Phase J / MultiBranch: `validateArtifact` ran `createProposalArtifact(strippedReceived)`
@@ -256,27 +297,34 @@ object NakamotoSnapshotValidator {
                           //
                           // Mirror the leader-side rekey in SnapshotLeaderLoop: walk the local pendingRef from
                           // stripped-hash to canonical-hash so the next ordinal's checkout finds the parent.
-                          for {
-                            strippedHash <- hasher.hash(strippedReceived)
-                            canonicalHash <- hasher.hash(signedSnapshot.value)
-                            _ <- mptOverlay.rekey(
-                              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(strippedHash),
-                              io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(canonicalHash)
-                            )
-                            // Task #12 slice-2c — mirror the overlay rekey for the changeset STAGING map.
-                            // `validateArtifact` staged this ordinal's accumulator under `strippedHash` (it re-derived
-                            // `strippedReceived`, whose hash is the no-cert hash); the finalize-sink promotion looks it
-                            // up under `canonicalHash`. Move stripped -> canonical so a NON-producer promotes on
-                            // finalize and the served ring is complete (no-op if nothing staged under `strippedHash`).
-                            _ <- pendingAccumulatorsRef.update(
-                              SnapshotLeaderLoop.rekeyStagedAccumulator(_, strippedHash, canonicalHash)
-                            )
-                            // 3c-A enabler — mirror the rekey for the signed-bytes staging (stripped -> canonical).
-                            _ <- pendingPostBytesRef.update(
-                              SnapshotLeaderLoop.rekeyStagedPostBytes(_, strippedHash, canonicalHash)
-                            )
-                            _ <- logger.debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
-                          } yield Valid(signedSnapshot, validatedContext): ValidationResult
+                          consensusFns.consumeReplayReceipt(replayReceipt) match {
+                            case Some((_, validatedContext)) =>
+                              for {
+                                strippedHash <- hasher.hash(strippedReceived)
+                                canonicalHash <- hasher.hash(signedSnapshot.value)
+                                _ <- mptOverlay.rekey(
+                                  io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(strippedHash),
+                                  io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(canonicalHash)
+                                )
+                                // Task #12 slice-2c — mirror the overlay rekey for the changeset STAGING map.
+                                // `validateArtifact` staged this ordinal's accumulator under `strippedHash` (it re-derived
+                                // `strippedReceived`, whose hash is the no-cert hash); the finalize-sink promotion looks it
+                                // up under `canonicalHash`. Move stripped -> canonical so a NON-producer promotes on
+                                // finalize and the served ring is complete (no-op if nothing staged under `strippedHash`).
+                                _ <- pendingAccumulatorsRef.update(
+                                  SnapshotLeaderLoop.rekeyStagedAccumulator(_, strippedHash, canonicalHash)
+                                )
+                                // 3c-A enabler — mirror the rekey for the signed-bytes staging (stripped -> canonical).
+                                _ <- pendingPostBytesRef.update(
+                                  SnapshotLeaderLoop.rekeyStagedPostBytes(_, strippedHash, canonicalHash)
+                                )
+                                _ <- logger.debug(s"✅ Full content validation passed: slot=$slot ordinal=${signedSnapshot.ordinal}")
+                              } yield replayValidMinterForThisValidation.mint(signedSnapshot, validatedContext, replayReceipt)
+                            case None =>
+                              Async[F].pure(
+                                ContentMismatch("replay receipt was not minted by this consensus-functions instance"): ValidationResult
+                              )
+                          }
                         case Left(err) =>
                           val logMsg = err match {
                             case gam: io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalArtifactMismatch =>

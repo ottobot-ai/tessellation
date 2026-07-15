@@ -327,37 +327,37 @@ Two safe options, pick one:
 
 ### Execution-shard checkpoints
 
-The abandoned committee state-diff adoption design has been removed. A checkpoint carries root claims and complete replay inputs, and
-every GL0 adopter recreates all framework-economic CL1 transitions at the signed finalized execution base before use. MPT-primary storage
-work may optimize how canonical bytes are persisted or served downstream, but it must never reintroduce committee-provided economic bytes
-as an adoption authority.
+The current every-adopter recreation path is temporary containment, not the target
+execution-shard authority model. A target checkpoint carries exact replay inputs,
+a canonical namespace-bounded diff, and its result root. The producer and every
+execution signer independently reproduce that diff/root; assigned watchtowers
+replay; an ordinary noncommittee GL0 validator verifies the execution certificate,
+exact base, scope, continuity, and positive replay coverage, applies the diff, and
+recomputes the root. MPT-primary storage must never turn committee-provided bytes
+or a claimed root into direct adoption authority. This optimization applies only
+to sharded CL1 framework transitions: every GL0 validator continues to execute and
+validate direct native GL1/DAG-token transitions. In the target architecture every
+GL0 validator also executes the global conflict/nullifier/settlement kernel; that
+kernel is E9 planned work, not a current guarantee.
 
-### `docs/nakamoto/259-FOLLOWER-TRUST-REDESIGN.md` (slices 1–2 built)
-Follower trusts the finalized `stateProof.mptRoot` and cross-checks only `followerConsumedFieldIds`
-via per-field inclusion proofs, instead of recomputing the global root. Slice 1 (`TrustedGlobalStateReader`,
-`4421bd506`) + slice 2 (`GlobalStateProofRoutes/Service/Client`, `3aef072ac`) built on worktrees;
-slice 3 (the gated trust-branch in `createContext`) is prep, awaiting sign-off.
+### `docs/nakamoto/259-FOLLOWER-TRUST-REDESIGN.md` (historical, not activation evidence)
 
-- **Same direction, complementary, mild overlap.**
-  - 3c-A removes the re-encode on the **bootstrap/resync/follow** path (store-the-signed-bytes); the
-    259 redesign removes the recompute on the **incremental verify-replay** path (trust-the-root +
-    per-field cross-check). 3c-A makes the verify gate pass by construction; 259 changes *which*
-    obligation the follower carries. They are not mutually exclusive — 3c-A is the stronger, simpler
-    primitive where the follower can get the full signed byte map; 259's per-field cold-cache proof
-    is the fallback where it cannot.
-  - **Conflict to watch — `historicalStakeSnapshots`.** 259 explicitly **removes** it from the
-    follower obligation (it is gl0 leader-election state the follower cannot reproduce; its empty
-    `c=000000` recompute was the original #259 SPM). 3c-C must therefore NOT introduce a follower
-    read-site that re-derives `historicalStakeSnapshots` from a recompute — followers read it from the
-    served/stored signed bytes (3c-A) only. Order: **259 slice-3 sign-off and 3c-A both precede** any
-    3c-C touch of `historicalStakeSnapshots`/`StakeRegistry`/`StakeDistribution`.
-  - **Shared infra:** 259's `GlobalStateProofRoutes` is finalized-anchored (`FinalityGate.finalizedOrdinal`);
-    3c-A's `mpt-entries` route is the same finality anchor (`FinalizedSnapshotReader`,
-    `FinalizedSnapshotReader.scala:87-97`). Put both on the same anchor callback to avoid two
-    finality-gate notions of "latest servable."
-  - **Migration gates:** both use typed-HOCON `FieldsAddedOrdinals.*` era gates
-    (`[[feedback_prefer_hocon_over_sysenv]]`). Keep the gate names distinct
-    (`serveSignedMptBytes` vs `followerTrustFinalizedRoot`) so they A/B independently.
+The old section described an ordinal-only “finalized” proof anchor and cited two
+worktree commits as built. Neither is a valid current implementation claim. Phase
+2 is exact-hash-bound and density-reorgable. Any follower proof/read service must:
+
+- bind the lease and every proof to exact `(ordinal, hash, mptRoot)`;
+- invalidate the lease, cached proofs, and derived downstream reads when that hash
+  is orphaned by density fork choice;
+- obtain a new exact-hash lease before serving or applying replacement state; and
+- enter defer/recovery when the exact retained branch state is unavailable, never
+  substitute the live head or an ordinal-only watermark.
+
+3c-A signed-byte storage can supply representation bytes, but it does not grant
+authority or weaken those exact-anchor/reorg obligations. Any future per-field
+proof fallback must use the same exact-hash `FinalityGate` capability. Typed era
+gates choose codecs/schema only; they cannot turn an ordinal into finality or
+preserve a proof across an orphaning reorg.
 
 ---
 

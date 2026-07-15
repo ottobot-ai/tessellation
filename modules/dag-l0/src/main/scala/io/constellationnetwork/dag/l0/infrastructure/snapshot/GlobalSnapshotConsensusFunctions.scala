@@ -57,6 +57,19 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.all.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
+/** Opaque evidence that a received GL0 artifact was independently recreated by the complete global transition function.
+  *
+  * This receipt proves replay only. It does not prove transport-envelope binding, KES verification, current chain preference, or finality,
+  * and no storage or signing API accepts it as authority.
+  */
+sealed trait GlobalSnapshotReplayReceipt
+
+/** Opaque evidence that the complete global transition function constructed a local GL0 proposal.
+  *
+  * Native GL1/DAG-token events remain part of that universal transition. This receipt does not authorize signing or chain selection.
+  */
+sealed trait GlobalSnapshotProposalExecutionReceipt
+
 /** Core consensus functions for Global Snapshot creation and validation.
   *
   * Both the leader and every follower independently call `createProposalArtifact` from the same inputs (events, lastArtifact, context,
@@ -67,16 +80,126 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * `(GlobalSnapshotArtifact, GlobalSnapshotContext)`. All collections passed to the acceptance pipeline must be in canonical order
   * (sorted).
   */
-abstract class GlobalSnapshotConsensusFunctions[F[_]: Async: SecurityProvider]
+sealed abstract class GlobalSnapshotConsensusFunctions[F[_]: Async: SecurityProvider]
     extends SnapshotConsensusFunctions[
       F,
       GlobalSnapshotEvent,
       GlobalSnapshotArtifact,
       GlobalSnapshotContext,
       ConsensusTrigger
-    ] {}
+    ] {
+
+  private[this] val receiptIssuer: AnyRef = new Object
+  private[this] val replayReceiptMapper = new GlobalSnapshotConsensusFunctions.ReplayReceiptMapper(receiptIssuer)
+  private[this] val proposalExecutionReceiptMapper =
+    new GlobalSnapshotConsensusFunctions.ProposalExecutionReceiptMapper(receiptIssuer)
+
+  /** Nakamoto-only replay boundary. A receipt is allocated only after the existing byte-exact follower recreation succeeds. */
+  private[snapshot] final def validateArtifactWithReplayReceipt(
+    lastSignedArtifact: Signed[GlobalSnapshotArtifact],
+    lastContext: GlobalSnapshotContext,
+    trigger: ConsensusTrigger,
+    artifact: GlobalSnapshotArtifact,
+    facilitators: Set[PeerId],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(implicit hasher: Hasher[F]): F[Either[InvalidArtifact, GlobalSnapshotReplayReceipt]] =
+    validateArtifact(
+      lastSignedArtifact,
+      lastContext,
+      trigger,
+      artifact,
+      facilitators,
+      getGlobalSnapshotByOrdinal
+    ).map(replayReceiptMapper)
+
+  /** Extract a replay result only when this exact consensus-functions instance minted the receipt. */
+  private[snapshot] final def consumeReplayReceipt(
+    receipt: GlobalSnapshotReplayReceipt
+  ): Option[(GlobalSnapshotArtifact, GlobalSnapshotContext)] =
+    receipt match {
+      case exact: GlobalSnapshotConsensusFunctions.ReplayReceipt => exact.consume(receiptIssuer)
+      case _                                                     => None
+    }
+
+  /** Nakamoto-only producer boundary. This wraps, rather than replaces, complete GL0 proposal execution. */
+  private[snapshot] final def createProposalArtifactWithExecutionReceipt(
+    lastKey: GlobalSnapshotKey,
+    lastArtifact: Signed[GlobalSnapshotArtifact],
+    lastContext: GlobalSnapshotContext,
+    lastArtifactHasher: Hasher[F],
+    trigger: ConsensusTrigger,
+    events: Set[GlobalSnapshotEvent],
+    facilitators: Set[PeerId],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(implicit hasher: Hasher[F]): F[GlobalSnapshotProposalExecutionReceipt] =
+    createProposalArtifact(
+      lastKey,
+      lastArtifact,
+      lastContext,
+      lastArtifactHasher,
+      trigger,
+      events,
+      facilitators,
+      getGlobalSnapshotByOrdinal
+    ).map(proposalExecutionReceiptMapper)
+
+  /** Extract a proposal result only when this exact consensus-functions instance minted the receipt. */
+  private[snapshot] final def consumeProposalExecutionReceipt(
+    receipt: GlobalSnapshotProposalExecutionReceipt
+  ): Option[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])] =
+    receipt match {
+      case exact: GlobalSnapshotConsensusFunctions.ProposalExecutionReceipt => exact.consume(receiptIssuer)
+      case _                                                                => None
+    }
+}
 
 object GlobalSnapshotConsensusFunctions {
+
+  private final class ReplayReceiptMapper(issuerValue: AnyRef)
+      extends (
+        Either[InvalidArtifact, (GlobalSnapshotArtifact, GlobalSnapshotContext)] => Either[InvalidArtifact, GlobalSnapshotReplayReceipt]
+      ) {
+    def apply(
+      result: Either[InvalidArtifact, (GlobalSnapshotArtifact, GlobalSnapshotContext)]
+    ): Either[InvalidArtifact, GlobalSnapshotReplayReceipt] =
+      result match {
+        case Right((artifact, context)) => Right(new ReplayReceipt(artifact, context, issuerValue))
+        case Left(error)                => Left(error)
+      }
+  }
+
+  private final class ProposalExecutionReceiptMapper(issuerValue: AnyRef)
+      extends (((GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])) => GlobalSnapshotProposalExecutionReceipt) {
+    def apply(
+      result: (GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])
+    ): GlobalSnapshotProposalExecutionReceipt = {
+      val (artifact, context, returnedEvents) = result
+      new ProposalExecutionReceipt(artifact, context, returnedEvents, issuerValue)
+    }
+  }
+
+  private final class ReplayReceipt(
+    artifactValue: GlobalSnapshotArtifact,
+    contextValue: GlobalSnapshotContext,
+    issuerValue: AnyRef
+  ) extends GlobalSnapshotReplayReceipt {
+    private[snapshot] def consume(
+      expectedIssuer: AnyRef
+    ): Option[(GlobalSnapshotArtifact, GlobalSnapshotContext)] =
+      Option.when(issuerValue eq expectedIssuer)((artifactValue, contextValue))
+  }
+
+  private final class ProposalExecutionReceipt(
+    artifactValue: GlobalSnapshotArtifact,
+    contextValue: GlobalSnapshotContext,
+    returnedEventsValue: Set[GlobalSnapshotEvent],
+    issuerValue: AnyRef
+  ) extends GlobalSnapshotProposalExecutionReceipt {
+    private[snapshot] def consume(
+      expectedIssuer: AnyRef
+    ): Option[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])] =
+      Option.when(issuerValue eq expectedIssuer)((artifactValue, contextValue, returnedEventsValue))
+  }
 
   /** Task #12 slice 2b — bound on the producer's hash-keyed STAGING map of per-ordinal accumulators awaiting finalization. Sized
     * comfortably above the served ring

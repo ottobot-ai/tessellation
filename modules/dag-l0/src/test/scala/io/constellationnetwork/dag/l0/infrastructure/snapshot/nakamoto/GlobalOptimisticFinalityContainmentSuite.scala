@@ -101,7 +101,7 @@ object GlobalOptimisticFinalityContainmentSuite extends SimpleIOSuite {
     }
   }
 
-  test("snapshot receive can mark Ready only inside the becameBestTip guard") {
+  test("snapshot receive can mark Ready only inside the exact selected-tip projection CAS") {
     readSources.map {
       case (syncDaemon, _, _, _) =>
         val processValid = sliceBetween(
@@ -109,15 +109,20 @@ object GlobalOptimisticFinalityContainmentSuite extends SimpleIOSuite {
           "private def processValidSnapshot[",
           "private def handleAttestation["
         )
-        val readyGuard = bracedBlock(
+        val selectedProjection = bracedBlock(
           processValid,
-          "Async[F].whenA(becameBestTip && !state.isReady && nodeState =!= NodeState.Ready)"
+          "canonicalOutcome <- selected.traverse { expected =>"
+        )._1
+        val exactSelectionCas = bracedBlock(
+          selectedProjection,
+          "chainStore.runCanonicalEffectsIfCurrent(expected) { canonical =>"
         )._1
 
         expect.all(
           readyMutation.findAllIn(processValid).size == 1,
-          readyMutation.findAllIn(readyGuard).size == 1,
-          readyGuard.contains("stateRef.update(_.copy(isReady = true, localTipOrdinal = snap.ordinal))")
+          readyMutation.findAllIn(selectedProjection).size == 1,
+          readyMutation.findAllIn(exactSelectionCas).size == 1,
+          exactSelectionCas.contains("localTipOrdinal = canonical.ordinal")
         )
     }
   }
@@ -150,7 +155,7 @@ object GlobalOptimisticFinalityContainmentSuite extends SimpleIOSuite {
       case (syncDaemon, _, _, _) =>
         val replayStore = sliceBetween(
           syncDaemon,
-          "replayCommitted <- commitReplayValidated(validationResult) { valid =>",
+          "replayCommitted <- commitReplayValidated(validationResult) { (validSnapshot, validContext) =>",
           "_ <- Async[F].unlessA(replayCommitted)"
         )
         val rejectedBranch = sliceBetween(

@@ -28,9 +28,11 @@ flowchart LR
     Data[Custom data client] --> DL1[DL1 / CurrencyL1App + data service]
     CL1 -->|framework economic blocks| ML0[ML0 / CL0 / Currency L0]
     DL1 -->|custom data blocks| ML0
-    ML0 -->|signed state-channel binary| ADM[GL0 admission committee]
+    ML0 -->|signed framework lane| ADM[GL0 admission committee]
     ADM --> SHARD[GL0 execution shard]
     SHARD -->|replay-backed diff/root| GL0
+    ML0 -->|opaque commitment / DA lane| CUST[GL0 admission / custody / availability / ordering]
+    CUST --> GL0
 
     GL0 -->|exact Phase-2 canonical state| GL1
     GL0 -->|exact Phase-2 canonical state| ML0
@@ -41,7 +43,13 @@ flowchart LR
 ML0 operators, the GL0 binary-admission committee, and the GL0 execution-shard
 committee are distinct roles. Every execution signer independently replays before
 signing; ordinary noncommittee GL0 nodes apply the canonical diff and recompute
-its root. GL0 uses Taktikos/LDD plus optimistic/depth phases; ML0 may remain BFT.
+its root. That reuse is limited to sharded CL1 framework transitions. Every GL0
+validator still independently executes and validates direct GL1/DAG-token
+transitions. The target additionally makes every GL0 validator run the deterministic
+global conflict/nullifier/settlement kernel, but E9 is not implemented. DL1 custom
+bytes take the separate commitment/DA lane; GL0 does not replay their unknown
+semantics. A currency-with-data envelope contains both isolated lanes. GL0 uses
+Taktikos/LDD plus optimistic/depth phases; ML0 may remain BFT.
 
 ## Directory Structure
 
