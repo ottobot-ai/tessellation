@@ -194,8 +194,6 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
   private val reviewedKesSigningProduction: Map[String, (Int, String)] = Map(
     "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala" ->
       (1 -> "signs admission/checkpoint evidence only with a capability returned by the resolved-pair local gate"),
-    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoSyncDaemon.scala" ->
-      (1 -> "signs optimistic attestations only after registeredSigningKey resolves and validates the complete pair"),
     "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/SnapshotLeaderLoop.scala" ->
       (1 -> "signs a produced snapshot only with the slot's preregistration-gated signing capability")
   )

@@ -452,8 +452,10 @@ criteria are in `NAKAMOTO-PLAN.md`.
     checkpoint can therefore draw/verify under different eta after a sibling
     density reorg. Add the exact Phase-2 `(ordinal,hash,mptRoot)` to the signed
     checkpoint and remove ambient eta from every shard validity path. A proved-
-    complete empty source also needs one ratified canonical liveness result
-    distinct from unavailable history.
+    complete empty source remains a protocol liveness/proof freeze gate: derive
+    one deterministic canonical result distinct from unavailable history and add
+    cross-implementation vectors before enabling that path. It is not an
+    unanswered O-01..O-17 owner decision.
   - **Current fixture status:** the currently inventoried operative snapshot,
     admission, committee, execution, tower, and slashing fixtures use the
     canonical committed-genesis fixture. Remaining direct
@@ -746,9 +748,10 @@ criteria are in `NAKAMOTO-PLAN.md`.
     bounded streaming verifier and add a long-history audit-journal checkpoint/
     accumulator before the bounded startup walk can become an availability limit.
     The schema represents only an already-decided `T_weight`
-    attestation or canonical depth-`k1` result, but does not yet authenticate either;
-    it must never legitimize today's cumulative-weight shortcut or introduce a global
-    BFT vote/lock/QC path.
+    attestation or canonical depth-`k1` result, but does not yet authenticate either.
+    The former cumulative-weight shortcut is now removed and guarded against
+    reintroduction; this dark schema must not recreate it or introduce a global BFT
+    vote/lock/QC path.
   - Density replacement reverses anchors, mirrors, settlement/nullifiers, and
     delivery before exact replacement re-follow/rebase.
   - Missing historical data fetches authenticated bytes or enters
@@ -839,7 +842,7 @@ be the independent closer.
 | Better-gossip-received gate trigger | 3bf8db7c | — |
 | Cold restart recovery (resume from disk) | 60ff0af4 | 3-node test |
 | Replay-only ancestry catch-up | Current tree | Fresh validation required; direct peer-state installation removed |
-| Optimistic attestation scaffold | Built, but legacy aggregation is not the real K/alpha/beta cascade and phase state is ordinal-only | See audit FIN-01/FIN-02 plus active lifecycle |
+| Optimistic attestation scaffold | Contained: verified remote evidence is telemetry only; raw local emission and the legacy state-changing aggregation sink are removed. Real K/alpha/beta and exact-hash phase state remain absent. | See audit FIN-01/FIN-02 plus active lifecycle |
 
 **Test cluster validated (as of original sweep):** 3-node genesis + 1 validator joining mid-chain, cold restart, single-node restart, reorgs, fork convergence, MPT determinism, attestation finality.
 
@@ -905,10 +908,15 @@ be the independent closer.
   replay, embedded adoption must also enforce distinct `kQuorum` and the signed
   checkpoint must bind exact Phase-2 hash/root plus network/genesis/era/parameters;
   neither holds today.
-- 🔴 **Global replay-before-attest type boundary** — `emitTipAttestation` accepts
-  naked tip hash/slot/ordinal inputs and the best-tip ticker calls it directly.
-  Replace it with an authenticated-locally-executed snapshot capability as part of
-  the real FinalityGate/Snowball work.
+- ⚠ **Global replay-before-attest type boundary partially contained** — raw
+  `emitAttestation`/`emitTipAttestation`, receiver-invented producer evidence,
+  periodic best-tip signing, and the cumulative-weight finalization sink are
+  removed. The current tree has no local GL0 optimistic emitter; verified remote
+  attestations are telemetry only, and canonical `k1` depth is the sole live
+  state-changing GL0 snapshot Phase-2 rail. Still open: opaque replay and
+  exact-tip preference capabilities, typed atomic store outcomes/revisions,
+  durable publication journal and lineage CAS, and the real sampled exact-hash
+  Snowball rail.
 
 ---
 
@@ -952,8 +960,10 @@ consensus-economic roadmap for dependencies and release gates.
     - **10c.** ProductionGate stale-fork detection / pause-if-behind — ⚠ confirm.
 
 11. 🔴 **Hash-bound P0/P1/P2 FinalityGate** — the full Avalanche cascade is absent,
-    `T_count` is diagnostic, the fast path still uses legacy aggregation, phase
-    refs are ordinal-only/volatile, and density-band recovery is disabled. Target:
+    `T_count`, remote attestations, and the unfinished accumulator are telemetry;
+    the unsafe legacy fast path is removed, leaving only canonical `k1` depth as a
+    state-changing GL0 snapshot Phase-2 sink. Phase refs remain ordinal-only/volatile and
+    density-band recovery is disabled. Target:
     P0 pending; P1 maxvalid-tk provisional; P2 operational via the ratified real
     Snowball optimistic trigger OR `k1` depth fallback. Phase 2 remains
     maxvalid-bg density-reorgable and emits exact-hash downstream rollback events.

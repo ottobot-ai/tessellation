@@ -32,7 +32,7 @@ Cross-references:
 
 - [`SHARD-CHECKPOINT-MONOTONICITY-DESIGN.md`](./SHARD-CHECKPOINT-MONOTONICITY-DESIGN.md) — Tier 1 (idempotent production); §9 predicted the cross-node case this doc addresses.
 - [`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`](./HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md) — the v1 checkpoint architecture.
-- Global ChainSync (the thing we mirror): `ChainSyncManager` (puller, `requestMissing`), `ChainSyncServer` (`serveSnapshots`/`serveMetagraphBinaries`), `ChainSyncRequestQueue`.
+- Global ChainSync (the thing we mirror): `ChainSyncManager` (puller, `requestMissing`) and `ChainSyncServer` (`serveSnapshots`/`serveMetagraphBinaries`). The former ordinal-only `ChainSyncRequestQueue` was deleted with the unsafe receiver-local attestation-finality sink that owned its only caller.
 - `ShardChainStore` — the `byParent` orphan buffer (the gap-detection primitive already exists).
 - Memory: `[[per-slot-rewire-runs12-13]]` (runs 18–20; the run-20 forensics), `[[feedback-prefer-hocon-over-sysenv]]`, `[[feedback-greenfield-no-wire-compat]]`.
 
@@ -97,8 +97,8 @@ Three parts, each mirroring an existing global-chain mechanism:
   empty store, no gap to "connect". So T1 cannot catch it. New: a periodic per-shard
   check — "I have no checkpoint at `adoptedOrd + 1` (or my tip is below a peer's adopted
   watermark) and have been stuck for > `stuckMs`" → pull `(shardId, ordinal = myTip+1 ..
-  peerTip)`. This mirrors the global `ChainSyncRequestQueue.request(ordinal)` /
-  stuck-detection tick. The producer's existing `awaiting-embed` / frozen-watermark state
+  peerTip)`. This mirrors the global pending-parent `requestMissing` and stuck-detection
+  recovery pattern. The producer's existing `awaiting-embed` / frozen-watermark state
   is the stuck signal.
 
 ### §2.2 Pull client

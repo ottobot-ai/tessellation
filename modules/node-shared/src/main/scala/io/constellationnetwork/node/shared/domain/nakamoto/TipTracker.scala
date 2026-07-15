@@ -17,7 +17,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 /** Tracks latest validator tip attestations and transitional finality telemetry.
   *
   * The intended GL0 optimistic Phase-2 rail is a K/alpha/beta exact-hash Snowball cascade, not GRANDPA and not a one-round 2/3 vote/QC. The
-  * cumulative-weight methods below remain executable legacy debt; the live leader loop still uses them as a state-changing sink.
+  * old cumulative-weight finalization query has been removed; until the sampled cascade and replay-gated emitter land, attestations are
+  * telemetry only and canonical k1 depth is the sole live Phase-2 rail.
   *
   * Production continues regardless of finality status. If attestation stalls, builders continue on the longest chain.
   *
@@ -27,7 +28,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *
   * Each accepted attestation is also forwarded into [[SnowballAccumulator]]. Despite its name, that sibling currently records a sticky
   * margin over each peer's latest color; it has no K/alpha query cascade or portable decision evidence and is arrival-order sensitive. Its
-  * result is evaluated as `T_weight` telemetry, but the live state-changing sink still calls [[highestFinalizedOrdinal]].
+  * result is evaluated as `T_weight` telemetry and cannot drive a state-changing sink.
   */
 trait TipTracker[F[_]] {
 
@@ -35,9 +36,8 @@ trait TipTracker[F[_]] {
     *
     * `now` is the receiver's local wall-clock in epoch milliseconds (`Clock[F].realTime.toMillis`) — used to defend against badly-skewed
     * peers (or attackers) submitting attestations with absurd `attestedAt` values. Attestations whose `|attestation.attestedAt - now|`
-    * exceeds `TipTracker.MaxAttestationSkewMs` are dropped (with a counter increment + WARN log) so they cannot pollute the `T_count`
-    * legacy finality sum. Self-attestations on this node always pass the gate because the emit sites (`SnapshotLeaderLoop.onSlotWon`,
-    * `NakamotoSyncDaemon.emitTipAttestation`) source `attestedAt` from the same `Clock[F].realTime` that's threaded through `now` here.
+    * exceeds `TipTracker.MaxAttestationSkewMs` are dropped (with a counter increment + WARN log) so they cannot pollute attestation
+    * telemetry. Local GL0 attestation emission is intentionally dark until it accepts only an opaque replay-and-preference capability.
     *
     * Accepted attestations are also forwarded into the sibling [[SnowballAccumulator]]. Because `now` and receipt order are node-local,
     * neither this overwrite rule nor the sibling's sticky margin can be the target consensus decision transcript.
@@ -52,30 +52,6 @@ trait TipTracker[F[_]] {
 
   /** Legacy heaviest-attestation diagnostic. GL0 fork choice remains maxvalid-tk/density. */
   def heaviestTip: F[Option[(Hash, Slot, Ratio)]]
-
-  /** Legacy chain-aware cumulative-weight calculation: find the highest ordinal where weight on our current canonical chain reaches the
-    * supplied threshold. It is not GRANDPA, a QC, or the target Snowball decision.
-    *
-    * Attesting to ordinal N with hash H implicitly attests to all ancestors of H. Walk attestation ordinals from highest to lowest,
-    * counting weight ONLY for attestations whose tipHash is reachable from our local tip (i.e., `canonicalHashAt(ord) == att.tipHash`).
-    *
-    * '''Why hash-aware''': attesting to ordinal N on fork A must not add weight for finalizing ordinal N on fork B. The hash-agnostic
-    * predecessor silently let forked chains each "finalize" their local fork (observed in a 3-node cluster where gl0-2 forked: all three
-    * nodes logged ATTEST-FINALIZED at the same ordinals with weight=0.67, yet their mptRoots at each ordinal were permanently different).
-    *
-    * This method includes self and depends on each node's locally retained latest-attestation map. The sibling accumulator does not make
-    * this calculation safe or portable. The live call from `SnapshotLeaderLoop` is a target violation, not a valid fallback rail.
-    *
-    * @param threshold
-    *   cumulative stake fraction required (e.g. 2/3)
-    * @param canonicalHashAt
-    *   lookup function that returns the canonical hash at a given ordinal on OUR local best chain (typically
-    *   `chainStore.walkBackTo(localTip.hash, ord)`). Attestations whose tipHash doesn't match are discarded from the weight sum.
-    */
-  def highestFinalizedOrdinal(
-    threshold: Ratio,
-    canonicalHashAt: Long => F[Option[Hash]]
-  ): F[Option[(Long, Ratio)]]
 
   /** Highest ordinal where the sibling [[SnowballAccumulator]] has a sticky margin decision on our canonical-chain hash.
     *
@@ -115,7 +91,7 @@ object TipTracker {
     * Default: 2/3. This is not a global BFT quorum or the target optimistic P2 predicate: target `T_weight` consumes an exact-hash
     * Avalanche/Snowball decision, while canonical k1 depth is the fallback. Env-var Doubles are locked to `Ratio` at boot.
     *
-    * Live legacy weight/count paths still read this value and must be removed or kept observational when the locked FinalityGate lands.
+    * Transitional weight/count calculators read this value for telemetry only.
     */
   val FinalityThreshold: Ratio =
     sys.env
@@ -128,8 +104,8 @@ object TipTracker {
     * runs.
     *
     * Attestations outside `±MaxAttestationSkewMs` are dropped (counter `dag_nakamoto_attestations_rejected_skew_total` + WARN log) so a
-    * badly-skewed or malicious peer cannot pollute `T_count` finality (#136). The bound is intentionally generous (default 60s) for today's
-    * loosely-coordinated clocks; it can be tightened in production after the Ouroboros-Chronos timestamp-gossip work lands, because
+    * badly-skewed or malicious peer cannot pollute `T_count` telemetry (#136). The bound is intentionally generous (default 60s) for
+    * today's loosely-coordinated clocks; it can be tightened in production after the Ouroboros-Chronos timestamp-gossip work lands, because
     * `attestedAt` is wall-clock epoch ms (not a consensus slot) precisely to leave that future surface open.
     *
     * Default: 60_000L ms. Override via env `NAKAMOTO_MAX_ATTESTATION_SKEW_MS` (e.g. `30000` for tighter, `120000` for looser). Read once at
@@ -178,22 +154,27 @@ object TipTracker {
                 s"now=$now skew=${skew}ms (max=${MaxAttestationSkewMs}ms)"
             ) >> Metrics[F].incrementCounter("dag_nakamoto_attestations_rejected_skew_total")
           else
-            attestationsRef.update { current =>
+            attestationsRef.modify { current =>
               current.get(peerId) match {
                 case Some(existing) if existing.attestedAt >= attestation.attestedAt =>
-                  // Existing attestation is same or newer, keep it
-                  current
+                  // Reject the entire stale update. It must not mutate the sibling
+                  // accumulator or active-set telemetry either.
+                  (current, false)
                 case _ =>
-                  // New or newer attestation, record it
-                  current.updated(peerId, attestation)
+                  (current.updated(peerId, attestation), true)
               }
-            } >> stakeRegistry.markActive(peerId) >> // Track this peer as actively participating
-              // Forward the same attestation into the transitional margin accumulator. Its
-              // `recordAttestation` handles the per-peer at-most-one-per-ordinal invariant internally
-              // (if the same peer flips hashes at this ordinal, the prior contribution is moved to the
-              // new hash, so this is a latest-color count rather than lifetime confidence). Calling unconditionally on the path that also writes
-              // `attestationsRef` keeps both views in lockstep.
-              snowball.recordAttestation(peerId, attestation.tipOrdinal, attestation.tipHash)
+            }.flatMap { accepted =>
+              Sync[F].whenA(accepted) {
+                stakeRegistry.markActive(peerId) >>
+                  // Forward only evidence accepted by the latest-per-peer map.
+                  snowball.recordAttestationIfNewer(
+                    peerId,
+                    attestation.tipOrdinal,
+                    attestation.tipHash,
+                    attestation.attestedAt
+                  )
+              }
+            }
         }
 
         def attestationWeight(tipHash: Hash): F[Ratio] =
@@ -220,42 +201,6 @@ object TipTracker {
                 attestationWeight(hash).map(w => (hash, slot, w))
             }
           } yield weighted.filter(_._3 > Ratio.Zero).maxByOption { case (_, _, w) => (w.numerator, w.denominator) }
-
-        def highestFinalizedOrdinal(
-          threshold: Ratio,
-          canonicalHashAt: Long => F[Option[Hash]]
-        ): F[Option[(Long, Ratio)]] =
-          for {
-            attestations <- attestationsRef.get
-            // Filter each attestation against our canonical chain: only count weight if the peer
-            // attested to the hash that's actually on OUR chain at that ordinal. Attestations on
-            // other forks (different hash at same ordinal) contribute zero weight to finalizing
-            // our chain.
-            //
-            // This legacy query no longer self-excludes. Including self removes an identity-based
-            // asymmetry from one local calculation, but does not make independently received
-            // attestation maps or receiver-local active-set denominators equal. The live use of
-            // this cumulative sum as an optimistic Phase-2 sink is a target violation.
-            onChain <- attestations.toList.traverse[F, Option[(Long, Ratio)]] {
-              case (peerId, att) =>
-                canonicalHashAt(att.tipOrdinal).flatMap {
-                  case Some(localHash) if localHash === att.tipHash =>
-                    stakeRegistry.optimisticRelativeStake(peerId).map(w => Option((att.tipOrdinal, w)))
-                  case _ =>
-                    Option.empty[(Long, Ratio)].pure[F]
-                }
-            }
-          } yield {
-            val sorted = onChain.flatten.filter(_._2 > Ratio.Zero).sortBy(-_._1)
-            // Walk down, accumulating weight. Attesting to ordinal N with a hash that's on our
-            // canonical chain identifies that tip's ancestor prefix. This is ordinary hash-chain ancestry,
-            // not a GRANDPA/BFT voting rule.
-            var cumWeight: Ratio = Ratio.Zero
-            sorted.collectFirst {
-              case (ordinal, weight) if { cumWeight = cumWeight + weight; cumWeight >= threshold } =>
-                (ordinal, cumWeight)
-            }
-          }
 
         def highestSnowballDecidedOrdinal(canonicalHashAt: Long => F[Option[Hash]]): F[Option[Long]] =
           snowball.highestDecidedOnCanonical(canonicalHashAt)
@@ -292,7 +237,7 @@ object TipTracker {
 
         // Re-bootstrap reset (P-11). Wipes attestation map + last-finalized marker so a
         // post-reset chain-resync starts with no prior state. Caller (RebootstrapOrchestrator)
-        // pauses production + attestation emit before calling.
+        // pauses production and finality effects before calling.
         def unsafe_reset: F[Unit] =
           attestationsRef.set(Map.empty) >>
             finalizedRef.set(None) >>

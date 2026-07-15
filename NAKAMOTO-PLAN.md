@@ -326,6 +326,20 @@ path on the current root shape.
 - Implement/validate the real K/alpha/beta Avalanche/Snowball cascade as the
   optimistic Phase-2 rail and `k1` depth as its Nakamoto fallback. Neither rail
   validates economics.
+- **Current containment (2026-07-14):** raw local GL0 attestation emitters,
+  receiver-invented producer evidence, periodic best-tip re-attestation, and the
+  one-round cumulative-weight finalization sink are removed. Verified remote
+  attestations and unfinished trigger/accumulator objects are telemetry only;
+  canonical `k1` depth is the sole live GL0 snapshot
+  `NakamotoChainStore.finalize` rail. The
+  source/API tripwire is
+  `GlobalOptimisticFinalityContainmentSuite.scala:31-52`, and
+  `RTA-RED-019` proves exact-hash depth progress with no attestations
+  (`NakamotoChainStoreSuite.scala:426-468`). This is a temporary safety
+  restriction, not E1 completion: replay/preference capabilities, typed atomic
+  store outcomes and revisions, a durable publication/lineage CAS, the sampled
+  exact-hash decision transcript, and exact-hash `FinalityGate` activation remain
+  open.
 - Use `maxvalid-tk` for short forks and valid-only `maxvalid-bg` density selection
   beyond `k1`. Separate storage retention from fork-choice eligibility; `k2`
   never makes a less-dense chain valid or final by fiat.
@@ -840,8 +854,10 @@ delivery, rollback, and recovery.
   recovery. Chain-store admission must also derive ordinal, parent, slot, and VRF
   metadata from the authenticated signed snapshot instead of trusting parallel
   caller arguments.
-- The first dark L-23 durability slice has landed without changing either live
-  finality rail. ScodecV1 ADTs/codecs, canonical identities, structural validators,
+- The first dark L-23 durability slice originally landed without changing the
+  then-live finality rails. The later containment described above disabled the
+  unsafe optimistic sink independently of this still-dark store. ScodecV1
+  ADTs/codecs, canonical identities, structural validators,
   and sealed mutation authority permit only initialization, a validated `Prepared`
   intent, or entry into absorbing `RecoveryRequired`. A checksummed coordinator,
   audit, artifact, and outbox store provides exact compare-and-set, durable
@@ -967,6 +983,12 @@ order.
 
 ## Historical roadmap (2026-05-16, superseded)
 
+All attestation-finality runtime descriptions below are point-in-time evidence,
+not current behavior. In particular, the logged `ATTEST-FINALIZED` path and raw
+re-attestation follow-up were removed by the 2026-07-14 containment. Current GL0
+finalization is depth-`k1` only until the replay-gated sampled exact-hash
+`T_weight` rail is implemented and activated.
+
 The implementation work that remains after the finality-trigger stack + GKL composition doc + empirical sim validation lives in **`docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md`**. Phases:
 
 1. **§1.1 Stake-weighted VRF** (parallel track, 5-8 d) — combined `delegatedStake + nodeCollateral` weighting; foundation for §3, §4.A.
@@ -981,7 +1003,7 @@ Critical path: §1.2 → §3 → §4.C ≈ 50-80 person-days. Whole-roadmap sequ
 
 ---
 
-## Current milestone (2026-05-14) — MPT overlay e2e validation
+## Historical milestone (2026-05-14) — MPT overlay e2e validation
 
 **Status: iter31 full e2e PASSED** (`feature/serde-typeclass-shim` @ `f51252ef`).
 
@@ -991,7 +1013,9 @@ Critical path: §1.2 → §3 → §4.C ≈ 50-80 person-days. Whole-roadmap sequ
 
 **Open follow-ups** (memory: `project_iter31_overlay_full_e2e_pass.md`):
 - dl1/cl1 `pullFinalityGated` tick=10s vs gl0 finalization ~6s/ord → follower-side download lag is the actual mechanism behind iter26's `TooFarLastValidEpochProgress`. Worked around with `allow-spends.max-epoch-progress` 200→500; structural fix is faster pull / parallel batch / direct gl0 epoch read.
-- Reorg re-attestation gap: chainSelection bestTip changes don't trigger fresh `processValidSnapshot` → no Polkadot-style re-attest to new canonical. Not failing tests but a correctness gap.
+- Historical reorg re-attestation gap: this raw best-tip re-attestation design is
+  not the target and is now removed. Future emission is driven by the ratified
+  replay-gated sampled Snowball protocol, not by restoring this ticker.
 - Reproducibility: iter31 is one pass; iter32 currently running for second confirmation.
 - Pending memory items #118 (OverlayReader rewire of 5 gl0 HTTP read sites), #119 (n1 fork-recovery deadlock re-bootstrap), #120 (2-of-2 fragility under VRF droughts).
 
@@ -1052,18 +1076,18 @@ Three checkpoints in `SnapshotLeaderLoop`: (1) slot-tick gate (already existed),
 > source provenance.
 Env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`, shared by `T_weight` and `T_count`), `NAKAMOTO_CONFIRMATION_DEPTH` (default **255**, in `SnapshotLeaderLoop.ConfirmationDepthK` / `T_depth1`), `NAKAMOTO_ARCHIVAL_DEPTH` (default **65536** = 2¹⁶, in `SnapshotLeaderLoop.ArchivalDepthK` / `T_depth2`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`), `NAKAMOTO_MAX_ATTESTATION_SKEW_MS` (default 60_000, in `TipTracker.MaxAttestationSkewMs`). All gates always run; whichever fires first finalizes. No mode switch.
 
-**k measures snapshots, not slots.** With LDD targeting ~15% slot fill, slots run ~6× sparser than snapshots, but the depth gate is purely an ordinal-distance check: `tip.ordinal - snapshotOrdinal > k`. The original k=31 choice (2026-04-08) was based on a measured-sim table topping out at k≤80 with k=6 too high a fork rate against a 1/3 adversary; k=31 gave ~0.91% per-attempt. Subsequent expanded sims (`adv_depth_expanded_parallel.py`, 10M trials, k≤400) extrapolate the fB=0.05-tail slope to ~10⁻¹² at k≈271–290. Default raised to **k=255** as a conservative operating point approximating Cardano-equivalent CP-violation; attestation finality remains the hot path (seconds), so this only affects worst-case finality time during degraded operation.
+**k measures snapshots, not slots.** With LDD targeting ~15% slot fill, slots run ~6× sparser than snapshots, but the depth gate is purely an ordinal-distance check: `tip.ordinal - snapshotOrdinal > k`. The original k=31 choice (2026-04-08) was based on a measured-sim table topping out at k≤80 with k=6 too high a fork rate against a 1/3 adversary; k=31 gave ~0.91% per-attempt. Subsequent expanded sims (`adv_depth_expanded_parallel.py`, 10M trials, k≤400) extrapolate the fB=0.05-tail slope to ~10⁻¹² at k≈271–290. Default raised to **k=255** as a conservative operating point approximating Cardano-equivalent CP-violation. Depth-`k1` is currently the sole live state-changing GL0 rail; the target sampled exact-hash optimistic rail is not active.
 
-**Two slot/ordinal-units bugs were fixed in this round** (2026-04-08), discovered while validating the wire-up: `lastFinalizedOrdinal` was being read off `tipTracker.lastFinalized`'s **slot** value, and `finalizeAtSlot` was being computed as `tip.slot - k` (mixing slot- and ordinal-units). The first bug had silently disabled the depth gate end-to-end since it landed — in our 720s e2e test we observed 224 ATTEST-FINALIZED entries and **zero** DEPTH-FINALIZED entries. Both gates now read their inputs from the chain store, which is the authoritative ordinal source.
+**Two slot/ordinal-units bugs were fixed in this round** (2026-04-08), discovered while validating the wire-up: `lastFinalizedOrdinal` was being read off `tipTracker.lastFinalized`'s **slot** value, and `finalizeAtSlot` was being computed as `tip.slot - k` (mixing slot- and ordinal-units). The first bug had silently disabled the depth gate end-to-end since it landed — in our 720s e2e test we observed 224 ATTEST-FINALIZED entries and **zero** DEPTH-FINALIZED entries. The surviving depth gate reads its inputs from the chain store, which is the authoritative ordinal source; the unsafe attestation-weight sink described by that historical run is removed.
 
 **Finality-trigger stack refactor (2026-05-15).** The two inline gates (depth-k₁ + attestation-2/3) were extracted into a `FinalityTrigger[F]` typeclass (`modules/node-shared/.../nakamoto/FinalityTrigger.scala`) so each trigger is a monotone-Ref-backed observable that `SnapshotLeaderLoop.finalityMonitor` evaluates and advances on each tick. With the refactor:
 
 - **`T_count`** added (commit `7003be21`) — 1-validator-1-vote canonical-hash-filtered count finality, self-excluded (#133), denominator = `StakeRegistry.validatorCount` (full seedlist). Reuses `TipTracker.FinalityThreshold` so it ties with `T_weight` under equal stake and is strictly stronger evidence once stake-weighted VRF lands.
 - **`T_depth2`** added historically (commit `06455f98`) as a claimed Phase-2-to-Phase-3 archival gate. That interpretation is rejected: `k2` is retention/recovery capacity only, and pruning must never become fork-choice truth. The associated `MptOverlay.pruneBelow` provenance remains relevant to the replacement recovery design.
-- **`T_weight`** got self-exclusion via #133 (commit `95471c7f`) — `TipTracker.highestFinalizedOrdinal` now takes a `selfId: PeerId` parameter and drops the self-entry before the canonical-hash filter. Partial mitigation of #119 fork-recovery deadlock.
+- **Historical `T_weight` mitigation** (commit `95471c7f`) added self-exclusion to the former `TipTracker.highestFinalizedOrdinal` cumulative query. That query and its state-changing sink are now removed; this history does not describe the target sampled exact-hash `T_weight`.
 - **Re-bootstrap reset machinery landed** (commit `01ebcca6`, task #141) — `RebootstrapOrchestrator` observes sustained `chainStore.divergentRefuseCount`, then resets TipTracker/Overlay/finality state. The typed-HOCON setting is live-default `true`. Reset is not itself recovery: completion now depends on ordinary verified ancestry replay because direct peer-context/state installers were removed. Fresh end-to-end validation is required.
 - **`attestedAt` skew bound** (commit `422e1a6b`) — receive-side defense-in-depth for `T_count`. Drops attestations outside ±`NAKAMOTO_MAX_ATTESTATION_SKEW_MS` of `Clock[F].realTime`; counter `dag_nakamoto_attestations_rejected_skew_total`. Tightenable post-Chronos.
-- **Chain-quality observable** (commit `866cd598`, task #138) — `FinalityTrigger.triggersFor(ord)` lookup answers "which triggers qualified ord N?" at both finalize sites (gauge `dag_nakamoto_chain_quality` ∈ {1, 2, 3}; per-kind counters) and via HTTP route `GET /global-snapshots/{ord}/finality-triggers`. Pure observability — never feeds back into consensus.
+- **Chain-quality observable** (commit `866cd598`, task #138) — `FinalityTrigger.triggersFor(ord)` lookup answers "which triggers qualified ord N?" at the depth-`k1` finalize site (gauge `dag_nakamoto_chain_quality` ∈ {1, 2, 3}; per-kind counters) and via HTTP route `GET /global-snapshots/{ord}/finality-triggers`. Pure observability — never feeds back into consensus.
 - **`SlotCertificate.parentSlot` wiring** (commit `bec9de6b`) — `NakamotoProposer` was passing `parentSlot = Slot.MinValue` (TODO placeholder); now threaded through correctly so verifier-side `slotGap = cert.slot - cert.parentSlot` reconstruction matches the producer's LDD lottery threshold.
 
 See the supersession notice in `docs/nakamoto/attestation-and-finality.md` and

@@ -2,12 +2,16 @@
 
 > **HISTORICAL AND UNSAFE - NOT A CURRENT PROTOCOL CLAIM.** The 2026-07-11
 > source audit disproved this document's max-of/Avalanche/common-prefix model.
-> The full K/alpha sampling cascade is absent; `T_count` is diagnostic; the
-> state-changing optimistic rail is the legacy latest-vote weight path; its
-> locally observed active stake is renormalized; and the depth rail can finalize
-> both sides of a long partition. Finality is also not durably restored after
-> restart. Do not use any probability, "first wins", phase, or common-prefix
-> statement below as a guarantee. See
+> The full K/alpha sampling cascade is absent; `T_count` is diagnostic; and the
+> depth rail can finalize both sides of a long partition. Finality is also not
+> durably restored after restart. The unsafe raw local emission, receiver-invented
+> evidence, periodic best-tip re-attestation, and legacy latest-vote
+> state-changing sink described below were removed by the 2026-07-14 containment.
+> Verified remote attestations and the unfinished trigger/accumulator objects are
+> now telemetry only; canonical `k1` depth is the sole live state-changing GL0
+> snapshot Phase-2 sink.
+> Do not use any probability, "first wins", phase, or common-prefix statement
+> below as a guarantee. See
 > [`../review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`](../review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md),
 > findings FIN-01 through FIN-12. The text below is preserved as design history.
 > It is superseded by

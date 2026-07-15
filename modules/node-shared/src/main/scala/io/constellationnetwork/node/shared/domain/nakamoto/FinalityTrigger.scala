@@ -183,8 +183,8 @@ object FinalityTriggerView {
   * the same `canonicalHashAt` predicate the legacy weight-sum path used. Only decisions matching our canonical chain contribute.
   *
   * '''Threshold parameter.''' Retained for signature stability; not used by the transitional margin path (decision is margin-based, not
-  * threshold-based). The legacy weight-sum `TipTracker.highestFinalizedOrdinal` remains executable migration debt and is still the live
-  * state-changing sink; it is not a target fallback rail. Canonical k1 depth is the only target fallback.
+  * threshold-based). This calculator is telemetry only while optimistic activation is dark. Canonical k1 depth is the sole live Phase-2
+  * rail until the real sampled cascade lands.
   */
 object TWeightTrigger {
 
@@ -264,8 +264,8 @@ object TDepth2Trigger {
   *
   * '''Why hash-aware''': same as `T_weight`. Attesting to ordinal N on fork A must not qualify ordinal N on fork B.
   *
-  * Live code still allows this calculator to influence finalization; that is a target violation. `T_count` must be removed/subsumed by
-  * decided-attestation `T_weight`, not treated as a third P2 rail.
+  * Live code retains this calculator for telemetry only. `T_count` must be removed/subsumed by decided-attestation `T_weight`, not treated
+  * as a third P2 rail.
   *
   * '''Denominator''': `validatorCount` (full seedlist), NOT the observed-active set. Counting against the full validator set means a
   * partition that loses 1/3 of the network correctly DOES NOT count-finalize (count below 2/3 of full). This is intentional — depth-k

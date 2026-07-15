@@ -923,8 +923,8 @@ object GlobalSnapshotConsensus {
       // Start the Nakamoto SnapshotLeaderLoop + sidecar bridge.
       //
       // This block runs in the outer Resource context so the long-lived resources it creates
-      // (ChainSyncRequestQueue drainer, Dispatcher for the ChainSync gRPC server, the gRPC
-      // server itself) are released when the app Resource tree tears down, instead of being
+      // (Dispatcher for the ChainSync gRPC server and the gRPC server itself) are released
+      // when the app Resource tree tears down, instead of being
       // escaped via `.allocated` and leaked across test restarts / shutdown.
       _ <- {
 
@@ -1182,31 +1182,6 @@ object GlobalSnapshotConsensus {
           // so each operation sees correct parent state (Bifrost uses same pattern)
           snapshotSemaphore <- cats.effect.std.Semaphore[F](1).toResource
           productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F].toResource
-          // Shared ChainSyncManager reference. Populated by NakamotoSyncDaemon after it constructs
-          // its internal manager; read-through by the ChainSyncRequestQueue worker below so the
-          // reactive walkback path piggybacks on existing hash-keyed dedup + fetch. No-op until bound.
-          sharedChainSyncManagerRef <- cats.effect.kernel.Ref
-            .of[F, Option[
-              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncManager.ChainSyncManagerAlgebra[F]
-            ]](None)
-            .toResource
-          // Reactive ChainSync trigger for the finality walkback path (see
-          // ChainSyncRequestQueue docs for the full rationale). Bound directly into the outer
-          // Resource — the drainer fiber is torn down cleanly on app shutdown.
-          chainSyncRequestQueue <- {
-            val workerFn = io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncRequestQueue
-              .walkbackWorker[F] _
-            val reactiveWorker: Long => F[Unit] = ord =>
-              sharedChainSyncManagerRef.get.flatMap {
-                case Some(csm) => workerFn(sidecarClient.channel, csm).apply(ord)
-                case None      =>
-                  // Pre-binding window before NakamotoSyncDaemon publishes its ChainSyncManager.
-                  // Brief in practice; the next 5s finality-monitor tick re-offers if the fork persists.
-                  cats.Applicative[F].unit
-              }
-            io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ChainSyncRequestQueue
-              .make[F](reactiveWorker)
-          }
           // sidecarClient is now created in Services.make and passed in as a parameter so that
           // the HTTP state-channel route can publish metagraph binaries via the same gRPC channel.
           // Wire rumor gossip onto the sidecar transport. Outbound: every rumor passing through
@@ -1980,25 +1955,24 @@ object GlobalSnapshotConsensus {
                   nakamotoFinalizedOrdinalRef = nakamotoFinalizedOrdinalRef,
                   // Axis 2 (gl1 follow): capture the just-finalized snapshot's GSI here so the slice producer
                   // serves the latest-FINALIZED `(ordinal, GSI)` (resolvable by a finality-gated gl1) rather
-                  // than the latest-produced one. Updated monotonically at both finalize sinks.
+                  // than the latest-produced one. Updated monotonically at the depth-k1 finalize sink.
                   latestFinalizedSliceSourceRef = latestFinalizedSliceSourceRef,
-                  // #287 "send diffs": the bounded recent-projection ring the loop also fills at both finalize
-                  // sinks, read by `GlobalFollowSliceService.sliceSince` to serve incremental gl1 follow diffs.
+                  // #287 "send diffs": the bounded recent-projection ring the loop also fills at the depth-k1
+                  // finalize sink, read by `GlobalFollowSliceService.sliceSince` to serve incremental gl1 follow diffs.
                   recentFollowProjectionsRef = recentFollowProjectionsRef,
                   // Task #12 slice 2b: the SAME staging map the consensus functions fill (above), read here at
-                  // both finalize sinks to promote the finalized snapshot's accumulator into the served ring.
+                  // the depth-k1 finalize sink to promote the finalized snapshot's accumulator into the served ring.
                   pendingAccumulatorsRef = pendingAccumulatorsRef,
                   // 3c-A enabler — signed-bytes staging (same Ref the consensus functions stage into) + the served
                   // signed-bytes store the finalize sink promotes into.
                   pendingPostBytesRef = pendingPostBytesRef,
                   signedBytesStore = signedBytesStore,
-                  // Task #12 slice 2b: the served changeset ring the loop fills at both finalize sinks; a later
+                  // Task #12 slice 2b: the served changeset ring the loop fills at the depth-k1 finalize sink; a later
                   // slice wires `GlobalChangeSetService.make(recentFinalizedAccumulatorsRef.get)` to serve it.
                   recentFinalizedAccumulatorsRef = recentFinalizedAccumulatorsRef,
                   // Task #12: served-ring depth (typed HOCON, default 1024) — bumped from the prior hardcoded 256
                   // to cut ml0 full-GSI resyncs by keeping a longer lag window on the light incremental path.
                   changesetRingDepth = sharedCfg.nakamoto.changesetRingDepth.value,
-                  chainSyncRequestQueue = chainSyncRequestQueue,
                   finalityTriggerViewRef = finalityTriggerViewRef,
                   settledOrdinalTracker = settledOrdinalTracker,
                   // §1.2 Slice 5/6: parallel-sign attestations + snapshots with KES.
@@ -2009,8 +1983,8 @@ object GlobalSnapshotConsensus {
                   // snapshot's `stateChannelSnapshots`. Otherwise the tally grows monotonically.
                   //
                   // #214 piggyback: drain any orphan-buffered children waiting on each binary's
-                  // value-hash. Cluster-wide finalization (2/3 peer attestation OR depth-k) is
-                  // authoritative; if the local gate dropped the parent at `count < kTarget`,
+                  // value-hash. Current Phase 2 is canonical depth-k1 only while the optimistic
+                  // rail is dark; if the local gate dropped the parent at `count < kTarget`,
                   // the just-finalized snapshot proves the cluster admitted it anyway. Re-feed
                   // each drained child through the SAME gate-aware processor used for fresh
                   // gossip — `processOrphanedMetagraphBinary` — NOT direct `processMetagraphBinary`.
@@ -2327,7 +2301,6 @@ object GlobalSnapshotConsensus {
                   enqueueAllowSpendBlock = enqueueAllowSpendBlock,
                   enqueueDAGBlock = enqueueDAGBlock,
                   enqueueTokenLockBlock = enqueueTokenLockBlock,
-                  sharedChainSyncManagerRef = sharedChainSyncManagerRef,
                   // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
                   // Always-on; no env flag — verification failures drop the message.
                   operationalKeyMaker = operationalKeyMaker,

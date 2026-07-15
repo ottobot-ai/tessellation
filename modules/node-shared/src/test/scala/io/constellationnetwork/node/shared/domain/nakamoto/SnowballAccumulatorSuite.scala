@@ -123,6 +123,21 @@ object SnowballAccumulatorSuite extends SimpleIOSuite {
         expect.same(1, counts.getOrElse(tipB, 0))
   }
 
+  test("versioned forwarding cannot apply an older color after a newer accepted attestation") {
+    val peer = pid("peer-1")
+    val tipA = hash("A")
+    val tipB = hash("B")
+
+    for {
+      acc <- SnowballAccumulator.make[IO](beta = 100)
+      _ <- acc.recordAttestationIfNewer(peer, 50L, tipB, attestedAt = 200L)
+      _ <- acc.recordAttestationIfNewer(peer, 50L, tipA, attestedAt = 100L)
+      counts <- acc.accumAt(50L)
+    } yield
+      expect.same(1, counts.getOrElse(tipB, 0)) &&
+        expect(!counts.contains(tipA))
+  }
+
   test("transitional first-crossing decision is sticky") {
     // This is executable behavior, not a proof that irrevocability is safe: after A first crosses
     // the margin, later contradictory current attestations cannot unset it.

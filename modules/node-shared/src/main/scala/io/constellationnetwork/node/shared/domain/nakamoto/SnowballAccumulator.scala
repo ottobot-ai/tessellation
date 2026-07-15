@@ -21,8 +21,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * neither portable decided-attestation evidence nor a proof of the target Avalanche/Snowball optimistic Phase-2 rail.
   *
   * `K` and `Alpha` below are unused constants. Calibration of a different K/alpha/beta simulation does not establish safety of this
-  * executable rule. Target `T_weight` must consume a fully specified, authenticated, exact-hash cascade decision; the live state-changing
-  * sink currently ignores this accumulator and uses the separate legacy cumulative-weight path.
+  * executable rule. Target `T_weight` must consume a fully specified, authenticated, exact-hash cascade decision; no state-changing sink
+  * consumes this accumulator while optimistic activation is dark.
   */
 trait SnowballAccumulator[F[_]] {
 
@@ -34,6 +34,13 @@ trait SnowballAccumulator[F[_]] {
     * arrival-order gap above and must not be read as proof of Snowball safety.
     */
   def recordAttestation(peerId: PeerId, ordinal: Long, hash: Hash): F[Unit]
+
+  /** Record an attestation already accepted by an external latest-per-peer map. The claimed timestamp is checked again in this
+    * accumulator's atomic state transition so concurrent handlers cannot apply an older color after a newer one. Equal timestamps are
+    * idempotently rejected. This only keeps transitional telemetry internally coherent; it does not make the accumulator portable consensus
+    * evidence.
+    */
+  def recordAttestationIfNewer(peerId: PeerId, ordinal: Long, hash: Hash, attestedAt: Long): F[Unit]
 
   /** Look up the decided hash at an ordinal, if any. */
   def decidedAt(ordinal: Long): F[Option[Hash]]
@@ -48,8 +55,7 @@ trait SnowballAccumulator[F[_]] {
     *
     * @param canonicalHashAt
     *   chain walk: returns our canonical hash at the given ordinal (typically `chainStore.walkBackTo`). Decisions whose hash doesn't match
-    *   are skipped (they're decisions on a divergent fork that this observer is not on — same canonical-hash filter as
-    *   `TipTracker.highestFinalizedOrdinal`).
+    *   are skipped (they're decisions on a divergent fork that this observer is not on).
     */
   def highestDecidedOnCanonical(canonicalHashAt: Long => F[Option[Hash]]): F[Option[Long]]
 
@@ -90,11 +96,12 @@ object SnowballAccumulator {
   final case class State(
     accum: Map[Long, Map[Hash, Int]],
     decided: Map[Long, Hash],
-    lastByPeer: Map[PeerId, Map[Long, Hash]]
+    lastByPeer: Map[PeerId, Map[Long, Hash]],
+    latestAcceptedAt: Map[PeerId, Long]
   )
 
   object State {
-    val empty: State = State(Map.empty, Map.empty, Map.empty)
+    val empty: State = State(Map.empty, Map.empty, Map.empty, Map.empty)
   }
 
   def make[F[_]: Sync: Metrics](beta: Int = Beta): F[SnowballAccumulator[F]] =
@@ -105,59 +112,70 @@ object SnowballAccumulator {
     } yield
       new SnowballAccumulator[F] {
 
-        def recordAttestation(peerId: PeerId, ordinal: Long, hash: Hash): F[Unit] = {
+        private def record(
+          peerId: PeerId,
+          ordinal: Long,
+          hash: Hash,
+          acceptedAt: Option[Long]
+        ): F[Unit] = {
           // `Ref.modify` so we can detect a newly-arrived decision and emit a log line / counter
           // outside the state transition (logging is effectful — keep it out of the pure update).
           // Returns `Some((leaderHash, leaderCount, runnerUp))` when this attestation crossed the
           // β margin for the first time at this ordinal; `None` otherwise (already decided OR margin
           // still short).
           val updated: F[Option[(Hash, Int, Int)]] = stateRef.modify { st =>
-            val peerHistory = st.lastByPeer.getOrElse(peerId, Map.empty)
-            val priorAtOrd = peerHistory.get(ordinal)
+            val stale = acceptedAt.exists(ts => st.latestAcceptedAt.get(peerId).exists(_ >= ts))
 
-            // Per-peer at-most-one-per-ordinal: if the peer previously attested a different hash at this
-            // ordinal, move its current contribution. This is not lifetime confidence accumulation.
-            val ordAccum = st.accum.getOrElse(ordinal, Map.empty)
-            val ordAccumAfterDrop = priorAtOrd match {
-              case Some(prevHash) if prevHash =!= hash =>
-                ordAccum.get(prevHash) match {
-                  case Some(v) if v > 1 => ordAccum.updated(prevHash, v - 1)
-                  case Some(_)          => ordAccum - prevHash
-                  case None             => ordAccum
-                }
-              case _ => ordAccum
+            if (stale) (st, None)
+            else {
+              val peerHistory = st.lastByPeer.getOrElse(peerId, Map.empty)
+              val priorAtOrd = peerHistory.get(ordinal)
+
+              // Per-peer at-most-one-per-ordinal: if the peer previously attested a different hash at this
+              // ordinal, move its current contribution. This is not lifetime confidence accumulation.
+              val ordAccum = st.accum.getOrElse(ordinal, Map.empty)
+              val ordAccumAfterDrop = priorAtOrd match {
+                case Some(prevHash) if prevHash =!= hash =>
+                  ordAccum.get(prevHash) match {
+                    case Some(v) if v > 1 => ordAccum.updated(prevHash, v - 1)
+                    case Some(_)          => ordAccum - prevHash
+                    case None             => ordAccum
+                  }
+                case _ => ordAccum
+              }
+
+              // Add this peer's vote for the new hash. If the peer previously attested the same hash, the
+              // increment is a no-op (the prior contribution still counts; we don't double-count). Detect by
+              // checking that priorAtOrd is None OR differs from hash.
+              val ordAccumAfterAdd =
+                if (priorAtOrd.contains(hash)) ordAccumAfterDrop // no change — already counted
+                else ordAccumAfterDrop.updated(hash, ordAccumAfterDrop.getOrElse(hash, 0) + 1)
+
+              val newAccum = st.accum.updated(ordinal, ordAccumAfterAdd)
+              val newPeerHistory = peerHistory.updated(ordinal, hash)
+              val newLastByPeer = st.lastByPeer.updated(peerId, newPeerHistory)
+              val newLatestAcceptedAt = acceptedAt.fold(st.latestAcceptedAt)(ts => st.latestAcceptedAt.updated(peerId, ts))
+
+              // Transitional rule: current leader_count - runner_up_count >= beta. Sticky once set, so arrival order matters.
+              val newDecisionInfo: Option[(Hash, Int, Int)] = st.decided.get(ordinal) match {
+                case Some(_) => None // already sticky under the transitional first-crossing rule
+                case None =>
+                  val sortedDesc = ordAccumAfterAdd.toList.sortBy(-_._2)
+                  sortedDesc match {
+                    case Nil => None
+                    case (leaderHash, leaderCount) :: rest =>
+                      val runnerUp = rest.headOption.map(_._2).getOrElse(0)
+                      if (leaderCount - runnerUp >= beta) Some((leaderHash, leaderCount, runnerUp))
+                      else None
+                  }
+              }
+              val newDecided = newDecisionInfo match {
+                case Some((h, _, _)) => st.decided.updated(ordinal, h)
+                case None            => st.decided
+              }
+
+              (State(newAccum, newDecided, newLastByPeer, newLatestAcceptedAt), newDecisionInfo)
             }
-
-            // Add this peer's vote for the new hash. If the peer previously attested the same hash, the
-            // increment is a no-op (the prior contribution still counts; we don't double-count). Detect by
-            // checking that priorAtOrd is None OR differs from hash.
-            val ordAccumAfterAdd =
-              if (priorAtOrd.contains(hash)) ordAccumAfterDrop // no change — already counted
-              else ordAccumAfterDrop.updated(hash, ordAccumAfterDrop.getOrElse(hash, 0) + 1)
-
-            val newAccum = st.accum.updated(ordinal, ordAccumAfterAdd)
-            val newPeerHistory = peerHistory.updated(ordinal, hash)
-            val newLastByPeer = st.lastByPeer.updated(peerId, newPeerHistory)
-
-            // Transitional rule: current leader_count - runner_up_count >= beta. Sticky once set, so arrival order matters.
-            val newDecisionInfo: Option[(Hash, Int, Int)] = st.decided.get(ordinal) match {
-              case Some(_) => None // already sticky under the transitional first-crossing rule
-              case None =>
-                val sortedDesc = ordAccumAfterAdd.toList.sortBy(-_._2)
-                sortedDesc match {
-                  case Nil => None
-                  case (leaderHash, leaderCount) :: rest =>
-                    val runnerUp = rest.headOption.map(_._2).getOrElse(0)
-                    if (leaderCount - runnerUp >= beta) Some((leaderHash, leaderCount, runnerUp))
-                    else None
-                }
-            }
-            val newDecided = newDecisionInfo match {
-              case Some((h, _, _)) => st.decided.updated(ordinal, h)
-              case None            => st.decided
-            }
-
-            (State(newAccum, newDecided, newLastByPeer), newDecisionInfo)
           }
 
           updated.flatMap {
@@ -175,6 +193,12 @@ object SnowballAccumulator {
             case None => Sync[F].unit
           }
         }
+
+        def recordAttestation(peerId: PeerId, ordinal: Long, hash: Hash): F[Unit] =
+          record(peerId, ordinal, hash, None)
+
+        def recordAttestationIfNewer(peerId: PeerId, ordinal: Long, hash: Hash, attestedAt: Long): F[Unit] =
+          record(peerId, ordinal, hash, Some(attestedAt))
 
         def decidedAt(ordinal: Long): F[Option[Hash]] =
           stateRef.get.map(_.decided.get(ordinal))
@@ -207,7 +231,8 @@ object SnowballAccumulator {
                 .mapValues(_.filter {
                   case (ord, _) => ord >= finalizedOrdinal
                 })
-                .toMap
+                .toMap,
+              latestAcceptedAt = st.latestAcceptedAt
             )
           }
 

@@ -11,6 +11,8 @@ recommendations and directions recorded here. Ratification does **not** assert t
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
 document records which direction is settled and which executable freeze gates remain.
+**Owner-question completeness:** `17/17` (`O-01` through `O-17`) dispositioned; no O-item awaits
+an owner response.
 
 ---
 
@@ -112,11 +114,12 @@ lifetime: **emit-once** at first β-clear. Epoch: registry `N-2`, eta `N-1`, gri
 (`sims/run_grinding_ci.py`). `[OWNER-RATIFIED DIRECTION — PROVISIONAL PARAMS]`
 
 **Open engineering/research gate (audit #8, must close before any freeze):** the shipped
-`SnowballAccumulator.scala:13-25,67-80` has **no K-query/α-sample cascade** and is arrival-order
-sensitive, and the live loop has a separate cumulative-weight sink
-(`SnapshotLeaderLoop.scala:1082-1103`). So the sim modeled an *idealized* Snowball the code does
-not yet implement — the numbers cannot be frozen until the accumulator implements the sampled
-cascade and is re-validated. Config posture: only `snowball-beta` is HOCON
+`SnowballAccumulator.scala` has **no K-query/α-sample cascade** and is arrival-order
+sensitive. The unsafe cumulative-weight finality sink has been removed; canonical depth-`k1` is
+currently the only state-changing GL0 Phase-2 rail, while verified attestations remain telemetry.
+The sim modeled an *idealized* Snowball the code does not yet implement, so the numbers cannot be
+frozen until the accumulator implements the sampled cascade and is re-validated. Config posture:
+only `snowball-beta` is HOCON
 (`application.conf:343`); K/α are code constants. Derive, test, and bake every final value per
 network as active-era protocol law.
 

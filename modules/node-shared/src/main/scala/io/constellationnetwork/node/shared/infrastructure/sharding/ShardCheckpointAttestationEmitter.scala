@@ -40,9 +40,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * `GlobalSnapshotConsensus.make`, alongside the producers). At `numShards = 1` the daemon receives `None` and the became-best-tip emit
   * branch is skipped entirely — byte-identical to the pre-wiring daemon.
   *
-  * '''Failure model''' (mirrors `ShardCheckpointPublisher.sidecar` + `emitTipAttestation`): publish failures are logged + swallowed; the
-  * gossip handler MUST NOT block on a publish failure. A persistent failure is observable in cluster-level metrics (the checkpoint never
-  * reaches execution quorum), not by raising errors on the receive path.
+  * '''Failure model''' (mirrors `ShardCheckpointPublisher.sidecar`): publish failures are logged + swallowed; the gossip handler MUST NOT
+  * block on a publish failure. A persistent failure is observable in cluster-level metrics (the checkpoint never reaches execution quorum),
+  * not by raising errors on the receive path.
   *
   * '''Replay capability.''' The only input is [[VerifiedShardCheckpoint]], minted by the acceptance manager after mandatory replay. It
   * carries the exact checkpoint and `Hasher[F].hash(checkpoint.signingPreimage)`; no naked hash signing API exists.

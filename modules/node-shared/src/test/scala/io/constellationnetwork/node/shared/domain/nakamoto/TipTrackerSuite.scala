@@ -285,6 +285,21 @@ object TipTrackerSuite extends SimpleIOSuite {
         expect.same(Ratio.One, weightB)
   }
 
+  test("older attestation cannot mutate the sibling accumulator after latest-map rejection") {
+    val peer1 = pid("peer1")
+    val tipA = hash("tipA")
+    val tipB = hash("tipB")
+
+    for {
+      (tracker, _) <- setupTracker(Set(peer1))
+      _ <- record(tracker, peer1, att(tipB, slot(10), 100L, slot(15)))
+      _ <- record(tracker, peer1, att(tipA, slot(10), 100L, slot(11)))
+      accum <- tracker.snowballAccumAt(100L)
+    } yield
+      expect.same(Some(1), accum.get(tipB)) &&
+        expect(!accum.contains(tipA))
+  }
+
   test("allAttestations returns all current attestations") {
     val peer1 = pid("peer1")
     val peer2 = pid("peer2")
@@ -300,153 +315,6 @@ object TipTrackerSuite extends SimpleIOSuite {
       expect.same(2, all.size) &&
         expect(all.get(peer1).exists(_.tipHash == tipA)) &&
         expect(all.get(peer2).exists(_.tipHash == tipB))
-  }
-
-  test("highestFinalizedOrdinal legacy query includes self and filters by the supplied canonical hash") {
-    // The legacy weight-sum query no longer self-excludes. Repeating a query against this same
-    // tracker with the same canonical-hash callback returns the same value. That is ordinary local
-    // repeatability, not a proof that independently receiving observers have identical state.
-    //
-    // Setup: 3-validator cluster (gl0-0, gl0-1, gl0-2). All three attest their local tip at
-    // ord 100. gl0-0 and gl0-1 share chain A; gl0-2 is on chain B. Two honest observers walking
-    // chain A. The two chain-A reads below intentionally use the same tracker and callback.
-    val gl0_0 = pid("gl0-0")
-    val gl0_1 = pid("gl0-1")
-    val gl0_2 = pid("gl0-2")
-    val hashA100 = hash("chainA_ord100")
-    val hashB100 = hash("chainB_ord100")
-
-    for {
-      (tracker, _) <- setupTracker(Set(gl0_0, gl0_1, gl0_2))
-      _ <- record(tracker, gl0_0, att(hashA100, slot(200), 100L, slot(201)))
-      _ <- record(tracker, gl0_1, att(hashA100, slot(200), 100L, slot(201)))
-      _ <- record(tracker, gl0_2, att(hashB100, slot(205), 100L, slot(206)))
-
-      // Chain A includes gl0-0 + gl0-1 = 2/3 seedlist weight. The hash callback filters gl0-2's
-      // competing attestation.
-      firstChainAQuery <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
-      )
-
-      // Repeat the exact same local query.
-      secondChainAQuery <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(hashA100) else None)
-      )
-
-      // Chain B matches only gl0-2's attestation (1/3 weight), so the legacy threshold is not met.
-      firstChainBQuery <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
-      )
-
-      // Repeat the exact same chain-B query.
-      secondChainBQuery <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(hashB100) else None)
-      )
-
-    } yield
-      expect.same(firstChainAQuery, secondChainAQuery) &&
-        expect(firstChainAQuery.isDefined) &&
-        expect.same(100L, firstChainAQuery.get._1) &&
-        expect.same(Ratio(2, 3), firstChainAQuery.get._2) &&
-        expect.same(firstChainBQuery, secondChainBQuery) &&
-        expect.same(None, firstChainBQuery)
-  }
-
-  test("highestFinalizedOrdinal legacy weight sum follows the matching hash-chain prefix") {
-    // No fork: all three peers attest different ordinals on the same chain.
-    // Finality should pick the highest ordinal where cumulative weight ≥ 2/3.
-    // The legacy weight-sum path walks attestation ordinals from highest down and accumulates
-    // weight; the highest ord where cum-weight clears 2/3 wins.
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
-    val h50 = hash("ord50")
-    val h60 = hash("ord60")
-    val h70 = hash("ord70")
-
-    for {
-      (tracker, _) <- setupTracker(Set(peer1, peer2, peer3))
-      _ <- record(tracker, peer1, att(h70, slot(140), 70L, slot(141)))
-      _ <- record(tracker, peer2, att(h60, slot(120), 60L, slot(121)))
-      _ <- record(tracker, peer3, att(h50, slot(100), 50L, slot(101)))
-
-      result <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord =>
-          IO.pure(ord match {
-            case 70L => Some(h70)
-            case 60L => Some(h60)
-            case 50L => Some(h50)
-            case _   => None
-          })
-      )
-    } yield
-      // peer1 alone at ord 70 = 1/3 (below threshold),
-      // peer1 + peer2 cumulative at ord 60 = 2/3 (at threshold — finalize ord 60)
-      expect(result.isDefined) &&
-        expect.same(60L, result.get._1)
-  }
-
-  test("highestFinalizedOrdinal repeated query returns the same legacy result") {
-    // Two validators attesting the same ordinal/hash both contribute because the query no longer
-    // self-excludes. Calling the same tracker twice proves local repeatability only. The live
-    // legacy weight sum and the transitional margin accumulator are not portable Phase-2 evidence.
-    val self = pid("self")
-    val peer = pid("peer")
-    val h100 = hash("ord100")
-
-    for {
-      (tracker, _) <- setupTracker(Set(self, peer))
-      _ <- record(tracker, self, att(h100, slot(200), 100L, slot(201)))
-      _ <- record(tracker, peer, att(h100, slot(200), 100L, slot(201)))
-
-      // Same tracker and same canonical-hash callback for both reads.
-      result1 <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(h100) else None)
-      )
-      result2 <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(h100) else None)
-      )
-    } yield
-      // Repeated local queries match.
-      expect.same(result1, result2) &&
-        // The legacy query returns ordinal 100 at full local weight.
-        expect(result1.isDefined) &&
-        expect.same(100L, result1.get._1)
-  }
-
-  test("highestFinalizedOrdinal includes others' attestations of the same ordinal as expected") {
-    // Four validators all attest ordinal 100 with the same hash. Self is included, so this local
-    // legacy calculation returns full weight. The assertion does not establish cluster-wide
-    // safety or validate the receiver-local activity denominator.
-    val self = pid("self")
-    val peer1 = pid("peer1")
-    val peer2 = pid("peer2")
-    val peer3 = pid("peer3")
-    val h100 = hash("ord100")
-
-    for {
-      (tracker, _) <- setupTracker(Set(self, peer1, peer2, peer3))
-      _ <- record(tracker, self, att(h100, slot(200), 100L, slot(201)))
-      _ <- record(tracker, peer1, att(h100, slot(200), 100L, slot(201)))
-      _ <- record(tracker, peer2, att(h100, slot(200), 100L, slot(201)))
-      _ <- record(tracker, peer3, att(h100, slot(200), 100L, slot(201)))
-
-      result <- tracker.highestFinalizedOrdinal(
-        Ratio(2, 3),
-        ord => IO.pure(if (ord == 100L) Some(h100) else None)
-      )
-      _ = self // referenced for symmetry / narrative
-    } yield
-      // All four validators contribute to the legacy local result.
-      expect(result.isDefined) &&
-        expect.same(100L, result.get._1)
   }
 
   // -- Skew gate (#140) --

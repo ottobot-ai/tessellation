@@ -30,13 +30,11 @@ import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.signature.signature.Signature
 import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.EcVrf25519
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
-import io.estatico.newtype.ops._
 import io.grpc.ManagedChannel
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
@@ -612,12 +610,6 @@ object NakamotoSyncDaemon {
     enqueueTokenLockBlock: io.constellationnetwork.security.signature.Signed[
       io.constellationnetwork.schema.tokenLock.TokenLockBlock
     ] => F[Unit],
-    // Shared `Option` ref so other components (e.g. the reactive finality-walkback
-    // ChainSyncRequestQueue) can route through the same hash-keyed dedup + fetch
-    // machinery without needing their own `ChainSyncManager`. We publish our
-    // internally-constructed manager into this Ref once it's built; consumers
-    // read-through it and no-op if the producer hasn't bound yet.
-    sharedChainSyncManagerRef: Ref[F, Option[ChainSyncManager.ChainSyncManagerAlgebra[F]]],
     // §1.2 Slice 5/6/9: KES parallel-signing infrastructure (sender) + load-bearing
     // receiver-side verify. The OperationalKeyMaker signs attestations + snapshots with
     // the operator's KES product key at the period derived from `EtaCalculation.rotationPeriod`.
@@ -839,7 +831,7 @@ object NakamotoSyncDaemon {
                         }
                       }
                     )
-                    .flatMap(csm => csRef.set(Some(csm)) >> sharedChainSyncManagerRef.set(Some(csm)).as(csm))
+                    .flatTap(csm => csRef.set(Some(csm)))
                 }
               )
               .flatMap { chainSyncManager =>
@@ -970,7 +962,9 @@ object NakamotoSyncDaemon {
                                   // during the boot attestation burst that is the exact head-of-line the demux was meant to remove
                                   // (the same skew-rejection failure the MetagraphBinary case documents below, and the channel by
                                   // which a shard genesis checkpoint queued behind the burst waited MINUTES in run-20). The
-                                  // `tipTracker` tally is `Ref`-backed (concurrent-safe), so order-independence holds.
+                                  // tracker mutation is race-safe, but the transitional sticky accumulator is receipt-order
+                                  // sensitive. This background path is telemetry-only until a portable sampled transcript
+                                  // replaces it; it cannot authorize Phase 2.
                                   Async[F]
                                     .start(handleAttestation(att, tipTracker, operatorKeyRegistry, etaRotationSnapshots, logger))
                                     .void
@@ -1570,25 +1564,12 @@ object NakamotoSyncDaemon {
             stateRef,
             chainStore,
             nodeStorage,
-            tipTracker,
-            sidecarClient,
-            selfId,
-            keyPair,
             lastKnownSlotRef,
-            epochStateRef,
-            etaRotationSnapshots,
             snapshotStorage,
             lastGlobalSnapshotStorage,
             lastNGlobalSnapshotStorage,
             productionGate,
             eventMempool,
-            operationalKeyMaker,
-            operatorKeyRegistry,
-            shardProducers,
-            shardChainStores,
-            shardBinaryBuffers,
-            shardAssignment,
-            shardCommitteeMembership,
             logger
           )
           // A replay-valid snapshot has passed the same store/processing boundary as live gossip. Re-enter every waiting child through
@@ -1668,7 +1649,7 @@ object NakamotoSyncDaemon {
     *     was stored as a fork branch (or duplicate) in chainStore and MPT was rolled back; we still update tip-tracking, attestation, and
     *     ready-transition.
     */
-  private def processValidSnapshot[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
+  private def processValidSnapshot[F[_]: Async: HasherSelector: Metrics](
     snap: pb.Snapshot,
     signedSnapshot: Option[Signed[GlobalIncrementalSnapshot]],
     context: Option[GlobalSnapshotInfo],
@@ -1676,125 +1657,13 @@ object NakamotoSyncDaemon {
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
-    tipTracker: TipTracker[F],
-    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
-    selfId: peer.PeerId,
-    keyPair: KeyPair,
     lastKnownSlotRef: Ref[F, Option[Long]],
-    epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSnapshots: Long,
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     productionGate: ProductionGate[F],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
-    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
-    // Hierarchical-shard-checkpoints v1 — per-ord producer fan-out (becameBestTip-gated). EMPTY / `None`
-    // at numShards=1 ⇒ the fan-out is `whenA(false)` in `processValidSnapshotInner`.
-    shardProducers: Map[
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
-    ],
-    shardChainStores: Map[
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
-    ],
-    // Per-shard admission-approved binary buffers — the producer fan-out input.
-    shardBinaryBuffers: Map[
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
-    ],
-    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
-    // EXECUTION-SHARDING Task 2: deterministic committee draw, threaded into `processValidSnapshotInner`'s producer fan-out gate.
-    shardCommitteeMembership: (
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.schema.nakamoto.EtaPeriod
-    ) => F[Set[peer.PeerId]],
     logger: org.typelevel.log4cats.Logger[F]
-  )(
-    // Slice S6: the producer shard-checkpoint fan-out is moved OFF the snapshot-processing
-    // critical path (it's launched on this app-scoped Supervisor inside `processValidSnapshotInner`,
-    // not run inline under `snapshotSemaphore.permit`). Implicit so the existing positional call
-    // site needs no change — it resolves from `run`'s implicit `Supervisor[F]`.
-    implicit supervisor: Supervisor[F]
-  ): F[Unit] =
-    processValidSnapshotInner(
-      snap,
-      signedSnapshot,
-      context,
-      becameBestTip,
-      stateRef,
-      chainStore,
-      nodeStorage,
-      tipTracker,
-      sidecarClient,
-      selfId,
-      keyPair,
-      lastKnownSlotRef,
-      epochStateRef,
-      etaRotationSnapshots,
-      snapshotStorage,
-      lastGlobalSnapshotStorage,
-      lastNGlobalSnapshotStorage,
-      productionGate,
-      eventMempool,
-      operationalKeyMaker,
-      operatorKeyRegistry,
-      shardProducers,
-      shardChainStores,
-      shardBinaryBuffers,
-      shardAssignment,
-      shardCommitteeMembership,
-      logger
-    )
-
-  private def processValidSnapshotInner[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
-    snap: pb.Snapshot,
-    signedSnapshot: Option[Signed[GlobalIncrementalSnapshot]],
-    context: Option[GlobalSnapshotInfo],
-    becameBestTip: Boolean,
-    stateRef: Ref[F, SyncState],
-    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
-    nodeStorage: NodeStorage[F],
-    tipTracker: TipTracker[F],
-    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
-    selfId: peer.PeerId,
-    keyPair: KeyPair,
-    lastKnownSlotRef: Ref[F, Option[Long]],
-    epochStateRef: Ref[F, SharedEpochState],
-    etaRotationSnapshots: Long,
-    snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
-    lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
-    productionGate: ProductionGate[F],
-    eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
-    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
-    shardProducers: Map[
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
-    ],
-    shardChainStores: Map[
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardChainStore[F]
-    ],
-    // Per-shard admission-approved binary buffers — the producer fan-out input.
-    shardBinaryBuffers: Map[
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardBinaryBuffer[F]
-    ],
-    shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]],
-    // EXECUTION-SHARDING Task 2: deterministic committee draw — the producer fan-out runs for a shard only if this node is in its
-    // committee (membership gate in `ShardCheckpointFanOut.run`). The SAME draw the verifier admits against.
-    shardCommitteeMembership: (
-      io.constellationnetwork.schema.sharding.ShardId,
-      io.constellationnetwork.schema.nakamoto.EtaPeriod
-    ) => F[Set[peer.PeerId]],
-    logger: org.typelevel.log4cats.Logger[F]
-  )(
-    // Slice S6: app-scoped Supervisor for the off-critical-path producer fan-out (see below).
-    implicit supervisor: Supervisor[F]
   ): F[Unit] =
     for {
       // Update network tip tracking
@@ -1844,22 +1713,6 @@ object NakamotoSyncDaemon {
       // lottery now draws every wall-clock slot on every node, with the envelope carrying its production
       // `slot` (signed). Nothing to do on the snapshot-receive path.
 
-      // Record in TipTracker (snapshot producer attests to their own tip).
-      // `attestedAt` is OUR wall-clock receive time (epoch ms via Clock[F].realTime,
-      // NOT System.currentTimeMillis()) — so TipTracker's "newer wins" rule sees
-      // the latest arrival from each peer. The unit is wall-clock millis, not a
-      // consensus slot — kept open as the future Ouroboros-Chronos timestamp
-      // gossip surface, per `docs/nakamoto/attestation-and-finality.md`.
-      tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-      tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
-      producerHex = Hex(snap.producerId.toByteArray.map("%02x".format(_)).mkString)
-      producerId = peer.PeerId(producerHex)
-      nowMs <- Clock[F].realTime.map(_.toMillis)
-      att = DomainTipAttestation(tipHash, tipSlot, snap.ordinal, nowMs)
-      // The producer-implicit attestation uses OUR local clock for `attestedAt`, so the
-      // skew gate (`TipTracker.MaxAttestationSkewMs`) is trivially satisfied here.
-      _ <- tipTracker.recordAttestation(producerId, att, nowMs)
-
       // Check if we should transition to Ready
       state <- stateRef.get
       nodeState <- nodeStorage.getNodeState
@@ -1873,40 +1726,9 @@ object NakamotoSyncDaemon {
         }
       }
 
-      // Emit OUR attestation only when chain-selection promoted this peer snapshot
-      // to our local bestTip (a Phase 0 → 1 transition for us, per
-      // `docs/nakamoto/attestation-and-finality.md` §0/§4). The earlier
-      // unconditional emit (commit `6e49b7d5`) moved selfId.tipHash onto any
-      // arriving fork-branch snap, which the canonical-hash filter in
-      // `TipTracker.highestFinalizedOrdinal` then zeroed out — disenfranchising
-      // us on our own canonical chain. The 5s re-attestation ticker
-      // (`SnapshotLeaderLoop.scala:396-412`) remains as a safety net for the
-      // case where bestTip flips between this branch and the ticker firing.
-      //
-      // The producer-implicit attestation above (recordAttestation for the
-      // producer's `peerId`) stays unconditional — it credits the producer
-      // for what they produced, independent of our chain selection.
-      //
-      // `attestedAt` is wall-clock epoch ms via `Clock[F].realTime` (NOT
-      // `System.currentTimeMillis()`, NOT a consensus slot). Wall-clock
-      // semantics are deliberate, keeping the field reusable as a future
-      // Ouroboros-Chronos-style timestamp-claim surface.
-      _ <- Async[F].whenA(becameBestTip) {
-        Clock[F].realTime.map(_.toMillis).flatMap { attestedAt =>
-          emitAttestation(
-            snap,
-            attestedAt,
-            sidecarClient,
-            tipTracker,
-            selfId,
-            keyPair,
-            operationalKeyMaker,
-            operatorKeyRegistry,
-            etaRotationSnapshots,
-            logger
-          )
-        }
-      }
+      // A replay-valid selected tip is not enough to authorize optimistic signing.
+      // Emission stays dark until this exact validation result is carried as an
+      // opaque replay receipt through an atomic exact-tip preference capability.
 
       // §1.2 Slice 9: KES verification of the incoming snapshot's `kes_signature` field is
       // run BEFORE this body via `processValidSnapshot`'s outer `kesGate`. By the time we
@@ -2352,8 +2174,8 @@ object NakamotoSyncDaemon {
                                 s"parentSlot=${parentOpt.map(_.signed.value.slot.value.value).getOrElse(-1L)}"
                             )
                           else
-                            // S3 — FIX THE ATTESTATION INVERSION. Mirror the global chain's gate
-                            // (validate-by-replay → adopt as best-tip → emitAttestation): re-exec/validate the checkpoint FIRST, and
+                            // S3 — FIX THE ATTESTATION INVERSION. Enforce the shard replay capability boundary:
+                            // re-exec/validate the checkpoint FIRST, and
                             // only adopt it into the fork DAG + count its signers' attestations + emit OUR own attestation if the
                             // derivation matched. Previously the emit fired on `becameBestTip` BEFORE `evaluate`, so a node could attest
                             // (and adopt) a checkpoint whose derivation it had not re-run. `evaluate` now runs `reExecuteDerivation`
@@ -3021,142 +2843,5 @@ object NakamotoSyncDaemon {
         }
       case None => Async[F].unit
     }
-
-  // Package-visible so SnapshotLeaderLoop can route producer-self-attestation through the
-  // same code path peer-received snapshots use. Unifies the two attestation sites: any future
-  // gating, signing semantics, or broadcast policy applies uniformly.
-  //
-  // `attestedAt` is **wall-clock epoch milliseconds** sourced via `Clock[F].realTime` by the
-  // caller (NEVER `System.currentTimeMillis()`). It is NOT a consensus slot. Wall-clock
-  // semantics here are deliberate — keeps the field reusable as a future Ouroboros-Chronos-style
-  // timestamp-claim surface (gossiping `attestedAt` values lets the network distill a consensus
-  // time without needing NTP). Today the value is only used by `TipTracker.recordAttestation`
-  // for the "newer wins" rule, which compares Longs.
-  def emitAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
-    snap: pb.Snapshot,
-    attestedAt: Long,
-    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
-    tipTracker: TipTracker[F],
-    selfId: peer.PeerId,
-    keyPair: KeyPair,
-    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
-    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
-    etaRotationSnapshots: Long,
-    logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] = {
-    // snap.hash bytes are the UTF-8 encoding of the hex hash string — decode back to string
-    val tipHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-    val tipSlot = Slot(NonNegLong.unsafeFrom(snap.slot))
-    emitTipAttestation(
-      tipHash,
-      tipSlot,
-      snap.ordinal,
-      attestedAt,
-      sidecarClient,
-      tipTracker,
-      selfId,
-      keyPair,
-      operationalKeyMaker,
-      operatorKeyRegistry,
-      etaRotationSnapshots,
-      logger
-    )
-  }
-
-  // Primitive variant for callers that have tip hash/slot/ordinal directly (e.g. the finality
-  // monitor's bestTip-change ticker re-attesting after chainSelection moves).
-  // See `emitAttestation` comment re: `attestedAt` semantics — wall-clock epoch ms via
-  // `Clock[F].realTime`, sourced by the caller; this function does not read the clock.
-  def emitTipAttestation[F[_]: Async: SecurityProvider: HasherSelector: Metrics](
-    tipHash: Hash,
-    tipSlot: Slot,
-    tipOrdinal: Long,
-    attestedAt: Long,
-    sidecarClient: SidecarClient.SidecarClientAlgebra[F],
-    tipTracker: TipTracker[F],
-    selfId: peer.PeerId,
-    keyPair: KeyPair,
-    operationalKeyMaker: io.constellationnetwork.security.kes.OperationalKeyMakerAlgebra[F],
-    operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
-    etaRotationSnapshots: Long,
-    logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] = {
-    val localAtt = DomainTipAttestation(tipHash, tipSlot, tipOrdinal, attestedAt)
-    val identityMatches = peer.PeerId.fromPublic(keyPair.getPublic) === selfId
-    val globalPeriod = EtaCalculation.globalSnapshotArtifactPeriod(tipOrdinal, etaRotationSnapshots).value
-
-    if (!identityMatches)
-      logger.warn(
-        s"KES-ATT local long-term key does not derive configured peer=${selfId.value.value.take(16)}... — refusing to sign or record a local attestation"
-      )
-    else
-      LocalOperatorKeyPairGate
-        .registeredSigningKey(operationalKeyMaker, selfId, keyPair, operatorKeyRegistry, globalPeriod)
-        .flatMap {
-          case Left(error) =>
-            Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_sign_failed_total") >>
-              logger.warn(
-                s"KES-ATT local preregistration gate failed for ord=$tipOrdinal: ${error.getMessage} — refusing local attestation"
-              )
-
-          case Right(signingKey) =>
-            // Neither long-term nor KES signature is reachable until the local identity and registered KES material pass above.
-            HasherSelector[F].withCurrent { implicit hasher =>
-              for {
-                attHash <- localAtt.hash
-                attHashBytes = attHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                sig <- Signature.fromHash[F](keyPair.getPrivate, attHash)
-                sigBytes = sig.coerce.toBytes
-                edSignatureValid <- Signing.verifySignature(attHash.getBytes, sigBytes)(keyPair.getPublic)
-                kesAttempt <- operationalKeyMaker.signAt(signingKey.treeStep, attHashBytes)
-                _ <- kesAttempt match {
-                  case Left(err) =>
-                    Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_sign_failed_total") >>
-                      logger.warn(
-                        s"KES-ATT sign failed for ord=$tipOrdinal globalPeriod=$globalPeriod treeStep=${signingKey.treeStep}: ${err.message} — refusing local attestation"
-                      )
-                  case Right(kSig) =>
-                    val kesSigBytes = io.constellationnetwork.security.kes.OperationalKeyMaker.encodeSignature(kSig)
-
-                    Metrics[F].incrementCounter("dag_nakamoto_kes_attestations_signed_total") >>
-                      KesGossipVerification
-                        .verifyAttestation[F](
-                          messageBytes = attHashBytes,
-                          kesSigBytes = kesSigBytes,
-                          attesterId = selfId,
-                          attesterHex = selfId.value,
-                          tipOrdinal = tipOrdinal,
-                          operatorKeys = signingKey.operatorKeys,
-                          etaRotationSnapshots = etaRotationSnapshots,
-                          logger = logger
-                        )
-                        .flatMap { kesSignatureValid =>
-                          if (edSignatureValid && kesSignatureValid)
-                            tipTracker.recordAttestation(selfId, localAtt, attestedAt) >>
-                              sidecarClient
-                                .publishAttestation(
-                                  SidecarClient.mkAttestation(
-                                    tipHash = tipHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                                    tipSlot = tipSlot.value.value,
-                                    tipOrdinal = tipOrdinal,
-                                    attestedAt = attestedAt,
-                                    attesterId = selfId.value.toBytes,
-                                    signature = sigBytes,
-                                    kesSignature = kesSigBytes
-                                  )
-                                )
-                                .void
-                                .handleErrorWith(e => logger.warn(s"Failed to emit attestation: ${e.getMessage}"))
-                          else
-                            logger.warn(
-                              s"KES-ATT local evidence did not verify against the preregistered operator pair for ord=$tipOrdinal " +
-                                s"peer=${selfId.value.value.take(16)}... — refusing local attestation"
-                            )
-                        }
-                }
-              } yield ()
-            }
-        }
-  }
 
 }

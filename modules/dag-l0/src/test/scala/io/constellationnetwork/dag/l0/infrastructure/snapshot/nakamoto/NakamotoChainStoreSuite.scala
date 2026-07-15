@@ -423,6 +423,57 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       }
       .map(_._1)
 
+  test("RTA-RED-019: canonical k1 depth finalizes the exact tip-minus-k1 hash without attestations") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    val k1 = 2L
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, tipTracker, _) = tuple
+      chain <- mkSignedLinkedChain(length = 5)
+      _ <- chain.traverse_ { linked =>
+        val value = linked.signed.value
+        chainStore.store(
+          linked.signed,
+          linked.context,
+          value.ordinal.value.value,
+          value.ordinal.value.value,
+          value.lastSnapshotHash,
+          Array.emptyByteArray
+        )
+      }
+      best <- chainStore.bestTip.flatMap(_.liftTo[IO](new IllegalStateException("missing canonical tip")))
+      trigger <- TDepth1Trigger.make[IO](k1)
+      qualifying <- trigger.evaluate(
+        FinalityTrigger.ConsensusState[IO](
+          selfId = pid("self"),
+          bestTipOrdinal = SnapshotOrdinal.unsafeApply(best.ordinal),
+          bestTipHash = best.hash,
+          canonicalHashAt = ordinal => chainStore.walkBackTo(best.hash, ordinal)
+        )
+      )
+      exactHash <- chainStore
+        .walkBackTo(best.hash, qualifying.value.value)
+        .flatMap(_.liftTo[IO](new IllegalStateException("missing exact depth target")))
+      exactStored <- chainStore.get(exactHash).flatMap(_.liftTo[IO](new IllegalStateException("missing stored depth target")))
+      _ <- tipTracker.markFinalized(exactHash, Slot(NonNegLong.unsafeFrom(exactStored.slot)))
+      _ <- chainStore.finalize(exactHash, qualifying.value.value)
+      finalized <- chainStore.lastFinalizedOrdinal
+      attestations <- tipTracker.allAttestations
+    } yield
+      expect.all(
+        best.ordinal == 5L,
+        qualifying == SnapshotOrdinal.unsafeApply(3L),
+        exactHash == chain(2).hash,
+        finalized == 3L,
+        attestations.isEmpty
+      )
+  }
+
   /** Store/control-flow witness under a synthetic enabled k/s configuration only: the bodies bind signed ordinal/parent ancestry and every
     * schedule is parent-first, but this deliberately bypasses NakamotoSnapshotValidator and therefore does not prove VRF/KES/eta/era-valid
     * network admission or divergence under a shipped environment configuration.

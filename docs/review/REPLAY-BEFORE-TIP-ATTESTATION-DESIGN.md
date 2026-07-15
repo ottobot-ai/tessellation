@@ -1,8 +1,10 @@
 # Replay Before GL0 Tip Attestation
 
-**Status:** implementation packet; restrictive safety work that may land before
-the full O-01 Avalanche/Snowball implementation. It does not make the current
-optimistic-finality implementation production-safe.
+**Status:** implementation packet; the first restrictive containment slice has
+landed in the current worktree. Raw local GL0 attestation emission and the
+receiver-local cumulative-weight finalization sink are removed. The remaining
+capability, lineage, journal, and real O-01 Avalanche/Snowball work is open. This
+containment does not make optimistic finality production-safe or active.
 
 ## 1. Purpose and consensus role
 
@@ -46,12 +48,38 @@ The received-snapshot path has the right operations but loses their provenance:
 5. `commitReplayValidated` permits storage and canonical effects only for
    `Valid` (`NakamotoSyncDaemon.scala:354-366,1546-1593`).
 
-That ordering is not encoded in the signing API. `Valid` is publicly
-constructible (`NakamotoSnapshotValidator.scala:32-43`), and
-`emitTipAttestation` accepts naked hash/slot/ordinal fields
-(`NakamotoSyncDaemon.scala:3070-3159`). The finality ticker obtains those fields
-from `chainStore.bestTip` and calls the naked emitter directly
-(`SnapshotLeaderLoop.scala:1087-1126`).
+That ordering is not yet encoded in a capability. `Valid` remains publicly
+constructible (`NakamotoSnapshotValidator.scala:32-43`), and both receive and
+production paths still reduce chain-store selection to a non-atomic Boolean plus
+a later `bestTip` read (`NakamotoSyncDaemon.scala:1540-1559`;
+`SnapshotLeaderLoop.scala:1630-1648`). No current signing API consumes either
+result.
+
+The pre-containment implementation had three independent authority defects:
+
+- naked `emitAttestation`/`emitTipAttestation` APIs could sign caller-supplied
+  fields;
+- receipt of a valid snapshot invented an attestation under the producer's
+  identity; and
+- a five-second best-tip ticker re-signed storage-derived fields and a one-round
+  cumulative-weight read could call `chainStore.finalize`.
+
+Those paths are now historical. The source/API tripwire requires both naked
+emitter names and every `publishAttestation` call in the GL0 leader/receive paths
+to be absent, forbids the legacy `highestFinalizedOrdinal` API, forbids
+producer-invented tracker mutation, and permits exactly one GL0
+`NakamotoChainStore.finalize` call in the leader loop
+(`GlobalOptimisticFinalityContainmentSuite.scala:12-52`).
+
+The sole state-changing GL0 snapshot Phase-2 sink is now canonical `k1` depth:
+the monitor derives the qualifying ordinal from `TDepth1`, walks the selected
+chain to its exact hash, and finalizes that hash
+(`SnapshotLeaderLoop.scala:1104-1127`). `RTA-RED-019` exercises the same exact-hash
+depth path with an empty attestation map
+(`NakamotoChainStoreSuite.scala:426-468`). Verified remote Ed25519+KES
+attestations may still enter `TipTracker`
+(`NakamotoSyncDaemon.scala:1740-1803`), but the leader loop labels them telemetry
+and gives them no finalization sink (`SnapshotLeaderLoop.scala:1213-1224`).
 
 The store also cannot prove replay provenance. `StoredSnapshot` has no validation
 receipt (`NakamotoChainStore.scala:31-46`), and `store` accepts raw snapshot,
@@ -167,11 +195,14 @@ KES signing, self-verification, and chain-store selection. Only the successful
 exact result can become `AuthenticatedExecutedGlobalSnapshot`.
 
 `chainStore.store == true` currently means only that an entry was new; it does not
-mean the entry became best. The local path currently treats it as success at
-`SnapshotLeaderLoop.scala:1798-1815`, then updates canonical storages at
-`:1845-1856` and attests at `:1917-1932`. The replacement API must return a typed
-store outcome that distinguishes `Duplicate`, `StoredAlternate`, and
-`BecameSelected`. Only `BecameSelected` can mint current preference.
+mean the entry became best. The local path still treats every `true` as a
+successful selected outcome (`SnapshotLeaderLoop.scala:1630-1648`), then updates
+canonical storages, clears included events, and may publish the snapshot
+(`SnapshotLeaderLoop.scala:1677-1755`). Optimistic attestation emission is dark,
+so this path no longer signs, but the canonical-state defect remains. The
+replacement API must return a typed store outcome that distinguishes `Duplicate`,
+`StoredAlternate`, and `BecameSelected`. Only `BecameSelected` can mint current
+preference or authorize canonical side effects.
 
 ### RTA-007 - Received flow never reconstructs authority from storage
 
@@ -218,11 +249,13 @@ add current weight after that hash was orphaned or its lineage was replaced. The
 canonical-lineage tally CAS, not the pre-publication check, is the local
 linearization point for current Snowball weight.
 
-Today local recording precedes publication and the response Boolean is discarded
-(`NakamotoSyncDaemon.scala:3133-3149`). The Go server returns ordinary
-`PublishResponse{Ok:false}` values rather than raising for every failure
-(`p2p/internal/grpcserver/server.go:188-197`). Therefore `.void` is not a success
-test.
+In the pre-containment path, local recording preceded publication and the
+response Boolean was discarded. That local emitter and its publication call are
+now deleted, so no current GL0 attestation can acquire local weight through this
+bug (`GlobalOptimisticFinalityContainmentSuite.scala:31-52`). The Go server still
+returns ordinary `PublishResponse{Ok:false}` values rather than raising for every
+failure (`p2p/internal/grpcserver/server.go:188-197`), so the future emitter must
+implement the durable publication protocol below; `.void` is not a success test.
 
 On exception, cancellation, `ok=false`, stale branch/lineage at the applicable
 gate, signing failure, or local verification failure, no active local weight is
@@ -282,8 +315,10 @@ QC, commit certificate, or view-change artifact. Signature count never validates
 state and never changes fork choice. The state-changing optimistic sink must
 eventually consume only the ratified decided-attestation `T_weight` transcript.
 
-The current one-round cumulative-weight sink is explicitly transitional and
-unsafe (`SnapshotLeaderLoop.scala:1268-1283`). This packet does not bless it.
+The former one-round cumulative-weight sink was unsafe and is now removed. It
+must not return under another name. Remote attestation and `T_weight` objects in
+the current tree are telemetry only; a future state-changing optimistic sink must
+consume the ratified sampled, portable exact-hash decision evidence.
 
 ## 4. Capability boundaries
 
@@ -411,22 +446,22 @@ revives.
 
 ## 6. Re-attestation ticker and Snowball integration
 
-The five-second ticker at `SnapshotLeaderLoop.scala:1087-1126` is not the target
-optimistic protocol. The owner direction recorded in
-`docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md:104-123` is emit-once at the
-first beta-clear, subject to O-01 implementation and proof gates.
+The former five-second raw best-tip re-attestation ticker was not the target
+optimistic protocol and is now removed. The owner direction recorded in
+`docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md:108-114,125-127` is emit-once
+at the first beta-clear, subject to O-01 implementation and proof gates.
 
-Do not add a raw-capability cache solely to preserve this ticker. The staged
-landing rules are:
+Do not restore that ticker or add a raw-capability cache to recreate it. The
+staged landing rules are:
 
-1. no current path may sign without both capabilities;
-2. the ticker is removed when the real sampled cascade becomes the emission
-   source;
-3. if the type-boundary slice lands first, optimistic emission remains dark or
-   any temporary ticker is capability-gated and explicitly non-authoritative;
-4. canonical `k1` depth remains the fallback while optimistic activation is
-   blocked; and
-5. the legacy cumulative-weight sink cannot be relabeled `T_weight`.
+1. the current containment exposes no local GL0 attestation signing path;
+2. future emission requires both replay and exact-tip preference capabilities;
+3. the ratified real sampled cascade, not a periodic best-tip observation, is the
+   emission source;
+4. canonical `k1` depth remains the sole live state-changing finality rail while
+   optimistic activation is blocked;
+5. verified remote attestations remain telemetry only; and
+6. the legacy cumulative-weight sink cannot be relabeled `T_weight`.
 
 ## 7. File plan
 
@@ -477,10 +512,14 @@ landing rules are:
   ownership boundary. It stores the idempotency key, exact signed bytes,
   publication outcome, exact hash, branch revision, and lineage revision; it is
   historical evidence/outbox state, never a capability factory.
-- Delete naked `emitAttestation`/`emitTipAttestation` signing APIs from
-  `NakamotoSyncDaemon.scala`.
-- Delete receiver-invented producer evidence at
-  `NakamotoSyncDaemon.scala:1847-1861`.
+- **Containment landed:** naked `emitAttestation`/`emitTipAttestation` signing
+  APIs, all `publishAttestation` calls in the GL0 leader/receive paths, the
+  periodic raw best-tip ticker, and receiver-invented producer evidence are
+  deleted. The source/API tripwire is
+  `GlobalOptimisticFinalityContainmentSuite.scala:31-52`.
+- **Containment landed:** the legacy cumulative-weight finalization API and sink
+  are deleted; canonical `k1` depth is the sole current `chainStore.finalize`
+  caller. This is a temporary safe restriction, not Phase D completion.
 - Enforce durable pre-publish command persistence, immutable retry,
   `PublishResponse.ok`, durable publication outcome, post-publish
   canonical-lineage recheck, and the chain-store-owned lineage-scoped active-tally
@@ -563,6 +602,12 @@ deterministic rather than timing-based. Run the same boundary matrix with proces
 injection against the durable journal.
 
 ## 9. Completion and activation gates
+
+The landed containment closes only the immediate raw-signing and legacy
+weight-to-finalization paths. It does not satisfy this section's completion
+criteria: there is intentionally no local optimistic emitter until the remaining
+capability, typed store outcome/revision, durable journal, publication CAS, and
+sampled Snowball work lands.
 
 The replay-before-sign slice is complete only when:
 
