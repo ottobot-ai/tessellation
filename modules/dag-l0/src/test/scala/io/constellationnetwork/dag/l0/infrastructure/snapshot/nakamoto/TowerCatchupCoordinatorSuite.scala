@@ -46,8 +46,7 @@ object TowerCatchupCoordinatorSuite extends SimpleIOSuite {
       ExactWalkLink(position(branch, ordinal), if (ordinal == 0L) Hash.empty else hash(branch, ordinal - 1L))
     }
 
-  private val completeWalker
-    : (ExactWalkPosition, SnapshotOrdinal, Int) => IO[Either[ExactWalkError, ExactWalkResult]] =
+  private val completeWalker: (ExactWalkPosition, SnapshotOrdinal, Int) => IO[Either[ExactWalkError, ExactWalkResult]] =
     (start, target, maxSteps) => {
       val branch = if (start.hash == hash(1, start.ordinal.value.value)) 1 else 2
       val required = start.ordinal.value.value - target.value.value + 1L
@@ -387,12 +386,14 @@ object TowerCatchupCoordinatorSuite extends SimpleIOSuite {
     } yield
       expect(initial.state.isInstanceOf[Ready])
         .and(expect(replacement.state.isInstanceOf[RebuildRequired]))
-        .and(expect(
-          replacement.state match {
-            case RebuildRequired(_, _, _: CursorNotOnTargetBranch) => true
-            case _                                                 => false
-          }
-        ))
+        .and(
+          expect(
+            replacement.state match {
+              case RebuildRequired(_, _, _: CursorNotOnTargetBranch) => true
+              case _                                                 => false
+            }
+          )
+        )
         .and(expect(!ready))
         .and(expect(observed == (1L to 5L).toVector))
   }
@@ -409,7 +410,7 @@ object TowerCatchupCoordinatorSuite extends SimpleIOSuite {
       expect(
         behind.state match {
           case RebuildRequired(_, _, _: TargetBehindCursor) => true
-          case _                                             => false
+          case _                                            => false
         }
       ).and(expect(observed == (1L to 5L).toVector))
   }
@@ -445,8 +446,7 @@ object TowerCatchupCoordinatorSuite extends SimpleIOSuite {
   }
 
   test("a complete exact walk that omits the requested lower boundary is rejected before processing") {
-    val truncatedWalker
-      : (ExactWalkPosition, SnapshotOrdinal, Int) => IO[Either[ExactWalkError, ExactWalkResult]] =
+    val truncatedWalker: (ExactWalkPosition, SnapshotOrdinal, Int) => IO[Either[ExactWalkError, ExactWalkResult]] =
       (start, _, _) => IO.pure(Right(ExactWalkResult.Complete(path(1, start.ordinal.value.value, 5L))))
 
     for {

@@ -107,12 +107,11 @@ object SnapshotRoutesActiveEraSuite extends HttpSuite {
         IO.pure(None)
       def get(requested: Hash): IO[Option[Signed[GlobalIncrementalSnapshot]]] = IO.pure(Some(value))
       def getHash(requested: SnapshotOrdinal)(implicit hasher: Hasher[IO]): IO[Option[Hash]] = IO.pure(None)
-      def setHeadForRecovery(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(implicit
-        hasher: Hasher[IO]
+      def setHeadForRecovery(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(
+        implicit hasher: Hasher[IO]
       ): IO[Unit] = IO.unit
-      def setTentativeHead(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(implicit
-        hasher: Hasher[IO]
-      ): IO[Unit] = IO.unit
+      def setTentativeHead(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(implicit hasher: Hasher[IO]): IO[Unit] =
+        IO.unit
       def confirmHead(hash: Hash): IO[Unit] = IO.unit
       def pruneTentative(finalizedOrdinal: SnapshotOrdinal): IO[Unit] = IO.unit
     }

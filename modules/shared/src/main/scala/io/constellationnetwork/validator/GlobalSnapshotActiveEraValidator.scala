@@ -9,9 +9,9 @@ import io.constellationnetwork.security.hash.Hash
 
 /** Active-protocol-era shape validation for global incremental snapshots.
   *
-  * Historical-commitment SMT activation is dark. The field remains in the schema for a future explicit activation, but no snapshot in
-  * the current era may claim an SMT root. This guard is intentionally independent of state-proof recreation so every ingress and egress
-  * path can reject the forbidden shape before trusting or exposing it.
+  * Historical-commitment SMT activation is dark. The field remains in the schema for a future explicit activation, but no snapshot in the
+  * current era may claim an SMT root. This guard is intentionally independent of state-proof recreation so every ingress and egress path
+  * can reject the forbidden shape before trusting or exposing it.
   */
 object GlobalSnapshotActiveEraValidator {
 
