@@ -257,6 +257,37 @@ object CatchUpVerificationSuite extends MutableIOSuite {
     validation: NakamotoSnapshotValidator.ValidationResult
   )
 
+  test("RTA-004: every failed authentication or replay result has zero authority effects") { _ =>
+    val failures: List[NakamotoSnapshotValidator.ValidationResult] = List(
+      NakamotoSnapshotValidator.ParentNotFound,
+      NakamotoSnapshotValidator.ParentBuffered,
+      NakamotoSnapshotValidator.VrfFailed(slot = 7L, detail = "ineligible"),
+      NakamotoSnapshotValidator.SignatureInvalid(ordinal = 8L),
+      NakamotoSnapshotValidator.KesInvalid(ordinal = 9L),
+      NakamotoSnapshotValidator.HistoricalEtaUnavailable(period = 2L, parentHash = Hash.empty),
+      NakamotoSnapshotValidator.ContentMismatch("envelope/lineage/context/state-proof/root mismatch"),
+      NakamotoSnapshotValidator.PayloadMissing(ordinal = 10L)
+    )
+
+    for {
+      effects <- Ref.of[IO, List[String]](List.empty)
+      committed <- failures.zipWithIndex.traverse {
+        case (failure, index) =>
+          NakamotoSyncDaemon.commitReplayValidated[IO](failure) { _ =>
+            effects.update(
+              _ ++ List(
+                s"store:$index",
+                s"sign:$index",
+                s"publish:$index",
+                s"tracker:$index"
+              )
+            )
+          }
+      }
+      observed <- effects.get
+    } yield expect.all(committed.forall(result => !result), observed.isEmpty)
+  }
+
   test("snapshot transport metadata is bound to the signed body and certificate") { res =>
     implicit val (_, j, h, sp, hs) = res
 
