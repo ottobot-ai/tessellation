@@ -1602,21 +1602,59 @@ object SnapshotLeaderLoop {
                               }
                               kesReady = kesSnapAttempt.isRight
                               parentHashValue = lastHashed.hash
+                              canonicalBranch = BranchId(snapshotHashedForStorage.hash)
+                              rawBranch = BranchId(rawArtifactHash)
+                              discardPreparedBranch =
+                                mptOverlay.discardBranch(canonicalBranch) >>
+                                  mptOverlay.discardBranch(rawBranch) >>
+                                  pendingAccumulatorsRef.update(_ - snapshotHashedForStorage.hash - rawArtifactHash) >>
+                                  pendingPostBytesRef.update(_ - snapshotHashedForStorage.hash - rawArtifactHash)
+                              prepareCanonicalBranch =
+                                mptOverlay.rekey(rawBranch, canonicalBranch) >>
+                                  pendingAccumulatorsRef.update(
+                                    rekeyStagedAccumulator(_, rawArtifactHash, snapshotHashedForStorage.hash)
+                                  ) >>
+                                  pendingPostBytesRef.update(
+                                    rekeyStagedPostBytes(_, rawArtifactHash, snapshotHashedForStorage.hash)
+                                  )
                               _ <- Async[F].whenA(kesReady) {
                                 SnapshotKesStorage.put[F](dataDir, snapshotHashedForStorage.hash, kesSnapSigBytes)
                               }
                               storeOutcome <-
                                 if (kesReady)
-                                  chainStore
-                                    .store(
-                                      signed,
-                                      context,
-                                      lastKey.value.value + 1,
-                                      currentSlot,
-                                      parentHashValue,
-                                      vrfOutput
-                                    )
-                                    .map(_.some)
+                                  // Prepare the canonical-hash branch before selection. The store and its production fence are then one
+                                  // uncancelable handoff; explicit nonselection or a preselection store failure discards the inert staging.
+                                  Async[F].uncancelable { _ =>
+                                    prepareCanonicalBranch.attempt.flatMap {
+                                      case Left(error) =>
+                                        discardPreparedBranch >>
+                                          Async[F].raiseError[NakamotoChainStore.StoreOutcome](error)
+                                      case Right(()) =>
+                                        chainStore
+                                          .store(
+                                            signed,
+                                            context,
+                                            lastKey.value.value + 1,
+                                            currentSlot,
+                                            parentHashValue,
+                                            vrfOutput
+                                          )
+                                          .attempt
+                                          .flatMap {
+                                            case Left(error) =>
+                                              discardPreparedBranch >>
+                                                Async[F].raiseError[NakamotoChainStore.StoreOutcome](error)
+                                            case Right(outcome @ NakamotoChainStore.StoreOutcome.BecameSelected(_, _)) =>
+                                              // If pausing raises after updating the gate, retain the selected branch and fail-stop. It is
+                                              // no longer safe to discard state after the chain store has published this exact selection.
+                                              productionGate
+                                                .pause(ProductionGate.ReorgInProgress)
+                                                .as(outcome: NakamotoChainStore.StoreOutcome)
+                                            case Right(other) =>
+                                              discardPreparedBranch.as(other: NakamotoChainStore.StoreOutcome)
+                                          }
+                                    }
+                                  }.map(_.some)
                                 else none[NakamotoChainStore.StoreOutcome].pure[F]
                             } yield (signed, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes, storeOutcome)
                           }
@@ -1632,35 +1670,20 @@ object SnapshotLeaderLoop {
                           ].pure[F]
                       storedOutcomeOpt = attemptOpt.collect {
                         case (
-                              signed,
+                              _,
                               snapshotHashedForStorage,
-                              parentHashValue,
+                              _,
                               kesSnapSigBytes,
-                              Some(NakamotoChainStore.StoreOutcome.BecameSelected(_, _))
+                              Some(NakamotoChainStore.StoreOutcome.BecameSelected(selected, _))
                             ) =>
-                          (signed, context, returnedEvents, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes)
+                          (selected, returnedEvents, snapshotHashedForStorage, kesSnapSigBytes)
                       }
-                      // Rekey the overlay branch on success; discard it on abandonment.
-                      // Done inside the `mptStore.withTransaction` block so the overlay update is
-                      // bundled with the underlying-MPT mutation: if the tx rolls back (action =
-                      // Rollback), the underlying writes are reverted but the overlay's
-                      // `discardBranch` has already cleaned up the now-orphan `pendingRef` entry.
+                      // The successful branch was rekeyed to the exact signed hash before `chainStore.store`, so selection never points at
+                      // raw-hash staging. Abandoned paths which never reached that preparation still need their raw staging removed.
                       _ <- storedOutcomeOpt match {
-                        case Some((_, _, _, snapshotHashedForStorage, _, _)) =>
-                          // Rekey the overlay branch AND the gl0 changeset staging map raw -> with-cert. The
-                          // accumulator was staged (GlobalSnapshotConsensusFunctions) under the RAW artifact hash
-                          // (== `rawArtifactHash`, pre slotCertificate+eta), but the finalize-sink promotion
-                          // (`recordFinalizedAccumulator`) looks it up under the with-cert canonical hash
-                          // (`snapshotHashedForStorage.hash`). Without this rekey the served ring never populates
-                          // for self-produced snapshots — the same raw->with-cert problem the overlay rekey beside
-                          // it already solves.
-                          mptOverlay.rekey(BranchId(rawArtifactHash), BranchId(snapshotHashedForStorage.hash)) >>
-                            pendingAccumulatorsRef.update(rekeyStagedAccumulator(_, rawArtifactHash, snapshotHashedForStorage.hash)) >>
-                            // 3c-A enabler — mirror the rekey for the signed-bytes staging so the finalize sink finds it under the
-                            // with-cert canonical hash.
-                            pendingPostBytesRef.update(rekeyStagedPostBytes(_, rawArtifactHash, snapshotHashedForStorage.hash))
-                        case None =>
-                          // Abandoned fork: drop both the overlay branch and its staged accumulator.
+                        case Some(_) => Async[F].unit
+                        case None    =>
+                          // Gate-closed, invalid-lineage, or KES-unavailable abandonment never prepared a canonical branch.
                           mptOverlay.discardBranch(BranchId(rawArtifactHash)) >>
                             pendingAccumulatorsRef.update(_ - rawArtifactHash) >>
                             pendingPostBytesRef.update(_ - rawArtifactHash)
@@ -1669,85 +1692,103 @@ object SnapshotLeaderLoop {
                     } yield (storedOutcomeOpt, action)
                   }
                   _ <- txOutcome.traverse_ {
-                    case (signed, context, returnedEvents, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes) =>
-                      for {
+                    case (selected, returnedEvents, _, kesSnapSigBytes) =>
+                      val includedHashes = hashedEvents.collect {
+                        case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
+                      }.toSet
 
-                        // Update ALL snapshot storages — snapshotStorage.head is what the leader loop
-                        // reads on the next slot to determine the parent ordinal. Without this, the
-                        // leader loop re-reads the last GOSSIP ordinal and re-produces the same ordinal.
-                        _ <- snapshotStorage.setHeadForRecovery(signed, context) >>
-                          lastGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                          lastNGlobalSnapshotStorage.setForRecovery(snapshotHashedForStorage, context) >>
-                          lastKnownSlotRef.set(Some(currentSlot)) >>
-                          snapshotStorage.confirmHead(parentHashValue)
-
-                        // Clear included events from mempool (returned events were NOT included). This
-                        // branch exists only for a successfully stored artifact. Every rejection path
-                        // returns None above, so its inputs remain available for the next slot.
-                        includedHashes = hashedEvents.collect {
-                          case (h, hashed) if !returnedEvents.contains(hashed.signed.value) => h
-                        }.toSet
-                        _ <- eventMempool.clearIncluded(includedHashes)
-
-                        // Check gate before publishing — a better gossip snapshot may have arrived
-                        // during proposal creation. If gate is closed, abandon this production.
-                        gateOpenBeforePublish <- productionGate.isOpen
-                        _ <-
-                          if (!gateOpenBeforePublish)
-                            productionGate.pauseReasons.flatMap(reasons =>
-                              logger
-                                .info(
-                                  s"🛑 Abandoning production at slot $currentSlot before publish (gate closed: ${reasons.mkString(", ")})"
-                                )
-                            )
-                          else Async[F].unit
-
-                        // Publish only if the production gate is still open. Optimistic attestation
-                        // emission remains dark until the replay-and-preference capability path lands.
-                        snapshotHash = snapshotHashedForStorage.hash
-                        producedOrdinal = lastKey.value.value + 1
-                        _ <- Async[F].whenA(gateOpenBeforePublish) {
-                          sidecarClient
-                            .publishSnapshot(
-                              SidecarClient.mkSnapshot(
-                                hash = snapshotHash.value.getBytes,
-                                slot = currentSlot,
-                                ordinal = producedOrdinal,
-                                parentHash = lastHashed.hash.value.getBytes,
-                                vrfProof = proof,
-                                vrfPublicKey = vrfPK,
-                                eta = currentEta,
-                                payload = {
-                                  import io.circe.syntax._
-                                  val snapshotJson = signed.asJson
-                                  val contextJson = context.asJson
-                                  val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
-                                  combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                                },
-                                producerId = selfId.value.toBytes,
-                                parentSlot = parentSlotValue,
-                                kesSignature = kesSnapSigBytes
-                              )
-                            )
-                            .void
-                            .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
-                            logger.info(
-                              s"Produced snapshot ordinal=$producedOrdinal slot=$currentSlot " +
-                                s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
-                            ) >>
-                            Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
-                            Metrics[F].updateGauge("dag_nakamoto_ordinal", producedOrdinal) >>
-                            Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
-                              Metrics[F].recordDistribution("dag_nakamoto_production_duration_ms", (nowMs - productionStartMs).toInt) >>
-                                productionTimestamps.update { ts =>
-                                  val updated = ts + (producedOrdinal -> nowMs)
-                                  // Evict entries older than 1000 ordinals to bound memory
-                                  if (updated.size > 1000) updated.toList.sortBy(-_._1).take(1000).toMap
-                                  else updated
-                                }
-                            }
+                      chainStore
+                        .runCanonicalEffectsIfCurrent(selected) { canonical =>
+                          for {
+                            canonicalHashed <- canonical.signedSnapshot.toHashed[F]
+                            // These are revision-unaware local projections. Keep them under the exact-selection lock so a competing
+                            // branch cannot interleave and leave storage or the mempool pointing at the stale producer result.
+                            _ <- snapshotStorage.setHeadForRecovery(canonical.signedSnapshot, canonical.context)
+                            _ <- lastGlobalSnapshotStorage.setForRecovery(canonicalHashed, canonical.context)
+                            _ <- lastNGlobalSnapshotStorage.setForRecovery(canonicalHashed, canonical.context)
+                            _ <- lastKnownSlotRef.set(Some(canonical.slot))
+                            _ <- eventMempool.clearIncluded(includedHashes)
+                            _ <- productionGate.resume(ProductionGate.ReorgInProgress)
+                          } yield (canonical, canonicalHashed)
                         }
-                      } yield ()
+                        .flatMap {
+                          case NakamotoChainStore.CanonicalEffectsOutcome.StaleSelection(current) =>
+                            logger.info(
+                              s"Skipped stale producer canonical effects for ordinal=${selected.snapshot.ordinal}; " +
+                                s"current=${current.fold("none")(tip => s"${tip.snapshot.ordinal}:${tip.snapshot.hash.value.take(12)}")}"
+                            ) >> Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
+
+                          case NakamotoChainStore.CanonicalEffectsOutcome.Applied(_, (canonical, canonicalHashed)) =>
+                            Metrics[F].updateGauge("dag_nakamoto_ordinal", canonical.ordinal) >>
+                              (canonical.signedSnapshot.value.slotCertificate match {
+                                case None =>
+                                  productionGate.pause(ProductionGate.ReorgInProgress) >>
+                                    logger.error(
+                                      s"Refusing publication and pausing production for locally selected ordinal=${canonical.ordinal}: " +
+                                        "stored snapshot has no slot certificate"
+                                    ) >> Metrics[F].incrementCounter("dag_nakamoto_production_abandoned_total")
+
+                                case Some(certificate) =>
+                                  for {
+                                    // This check can race a later selection change after the CAS lock is released. Publication therefore
+                                    // disseminates only a replay-valid branch candidate; it is not a canonicality, preference, finality, or
+                                    // state-validity assertion and cannot feed optimistic attestation emission.
+                                    gateOpenBeforePublish <- productionGate.isOpen
+                                    _ <-
+                                      if (!gateOpenBeforePublish)
+                                        productionGate.pauseReasons.flatMap(reasons =>
+                                          logger.info(
+                                            s"🛑 Abandoning production at slot ${canonical.slot} before publish " +
+                                              s"(gate closed: ${reasons.mkString(", ")})"
+                                          )
+                                        )
+                                      else Async[F].unit
+                                    _ <- Async[F].whenA(gateOpenBeforePublish) {
+                                      sidecarClient
+                                        .publishSnapshot(
+                                          SidecarClient.mkSnapshot(
+                                            hash = canonicalHashed.hash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                                            slot = canonical.slot,
+                                            ordinal = canonical.ordinal,
+                                            parentHash = canonical.parentHash.value.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                                            vrfProof = certificate.vrfProof.toBytes,
+                                            vrfPublicKey = certificate.vrfPublicKey.toBytes,
+                                            eta = Hex(certificate.eta.value).toBytes,
+                                            payload = {
+                                              import io.circe.syntax._
+                                              val snapshotJson = canonical.signedSnapshot.asJson
+                                              val contextJson = canonical.context.asJson
+                                              val combined = io.circe.Json.obj("snapshot" -> snapshotJson, "context" -> contextJson)
+                                              combined.noSpaces.getBytes(java.nio.charset.StandardCharsets.UTF_8)
+                                            },
+                                            producerId = selfId.value.toBytes,
+                                            parentSlot = certificate.parentSlot.value.value,
+                                            kesSignature = kesSnapSigBytes
+                                          )
+                                        )
+                                        .void
+                                        .handleErrorWith(e => logger.warn(s"Sidecar publish failed: ${e.getMessage}")) >>
+                                        logger.info(
+                                          s"Produced snapshot ordinal=${canonical.ordinal} slot=${canonical.slot} " +
+                                            s"events=${eventSet.size} returned=${returnedEvents.size} pool=$activePoolSize"
+                                        ) >>
+                                        Metrics[F].incrementCounter("dag_nakamoto_snapshots_produced") >>
+                                        Async[F].delay(System.currentTimeMillis()).flatMap { nowMs =>
+                                          Metrics[F].recordDistribution(
+                                            "dag_nakamoto_production_duration_ms",
+                                            (nowMs - productionStartMs).toInt
+                                          ) >>
+                                            productionTimestamps.update { ts =>
+                                              val updated = ts + (canonical.ordinal -> nowMs)
+                                              // Evict entries older than 1000 ordinals to bound memory
+                                              if (updated.size > 1000) updated.toList.sortBy(-_._1).take(1000).toMap
+                                              else updated
+                                            }
+                                        }
+                                    }
+                                  } yield ()
+                              })
+                        }
                   }
 
                   // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick (design §5.7, 2026-06-12) ───

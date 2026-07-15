@@ -510,11 +510,10 @@ object NakamotoSyncDaemon {
     * Transactions whose parent no longer matches canonical GL0 state cannot become valid on the selected branch. Other event types remain
     * queued for their own validation paths.
     */
-  private def reconcileMempool[F[_]: Async](
+  private def staleMempoolHashes[F[_]: Async](
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    context: GlobalSnapshotInfo,
-    logger: org.typelevel.log4cats.Logger[F]
-  ): F[Unit] =
+    context: GlobalSnapshotInfo
+  ): F[Set[Hash]] =
     for {
       hashes <- eventMempool.getEventHashes
       events <- eventMempool.getMultiple(hashes)
@@ -531,9 +530,7 @@ object NakamotoSyncDaemon {
             case _ => None
           }
       }.flatten.toSet
-      _ <- eventMempool.remove(staleHashes).whenA(staleHashes.nonEmpty)
-      _ <- logger.info(s"Mempool reconciliation evicted ${staleHashes.size} stale DAG event(s)")
-    } yield ()
+    } yield staleHashes
 
   final case class SyncState(
     networkTipOrdinal: Long,
@@ -1540,24 +1537,36 @@ object NakamotoSyncDaemon {
       replayCommitted <- commitReplayValidated(validationResult) { valid =>
         for {
           validHash <- HasherSelector[F].withCurrent(implicit h => valid.snapshot.toHashed[F].map(_.hash))
-          storeOutcome <- chainStore.store(
-            valid.snapshot,
-            valid.context,
-            snap.ordinal,
-            snap.slot,
-            parentHash,
-            vrf.vrfProofToHash(snap.vrfProof.toByteArray).getOrElse(snap.vrfProof.toByteArray)
-          )
+          // Archive already-verified KES evidence before selection. A local evidence-write failure must not leave a newly selected
+          // in-memory tip whose canonical projection was never attempted.
+          _ <- SnapshotKesStorage.put[F](dataDir, validHash, snap.kesSignature.toByteArray)
+          // Selection and its production fence form one uncancelable local handoff. Without this bracket, cancellation may land after
+          // `store` publishes a new selected tip but before the next effect pauses production on its incomplete local projection.
+          storeOutcome <- Async[F].uncancelable { _ =>
+            chainStore
+              .store(
+                valid.snapshot,
+                valid.context,
+                snap.ordinal,
+                snap.slot,
+                parentHash,
+                vrf.vrfProofToHash(snap.vrfProof.toByteArray).getOrElse(snap.vrfProof.toByteArray)
+              )
+              .flatTap {
+                case NakamotoChainStore.StoreOutcome.BecameSelected(_, _) =>
+                  productionGate.pause(ProductionGate.ReorgInProgress)
+                case _ => Async[F].unit
+              }
+          }
           storeAccepted = storeOutcome match {
             case _: NakamotoChainStore.StoreOutcome.Rejected => false
             case _                                           => true
           }
-          becameBest = storeOutcome match {
-            case _: NakamotoChainStore.StoreOutcome.BecameSelected => true
-            case _                                                 => false
-          }
-          _ <- Async[F].whenA(storeAccepted) {
-            SnapshotKesStorage.put[F](dataDir, validHash, snap.kesSignature.toByteArray)
+          selected = storeOutcome match {
+            case NakamotoChainStore.StoreOutcome.BecameSelected(exact, _) => exact.some
+            // Duplicate equality is not execution/context authority: persisted recovery state can select bytes before this intake's exact
+            // validation receipt is durably bound. Retry therefore waits for storeValidated/a projection journal in a later tranche.
+            case _ => none[NakamotoChainStore.SelectedTip]
           }
           _ <- storeOutcome match {
             case _: NakamotoChainStore.StoreOutcome.StoredAlternate =>
@@ -1580,9 +1589,7 @@ object NakamotoSyncDaemon {
           _ <- Async[F].whenA(storeAccepted) {
             processValidSnapshot(
               snap,
-              valid.snapshot.some,
-              valid.context.some,
-              becameBest,
+              selected,
               stateRef,
               chainStore,
               nodeStorage,
@@ -1667,18 +1674,14 @@ object NakamotoSyncDaemon {
       }
     } yield ()
 
-  /** Process a VRF-validated snapshot AFTER the validate+chainStore.store bracket has decided whether to commit MPT.
+  /** Process a replay-valid snapshot after chain storage.
     *
-    *   - `signedSnapshot`/`context` are `None` for VRF-only payloads (no body to thread through canonical state).
-    *   - `becameBestTip` gates the canonical storage updates (snapshotStorage / last*Snapshot / lastKnownSlot). When false, the snapshot
-    *     was stored as a fork branch (or duplicate) in chainStore and MPT was rolled back. Such a snapshot may advance observed network-tip
-    *     telemetry, but it cannot advance canonical storage or the node's readiness state.
+    * Network-tip telemetry may advance for any retained snapshot. Canonical storage, mempool reconciliation, and readiness effects require
+    * the exact `BecameSelected` observation to remain current under the chain-store mutation lock.
     */
   private def processValidSnapshot[F[_]: Async: HasherSelector: Metrics](
     snap: pb.Snapshot,
-    signedSnapshot: Option[Signed[GlobalIncrementalSnapshot]],
-    context: Option[GlobalSnapshotInfo],
-    becameBestTip: Boolean,
+    selected: Option[NakamotoChainStore.SelectedTip],
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
@@ -1701,55 +1704,75 @@ object NakamotoSyncDaemon {
         else s
       }
 
-      // Canonical-state updates only when this snapshot became the bestTip in the chainStore.
-      // After Phase E, the validate+store path no longer wraps MPT writes in a savepoint
-      // bracket — accept() routes through the overlay algebra (Phase D, commit caa3559e),
-      // so the MPT mutations for this snapshot are already in flight (Passthrough → base
-      // immediately; MultiBranch → pending ChangeSet under the parent's branch). On the
-      // fork-branch path we still must NOT update canonical storage; the overlay's
-      // pending isolation (or the eventual finalizeBranch promotion) handles state.
-      _ <- (signedSnapshot, context) match {
-        case (Some(signed), Some(ctx)) if becameBestTip =>
-          productionGate.pause(ProductionGate.ReorgInProgress) >>
-            HasherSelector[F].withCurrent { implicit hasher =>
-              signed.toHashed[F].flatMap { hashed =>
-                snapshotStorage.setHeadForRecovery(signed, ctx) >>
-                  lastGlobalSnapshotStorage.setForRecovery(hashed, ctx) >>
-                  lastNGlobalSnapshotStorage.setForRecovery(hashed, ctx) >>
-                  logger.debug(s"Updated canonical storage to ordinal=${snap.ordinal} slot=${snap.slot}") >>
-                  Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
-                  Metrics[F].updateGauge("dag_nakamoto_ordinal", snap.ordinal) >>
-                  Metrics[F].recordDistribution("dag_nakamoto_slot_gap", (snap.slot - snap.parentSlot).toInt) >>
-                  reconcileMempool(eventMempool, ctx, logger)
-              }
-            } >>
-            chainStore.bestTipSlot.flatMap {
-              case Some(bestSlot) => lastKnownSlotRef.set(Some(bestSlot))
-              case None           => Async[F].unit
-            } >>
-            productionGate.resume(ProductionGate.ReorgInProgress)
-        case _ => Async[F].unit
+      // Whole-pool inspection is deliberately outside the chain-store mutation lock. The exact-selection CAS below removes only this
+      // precomputed set; events inserted after this scan remain queued for later validation rather than extending the consensus lock.
+      staleHashes <- selected.fold(Set.empty[Hash].pure[F]) { expected =>
+        staleMempoolHashes(eventMempool, expected.snapshot.context)
       }
 
-      // ─── Shard-checkpoint fan-out: MOVED to the per-slot tick in SnapshotLeaderLoop (design §5.7,
-      // 2026-06-12). The becameBestTip hook that lived here was the second half of the run-10 Gap-A
-      // cadence inversion: it advanced shard producer duty only once per canonical GL0 ordinal (the GL0 leader
-      // onSlotWon self-call was the first half), so shards drew ~6.5× slower than gl0's slot grid. The
-      // lottery now draws every wall-clock slot on every node, with the envelope carrying its production
-      // `slot` (signed). Nothing to do on the snapshot-receive path.
+      // Canonical-state updates only while this exact selection remains current in the chain store.
+      // The production-default MPT overlay is MultiBranch, so replay mutations remain isolated under their exact branch until promotion.
+      // This CAS separately protects revision-unaware local projection stores and the mempool from an interleaved selection change.
+      canonicalOutcome <- selected.traverse { expected =>
+        chainStore.runCanonicalEffectsIfCurrent(expected) { canonical =>
+          val effects = HasherSelector[F].withCurrent { implicit hasher =>
+            canonical.signedSnapshot.toHashed[F].flatMap { hashed =>
+              snapshotStorage.setHeadForRecovery(canonical.signedSnapshot, canonical.context) >>
+                lastGlobalSnapshotStorage.setForRecovery(hashed, canonical.context) >>
+                lastNGlobalSnapshotStorage.setForRecovery(hashed, canonical.context) >>
+                lastKnownSlotRef.set(Some(canonical.slot))
+            }
+          } >>
+            stateRef.get.flatMap { state =>
+              nodeStorage.getNodeState.flatMap { nodeState =>
+                if (!state.isReady && nodeState =!= NodeState.Ready) {
+                  val caughtUp = state.networkTipOrdinal - canonical.ordinal <= CatchUpThreshold
+                  if (caughtUp)
+                    // Persist the externally observed node state before flipping the local retry guard. A failed NodeStorage write must
+                    // leave `isReady=false` so the exact projection can retry instead of silently skipping readiness forever.
+                    nodeStorage.setNodeState(NodeState.Ready) >>
+                      stateRef
+                        .update(_.copy(isReady = true, localTipOrdinal = canonical.ordinal))
+                        .as(state.networkTipOrdinal.some)
+                  else none[Long].pure[F]
+                } else none[Long].pure[F]
+              }
+            }.flatTap { _ =>
+              // Eviction is intentionally the last irreversible projection effect. If any storage or readiness write above fails, inputs
+              // remain available for deterministic retry while production stays fenced.
+              eventMempool.remove(staleHashes).whenA(staleHashes.nonEmpty)
+            }
 
-      // Check if we should transition to Ready
-      state <- stateRef.get
-      nodeState <- nodeStorage.getNodeState
-      _ <- Async[F].whenA(becameBestTip && !state.isReady && nodeState =!= NodeState.Ready) {
-        val caughtUp = state.networkTipOrdinal - snap.ordinal <= CatchUpThreshold
-        Async[F].whenA(caughtUp) {
-          logger.info(s"Caught up (local=${snap.ordinal}, network=${state.networkTipOrdinal}). → Ready.") >>
-            stateRef.update(_.copy(isReady = true, localTipOrdinal = snap.ordinal)) >>
-            nodeStorage.setNodeState(NodeState.Ready) >>
-            logger.info(s"🟢 Node Ready — VRF production begins")
+          // Resume only after every projection sink succeeds. A partial multi-store write has no durable retry journal yet, so an error
+          // must fail-stop production rather than reopen it on a potentially split local projection.
+          effects.flatTap(_ => productionGate.resume(ProductionGate.ReorgInProgress))
         }
       }
+      _ <- canonicalOutcome.traverse_ {
+        case NakamotoChainStore.CanonicalEffectsOutcome.Applied(applied, readyNetworkTip) =>
+          val canonical = applied.snapshot
+          logger.debug(s"Updated canonical storage to ordinal=${canonical.ordinal} slot=${canonical.slot}") >>
+            Metrics[F].incrementCounter("dag_nakamoto_snapshots_received") >>
+            Metrics[F].updateGauge("dag_nakamoto_ordinal", canonical.ordinal) >>
+            canonical.signedSnapshot.value.slotCertificate.traverse_ { certificate =>
+              Metrics[F].recordDistribution(
+                "dag_nakamoto_slot_gap",
+                (canonical.slot - certificate.parentSlot.value.value).toInt
+              )
+            } >>
+            logger.info(s"Mempool reconciliation evicted ${staleHashes.size} stale DAG event(s)") >>
+            readyNetworkTip.traverse_ { networkTip =>
+              logger.info(s"Caught up (local=${canonical.ordinal}, network=$networkTip). → Ready.") >>
+                logger.info(s"🟢 Node Ready — VRF production begins")
+            }
+        case NakamotoChainStore.CanonicalEffectsOutcome.StaleSelection(current) =>
+          logger.info(
+            s"Skipped stale receiver canonical effects for ordinal=${snap.ordinal}; " +
+              s"current=${current.fold("none")(tip => s"${tip.snapshot.ordinal}:${tip.snapshot.hash.value.take(12)}")}"
+          )
+      }
+
+      // Shard-checkpoint fan-out remains in SnapshotLeaderLoop's per-slot tick. This receiver path performs no shard duty.
 
       // A replay-valid selected tip is not enough to authorize optimistic signing.
       // Emission stays dark until this exact validation result is carried as an

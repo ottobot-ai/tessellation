@@ -180,6 +180,11 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSourceSuite extends Simpl
       vrfOutput: Array[Byte]
     ): IO[NakamotoChainStore.StoreOutcome] = unexpected("store")
     def selectedTip: IO[Option[NakamotoChainStore.SelectedTip]] = unexpected("selectedTip")
+    private[nakamoto] def runCanonicalEffectsIfCurrent[A](
+      expected: NakamotoChainStore.SelectedTip
+    )(
+      effects: NakamotoChainStore.StoredSnapshot => IO[A]
+    ): IO[NakamotoChainStore.CanonicalEffectsOutcome[A]] = unexpected("runCanonicalEffectsIfCurrent")
     def bestTip: IO[Option[NakamotoChainStore.StoredSnapshot]] = unexpected("bestTip")
     def bestTipSlot: IO[Option[Long]] = unexpected("bestTipSlot")
     def bestTipOrdinal: IO[Option[Long]] = unexpected("bestTipOrdinal")

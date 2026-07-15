@@ -1,9 +1,11 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.IO
-import cats.effect.kernel.Ref
+import cats.effect.kernel.{Deferred, Ref}
 import cats.effect.std.Supervisor
 import cats.syntax.all._
+
+import scala.concurrent.duration._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.ext.crypto._
@@ -55,15 +57,14 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     h = Hasher.forJson[IO]
   } yield (supervisor, ks, j, h, sp)
 
-  // Minimal in-memory SnapshotStorage stub. The chain store calls only `prepend`,
-  // `setHeadForRecovery`, and `getHash` (the latter only during `walkBackTo` fallback).
-  // Returns no-op success for writes; reads return None. Good enough for the P-11 surface,
-  // which doesn't depend on file-system persistence.
+  // Minimal in-memory SnapshotStorage stub. Candidate retention/selection must never mutate this
+  // revision-unaware canonical projection before the caller's exact-selection CAS, so both write
+  // methods are fail-fast tripwires. Historical fallback reads return None.
   private def stubStorage: SnapshotStorage[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo] =
     new SnapshotStorage[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo] {
       def prepend(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(
         implicit hasher: Hasher[IO]
-      ): IO[Boolean] = IO.pure(true)
+      ): IO[Boolean] = IO.raiseError(new AssertionError("chain store must not prepend canonical projection state"))
       def head: IO[Option[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]] = IO.pure(None)
       def headSnapshot: IO[Option[Signed[GlobalIncrementalSnapshot]]] = IO.pure(None)
       def get(ordinal: SnapshotOrdinal): IO[Option[Signed[GlobalIncrementalSnapshot]]] = IO.pure(None)
@@ -74,7 +75,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       def getHash(ordinal: SnapshotOrdinal)(implicit hasher: Hasher[IO]): IO[Option[Hash]] = IO.pure(None)
       def setHeadForRecovery(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(
         implicit hasher: Hasher[IO]
-      ): IO[Unit] = IO.unit
+      ): IO[Unit] = IO.raiseError(new AssertionError("chain store must not set canonical projection head"))
       def setTentativeHead(snapshot: Signed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo)(
         implicit hasher: Hasher[IO]
       ): IO[Unit] = IO.unit
@@ -426,6 +427,12 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
   ): IO[NakamotoChainStore.SelectedTip] =
     chainStore.selectedTip.flatMap(_.liftTo[IO](new IllegalStateException("missing selected chain tip")))
 
+  private def becameSelected(outcome: NakamotoChainStore.StoreOutcome): IO[NakamotoChainStore.SelectedTip] =
+    outcome match {
+      case NakamotoChainStore.StoreOutcome.BecameSelected(selected, _) => IO.pure(selected)
+      case other => IO.raiseError(new IllegalStateException(s"expected selected store outcome, got $other"))
+    }
+
   private def finalizeCurrentSelection(
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[IO],
     targetOrdinal: Long
@@ -549,6 +556,271 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       }
 
       expect.all(exactInitialized, exactDuplicate, exactExtension)
+    }
+  }
+
+  test("stored VRF output is immutable after crossing the chain-store boundary") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    val callerOwned = Array.fill[Byte](64)(0x11.toByte)
+    val expected = callerOwned.clone()
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      pair <- mkGenesis
+      (signed, context) = pair
+      outcome <- chainStore.store(signed, context, 1L, 1L, Hash.empty, callerOwned)
+      selectedHash <- outcome match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(selected, _) => selected.snapshot.hash.pure[IO]
+        case other => IO.raiseError[Hash](new AssertionError(s"expected selected snapshot, got $other"))
+      }
+      _ <- IO.delay(callerOwned(0) = 0x22.toByte)
+      first <- chainStore.bestTip.flatMap(_.liftTo[IO](new AssertionError("missing selected tip")))
+      exposed = first.vrfOutput.toBytes
+      _ <- IO.delay(exposed(1) = 0x33.toByte)
+      second <- chainStore.bestTip.flatMap(_.liftTo[IO](new AssertionError("missing selected tip")))
+      tip <- chainStore.tipFor(selectedHash).flatMap(_.liftTo[IO](new AssertionError("missing selected ChainTip")))
+    } yield
+      expect.all(
+        first.vrfOutput.toBytes.sameElements(expected),
+        second.vrfOutput.toBytes.sameElements(expected),
+        tip.vrfOutput.toBytes.sameElements(expected)
+      )
+  }
+
+  test("canonical effects run against the store-owned snapshot only while the exact selection is current") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      first <- mkSignedLinkedChain(length = 1).map(_.head)
+      stored <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      selected <- becameSelected(stored)
+      observed <- Ref.of[IO, Option[NakamotoChainStore.StoredSnapshot]](None)
+      outcome <- chainStore.runCanonicalEffectsIfCurrent(selected) { canonical =>
+        observed.set(canonical.some).as(canonical.hash)
+      }
+      exactObserved <- observed.get
+    } yield {
+      val exactApplied = outcome match {
+        case NakamotoChainStore.CanonicalEffectsOutcome.Applied(current, value) =>
+          current == selected && value == first.hash
+        case _ => false
+      }
+
+      expect.all(
+        exactApplied,
+        exactObserved.exists(snapshot => snapshot.hash == first.hash && snapshot.context == first.context)
+      )
+    }
+  }
+
+  test("candidate selection never writes the revision-unaware SnapshotStorage projection") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      first <- mkSignedLinkedChain(length = 1).map(_.head)
+      outcome <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+    } yield expect(outcome.isInstanceOf[NakamotoChainStore.StoreOutcome.BecameSelected])
+  }
+
+  test("stale selected token performs zero canonical effects and retains pending events") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 2)
+      first = chain.head
+      second = chain.last
+      initial <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      observed <- becameSelected(initial)
+      _ <- chainStore.store(second.signed, second.context, 2L, 2L, first.hash, Array.emptyByteArray)
+      pendingEvents <- Ref.of[IO, Set[String]](Set("pending-native-event"))
+      published <- Ref.of[IO, Boolean](false)
+      outcome <- chainStore.runCanonicalEffectsIfCurrent(observed) { _ =>
+        pendingEvents.set(Set.empty) >> published.set(true)
+      }
+      eventsAfter <- pendingEvents.get
+      publishedAfter <- published.get
+    } yield {
+      val rejectedExactStale = outcome match {
+        case NakamotoChainStore.CanonicalEffectsOutcome.StaleSelection(Some(current)) =>
+          current.snapshot.hash == second.hash &&
+          current.branchRevision.value.value > observed.branchRevision.value.value
+        case _ => false
+      }
+
+      expect.all(rejectedExactStale, eventsAfter == Set("pending-native-event"), !publishedAfter)
+    }
+  }
+
+  test("selected token rejects same-hash ABA reconstruction after reset") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      first <- mkSignedLinkedChain(length = 1).map(_.head)
+      initial <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      beforeReset <- becameSelected(initial)
+      _ <- chainStore.unsafe_clearFinality
+      reconstructed <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      afterReset <- becameSelected(reconstructed)
+      effectRan <- Ref.of[IO, Boolean](false)
+      outcome <- chainStore.runCanonicalEffectsIfCurrent(beforeReset)(_ => effectRan.set(true))
+      didRun <- effectRan.get
+    } yield {
+      val rejectedAba = outcome match {
+        case NakamotoChainStore.CanonicalEffectsOutcome.StaleSelection(Some(current)) =>
+          current.snapshot.hash == beforeReset.snapshot.hash &&
+          current == afterReset &&
+          current.branchRevision.value.value > beforeReset.branchRevision.value.value &&
+          current.lineageRevision.value.value > beforeReset.lineageRevision.value.value
+        case _ => false
+      }
+
+      expect.all(rejectedAba, !didRun)
+    }
+  }
+
+  test("selected token cannot authorize canonical effects in another chain-store instance") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      firstStoreTuple <- mkChainStore()
+      secondStoreTuple <- mkChainStore()
+      firstStore = firstStoreTuple._1
+      secondStore = secondStoreTuple._1
+      snapshot <- mkSignedLinkedChain(length = 1).map(_.head)
+      firstOutcome <- firstStore.store(snapshot.signed, snapshot.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      foreignSelection <- becameSelected(firstOutcome)
+      _ <- secondStore.store(snapshot.signed, snapshot.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      effectRan <- Ref.of[IO, Boolean](false)
+      outcome <- secondStore.runCanonicalEffectsIfCurrent(foreignSelection)(_ => effectRan.set(true))
+      didRun <- effectRan.get
+    } yield {
+      val rejectedForeignToken = outcome match {
+        case NakamotoChainStore.CanonicalEffectsOutcome.StaleSelection(Some(current)) =>
+          current.snapshot.hash == foreignSelection.snapshot.hash && current != foreignSelection
+        case _ => false
+      }
+
+      expect.all(rejectedForeignToken, !didRun)
+    }
+  }
+
+  test("canonical effects exclude concurrent store mutation until the callback completes") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 2)
+      first = chain.head
+      second = chain.last
+      initial <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      selected <- becameSelected(initial)
+      callbackEntered <- Deferred[IO, Unit]
+      releaseCallback <- Deferred[IO, Unit]
+      storeStarted <- Deferred[IO, Unit]
+      storeFinished <- Deferred[IO, Unit]
+      callbackFiber <- chainStore
+        .runCanonicalEffectsIfCurrent(selected) { _ =>
+          callbackEntered.complete(()).void >> releaseCallback.get
+        }
+        .start
+      _ <- callbackEntered.get
+      storeFiber <- (storeStarted.complete(()).void >>
+        chainStore
+          .store(second.signed, second.context, 2L, 2L, first.hash, Array.emptyByteArray)
+          .flatTap(_ => storeFinished.complete(()).void)).start
+      _ <- storeStarted.get >> IO.cede
+      completedWhileCallbackHeldLock <- storeFinished.tryGet
+      _ <- releaseCallback.complete(())
+      callbackOutcome <- callbackFiber.joinWithNever
+      storeOutcome <- storeFiber.joinWithNever
+      current <- currentSelection(chainStore)
+    } yield {
+      val callbackApplied = callbackOutcome match {
+        case NakamotoChainStore.CanonicalEffectsOutcome.Applied(exact, _) => exact == selected
+        case _                                                            => false
+      }
+      val extensionApplied = storeOutcome match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(exact, NakamotoChainStore.SelectionChange.Extended) =>
+          exact.snapshot.hash == second.hash && exact == current
+        case _ => false
+      }
+
+      expect.all(completedWhileCallbackHeldLock.isEmpty, callbackApplied, extensionApplied)
+    }
+  }
+
+  test("raising canonical callback releases the mutation permit for a subsequent extension") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+    val projectionFailure = new RuntimeException("projection failed")
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 2)
+      first = chain.head
+      second = chain.last
+      initial <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      selected <- becameSelected(initial)
+      failed <- chainStore.runCanonicalEffectsIfCurrent(selected)(_ => IO.raiseError[Unit](projectionFailure)).attempt
+      extension <- chainStore
+        .store(second.signed, second.context, 2L, 2L, first.hash, Array.emptyByteArray)
+        .timeout(2.seconds)
+      current <- currentSelection(chainStore)
+    } yield {
+      val exactFailure = failed match {
+        case Left(error) => error eq projectionFailure
+        case _           => false
+      }
+      val extensionApplied = extension match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(exact, NakamotoChainStore.SelectionChange.Extended) =>
+          exact.snapshot.hash == second.hash && exact == current
+        case _ => false
+      }
+
+      expect.all(exactFailure, extensionApplied)
     }
   }
 
@@ -1889,7 +2161,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     // since `walkBackTo periodStart` stops at 6.
     //
     // Note on the VRF-output check: the genesis fixtures used here don't carry a `SlotCertificate`
-    // (slotCertificate=None), so the disk-recovered `StoredSnapshot.vrfOutput` is `Array.empty`
+    // (slotCertificate=None), so the disk-recovered `StoredSnapshot.vrfOutput` has an empty immutable value
     // and the walk's `vrfOutput.nonEmpty` filter drops it. The walk itself reaches ord=6 — the
     // assertion below verifies the walk-reachability (parent-resolution across the boundary) via
     // the fact that ords 7..9 are returned, which requires the walk to have visited ord=7 via the

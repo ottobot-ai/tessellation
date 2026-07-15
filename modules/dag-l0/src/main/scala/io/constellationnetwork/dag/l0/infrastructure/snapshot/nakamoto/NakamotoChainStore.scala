@@ -12,7 +12,6 @@ import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfOutput}
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -25,8 +24,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - The current "best tip" as determined by ChainSelection
   *   - Proper reorg support: when a better chain is received, update the canonical head
   *
-  * It wraps the underlying SnapshotStorage for actual persistence, using setHeadForRecovery only during reorgs (which is appropriate — it
-  * IS a recovery from a shorter/weaker chain).
+  * The underlying SnapshotStorage is a historical read fallback only. `store` retains and selects candidates in this hash-addressed store;
+  * it must not mutate the revision-unaware canonical projection before the caller's exact-selection CAS. The canonical-effects path owns
+  * persistence after rechecking the selected hash and revisions.
   */
 object NakamotoChainStore {
 
@@ -38,7 +38,7 @@ object NakamotoChainStore {
     slot: Long,
     parentHash: Hash,
     hash: Hash,
-    vrfOutput: Array[Byte] = Array.empty
+    vrfOutput: VrfOutput = VrfOutput.fromHex("")
   )
 
   case class ChainState(
@@ -61,11 +61,47 @@ object NakamotoChainStore {
     )
   }
 
-  final case class SelectedTip(
-    snapshot: StoredSnapshot,
-    branchRevision: CanonicalBranchRevision,
-    lineageRevision: CanonicalLineageRevision
-  )
+  /** Exact observation of this store's selected tip.
+    *
+    * The private store identity prevents a structurally identical observation from another chain-store instance from authorizing local
+    * canonical effects. Equality intentionally includes that identity while remaining value-based for repeated reads from this store.
+    */
+  final class SelectedTip private (
+    val snapshot: StoredSnapshot,
+    val branchRevision: CanonicalBranchRevision,
+    val lineageRevision: CanonicalLineageRevision,
+    private val storeIdentity: AnyRef
+  ) {
+
+    private[NakamotoChainStore] def belongsTo(identity: AnyRef): Boolean =
+      storeIdentity eq identity
+
+    override def equals(other: Any): Boolean =
+      other match {
+        case that: SelectedTip =>
+          (storeIdentity eq that.storeIdentity) &&
+          snapshot == that.snapshot &&
+          branchRevision == that.branchRevision &&
+          lineageRevision == that.lineageRevision
+        case _ => false
+      }
+
+    override def hashCode(): Int =
+      31 * (31 * (31 * System.identityHashCode(storeIdentity) + snapshot.##) + branchRevision.##) + lineageRevision.##
+
+    override def toString: String =
+      s"SelectedTip(snapshot=$snapshot,branchRevision=$branchRevision,lineageRevision=$lineageRevision)"
+  }
+
+  object SelectedTip {
+    private[NakamotoChainStore] def bind(
+      snapshot: StoredSnapshot,
+      branchRevision: CanonicalBranchRevision,
+      lineageRevision: CanonicalLineageRevision,
+      storeIdentity: AnyRef
+    ): SelectedTip =
+      new SelectedTip(snapshot, branchRevision, lineageRevision, storeIdentity)
+  }
 
   sealed trait SelectionChange extends Product with Serializable
 
@@ -95,6 +131,13 @@ object NakamotoChainStore {
     final case class StoredAlternate(stored: StoredSnapshot, selected: SelectedTip) extends StoreOutcome
     final case class BecameSelected(selected: SelectedTip, change: SelectionChange) extends StoreOutcome
     final case class Rejected(reason: StoreRejection, selected: Option[SelectedTip]) extends StoreOutcome
+  }
+
+  sealed trait CanonicalEffectsOutcome[+A] extends Product with Serializable
+
+  object CanonicalEffectsOutcome {
+    final case class Applied[A](selected: SelectedTip, value: A) extends CanonicalEffectsOutcome[A]
+    final case class StaleSelection(current: Option[SelectedTip]) extends CanonicalEffectsOutcome[Nothing]
   }
 
   sealed trait FinalizeOutcome extends Product with Serializable
@@ -201,6 +244,23 @@ object NakamotoChainStore {
 
     /** Read the exact selected tip together with the revisions under which it was observed. */
     def selectedTip: F[Option[SelectedTip]]
+
+    /** Run bounded local canonical effects only while `expected` is still this store's exact selected tip.
+      *
+      * The selected hash plus branch and lineage revisions are rechecked under the same mutation lock used by `store`,
+      * `finalizeSelectedAt`, and reset. The callback receives the store-owned snapshot/context rather than caller-held transport values and
+      * runs uncancelably while the lock is held. Signing, network I/O, and nested calls to this chain store must remain outside this
+      * callback.
+      *
+      * This excludes concurrent selection changes; it does not make writes to several independent local stores atomic. A callback failure
+      * can therefore leave an earlier projection write applied, and durable journaling/recovery remains required to close that
+      * partial-failure gap.
+      */
+    private[nakamoto] def runCanonicalEffectsIfCurrent[A](
+      expected: SelectedTip
+    )(
+      effects: StoredSnapshot => F[A]
+    ): F[CanonicalEffectsOutcome[A]]
 
     /** Get the current best chain tip */
     def bestTip: F[Option[StoredSnapshot]]
@@ -386,6 +446,7 @@ object NakamotoChainStore {
     bandDensityReorgEnabled: Boolean = false
   ): F[NakamotoChainStoreAlgebra[F]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("NakamotoChainStore")
+    val storeIdentity: AnyRef = new AnyRef
 
     for {
       stateRef <- Ref.of[F, ChainState](ChainState.empty)
@@ -399,7 +460,9 @@ object NakamotoChainStore {
       new NakamotoChainStoreAlgebra[F] {
 
         private def selectedFrom(state: ChainState): Option[SelectedTip] =
-          state.bestTipHash.flatMap(state.byHash.get).map(SelectedTip(_, state.branchRevision, state.lineageRevision))
+          state.bestTipHash
+            .flatMap(state.byHash.get)
+            .map(SelectedTip.bind(_, state.branchRevision, state.lineageRevision, storeIdentity))
 
         private def nextRevision(current: NonNegLong): NonNegLong =
           NonNegLong.unsafeFrom(Math.addExact(current.value, 1L))
@@ -420,7 +483,7 @@ object NakamotoChainStore {
             branchRevision = branchRevision,
             lineageRevision = lineageRevision
           )
-          (next, SelectedTip(stored, branchRevision, lineageRevision))
+          (next, SelectedTip.bind(stored, branchRevision, lineageRevision, storeIdentity))
         }
 
         def store(
@@ -435,13 +498,16 @@ object NakamotoChainStore {
             HasherSelector[F].withCurrent { implicit hasher =>
               signedSnapshot.toHashed[F].flatMap { hashed =>
                 val snapshotHash = hashed.hash
-                val stored = StoredSnapshot(signedSnapshot, context, ordinal, slot, parentHash, snapshotHash, vrfOutput)
+                // Convert caller-owned mutable bytes at the storage boundary. Fork choice must never observe a post-store mutation of the
+                // transport buffer that carried this VRF output.
+                val stored =
+                  StoredSnapshot(signedSnapshot, context, ordinal, slot, parentHash, snapshotHash, VrfOutput.fromBytes(vrfOutput))
                 val newTip = ChainTip(
                   snapshotHash,
                   Slot(NonNegLong.unsafeFrom(slot)),
                   ordinal,
                   parentHash,
-                  VrfOutput(Hex(vrfOutput.map("%02x".format(_)).mkString))
+                  stored.vrfOutput
                 )
                 val floorRef = if (bandDensityReorgEnabled) nakamotoSettledOrdinalRef else nakamotoFinalizedOrdinalRef
 
@@ -498,15 +564,14 @@ object NakamotoChainStore {
                                 val reconstructing = state.branchRevision.value.value > 0L
                                 val change = if (reconstructing) SelectionChange.Reconstructed else SelectionChange.Initialized
                                 Async[F].uncancelable { _ =>
-                                  persistHead(stored, snapshotHash) >>
-                                    Async[F].delay(select(state, newByHash, stored, lineageChanged = reconstructing)).flatMap {
-                                      case (next, selected) =>
-                                        logger.info(
-                                          if (reconstructing)
-                                            s"Chain reconstructed at ordinal=$ordinal slot=$slot hash=${snapshotHash.value.take(12)}"
-                                          else s"Chain initialized at ordinal=$ordinal slot=$slot"
-                                        ) >> stateRef.set(next).as(StoreOutcome.BecameSelected(selected, change))
-                                    }
+                                  Async[F].delay(select(state, newByHash, stored, lineageChanged = reconstructing)).flatMap {
+                                    case (next, selected) =>
+                                      logger.info(
+                                        if (reconstructing)
+                                          s"Chain reconstructed at ordinal=$ordinal slot=$slot hash=${snapshotHash.value.take(12)}"
+                                        else s"Chain initialized at ordinal=$ordinal slot=$slot"
+                                      ) >> stateRef.set(next).as(StoreOutcome.BecameSelected(selected, change))
+                                  }
                                 }
 
                               case Some(currentSelection) =>
@@ -517,39 +582,35 @@ object NakamotoChainStore {
                                   Slot(NonNegLong.unsafeFrom(currentBest.slot)),
                                   currentBest.ordinal,
                                   currentBest.parentHash,
-                                  VrfOutput(Hex(currentBest.vrfOutput.map("%02x".format(_)).mkString))
+                                  currentBest.vrfOutput
                                 )
 
                                 if (parentHash === currentBestHash)
                                   Async[F].uncancelable { _ =>
-                                    persistLinear(stored).flatMap { appended =>
-                                      val change = if (appended) SelectionChange.Extended else SelectionChange.Reconstructed
-                                      Async[F]
-                                        .delay(select(state, newByHash, stored, lineageChanged = !appended))
-                                        .flatMap {
-                                          case (next, selected) =>
-                                            logger.debug(s"Chain extended to ordinal=$ordinal slot=$slot") >>
-                                              stateRef.set(next).as(StoreOutcome.BecameSelected(selected, change))
-                                        }
+                                    Async[F].delay(select(state, newByHash, stored, lineageChanged = false)).flatMap {
+                                      case (next, selected) =>
+                                        logger.debug(s"Chain extended to ordinal=$ordinal slot=$slot") >>
+                                          stateRef
+                                            .set(next)
+                                            .as(StoreOutcome.BecameSelected(selected, SelectionChange.Extended))
                                     }
                                   }
                                 else
                                   chainSelection.shouldSwitch(currentTip, newTip).flatMap {
                                     case true =>
                                       Async[F].uncancelable { _ =>
-                                        persistHead(stored, snapshotHash) >>
-                                          Async[F].delay(select(state, newByHash, stored, lineageChanged = true)).flatMap {
-                                            case (next, selected) =>
-                                              logger.info(
-                                                s"Chain reorg: ordinal=$ordinal slot=$slot (parent=${parentHash.value.take(8)}) beats " +
-                                                  s"previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot} " +
-                                                  s"hash=${currentBestHash.value.take(8)}"
-                                              ) >> stateRef
-                                                .set(next)
-                                                .as(
-                                                  StoreOutcome.BecameSelected(selected, SelectionChange.Replaced)
-                                                )
-                                          }
+                                        Async[F].delay(select(state, newByHash, stored, lineageChanged = true)).flatMap {
+                                          case (next, selected) =>
+                                            logger.info(
+                                              s"Chain reorg: ordinal=$ordinal slot=$slot (parent=${parentHash.value.take(8)}) beats " +
+                                                s"previous tip ordinal=${currentBest.ordinal} slot=${currentBest.slot} " +
+                                                s"hash=${currentBestHash.value.take(8)}"
+                                            ) >> stateRef
+                                              .set(next)
+                                              .as(
+                                                StoreOutcome.BecameSelected(selected, SelectionChange.Replaced)
+                                              )
+                                        }
                                       }
                                     case false =>
                                       Async[F].uncancelable { _ =>
@@ -571,6 +632,31 @@ object NakamotoChainStore {
 
         def selectedTip: F[Option[SelectedTip]] =
           stateRef.get.map(selectedFrom)
+
+        private[nakamoto] def runCanonicalEffectsIfCurrent[A](
+          expected: SelectedTip
+        )(
+          effects: StoredSnapshot => F[A]
+        ): F[CanonicalEffectsOutcome[A]] =
+          mutationLock.permit.use { _ =>
+            stateRef.get.flatMap { state =>
+              val currentSelection = selectedFrom(state)
+              val selectionMatches = expected.belongsTo(storeIdentity) && currentSelection.exists { current =>
+                current.snapshot.hash === expected.snapshot.hash &&
+                current.branchRevision == expected.branchRevision &&
+                current.lineageRevision == expected.lineageRevision
+              }
+
+              if (!selectionMatches)
+                Async[F].pure(CanonicalEffectsOutcome.StaleSelection(currentSelection))
+              else {
+                val current = currentSelection.get
+                Async[F].uncancelable { _ =>
+                  effects(current.snapshot).map(CanonicalEffectsOutcome.Applied(current, _))
+                }
+              }
+            }
+          }
 
         def bestTip: F[Option[StoredSnapshot]] =
           stateRef.get.map(s => s.bestTipHash.flatMap(s.byHash.get))
@@ -638,7 +724,7 @@ object NakamotoChainStore {
                           val cert = signed.value.slotCertificate
                           val slot = cert.map(_.slot.value.value).getOrElse(0L)
                           val parentHash = signed.value.lastSnapshotHash
-                          val vrfBytes = cert.map(_.vrfOutput.value.toBytes).getOrElse(Array.empty[Byte])
+                          val immutableVrfOutput = cert.map(_.vrfOutput).getOrElse(VrfOutput.fromHex(""))
                           // Disk doesn't persist `GlobalSnapshotInfo`; the StoredSnapshot.context
                           // is left as the snapshot's `info` slice from the toGlobalSnapshotInfo
                           // path. For the chain-walk consumers wired by Path 1
@@ -663,7 +749,7 @@ object NakamotoChainStore {
                             slot = slot,
                             parentHash = parentHash,
                             hash = hash,
-                            vrfOutput = vrfBytes
+                            vrfOutput = immutableVrfOutput
                           )
                           Async[F].pure(Some(stored): Option[StoredSnapshot])
                         }
@@ -762,7 +848,7 @@ object NakamotoChainStore {
             missingHash: Hash,
             expectedOrdinal: Option[Long]
           ): VrfOutputRange = {
-            val outputs = collected.sortBy(_.ordinal).map(s => (s.ordinal, s.vrfOutput))
+            val outputs = collected.sortBy(_.ordinal).map(s => (s.ordinal, s.vrfOutput.toBytes))
             if (complete) VrfOutputRange.Complete(outputs)
             else VrfOutputRange.Incomplete(outputs, missingHash, expectedOrdinal)
           }
@@ -770,7 +856,7 @@ object NakamotoChainStore {
           def goImpl(current: StoredSnapshot, acc: List[StoredSnapshot]): F[VrfOutputRange] =
             if (current.ordinal < periodStart)
               Async[F].pure(result(complete = true, acc, current.hash, current.ordinal.some))
-            else if (current.ordinal < cutoff && current.vrfOutput.isEmpty)
+            else if (current.ordinal < cutoff && current.vrfOutput.value.value.isEmpty)
               // Every ordinal in [periodStart, cutoff) contributes rho. Treat a missing output as an
               // evidence gap even when the parent chain itself is intact (for example, historical
               // data imported without a slot certificate).
@@ -1117,24 +1203,9 @@ object NakamotoChainStore {
               slot = Slot(NonNegLong.unsafeFrom(stored.slot)),
               ordinal = stored.ordinal,
               parentHash = stored.parentHash,
-              vrfOutput = VrfOutput(Hex(stored.vrfOutput.map("%02x".format(_)).mkString))
+              vrfOutput = stored.vrfOutput
             )
           })
-
-        /** Persist to underlying storage by extending the linear chain */
-        private def persistLinear(stored: StoredSnapshot)(implicit hasher: Hasher[F]): F[Boolean] =
-          underlyingStorage.prepend(stored.signedSnapshot, stored.context).flatMap {
-            case true  => logger.debug(s"💾 Prepended ordinal=${stored.ordinal} to linear storage").as(true)
-            case false =>
-              // prepend failed (parent mismatch) — fall back to setHead
-              logger.warn(s"⚠️ prepend failed for ordinal=${stored.ordinal}, setting head for reorg") >>
-                underlyingStorage.setHeadForRecovery(stored.signedSnapshot, stored.context).as(false)
-          }
-
-        /** Persist during reorg — always uses setHead since we're switching chains */
-        private def persistHead(stored: StoredSnapshot, hash: Hash)(implicit hasher: Hasher[F]): F[Unit] =
-          underlyingStorage.setHeadForRecovery(stored.signedSnapshot, stored.context) >>
-            logger.debug(s"💾 Set head to ordinal=${stored.ordinal} hash=${hash.value.take(8)}")
 
         def divergentRefuseCount: F[Long] =
           divergentRefuseCounterRef.get
