@@ -2,6 +2,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.Semaphore
+import cats.effect.syntax.all._
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -9,14 +10,18 @@ import scala.concurrent.duration._
 import io.constellationnetwork.node.shared.domain.nakamoto.TipTracker
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics._
 
 import eu.timepit.refined.auto._
 import fs2.Stream
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-/** Re-bootstrap orchestrator (P-11, task #141). The full node-level recovery path for the divergent-self-finalize lock-out documented in
+/** Transitional re-bootstrap reset trigger (P-11, task #141) for the divergent-self-finalize lock-out documented in
   * `project_117_path_b_fork_recovery_deadlock`.
+  *
+  * This is not the target recovery protocol. A refuse counter is not objective fork-choice evidence, and this reset does not atomically
+  * reconstruct durable selection/finality state or quarantine every follower-serving projection. Target recovery authenticates and
+  * objectively selects an exact tine, journals abandonment, reconstructs from verified history, and remains fail-stopped until every
+  * canonical consumer is reconciled. Keep those gaps visible when this legacy switch is enabled.
   *
   * ==The bug==
   *
@@ -39,9 +44,9 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * observation window, the node has clearly been locked out (a single random peer-replay would generate at most one increment; sustained
   * sustained increments imply many peers all delivering canonical that we keep refusing).
   *
-  * No fancy peer-ChainSync-probe is needed: the refuse-counter is a precise, conservative signal because the safety gate fires ONLY on
-  * different-hash writes at-or-below finalized. There is no false-positive scenario for the gate itself; the only ambiguity is whether one
-  * such refuse means "transient peer flake" or "this node is stuck". Requiring K sustained refuses crosses that threshold cleanly.
+  * The counter proves only that replay-valid conflicting input reached this node below its local floor. Repeated delivery or equivocation
+  * can increase it without proving that the local tine lost objective fork choice. The threshold is therefore a transitional operational
+  * heuristic, not portable consensus evidence.
   *
   * ==Reset sequence==
   *
@@ -53,9 +58,10 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * replay before it can re-enter the chain store. Production resumes once the divergent-refuse counter stays at 0 across the cooldown
   * window (`RebootstrapCooldown`) — preventing flap if the bug recurs immediately.
   *
-  * NOTE: the orchestrator does NOT itself touch `lastGlobalSnapshotStorage`, `snapshotStorage`, or the `MptStore` base. Follow-on recovery
-  * must fetch ancestry and pass each transition through `NakamotoSyncDaemon.handleSnapshot`'s normal global replay path. A delivered peer
-  * tip or self-consistent root is not authority to rewrite those stores.
+  * NOTE: the orchestrator does NOT itself touch `lastGlobalSnapshotStorage`, `snapshotStorage`, the `MptStore` base, or every served
+  * finalized projection. Follow-on recovery must fetch ancestry and pass each transition through `NakamotoSyncDaemon.handleSnapshot`'s
+  * normal global replay path. A delivered peer tip or self-consistent root is not authority to rewrite those stores. Until the durable
+  * recovery coordinator owns all of them, this mechanism is containment rather than complete recovery.
   *
   * ==Enablement (currently ON; target OFF once density-past-k₁ (S3) lands + is e2e-validated)==
   *
@@ -168,7 +174,8 @@ object RebootstrapOrchestrator {
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     tipTracker: TipTracker[F],
     mptOverlay: MptOverlay[F, io.constellationnetwork.schema.mpt.GlobalStateKey],
-    productionGate: io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate[F]
+    productionGate: io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate[F],
+    snapshotSemaphore: Semaphore[F]
   ): Stream[F, Unit] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("RebootstrapOrchestrator")
 
@@ -227,6 +234,7 @@ object RebootstrapOrchestrator {
                           tipTracker,
                           mptOverlay,
                           productionGate,
+                          snapshotSemaphore,
                           refuseCount,
                           sample,
                           now,
@@ -260,6 +268,7 @@ object RebootstrapOrchestrator {
     tipTracker: TipTracker[F],
     mptOverlay: MptOverlay[F, io.constellationnetwork.schema.mpt.GlobalStateKey],
     productionGate: io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate[F],
+    snapshotSemaphore: Semaphore[F],
     refuseCount: Long,
     sample: Option[(Long, io.constellationnetwork.security.hash.Hash)],
     nowMs: Long,
@@ -274,17 +283,51 @@ object RebootstrapOrchestrator {
           s"(sample: $sampleStr) — triggering RE-BOOTSTRAP"
       )
       _ <- Metrics[F].incrementCounter("dag_nakamoto_rebootstrap_initiated_total")
-      _ <- productionGate.pause(RebootstrapInProgress)
-      _ <- logger.info(s"RE-BOOTSTRAP started ($sampleStr)")
-      _ <- tipTracker.unsafe_reset
-      _ <- mptOverlay.unsafe_reset
-      _ <- chainStore.unsafe_clearFinality
-      _ <- stateRef.update(s => s.copy(lastResetAtMs = Some(nowMs), totalResets = s.totalResets + 1L))
-      _ <- logger.info(
-        s"RE-BOOTSTRAP complete — chain store + tipTracker + overlay reset; awaiting canonical " +
-          s"chain re-seed via gossip/ChainSync. Production gate will reopen after this method returns."
-      )
-      _ <- productionGate.resume(RebootstrapInProgress)
+      _ <- withPausedSnapshotSemaphore(
+        snapshotSemaphore,
+        productionGate,
+        logger.error(
+          "RE-BOOTSTRAP canceled while waiting for snapshot semaphore; production remains paused for operator/recovery intervention"
+        )
+      ) {
+        logger.info(s"RE-BOOTSTRAP started ($sampleStr)") >>
+          tipTracker.unsafe_reset >>
+          mptOverlay.unsafe_reset >>
+          chainStore.unsafe_clearFinality >>
+          stateRef.update(s => s.copy(lastResetAtMs = Some(nowMs), totalResets = s.totalResets + 1L)) >>
+          logger.info(
+            s"RE-BOOTSTRAP complete — chain store + tipTracker + overlay reset; awaiting canonical " +
+              s"chain re-seed via gossip/ChainSync. Production gate will reopen after this method returns."
+          )
+      }
     } yield ()
   }
+
+  /** Pause production, wait for the shared snapshot mutation barrier, and run one reset atomically with respect to production, gossip
+    * adoption, and finality effects.
+    *
+    * Cancellation while waiting for the semaphore is allowed, but deliberately leaves production paused. Once the permit is acquired, reset
+    * and the success path are uncancelable. A reset failure deliberately retains the permit and leaves production paused: the producer,
+    * gossip adopter, and finalizer must all fail-stop after a partial reset until operator recovery or process restart.
+    *
+    * Lock order is load-bearing: shared `snapshotSemaphore` first, then the component-internal locks acquired by `reset`.
+    */
+  private[nakamoto] def withPausedSnapshotSemaphore[F[_]: Async](
+    snapshotSemaphore: Semaphore[F],
+    productionGate: io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate[F],
+    onAcquireCanceled: F[Unit]
+  )(reset: F[Unit]): F[Unit] =
+    Async[F].uncancelable { poll =>
+      productionGate.pause(RebootstrapInProgress) >>
+        poll(snapshotSemaphore.acquire)
+          .onCancel(onAcquireCanceled)
+          .flatMap { _ =>
+            reset.attempt.flatMap {
+              case Right(_)    => snapshotSemaphore.release >> productionGate.resume(RebootstrapInProgress)
+              case Left(error) =>
+                // Intentional permit retention. `ProductionGate` alone does not stop gossip adoption.
+                Async[F].raiseError[Unit](error)
+            }
+          }
+    }
 }

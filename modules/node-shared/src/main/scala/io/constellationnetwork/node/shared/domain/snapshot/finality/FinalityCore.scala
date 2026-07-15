@@ -27,6 +27,13 @@ final case class HeadRevision(value: NonNegLong)
   */
 final case class CanonicalBranchRevision(value: NonNegLong)
 
+/** Local canonical-lineage generation.
+  *
+  * Unlike [[CanonicalBranchRevision]], a pure descendant extension does not advance this value. Rollback, replacement, reconstruction, or
+  * clearing does. It is a local crash-consistent CAS input in the target design, not transported consensus evidence.
+  */
+final case class CanonicalLineageRevision(value: NonNegLong)
+
 /** Domain-separated hash of the canonical [[IntentScope]] bytes.
   *
   * The scope contains only unscoped immutable commitments. Artifacts may therefore bind this identifier without making its preimage

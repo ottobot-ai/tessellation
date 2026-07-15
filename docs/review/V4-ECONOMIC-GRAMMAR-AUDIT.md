@@ -9,10 +9,11 @@ no-reference `SpendTransaction`, and operations that the current E2 grammar
 collapses or omits.
 
 This document is not a protocol specification, owner decision, implementation
-claim, or production-readiness finding. It does not resolve
-`CONSENSUS-OWNER-DECISIONS.md` O-06, O-07, or O-09. It records source evidence
-that E2.1/E2.9 and their RED/oracle suites must cover before an operation is
-enabled.
+claim, or production-readiness finding. O-06, O-07, and O-09 are owner-ratified
+in `CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; this source audit neither supersedes
+those directions nor closes their remaining engineering grammar/schema gates.
+It records source evidence that E2.1/E2.9 and their RED/oracle suites must cover
+before an operation is enabled.
 
 ## 1. Verified baseline and limits
 
@@ -261,7 +262,7 @@ replay, source/sink, or state transition differs.
 | Token-lock create, replacement, expiry, manual unlock | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/tokenLock.scala:82-93`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:35-41` | Signed creation/replacement, deterministic expiry, and owner-triggered early release have different authority and backing effects. |
 | Distinct fee lanes | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/transaction.scala:43-49`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/swap.scala:43-49`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/tokenLock.scala:56`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/delegatedStake.scala:53`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:40`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/currency/dataApplication/package.scala:102-119`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/currency/schema/currency.scala:166-174` | Signer, destination, binding, replay key, debit time, and source/sink differ. |
 | `PricingUpdate` | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:48-56`; validation at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/priceOracle/PricingUpdateValidator.scala:39-110`; application at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala:1051-1055` | This is an existing named v4 operation affecting consensus price state. Its allowed-source and frequency policy must be explicit; do not invent a differently named authority. |
-| Protocol balance correction | V4 `BalanceAdjustment` at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:58-72`; v4 application at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/CurrencySnapshotAcceptanceManager.scala:490-515` | Preserve the capability, not the upward ML0 authority. The target is a separately typed, root-covered GL0 protocol correction under locked decision L-18 and open gate O-06. |
+| Protocol balance correction | V4 `BalanceAdjustment` at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:58-72`; v4 application at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/CurrencySnapshotAcceptanceManager.scala:490-515` | Preserve the capability, not the upward ML0 authority. The target is a separately typed, root-covered GL0 protocol correction under locked decision L-18 and O-06's deferred engineering schema gate; no owner answer remains pending. |
 | Node parameter update | `v4.0.0@22953a1e:modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotEvent.scala:33-34`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/node.scala:162-181` | Changes reward fraction and requires source, reference, replay, and activation rules. |
 | Delegated stake create/withdraw | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/delegatedStake.scala:80-100` | Backing lock, amount, fee, replacement, withdrawal delay, and reward payout cannot be one generic `stake` rule. |
 | Node collateral create/withdraw | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:67-87` | Backing and eligibility lifecycle differ from delegated stake. |
@@ -307,19 +308,21 @@ the final root.
 
 ## 7. Residual unknowns
 
-1. O-07 remains open: this packet is not a mechanically exhaustive inventory of
-   every v4 economic constructor, configuration-driven issuance path, migration
-   repair, or route. Freeze requires an automated ADT/codec/event/acceptance
-   reachability inventory and human classification.
+1. O-07's direction is owner-ratified, but its engineering grammar gate remains
+   open: this packet is not a mechanically exhaustive inventory of every v4
+   economic constructor, configuration-driven issuance path, migration repair,
+   or route. Freeze requires an automated ADT/codec/event/acceptance reachability
+   inventory and human classification.
 2. The canonical ML0 operator registry, threshold, rotation, and emergency
    replacement policy for metagraph-source authority is not frozen here.
-3. O-06 remains open: the permissionless authorization and activation mechanism
-   for a GL0 protocol correction is unresolved. Metagraph-originated authority
-   is excluded by locked decision L-18.
+3. O-06's direction is owner-ratified, but its engineering schema and activation
+   mechanism for a GL0 protocol correction remain unresolved.
+   Metagraph-originated authority is excluded by locked decision L-18.
 4. `PricingUpdate` exists and mutates v4 consensus state, but this packet does
-   not ratify whether it ships unchanged or its exact allowed-source policy.
-5. O-09 remains open for a pure opaque/data-only lane. This does not affect the
-   locked `FrameworkCurrency` and `FrameworkCurrencyWithData` lanes.
+   not establish whether it ships unchanged or its exact allowed-source policy.
+5. O-09's pure opaque/data-only lane remains an engineering/schema gate. This
+   does not affect the locked `FrameworkCurrency` and
+   `FrameworkCurrencyWithData` lanes.
 6. No runtime, differential, cross-JVM, or adversarial test was run for this
    source-only packet.
 

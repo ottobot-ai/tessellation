@@ -5,7 +5,6 @@ import cats.effect.IO
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
-import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
@@ -179,7 +178,8 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSourceSuite extends Simpl
       slot: Long,
       parentHash: Hash,
       vrfOutput: Array[Byte]
-    ): IO[Boolean] = unexpected("store")
+    ): IO[NakamotoChainStore.StoreOutcome] = unexpected("store")
+    def selectedTip: IO[Option[NakamotoChainStore.SelectedTip]] = unexpected("selectedTip")
     def bestTip: IO[Option[NakamotoChainStore.StoredSnapshot]] = unexpected("bestTip")
     def bestTipSlot: IO[Option[Long]] = unexpected("bestTipSlot")
     def bestTipOrdinal: IO[Option[Long]] = unexpected("bestTipOrdinal")
@@ -195,7 +195,10 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSourceSuite extends Simpl
       etaRotationSnapshots: Long,
       fromHash: Hash
     ): IO[NakamotoChainStore.VrfOutputRange] = unexpected("vrfOutputRangeForPeriodFrom")
-    def finalize(hash: Hash, ordinal: Long): IO[Unit] = unexpected("finalize")
+    def finalizeSelectedAt(
+      expected: NakamotoChainStore.SelectedTip,
+      targetOrdinal: Long
+    ): IO[NakamotoChainStore.FinalizeOutcome] = unexpected("finalizeSelectedAt")
     def walkBackTo(startHash: Hash, targetOrdinal: Long): IO[Option[Hash]] = unexpected("walkBackTo")
     def walkBackExact(
       start: NakamotoChainStore.ExactWalkPosition,
@@ -204,7 +207,6 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSourceSuite extends Simpl
     ): IO[Either[NakamotoChainStore.ExactWalkError, NakamotoChainStore.ExactWalkResult]] = unexpected("walkBackExact")
     def getByOrdinal(ordinal: Long): IO[Option[NakamotoChainStore.StoredSnapshot]] = unexpected("getByOrdinal")
     def size: IO[Int] = unexpected("size")
-    def tree: ParentChildTree[IO] = throw new AssertionError("historical registry view source called forbidden chain-store method: tree")
     def tipFor(hash: Hash): IO[Option[ChainTip]] = unexpected("tipFor")
     def divergentRefuseCount: IO[Long] = unexpected("divergentRefuseCount")
     def divergentRefuseSample: IO[Option[(Long, Hash)]] = unexpected("divergentRefuseSample")

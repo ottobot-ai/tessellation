@@ -1540,8 +1540,7 @@ object NakamotoSyncDaemon {
       replayCommitted <- commitReplayValidated(validationResult) { valid =>
         for {
           validHash <- HasherSelector[F].withCurrent(implicit h => valid.snapshot.toHashed[F].map(_.hash))
-          _ <- SnapshotKesStorage.put[F](dataDir, validHash, snap.kesSignature.toByteArray)
-          isNew <- chainStore.store(
+          storeOutcome <- chainStore.store(
             valid.snapshot,
             valid.context,
             snap.ordinal,
@@ -1549,71 +1548,97 @@ object NakamotoSyncDaemon {
             parentHash,
             vrf.vrfProofToHash(snap.vrfProof.toByteArray).getOrElse(snap.vrfProof.toByteArray)
           )
-          bestTipOpt <- chainStore.bestTip
-          becameBest = isNew && bestTipOpt.exists(_.hash === validHash)
-          _ <- Async[F].whenA(isNew && !becameBest) {
-            logger.info(
-              s"🔀 Stored Nakamoto snapshot at ordinal=${snap.ordinal} as fork branch (not bestTip) — overlay isolates pending branches from canonical."
+          storeAccepted = storeOutcome match {
+            case _: NakamotoChainStore.StoreOutcome.Rejected => false
+            case _                                           => true
+          }
+          becameBest = storeOutcome match {
+            case _: NakamotoChainStore.StoreOutcome.BecameSelected => true
+            case _                                                 => false
+          }
+          _ <- Async[F].whenA(storeAccepted) {
+            SnapshotKesStorage.put[F](dataDir, validHash, snap.kesSignature.toByteArray)
+          }
+          _ <- storeOutcome match {
+            case _: NakamotoChainStore.StoreOutcome.StoredAlternate =>
+              logger.info(
+                s"Stored Nakamoto snapshot at ordinal=${snap.ordinal} as an alternate branch; no canonical effects are authorized"
+              )
+            case NakamotoChainStore.StoreOutcome.Rejected(reason, _) =>
+              // Full replay stages the candidate under its canonical hash before the
+              // chain store applies the finality floor. A store rejection means that hash
+              // is neither retained ancestry nor an eligible alternate, so its staged
+              // economic state and serve data must be removed symmetrically.
+              mptOverlay.discardBranch(
+                io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(validHash)
+              ) >>
+                pendingAccumulatorsRef.update(_ - validHash) >>
+                pendingPostBytesRef.update(_ - validHash) >>
+                logger.warn(s"Rejected replay-valid Nakamoto snapshot at ordinal=${snap.ordinal}: $reason")
+            case _ => Async[F].unit
+          }
+          _ <- Async[F].whenA(storeAccepted) {
+            processValidSnapshot(
+              snap,
+              valid.snapshot.some,
+              valid.context.some,
+              becameBest,
+              stateRef,
+              chainStore,
+              nodeStorage,
+              lastKnownSlotRef,
+              snapshotStorage,
+              lastGlobalSnapshotStorage,
+              lastNGlobalSnapshotStorage,
+              productionGate,
+              eventMempool,
+              logger
             )
           }
-          _ <- processValidSnapshot(
-            snap,
-            valid.snapshot.some,
-            valid.context.some,
-            becameBest,
-            stateRef,
-            chainStore,
-            nodeStorage,
-            lastKnownSlotRef,
-            snapshotStorage,
-            lastGlobalSnapshotStorage,
-            lastNGlobalSnapshotStorage,
-            productionGate,
-            eventMempool,
-            logger
-          )
-          // A replay-valid snapshot has passed the same store/processing boundary as live gossip. Re-enter every waiting child through
-          // `handleSnapshot`; a rejected child cannot invoke this drain for its own descendants.
+          // Only a stored or duplicate replay-valid parent may release waiting children. A rejected
+          // candidate is not ancestry merely because its transition replayed.
           storedHash = Hash(new String(snap.hash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-          _ <- drainPendingChildren(
-            storedHash,
-            stateRef,
-            pendingParentRef,
-            chainStore,
-            nodeStorage,
-            tipTracker,
-            stakeRegistry,
-            operatorKeyRegistry,
-            sidecarClient,
-            selfId,
-            keyPair,
-            lddConfig,
-            eligibilityChecker,
-            lastKnownSlotRef,
-            epochStateRef,
-            etaRotationSnapshots,
-            confirmationDepthK,
-            consensusFns,
-            snapshotStorage,
-            lastGlobalSnapshotStorage,
-            lastNGlobalSnapshotStorage,
-            productionGate,
-            mptStore,
-            mptOverlay,
-            pendingAccumulatorsRef,
-            pendingPostBytesRef,
-            eventMempool,
-            chainSyncManager,
-            channel,
-            dataDir,
-            operationalKeyMaker,
-            shardProducers,
-            shardChainStores,
-            shardBinaryBuffers,
-            shardAssignment,
-            shardCommitteeMembership,
-            logger
-          )
+          _ <- Async[F].whenA(storeAccepted) {
+            drainPendingChildren(
+              storedHash,
+              stateRef,
+              pendingParentRef,
+              chainStore,
+              nodeStorage,
+              tipTracker,
+              stakeRegistry,
+              operatorKeyRegistry,
+              sidecarClient,
+              selfId,
+              keyPair,
+              lddConfig,
+              eligibilityChecker,
+              lastKnownSlotRef,
+              epochStateRef,
+              etaRotationSnapshots,
+              confirmationDepthK,
+              consensusFns,
+              snapshotStorage,
+              lastGlobalSnapshotStorage,
+              lastNGlobalSnapshotStorage,
+              productionGate,
+              mptStore,
+              mptOverlay,
+              pendingAccumulatorsRef,
+              pendingPostBytesRef,
+              eventMempool,
+              chainSyncManager,
+              channel,
+              dataDir,
+              operationalKeyMaker,
+              shardProducers,
+              shardChainStores,
+              shardBinaryBuffers,
+              shardAssignment,
+              shardCommitteeMembership,
+              logger
+            )
+          }
         } yield ()
       }
       _ <- Async[F].unlessA(replayCommitted) {
@@ -1646,8 +1671,8 @@ object NakamotoSyncDaemon {
     *
     *   - `signedSnapshot`/`context` are `None` for VRF-only payloads (no body to thread through canonical state).
     *   - `becameBestTip` gates the canonical storage updates (snapshotStorage / last*Snapshot / lastKnownSlot). When false, the snapshot
-    *     was stored as a fork branch (or duplicate) in chainStore and MPT was rolled back; we still update tip-tracking, attestation, and
-    *     ready-transition.
+    *     was stored as a fork branch (or duplicate) in chainStore and MPT was rolled back. Such a snapshot may advance observed network-tip
+    *     telemetry, but it cannot advance canonical storage or the node's readiness state.
     */
   private def processValidSnapshot[F[_]: Async: HasherSelector: Metrics](
     snap: pb.Snapshot,
@@ -1716,7 +1741,7 @@ object NakamotoSyncDaemon {
       // Check if we should transition to Ready
       state <- stateRef.get
       nodeState <- nodeStorage.getNodeState
-      _ <- Async[F].whenA(!state.isReady && nodeState =!= NodeState.Ready) {
+      _ <- Async[F].whenA(becameBestTip && !state.isReady && nodeState =!= NodeState.Ready) {
         val caughtUp = state.networkTipOrdinal - snap.ordinal <= CatchUpThreshold
         Async[F].whenA(caughtUp) {
           logger.info(s"Caught up (local=${snap.ordinal}, network=${state.networkTipOrdinal}). → Ready.") >>

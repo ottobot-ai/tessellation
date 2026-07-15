@@ -49,7 +49,7 @@ committee, members are deterministically hash-ordered for the next shard ordinal
 One member owns each staircase duty window, then duty moves to the next rank and
 wraps. The exact duty length and genesis multiplier are canonical parameters.
 
-Current source parameters, pending final security ratification:
+Current source parameters, pending derivation, protocol freeze, and security proof:
 
 | Mechanism | Current cadence/rule |
 |---|---|

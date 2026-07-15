@@ -6,14 +6,17 @@
 > votes, locks, QCs, or view changes. Every decided attestation must name an
 > authenticated snapshot the signer has locally executed. Phase 2 remains
 > maxvalid-bg density-reorgable; `k2` is retention/recovery capacity, not a later
-> finality phase or floor. The exact decision of whether a
-> local beta result directly advances Phase 2 or still feeds `T_weight` is open
-> in `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` section 14.
+> finality phase or floor. The owner-ratified composition is
+> `T_optimistic = decided-attestation T_weight` and
+> `P2 = T_optimistic OR T_depth1`; a local beta result does not directly advance
+> Phase 2 and `T_count` is subsumed.
 
 **Status:** historical research proposal and active evidence input, not a protocol
 decision. Its old “locked/settled” labels are superseded by
-`../review/CONSENSUS-OWNER-DECISIONS.md`; D-01 through D-03 control. Implementation
-is not complete. Written 2026-05-15. Revised 2026-05-15 to fold in then-current
+`../review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; O-01 records the ratified
+direction and provisional calibration, while implementation parity, parameters,
+and proof remain activation gates. Implementation is not complete. Written
+2026-05-15. Revised 2026-05-15 to fold in then-current
 decisions and the quick-sweep sim recommendation from
 [`~/repos/research-nipopos-2026` commit `15983f1a`](#). Revised again
 2026-05-15 to flip cascade semantics from **Snowflake → Snowball** (per-color
@@ -42,9 +45,11 @@ subsampling decision protocol** that converges on a single hash per
 validator per ordinal *before* emitting attestation. Once decided, no
 re-emit. It kept the receiver aggregation policy (TipTracker newer-wins,
 T_weight / T_count / T_depth1 / T_depth2 triggers, canonical-hash filter)
-unchanged. That is no longer settled: the active design must choose whether local
-beta directly advances P2 or feeds a fixed-registry T_weight trigger, and must
-prove its interaction with density replacement and current-canonical evidence.
+unchanged. That historical composition is superseded: the active design feeds
+portable decided attestations into fixed-historical-registry `T_weight`, with
+`T_depth1` as the independent fallback and no `T_count` rail. Its interaction
+with density replacement and current-canonical evidence still requires an
+implementation and proof.
 
 Cross-references:
 - [`docs/nakamoto/attestation-and-finality.md`](./attestation-and-finality.md)

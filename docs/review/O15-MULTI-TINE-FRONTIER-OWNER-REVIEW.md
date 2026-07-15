@@ -211,7 +211,8 @@ winner or refusal.
 ### 4.6 The current portable type is only an opaque placeholder
 
 `ForkChoiceDecision` contains only one immutable artifact pointer and explicitly
-leaves its evidence opaque until O-15 is closed
+leaves its evidence opaque until the exact O-15 selector, cutoff, metric, tie,
+evidence, and independent-verifier research gates close
 (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalityCore.scala:120-138`).
 Its codec merely serializes that pointer
 (`FinalityBaseCodecs.scala:96-119,178-179`). The validator checks pointer kind,
@@ -421,7 +422,8 @@ Until all nine are closed, the activation verdict is:
 ## 10. Relationship to other freeze gates
 
 - O-01 defines Avalanche/Snowball population and parameters after fork choice has
-  selected an exact valid hash. It cannot resolve O-15.
+  selected an exact valid hash. It cannot close O-15's selector, evidence, or
+  proof gates.
 - O-02 defines authenticated recovery when the true MRCA predates local retained
   state. Recovery obtains the inputs O-15 needs; it cannot choose the winner.
 - O-16 defines how a downstream consumer holds and rechecks authority to one exact

@@ -42,6 +42,11 @@
 > conflicting older text is not an implementation instruction. The historical
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
+>
+> **Owner-decision status:** `O-01` through `O-17` are `17/17`
+> dispositioned in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. Open
+> O-item work below is an engineering, research, schema, parameter, or proof
+> gate under a ratified direction, not a request for another owner answer.
 
 ---
 
@@ -913,10 +918,11 @@ be the independent closer.
   periodic best-tip signing, and the cumulative-weight finalization sink are
   removed. The current tree has no local GL0 optimistic emitter; verified remote
   attestations are telemetry only, and canonical `k1` depth is the sole live
-  state-changing GL0 snapshot Phase-2 rail. Still open: opaque replay and
-  exact-tip preference capabilities, typed atomic store outcomes/revisions,
-  durable publication journal and lineage CAS, and the real sampled exact-hash
-  Snowball rail.
+  state-changing GL0 snapshot Phase-2 rail. Typed store outcomes, internal
+  mutation serialization, in-memory branch/lineage revisions, and exact
+  selected-tip finalization CAS have landed. Still open: authenticated opaque
+  replay and exact-tip preference capabilities, durable revisions and
+  publication/effect journals, and the real sampled exact-hash Snowball rail.
 
 ---
 

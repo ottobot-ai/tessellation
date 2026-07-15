@@ -31,11 +31,11 @@ is retention/recovery policy only; neither can activate tower publication.
   availability, and exact-parent roster/key-pair resolution remain `ECO-02`/`CONS-03`/`CONS-05`/`CONS-06` gates. Execution-shard membership
   is a separate uniform public draw, not this stake-weighted leader rule.
 - ⚠ Period-zero KES+VRF verification is load-bearing, but runtime registration activation, historical pair selection, secret provisioning/
-  deletion, and reorg/rejoin behavior remain open under `CONS-06`/O-12. NIPoPoW activation cannot treat period-zero verification as a
-  complete end-to-end runtime-key prerequisite.
+  deletion, and implementation of O-12's ratified reorg/rejoin direction remain open under `CONS-06`. NIPoPoW activation cannot treat
+  period-zero verification as a complete end-to-end runtime-key prerequisite.
 - ⚠ Legacy trigger/telemetry scaffold (`b65` series) exists, but it is not the target finality stack. `T_count` is non-authoritative and
   must be removed/subsumed; `T_depth2` is local retention telemetry only. Target Phase 2 remains decided-attestation `T_weight` OR canonical
-  `k1` depth, and the current optimistic accumulator still requires O-01 qualification.
+  `k1` depth, and the current optimistic accumulator still requires O-01's implementation, parameter, and proof gates.
 
 ---
 

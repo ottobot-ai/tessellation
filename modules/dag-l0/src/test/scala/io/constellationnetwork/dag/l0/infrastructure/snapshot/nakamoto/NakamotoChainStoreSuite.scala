@@ -139,7 +139,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       // ChainSelection wants a fetchParent — for our P-11 surface tests we never trigger fork
       // selection, so a None-returning stub suffices.
       chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
-      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, tipTracker, finalizedRef, settledRef, keepDepthBehindFinalized)
+      chainStore <- NakamotoChainStore.make[IO](stubStorage, chainSelection, finalizedRef, settledRef, keepDepthBehindFinalized)
     } yield (chainStore, finalizedRef, tipTracker, stakeRegistry)
 
   /** Track-3 S1.5 "marker split": exposes BOTH the k₁ finalized ref AND the DISTINCT k₂ settled ref so tests can drive them independently
@@ -171,7 +171,6 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       chainStore <- NakamotoChainStore.make[IO](
         stubStorage,
         chainSelection,
-        tipTracker,
         finalizedRef,
         settledRef,
         keepDepthBehindFinalized,
@@ -205,7 +204,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       diskByHashRef <- Ref.of[IO, Map[Hash, Signed[GlobalIncrementalSnapshot]]](Map.empty)
       storage = diskBackedStorage(diskRef, diskByHashRef)
       chainSelection = ChainSelection.make[IO](tipTracker, _ => IO.pure(None))
-      chainStore <- NakamotoChainStore.make[IO](storage, chainSelection, tipTracker, finalizedRef, settledRef, keepDepthBehindFinalized)
+      chainStore <- NakamotoChainStore.make[IO](storage, chainSelection, finalizedRef, settledRef, keepDepthBehindFinalized)
     } yield (chainStore, finalizedRef, diskRef, diskByHashRef)
 
   private def pid(name: String): PeerId =
@@ -361,7 +360,6 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       chainStore <- NakamotoChainStore.make[IO](
         stubStorage,
         chainSelection,
-        tipTracker,
         finalizedRef,
         settledRef,
         NakamotoChainStore.DefaultKeepDepthBehindFinalized,
@@ -423,6 +421,32 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       }
       .map(_._1)
 
+  private def currentSelection(
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[IO]
+  ): IO[NakamotoChainStore.SelectedTip] =
+    chainStore.selectedTip.flatMap(_.liftTo[IO](new IllegalStateException("missing selected chain tip")))
+
+  private def finalizeCurrentSelection(
+    chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[IO],
+    targetOrdinal: Long
+  ): IO[NakamotoChainStore.FinalizeOutcome] =
+    currentSelection(chainStore).flatMap(chainStore.finalizeSelectedAt(_, targetOrdinal))
+
+  private def finalizedExactly(
+    outcome: NakamotoChainStore.FinalizeOutcome,
+    targetHash: Hash,
+    targetOrdinal: Long,
+    previousOrdinal: Long
+  ): Boolean =
+    outcome match {
+      case NakamotoChainStore.FinalizeOutcome.Finalized(target, selected, previous, _) =>
+        target.hash == targetHash &&
+        target.ordinal == targetOrdinal &&
+        selected.snapshot.ordinal >= targetOrdinal &&
+        previous == previousOrdinal
+      case _ => false
+    }
+
   test("RTA-RED-019: canonical k1 depth finalizes the exact tip-minus-k1 hash without attestations") { res =>
     val (_, _, j, h, sp) = res
     implicit val jSer: JsonSerializer[IO] = j
@@ -446,7 +470,8 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
           Array.emptyByteArray
         )
       }
-      best <- chainStore.bestTip.flatMap(_.liftTo[IO](new IllegalStateException("missing canonical tip")))
+      selected <- currentSelection(chainStore)
+      best = selected.snapshot
       trigger <- TDepth1Trigger.make[IO](k1)
       qualifying <- trigger.evaluate(
         FinalityTrigger.ConsensusState[IO](
@@ -459,19 +484,259 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       exactHash <- chainStore
         .walkBackTo(best.hash, qualifying.value.value)
         .flatMap(_.liftTo[IO](new IllegalStateException("missing exact depth target")))
-      exactStored <- chainStore.get(exactHash).flatMap(_.liftTo[IO](new IllegalStateException("missing stored depth target")))
-      _ <- tipTracker.markFinalized(exactHash, Slot(NonNegLong.unsafeFrom(exactStored.slot)))
-      _ <- chainStore.finalize(exactHash, qualifying.value.value)
-      finalized <- chainStore.lastFinalizedOrdinal
+      finalizedOutcome <- chainStore.finalizeSelectedAt(selected, qualifying.value.value)
+      finalized <- finalizedOutcome match {
+        case result: NakamotoChainStore.FinalizeOutcome.Finalized => IO.pure(result)
+        case other => IO.raiseError(new IllegalStateException(s"depth finalization failed: $other"))
+      }
+      _ <- tipTracker.markFinalized(finalized.target.hash, Slot(NonNegLong.unsafeFrom(finalized.target.slot)))
+      finalizedOrdinal <- chainStore.lastFinalizedOrdinal
       attestations <- tipTracker.allAttestations
     } yield
       expect.all(
         best.ordinal == 5L,
         qualifying == SnapshotOrdinal.unsafeApply(3L),
         exactHash == chain(2).hash,
-        finalized == 3L,
+        finalized.target.hash == exactHash,
+        finalized.target.ordinal == qualifying.value.value,
+        finalized.selected == selected,
+        finalized.previousOrdinal == 0L,
+        finalizedOrdinal == 3L,
         attestations.isEmpty
       )
+  }
+
+  test("typed store outcomes preserve exact selection revisions across duplicate and extension") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 2)
+      first = chain.head
+      second = chain.last
+      initialized <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      duplicate <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      extended <- chainStore.store(second.signed, second.context, 2L, 2L, first.hash, Array.emptyByteArray)
+      current <- currentSelection(chainStore)
+    } yield {
+      val exactInitialized = initialized match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(selected, NakamotoChainStore.SelectionChange.Initialized) =>
+          selected.snapshot.hash == first.hash &&
+          selected.branchRevision.value.value == 1L &&
+          selected.lineageRevision.value.value == 0L
+        case _ => false
+      }
+      val exactDuplicate = duplicate match {
+        case NakamotoChainStore.StoreOutcome.Duplicate(existing, Some(selected)) =>
+          existing.hash == first.hash &&
+          selected.snapshot.hash == first.hash &&
+          selected.branchRevision.value.value == 1L &&
+          selected.lineageRevision.value.value == 0L
+        case _ => false
+      }
+      val exactExtension = extended match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(selected, NakamotoChainStore.SelectionChange.Extended) =>
+          selected.snapshot.hash == second.hash &&
+          selected.branchRevision.value.value == 2L &&
+          selected.lineageRevision.value.value == 0L &&
+          selected == current
+        case _ => false
+      }
+
+      expect.all(exactInitialized, exactDuplicate, exactExtension)
+    }
+  }
+
+  test("finalizeSelectedAt rejects an observed selection after the selected branch advances") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 2)
+      first = chain.head
+      second = chain.last
+      _ <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      observed <- currentSelection(chainStore)
+      _ <- chainStore.store(second.signed, second.context, 2L, 2L, first.hash, Array.emptyByteArray)
+      outcome <- chainStore.finalizeSelectedAt(observed, targetOrdinal = 1L)
+      finalizedOrdinal <- chainStore.lastFinalizedOrdinal
+    } yield {
+      val exactStaleSelection = outcome match {
+        case NakamotoChainStore.FinalizeOutcome.StaleSelection(Some(current)) =>
+          current.snapshot.hash == second.hash &&
+          current.branchRevision.value.value == observed.branchRevision.value.value + 1L &&
+          current.lineageRevision == observed.lineageRevision
+        case _ => false
+      }
+
+      expect.all(exactStaleSelection, finalizedOrdinal == 0L)
+    }
+  }
+
+  test("finalizeSelectedAt derives the exact ancestor and repeated finalization is an exact no-op") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 3)
+      _ <- chain.traverse_ { item =>
+        val ordinal = item.signed.value.ordinal.value.value
+        chainStore.store(item.signed, item.context, ordinal, ordinal, item.signed.value.lastSnapshotHash, Array.emptyByteArray)
+      }
+      selected <- currentSelection(chainStore)
+      first <- chainStore.finalizeSelectedAt(selected, targetOrdinal = 2L)
+      repeated <- chainStore.finalizeSelectedAt(selected, targetOrdinal = 2L)
+      finalizedOrdinal <- chainStore.lastFinalizedOrdinal
+    } yield {
+      val exactFinalized = first match {
+        case NakamotoChainStore.FinalizeOutcome.Finalized(target, current, previousOrdinal, prunedHashes) =>
+          target.hash == chain(1).hash &&
+          target.ordinal == 2L &&
+          current == selected &&
+          previousOrdinal == 0L &&
+          prunedHashes.isEmpty
+        case _ => false
+      }
+      val exactRepeatedNoOp = repeated match {
+        case NakamotoChainStore.FinalizeOutcome.AlreadyFinalized(lastOrdinal, Some(lastHash)) =>
+          lastOrdinal == 2L && lastHash == chain(1).hash
+        case _ => false
+      }
+
+      expect.all(exactFinalized, exactRepeatedNoOp, finalizedOrdinal == 2L)
+    }
+  }
+
+  test("internal finality CAS keeps the store floor closed while the public watermark lags") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, publishedFinalityRef, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 3)
+      _ <- chain.traverse_ { item =>
+        val ordinal = item.signed.value.ordinal.value.value
+        chainStore.store(item.signed, item.context, ordinal, ordinal, item.signed.value.lastSnapshotHash, Array.emptyByteArray)
+      }
+      selected <- currentSelection(chainStore)
+      finalized <- chainStore.finalizeSelectedAt(selected, targetOrdinal = 2L)
+      publishedBeforeEffects <- publishedFinalityRef.get
+      alternateKey <- KeyPairGenerator.makeKeyPair[IO]
+      alternate <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        chain(1).signed.value.copy(epochProgress = EpochProgress(NonNegLong.unsafeFrom(99L))),
+        alternateKey
+      )
+      rejected <- chainStore.store(alternate, chain(1).context, 2L, 2L, chain.head.hash, Array.emptyByteArray)
+    } yield {
+      val finalizedExactHash = finalized match {
+        case NakamotoChainStore.FinalizeOutcome.Finalized(target, _, _, _) => target.hash == chain(1).hash
+        case _                                                             => false
+      }
+      val refusedOnInternalFloor = rejected match {
+        case NakamotoChainStore.StoreOutcome.Rejected(
+              NakamotoChainStore.StoreRejection.FinalityConflict(_, existingHash, _, floor, _),
+              _
+            ) =>
+          existingHash == chain(1).hash && floor.value.value == 2L
+        case _ => false
+      }
+
+      expect.all(
+        finalizedExactHash,
+        publishedBeforeEffects == SnapshotOrdinal.MinValue,
+        refusedOnInternalFloor
+      )
+    }
+  }
+
+  test("finalizeSelectedAt cannot advance across a missing selected-lineage ordinal") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      parent <- mkSignedLinkedChain(length = 1).map(_.head)
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      childSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        parent.signed.value.copy(
+          ordinal = SnapshotOrdinal.unsafeApply(3L),
+          lastSnapshotHash = parent.hash,
+          epochProgress = EpochProgress(NonNegLong.unsafeFrom(3L))
+        ),
+        keyPair
+      )
+      _ <- chainStore.store(parent.signed, parent.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      _ <- chainStore.store(childSigned, parent.context, 3L, 3L, parent.hash, Array.emptyByteArray)
+      selected <- currentSelection(chainStore)
+      outcome <- chainStore.finalizeSelectedAt(selected, targetOrdinal = 2L)
+      finalizedOrdinal <- chainStore.lastFinalizedOrdinal
+    } yield
+      expect.all(
+        outcome == NakamotoChainStore.FinalizeOutcome.TargetUnavailable(2L),
+        selected.snapshot.ordinal == 3L,
+        finalizedOrdinal == 0L
+      )
+  }
+
+  test("unsafe_clearFinality advances revision identities before reconstructed selection") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      tuple <- mkChainStore()
+      (chainStore, _, _, _) = tuple
+      chain <- mkSignedLinkedChain(length = 2)
+      first = chain.head
+      replacement = chain.last
+      _ <- chainStore.store(first.signed, first.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      beforeClear <- currentSelection(chainStore)
+      cleared <- chainStore.unsafe_clearFinality
+      emptyAfterClear <- chainStore.selectedTip
+      reconstructed <- chainStore.store(
+        replacement.signed,
+        replacement.context,
+        2L,
+        2L,
+        replacement.signed.value.lastSnapshotHash,
+        Array.emptyByteArray
+      )
+    } yield {
+      val exactReconstruction = reconstructed match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(after, NakamotoChainStore.SelectionChange.Reconstructed) =>
+          after.snapshot.hash == replacement.hash &&
+          after.branchRevision.value.value > beforeClear.branchRevision.value.value &&
+          after.lineageRevision.value.value > beforeClear.lineageRevision.value.value
+        case _ => false
+      }
+
+      expect.all(cleared, emptyAfterClear.isEmpty, exactReconstruction)
+    }
   }
 
   /** Store/control-flow witness under a synthetic enabled k/s configuration only: the bodies bind signed ordinal/parent ancestry and every
@@ -509,7 +774,13 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
               node.tip.vrfOutput.toBytes
             )
         }
-        _ <- IO.raiseUnless(stored.forall(identity))(new IllegalStateException("strict-cycle schedule was not fully stored"))
+        _ <- IO.raiseUnless(
+          stored.forall {
+            case NakamotoChainStore.StoreOutcome.BecameSelected(_, _)  => true
+            case NakamotoChainStore.StoreOutcome.StoredAlternate(_, _) => true
+            case _                                                     => false
+          }
+        )(new IllegalStateException(s"strict-cycle schedule was not fully stored: $stored"))
         best <- chainStore.bestTip.flatMap(_.liftTo[IO](new IllegalStateException("strict-cycle store has no best tip")))
       } yield best.hash
 
@@ -553,13 +824,30 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       h2 <- s2.toHashed[IO]
       count <- chainStore.divergentRefuseCount
       sample <- chainStore.divergentRefuseSample
-    } yield
+      firstHash <- s1.toHashed[IO].map(_.hash)
+    } yield {
+      val firstSelected = stored1 match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(selected, NakamotoChainStore.SelectionChange.Initialized) =>
+          selected.snapshot.hash == firstHash
+        case _ => false
+      }
+      val secondRejected = stored2 match {
+        case NakamotoChainStore.StoreOutcome.Rejected(
+              NakamotoChainStore.StoreRejection.FinalityConflict(1L, existingHash, candidateHash, floor, false),
+              Some(selected)
+            ) =>
+          existingHash == firstHash && candidateHash == h2.hash && floor == SnapshotOrdinal.unsafeApply(1L) &&
+          selected.snapshot.hash == firstHash
+        case _ => false
+      }
+
       expect.all(
-        stored1, // first store succeeded
-        !stored2, // second store refused
+        firstSelected,
+        secondRejected,
         count == 1L, // counter incremented
         sample.contains((1L, h2.hash))
       )
+    }
   }
 
   test("divergentRefuseCount: same-hash re-delivery at-or-below-finalized does NOT increment") { res =>
@@ -573,12 +861,23 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       (chainStore, finalizedRef, _, _) = r
       pair <- mkGenesis
       (s1, ctx1) = pair
-      _ <- chainStore.store(s1, ctx1, ordinal = 1L, slot = 1L, parentHash = Hash.empty, vrfOutput = Array.empty)
+      first <- chainStore.store(s1, ctx1, ordinal = 1L, slot = 1L, parentHash = Hash.empty, vrfOutput = Array.empty)
       _ <- finalizedRef.set(SnapshotOrdinal(NonNegLong(1L)))
       // Re-deliver the SAME snapshot — should fall through to the tryStore path and be a duplicate.
-      _ <- chainStore.store(s1, ctx1, ordinal = 1L, slot = 1L, parentHash = Hash.empty, vrfOutput = Array.empty)
+      duplicate <- chainStore.store(s1, ctx1, ordinal = 1L, slot = 1L, parentHash = Hash.empty, vrfOutput = Array.empty)
       count <- chainStore.divergentRefuseCount
-    } yield expect.same(0L, count)
+    } yield {
+      val exactDuplicate = (first, duplicate) match {
+        case (
+              NakamotoChainStore.StoreOutcome.BecameSelected(initial, NakamotoChainStore.SelectionChange.Initialized),
+              NakamotoChainStore.StoreOutcome.Duplicate(existing, Some(selected))
+            ) =>
+          existing.hash == initial.snapshot.hash && selected == initial
+        case _ => false
+      }
+
+      expect.all(exactDuplicate, count == 0L)
+    }
   }
 
   test("unsafe_clearFinality: clears byHash, bestTip, lastFinalizedOrdinal, refuse counter, refuse sample") { res =>
@@ -667,17 +966,28 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       postStored <- chainStore.store(s2, ctx2, ordinal = 1L, slot = 1L, parentHash = Hash.empty, vrfOutput = Array.empty)
       h2 <- s2.toHashed[IO]
       postBestTip <- chainStore.bestTip.map(_.map(_.hash))
-    } yield
+    } yield {
+      val refusedByFinality = preRefused match {
+        case NakamotoChainStore.StoreOutcome.Rejected(_: NakamotoChainStore.StoreRejection.FinalityConflict, _) => true
+        case _                                                                                                  => false
+      }
+      val reconstructed = postStored match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(selected, NakamotoChainStore.SelectionChange.Reconstructed) =>
+          selected.snapshot.hash == h2.hash
+        case _ => false
+      }
+
       expect.all(
         // Pre-reset: refused.
-        !preRefused,
+        refusedByFinality,
         preCount == 1L,
         // Post-reset: accepted.
-        postStored,
+        reconstructed,
         // The previously-refused canonical is now the bestTip (the core P-11 contract — the
         // reset unblocks the chain).
         postBestTip.contains(h2.hash)
       )
+    }
   }
 
   // ============================================================
@@ -734,12 +1044,26 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       (sB, ctxB) = pairB
       storedB <- chainStore.store(sB, ctxB, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
       refuseCount <- chainStore.divergentRefuseCount
-    } yield
+    } yield {
+      val initialized = storedA match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(_, NakamotoChainStore.SelectionChange.Initialized) => true
+        case _                                                                                                 => false
+      }
+      val rejectedAtK1 = storedB match {
+        case NakamotoChainStore.StoreOutcome.Rejected(
+              NakamotoChainStore.StoreRejection.FinalityConflict(3L, _, _, floor, false),
+              Some(_)
+            ) =>
+          floor == SnapshotOrdinal.unsafeApply(5L)
+        case _ => false
+      }
+
       expect.all(
-        storedA, // first write accepted
-        !storedB, // divergent write at 3 REFUSED because 3 ≤ finalized (k₁) — proves the DEFAULT gate is k₁, not settled(1)
+        initialized,
+        rejectedAtK1,
         refuseCount == 1L
       )
+    }
   }
 
   test("S3 (flag ON): store-gate keyed on settled (k₂) — divergent write in (settled, finalized] is routed to compare, NOT auto-refused") {
@@ -769,13 +1093,24 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         storedB <- chainStore.store(sB, ctxB, ordinal = 3L, slot = 3L, parentHash = Hash.empty, vrfOutput = Array.empty)
         refuseCount <- chainStore.divergentRefuseCount
         sample <- chainStore.divergentRefuseSample
-      } yield
+      } yield {
+        val initialized = storedA match {
+          case NakamotoChainStore.StoreOutcome.BecameSelected(_, NakamotoChainStore.SelectionChange.Initialized) => true
+          case _                                                                                                 => false
+        }
+        val alternate = storedB match {
+          case NakamotoChainStore.StoreOutcome.StoredAlternate(stored, selected) =>
+            stored.ordinal == 3L && selected.snapshot.hash =!= stored.hash
+          case _ => false
+        }
+
         expect.all(
-          storedA, // first write accepted
-          storedB, // NOT refused by the k₂ store-gate (3 > settled(1)) — routed to compare and stored
+          initialized,
+          alternate,
           refuseCount == 0L, // the finality-safety gate did NOT trip (it keys off settled now, not finalized)
           sample.isEmpty
         )
+      }
   }
 
   test("S1.5: unsafe_clearFinality resets BOTH finalized (k₁) and settled (k₂) to MinValue") { res =>
@@ -870,13 +1205,14 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       hashes <- seedChainOfLength(chainStore, n = 5)
       preSize <- chainStore.size
       // Finalize the tip — at ord=5, keepFloor = max(0, 5-10) = 0, so all canonical entries stay.
-      _ <- chainStore.finalize(hashes.last, ordinal = 5L)
+      finalizedOutcome <- finalizeCurrentSelection(chainStore, targetOrdinal = 5L)
       postSize <- chainStore.size
       tipPresent <- chainStore.get(hashes.last).map(_.isDefined)
       genesisPresent <- chainStore.get(hashes.head).map(_.isDefined)
     } yield
       expect.all(
         preSize == 5,
+        finalizedExactly(finalizedOutcome, hashes.last, targetOrdinal = 5L, previousOrdinal = 0L),
         postSize == 5, // nothing evicted
         tipPresent,
         genesisPresent // genesis still in byHash because keepFloor=0
@@ -895,7 +1231,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       (chainStore, _, _, _) = r
       hashes <- seedChainOfLength(chainStore, n = 10)
       preSize <- chainStore.size
-      _ <- chainStore.finalize(hashes.last, ordinal = 10L)
+      finalizedOutcome <- finalizeCurrentSelection(chainStore, targetOrdinal = 10L)
       postSize <- chainStore.size
       // Entries at ords 7..10 (the keep-window) should remain. 4 entries: 10, 9, 8, 7.
       tipPresent <- chainStore.get(hashes(9)).map(_.isDefined) // ord 10
@@ -905,6 +1241,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     } yield
       expect.all(
         preSize == 10,
+        finalizedExactly(finalizedOutcome, hashes.last, targetOrdinal = 10L, previousOrdinal = 0L),
         postSize == 4, // 10, 9, 8, 7 retained
         tipPresent,
         keepFloorPresent,
@@ -924,10 +1261,10 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       (chainStore, _, _, _) = r
       hashes <- seedChainOfLength(chainStore, n = 15)
       // First finalize at ord=10 ⇒ keepFloor=7; entries 7..15 retained (9 entries).
-      _ <- chainStore.finalize(hashes(9), ordinal = 10L)
+      firstFinalized <- finalizeCurrentSelection(chainStore, targetOrdinal = 10L)
       sizeAfterFirst <- chainStore.size
       // Second finalize at ord=15 ⇒ keepFloor=12; entries 12..15 retained (4 entries).
-      _ <- chainStore.finalize(hashes(14), ordinal = 15L)
+      secondFinalized <- finalizeCurrentSelection(chainStore, targetOrdinal = 15L)
       sizeAfterSecond <- chainStore.size
       tipPresent <- chainStore.get(hashes(14)).map(_.isDefined) // ord 15
       newFloorPresent <- chainStore.get(hashes(11)).map(_.isDefined) // ord 12
@@ -937,6 +1274,8 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       expect.all(
         sizeAfterFirst == 9, // 7..15
         sizeAfterSecond == 4, // 12..15
+        finalizedExactly(firstFinalized, hashes(9), targetOrdinal = 10L, previousOrdinal = 0L),
+        finalizedExactly(secondFinalized, hashes(14), targetOrdinal = 15L, previousOrdinal = 10L),
         tipPresent,
         newFloorPresent,
         belowNewFloorAbsent,
@@ -955,10 +1294,15 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       r <- mkChainStore(keepDepthBehindFinalized = 255L)
       (chainStore, _, _, _) = r
       hashes <- seedChainOfLength(chainStore, n = 20)
-      _ <- chainStore.finalize(hashes.last, ordinal = 20L)
+      finalizedOutcome <- finalizeCurrentSelection(chainStore, targetOrdinal = 20L)
       postSize <- chainStore.size
       genesisPresent <- chainStore.get(hashes.head).map(_.isDefined)
-    } yield expect.all(postSize == 20, genesisPresent)
+    } yield
+      expect.all(
+        finalizedExactly(finalizedOutcome, hashes.last, targetOrdinal = 20L, previousOrdinal = 0L),
+        postSize == 20,
+        genesisPresent
+      )
   }
 
   pureTest("Fix B: DefaultKeepDepthBehindFinalized is 255 (matches operational confirmation depth k₁)") {
@@ -1148,20 +1492,26 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         SnapshotOrdinal.unsafeApply(1L),
         maxSteps = 1
       )
-    } yield
-      expect(stored) &&
-        expect(storedByHistoricalHash.isEmpty) &&
-        expect(storedByCurrentHash.nonEmpty) &&
-        expect.same(
-          Left(
-            NakamotoChainStore.ExactWalkError.HashEraUnavailable(
-              NakamotoChainStore.ExactWalkPosition(item.hash, SnapshotOrdinal.unsafeApply(1L)),
-              JsonHash,
-              KryoHash
-            )
-          ),
-          result
-        )
+    } yield {
+      val initialized = stored match {
+        case NakamotoChainStore.StoreOutcome.BecameSelected(_, NakamotoChainStore.SelectionChange.Initialized) => true
+        case _                                                                                                 => false
+      }
+
+      expect(initialized) &&
+      expect(storedByHistoricalHash.isEmpty) &&
+      expect(storedByCurrentHash.nonEmpty) &&
+      expect.same(
+        Left(
+          NakamotoChainStore.ExactWalkError.HashEraUnavailable(
+            NakamotoChainStore.ExactWalkPosition(item.hash, SnapshotOrdinal.unsafeApply(1L)),
+            JsonHash,
+            KryoHash
+          )
+        ),
+        result
+      )
+    }
   }
 
   test("walkBackExact: content hashing failures remain inside the typed result") { res =>
@@ -1579,7 +1929,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         fromHash = hashes(8) // ordinal 9 is below the exclusive cutoff at ordinal 10
       )
       // Finalize at ord=10 ⇒ keepFloor = max(0, 10-3) = 7. Ords 1..6 evicted from byHash.
-      _ <- chainStore.finalize(hashes.last, ordinal = 10L)
+      finalizedOutcome <- finalizeCurrentSelection(chainStore, targetOrdinal = 10L)
       postSize <- chainStore.size
       lowestPresent <- chainStore.get(hashes(6)).map(_.isDefined) // ord 7
       ord6Absent <- chainStore.get(hashes(5)).map(_.isEmpty) // ord 6 (below floor)
@@ -1602,6 +1952,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     } yield
       expect.all(
         postSize == 4, // 7..10 retained in-memory
+        finalizedExactly(finalizedOutcome, hashes.last, targetOrdinal = 10L, previousOrdinal = 0L),
         lowestPresent,
         ord6Absent,
         // Direct fallback test: ord 6 IS reachable via disk fallback.

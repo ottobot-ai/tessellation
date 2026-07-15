@@ -48,12 +48,14 @@ The received-snapshot path has the right operations but loses their provenance:
 5. `commitReplayValidated` permits storage and canonical effects only for
    `Valid` (`NakamotoSyncDaemon.scala:354-366,1546-1593`).
 
-That ordering is not yet encoded in a capability. `Valid` remains publicly
-constructible (`NakamotoSnapshotValidator.scala:32-43`), and both receive and
-production paths still reduce chain-store selection to a non-atomic Boolean plus
-a later `bestTip` read (`NakamotoSyncDaemon.scala:1540-1559`;
-`SnapshotLeaderLoop.scala:1630-1648`). No current signing API consumes either
-result.
+That ordering is not yet encoded in an opaque execution capability. `Valid`
+remains publicly constructible (`NakamotoSnapshotValidator.scala:32-43`). The
+chain-store boundary is now contained with typed outcomes and an internally
+serialized selected-tip transition: receive and production authorize canonical
+effects only from `BecameSelected`, and rejected replay staging is discarded.
+The remaining gap is that `store` still accepts caller-supplied metadata rather
+than an authenticated-executed receipt, and revisions are neither durable nor
+signing authority. No current signing API consumes either result.
 
 The pre-containment implementation had three independent authority defects:
 
@@ -68,18 +70,19 @@ Those paths are now historical. The source/API tripwire requires both naked
 emitter names and every `publishAttestation` call in the GL0 leader/receive paths
 to be absent, forbids the legacy `highestFinalizedOrdinal` API, forbids
 producer-invented tracker mutation, and permits exactly one GL0
-`NakamotoChainStore.finalize` call in the leader loop
-(`GlobalOptimisticFinalityContainmentSuite.scala:12-52`).
+`NakamotoChainStore.finalizeSelectedAt` call
+(`GlobalOptimisticFinalityContainmentSuite.scala`).
 
 The sole state-changing GL0 snapshot Phase-2 sink is now canonical `k1` depth:
-the monitor derives the qualifying ordinal from `TDepth1`, walks the selected
-chain to its exact hash, and finalizes that hash
-(`SnapshotLeaderLoop.scala:1104-1127`). `RTA-RED-019` exercises the same exact-hash
-depth path with an empty attestation map
-(`NakamotoChainStoreSuite.scala:426-468`). Verified remote Ed25519+KES
-attestations may still enter `TipTracker`
-(`NakamotoSyncDaemon.scala:1740-1803`), but the leader loop labels them telemetry
-and gives them no finalization sink (`SnapshotLeaderLoop.scala:1213-1224`).
+the monitor rereads the exact selected tip under the shared mutation barrier,
+derives `selected.ordinal - k1` without consuming sticky trigger telemetry, and
+uses hash + branch/lineage revision CAS to derive the target under the chain-store
+lock. Local serve state precedes the public watermark; Phase-2 consumers run only
+after it. This is in-process containment, not durable exact-hash finality.
+`RTA-RED-019` exercises exact-hash depth progress with an empty attestation map
+(`NakamotoChainStoreSuite.scala`). Verified remote Ed25519+KES attestations may
+still enter `TipTracker`, but the leader loop labels them telemetry and gives
+them no finalization sink.
 
 The store also cannot prove replay provenance. `StoredSnapshot` has no validation
 receipt (`NakamotoChainStore.scala:31-46`), and `store` accepts raw snapshot,
@@ -194,15 +197,13 @@ receipt is carried through exact artifact decoration, Ed25519 signing, registere
 KES signing, self-verification, and chain-store selection. Only the successful
 exact result can become `AuthenticatedExecutedGlobalSnapshot`.
 
-`chainStore.store == true` currently means only that an entry was new; it does not
-mean the entry became best. The local path still treats every `true` as a
-successful selected outcome (`SnapshotLeaderLoop.scala:1630-1648`), then updates
-canonical storages, clears included events, and may publish the snapshot
-(`SnapshotLeaderLoop.scala:1677-1755`). Optimistic attestation emission is dark,
-so this path no longer signs, but the canonical-state defect remains. The
-replacement API must return a typed store outcome that distinguishes `Duplicate`,
-`StoredAlternate`, and `BecameSelected`. Only `BecameSelected` can mint current
-preference or authorize canonical side effects.
+**Containment landed:** the store returns `Duplicate`, `StoredAlternate`,
+`BecameSelected`, or typed rejection. The local path commits its MPT transaction,
+updates canonical storage, removes events, and publishes only for
+`BecameSelected`; receive no longer reconstructs selection with a later
+`bestTip` read. This prevents an alternate from acquiring canonical effects, but
+does not mint current preference: that still requires the opaque execution
+receipt, durable revisions, and exact publication CAS.
 
 ### RTA-007 - Received flow never reconstructs authority from storage
 
@@ -487,6 +488,12 @@ staged landing rules are:
 
 ### Phase C - Selected-tip revision and store outcomes
 
+**Partial containment landed:** typed `StoreOutcome`, an internal mutation lock,
+in-memory monotone branch/lineage revisions, and exact selected-tip finalization
+CAS are live. Reset advances revisions in-process instead of resetting them.
+These revisions restart at zero and persistence is not crash-atomic, so they
+cannot authorize signing or satisfy Phase C.
+
 - `NakamotoChainStore.scala`: add the persisted monotone branch and lineage
   revisions, validated storage,
   explicit unattestable recovery seed, typed `StoreOutcome`, exact duplicate
@@ -518,7 +525,7 @@ staged landing rules are:
   deleted. The source/API tripwire is
   `GlobalOptimisticFinalityContainmentSuite.scala:31-52`.
 - **Containment landed:** the legacy cumulative-weight finalization API and sink
-  are deleted; canonical `k1` depth is the sole current `chainStore.finalize`
+  are deleted; canonical `k1` depth is the sole current `chainStore.finalizeSelectedAt`
   caller. This is a temporary safe restriction, not Phase D completion.
 - Enforce durable pre-publish command persistence, immutable retry,
   `PublishResponse.ok`, durable publication outcome, post-publish
@@ -547,8 +554,10 @@ staged landing rules are:
 - Bind fixed historical registry/weight/parameter context and the query or
   decision transcript.
 - Keep the emitter capability-only. No compatibility overload is permitted.
-- Activation remains blocked on O-01 and the relevant O-15/finality-lifecycle
-  gates; the type boundary may land earlier because it only removes authority.
+- Activation remains blocked on O-01's implementation/parameter/proof gates and
+  the relevant O-15 construction/proof and finality-lifecycle gates; the type
+  boundary may land earlier because it only removes authority. Both O-item
+  directions are owner-ratified.
 
 ## 8. Mandatory RED and race tests
 
@@ -603,11 +612,11 @@ injection against the durable journal.
 
 ## 9. Completion and activation gates
 
-The landed containment closes only the immediate raw-signing and legacy
-weight-to-finalization paths. It does not satisfy this section's completion
-criteria: there is intentionally no local optimistic emitter until the remaining
-capability, typed store outcome/revision, durable journal, publication CAS, and
-sampled Snowball work lands.
+The landed containment closes the immediate raw-signing, alternate-as-canonical,
+stale depth-target, and legacy weight-to-finalization paths. It does not satisfy
+this section's completion criteria: there is intentionally no local optimistic
+emitter until the remaining opaque capability, durable revision/journal,
+publication CAS, and sampled Snowball work lands.
 
 The replay-before-sign slice is complete only when:
 

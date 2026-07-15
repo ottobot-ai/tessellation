@@ -1087,7 +1087,6 @@ object GlobalSnapshotConsensus {
             .make[F](
               globalSnapshotStorage,
               chainSelection,
-              tipTracker,
               nakamotoFinalizedOrdinalRef,
               // Transitional legacy k2 watermark. Current store consumption as a floor is a known target
               // violation; k2 may size retention/recovery only.
@@ -1160,7 +1159,18 @@ object GlobalSnapshotConsensus {
                         hashed.lastSnapshotHash,
                         Array.empty // no VRF output for genesis
                       )
-                      .void
+                      .flatMap {
+                        case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.StoreOutcome
+                              .BecameSelected(_, _) =>
+                          Async[F].unit
+                        case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.StoreOutcome
+                              .Duplicate(_, _) =>
+                          nakLogger.debug("Chain store recovery head was already present")
+                        case other =>
+                          Async[F].raiseError[Unit](
+                            new IllegalStateException(s"Chain store rejected the recovery head: outcome=$other")
+                          )
+                      }
                 }
               }
             case None =>
@@ -2361,7 +2371,8 @@ object GlobalSnapshotConsensus {
                   chainStore = chainStore,
                   tipTracker = tipTracker,
                   mptOverlay = mptOverlay,
-                  productionGate = productionGate
+                  productionGate = productionGate,
+                  snapshotSemaphore = snapshotSemaphore
                 )
                 .compile
                 .drain

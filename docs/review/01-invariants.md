@@ -1,5 +1,17 @@
 # Tessellation-Nakamoto — Invariant Catalog (CLAIM-SET for adversarial review)
 
+> **SUPERSEDED PRE-CONTAINMENT CLAIM SET (2026-07-15).** This catalog was
+> verified against the 2026-07-07 tree and is preserved as adversarial audit
+> input, not current enforcement evidence. In particular, INV-LIVE-001's raw
+> attestation-weight sink and its `chainStore.finalize` call no longer exist.
+> Canonical `k1` depth is the sole live state-changing rail; typed store outcomes
+> and exact selected-tip branch/lineage CAS are in-process containment, while
+> durable revisions/effect journals, the authenticated replay capability,
+> density-reorgable exact-hash `FinalityGate`, and sampled decided-attestation
+> `T_weight` remain activation blockers. Revalidate every `Holds` label and line
+> citation against current source and
+> `CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md` before relying on it.
+
 > **Purpose.** A pre-seeded catalog of the consensus invariants the Track-1 / Track-3 sharding
 > workstream is supposed to uphold, each anchored to `file:line` in the *current* working tree
 > (branch `feature/committee-state-diff`, HEAD `21933559c`, verified 2026-07-07) and rated by

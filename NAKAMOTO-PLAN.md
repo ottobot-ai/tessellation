@@ -14,6 +14,12 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
+**Owner-decision status:** `O-01` through `O-17` are `17/17`
+dispositioned in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. Every O-item
+dependency below means implementation of its ratified direction and closure of
+its explicitly listed engineering, research, schema, parameter, or proof gates;
+none means that an owner response is pending.
+
 ## Active objective
 
 Safely enable framework-economic interactions among metagraphs assigned to
@@ -331,15 +337,16 @@ path on the current root shape.
   one-round cumulative-weight finalization sink are removed. Verified remote
   attestations and unfinished trigger/accumulator objects are telemetry only;
   canonical `k1` depth is the sole live GL0 snapshot
-  `NakamotoChainStore.finalize` rail. The
+  `NakamotoChainStore.finalizeSelectedAt` rail. The
   source/API tripwire is
-  `GlobalOptimisticFinalityContainmentSuite.scala:31-52`, and
+  `GlobalOptimisticFinalityContainmentSuite.scala`, and
   `RTA-RED-019` proves exact-hash depth progress with no attestations
-  (`NakamotoChainStoreSuite.scala:426-468`). This is a temporary safety
-  restriction, not E1 completion: replay/preference capabilities, typed atomic
-  store outcomes and revisions, a durable publication/lineage CAS, the sampled
-  exact-hash decision transcript, and exact-hash `FinalityGate` activation remain
-  open.
+  (`NakamotoChainStoreSuite.scala`). Typed store outcomes, internal mutation
+  serialization, in-memory branch/lineage revisions, and exact selected-tip
+  finalization CAS have also landed. This is a temporary safety restriction, not
+  E1 completion: authenticated replay/preference capabilities, durable revisions
+  and publication/effect journals, the sampled exact-hash decision transcript,
+  and exact-hash `FinalityGate` activation remain open.
 - Use `maxvalid-tk` for short forks and valid-only `maxvalid-bg` density selection
   beyond `k1`. Separate storage retention from fork-choice eligibility; `k2`
   never makes a less-dense chain valid or final by fiat.
@@ -435,8 +442,9 @@ from S1. Runtime stake/committee eligibility also depends on steps 3-5.
 
 **Depends on:** E0 and S1 identity/codecs. The immutable-genesis safety cut can
 finish independently. Runtime activation depends on E1's authenticated exact-
-parent branch view and on resolution of O-11; checkpoint consumers additionally
-depend on E4's exact Phase-2 reference schema.
+parent branch view and implementation of O-11's ratified roster direction,
+including its schema, parameter, and proof gates; checkpoint consumers
+additionally depend on E4's exact Phase-2 reference schema.
 
 **Invariant:** every KES signature, VRF proof, or registered-VK draw resolves one
 atomic `(PeerId, KES master VK/offset, VRF VK)` pair from the artifact's exact
@@ -1074,9 +1082,9 @@ Three checkpoints in `SnapshotLeaderLoop`: (1) slot-tick gate (already existed),
 > not a finality rail and `T_depth2`/`k2` is not Phase 3 or an immutable floor.
 > The active E1/E3 work above replaces these semantics while retaining useful
 > source provenance.
-Env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (default 2/3, in `TipTracker.FinalityThreshold`, shared by `T_weight` and `T_count`), `NAKAMOTO_CONFIRMATION_DEPTH` (default **255**, in `SnapshotLeaderLoop.ConfirmationDepthK` / `T_depth1`), `NAKAMOTO_ARCHIVAL_DEPTH` (default **65536** = 2¹⁶, in `SnapshotLeaderLoop.ArchivalDepthK` / `T_depth2`), `NAKAMOTO_OPTIMISTIC_MIN_FRACTION` (default 0.5, in `StakeRegistry.MinActiveQuorumFraction`), `NAKAMOTO_MAX_ATTESTATION_SKEW_MS` (default 60_000, in `TipTracker.MaxAttestationSkewMs`). All gates always run; whichever fires first finalizes. No mode switch.
+Historical env-var knobs include `NAKAMOTO_ATTESTATION_THRESHOLD`, `NAKAMOTO_CONFIRMATION_DEPTH`, `NAKAMOTO_ARCHIVAL_DEPTH`, `NAKAMOTO_OPTIMISTIC_MIN_FRACTION`, and `NAKAMOTO_MAX_ATTESTATION_SKEW_MS`. In the current containment tree, the unfinished `T_weight`, `T_count`, and `T_depth2` calculators may run for telemetry, but only canonical `T_depth1`/`k1` can advance GL0 Phase 2. The target later adds the sampled decided-attestation `T_weight` rail after its activation gates pass; it does not restore `T_count` or give `k2` finality authority.
 
-**k measures snapshots, not slots.** With LDD targeting ~15% slot fill, slots run ~6× sparser than snapshots, but the depth gate is purely an ordinal-distance check: `tip.ordinal - snapshotOrdinal > k`. The original k=31 choice (2026-04-08) was based on a measured-sim table topping out at k≤80 with k=6 too high a fork rate against a 1/3 adversary; k=31 gave ~0.91% per-attempt. Subsequent expanded sims (`adv_depth_expanded_parallel.py`, 10M trials, k≤400) extrapolate the fB=0.05-tail slope to ~10⁻¹² at k≈271–290. Default raised to **k=255** as a conservative operating point approximating Cardano-equivalent CP-violation. Depth-`k1` is currently the sole live state-changing GL0 rail; the target sampled exact-hash optimistic rail is not active.
+**k measures snapshots, not slots.** With LDD targeting ~15% slot fill, slots run ~6× sparser than snapshots, but the live depth gate is purely an ordinal-distance check: `tip.ordinal - snapshotOrdinal >= k`. The original k=31 choice (2026-04-08) was based on a measured-sim table topping out at k≤80 with k=6 too high a fork rate against a 1/3 adversary; k=31 gave ~0.91% per-attempt. Subsequent expanded sims (`adv_depth_expanded_parallel.py`, 10M trials, k≤400) extrapolate the fB=0.05-tail slope to ~10⁻¹² at k≈271–290. Default raised to **k=255** as a conservative operating point approximating Cardano-equivalent CP-violation. Depth-`k1` is currently the sole live state-changing GL0 rail; the target sampled exact-hash optimistic rail is not active.
 
 **Two slot/ordinal-units bugs were fixed in this round** (2026-04-08), discovered while validating the wire-up: `lastFinalizedOrdinal` was being read off `tipTracker.lastFinalized`'s **slot** value, and `finalizeAtSlot` was being computed as `tip.slot - k` (mixing slot- and ordinal-units). The first bug had silently disabled the depth gate end-to-end since it landed — in our 720s e2e test we observed 224 ATTEST-FINALIZED entries and **zero** DEPTH-FINALIZED entries. The surviving depth gate reads its inputs from the chain store, which is the authoritative ordinal source; the unsafe attestation-weight sink described by that historical run is removed.
 
@@ -1085,7 +1093,7 @@ Env-var knobs with sensible defaults — `NAKAMOTO_ATTESTATION_THRESHOLD` (defau
 - **`T_count`** added (commit `7003be21`) — 1-validator-1-vote canonical-hash-filtered count finality, self-excluded (#133), denominator = `StakeRegistry.validatorCount` (full seedlist). Reuses `TipTracker.FinalityThreshold` so it ties with `T_weight` under equal stake and is strictly stronger evidence once stake-weighted VRF lands.
 - **`T_depth2`** added historically (commit `06455f98`) as a claimed Phase-2-to-Phase-3 archival gate. That interpretation is rejected: `k2` is retention/recovery capacity only, and pruning must never become fork-choice truth. The associated `MptOverlay.pruneBelow` provenance remains relevant to the replacement recovery design.
 - **Historical `T_weight` mitigation** (commit `95471c7f`) added self-exclusion to the former `TipTracker.highestFinalizedOrdinal` cumulative query. That query and its state-changing sink are now removed; this history does not describe the target sampled exact-hash `T_weight`.
-- **Re-bootstrap reset machinery landed** (commit `01ebcca6`, task #141) — `RebootstrapOrchestrator` observes sustained `chainStore.divergentRefuseCount`, then resets TipTracker/Overlay/finality state. The typed-HOCON setting is live-default `true`. Reset is not itself recovery: completion now depends on ordinary verified ancestry replay because direct peer-context/state installers were removed. Fresh end-to-end validation is required.
+- **Re-bootstrap reset machinery landed** (commit `01ebcca6`, task #141) — `RebootstrapOrchestrator` observes sustained `chainStore.divergentRefuseCount`, then resets TipTracker/Overlay/finality state. The reset now pauses before waiting for and retains the shared snapshot mutation barrier through the complete reset; cancellation or failure fail-stops instead of reopening concurrent canonical mutation. The typed-HOCON setting remains live-default `true`. This is still not objective recovery: a peer-driven refuse count is only a heuristic, revisions/journals are not durable, served projections are not atomically quarantined, and completion depends on ordinary verified ancestry replay. Replace it with authenticated objective recovery before activation.
 - **`attestedAt` skew bound** (commit `422e1a6b`) — receive-side defense-in-depth for `T_count`. Drops attestations outside ±`NAKAMOTO_MAX_ATTESTATION_SKEW_MS` of `Clock[F].realTime`; counter `dag_nakamoto_attestations_rejected_skew_total`. Tightenable post-Chronos.
 - **Chain-quality observable** (commit `866cd598`, task #138) — `FinalityTrigger.triggersFor(ord)` lookup answers "which triggers qualified ord N?" at the depth-`k1` finalize site (gauge `dag_nakamoto_chain_quality` ∈ {1, 2, 3}; per-kind counters) and via HTTP route `GET /global-snapshots/{ord}/finality-triggers`. Pure observability — never feeds back into consensus.
 - **`SlotCertificate.parentSlot` wiring** (commit `bec9de6b`) — `NakamotoProposer` was passing `parentSlot = Slot.MinValue` (TODO placeholder); now threaded through correctly so verifier-side `slotGap = cert.slot - cert.parentSlot` reconstruction matches the producer's LDD lottery threshold.
@@ -1100,7 +1108,7 @@ semantics.
 
 **Fix landed:**
 - **Data model:** `BinaryTracker.pruneFinalizedBelow(SnapshotOrdinal)` only prunes ConfirmedBinary entries whose `proof.globalOrdinal <= lastFinalizedGlobalOrdinal`. `StateChannelBinarySender.confirm` gained an optional `lastFinalizedGlobalOrdinal: Option[SnapshotOrdinal]` parameter defaulting to the snapshot's own ordinal (BFT-preserving).
-- **GL0 endpoint:** new `GET /global-snapshots/latest/finalized-ordinal` route on `SnapshotRoutes`. In Nakamoto mode, dag-l0 wires it to a `Ref[F, Long]` that `SnapshotLeaderLoop` updates after every successful `chainStore.finalize` call (depth-k or attestation-2/3, whichever fires first). In BFT mode the route defaults to head ordinal — semantically correct since BFT snapshots are immediately final.
+- **GL0 endpoint:** new `GET /global-snapshots/latest/finalized-ordinal` route on `SnapshotRoutes`. In Nakamoto mode, dag-l0 wires it to a `Ref[F, Long]` that `SnapshotLeaderLoop` currently updates only after a successful exact selected-tip `finalizeSelectedAt` receipt from canonical `k1` depth. The target exact-hash `FinalityGate` must replace this ordinal-only surface before the optimistic rail activates. In BFT mode the route defaults to head ordinal because that separate consensus engine commits its snapshots immediately.
 - **CL0 caller:** `StateChannel.scala:172` now calls `services.globalL0.pullLatestFinalizedOrdinal` (best-effort, falls back to legacy snapshot-own-ordinal on error) and passes the result into `stateChannelBinarySender.confirm`.
 
 **Validated live:** in the metagraph e2e (#7 below), `GET /global-snapshots/latest/finalized-ordinal` returns a real value (`{"value":159}`) at end-of-test, proving the route is reachable, the Ref is being updated, and CL0 is consuming it.

@@ -668,20 +668,20 @@ object SnapshotLeaderLoop {
     // walk misses — e.g. mid-reorg) is skipped exactly as the single-ordinal path skips an absent hash: the follower
     // full-GSI-adopts that one gap, but the common multi-ordinal-jump case is now COMPLETE. Idempotent on re-finalize
     // (each ordinal drains its staging entry); absence never errors.
-    def recordFinalizedRange(fromExclusive: Long, toInclusive: Long, tipHash: Hash): F[Unit] =
-      if (toInclusive <= fromExclusive) Async[F].unit
+    def recordFinalizedRange(
+      fromExclusive: Long,
+      toInclusive: Long,
+      tipHash: Hash
+    ): F[List[Hash]] =
+      if (toInclusive <= fromExclusive) List.empty[Hash].pure[F]
       else
-        (fromExclusive + 1L to toInclusive).toList.traverse_ { o =>
+        (fromExclusive + 1L to toInclusive).toList.traverse { o =>
           chainStore.walkBackTo(tipHash, o).flatMap {
             case Some(hashAtOrdinal) =>
-              recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(o), hashAtOrdinal) >>
-                // `chainStore.finalize` may already have evicted intermediate ancestors from its bounded in-memory retention window.
-                // Finality callbacks are consensus-adjacent release events and must not depend on that cache. SnapshotStorage is the
-                // durable canonical byte source used by the other finalized-range consumers.
-                snapshotStorage.get(hashAtOrdinal).flatMap(_.traverse_(stored => onFinalize(stored.value)))
-            case None => Async[F].unit
+              recordFinalizedAccumulator(SnapshotOrdinal.unsafeApply(o), hashAtOrdinal).as(hashAtOrdinal.some)
+            case None => none[Hash].pure[F]
           }
-        }
+        }.map(_.flatten)
     // Use shared genesis time if provided, else fall back to wall clock
     val effectiveGenesisTime = if (genesisTimeMs > 0) genesisTimeMs else System.currentTimeMillis()
 
@@ -699,12 +699,16 @@ object SnapshotLeaderLoop {
               HasherSelector[F].withCurrent { implicit hasher =>
                 headSigned.toHashed[F].flatMap { hashed =>
                   chainStore.store(headSigned, headCtx, hashed.ordinal.value.value, 0L, hashed.lastSnapshotHash, Array.empty).flatMap {
-                    case true =>
+                    case NakamotoChainStore.StoreOutcome.BecameSelected(_, _) =>
                       logger.info(
                         s"🌱 Seeded chain store with genesis: ordinal=${hashed.ordinal} hash=${hashed.hash.value.take(16)}"
                       )
-                    case false =>
+                    case NakamotoChainStore.StoreOutcome.Duplicate(_, _) =>
                       logger.debug(s"Chain store already has genesis at ordinal=${hashed.ordinal}")
+                    case other =>
+                      Async[F].raiseError[Unit](
+                        new IllegalStateException(s"Recovery head could not become selected: outcome=$other")
+                      )
                   }
                 }
               }
@@ -968,7 +972,7 @@ object SnapshotLeaderLoop {
         //   - Fast path: tip attestation weight ≥ TipTracker.FinalityThreshold (default 2/3,
         //     with optimistic dynamic-quorum sizing for partial cluster availability).
         //   - Fallback: a snapshot is depth-finalized once at least k snapshots sit above it
-        //     on the canonical chain — i.e. `tip.ordinal - snapshotOrdinal > k`. This is the
+        //     on the canonical chain — i.e. `tip.ordinal - snapshotOrdinal >= k`. This is the
         //     Bitcoin-style confirmation rule, and k is measured in **snapshots (ordinals)**,
         //     not slots. With LDD targeting ~15% slot fill, slots run ~6× sparser than
         //     snapshots, but the depth gate is purely an ordinal-distance check.
@@ -1047,20 +1051,10 @@ object SnapshotLeaderLoop {
                     // deliberately distinct from the P2 ordinal ref, but the target removes its
                     // Phase-3/settled meaning entirely. The trivial Stream keeps current wiring intact.
                     Stream.eval(Async[F].unit).flatMap { _ =>
-                      // TRANSITIONAL IMPLEMENTATION GAP: k1-driven overlay-prune watermark. Drives
-                      // `mptOverlay.pruneBelow` once per advance of `T_depth1.latestQualifyingOrdinal`
-                      // (the k1 Phase-2 depth trigger). Decoupling from the legacy k2 retention watermark
-                      // means undoJournalRef + finalizedRef are bounded by k₁ ords instead of k₂ — a
-                      // ~257× reduction in worst-case retention (255 vs 65536).
-                      //
-                      // Target P2 remains density-reorgable beyond k1, so pruning cannot assume such
-                      // reorgs are impossible. Required history must remain reconstructible from exact
-                      // authenticated disk/proof state or the node must enter RecoveryRequired.
-                      //
-                      // Monotone advance via `Ref` mirrors the legacy k2 watermark pattern. The overlay's
-                      // `pruneBelow` is itself idempotent and monotone — the local Ref just dedups
-                      // the call so we don't emit OVERLAY-PRUNE-BELOW log noise per finality tick.
-                      Stream.eval(Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue)).flatMap { lastOperationalPruneOrdinalRef =>
+                      // Keep the historical stream shape while the durable finality coordinator is
+                      // introduced. Overlay pruning now occurs only from an exact successful chain-store
+                      // finalization receipt; sticky trigger telemetry cannot prune canonical state.
+                      Stream.eval(Async[F].unit).flatMap { _ =>
                         // Tick at 5× slot duration: 5s in prod (1000ms slot), 2.5s in e2e (500ms slot).
                         // Slightly faster than the expected snapshot arrival rate so the finality
                         // monitor catches new tips reactively, but still amortizes the chain-walk +
@@ -1071,7 +1065,8 @@ object SnapshotLeaderLoop {
                             for {
                               allAtts <- tipTracker.allAttestations
                               validatorCount <- stakeRegistry.validatorCount
-                              bestTip <- chainStore.bestTip
+                              selectedTip <- chainStore.selectedTip
+                              bestTip = selectedTip.map(_.snapshot)
 
                               // The last-finalized **ordinal** must come from chainStore — tipTracker.lastFinalized
                               // only carries (Hash, Slot), and slots are LDD-paced not 1:1 with ordinals. The
@@ -1101,120 +1096,145 @@ object SnapshotLeaderLoop {
                                   Async[F].unit
                               }
 
-                              // Depth-based finality: a snapshot is final once k+ snapshots sit above it on
-                              // the canonical chain — `tip.ordinal - snapshotOrdinal > k`.
+                              // Depth-based finality: a snapshot is final once at least k descendants sit above it on
+                              // the canonical chain — `tip.ordinal - snapshotOrdinal >= k`.
                               //
-                              // Driven by `tDepth1.latestQualifyingOrdinal` (the trigger). The trigger's
-                              // monotone-advance Ref was just updated above; we read it here to drive
-                              // the side-effecting finalization below.
+                              // `tDepth1.latestQualifyingOrdinal` remains telemetry only. Its Ref is
+                              // monotone and therefore cannot represent a denser-but-shorter replacement.
                               depthQualifying <- tDepth1.latestQualifyingOrdinal
-                              _ <- bestTip match {
-                                case Some(tip) if depthQualifying.value.value > lastFinalizedOrdinal =>
-                                  val finalizeAtOrdinal = depthQualifying.value.value
-                                  // Walk the canonical chain from best tip to the hash at finalizeAtOrdinal,
-                                  // then look up its actual slot from the chain store. The slot is needed by
-                                  // tipTracker.markFinalized / pruneBelow which key attestations by slot. Do
-                                  // NOT compute it as `tip.slot - k` — that mixes slot-units with ordinal-units
-                                  // (the old bug) and produces a slot far above the canonical snapshot's real
-                                  // slot, over-pruning attestations.
-                                  chainStore.walkBackTo(tip.hash, finalizeAtOrdinal).flatMap {
-                                    case Some(canonicalHash) =>
-                                      chainStore.get(canonicalHash).flatMap {
-                                        case Some(canonicalSnapshot) =>
-                                          val finalizeAtSlot = Slot(NonNegLong.unsafeFrom(canonicalSnapshot.slot))
-                                          tipTracker.markFinalized(canonicalHash, finalizeAtSlot) >>
-                                            tipTracker.pruneBelow(finalizeAtSlot) >>
-                                            chainStore.finalize(canonicalHash, finalizeAtOrdinal) >>
-                                            // (#196) Phase-2 operational ack to the sidecar outbox. After this finalize call
-                                            // the snapshot's AllowSpendBlocks + StateChannelSnapshots are durably
-                                            // committed; the sidecar can drop the corresponding outbox entries
-                                            // and stop re-gossiping. Failure here is non-fatal — the outbox TTL
-                                            // catches it eventually and the next finalize call would re-confirm
-                                            // anyway (Confirm is idempotent on the sidecar side).
-                                            confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger) >>
-                                            // #56.6: notify the MPT overlay that this branch is finalized. With
-                                            // accept() not yet migrated, this is a runtime no-op (pending=empty
-                                            // returns NoOp). When #56.10 migrates accept() to commit branches,
-                                            // this becomes the fold-forward sink without touching this site.
-                                            mptOverlay
-                                              .finalizeBranch(BranchId(canonicalHash), SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                              .void >>
-                                            // Advance the finalized-ordinal tracker so HttpApi
-                                            // /latest/finalized-ordinal reflects the new high-water mark. CL0
-                                            // polls this to gate state-channel-binary pruning on actual finality
-                                            // (not just first sight).
-                                            nakamotoFinalizedOrdinalRef
-                                              .update(prev =>
-                                                cats.Order[SnapshotOrdinal].max(prev, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                              ) >>
-                                            // Axis 2 (gl1 follow): capture this just-finalized snapshot's GSI as the slice
-                                            // producer's source. `canonicalSnapshot.context` is the in-memory finalized GSI
-                                            // (the `chainStore.get(canonicalHash)` above returned it). Monotone: only advance
-                                            // when this ordinal is strictly higher than the stored one.
-                                            latestFinalizedSliceSourceRef.update {
-                                              case Some((o, _)) if o.value.value >= finalizeAtOrdinal =>
-                                                Some((o, canonicalSnapshot.context))
-                                              case _ =>
-                                                Some((SnapshotOrdinal.unsafeApply(finalizeAtOrdinal), canonicalSnapshot.context))
-                                            } >>
-                                            // #287: record this finalized projection in the bounded diff ring (trimmed to the
-                                            // last K), so `GlobalFollowSliceService.sliceSince` can serve incremental gl1 diffs.
-                                            recordFollowProjection(
-                                              SnapshotOrdinal.unsafeApply(finalizeAtOrdinal),
-                                              canonicalSnapshot.context
-                                            ) >>
-                                            // Task #12 slice 2b: promote this finalized snapshot's per-ordinal accumulator
-                                            // (staged hash-keyed under `canonicalHash` by BOTH the producer AND any non-
-                                            // producer that validated it — NakamotoSnapshotValidator rekeys stripped->
-                                            // canonical) into the served changeset ring. COMPLETE on every finalizer now;
-                                            // the rare no-op is a catch-up/download node that adopted without staging.
-                                            // Promote the WHOLE just-finalized range `(lastFinalizedOrdinal, finalizeAtOrdinal]`,
-                                            // not just the top: depth-k can advance several ordinals in one tick and the skipped
-                                            // canonical ancestors are otherwise pruned from staging unpromoted (the ml0 "ring-gap").
-                                            recordFinalizedRange(lastFinalizedOrdinal, finalizeAtOrdinal, tip.hash) >>
-                                            logger
-                                              .info(
-                                                s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} (tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
-                                              ) >>
-                                            Metrics[F].incrementCounter("dag_nakamoto_finalized") >>
-                                            Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal) >>
-                                            productionTimestamps.getAndUpdate(_ - finalizeAtOrdinal).flatMap { ts =>
-                                              ts.get(finalizeAtOrdinal).traverse_ { prodMs =>
-                                                val latencyMs = System.currentTimeMillis() - prodMs
-                                                Metrics[F].recordDistribution("dag_nakamoto_finality_latency_ms", latencyMs.toInt)
-                                              }
-                                            } >>
-                                            // Chain-quality observable (#138): sample which Phase 1→2 triggers
-                                            // qualified this ordinal at finalize time. Pure observability — the
-                                            // qualifying-set lookup walks each trigger's monotone Ref (no chain
-                                            // walk). The value counts current telemetry kinds; it is not a safety
-                                            // score because legacy T_count does not strengthen the target T_weight
-                                            // OR k1 predicate. The per-kind counter increments let dashboards
-                                            // break down "what fired" over time.
-                                            FinalityTrigger
-                                              .triggersFor(phase12Triggers, SnapshotOrdinal.unsafeApply(finalizeAtOrdinal))
-                                              .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalizeAtOrdinal))) >>
-                                            Async[F].pure(true)
-                                        case None =>
-                                          logger.warn(
-                                            s"⚠️ DEPTH-FINALIZE: walked back to ordinal=$finalizeAtOrdinal but chainStore.get returned None for hash=${canonicalHash.value
-                                                .take(12)}"
-                                          ) >> Async[F].pure(false)
-                                      }
-                                    case None =>
-                                      logger.warn(
-                                        s"⚠️ DEPTH-FINALIZE: could not find canonical hash at ordinal=$finalizeAtOrdinal from tip=${tip.hash.value
-                                            .take(12)}"
-                                      ) >> Async[F].pure(false)
+                              finalizedOutbox <- selectedTip match {
+                                case Some(_) =>
+                                  // The outer semaphore serializes the multi-store Phase-2 effects with
+                                  // producer/receiver canonical effects. Re-read the selected tip and
+                                  // watermark only after acquiring it; no sticky ordinal is an input.
+                                  snapshotSemaphore.permit.use { _ =>
+                                    (chainStore.selectedTip, chainStore.lastFinalizedOrdinal).tupled.flatMap {
+                                      case (Some(expected), currentLastFinalizedOrdinal) =>
+                                        val finalizeAtOrdinal = math.max(0L, expected.snapshot.ordinal - ConfirmationDepthK)
+
+                                        if (finalizeAtOrdinal <= currentLastFinalizedOrdinal)
+                                          Async[F].pure(none[NakamotoChainStore.StoredSnapshot])
+                                        else
+                                          chainStore.finalizeSelectedAt(expected, finalizeAtOrdinal).flatMap {
+                                            case NakamotoChainStore.FinalizeOutcome.Finalized(
+                                                  canonicalSnapshot,
+                                                  selectedAtCommit,
+                                                  previousFinalizedOrdinal,
+                                                  _
+                                                ) =>
+                                              val canonicalHash = canonicalSnapshot.hash
+                                              val canonicalOrdinal = SnapshotOrdinal.unsafeApply(finalizeAtOrdinal)
+                                              val finalizeAtSlot = Slot(NonNegLong.unsafeFrom(canonicalSnapshot.slot))
+                                              val tip = selectedAtCommit.snapshot
+
+                                              // Every downstream canonical effect is gated on the successful exact
+                                              // chain-store CAS. They are not yet crash-atomic; the durable finality
+                                              // journal remains an activation blocker. Publish the Phase-2 watermark
+                                              // only after local state/serve data is ready, then invoke consumers that
+                                              // are required to observe that watermark.
+                                              for {
+                                                _ <- mptOverlay.finalizeBranch(BranchId(canonicalHash), canonicalOrdinal).void
+                                                _ <- mptOverlay.pruneBelow(canonicalOrdinal)
+                                                _ <- Metrics[F].updateGauge(
+                                                  "dag_nakamoto_overlay_prune_ordinal",
+                                                  finalizeAtOrdinal
+                                                )
+                                                finalizedHashes <- recordFinalizedRange(
+                                                  previousFinalizedOrdinal,
+                                                  finalizeAtOrdinal,
+                                                  tip.hash
+                                                )
+                                                _ <- recordFollowProjection(canonicalOrdinal, canonicalSnapshot.context)
+                                                _ <- latestFinalizedSliceSourceRef.update {
+                                                  case Some((o, _)) if o.value.value >= finalizeAtOrdinal =>
+                                                    Some((o, canonicalSnapshot.context))
+                                                  case _ => Some((canonicalOrdinal, canonicalSnapshot.context))
+                                                }
+                                                _ <- tipTracker.markFinalized(canonicalHash, finalizeAtSlot)
+                                                _ <- tipTracker.pruneBelow(finalizeAtSlot)
+                                                _ <- nakamotoFinalizedOrdinalRef
+                                                  .update(prev => cats.Order[SnapshotOrdinal].max(prev, canonicalOrdinal))
+                                                // Metagraph orphan release rechecks the public Phase-2 gate. Running
+                                                // this before the update above can re-buffer a valid child after the
+                                                // sole finalize-driven drain.
+                                                // The chain store may already have evicted intermediate
+                                                // ancestors. Resolve callbacks from canonical snapshot storage
+                                                // after publication while retaining only lightweight hashes.
+                                                _ <- finalizedHashes.traverse_ { finalizedHash =>
+                                                  snapshotStorage
+                                                    .get(finalizedHash)
+                                                    .flatMap(_.traverse_(stored => onFinalize(stored.value)))
+                                                }
+                                                _ <- logger.info(
+                                                  s"DEPTH-FINALIZED ordinal=$finalizeAtOrdinal slot=${canonicalSnapshot.slot} " +
+                                                    s"(tip ord=${tip.ordinal} slot=${tip.slot}, k=$ConfirmationDepthK)"
+                                                )
+                                                _ <- Metrics[F].incrementCounter("dag_nakamoto_finalized")
+                                                _ <- Metrics[F].updateGauge("dag_nakamoto_finalized_ordinal", finalizeAtOrdinal)
+                                                _ <- productionTimestamps.getAndUpdate(_ - finalizeAtOrdinal).flatMap { ts =>
+                                                  ts.get(finalizeAtOrdinal).traverse_ { prodMs =>
+                                                    val latencyMs = System.currentTimeMillis() - prodMs
+                                                    Metrics[F].recordDistribution("dag_nakamoto_finality_latency_ms", latencyMs.toInt)
+                                                  }
+                                                }
+                                                _ <- FinalityTrigger
+                                                  .triggersFor(phase12Triggers, canonicalOrdinal)
+                                                  .flatMap(qs => emitChainQuality[F](qs, finalizedOrdinal = Some(finalizeAtOrdinal)))
+                                              } yield canonicalSnapshot.some
+
+                                            case NakamotoChainStore.FinalizeOutcome.StaleSelection(current) =>
+                                              logger
+                                                .debug(
+                                                  s"DEPTH-FINALIZE deferred stale selection at ordinal=$finalizeAtOrdinal: " +
+                                                    s"expected=${expected.snapshot.hash.value.take(12)}, " +
+                                                    s"current=${current.fold("none")(_.snapshot.hash.value.take(12))}"
+                                                )
+                                                .as(none[NakamotoChainStore.StoredSnapshot])
+
+                                            case NakamotoChainStore.FinalizeOutcome.AlreadyFinalized(currentOrdinal, currentHash) =>
+                                              logger
+                                                .debug(
+                                                  s"DEPTH-FINALIZE already applied through ordinal=$currentOrdinal " +
+                                                    s"hash=${currentHash.fold("none")(_.value.take(12))}"
+                                                )
+                                                .as(none[NakamotoChainStore.StoredSnapshot])
+
+                                            case NakamotoChainStore.FinalizeOutcome.TargetUnavailable(targetOrdinal) =>
+                                              Metrics[F].incrementCounter("dag_nakamoto_finality_target_unavailable") >>
+                                                logger
+                                                  .warn(
+                                                    s"DEPTH-FINALIZE recovery required: selected exact ancestry does not contain " +
+                                                      s"ordinal=$targetOrdinal from tip=${expected.snapshot.hash.value.take(12)}"
+                                                  )
+                                                  .as(none[NakamotoChainStore.StoredSnapshot])
+                                          }
+
+                                      case (None, _) => Async[F].pure(none[NakamotoChainStore.StoredSnapshot])
+                                    }
                                   }
-                                case _ => Async[F].pure(false)
+                                case None => Async[F].pure(none[NakamotoChainStore.StoredSnapshot])
+                              }
+                              // Sidecar acknowledgement is transport cleanup, not a validity or finality
+                              // prerequisite. Keep the unbounded RPC outside the canonical semaphore; its
+                              // durable outbox TTL remains the retry/backstop until the effect journal lands.
+                              _ <- finalizedOutbox.traverse_ { canonicalSnapshot =>
+                                supervisor
+                                  .supervise(
+                                    confirmSnapshotOutbox(canonicalSnapshot, sidecarClient, logger).handleErrorWith { error =>
+                                      logger.warn(error)(
+                                        s"Finalized outbox acknowledgement failed at ordinal=${canonicalSnapshot.ordinal}; " +
+                                          s"sidecar TTL cleanup remains active"
+                                      )
+                                    }
+                                  )
+                                  .void
                               }
 
                               // Optimistic Phase 2 is deliberately dark here. The removed predecessor
                               // finalized from one receiver-local cumulative 2/3 weight read. That was
                               // neither the ratified sampled K/alpha/beta transcript nor portable evidence.
                               // Remote attestations remain observable below, but only the depth block above
-                              // may call chainStore.finalize until the replay-gated exact-hash rail lands.
+                              // may call chainStore.finalizeSelectedAt until the replay-gated exact-hash rail lands.
                               _ <- Async[F].whenA(allAtts.nonEmpty) {
                                 val ordinals = allAtts.values.map(_.tipOrdinal).toList.sorted
                                 logger.debug(
@@ -1264,41 +1284,10 @@ object SnapshotLeaderLoop {
                                 }
                               }
 
-                              // Heap-leak Fix A — transitional k1 overlay prune.
-                              //
-                              // Drives `mptOverlay.pruneBelow` once per advance of `tDepth1.latestQualifyingOrdinal`
-                              // (the operational k₁ finality trigger). Previously the only `pruneBelow` site was
-                              // wired to `tDepth2` (k₂ ≈ 65536 ≈ 6 days at ~445 snapshots/h), so the overlay's
-                              // `undoJournalRef` + `finalizedRef` accumulators grew linearly across every 12h soak.
-                              // Decoupling to k₁ (≈ 255 ≈ 30 min at the same rate) bounds the in-memory overlay-
-                              // history sets and was the dominant contributor to the leak documented in
-                              // `test-runs/soak-12h-preserve-20260521-083116/HEAP-LEAK-DIAGNOSIS.md` §1.
-                              //
-                              // Target safety does not exclude density reorgs beyond k1. This prune is safe only
-                              // when exact authenticated state remains reconstructible outside the RAM journal;
-                              // otherwise a required deeper comparison must enter RecoveryRequired. Treating k1
-                              // itself as an irreversible floor would violate the locked P2 lifecycle.
-                              //
-                              // The legacy k2 prune below is now a strict subset of what this k1 prune already
-                              // did and is retained for local NIPoPoW tower scheduling + telemetry. The
-                              // `mptOverlay.pruneBelow(archivalQualifying)` call there becomes a no-op once this
-                              // k₁ block has already dropped its slice.
-                              operationalPruneQualifying <- tDepth1.latestQualifyingOrdinal
-                              _ <- lastOperationalPruneOrdinalRef.get.flatMap { prev =>
-                                if (operationalPruneQualifying.value.value > prev.value.value)
-                                  lastOperationalPruneOrdinalRef.set(operationalPruneQualifying) >>
-                                    mptOverlay.pruneBelow(operationalPruneQualifying) >>
-                                    Metrics[F].updateGauge(
-                                      "dag_nakamoto_overlay_prune_ordinal",
-                                      operationalPruneQualifying.value.value
-                                    )
-                                else Async[F].unit
-                              }
-
                               // Track-3 S2: RAM undo-journal bound telemetry. The disk `signedBytesStore` now holds the deep
                               // signed bytes to k₂ (`ContiguousOrdinalCutoff(keepDepthBehindFinalized)`); the in-memory
-                              // `undoJournalRef` MUST stay bounded to the operational-k₁ fast-path window (the Fix A prune just
-                              // above). Emit its size EVERY tick as a gauge, and fire an over-bound counter if it exceeds the k₁
+                              // `undoJournalRef` MUST stay bounded to the operational-k₁ fast-path window (the exact-finality
+                              // prune above). Emit its size EVERY tick as a gauge, and fire an over-bound counter if it exceeds the k₁
                               // window — the sentinel that the RAM journal is NOT silently regressing toward the k₂ disk depth
                               // (the pre-Fix-A heap leak). Read-only snapshot: no mutex, no consensus effect.
                               overlayJournalSizes <- mptOverlay.journalSizes
@@ -1320,16 +1309,9 @@ object SnapshotLeaderLoop {
                               // Legacy T_depth2 local-retention observability. There is no Phase 3.
                               //
                               // When `tDepth2.latestQualifyingOrdinal` advances the current local watermark,
-                              // live code emits telemetry and prunes redundant RAM state. Neither action upgrades
-                              // snapshot validity or freezes fork choice. NIPoPoW tower catch-up is deliberately
+                              // live code emits retention telemetry only. It cannot prune the overlay, upgrade
+                              // snapshot validity, or freeze fork choice. NIPoPoW tower catch-up is deliberately
                               // not driven here until bounded exact-hash recovery is implemented.
-                              //
-                              // Heap-leak Fix A note: the `mptOverlay.pruneBelow(archivalQualifying)` call
-                              // below is now effectively a no-op for `undoJournalRef`/`finalizedRef` because
-                              // the k₁-driven prune above already dropped entries below `tDepth1` (which is
-                              // strictly less than `tDepth2`). It remains in place so the archival pattern
-                              // is still self-contained — adding local proof-service sinks later won't
-                              // need to coordinate with the operational-prune block.
                               archivalQualifying <- tDepth2.latestQualifyingOrdinal
                               _ <- settledOrdinalTracker.settledOrdinal.flatMap { prev =>
                                 if (archivalQualifying.value.value > prev.value.value)
@@ -1341,11 +1323,7 @@ object SnapshotLeaderLoop {
                                             s"(tip ord=${tip.ordinal}, k₂=$archivalDepthK)"
                                         ) >>
                                         Metrics[F].incrementCounter("dag_nakamoto_archival_finalized") >>
-                                        Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value) >>
-                                        // Legacy local-retention prune. k2 does not exclude density reorgs;
-                                        // exact authenticated disk/proof reconstruction must cover removed RAM
-                                        // state or the node must enter RecoveryRequired. Logged inside the overlay.
-                                        mptOverlay.pruneBelow(archivalQualifying)
+                                        Metrics[F].updateGauge("dag_nakamoto_archival_ordinal", archivalQualifying.value.value)
                                     case None =>
                                       // Trigger advanced without a tip — shouldn't happen because the
                                       // trigger's evaluator returns MinValue when bestTip is None.
@@ -1627,23 +1605,39 @@ object SnapshotLeaderLoop {
                               _ <- Async[F].whenA(kesReady) {
                                 SnapshotKesStorage.put[F](dataDir, snapshotHashedForStorage.hash, kesSnapSigBytes)
                               }
-                              stored <-
+                              storeOutcome <-
                                 if (kesReady)
-                                  chainStore.store(
-                                    signed,
-                                    context,
-                                    lastKey.value.value + 1,
-                                    currentSlot,
-                                    parentHashValue,
-                                    vrfOutput
-                                  )
-                                else Async[F].pure(false)
-                            } yield (signed, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes, stored)
+                                  chainStore
+                                    .store(
+                                      signed,
+                                      context,
+                                      lastKey.value.value + 1,
+                                      currentSlot,
+                                      parentHashValue,
+                                      vrfOutput
+                                    )
+                                    .map(_.some)
+                                else none[NakamotoChainStore.StoreOutcome].pure[F]
+                            } yield (signed, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes, storeOutcome)
                           }
                         else
-                          none[(Signed[GlobalIncrementalSnapshot], Hashed[GlobalIncrementalSnapshot], Hash, Array[Byte], Boolean)].pure[F]
+                          none[
+                            (
+                              Signed[GlobalIncrementalSnapshot],
+                              Hashed[GlobalIncrementalSnapshot],
+                              Hash,
+                              Array[Byte],
+                              Option[NakamotoChainStore.StoreOutcome]
+                            )
+                          ].pure[F]
                       storedOutcomeOpt = attemptOpt.collect {
-                        case (signed, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes, true) =>
+                        case (
+                              signed,
+                              snapshotHashedForStorage,
+                              parentHashValue,
+                              kesSnapSigBytes,
+                              Some(NakamotoChainStore.StoreOutcome.BecameSelected(_, _))
+                            ) =>
                           (signed, context, returnedEvents, snapshotHashedForStorage, parentHashValue, kesSnapSigBytes)
                       }
                       // Rekey the overlay branch on success; discard it on abandonment.

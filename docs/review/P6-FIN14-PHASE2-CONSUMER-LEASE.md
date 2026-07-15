@@ -103,7 +103,7 @@ urgent fork-choice replacement and finality progress.
   state, and authenticated-anchor artifacts (`FinalityCore.scala:314-343,366-376`).
 
 They are not live `FinalityGate` authority. In particular, the fork-choice evidence
-is intentionally opaque until O-15 supplies an objective selector and verifier
+is intentionally opaque until O-15's ratified direction is implemented and proved
 (`FinalityCore.scala:120-125`), and production code outside the finality package
 does not consume `FinalityCoreBatch`, `CanonicalSelectionToken`, or `ReleasedCore`.
 Durable restart validation currently proves that semantic/anchor artifact bytes are
@@ -460,7 +460,7 @@ negative test, not merely a schema.
 
 | Dependency | Required proof/readback | Current status |
 |---|---|---|
-| Objective fork choice | Complete O-15 frontier decision, parameter era, lineage, selected result, and independent verifier | Open; `ForkChoiceDecision` is an opaque pointer |
+| Objective fork choice | Complete the O-15 frontier construction and its parameter-era, lineage, selected-result, evidence, and independent-verifier gates | Open; the direction is owner-ratified, but `ForkChoiceDecision` is an opaque pointer |
 | Optimistic qualification | O-01 registry/weight snapshot, K/alpha/beta, emit-once attestations, `T_weight`, exact target | Open |
 | Depth qualification | Exact authenticated canonical suffix, `k1` metric/equality, parameter hash, target position | Open with O-15 metric boundary |
 | Authenticated executed snapshot | Exact signed bytes, network/genesis/era/parameters, parent/ordinal/slot, VRF/KES, body, transition, root | Live validation exists in pieces; no released-core capability |
