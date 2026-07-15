@@ -18,7 +18,7 @@ import io.constellationnetwork.dag.l0.domain.snapshot.programs.{
   UpdateNodeParametersCutter
 }
 import io.constellationnetwork.dag.l0.infrastructure.rewards.RewardsService
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{GlobalSnapshotEvent, StateChannelEvent}
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{DAGEvent, GlobalSnapshotEvent, StateChannelEvent}
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment.Dev
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -61,6 +61,7 @@ import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.tokenLock.TokenLockBlock
+import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.schema.{GlobalStateProofSelector, _}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -144,6 +145,87 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       shouldPerformMetagraphSpecificValidations: Boolean = true
     )(implicit hasher: Hasher[F]): IO[Either[BlockNotAcceptedReason, (BlockAcceptanceContextUpdate, UsageCount)]] = ???
 
+  }
+
+  private final case class NativeBlockAcceptanceCall(
+    blocks: List[Signed[Block]],
+    ordinal: SnapshotOrdinal,
+    shouldPerformMetagraphSpecificValidations: Boolean
+  )
+
+  private def isExpectedNativeBlockAcceptance(
+    calls: List[NativeBlockAcceptanceCall],
+    block: Signed[Block],
+    ordinal: SnapshotOrdinal
+  ): Boolean =
+    calls match {
+      case List(call) =>
+        call.blocks == List(block) &&
+        call.ordinal == ordinal &&
+        call.shouldPerformMetagraphSpecificValidations
+      case _ => false
+    }
+
+  private def recordingNativeBlockAcceptanceManager(
+    calls: Ref[IO, List[NativeBlockAcceptanceCall]],
+    balanceUpdate: Map[Address, Balance]
+  ): BlockAcceptanceManager[IO] =
+    new BlockAcceptanceManager[IO] {
+      override def acceptBlocksIteratively(
+        blocks: List[Signed[Block]],
+        context: BlockAcceptanceContext[IO],
+        ordinal: SnapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations: Boolean = true
+      )(implicit hasher: Hasher[IO]): IO[BlockAcceptanceResult] =
+        calls
+          .update(_ :+ NativeBlockAcceptanceCall(blocks, ordinal, shouldPerformMetagraphSpecificValidations))
+          .as(
+            BlockAcceptanceResult(
+              BlockAcceptanceContextUpdate(balanceUpdate, Map.empty, Map.empty),
+              blocks.map(_ -> initUsageCount),
+              List.empty
+            )
+          )
+
+      override def acceptBlock(
+        block: Signed[Block],
+        context: BlockAcceptanceContext[IO],
+        ordinal: SnapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations: Boolean = true
+      )(implicit hasher: Hasher[IO]): IO[Either[BlockNotAcceptedReason, (BlockAcceptanceContextUpdate, UsageCount)]] =
+        IO.raiseError(new IllegalStateException("The global acceptance path must use iterative native block acceptance"))
+    }
+
+  private def mkNativeDagBlock(
+    sourceKeyPair: java.security.KeyPair,
+    destination: Address
+  )(
+    implicit sp: SecurityProvider[IO],
+    hasher: Hasher[IO]
+  ): IO[Signed[Block]] = {
+    val source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+    val transaction = Transaction(
+      source,
+      destination,
+      TransactionAmount(10L),
+      TransactionFee(1L),
+      TransactionReference.empty,
+      TransactionSalt(1L)
+    )
+
+    for {
+      signedTransaction <- Signed.forAsyncHasher[IO, Transaction](transaction, sourceKeyPair)
+      block = Block(
+        NonEmptyList.one(
+          BlockReference(
+            io.constellationnetwork.schema.height.Height.MinValue,
+            io.constellationnetwork.security.hash.ProofsHash(Hash.empty.value)
+          )
+        ),
+        NonEmptySet.one(signedTransaction)
+      )
+      signedBlock <- Signed.forAsyncHasher[IO, Block](block, sourceKeyPair)
+    } yield signedBlock
   }
 
   val asbam: AllowSpendBlockAcceptanceManager[IO] = new AllowSpendBlockAcceptanceManager[IO] {
@@ -345,7 +427,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
   def mkGlobalSnapshotConsensusFunctions(
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[IO]
-    ] = None
+    ] = None,
+    blockAcceptanceManager: BlockAcceptanceManager[IO] = bam
   )(
     implicit j: JsonSerializer[IO],
     sp: SecurityProvider[IO],
@@ -395,7 +478,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           ),
           MetagraphsSyncConfig(PosInt(100)),
           Dev,
-          bam,
+          blockAcceptanceManager,
           asbam,
           tlbam,
           scProcessor,
@@ -547,22 +630,124 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     } yield expect.same(true, result.isLeft)
   }
 
+  test("native GL1 blocks are independently accepted and executed by GL0 producer and follower paths") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      producerCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      followerCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+      destination = PublicKeyOps(destinationKeyPair.getPublic).toAddress
+      block <- mkNativeDagBlock(sourceKeyPair, destination)
+      reproducedBalances = SortedMap(source -> Balance(89L), destination -> Balance(10L))
+      producer <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(producerCalls, reproducedBalances)
+      )
+      follower <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(followerCalls, reproducedBalances)
+      )
+      genesisKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
+      (artifact, producerContext, _) <- producer.createProposalArtifact(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(DAGEvent(block)),
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerResult <- follower.validateArtifact(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      observedProducerCalls <- producerCalls.get
+      observedFollowerCalls <- followerCalls.get
+    } yield
+      expect(isExpectedNativeBlockAcceptance(observedProducerCalls, block, SnapshotOrdinal.MinValue.next)) &&
+        expect(isExpectedNativeBlockAcceptance(observedFollowerCalls, block, SnapshotOrdinal.MinValue.next)) &&
+        expect(artifact.blocks.exists(_.block == block)) &&
+        expect(artifact.shardCheckpoints.isEmpty) &&
+        expect(artifact.stateChannelSnapshots.isEmpty) &&
+        expect.eql(reproducedBalances, producerContext.balances) &&
+        expect.eql(Some(reproducedBalances), followerResult.toOption.map(_._2.balances))
+  }
+
+  test("a GL0 follower rejects a leader artifact when native GL1 execution differs") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      producerCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      followerCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+      destination = PublicKeyOps(destinationKeyPair.getPublic).toAddress
+      block <- mkNativeDagBlock(sourceKeyPair, destination)
+      producerBalances = SortedMap(source -> Balance(89L), destination -> Balance(10L))
+      divergentFollowerBalances = SortedMap(source -> Balance(88L), destination -> Balance(11L))
+      producer <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(producerCalls, producerBalances)
+      )
+      follower <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(followerCalls, divergentFollowerBalances)
+      )
+      genesisKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
+      (artifact, _, _) <- producer.createProposalArtifact(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(DAGEvent(block)),
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerResult <- follower.validateArtifact(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      observedProducerCalls <- producerCalls.get
+      observedFollowerCalls <- followerCalls.get
+    } yield
+      expect(isExpectedNativeBlockAcceptance(observedProducerCalls, block, SnapshotOrdinal.MinValue.next)) &&
+        expect(isExpectedNativeBlockAcceptance(observedFollowerCalls, block, SnapshotOrdinal.MinValue.next)) &&
+        expect(followerResult.isLeft)
+  }
+
   // ───────────────────────────────────────────────────────────────────────────────────────────────
-  // R2 — follower-replay invariant (split-safety): `validateArtifact` always re-derives with
-  // `sourceShardCheckpoints = false`. A follower whose shard deps are PRESENT (numShards > 1) but whose
-  // local shard chain is EMPTY still validates a leader's artifact by REPLAYING the embedded
-  // `stateChannelSnapshots` as ordinary SC events — it does NOT re-source node-local shard finality state.
+  // TRANSITIONAL R2 — current follower behavior, not the target economic architecture:
+  // `validateArtifact` re-derives with `sourceShardCheckpoints = false`. A follower whose shard deps are
+  // PRESENT (numShards > 1) but whose local shard chain is EMPTY currently validates a leader's artifact
+  // by replaying embedded `stateChannelSnapshots` as ordinary SC events instead of re-sourcing node-local
+  // shard finality state.
   //
-  // This is the entire reason the decoupled design is split-safe: followers reach byte-identical state
-  // only by replaying the leader's embedded binaries, never by re-running their own shard sourcing on the
-  // validate path. The invariant is statically guaranteed in source (`validateArtifact` → `usingJson` →
-  // `createProposalArtifactInternal(..., sourceShardCheckpoints = false)`); this test exercises it through
-  // a follower wired WITH active sharding deps so a regression that flipped the follower to source would
-  // surface as a mismatch (the followers's empty-chain source would still be empty here, but the test pins
-  // the contract that the validate path tolerates + ignores present sharding deps).
+  // This behavior is superseded by execution-committee replay, positive assigned replay coverage, and
+  // noncommittee GL0 scoped-diff adoption with base/version CAS and root recomputation. Ordinary
+  // noncommittee GL0 followers must not replay sharded CL1 transitions once that replacement lands. Native
+  // GL1/DAG blocks remain universally validated and executed by every GL0 node. Keep this test enabled only
+  // as a regression for the current transition until the replacement path and its tests land.
   // ───────────────────────────────────────────────────────────────────────────────────────────────
   test(
-    "R2 follower-replay: validateArtifact (sourceShardCheckpoints=false) succeeds for a follower with active shard deps + EMPTY shard chain"
+    "TRANSITIONAL R2: validateArtifact succeeds with active shard deps and an empty local shard chain"
   ) { res =>
     implicit val (_, j, h, sp, m) = res
 
