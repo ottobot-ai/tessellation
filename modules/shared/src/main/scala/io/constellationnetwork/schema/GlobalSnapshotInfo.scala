@@ -383,8 +383,8 @@ object GlobalSnapshotInfo {
         lastGlobalSnapshotsWithCurrency = None,
         mptRoot = Some(mptRoot.value),
         historicalStakeSnapshots = optionalFieldRoot(FId.HistoricalStakeSnapshots),
-        // smtRoot intentionally None on this byte-rebuild path — see the producer-path note above. GSAM's accept() overrides it with the
-        // maintained store's cutoff-root after calling this helper (smtRoot is set on the returned proof, not derived from `entries`).
+        // The active protocol era requires smtRoot=None on every construction path. The historical-commitment tower remains staged and
+        // cannot be made consensus-bearing by a caller override; a future era must activate and verify that field explicitly.
         smtRoot = None
       )
     }

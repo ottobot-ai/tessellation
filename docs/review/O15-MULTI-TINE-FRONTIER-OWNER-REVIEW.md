@@ -1,9 +1,10 @@
-# O-15 Multi-Tine Frontier Owner Review
+# O-15 Multi-Tine Frontier Ratified Direction and Engineering Review
 
-**Status:** Owner review required. The objective result property is ratified;
-the selector, declared-frontier protocol, divergent-tine distance metric,
-evidence verifier, tie rule, resource-exhaustion rule, and proof are not ratified
-or implemented.
+**Status:** Owner direction ratified; stop-the-line research/proof packet. The objective result
+property, single-common-anchor density research direction, and tower-as-portable-evidence-only
+boundary are ratified. The exact selector, declared-frontier protocol, divergent-tine distance
+metric/equality, evidence verifier, tie rule, resource-exhaustion rule, and proof are not yet
+specified or implemented and therefore have no runtime authority.
 
 **Runtime authority:** None. This packet does not authorize the current pairwise
 fold, change GL0 fork choice, issue finality evidence, or make a snapshot Phase 2.
@@ -20,7 +21,7 @@ O-15 answers one narrow consensus question:
 > arrival order, restart order, or the node's previous incumbent choose the
 > result?
 
-The binary short-fork/deep-fork rule is already settled:
+The project's binary short-fork/deep-fork composition is already settled:
 
 - use Taktikos `maxvalid-tk` within `k1`; and
 - use the Ouroboros Genesis-family `maxvalid-bg` density comparison beyond
@@ -75,7 +76,7 @@ The following points are not reopened by O-15:
    winner locally or refuse a winner merely because the fork is old.
 
 These properties are recorded as L-02 through L-05 and L-24 in
-`CONSENSUS-OWNER-DECISIONS.md:13-18,38` and as the GL0 lifecycle in
+`CONSENSUS-OWNER-DECISIONS.md:19-22,42` and as the GL0 lifecycle in
 `CONSENSUS-ARTIFACT-LIFECYCLE.md:53-76,165-186`.
 
 ## 4. Why the current implementation is unsafe
@@ -92,6 +93,10 @@ order, or proves that the mixed relation is transitive or permutation-independen
 This is not a claim that either paper is BFT or that its two-chain rule is unused.
 It means this project's stronger L-24 total-frontier requirement needs a new,
 explicit construction and proof rather than an assumption that it was inherited.
+Published Taktikos Algorithm 1 also does not replace the incumbent with a candidate
+that forks deeper than `k`; the Tk-within-`k1` plus Genesis-density-beyond-`k1`
+composition in section 1 is a project rule, not a complete selector proved by that
+algorithm.
 
 Sources: Schutza et al., *Ouroboros Taktikos*, section 3/Algorithm 1
 ([DOI](https://doi.org/10.1007/978-981-99-8104-5_20), owner-supplied published
@@ -103,6 +108,22 @@ algorithm in Appendix A.1, pp. 22-23, SHA-256
 Badertscher et al., *Ouroboros Genesis*, section 3.2.4/Figure 7
 ([accepted manuscript](https://www.pure.ed.ac.uk/ws/portalfiles/portal/76645278/Ouroboros_Genesis.pdf),
 pp. 11-13).
+
+**Security-transfer limit.** The prepublication Taktikos artifact states a
+bounded-delay, static-stake result in its abstract (p. 1). Its section 4.1 assumes
+a synchronous network, static registration, and a time-homogeneous Markov process
+(p. 10), and Theorems 2 through 4 state their common-prefix, chain-growth, and
+chain-quality bounds for that synchronous process (pp. 14-15). Its `FINIT`
+description fixes a static stake distribution and constant genesis nonce and says
+that a real dynamic-stake instantiation is future work (p. 20). Appendix A.1
+proposes the semi-synchronous `maxvalid-tk` fold (pp. 22-23); it does not prove an
+incumbent-independent total-frontier selector. Ouroboros Genesis Figure 5 derives
+each candidate chain's `N-2` stake and `N-1` eta inputs inside `IsValidChain`;
+Figure 6 independently derives the same epoch-offset inputs for the current
+`Cloc` view. Combining that branch-derived schedule with Taktikos LDD, dynamic
+KES/VRF/registry eras, and a new L-24 selector requires a project-specific transfer
+argument. Authenticating every branch-local parameter is necessary validation
+evidence; it is not by itself that security proof.
 
 ### 4.2 The pairwise rule is not a frontier selector
 
@@ -149,8 +170,11 @@ Concrete failure:
 3. Each node runs the incumbent tournament and ends at a different head.
 4. Each head can feed different descendants, Phase-2 evidence, MPT branches, and
    downstream state.
-5. Arrival order has become consensus authority, producing a persistent fork even
-   though the nodes know the same frontier.
+5. Arrival order has become an input to the current canonical-head state: the
+   fixture proves different heads after the same stored frontier arrives in
+   different schedules. Persistence under valid leader production and the
+   resulting common-prefix or liveness impact remain activation proof obligations;
+   this fixture does not establish them.
 
 ### 4.4 The `k1` equality boundary is wired inconsistently
 
@@ -199,20 +223,20 @@ selected result
 The dark type is useful plumbing. It is not fork-choice evidence and cannot
 authorize live `FinalityGate` transitions.
 
-## 5. Exact decision under owner review
+## 5. Ratified direction and engineering freeze gates
 
 O-15 contains seven related decisions. They must land as one coherent protocol and
 proof; selecting only the easy rows does not close the gate.
 
-| ID | Owner decision | Recommendation for this review | Current status |
+| ID | Protocol area | Owner-ratified direction | Engineering status |
 |---|---|---|---|
-| O-15A | Observation boundary and late reveal | Define an authenticated slot/era-derived observation boundary under an explicit Taktikos diffusion assumption. Local arrival time, wall clock, peer count, first-N receipt, vote, quorum, certificate, or QC is not authority. Evidence binds one exact declared manifest; it cannot prove that every valid/private tine was disclosed. Every later valid reveal enters a subsequent frontier and causes deterministic reselection. | Fully open; no concrete boundary or evidence rule yet |
-| O-15B | Multi-tine selector | Require one pure objective total-frontier function over a verified set. Reject incumbent folds, receiver-local iteration order, and hidden map/set order. Do not activate any concrete cycle rule until it has an independent reference model and security/liveness argument. | Property ratified; algorithm open |
-| O-15C | Lineage classification, short/deep metric, and equality | Classify exact ancestry first: identical tines are equal and a strict descendant beats its strict prefix. For genuinely divergent tines, freeze what distance is compared to `k1` and the equality boundary. The cited algorithms measure a candidate relative to the current incumbent; the candidate symmetric `max(post-MRCA suffix lengths)` metric is a new project rule and its paper bounds do not automatically transfer. | Open research; no metric is ready for ratification |
-| O-15D | Exact ties | Do not treat the current lower-VRF-then-hash rule as ratified. Retain it only as a RED/reference input until its grinding, equivocation, and precomputation consequences are quantified or a different objective rule is proposed. Incumbent or argument order is forbidden. | Open; no supportable exact choice in current evidence |
-| O-15E | Portable evidence and verifier | Define a canonical, resource-bounded manifest for the declared frontier, complete compared ancestry, boundary context, exact immutable snapshot/body/state/era validation inputs, and selected result. The verifier independently reconstructs validity, MRCA facts, measurements used by the selector, and the final selection. Local validation receipts are cache hints only, never portable authority. A decoded pointer or peer assertion is never enough. | Recommended shape; exact schema/limits open |
-| O-15F | Activation proof | Require the full validator-backed witness, order/restart/late-reveal convergence, partition/withholding simulations, chain-quality/common-prefix analysis, and corrected-store tests before this selector may mint canonical-selection authority. | Mandatory; open |
-| O-15G | Byzantine frontier overflow | Define objective dominance, expiry, authenticated compaction, or bounded-memory streaming for arbitrarily many individually valid equivocations. No receiver-local eviction, first-N cap, hash truncation, or `k2` retention limit may change frontier membership or the selected result; fail-stop cannot be the normal overflow rule. | Open; no non-halting resource rule yet |
+| O-15A | Observation boundary and late reveal | Use an authenticated slot/era-derived boundary under an explicit Taktikos diffusion assumption; local arrival/peer/quorum state is never authority, and later valid reveals trigger deterministic reselection. | Exact boundary and evidence rule remain research. |
+| O-15B | Multi-tine selector | Require one pure objective total-frontier function over a verified set; reject incumbent folds and receiver-local collection order. | Exact algorithm and reference model remain research. |
+| O-15C | Lineage, short/deep metric, equality | Classify exact ancestry first; use the single-common-anchor density direction for divergent tines, never the unproved symmetric max-suffix rule by default. | Exact `k1` metric/equality and transferred security argument remain research. |
+| O-15D | Exact ties | Current lower-VRF-then-hash is RED/reference input only; incumbent or argument order is forbidden. | No exact tie has activation authority; grinding/equivocation analysis remains. |
+| O-15E | Portable evidence and verifier | Use a canonical resource-bounded manifest whose verifier independently reconstructs validity, ancestry, measurements, and result. | Exact schema and limits remain engineering. |
+| O-15F | Activation proof | Require validator-backed, order/restart/late-reveal convergence, partition/withholding, chain-quality/common-prefix, and corrected-store evidence. | Mandatory proof suite remains open. |
+| O-15G | Byzantine frontier overflow | Use objective dominance/expiry/authenticated compaction/bounded streaming; receiver-local eviction, first-N/hash truncation, `k2`, and normal fail-stop cannot choose. | Exact non-halting resource rule remains research. |
 
 ### 5.1 Lineage must be classified before divergent-tine distance
 
@@ -266,9 +290,8 @@ cycle. The following implementation shortcuts are not acceptable substitutes:
 | Add a GL0 vote/QC to choose among the tines | Reintroduces the global partially synchronous BFT architecture explicitly forbidden by L-02. | Forbidden |
 | Define a new objective total-frontier construction and prove it | Can satisfy L-24 if it preserves the Tk/Bg security assumptions and converges under the declared frontier protocol. | Required design class; exact construction still open |
 
-The owner should not be asked to approve a named selector until its complete
-formula, adversary model, and reference traces exist. The present recommendation
-is therefore to keep O-15B open and stop live finality authorization at this gate.
+No named selector may receive activation authority until its complete formula, adversary model,
+and reference traces exist. O-15B therefore remains a stop-the-line research gate.
 
 ## 6. Invariants the final design must enforce
 
@@ -291,7 +314,7 @@ There is no current source line that enforces all of these invariants. O-15 is a
 activation blocker precisely because `ChainSelection.selectBest` and
 `NakamotoChainStore.store` violate `SET-NOT-LIST` and `OBJECTIVE-RESULT`.
 
-## 7. Required code impact after ratification
+## 7. Required code impact after engineering freeze
 
 No code change should begin with "make `selectBest` sort the list." The coherent
 implementation surface is:
@@ -306,7 +329,7 @@ implementation surface is:
    divergent-tine `k1` metric in configuration, runtime comparison, reference
    model, and evidence vectors together.
 4. Replace opaque `ForkChoiceDecision` evidence with a canonical bounded schema
-   only after O-15E is ratified. Keep `CanonicalBranchRevision` a local CAS guard,
+   only after O-15E's exact objective tie is derived, proved, and frozen. Keep `CanonicalBranchRevision` a local CAS guard,
    not portable proof.
 5. Permit `FinalityGate` to consume only an independently verified fork-choice
    capability. The raw chain-store result cannot directly authorize P1/P2 or a
@@ -341,7 +364,7 @@ The minimum close evidence is:
 6. **Cutoff/late-reveal model:** exercise on-time publication, delayed honest
    gossip, withholding through one cutoff, later disclosure, partition/heal, and
    repeated reselection. Converged frontiers must converge without a lock.
-7. **Tie/grinding model:** quantify the ratified tie rule under producer
+7. **Tie/grinding model:** quantify the eventual frozen objective tie rule under producer
    equivocation, eligible-slot precomputation, many privately produced candidates,
    and exact VRF collision fixtures.
 8. **Overflow model:** one eligible producer emits unbounded distinct valid
@@ -366,22 +389,20 @@ These are the repository gates `FIN-D-001`, `FIN-D-001A`, `FIN-D-001B`,
 store tests are RED evidence, not closure
 (`CONSENSUS-PROTOCOL-TEST-PLAN.md:195-226`).
 
-## 9. Owner review checklist
+## 9. Engineering/research checklist
 
-No O-15 algorithmic decision is ready for ratification. L-24's objective-result
-property remains ratified; the owner should review whether this packet frames the
-open questions correctly before protocol research continues:
+Owner direction is ratified, but no exact O-15 algorithm is activation-ready. Engineering must
+answer and prove the following before protocol research can become runtime authority:
 
 1. What authenticated slot/era boundary and exact Taktikos diffusion assumption
    define one declared frontier manifest without using local time, peer count, or
    global voting/quorum machinery?
 2. What exact event moves a late valid reveal into the next selection frontier?
-3. Does the owner confirm strict extension monotonicity for arbitrary-depth valid
-   descendants before any divergent-tine metric is applied?
-4. For genuinely divergent tines, should research retain an explicitly
-   incumbent-relative construction, investigate the symmetric maximum-suffix
-   candidate as a new project rule, or evaluate another precisely specified
-   metric? No choice is recommended without its proof.
+3. Prove strict extension monotonicity for arbitrary-depth valid descendants
+   before any divergent-tine metric is applied.
+4. Define the exact single-common-anchor density metric and `k1` equality boundary
+   for genuinely divergent tines; do not silently retain incumbent-relative or
+   symmetric maximum-suffix behavior.
 5. What objective total-frontier function resolves the proven strict Tk/Bg cycle?
 6. What exact tie rule is acceptable after grinding and equivocation analysis?
 7. What objective non-halting rule bounds an equivocator-created frontier without
@@ -391,13 +412,13 @@ open questions correctly before protocol research continues:
 9. What security/liveness argument supports the selector under Taktikos/LDD's
    actual leader process and the project's Genesis-family density rule?
 
-Until all nine are closed, the safe owner verdict is:
+Until all nine are closed, the activation verdict is:
 
-> Keep O-15 open. Preserve the objective total-frontier requirement and the RED
+> Keep O-15 activation-blocked. Preserve the objective total-frontier requirement and the RED
 > witnesses. Do not let the current pairwise tournament, an arbitrary sorted fold,
 > or an opaque `ForkChoiceDecision` authorize `FinalityGate` or Phase 2.
 
-## 10. Relationship to other owner gates
+## 10. Relationship to other freeze gates
 
 - O-01 defines Avalanche/Snowball population and parameters after fork choice has
   selected an exact valid hash. It cannot resolve O-15.

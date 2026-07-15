@@ -195,15 +195,18 @@ is hash-bound mirror progress only. Physical shard count cannot change the resul
 
 ## 9. Payload and data availability
 
-V1 proposes two explicit signed lanes:
+O-09 and L-16 require three explicit signed lanes:
 
 - `FrameworkCurrency`;
-- `FrameworkCurrencyWithData`.
+- `FrameworkCurrencyWithData`; and
+- a limited standalone opaque/data-only lane.
 
-The framework portion always follows replay/diff rules. Custom bytes are a
-separate authenticated availability commitment and cannot influence the framework
-result. Standalone opaque/data-only state channels are disabled unless the owner
-explicitly retains them.
+The framework portion of either framework lane always follows replay/diff rules.
+Custom bytes are a separate authenticated availability commitment and cannot
+influence the framework result. The owner-retained standalone opaque/data-only
+lane has authenticated custody/availability/ordering only, zero framework-economic
+write surface, and no path to import claimed framework state. Decoder success can
+never select or promote a lane.
 
 Complete inputs remain available through the maximum of recommended `k2`, challenge,
 watchtower, rollback, recovery, and downstream acknowledgement horizons. Missing
@@ -219,15 +222,16 @@ timeout, or an unresolvable base cannot slash. The watchtower assertion is not a
 verdict; a ratified deterministic adjudicator computes the mismatch, initially by
 exceptional bounded universal GL0 replay of the challenged exact checkpoint.
 
-The protocol still requires owner decisions for watchtower population/coverage and
-whether replay must finish before economic Phase-2 release or a bounded challenge
-window quarantines every derived use. Blocking only withdraw/cross-MG is
-insufficient: invalid value must not transfer locally, pay fees, stake, gain reward
-weight, mint, bridge, or compact before release.
+O-03/L-09 ratify positive assigned-watchtower replay coverage as a prerequisite
+for GL0-inclusion eligibility; a post-release challenge window is not an
+alternative. Engineering must derive and freeze the population, minimum coverage,
+assignment anchor, deadline, redraw/retry, bond, replay-budget, and censorship
+parameters. Blocking only withdraw/cross-MG is insufficient: invalid value must
+not transfer locally, pay fees, stake, gain reward weight, mint, bridge, or compact
+before release.
 
-The conservative planning default makes positive coverage a prerequisite for
-GL0-inclusion eligibility. An uncovered checkpoint waits while unrelated GL0 and
-other-shard work proceeds.
+An uncovered checkpoint waits while unrelated GL0 and other-shard work proceeds.
+Timeout/nonresponse cannot release value or slash.
 
 ## 11. Current implementation delta
 

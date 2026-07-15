@@ -649,6 +649,28 @@ object GlobalSnapshotTraverseSuite extends MutableIOSuite with Checkers {
       }
   }
 
+  test("rollback traversal rejects a forbidden smtRoot in a tail snapshot before installing it") {
+    case (ks, h, j, sp, m, _) =>
+      implicit val (kryo, hasher, json, security, metrics) = (ks, h, j, sp, m)
+      implicit val gsps: GlobalStateProofSelector = GlobalStateProofSelector(SnapshotOrdinal.MinValue)
+
+      for {
+        snapshots <- mkSnapshots(
+          List(List.empty[BlockAsActiveTip], List.empty[BlockAsActiveTip]),
+          balances
+        )
+        (global, incrementals) = snapshots
+        tail = incrementals.last.signed.value
+        tampered = tail.copy(stateProof = tail.stateProof.copy(smtRoot = Some(Hash("ab" * 32))))
+        keyPair <- KeyPairGenerator.makeKeyPair[IO]
+        signedTampered <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](tampered, keyPair)
+        hashedTampered <- signedTampered.toHashed
+        chain = incrementals.toList.init :+ hashedTampered
+        traverser <- gst(global, chain, hashedTampered.hash)
+        result <- traverser.loadChain().attempt
+      } yield expect(result.swap.exists(_.isInstanceOf[io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator.Violation]))
+  }
+
   private def initialReferences() =
     NonEmptyList.fromListUnsafe(
       List

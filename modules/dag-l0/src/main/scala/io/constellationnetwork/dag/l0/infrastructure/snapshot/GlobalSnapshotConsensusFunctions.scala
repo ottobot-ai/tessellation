@@ -51,6 +51,7 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelValidationType}
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
+import io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator
 
 import eu.timepit.refined.auto._
 import eu.timepit.refined.types.all.NonNegLong
@@ -278,26 +279,24 @@ object GlobalSnapshotConsensusFunctions {
         incomingFraudProofs = artifact.fraudProofs
       )
 
-      // The §3 NIPoPoW historical-commitment `smtRoot` is gl0-maintained and PATH-DEPENDENT: it folds the locally-resolved
-      // snapshot[N−k] into a SEPARATELY-maintained accumulating SMT (keyed by finalized ordinal, not in the GSI), so honest
-      // nodes provably cannot reproduce it in lockstep. It must NOT gate consensus acceptance — including it in this `===` made
-      // ~97% of freshly-won blocks fail content-validation against each other (the fork storm). Compare smtRoot-blind, matching
-      // the existing `StateProofComparison.equivalent` precedent (which already normalizes smtRoot away for exactly this reason).
-      // smtRoot integrity is covered by (a) its inclusion in the SIGNED snapshot and (b) the dedicated chain-replay check at the
-      // finalize sink — never by this re-derivation equality.
-      def smtRootBlind(a: GlobalSnapshotArtifact): GlobalSnapshotArtifact =
-        a.copy(stateProof = a.stateProof.copy(smtRoot = None))
-
       def check(result: F[(GlobalSnapshotArtifact, GlobalSnapshotContext, Set[GlobalSnapshotEvent])]) =
         result.map {
           case (recreatedArtifact, context, _) =>
-            if (smtRootBlind(recreatedArtifact) === smtRootBlind(artifact))
+            // Historical commitment activation is dark: honest construction reproduces `smtRoot = None`. Exact equality rejects a
+            // producer-supplied root instead of treating an unverified commitment as consensus-valid.
+            if (recreatedArtifact === artifact)
               (artifact, context).asRight[InvalidArtifact]
             else
               GlobalArtifactMismatch(artifact, recreatedArtifact).asLeft[(GlobalSnapshotArtifact, GlobalSnapshotContext)]
         }
 
-      check(usingJson)
+      GlobalSnapshotActiveEraValidator.validate(artifact) match {
+        case Left(_) =>
+          (GlobalArtifactActiveEraViolation(artifact.ordinal): InvalidArtifact)
+            .asLeft[(GlobalSnapshotArtifact, GlobalSnapshotContext)]
+            .pure[F]
+        case Right(_) => check(usingJson)
+      }
     }
 
     /** Builds a new GlobalIncrementalSnapshot proposal from the previous snapshot and pending events.
@@ -351,7 +350,7 @@ object GlobalSnapshotConsensusFunctions {
         incomingShardCheckpoints = SortedMap.empty,
         // Produce path peeks its own `fraudProofPool` below; nothing incoming.
         incomingFraudProofs = SortedSet.empty
-      )
+      ).flatTap { case (artifact, _, _) => GlobalSnapshotActiveEraValidator.requireValid[F](artifact) }
 
     /** Implementation of [[createProposalArtifact]] with an explicit `sourceShardCheckpoints` gate.
       *

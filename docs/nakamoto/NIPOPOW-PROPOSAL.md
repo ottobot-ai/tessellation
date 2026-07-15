@@ -756,7 +756,13 @@ today).
 
 ---
 
-## §8 — Open questions for the user
+## §8 — Historical proposal questions (non-authoritative)
+
+The ratified tower direction and active engineering gates are now O-08, L-22, and
+`NIPOPOW-IMPLEMENTATION-PLAN.md`. The alternatives below are preserved research
+inputs, not pending owner questions or runtime authority. Any choice must be
+derived, proved, parameter-frozen, and reconciled through the active decision
+register before implementation.
 
 1. **Tower compression.** The paper publishes one tower entry per
    qualifying snapshot — straightforward append-only structure. An

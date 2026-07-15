@@ -228,11 +228,9 @@ object GlobalSnapshotConsensus {
     // Write-restricted view over the transitional legacy k2 watermark above. It is local telemetry
     // only in the target architecture; `T_depth2` and Phase 3 must be removed rather than promoted.
     settledOrdinalTracker: io.constellationnetwork.node.shared.domain.nakamoto.SettledOrdinalTracker[F],
-    // §3 NIPoPoW S5 — observability seam for the NipopowRoutes light-client endpoints. Populated
-    // here in the resource block once the local `TowerStore` and snapshot storage are available.
-    // Read by `NipopowRoutes` to answer GET /nakamoto/nipopow/proof and POST /nakamoto/nipopow/verify
-    // without owning the builder/verifier references. Empty until this resource has produced the
-    // wired provider — the route handles `None` as a 503.
+    // NIPoPoW route seam. Production proof publication is deliberately dark: the Ref remains `None`
+    // and both endpoints return 503 until proof construction is exact-target-bound, catch-up/rebuild
+    // state is durable, and hard input/output/work bounds are ratified and enforced.
     nipopowProofProviderRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider[F]
     ]],
@@ -568,16 +566,6 @@ object GlobalSnapshotConsensus {
       // bar) — the GSAM below then passes `None` for all sharding params, byte-identical to the pre-wiring call.
       shardAcceptanceDeps = sharedServices.shardAcceptanceDeps
 
-      // §3 NIPoPoW historical-commitment SMT store — gl0-only (this produce/verify GSAM has the finalized global-snapshot chain
-      // via `getGlobalSnapshotByOrdinalWithFallback`, which accept() reads to derive each finalized ordinal's commitment). In-memory
-      // reference (durable MPT producer + versioned SMT); recoverable by chain-replay like `MptTowerStore`. The SharedServices
-      // (cl0/dl1 follower) GSAM is NOT given the store, so those layers keep `smtRoot = None`.
-      historicalCommitmentSmtStore <- {
-        implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-        io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore
-          .inMemory[F](sharedCfg.nakamoto.commitmentSmt.versionRootRetention.value)
-      }.toResource
-
       // ─── Signed-byte-store read-time BACKFILL (2026-07-09): heals HOLES in the contiguous `signedBytesStore` at the pinned-read miss
       // seam. Creation-side staging races (fail-closed reorg adopts whose carried GSI can't reproduce the fork's signed root,
       // same-ordinal proposal-race losses where the winner's bytes were never staged under the finalized hash, catch-up jumps) leave
@@ -701,10 +689,9 @@ object GlobalSnapshotConsensus {
           shardingConfig = shardAcceptanceDeps.map(_.shardingConfig),
           shardCheckpointAcceptanceManager = shardAcceptanceDeps.map(_.acceptanceManager),
           shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
-          // §3 NIPoPoW historical-commitment SMT: wire the gl0 store COUPLED with its confirmation-depth cutoff k so accept()
-          // anchors `smtRoot(N)`. Same per-env k the leader loop / sync daemon read (`nakamoto.confirmation-depth-k`, no default).
-          historicalCommitmentSmt =
-            Some((historicalCommitmentSmtStore, sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value)),
+          // Historical commitment activation remains dark until exact-hash branch recovery, durable boot replay, and recipient
+          // reproduction are complete. Honest GL0 artifacts therefore carry `smtRoot = None`.
+          historicalCommitmentSmt = None,
           // WATCHTOWER slashing config — threaded from the single HOCON source (same as the SharedServices GSAM) so both GSAM
           // sites apply the operator-configured, cluster-uniform slash/bounty fractions (now required — no source-level default).
           invaliditySlashingConfig = sharedCfg.nakamoto.invaliditySlashing,
@@ -1520,48 +1507,11 @@ object GlobalSnapshotConsensus {
               shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
               logger = orphanBufferLogger
             )
-          // Dedicated local NIPoPoW tower store + finalizer. Tower retention/proof eligibility is not a
-          // protocol phase or a fork-choice floor. Current invocation from the legacy T_depth2 branch is
-          // transitional and must not be interpreted as global finality.
-          // The tower lives in its own in-memory MPT producer (NOT the shared `mptStore`); proposal §4.5
-          // explicitly forbids anchoring the tower root in headers, so its bytes never enter the global
-          // `mptRoot` / `stateProof`. Each node maintains its own copy; corruption recovery is a chain
-          // replay (re-run LevelTrialComputer.runAll over finalized snapshots), not a state-proof rollback.
-          //
-          // The same `LevelTrialComputer` (using the byte-deterministic Bifrost `Exp` interpreter already
-          // built for L0 eligibility) drives both the per-snapshot trial computation and the finalizer's
-          // gap derivation. `HasherSelector.getCurrent` is fine here because the tower partition is local
-          // and doesn't participate in consensus-bytes hashing — same trick as `gateHasher` above.
-          towerStore <- {
-            implicit val towerHasher: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
-            io.constellationnetwork.node.shared.domain.nakamoto.nipopow.MptTowerStore.inMemory[F].toResource
-          }
-          levelTrialComputer = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.LevelTrialComputer.make[F](exp)
-          towerFinalizer <- io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerFinalizer
-            .make[F](towerStore, levelTrialComputer, lddConfig.lddCutoff.toLong)
-            .toResource
-          // §3 NIPoPoW S5 — wire the proof builder + verifier and publish a `NipopowProofProvider` to the HTTP layer.
-          //   - Builder reads the local tower store + global snapshot storage to assemble per-level chains + L0 suffix.
-          //   - Verifier uses the same `(log1p, exp)` interpreters that drive the leader-loop's eligibility check, so any
-          //     proof a remote builder produces from this node's chain is byte-identical-verifiable here.
-          //   - Provider bakes in `(genesisEta, etaRotationSnapshots, lddConfig)` so the route doesn't need them.
-          // Provider is published once at startup — the towerStore + verifier are immutable for the lifetime of the
-          // process, so re-publishing under reorg is unnecessary.
-          _ <- {
-            val proofBuilder = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerProofBuilder
-              .make[F](towerStore, globalSnapshotStorage)
-            val proofVerifier =
-              io.constellationnetwork.node.shared.domain.nakamoto.nipopow.TowerVerifier
-                .make[F](log1p, exp, sharedServices.operatorKeyRegistry)
-            val provider = io.constellationnetwork.node.shared.domain.nakamoto.nipopow.NipopowProofProvider.make[F](
-              proofBuilder,
-              proofVerifier,
-              genesisEta = genesisEta,
-              etaRotationSnapshots = etaRotationSnapshots.toLong,
-              lddConfig = lddConfig
-            )
-            nipopowProofProviderRef.set(Some(provider))
-          }.toResource
+          // Keep proof publication unavailable. The staged tower finalizer/catch-up implementation is
+          // intentionally not attached to the finality monitor: its current exact walk scans the full
+          // tip-to-cursor interval per bounded processing chunk, has no durable clean-rebuild protocol,
+          // and its builder is not bound to an immutable requested target.
+          _ <- nipopowProofProviderRef.set(None).toResource
 
           // Axis 2 (gl1 inclusion-proof follow) — publish the gl0-side slice producer so
           // `GlobalFollowRoutes` (mounted in HttpApi) can serve `GET /global-follow/slice/latest`.
@@ -1591,13 +1541,12 @@ object GlobalSnapshotConsensus {
           // finalize sinks, and serves the contiguous deltas a full-state ml0 follower adopts to reach the latest
           // finalized ordinal. Never feeds back into consensus.
           _ <- {
-            // Slice B — thread the gl0 §3-NIPoPoW historical-commitment SMT store + the SAME confirmation-depth cutoff
-            // accept() anchors `smtRoot(N)` with, so each served delta carries the inclusion proof (smtRoot(ord)) and
-            // absence-at-parent proof (smtRoot(ord−1)) ml0 verifies the signed smtRoot against by construction.
+            // Historical commitment activation is dark. Do not serve proofs from a node-local, restart-empty store while signed GL0
+            // artifacts are required to carry `smtRoot = None`.
             val changeSetService = io.constellationnetwork.node.shared.domain.nakamoto.GlobalChangeSetService
               .make[F](
                 recentFinalizedAccumulatorsRef.get,
-                Some(historicalCommitmentSmtStore),
+                None,
                 sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value
               )
             globalChangeSetServiceRef.set(Some(changeSetService))
@@ -1609,18 +1558,12 @@ object GlobalSnapshotConsensus {
           // (`shardAcceptanceDeps = Some`); at numShards=1 the Ref stays `None` and the route serves 503.
           //
           // Wiring:
-          //   - prover MPT primitive = `HistoricalMptProofService(mptStore, mptOverlay)` — the SAME global-MPT
-          //     substrate the rest of gl0 proves against (v1 reuses the global trie; the per-MG subtree root in
-          //     the checkpoint is the verification anchor — design §8.5).
+          //   - subtree reconstruction = `perMgEntriesFor` below, read from the current finalized global MPT view;
+          //     this is not `HistoricalMptProofService` and does not claim an exact historical generation.
           //   - shard-ownership oracle = `deps.shardAssignment` (the cluster-wide static map).
-          //   - checkpoint lookup = `ShardChainStore.bestTip` per shard, lifted to its `Signed[ShardCheckpoint]`
-          //     (the prover's scaladoc specifies exactly this — the shard's last committee-signed checkpoint).
-          //   - generation anchor = `(BranchId.base, finalizedOrdinal)`: the read-only serve anchors at gl0's
-          //     FINALIZED base trie (matches the route's "serve finalized state" contract + the §8.3 one-snapshot
-          //     read-after-write staleness bound). The ordinal is captured once here; the consumer re-verifies
-          //     every proof against gl0's OWN finalized `shardCheckpoints[shardId]` root regardless, so a slightly
-          //     stale generation anchor cannot widen the trust surface (a v2 refinement would make the anchor a
-          //     per-request callback once the service surface supports it).
+          //   - checkpoint lookup = `ShardChainStore.bestTip` per shard, lifted to its `Signed[ShardCheckpoint]`.
+          //   - the proof service emits only when the reconstructed subtree root equals the checkpoint's committed
+          //     per-MG root. Consumers still verify the proof against the exact GL0-anchored checkpoint they trust.
           // ADDITIVE / serve-only — a pure read of MPT + finalized shard-checkpoint state, never feeds back into
           // consensus.
           _ <- shardAcceptanceDeps match {
@@ -2181,10 +2124,6 @@ object GlobalSnapshotConsensus {
                         }
                       }
                     },
-                  // Local NIPoPoW tower finalizer (not in the consensus stateProof). Current code invokes
-                  // it from the legacy T_depth2 retention branch; tower updates must not imply a phase or
-                  // constrain objective GL0 fork choice.
-                  towerFinalizer = towerFinalizer,
                   // Gap A — per-shard checkpoint producers + the SAME chain stores they write into + the
                   // per-shard admission-approved binary buffers (the producer fan-out input) + the
                   // static metagraph→shard assignment. Empty / None at numShards=1 (regression bar); the

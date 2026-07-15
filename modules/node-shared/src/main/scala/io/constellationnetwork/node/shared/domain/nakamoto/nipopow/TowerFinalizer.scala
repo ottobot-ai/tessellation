@@ -14,8 +14,8 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Local NIPoPoW updater that grows [[TowerStore]] from tower-eligible snapshots.
   *
-  * Current wiring calls it from the legacy `T_depth2` retention watermark. That scheduling is local proof-service policy, not a global
-  * finality phase. For each super-level µ in 1..L-1:
+  * This component is staged but deliberately not wired into the live finality monitor. Production activation requires a bounded,
+  * branch-relative exact-hash catch-up target and durable tower/cursor recovery. For each super-level µ in 1..L-1:
   *
   *   - looks up `tower.latestAt(µ).ordinal` (or 0 if none — every snapshot starts with `g_µ = ord - 0`)
   *   - derives `g_µ = ord - lastLevelMuOrdinal` (snapshots since previous level-µ hit, in ordinal-units NOT slot-units)
@@ -23,18 +23,29 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - runs `LevelTrialComputer.runAll(vrfOutput, gapsPerLevel, δ_S, γ)`
   *   - appends per-level passes via `tower.appendAtFinality(ord, snapshotHash, trials)`
   *
-  * '''Strict-forward, idempotent.''' The finalizer is called with monotonically-increasing ordinals (driven by `lastArchivalOrdinalRef`
-  * advancing strictly forward). A snapshot replayed against a tower that already includes its passes is a no-op because the underlying MPT
-  * `insert` with the same `(level, ord)` key just overwrites with the same `snapshotHash` value, and the per-level computations are
-  * deterministic.
+  * '''Strict-forward, idempotent.''' The staged exact-hash coordinator supplies one branch in monotonically increasing ordinal order. The
+  * local high-water mark makes a replay at or below the latest committed ordinal a no-op. A same-ordinal branch replacement is not an
+  * ordinal replay: the coordinator enters `RebuildRequired` before invoking this component.
   *
   * '''No-cert snapshots are skipped.''' Pre-activation snapshots have `slotCertificate = None` and `eta = None`; we skip them with a debug
   * log line — they contribute no level-µ hits because there's no `ρ_S` to rehash.
   */
 trait TowerFinalizer[F[_]] {
 
+  /** Perform all cancelable reads and level-trial computation without mutating tower state. The returned commit is the minimal local
+    * publication step which the tower coordinator masks together with its exact-hash cursor.
+    */
+  def prepare(snapshot: Hashed[GlobalIncrementalSnapshot]): F[PreparedTowerFinalization[F]]
+
   /** Compute and append super-level passes for a single finalized snapshot. See class docstring. */
   def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit]
+
+  def prepareFromParts(
+    ordinal: SnapshotOrdinal,
+    snapshotHash: Hash,
+    vrfOutput: Array[Byte],
+    deltaSlot: Long
+  ): F[PreparedTowerFinalization[F]]
 
   /** Pure inner method exposed for unit testing — operates directly on the ingredients the wire-level [[finalize]] extracts from a
     * `Hashed[GlobalIncrementalSnapshot]`. Synthetic snapshot tests use this to bypass the full schema construction.
@@ -51,6 +62,16 @@ trait TowerFinalizer[F[_]] {
     deltaSlot: Long
   ): F[Vector[LevelTrial]]
 }
+
+/** A non-mutating tower computation and its minimal publication action. `commit` is idempotent against the finalizer's current high-water
+  * mark and returns the new level-0 count only when it publishes this item. `observe` is non-authoritative telemetry which callers run
+  * after publishing their matching exact-hash cursor.
+  */
+final case class PreparedTowerFinalization[F[_]](
+  trials: Vector[LevelTrial],
+  commit: F[Option[Long]],
+  observe: Long => F[Unit]
+)
 
 object TowerFinalizer {
 
@@ -70,7 +91,7 @@ object TowerFinalizer {
     computer: LevelTrialComputer[F],
     lddCutoff: Long
   ): F[TowerFinalizer[F]] =
-    (Ref.of[F, SnapshotOrdinal](SnapshotOrdinal.MinValue), Ref.of[F, Long](0L)).tupled.map {
+    (Ref.of[F, Option[SnapshotOrdinal]](none), Ref.of[F, Long](0L)).tupled.map {
       case (highWaterMarkRef, finalizeCountRef) =>
         new TowerFinalizer[F] {
 
@@ -132,15 +153,77 @@ object TowerFinalizer {
               }
             }
 
-          def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
+          def prepare(snapshot: Hashed[GlobalIncrementalSnapshot]): F[PreparedTowerFinalization[F]] =
             snapshot.signed.value.slotCertificate match {
               case None =>
-                logger.debug(
-                  s"[TowerFinalizer] Skip ord=${snapshot.ordinal.value.value} hash=${snapshot.hash.value.take(16)} — no slotCertificate (pre-activation snapshot)"
-                )
+                logger
+                  .debug(
+                    s"[TowerFinalizer] Skip ord=${snapshot.ordinal.value.value} hash=${snapshot.hash.value.take(16)} — no slotCertificate (pre-activation snapshot)"
+                  )
+                  .attempt
+                  .void
+                  .as(PreparedTowerFinalization(Vector.empty, none[Long].pure[F], _ => Async[F].unit))
               case Some(cert) =>
                 val deltaSlot = cert.slot.value.value - cert.parentSlot.value.value
-                finalizeFromParts(snapshot.ordinal, snapshot.hash, cert.vrfOutput.toBytes, deltaSlot).void
+                prepareFromParts(snapshot.ordinal, snapshot.hash, cert.vrfOutput.toBytes, deltaSlot)
+            }
+
+          def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] =
+            prepare(snapshot).flatMap(runPrepared).void
+
+          def prepareFromParts(
+            ordinal: SnapshotOrdinal,
+            snapshotHash: Hash,
+            vrfOutput: Array[Byte],
+            deltaSlot: Long
+          ): F[PreparedTowerFinalization[F]] =
+            highWaterMarkRef.get.flatMap { lastFinalized =>
+              if (lastFinalized.exists(last => ordinal.value.value <= last.value.value))
+                logger
+                  .debug(
+                    s"[TowerFinalizer] Skip ord=${ordinal.value.value} — already at-or-below high-water-mark ${lastFinalized.map(_.value.value).getOrElse(0L)}"
+                  )
+                  .attempt
+                  .void
+                  .as(PreparedTowerFinalization(Vector.empty, none[Long].pure[F], _ => Async[F].unit))
+              else
+                for {
+                  // Per-level base-block gap g_µ = ord - (last level-µ ordinal, or 0 if none).
+                  //
+                  // Important: gaps are computed in ordinal units, not slot units (proposal §2.1).
+                  // The producer-side equivalent in the next slice (S2 phase 2c, deferred) will track these gaps
+                  // incrementally; here we recompute from the store on each finalize, which is fine because
+                  // The staged catch-up coordinator is the intended single writer and visits an exact branch
+                  // oldest-first; this read remains a fixed set of per-level index lookups.
+                  gaps <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse { µ =>
+                    tower.latestAt(µ).map { latest =>
+                      val baseOrd = latest.map(_.ordinal.value.value).getOrElse(0L)
+                      ordinal.value.value - baseOrd
+                    }
+                  }
+                  trials <- computer.runAll(vrfOutput, gaps, deltaSlot, lddCutoff)
+                  commit = highWaterMarkRef.get.flatMap { current =>
+                    if (current.exists(last => ordinal.value.value <= last.value.value))
+                      none[Long].pure[F]
+                    else {
+                      val anyPassed = trials.exists(_.passed)
+                      tower.appendAtFinality(ordinal, snapshotHash, trials).whenA(anyPassed) >>
+                        highWaterMarkRef.set(ordinal.some) >>
+                        finalizeCountRef.updateAndGet(_ + 1L).map(_.some)
+                    }
+                  }
+                  observe = (level0Ref: Long) =>
+                    emitTrialMetrics(trials) >>
+                      emitDensityMetrics(level0Ref) >>
+                      logger
+                        .debug(
+                          s"[TowerFinalizer] Appended ord=${ordinal.value.value} levels=${trials.collect {
+                              case t if t.passed => t.level
+                            }.mkString(",")} " +
+                            s"deltaSlot=$deltaSlot gaps=${gaps.mkString(",")}"
+                        )
+                        .whenA(trials.exists(_.passed))
+                } yield PreparedTowerFinalization(trials, commit, observe)
             }
 
           def finalizeFromParts(
@@ -149,44 +232,15 @@ object TowerFinalizer {
             vrfOutput: Array[Byte],
             deltaSlot: Long
           ): F[Vector[LevelTrial]] =
-            highWaterMarkRef.get.flatMap { lastFinalized =>
-              if (ordinal.value.value <= lastFinalized.value.value && lastFinalized.value.value > 0L)
-                logger
-                  .debug(
-                    s"[TowerFinalizer] Skip ord=${ordinal.value.value} — already at-or-below high-water-mark ${lastFinalized.value.value}"
-                  )
-                  .as(Vector.empty[LevelTrial])
-              else
-                for {
-                  // Per-level base-block gap g_µ = ord - (last level-µ ordinal, or 0 if none).
-                  //
-                  // Important: gaps are computed in ordinal units, not slot units (proposal §2.1).
-                  // The producer-side equivalent in the next slice (S2 phase 2c, deferred) will track these gaps
-                  // incrementally; here we recompute from the store on each finalize, which is fine because
-                  // Current tower scheduling visits each eligible snapshot once; the read is a fixed set of
-                  // per-level index lookups.
-                  gaps <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse { µ =>
-                    tower.latestAt(µ).map { latest =>
-                      val baseOrd = latest.map(_.ordinal.value.value).getOrElse(0L)
-                      ordinal.value.value - baseOrd
-                    }
-                  }
-                  trials <- computer.runAll(vrfOutput, gaps, deltaSlot, lddCutoff)
-                  anyPassed = trials.exists(_.passed)
-                  _ <- tower.appendAtFinality(ordinal, snapshotHash, trials).whenA(anyPassed)
-                  _ <- highWaterMarkRef.set(ordinal)
-                  level0Ref <- finalizeCountRef.updateAndGet(_ + 1L)
-                  _ <- emitTrialMetrics(trials)
-                  _ <- emitDensityMetrics(level0Ref)
-                  _ <- logger
-                    .debug(
-                      s"[TowerFinalizer] Appended ord=${ordinal.value.value} levels=${trials.collect { case t if t.passed => t.level }
-                          .mkString(",")} " +
-                        s"deltaSlot=$deltaSlot gaps=${gaps.mkString(",")}"
-                    )
-                    .whenA(anyPassed)
-                } yield trials
-            }
+            prepareFromParts(ordinal, snapshotHash, vrfOutput, deltaSlot).flatMap(runPrepared)
+
+          private def runPrepared(prepared: PreparedTowerFinalization[F]): F[Vector[LevelTrial]] =
+            Async[F]
+              .uncancelable(_ => prepared.commit)
+              .flatMap {
+                case None              => Vector.empty[LevelTrial].pure[F]
+                case Some(level0Count) => prepared.observe(level0Count).attempt.void.as(prepared.trials)
+              }
         }
     }
 
@@ -194,9 +248,24 @@ object TowerFinalizer {
     * importing the trait directly.
     */
   def noop[F[_]: Async]: TowerFinalizer[F] = new TowerFinalizer[F] {
+    def prepare(snapshot: Hashed[GlobalIncrementalSnapshot]): F[PreparedTowerFinalization[F]] = {
+      val _ = snapshot
+      PreparedTowerFinalization(Vector.empty, none[Long].pure[F], _ => Async[F].unit).pure[F]
+    }
+
     def finalize(snapshot: Hashed[GlobalIncrementalSnapshot]): F[Unit] = {
       val _ = snapshot
       Async[F].unit
+    }
+
+    def prepareFromParts(
+      ordinal: SnapshotOrdinal,
+      snapshotHash: Hash,
+      vrfOutput: Array[Byte],
+      deltaSlot: Long
+    ): F[PreparedTowerFinalization[F]] = {
+      val _ = (ordinal, snapshotHash, vrfOutput, deltaSlot)
+      PreparedTowerFinalization(Vector.empty, none[Long].pure[F], _ => Async[F].unit).pure[F]
     }
 
     def finalizeFromParts(

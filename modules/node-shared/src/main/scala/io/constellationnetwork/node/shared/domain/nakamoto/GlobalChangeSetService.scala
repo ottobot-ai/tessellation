@@ -23,10 +23,10 @@ import eu.timepit.refined.types.numeric.NonNegLong
   * `mptRoot` — NO re-execution.
   *
   * This service serves those deltas from a BOUNDED ring of recent FINALIZED accumulators that `SnapshotLeaderLoop` fills at its finalize
-  * sinks (parallel to the #287 [[GlobalFollowSliceService]] projection ring). Each served delta additionally carries the §3-NIPoPoW
-  * historical-commitment SMT proofs ([[HistoricalCommitmentSmtStore.proveAt]]) that let the follower VERIFY the signed `smtRoot` by
-  * construction (it re-derives the eligible ordinal's commitment leaf, binds the proof to it, and folds to the signed root). Additive: a
-  * pure read of finalized state; it never feeds back into consensus.
+  * sinks (parallel to the #287 [[GlobalFollowSliceService]] projection ring). Each served delta additionally carries the §3-NIPoPoW staged
+  * historical-commitment SMT proofs ([[HistoricalCommitmentSmtStore.proveAt]]). The current active era requires signed `smtRoot = None`, so
+  * these proof fields are not consensus authority and cannot activate the tower commitment. Additive: a pure read of finalized state; it
+  * never feeds back into consensus.
   */
 trait GlobalChangeSetService[F[_]] {
 
@@ -55,9 +55,8 @@ object GlobalChangeSetService {
     *   thunk yielding the producer's bounded ring of recent FINALIZED per-ordinal accumulators keyed by ordinal — production reads the Ref
     *   `SnapshotLeaderLoop` updates at its finalize sinks. Empty until the first finalize.
     * @param historicalCommitmentSmtStore
-    *   the gl0 §3-NIPoPoW historical-commitment SMT store, used to build each served delta's inclusion proof against `smtRoot(ordinal)` and
-    *   absence-at-parent proof against `smtRoot(ordinal − 1)`. `None` on followers that do not maintain the store (cl0/dl1 SharedServices),
-    *   in which case both proof fields are always `None` (the follower degrades to mptRoot-only adoption).
+    *   staged GL0 NIPoPoW historical-commitment SMT store. `None` produces no SMT proof fields. Current active-era adoption is always
+    *   mptRoot-bound and rejects a populated signed `smtRoot`; these optional proofs cannot weaken or replace that check.
     * @param confirmationDepthK
     *   the confirmation-depth cutoff `k`: the eligible ordinal a proof targets is `ordinal − k` (the SAME cutoff `accept()` uses to anchor
     *   `smtRoot(ordinal)`). For `ordinal ≤ k` no `smtRoot` exists (genesis/warmup) ⇒ both proofs `None`.

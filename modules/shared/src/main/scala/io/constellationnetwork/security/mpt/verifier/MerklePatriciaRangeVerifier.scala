@@ -168,9 +168,9 @@ object MerklePatriciaRangeVerifier {
           * present and every in-range leaf returned, so they still verify (additive strengthening — no previously-valid complete proof
           * newly fails).
           *
-          * Degenerate case: an empty range with NO boundary on either side carries no commitments at all (only valid at a keyspace extreme
-          * or an empty trie). With no authenticated structure to traverse there is nothing to omit and the root cannot be independently
-          * re-derived here; this preserves the pre-existing boundary semantics and accepts.
+          * Degenerate case: a range with no inclusion or boundary commitments carries no authenticated structure. It is accepted only when
+          * the trusted root equals the canonical empty-branch root; under any nonempty root it cannot prove that an in-range leaf was not
+          * omitted.
           */
         def verifyCompleteness: F[Either[MerklePatriciaVerificationError, Unit]] = {
           val keyLen = math.max(Nibble(proof.startPath).length, Nibble(proof.endPath).length)
@@ -257,8 +257,13 @@ object MerklePatriciaRangeVerifier {
               }
 
             if (index.isEmpty)
-              // Degenerate: no authenticated structure (empty range at a keyspace extreme / empty trie). Accept.
-              ().asRight[MerklePatriciaVerificationError].pure[F]
+              MerklePatriciaNode.Branch.empty[F].map { emptyRoot =>
+                Either.cond(
+                  root === emptyRoot.digest,
+                  (),
+                  InvalidWitness("Evidence-free range proof requires the canonical empty-trie root"): MerklePatriciaVerificationError
+                )
+              }
             else
               Async[F].tailRecM[List[Frame], Return](List((root, Seq.empty[Nibble])))(step)
           }

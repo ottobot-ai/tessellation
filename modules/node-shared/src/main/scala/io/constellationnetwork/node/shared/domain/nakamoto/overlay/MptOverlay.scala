@@ -1,5 +1,6 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
+import cats.Parallel
 import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.Semaphore
 import cats.syntax.all._
@@ -7,6 +8,7 @@ import cats.syntax.all._
 import scala.annotation.tailrec
 import scala.collection.immutable.SortedMap
 
+import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.mpt._
@@ -19,6 +21,7 @@ import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.implicits._
 
 import org.typelevel.log4cats.slf4j.Slf4jLogger
+import scodec.bits.ByteVector
 
 /** Branch identity within the overlay. Reuses chain-store snapshot identity (the `Hash` of a snapshot/block tip) so that callers can pass
   * `chainStore.bestTip` (or any known parent hash) without any conversion. The opaque-ness target of the rev3 plan is approximated here as
@@ -38,6 +41,47 @@ object BranchId {
     * overlay's pending map resolves to the base, so this is purely a documentation alias.
     */
   val base: BranchId = BranchId(Hash.empty)
+}
+
+/** Defensively owned, read-only materialization of one overlay branch view and the trie derived from those exact bytes.
+  *
+  * This is a local computation capability, not an authenticated exact-parent generation: direct callers which bypass the overlay can still
+  * mutate the base while capture is in progress until ROOT-005B gives the store one mutation owner. The immutable byte ownership does
+  * ensure that later caller/base mutation cannot change this image, and proof code can no longer derive its root and carried values from
+  * two different overlay reads.
+  */
+final class MptBranchImage private (
+  val entries: SortedMap[Hex, ByteVector],
+  val trie: MerklePatriciaTrie
+) {
+
+  /** Fresh mutable arrays for legacy byte-map consumers. Mutating the result cannot change this image. */
+  def toByteMap: Map[Hex, Array[Byte]] =
+    entries.iterator.map { case (key, value) => key -> value.toArray }.toMap
+}
+
+object MptBranchImage {
+
+  /** Build a defensively owned local image from exact bytes. This validates trie-key structure and derives a root, but does not
+    * authenticate the bytes, bind an ordinal/branch generation, or decide which entries belong to a consensus projection.
+    */
+  def fromBytes[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    entries: Map[Hex, Array[Byte]]
+  ): F[Either[MerklePatriciaError, MptBranchImage]] =
+    if (entries.exists { case (_, bytes) => bytes eq null })
+      (InvalidData("Cannot build trie with a null entry value"): MerklePatriciaError).asLeft[MptBranchImage].pure[F]
+    else
+      Async[F].delay {
+        SortedMap.from(entries.iterator.map {
+          case (key, bytes) => key -> ByteVector.view(bytes.clone())
+        })
+      }.flatMap { captured =>
+        MerklePatriciaTrie.makeParallelFromBytes[F](captured.iterator.map { case (key, value) => key -> value.toArray }.toMap).attempt.map {
+          case Right(trie)                      => new MptBranchImage(captured, trie).asRight[MerklePatriciaError]
+          case Left(error: MerklePatriciaError) => error.asLeft[MptBranchImage]
+          case Left(error)                      => OperationError(error.getMessage).asLeft[MptBranchImage]
+        }
+      }
 }
 
 /** Outcome of `MptOverlay.finalizeBranch`. The plan (#56.6) defines this as the single return value the finality sink reads after each
@@ -162,9 +206,9 @@ trait BranchHandle[F[_], K] {
   *   - The overlay accumulates writes as raw `Hex → Array[Byte]` pairs without distinguishing partition kind. Rooted System partitions
   *     (`ActiveAddressIndex`, expiry indices for AllowSpend / TokenLock / NodeCollateral) and user-field partitions (Balances, LastTxRefs,
   *     etc.) all flow through the same `ChangeSet`. They share the producer's hex keyspace.
-  *   - '''Raw overlay root''' (`buildRoot(branch, ordinal)`): includes every stored partition and is composed via
-  *     `MerklePatriciaTrie.withChanges` from the on-disk base trie at `ordinal`. The signed consensus `mptRoot` must instead be computed
-  *     from the branch byte view through `GlobalStateKey.consensusRootEntries`: that retains every economic System index and temporarily
+  *   - '''Raw overlay root''' (`buildRoot(branch, ordinal)`): includes every stored partition and is rebuilt from one defensively owned
+  *     branch byte image without mutating producer state or ordinal caches. The signed consensus `mptRoot` must instead be computed from
+  *     the branch byte view through `GlobalStateKey.consensusRootEntries`: that retains every economic System index and temporarily
   *     excludes field 32. A raw overlay root is therefore not itself state-proof authority.
   *   - '''Per-field root algorithm already exists''' at `GlobalStateConverter.buildPerFieldMptRoots`: it groups `Map[GlobalStateKey,
   *     Array[Byte]]` by `_._1.fieldId` (structured component of `GlobalStateKey`, not a Hex-prefix slice) and builds a fresh
@@ -239,8 +283,16 @@ trait MptOverlay[F[_], K] {
     */
   def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]]
 
-  /** Build the per-branch trie at `ordinal`. Multi-branch: takes the on-disk base trie at `ordinal` and applies the chain's merged
-    * `ChangeSet` via `MerklePatriciaTrie.withChanges`. Passthrough: ignores `branch`, delegates to `MptStore.build`.
+  /** Capture one defensively owned branch byte image and derive its trie without mutating the base producer, its pending-change refs, or
+    * its ordinal/root caches. Root and proof/value consumers must use this single image rather than reading the overlay twice.
+    *
+    * Capture is serialized against overlay mutation, but ROOT-005B is still required to serialize callers which directly mutate `base`.
+    * This method therefore does not authenticate an exact parent or make the returned image finality authority.
+    */
+  def captureBranchImage(branch: BranchId): F[Either[MerklePatriciaError, MptBranchImage]]
+
+  /** Compatibility projection of [[captureBranchImage]]. `ordinal` is not written into producer caches and does not turn the current branch
+    * materialization into a historical-ordinal lookup.
     */
   def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]]
 
@@ -410,7 +462,7 @@ object MptOverlay {
     * attestation-2/3 finality can still walk back through pending branches AND fork-recovery doesn't lose the canonical chain when the
     * local-fork chain is bestTip.
     */
-  def make[F[_]: Async: Hasher, K](
+  def make[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
     mode: OverlayMode,
     underlying: MptStore[F, K],
     pcTree: ParentChildTree[F],
@@ -442,7 +494,7 @@ object MptOverlay {
   /** Single-branch passthrough — correctness-equivalent to using `MptStore` directly. The `BranchId` argument on every method is ignored.
     * `commit` registers the branch in `parentChildTree` so consensus topology stays consistent with what multi-branch mode needs.
     */
-  def passthrough[F[_]: Async, K](
+  def passthrough[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
     underlying: MptStore[F, K],
     pcTree: ParentChildTree[F]
   ): MptOverlay[F, K] =
@@ -503,8 +555,11 @@ object MptOverlay {
         // Passthrough: handle writes already landed in `underlying` (PassthroughHandle delegates directly).
         underlying.allEntriesAsBytes
 
+      def captureBranchImage(branch: BranchId): F[Either[MerklePatriciaError, MptBranchImage]] =
+        underlying.allEntriesAsBytes.flatMap(MptBranchImage.fromBytes[F])
+
       def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
-        underlying.build(ordinal)
+        captureBranchImage(branch).map(_.map(_.trie))
 
       def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
         // Passthrough has no pending state, so finalization is always a no-op. The conflict-detection
@@ -634,7 +689,7 @@ object MptOverlay {
     */
   private object MultiBranch {
 
-    def apply[F[_]: Async: Hasher, K](
+    def apply[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
       underlying: MptStore[F, K],
       pcTree: ParentChildTree[F],
       toHex: K => F[Hex],
@@ -683,7 +738,7 @@ object MptOverlay {
         ): MptOverlay[F, K]
       }
 
-    private final class Impl[F[_]: Async: Hasher, K](
+    private final class Impl[F[_]: Async: Parallel: Hasher: JsonSerializer, K](
       underlying: MptStore[F, K],
       pcTree: ParentChildTree[F],
       toHex: K => F[Hex],
@@ -895,27 +950,17 @@ object MptOverlay {
           } yield StrictMptRead.decodeEntries[V](branchEntries)
         }
 
+      def captureBranchImage(branch: BranchId): F[Either[MerklePatriciaError, MptBranchImage]] =
+        mutex.permit
+          .use(_ => allEntriesAsBytesUnlocked(branch))
+          .flatMap(MptBranchImage.fromBytes[F])
+          .handleError {
+            case error: MerklePatriciaError => Left(error)
+            case error                      => Left(OperationError(error.getMessage))
+          }
+
       def buildRoot(branch: BranchId, ordinal: SnapshotOrdinal): F[Either[MerklePatriciaError, MerklePatriciaTrie]] =
-        mutex.permit.use { _ =>
-          for {
-            baseKeys <- underlying.underlying.physicalKeys
-            pending <- pendingRef.get
-            merged = mergedChain(branch, pending)
-            _ <- validateChanges(baseKeys, merged)
-            baseResult <- underlying.build(ordinal)
-            result <- baseResult match {
-              case Left(err) => Async[F].pure(Left(err): Either[MerklePatriciaError, MerklePatriciaTrie])
-              case Right(baseTrie) if merged.isEmpty =>
-                Async[F].pure(Right(baseTrie): Either[MerklePatriciaError, MerklePatriciaTrie])
-              case Right(baseTrie) =>
-                baseTrie.withChanges[F](merged.upserts, merged.removals).attempt.map {
-                  case Right(trie)                      => Right(trie)
-                  case Left(error: MerklePatriciaError) => Left(error)
-                  case Left(error)                      => Left(OperationError(error.getMessage))
-                }
-            }
-          } yield result
-        }.handleError {
+        captureBranchImage(branch).map(_.map(_.trie)).handleError {
           case error: MerklePatriciaError => Left(error)
           case error                      => Left(OperationError(error.getMessage))
         }

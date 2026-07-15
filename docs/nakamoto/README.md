@@ -13,12 +13,13 @@ Use these in order for new consensus work:
    shard, and Phase-2 cross-metagraph decision.
 3. `../adr/0017-committee-reexecution-is-the-primary-economic-validity-gate.md` -
    replay-before-sign and noncommittee diff adoption.
-4. `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` - full target lifecycle and open
-   owner decisions.
+4. `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md` - full target lifecycle and remaining
+   engineering/research/schema/parameter gates.
 5. `../review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md` - dependency-ordered work.
 6. `../review/CONSENSUS-PROTOCOL-TEST-PLAN.md` - packet and release gates.
-7. `../review/CONSENSUS-OWNER-DECISIONS.md` - locked and explicitly open owner
-   protocol choices.
+7. `../review/CONSENSUS-OWNER-DECISIONS.md` and
+   `../review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md` - owner-ratified O-01..O-17
+   directions and the executable freeze gates that remain.
 
 Code and tests still outrank documentation as evidence of current behavior. The
 normative files explicitly separate current source facts from target design.
@@ -26,8 +27,9 @@ normative files explicitly separate current source facts from target design.
 ## Active design inputs
 
 - `AVALANCHE-ATTESTATION-PROPOSAL.md` - research input for the optimistic Phase-2
-  rail. Its K/alpha/beta cascade is not implemented today; the exact Phase-2
-  threshold remains an owner decision.
+  rail. Its K/alpha/beta cascade is not implemented today; O-01 ratifies the
+  sampled direction and provisional calibration, while the exact active-era
+  threshold, implementation parity, and proof remain engineering/research gates.
 - `GENESIS-DENSITY-PHASE2-REORG-AUDIT.md` - accepted P2-reorgable density and
   retention-only `k2` semantics.
 - `HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` - target staircase checkpoint flow,

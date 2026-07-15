@@ -118,7 +118,7 @@ object GlobalFollowProofServiceSuite extends MutableIOSuite {
         GlobalStateKey.toHex[IO],
         bestTipsFn = IO.pure(Set.empty[BranchId])
       )
-      svc = GlobalFollowProofService.make[IO](store, overlay)
+      svc = GlobalFollowProofService.make[IO](overlay)
     } yield (store, overlay, svc)
 
   /** Seed a consistent slice of consumed-field state. Returns the seeded typed maps keyed by leaf-path hex so tests can assert the verified
@@ -246,6 +246,173 @@ object GlobalFollowProofServiceSuite extends MutableIOSuite {
         case Left(FollowVerificationError.RangeProofInvalid(GlobalStateFieldId.Balances, InvalidWitness(message))) =>
           expect(message.contains("Incomplete range proof"))
         case other => failure(s"expected Left(RangeProofInvalid(Balances, Incomplete range proof)), got $other")
+      }
+  }
+
+  test("omitted consumed field: dropping its proof and values is rejected") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, _, svc) = setup
+      _ <- seedConsumedState(store)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      omitted = proof.copy(
+        fields = proof.fields - GlobalStateFieldId.Balances,
+        values = proof.values - GlobalStateFieldId.Balances
+      )
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](omitted.committedRoot, omitted)
+    } yield expect(verifiedE == Left(FollowVerificationError.MissingFieldProof(GlobalStateFieldId.Balances)))
+  }
+
+  test("omitted consumed-field values map is rejected even when its range proof remains") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, _, svc) = setup
+      _ <- seedConsumedState(store)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      omitted = proof.copy(values = proof.values - GlobalStateFieldId.Balances)
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](omitted.committedRoot, omitted)
+    } yield expect(verifiedE == Left(FollowVerificationError.MissingFieldValues(GlobalStateFieldId.Balances)))
+  }
+
+  test("omitted committed value: retaining the range proof but dropping one value is rejected") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, _, svc) = setup
+      _ <- seedConsumedState(store)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      balanceValues = proof.values(GlobalStateFieldId.Balances)
+      missingKey = balanceValues.firstKey
+      omitted = proof.copy(values = proof.values.updated(GlobalStateFieldId.Balances, balanceValues - missingKey))
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](omitted.committedRoot, omitted)
+    } yield expect(verifiedE == Left(FollowVerificationError.MissingFieldValue(GlobalStateFieldId.Balances, missingKey)))
+  }
+
+  test("fabricated evidence-free empty field is rejected under a nonempty attested root") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, _, svc) = setup
+      _ <- seedConsumedState(store)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      fabricatedRange = proof.fields(GlobalStateFieldId.Balances).copy(inclusionProofs = Nil, exclusionBoundaries = None)
+      fabricated = proof.copy(
+        fields = proof.fields.updated(GlobalStateFieldId.Balances, fabricatedRange),
+        values = proof.values.updated(GlobalStateFieldId.Balances, SortedMap.empty)
+      )
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](fabricated.committedRoot, fabricated)
+    } yield expect(verifiedE == Left(FollowVerificationError.UnprovenEmptyField(GlobalStateFieldId.Balances)))
+  }
+
+  test("range proof for another field cannot be relabeled as Balances") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, _, svc) = setup
+      _ <- seedConsumedState(store)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      foreignRange = proof.fields(GlobalStateFieldId.LastTxRefs)
+      substituted = proof.copy(
+        fields = proof.fields.updated(GlobalStateFieldId.Balances, foreignRange),
+        values = proof.values.updated(GlobalStateFieldId.Balances, SortedMap.empty)
+      )
+      expectedBounds <- FollowVerifyCore.consumedFieldBounds[IO](GlobalStateFieldId.Balances)
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](substituted.committedRoot, substituted)
+    } yield
+      expect(
+        verifiedE == Left(
+          FollowVerificationError.RangeBoundsMismatch(
+            GlobalStateFieldId.Balances,
+            expectedBounds._1,
+            expectedBounds._2,
+            foreignRange.startPath,
+            foreignRange.endPath
+          )
+        )
+      )
+  }
+
+  test("canonical empty trie accepts explicit evidence-free empty proofs for every consumed field") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (_, _, svc) = setup
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](proof.committedRoot, proof)
+    } yield
+      verifiedE match {
+        case Right(verified) =>
+          expect.all(
+            proof.fields.values.forall(_.inclusionProofs.isEmpty),
+            proof.fields.values.forall(_.exclusionBoundaries.isEmpty),
+            verified.value.balances.isEmpty,
+            verified.value.lastTxRefs.isEmpty,
+            verified.value.lastAllowSpendRefs.isEmpty,
+            verified.value.lastTokenLockRefs.isEmpty,
+            verified.value.activeTokenLocks.isEmpty
+          )
+        case Left(error) => failure(s"expected canonical empty proof to verify, got $error")
+      }
+  }
+
+  test("proof root and values use one canonical projection that excludes root-invisible field 32") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, overlay, svc) = setup
+      _ <- seedConsumedState(store)
+      syncKey <- GlobalStateKey.metagraphEntryHashed[IO](addr(99), GlobalStateFieldId.MgGlobalSnapshotSyncView, "peer-1")
+      syncHex <- GlobalStateKey.toHex[IO](syncKey)
+      _ <- store.underlying.insertBytes(Map(syncHex -> Array[Byte](1, 2, 3))).rethrow
+
+      rawEntries <- overlay.allEntriesAsBytes(parentP)
+      consensusEntries = GlobalStateKey.consensusRootEntries(rawEntries)
+      rawTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[IO](rawEntries)
+      expectedTrie <- io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[IO](consensusEntries)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](expectedTrie.rootHash.value, proof)
+    } yield
+      expect.all(
+        rawEntries.contains(syncHex),
+        !consensusEntries.contains(syncHex),
+        rawTrie.rootHash =!= expectedTrie.rootHash,
+        proof.committedRoot === expectedTrie.rootHash.value,
+        verifiedE.isRight
+      )
+  }
+
+  test("empty consumed field under a nonempty root verifies only with authenticated boundary evidence") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, _, svc) = setup
+      balance = Balance(NonNegLong.unsafeFrom(1000L))
+      balanceKey0 = balanceKey(1)
+      _ <- store.insert[Balance](balanceKey0, balance)
+      balanceHex <- GlobalStateKey.toHex[IO](balanceKey0)
+      proofE <- svc.proveConsumedFields(parentP, ordinal)
+      proof <- IO.fromEither(proofE.leftMap(e => new RuntimeException(s"prove failed: $e")))
+      emptyTxRange = proof.fields(GlobalStateFieldId.LastTxRefs)
+      verifiedE <- FollowVerifyCore.verifyConsumedFields[IO](proof.committedRoot, proof)
+    } yield
+      verifiedE match {
+        case Right(verified) =>
+          expect.all(
+            emptyTxRange.inclusionProofs.isEmpty,
+            emptyTxRange.exclusionBoundaries.exists(b => b.leftBoundary.nonEmpty || b.rightBoundary.nonEmpty),
+            verified.value.balances == SortedMap(balanceHex -> balance),
+            verified.value.lastTxRefs.isEmpty
+          )
+        case Left(error) => failure(s"expected boundary-proven empty field to verify, got $error")
       }
   }
 

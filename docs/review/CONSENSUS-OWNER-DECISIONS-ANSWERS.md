@@ -1,770 +1,589 @@
-# Consensus Owner Decision Register - Rejected Advisory Draft
+# Consensus Owner Decision Register — Answers & Ratified Directions (v2)
 
 **Companion to:** [`CONSENSUS-OWNER-DECISIONS.md`](CONSENSUS-OWNER-DECISIONS.md)
-**Original compilation:** 2026-07-14 at stale HEAD `5557ee084`
+**Revised:** 2026-07-14 · source-audit baseline `ad13026d1`
+**Supersedes:** the v1 draft that was rejected by adversarial audit at HEAD `e26ad406e`.
+This revision reworks every gate against that audited source baseline, dispositions all
+15 audit findings, and folds in the owner's refinement dialogue.
 
-**AUDIT DISPOSITION: REJECTED. DO NOT RATIFY OR IMPLEMENT FROM THIS FILE.** An
-adversarial source audit at HEAD `e26ad406e` found material factual errors,
-unsupported readiness claims, reversed dependencies, and recommendations refuted
-by the owner-supplied Taktikos papers. The stale draft is retained below only to
-avoid destroying work. Review authority for O-15/O-16/O-17 is the audited source
-packet for each gate:
-
-- [O-15 Multi-Tine Frontier Owner Review](O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md)
-- [O-16 Exact Phase-2 Consumer Lease](P6-FIN14-PHASE2-CONSUMER-LEASE.md#10-owner-review-required)
-- [O-17 ROOT-008 GL0 Partition Grammar](ROOT-008-GL0-PARTITION-GRAMMAR.md#8-owner-review-required)
-
-### Why this draft failed audit
-
-1. **O-15 is not partly freeze-ready.** Taktikos Algorithm 1 initializes `C <-
-   Cloc` and enumerates candidates against the current incumbent. Neither supplied
-   paper defines a symmetric `max(post-MRCA suffix)` metric, an objective
-   total-frontier selector, or the repository's lower-VRF/hash exact tie rule.
-   O-15A through O-15G therefore remain open except for the already-ratified
-   objective-result property. Sources and hashes are recorded in the O-15 packet
-   at lines 94-112 and its review table at lines 202-215.
-2. **Committee blind-signing is not the current root-recreation defect.** The live
-   signing path calls `evaluateForSigning -> evaluateIntake -> reExecPath` and
-   compares the claimed roots before producing `VerifiedShardCheckpoint`
-   (`ShardCheckpointGl0AcceptanceManager.scala:312-350,629-708`); the emitter only
-   accepts that capability (`ShardCheckpointAttestationEmitter.scala:47-53,128-224`).
-   Remaining gaps include complete canonical diff/intent/result binding, ordinary
-   adopter verification, and positive pre-inclusion watchtower coverage
-   (`docs/adr/0017:182-194`).
-3. **The economic invariant was stated incompletely.** The producer and every
-   execution signer replay the exact ordered framework inputs at the exact Phase-2
-   base and must match the canonical diff and root. A noncommittee adopter verifies
-   the certificate/base/scope/continuity/diff, applies the scoped diff, and
-   reproduces the root. Assigned watchtowers replay, and positive coverage precedes
-   inclusion. Admission/DA signatures never satisfy execution quorum
-   (`docs/adr/0017:66-135`; `AGENTS.md:39-60,78-81`).
-4. **Certified diff adoption was not owner-rejected.** Rejected designs were
-   universal noncommittee replay and authority/root-only adoption. The target is
-   execution-certified canonical diff adoption plus adopter root reproduction
-   (`docs/adr/0017:35-44,100-180`;
-   `docs/review/10-reexec-byte-contract.md:3-11`).
-5. **The dependency was reversed.** O-17 structural validity plus O-07/ECON-G
-   semantic validity precede valid tines, then O-15 fork choice, exact-hash Phase 2,
-   and O-16 consumer leases
-   (`O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md:400-421`). O-17 parser/grammar work is
-   not blocked on selecting an O-15 algorithm.
-6. **O-16 readiness was overstated.** O-16A and O-16C are recommendations; O-16B
-   and O-16E are conformance to locked L-19/L-23; O-16D and O-16F still require
-   schema/era decisions. Issuance remains blocked by the full dependency inventory
-   in `P6-FIN14-PHASE2-CONSUMER-LEASE.md:456-477`, and positive watchtower coverage
-   is not live.
-7. **O-17 is not “5/7 firm.”** R008-01 still needs the numeric-gap decision,
-   R008-04 needs protocol budgets/growth rules, R008-05 waits on exact ECON-G
-   identities, R008-06 needs the currency-scope rule, and R008-07 is a conformance
-   gate (`ROOT-008-GL0-PARTITION-GRAMMAR.md:467-548`). ECO-F32 is HIGH, not
-   CRITICAL.
-8. **O-01 is not proven or freeze-ready.** `SnowballAccumulator` has no K-query/
-   alpha sample cascade and is arrival-order sensitive
-   (`SnowballAccumulator.scala:13-25,67-80`); the live loop also has a separate
-   cumulative-weight sink (`SnapshotLeaderLoop.scala:1082-1103`). Finite simulation
-   runs are calibration evidence, not a proof or a numeric `T_weight` freeze.
-9. **Local defaults are not protocol law.** O-03's current HOCON penalty, cooldown,
-   and window values are defaults, not rooted/ratified active-era parameters. The
-   population, coverage, deadline, bond, bounty, and replay-budget contract remains
-   open (`CONSENSUS-OWNER-DECISIONS.md:117-123`).
-10. **The tower-store status was stale.** `MptTowerStore` and production wiring
-    already exist (`MptTowerStore.scala:104-115,264-275`); durable restart,
-    branch-aware reconstruction, and activation proof remain open.
-11. **Positive stake is not a settled operator-membership predicate.** It permits
-    stake splitting; the exact backing/bond predicate remains an owner decision
-    (`CONSENSUS-OWNER-DECISIONS.md:214-237,279-294`).
-12. **The claimed KES end-to-end run is not repository-verifiable.** No committed
-    test or immutable log supports the stated 16-rotation/8-node/13,724-signature
-    result. It must remain an unverified external claim.
-13. **Severity labels were inflated.** FIN-14, SER-02, ECO-F32, and SMT-01 are HIGH
-    in the audited ledger; ECO-04, ECO-05, ECO-18, and SHARD-C-009 are CRITICAL.
-14. **The provenance claim is false.** The draft was compiled 39 commits behind
-    the audited HEAD and cites out-of-repository `project_*`/`feedback_*` material
-    as though every assertion were reproducible from committed source.
-15. **O-05 describes the draw incorrectly.** Admission and execution are distinct
-    draws sharing a parameter block; the missing construct is a separately typed
-    custody/admission threshold that can never satisfy execution quorum.
-
-<details>
-<summary>Preserved stale advisory draft (not reviewed authority)</summary>
+**Status:** Owner-ratified architecture and design direction. The owner has accepted the
+recommendations and directions recorded here. Ratification does **not** assert that missing
+protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
+For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
+document records which direction is settled and which executable freeze gates remain.
 
 ---
 
-## What this is
+## 0. Response to the audit (v1 → v2 disposition)
 
-For every open gate (O-01…O-17) this collects the answer **our own prior work already
-supports** — from the sims, ADRs, design docs, code, and memory — separates it from the part
-that remains a **genuine owner economic/governance judgment**, and flags any **live defect**
-that motivates the gate. Every substantive claim carries a `file:line` citation so the owner
-can verify at source rather than trust prose.
+| # | Audit finding | Disposition in v2 |
+|---|---|---|
+| 1 | O-15 is not partly freeze-ready; the symmetric `max(post-MRCA suffix)` metric and the tie rule are not inherited from the papers. | **Accepted.** O-15 remains 🔴 across A–G, including D. The owner ratifies the single-common-anchor density/tower-evidence research direction, not an exact metric, tie, selector, or activation. |
+| 2 | Committee blind-signing is not the current defect; the signing path re-executes and root-compares before `VerifiedShardCheckpoint`. | **Accepted.** Re-exec model corrected in §1 from `AGENTS.md:39-82`. The live gap is *pre-inclusion watchtower coverage* + complete adopter binding, not blind-sign. |
+| 3 | The economic invariant was stated incompletely. | **Accepted.** §1 states the full chain: producer + every execution signer replay; adopter verifies cert + applies diff + **reproduces root**; watchtower backstop; admission never satisfies quorum. |
+| 4 | Certified-diff adoption was **not** owner-rejected — it is the target; only universal-replay and roots-only/authority adoption were rejected. | **Accepted.** v1 wrongly swept certified-diff adoption into "roots-only." Corrected throughout; `10-reexec-byte-contract.md` is the target contract, not superseded. |
+| 5 | Dependency reversed: O-17 structural + O-07 semantic → valid tines → O-15 → O-16. O-17 is not blocked on O-15. | **Accepted.** Corrected in the summary and cross-cutting §. |
+| 6 | O-16 readiness overstated (A/C were recommendations; B/E are conformance; D/F need schema/era). | **Accepted.** The owner has since ratified A/C/F direction and B/E conformance; O-16 remains 🔴 because freshness, purpose inventory, schemas, and dependencies are not executable. |
+| 7 | O-17 is not "5/7 firm." | **Accepted.** The owner has since ratified the packet directions, including R008-06; O-17 remains 🔴 until identity, resource, codec, and proof gates close. ECO-F32 = HIGH. |
+| 8 | O-01 not proven/freeze-ready; `SnowballAccumulator` has no K/α sample cascade and is arrival-order sensitive; sims are calibration, not a proof or `T_weight` freeze. | **Accepted.** O-01 remains activation-blocked; values are **owner-ratified provisional calibration with sim references**, and the sim-vs-impl proof gap remains explicit. |
+| 9 | Local HOCON defaults are not protocol law. | **Accepted.** O-03 and every parameter gate require derived, tested, frozen active-era parameters, never overridable local defaults. |
+| 10 | `MptTowerStore` and wiring already exist. | **Accepted.** O-08 corrected: store exists; durable-restart / branch-aware / activation-proof remain open. |
+| 11 | Positive stake is not a settled operator-membership predicate. | **Accepted.** O-11 stays 🔴; Cardano-style pledge/self-bond, proportional delegation slashing, and `bond >= extractable value` are ratified, while exact rooted predicates and values remain engineering. |
+| 12 | The KES end-to-end run is not repository-verifiable. | **Accepted.** O-12 no longer asserts the 16-rotation/8-node/13,724-sig figure as fact; it is marked an unverified external claim. |
+| 13 | Severity labels inflated. | **Accepted.** CRITICAL = ECO-04, ECO-05, ECO-18, SHARD-C-009. HIGH = FIN-14, SER-02, ECO-F32, SMT-01. |
+| 14 | Provenance claim false (compiled behind HEAD; cited out-of-repo memory as reproducible). | **Accepted.** v2 verified at HEAD `ad13026d1`; committed-source citations are distinguished from out-of-repo memory context, which is labeled as such and not treated as reproducible. |
+| 15 | O-05 draw described incorrectly. | **Accepted.** Admission and execution are distinct draws sharing a parameter block; the missing construct is a separately-typed custody/admission threshold that can never satisfy execution quorum. |
 
-### The #1 rule this synthesis is held to
+---
 
-**CL1 framework-economic operations (allow-spend, spend, token-lock, transfer, framework fee,
-balance, supply) MUST be re-executed** by the shard committee and checked by watchtowers.
-"Roots-only / proof-carrying / attestation-only" adoption is correct **only for DL1
-custom-data** (which GL0 cannot run) and is **never** a substitute for CL1 re-execution
-(`docs/adr/0016`, `docs/adr/0017`). Every answer below carries a re-exec check; none weakens
-this rule.
+## 1. The re-execution model (corrected, from `AGENTS.md:39-82`)
 
-### Legends
+This is the invariant every answer is held to. Stated completely:
 
-**Readiness**
-- 🟢 **Ready to freeze** — evidence settles it; owner ratifies as-is (or only a single binary product choice remains).
-- 🟡 **Recommendation on record → ratify** — a complete drafted recommendation exists; owner reviews and ratifies. Implementation may be a separately scheduled gate.
-- 🔴 **Open → needs work** — genuine owner economics/governance and/or unbuilt design/proof; not ratifiable from evidence alone.
+- **Producer + every execution-committee signer** independently re-execute the exact ordered
+  CL1 inputs at the same Phase-2 GL0 base; a signer signs **only** when its byte-identical
+  canonical diff **and** resulting root match. Missing inputs ⇒ defer/no-sign
+  (`AGENTS.md:41-49`).
+- **A noncommittee GL0 adopter** verifies the execution certificate, applies the
+  namespace-bounded diff to the signed base, and **recomputes the root** — it does not blindly
+  install a claimed root, and it does not re-run ordinary CL1 (`AGENTS.md:44-46`). This is
+  **certified-diff adoption with adopter root reproduction** — the target model, not a rejected
+  one.
+- **Watchtowers** are the noncommittee collusion backstop; **positive assigned replay coverage
+  is required before GL0 inclusion**; its population/deadline/retry/bond/resource parameters are
+  **open (O-03)** (`AGENTS.md:58-60`).
+- **ML0 / admission / DA** signatures authenticate input only and **can never satisfy execution
+  quorum** (`AGENTS.md:53-57`).
+- **Forbidden:** `authoritative*`, `AdoptFromSignedFields`, and **roots-only economic adoption**
+  (adopting a claimed root without recomputing it) (`AGENTS.md:79-82`).
 
-**Evidence tags** used inline: `[LOCKED]` `[RECOMMENDED]` (on record) `[PARTIAL]` (partially implemented) `[GAP]` (defect/unbuilt) `[OPEN]` (no prior work / owner call).
+The distinction v1 missed: **roots-only adoption is forbidden; certified-diff adoption where the
+adopter recomputes the root is the target.** Both involve a diff; only one skips the recompute.
+
+## 2. Provisional-values policy (per owner instruction)
+
+Where our sims calibrated a value, this doc records it as a **provisional number with a sim
+reference**, explicitly marked *calibration evidence, not proof*, to be re-validated against the
+actual implementation. This applies especially to O-01 (the shipped `SnowballAccumulator`
+differs from the idealized sim) and O-15C (existing bounds were measured for the *current*
+pairwise rule, not a new selector). Provisional numbers are a starting point to return to under
+test, never a freeze.
+
+## 3. Legends
+
+**Readiness** — 🟢 owner direction and executable contract ready to freeze · 🟡 owner direction ratified, engineering freeze gates remain · 🔴 stop-the-line research/schema/parameter/proof gate.
+**Evidence tags** — `[LOCKED]` `[OWNER-RATIFIED DIRECTION]` `[PARTIAL]` `[GAP]` `[OPEN ENGINEERING]`.
+**Provenance** — citations to `path:line` are verifiable at HEAD `ad13026d1`; italic *(memory)* notes are out-of-repo context, not reproducible from committed source.
 
 ---
 
 ## Summary
 
-| Gate | Title | Ready | One-line answer our work supports |
+| Gate | Title | Ready | One-line answer |
 |---|---|:--:|---|
-| O-01 | Avalanche population & parameters | 🟢 | `(K=8, α=5, β=10, Δ=slot/2)`, N≥16 floor (else T_depth1), without-replacement sampling; sim-locked, ratify + lift K/α into typed config. |
-| O-02 | Deep-history recovery beyond `k2` | 🟡 | Halt → fetch authenticated hash-addressed ancestry/state → re-verify the **same** `maxvalid-bg` decision → rebuild **before** mutation; atomic multi-sink recovery. Params still open. |
-| O-03 | Watchtower params & availability fallback | 🔴 | Release rule + penalties locked (slash 1/1, bounty 1/20, cooldown 100, window=`k1`); every population/coverage/deadline/bond/replay-budget value is unset. |
-| O-04 | ML0 response to a Phase-2 density reorg | 🟡 | Append-only audit → registered deterministic rebase/undo → else new ML0 epoch at last valid GL0 ref. Reconcile register-OPEN vs lifecycle-ratified. |
-| O-05 | Intake threshold & censorship recovery | 🔴 | Intake↔execution separation locked (intake never satisfies `kQuorum`); all six intake parameters unset; no distinct custody-intake layer built. |
-| O-06 | Global correction authorization | 🔴 | Forbidden case locked (no metagraph authority); vehicle = ordinal/hash-bound `ProtocolEra`; authorization **model** and the signed-correction **schema** undesigned. |
-| O-07 | Economic operation grammar | 🔴 | Preserve manual-unlock + metagraph-source spend as authorized v4 features, re-specified with explicit authority; ~15 grammar rows + 12 RED/oracle vectors unbuilt. |
-| O-08 | Tower proof contract | 🟡 | Proof contract designed + partly landed; blocked on making `smtRoot` deterministic & recipient-reproduced (L-22 precondition); size params stale. |
-| O-09 | Pure opaque state-channel scope | 🟢 | Default: opaque/data-only lane **disabled unless owner explicitly retains**; if kept, availability-only, no economic write. Conditioned on the SER-02 fix. |
-| O-10 | Portable shard-parent duty & slot bound | 🟡 | Ratify the drafted recommendation (exact `(ordinal,hash)` Phase-2 parent ref in the signed preimage; slot ≤ including-GL0-snapshot slot). Impl = `SHARD-C-009`. |
-| O-11 | Permissionless GL0 operator roster | 🔴 | Frame + containment settled (registration≠membership; uniform `1/N` over N-2 pop ∩ active keys ∩ positive stake, fail-closed). The **economics** are undecided. |
-| O-12 | Runtime KES secret deletion & N-2 reorg | 🟡 | Baseline drafted; one-way deletion at the eta-period evolution boundary **implemented + e2e-validated**; common-prefix probability, escrow y/n, rejoin still open. |
-| O-13 | Durable global delivery sequence | 🟡 | Hash-linked per-destination sequence + rooted outbox + permanent nullifier + ML0 cursor; inbox-before-local-spend first rule. Motivated by live ECO-05 double-apply. |
-| O-14 | Framework fee sequence & opaque-data binding | 🟡 | Reuse rooted `MgLastFeeTxRefs` (field 27) as strict per-source head + v1 rules; one clean choice: manifest-vs-bytes. Motivated by live ECO-18 fee replay. |
-| O-15 | Multi-tine Taktikos/Genesis frontier | 🔴 | Property (L-24) + boundary (L-04) settled; the **selector (A)**, **frontier evidence (B)**, **proof (C)** genuinely open. **D** is ratifiable now; **E** open + flagged tension. |
-| O-16 | Exact Phase-2 consumer lease (FIN-14) | 🔴 | All six sub-choices (A–F) recommended on record; zero constructs built; FIN-14 defect live; blocked on O-15/O-01. |
-| O-17 | ROOT-008 GL0 partition grammar | 🔴 | 5/7 anchors carry firm recommendations; R008-04 (numeric budgets) and R008-06 (token-lock scope) genuinely unanswered; GROWTH-001 + field-32 parity open. |
-
-**Freeze-now shortlist (evidence is sufficient):** O-01, O-09 (product yes/no + SER-02),
-O-10, O-12, O-15-**D only**, and the O-16A–F / R008-01/02/03/05/07 recommendations as
-*conditional* ratifications. Everything else needs either owner economics or design/proof work.
+| O-01 | Avalanche parameters | 🟡 | Sampled K/α/β direction and provisional `(K=8,α=5,β=10,Δ=slot/2)`, N≥16 else T_depth1 are owner-ratified; implementation parity, `T_weight`, network constants, and proof remain open engineering. |
+| O-02 | Deep-history recovery | 🟡 | Owner-ratified as authenticated chain-sync/rejoin from the objectively selected MRCA; atomic abandon/reconstruction and archive availability policy remain engineering. |
+| O-03 | Watchtower parameters | 🔴 | Pre-inclusion positive replay and fixed-approval/redraw direction are ratified; population, coverage, deadline, bond, and replay-budget constants remain activation-blocking parameter work. |
+| O-04 | ML0 density-reorg response | 🟡 | Owner-ratified rollback to the last GL0-embedded snapshot, with registered deterministic rebase or new epoch; schema and retained horizon remain engineering. |
+| O-05 | Intake threshold | 🔴 | Separate typed custody/admission threshold is ratified and can never satisfy execution quorum; its schema and six protocol parameters remain open engineering. |
+| O-06 | Global correction authorization | 🟡 | V1 uses binary/social `ProtocolEra` hard forks; a live Shape-B signed correction mechanism is deferred engineering, not a current owner gate. |
+| O-07 | Economic operation grammar | 🟡 | The allowlisted service-metagraph data exception and four guardrails are ratified; the mechanical inventory, exact predicates, and RED/oracle corpus remain activation gates. |
+| O-08 | Tower proof contract | 🟡 | Tower direction is ratified and partly staged (**`MptTowerStore` exists**); deterministic recipient reconstruction, reorg/restart behavior, proof, and size parameters remain open. |
+| O-09 | Opaque state-channel scope | 🟢 | Retain the limited authenticated DA-only opaque lane for v4 functionality; it has zero framework-economic authority and requires an explicit signed lane, never decoder selection. |
+| O-10 | Portable shard-parent duty | 🟡 | Exact Phase-2 `(ordinal,hash)` signed parent reference and containing-slot cap are ratified; implementation remains `SHARD-C-009` (CRITICAL). |
+| O-11 | Operator roster | 🔴 | Cardano-style pledge/self-bond plus Cosmos-style proportional delegation slashing and `bond >= extractable value` are ratified; rooted schema and per-network bounds remain open engineering. |
+| O-12 | KES secret deletion / N-2 reorg | 🟡 | No-`k2`-secret-retention and `RecoveryRequired`/rejoin baseline is ratified; common-prefix quantification and recovery implementation remain engineering. |
+| O-13 | Durable delivery sequence | 🟡 | Hash-linked per-destination sequence, rooted outbox/nullifier/cursor, and inbox-before-local-spend are ratified; complete ordering, bounds, and field allocation remain engineering. |
+| O-14 | Framework fee sequence | 🟡 | Field-27 strict head, v1 rules, and conditional manifest-versus-exact-bytes binding are ratified; codec and E9 reservation work remain. |
+| O-15 | Multi-tine frontier | 🔴 | L-24/L-04 and the single-common-anchor density/tower-evidence-only direction are ratified; exact selector, boundary, metric, tie, evidence, overflow rule, and proof remain stop-the-line research. |
+| O-16 | Phase-2 consumer lease | 🔴 | Conservative invalidation, raw-byte re-verification, L-19/L-23 conformance, and full signed exact-ref direction are ratified; freshness policy, purpose inventory, schema, and dependencies remain stop-the-line engineering. |
+| O-17 | ROOT-008 partition grammar | 🔴 | Numeric gaps/offline import, self-authenticating fields, token-lock scope, and field-32 direction are ratified; identity functions, resource parameters, codecs, and proofs remain stop-the-line engineering. |
 
 ---
 
-## O-01 — Avalanche population and exact parameters 🟢
+## O-01 — Avalanche parameters 🟡
 
-**Freeze:** delayed canonical registry/weight snapshot, `K`, `alpha`, `beta`, `T_weight`,
-sampling replacement rule, attestation lifetime, small-network failure mode; epoch pattern
-stake/registry from `N-2`, eta from `N-1`.
+**Owner-ratified provisional calibration (not proof):** `(K=8, α=5, β=10, Δ=slot/2)`, floor **N≥16** else fall
+back to T_depth1 — from `~/repos/research-nipopos-2026/sims/avalanche_attestation_calibration_gpu.py`
+(6696-cell × 10k-trial sweep, data `sims/data/avalanche_attestation_full_gpu_n10000_v2.json`;
+write-up `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md §0.A/§0.M`). `T_weight` provisional from
+`sims/mithril_quorum_threshold.py`. Sampling: uniform **without replacement**. Attestation
+lifetime: **emit-once** at first β-clear. Epoch: registry `N-2`, eta `N-1`, grinding-checked
+(`sims/run_grinding_ci.py`). `[OWNER-RATIFIED DIRECTION — PROVISIONAL PARAMS]`
 
-**Answer (from our work):** Calibrated in the research repo `~/repos/research-nipopos-2026`.
-- **`(K, α, β) = (8, 5, 10)`**, tick cadence **Δ = slot/2** — the smallest Snowball triple that
-  zeroes safety violations across N∈{16,32,100,500,1000} at f_adv=0.33, per the 6696-cell ×
-  10k-trial GPU sweep (`sims/avalanche_attestation_calibration_gpu.py`, data
-  `sims/data/avalanche_attestation_full_gpu_n10000_v2.json`; write-up
-  `docs/nakamoto/AVALANCHE-ATTESTATION-PROPOSAL.md §0.A/§0.M`). Flipped up from `(3,2,10)`
-  after K=3 was found at the Snowball noise floor. `[RECOMMENDED]`
-- **Small-network failure mode:** K=8 is **infeasible at N≤8** (no perfectly-safe grid cell);
-  recommendation holds for **N≥16**, and below that finality falls back to **T_depth1**
-  (`AVALANCHE-ATTESTATION-PROPOSAL.md` lines 171-182). `[RECOMMENDED]`
-- **Sampling replacement rule:** K peers sampled **uniformly without replacement** (Floyd
-  K-subset in the sim; `AVALANCHE-ATTESTATION-PROPOSAL.md §2.2`). *Confirm against the
-  `SnowballAccumulator` code, not only the sim.* `[RECOMMENDED]`
-- **`T_weight` (finality quorum):** derived under Taktikos election in
-  `sims/mithril_quorum_threshold.py` (5M-trial, `data/mithril_quorum_full_n5000000.json`).
-  L-03 fixes Phase 2 = decided-attestation `T_weight` **or** canonical `k1` depth. `[RECOMMENDED]`
-- **Attestation lifetime:** **emit-once** when the Snowball margin first clears β
-  (`AVALANCHE-ATTESTATION-PROPOSAL.md §5.4`; design `ATTESTATION-TIMELINESS-INCENTIVE-DESIGN.md`).
-  No dedicated lifetime sweep exists — this is a design decision informed by the suite. `[RECOMMENDED]`
-- **Epoch pattern / registry snapshot:** stake/registry from `N-2`, eta from `N-1` for `N`,
-  subject to the grinding suite (`sims/run_grinding_ci.py`, `grinding_results_ci.json`); aligns
-  with the register's own O-11 lookup invariant and O-17/R008-02 self-authenticating field-20. `[RECOMMENDED]`
+**Open engineering/research gate (audit #8, must close before any freeze):** the shipped
+`SnowballAccumulator.scala:13-25,67-80` has **no K-query/α-sample cascade** and is arrival-order
+sensitive, and the live loop has a separate cumulative-weight sink
+(`SnapshotLeaderLoop.scala:1082-1103`). So the sim modeled an *idealized* Snowball the code does
+not yet implement — the numbers cannot be frozen until the accumulator implements the sampled
+cascade and is re-validated. Config posture: only `snowball-beta` is HOCON
+(`application.conf:343`); K/α are code constants. Derive, test, and bake every final value per
+network as active-era protocol law.
 
-**Owner still decides:** (a) The config posture — `application.conf:340-343` already documents
-`(K=8, α=5, β=10)` as the "GPU-sim-locked production point," but **only `snowball-beta` is a
-HOCON knob (`:343`); K and α are code constants.** Ratifying O-01 means deciding whether to
-lift K/α into typed `SharedConfig.nakamoto.*` (recommended, per the HOCON rule) or ratify them
-as constants. (b) Whether the N≥16 floor + T_depth1 fallback is acceptable given the small
-default test/prod clusters.
+The sampled K/α cascade and N<16 depth fallback are the ratified direction. Engineering must
+implement the cascade, derive and freeze an executable `T_weight`, and rerun the reference,
+grinding, convergence, and adversarial calibration before activation.
 
-**Caveat:** the calibration is dated **2026-05-15 → 06-02**, i.e. ~6 weeks *before* the
-committee-re-exec redesign (ADR-0016/0017). Re-confirm the population model (delayed canonical
-registry vs the current seedlist — see O-11) before locking.
+## O-02 — Deep-history recovery = chain-sync 🟡
 
-**Re-exec check:** OK. Avalanche is the optimistic finality rail only (L-03); it validates no
-economics.
+**Owner-ratified direction:** a deep reorg whose true MRCA predates local `k2` retention is
+**recovered by the same authenticated historical-sync the rejoin/long-offline path uses.** Once
+objective fork choice selects the winning `maxvalid-bg` tine, the node conceptually rolls back to
+the deep MRCA and **ChainSyncs up the winning branch to its tip** — exactly `SYNC-PROTOCOL.md:94-132`
+("Historical Sync… once caught up (local tip ≥ network tip − 2), transition to Ready"), and the
+O-15 packet agrees (`O15-…:73-75,404-405`). This **collapses O-02 into the sync protocol** plus
+three additions: (1) **objective trigger** — recovery obtains inputs, never picks the winner
+(L-05); (2) **atomic abandonment** of the orphaned branch's state + downstream events
+(`CONSENSUS-ARTIFACT-LIFECYCLE.md:744-757`); (3) **authenticated reconstruction** vs the winning
+tine's commitments, no social choice. `[OWNER-RATIFIED DIRECTION]`
 
----
+**Open engineering gate:** specify atomic abandonment/reconstruction and minimum archive service.
+A single peer may supply history or a NiPoPoW/tower proof, but proof verification against the
+canonical commitment decides truth; peer diversity is availability hardening, not consensus
+authority. **Re-exec:** OK — refold runs the live execution path; no peer-GSI install authority.
 
-## O-02 — Deep-history recovery beyond local `k2` 🟡
+## O-03 — Watchtower parameters 🔴
 
-**Freeze:** the authenticated archive/bootstrap protocol when a winning `maxvalid-bg` tine's
-true common ancestor predates local rollback (`k2`) state.
+**Owner-ratified direction (template = Polkadot approval-checking):** the shard model maps onto
+Polkadot's **backing group (execution committee) + approval checkers (watchtowers)**: checkers
+are **VRF-secretly self-selected** (the unpredictability the owner wants), any checker whose
+re-exec disagrees raises a **dispute → escalate → slash**. Two thresholds, kept distinct:
+- **Safety/veto:** *one* honest watchtower mismatch must trigger the fraud-proof/slash path.
+- **Liveness/affirmative coverage:** how many must *affirm* before inclusion. A flat **1/3**
+  (owner's proposal) is defensible, but Polkadot's **fixed `needed_approvals` + "no-show"
+  redraw** degrades more gracefully than a fraction of the whole set being online. The
+  fixed-approval plus no-show-redraw shape is the V1 direction; the exact approval count is not
+  yet frozen.
 
-**Answer (from our work):** The **semantics are specified consistently across three docs** and
-governed by L-05 (`CONSENSUS-OWNER-DECISIONS.md:18` — objective comparison only, never guess or
-choose socially):
-- On `RecoveryRequired`, the node **halts production and Phase-2 serving**, fetches **exact
-  hash-addressed ancestry + state from archival peers** (MPT-primary, exact-byte/root verified,
-  **no peer-GSI installation authority**), **re-verifies the same `maxvalid-bg` decision**, and
-  **rebuilds before any mutation**; corrupt/missing bytes **halt before mutation**; recovery
-  derives eta/registry/tower state identical to a fresh bootstrap "by the same chain walk used
-  by bootstrap" (`CONSENSUS-ARTIFACT-LIFECYCLE.md:769-774`;
-  `GENESIS-DENSITY-PHASE2-REORG-AUDIT.md:64-133`). `[RECOMMENDED]`
-- The **atomic multi-sink recovery inventory** is enumerated: MPT undo→MRCA via retained undo;
-  requeue native + metagraph inputs exactly once; reverse checkpoint anchors + per-shard
-  watermarks + binary confirmations; reverse pending delivery/nullifier; recompute
-  eta/committee/tower/registry; durably publish the downstream replacement event
-  (`CONSENSUS-ARTIFACT-LIFECYCLE.md:744-757`). `[RECOMMENDED]`
+**Stake-to-produce vs bond-to-verify/slash (owner's split):** reasonable and precedented
+(Polkadot **fishermen**, Lightning watchtowers). Guard the **lazy-watchtower** failure: VRF
+assignment (already planned) + the affirmation must *carry the re-exec result* + random audits.
+Reward side already exists (`bounty-fraction=1/20`). `[LOCKED DIRECTION / OPEN PARAMETERS]`
 
-**Owner still decides:** the concrete **proof material**, the **minimum rollback/archive
-service + DA/checkpoint/input/diff limits** (explicitly open,
-`CONSENSUS-ARTIFACT-LIFECYCLE.md:887-888`), and a real **peer-diversity / anti-Sybil
-archival-peer rule** (only "archival peers" + freshest-peer ranking exist today — no quorum or
-diversity count). `[OPEN]`
+**Open parameter/schema gate (not HOCON defaults, audit #9):** derive and freeze watchtower set
+size, fixed affirmative approval count, assignment anchor, deadline, retry/redraw, challenger
+bond, replay budget, and censorship fallback. No numeric value is implied here. **Re-exec:** OK
+— pre-inclusion coverage is pro-guarantee.
 
-**Status:** L-23's durable `RecoveryRequired` + idempotent finality-intent substrate is
-**OPEN/PARTIAL** — built but **not wired** to the live FinalityGate/fork-choice/MPT
-(`CONSENSUS-OWNER-DECISIONS.md:45-79`). The existing byte-faithful adopt primitive
-(`project_gl0_deepcatchup_gsi_divergence`) covers the `>k1` gossip catch-up case, **not** the
-`>k2` predates-retention case.
+## O-04 — ML0 density-reorg response 🟡
 
-**Re-exec check:** OK — refold runs "the same validation/execution path as live production,"
-and "no peer-GSI installation authority" explicitly forbids adopting un-re-executed state.
+**Owner-ratified direction (standard L2-follows-L1):** the metagraph treats a GL0 density reorg as
+a **rollback to the last currency snapshot embedded in the winning GL0 branch** — its canonical
+state is only what the finalized GL0 chain embeds. This is the mainstream shared-security model:
+- **Polkadot parachains** — a parachain block is only as final as its backing relay block; relay
+  reorg → candidate orphaned → collator re-proposes on the new parent.
+- **Ethereum rollups** — L2 state is a function of L1 data; L1 reorg → L2 re-derivation.
+- **Cosmos/IBC** — avoids it by acting only on finalized state (the "Option A finality-first"
+  already chosen for cross-shard).
 
----
+Levers (both on record): **fast finality to shrink the reorg window**, and a **registered
+deterministic rebase/undo** for replayable apps (else new ML0 epoch at last valid GL0 ref).
+Non-invertible external effects are integrator risk — same as every L2. `[OWNER-RATIFIED DIRECTION]`
 
-## O-03 — Watchtower parameters and availability fallback 🔴
+**Open engineering gate:** reconcile stale status labels mechanically, then define the
+rebase/undo registration schema and ML0 retained-history horizon. **Re-exec:** OK — ML0
+own-state rollback; refold re-runs the live execution path.
 
-**Freeze:** complement/sample size, minimum positive coverage, assignment anchor, deadline,
-retry/redraw, bonds, replay budget, challenge lifetime, censorship fallback.
+## O-05 — Intake threshold 🔴
 
-**Answer (from our work):** The **release rule is locked** — positive deterministic
-noncommittee replay coverage precedes GL0-inclusion eligibility; a valid challenge triggers
-exceptional bounded universal GL0 replay and the replay result (not the assertion) decides
-rollback/slash (L-09, `CONSENSUS-OWNER-DECISIONS.md:22`; `docs/adr/0017:132-135`). **Penalty
-parameters are set:** slash-fraction `1/1`, bounty-fraction `1/20`, cooldown `100` epochs
-(`application.conf:565,571,576`); the **challenge lifetime is `k1`** — the GSAM keeps a
-checkpoint's economic effects reversible until `k1` finalized ordinals after adoption
-(`application.conf:296-302,552-555`). `[LOCKED]` / `[PARTIAL]`
+**Owner-ratified layering (template = Polkadot pipeline):** the model is consistent
+with the design. ML0 (currency-l0) = L2-specific BFT, no global responsibility, pushes
+incrementals to GL0 (`AGENTS.md:55-57`). The three GL0 committees map cleanly to Polkadot:
 
-**Owner still decides — no recorded values exist for any of these** (ADR-0017 explicitly defers
-them, `:238-239,253-255`): watchtower complement/sample size; minimum positive-coverage
-fraction; assignment anchor; deadline; retry/redraw; challenger **bond amount**; replay
-budget/rate-limit; direct-fetch/censorship fallback. `[OPEN]`
+| GL0 layer | Role | Polkadot analog |
+|---|---|---|
+| Intake committee | authenticate source, check parent/ordinal/envelope, durable custody + availability | availability distribution |
+| Shard execution committee | re-execute CL1, diff+root, sign-on-match | backing group |
+| Shard watchtowers | independent re-exec, dispute/slash | approval checkers |
 
-**Status / re-exec flag:** the **shipped** watchtower is a *post-adoption, reversible-until-`k1`*
-backstop — weaker than the **locked pre-inclusion coverage rule**. This is the ADR-0017
-enforcement gap (committee signs on best-tip; GL0 adopts on quorum-sig; watchtower re-execs
-after adoption). **Pro-guarantee: fix inside the re-exec model** by moving coverage before
-inclusion — do not weaken the rule to match the code.
+**The correction (audit #15):** intake and execution are **distinct draws** but currently share
+one parameter block (`nakamoto.committee`, k-draw/k-quorum). The missing construct is a
+**separately-typed custody/admission threshold that can never satisfy execution `kQuorum`**
+(L-12/L-13). `[LOCKED DIRECTION / OPEN PARAMETERS]`
 
-> Note: `SLASHING-DESIGN.md` and `COMMITTEE-SORTITION-DESIGN.md` are **historical/superseded**
-> (stake-weighted admission; "not the current implementation"). Live values are
-> `application.conf` + ADR-0016/0017.
+**Open parameter/schema gate:** derive and freeze the custody threshold, receipt/custody
+lifetime, queue ownership, durable-replication rule, redraw schedule, and censorship fallback.
+**Re-exec:** OK.
 
----
+## O-06 — Global correction authorization 🟡
 
-## O-04 — ML0 response to a Phase-2 density reorg 🟡
+**Locked V1 owner decision:** **binary/social governance through an ordinal/hash-bound
+`ProtocolEra` hard fork now; an on-chain governance/adoption mechanism later.** Operators run
+the release binary that encodes the correction/era rules; a formal on-chain governance/voting
+layer is deferred. This is consistent with L-18 (trust flows *down* only;
+metagraphs never force an economic view onto the hypergraph, `AGENTS.md:61-63`) and
+`feedback_greenfield_no_wire_compat` *(memory)*. `[LOCKED V1 DIRECTION]`
 
-**Freeze:** ML0's retained history + deterministic rewind/rebase/new-epoch contract when a
-consumed GL0 Phase-2 ref is orphaned by a density reorg.
+**Sharpening:** "governance via binary" fixes *who authorizes*; a correction still needs a
+deterministic **on-chain mechanism** so every node applies a byte-identical change — an exact
+`(metagraph, preRoot→postRoot)` target, an **activation ordinal**, replay protection — i.e. the
+ordinal/hash-bound `ProtocolEra` boundary (`ERA-REGISTRY-DESIGN.md`; `EraCodecRegistry` exists,
+greenfield `dev=0`, unwired).
 
-**Answer (from our work):** The three-way contract is drafted and consistent across four docs:
-**(1)** retained history = append-only auditable ML0 history + rollback material through the
-local horizon and every longer dependency (`k2` = capacity, not a validity floor); **(2)**
-response order: append-only audit (preferred) → an app with a **registered deterministic
-rebase/undo contract** appends a corrective snapshot → else a **new ML0 epoch at the last valid
-GL0 ref**; **(3)** noninvertible external effects are integrator risk, not made reversible by a
-new phase. Downstream follows exact hashes + explicit replacement events; orphaned inputs
-requeue exactly once (`CONSENSUS-ARTIFACT-LIFECYCLE.md:759-767`;
-`GENESIS-DENSITY-PHASE2-REORG-AUDIT.md:109-118`). `[RECOMMENDED]`
+**Deferred engineering:** a signed-correction schema (target/diff/post-root/reason/activation-
+ordinal/audit-trail) and live Shape-B correction implementation are not V1 prerequisites. A
+future re-genesis import remains separate migration work. **Re-exec:** OK — pro-guarantee (no
+metagraph-originated authority).
 
-**Owner still decides:** formally freeze it and **reconcile a status tension** — the lifecycle
-lists this as a *ratified* implementation-input (`CONSENSUS-ARTIFACT-LIFECYCLE.md:862-864`)
-while the register keeps it **OPEN**. Also: the registration schema qualifying an app's
-"deterministic rebase/undo contract," ML0's exact retained-history horizon and its
-eviction→`RecoveryRequired` boundary, and the O-13 delivery-cursor-rewind interaction.
+## O-07 — Economic operation grammar 🟡
 
-**Status:** the GL0 reorg gadget is **not yet one crash-consistent transaction**
-(`GENESIS-DENSITY-PHASE2-REORG-AUDIT.md:24-36`); ML0's live `resyncToCanonical` is
-ordinal-forward, not hash-bound Phase-2 replacement (`project_ml0_diff_adopt_design`). `[GAP]`
+**Owner-ratified resolution — the "oracle exception":** specialized **service metagraphs**
+(e.g. a price metagraph) that publish data consumed by other services are a **network-defined
+allowlisted exception**, not "invented oracle authority." This resolves the O-07 tension. The
+four guardrails that keep it inside the #1 rule:
+1. **Allowlist is network-defined/rooted** (genesis or era-governed), never self-claimed.
+2. **Oracle output is authenticated-source *data*, not self-authorizing value** — it cannot mint
+   or move framework balances on its own.
+3. **Downstream economic consumption is still re-executed** — a consuming metagraph's CL1 uses
+   the value as a *signed input* (finality-first, like a cross-shard read); the oracle is a
+   witness, not an authority (`AGENTS.md:64-68` — DL1 data carriage "never extends to CL1
+   economics").
+4. **The oracle metagraph's own economics** are CL1-re-executed by its committee like any
+   metagraph; only its *data-publish lane* is privileged (likely the v4 `PricingUpdate` op).
 
-**Re-exec check:** OK — ML0 own-state rollback; refold re-runs the live execution path,
-preserving committee+watchtower re-exec. Registered-rebase/proof-carried rollback is scoped to
-currency-with-data (DL1), consistent with the rule.
+Separately, **manual owner unlock (ECO-03)** and **metagraph-source spend (ECO-04, CRITICAL)**
+are intended, authorized v4 features to *preserve* with explicit authority (owner-signed
+`TokenUnlockIntent`; `MetagraphSpendIntent` bound to a rooted registry/threshold/nullifier) —
+not delete, not treasury/oracle-invent (`V4-ECONOMIC-GRAMMAR-AUDIT.md:104-249`).
+`[OWNER-RATIFIED DIRECTION]`
 
----
-
-## O-05 — Intake threshold and censorship recovery 🔴
-
-**Freeze:** intake threshold, receipt/custody lifetime, queue ownership, durable-replication
-requirement, redraw schedule, direct-fetch/censorship fallback.
-
-**Answer (from our work):** The **separation is locked**: the binary-intake committee and the
-execution committee are distinct draws; ML0 operators authenticate the binary but are not
-committee members; intake receipts claim only authenticated source / checked
-parent-ordinal-envelope / durable custody / availability and **never satisfy execution
-`kQuorum`** (L-12/L-13, `CONSENSUS-OWNER-DECISIONS.md:25-26`). The L-13 "derive parent/ordinal
-from authenticated state, not self-claim" duty is partially realized in
-`MetagraphParentOrdinalResolver.scala:38-99`. `[LOCKED]` / `[PARTIAL]`
-
-**Owner still decides — no recorded values for any of the six** freeze items. `[OPEN]`
-
-**Status / config smell:** live code has **one shared committee draw** (`nakamoto.committee`,
-`k-draw=8` / `k-quorum=6`, `application.conf:474-476`) doing per-metagraph admission; there is
-**no distinct durable-custody intake layer** with receipts/replication. When the owner sets an
-intake threshold it must be a **separate** value, or the "intake can't satisfy `kQuorum`"
-invariant risks being collapsed in code.
-
-**Re-exec check:** OK — L-12/L-13 explicitly bar intake receipts from counting toward execution
-quorum.
-
----
-
-## O-06 — Global correction authorization 🔴
-
-**Freeze:** how a GL0 protocol correction of malformed metagraph state is authorized/activated,
-plus the signed-correction schema. No metagraph-originated authority is an option.
-
-**Answer (from our work):** The **forbidden case is locked** (L-18,
-`CONSENSUS-OWNER-DECISIONS.md:32` — trust arrow is only `GL0 protocol → canonical GL0 state →
-downstream rebase`; no ML0/CL1/DL1 or operator authority; a correction is a deterministic
-root-covered GL0 transition, not a hidden producer override). The **activation vehicle has a
-recorded direction**: an ordinal/hash-bound `ProtocolEra` boundary — deployed either as a
-greenfield re-genesis cutover pre-launch (Shape A) or an ordinal-gated era boundary post-launch
-(Shape B) (`21-workstream-hardfork.md:12-18,76-106`), with `EraCodecRegistry`'s validated
-range-list as the disciplined seed (`ERA-REGISTRY-DESIGN.md:28-31`) and O-04 supplying the
-downstream-rebase contract. `[LOCKED]` / `[RECOMMENDED]`
-
-**Owner still decides:** the **authorization model itself** — hard-fork/era rule vs a future
-canonical governance rule vs another deterministic GL0 mechanism (all three still open,
-`:143-145`; no governance mechanism is designed anywhere); Shape A vs Shape B for a live-history
-correction; and the **entire signed-correction schema** (signed domain, exact
-`(metagraph, preRoot, version)` target, correction diff, post-root, reason, activation ordinal,
-replay-protection field, audit trail) — **undesigned**; a prior attempt was deliberately
-deleted (`21-workstream-hardfork.md:9-10`). `[OPEN]`
-
-**Status:** `EraCodecRegistry` is **built but unwired** (greenfield `dev=0`, no production
-dispatch); the unified `EraRegistry` is design-only (`ERA-REGISTRY-DESIGN.md:3,40`). `[GAP]`
-
-**Re-exec check:** OK — pro-guarantee; L-18 bars metagraph-originated authority and consistent
-with L-17's deletion of `authoritative*` overrides.
-
----
-
-## O-07 — Economic operation grammar 🔴
-
-**Freeze:** audit every v4.0.0 framework op; preserve ops with explicit deterministic
-authority/conservation/ordering/replay; don't invent treasury/oracle authority; don't disable
-working functionality just because its rule isn't restated; defective behavior gets a protocol
-rule + RED/oracle vectors before enablement.
-
-**Answer (from our work):** **Manual owner unlock and metagraph-source spend are intended,
-authorized v4 features to preserve** — re-specified with explicit authority
-(`V4-ECONOMIC-GRAMMAR-AUDIT.md`):
-- **ECO-03** unsigned `TokenUnlock` — CONFIRMED intended (owner-signed unlock), authority
-  **defective**; current `c610a0740` adds amount/currency/source equality
-  (`TokenLockOpsManager.scala:161-173`) but that is not authorization (a Byzantine ML0 can copy
-  public lock fields). Target = owner-signed `TokenUnlockIntent` derived from the canonical lock.
-  `[PARTIAL]`/`[GAP]`
-- **ECO-04** no-reference `SpendTransaction` — CONFIRMED intended metagraph-source spend
-  (`SpendActionValidator.scala:258-261,319-328`); authority **gap**: GL0 doesn't bind the inner
-  signer population/threshold to a canonical MG→ML0-operator registry. Target = explicit
-  `MetagraphSpendIntent` with rooted registration + threshold + nullifier + settlement kernel
-  (`V4-ECONOMIC-GRAMMAR-AUDIT.md:214-243`). `[PARTIAL]`/`[GAP]`
-- `PricingUpdate` and protocol balance correction are real v4 mutators (correction routes to
-  L-18/O-06, not metagraph authority).
-
-**Owner still decides:** the exact authority predicate per op (esp. the canonical ML0-operator
-registry/threshold/rotation for metagraph-source spend — couples to O-11), whether `PricingUpdate`
-ships unchanged, and human classification after a **mechanical
-constructor/codec/event/acceptance reachability inventory**. The gate is explicitly open until
-that inventory + the **full RED/oracle corpus** land (~15 grammar rows + 12 vectors:
-`ECON-AUTH-001/002`, `ECON-REPLAY-MGSPEND-001`, `ECON-RESERVE-001`, `ECON-LANE-001`, …
-`V4-ECONOMIC-GRAMMAR-AUDIT.md:250-307`). `[OPEN]`
-
-**Re-exec check:** OK, pro-guarantee — the audit *preserves* CL1 ops **with** committee
-re-exec-before-sign; `ECON-LANE-001` forbids DL1 output synthesizing framework effects.
-
----
+**Open engineering gate:** complete the mechanical constructor/codec/event/acceptance inventory,
+the RED/oracle corpus (`ECON-AUTH-*`, `ECON-LANE-001`, …), and exact per-op authority predicates
+before enablement. **Re-exec:** OK — the oracle exception is a *data-input* exception, not an
+economic-authority one; consumption is re-executed.
 
 ## O-08 — Tower proof contract 🟡
 
-**Freeze:** snapshot-carried per-level state/pointers, trial computation, `N-2` registry / `N-1`
-eta inputs, KES/VRF verification, SMT inclusion, proof comparison, size limits, cache
-reconstruction, density-reorg rollback (L-22 locks eligibility but stages activation).
+**Owner-ratified direction:** the proof contract is designed end-to-end (`NIPOPOW-PROPOSAL.md §2-4`) and
+**partially landed as staged, production-dark components — including `MptTowerStore` (audit #10,
+`MptTowerStore.scala:104-115,264-275`).** The production GL0 resource explicitly sets the proof
+provider to `None`; the staged `TowerCatchupCoordinator`/`TowerFinalizer` are not attached to runtime
+finality or proof-serving authority (`GlobalSnapshotConsensus.scala:1510-1514`). Per-level pointers,
+L domain-separated VRF trials, MPT `(level,ordinal)`
+inclusion, weight-for-proofs-only, KES-gated verification are on record; N-2 registry / N-1 eta
+inputs match O-11/O-17. `[OWNER-RATIFIED DIRECTION / PARTIAL]`
 
-**Answer (from our work):** The contract is **designed end-to-end** and **partially
-implemented**: per-level `subchainState` pointers (`NIPOPOW-PROPOSAL.md §2.3`; data landed
-`NIPOPOW-IMPLEMENTATION-PLAN.md:66-71`), L independent domain-separated VRF trials (§2.1; S1
-landed `:39-58`), MPT `(level,ordinal)` inclusion (§2.6), weight used **only** to compare proofs
-never chain selection (§2.4), `m=50` / `k=k1` window (§2.5), KES-gated verification (§3-4). `N-2`
-registry / `N-1` eta inputs match the register's O-11/O-17 constructs. `[RECOMMENDED]`/`[PARTIAL]`
+**Blocker (L-22 activation):** the active era requires exact state-proof equality and rejects every
+snapshot carrying `Some(smtRoot)`; the old `smtRootBlind` normalization is removed. Future
+activation still requires one deterministic, branch-bound construction that every recipient
+reproduces before acceptance, plus durable restart/reorg reconstruction and an activation proof.
+The size parameters must also be re-frozen (proposal `k=255` is stale vs live `k1=1024`).
+**Re-exec:** OK — light-client proof, not chain selection or economics. SMT-01 = HIGH.
 
-**Owner still decides / blocker:** **L-22's activation precondition is unmet** — `smtRoot` is
-currently *normalized out of consensus* (`smtRootBlind`) because it is path-dependent /
-non-deterministic (`GlobalSnapshotConsensusFunctions.scala:281-294`), so the field a tower proof
-relies on is **not** independently reproduced by every recipient today. Before activation:
-make `smtRoot` deterministic **and** recipient-reproduced (or re-derive the tower commitment off
-a non-consensus field), land the `MptTowerStore` (S3, restart/branch-aware reconstruction), and
-**re-freeze the size params** — the proposal's `k=255`/`k2=65536` are stale vs the live
-`k1=1024`, `k2=100·k1`, `R=3.1·k1`. `[GAP]`/`[OPEN]`
+## O-09 — Opaque state-channel scope 🟢
 
-**Re-exec check:** OK — tower/NIPoPoW is light-client retroactive proof, explicitly not chain
-selection and not economic validation (correctly proof-carrying for the serve path).
+**Locked owner decision:** retain the limited opaque/data-only lane needed to preserve v4
+state-channel functionality. It receives authenticated inclusion/availability semantics only,
+has zero framework-economic write surface, and is never decoder-selected
+(`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md:196-211`;
+`docs/adr/0016-execution-sharding-reexecution-and-cross-shard-reads.md:158-170`). `[LOCKED]`
+
+**Condition:** close **SER-02 (HIGH)** — today lane selection is by whichever JSON decoder
+succeeds; fix = one explicit signed lane/type envelope so opaque bytes cannot be decoder-promoted
+into economics (decoder-promotion *would* violate the #1 rule). The product decision is closed;
+the explicit envelope and negative decoder-promotion tests remain engineering.
+
+## O-10 — Portable shard-parent duty 🟡
+
+**Owner-ratified direction** (`CONSENSUS-OWNER-DECISIONS.md:200-223`): put an
+exact `(ordinal, hash)` Phase-2 parent reference in the child's **signed preimage**; verifier
+requires that GL0 snapshot Phase-2, extracts the parent under the same shardId, hashes to the
+child's `parentCheckpointHash`; carry the parent artifact/header or inclusion proof; slot ≤ the
+including GL0 snapshot's slot cert; single genesis sentinel. `[OWNER-RATIFIED DIRECTION]`
+
+**Status:** impl is `SHARD-C-009` (**CRITICAL**) — parent resolved from a receiver-local shard
+store; the checkpoint binds an execution-base ordinal but **not** the exact Phase-2 `(ordinal,hash)`;
+and **no slot cap exists**. Target pattern exists on the ML0-binary side already. Scheduling and
+implementation are open engineering. **Re-exec:** OK.
+
+## O-11 — Operator roster 🔴
+
+**Settled frame:** registration ≠ membership; uniform 1/N over a delayed-canonical **N-2**
+population **intersected** with active KES+VRF pairs, the rooted minimum self-stake/self-bond
+predicate, and delegated backing; **fail-closed** to
+"unavailable" (never seedlist/key-only) until a rooted roster exists
+(`HistoricalOperatorConsensusKeyRegistry.scala:117-204`). `[LOCKED / PARTIAL]`
+
+**Answer (owner-refined; Cardano + slashable bond):** Cardano registers pools with a **pledge**
+(operator's own committed stake) + delegation on top, snapshots stake at epoch boundaries used
+**N-2** — but **Cardano does not slash.** The owner wants Cardano's pledge **plus a slashable
+bond** (this project *does* slash). The plan — **min self-stake to register KES/VRF + for
+stake-snapshot inclusion; delegation allowed; operator min self-bond required for committee/
+production eligibility** — is the Cosmos `min_self_delegation` + Cardano-pledge hybrid and is
+sound. `[OWNER-RATIFIED DIRECTION]`
+
+**Ratified load-bearing invariants (audit #11 — positive stake alone permits splitting):**
+1. Delegated stake is slashed proportionally with the operator, Cosmos/Polkadot style, so
+   delegation is security-additive rather than only liveness-additive.
+2. **Bond ≥ extractable value in one fraud window** (ties to O-03/ADR-0017). The minimum bond
+   is a safety margin, not merely Sybil resistance.
+
+**Values & config:** no universal number (Eth 32 fixed; Cosmos `min_self_delegation` per-chain;
+Polkadot dynamic-from-election; Cardano pledge+`a0`). The structure is ratified; derive and test
+the numbers per network. Bake them as compiled per-network constants keyed by `AppEnvironment`
+(like `k1`), not `${?ENV}`-overridable, then root the active parameters. The one HOCON nit:
+`StakeRegistry.scala:102-107` reads `sys.env.get("NAKAMOTO_OPTIMISTIC_MIN_FRACTION")` — migrate
+to `SharedConfig.nakamoto.*`. **Re-exec:** OK — the roster *defines the committee that
+re-executes*; closing the live seedlist-defined-population gap (`SharedServices.scala:300-304`)
+strengthens the guarantee (it is the `α_total>1/(2S)` exposure, `sims/cross_shard.py`).
+
+## O-12 — KES secret deletion / N-2 reorg 🟡
+
+**Owner-ratified baseline** (`OPERATOR-CONSENSUS-KEY-REGISTRY.md:287-295`): one-way secret
+deletion at each **eta-period evolution** boundary (forward-secure `SecureStore` mechanism is
+present in code); N-2 prefix assumed common-prefix-stable; a density reorg crossing an
+erased-secret activation → durable `RecoveryRequired` + explicit rejoin; missing secret history
+is **not** slash evidence; **no** `k2` master retention / automatic secret rollback.
+`[OWNER-RATIFIED DIRECTION]`
+
+**Provenance (audit #12):** the "16-rotation / 8-node / 13,724-sig" e2e figure is an *unverified
+external claim* — no committed test/log reproduces it; treat as unverified. **Open engineering
+gate:** quantify the common-prefix failure probability and implement the recovery/rejoin
+procedure (`RecoveryRequired` remains unwired per L-23). Offline escrow economics are deferred
+and non-load-bearing for V1; V1 safety cannot assume escrow or `k2` secret rollback. **Re-exec:** OK.
+
+## O-13 — Durable delivery sequence 🟡
+
+**Owner-ratified direction** (`CONSENSUS-OWNER-DECISIONS.md:350-386`): hash-linked
+per-destination sequence, rooted outbox head + permanent nullifier, ML0 applied-`(sequence,
+deliveryId)` cursor, contiguous execution from one exact Phase-2 ref, CAS ack, pending records as
+rooted leaves, missing bytes **defer**; **inbox-before-local-spend** the first ordering rule;
+delivery markers stay framework-recomputed. `[OWNER-RATIFIED DIRECTION]`
+
+**Motivation:** ECO-05 (**CRITICAL**) — the 50-snapshot reconstruction window double-applies a
+pending ordinal that falls outside it. **Open engineering/schema gate:** define the full total
+order among the six op types, rooted limits/backpressure/fees, retention/deep-recovery, O-04
+interaction, and field allocation. **Re-exec:** OK — GL0-owned framework kernel.
+
+## O-14 — Framework fee sequence 🟡
+
+**Owner-ratified direction:** reuse the already-rooted `MgLastFeeTxRefs` (field 27, `GlobalStateKey.scala:258`) as
+the strict per-source head; fee signs network/era/lane/metagraph/source/dest/amount/parent-ref/
+opaque-data-commitment; parent must equal rooted state; check availability **without executing
+DL1**; atomic balance+head update; v1 rules on record (0-or-1 per item; invalid ⇒ reject whole
+segment; reserve pre-batch; no v1 expiry; resign-to-pay-again). The ratified conditional binding is
+**chunk-manifest root only when all chunks are available pre-signature, else exact bytes.**
+`[OWNER-RATIFIED DIRECTION]`
+
+**Motivation:** ECO-18 (**CRITICAL**) — a signed fee can be re-included until the source drains.
+**Open engineering/schema gate:** encode the ratified conditional manifest/exact-bytes shape,
+close the E9 outer-fee reservation interaction, and allocate the field/codec. **Re-exec:** OK — GL0 verifies authorization/arithmetic/conservation, never treats
+ML0 custom output as authority. *Do not* let the DL1 `data-with-fee` "authoritative push"
+precedent bleed into framework fees.
+
+## O-15 — Multi-tine frontier 🔴
+
+**Authority:** [`O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md`](O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md).
+Owner-ratified: the objective-result **property** (L-24), the conceptual Tk/Bg **boundary**
+(L-04), and the single-common-anchor density direction with the tower used only for portable
+evidence. The observation protocol, exact selector, short/deep metric and equality, tie rule,
+evidence schema, activation proof, and Byzantine-overflow rule remain stop-the-line research
+(`O15-…:225-238`). Ratified direction is not an executable selector.
+
+**What the primary papers actually specify:**
+
+- Published Taktikos Algorithm 1 sets `C <- Cloc` and processes `C1..Cj` in
+  sequence. A valid candidate that forks from the current incumbent by at most
+  `k` replaces it only when the candidate is longer, or when lengths are equal
+  and the candidate's head slot is strictly earlier. A deeper candidate and an
+  exact length/slot tie retain the incumbent. The algorithm contains no VRF/hash
+  final tie and does not define an incumbent-independent set argmax
+  (published p. 6; prepublication Appendix A.1, pp. 22-23).
+- Genesis Figure 7 also starts at `Cmax <- Cloc` and processes candidates in
+  sequence. Its short-fork test is relative to that current incumbent; its deep
+  condition uses the pair's most-recent common slot and a strict density win.
+  Neither paper specifies a consensus candidate enumeration order or proves that
+  this fold is a permutation-independent total-frontier function.
+- Taktikos's prepublication bounds assume static stake/registration and a
+  synchronous, time-homogeneous process; `FINIT` fixes a constant genesis nonce.
+  Its Appendix A proposes the bounded-delay fold but does not prove L-24 or this
+  project's dynamic `N-2` stake, `N-1` eta, and KES/VRF/registry-era composition.
+
+**What the repository evidence proves:**
+
+- The Scala comparator is a project variant, not a literal implementation of
+  Algorithm 1. It uses a symmetric ancestry walk, a symmetric maximum-suffix
+  depth, mixed Tk/Bg pairwise comparison, and a lower-VRF-then-hash final tie.
+- Under a synthetic `k`/density configuration, the retained A/B/C fixture forms
+  strict mixed Tk/Bg preferences whose left-fold result changes with permutation
+  (`ChainSelectionSuite.scala:191-226`). The store fixture likewise finishes at
+  different heads for three parent-before-child arrival schedules
+  (`NakamotoChainStoreSuite.scala:280-372,426-469`).
+- Those fixtures prove order-sensitive behavior in the current comparator/store
+  control flow. They bypass complete VRF/KES/eta/era snapshot admission and do
+  not prove that published Taktikos is broken, that the synthetic frontier is
+  reachable under an active environment, or that the resulting divergence is
+  persistent under subsequent valid block production.
+
+**Engineering disposition:** the dedicated packet's O-15A through O-15G remain activation
+gates. The source decision register groups the remaining work separately as A through F; those
+labels are not a one-to-one subgate mapping. The owner-ratified research direction does not
+authorize the current symmetric max-suffix rule, an unproved scalar ordering, the VRF/hash tie,
+or a cutoff manifest. A precise construction, validator-backed traces, and a Taktikos/LDD
+security and liveness argument are mandatory. The review packet is the engineering authority.
+
+### O-15 owner-ratified research direction — tower-augmented evidence
+
+This direction is not implementable without the packet's construction, proof, and simulations.
+Ratification settles what engineering should attempt; it does not waive the activation gates.
+
+**Why the pairwise relation cycles (worked example).** The Tk/Bg choice is
+per-**pair**, keyed on *that pair's* fork depth from *that pair's* MRCA — not a
+tine's absolute length. For a frontier `{A,B,C}` where A and B diverge at a recent
+fork `m3` but both diverge from C at a deep fork `R`: `MRCA(A,B)=m3` (short → Tk)
+while `MRCA(A,C)=MRCA(B,C)=R` (deep → Bg). The *same* tine A is therefore in a Tk
+comparison (vs B) and a Bg comparison (vs C) at once; the comparison operator itself
+changes per pair, so a strict `A>B`, `B>C`, `C>A` cycle is possible
+(`ChainSelectionSuite.scala:191-226`). Note `k1` is the Tk/Bg boundary; `k2` is the
+retention/recovery horizon, **not** a selection cutoff (L-05) — a fork deeper than
+retained history goes to `RecoveryRequired`/O-02, not to a different rule.
+
+**The anchoring requirement.** The cycle exists because A-vs-B is measured from `m3`
+while A-vs-C is measured from `R` — *different anchors per pair*. Scoring every tine
+from ONE common anchor (the frontier's deepest common ancestor `R`) gives a per-tine
+scalar → total order → cycle gone. Worked, with block-count density from `R`:
+`score(A)=5`, `score(B)=6`, `score(C)=3` → `B > A > C`, order-independent.
+
+**Tower weight vs. extension count (grinding).** The μ-tower does supply a per-tine
+scalar, but as a *decision* statistic it is a noisier estimator of the same quantity
+density already measures (production rate ∝ stake-in-window):
+- **Weight** `Σ 2^μ·n_μ` is tail-dominated (a μ=9 block ≈ 1024) → high variance →
+  withholding/selection-grindable (publish the luckiest private chain). This is why
+  the research relegates weight to the proof layer (`README.md:39-46`; NIPoPoW
+  proposal §2.4 uses weight for proof comparison only, never chain selection).
+- **Counting extensions** removes the `2^μ` amplification → lower variance →
+  directionally less grindable. But **count-all-levels ≈ density** (`Σ n_μ ≈ n`;
+  safe but redundant), and **count-only-high-μ ≈ as grindable as weight**. So the
+  safe endpoint of "count instead of weight" is density itself; the tower adds no
+  safer decision signal.
+
+**Anchor choice (safest bet).** Anchoring on "the last common μ\*-superblock" is a
+sound *instinct* (the anchor must be common), and it sits at-or-*deeper* than the
+plain MRCA — the shared prefix cancels in the relative comparison, so it yields the
+*same relative order* as anchoring at the plain MRCA. Its value is therefore
+**mechanism** (jump to the anchor via the tower) and **succinct portable evidence**
+(O-15E: verify "last common μ\*-superblock + density since it" with a log-size
+proof), not a safer decision. Anchor-grinding is bounded: the shared prefix is
+settled mutually-agreed history that cannot be ground; only late-reveal can move the
+frontier MRCA (handled by O-15A reselection), and deeper anchors are less
+manipulable.
+
+**Owner-ratified direction (activation remains subject to O-15C proof + simulations):**
+- Decision statistic = **density from a single common anchor** — not weight, not
+  high-μ count.
+- Anchor = the **deepest** common reference (frontier MRCA / most-conservative common
+  superblock); recompute on late-reveal.
+- Tower's role = **mechanism + O-15E evidence**, at most a low-variance secondary
+  sanity check; **never** primary or override. The lower-VRF-then-hash tie remains only a
+  RED/reference input pending O-15D grinding analysis; no exact tie is ratified.
+
+**Warnings:** (1) a per-tine scalar is required to break the cycle, but a tiebreaker
+*layer* under the current pairwise density does **not** help — the retained cycle is
+strict density wins with no ties. (2) Do not let any tower statistic be primary or
+override density. (3) Do not count only high-μ levels. (4) Do not use a shallow
+anchor. (5) None of this is safe until re-validated: the density bound must be
+re-proven for the anchored metric, and the withholding/grinding surface quantified
+under it — `sims/weight_grinding_intuition.py`, `weight_grinding_intuition_v2.py`,
+`nipopow_levels.py`, `adv_depth_*.py`, `run_grinding_ci.py`. The existing
+`grinding_results_ci.json` measured the *rejected* weighted scheme, not this.
+
+**Re-exec:** OK — GL0 fork choice only; introduces no BFT.
+
+## O-16 — Phase-2 consumer lease 🔴
+
+**Authority:** [`P6-FIN14-PHASE2-CONSUMER-LEASE.md`](P6-FIN14-PHASE2-CONSUMER-LEASE.md).
+The owner ratifies: **O-16A** conservative all-lease invalidation; **O-16C** retaining raw signed
+bytes and rerunning every registry/VRF/KES/signature/anchor check; **O-16B / O-16E** conformance
+to locked L-19/L-23; and **O-16F** a signed full `GlobalSnapshotStateRef` plus registry/parameter
+era and purpose domain. For **O-16D**, receiver-local wall clock/HOCON is forbidden; engineering
+must define any operation-specific or branch-authenticated historical freshness rule through
+ECON-G. The purpose inventory, concrete schema/codecs, and freshness rules remain stop-the-line
+engineering. Issuance is also blocked by the full dependency inventory (`P6-…:456-477`),
+O-15/O-01, and absent positive watchtower coverage. **Re-exec:** OK — the lease binds *which exact
+base*; inclusion still requires replay + adopter root reproduction.
+
+## O-17 — ROOT-008 partition grammar 🔴
+
+**Authority:** [`ROOT-008-GL0-PARTITION-GRAMMAR.md`](ROOT-008-GL0-PARTITION-GRAMMAR.md).
+
+**R008-06 — RESOLVED by owner decision.** A metagraph may issue token locks **only for its own
+currency.** Confirmed against the schema (`TokenLock.currencyId: Option[CurrencyId]`,
+`tokenLock.scala:88`; `CurrencyId` = the metagraph's address):
+- **Field 8 `ActiveTokenLocks` (global partition):** `currencyId == None` (native/global token).
+- **Field 30 `MgActiveTokenLocks` (metagraph partition):** `currencyId == Some(CurrencyId(that
+  metagraph's address))` — must equal the owning metagraph; no cross-metagraph, no native in a
+  metagraph partition.
+
+This removes the parser's `None`-vs-surrounding-MG ambiguity (`ROOT-008-…:174,196,532-535`) without
+transferring framework-economic authority to the metagraph. ROOT-008 proves the physical
+currency-scope-to-partition shape; GL0's protocol-defined framework transition function and the
+O-07/ECON-G gate still enforce authorization, conservation, backing, replay protection, and the
+other economic semantics through committee replay and root-checked adoption. Only isolated opaque
+DL1 custom semantics remain application-defined and subject to a malicious application's trust
+boundary; custom output cannot synthesize or authorize a framework effect.
+`[RESOLVED — freeze the currencyId × partition table with ECON-G]`
+
+**Other owner-ratified anchors (audit #7):** R008-01 keeps numeric gaps and uses an offline typed
+v4 import rather than live abandoned-schema decoders; R008-02 stores field-20 `(EtaPeriod,
+HistoricalStakeSnapshot)`; R008-03 stores field-23 `(PeerId, KesRegistrationReference)`;
+R008-07 deletes field 32 only after L-15A witness parity. R008-05's exact ECON-G identity
+functions remain an engineering freeze gate.
+
+**R008-04 (resource/growth) — owner asked for comparable templates.** Two *different* contracts:
+- **Per-candidate work budget:** emulate **gas / weight / compute-unit** limits (Ethereum gas,
+  Polkadot PoV+weight, Solana CUs) — bounded work per snapshot.
+- **Permanent-state growth** (nullifiers field 33, slashes field 34): **do not cap** — a finite
+  cap that halts an otherwise-valid chain is unacceptable (`ROOT-008-…:464`). Emulate a
+  **cryptographic accumulator** — this is exactly how **Zcash** handles its ever-growing
+  nullifier set (Merkle accumulator, O(log n) proofs, never a cap); that is what the packet's
+  "authenticated compaction or accumulator + exact-once proof" means (`:519-521`). Ethereum is
+  the *cautionary* example (unbounded state growth is its unsolved problem). The **numbers** remain
+  network engineering (hardware × cadence); the owner-ratified **structure** is a gas-style work
+  limit plus a non-halting accumulator/compaction contract with exact-once proof.
+  `[OWNER-RATIFIED DIRECTION / OPEN PARAMETERS]`
+
+**Re-exec:** OK — ROOT-008 is structural grammar only; the economic oracle (O-07/ECON-G) stays
+separate (this is the "MPT-as-byte-source = representation, not re-exec removal" distinction).
+ECO-F32 = HIGH.
 
 ---
 
-## O-09 — Pure opaque state-channel product scope 🟢
-
-**Freeze:** whether a standalone opaque/data-only lane exists (product decision);
-`FrameworkCurrency` + `FrameworkCurrencyWithData` are locked (L-16).
-
-**Answer (from our work):** Default on record = **opaque/data-only lane is absent/disabled in
-v1 unless the owner explicitly retains it**; if retained, authenticated inclusion/availability
-only, **zero framework-economic write surface**, never selectable by decoder-probe
-(`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md:198-206`;
-`CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md:290,745`; `docs/adr/0016:160`). `[RECOMMENDED]`
-
-**Owner still decides:** the binary product choice — ship a standalone opaque lane in v1 or not.
-
-**Condition:** enforcing L-16 requires closing **SER-02** (CONFIRMED, OPEN) — today the code
-"decides framework-currency vs opaque DL1 by whichever JSON decoder succeeds"
-(`CORRECTNESS-SECURITY-AUDIT-2026-07-11.md:204`); fix = one explicit signed lane/type envelope
-so opaque bytes cannot be **decoder-promoted** into economics. Decoder-promotion *would* violate
-the #1 rule, so this is the one guard that must land.
-
-**Re-exec check:** OK — opaque/data-only is DL1-style authenticated carriage, barred from
-economic writes (once SER-02 lands).
-
----
-
-## O-10 — Portable shard-parent duty and slot bound 🟡
-
-**Freeze:** the portable evidence validating a child checkpoint's parent-relative staircase
-duty, plus the slot upper bound.
-
-**Answer (from our work):** The register already carries the full drafted recommendation and it
-is design-consistent (`CONSENSUS-OWNER-DECISIONS.md:189-204`;
-`HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md:42-50`; `docs/adr/0017:61-64`): add an exact
-`(ordinal, hash)` GL0 reference for the parent checkpoint to the child's **signed preimage**; a
-verifier requires that GL0 snapshot Phase-2 under the hash-bound FinalityGate, extracts the
-parent under the same shardId, hashes its canonical signing preimage to the child's
-`parentCheckpointHash`, then uses its signed ordinal/slot for continuity + staircase duty; carry
-the parent artifact/header or an authenticated inclusion proof (a bare claimed slot is
-insufficient); single genesis sentinel; parent ref + bytes durably recoverable by a
-gossip-missing node. **Slot bound:** the embedded checkpoint's signed slot ≤ the signed slot
-certificate of the including GL0 snapshot. `[RECOMMENDED]`
-
-**Owner still decides:** ratify the recommendation as written and schedule implementation.
-
-**Status:** implementation is a **known RED gate** — the shard parent is resolved from a
-receiver-local shard chain store (`SHARD-C-009`,
-`ShardCheckpointGl0AcceptanceManager.scala:250-253`); the checkpoint binds an execution-base
-ordinal + slot but **not** the exact Phase-2 `(ordinal,hash)` (`docs/adr/0017:196`;
-`SHARD-CHECKPOINT-MONOTONICITY-DESIGN.md:57-62`); and **no slot ≤ GL0-snapshot-slot cap exists
-anywhere** (`ShardCheckpointGl0AcceptanceManager.scala:232-233`). The target pattern already
-exists on the ML0-binary side (`MetagraphParentOrdinalResolver`). `[GAP]`
-
-**Re-exec check:** OK — anti-equivocation/validity, does not touch CL1 re-exec.
-
----
-
-## O-11 — Permissionless GL0 operator roster 🔴
-
-**Freeze:** the canonical rule turning a `PeerId` into an eligible GL0 operator — registration,
-stake/collateral, minimum bond, activation/exit delay, slash/cooldown interaction, exact `N-2`
-period-boundary root. Load-bearing for every uniform `1/N` admission/execution/watchtower draw.
-
-**Answer (from our work) — the frame and containment are settled; the economics are not:**
-- **Settled & enforceable:** registration ≠ membership (`:212`;
-  `OPERATOR-CONSENSUS-KEY-REGISTRY.md:56-60`); uniform `1/N` over a delayed-canonical (`N-2`)
-  population **intersected** with active KES+VRF pairs **and** positive stake, **fail-closed to
-  "unavailable"** (never seedlist/key-only/live-peer) until a rooted roster exists
-  (`HistoricalOperatorConsensusKeyRegistry.scala:117-204` — built and correct); a per-period
-  boundary root retained (stake side already 4-period-retained,
-  `GlobalSnapshotInfo.scala:169`). `[LOCKED]`/`[PARTIAL]`
-- **Direction on record:** reuse v4 delegated-stake/node-collateral **event machinery** but
-  **not its seedlist authority** (`feedback_new_tx_type_patterns`; the three v4 validators
-  authorize via seedlist — `UpdateNodeParametersValidator.scala:74` etc.); genesis-first
-  population injection (`feedback_stake_state_via_genesis`, HARD RULE); VRF-sortition + slashing
-  as the anti-Sybil substitute for a stake-splitting ceiling. `[RECOMMENDED]`
-- **The one quantitative safety result:** sharding amplifies adversary stake `α_local = α·S`;
-  **`α_total > 1/(2S)` breaks per-shard honest-majority** (`project_cross_shard_cq_collapse_bound`;
-  `sims/cross_shard.py:37-45`) — this is *why* a rooted minimum-bond/identity rule is mandatory,
-  but it is not the numeric bond. `[RECOMMENDED]`
-
-**Owner still decides (genuine economics — mostly UNDECIDED,** register `:281-294`): minimum
-self-bond vs delegated/collateral backing + third-party collateralization; the quantitative
-anti-stake-splitting bond; activation/exit/unbond/slash horizons (couples to O-03 challenge
-lifetime + O-12 KES boundary); slash/cooldown timing + any liveness cap; derived-vs-explicit-event
-membership (two candidate models on record, unadjudicated); the genesis population's exact
-backing rule; and bounded registration/state-growth fees (overlaps O-17/R008-04). `[OPEN]`
-
-**Status:** **no operator roster is rooted anywhere** in GSI/MPT; production still defines the
-committee/validator population from the **local seedlist**
-(`StakeRegistry.scala:32-45,68-85`; `SharedServices.scala:275,300-304`) — a forked-denominator,
-Sybil-open authority that is exactly the `α_total>1/(2S)` exposure. `[GAP]`
-
-**Re-exec check:** OK, pro-guarantee — the roster **defines who sits on the committee that
-re-executes CL1**; it is the foundation of the re-exec model, never a substitute
-(`OPERATOR-CONSENSUS-KEY-REGISTRY.md:238-241`). Closing the seedlist gap strengthens the
-guarantee.
-
-> Config nit (HOCON rule): `StakeRegistry.scala:102-107` reads
-> `sys.env.get("NAKAMOTO_OPTIMISTIC_MIN_FRACTION")` directly — migrate to
-> `SharedConfig.nakamoto.*`.
-
----
-
-## O-12 — Runtime KES secret deletion and N-2 reorg boundary 🟡
-
-**Freeze:** KES secret deletion point, quantified common-prefix failure probability, offline
-escrow y/n, recovery/rejoin.
-
-**Answer (from our work):** The baseline is drafted and on record
-(`CONSENSUS-OWNER-DECISIONS.md:302-324`; `OPERATOR-CONSENSUS-KEY-REGISTRY.md:287-295`):
-- **One-way secret deletion at each eta-period evolution boundary is already implemented,
-  forward-secure, and e2e-validated** (`OperationalKeyMaker` + read-once `SecureStore.scala`
-  with `SecureRandom` overwrite; `project_kes_live_wiring_validated`: 16 rotations / 8 nodes /
-  13724 sigs / 0 invalid). `[PARTIAL-IMPL — mechanism live]`
-- `N-2` prefix assumed common-prefix-stable at the ratified bound; a density reorg crossing an
-  **erased-secret activation** → durable `RecoveryRequired` (stop signing, follow authenticated
-  recovery, explicit realign/rejoin); operator cannot choose the branch; missing secret history
-  is **not** slash evidence; **no** `k2` retention of old masters and **no** automatic secret
-  rollback (that would weaken forward security). `[RECOMMENDED]`
-
-**Owner still decides:** ratify the deletion point (currently the eta-period evolution
-boundary); the **quantified common-prefix failure probability** (no number exists anywhere);
-**offline escrow y/n** (recommendation leans no, unratified); the **recovery/rejoin procedure**
-— which is design-only and **unwired** (as is `RecoveryRequired`, per L-23). `[OPEN]`/`[GAP]`
-
-**Re-exec check:** OK — KES is signing-identity/forward-security, not CL1 economics; "missing
-secret history cannot be slash evidence" aligns with `feedback_slashing_safety_bar`.
-
----
-
-## O-13 — Durable global delivery sequence and settlement ordering 🟡
-
-**Freeze:** replace `GlobalSnapshotsProcessed` + bounded-history reconstruction with a
-hash-linked per-destination delivery sequence.
-
-**Answer (from our work):** Adopt the PROPOSED design
-(`CONSENSUS-OWNER-DECISIONS.md:326-361`): GL0 atomically appends canonical framework delivery
-records + advances a **rooted outbox head** with settlement + **permanent authorization
-nullifier**; ML0 stores an applied `(sequence, deliveryId)` cursor in `CurrencySnapshotInfo` +
-state proof, executes a contiguous range from **one exact Phase-2 GL0 ref**, and emits a CAS
-ack; pending records are individual rooted leaves; missing bytes **defer** (never authorize a
-peer claim or skip an effect); **inbox-before-local-spend** is the recommended first ordering
-rule. Delivery markers stay **framework-recomputed**, never DL1-supplied
-(`CurrencySnapshotAcceptanceManager.scala:296,305-308`). `[RECOMMENDED]`
-
-**Owner still decides:** the **full** total order among inbound-delivery / local-spend /
-consume / cancel / expiry / refund (only the first rule is recommended); rooted byte/entry/pending
-limits + backpressure + protocol fees ("local HOCON is not validity"); retention + authenticated
-deep-recovery; the O-04 interaction after a density reorg orphans an applied ref; active
-field-number allocation. `[OPEN]`
-
-**Status:** motivated by a **live CRITICAL** — `GlobalSnapshotsProcessed` reconstructs over a
-**50-snapshot window**; a pending ordinal outside it becomes eligible again and its adjustment
-is **applied twice** (ECO-05, `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md:146`). `[GAP]`
-
-**Re-exec check:** OK — delivery/settlement is a GL0-owned framework kernel; nullifier + outbox
-are GL0 state; markers framework-recomputed; cross-shard reads finality-first (Option A / L-10).
-
-> `LOCAL-EVENTS-SERVICE-DESIGN.md` is a separate read-only observability stream — **not** this
-> consensus delivery path; do not conflate.
-
----
-
-## O-14 — Framework fee sequence and opaque-data binding 🟡
-
-**Freeze:** reuse `MgLastFeeTxRefs` (field 27) as the strict per-source fee head + fee signing
-contract; and the exact-bytes vs chunk-manifest choice.
-
-**Answer (from our work):** Adopt the PROPOSED design
-(`CONSENSUS-OWNER-DECISIONS.md:363-393`): field 27 is **already live and rooted**
-(`GlobalStateKey.scala:258,331,390`) — use it as the strict per-MG/source head; a framework fee
-signs network/genesis, era/lane, metagraph, source, dest, amount, exact parent ref, and an exact
-opaque-data commitment; acceptance requires parent == rooted state, derives the successor, checks
-available bytes **or a content-addressed chunk manifest without executing DL1 logic**, atomically
-updates balances + head. v1 rules: 0-or-1 fee per custom item; any invalid fee rejects the whole
-framework segment; outgoing fees reserve against pre-batch balance; no v1 expiry (one same-parent
-sibling wins); resign-to-pay-again. **Recommended choice: content-addressed chunk-manifest root
-only when every chunk is available before the execution signature, else exact signed-item
-bytes.** `[RECOMMENDED]`/`[PARTIAL]`
-
-**Owner still decides:** exact-bytes vs chunk-manifest; the interaction with E9's checkpoint-wide
-reservation kernel for the outer `StateChannelSnapshotBinary.fee`; final field/codec allocation.
-`[OPEN]`
-
-**Status:** motivated by a **live CRITICAL** — a Byzantine ML0 can **reinclude a signed fee
-until the source is drained** (ECO-18, `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md:172`). `[GAP]`
-
-**Re-exec check:** OK — the gate is explicit that GL0 verifies bytes/availability/authorization/
-sequence/arithmetic/conservation and **never treats ML0 custom output as economic authority**.
-⚠ Do **not** let the DL1 `data-with-fee` "authoritative-balances push" precedent
-(`project_data_with_fee_shard_imbalance_grind`, on the now-superseded byte-diff/adopt
-architecture) bleed into treating **framework** fees as authoritative-pushed — framework fees
-are re-exec-verified.
-
----
-
-## O-15 — Multi-tine Taktikos/Genesis frontier semantics 🔴
-
-**Freeze:** A (total deterministic selector), B (frontier evidence + cutoff/bounded-diffusion +
-late-reveal), C (security/liveness proof), D (exact `k1` short/deep metric), E (exact tie rule).
-Full packet: [`O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md`](O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md).
-
-**Answer (from our work):**
-- **Settled:** the objective **property** (L-24 — same cutoff-complete frontier + params ⇒ same
-  head, independent of enumeration/arrival/restart/incumbent) and the pairwise-rule **boundary**
-  (L-04 — `maxvalid-tk` ≤ `k1`, `maxvalid-bg` > `k1`). `[LOCKED]`
-- **A / B / C are genuinely OPEN** — not inherited from either cited paper. The current
-  `selectBest` left-fold is **proven non-transitive** by retained RED witnesses (a strict Tk/Bg
-  3-cycle, 3 permutations → 3 winners: `ChainSelectionSuite.scala:191-226`; store-path
-  reproduction `NakamotoChainStoreSuite.scala:430-469`). A new total-frontier construction +
-  security/liveness proof + portable frontier-evidence scheme (cutoff + bounded-diffusion +
-  deterministic late-reveal) must be designed. `[OPEN]`
-- **D is ratifiable now:** recommended `forkDepth = max post-MRCA suffix (excluding MRCA)`, Tk if
-  ≤ `k1` else Bg — which **fixes a live code/spec mismatch**: `kLookback = k1+1`
-  (`config/types.scala:177`) makes `depth = k1+1` still use Tk, contrary to L-04
-  (`ChainSelection.scala:161-175`; RED `ChainSelectionSuite.scala:228-250`). `[RECOMMENDED]`
-- **E is OPEN with a flagged tension:** the register keeps the current **lower-VRF-then-hash**
-  tie rule *unratified* pending grinding/precomputation analysis (`:482-484`), while the standing
-  memory instruction `feedback_vrf_tiebreaker_keep` is to **keep** it and not propose removal.
-  Our sims do **not** quantify the specific VRF-tiebreaker grinding surface (the grinding suite
-  measures the *rejected* weighted scheme). **Owner tension to resolve, not for the model to
-  decide.** `[OPEN]`
-
-**Owner still decides:** A (selector construction), B (evidence/cutoff params), C (the proof); ratify
-D now; ratify-or-reject E after the missing grinding quantification.
-
-**Re-exec check:** OK — GL0 fork choice only; a "valid tine" is snapshots that already passed
-complete GL0 authentication; introduces no BFT (L-02).
-
----
-
-## O-16 — Exact Phase-2 consumer lease and invalidation (FIN-14) 🔴
-
-**Freeze:** ratify `CanonicalPhase2Lease` + the six sub-choices A–F. Packet:
-[`P6-FIN14-PHASE2-CONSUMER-LEASE.md`](P6-FIN14-PHASE2-CONSUMER-LEASE.md).
-
-**Answer (from our work) — all six recommended on record:**
-- **A (invalidation granularity):** conservative **all-lease invalidation** on
-  replacement/rollback via a monotone `CanonicalLineageRevision` (ABA-safe; no per-target
-  dependency graph in V1). `[RECOMMENDED]`
-- **B (purpose policy):** a **sealed exhaustive `Phase2UseScope`** (~18 cases, no
-  Generic/Other/string), each with an explicit exact-ancestor-vs-current-P2-head + retention
-  rule; confirms (not reopens) L-19. `[RECOMMENDED]`
-- **C (attestation reuse):** retain **raw signed bytes only**, re-verify registry/VRF/KES/sig +
-  exact anchor before reindexing; never copy a prior count/threshold. `[RECOMMENDED]`
-- **D (historical age):** **no** receiver wall-clock/HOCON validity limit; any age bound must be
-  branch-authenticated protocol data. `[RECOMMENDED]`
-- **E (effect-journal conformance):** conform to locked **L-23** (idempotent scoped command +
-  inverse/requeue; physical sink presence is never authority). `[RECOMMENDED]`
-- **F (signed scope schema):** ratify an active-era binary/checkpoint shape binding the full
-  `GlobalSnapshotStateRef` + registry/parameter era + purpose domain; the current ordinal/hash-only
-  `GlobalSyncView` cannot be the final signed consumer scope. `[RECOMMENDED]`
-
-**Owner still decides:** explicitly ratify all six (the packet recommends, does not decide).
-
-**Status:** motivated by the live **FIN-14** defect (ordinal watermark transfers A's
-qualification to unqualified B; the boolean adapter is live,
-`GlobalSnapshotConsensus.scala:1409`); **zero** lease constructs are implemented; and activation
-is **blocked on O-15 (selector) and O-01**. `[GAP]`/`[OPEN]`
-
-**Re-exec check:** OK — the lease governs *which exact Phase-2 base* a consumer binds; the GL0
-checkpoint-inclusion boundary still requires every signer to replay and validators to verify
-committee/coverage + recompute the root. Strengthens, not substitutes, re-exec.
-
----
-
-## O-17 — ROOT-008 GL0 partition grammar 🔴
-
-**Freeze:** the seven partition-grammar anchors before schema activation. Packet:
-[`ROOT-008-GL0-PARTITION-GRAMMAR.md`](ROOT-008-GL0-PARTITION-GRAMMAR.md).
-
-**Answer (from our work) — 5/7 firm; 2 genuinely unanswered:**
-- **R008-01 (retired IDs):** delete physical 3/6/21 from active GL0 + `fromInt`; delete 32 after
-  ROOT-010 parity; keep numeric gaps (no renumbering); upstream-v4 disk only via offline typed
-  import. `[RECOMMENDED]`
-- **R008-02 (field-20 self-auth):** store `(EtaPeriod, HistoricalStakeSnapshot)` so the leaf
-  reproduces its key. `[RECOMMENDED]`
-- **R008-03 (field-23 self-auth):** store `(PeerId, KesRegistrationReference)` + separately prove
-  the unique field-22 match. `[RECOMMENDED]`
-- **R008-04 (resource/growth):** **UNANSWERED** — the numeric per-image/field/value/member
-  budgets and the permanent nullifier/slash growth-or-compaction strategy must be owner-approved;
-  `uint16`/JVM memory are not protocol bounds; needs an exact-once compaction/accumulator proof +
-  `GROWTH-001`. `[OPEN]`
-- **R008-05 (set-member identity):** canonical unsigned event/content-reference hashes for
-  economic-event uniqueness; signed cert reference/domain for KES; freeze exact identity
-  functions with ECON-G. `[RECOMMENDED]`
-- **R008-06 (token-lock field-8/30 scope):** **UNANSWERED** — the owner must freeze the relation
-  among `TokenLock.currencyId`, the global partition, and the network metagraph; the packet
-  deliberately declines to pick (an economic-schema decision with ECON-G). `[OPEN]`
-- **R008-07 (field-32 deletion gate):** confirm optional full-view witness parity, `None` vs
-  `Some(empty)`, explicit ML0 population, and staged/backfill/restart/reorg behavior — a
-  **conformance gate on locked L-15A**, not an option to retain an unrooted writable field.
-  `[RECOMMENDED]`
-
-**Owner still decides:** R008-04 numbers + growth strategy, R008-06 currency scope; confirm the
-numeric-gaps-vs-renumber choice (must precede freeze); freeze R008-05 identity functions with
-ECON-G.
-
-**Status:** live defects — `fromInt` still **accepts** retired 3/6/21 and root-excluded 32
-(`GlobalStateKey.scala:362-397`); field 32 is deliberately root-excluded, an "open
-root-invisible-state defect" (`:311-335`); GROWTH-001 and ROOT-010 field-32 parity (ECO-F32) are
-open. `[GAP]`/`[OPEN]`
-
-**Re-exec check:** OK — ROOT-008 is a storage/structural-grammar layer that "does not prove
-authorization, conservation, backing, replay, or transition"; the economic oracle (O-07/ECON-G)
-stays separate. This is the "MPT-as-byte-source = representation, not re-exec removal"
-distinction.
-
----
-
-## Cross-cutting caveats (read before ratifying anything)
-
-1. **The committee blind-sign enforcement gap is the umbrella issue.** ADR-0017 documents that,
-   on the happy path, committee members sign on best-tip and GL0 adopts on quorum-signature
-   **without re-execution** (only the producer re-execs); the watchtower is a *post-adoption*
-   backstop. O-03's release rule (pre-inclusion positive coverage) and this fix are the same
-   work. Several 🟡/🔴 readiness marks trace back here — the *design* is correct (committee
-   re-exec is primary), the *implementation* has not closed the gate.
-
-2. **Do not cite these superseded docs as live parameters:** `SLASHING-DESIGN.md` and
-   `COMMITTEE-SORTITION-DESIGN.md` (stake-weighted admission — superseded by uniform `1/N`),
-   `docs/review/10-reexec-byte-contract.md` and `docs/nakamoto/CURRENCY-APP-TOKEN-ENFORCEMENT.md`
-   (byte-diff/adopt — owner-rejected 2026-07-11). The canonical model is committee
-   re-exec-before-sign + watchtower backstop (ADR-0016/0017); live values are `application.conf`.
-
-3. **The roots-only WRONG pattern.** Two memories (`project_trust_model_audit_roots_only_greenlight`,
-   `project_roots_only_sharding_ii_decision`) and one fix-option in
-   `project_adopt_gate_drops_allowspends_run26` advocate deleting the CL1 fold / roots-only
-   substitution. **None of the answers above depends on them.** Roots are a storage commitment of
-   committee-**re-executed** state, and proof-carrying is the DL1/light-client serve path only.
-
-4. **Status tension to reconcile:** O-04 is a *ratified implementation-input* in
-   `CONSENSUS-ARTIFACT-LIFECYCLE.md:862-864` but **OPEN** in the register. Pick one before it
-   confuses an implementer.
-
-5. **Dependency ordering.** O-16 and O-17 are hard-blocked on **O-15** (frontier selector);
-   O-16 additionally on **O-01**. O-06's `ProtocolEra` vehicle and O-11's rooted `N-2` boundary
-   share the same unbuilt substrate (a live `EraRegistry` / canonical-root ownership). O-08's
-   activation depends on making `smtRoot` deterministic. Sequence accordingly.
-
-6. **Live CRITICAL defects the owner should track alongside the gates:** ECO-04 (O-07 authority),
-   ECO-05 (O-13 double-apply), ECO-18 (O-14 fee replay), FIN-14 (O-16), SER-02 (O-09
-   decoder-promotion), SHARD-C-009 (O-10), retired-ID acceptance + field-32 root-exclusion (O-17),
-   `smtRoot` non-determinism (O-08). Each is CONFIRMED and OPEN.
-
----
+## Cross-cutting caveats
+
+1. **Dependency direction (corrected, audit #5):** `O-17 structural validity + O-07/ECON-G
+   semantic validity → complete GL0 validation → valid tines → O-15 fork choice → exact-hash
+   Phase-2 (T_weight OR k1) → O-16 consumer lease` (`O15-…:421-443`). O-17 parser work is **not**
+   blocked on O-15.
+2. **Re-exec model (corrected, audit #2/#3/#4):** the committee re-executes and signs-on-match
+   today; certified-diff adoption with adopter root reproduction is the **target**; only
+   roots-only adoption is forbidden (§1). The live economic-enforcement gap is **pre-inclusion
+   watchtower coverage** (O-03), not blind-signing.
+3. **Severities (corrected, audit #13):** CRITICAL = ECO-04, ECO-05, ECO-18, SHARD-C-009. HIGH =
+   FIN-14, SER-02, ECO-F32, SMT-01.
+4. **Parameters are protocol law, not local knobs (audit #9):** derive, test, and freeze O-01,
+   O-03, and O-11 values per network (like `k1`), then root them so all nodes provably agree.
+   `${?ENV}`-overridable HOCON cannot define artifact validity.
+5. **Provenance (audit #14):** every `path:line` here is at HEAD `ad13026d1`; *(memory)*-tagged
+   context is out-of-repo and not reproducible from committed source; it is not activation evidence.
+6. **Superseded docs** (do not cite as live): `SLASHING-DESIGN.md`, `COMMITTEE-SORTITION-DESIGN.md`
+   (stake-weighted). `10-reexec-byte-contract.md` is **not** superseded — it is the certified-diff
+   target contract.
+7. **Status reconciliation (O-04):** the owner direction is ratified; remaining rebase schema and
+   retained-history work are engineering freeze gates in both the lifecycle and register.
+8. **Open engineering/research freeze gates:** O-01 finality implementation/parameters/proof;
+   O-03 watchtower parameters; O-05 custody schema/parameters; O-07 economic inventory/predicates/
+   corpus; O-08 deterministic tower activation; O-11 roster schema/bounds; O-12 common-prefix
+   quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
+   A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
+   activation proofs. These are not unanswered owner choices and may not be filled by local
+   configuration or an implementation shortcut.
 
 ## Provenance
 
-Compiled from: the register itself; the four companion packets (`O15-…`, `P6-FIN14-…`,
-`ROOT-008-…`, `V4-ECONOMIC-GRAMMAR-AUDIT`); design docs under `docs/nakamoto/`; ADR-0016/0017;
-`CONSENSUS-ARTIFACT-LIFECYCLE.md`, `CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md`,
-`CONSENSUS-PROTOCOL-TEST-PLAN.md`, `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`; source code at
-HEAD `5557ee084`; the simulation suite in `~/repos/research-nipopos-2026/sims`; and the project
-memory. Every `file:line` is verifiable at that state; where prior work does not answer a gate,
-it is marked a genuine owner decision rather than filled in.
-
-</details>
+Compiled at HEAD `ad13026d1` from: the register; the four audited packets (`O15-…`, `P6-FIN14-…`,
+`ROOT-008-…`, `V4-ECONOMIC-GRAMMAR-AUDIT`); `AGENTS.md`; `docs/nakamoto/` design docs; ADR-0016/0017;
+`CONSENSUS-ARTIFACT-LIFECYCLE.md`, `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`; source at that HEAD;
+and the sim suite in `~/repos/research-nipopos-2026/sims` (calibration evidence, marked
+provisional). Comparable-network references (Polkadot approval-checking/parachains, Cardano
+pledge, Cosmos self-delegation, Zcash nullifier accumulator, Ethereum gas/state-growth) are
+architectural analogs, not citations to this repo.

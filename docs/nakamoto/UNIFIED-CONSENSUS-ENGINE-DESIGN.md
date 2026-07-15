@@ -5,8 +5,9 @@
 **Owner clarification 2026-07-11:** ML0 may remain BFT for small, well-connected
 metagraph networks. GL0 remains Nakamoto/Taktikos/LDD, and execution-shard
 checkpoint chains remain staircase/Nakamoto. A future ML0 chain-engine migration
-requires a separate owner decision and must not leak BFT or this draft's generic
-engine assumptions into GL0. Current architecture is in
+is out-of-scope new architecture work requiring a new ratified ADR; this
+superseded draft has no authority to initiate it and must not leak BFT or its
+generic engine assumptions into GL0. Current architecture is in
 `../review/CONSENSUS-ARTIFACT-LIFECYCLE.md`.
 **Companion evidence:** the 2026-06-11 e2e campaign post-mortems (runs `bimn7o09f`, `bmnnfnao7`) and the upstream comparison (mainnet BFT 1,859 LOC / testnet 12,666 / this branch 6,245 in the consensus engine).
 
@@ -246,8 +247,8 @@ Levers, in activation order — each conditional on a pressure we do not yet hav
    tip (the existing unseeded-MG fallback).
 4. **IF both a window cap AND a hot MG**: fold k consecutive same-shard checkpoints (parent-linked, order preserved)
    in one gl0 ord — the Polkadot elastic-scaling analog. Escape hatch only; meaningless while windows are uncapped.
-5. **IF adversarial congestion**: collateral-weighted bandwidth shares (stake-weighted QoS). Economic policy, owner
-   call, not a correctness mechanism.
+5. **IF adversarial congestion**: collateral-weighted bandwidth shares (stake-weighted QoS). This is out-of-scope
+   economic policy requiring a future ADR, not a correctness mechanism or current target.
 
 ## 6. Migration plan (hard fork LAST, per standing phase order)
 
@@ -260,7 +261,12 @@ Levers, in activation order — each conditional on a pressure we do not yet hav
 | 4 | Delete the BFT engine path (§5.4); dl1/cl1's ml0-follow already consumes snapshots, unaffected. | full suite |
 | 5 | Hard fork: wire/genesis cleanups, registry in metagraph genesis (balance-CSV pattern per the stake-via-genesis rule). | — |
 
-## 7. Open questions for owner review
+## 7. Historical questions inside this superseded draft
+
+These are preserved only as provenance for the rejected ML0 migration proposal.
+They are not current owner questions, implementation gates, or permission to alter
+the ratified GL0/ML0 architecture. Any future proposal must restate and review them
+in a new ADR against the then-current protocol.
 
 1. ~~ml0 eligibility: lottery vs rotation~~ **RESOLVED (owner, 2026-06-11): scheduled rank-staircase with eta-from-gl0 ordering (§5.1) + countersign fast rail (§5.2).** Remaining tunable: δ (per-rank window; straw-man δ = p99 mg gossip latency × 2 ≈ 2–4s) and the per-interval reshuffle granularity (per-snapshot vs per-epoch — per-snapshot ordering uses `intervalIndex = parent ordinal`, giving every snapshot a fresh ladder).
 2. **Soft-confirmation depth at ml0** for cl1/dl1 reads before the anchor lands (d=1? d=2? tip?).

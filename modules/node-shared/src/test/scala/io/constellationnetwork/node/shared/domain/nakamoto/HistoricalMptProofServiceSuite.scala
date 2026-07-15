@@ -3,9 +3,11 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay}
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, FinalizationOutcome, MptOverlay}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
@@ -58,7 +60,7 @@ object HistoricalMptProofServiceSuite extends MutableIOSuite {
         GlobalStateKey.toHex[IO],
         bestTipsFn = IO.pure(Set.empty[BranchId])
       )
-      svc = HistoricalMptProofService.make[IO](store, overlay)
+      svc = HistoricalMptProofService.make[IO](overlay)
     } yield (store, overlay, svc)
 
   test("proofAtBranch: produces a valid inclusion proof for a key in the base trie (branch unknown to overlay = base view)") { res =>
@@ -138,19 +140,38 @@ object HistoricalMptProofServiceSuite extends MutableIOSuite {
       )
   }
 
-  test("proofAtBranch: returns TrieBuildFailed when underlying base trie is empty (InMemoryProducer build error)") { res =>
+  test("proofAtBranch: concurrent branch finalization completes without store-to-overlay lock inversion") { res =>
+    implicit val (h, _, js) = res
+    for {
+      setup <- mkSetup
+      (store, overlay, svc) = setup
+      _ <- store.insert[Balance](gskBalance(99), Balance(NonNegLong(1L)))
+
+      key = gskBalance(30)
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](key, Balance(NonNegLong(7L)))
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      result <- (svc.proofAtBranch(branchA, ordinal, key), overlay.finalizeBranch(branchA, ordinal)).parTupled.timeout(5.seconds)
+      (proof, finalization) = result
+    } yield
+      expect.all(
+        proof.isRight,
+        finalization == FinalizationOutcome.Folded(keysApplied = 1, branchesDropped = 0)
+      )
+  }
+
+  test("proofAtBranch: builds the canonical empty trie and returns the underlying missing-path proof error") { res =>
     implicit val (h, _, js) = res
     for {
       setup <- mkSetup
       (_, _, svc) = setup
-      // No base entries — InMemoryMerklePatriciaProducer.build fails with OperationError("Cannot build trie with no entries").
-      // The proof service should surface this as TrieBuildFailed rather than throwing.
       proofE <- svc.proofAtBranch(parentP, ordinal, gskBalance(4))
     } yield
       expect(
         proofE match {
-          case Left(HistoricalMptProofService.TrieBuildFailed(_)) => true
-          case _                                                  => false
+          case Left(HistoricalMptProofService.Underlying(_)) => true
+          case _                                             => false
         }
       )
   }

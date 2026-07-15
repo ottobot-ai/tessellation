@@ -12,7 +12,7 @@ digraph trigger_composition {
   edge [fontname="Helvetica", fontsize=9];
 
   executed [label="Locally executed canonical candidate\n(ref = ordinal + hash + parent + root)", fillcolor="#e3f2fd"];
-  registry [label="Canonical sample/weight registry\n(anchor pending owner decision)", fillcolor="#e3f2fd"];
+  registry [label="Canonical sample/weight registry\n(anchor/schema engineering gate)", fillcolor="#e3f2fd"];
   replies [label="Authenticated peer preferences\nfresh and branch-bound", fillcolor="#e3f2fd"];
   tip [label="maxvalid-tk canonical tine\nand exact depth", fillcolor="#e3f2fd"];
 

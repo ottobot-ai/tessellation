@@ -8,25 +8,27 @@ import scala.concurrent.duration._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.mpt.MptStore
+import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
+import io.constellationnetwork.security.mpt.producer._
+import io.constellationnetwork.security.mpt.prover.MerklePatriciaSingleInclusionProver
+import io.constellationnetwork.security.mpt.{MerklePatriciaTrie, MptRoot}
 import io.constellationnetwork.security.smt._
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.HashCodec._
 
 import eu.timepit.refined.types.numeric.NonNegLong
-import io.circe.Encoder
+import io.circe.{Encoder, Json}
 import weaver.MutableIOSuite
 
-/** §3 NIPoPoW — [[HistoricalCommitmentSmtStore]] suite. Proves the load-bearing properties of the historical-commitment SMT anchored as
-  * `smtRoot`:
+/** §3 NIPoPoW — [[HistoricalCommitmentSmtStore]] component suite. Proves deterministic derived-SMT properties needed before `smtRoot` can
+  * become load-bearing; exact-hash reorg recovery, authenticated production wiring, and follower enforcement remain separate gates:
   *   - producer == simulated-follower `smtRoot(N)` for the SAME chain of finalized commitments,
   *   - `smtRoot(N)` is reproducible purely from commitments `≤ N−k`,
   *   - an inclusion proof of a PAST ordinal's `PerOrdinalCommitment` verifies against the committed `smtRoot(N)`,
-  *   - genesis / warmup (`N ≤ k`) is deterministic (no root recorded),
+  *   - genesis / warmup (`N < k`) is deterministic and the first root at `N = k` includes eligible ordinal zero,
   *   - CIRCULARITY-FREE: ordinal N's OWN commitment (carrying snapshot N's incremental hash) is NOT in `smtRoot(N)`.
   *
   * The store is a pure ordinal-keyed structure: `appendAtFinality(snapshotOrdinal = N, eligibleOrdinal = N−k, commitment)`. These tests
@@ -75,6 +77,44 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     def prefixedHash[A: Encoder](data: A, prefix: Array[Byte]): IO[Hash] = before >> delegate.prefixedHash(data, prefix)
   }
 
+  private final class PausedSnapshotProducer(
+    delegate: StatefulMerklePatriciaProducer[IO],
+    snapshotTaken: Deferred[IO, Unit],
+    releaseSnapshot: Deferred[IO, Unit]
+  ) extends StatefulMerklePatriciaProducer[IO] {
+
+    def entries: IO[Map[Hex, Array[Byte]]] =
+      delegate.entries.flatMap(image => snapshotTaken.complete(()).void >> releaseSnapshot.get.as(image))
+
+    def physicalKeys: IO[Set[Hex]] =
+      IO.raiseError(new AssertionError("recovery must not enumerate physical keys separately from values"))
+
+    def entriesForKeys(keys: Set[Hex]): IO[Map[Hex, Array[Byte]]] =
+      IO.raiseError(new AssertionError(s"recovery must not perform a second value read for ${keys.size} captured keys"))
+
+    def entry(key: Hex): IO[Option[Array[Byte]]] = delegate.entry(key)
+    def entryCount: IO[Int] = delegate.entryCount
+    def entriesWithPrefix(prefix: Hex): IO[Map[Hex, Array[Byte]]] = delegate.entriesWithPrefix(prefix)
+    def build: IO[Either[MerklePatriciaError, MerklePatriciaTrie]] = delegate.build
+    def buildForOrdinal(ordinal: SnapshotOrdinal): IO[Either[MerklePatriciaError, MerklePatriciaTrie]] =
+      delegate.buildForOrdinal(ordinal)
+    def getRootHashForOrdinal(ordinal: SnapshotOrdinal): IO[Option[MptRoot]] = delegate.getRootHashForOrdinal(ordinal)
+    def getCurrentRootHash: IO[Option[MptRoot]] = delegate.getCurrentRootHash
+    def getLastBuiltOrdinal: IO[Option[SnapshotOrdinal]] = delegate.getLastBuiltOrdinal
+    def insert[A: Encoder](data: Map[Hex, A]): IO[Either[MerklePatriciaError, Unit]] = delegate.insert(data)
+    def insertBytes(data: Map[Hex, Array[Byte]]): IO[Either[MerklePatriciaError, Unit]] = delegate.insertBytes(data)
+    def replaceBytes(
+      upserts: Map[Hex, Array[Byte]],
+      removals: List[Hex]
+    ): IO[Either[MerklePatriciaError, Unit]] = delegate.replaceBytes(upserts, removals)
+    def update[A: Encoder](key: Hex, value: A): IO[Either[MerklePatriciaError, Unit]] = delegate.update(key, value)
+    def remove(keys: List[Hex]): IO[Either[MerklePatriciaError, Unit]] = delegate.remove(keys)
+    def clear: IO[Unit] = delegate.clear
+    def getProver: IO[MerklePatriciaSingleInclusionProver[IO]] = delegate.getProver
+    def buildHexMap(data: Map[GlobalStateKey, Json]): IO[Map[Hex, Array[Byte]]] = delegate.buildHexMap(data)
+    def savepoint: IO[ProducerSavepoint[IO]] = delegate.savepoint
+  }
+
   private def hashBytes(hash: Hash): Array[Byte] =
     ImmutableCodec[Hash].immutableBytes(hash).toArray
 
@@ -83,13 +123,26 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     entries: List[(Hex, Hash)],
     retention: Int = HistoricalCommitmentSmtStore.UnboundedVersionRetention,
     hasherOverride: Option[Hasher[IO]] = None
+  ): IO[Fixture] =
+    rawFixture(
+      res,
+      entries.map { case (key, hash) => key -> hashBytes(hash) }.toMap,
+      retention,
+      hasherOverride
+    )
+
+  private def rawFixture(
+    res: Res,
+    entries: Map[Hex, Array[Byte]],
+    retention: Int = HistoricalCommitmentSmtStore.UnboundedVersionRetention,
+    hasherOverride: Option[Hasher[IO]] = None
   ): IO[Fixture] = {
     implicit val hh: Hasher[IO] = hasherOverride.getOrElse(res._1)
     implicit val sp: SecurityProvider[IO] = res._2
     implicit val js: JsonSerializer[IO] = res._3
     val _ = (sp, js)
     for {
-      producer <- InMemoryMerklePatriciaProducer.make[IO](entries.map { case (key, hash) => key -> hashBytes(hash) }.toMap)
+      producer <- InMemoryMerklePatriciaProducer.make[IO](entries)
       durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
       store <- HistoricalCommitmentSmtStore.make[IO](durable, retention)
     } yield Fixture(store, producer)
@@ -119,11 +172,11 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     HistoricalCommitmentSmtStore.inMemory[IO](retention)
   }
 
-  /** Drive `appendAtFinality` for every snapshot N in `[k+1 .. upTo]`, committing the eligible ordinal `N−k`'s commitment under version N.
+  /** Drive `appendAtFinality` for every snapshot N in `[k .. upTo]`, committing the eligible ordinal `N−k`'s commitment under version N.
     * This is exactly the per-accept(N) sink the GSAM wiring performs (in strict-increasing N order).
     */
   private def driveChain(store: HistoricalCommitmentSmtStore[IO], upTo: Long, k: Long = K): IO[Unit] =
-    (k + 1 to upTo).toList.traverse_ { n =>
+    (k to upTo).toList.traverse_ { n =>
       store.appendAtFinality(ord(n), ord(n - k), commitmentFor(n - k))
     }
 
@@ -134,8 +187,8 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
       _ <- driveChain(producer, upTo = 30L)
       // follower feeds the SAME (N, N−k, commitment) sequence — modeling the symmetric accept() path on every node.
       _ <- driveChain(follower, upTo = 30L)
-      pRoots <- (K + 1 to 30L).toList.traverse(n => producer.rootForSnapshot(ord(n)))
-      fRoots <- (K + 1 to 30L).toList.traverse(n => follower.rootForSnapshot(ord(n)))
+      pRoots <- (K to 30L).toList.traverse(n => producer.rootForSnapshot(ord(n)))
+      fRoots <- (K to 30L).toList.traverse(n => follower.rootForSnapshot(ord(n)))
     } yield expect(pRoots === fRoots) && expect(pRoots.forall(_.isDefined))
   }
 
@@ -148,7 +201,7 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
       storeRoot <- store.rootForSnapshot(ord(n)).map(_.get)
       // Independently rebuild an SMT over EXACTLY the commitments <= N-k, keyed by the same ordinal hex, value = commitment hash bytes.
       // No version axis, no incremental accumulation — a pure set. Its root must equal the store's smtRoot(N).
-      pairs <- (1L to (n - K)).toList.traverse { i =>
+      pairs <- (0L to (n - K)).toList.traverse { i =>
         PerOrdinalCommitment.commitmentHash[IO](commitmentFor(i)).map { ch =>
           CommitmentKey.toHex(ord(i)) -> io.constellationnetwork.security.hex.Hex(ch.value).toBytes
         }
@@ -213,15 +266,18 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     } yield selfAbsent && cutoffIncluded && justAboveAbsent
   }
 
-  test("genesis / warmup (N <= k): no eligible ancestor, so the SMT records no root (deterministic across nodes)") { res =>
+  test("warmup N < k has no root and N = k commits eligible ordinal zero") { res =>
     for {
       store <- fresh(res)
-      // The GSAM wiring never calls appendAtFinality for N <= k (no eligible ordinal); model that by driving only N > k.
-      // Assert that NO version <= k has a root (nothing was committed), and the first recorded root is at N = k+1.
+      // Production calls appendAtFinality at N = k with eligible ordinal zero. Earlier versions have no eligible incremental commitment.
       _ <- driveChain(store, upTo = K + 3L)
-      genesisRoots <- (0L to K).toList.traverse(n => store.rootForSnapshot(ord(n)))
-      firstReal <- store.rootForSnapshot(ord(K + 1L))
-    } yield expect(genesisRoots.forall(_.isEmpty)) && expect(firstReal.isDefined)
+      warmupRoots <- (0L until K).toList.traverse(n => store.rootForSnapshot(ord(n)))
+      firstReal <- store.rootForSnapshot(ord(K))
+      zeroProof <- store.proveAt(ord(K), ord(0L))
+    } yield
+      expect(warmupRoots.forall(_.isEmpty)) &&
+        expect(firstReal.isDefined) &&
+        expect(zeroProof.exists { case _: SmtProof.Inclusion => true; case _ => false })
   }
 
   test("appendAtFinality latest-version exact duplicate is idempotent") { res =>
@@ -238,16 +294,16 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     for {
       live <- fresh(res)
       _ <- driveChain(live, upTo = 18L)
-      liveRoots <- (K + 1 to 18L).toList.traverse(n => live.rootForSnapshot(ord(n)))
-      durableEntries <- (1L to 18L - K).toList.traverse { n =>
+      liveRoots <- (K to 18L).toList.traverse(n => live.rootForSnapshot(ord(n)))
+      durableEntries <- (0L to 18L - K).toList.traverse { n =>
         live.commitmentHashAt(ord(n)).map(_.get).map(CommitmentKey.toHex(ord(n)) -> _)
       }
       recovered <- fixture(res, durableEntries)
-      _ <- recovered.store.replayFrom(K)
-      firstReplayRoots <- (K + 1 to 18L).toList.traverse(n => recovered.store.rootForSnapshot(ord(n)))
-      _ <- recovered.store.replayFrom(K)
-      secondReplayRoots <- (K + 1 to 18L).toList.traverse(n => recovered.store.rootForSnapshot(ord(n)))
-      // commitmentHashAt reads the DURABLE KV — present for every finalized eligible ordinal.
+      _ <- recovered.store.replayFrom(K, ord(18L - K))
+      firstReplayRoots <- (K to 18L).toList.traverse(n => recovered.store.rootForSnapshot(ord(n)))
+      _ <- recovered.store.replayFrom(K, ord(18L - K))
+      secondReplayRoots <- (K to 18L).toList.traverse(n => recovered.store.rootForSnapshot(ord(n)))
+      // commitmentHashAt reads the current recovery KV image — present for every appended eligible ordinal.
       durableAt10 <- live.commitmentHashAt(ord(10L))
       expectedAt10 <- {
         implicit val (hh: Hasher[IO], _sp: SecurityProvider[IO], _js: JsonSerializer[IO]) = res
@@ -258,6 +314,27 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
         expect(firstReplayRoots === liveRoots) &&
         expect(secondReplayRoots === firstReplayRoots) &&
         expect(durableAt10.contains(expectedAt10))
+  }
+
+  test("bounded-retention replay preserves exactly the same retained roots and pruned boundary") { res =>
+    val retention = 3
+    for {
+      live <- fresh(res, retention)
+      _ <- driveChain(live, upTo = 20L)
+      durableEntries <- (0L to 20L - K).toList.traverse { n =>
+        live.commitmentHashAt(ord(n)).map(_.get).map(CommitmentKey.toHex(ord(n)) -> _)
+      }
+      recovered <- fixture(res, durableEntries, retention)
+      _ <- recovered.store.replayFrom(K, ord(20L - K))
+      liveRetained <- (18L to 20L).toList.traverse(n => live.rootForSnapshot(ord(n)))
+      recoveredRetained <- (18L to 20L).toList.traverse(n => recovered.store.rootForSnapshot(ord(n)))
+      livePruned <- live.proveAt(ord(17L), ord(12L))
+      recoveredPruned <- recovered.store.proveAt(ord(17L), ord(12L))
+    } yield
+      expect(liveRetained.forall(_.isDefined)) &&
+        expect(recoveredRetained === liveRetained) &&
+        expect(livePruned === Left(SmtProofError.UnknownVersion(ord(17L)))) &&
+        expect(recoveredPruned === livePruned)
   }
 
   test("proveAt on a pruned/unknown version -> UnknownVersion") { res =>
@@ -301,7 +378,7 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     for {
       f <- fixture(res, List(valid -> h("valid"), oversized -> h("bad")))
       beforeKeys <- f.producer.physicalKeys
-      result <- f.store.replayFrom(K).attempt
+      result <- f.store.replayFrom(K, ord(1L)).attempt
       replayPrefix <- f.store.rootForSnapshot(ord(K + 1L))
       afterKeys <- f.producer.physicalKeys
     } yield
@@ -310,13 +387,112 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
         .and(expect(afterKeys == beforeKeys))
   }
 
-  test("historical replay preflights every derived version and rejects ordinal-plus-k overflow atomically") { res =>
-    val validFirst = CommitmentKey.toHex(ord(1))
-    val overflowing = CommitmentKey.toHex(ord(Long.MaxValue))
+  test("historical replay rejects a malformed recovery-KV value before publishing any derived version") { res =>
+    val validKey = CommitmentKey.toHex(ord(1L))
     for {
-      f <- fixture(res, List(validFirst -> h("valid"), overflowing -> h("overflow")))
-      result <- f.store.replayFrom(1L).attempt
-      replayPrefix <- f.store.rootForSnapshot(ord(2L))
+      f <- rawFixture(res, Map(validKey -> Array[Byte](0x01, 0x02)))
+      _ <- f.store.appendAtFinality(ord(50L), ord(50L), commitmentFor(50L))
+      before <- f.store.rootForSnapshot(ord(50L))
+      beforeKeys <- f.producer.physicalKeys
+      result <- f.store.replayFrom(K, ord(1L)).attempt
+      replayPrefix <- f.store.rootForSnapshot(ord(K + 1L))
+      after <- f.store.rootForSnapshot(ord(50L))
+      afterKeys <- f.producer.physicalKeys
+    } yield
+      expect(result.left.exists(_.isInstanceOf[MalformedDurableNipopowValue])) &&
+        expect(before.isDefined) &&
+        expect(after === before) &&
+        expect(replayPrefix.isEmpty) &&
+        expect(afterKeys == beforeKeys)
+  }
+
+  test("historical replay rejects a missing ordinal-zero prefix") { res =>
+    for {
+      f <- fixture(res, List(CommitmentKey.toHex(ord(1L)) -> h("one")))
+      result <- f.store.replayFrom(K, ord(1L)).attempt
+      published <- f.store.rootForSnapshot(ord(K + 1L))
+    } yield
+      expect(
+        result.left.exists {
+          case IncompleteDurableNipopowHistory(_, expected, 1, 0L, Some(observed)) =>
+            expected === ord(1L) && observed === ord(1L)
+          case _ => false
+        }
+      ) && expect(published.isEmpty)
+  }
+
+  test("historical replay rejects an internal ordinal gap") { res =>
+    val entries = List(
+      CommitmentKey.toHex(ord(0L)) -> h("zero"),
+      CommitmentKey.toHex(ord(2L)) -> h("two")
+    )
+    for {
+      f <- fixture(res, entries)
+      result <- f.store.replayFrom(K, ord(2L)).attempt
+      published <- f.store.rootForSnapshot(ord(K))
+    } yield
+      expect(
+        result.left.exists {
+          case IncompleteDurableNipopowHistory(_, expected, 2, 1L, Some(observed)) =>
+            expected === ord(2L) && observed === ord(2L)
+          case _ => false
+        }
+      ) && expect(published.isEmpty)
+  }
+
+  test("historical replay rejects a missing terminal suffix") { res =>
+    val entries = List(
+      CommitmentKey.toHex(ord(0L)) -> h("zero"),
+      CommitmentKey.toHex(ord(1L)) -> h("one")
+    )
+    for {
+      f <- fixture(res, entries)
+      result <- f.store.replayFrom(K, ord(2L)).attempt
+      published <- f.store.rootForSnapshot(ord(K))
+    } yield
+      expect(
+        result.left.exists {
+          case IncompleteDurableNipopowHistory(_, expected, 2, 2L, None) => expected === ord(2L)
+          case _                                                         => false
+        }
+      ) && expect(published.isEmpty)
+  }
+
+  test("historical replay validates one immutable producer image under concurrent underlying mutation") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
+    val zero = CommitmentKey.toHex(ord(0L)) -> hashBytes(h("zero"))
+    val one = CommitmentKey.toHex(ord(1L)) -> hashBytes(h("one"))
+
+    for {
+      snapshotTaken <- Deferred[IO, Unit]
+      releaseSnapshot <- Deferred[IO, Unit]
+      delegate <- InMemoryMerklePatriciaProducer.make[IO](Map(zero))
+      producer = new PausedSnapshotProducer(delegate, snapshotTaken, releaseSnapshot)
+      durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
+      store <- HistoricalCommitmentSmtStore.make[IO](durable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+      replay <- store.replayFrom(K, ord(0L)).start
+      _ <- snapshotTaken.get.timeout(5.seconds)
+      _ <- delegate.insertBytes(Map(one)).rethrow
+      _ <- releaseSnapshot.complete(())
+      outcome <- replay.joinWithNever
+      rootFromCapturedImage <- store.rootForSnapshot(ord(K))
+      rootFromConcurrentSuffix <- store.rootForSnapshot(ord(K + 1L))
+    } yield
+      expect(outcome === ()) &&
+        expect(rootFromCapturedImage.isDefined) &&
+        expect(rootFromConcurrentSuffix.isEmpty)
+  }
+
+  test("historical replay preflights every derived version and rejects ordinal-plus-k overflow atomically") { res =>
+    val entries = List(
+      CommitmentKey.toHex(ord(0L)) -> h("zero"),
+      CommitmentKey.toHex(ord(1L)) -> h("one")
+    )
+    for {
+      f <- fixture(res, entries)
+      result <- f.store.replayFrom(Long.MaxValue, ord(1L)).attempt
+      replayPrefix <- f.store.rootForSnapshot(ord(Long.MaxValue))
     } yield
       expect(result.left.exists(_.isInstanceOf[MalformedDurableNipopowKey]))
         .and(expect(replayPrefix.isEmpty))
@@ -325,7 +501,7 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
   test("historical replay rejects a negative k before committing any version") { res =>
     for {
       f <- fixture(res, List(CommitmentKey.toHex(ord(1)) -> h("valid")))
-      result <- f.store.replayFrom(-1L).attempt
+      result <- f.store.replayFrom(-1L, ord(1L)).attempt
       replayPrefix <- f.store.rootForSnapshot(ord(K + 1L))
     } yield
       expect(result.left.exists(_.isInstanceOf[InvalidHistoricalReplayLag]))
@@ -334,29 +510,26 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
 
   test("historical replay hashing failure preserves the complete previously published tree and exposes no prefix") { res =>
     val failure = new RuntimeException("injected replay hashing failure")
-    val entries = (1L to 4L).toList.map(n => CommitmentKey.toHex(ord(n)) -> h(s"durable-$n"))
+    val entries = (0L to 4L).toList.map(n => CommitmentKey.toHex(ord(n)) -> h(s"durable-$n"))
     for {
       armed <- Ref.of[IO, Boolean](false)
       calls <- Ref.of[IO, Int](0)
       controlled = controlledBeforeNthHash(res._1, armed, calls, n = 5, action = IO.raiseError(failure))
       f <- fixture(res, entries, hasherOverride = controlled.some)
-      _ <- f.store.appendAtFinality(ord(50L), ord(50L), commitmentFor(50L))
-      before <- f.store.rootForSnapshot(ord(50L))
-      prefixBefore <- f.store.rootForSnapshot(ord(K + 1L))
+      _ <- f.store.replayFrom(K, ord(4L))
+      before <- (K to K + 4L).toList.traverse(n => f.store.rootForSnapshot(ord(n)))
       _ <- armed.set(true)
-      result <- f.store.replayFrom(K).attempt
-      after <- f.store.rootForSnapshot(ord(50L))
-      prefixAfter <- f.store.rootForSnapshot(ord(K + 1L))
+      result <- f.store.replayFrom(K, ord(4L)).attempt
+      after <- (K to K + 4L).toList.traverse(n => f.store.rootForSnapshot(ord(n)))
     } yield
       expect(result.left.exists(_ eq failure)) &&
-        expect(before.isDefined) &&
+        expect(before.forall(_.isDefined)) &&
         expect(after === before) &&
-        expect(prefixBefore.isEmpty) &&
-        expect(prefixAfter.isEmpty)
+        expect(after.forall(_.isDefined))
   }
 
   test("historical replay cancellation preserves the complete previously published tree and exposes no prefix") { res =>
-    val entries = (1L to 4L).toList.map(n => CommitmentKey.toHex(ord(n)) -> h(s"durable-$n"))
+    val entries = (0L to 4L).toList.map(n => CommitmentKey.toHex(ord(n)) -> h(s"durable-$n"))
     for {
       entered <- Deferred[IO, Unit]
       release <- Deferred[IO, Unit]
@@ -365,25 +538,22 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
       controlled =
         controlledBeforeNthHash(res._1, armed, calls, n = 5, action = entered.complete(()).void >> release.get)
       f <- fixture(res, entries, hasherOverride = controlled.some)
-      _ <- f.store.appendAtFinality(ord(50L), ord(50L), commitmentFor(50L))
-      before <- f.store.rootForSnapshot(ord(50L))
-      prefixBefore <- f.store.rootForSnapshot(ord(K + 1L))
+      _ <- f.store.replayFrom(K, ord(4L))
+      before <- (K to K + 4L).toList.traverse(n => f.store.rootForSnapshot(ord(n)))
       _ <- armed.set(true)
-      replay <- f.store.replayFrom(K).start
+      replay <- f.store.replayFrom(K, ord(4L)).start
       _ <- entered.get.timeout(5.seconds)
       _ <- replay.cancel
       outcome <- replay.join
-      after <- f.store.rootForSnapshot(ord(50L))
-      prefixAfter <- f.store.rootForSnapshot(ord(K + 1L))
+      after <- (K to K + 4L).toList.traverse(n => f.store.rootForSnapshot(ord(n)))
       wasCanceled = outcome match {
         case Outcome.Canceled() => true
         case _                  => false
       }
     } yield
       expect(wasCanceled) &&
-        expect(before.isDefined) &&
+        expect(before.forall(_.isDefined)) &&
         expect(after === before) &&
-        expect(prefixBefore.isEmpty) &&
-        expect(prefixAfter.isEmpty)
+        expect(after.forall(_.isDefined))
   }
 }

@@ -19,7 +19,6 @@ import io.constellationnetwork.currency.schema.globalSnapshotSync.{GlobalSnapsho
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kernel.{:: => _, _}
-import io.constellationnetwork.node.shared.domain.nakamoto.nipopow.{PerOrdinalCommitment, TowerEligibility}
 import io.constellationnetwork.node.shared.domain.snapshot.Validator
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.modules.SharedStorages
@@ -29,17 +28,12 @@ import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.nakamoto.follow.GlobalChangeSetDelta
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
-import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.smt.{SmtProof, SmtRoot, SmtVerifier}
-import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
+import io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator
 
-import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
-import io.circe.Json
-import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object StateChannel {
@@ -72,11 +66,6 @@ object StateChannel {
     dataApplicationService: Option[BaseDataApplicationL0Service[F]],
     selfKeyPair: KeyPair,
     enqueueConsensusEventFn: CurrencySnapshotEvent => Cell[F, StackF, _, Either[CellError, Ω], _],
-    // Slice B — the confirmation-depth cutoff `k` (gl0 anchors `smtRoot(N)` over commitments `≤ N − k`). ml0 uses it on
-    // the adopt path to derive the eligible ordinal `N − k` whose commitment the carried inclusion proof reveals, so it
-    // can verify the signed smtRoot by construction. Sourced from `SharedConfig.nakamoto.confirmationDepthK(env)`
-    // (resolved for the active `SharedConfig.environment` at the call site).
-    confirmationDepthK: Long,
     // Track-3 S4: threaded straight into `performGlobalL0SnapshotProcess` (which owns `resyncToCanonical`) so the eta
     // walk cache is dropped on a follower base revert. See that method's param for rationale (inert-and-redundant on ml0).
     etaForgetUncommitted: F[Unit]
@@ -98,7 +87,6 @@ object StateChannel {
             dataApplicationService,
             selfKeyPair,
             enqueueConsensusEventFn,
-            confirmationDepthK,
             etaForgetUncommitted
           ).handleErrorWith { error =>
             logger.error(error)("Error during global L0 snapshot processing")
@@ -124,8 +112,6 @@ object StateChannel {
     dataApplicationService: Option[BaseDataApplicationL0Service[F]],
     selfKeyPair: KeyPair,
     enqueueConsensusEventFn: CurrencySnapshotEvent => Cell[F, StackF, _, Either[CellError, Ω], _],
-    // Slice B — confirmation-depth cutoff `k`; see `run`. Used by `deriveFollowContext` to verify the signed smtRoot.
-    confirmationDepthK: Long,
     // Track-3 S4: the `EtaStateManager.forgetUncommitted` effect. Fired inside `resyncToCanonical` after the MPT base is
     // realigned to gl0's canonical GSI, so the in-process eta walk cache does not survive a base revert. Inert-and-redundant
     // on ml0 (no-op eta chain walk + MPT-primary getEta), but keeps the follower symmetric with the gl0 base-revert hook.
@@ -226,6 +212,7 @@ object StateChannel {
 
     def persistGlobalSnapshot(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
       for {
+        _ <- GlobalSnapshotActiveEraValidator.requireValid[F](snapshot.signed.value)
         _ <- storages.globalSnapshotsWithStateFileStorage
           .write(snapshot.ordinal, GlobalSnapshotWithState(snapshot.signed, state))
         _ <- storages.globalSnapshotsWithStateDeltasFileStorage
@@ -234,6 +221,7 @@ object StateChannel {
 
     def handleInitialSnapshot(snapshot: Hashed[GlobalIncrementalSnapshot], state: GlobalSnapshotInfo): F[Unit] =
       for {
+        _ <- GlobalSnapshotActiveEraValidator.requireValid[F](snapshot.signed.value)
         _ <- logger.info(s"Initializing global snapshot storages with ordinal=${snapshot.ordinal}")
         _ <- storages.lastSyncGlobalSnapshot.setInitial(snapshot, state)
         _ <- sharedStorages.lastNGlobalSnapshot.setInitialFetchingGL0(snapshot, state, services.globalL0.asLeft.some, none)
@@ -317,6 +305,7 @@ object StateChannel {
             // by construction.
             canonical <- services.globalL0.pullLatestMptEntries
             (canonicalSnapshot, canonicalState, canonicalEntries) = canonical
+            _ <- GlobalSnapshotActiveEraValidator.requireValid[F](canonicalSnapshot.signed.value)
             _ <- canonicalEntries match {
               case Some(bytes) => ensureMptFromSignedBytes(canonicalSnapshot.ordinal, bytes)
               case None =>
@@ -404,92 +393,6 @@ object StateChannel {
       def resyncSignal(reason: String): F[GlobalSnapshotInfo] =
         FollowResyncNeeded(snapshot.ordinal, reason).raiseError[F, GlobalSnapshotInfo]
 
-      // Slice B — VERIFY the signed `smtRoot` (GlobalSnapshotStateProof field 19) by construction, as a SECOND gate on top
-      // of the mptRoot gate. ml0 derives the §3-NIPoPoW per-ordinal commitment leaf for the eligible ordinal `N − k`
-      // ITSELF (from that ordinal's own signed `stateProof.mptRoot`, content hash, and `TowerEligibility.NotComputed`),
-      // binds the carried inclusion proof's leaf bytes to its OWN derived leaf (LEAF-BINDING — without this the verifier
-      // only checks the proof is internally consistent against the root and would accept ANY leaf the producer placed
-      // there; the bind is what proves ml0's OWN commitment is committed), then folds the proof to the SIGNED smtRoot.
-      // Returns true ⇒ smt-verified (adopt); false ⇒ unverifiable (caller falls back, NEVER adopts on an unverified
-      // smtRoot). Additive: missing proof / bind-mismatch / verify-Left all degrade to mptRoot-only adopt, exactly
-      // like the mptRoot-miss path — the mptRoot === remains the ledger gate, this never blocks it. NOTE: ml0 no longer
-      // re-executes (`createContext`) on ANY miss; the mptRoot-miss ledger path now raises `FollowResyncNeeded` →
-      // `resyncToCanonical`, while this smt-unverifiable path adopts on the already-passed mptRoot gate (mptRoot-only).
-      def verifySmtRoot(signedSmtRoot: Hash, inclusionProof: Option[SmtProof]): F[Boolean] = {
-        val eligibleOrdinalOpt: Option[SnapshotOrdinal] =
-          NonNegLong.from(snapshot.ordinal.value.value - confirmationDepthK).toOption.map(SnapshotOrdinal(_))
-
-        (eligibleOrdinalOpt, inclusionProof) match {
-          case (None, _) =>
-            // Should not happen: a Some(smtRoot) implies snapshot.ordinal > k (gl0 only anchors smtRoot past warmup).
-            logger
-              .info(
-                s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} has a signed smtRoot but ordinal − k underflows " +
-                  s"(k=$confirmationDepthK); cannot derive eligible ordinal, degrading to mptRoot-only adopt"
-              )
-              .as(false)
-          case (Some(_), None) =>
-            logger
-              .info(
-                s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} has a signed smtRoot but the change-set delta carries no " +
-                  s"inclusion proof; degrading to mptRoot-only adopt"
-              )
-              .as(false)
-          case (Some(eligibleOrdinal), Some(proof)) =>
-            services.globalL0.pullGlobalSnapshot(eligibleOrdinal).flatMap {
-              case None =>
-                logger
-                  .info(
-                    s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} eligible ordinal=${eligibleOrdinal.show} not " +
-                      s"retrievable (out of retention); degrading this ordinal to mptRoot-only adopt"
-                  )
-                  .as(false)
-              case Some(eligibleSnapshot) =>
-                // Mirror the producer's commitment derivation EXACTLY (GlobalSnapshotAcceptanceManager.attachSmtRoot):
-                // hypergraphRoot = eligible.stateProof.mptRoot.getOrElse(Hash.empty), incrementalSnapshotHash = eligible.hash,
-                // towerEligibility = NotComputed. Any divergence here breaks the byte-identical leaf the leaf-binding requires.
-                val commitment = PerOrdinalCommitment(
-                  hypergraphRoot = eligibleSnapshot.signed.value.stateProof.mptRoot.getOrElse(Hash.empty),
-                  incrementalSnapshotHash = eligibleSnapshot.hash,
-                  towerEligibility = TowerEligibility.NotComputed
-                )
-                PerOrdinalCommitment.commitmentHash[F](commitment).flatMap { leaf =>
-                  // LEAF-BINDING: the proof must be an Inclusion AND its leaf value bytes must equal ml0's OWN derived
-                  // leaf bytes (the SMT stores the leaf value as `Hex(commitmentHash).toBytes` — match that exactly).
-                  val boundOk = proof match {
-                    case SmtProof.Inclusion(_, value, _, _) => value.sameElements(Hex(leaf.value).toBytes)
-                    case _: SmtProof.Absence                => false
-                  }
-                  if (!boundOk)
-                    logger
-                      .warn(
-                        s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} LEAF-BINDING failed for eligible " +
-                          s"ordinal=${eligibleOrdinal.show} (proof leaf bytes ≠ ml0-derived commitment, or not an Inclusion); " +
-                          s"degrading to mptRoot-only adopt"
-                      )
-                      .as(false)
-                  else
-                    SmtVerifier.make[F].verify(SmtRoot(signedSmtRoot), proof).flatMap {
-                      case Right(_) =>
-                        logger
-                          .debug(
-                            s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} VERIFIED signed smtRoot (eligible " +
-                              s"ordinal=${eligibleOrdinal.show} commitment included)"
-                          )
-                          .as(true)
-                      case Left(err) =>
-                        logger
-                          .warn(
-                            s"ml0 smt-verify: ordinal=${snapshot.ordinal.show} smtRoot verify FAILED ($err) for eligible " +
-                              s"ordinal=${eligibleOrdinal.show}; degrading to mptRoot-only adopt"
-                          )
-                          .as(false)
-                    }
-                }
-            }
-        }
-      }
-
       def adopt(deltaN: GlobalChangeSetDelta): F[GlobalSnapshotInfo] =
         io.constellationnetwork.schema.mpt.GlobalStateConverter
           .adoptAndVerifyChangeSetDelta[F](
@@ -501,41 +404,9 @@ object StateChannel {
           )
           .flatMap {
             case Some(adoptedGsi) =>
-              // mptRoot gate SUCCEEDED. Now the smtRoot SECOND gate (Slice B):
-              snapshot.signed.value.stateProof.smtRoot match {
-                case None =>
-                  // Warmup window (ordinal ≤ k): gl0 anchored no smtRoot. Adopt on mptRoot alone (unchanged behavior).
-                  logger
-                    .debug(
-                      s"ml0 adopt-and-verify: adopted ordinal=${snapshot.ordinal.show} (mptRoot matched; no signed smtRoot — warmup)"
-                    )
-                    .as(adoptedGsi)
-                case Some(signedSmtRoot) =>
-                  verifySmtRoot(signedSmtRoot, deltaN.smtInclusionProof).flatMap {
-                    case true =>
-                      logger
-                        .debug(
-                          s"ml0 adopt-and-verify: adopted ordinal=${snapshot.ordinal.show} (mptRoot AND smtRoot both verified)"
-                        )
-                        .as(adoptedGsi)
-                    case false =>
-                      // smtRoot verify did not succeed (proof out of retention / absent, or — logged at WARN inside
-                      // verifySmtRoot — a genuine leaf/root mismatch). The LEDGER is ALREADY verified by the mptRoot gate
-                      // above, and smtRoot is a SEPARATE gl0-maintained commitment, independent of the hypergraph ledger
-                      // root, so a follower that cannot independently (re)confirm it sits in exactly the pre-Slice-B
-                      // position: it holds the SIGNED smtRoot inside the committee-attested snapshot without a local check.
-                      // Adopt the mptRoot-verified GSI; do NOT fall back to full createContext re-execution — that would
-                      // re-introduce the global re-exec this workstream removes, and createContext yields smtRoot=None so it
-                      // would not confirm the smtRoot either (zero gain, real cost). smtRoot verify is ADDITIVE
-                      // defense-in-depth, never a ledger gate.
-                      logger
-                        .debug(
-                          s"ml0 adopt-and-verify: adopted ordinal=${snapshot.ordinal.show} (mptRoot verified; smtRoot NOT " +
-                            s"independently confirmed this ordinal — see smt-verify log above; ledger is mptRoot-anchored)"
-                        )
-                        .as(adoptedGsi)
-                  }
-              }
+              logger
+                .debug(s"ml0 adopt-and-verify: adopted ordinal=${snapshot.ordinal.show} (active-era shape and mptRoot matched)")
+                .as(adoptedGsi)
             case None =>
               logger.info(
                 s"ml0 adopt-and-verify: verify FAILED for ordinal=${snapshot.ordinal.show} (recomputed mptRoot ≠ signed " +
@@ -550,7 +421,7 @@ object StateChannel {
       // rest, each verified against its OWN signed mptRoot. (Re-fetching the change-set per ordinal-step is a perf
       // follow-up — the verify gate's correctness does not depend on batching.)
       val since = lastSnapshot.ordinal
-      services.globalL0.getChangeSetSince(since).flatMap {
+      GlobalSnapshotActiveEraValidator.requireValid[F](snapshot.signed.value) >> services.globalL0.getChangeSetSince(since).flatMap {
         case Some(resp) if resp.baseOrdinal.contains(since) =>
           resp.deltas.collectFirst { case d if d.ordinal === snapshot.ordinal => d } match {
             case Some(deltaN) => adopt(deltaN)

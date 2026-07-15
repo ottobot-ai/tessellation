@@ -39,6 +39,7 @@ import io.circe.Encoder
 case class InvalidHeight(lastHeight: Height, currentHeight: Height) extends NoStackTrace
 case object NoTipsRemaining extends NoStackTrace
 case class GlobalArtifactMismatch(expected: GlobalIncrementalSnapshot, found: GlobalIncrementalSnapshot) extends InvalidArtifact
+case class GlobalArtifactActiveEraViolation(ordinal: SnapshotOrdinal) extends InvalidArtifact
 case class CurrencyArtifactMismatch(errors: List[CurrencySnapshotValidationError]) extends InvalidArtifact
 
 abstract class SnapshotConsensusFunctions[

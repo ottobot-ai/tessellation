@@ -1,9 +1,13 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.storage
 
 import java.io.{FileOutputStream, OutputStreamWriter}
+import java.nio.charset.StandardCharsets.UTF_8
+import java.nio.file.{Files => JFiles, StandardCopyOption}
+import java.util.UUID
 
+import cats.effect._
 import cats.effect.std.Semaphore
-import cats.effect.{Async, Concurrent, Resource}
+import cats.effect.syntax.all._
 import cats.syntax.all._
 
 import io.constellationnetwork.schema._
@@ -18,7 +22,7 @@ import derevo.circe.magnolia.{decoder, encoder}
 import derevo.derive
 import fs2.Stream
 import fs2.concurrent.SignallingRef
-import fs2.io.file.{Files, Flags, Path}
+import fs2.io.file._
 import io.circe.syntax._
 import io.circe.{Encoder, Printer}
 import org.http4s._
@@ -47,7 +51,8 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
 ](
   path: Path,
   lastSnapshotInfo: SignallingRef[F, LastCheckpointInfo],
-  concurrentStreams: Semaphore[F]
+  concurrentStreams: Semaphore[F],
+  openWriter: Path => Resource[F, OutputStreamWriter]
 )(
   implicit encSigned: Encoder[Signed[S]],
   encState: Encoder[SI]
@@ -69,38 +74,37 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
     state: SI
   ): F[Unit] = {
     val filePath = path / ordinal.value.value.toString
+    val temporaryPath = path / s".${ordinal.value.value}.${UUID.randomUUID().toString}.tmp"
 
-    val openFile: Resource[F, (FileOutputStream, OutputStreamWriter)] =
-      Resource.make(
-        Concurrent[F].blocking {
-          // Ensure parent directory exists before creating file
-          val file = new java.io.File(filePath.toString)
-          Option(file.getParentFile).foreach(_.mkdirs())
-          val fos = new FileOutputStream(file)
-          val writer = new OutputStreamWriter(fos, "UTF-8")
-          (fos, writer)
-        }
-      ) {
-        case (fos, writer) =>
-          Concurrent[F].blocking {
-            writer.flush()
-            writer.close()
-            fos.close()
-          }.handleErrorWith(_ => Concurrent[F].unit)
+    val writeTemporary = openWriter(temporaryPath).use { writer =>
+      val printer = Printer.noSpaces.copy(dropNullValues = true)
+      Concurrent[F].blocking {
+        writer.append('[')
+        printer.unsafePrintToAppendable(snapshot.asJson, writer)
+        writer.append(',')
+        printer.unsafePrintToAppendable(state.asJson, writer)
+        writer.append(']')
+        ()
       }
-
-    openFile.use {
-      case (_, writer) =>
-        val printer = Printer.noSpaces.copy(dropNullValues = true)
-        Concurrent[F].blocking {
-          writer.append('[')
-          printer.unsafePrintToAppendable(snapshot.asJson, writer)
-          writer.append(',')
-          printer.unsafePrintToAppendable(state.asJson, writer)
-          writer.append(']')
-          ()
-        }
     }
+
+    val publish = Concurrent[F].blocking {
+      JFiles.move(
+        temporaryPath.toNioPath,
+        filePath.toNioPath,
+        StandardCopyOption.ATOMIC_MOVE,
+        StandardCopyOption.REPLACE_EXISTING
+      )
+      ()
+    }
+
+    val cleanupTemporary = Concurrent[F].blocking(JFiles.deleteIfExists(temporaryPath.toNioPath)).void
+
+    // Atomic replacement guarantees whole-generation visibility to concurrent readers. This is not an fsync/crash-durability claim.
+    Async[F].guarantee(
+      writeTemporary >> Async[F].uncancelable(_ => publish),
+      cleanupTemporary
+    )
   }
 
   def getAsHttpResponse(ordinal: SnapshotOrdinal): F[Option[Response[F]]] = {
@@ -139,6 +143,89 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
           }
         fileStream.some.pure[F]
     }
+  }
+
+  private def readFrom(handle: FileHandle[F]): Stream[F, Byte] =
+    Stream.unfoldChunkEval(0L) { offset =>
+      handle
+        .read(64 * 1024, offset)
+        .map(_.filter(_.nonEmpty).map(chunk => (chunk, offset + chunk.size.toLong)))
+    }
+
+  /** Validate and serve one exact open checkpoint file without reopening the ordinal path between the check and the response body.
+    * Validation may compile `bytes` multiple times: every run reads the same open file handle from offset zero. The body holds the file
+    * handle and stream permit until the HTTP consumer completes or cancels it. A validation or I/O failure is fail-closed (`None`).
+    */
+  def getAsValidatedHttpResponse(
+    ordinal: SnapshotOrdinal,
+    validate: Stream[F, Byte] => F[Boolean],
+    transform: Stream[F, Byte] => Stream[F, Byte]
+  ): F[Option[Response[F]]] = {
+    val file = path / ordinal.value.value.toString
+    val opened = concurrentStreams.permit.flatMap(_ => Files[F].open(file, Flags.Read))
+
+    Files[F]
+      .exists(file)
+      .ifM(
+        Ref.of[F, F[Unit]](Async[F].unit).flatMap { releaseOnCancel =>
+          Async[F].uncancelable { poll =>
+            poll(opened.allocated).attempt.flatMap {
+              case Left(_) => Option.empty[Response[F]].pure[F]
+              case Right((handle, rawRelease)) =>
+                val installGuard =
+                  CombinedSnapshotCheckpointFileSystemStorage
+                    .releaseOnce(rawRelease)
+                    .flatTap(releaseOnCancel.set)
+                    .handleErrorWith(error => rawRelease.attempt >> error.raiseError[F, F[Unit]])
+
+                installGuard.flatMap { release =>
+                  val bytes = readFrom(handle)
+                  val transferOwnership =
+                    validate(bytes).attempt.flatMap {
+                      case Right(true) =>
+                        Async[F].delay(transform(bytes)).attempt.flatMap {
+                          case Right(body) =>
+                            Response[F](
+                              status = Status.Ok,
+                              headers = Headers(`Content-Type`(MediaType.application.json)),
+                              body = body.onFinalize(release)
+                            ).some.pure[F]
+                          case Left(_) => release.as(Option.empty[Response[F]])
+                        }
+                      case _ => release.as(Option.empty[Response[F]])
+                    }
+
+                  // The outer cancellation handler also covers a pending cancellation observed as the uncancelable allocation/guard
+                  // scope returns. On success the response body owns the same release-once token.
+                  poll(transferOwnership)
+                }
+            }
+          }
+            .onCancel(releaseOnCancel.get.flatten)
+        },
+        Option.empty[Response[F]].pure[F]
+      )
+  }
+
+  def getAsValidatedHttpResponse(
+    ordinal: SnapshotOrdinal,
+    validate: Stream[F, Byte] => F[Boolean]
+  ): F[Option[Response[F]]] =
+    getAsValidatedHttpResponse(ordinal, validate, identity)
+
+  /** Validate an exact checkpoint while holding one open handle for the whole check. Unlike the response method, this always releases the
+    * handle before returning and is intended for metadata/fallback decisions that must distinguish absence from a forbidden file.
+    */
+  def validateExact(ordinal: SnapshotOrdinal, validate: Stream[F, Byte] => F[Boolean]): F[Boolean] = {
+    val file = path / ordinal.value.value.toString
+    val opened = concurrentStreams.permit.flatMap(_ => Files[F].open(file, Flags.Read))
+
+    Files[F]
+      .exists(file)
+      .ifM(
+        opened.use(handle => validate(readFrom(handle))).handleError(_ => false),
+        false.pure[F]
+      )
   }
 
   def exists(ordinal: SnapshotOrdinal): F[Boolean] =
@@ -233,16 +320,54 @@ final class CombinedSnapshotCheckpointFileSystemStorage[
 
 object CombinedSnapshotCheckpointFileSystemStorage {
 
+  private[storage] def releaseOnce[F[_]: Async](release: F[Unit]): F[F[Unit]] =
+    (Ref.of[F, Boolean](false), Deferred[F, Either[Throwable, Unit]]).mapN { (claimed, completed) =>
+      val runRelease = Async[F].uncancelable { _ =>
+        release.attempt.flatTap(result => completed.complete(result).void).flatMap(_.liftTo[F])
+      }
+
+      Async[F].uncancelable { _ =>
+        claimed.modify {
+          case false => true -> runRelease
+          case true  => true -> completed.get.flatMap(_.liftTo[F])
+        }.flatten
+      }
+    }
+
+  private def defaultOpenWriter[F[_]: Async](temporaryPath: Path): Resource[F, OutputStreamWriter] = {
+    val output = Resource.make(
+      Async[F].blocking {
+        val file = new java.io.File(temporaryPath.toString)
+        Option(file.getParentFile).foreach(_.mkdirs())
+        new FileOutputStream(file)
+      }
+    )(stream => Async[F].blocking(stream.close()))
+
+    output.flatMap { stream =>
+      Resource.make(Async[F].blocking(new OutputStreamWriter(stream, UTF_8)))(writer => Async[F].blocking(writer.close()))
+    }
+  }
+
   def make[
     F[_]: Async: Files,
     S <: Snapshot,
     SI <: SnapshotInfo[_]
   ](
     path: Path
+  )(implicit encSigned: Encoder[Signed[S]], encState: Encoder[SI]): F[CombinedSnapshotCheckpointFileSystemStorage[F, S, SI]] =
+    makeWithWriter(path, defaultOpenWriter[F])
+
+  private[storage] def makeWithWriter[
+    F[_]: Async: Files,
+    S <: Snapshot,
+    SI <: SnapshotInfo[_]
+  ](
+    path: Path,
+    openWriter: Path => Resource[F, OutputStreamWriter]
   )(implicit encSigned: Encoder[Signed[S]], encState: Encoder[SI]): F[CombinedSnapshotCheckpointFileSystemStorage[F, S, SI]] = for {
     lastCheckpointInfo <- SignallingRef.of[F, LastCheckpointInfo](LastCheckpointInfo.empty())
     concurrentStreams <- Semaphore[F](5)
-    storage = new CombinedSnapshotCheckpointFileSystemStorage[F, S, SI](path, lastCheckpointInfo, concurrentStreams)
+    storage = new CombinedSnapshotCheckpointFileSystemStorage[F, S, SI](path, lastCheckpointInfo, concurrentStreams, openWriter)
     _ <- storage.createDirectoryIfNotExists().rethrowT
     // BOOT RESCAN (2026-06-10): a restart used to leave the tracked ref EMPTY even though servable
     // checkpoint files sat on disk — the Nakamoto `FinalizedSnapshotReader` then 404'd `/latest/combined`

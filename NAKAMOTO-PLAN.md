@@ -44,7 +44,7 @@ specify stateful incumbent folds; they do not specify or prove an
 incumbent-independent total frontier order. Structurally connected bare
 `ChainTip` inputs form a strict-preference three-cycle without using the current
 tie rule, but they are not authenticated snapshots passing VRF/KES/era validation
-(`ChainSelectionSuite.scala:191-226`). Owner gate O-15 now ratifies objective
+(`ChainSelectionSuite.scala:191-226`). O-15 ratifies objective
 total-frontier semantics: the same cutoff-complete published valid frontier and
 branch-authenticated parameters must produce the same head independently of
 candidate order, arrival schedule, restart, or prior incumbent. The exact
@@ -191,17 +191,35 @@ already has a hard-coded kill switch.
    disk/wire maps, overlays, and durable images; it also canonically orders public
    incremental operations and restores the in-memory savepoint on replacement
    build failure. ROOT-011 remains open for duplicate-member-preserving bounded
-   transport, integration/scale tests, ROOT-005 mutation ownership, and ROOT-009/
-   BR-05 authenticated crash-atomic installation.
+   transport and integration/scale tests. `ROOT-005A` now captures one immutable
+   branch image and requires complete follow-proof field/range/value coverage,
+   with evidence-free success limited to the canonical empty trie root. Its
+   focused tests do not activate the unwired proof services. Exact generation is
+   still absent: `HistoricalMptProofService` accepts but ignores `ordinal`, an
+   unknown branch resolves to the mutable base, and GlobalFollow stamps the caller
+   ordinal on the captured image. `ROOT-005B` remains open for exact authenticated
+   `(ordinal,hash,root)` binding, typed rejection of unknown/evicted branches, and
+   one owner for base, overlay, proof capture, persistence, and replacement mutations;
+   `ROOT-009`/`BR-05` still own authenticated crash-atomic installation
+   (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/MptOverlay.scala:46-84,286-297,953-966`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/MptOverlay.scala:1531-1538`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/HistoricalMptProofService.scala:40-52`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/GlobalFollowProofService.scala:39-47,65-112`;
+   `modules/shared/src/main/scala/io/constellationnetwork/schema/nakamoto/follow/FollowVerifyCore.scala:585-683`;
+   `modules/shared/src/main/scala/io/constellationnetwork/security/mpt/verifier/MerklePatriciaRangeVerifier.scala:259-268`;
+   regressions `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/GlobalFollowProofServiceSuite.scala:180-190,195-415`,
+   `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/MptOverlaySuite.scala:852-904`, and
+   `modules/shared/src/test/scala/io/constellationnetwork/security/mpt/MerklePatriciaRangeVerifierSuite.scala:87-123`).
    The exhaustive target field manifest, physical shapes, codecs, identity/scope
-   rules, structural/index/population relations, root ownership, and unresolved
-   owner choices
+   rules, structural/index/population relations, root ownership, and remaining
+   engineering freeze gates
    are in `docs/review/ROOT-008-GL0-PARTITION-GRAMMAR.md`. `ROOT-008` parser and
    RED work for final rooted fields may proceed alongside `ROOT-010`, but the
    target manifest has no GL0 field-32 lane and cannot activate until witness
    parity permits field-32 deletion. Numeric resource limits, retired-ID policy,
    field-20/23 self-authentication, set identities, and token-lock currency scope
-   require owner review at O-17/R008-01..07 before schema freeze. ROOT-008 proves
+   must implement the ratified O-17/R008-01..07 directions and pass their codec,
+   resource, and proof gates before schema freeze. ROOT-008 proves
    physical placement, codec/identity, and structural/population relations; it
    composes with, but does not replace, O-07/ECON-G economic authorization,
    conservation, backing, replay protection, and transition validity.
@@ -224,15 +242,61 @@ already has a hard-coded kill switch.
    every GL0 load rather than converted to a synthetic empty replay input.
    Malformed tower/SMT durable keys fail the whole load instead of
    disappearing during decode (`STOR-02`, `REC-004`). The strict total decoder,
-   one-time validated tower index, and isolated historical replay tree swap are
-   green in focused worktree tests; double replay produces identical retained
-   roots, and injected hashing failure/cancellation preserves the prior derived tree. Durable-KV
-   crash atomicity, production boot/disk wiring, `TowerFinalizer` restart refs,
-   and its bounded catch-up cursor remain open: the live loop marks target A
-   settled before asynchronously processing at most 100 ordinals from prior P,
-   so a farther suffix or missing/failed entry is not retried. Restart/compaction,
-   exact-hash density reorg, proof serving, and authenticated clean-rebuild
-   integration remain open.
+   one-time validated tower index, and strict historical replay are green in
+   focused worktree tests. Replay consumes one retained image, requires exact
+   contiguous `0..expectedEligible` coverage including ordinal zero, preflights
+   `ordinal + k`, and atomically swaps an isolated completed tree; malformed,
+   gapped, failed, or cancelled replay preserves the prior tree (`STOR-02`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/DurableNipopowKey.scala:32-42,44-115`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStore.scala:101-108,159-262`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStore.scala:179-264`;
+   `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStoreSuite.scala:258-456`;
+   `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStoreSuite.scala:293-337,349-559`). The
+   steady-state append path is not covered by that atomic-swap claim: it publishes
+   `durable.insert/commit` before `versioned.commit`, without an all-or-none
+   failure/cancellation boundary. A failure after durable publication can leave a
+   retained leaf absent from the live tree, and a later append can extend that
+   stale tree until restart replay derives another root
+   (`HistoricalCommitmentSmtStore.scala:150-168`). Add the `REC-004` RED injection
+   between those effects and require the next append plus restart replay to match
+   clean replay before activation. The
+   detached skip-ahead tower driver and startup provider publication are removed.
+   Its staged serialized exact-hash coordinator/finalizer is deliberately
+   unwired and in-memory. It still has three correctness/resource defects: public
+   finalizer prepare/commit is not one single-writer generation, every bounded
+   catch-up run walks the full remaining interval before slicing (`O(M^2/B)` over
+   a gap), and the builder reads ordinal state then injects a tower hash without
+   rehashing or binding one immutable exact target. Provider remains `None`, so
+   proof routes remain unavailable/503; this also unnecessarily disables the pure
+   verifier route (`STOR-03`, contained dark, not closed;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:1510-1514`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/TowerCatchupCoordinator.scala:216-312,372-513`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerFinalizer.scala:89-96,180-213`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerProofBuilder.scala:96-103,148-166`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/NipopowRoutes.scala:82-87,154-168`).
+   Durable-KV crash atomicity, production boot/disk wiring, durable rebuild and
+   cursor, restart/compaction, exact-hash density reorg, one-writer finalization,
+   paged linear catch-up, target-bound exact-hash proof construction, resource
+   bounds, verifier/builder service separation, and atomic provider publication
+   remain open. RED tests must force simultaneous `finalize(N/N+1)`, measure total
+   and per-call walk work for `M >> B`, switch same-ordinal branches during proof
+   build, and keep `POST /verify` usable while local building is unavailable.
+   `SMT-01` is separately contained by active-era `smtRoot=None`, exact proof
+   comparison, and fail-closed producer/validator/download/context/traverse/ML0/
+   route gates. The schema field remains; future activation must reproduce it
+   from an exact branch-bound durable image at every lifecycle boundary
+   (`modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala:10-30`;
+   `modules/shared/src/main/scala/io/constellationnetwork/validator/StateProofComparison.scala:28-37,45-78`;
+   `modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotStateProof.scala:124-130`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala:282-299,353`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:692-694`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/domain/snapshot/programs/Download.scala:368-381,607-622`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala:61-72`;
+   `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotTraverse.scala:107-116,183-194`;
+   `modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/StateChannel.scala:213-230,306-315,423-432`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotStorage.scala:100-125`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalizedSnapshotReader.scala:145-169`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/http/routes/SnapshotRoutes.scala:62-82`).
 5. **Qualify the integrated state machine.** Run GSAM differential tests from
    identical rooted bytes with every sidecar omission/substitution, then
    restart, compaction, density unwind/refold, authenticated recovery, and
@@ -382,8 +446,10 @@ only. Registration proves key ownership and never grants operator eligibility.
   compare the new pair with the same operator's prior pair, so full-pair reuse
   and a complete record in which only the KES or only the VRF key changes remain
   accepted. Atomicity means one record selects both active keys; it does not
-  itself require both byte strings to change. The permitted reuse/rotation
-  policy is an open owner decision and blocks runtime activation.
+  itself require both byte strings to change. The atomic-pair direction is
+  owner-ratified; the explicit active-era validator for complete-pair reuse and
+  one-key-change rotations remains schema/RED engineering and must fail closed
+  until frozen.
 - An exact-hash hot-chain view adapter now exists, distinguishes same-ordinal
   siblings by requested hash, and rejects mismatched, malformed, or missing
   results without disk, ordinal, head, or current-state fallback.
@@ -399,7 +465,9 @@ only. Registration proves key ownership and never grants operator eligibility.
 - The genesis key commitment is not by itself an eligibility roster. Until the
   separately authorized immutable genesis operator/stake population is also a
   canonical rooted input, the genesis-only path is a development safety cut, not
-  permissionless membership. O-11 remains unresolved and blocks runtime admission
+  permissionless membership. O-11's pledge/self-bond, proportional delegation
+  slashing, and `bond >= extractable value` structure is owner-ratified, but its
+  exact rooted predicates, codec, and network bounds still block runtime admission
   of new operators even though their key-registration bytes can be persisted.
 - The live GL0 leader/receiver, `EtaStateManager`, both GSAM boundary/follower
   construction sites, and admission-anchor callback accept only a typed proved-
@@ -442,7 +510,7 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    consumer through the pair/population intersection before this cut can close.
    Gates: `KEYREG-001`, `KEYREG-005`, `KEYREG-011`, `KEYREG-012`, and the genesis
    case of `KEYREG-013`.
-2. **K1 - Freeze O-11 and its state ownership.** Specify the permissionless GL0
+2. **K1 - Implement owner-ratified O-11 and freeze its state ownership.** Specify the permissionless GL0
    operator/Sybil-resistance rule, including bond/stake requirements, activation,
    exit, slash/cooldown, and the exact period-boundary roster root. Define its
    canonical codec, MPT ownership, undo/refold, retention, and recovery contract.
@@ -457,10 +525,11 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    reject/defer before draw, proof, signing, storage, acceptance, or slash. Replace
    every list-returning eta fallback with a typed complete/incomplete exact-parent
    interval; a nonempty partial prefix is never eta authority, and a proved-
-   complete empty interval follows one separately ratified canonical rule. Gates:
+   complete empty interval follows one explicitly encoded, branch-authenticated
+   canonical rule rather than an unavailable-history fallback. Gates:
    `KEYREG-002..005`, `KEYREG-007`, `KEYREG-008`, and
    `CRYPTO-001`.
-4. **K3 - Provision secrets, ratify O-12, and activate runtime rotation.** Before
+4. **K3 - Provision secrets, implement O-12's ratified baseline, and activate runtime rotation.** Before
    submitting a record, atomically provision the future VRF secret and fresh KES
    tree, durably bind them to the registration ID, and verify both public keys.
    Wire the existing durable record/activation model to K1/K2. Require
@@ -469,8 +538,9 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    `I+3` elapsed-duration rule. Paired
    KES/VRF public and local-secret selection is atomic. The exact-parent
    eligibility capability selects the record before the local bundle is opened;
-   time/current-head selection is forbidden. Ratify the N-2 common-prefix
-   stability, secret-deletion point, and recovery/rejoin rule in O-12. A reorg
+   time/current-head selection is forbidden. Quantify the N-2 common-prefix
+   stability and implement O-12's ratified secret-deletion and recovery/rejoin
+   baseline. A reorg
    crossing an erased KES activation enters `RecoveryRequired`; it does not roll
    the KES secret back as ordinary Phase-2 state. Retaining old masters through
    k2 is an explicit forward-security tradeoff, not a hidden fallback. Gates:
@@ -528,10 +598,23 @@ permissionless proof claims.
 - Define a bounded portable proof carrying authenticated SMT paths, ancestry,
   KES/VRF/tower evidence, historical registry/eta/parameters, and freshness/
   current-chain evidence. Implement an independent proof verifier/comparator.
+- Preserve the active-era dark cut while those gates are open: `smtRoot=None`
+  at every producer/validator/download/context/traverse/ML0/serving boundary,
+  exact state-proof comparison, no production historical-store/coordinator
+  wiring, provider `None`, and unavailable/503 proof routes. This contains
+  `SMT-01`/`STOR-03`; it does not remove the schema field or close activation
+  (`modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala:10-30`;
+  `modules/shared/src/main/scala/io/constellationnetwork/validator/StateProofComparison.scala:28-37,45-78`;
+  `modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotStateProof.scala:124-130`;
+  `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotStorage.scala:100-125`;
+  `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalizedSnapshotReader.scala:145-169`;
+  `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:692-694,1510-1514`;
+  `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/NipopowRoutes.scala:82-87`).
 - Do not flip `TowerEligibility.NotComputed` until producer/verifier parity and
   root verification are load-bearing.
-- Gates: `ROOT-001`, `SER-*`, `CRYPTO-001`, `LIGHT-001`, restart/reorg proof
-  vectors, one-peer forgery/withholding/truncation tests.
+- Gates: `ROOT-001`, `ROOT-005B`, `STOR-02/03`, `TOWER-001..007`, `REC-004`,
+  `SER-*`, `CRYPTO-001`, `LIGHT-001`, restart/reorg proof vectors, and one-peer
+  forgery/withholding/truncation tests.
 
 ### E4 - Replayable checkpoint schema and complete root (`PLANNED`)
 
@@ -767,7 +850,7 @@ delivery, rollback, and recovery.
   followers, and serving; this is a partial nonactivating prerequisite, not L-23
   completion. It does not yet implement exact per-hash P0/P1 tracking or the
   optimistic K/alpha/beta decision cascade.
-- P6-FIN14-A now has a proposed, nonactivating exact-consumer contract in
+- P6-FIN14-A now has an owner-ratified, nonactivating exact-consumer direction in
   `docs/review/P6-FIN14-PHASE2-CONSUMER-LEASE.md`. It separates portable evidence
   from a package-minted local lease, uses two short acquisition operations around
   unlocked immutable verification, distinguishes descendant extension from
@@ -779,7 +862,7 @@ delivery, rollback, and recovery.
   no generic economic-read scope can authorize another effect. No finality/MPT/
   chain lock may span image verification, committee polling, or replay. P6 owns
   the kernel, with P8/P10/P11 owning their consumer adapters and P7 supplying exact
-  checkpoint/state interfaces. O-16A..F owner review, O-15/O-01, exact released-
+  checkpoint/state interfaces. O-16A..F engineering/schema gates, O-15/O-01, exact released-
   core readback, ROOT semantic/image gates, and consumer effect ordering block any
   live issuer. Wrapping the current watermark/best-tip Boolean in an opaque type
   does not close FIN-14.
@@ -801,7 +884,7 @@ delivery, rollback, and recovery.
 - Gates: `BOOT-001` through `BOOT-005`, `XMG-006`, `FOLLOW-001` through
   `FOLLOW-007`, `FOLLOW-008A` through `FOLLOW-008P`, `REC-*` including
   `REC-004`/`REC-005`, `MEMPOOL-001`,
-  `ROOT-002` through `ROOT-005`, `ROOT-009`,
+  `ROOT-002` through `ROOT-005`, including `ROOT-005A/005B`, `ROOT-009`,
   `STOR-02`, `STOR-03`, and `GROWTH-001`.
 
 ### E11 - Exceptional challenge replay and sound slashing (`SCAFFOLD ONLY`)

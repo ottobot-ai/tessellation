@@ -1,6 +1,10 @@
 # Consensus Owner Decision Register
 
-**Status:** Active. Runtime packets may not silently choose an `OPEN` item.
+**Status:** Active. Owner directions in this register and
+`CONSENSUS-OWNER-DECISIONS-ANSWERS.md` are ratified. Runtime packets may not silently invent a
+missing parameter, schema, reference model, or proof needed to close an engineering freeze gate.
+Every owner question formerly posed by this register is dispositioned by the answers document;
+none remains awaiting an owner response.
 **Updated:** 2026-07-14
 
 This register uses project phases only where the owner has ratified them:
@@ -35,7 +39,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-21 | Greenfield runtime starts with one canonical `ScodecV1` era at new-chain ordinal 0. Existing-network migration work is deferred, while prior data already on disk remains readable according to an explicit historical-read contract. Undeployed fork schemas are not retained. |
 | L-22 | Tower eligibility is a required protocol feature, but enabling it is multi-stage. Snapshot-carried trial/tower state and `smtRoot` must be independently reproduced and verified by every GL0 recipient, durable across restart, and branch-aware across density reorgs before proofs are treated as security evidence. Replacing `NotComputed` alone is forbidden. |
 | L-23 | Exact-parent state uses an immutable captured parent generation plus compare-and-set at commit; a stale session retries or defers and never blocks GL0 finality indefinitely. Locally viable branch generations are retained only within bounded policy; history beyond that bound is accepted only through exact authenticated reconstruction, otherwise the node enters `RecoveryRequired`. Finality durability uses one idempotent intent journal coordinating the existing overlay, chain store, tracker, outbox, watermarks, projections, and other sinks; it does not require migrating every sink into one database transaction. No exact-parent guard activates until the verified base anchor, descendant-preserving fold, authenticated restart/reorg recovery, and recoverable finality-intent transition land as one coherent unit. |
-| L-24 | GL0 fork choice over three or more valid tines is an objective total-frontier function: the same cutoff-complete published valid frontier and branch-authenticated parameters produce the same canonical head independently of candidate enumeration, gossip arrival schedule, restart, or prior local incumbent. A stateful pairwise incumbent tournament cannot authorize canonical selection or Phase 2. O-15 remains open for cutoff/bounded-diffusion and late-reveal semantics, cycle resolution, exact `k1` metric/equality, objective tie, evidence/verifier, complete validator-backed admission and corrected-store convergence witnesses, and security/liveness proof. |
+| L-24 | GL0 fork choice over three or more valid tines is an objective total-frontier function: the same cutoff-complete published valid frontier and branch-authenticated parameters produce the same canonical head independently of candidate enumeration, gossip arrival schedule, restart, or prior local incumbent. A stateful pairwise incumbent tournament cannot authorize canonical selection or Phase 2. O-15's single-common-anchor density/tower-evidence research direction is ratified, but activation remains blocked on cutoff/bounded-diffusion and late-reveal semantics, an exact selector and `k1` metric/equality, objective tie, evidence/verifier, Byzantine-overflow rule, complete validator-backed convergence witnesses, and security/liveness proof. |
 
 Implementation status for L-15A is **OPEN**. The current currency incremental
 contains the `globalSnapshotSync` proof hash and accepted `globalSnapshotSyncs`
@@ -92,21 +96,26 @@ an infinite full build and incremental raw-map/root divergence for case aliases.
 `ROOT-011` must reject the complete candidate before root construction or live
 mutation and the builder must independently terminate with a typed collision error.
 
-## Open decision gates
+## Ratified direction with engineering freeze gates
 
-These are the remaining choices that cannot safely be hidden inside an
-implementation packet. They do not reopen the locked architecture above.
+The owner has ratified the direction recorded for every O-item below. These sections enumerate
+the executable constants, schemas, reference models, RED vectors, and proofs still required
+before activation. They do not reopen the locked architecture above, and incomplete engineering
+cannot be filled by a local configuration value or caller-specific shortcut.
 
 ### O-01 Avalanche population and exact parameters
 
-Freeze the delayed canonical registry/weight snapshot, `K`, `alpha`, `beta`,
-`T_weight`, sampling replacement rule, attestation lifetime, and small-network
-failure mode. The intended epoch pattern is stake/registry from epoch `N-2` and
-eta from epoch `N-1` for epoch `N`, subject to reference-model and grinding tests.
+**Owner-ratified direction:** sampled K/alpha/beta optimistic finality over the delayed canonical
+population, using stake/registry from epoch `N-2` and eta from `N-1` for epoch `N`, with depth-`k1`
+fallback for undersized populations. The current values in the answers are provisional calibration.
+Engineering must implement the sampled cascade, derive and freeze `T_weight` and every per-network
+constant, then pass reference-model, convergence, grinding, and adversarial tests.
 
 ### O-02 Deep-history recovery beyond local `k2`
 
-Specify the authenticated archive/bootstrap protocol when a winning
+**Owner-ratified direction:** use authenticated historical chain-sync/rejoin from the objectively
+selected true common ancestor; a peer supplies bytes/proofs but never chooses truth. Engineering
+must specify the archive/bootstrap protocol when a winning
 `maxvalid-bg` tine's true common ancestor predates local rollback state: required
 proof material, state reconstruction, production halt/resume conditions, peer
 diversity, and atomic recovery of MPT, mempool, checkpoints, downstream events,
@@ -116,7 +125,9 @@ tine.
 
 ### O-03 Watchtower parameters and availability fallback
 
-Freeze complement/sample size, minimum positive coverage, assignment anchor,
+**Owner-ratified direction:** VRF-assigned watchtowers, one honest mismatch triggers adjudication,
+and fixed affirmative approvals with no-show redraw before inclusion. Engineering must derive and
+freeze complement/sample size, minimum positive coverage, assignment anchor,
 deadline, retry/redraw, bonds, replay budget, challenge lifetime, and censorship
 fallback. The locked release rule is pre-inclusion positive coverage; these
 parameters must preserve unrelated GL0 progress without letting an unchecked
@@ -124,7 +135,9 @@ checkpoint-derived economic effect become usable.
 
 ### O-04 ML0 response to a Phase-2 density reorg
 
-Specify the exact retained history and deterministic rewind/rebase/new-epoch
+**Owner-ratified direction:** roll back to the last ML0 snapshot embedded by the winning GL0 branch;
+use a registered deterministic rebase/undo contract where available, otherwise begin a new ML0
+epoch. Engineering must specify the exact retained history and deterministic rewind/rebase/new-epoch
 contract. Append-only audit history is preferred; applications with a registered
 deterministic rebase/undo contract may append a corrective snapshot. Otherwise a
 new ML0 epoch begins at the last valid GL0 reference. Noninvertible external
@@ -133,27 +146,31 @@ protocol phase.
 
 ### O-05 Intake threshold and censorship recovery
 
-Freeze intake threshold, receipt/custody lifetime, queue ownership, durable
+**Owner-ratified direction:** intake is a separately typed custody/admission threshold and can
+never satisfy execution `kQuorum`. Engineering must freeze its threshold, receipt/custody lifetime, queue ownership, durable
 replication requirement, redraw schedule, and direct-fetch/censorship fallback.
 The threshold proves intake/availability only and remains unable to satisfy
 execution `kQuorum`.
 
 ### O-06 Global correction authorization
 
-Define how a GL0 protocol correction is authorized and activated in a
-permissionless network: hard-fork/era rule, a future canonical governance rule,
-or another deterministic GL0-level mechanism. Freeze its signed domain, exact
-metagraph/pre-root/version target, correction diff, post-root, reason, activation
-ordinal, replay protection, downstream rebase behavior, and audit trail. No
-metagraph-originated authority is an option.
+**Locked V1 direction:** GL0 protocol corrections are authorized by binary/social governance and
+activated through an ordinal/hash-bound `ProtocolEra` hard fork. No metagraph-originated authority
+is an option. An on-chain governance/adoption mechanism and live Shape-B signed-correction schema
+are deferred engineering, not V1 owner gates; when pursued they must bind the exact metagraph,
+pre-root/version, diff, post-root, reason, activation ordinal, replay protection, downstream rebase,
+and audit trail.
 
 ### O-07 Economic operation grammar
 
-Audit Tessellation v4.0.0 behavior for every framework operation, then preserve
+**Owner-ratified direction:** preserve v4 framework functionality with explicit deterministic
+authority, including the rooted allowlisted service-metagraph data exception; service output is
+data, never self-authorizing value, and every economic consumer still re-executes. Audit
+Tessellation v4.0.0 behavior for every framework operation, then preserve
 the functionality that has explicit deterministic authority, conservation,
 ordering, and replay semantics. Do not invent treasury or oracle authority and
 do not disable existing functionality merely because its rule has not yet been
-restated. Any defective upstream behavior receives an explicit protocol rule and
+restated. Do not invent treasury authority. Any defective upstream behavior receives an explicit protocol rule and
 RED/oracle vectors before enablement.
 
 `V4-ECONOMIC-GRAMMAR-AUDIT.md` records partial source evidence. It confirms
@@ -164,7 +181,9 @@ inventory and the full differential corpus are complete.
 
 ### O-08 Tower proof contract
 
-Freeze snapshot-carried per-level state/pointers, trial computation, historical
+**Owner-ratified direction:** enable tower eligibility only through recipient-reproducible,
+branch-bound, KES/VRF-verified proofs; weight is proof selection only, never chain selection.
+Engineering must freeze snapshot-carried per-level state/pointers, trial computation, historical
 `N-2` registry and `N-1` eta inputs, KES/VRF verification, SMT inclusion path,
 proof comparison, size limits, cache reconstruction, and density-reorg rollback.
 A single GL0 peer may supply a proof, but it must verify from a trusted genesis or
@@ -173,10 +192,10 @@ proof truth.
 
 ### O-09 Pure opaque state-channel product scope
 
-`FrameworkCurrency` and `FrameworkCurrencyWithData` are locked. Whether a future
-standalone opaque/data-only lane exists remains a product decision. If retained,
-it has no framework-economic write surface and receives only authenticated
-inclusion/availability semantics.
+`FrameworkCurrency` and `FrameworkCurrencyWithData` are locked. The owner also retains the limited
+standalone opaque/data-only lane needed for v4 functionality. It has no framework-economic write
+surface, receives only authenticated inclusion/availability semantics, and uses an explicit signed
+lane/type; decoder success can never select or promote it.
 
 ### O-10 Portable shard-parent duty and slot bound
 
@@ -186,7 +205,7 @@ chain store, so a GL0 producer that saw shard gossip can accept an artifact that
 follower missing that gossip rejects. Parent availability may delay validation, but
 prior receipt cannot be a validity input.
 
-**Recommendation:** add an exact `(ordinal, hash)` reference to the GL0 snapshot that
+**Owner-ratified direction:** add an exact `(ordinal, hash)` reference to the GL0 snapshot that
 carried the parent checkpoint to the child's signed preimage. A verifier requires that
 exact GL0 snapshot to be Phase 2 under the hash-bound `FinalityGate`, extracts the
 parent checkpoint under the same shard ID, hashes its canonical signing preimage to
@@ -205,11 +224,12 @@ halting honest successor production until wall time catches up.
 
 ### O-11 Permissionless GL0 operator roster
 
-Freeze the canonical rule that turns a `PeerId` into an eligible GL0 operator:
-required registration, stake and/or collateral, minimum bond, activation and exit
-delay, slash/cooldown interaction, and the exact period-boundary root retained for
-historical verification. Key registration proves ownership only and cannot grant
-membership.
+**Owner-ratified structure:** Cardano-style minimum self-stake/pledge and slashable self-bond,
+delegation permitted and slashed proportionally with the operator, with
+`bond >= extractable value in one fraud window`. Key registration proves ownership only and
+cannot grant membership. Engineering must encode the canonical rule that turns a `PeerId` into
+an eligible GL0 operator, including activation/exit, slash/cooldown, and exact period-boundary
+root semantics, then derive per-network bounds.
 
 This rule is load-bearing for every uniform `1/N` admission, execution, and
 watchtower population. Using every positive-stake identity without a rooted
@@ -231,12 +251,12 @@ resolver correctly keeps a roster separate from key registration and fails when
 one is unavailable; production does not yet supply that rooted roster
 (`HistoricalOperatorConsensusKeyRegistry.scala:37-63,126-140,201-231`). Its model
 also requires positive stake after the supplied roster intersection
-(`HistoricalOperatorConsensusKeyRegistry.scala:169-198`); that may be an
-owner-ratified backing predicate, but cannot define the roster by itself. Neither
+(`HistoricalOperatorConsensusKeyRegistry.scala:169-198`); positive stake is a necessary input
+but cannot define the ratified self-bond/backing predicate or roster by itself. Neither
 the seedlist, observed peers, a valid key record, nor positive stake is an interim
 authority.
 
-**PROPOSED, NOT RATIFIED - atomic historical population boundary.** At the exact
+**Owner-ratified direction; schema not frozen - atomic historical population boundary.** At the exact
 closing snapshot of period `P`, every GL0 producer and verifier would run one pure,
 era-selected authorization rule over the same post-transition rooted state and
 commit one canonical value whose sorted map keys are the exact authorized operator
@@ -276,7 +296,7 @@ nodes through the seedlist
 operator roster. The event/state machinery may be reused; the seedlist decision may
 not.
 
-**Owner answers still required before schema or runtime work:**
+**Open engineering/parameter freeze gates before schema or runtime activation:**
 
 - minimum self-bond versus total delegated/collateral backing, and whether a third
   party may collateralize an operator;
@@ -293,22 +313,25 @@ not.
 - bounded registration/state-growth fees or limits, without making registration a
   membership grant.
 
-After those answers, delivery order is: canonical codec/root ownership, immutable
+After those gates are specified, delivery order is: canonical codec/root ownership, immutable
 genesis population, pure boundary derivation and undo/refold, exact-parent N-2/N-1
 resolver, exact Phase-2 artifact references, all-consumer migration, then fixture
-and adversarial qualification. O-11 remains open until that sequence passes the
+and adversarial qualification. O-11 remains activation-blocked until that sequence passes the
 `KEYREG-013`, `PERM-*`, and `PARAM-001` gates.
 
 ### O-12 Runtime KES secret deletion and N-2 reorg boundary
 
-Freeze the common-prefix assumption under which an operator may delete/evolve
+**Owner-ratified baseline:** delete/evolve KES secret material at eta-period evolution; do not
+retain old masters through `k2`; an objective reorg across erased activation enters
+`RecoveryRequired` and explicit rejoin, and missing secret history is never slash evidence.
+Engineering must quantify the common-prefix assumption under which an operator may delete/evolve
 past KES secret material after a paired runtime registration becomes active.
 Eligibility in period `N` reads the registration/roster/stake prefix at `N-2`,
 but Phase-2 state remains density-reorgable. KES secret state is deliberately
 one-way and must not be modeled as another MPT field that ordinary Phase-2
 rollback can restore.
 
-The recommended baseline is: the activation policy explicitly assumes the N-2
+The baseline activation policy explicitly assumes the N-2
 prefix is common-prefix stable at the ratified security bound; an objective
 density reorg that nevertheless crosses an activation whose prior KES secret was
 erased puts the operator in durable `RecoveryRequired`. It stops all consensus
@@ -319,13 +342,14 @@ be guilt or slash evidence.
 
 Retaining old KES masters through the local `k2` horizon would allow automatic
 secret rollback only by weakening the KES forward-security guarantee. That is
-not an implicit retention policy. Ratify the exact deletion point, the quantified
-common-prefix failure probability, whether any offline escrow is permitted, and
-the recovery/rejoin availability consequences before runtime key activation.
+not an implicit retention policy. Engineering must encode the exact deletion point, quantify the
+common-prefix failure probability, and implement recovery/rejoin consequences before runtime key
+activation. Offline escrow economics are deferred and non-load-bearing for V1; V1 cannot assume
+escrow for safety or automatic rollback.
 
 ### O-13 Durable global delivery sequence and settlement ordering
 
-**PROPOSED, NOT RATIFIED.** Replace `GlobalSnapshotsProcessed` and every bounded
+**Owner-ratified direction; schema not frozen.** Replace `GlobalSnapshotsProcessed` and every bounded
 history reconstruction with a hash-linked sequence per destination metagraph.
 GL0 atomically appends canonical framework delivery records and advances a rooted
 outbox head with the settlement and permanent authorization nullifier. ML0 stores
@@ -335,7 +359,7 @@ emits a compare-and-set acknowledgement. Acknowledgement changes representation
 only: effective balances before and after compaction are byte-identical and the
 permanent economic nullifier remains.
 
-The recommended granularity is a bounded canonical per-metagraph batch with
+The owner-ratified granularity is a bounded canonical per-metagraph batch with
 contiguous multi-entry acknowledgement. GL0 ordinals are not delivery sequence
 numbers: they are sparse, and ML0 may discover an older still-pending delivery
 after observing a higher GL0 ordinal. GL0 assigns its destination sequence at the
@@ -344,11 +368,12 @@ individual rooted leaves, not one growing field-18 ordinal set. Their framework
 bytes remain available until acknowledged; missing bytes defer rather than
 authorizing a peer claim or skipping an effect.
 
-Owner answers still required before schema allocation:
+Open engineering/schema freeze gates before allocation:
 
 - the exact total order among an already-canonical inbound delivery, local spend,
-  consume, cancel, expiry, and refund; inbox-before-local-spend is the recommended
-  fixed first rule, but it does not settle the other conflicts;
+  consume, cancel, expiry, and refund after the ratified fixed first rule that the
+  inbox applies before local spend; that first rule does not settle the other
+  conflicts;
 - rooted limits for record bytes, entries per batch/snapshot, pending entries,
   deterministic backpressure, and protocol fees; local HOCON is not validity;
 - exact retention and authenticated deep-recovery behavior after local history is
@@ -362,7 +387,7 @@ cannot silently default a missing cursor into signable state.
 
 ### O-14 Framework fee sequence and opaque-data binding
 
-**PROPOSED, NOT RATIFIED.** Reuse the already rooted per-metagraph
+**Owner-ratified direction; schema not frozen.** Reuse the already rooted per-metagraph
 `MgLastFeeTxRefs` partition (field 27) as the strict head for each fee source. A
 framework fee signs network/genesis, era/lane, metagraph, source, destination,
 amount, exact parent reference, and an exact opaque-data commitment. Acceptance
@@ -371,7 +396,7 @@ available bytes or a content-addressed chunk manifest without executing DL1 logi
 and atomically updates balances plus the head. Signature proofs do not change the
 semantic fee identity.
 
-Recommended v1 rules are:
+The owner-ratified v1 rules are:
 
 - exactly zero or one framework fee per custom item; no unmatched item, orphan
   fee, duplicate mapping, or extra fee record is accepted;
@@ -384,9 +409,9 @@ Recommended v1 rules are:
 - a newly signed successor may intentionally pay again for identical data. A ban on
   repeated semantic data requires a separate explicit data nullifier.
 
-The remaining owner choice is exact signed-item bytes versus a content-addressed
-chunk-manifest root. The recommendation is the manifest only when every exact chunk
-is available before an execution signature. GL0 verifies bytes, availability,
+The ratified conditional rule uses a content-addressed chunk-manifest root only when every exact
+chunk is available before an execution signature; otherwise the fee binds exact signed-item
+bytes. Engineering must encode the tagged shape and close the E9 reservation interaction. GL0 verifies bytes, availability,
 authorization, sequence, arithmetic, and conservation; it never treats ML0 custom
 execution output as economic authority. The outer `StateChannelSnapshotBinary.fee`
 is a separate global-balance operation and still requires E9's checkpoint-wide
@@ -394,16 +419,18 @@ reservation kernel.
 
 ### O-15 Multi-tine Taktikos/Genesis frontier semantics
 
-Owner review packet: [O-15 Multi-Tine Frontier Owner Review](O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md).
+Engineering/proof packet: [O-15 Multi-Tine Frontier Owner Review](O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md).
 
-**RATIFIED PROPERTY; OPEN PROTOCOL AND PROOF GATE.** L-04 fixes the binary rule
+**RATIFIED PROPERTY AND RESEARCH DIRECTION; ACTIVATION-BLOCKING PROTOCOL/PROOF GATE.** L-04 fixes the binary rule
 boundary: `maxvalid-tk` within `k1` and Genesis-family `maxvalid-bg` beyond `k1`.
 L-24 now fixes the multi-tine semantics: once two nodes have the same
 cutoff-complete published valid frontier and branch-authenticated parameters, they must
 produce the same canonical head independently of enumeration, prior arrival
 order, restart, and prior incumbent. Interim heads may differ before their
 published frontiers converge; a late valid reveal extends the frontier and
-requires deterministic reselection. This does not yet define the concrete
+requires deterministic reselection. The owner-ratified research direction uses density measured
+from one common anchor and reserves the tower for mechanism/portable evidence, never an override.
+This does not yet define the concrete
 objective selector or its portable declared-frontier evidence. No Nakamoto-only
 artifact can prove that an adversary has no unrevealed private tine.
 
@@ -458,7 +485,7 @@ parameter era, or the selected result (`FinalityCore.scala:120-138,353-364`;
 `FinalityBaseCodecs.scala:96-119,178-179`;
 `FinalityIntentValidator.scala:59-120,748-761`).
 
-The following design/proof work remains open and must land coherently:
+The following engineering/research freeze gates remain and must land coherently:
 
 - **A - Selector:** define a total deterministic function over the complete valid
   frontier that resolves mixed short/deep cycles without an incumbent or hidden
@@ -484,8 +511,8 @@ The following design/proof work remains open and must land coherently:
   (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/config/types.scala:173-177`;
   `GlobalSnapshotConsensus.scala:1074-1088`; `ChainSelection.scala:161-175,187-240`;
   `ChainSelectionSuite.scala:228-250`).
-- **E - Exact ties:** define an objective tie result. In particular, ratify or
-  reject the current lower-VRF then hash rule; it is not in either cited algorithm
+- **E - Exact ties:** define and prove an objective tie result, or reject the current lower-VRF
+  then hash rule; it is not in either cited algorithm
   and must be assessed for precomputation and grinding.
 - **F - Lineage and overflow:** classify arbitrary-depth strict ancestry before
   any divergent-tine rule so a valid descendant cannot lose to its own prefix.
@@ -500,10 +527,10 @@ and `k2` remains retention/recovery policy only.
 
 ### O-16 Exact Phase-2 consumer lease and invalidation
 
-Owner review packet:
-[P6 FIN-14 Phase-2 Consumer Lease](P6-FIN14-PHASE2-CONSUMER-LEASE.md#10-owner-review-required).
+Engineering packet:
+[P6 FIN-14 Phase-2 Consumer Lease](P6-FIN14-PHASE2-CONSUMER-LEASE.md#10-ratified-choices-and-engineering-freeze-gates).
 
-**PROPOSED, NOT RATIFIED.** `FIN-14` requires more than replacing the ordinal
+**OWNER-RATIFIED DIRECTION; SCHEMA/DEPENDENCIES NOT FROZEN.** `FIN-14` requires more than replacing the ordinal
 watermark with an exact-ref query. A consumer can verify a valid exact P2 anchor,
 wait for committee work, and then mutate after a density replacement. The proposed
 local `CanonicalPhase2Lease` therefore binds the complete exact ref, released-core
@@ -513,7 +540,7 @@ non-serializable, non-portable, and usable only through a short
 `commitIfCurrent`; no finality/MPT/chain lock is held across network, DA, replay,
 signature, or committee waits. Portable evidence remains separately verified.
 
-Acquisition is proposed as two short coordinator operations around unlocked
+Acquisition uses two short coordinator operations around unlocked
 immutable verification. The first captures a complete descriptor of revisions,
 lineage, target, evidence/readback pointers, purpose policy, and sink revision. The
 second compare-and-sets that same descriptor after snapshot, evidence, MPT,
@@ -521,7 +548,7 @@ semantic, and anchor verification. Holding a coordinator/finality lock across
 complete-image verification is forbidden, while a single pre-verification read is
 insufficient because it leaves the `FOLLOW-008C` race.
 
-The recommended revision rule uses `CanonicalBranchRevision` for every selection
+The ratified revision rule uses `CanonicalBranchRevision` for every selection
 mutation and a separate monotone `CanonicalLineageRevision` for any
 rollback/replacement/recovery that removes or substitutes a previously canonical
 hash. Pure descendant extension may preserve an exact-ancestor use after a final
@@ -529,12 +556,10 @@ recheck. Every replacement invalidates all old-generation permits; even a target
 that survives below the MRCA must be reacquired. This deliberately prevents ABA
 reuse and avoids requiring a complete selective dependency graph in V1.
 
-Owner review must freeze the new choices and confirm that the packet represents
-the locked constraints accurately:
+Engineering must encode and verify these ratified choices and remaining freeze gates:
 
-- **O-16A - replacement invalidation:** conservative all-lease invalidation on
-  replacement versus selective orphan-only
-  invalidation;
+- **O-16A - replacement invalidation:** every replacement invalidates all old leases; selective
+  orphan-only invalidation is not V1;
 - **O-16B - exhaustive purpose policy:** explicit, closed purpose cases for binary
   admission/confirmation/requeue, shard execution, checkpoint inclusion/anchor,
   assigned-watchtower replay,
@@ -545,76 +570,72 @@ the locked constraints accurately:
   delivery; for each, freeze
   still-canonical exact-ancestor versus current-P2-head behavior without reopening
   L-19's signed historical-reference rule;
-- **O-16C - attestation reuse:** whether raw signed admission attestations may be
-  reverified and reindexed after a
-  target-surviving replacement (recommended), while prior counts/thresholds may
-  never transfer;
-- **O-16D - historical age:** whether exact historical P2 references have a
-  consensus age bound beyond
-  operation-specific expiry and authenticated data availability; local wall clock
-  or HOCON cannot decide validity;
+- **O-16C - attestation reuse:** raw signed admission attestations may be reverified and reindexed
+  after a target-surviving replacement; prior counts/thresholds never transfer;
+- **O-16D - historical age:** local wall clock or HOCON cannot decide validity. Engineering must
+  define any operation-specific or branch-authenticated age/freshness bound through ECON-G;
 - **O-16E - effect-journal conformance:** conformance to L-23's already locked
   idempotent effect-journal boundary for
   admission/cache/tally/shard-buffer commit and inverse/requeue; and
-- **O-16F - signed scope schema:** the active-era signed
-  full-ref/registry/parameter/purpose shape replacing the
-  current incomplete `GlobalSyncView` consumer scope.
+- **O-16F - signed scope schema:** the active-era signed full
+  `GlobalSnapshotStateRef`/registry/parameter-era/purpose shape replaces the current incomplete
+  `GlobalSyncView` consumer scope; its concrete codec remains engineering.
 
 The exact-ancestor rule and effect-journal strategy are conformance checks, not
 open alternatives to L-19 or L-23.
 
 The exact contract, current-source interleavings, invalidation inventory, and
-`FOLLOW-008A` through `FOLLOW-008P` matrix are in the linked packet. No live lease issuer may land before O-16 is
-ratified and O-15, O-01, released-core readback, ROOT semantic/image gates, and
+`FOLLOW-008A` through `FOLLOW-008P` matrix are in the linked packet. No live lease issuer may land before O-16's
+engineering freeze gates close and O-15, O-01, released-core readback, ROOT semantic/image gates, and
 consumer effect ordering are independently verified. Wrapping the current Boolean
 adapter in an opaque type is explicitly forbidden.
 
 ### O-17 ROOT-008 GL0 partition grammar
 
-Owner review packet:
-[ROOT-008 GL0 Partition Grammar](ROOT-008-GL0-PARTITION-GRAMMAR.md#8-owner-review-required).
+Engineering packet:
+[ROOT-008 GL0 Partition Grammar](ROOT-008-GL0-PARTITION-GRAMMAR.md#8-ratified-anchors-and-engineering-freeze-gates).
 
-**PROPOSED, NOT RATIFIED.** `ROOT-008` owns canonical physical placement, one
+**OWNER-RATIFIED DIRECTION; SCHEMA/PROOFS NOT FROZEN.** `ROOT-008` owns canonical physical placement, one
 active-era value codec per field, logical identity/scope reproduction, bounded
 decoding, and structural/index/population relations. It does not replace the P2
 economic oracle or the O-07/ECON-G authorization, conservation, backing, replay,
 and transition rules. Both gates must pass before a structurally valid image can
 be used as canonical economic state.
 
-Owner review must freeze these exact anchors before schema activation:
+Engineering must encode and verify these ratified anchors before schema activation:
 
-- **O-17/R008-01 - retired ID lifecycle:** recommend deleting physical IDs 3, 6,
+- **O-17/R008-01 - retired ID lifecycle:** delete physical IDs 3, 6,
   and 21 from active GL0, deleting 32 after ROOT-010 witness parity, retaining
   numeric gaps, and handling upstream-v4 disk history only through an offline
   typed import rather than live fork-only compatibility decoders.
-- **O-17/R008-02 - field-20 self-authentication:** recommend storing
+- **O-17/R008-02 - field-20 self-authentication:** store
   `(EtaPeriod, HistoricalStakeSnapshot)` so the leaf reproduces its physical key.
-- **O-17/R008-03 - field-23 self-authentication:** recommend storing
+- **O-17/R008-03 - field-23 self-authentication:** store
   `(PeerId, KesRegistrationReference)` and separately proving the pointer's exact
   unique match in field 22.
-- **O-17/R008-04 - resource and persistent-growth contract:** approve measured,
+- **O-17/R008-04 - resource and persistent-growth contract:** derive measured,
   versioned per-image/field/value/member budgets and a non-halting permanent
   nullifier/slash growth strategy. A finite state-size cap cannot silently make a
   valid chain stop once permanent nullifiers reach it; authenticated compaction or
   an accumulator requires its own exact-once proof and `GROWTH-001` test plan.
-- **O-17/R008-05 - set-member identity:** recommend canonical unsigned
+- **O-17/R008-05 - set-member identity:** derive and freeze canonical unsigned
   event/content-reference hashes for economic-event uniqueness and the signed
   domain/reference identity for KES records.
-- **O-17/R008-06 - token-lock currency scope:** freeze the field-8/field-30
-  relationship among `TokenLock.currencyId`, the global partition, and the network
-  metagraph; the parser cannot infer it.
-- **O-17/R008-07 - field-32 deletion gate:** confirm exact optional full-view
+- **O-17/R008-06 - token-lock currency scope:** field 8 accepts only native/global
+  `currencyId == None`; field 30 accepts only `Some(CurrencyId(owningMetagraph))`. The parser
+  must reproduce and enforce this relationship.
+- **O-17/R008-07 - field-32 deletion gate:** prove exact optional full-view
   witness parity, `None` versus `Some(empty)`, explicit ML0 population, and
   staged/backfill/restart/reorg behavior before deleting field 32 at every GL0
   boundary. This is a conformance gate on locked L-15A, not an option to retain an
   unrooted writable field.
 
-The complete inventory, recommendations, and generated-test contract are in the
+The complete inventory, ratified directions, and generated-test contract are in the
 linked packet.
 
 ## Change rule
 
-Changing a locked answer or resolving an open gate requires one coherent change
+Changing a locked answer or closing an engineering freeze gate requires one coherent change
 that updates ADR-0016/0017 as applicable, the lifecycle, roadmap, test plan, this
 register, canonical parameter/schema definitions, and associated RED/oracle
 tests. No implementation commit may bury a protocol decision in HOCON or a

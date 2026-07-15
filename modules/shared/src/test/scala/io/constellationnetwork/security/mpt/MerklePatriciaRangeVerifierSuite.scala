@@ -11,7 +11,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.prover.MerklePatriciaRangeProver
 import io.constellationnetwork.security.mpt.prover.attestation.{MerklePatriciaRangeProof, RangeExclusionBoundaries}
-import io.constellationnetwork.security.mpt.verifier.MerklePatriciaRangeVerifier
+import io.constellationnetwork.security.mpt.verifier.{InvalidWitness, MerklePatriciaRangeVerifier}
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.auto._
@@ -81,6 +81,45 @@ object MerklePatriciaRangeVerifierSuite extends MutableIOSuite {
           proof.inclusionProofs.isEmpty,
           proof.exclusionBoundaries.isDefined
         )
+    }
+  }
+
+  test("evidence-free range proof is rejected against a nonempty root") { implicit res =>
+    implicit val (hs, js) = res
+    hs.withCurrent { implicit hasher =>
+      for {
+        valueHash <- hasher.hash("value")
+        trie <- MerklePatriciaTrie.make(Map(Hex("10".padTo(64, '0')) -> valueHash))
+        proof = MerklePatriciaRangeProof(
+          Hex("20".padTo(64, '0')),
+          Hex("30".padTo(64, '0')),
+          Nil,
+          None
+        )
+        result <- MerklePatriciaRangeVerifier.make[IO](trie.rootNode.digest).confirmRange(proof)
+      } yield
+        expect(
+          result match {
+            case Left(InvalidWitness(message)) => message.contains("canonical empty-trie root")
+            case _                             => false
+          }
+        )
+    }
+  }
+
+  test("evidence-free range proof verifies against the canonical empty-trie root") { implicit res =>
+    implicit val (hs, js) = res
+    hs.withCurrent { implicit hasher =>
+      for {
+        emptyRoot <- MerklePatriciaNode.Branch.empty[IO]
+        proof = MerklePatriciaRangeProof(
+          Hex("20".padTo(64, '0')),
+          Hex("30".padTo(64, '0')),
+          Nil,
+          None
+        )
+        result <- MerklePatriciaRangeVerifier.make[IO](emptyRoot.digest).confirmRange(proof)
+      } yield expect(result.isRight)
     }
   }
 

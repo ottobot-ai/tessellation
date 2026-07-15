@@ -36,7 +36,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-import io.constellationnetwork.validator.StateProofValidator
+import io.constellationnetwork.validator.{GlobalSnapshotActiveEraValidator, StateProofValidator}
 
 import eu.timepit.refined.cats._
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -46,7 +46,7 @@ import retry.RetryPolicies._
 import retry._
 
 object Download {
-  def make[F[_]: Async: Parallel: Random: KryoSerializer: JsonSerializer](
+  def make[F[_]: Async: Parallel: Random: KryoSerializer: JsonSerializer: SecurityProvider](
     snapshotStorage: SnapshotDownloadStorage[F],
     p2pClient: P2PClient[F],
     clusterStorage: ClusterStorage[F],
@@ -117,6 +117,7 @@ object Download {
       context: GlobalSnapshotContext
     )(implicit hasherSelector: HasherSelector[F]): F[Unit] =
       for {
+        _ <- GlobalSnapshotActiveEraValidator.requireValid[F](snapshot.value)
         hashedSnapshot <- hasherSelector.withCurrent(implicit hs => snapshot.toHashed)
         alreadyInitializedStorage <- lastNGlobalSnapshotStorage.get
         _ <-
@@ -367,13 +368,14 @@ object Download {
       retryingOnSomeErrors(retryPolicy, isWorthRetrying, retry.noop[F, Throwable]) {
         val (lastSnapshot, lastContext) = result
         hasherSelector.withCurrent(implicit hs => fetchSnapshot(none, lastSnapshot.ordinal.next)).flatMap { snapshot =>
-          hasherSelector.withCurrent { implicit hasher =>
-            lastSnapshot.toHashed[F]
-          }.flatMap { hashed =>
-            Applicative[F].unlessA {
-              Validator.isNextSnapshot(hashed, snapshot.value)
-            }(InvalidChain.raiseError[F, Unit])
-          } >>
+          GlobalSnapshotActiveEraValidator.requireValid[F](snapshot.value) >>
+            hasherSelector.withCurrent { implicit hasher =>
+              lastSnapshot.toHashed[F]
+            }.flatMap { hashed =>
+              Applicative[F].unlessA {
+                Validator.isNextSnapshot(hashed, snapshot.value)
+              }(InvalidChain.raiseError[F, Unit])
+            } >>
             HasherSelector[F].withCurrent { implicit hasher =>
               globalSnapshotContextFns
                 .createContext(
@@ -608,7 +610,10 @@ object Download {
               p2pClient.globalSnapshot
                 .get(ordinal)
                 .run(peer)
-                .flatMap(snapshot => snapshot.toHashed[F])
+                .flatMap { snapshot =>
+                  GlobalSnapshotActiveEraValidator.requireValid[F](snapshot.value) >>
+                    snapshot.toHashedWithSignatureCheck[F].flatMap(_.liftTo[F])
+                }
                 .map(_.some)
                 .handleErrorWith(e =>
                   logger

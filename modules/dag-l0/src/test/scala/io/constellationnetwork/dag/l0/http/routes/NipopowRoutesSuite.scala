@@ -69,22 +69,29 @@ object NipopowRoutesSuite extends HttpSuite {
     verifyResult: Either[ProofError, Unit] = Right(())
   ): NipopowProofProvider[IO] =
     new NipopowProofProvider[IO] {
-      def build(since: SnapshotOrdinal, k: Int): IO[TowerProof] = IO.pure(proof)
+      def build(since: SnapshotOrdinal, k: Int): IO[Either[NipopowProofUnavailable, TowerProof]] = IO.pure(Right(proof))
       def verify(p: TowerProof): IO[Either[ProofError, Unit]] = IO.pure(verifyResult)
     }
 
   /** Stub provider whose `build` returns an empty proof (no L0 suffix) — used to exercise the 404 path. */
   private def emptyProvider: NipopowProofProvider[IO] =
     new NipopowProofProvider[IO] {
-      def build(since: SnapshotOrdinal, k: Int): IO[TowerProof] = IO.pure(TowerProof.Empty)
+      def build(since: SnapshotOrdinal, k: Int): IO[Either[NipopowProofUnavailable, TowerProof]] =
+        IO.pure(Right(TowerProof.Empty))
       def verify(p: TowerProof): IO[Either[ProofError, Unit]] = IO.pure(Right(()))
     }
 
   /** Stub provider whose `build` returns a proof whose `tipOrdinal < since` — exercises the 400 "ahead of head" path. */
   private def behindHeadProvider(reportedTip: Long): NipopowProofProvider[IO] =
     new NipopowProofProvider[IO] {
-      def build(since: SnapshotOrdinal, k: Int): IO[TowerProof] =
-        IO.pure(TowerProof(since, ord(reportedTip), Vector.empty, Map.empty))
+      def build(since: SnapshotOrdinal, k: Int): IO[Either[NipopowProofUnavailable, TowerProof]] =
+        IO.pure(Right(TowerProof(since, ord(reportedTip), Vector.empty, Map.empty)))
+      def verify(p: TowerProof): IO[Either[ProofError, Unit]] = IO.pure(Right(()))
+    }
+
+  private def unavailableProvider(reason: NipopowProofUnavailable): NipopowProofProvider[IO] =
+    new NipopowProofProvider[IO] {
+      def build(since: SnapshotOrdinal, k: Int): IO[Either[NipopowProofUnavailable, TowerProof]] = IO.pure(Left(reason))
       def verify(p: TowerProof): IO[Either[ProofError, Unit]] = IO.pure(Right(()))
     }
 
@@ -97,6 +104,23 @@ object NipopowRoutesSuite extends HttpSuite {
       routes <- mkRoutes(None)
       r <- expectHttpStatus(routes, req)(Status.ServiceUnavailable)
     } yield r
+  }
+
+  test("GET /nakamoto/nipopow/proof maps typed catch-up unavailability to 503") {
+    val req = GET(uri"/nakamoto/nipopow/proof")
+    for {
+      routes <- mkRoutes(Some(unavailableProvider(NipopowProofUnavailable.RecoveryRequired)))
+      response <- routes.run(req).value
+      result <- response match {
+        case Some(value) =>
+          value.as[Json].map { body =>
+            expect
+              .same(value.status, Status.ServiceUnavailable)
+              .and(expect(body.hcursor.downField("reason").as[String].toOption.contains("recovery_required")))
+          }
+        case None => IO.pure(failure("route not found"))
+      }
+    } yield result
   }
 
   test("GET /nakamoto/nipopow/proof returns 200 with TowerProof body on success") {

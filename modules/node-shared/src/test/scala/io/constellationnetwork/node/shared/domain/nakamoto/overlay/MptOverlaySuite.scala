@@ -799,6 +799,29 @@ object MptOverlaySuite extends MutableIOSuite {
 
   // ----- buildRoot includes branch deltas -----
 
+  test("multi-branch: removing the final base key captures the canonical empty trie") { res =>
+    implicit val (h, _, js) = res
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      onlyKey = gskBalance(798)
+      _ <- store.insert[Balance](onlyKey, Balance(NonNegLong(100L)))
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.remove(onlyKey)
+      _ <- overlay.commit(handle, branchA, ordinal)
+
+      image <- overlay.captureBranchImage(branchA).flatMap(_.liftTo[IO])
+      compatibilityRoot <- overlay.buildRoot(branchA, ordinal).flatMap(_.liftTo[IO])
+      expected <- io.constellationnetwork.security.mpt.MerklePatriciaTrie.makeParallelFromBytes[IO](Map.empty)
+    } yield
+      expect.all(
+        image.entries.isEmpty,
+        image.trie.rootHash == expected.rootHash,
+        compatibilityRoot.rootHash == expected.rootHash
+      )
+  }
+
   test("multi-branch: buildRoot for sibling branches yields different root hashes") { res =>
     implicit val (h, _, js) = res
     for {
@@ -823,6 +846,62 @@ object MptOverlaySuite extends MutableIOSuite {
         rootA.isRight,
         rootB.isRight,
         rootA.toOption.map(_.rootHash) != rootB.toOption.map(_.rootHash)
+      )
+  }
+
+  test("multi-branch: branch-image capture is defensively owned and does not mutate producer root caches") { res =>
+    implicit val (h, _, js) = res
+    val baseOrdinal = SnapshotOrdinal(NonNegLong(10L))
+    val proofOrdinal = SnapshotOrdinal(NonNegLong(11L))
+
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+
+      baseKey = gskBalance(850)
+      branchKey = gskBalance(851)
+      _ <- store.insert[Balance](baseKey, Balance(NonNegLong(100L)))
+      _ <- store.build(baseOrdinal).rethrow
+
+      baseEntriesBefore <- snapshotBytes(store)
+      currentRootBefore <- store.underlying.getCurrentRootHash
+      lastBuiltBefore <- store.underlying.getLastBuiltOrdinal
+      proofOrdinalBefore <- store.underlying.getRootHashForOrdinal(proofOrdinal)
+
+      handle <- overlay.checkout(parentP)
+      _ <- handle.insert[Balance](branchKey, Balance(NonNegLong(7L)))
+      _ <- overlay.commit(handle, branchA, proofOrdinal)
+
+      image <- overlay.captureBranchImage(branchA).flatMap(_.liftTo[IO])
+      compatibilityRoot <- overlay.buildRoot(branchA, proofOrdinal).flatMap(_.liftTo[IO])
+      branchKeyHex <- GlobalStateKey.toHex[IO](branchKey)
+      capturedValue = image.entries(branchKeyHex)
+
+      // Every legacy byte-map projection owns fresh arrays. Mutating one projection must not alter
+      // the immutable image used by the trie/proof path.
+      projected = image.toByteMap
+      _ <- IO {
+        val bytes = projected(branchKeyHex)
+        bytes(0) = (bytes(0) ^ 0x01).toByte
+      }
+
+      // Mutating the live base after capture must likewise leave the captured branch image unchanged.
+      _ <- store.insert[Balance](gskBalance(852), Balance(NonNegLong(9L)))
+
+      baseEntriesAfter <- snapshotBytes(store)
+      currentRootAfter <- store.underlying.getCurrentRootHash
+      lastBuiltAfter <- store.underlying.getLastBuiltOrdinal
+      proofOrdinalAfter <- store.underlying.getRootHashForOrdinal(proofOrdinal)
+    } yield
+      expect.all(
+        image.trie.rootHash == compatibilityRoot.rootHash,
+        image.entries(branchKeyHex) == capturedValue,
+        image.toByteMap(branchKeyHex).toList == capturedValue.toArray.toList,
+        currentRootAfter == currentRootBefore,
+        lastBuiltAfter == lastBuiltBefore,
+        proofOrdinalBefore.isEmpty,
+        proofOrdinalAfter.isEmpty,
+        !sameBytes(baseEntriesAfter, baseEntriesBefore)
       )
   }
 

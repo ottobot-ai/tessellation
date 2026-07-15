@@ -20,7 +20,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-import io.constellationnetwork.validator.StateProofValidator
+import io.constellationnetwork.validator.{GlobalSnapshotActiveEraValidator, StateProofValidator}
 
 import io.circe.Json
 import org.typelevel.log4cats.SelfAwareStructuredLogger
@@ -108,6 +108,7 @@ object GlobalSnapshotTraverse {
           (hashCandidate, incHashesNec) <- discoverHashesChain(rollbackHash)
           _ <- logger.info(s"Rollback hash candidate: ${hashCandidate.show}")
           firstInc <- loadIncOrErr(incHashesNec.head)
+          _ <- GlobalSnapshotActiveEraValidator.requireValid[F](firstInc.value)
 
           firstInfo <- loadFullOrIncOrErr(hashCandidate).flatMap {
             case Left(globalIncrementalSnapshot) => loadInfoOrErr(globalIncrementalSnapshot.ordinal)
@@ -183,6 +184,7 @@ object GlobalSnapshotTraverse {
             case ((lastCtx, lastInc), hash) =>
               for {
                 inc <- loadIncOrErr(hash)
+                _ <- GlobalSnapshotActiveEraValidator.requireValid[F](inc.value)
 
                 (hashedInc, (updatedState, _)) <- HasherSelector[F].withCurrent { implicit hasher =>
                   for {

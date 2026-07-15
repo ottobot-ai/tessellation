@@ -3,7 +3,6 @@ package io.constellationnetwork.validator
 import cats.data.Validated
 import cats.data.Validated.Invalid
 import cats.effect.Async
-import cats.kernel.Eq
 import cats.syntax.all._
 import cats.{Parallel, Show}
 
@@ -90,8 +89,8 @@ object StateProofValidator {
     val expectedStateProof = snapshot.signed.value.stateProof
 
     val result = Validated.cond(
-      // `equivalent` is structural equality for every field EXCEPT GlobalSnapshotStateProof.smtRoot (not recomputable on this rebuild
-      // path; see StateProofComparison). Every other proof type uses full Eq via `StateProofComparison.fromEq`.
+      // GlobalSnapshotStateProof is compared field-for-field, including the dark `smtRoot` slot. Active-era ingress guards additionally
+      // reject any populated slot before storage, adoption, traversal, or serving.
       StateProofComparison[P].equivalent(stateProof, expectedStateProof),
       (),
       StateBroken(snapshot.ordinal, snapshot.hash)

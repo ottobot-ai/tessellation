@@ -84,7 +84,7 @@ object TransactionReferenceManagerParitySuite extends MutableIOSuite {
 
   private def mkOverlayPassthrough(
     store: MptStore[IO, GlobalStateKey]
-  ): IO[MptOverlay[IO, GlobalStateKey]] =
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[MptOverlay[IO, GlobalStateKey]] =
     ParentChildTree.make[IO].map(MptOverlay.passthrough[IO, GlobalStateKey](store, _))
 
   private def mkSignedTx(source: Address, destination: Address): Signed[Transaction] =

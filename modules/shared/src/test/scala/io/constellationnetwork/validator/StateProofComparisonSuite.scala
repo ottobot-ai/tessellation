@@ -66,10 +66,9 @@ object StateProofComparisonSuite extends SimpleIOSuite {
     expect(diffs.exists(_.startsWith("balances(c="))).and(expect(diffs.exists(_.startsWith("mptRoot(c=")))).and(expect(diffs.size == 2))
   }
 
-  pureTest("smtRoot-only difference: surfaced by fieldDiffs (diagnostic) but ignored by equivalent") {
+  pureTest("smtRoot-only difference is named and breaks equivalence") {
     val a = base.copy(smtRoot = Some(h("33")))
     val b = base.copy(smtRoot = None)
-    // `equivalent` normalizes smtRoot away on both sides, so an smtRoot-only delta is still equivalent — yet the diagnostic still shows it.
-    expect(cmp.equivalent(a, b)).and(expect(cmp.fieldDiffs(a, b).exists(_.startsWith("smtRoot(c="))))
+    expect(!cmp.equivalent(a, b)).and(expect(cmp.fieldDiffs(a, b).exists(_.startsWith("smtRoot(c="))))
   }
 }

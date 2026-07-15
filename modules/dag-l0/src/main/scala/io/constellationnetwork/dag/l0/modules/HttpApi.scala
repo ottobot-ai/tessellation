@@ -84,12 +84,19 @@ object HttpApi {
     // MultiBranch, whereas the `_signed` store holds the EXACT bytes `accept()` derived the signed `mptRoot` from — so the served map
     // reproduces the signed root BY CONSTRUCTION and the follower's verify gate passes without falling back to the legacy re-encode. It
     // backs the additive `/latest/combined/mpt-entries` route, serving gl0's SIGNED MPT byte map at the finalized ordinal VERBATIM (no
-    // re-encode). Read-only access to the finality-gated files is race-free with the sink's writes. NOTE: era-gate is a follow-up — the
-    // route is purely additive (new endpoint), so it always serves for now.
+    // re-encode). Read-only access to the finality-gated files is race-free with the sink's writes. Every combined/checkpoint/byte response
+    // parses and validates the exact signed artifact in each raw combined/checkpoint file before serving it. Exact-ordinal byte-only
+    // responses, which carry no snapshot themselves, are gated by the corresponding persisted global incremental snapshot; if that sibling
+    // artifact is missing from retained storage, the byte response fails closed rather than exposing an unaudited derivative.
     FinalizedSnapshotReader
       .nakamotoF[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo](
         FinalityGate[F],
         combinedSnapshotCheckpointFileSystemStorage,
+        ordinal =>
+          storages.globalSnapshot.get(ordinal).map {
+            case Some(snapshot) => io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator.validate(snapshot.value).isRight
+            case None           => false
+          },
         fs2.io.file.Path(sharedConfig.mptSnapshotInfoPath.toString + "_signed")
       )
       .flatMap { finalizedReader =>

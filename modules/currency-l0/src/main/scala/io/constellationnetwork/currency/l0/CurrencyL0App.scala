@@ -277,7 +277,6 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
                       // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
                       sharedServices.etaStateManager.forgetUncommitted
                     )
@@ -313,7 +312,6 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
                       // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
                       sharedServices.etaStateManager.forgetUncommitted
                     )
@@ -363,7 +361,6 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
                       // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
                       sharedServices.etaStateManager.forgetUncommitted
                     )
@@ -465,7 +462,6 @@ abstract class CurrencyL0App(
                       dataApplicationService,
                       keyPair,
                       mkCell,
-                      sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
                       // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
                       sharedServices.etaStateManager.forgetUncommitted
                     )
@@ -570,7 +566,6 @@ abstract class CurrencyL0App(
                   dataApplicationService,
                   keyPair,
                   mkCell,
-                  sharedConfig.nakamoto.confirmationDepthK(sharedConfig.environment).value,
                   // Track-3 S4: follower base-revert hook — drop the eta walk cache on resync-to-canonical.
                   sharedServices.etaStateManager.forgetUncommitted
                 )

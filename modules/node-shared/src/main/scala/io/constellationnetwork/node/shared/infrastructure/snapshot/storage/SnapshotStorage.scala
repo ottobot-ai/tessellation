@@ -12,13 +12,14 @@ import io.constellationnetwork.ext.cats.syntax.partialPrevious._
 import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
-import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher, HasherSelector}
+import io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
@@ -106,6 +107,12 @@ object SnapshotStorage {
 
     def cutoffLogic: OrdinalCutoff = LogarithmicOrdinalCutoff.make
 
+    def requireActiveEra(snapshot: Signed[S]): F[Unit] =
+      snapshot.value match {
+        case global: GlobalIncrementalSnapshot => GlobalSnapshotActiveEraValidator.requireValid[F](global)
+        case _                                 => Async[F].unit
+      }
+
     def offloadProcess: Stream[F, Unit] =
       Stream
         .fromQueueUnterminated(offloadQueue)
@@ -171,7 +178,7 @@ object SnapshotStorage {
         .void
 
     def enqueue(snapshot: Signed[S], snapshotInfo: C)(implicit hasher: Hasher[F]) =
-      snapshot.value.hash.flatMap { hash =>
+      requireActiveEra(snapshot) >> snapshot.value.hash.flatMap { hash =>
         hashCache(hash).set(snapshot.some) >>
           ordinalCache(snapshot.ordinal).set(hash.some) >>
           snapshotLocalFileSystemStorage.write(snapshot).handleErrorWith { e =>
@@ -227,7 +234,7 @@ object SnapshotStorage {
                 }
             }
 
-          loop
+          requireActiveEra(snapshot) >> loop
         }
 
         def head: F[Option[(Signed[S], C)]] = headRef.get.map(_.map { case (snapshot, _, info) => (snapshot, info) })
@@ -287,7 +294,8 @@ object SnapshotStorage {
                 }
             }
 
-          logger.info(s"[SnapshotStorage] Recovery: setting head to ordinal=${snapshot.ordinal.show}") >>
+          requireActiveEra(snapshot) >>
+            logger.info(s"[SnapshotStorage] Recovery: setting head to ordinal=${snapshot.ordinal.show}") >>
             snapshot.toHashed.flatMap { hashed =>
               finalitySafe(hashed).ifM(
                 // Only delete existing file if a DIFFERENT snapshot exists at this ordinal
@@ -318,6 +326,7 @@ object SnapshotStorage {
 
         def setTentativeHead(snapshot: Signed[S], state: C)(implicit hasher: Hasher[F]): F[Unit] =
           for {
+            _ <- requireActiveEra(snapshot)
             hash <- snapshot.toHashed.map(_.hash)
             _ <- logger.info(
               s"[SnapshotStorage] Tentative head: ordinal=${snapshot.ordinal.show} hash=${hash.show.take(16)}"

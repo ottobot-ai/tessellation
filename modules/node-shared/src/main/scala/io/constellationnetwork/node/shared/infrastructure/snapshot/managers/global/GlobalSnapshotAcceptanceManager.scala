@@ -546,18 +546,10 @@ object GlobalSnapshotAcceptanceManager {
     // `spendActionValidator` is used verbatim ⇒ the cross-shard branch is unreachable, the gl0-local client is never constructed
     // ⇒ byte-identical to today.
     crossShardSpendProofClient: Option[ShardSubtreeProofClient[F]] = None,
-    // §3 NIPoPoW historical-commitment SMT store COUPLED with its confirmation-depth cutoff k `(store, k)`. k is read ONLY
-    // in the `Some` branch (the cutoff ordinal committed at accept(N) is `N − k`), so binding it to the store makes "wired
-    // the store but forgot k" unrepresentable — and there is NO source-level k default (Option-None is the only default, so
-    // every `None` caller — cl0/dl1/tests/the SharedServices verify-GSAM — stays free of a meaningless k literal). k is our
-    // primary security knob; it must never silently default. `Some((store, k))` is wired ONLY at the gl0 produce/verify GSAM
-    // (`GlobalSnapshotConsensus.make`), which has the finalized global-snapshot chain (`getGlobalSnapshotByOrdinal`) to
-    // derive the per-ordinal commitment for the eligible finalized ordinal `N − k`. accept() folds that ordinal's
-    // `PerOrdinalCommitment(hypergraphRoot, incrementalSnapshotHash, towerEligibility)` into the store and overrides
-    // `stateProof.smtRoot` with `smtRoot(N)` (= root over commitments ≤ N − k). gl0-leader and gl0-peer share this single
-    // GSAM/store, so they compute byte-identical roots. `None` leaves `smtRoot = None` — byte-identical to pre-SMT behavior,
-    // and excluded from the `StateProofValidator` `===` via `StateProofComparison`. (Sibling `GlobalChangeSetService.make`
-    // keeps the separate `store` + required-`k` shape; this GSAM couples them since here the `None` callers are the majority.)
+    // Staged future-era NIPoPoW historical-commitment SMT store coupled with its confirmation-depth cutoff k `(store, k)`.
+    // Current GL0 production wiring MUST pass `None`: the active-era snapshot contract requires `stateProof.smtRoot = None`, and
+    // GlobalSnapshotActiveEraValidator rejects a populated slot before persistence or adoption. Retaining this dependency keeps the
+    // unfinished tower implementation reviewable; wiring `Some` is not an activation mechanism and would produce an invalid artifact.
     historicalCommitmentSmt: Option[
       (io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore[F], Long)
     ] = None,
@@ -670,7 +662,9 @@ object GlobalSnapshotAcceptanceManager {
       new GlobalSnapshotAcceptanceManager[F] {
         private val builder = GlobalSnapshotInfo.stateProofBuilder(Some(mptStore.underlying))
 
-        /** §3 NIPoPoW historical-commitment SMT: override `proof.smtRoot` with `smtRoot(ordinal)` when the gl0 store is wired.
+        /** Staged future-era NIPoPoW computation. If the optional store is wired, this method populates `proof.smtRoot`; that output is
+          * deliberately invalid in the current active era and is rejected by GlobalSnapshotActiveEraValidator. This code is retained for
+          * owner review, not as a live activation path.
           *
           * Deterministic + producer/verifier-symmetric:
           *   - eligible ordinal `j = ordinal − k`; below the genesis/warmup window (`ordinal ≤ k`, or `j` not yet a finalized snapshot)
@@ -3122,11 +3116,8 @@ object GlobalSnapshotAcceptanceManager {
                     } yield result
                   }
 
-                // §3 NIPoPoW historical-commitment SMT: when the gl0 store is wired, fold the now-finalized eligible ordinal's
-                // commitment in and anchor `smtRoot(ordinal)`. Self-contained + producer/verifier-symmetric: the eligible
-                // ordinal `ordinal − k` and its `(mptRoot, snapshotHash)` are read from the SAME on-disk finalized snapshot via
-                // `getGlobalSnapshotByOrdinal`, so the leader and every gl0 peer derive byte-identical commitments and roots.
-                // `None` store (cl0/dl1/tests) ⇒ `stateProof = stateProofBeforeSmt` unchanged (smtRoot stays None).
+                // Current active-era wiring passes no SMT store, so the signed proof remains `smtRoot = None`. Supplying a store executes
+                // the staged future-era computation above, but the resulting artifact is rejected by the active-era boundary validators.
                 stateProof <- attachSmtRoot(ordinal, stateProofBeforeSmt, getGlobalSnapshotByOrdinal)
 
                 expiredAllowSpends = allowSpendStateManager.filterExpiredAllowSpends(

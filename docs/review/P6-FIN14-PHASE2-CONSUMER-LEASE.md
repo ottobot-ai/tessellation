@@ -1,6 +1,6 @@
 # P6-FIN14-A Exact Phase-2 Consumer Lease
 
-**Status:** Proposed for owner review; design and RED-test packet only
+**Status:** Owner direction ratified; design/RED packet with activation-blocking schema and dependency gates
 **Runtime authority:** None. This packet does not wire `FinalityGate`, issue a live
 lease, qualify a snapshot, or make state usable.
 **Finding:** `FIN-14`
@@ -472,7 +472,7 @@ negative test, not merely a schema.
 | Consumer sink | Expected digest/revision, idempotent command, readback receipt, inverse/requeue, restart verification | Not implemented for admission/shard consumers |
 | Reorg delivery | Ordered old/new/MRCA plus orphaned/adopted paths, durable downstream acknowledgement | Open |
 
-The lease interface may be coded dark after owner review, but issuance remains
+The lease interface may be coded dark under the ratified direction, but issuance remains
 disabled until these dependencies close. In particular, wrapping the current
 Boolean callback in the opaque class would preserve `FIN-14`.
 
@@ -506,9 +506,9 @@ CAS, journal append, sink write, and readback. Assertions include zero unintende
 admission receipt, state-validity/execution/optimistic signature, checkpoint
 eligibility, economic read capability, follower release, or external serving.
 
-## 9. Proposed implementation sequence
+## 9. Implementation sequence
 
-1. Ratify the owner-review items below. Do not change live issuance.
+1. Treat the ratified directions below as fixed and close their engineering freeze gates. Do not change live issuance.
 2. Add a test-only reference model for branch/lineage revisions, lease acquisition,
    and `commitIfCurrent`; make FOLLOW-008A through FOLLOW-008P executable.
 3. Close O-15/O-01 evidence verifiers and the exact P0/P1/P2 transition model.
@@ -541,44 +541,40 @@ The protocol test plan's packet map is authoritative:
 No packet may close `FOLLOW-008` alone. P6 integrates the complete matrix after the
 consumer owners supply their disjoint adapters and tests.
 
-## 10. Owner review required
+## 10. Ratified choices and engineering freeze gates
 
-The architecture already forbids ordinal inheritance and stale use. The following
-new choices and conformance points need explicit owner review before
-interface/schema work:
+The architecture already forbids ordinal inheritance and stale use. The owner has ratified the
+directions below; engineering must encode the remaining purpose, freshness, schema, and dependency
+gates before interface activation:
 
-1. **O-16A - replacement invalidation granularity.** Recommend the conservative V1 rule:
+1. **O-16A - replacement invalidation granularity.** The conservative V1 rule is ratified:
    every rollback/replacement advances `CanonicalLineageRevision` and invalidates
    all old leases, even when a target survives below the MRCA. Reacquisition can
    then preserve valid work. Selective invalidation is more available but adds a
    per-target dependency graph to every sink.
-2. **O-16B - exhaustive exact-ancestor versus latest-head purpose policy (confirm
-   locked L-19 semantics).** Freeze a policy for every sealed purpose above:
+2. **O-16B - exhaustive exact-ancestor versus latest-head purpose policy (locked
+   L-19 semantics).** Freeze a policy for every sealed purpose above:
    binary historical reads/execution may use a still-canonical exact P2 ancestor;
-   `/latest` serving requires the current P2 head. Explicitly decide watchtower,
+   `/latest` serving requires the current P2 head. Engineering must classify watchtower,
    challenge, settlement, optimistic-context, tower, correction, follower, and
    event-delivery scopes. No generic case or caller silently chooses.
-3. **O-16C - attestation reuse after a target-surviving replacement.** Recommend
-   retaining
+3. **O-16C - attestation reuse after a target-surviving replacement.** Retain
    raw signed bytes only, then rerunning registry/VRF/KES/signature and exact-anchor
    verification before indexing them into the new lineage revision. Never copy a
    prior count or threshold result.
-4. **O-16D - historical-reference age rule.** Decide whether canonical exact P2
-   ancestors
-   have a protocol maximum age beyond operation-specific expiry and available
-   authenticated recovery. Recommend no receiver-local wall-clock/HOCON validity
-   limit; any bound must be branch-authenticated protocol data and tested across
-   reorg/era boundaries.
-5. **O-16E - consumer-command durability boundary (confirm locked L-23
+4. **O-16D - historical-reference age rule.** Receiver-local wall-clock/HOCON validity limits are
+   forbidden. Engineering must define any operation-specific or branch-authenticated protocol age
+   bound through ECON-G and test it across reorg/era boundaries.
+5. **O-16E - consumer-command durability boundary (locked L-23
    semantics).** Use
    the existing L-23 model:
    finality orders an idempotent scoped command plus inverse/requeue through its
    durable effect journal; physical sink presence alone is never authority. An
    all-stores database transaction is not required.
-6. **O-16F - signed exact reference migration.** Ratify the active-era binary/checkpoint
-   shape that binds the full `GlobalSnapshotStateRef`, registry/parameter era, and
-   purpose domain. The current ordinal/hash-only `GlobalSyncView` cannot be the
-   final signed consumer scope.
+6. **O-16F - signed exact reference migration.** The active-era binary/checkpoint shape binds the
+   full `GlobalSnapshotStateRef`, registry/parameter era, and purpose domain. The current
+   ordinal/hash-only `GlobalSyncView` cannot be the final signed consumer scope; the concrete
+   schema and codec remain engineering.
 
 Items 2 and 5 are conformance checks, not requests to reopen L-19 or L-23. Items 1
 and 3 choose the V1 invalidation/revalidation behavior. Items 4 and 6 affect

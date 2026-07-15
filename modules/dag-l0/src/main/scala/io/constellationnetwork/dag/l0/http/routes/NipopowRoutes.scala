@@ -4,7 +4,7 @@ import cats.effect.Async
 import cats.effect.kernel.Ref
 import cats.syntax.all._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.nipopow.{NipopowProofProvider, ProofError, TowerProof}
+import io.constellationnetwork.node.shared.domain.nakamoto.nipopow._
 import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema.SnapshotOrdinal
 
@@ -23,7 +23,7 @@ import org.http4s.{HttpRoutes, Response}
   *     - 200 `NipopowProof` on success.
   *     - 400 if `fromOrd` is malformed, negative, or strictly greater than the local chain head.
   *     - 404 if the proof's `level0Suffix` is empty (no finalized snapshots in range — tower has no entries).
-  *     - 503 while the provider Ref is still empty (pre-startup).
+  *     - 503 while the provider Ref is empty or exact tower catch-up is not ready/requires rebuild or recovery.
   *   - `GET /nakamoto/nipopow/proof/genesis[?k=K]` — convenience for cold-start light clients; equivalent to the main route with `fromOrd =
   *     SnapshotOrdinal.MinValue`.
   *   - `POST /nakamoto/nipopow/verify` — server-side verifier offload. Accepts a Circe-encoded [[TowerProof]] body; returns 200 `{
@@ -86,13 +86,29 @@ final case class NipopowRoutes[F[_]: Async](
       case Some(provider) => f(provider)
     }
 
+  private def proofUnavailable(reason: NipopowProofUnavailable): F[Response[F]] = {
+    val kind = reason match {
+      case NipopowProofUnavailable.CatchupNotReady  => "catchup_not_ready"
+      case NipopowProofUnavailable.RebuildRequired  => "rebuild_required"
+      case NipopowProofUnavailable.RecoveryRequired => "recovery_required"
+    }
+    ServiceUnavailable(
+      Json.obj(
+        "message" -> Json.fromString("Nipopow proof service is unavailable"),
+        "reason" -> Json.fromString(kind)
+      )
+    )
+  }
+
   /** Build a proof anchored at `since` with suffix length `k`. Returns 200 on success, 404 when the proof has no L0 suffix (tower empty —
     * no finalized headers in range).
     */
   private def buildAndRespond(provider: NipopowProofProvider[F], since: SnapshotOrdinal, k: Int): F[Response[F]] =
-    provider.build(since, k).flatMap { proof =>
-      if (proof.level0Suffix.isEmpty) NotFound(Json.obj("message" -> Json.fromString("no finalized headers in requested range")))
-      else Ok(proof.asJson)
+    provider.build(since, k).flatMap {
+      case Left(reason) => proofUnavailable(reason)
+      case Right(proof) =>
+        if (proof.level0Suffix.isEmpty) NotFound(Json.obj("message" -> Json.fromString("no finalized headers in requested range")))
+        else Ok(proof.asJson)
     }
 
   protected val public: HttpRoutes[F] = HttpRoutes.of[F] {
@@ -101,22 +117,24 @@ final case class NipopowRoutes[F[_]: Async](
         case Left(err) => BadRequest(Json.obj("message" -> Json.fromString(err)))
         case Right((since, k)) =>
           withProvider { provider =>
-            provider.build(since, k).flatMap { proof =>
-              // 400 when `since` is strictly ahead of tip — the proof builder returns an empty proof
-              // in that case (tip < since means no headers fall in range), but the user-supplied
-              // anchor is unsatisfiable. Distinguishable from 404 (server is past `since` but no
-              // tower entries are present yet) by `proof.tipOrdinal`.
-              if (since.value.value > proof.tipOrdinal.value.value)
-                BadRequest(
-                  Json.obj(
-                    "message" -> Json.fromString("fromOrd is ahead of chain head"),
-                    "fromOrd" -> since.asJson,
-                    "head" -> proof.tipOrdinal.asJson
+            provider.build(since, k).flatMap {
+              case Left(reason) => proofUnavailable(reason)
+              case Right(proof) =>
+                // 400 when `since` is strictly ahead of tip — the proof builder returns an empty proof
+                // in that case (tip < since means no headers fall in range), but the user-supplied
+                // anchor is unsatisfiable. Distinguishable from 404 (server is past `since` but no
+                // tower entries are present yet) by `proof.tipOrdinal`.
+                if (since.value.value > proof.tipOrdinal.value.value)
+                  BadRequest(
+                    Json.obj(
+                      "message" -> Json.fromString("fromOrd is ahead of chain head"),
+                      "fromOrd" -> since.asJson,
+                      "head" -> proof.tipOrdinal.asJson
+                    )
                   )
-                )
-              else if (proof.level0Suffix.isEmpty)
-                NotFound(Json.obj("message" -> Json.fromString("no finalized headers in requested range")))
-              else Ok(proof.asJson)
+                else if (proof.level0Suffix.isEmpty)
+                  NotFound(Json.obj("message" -> Json.fromString("no finalized headers in requested range")))
+                else Ok(proof.asJson)
             }
           }
       }

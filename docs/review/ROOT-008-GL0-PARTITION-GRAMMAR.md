@@ -183,10 +183,10 @@ inside one exact-parent transaction.
 | 17 | `PriceState` | `PriceRecord`; GSI typed writer and `PriceStateUpdater` | `GlobalHashed`; `currentPrice`, `upcomingPrice`, and `currentSum` must carry one identical `TokenPair`; derive `HASH32(base + "/" + quote)`, reproduce key, and reject duplicate pairs. Validate price/window invariants separately. | `G + P(17)` |
 | 18 | `MetagraphSyncData` | `MetagraphSyncDataInfo`; GSI typed writer and indexed/point readers | `GlobalAddress`; MG identity comes from the exact field-18 address index. Require index/leaf bijection and monotone/canonical ordinal-set rules. | `G` only |
 | 19 | `SystemIndex` | One of `SortedSet[Address]`, `SortedSet[(Address,Address)]`, or one of three expiry-key sets; derived GSI projection and exact index readers | `SystemHashed`; only the four registered labels are legal. Label hash, field 19, empty contract, and user digest must reproduce exactly. All values must be nonempty. The user digest is `HASH32(fieldId decimal)` for active indexes and `HASH32(epoch.show)` for expiry buckets. Identity is proven only by the relational rules in section 6. | `G` only |
-| 20 | `HistoricalStakeSnapshots` | `HistoricalStakeSnapshot`; boundary writer and historical/tower readers | `GlobalHashed`; the current value does not contain its `EtaPeriod`, so the key cannot be authenticated from the leaf alone. Target value shape is an owner decision in section 8. Exactly the active retention window is permitted. | `G + P(20)` |
+| 20 | `HistoricalStakeSnapshots` | `HistoricalStakeSnapshot`; boundary writer and historical/tower readers | `GlobalHashed`; the current value does not contain its `EtaPeriod`, so the key cannot be authenticated from the leaf alone. The ratified target stores `(EtaPeriod, HistoricalStakeSnapshot)`. Exactly the active retention window is permitted. | `G + P(20)` |
 | 21 | `TowerEntries` | Dedicated local `MptTowerStore`; no canonical GL0 writer | `DENY` in the GL0 image. Tower bytes are validated by their dedicated-store grammar. Reserving a taxonomy number does not authorize a global leaf. | `DENY` |
 | 22 | `KesRegistrationCerts` | `SortedSet[KesRegistrationRecord]`; GSI typed writer and KES state manager | `GlobalHashed`; nonempty, every record carries one identical `operatorPeerId`, derive `HASH32(peerId)`, and reproduce key. Enforce signature/domain, parent/ordinal chain, active-era limits, semantic cert identity uniqueness, and no cross-operator key collision. | `G` only |
-| 23 | `LastKesRegistrationRefs` | `KesRegistrationReference`; GSI typed writer and KES pointer resolver | `GlobalHashed`; current value lacks `PeerId`, so the key is not self-authenticating. Target value/join is an owner decision in section 8. Require exactly one pointer per field-22 operator and an exact unique cert match; no dangling or extra pointer. | `G` only |
+| 23 | `LastKesRegistrationRefs` | `KesRegistrationReference`; GSI typed writer and KES pointer resolver | `GlobalHashed`; current value lacks `PeerId`, so the key is not self-authenticating. The ratified target stores `(PeerId, KesRegistrationReference)`. Require exactly one pointer per field-22 operator and an exact unique cert match; no dangling or extra pointer. | `G` only |
 | 24 | `GenesisOperatorKeys` | `GenesisOperatorConsensusKey`; genesis writer and `L0GenesisLoader` | `GlobalHashed`; value's `operatorPeerId` derives `HASH32(peerId)`. Reproduce key; reject duplicates; validate long-term signature, network/genesis domain, uniqueness of the complete KES+VRF pair, and immutable genesis-only write epoch. | `G` only |
 | 25 | `MgBalances` | `(Address, Balance)`; `infoEntryBytes`/currency writer and Mg reconstruction | `MGEntryAddress`; derive `mg` from network slot population relation and account from tuple. Reproduce exact key; reject duplicate `(mg, account)` and enforce amount bounds. | `G + C-info` |
 | 26 | `MgLastTxRefs` | `(Address, TransactionReference)`; same writer/reader family | `MGEntryAddress`; account from tuple, exact key, duplicate rejection, valid reference. | `G + C-info` |
@@ -401,7 +401,7 @@ cert chain and one pointer which resolves to exactly one record in that chain.
 Every record is signed in the correct network/genesis/era domain and binds the
 complete KES+VRF pair. Duplicate operator claims, duplicate active key pairs,
 ambiguous references, missing pointers, pointer-only operators, or reuse that
-violates the ratified rotation policy reject the image. Field 24 is immutable
+violates the frozen protocol-era rotation policy reject the image. Field 24 is immutable
 genesis identity and cannot be updated by the runtime registration writer.
 
 Registration is not eligibility. The resulting registry is later intersected
@@ -464,18 +464,16 @@ witness protocol must preserve authorization and replay semantics and pass
 growth. A numeric maximum which eventually makes an otherwise valid chain halt is
 not a completed resource policy.
 
-## 8. Owner review required
+## 8. Ratified anchors and engineering freeze gates
 
-These are the owner decisions found by this packet which block its schema
-freeze. They are registered as O-17/R008-01..07 in
-`CONSENSUS-OWNER-DECISIONS.md`. Other economic/finality owner decisions remain in
-their owning packets.
-Implementation can build interfaces and RED tests around these, but the target
-schema cannot freeze until they are answered.
+The owner has ratified O-17/R008-01..07 as dispositioned in
+`CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. The concrete identities, codecs, resource values, and
+proofs below remain engineering freeze gates. Implementation can build interfaces and RED tests,
+but the target schema cannot activate until those gates close.
 
-### O-17/R008-01 - Retired ID lifecycle (review requested)
+### O-17/R008-01 - Retired ID lifecycle
 
-**Recommendation:** delete physical field cases 3, 6, and 21 from the active GL0
+**Owner-ratified direction:** delete physical field cases 3, 6, and 21 from the active GL0
 manifest and `fromInt` acceptance; keep their numeric values unallocated rather
 than renumbering later fields. Replace field 3's current logical currency-index
 label with field 5 or a distinct logical-index enum. Delete field 32 from active
@@ -483,66 +481,61 @@ GL0 only after `ROOT-010` witness parity, then leave numeric 32 unallocated.
 Upstream-v4 disk import is an offline typed transform from the upstream schema,
 not a decoder for abandoned fork-only physical fields.
 
-**Owner confirmation needed:** numeric gaps plus an offline import tool, versus
-renumbering active fork-only fields. Renumbering changes every physical key/root
-and therefore must happen before schema freeze if selected.
+Numeric gaps plus an offline typed import are locked; do not renumber active later fields and do
+not retain abandoned fork-only compatibility decoders.
 
-### O-17/R008-02 - Field-20 self-authentication (review requested)
+### O-17/R008-02 - Field-20 self-authentication
 
 `HistoricalStakeSnapshot(stakes, eta)` does not carry the `EtaPeriod` used to
 derive its physical key (`StakeDistribution.scala:150-175`;
 `GlobalStateKey.scala:546-552`).
 
-**Recommendation:** because this is a greenfield fork-only MPT layout, store
+**Owner-ratified direction:** because this is a greenfield fork-only MPT layout, store
 `(EtaPeriod, HistoricalStakeSnapshot)` and derive the exact key from the value.
 The alternative is to invert the key over the exact candidate-ordinal retention
 window and require one unique match. That alternative is more contextual,
 couples parsing to retention, and is easier to misuse in recovery.
 
-### O-17/R008-03 - Field-23 self-authentication (review requested)
+### O-17/R008-03 - Field-23 self-authentication
 
 `KesRegistrationReference` carries only ordinal and hash, not `PeerId`
 (`KesRegistrationCert.scala:66-84`).
 
-**Recommendation:** store `(PeerId, KesRegistrationReference)`, then separately
+**Owner-ratified direction:** store `(PeerId, KesRegistrationReference)`, then separately
 prove it points to exactly one field-22 record. The alternative is a mandatory
 join against every homogeneous field-22 chain and acceptance only when exactly
 one operator resolves the reference. The tuple is simpler and makes point,
 prefix, recovery, and proof readers share one key-reproduction rule.
 
-### O-17/R008-04 - Consensus resource and growth contract (review required before activation)
+### O-17/R008-04 - Consensus resource and growth contract
 
-**Recommendation:** protocol engineering proposes concrete limits from measured
-worst-case valid snapshots and adversarial benchmarks, with headroom and a
-versioned change mechanism. The owner must approve the economic capacity target
-and maximum validation budget. No safe numeric values can be inferred from the
-current `uint16` codecs. Separately freeze the permanent nullifier/slash growth or
-authenticated compaction/accumulator strategy required by `GROWTH-001`; do not use
-a finite image cap as implicit consensus expiry.
+**Owner-ratified structure:** use measured, versioned gas/weight-style per-candidate work limits
+and a non-halting authenticated compaction/accumulator contract for permanent nullifier/slash
+growth. Engineering must derive numeric limits from worst-case valid snapshots and adversarial
+benchmarks with headroom; no safe values follow from the current `uint16` codecs. A finite image
+cap cannot become implicit consensus expiry.
 
-### O-17/R008-05 - Semantic identity of set members (review requested with ECON-G)
+### O-17/R008-05 - Semantic identity of set members
 
-**Recommendation:** uniqueness for economic event sets is the canonical unsigned
+**Owner-ratified direction:** uniqueness for economic event sets is the canonical unsigned
 event/content reference hash, not Scala object equality, arrival order, or a
 signed wrapper whose proof list can vary. KES uniqueness is the signed cert
 reference/domain identity. The exact identity function for allow-spends,
 token-locks, delegated stakes, collateral, and KES records must be frozen with
 the economic grammar and test vectors.
 
-### O-17/R008-06 - Currency scope rules inside token-lock sets (review requested with ECON-G)
+### O-17/R008-06 - Currency scope rules inside token-lock sets
 
-**Recommendation:** freeze the valid relation between a field-8/field-30
-`TokenLock.currencyId`, the GL0 global partition, and the network MG before the
-parser enforces it. The parser must not guess that `None` or a particular address
-means the surrounding MG. This is an economic-schema decision, not a generic MPT
-decision.
+**Owner-ratified rule:** field 8 accepts only native/global locks with `currencyId == None`;
+field 30 accepts only `currencyId == Some(CurrencyId(owningMetagraph))`. No cross-metagraph or
+native lock belongs in a metagraph partition. The parser must reproduce and enforce this relation.
 
-### O-17/R008-07 - Field-32 deletion checkpoint (owner review gate, design settled)
+### O-17/R008-07 - Field-32 deletion checkpoint
 
-This is a review gate, not a request to retain field 32. Review the exact signed
+Deletion after L-15A witness parity is ratified; field 32 is not retained. Engineering must prove the exact signed
 optional full-view witness, `None` versus `Some(empty)` vectors, explicit ML0
 operator population, staged/backfill/restart/reorg parity, and missing-data
-behavior before approving deletion. After approval, target GL0 rejects field 32
+behavior before activation. After the proof gate closes, target GL0 rejects field 32
 at producer diff, signer, adopter, disk, peer, bootstrap, and reorg boundaries.
 
 ## 9. Test obligations
@@ -593,7 +586,7 @@ resolved as follows:
    its bytes are unrooted.
 3. `ROOT-010` staged/backfill/restart/reorg parity passes.
 4. Field 32 is removed and denied at every GL0 boundary.
-5. The final target manifest, owner choices, limits, and generated field corpus
+5. The final target manifest, ratified anchors, derived limits, and generated field corpus
    freeze; `ROOT-008` consumers activate and key-blind parser families migrate in
    parallel.
 6. `ROOT-009` installs only a complete `ROOT-011` + `ROOT-008` verified image in
@@ -606,7 +599,7 @@ field-32 schema or installing pre-deletion bytes as target state.
 
 `ROOT-008` is complete only when:
 
-- every owner review item above is ratified in the active-era schema;
+- every ratified anchor above is encoded and every engineering freeze gate is closed;
 - one exhaustive registry covers every permitted ID and rejects every other ID;
 - field 34 has one frozen scodec value codec;
 - fields 3, 6, 21, and post-`ROOT-010` 32 cannot enter a GL0 image;

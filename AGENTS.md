@@ -72,9 +72,10 @@ exact Phase-2 GL0 state -> GL1, ML0, CL1, DL1
   custom-data commitment/availability payload. Decoder success is never a lane
   selector. Custom application output cannot authorize or synthesize a framework
   effect; an independently signed framework fee/intent may explicitly bind the
-  exact custom-data commitment and rejects if it changes. Pure
-  opaque state-channel support, if retained at all, has no framework-economic
-  effect and is an unresolved product decision.
+  exact custom-data commitment and rejects if it changes. The owner-retained
+  standalone opaque/data-only lane provides authenticated custody, availability,
+  and ordering only. It has no framework-economic effect and cannot import,
+  authorize, or synthesize framework state.
 - `authoritative*`, `AdoptFromSignedFields`, roots-only economic adoption, and
   fork-only V1/V2 compatibility schemas are forbidden. The canonical checkpoint
   byte diff is not an authoritative override: it is the exact output reproduced

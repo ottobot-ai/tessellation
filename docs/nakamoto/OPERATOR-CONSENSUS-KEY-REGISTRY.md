@@ -40,8 +40,8 @@ the registration to be in the exact branch prefix selected for `N-2` before its
 key can be used in `N`; disclosure of eta for `N` cannot be followed by a new key
 registration for that same period. This is a two-period index lookback, not a
 claim that two full period durations elapsed after an intra-period inclusion.
-Requiring that additional elapsed-duration delay would be a separate owner
-decision and must not be silently inferred as `I+3`. Wall time is never the
+The ratified V1 rule is this period-index delay; implementations must not silently
+strengthen or weaken it to an elapsed-duration `I+3` rule. Wall time is never the
 source of activation.
 
 Genesis records are the only exception to runtime inclusion delay. They are
@@ -73,7 +73,7 @@ be promoted into the missing source. The model's additional `stakeOf > 0` filter
 can enforce a ratified backing condition after roster resolution, but positive
 stake cannot become the roster rule by itself.
 
-**PROPOSED, NOT RATIFIED.** The smallest common boundary model is conceptually:
+**OWNER-RATIFIED DIRECTION; SCHEMA NOT FROZEN.** The smallest common boundary model is conceptually:
 
 ```scala
 CanonicalOperatorPopulation(
@@ -131,9 +131,10 @@ stake/collateral create, withdrawal, and pending-withdrawal state can be reused 
 identity/profile and bonded-principal inputs. Their validators use the seedlist to
 authorize target nodes, and v4 GSI contains no permissionless roster. Therefore
 the event/accounting machinery is reusable, but its membership authority is not.
-The unresolved minimum bond, delegation/collateralization, stake-splitting,
+The minimum-bond/self-pledge structure, proportional delegation slashing, and
+`bond >= extractable value in one fraud window` are ratified. Exact values,
 activation/exit/unbond, slash/cooldown, genesis-population, lifecycle-event, and
-state-growth rules remain owner gate O-11 in
+state-growth rules remain engineering and parameter freeze gates under O-11 in
 `docs/review/CONSENSUS-OWNER-DECISIONS.md`.
 
 ## 3. Signed Record
@@ -157,9 +158,11 @@ candidates in one batch, enforces sequence/effective-period monotonicity, and
 rejects cross-operator KES/VRF ownership collisions. It does not compare a new
 record's keys with that operator's prior record, so same-owner full-key reuse and
 a record in which only the KES or only the VRF key changes are currently
-accepted. Whether either form is permitted remains an explicit owner decision
-under `KEYREG-004`, `KEYREG-005`, and `KEYREG-014`; runtime activation must fail
-closed until that policy is ratified.
+accepted. The locked safety boundary is one complete, uniquely active,
+pre-registered pair selected from the exact N-2 branch prefix. Engineering must
+freeze canonical duplicate and partial-rotation semantics and prove
+`KEYREG-004`, `KEYREG-005`, and `KEYREG-014`; runtime rotation remains fail-closed
+until those schema and proof gates pass.
 
 The current `KesRegistrationCert` binds the operator, both public keys, timing,
 sequence link, and registration-parent hash, but it does **not** carry an explicit
@@ -291,8 +294,10 @@ remaining bullets are target behavior, not landed production guarantees:
   enters `RecoveryRequired`, emits no consensus signatures, and requires explicit
   operator realignment to the winning chain. Retaining old KES masters through
   `k2` would permit automatic rollback only by weakening KES forward security and
-  is not an implicit implementation option. The exact stability assumption,
-  deletion point, and recovery/rejoin procedure remain owner gate O-12.
+  is not an implicit implementation option. The no-`k2`-secret-retention and
+  `RecoveryRequired`/rejoin baseline is owner-ratified; quantifying the stability
+  assumption and implementing the deletion and recovery boundaries remain O-12
+  engineering gates.
 
 ## 8. Current State
 
@@ -331,9 +336,13 @@ artifact boundary: `ShardCheckpoint` carries an anchor ordinal and epoch but no
 exact GL0 hash/root, so SharedServices committee selection and shard
 producer/attester proof eta still use ambient `getEta(period)`. The signed
 checkpoint must bind exact Phase-2 `(ordinal,hash,mptRoot)` and every shard VRF
-consumer must use that parent. The target also must ratify one canonical result
-for a genuinely complete empty source period rather than reuse the unavailable-
-history fallback.
+consumer must use that parent. A separate engineering/reference-model gate must
+derive and freeze one portable canonical result for a genuinely complete empty
+source period while preserving the owner-ratified N-2/N-1 and fail-closed rules.
+Until that gate closes, complete-empty remains typed unavailable/defer; it cannot
+reuse an older eta, substitute producer/bootstrap randomness, sign, mutate, or
+slash. This is an unresolved liveness construction, not an unanswered owner
+choice and not permission to conflate complete-empty with incomplete history.
 
 The currently inventoried operative consensus fixtures use a canonical committed
 genesis pair. Remaining direct pair construction is registry algebra or an
@@ -371,17 +380,18 @@ This is not runtime completion. The following remain merge gates:
    hash-bound historical lookup at every producer, signer, and verifier;
 4. one typed complete/incomplete exact-parent eta-source API at the GL0 leader,
    receiver, shared boundary, admission, checkpoint, finality, tower, and
-   evidence consumers, with one explicit canonical complete-empty rule and no
-   unavailable-history fallback;
+   evidence consumers, with one reference-model-derived canonical complete-empty
+   rule and no unavailable-history fallback; complete-empty remains fail-closed
+   until that engineering gate passes;
 5. portable inclusion, activation, and registry-root proofs, including tower
    and backfill/recovery evidence;
 6. migration of every producer, verifier, selected watchtower, optimistic-
    finality sampler, tower, and slashing verifier to the historical resolver;
 7. atomic provisioning, durable selection, and public-key matching of future
-   local KES+VRF secret bundles before registration, plus owner ratification of
-   O-12's common-prefix/deletion/recovery rule;
-8. an owner decision on same-owner key reuse and whether a successive complete
-   pair record may retain either prior key, plus completion of
+   local KES+VRF secret bundles before registration, plus implementation of
+   O-12's ratified common-prefix/deletion/recovery baseline;
+8. canonical duplicate and partial-rotation semantics consistent with the
+   ratified atomic N-2 preregistration boundary, plus completion of
    duplicate/rotation/reorg/restart proofs and `KEYREG-001..015`; and
 9. cross-consumer semantic qualification behind the landed static source/fixture
    inventory tripwire. `CommitteeSortitionSuite`, `CommitteeShardSortitionSuite`,

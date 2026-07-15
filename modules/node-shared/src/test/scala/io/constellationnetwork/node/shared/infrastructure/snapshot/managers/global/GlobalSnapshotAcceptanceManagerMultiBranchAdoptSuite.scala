@@ -289,7 +289,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
     inc: Signed[CurrencyIncrementalSnapshot],
     basePrior: CurrencySnapshotInfo,
     branchPrior: Option[CurrencySnapshotInfo]
-  )(implicit h: Hasher[IO]): IO[(MptOverlay[IO, GlobalStateKey], BranchId)] =
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[(MptOverlay[IO, GlobalStateKey], BranchId)] =
     for {
       pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
       overlay <- MptOverlay.make[IO, GlobalStateKey](

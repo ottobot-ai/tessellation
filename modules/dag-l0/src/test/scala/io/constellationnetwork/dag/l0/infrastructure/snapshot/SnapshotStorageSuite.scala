@@ -13,7 +13,9 @@ import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.{GlobalStateProofSelector, SnapshotOrdinal, _}
 import io.constellationnetwork.security._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator
 
 import better.files._
 import eu.timepit.refined.auto._
@@ -69,6 +71,11 @@ object SnapshotStorageSuite extends MutableIOSuite with Checkers {
       }
     }
 
+  private def withForbiddenSmtRoot(
+    snapshot: Signed[GlobalIncrementalSnapshot]
+  ): Signed[GlobalIncrementalSnapshot] =
+    snapshot.copy(value = snapshot.value.copy(stateProof = snapshot.value.stateProof.copy(smtRoot = Hash.empty.some)))
+
   test("head - returns none for empty storage") { res =>
     implicit val (s, kryo, j, h, _) = res
 
@@ -118,6 +125,69 @@ object SnapshotStorageSuite extends MutableIOSuite with Checkers {
         mkSnapshots.flatMap {
           case (genesis, snapshot) =>
             storage.prepend(snapshot, genesis.info.toGlobalSnapshotInfo).map(expect.same(true, _))
+        }
+      }
+    }
+  }
+
+  test("prepend rejects a global snapshot with an active-era forbidden smtRoot before mutating storage") { res =>
+    implicit val (s, kryo, j, h, sp) = res
+
+    File.temporaryDirectory() { tmpDir =>
+      mkStorage(tmpDir).flatMap { storage =>
+        mkSnapshots.flatMap {
+          case (genesis, snapshot) =>
+            val forbidden = withForbiddenSmtRoot(snapshot)
+            for {
+              result <- storage.prepend(forbidden, genesis.info.toGlobalSnapshotInfo).attempt
+              head <- storage.headSnapshot
+              stored <- storage.get(forbidden.ordinal)
+            } yield
+              expect(result.swap.exists(_.isInstanceOf[GlobalSnapshotActiveEraValidator.Violation])) &&
+                expect(head.isEmpty) &&
+                expect(stored.isEmpty)
+        }
+      }
+    }
+  }
+
+  test("setHeadForRecovery rejects a global snapshot with an active-era forbidden smtRoot before mutating storage") { res =>
+    implicit val (s, kryo, j, h, sp) = res
+
+    File.temporaryDirectory() { tmpDir =>
+      mkStorage(tmpDir).flatMap { storage =>
+        mkSnapshots.flatMap {
+          case (genesis, snapshot) =>
+            val forbidden = withForbiddenSmtRoot(snapshot)
+            for {
+              result <- storage.setHeadForRecovery(forbidden, genesis.info.toGlobalSnapshotInfo).attempt
+              head <- storage.headSnapshot
+              stored <- storage.get(forbidden.ordinal)
+            } yield
+              expect(result.swap.exists(_.isInstanceOf[GlobalSnapshotActiveEraValidator.Violation])) &&
+                expect(head.isEmpty) &&
+                expect(stored.isEmpty)
+        }
+      }
+    }
+  }
+
+  test("setTentativeHead rejects a global snapshot with an active-era forbidden smtRoot before mutating storage") { res =>
+    implicit val (s, kryo, j, h, sp) = res
+
+    File.temporaryDirectory() { tmpDir =>
+      mkStorage(tmpDir).flatMap { storage =>
+        mkSnapshots.flatMap {
+          case (genesis, snapshot) =>
+            val forbidden = withForbiddenSmtRoot(snapshot)
+            for {
+              result <- storage.setTentativeHead(forbidden, genesis.info.toGlobalSnapshotInfo).attempt
+              head <- storage.headSnapshot
+              stored <- storage.get(forbidden.ordinal)
+            } yield
+              expect(result.swap.exists(_.isInstanceOf[GlobalSnapshotActiveEraValidator.Violation])) &&
+                expect(head.isEmpty) &&
+                expect(stored.isEmpty)
         }
       }
     }

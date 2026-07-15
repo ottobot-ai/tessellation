@@ -19,10 +19,10 @@ import io.constellationnetwork.schema.{GlobalSnapshotInfo, GlobalSnapshotStatePr
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.security.mpt.MerklePatriciaCommitment
 import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
 import io.constellationnetwork.security.mpt.prover.attestation.MerklePatriciaRangeProof
 import io.constellationnetwork.security.mpt.verifier.{MerklePatriciaRangeVerifier, MerklePatriciaVerificationError}
+import io.constellationnetwork.security.mpt.{MerklePatriciaCommitment, MerklePatriciaNode}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.AllowSpendReferenceCodec.{immutableCodec => allowSpendRefImmutable}
@@ -54,11 +54,27 @@ import scodec.bits.ByteVector
   *     full-content holder (correct-by-design via field-root equality), distinct from the per-key [[RangeProofInvalid]] /
   *     [[ValueBindingFailed]] path used by cross-shard / light-client consumers. See `docs/nakamoto/GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md`,
   *     "Locked decisions" → recompute-and- match (field-root equality).
+  *   - [[FollowVerificationError.MissingFieldProof]], [[FollowVerificationError.MissingFieldValues]], and
+  *     [[FollowVerificationError.MissingFieldValue]] — the payload omitted a required consumed-field component or a value for an
+  *     authenticated in-range leaf. Empty fields remain legal, but must carry an explicit verified empty range proof and empty values map.
+  *   - [[FollowVerificationError.RangeBoundsMismatch]] and [[FollowVerificationError.UnprovenEmptyField]] — a field proof does not cover
+  *     that field's exact canonical full range, or claims an evidence-free empty range under a nonempty authenticated trie root.
   */
 sealed trait FollowVerificationError extends Product with Serializable
 
 object FollowVerificationError {
   final case class CommittedRootMismatch(expected: Hash, got: Hash) extends FollowVerificationError
+  final case class MissingFieldProof(field: GlobalStateFieldId) extends FollowVerificationError
+  final case class MissingFieldValues(field: GlobalStateFieldId) extends FollowVerificationError
+  final case class MissingFieldValue(field: GlobalStateFieldId, key: Hex) extends FollowVerificationError
+  final case class RangeBoundsMismatch(
+    field: GlobalStateFieldId,
+    expectedStart: Hex,
+    expectedEnd: Hex,
+    observedStart: Hex,
+    observedEnd: Hex
+  ) extends FollowVerificationError
+  final case class UnprovenEmptyField(field: GlobalStateFieldId) extends FollowVerificationError
   final case class RangeProofInvalid(field: GlobalStateFieldId, cause: MerklePatriciaVerificationError) extends FollowVerificationError
   final case class ValueBindingFailed(field: GlobalStateFieldId, key: Hex) extends FollowVerificationError
   final case class FieldRootMismatch(field: GlobalStateFieldId, expected: Hash, got: Hash) extends FollowVerificationError
@@ -77,6 +93,12 @@ object FollowVerificationError {
 
   implicit val eq: Eq[FollowVerificationError] = Eq.instance {
     case (CommittedRootMismatch(e1, g1), CommittedRootMismatch(e2, g2)) => e1 === e2 && g1 === g2
+    case (MissingFieldProof(f1), MissingFieldProof(f2))                 => f1 === f2
+    case (MissingFieldValues(f1), MissingFieldValues(f2))               => f1 === f2
+    case (MissingFieldValue(f1, k1), MissingFieldValue(f2, k2))         => f1 === f2 && k1 === k2
+    case (RangeBoundsMismatch(f1, es1, ee1, os1, oe1), RangeBoundsMismatch(f2, es2, ee2, os2, oe2)) =>
+      f1 === f2 && es1 === es2 && ee1 === ee2 && os1 === os2 && oe1 === oe2
+    case (UnprovenEmptyField(f1), UnprovenEmptyField(f2))               => f1 === f2
     case (RangeProofInvalid(f1, c1), RangeProofInvalid(f2, c2))         => f1 === f2 && c1 === c2
     case (ValueBindingFailed(f1, k1), ValueBindingFailed(f2, k2))       => f1 === f2 && k1 === k2
     case (FieldRootMismatch(f1, e1, g1), FieldRootMismatch(f2, e2, g2)) => f1 === f2 && e1 === e2 && g1 === g2
@@ -351,8 +373,8 @@ object Verified {
   */
 object FollowVerifyCore {
 
-  /** The fields a gl1 follower actually consumes (design doc "What gl1 actually consumes"). The prover is expected to populate exactly
-    * these; the verifier processes whichever of them appear in the payload and ignores any extra field a (possibly buggy) prover added —
+  /** The fields a gl1 follower actually consumes (design doc "What gl1 actually consumes"). The verifier requires every one of these fields
+    * with its exact canonical full-range proof and complete value coverage. It ignores any extra field a (possibly buggy) prover added;
     * extra fields cannot widen the verified state because [[ConsumedFieldState]] / [[ConsumedFieldLeaves]] only expose these five.
     *
     * `ActiveTokenLocks` is consumed by gl1's token-lock-replacement validator (`ContextualTokenLockValidator.validateReplaceTokenLockRef` /
@@ -360,6 +382,17 @@ object FollowVerifyCore {
     * empty and every replacement fails `NothingToReplace`.
     */
   val consumedFields: List[GlobalStateFieldId] = SyncedField.baseRegistry.map(_.fieldId)
+
+  private val GlobalStateKeyHexLength = 78
+
+  /** Exact full MPT range for one globally scoped consumed field. Both prover and verifier derive this independently from the structured
+    * field identifier; sender-selected range bounds never define what a field proof covers.
+    */
+  def consumedFieldBounds[F[_]: Async: Hasher](field: GlobalStateFieldId): F[(Hex, Hex)] =
+    GlobalStateKey.hypergraphFieldPrefix[F](field).map { prefix =>
+      val suffixLength = math.max(GlobalStateKeyHexLength - prefix.value.length, 0)
+      (Hex(prefix.value + ("0" * suffixLength)), Hex(prefix.value + ("f" * suffixLength)))
+    }
 
   /** Map a snapshot's signed `stateProof` per-field roots onto the five UNIFORM [[GlobalStateFieldId]]s a follower syncs, in the shape
     * [[GlobalFollowMirrorVerifier.verifyByFieldRoot]] / [[verifyFieldRoots]] expect. `Balances` / `LastTxRefs` are always-present `Hash`es;
@@ -560,24 +593,48 @@ object FollowVerifyCore {
     else {
       val verifier = MerklePatriciaRangeVerifier.make[F](attestedRoot)
 
-      // (b) + (c): for every consumed field present in the payload, verify the range proof then bind its
-      // values. Short-circuits on the first failure via EitherT.
+      // (b) + (c): every consumed field must carry both an explicit range proof and an explicit values map. Verify the range proof, then
+      // require exact value coverage for every authenticated in-range leaf. Short-circuits on the first failure via EitherT.
       val verifyFields: F[Either[FollowVerificationError, Unit]] =
-        consumedFields.traverse_ { field =>
-          proof.fields.get(field) match {
-            case None =>
-              // Field carries no proof — nothing to verify for it. A field gl1 consumes but that has no
-              // entries this ordinal is legitimately absent (empty map); cryptographic absence of any
-              // particular key is established by the range proof when the field IS present.
-              EitherT.rightT[F, FollowVerificationError](())
-            case Some(rangeProof) =>
-              for {
-                _ <- EitherT(verifier.confirmRange(rangeProof))
-                  .leftMap(cause => FollowVerificationError.RangeProofInvalid(field, cause): FollowVerificationError)
-                _ <- EitherT(bindValues[F](field, rangeProof, proof.values.getOrElse(field, SortedMap.empty[Hex, Hex])))
-              } yield ()
-          }
-        }.value
+        MerklePatriciaNode.Branch.empty[F].flatMap { emptyRoot =>
+          consumedFields.traverse_ { field =>
+            proof.fields.get(field) match {
+              case None =>
+                EitherT.leftT[F, Unit](FollowVerificationError.MissingFieldProof(field): FollowVerificationError)
+              case Some(rangeProof) =>
+                proof.values.get(field) match {
+                  case None =>
+                    EitherT.leftT[F, Unit](FollowVerificationError.MissingFieldValues(field): FollowVerificationError)
+                  case Some(values) =>
+                    for {
+                      expectedBounds <- EitherT.liftF[F, FollowVerificationError, (Hex, Hex)](consumedFieldBounds[F](field))
+                      _ <- EitherT.cond[F](
+                        rangeProof.startPath === expectedBounds._1 && rangeProof.endPath === expectedBounds._2,
+                        (),
+                        FollowVerificationError.RangeBoundsMismatch(
+                          field,
+                          expectedBounds._1,
+                          expectedBounds._2,
+                          rangeProof.startPath,
+                          rangeProof.endPath
+                        ): FollowVerificationError
+                      )
+                      hasEvidence = rangeProof.inclusionProofs.nonEmpty || rangeProof.exclusionBoundaries.exists { boundaries =>
+                        boundaries.leftBoundary.nonEmpty || boundaries.rightBoundary.nonEmpty
+                      }
+                      _ <- EitherT.cond[F](
+                        hasEvidence || attestedRoot === emptyRoot.digest,
+                        (),
+                        FollowVerificationError.UnprovenEmptyField(field): FollowVerificationError
+                      )
+                      _ <- EitherT(verifier.confirmRange(rangeProof))
+                        .leftMap(cause => FollowVerificationError.RangeProofInvalid(field, cause): FollowVerificationError)
+                      _ <- EitherT(bindValues[F](field, rangeProof, values))
+                    } yield ()
+                }
+            }
+          }.value
+        }
 
       verifyFields.flatMap {
         case Left(err) => err.asLeft[Verified[ConsumedFieldLeaves]].pure[F]
@@ -602,23 +659,28 @@ object FollowVerifyCore {
         }
       }.toMap
 
-    values.toList.traverse_ {
-      case (keyHex, valueHex) =>
-        EitherT(
-          leafDigestByPath.get(keyHex) match {
-            case None =>
-              // The payload carries a value for a key that has no committed leaf in the range proof —
-              // cannot be bound. (Includes the omitted-leaf case where prover dropped the inclusion
-              // proof but kept the value.)
-              (FollowVerificationError.ValueBindingFailed(field, keyHex): FollowVerificationError).asLeft[Unit].pure[F]
-            case Some(dataDigest) =>
-              Hasher[F].hashBytes(valueHex.toBytes).map { computed =>
-                if (computed === dataDigest) ().asRight[FollowVerificationError]
-                else (FollowVerificationError.ValueBindingFailed(field, keyHex): FollowVerificationError).asLeft[Unit]
+    leafDigestByPath.keys.toList.sortBy(_.value).find(!values.contains(_)) match {
+      case Some(missingKey) =>
+        (FollowVerificationError.MissingFieldValue(field, missingKey): FollowVerificationError).asLeft[Unit].pure[F]
+      case None =>
+        values.toList.traverse_ {
+          case (keyHex, valueHex) =>
+            EitherT(
+              leafDigestByPath.get(keyHex) match {
+                case None =>
+                  // The payload carries a value for a key that has no committed leaf in the range proof —
+                  // cannot be bound. (Includes the omitted-leaf case where prover dropped the inclusion
+                  // proof but kept the value.)
+                  (FollowVerificationError.ValueBindingFailed(field, keyHex): FollowVerificationError).asLeft[Unit].pure[F]
+                case Some(dataDigest) =>
+                  Hasher[F].hashBytes(valueHex.toBytes).map { computed =>
+                    if (computed === dataDigest) ().asRight[FollowVerificationError]
+                    else (FollowVerificationError.ValueBindingFailed(field, keyHex): FollowVerificationError).asLeft[Unit]
+                  }
               }
-          }
-        )
-    }.value
+            )
+        }.value
+    }
   }
 
   /** Decode the (now value-bound) bytes into typed maps, keyed by the committed leaf-path `Hex`. Decode failures surface as a raised error

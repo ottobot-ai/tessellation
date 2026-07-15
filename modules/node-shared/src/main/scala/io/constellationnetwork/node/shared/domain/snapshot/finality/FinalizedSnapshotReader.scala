@@ -1,5 +1,7 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality
 
+import java.nio.charset.StandardCharsets.UTF_8
+
 import cats.effect.Async
 import cats.syntax.all._
 
@@ -9,14 +11,19 @@ import io.constellationnetwork.node.shared.http.routes.CachedCombinedResponse
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.{CombinedSnapshotCheckpointFileSystemStorage, LastCheckpointInfo}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo}
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.storages.MptStateStorage
+import io.constellationnetwork.security.signature.Signed
 
 import fs2.io.file.Path
-import fs2.text
+import fs2.{Pipe, Stream}
+import io.circe.jawn.CirceSupportParser
 import io.circe.syntax._
-import io.circe.{Json, parser}
+import io.circe.{Decoder, Json}
 import org.http4s._
 import org.http4s.headers.`Content-Type`
+import org.typelevel.jawn.Facade
+import org.typelevel.jawn.fs2._
 
 /** How a node exposes the latest *finalized* combined snapshot (signed + info) to external consumers.
   *
@@ -116,9 +123,10 @@ object FinalizedSnapshotReader {
   /** Nakamoto implementation: serve only at-or-below the finalized ordinal, read bytes from the on-disk checkpoint. Tentative
     * (pre-finality) state never leaves via these endpoints; that channel is reserved for the sidecar GossipSub transport.
     */
-  def nakamoto[F[_]: Async, S <: Snapshot, SI <: SnapshotInfo[_]](
+  def nakamoto[F[_]: Async, S <: Snapshot: Decoder, SI <: SnapshotInfo[_]](
     finalityGate: FinalityGate[F],
     fileStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, SI],
+    activeEraSnapshotAt: SnapshotOrdinal => F[Boolean],
     // 3c-A serve side: the GLOBAL signed MPT byte store, read-only, used ONLY by `latestMptEntriesResponse`. `None` for any non-global
     // Nakamoto reader (then the `mpt-entries` route 404s, identical to BFT). gl0 wiring passes a read-only `MptStateStorage` pointed at the
     // SIGNED byte store (`<mptSnapshotInfoPath>_signed`) — the finalize sink in `GlobalSnapshotConsensus` writes the bytes used by
@@ -127,57 +135,70 @@ object FinalizedSnapshotReader {
     mptStateStorage: Option[MptStateStorage[F]] = None
   ): FinalizedSnapshotReader[F, S, SI] = new FinalizedSnapshotReader[F, S, SI] {
 
-    // Used only by `latestMptEntriesResponse` (the triple is materialized in-memory, not streamed from a file). The combined/checkpoint
-    // endpoints serve `Response[F]` objects straight from `fileStorage`, so they don't need this.
+    implicit private val circeFacade: Facade[Json] = new CirceSupportParser(None, false).facade
+
+    // Byte-only responses remain materialized from the signed byte-store map; combined checkpoint bodies stream from one validated handle.
     private def respOf(json: Json): Response[F] =
       Response[F](Status.Ok)
         .withEntity(json.noSpaces)
         .putHeaders(`Content-Type`(MediaType.application.json))
 
+    private def hasExactPairShape(bytes: Stream[F, Byte]): F[Boolean] = {
+      implicit val discardFacade: Facade[Unit] = Facade.NullFacade
+      bytes.chunks.unwrapJsonArray[Unit].compile.count.map(_ === 2L)
+    }
+
+    /** Validate a combined checkpoint without materializing the full file or state-info JSON. The first pass checks the entire JSON array
+      * with Jawn's discarding facade. The second pass materializes only the signed snapshot element; its size is the remaining per-request
+      * decode bound until the protocol ratifies a signed-artifact byte limit. Requiring `]` as the final byte preserves the storage
+      * writer's canonical compact shape and makes the streaming MPT-triple extension unambiguous.
+      */
+    private def validateActiveCombined(ordinal: SnapshotOrdinal)(bytes: Stream[F, Byte]): F[Boolean] =
+      (for {
+        exactPair <- hasExactPairShape(bytes)
+        finalByte <- bytes.takeRight(1).compile.last
+        signed <- bytes.chunks.unwrapJsonArray[Json].take(1).compile.lastOrError.flatMap(_.as[Signed[S]].liftTo[F])
+      } yield
+        exactPair && finalByte.contains(']'.toByte) && signed.value.ordinal === ordinal && (signed.value match {
+          case global: io.constellationnetwork.schema.GlobalIncrementalSnapshot =>
+            io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator.validate(global).isRight
+          case _ => true
+        })).handleError(_ => false)
+
+    private def combinedAtIfActive(ordinal: SnapshotOrdinal): F[Option[Response[F]]] =
+      fileStorage.getAsValidatedHttpResponse(ordinal, validateActiveCombined(ordinal))
+
     def latestCombinedResponse: F[Option[Response[F]]] =
       finalityGate.finalizedOrdinal.flatMap {
         case None => Option.empty[Response[F]].pure[F]
         case Some(finalized) =>
-          fileStorage.getAsHttpResponse(finalized).flatMap {
-            case Some(resp) => (resp.some: Option[Response[F]]).pure[F]
-            // Checkpoint files are written sparsely (every N epochs). If none exists at the exact finalized ordinal, fall back to the
-            // most recent checkpoint at-or-below finalized — never a post-finality checkpoint, even if one exists on disk.
-            case None => fileStorage.getLatestAsHttpResponseAtOrBelow(finalized)
+          fileStorage.exists(finalized).flatMap {
+            // An exact checkpoint that violates the active-era rule is not equivalent to a sparse-store miss. Fail closed rather than
+            // silently masking it by serving an older checkpoint.
+            case true => combinedAtIfActive(finalized)
+            // Checkpoint files are written sparsely (every N epochs). Only an actual absence may fall back to the most recent checkpoint
+            // at-or-below finalized — never a post-finality checkpoint, even if one exists on disk.
+            case false =>
+              fileStorage.getLatestOrdinalAtOrBelow(finalized).flatMap {
+                case Some(ordinal) => combinedAtIfActive(ordinal)
+                case None          => Option.empty[Response[F]].pure[F]
+              }
           }
       }
 
-    // 3c-A: append the signed MPT byte map to the SAME finalized combined pair `/latest/combined` serves. Build the
-    // `[snapshot, state, entries]` triple at a SINGLE ordinal. The follower loads the byte-faithful map, then independently requires
-    // `consensusMptRoot === snapshot.stateProof.mptRoot`. Reads the checkpoint file's raw JSON
-    // (the 2-array `[snapshot, state]` — `fileStorage` holds Encoders only, so we splice the JSON verbatim rather than
-    // re-encode S/SI) and `byteStore.readState(thatSameOrdinal)`. `None` when either file is absent at `ordinal`.
-    def buildTripleAt(byteStore: MptStateStorage[F], ordinal: SnapshotOrdinal): F[Option[Response[F]]] =
-      (fileStorage.getAsStream(ordinal), byteStore.readState(ordinal)).tupled.flatMap {
-        case (Some(combinedStream), Some(entries)) =>
-          combinedStream
-            .through(text.utf8.decode)
-            .compile
-            .string
-            .flatMap { combinedJson =>
-              Async[F].fromEither(parser.decode[List[Json]](combinedJson)).flatMap {
-                // The combined checkpoint file is the JSON 2-array `[snapshot, state]`. Append the signed entries as the
-                // third element to form the `[snapshot, state, entries]` triple the client (`SnapshotClient.getLatestMptEntries`)
-                // decodes positionally. The entries element uses the shared anchor codec so wire == on-disk byte-form.
-                case snapshotAndState if snapshotAndState.sizeIs == 2 =>
-                  val entriesJson: Json = entries.asJson(MptStateStorage.mptEntriesEncoder)
-                  val triple = Json.arr((snapshotAndState :+ entriesJson): _*)
-                  (respOf(triple).some: Option[Response[F]]).pure[F]
-                case other =>
-                  Async[F].raiseError[Option[Response[F]]](
-                    new RuntimeException(
-                      s"Unexpected combined checkpoint JSON structure at ordinal=$ordinal: expected a 2-element [snapshot, state] array, got ${other.size} elements"
-                    )
-                  )
-              }
-            }
-        // Either the combined checkpoint or the signed byte file is missing at this ordinal.
-        case _ => Option.empty[Response[F]].pure[F]
-      }
+    // 3c-A: append the signed MPT byte map to the SAME open finalized combined file `/latest/combined` validates. The canonical combined
+    // writer ends its compact two-element array at the final byte, so dropping that `]` and appending the third element is streaming and
+    // does not materialize the potentially large state-info JSON.
+    private def appendEntries(entries: Map[Hex, Array[Byte]]): Pipe[F, Byte, Byte] = { combined =>
+      val entriesJson: Json = entries.asJson(MptStateStorage.mptEntriesEncoder)
+      combined.dropRight(1) ++ Stream.emits(s",${entriesJson.noSpaces}]".getBytes(UTF_8)).covary[F]
+    }
+
+    private def tripleAtIfActive(
+      ordinal: SnapshotOrdinal,
+      entries: Map[Hex, Array[Byte]]
+    ): F[Option[Response[F]]] =
+      fileStorage.getAsValidatedHttpResponse(ordinal, validateActiveCombined(ordinal), appendEntries(entries))
 
     // Highest ordinal at-or-below `ceiling` that is present in BOTH the combined-checkpoint store AND the signed-bytes
     // store. Belt-and-suspenders for `latestMptEntriesResponse`: the resolved checkpoint ordinal's signed bytes are
@@ -185,16 +206,20 @@ object FinalizedSnapshotReader {
     // exact ordinal (mid-reorg gap) would otherwise 404. Walking down to the latest COMMON ordinal keeps the
     // snapshot↔entries pairing intact (both served from the same ordinal) while letting the fast path still fire. Bounded:
     // checkpoint ordinals are sparse (≤ `maxCheckpointsStored`) and signed ordinals are a contiguous recent window.
-    def latestCommonOrdinalAtOrBelow(byteStore: MptStateStorage[F], ceiling: SnapshotOrdinal): F[Option[SnapshotOrdinal]] =
+    private def latestCommonAtOrBelow(
+      byteStore: MptStateStorage[F],
+      ceiling: SnapshotOrdinal
+    ): F[Option[SnapshotOrdinal]] =
       (
         fileStorage.listStoredOrdinals.flatMap(_.compile.toList),
         byteStore.listStoredOrdinals
-      ).tupled.map {
+      ).tupled.flatMap {
         case (checkpointOrdinals, signedOrdinals) =>
           val signedSet = signedOrdinals.toSet
-          checkpointOrdinals
+          val latestCommon = checkpointOrdinals
             .filter(o => o.value.value <= ceiling.value.value && signedSet.contains(o))
             .maxOption
+          latestCommon.pure[F]
       }
 
     def latestMptEntriesResponse: F[Option[Response[F]]] =
@@ -209,19 +234,23 @@ object FinalizedSnapshotReader {
               fileStorage.getLatestOrdinalAtOrBelow(finalized).flatMap {
                 case None => Option.empty[Response[F]].pure[F]
                 case Some(servableOrdinal) =>
-                  buildTripleAt(byteStore, servableOrdinal).flatMap {
-                    case some @ Some(_) => (some: Option[Response[F]]).pure[F]
-                    // The signed bytes (or the combined file) for the resolved checkpoint ordinal are absent — instead of
-                    // 404ing the follower onto the legacy (drift-prone) GSI path, walk DOWN to the latest ordinal present
-                    // in BOTH stores at-or-below `servableOrdinal` and serve that pair (same-ordinal, still finality-gated:
-                    // any common ordinal ≤ servableOrdinal ≤ finalized). The follower's verify gate is unchanged. Only if
-                    // NO common ordinal exists do we fail not-servable (then the legacy fallback applies, as before).
-                    case None =>
-                      latestCommonOrdinalAtOrBelow(byteStore, servableOrdinal).flatMap {
-                        case Some(commonOrdinal) if commonOrdinal =!= servableOrdinal => buildTripleAt(byteStore, commonOrdinal)
-                        // commonOrdinal == servableOrdinal would have already succeeded above; None ⇒ no coverage.
-                        case _ => Option.empty[Response[F]].pure[F]
-                      }
+                  byteStore.readState(servableOrdinal).flatMap {
+                    case Some(entries) => tripleAtIfActive(servableOrdinal, entries)
+                    case None          =>
+                      // A present selected checkpoint that is forbidden or corrupt cannot be masked by an older checkpoint merely
+                      // because its sibling byte image is missing.
+                      fileStorage
+                        .validateExact(servableOrdinal, validateActiveCombined(servableOrdinal))
+                        .ifM(
+                          latestCommonAtOrBelow(byteStore, servableOrdinal).flatMap {
+                            case Some(commonOrdinal) if commonOrdinal =!= servableOrdinal =>
+                              byteStore
+                                .readState(commonOrdinal)
+                                .flatMap(_.traverse(entries => tripleAtIfActive(commonOrdinal, entries)).map(_.flatten))
+                            case _ => Option.empty[Response[F]].pure[F]
+                          },
+                          Option.empty[Response[F]].pure[F]
+                        )
                   }
               }
           }
@@ -237,21 +266,26 @@ object FinalizedSnapshotReader {
           finalityGate.isServable(ordinal).flatMap {
             case false => Option.empty[Response[F]].pure[F]
             case true =>
-              byteStore
-                .readState(ordinal)
-                .map(_.map(entries => respOf(entries.asJson(MptStateStorage.mptEntriesEncoder))))
+              activeEraSnapshotAt(ordinal).ifM(
+                byteStore
+                  .readState(ordinal)
+                  .map(_.map(entries => respOf(entries.asJson(MptStateStorage.mptEntriesEncoder)))),
+                Option.empty[Response[F]].pure[F]
+              )
           }
       }
 
     def latestCheckpointInfo: F[Option[LastCheckpointInfo]] =
       fileStorage.getLatestCheckpointInfo.flatMap { info =>
-        finalityGate.isServable(info.ordinal).map(s => if (s) info.some else None)
+        (finalityGate.isServable(info.ordinal), fileStorage.validateExact(info.ordinal, validateActiveCombined(info.ordinal))).mapN(
+          (servable, active) => if (servable && active) info.some else None
+        )
       }
 
     def combinedCheckpointAt(ordinal: SnapshotOrdinal): F[Option[Response[F]]] =
       finalityGate.isServable(ordinal).flatMap {
         case false => Option.empty[Response[F]].pure[F]
-        case true  => fileStorage.getAsHttpResponse(ordinal)
+        case true  => combinedAtIfActive(ordinal)
       }
   }
 
@@ -262,12 +296,13 @@ object FinalizedSnapshotReader {
     * race-free with the sink's writes. Use this at the gl0 HTTP wiring site; non-global Nakamoto readers keep using [[nakamoto]] (which
     * defaults `mptStateStorage = None`, so their `mpt-entries` route 404s).
     */
-  def nakamotoF[F[_]: Async: JsonSerializer, S <: Snapshot, SI <: SnapshotInfo[_]](
+  def nakamotoF[F[_]: Async: JsonSerializer, S <: Snapshot: Decoder, SI <: SnapshotInfo[_]](
     finalityGate: FinalityGate[F],
     fileStorage: CombinedSnapshotCheckpointFileSystemStorage[F, S, SI],
+    activeEraSnapshotAt: SnapshotOrdinal => F[Boolean],
     mptSnapshotInfoPath: Path
   ): F[FinalizedSnapshotReader[F, S, SI]] =
     MptStateStorage.make[F](mptSnapshotInfoPath).map { byteStore =>
-      nakamoto[F, S, SI](finalityGate, fileStorage, byteStore.some)
+      nakamoto[F, S, SI](finalityGate, fileStorage, activeEraSnapshotAt, byteStore.some)
     }
 }

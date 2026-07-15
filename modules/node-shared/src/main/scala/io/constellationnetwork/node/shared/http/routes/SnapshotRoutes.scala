@@ -14,9 +14,10 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.storage.Snaps
 import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, SnapshotMetadata}
-import io.constellationnetwork.schema.{GlobalSnapshot, SnapshotOrdinal}
+import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot, SnapshotOrdinal}
 import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator
 
 import io.circe.Encoder
 import io.circe.shapes._
@@ -48,12 +49,37 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
   private val serviceUnavailableNodeNotReady: F[Response[F]] =
     ServiceUnavailable(("message" ->> "Node is not ready yet") :: HNil)
 
+  private val serviceUnavailableSnapshotNotServable: F[Response[F]] =
+    ServiceUnavailable(("message" ->> "Snapshot is not servable in the active protocol era") :: HNil)
+
   private def validStateForSnapshotReturn(state: NodeState): Boolean = state === NodeState.Ready
 
   private def whenNodeReady(action: F[Response[F]]): F[Response[F]] =
     nodeStorage.getNodeState
       .map(validStateForSnapshotReturn)
       .ifM(action, serviceUnavailableNodeNotReady)
+
+  private def requireActiveEra(snapshot: Signed[S]): F[Unit] =
+    snapshot.value match {
+      case global: GlobalIncrementalSnapshot => GlobalSnapshotActiveEraValidator.requireValid[F](global)
+      case _                                 => Async[F].unit
+    }
+
+  private def withActiveEraSnapshot(snapshot: Signed[S])(response: => F[Response[F]]): F[Response[F]] =
+    requireActiveEra(snapshot)
+      .flatMap(_ => response)
+      .recoverWith { case _: GlobalSnapshotActiveEraValidator.Violation => serviceUnavailableSnapshotNotServable }
+
+  private def withActiveEraSnapshotAt(ordinal: SnapshotOrdinal)(
+    response: Signed[S] => F[Response[F]]
+  ): F[Response[F]] =
+    snapshotStorage.get(ordinal).flatMap {
+      case Some(snapshot) => withActiveEraSnapshot(snapshot)(response(snapshot))
+      case None           => NotFound()
+    }
+
+  private def serveSnapshot(snapshot: Signed[S])(implicit encoder: EntityEncoder[F, Signed[S]]): F[Response[F]] =
+    withActiveEraSnapshot(snapshot)(Ok(snapshot))
 
   // Gating delegates to FinalityGate[F]. ML0 may use its BFT pass-through instance. GL0 currently
   // reads an ordinal-only transitional watermark; target serving is exact-hash Phase 2 and reorg-aware.
@@ -69,16 +95,18 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
         case GET -> Root / "latest" / "ordinal" =>
           whenNodeReady {
             effectiveLatestOrdinal.flatMap {
-              case Some(ordinal) => Ok(("value" ->> ordinal.value.value) :: HNil)
-              case None          => NotFound()
+              case Some(ordinal) =>
+                withActiveEraSnapshotAt(ordinal)(_ => Ok(("value" ->> ordinal.value.value) :: HNil))
+              case None => NotFound()
             }
           }
 
         case GET -> Root / "latest" / "finalized-ordinal" =>
           whenNodeReady {
             FinalityGate[F].finalizedOrdinal.flatMap {
-              case Some(ordinal) => Ok(("value" ->> ordinal.value.value) :: HNil)
-              case None          => NotFound()
+              case Some(ordinal) =>
+                withActiveEraSnapshotAt(ordinal)(_ => Ok(("value" ->> ordinal.value.value) :: HNil))
+              case None => NotFound()
             }
           }
 
@@ -86,12 +114,10 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
           whenNodeReady {
             effectiveLatestOrdinal.flatMap {
               case Some(effOrdinal) =>
-                hasherSelector.withCurrent { implicit hasher =>
-                  snapshotStorage.getHashed(effOrdinal)
-                }.flatMap {
-                  case Some(snapshot) =>
-                    Ok(SnapshotMetadata(snapshot.ordinal, snapshot.hash, snapshot.lastSnapshotHash))
-                  case None => NotFound()
+                withActiveEraSnapshotAt(effOrdinal) { snapshot =>
+                  hasherSelector
+                    .withCurrent(implicit hasher => snapshot.toHashed[F])
+                    .flatMap(hashed => Ok(SnapshotMetadata(hashed.ordinal, hashed.hash, hashed.lastSnapshotHash)))
                 }
               case None => NotFound()
             }
@@ -102,10 +128,7 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
             effectiveLatestOrdinal.flatMap {
               case Some(effOrdinal) =>
                 resolveEncoder[F, Signed[S]](req) { implicit enc =>
-                  snapshotStorage.get(effOrdinal).flatMap {
-                    case Some(snapshot) => Ok(snapshot)
-                    case _              => NotFound()
-                  }
+                  withActiveEraSnapshotAt(effOrdinal)(serveSnapshot)
                 }
               case None => NotFound()
             }
@@ -121,7 +144,7 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
                 effectiveLatestOrdinal.flatMap {
                   case Some(finalized) if snapshot.ordinal === finalized =>
                     // Fast path (both modes agree): head equals finalized.
-                    Ok(info)
+                    withActiveEraSnapshot(snapshot)(Ok(info))
                   case Some(_) =>
                     // Nakamoto head-ahead-of-finalized path — can't expose head.info (tentative). The reader serves the finalized
                     // checkpoint but currently only exposes combined, not info-only; return 503 so callers retry once finality advances.
@@ -192,20 +215,19 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
               case true =>
                 if (!fullSnapshot)
                   resolveEncoder[F, Signed[S]](req) { implicit enc =>
-                    snapshotStorage.get(ordinal).flatMap {
-                      case Some(snapshot) => Ok(snapshot)
-                      case _              => NotFound()
-                    }
+                    withActiveEraSnapshotAt(ordinal)(serveSnapshot)
                   }
                 else
-                  fullGlobalSnapshotStorage.map { storage =>
-                    resolveEncoder[F, Signed[GlobalSnapshot]](req) { implicit enc =>
-                      storage.read(ordinal).flatMap {
-                        case Some(snapshot) => Ok(snapshot)
-                        case _              => NotFound()
+                  withActiveEraSnapshotAt(ordinal) { _ =>
+                    fullGlobalSnapshotStorage.map { storage =>
+                      resolveEncoder[F, Signed[GlobalSnapshot]](req) { implicit enc =>
+                        storage.read(ordinal).flatMap {
+                          case Some(snapshot) => Ok(snapshot)
+                          case _              => NotFound()
+                        }
                       }
-                    }
-                  }.getOrElse(NotFound())
+                    }.getOrElse(NotFound())
+                  }
             }
           }
 
@@ -214,11 +236,10 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
             isOrdinalServable(ordinal).flatMap {
               case false => NotFound()
               case true =>
-                hasherSelector.withCurrent { implicit hasher =>
-                  snapshotStorage.getHash(ordinal)
-                }.flatMap {
-                  case None           => NotFound()
-                  case Some(snapshot) => Ok(snapshot)
+                withActiveEraSnapshotAt(ordinal) { snapshot =>
+                  hasherSelector
+                    .withCurrent(implicit hasher => snapshot.toHashed[F])
+                    .flatMap(hashed => Ok(hashed.hash))
                 }
             }
           }
@@ -251,7 +272,7 @@ final case class SnapshotRoutes[F[_]: Async: FinalityGate, S <: Snapshot: Encode
             resolveEncoder[F, Signed[S]](req) { implicit enc =>
               snapshotStorage.get(hash).flatMap {
                 case Some(snapshot) =>
-                  isOrdinalServable(snapshot.ordinal).ifM(Ok(snapshot), NotFound())
+                  isOrdinalServable(snapshot.ordinal).ifM(serveSnapshot(snapshot), NotFound())
                 case _ => NotFound()
               }
             }

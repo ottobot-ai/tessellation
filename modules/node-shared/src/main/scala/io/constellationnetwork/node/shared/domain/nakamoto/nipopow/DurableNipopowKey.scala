@@ -2,6 +2,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
 import cats.syntax.all._
 
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hex.Hex
 
 sealed abstract class DurableNipopowRecoveryRequired(message: String) extends RuntimeException(message)
@@ -26,6 +27,18 @@ final case class MalformedDurableNipopowValue(partition: String, key: Hex, reaso
 final case class DurableNipopowEnumerationChanged(partition: String)
     extends DurableNipopowRecoveryRequired(
       s"$partition changed between complete key validation and value enumeration; authenticated recovery required"
+    )
+
+final case class IncompleteDurableNipopowHistory(
+  partition: String,
+  expectedThrough: SnapshotOrdinal,
+  actualCount: Int,
+  firstMismatchIndex: Long,
+  observedOrdinal: Option[SnapshotOrdinal]
+) extends DurableNipopowRecoveryRequired(
+      s"$partition does not contain the complete ordinal range 0..${expectedThrough.value.value}: " +
+        s"actualCount=$actualCount firstMismatchIndex=$firstMismatchIndex " +
+        s"observedOrdinal=${observedOrdinal.fold("<missing>")(_.value.value.toString)}; authenticated recovery required"
     )
 
 private[nipopow] object DurableNipopowKeyCodec {
@@ -85,24 +98,24 @@ private[nipopow] object DurableNipopowKeyCodec {
     canonicalKey: A => Hex,
     identity: A => String
   ): Either[DurableNipopowRecoveryRequired, List[(Hex, A)]] =
-    keys.toList.sortBy(render).traverse { key =>
-      decodeCandidate(key).map(key -> _)
-    }.flatMap { decoded =>
-      val duplicate = decoded
-        .groupBy { case (_, logical) => identity(logical) }
-        .toList
-        .collect {
+    keys.toList
+      .sortBy(render)
+      .traverse { key =>
+        decodeCandidate(key).map(key -> _)
+      }
+      .flatMap { decoded =>
+        val duplicate = decoded.groupBy { case (_, logical) => identity(logical) }.toList.collect {
           case (logicalIdentity, occurrences) if occurrences.sizeCompare(1) > 0 =>
             DuplicateDurableNipopowIdentity(partition, logicalIdentity, occurrences.map(_._1).sortBy(render))
         }
-        .sortBy(_.identity)
-        .headOption
+          .sortBy(_.identity)
+          .headOption
 
-      duplicate
-        .toLeft(())
-        .flatMap(_ => decoded.traverse_ { case (physical, logical) => canonical(partition, physical, canonicalKey(logical)) })
-        .as(decoded)
-    }
+        duplicate
+          .toLeft(())
+          .flatMap(_ => decoded.traverse_ { case (physical, logical) => canonical(partition, physical, canonicalKey(logical)) })
+          .as(decoded)
+      }
 
   private def isHexDigit(char: Char): Boolean =
     (char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')

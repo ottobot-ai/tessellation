@@ -77,8 +77,9 @@ object types {
     *   - k1 = `confirmationDepthK(env)` — canonical-depth fallback for reversible exact-hash Phase 2. Loaded from HOCON per environment
     *     (`nakamoto.confirmation-depth-k` is a `{ mainnet, testnet, integrationnet, dev }` block, mirroring `last-kryo-hash-ordinal`) and
     *     resolved ONCE for the active `AppEnvironment` at the use site — mainnet 1024, test/integration nets 256, dev 32 (with the
-    *     `${?NAKAMOTO_CONFIRMATION_DEPTH}` override applied to the dev value only). REUSED by the §3 NIPoPoW historical-commitment SMT as
-    *     its finalized cutoff (`smtRoot(N)` commits ordinals i ≤ N − k₁), and by `SnapshotLeaderLoop` / `NakamotoSyncDaemon`.
+    *     `${?NAKAMOTO_CONFIRMATION_DEPTH}` override applied to the dev value only). Also parameterizes the staged §3 NIPoPoW
+    *     historical-commitment SMT cutoff; that store is not active-era consensus authority. Used live by `SnapshotLeaderLoop` /
+    *     `NakamotoSyncDaemon`.
     *   - R = `etaRotationSnapshots(env)` = round(3.1·k₁) — eta-rotation period. Ouroboros: the eta nonce uses the first 2/3 of the period's
     *     VRF rho values, so the last 1/3 = R/3 must be ≥ k₁ (those inputs FINALIZED before use) ⇒ R ≥ 3·k₁; the .1 over 3 is the worst-case
     *     finalization margin (the 2/3-mark must FINALIZE before the boundary; finalization lags production by ≤ k₁) ⇒ (R/3−k₁)=0.033·k₁.

@@ -1,7 +1,9 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
-import cats.effect.{IO, Resource}
+import cats.effect._
 import cats.syntax.all._
+
+import scala.concurrent.duration._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
@@ -189,6 +191,87 @@ object TowerFinalizerSuite extends MutableIOSuite {
         .and(expect(replay.isEmpty)) // re-finalize at same ord blocked
         .and(expect(earlier.isEmpty)) // earlier ord blocked
         .and(expect(later.nonEmpty)) // later ord ran
+  }
+
+  test("prepareFromParts — store reads and level-trial preparation remain cancelable before publication") { res =>
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
+
+    for {
+      delegate <- freshTower(res)
+      readStarted <- Deferred[IO, Unit]
+      appendCalls <- Ref.of[IO, Int](0)
+      blockingTower = new TowerStore[IO] {
+        def appendAtFinality(
+          ordinal: SnapshotOrdinal,
+          snapshotHash: Hash,
+          passes: Vector[LevelTrial]
+        ): IO[Unit] = appendCalls.update(_ + 1) >> delegate.appendAtFinality(ordinal, snapshotHash, passes)
+
+        def entriesAtLevel(level: Int, since: SnapshotOrdinal): IO[List[TowerEntry]] = delegate.entriesAtLevel(level, since)
+        def latestAt(level: Int): IO[Option[TowerEntry]] = readStarted.complete(()).void >> IO.never
+        def cumulativeCount(level: Int): IO[Long] = delegate.cumulativeCount(level)
+        def pruneBelow(keepFrom: SnapshotOrdinal): IO[Unit] = delegate.pruneBelow(keepFrom)
+      }
+      finalizer <- TowerFinalizer.make[IO](blockingTower, computer, Gamma)
+      preparing <- finalizer.prepareFromParts(ord(3), synthHash("prepare"), synthVrf(0x42.toByte), Gamma).start
+      _ <- readStarted.get
+      _ <- preparing.cancel
+      outcome <- preparing.join
+      observedAppends <- appendCalls.get
+      wasCanceled = outcome match {
+        case Outcome.Canceled() => true
+        case _                  => false
+      }
+    } yield expect(wasCanceled).and(expect(observedAppends == 0))
+  }
+
+  test("finalizeFromParts — cancellation cannot publish a tower append without its de-duplication watermark") { res =>
+    val (_, _, _, computer, _) = res
+    implicit val metrics: Metrics[IO] = res._5
+
+    for {
+      delegate <- freshTower(res)
+      appendCalls <- Ref.of[IO, Int](0)
+      appendPublished <- Deferred[IO, Unit]
+      releaseFirstAppend <- Deferred[IO, Unit]
+      blockingTower = new TowerStore[IO] {
+        def appendAtFinality(
+          ordinal: SnapshotOrdinal,
+          snapshotHash: Hash,
+          passes: Vector[LevelTrial]
+        ): IO[Unit] =
+          delegate.appendAtFinality(ordinal, snapshotHash, passes) >> appendCalls.updateAndGet(_ + 1).flatMap {
+            case 1 => appendPublished.complete(()).void >> releaseFirstAppend.get
+            case _ => IO.unit
+          }
+
+        def entriesAtLevel(level: Int, since: SnapshotOrdinal): IO[List[TowerEntry]] = delegate.entriesAtLevel(level, since)
+        def latestAt(level: Int): IO[Option[TowerEntry]] = delegate.latestAt(level)
+        def cumulativeCount(level: Int): IO[Long] = delegate.cumulativeCount(level)
+        def pruneBelow(keepFrom: SnapshotOrdinal): IO[Unit] = delegate.pruneBelow(keepFrom)
+      }
+      passingSeed <- (0 to 255).toList.findM { seed =>
+        computer
+          .runAll(synthVrf(seed.toByte), Vector.fill(SuperLevelParams.SuperLevelCount)(3L), Gamma, Gamma)
+          .map(_.exists(_.passed))
+      }
+        .flatMap(IO.fromOption(_)(new AssertionError("expected at least one deterministic passing VRF fixture")))
+      finalizer <- TowerFinalizer.make[IO](blockingTower, computer, Gamma)
+      first <- finalizer.finalizeFromParts(ord(3), synthHash("atomic"), synthVrf(passingSeed.toByte), Gamma).start
+      _ <- appendPublished.get
+      cancel <- first.cancel.start
+      _ <- IO.sleep(20.millis)
+      _ <- releaseFirstAppend.complete(())
+      _ <- cancel.joinWithNever
+      firstOutcome <- first.join
+      retry <- finalizer.finalizeFromParts(ord(3), synthHash("atomic"), synthVrf(passingSeed.toByte), Gamma)
+      observedCalls <- appendCalls.get
+      wasCanceled = firstOutcome match {
+        case Outcome.Canceled() => true
+        case _                  => false
+      }
+    } yield expect(wasCanceled).and(expect(retry.isEmpty)).and(expect(observedCalls == 1))
   }
 
   test("noop finalizer — finalizeFromParts returns empty vector, no store side effects") { res =>

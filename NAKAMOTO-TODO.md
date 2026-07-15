@@ -161,12 +161,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
         every physical ID 0-34, current carrier/codec, target shape, semantic
         identity, relational checks, and root ownership. This is design evidence,
         not implementation closure.
-      - [ ] **OWNER REVIEW O-17/R008-01..07:** retired IDs 3/6/21 and
+      - [ ] **O-17/R008-01..07 OWNER DIRECTION RATIFIED / ENGINEERING FREEZE OPEN:** retired IDs 3/6/21 and
         post-witness 32; field-20
         period-bearing value; field-23 peer-bearing value; concrete consensus
         resource limits plus permanent nullifier/slash growth; economic set-member
         identities; and token-lock currency scope. Do not freeze or activate the
-        target schema before these decisions.
+        target schema until the remaining identity functions, resource
+        parameters, codecs, and proof gates are executable.
       - [ ] Generate and pass `ROOT-008-F00..F34` across producer, signer,
         adopter, restart, catch-up, reorg, bootstrap, and offline import.
       - [ ] Replace field-34 canonical JSON with one frozen scodec value codec;
@@ -198,24 +199,84 @@ criteria are in `NAKAMOTO-PLAN.md`.
     from GL0 recovery rather than synthesized as an empty replay input. Make
     malformed tower/SMT durable keys reject the whole load instead of disappearing
     (`STOR-02`, `REC-004`). The strict total decoder, complete tower construction,
-    one-time validated tower index, and isolated historical replay tree swap are
-    green in focused worktree tests; double replay produces identical retained
-    roots, and injected hashing failure/cancellation preserves the prior derived tree. Durable-KV
-    crash atomicity, production boot/disk wiring, `TowerFinalizer` restart refs,
-    and its bounded catch-up cursor remain open: the live loop marks target A
-    settled before asynchronously processing at most 100 ordinals from prior P,
-    so a farther suffix or missing/failed entry is not retried. Restart/compaction,
-    exact-hash density reorg, proof serving, and authenticated clean-rebuild
-    integration remain open.
+    one-time validated tower index, and strict historical replay are green in
+    focused worktree tests. Replay consumes one image, requires exact contiguous
+    `0..expectedEligible` coverage including ordinal zero, preflights
+    `ordinal + k`, and atomically swaps an isolated completed tree; malformed,
+    gapped, failed, or cancelled replay preserves the prior tree (`STOR-02`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/DurableNipopowKey.scala:32-42,44-115`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStore.scala:101-108,159-262`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStore.scala:179-264`;
+    `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStoreSuite.scala:258-456`;
+    `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStoreSuite.scala:293-337,349-559`). The
+    append path is still split-publication: durable KV commit precedes the live
+    versioned-SMT commit without one all-or-none boundary
+    (`HistoricalCommitmentSmtStore.scala:150-168`). Add `REC-004` failure and
+    cancellation injection between those effects; the old or new complete
+    generation must remain visible, later append cannot extend stale live state,
+    and restart replay plus the next append must equal clean replay. The old
+    detached skip-ahead driver and startup provider publication are removed.
+    Its serialized exact-hash coordinator/finalizer is deliberately unwired,
+    in-memory, and not activation-safe. The public finalizer lacks a single-writer
+    prepare/commit generation; each nominally bounded catch-up run first walks the
+    whole remaining interval, yielding `O(M^2/B)` cumulative work; and the builder
+    reads by ordinal then injects a tower hash without rehashing or binding one
+    immutable exact target. Provider remains `None` and proof routes remain
+    unavailable/503, including pure verification (`STOR-03`, contained dark, not closed;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:1510-1514`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/TowerCatchupCoordinator.scala:216-312,372-513`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerFinalizer.scala:89-96,180-213`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerProofBuilder.scala:96-103,148-166`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/NipopowRoutes.scala:82-87,154-168`).
+    Durable-KV crash atomicity, production boot/disk wiring, durable rebuild and
+    cursor, restart/compaction, exact-hash density reorg, one-writer finalization,
+    paged linear catch-up, target-bound exact-hash proof construction, resource
+    bounds, verifier/builder service separation, and atomic provider publication
+    remain open. Required RED tests force concurrent `finalize(N/N+1)`, count per-run
+    and cumulative walk links for `M >> B`, switch same-ordinal branches while a
+    build is paused, and prove pure verification stays callable while building is dark.
+  - [ ] **SMT-01 CONTAINED DARK - keep the current-era cut fail-closed.** Active
+    snapshots use `smtRoot=None`; producer, validator, signed download,
+    context/traverse, ML0 adoption, and route boundaries reject `Some`, and state
+    proof comparison is exact. The field remains in the schema. Do not wire the
+    historical store or provider until branch-bound durable reproduction passes
+    production, follow, restart, reorg, bootstrap, and serving tests
+    (`modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala:10-30`;
+    `modules/shared/src/main/scala/io/constellationnetwork/validator/StateProofComparison.scala:28-37,45-78`;
+    `modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotStateProof.scala:124-130`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala:282-299,353`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:692-694,1510-1514`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/domain/snapshot/programs/Download.scala:368-381,607-622`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala:61-72`;
+    `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotTraverse.scala:107-116,183-194`;
+    `modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/StateChannel.scala:213-230,306-315,423-432`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotStorage.scala:100-125`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalizedSnapshotReader.scala:145-169`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/http/routes/SnapshotRoutes.scala:62-82`).
   - [ ] **5. Integrated qualification:** prove identical GSAM decisions/root from
     identical rooted state under every sidecar mutation, then exercise restart,
     compaction, density reorg/recovery, and shard counts 1/2/K. Include expiry,
     stake/committee eligibility, slash/cooldown, checkpoint adoption, and supply.
-  - **HTTP field-7 residual:** `41c19903d` fixes proof-envelope key/value/leaf
-    binding and the local field-25 `MgBalances` path, but the served per-MG root
-    still covers field 5 plus fields 25-31, not active allow-spends field 7.
-    Root field 7 in the applicable complete commitment or prove it against the
-    exact Phase-2 GL0 complete root before activating HTTP cross-shard reads.
+  - **ROOT-005A focused proof hardening landed; ROOT-005B remains open.** One
+    immutable captured branch image now supplies the complete-root proof and
+    values; every consumed field, exact verifier-derived bound, and proved leaf
+    value is mandatory, and evidence-free success requires the canonical empty
+    root. The services remain unwired until the image is bound to an
+    authenticated exact `(ordinal,hash,root)` and base/overlay/proof/persistence
+    mutations share one owner. Today `HistoricalMptProofService` ignores the
+    supplied ordinal, unknown branch IDs resolve to base, and GlobalFollow stamps
+    the caller ordinal on the captured image. RED tests must reject unknown,
+    evicted, sibling, and wrong-ordinal requests while capture races
+    finalize/reset/replacement. Do not treat the green primitive suites as live
+    HTTP cross-shard evidence
+    (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/MptOverlay.scala:46-84,286-297,953-966,1531-1538`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/HistoricalMptProofService.scala:40-52`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/GlobalFollowProofService.scala:39-47,65-112`;
+    `modules/shared/src/main/scala/io/constellationnetwork/schema/nakamoto/follow/FollowVerifyCore.scala:585-683`;
+    `modules/shared/src/main/scala/io/constellationnetwork/security/mpt/verifier/MerklePatriciaRangeVerifier.scala:259-268`;
+    regressions `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/GlobalFollowProofServiceSuite.scala:180-190,195-415`,
+    `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/MptOverlaySuite.scala:852-904`, and
+    `modules/shared/src/test/scala/io/constellationnetwork/security/mpt/MerklePatriciaRangeVerifierSuite.scala:87-123`).
 
 ### Wave 1 - Parallel models and shared contracts
 
@@ -362,15 +423,19 @@ criteria are in `NAKAMOTO-PLAN.md`.
     witness. Acceptance rejects cross-operator key collisions but does not reject
     one operator reusing both keys or submitting a complete pair record in which
     only one key changed. Atomic activation requires selecting both keys from one
-    preregistered record; whether an unchanged KES or VRF key is permitted across
-    successive complete records remains an owner decision.
+    preregistered record. The atomic-pair direction is owner-ratified; derive and
+    freeze the explicit active-era validation rule for full-pair reuse and
+    one-key-change rotations as schema/RED engineering. Until then both cases
+    fail closed.
   - **Runtime secret/reorg gate:** atomically provision and durably store the
     future VRF secret plus fresh KES tree, register their public pair under the
     exact N-2 historical-view preregistration rule before eligibility, and
     select that bundle only from an
     exact-parent historical eligibility capability after comparing both public
-    keys. Ratify O-12: activation assumes the N-2 registration/roster prefix is
-    common-prefix stable. KES erasure cannot be rolled back like Phase-2 state; a
+    keys. Implement O-12's ratified baseline: activation assumes the N-2
+    registration/roster prefix is common-prefix stable, while the exact bound
+    still requires quantitative engineering. KES erasure cannot be rolled back
+    like Phase-2 state; a
     density reorg crossing an erased activation boundary enters
     `RecoveryRequired`/operator realignment. Retaining old KES masters through
     k2 weakens forward security and is not an implicit fallback.
@@ -657,7 +722,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     MPT publisher, follower, or service path calls it, so L-23 remains open.
     Exact per-hash P0/P1 state and the optimistic K/alpha/beta decision cascade are
     not implemented by this durability slice.
-  - [ ] **P6-FIN14-A DESIGNED / OWNER REVIEW REQUIRED - exact Phase-2 consumer
+  - [ ] **P6-FIN14-A OWNER DIRECTION RATIFIED / ENGINEERING GATES OPEN - exact Phase-2 consumer
     lease and invalidation.** The nonactivating packet at
     `docs/review/P6-FIN14-PHASE2-CONSUMER-LEASE.md` defines a package-minted,
     exhaustively purpose-scoped local lease, two short acquisition operations
@@ -667,8 +732,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
     forbids holding finality/MPT/chain locks across image validation, committee
     polling, or replay. P6 owns the lease kernel; P8 owns shard/admission consumers,
     P10 followers/economic reads, P11 serving/recovery, and P7 only the exact diff/
-    root/checkpoint interfaces. Do not add a live issuer until O-16A..F is ratified
-    and O-15/O-01, exact released-core evidence and MPT/semantic/anchor readback,
+    root/checkpoint interfaces. Do not add a live issuer until the owner-ratified
+    O-16A..F direction is executable: freshness/purpose/schema gates, O-15/O-01,
+    exact released-core evidence and MPT/semantic/anchor readback,
     ROOT gates, durable consumer effect ordering, and the complete RED matrix close.
     An opaque wrapper around the current Boolean is still FIN-14.
   - Before activation, add authenticated finality-evidence/fork-choice authority and
@@ -689,7 +755,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `RecoveryRequired`; it never falls back to receiver live head.
   - **Gate:** `BOOT-001..005`, `XMG-006`, `FOLLOW-001..007` plus
     `FOLLOW-008A..P`, `REC-*` including
-    `REC-004/005`, `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02/03`,
+    `REC-004/005`, `MEMPOOL-001`, `ROOT-002..005` including `ROOT-005A/005B`,
+    `ROOT-009`, `STOR-02/03`,
     `GROWTH-001`.
 
 - [ ] **E11 SCAFFOLD ONLY - exceptional replay, adjudication, and slashing**
@@ -824,7 +891,8 @@ be the independent closer.
 - ⚠ **ML0 consensus integration** — ML0 may remain BFT for its small,
   well-connected validator set, with the GL0 Phase-2 chain as global truth. Any
   prior plan to force global-style Nakamoto consensus onto ML0 is not the current
-  target and requires a separate product decision.
+  target. Such a migration is outside this plan and would require a new,
+  owner-ratified ADR; it is not a gate on the current architecture.
 - ⚠ **Go↔JVM gossip transport for shard-checkpoint + fraud-proof legs** (`72f39d652`, F1/F2/F8); sidecar carries l1-block topics + self-delivery (`b0ca67908`).
 - 🔴 **RECURRING WEDGE / current e2e operational frontier (not the security dependency head) — metagraph committee-gate parent-ordinal resolution.** `MetagraphCommitteeGate` / `MetagraphParentOrdinalResolver` / `MetagraphOrphanBuffer`; resolver→None on GSI-tip-lag → orphan re-buffer loop. Prior fix "walk-finalized-not-bestTip" (`40d546761`) recurred; blocks the 2mg/2shard token-lock e2e. **Must be fixed WITHIN the re-exec model, after the active roadmap's security ordering is respected.**
 - ⚠ **CL1 replay-before-sign is type-gated; target result/adoption is missing** —

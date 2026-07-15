@@ -3,7 +3,6 @@ package io.constellationnetwork.schema
 import io.constellationnetwork.merkletree.MerkleRoot
 import io.constellationnetwork.schema.snapshot.StateProof
 import io.constellationnetwork.security.hash.Hash
-import io.constellationnetwork.security.mpt.MptRoot
 
 import derevo.cats.{eqv, show}
 import derevo.circe.magnolia.{decoder, encoder}
@@ -121,14 +120,11 @@ case class GlobalSnapshotStateProof(
     * single-period Merkle proofs by NIPoPoW light clients.
     */
   historicalStakeSnapshots: Option[Hash],
-  /** §3 NIPoPoW historical-commitment SMT: the SINGLE root of the unbounded, on-disk SMT keyed by snapshot ordinal whose leaves are
-    * `PerOrdinalCommitment(hypergraphRoot, incrementalSnapshotHash, towerEligibility)` (see
-    * `node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore`). `smtRoot(N) = SMT({ (i, commitment_i) : i ≤ N−k }).root`, `k` =
-    * the confirmation depth, so it commits ONLY finalized ordinals (circularity-free: snapshot N's own incremental hash first appears in
-    * `smtRoot(N+k)`). `None` in the genesis/warmup window (`N ≤ k`) and on any proof-build path that lacks the maintained store (those are
-    * EXCLUDED from the `StateProofValidator` `===` via `StateProofComparison`; the field is populated + cross-checked on the
-    * producer/follower-symmetric GSAM accept path). NOT transitively covered by `mptRoot` — the SMT is a SEPARATE on-disk store, so the
-    * hypergraph (ledger) root stays independent of `smtRoot`.
+  /** Reserved wire slot for a future NIPoPoW historical-commitment SMT root. In the current greenfield active era this field MUST be
+    * `None`; [[io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator]] rejects `Some` before snapshots can be stored, adopted,
+    * traversed, or served. The staged SMT implementation is not consensus-active and must not populate this slot until a future active-era
+    * transition specifies deterministic reconstruction, restart/reorg behavior, and complete proof validation. The field is intentionally
+    * outside `mptRoot`, so merely computing it locally cannot make it consensus-valid.
     */
   smtRoot: Option[Hash]
 ) extends StateProof

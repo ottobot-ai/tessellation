@@ -1,17 +1,41 @@
 # §3 NIPoPoW — implementation slice plan
 
-**Status**: SCHEDULED 2026-05-17 (post §1.2 KES Slice 9 land at `ddf183adc`).
+**Status**: PARTIAL IMPLEMENTATION; PRODUCTION ACTIVATION DARK (reviewed 2026-07-14).
 **Companion to**: [NIPOPOW-PROPOSAL.md](./NIPOPOW-PROPOSAL.md) §1–§7 (design + phase sizing). This file slices the design into ordered, dependency-aware chunks with prereq gates and e2e milestones.
 
 Estimate from the proposal §6.6: **~2,400 LOC, 6–10 engineer-weeks** in-node (Phases A–D). Add ~1–2 weeks for the N-2 staggering prereq (S0). Total: **8–12 weeks** to v1.
+
+> **Production activation is dark (2026-07-14).** The HTTP routes remain mounted, but `GlobalSnapshotConsensus` keeps
+> `nipopowProofProviderRef = None`, so proof and verification requests return 503. The tower finalizer and exact-walk catch-up coordinator
+> are staged, tested components and are not attached to the live finality monitor. Activation is blocked on all of the following:
+>
+> 1. proof construction bound to an immutable, exact `(ordinal, hash)` target rather than mutable latest/head storage;
+> 2. one all-or-none publication boundary for durable tower bytes, live indexed state, exact-hash cursor, and finalizer watermark, with
+>    authenticated clean rebuild after crash, cancellation, hash failure, or density reorg;
+> 3. serialized/idempotent finalizer publication under concurrent triggers, rather than separate read/append/watermark operations;
+> 4. a bounded/paged catch-up algorithm whose total work is linear in the missing interval rather than rescanning the full
+>    tip-to-cursor history for every processing chunk;
+> 5. proof construction from one immutable exact `(ordinal, hash)` generation, including re-hashing the exact target rather than injecting
+>    an independently read hash into a proof assembled from mutable current head/levels; and
+> 6. ratified and enforced request, proof-size, verification-work, and memory limits. The S6 `50 KB` target is empirical acceptance data,
+>    not a protocol bound on caller-supplied `k`.
 
 ---
 
 ## Prereqs (must land first)
 
-- ✅ §1.1 Stake-weighted VRF (`b0e3` series — combined delegated + collateral; validated 2026-05-16)
-- ✅ §1.2 KES live wiring through Slice 9 (load-bearing flip @ `ddf183adc`); Slice 10 (#179 runtime registration) **can land in parallel** with NIPoPoW Slice S1+ — neither blocks the other since NIPoPoW's KES dependency is per-snapshot-sig verification, not registration mid-life
-- ✅ Finality trigger stack (`b65` series — T_count, T_depth2, chain-quality)
+This is a historical slice checklist, not current consensus authority. In particular, `T_count` is not a finality rail and `T_depth2`/`k2`
+is retention/recovery policy only; neither can activate tower publication.
+
+- ⚠ GL0 stake-weighted eligibility mechanics exist, but production safety is not closed: unbacked stake, fail-closed exact historical N-2
+  availability, and exact-parent roster/key-pair resolution remain `ECO-02`/`CONS-03`/`CONS-05`/`CONS-06` gates. Execution-shard membership
+  is a separate uniform public draw, not this stake-weighted leader rule.
+- ⚠ Period-zero KES+VRF verification is load-bearing, but runtime registration activation, historical pair selection, secret provisioning/
+  deletion, and reorg/rejoin behavior remain open under `CONS-06`/O-12. NIPoPoW activation cannot treat period-zero verification as a
+  complete end-to-end runtime-key prerequisite.
+- ⚠ Legacy trigger/telemetry scaffold (`b65` series) exists, but it is not the target finality stack. `T_count` is non-authoritative and
+  must be removed/subsumed; `T_depth2` is local retention telemetry only. Target Phase 2 remains decided-attestation `T_weight` OR canonical
+  `k1` depth, and the current optimistic accumulator still requires O-01 qualification.
 
 ---
 
@@ -27,8 +51,8 @@ Estimate from the proposal §6.6: **~2,400 LOC, 6–10 engineer-weeks** in-node 
 | S0.2 | Extend `StakeRegistry` with `relativeStakeAt(peerId, etaPeriod)` | ~100 | edit existing |
 | S0.3 | `GlobalSnapshotInfo` — add `historicalStakeSnapshots: Map[EtaPeriod, StakeDistribution]` (capped at N-2 retention) | ~80 | schema + MPT keying |
 | S0.4 | Wire `EligibilityChecker` to read `relativeStakeAt(_, currentEtaPeriod - 2)` instead of latest | ~50 | edit |
-| ~~S0.5~~ | ~~Backfill at genesis: stamp the genesis stake distribution as N-2/N-1/N for the first 3 periods~~ — **DROPPED 2026-05-20** as redundant. `StakeRegistry.relativeStakeAt` already falls through to the current GSI when `historicalDistributionFor(period) = None`; during warmup (periods 0-2) the current GSI IS the genesis distribution (no stake events have fired yet), so both code paths return identical `Ratio`s. The "uniform always-branch-1" benefit doesn't justify the genesis-load stateProof/MPT triangle bug that S0.5 exposed (memory `project_nipopow_s0_s3_landing`). | — | — |
-| ~~S0.6~~ | ~~Unit tests + property test (stake change at ord X is invisible to eligibility until ord X + 2 × eta-period)~~ — **DROPPED 2026-05-20** alongside S0.5. The property holds anyway because of fall-through + GSAM boundary writes; re-introduce only if S0.5 is ever re-attempted. | — | — |
+| ~~S0.5~~ | ~~Backfill at genesis: stamp the genesis stake distribution as N-2/N-1/N for the first 3 periods~~ — **DROPPED 2026-05-20** by the historical implementation because `relativeStakeAt` falls through to current GSI during warmup. The current audit does not treat the assumptions that current GSI still equals genesis and no stake event can affect periods 0-2 as proved activation invariants; the reopened S0.6 coverage below must freeze the exact warmup behavior. | — | — |
+| ~~S0.6~~ | ~~Unit tests + property test (stake change at ord X is invisible to eligibility until ord X + 2 × eta-period)~~ — **DROPPED 2026-05-20** alongside S0.5. The current audit does not accept fall-through plus boundary-write reasoning as proof. Reintroduce branch/reorg/restart property coverage before treating the N-2/N-1 schedule as an activation guarantee. | — | — |
 
 **E2e milestone**: 8-node cluster with `NAKAMOTO_ETA_ROTATION_SNAPSHOTS=100`, mid-run delegate-stake change to op-7. Verify op-7's slot wins do NOT shift until after 2 full eta periods (~24 min wall clock at default cadence). This closes #177 cleanly because the demo's stake-change-impact assertion gets a deterministic deadline.
 
@@ -83,9 +107,16 @@ Split into two phases against the "8gl0+4mg+4shards baseline that can't be broke
 ## Slice S3 — TowerStore (Phase B, ~1 week)
 
 - `TowerStore[F]` trait + `MptTowerStore` impl keyed `(level, ordinal) → snapshotHash` (~250 LOC)
-- `TowerFinalizer` — Phase-3 sink that appends an entry on `T_depth2.advance` (~120 LOC, wired into `SnapshotLeaderLoop.finalityMonitor`)
+- `TowerFinalizer` — local retention/proof-service component; staged and deliberately unwired pending the activation gates above. There is
+  no protocol Phase 3, and `T_depth2`/`k2` cannot confer finality or select a branch. Before wiring, concurrent `finalizeThrough` calls must
+  be serialized or made transactionally idempotent: the staged implementation derives work from separately read refs and publishes the
+  tower append before a separate watermark update, so overlapping calls can duplicate/conflict or regress the watermark.
+- `HistoricalCommitmentSmtStore.append` must publish its durable insert/commit and live `VersionedMptStorage` commit as one recoverable
+  generation. Cancellation or hashing failure between those steps currently leaves durable and live views disagreeing until restart.
 - MPT overlay extension for tower-entry pruning under memory pressure (~50 LOC)
-- Tests: tower length grows monotonically with finalized depth; pruning preserves the prefix needed for the most-recent N proofs (~100 LOC)
+- Tests: tower length grows monotonically with finalized depth; pruning preserves the prefix needed for the most-recent N proofs; concurrent
+  finalizers cannot duplicate/conflict/regress; and injected cancellation/failure at every append publication boundary yields either the old
+  or new complete generation, with live/durable parity before and after clean replay (~100 LOC)
 
 **Validation**: 8-node soak, observe `dag_nakamoto_tower_entries_total{level}` Prometheus gauge per level grows at expected `f_0 · 2^(-µ)` rate.
 
@@ -93,24 +124,33 @@ Split into two phases against the "8gl0+4mg+4shards baseline that can't be broke
 
 ## Slice S4 — Tower proof builder + verifier (Phase C, ~1 week)
 
-- `TowerProofBuilder[F]` serves `GET /nakamoto/tower` and `GET /nakamoto/tower/since/{N}` (~250 LOC, edit `dag-l0/.../routes/TowerRoutes.scala`)
+- `TowerProofBuilder[F]` serves `GET /nakamoto/tower` and `GET /nakamoto/tower/since/{N}` (~250 LOC, edit `dag-l0/.../routes/TowerRoutes.scala`).
+  It must pin one immutable exact-target generation, recompute/verify that target's hash, and derive the head and all levels from the same
+  generation. The staged builder independently reads an ordinal snapshot, current head, and levels, then substitutes the separately read
+  hash into the exact target without re-hashing; a same-height reorg can therefore construct a mixed-generation proof.
+- Catch-up must page or persist traversal progress so `B`-sized runs over an `M`-snapshot gap perform `O(M)` total historical reads. The
+  staged coordinator walks the full tip-to-cursor interval and only then takes `maxPerRun`, yielding `O(M^2/B)` reads across repeated runs.
 - `TowerVerifier` (pure `F[_]`) — round-trips a serialized proof, validates: (a) all L trial outcomes per claimed-eligible slot; (b) density-relative-error gating; (c) eta-rotation reconstruction against `EtaCalculation` (~250 LOC)
 - Density-violation detector (~50 LOC)
-- Adversarial-tower tests: garbage levels, level-0 forged, density-padding attacks (~70 LOC)
+- Adversarial-tower tests: garbage levels, level-0 forged, density-padding attacks, same-height reorg during exact-target construction, and
+  total traversal-work bounds across repeated catch-up chunks (~70 LOC)
 
 **Validation**: build proof from gl0-0's tower, verify on gl0-7. Round-trip latency for a 10-eta-period proof ≤ 200ms.
 
 ---
 
-## Slice S5 — Inclusion proofs + HTTP routes (Phase D)  ✅ **LANDED `bc58afca6` (2026-05-20)**
+## Slice S5 — Inclusion proofs + HTTP routes (Phase D)  ⚠ **CODE LANDED; PRODUCTION PUBLICATION DISABLED**
 
 - `GET /nakamoto/nipopow/proof?fromOrd=N&k=K` — returns Circe-encoded `NipopowProof` from ordinal N with L0-suffix length K
 - `GET /nakamoto/nipopow/proof/genesis?k=K` — convenience: full-chain proof from genesis
-- `POST /nakamoto/nipopow/verify` — server-side verification offload (returns `{verified: bool, error?: ProofError}`)
-- `NipopowProofProvider[F]` trait at `node-shared/.../nipopow/` wraps `(TowerProofBuilder, TowerVerifier)` with the `(genesisEta, etaRotationSnapshots, lddConfig)` bound at consensus-startup. Exposed via `Ref[F, Option[NipopowProofProvider[F]]]` populated inside `GlobalSnapshotConsensus.make` (pattern mirrors `finalityTriggerViewRef` from #138).
+- `POST /nakamoto/nipopow/verify` — server-side verification offload (returns `{verified: bool, error?: ProofError}`). It currently shares
+  the absent provider gate with proof construction and therefore returns 503 even though verification is pure and needs no local tower.
+  Restore verifier-only availability through a separately constructed bounded verifier capability; do not enable proof generation with it.
+- `NipopowProofProvider[F]` trait at `node-shared/.../nipopow/` wraps `(TowerProofBuilder, TowerVerifier)` with the `(genesisEta, etaRotationSnapshots, lddConfig)` bound at construction. The route seam is a `Ref[F, Option[NipopowProofProvider[F]]]`, but production intentionally leaves it empty until every activation gate at the top of this document is closed.
 - Routes at `dag-l0/.../http/routes/NipopowRoutes.scala`. URL prefix `"/nakamoto"` added to `InternalUrlPrefixes`.
 - `ProofError` JSON encoder routes through a stable `kind` discriminator (sealed-ADT, no string-matching).
-- 12/12 new `NipopowRoutesSuite` tests + 81/81 nipopow domain tests + 1069 total tests pass.
+- Current focused `NipopowRoutesSuite`: 13/13 passing. Historical aggregate counts are not activation evidence; the restart/reorg, target
+  binding, and adversarial resource suites listed above remain mandatory.
 - Prometheus `dag_nakamoto_tower_density_relative_error{level}` — DEFERRED to a follow-up; the metric infrastructure for the density check is wired in the dashboard revamp (`5338d6c59`), but the gauge sampler that feeds it isn't.
 
 ---
@@ -143,8 +183,9 @@ Split into two phases against the "8gl0+4mg+4shards baseline that can't be broke
 1. **Density-tuning empirical gap** — proposal §6.4 flags this as the hardest non-cryptographic part. We should validate density behavior on the iter-stake-1-1 cluster BEFORE building proof routes (catch parameter mismatch early).
 2. **N-2 staggering correctness** — if Slice S0 is wrong, all downstream NIPoPoW levels are silently broken because the verifier uses the wrong stake-at-period. With S0.5/S0.6 dropped (see slice table), correctness is enforced by S0.4 boundary writes + StakeRegistry warmup fall-through — both deterministic. Re-introduce a property test if `StakeRegistry.relativeStakeAt` is ever refactored.
 
-4. **GSI/MPT/stateProof triangle at genesis** (uncovered 2026-05-20): `mkFirstIncrementalSnapshot` computes ord=1 stateProof from PRE-augmentation GSI; `augmenter` then overlays delegated-stake + collateral records; `syncFromGlobalSnapshotInfo` writes augmented bytes to MPT. The stored ord=1 snapshot.stateProof is inconsistent with the persisted GSI + MPT. Compounding factor: ECDSA signatures on `DelegatedStakeRecord` are generated at JSON load time and are NOT deterministic, so `SortedSet[DelegatedStakeRecord]` ordering varies per node — `activeDelegatedStakes` MPT bytes diverge across the cluster. This is the genuine bug behind the slot=3 `delegStakes,mptRoot` reject. Fix is on the genesis-path side (augment-before-mkFirstIncrementalSnapshot), not the NIPoPoW slice plan.
-3. **KES forward-security assumption** — Slice 9 made KES load-bearing unconditionally (no enforce flag; receivers drop any message that fails KES verify). NIPoPoW v1 can rely on KES authenticity end-to-end.
+3. **GSI/MPT/stateProof triangle at genesis** (uncovered 2026-05-20): `mkFirstIncrementalSnapshot` computes ord=1 stateProof from PRE-augmentation GSI; `augmenter` then overlays delegated-stake + collateral records; `syncFromGlobalSnapshotInfo` writes augmented bytes to MPT. The stored ord=1 snapshot.stateProof is inconsistent with the persisted GSI + MPT. Compounding factor: ECDSA signatures on `DelegatedStakeRecord` are generated at JSON load time and are NOT deterministic, so `SortedSet[DelegatedStakeRecord]` ordering varies per node — `activeDelegatedStakes` MPT bytes diverge across the cluster. This is the genuine bug behind the slot=3 `delegStakes,mptRoot` reject. Fix is on the genesis-path side (augment-before-mkFirstIncrementalSnapshot), not the NIPoPoW slice plan.
+4. **KES forward-security assumption** — Slice 9 made KES load-bearing unconditionally (no enforce flag; receivers drop any message that fails KES verify). NIPoPoW v1 can rely on KES authenticity end-to-end.
+5. **Unbounded proof-service work** — no ratified `k`, proof-byte, verification-step, or memory limit currently turns the empirical S6 targets into fail-closed runtime bounds. The production provider stays absent until those bounds and adversarial resource tests land.
 
 ---
 

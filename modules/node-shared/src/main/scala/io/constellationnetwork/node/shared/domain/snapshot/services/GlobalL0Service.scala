@@ -31,7 +31,7 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
-import io.constellationnetwork.validator.StateProofValidator
+import io.constellationnetwork.validator.{GlobalSnapshotActiveEraValidator, StateProofValidator}
 
 import eu.timepit.refined.auto.autoUnwrap
 import eu.timepit.refined.types.numeric.PosLong
@@ -156,6 +156,13 @@ object GlobalL0Service {
 
       private val noSnapshots = List.empty[Hashed[GlobalIncrementalSnapshot]]
 
+      private def validateAndHash(snapshot: Signed[GlobalIncrementalSnapshot])(
+        implicit hasher: Hasher[F]
+      ): F[Hashed[GlobalIncrementalSnapshot]] =
+        snapshot.toHashedWithSignatureCheck.flatMap(_.liftTo[F]).flatTap { hashed =>
+          GlobalSnapshotActiveEraValidator.requireValid[F](hashed.signed.value)
+        }
+
       def pullLatestSnapshot: F[LatestSnapshotTuple] =
         maybeMajorityPeerIds.fold(pullLatestSnapshotFromRandomPeer)(pullLatestSnapshotWithMajorityHash)
 
@@ -182,9 +189,8 @@ object GlobalL0Service {
           l0GlobalSnapshotClient.getLatestMptEntries(l0Peer).flatMap {
             case (snapshot, state, entries) =>
               HasherSelector[F].withCurrent { implicit hasher =>
-                snapshot.toHashedWithSignatureCheck
+                validateAndHash(snapshot)
               }
-                .flatMap(_.liftTo[F])
                 .flatTap(_ =>
                   logger.info(
                     s"3c-A FAST-PATH fired: pulled gl0's signed MPT byte map (${entries.size} entries) at ord=${snapshot.value.ordinal.show}; " +
@@ -445,9 +451,8 @@ object GlobalL0Service {
         l0GlobalSnapshotClient.getLatest(l0Peer).flatMap {
           case (snapshot, state) =>
             HasherSelector[F].withCurrent { implicit hasher =>
-              snapshot.toHashedWithSignatureCheck
+              validateAndHash(snapshot)
             }
-              .flatMap(_.liftTo[F])
               .map((_, state))
         }
 
@@ -456,7 +461,7 @@ object GlobalL0Service {
       ): F[Option[Hashed[GlobalIncrementalSnapshot]]] =
         globalL0ClusterStorage.getRandomPeer.flatMap { l0Peer =>
           peerResponse(l0Peer)
-            .flatMap(snapshot => HasherSelector[F].withCurrent(implicit hasher => snapshot.toHashedWithSignatureCheck).flatMap(_.liftTo[F]))
+            .flatMap(snapshot => HasherSelector[F].withCurrent(implicit hasher => validateAndHash(snapshot)))
             .map(_.some)
         }
 
@@ -508,7 +513,7 @@ object GlobalL0Service {
           case (ordinal #:: nextOrdinals, snapshots) =>
             l0GlobalSnapshotClient
               .get(ordinal)(l0Peer)
-              .flatMap(snapshot => hasherSelector.withCurrent(implicit hasher => snapshot.toHashedWithSignatureCheck).flatMap(_.liftTo[F]))
+              .flatMap(snapshot => hasherSelector.withCurrent(implicit hasher => validateAndHash(snapshot)))
               .map(s => (nextOrdinals, snapshots :+ s).asLeft[Result])
               .handleErrorWith { e =>
                 logger

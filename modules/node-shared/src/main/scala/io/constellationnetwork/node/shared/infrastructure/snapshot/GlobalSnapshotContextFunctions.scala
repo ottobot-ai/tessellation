@@ -30,6 +30,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelValidationType}
+import io.constellationnetwork.validator.GlobalSnapshotActiveEraValidator
 
 import derevo.cats.{eqv, show}
 import derevo.derive
@@ -57,10 +58,9 @@ object GlobalSnapshotContextFunctions {
     new GlobalSnapshotContextFunctions[F] {
       private val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLogger[F]
 
-      // Note: State proof validation is skipped for followers (currency-l0, dag-l1) because:
-      // 1. The snapshot was already validated by dag-l0 majority consensus
-      // 2. Full MPT sync on every ordinal is too expensive (~2 min for 800K entries)
-      // The MPT store is synced once during initial download for query support.
+      // Full state proof reconstruction is skipped on downstream follower paths because it is too expensive (~2 min for 800K entries).
+      // The snapshot is expected to come from GL0's authenticated production/acceptance path, but that is not treated as sufficient here:
+      // the carried active-era shape and locally reproduced mptRoot are still checked before any MPT or overlay mutation.
 
       def createContext(
         context: GlobalSnapshotInfo,
@@ -68,6 +68,7 @@ object GlobalSnapshotContextFunctions {
         signedArtifact: Signed[GlobalIncrementalSnapshot],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[F]): F[GlobalSnapshotInfo] = for {
+        _ <- GlobalSnapshotActiveEraValidator.requireValid[F](signedArtifact.value)
         lastActiveTips <- HasherSelector[F].forOrdinal(lastArtifact.ordinal)(implicit hasher => lastArtifact.activeTips)
 
         lastDeprecatedTips = lastArtifact.tips.deprecated
@@ -270,29 +271,28 @@ object GlobalSnapshotContextFunctions {
                   ) =>
                 // For followers (currency-l0, dag-l1, currency-l1), we log warnings instead of raising errors
                 // for blocks, state channels, and rewards validation divergences.
-                // The snapshot was already validated by dag-l0 majority consensus, so local acceptance
-                // divergences on followers should not cause permanent stalls. The same rationale applies
-                // as for skipping state proof validation below.
+                // The snapshot is expected from GL0's authenticated production/acceptance path, but the follower still enforces the
+                // active-era shape above and the locally reproduced mptRoot below before committing any state.
                 for {
                   _ <- logger
                     .warn(
                       s"Follower: ${acceptanceResult.notAccepted.size} blocks not accepted at ordinal=${signedArtifact.ordinal.show}. " +
                         s"Reasons: ${acceptanceResult.notAccepted.map { case (_, reason) => reason }.mkString(", ")}. " +
-                        s"Continuing since snapshot was already validated by L0 majority consensus."
+                        s"Continuing subject to active-era and mptRoot verification."
                     )
                     .whenA(acceptanceResult.notAccepted.nonEmpty)
                   _ <- logger
                     .warn(
                       s"Follower: ${returnedSCEvents.size} state channels returned at ordinal=${signedArtifact.ordinal.show} " +
                         s"for addresses: ${returnedSCEvents.toList.map(_.address).mkString(", ")}. " +
-                        s"Continuing since snapshot was already validated by L0 majority consensus."
+                        s"Continuing subject to active-era and mptRoot verification."
                     )
                     .whenA(returnedSCEvents.nonEmpty)
                   diffRewards = acceptedRewardTxs -- signedArtifact.rewards
                   _ <- logger
                     .warn(
                       s"Follower: ${diffRewards.size} rewards not accepted at ordinal=${signedArtifact.ordinal.show}. " +
-                        s"Continuing since snapshot was already validated by L0 majority consensus."
+                        s"Continuing subject to active-era and mptRoot verification."
                     )
                     .whenA(diffRewards.nonEmpty)
                   // State-proof cross-check: compare the MPT root we computed locally (by applying
@@ -451,10 +451,8 @@ object GlobalSnapshotContextFunctions {
     * ([[io.constellationnetwork.validator.StateProofComparison.globalSnapshotStateProofFieldDiffs]]) so this live-follower log and the
     * catch-up validator (`StateProofValidator.validateProof`) name fields identically (`field(c=<computed>,l=<claimed/signed>)`).
     *
-    * Note on `smtRoot`: it appears in the breakdown as DIAGNOSTIC only. The follower mismatch above compares only the consensus-canonical
-    * `mptRoot`, and `smtRoot` is gl0-maintained — non-gl0 followers (cl0/dl1) run accept() WITHOUT the HistoricalCommitmentSmtStore, so
-    * their `computed.smtRoot` is None while the gl0-signed `claimed.smtRoot` is Some. That asymmetry is EXPECTED; gl0-producer↔gl0-peer
-    * agreement is enforced separately on the accept-with-store path.
+    * `smtRoot` is dark in the active era and is rejected before this diagnostic path. The follower mismatch below can therefore keep its
+    * focused `mptRoot` comparison without accepting a producer-supplied historical commitment.
     */
   private[snapshot] def perFieldRootDiffs(
     computed: GlobalSnapshotStateProof,

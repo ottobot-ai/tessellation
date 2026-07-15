@@ -155,12 +155,18 @@ validity or state bytes.
 - Direct shard-to-shard receipts are unnecessary for the first protocol version.
   GL0 canonical state and nullifiers are the rendezvous point.
 
-## Required follow-up decisions
+## Ratified follow-up directions and engineering gates
 
-1. Whether pure opaque/data-only metagraphs remain a supported public lane.
-2. The exact Phase-2 rollback contract exposed to ML0 and external integrators.
-3. The canonical ordering between same-snapshot cross-metagraph consumes,
-   cancellation, expiry, refunds, and local spends.
+1. O-09 retains a limited explicitly signed opaque/data-only public lane with
+   authenticated custody/availability/ordering and zero framework-economic write
+   surface. Its codec, resource, retention, and decoder-promotion tests remain
+   engineering gates.
+2. O-04 ratifies ML0 rewind to the last winning-branch embedding, followed by a
+   registered deterministic rebase or a new ML0 epoch. Exact retained-history and
+   rebase/new-epoch schemas remain engineering gates.
+3. O-13 ratifies inbox-before-local-spend as the first same-snapshot ordering rule.
+   Engineering must freeze the remaining total order among cross-metagraph
+   consumes, cancellation, expiry, refunds, and local spends.
 
 ## References
 

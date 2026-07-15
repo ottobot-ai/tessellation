@@ -4,11 +4,12 @@
 **Source baseline:** `c610a0740c34833e563f8a94c2ab820186a75897`
 **Security baseline:** `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`
 
-Owner decisions are tracked in `CONSENSUS-OWNER-DECISIONS.md`.
+The ratified decision register and its remaining engineering freeze gates are tracked in
+`CONSENSUS-OWNER-DECISIONS.md` and `CONSENSUS-OWNER-DECISIONS-ANSWERS.md`.
 
 This document is normative for implementation planning. It does not claim the
 current code implements the target. When it conflicts with older fork-only notes,
-the owner decisions recorded here and ADR-0016/0017 control.
+the ratified architecture recorded here and ADR-0016/0017 control.
 
 ## 1. Layer map and topology
 
@@ -151,11 +152,13 @@ second GL0 consensus engine.
 | DL1 custom bytes | No framework execution claim. ML0 source authentication plus DA commitment only. | Verify inclusion/availability commitment; no economic write surface. | Custom availability at containing P2; semantic truth remains the metagraph's concern. |
 | Canonical return to GL1/ML0/CL1/DL1 | No new execution signature or economic transition. | Downstream verifies exact P2 ref and adopts/resyncs. | Immediately under the explicit P2 reorg contract. |
 
-For every CL1-derived row, “containing P2” is necessary but not sufficient until
-the watchtower release decision is ratified. Under the conservative default, no
-checkpoint-derived economic leaf or derivative capability is usable before
-required positive replay coverage. This includes local transfers/fees/stake/reward
-weight, not only withdrawal and cross-metagraph use.
+For every CL1-derived row, “containing P2” is necessary but not sufficient. The
+owner-ratified release rule requires positive assigned-watchtower replay coverage
+before GL0 inclusion eligibility. No checkpoint-derived economic leaf or
+derivative capability is usable before that coverage. This includes local
+transfers/fees/stake/reward weight, not only withdrawal and cross-metagraph use.
+The exact population, minimum coverage, deadlines, redraw, bond, and resource
+values remain O-03 engineering/parameter freeze gates.
 
 Current code does not match all rows: it universally recreates checkpoint currency
 on ordinary GL0 adoption, lacks the target diff, and disables the shard path at
@@ -272,21 +275,21 @@ reject a valid density winner.
 read-only facade. Evidence validation is separate from the crash-consistent
 coordinator that applies the resulting transition.
 
-**Proposed O-16 contract, not ratified:** if O-16 is accepted, a verified exact P2
-query would mint only a local, purpose-scoped, non-serializable lease over the
+**Owner-ratified O-16 direction; activation gates remain:** a verified exact P2 query mints only
+a local, purpose-scoped, non-serializable lease over the
 exact released core, qualification/current-chain evidence, MPT/semantic/anchor
-readbacks, and persisted lineage revision. Acquisition would use two short
+readbacks, and persisted lineage revision. Acquisition uses two short
 coordinator operations around unlocked immutable artifact verification; the
 second operation would compare-and-set the complete captured descriptor before
 minting. Long replay, DA, network, signature, and committee waits would run
 without holding finality or MPT locks. Immediately before an authority-bearing
 consumer mutation, `commitIfCurrent` would recheck the exact release and lineage
-and order an idempotent scoped sink command. Under the recommended V1 choice, a
+and order an idempotent scoped sink command. Under the ratified V1 rule, a
 density replacement would invalidate every old-lineage permit and all derived
 cache/tally/queue/shard-buffer authority; raw bounded bytes could remain only for
 fresh verification. Pure descendant extension could preserve an exact-ancestor
 use after recheck, while a current-head use would reacquire when the P2 head
-advances. The proposed contract and unresolved owner choices are in
+advances. The ratified direction and unresolved engineering/schema gates are in
 `P6-FIN14-PHASE2-CONSUMER-LEASE.md` and O-16. None of this is live authority today.
 
 ### 4.4 Capabilities governed by the gadget
@@ -421,10 +424,10 @@ and length/content commitment are signed. Decoder success is not a lane selector
 Unknown tags, trailing bytes, ambiguous encodings, and currency-shaped custom data
 reject or stay custom according to the signed lane; they never gain authority.
 
-Standalone `OpaqueStateChannel` is disabled by the proposed v1 scope unless the
-owner explicitly retains pure data-only metagraphs. If retained, it provides only
-authenticated ordering/availability and no economic state, genesis balance, or
-upgrade path that imports claimed framework state.
+O-09 retains a limited authenticated data-only/opaque carriage lane for v4
+functionality. It provides only authenticated ordering, custody, and availability;
+it has no economic state, genesis balance, or upgrade path that imports claimed
+framework state. Decoder success can never promote it into a framework lane.
 
 ## 7. Execution checkpoint lifecycle
 
@@ -697,9 +700,10 @@ before local CL1 spends; its execution committee replays the same order and its
 new mirror root can absorb acknowledged adjustments without changing effective
 balances.
 
-The exact order of consumes, cancel, expiry, refund, inbound delivery, and local
-spend is an owner-blocking protocol decision. Wall clock, ML0 progress, peer order,
-shard arrival order, and map iteration are invalid tie breakers.
+O-13 ratifies inbox-before-local-spend as the first ordering rule. Engineering must
+still freeze the complete deterministic total order among consumes, cancel,
+expiry, refund, inbound delivery, and local spend. Wall clock, ML0 progress, peer
+order, shard arrival order, and map iteration are invalid tie breakers.
 
 ### 9.4 Phase-2 use and rollback
 
@@ -838,7 +842,7 @@ work is complete only when production code has:
 GSI may be used temporarily as a migration-test oracle, then is deleted from
 production sources. This is not complete today.
 
-## 14. Ratified decisions and remaining parameter gates
+## 14. Ratified decisions and remaining engineering freeze gates
 
 The following architecture decisions are implementation inputs, not open choices:
 
@@ -876,8 +880,9 @@ The following architecture decisions are implementation inputs, not open choices
 16. GL0 may apply explicit protocol-defined metagraph corrections. A metagraph
     cannot originate or authorize a correction of GL0 canonical state.
 
-These numeric/resource choices still gate their dependent runtime merge, but do
-not block pure models, codecs, RED tests, or interface work:
+These engineering/research/schema/parameter gates still block their dependent
+runtime merge, but do not reopen the owner-ratified directions or block pure
+models, codecs, RED tests, or interface work:
 
 - exact K/alpha/beta, `T_weight`, registry snapshot, churn, and small-network mode;
 - admission draw/threshold, receipt lifetime, custody horizon, and censorship
@@ -886,7 +891,9 @@ not block pure models, codecs, RED tests, or interface work:
   replay resource caps, and penalty schedule;
 - checkpoint/input/diff/DA limits and the minimum required rollback/archive service
   for recovery beyond local `k2` retention;
-- global settlement total order for consume/cancel/expiry/refund/inbox/local spend;
+- complete global settlement order after the ratified inbox-before-local-spend
+  first rule;
 - exact active-era authorization and activation form for a GL0 protocol correction;
-- whether a pure opaque/data-only non-economic lane ships in v1;
+- explicit signed codec, bounds, custody/availability contract, and negative
+  decoder-promotion tests for O-09's retained opaque/data-only non-economic lane;
 - future public-network migration policy, which is intentionally deferred.

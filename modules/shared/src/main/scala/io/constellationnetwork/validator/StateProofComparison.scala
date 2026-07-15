@@ -7,20 +7,7 @@ import io.constellationnetwork.schema.snapshot.StateProof
 import io.constellationnetwork.schema.{CurrencySnapshotMptRoots, GlobalSnapshotStateProof}
 import io.constellationnetwork.security.hash.Hash
 
-/** How [[StateProofValidator.validateProof]] decides a recomputed state proof matches the one carried in a signed snapshot.
-  *
-  * For every state-proof type this is plain structural equality ([[Eq]]). The ONE exception is `GlobalSnapshotStateProof`'s `smtRoot` (the
-  * §3 NIPoPoW historical-commitment SMT root): it is NOT reproducible on the proof-build paths `validateProof` uses
-  * (`GlobalSnapshotInfo.stateProofBuilder` / `mptStateProofFromBytes`), because those rebuild from `GlobalSnapshotInfo` alone and the
-  * accumulated SMT lives in a SEPARATE maintained on-disk store keyed by finalized ordinal — not in the GSI. `smtRoot` is instead populated
-  * + cross-checked on the producer/follower-symmetric GSAM accept path (where the maintained store is threaded), so excluding it from the
-  * `===` here keeps the download/traverse/sync `validateProof` paths passing for every OTHER (GSI-derived) field while leaving `smtRoot`'s
-  * integrity to (a) its inclusion in the signed snapshot and (b) the dedicated chain-replay check at the finalize sink.
-  *
-  * This mirrors the live follower path's existing precedent (`GlobalSnapshotContextFunctions` compares only the consensus-canonical
-  * `mptRoot`, not all 18 legacy per-field roots): the project already runs two comparison strictnesses, and `smtRoot` joins the
-  * not-recomputable-here set.
-  */
+/** How [[StateProofValidator.validateProof]] decides a recomputed state proof matches the one carried in a signed snapshot. */
 trait StateProofComparison[P <: StateProof] {
 
   /** True iff `recomputed` matches `claimed` for the purposes of state-proof validation. */
@@ -29,8 +16,7 @@ trait StateProofComparison[P <: StateProof] {
   /** Human-readable per-field breakdown of where `recomputed` (the locally-rebuilt proof, labelled `c=`) differs from `claimed` (the value
     * the signed snapshot commits to, labelled `l=`). Empty when there is no field-level difference to report. Diagnostic only — it is
     * logged by [[StateProofValidator.validateProof]] on a mismatch so the offending field is NAMED instead of having to parse a positional
-    * `Expected: … Found: …` dump. May include fields (e.g. `smtRoot`) that `equivalent` deliberately ignores; it is only ever consulted on
-    * the `!equivalent` branch.
+    * `Expected: … Found: …` dump. It is only ever consulted on the `!equivalent` branch.
     */
   def fieldDiffs(recomputed: P, claimed: P): List[String]
 }
@@ -39,13 +25,13 @@ object StateProofComparison extends StateProofComparisonLowPriority {
 
   def apply[P <: StateProof](implicit ev: StateProofComparison[P]): StateProofComparison[P] = ev
 
-  /** `GlobalSnapshotStateProof` comparison: structural equality with `smtRoot` normalized away on BOTH sides (see trait docstring). Every
-    * other field — including `mptRoot` and the per-field subtree roots — is compared exactly.
+  /** `GlobalSnapshotStateProof` comparison is exact structural equality. Historical commitment activation is dark, so honest snapshots
+    * carry `smtRoot = None`; a supplied `Some` must not bypass proof validation.
     */
   implicit val globalSnapshotStateProof: StateProofComparison[GlobalSnapshotStateProof] =
     new StateProofComparison[GlobalSnapshotStateProof] {
       def equivalent(recomputed: GlobalSnapshotStateProof, claimed: GlobalSnapshotStateProof): Boolean =
-        recomputed.copy(smtRoot = None) === claimed.copy(smtRoot = None)
+        recomputed === claimed
 
       def fieldDiffs(recomputed: GlobalSnapshotStateProof, claimed: GlobalSnapshotStateProof): List[String] =
         globalSnapshotStateProofFieldDiffs(recomputed, claimed)
@@ -88,9 +74,6 @@ object StateProofComparison extends StateProofComparisonLowPriority {
       diffOptHash("lastGlobalSnapshotsWithCurrency", computed.lastGlobalSnapshotsWithCurrency, claimed.lastGlobalSnapshotsWithCurrency),
       diffOptHash("mptRoot", computed.mptRoot, claimed.mptRoot),
       diffOptHash("historicalStakeSnapshots", computed.historicalStakeSnapshots, claimed.historicalStakeSnapshots),
-      // §3 NIPoPoW historical-commitment SMT root. DIAGNOSTIC ONLY: `equivalent` deliberately excludes `smtRoot` (it is gl0-maintained and
-      // not recomputable on the GSI-rebuild paths), so a `smtRoot`-only difference never reaches this diff. The row only surfaces the value
-      // when SOME other field already broke the equivalence.
       diffOptHash("smtRoot", computed.smtRoot, claimed.smtRoot)
     ).flatten
   }
@@ -98,9 +81,7 @@ object StateProofComparison extends StateProofComparisonLowPriority {
 
 private[validator] trait StateProofComparisonLowPriority {
 
-  /** Default for any state-proof type: plain structural equality. Lower priority than the `GlobalSnapshotStateProof` instance so the
-    * `smtRoot`-aware comparison wins for that type while every other type (e.g. `CurrencySnapshotStateProof`) keeps full `Eq`.
-    */
+  /** Default for any state-proof type: plain structural equality. */
   implicit def fromEq[P <: StateProof: Eq]: StateProofComparison[P] =
     new StateProofComparison[P] {
       def equivalent(recomputed: P, claimed: P): Boolean = recomputed === claimed
