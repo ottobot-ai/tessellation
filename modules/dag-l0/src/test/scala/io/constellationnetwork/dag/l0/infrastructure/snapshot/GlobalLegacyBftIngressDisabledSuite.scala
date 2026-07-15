@@ -49,26 +49,46 @@ object GlobalLegacyBftIngressDisabledSuite extends SimpleIOSuite {
       reset <- manager.resetForRecovery.attempt
       withdraw <- manager.withdrawFromConsensus.attempt
       fieldTypes = manager.getClass.getDeclaredFields.iterator.map(_.getType.getName).toList
-    } yield expect.all(
-      register.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
-      reset.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
-      withdraw.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
-      !fieldTypes.exists(_.contains("cats.effect.std.Queue"))
-    )
+    } yield
+      expect.all(
+        register.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
+        reset.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
+        withdraw.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
+        !fieldTypes.exists(_.contains("cats.effect.std.Queue"))
+      )
   }
 
   test("GL0 starts bounded rumor consumption without registering the generic BFT engine") {
     readSources.map {
       case (main, consensus, currencyConsensus, currencyMain, oldHandlerExists) =>
         val ingress = sliceBetween(main, "rumorHandler =", "forkRecoveryService =")
-        val consumeAfterBootstrap =
-          "(?s)gossipDaemon\\.startAsInitialValidator\\s*>>\\s*storages\\.node\\.setNodeState\\(NodeState\\.Ready\\)".r
+        val bootstrapStart = main.indexOf("// Unified Nakamoto bootstrap")
+        val bootstrapEnd = main.indexOf("}).asResource", bootstrapStart)
+        val daemonsStart = main.indexOf("Daemons\n        .startNakamoto", bootstrapEnd)
+        val inputRelease = main.indexOf("consensusInputGateControl.releaseInput", daemonsStart)
+        val subscriptionAck = main.indexOf("services.sidecarSubscriptionReadiness.awaitBothAndRun", inputRelease)
+        val readyHandoff = main.indexOf("storages.node.setNodeState(NodeState.Ready)", subscriptionAck)
+        val publicServer = main.indexOf("MkHttpServer[IO].newEmber(ServerName(\"public\")", daemonsStart)
+        val p2pServer = main.indexOf("MkHttpServer[IO].newEmber(ServerName(\"p2p\")", publicServer)
+        val cliServer = main.indexOf("MkHttpServer[IO].newEmber(ServerName(\"cli\")", p2pServer)
 
         expect.all(
           ingress.contains("eventRumorHandler"),
           !ingress.contains("services.consensus.handler"),
-          main.sliding("gossipDaemon.startAsInitialValidator".length).count(_ == "gossipDaemon.startAsInitialValidator") == 2,
-          consumeAfterBootstrap.findAllIn(main).size == 2,
+          main.sliding("gossipDaemon.startAsInitialValidator".length).count(_ == "gossipDaemon.startAsInitialValidator") == 1,
+          main.contains("consensusInputGateControl.awaitChainSeed"),
+          main.contains("consensusInputGateControl.markLocalStateReady"),
+          bootstrapStart >= 0,
+          bootstrapEnd > bootstrapStart,
+          daemonsStart > bootstrapEnd,
+          publicServer > daemonsStart,
+          p2pServer > publicServer,
+          cliServer > p2pServer,
+          inputRelease > cliServer,
+          subscriptionAck > inputRelease,
+          readyHandoff > subscriptionAck,
+          consensus.sliding("consensusInputGate.awaitBootstrap".length).count(_ == "consensusInputGate.awaitBootstrap") >= 2,
+          consensus.contains("chainSeedGate = chainSeedGate"),
           !consensus.contains("ConsensusEventLoop"),
           !consensus.contains("Queue.unbounded"),
           !consensus.contains("GlobalConsensusHandler"),

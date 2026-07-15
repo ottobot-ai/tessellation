@@ -57,9 +57,9 @@ func TestFraudProofTopic_TwoNodeRelay(t *testing.T) {
 	// B subscribes BEFORE A publishes; then wait until A's topic sees B as a
 	// subscriber (subscription propagation), else the publish precedes the
 	// subscription exchange and is legitimately not delivered.
-	recvCh := nodeB.FraudProofMessages(ctx)
-	if recvCh == nil {
-		t.Fatal("FraudProofMessages returned nil at numShards=2")
+	recvCh, err := nodeB.FraudProofMessages(ctx)
+	if err != nil {
+		t.Fatalf("FraudProofMessages: %v", err)
 	}
 	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
@@ -106,7 +106,7 @@ func TestFraudProofTopic_NotJoinedAtSingleShard(t *testing.T) {
 	if err := node.PublishFraudProof(ctx, []byte("x")); err == nil {
 		t.Error("PublishFraudProof succeeded at numShards=1 — must fail closed (topic not joined)")
 	}
-	if ch := node.FraudProofMessages(ctx); ch != nil {
-		t.Error("FraudProofMessages returned a non-nil channel at numShards=1 — must be nil (never delivers)")
+	if ch, err := node.FraudProofMessages(ctx); err == nil || ch != nil {
+		t.Error("FraudProofMessages acquired a subscription at numShards=1 — must fail closed")
 	}
 }

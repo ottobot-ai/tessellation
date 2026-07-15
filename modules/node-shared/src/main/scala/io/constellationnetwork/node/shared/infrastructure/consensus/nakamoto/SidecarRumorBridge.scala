@@ -9,7 +9,6 @@ import cats.syntax.all._
 import scala.concurrent.duration._
 
 import io.constellationnetwork.node.shared.domain.gossip.{Gossip => GossipAlg}
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.schema.gossip.RumorRaw
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.signature.Signed
@@ -73,13 +72,14 @@ object SidecarRumorBridge {
     */
   def receive[F[_]: Async](
     channel: ManagedChannel,
-    rumorQueue: Queue[F, Hashed[RumorRaw]]
+    rumorQueue: Queue[F, Hashed[RumorRaw]],
+    subscriptionReadiness: SidecarSubscriptionReadiness[F]
   )(implicit S: Supervisor[F], hasherSelector: HasherSelector[F]): F[Unit] = {
     val logger = Slf4jLogger.getLogger[F]
 
     def receiveStream: Stream[F, Unit] =
       GossipStream
-        .subscribe[F](channel, SidecarClient.SubscribeTopics.rumorOnly)
+        .subscribe[F](channel, SidecarClient.SubscriptionProfile.rumorBridge, subscriptionReadiness)
         .collect { case msg if msg.body.isRumor => msg.getRumor }
         .evalMap { rumor =>
           val bytes = rumor.signedRumorBytes.toByteArray

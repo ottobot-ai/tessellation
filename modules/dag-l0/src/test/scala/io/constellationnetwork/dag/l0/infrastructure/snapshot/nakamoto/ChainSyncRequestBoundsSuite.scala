@@ -17,4 +17,33 @@ object ChainSyncRequestBoundsSuite extends SimpleIOSuite {
 
     IO.pure(expect.all(result.isLeft, status.getCode == Status.Code.RESOURCE_EXHAUSTED))
   }
+
+  test("chain sync is unavailable until the restored head is seeded") {
+    val result = ChainSyncServer.chainSeedAvailability(None)
+
+    IO.pure(
+      expect.all(
+        result.isLeft,
+        result.swap.toOption.exists(_.getCode == Status.Code.UNAVAILABLE),
+        result.swap.toOption.flatMap(status => Option(status.getDescription)).contains("GL0 local bootstrap is not complete")
+      )
+    )
+  }
+
+  test("chain sync preserves the chain-seed failure as the unavailable cause") {
+    val failure = new IllegalStateException("invalid recovery head")
+    val result = ChainSyncServer.chainSeedAvailability(Some(Left(failure)))
+
+    IO.pure(
+      expect.all(
+        result.isLeft,
+        result.swap.toOption.exists(_.getCode == Status.Code.UNAVAILABLE),
+        result.swap.toOption.flatMap(status => Option(status.getCause)).contains(failure)
+      )
+    )
+  }
+
+  test("chain sync is available only after successful chain seeding") {
+    IO.pure(expect(ChainSyncServer.chainSeedAvailability(Some(Right(()))).isRight))
+  }
 }

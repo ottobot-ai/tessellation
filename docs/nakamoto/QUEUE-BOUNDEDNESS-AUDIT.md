@@ -15,8 +15,8 @@ Prior-fixed (context): `NakamotoChainStore.byHash` (keepDepth=k₁=255, prune-on
 ## Open findings — ranked, with the bug-class test applied
 
 ### TIER 1 — same class, fix next (large payload OR firehose + serial)
-1. **`GossipStream` sidecar bridge queue** — `Queue.unbounded[Option[GossipMessage]]` (GossipStream.scala:23). The layer directly upstream of rumorQueue; protobuf bytes (smaller than parsed Json, but the same inbound firehose). The downstream tryOffer-drop prevents migration into the bounded rumor queue, but HEAD had no `GossipDaemon` consumer for that queue; the current worktree adds it. The upstream stream still needs a bound with backpressure to the gRPC `request(n)` observer. **Fix: bound + gRPC flow-control.**
-2. **dag-l0 consensus output queues** — 8× `Queue.unbounded` (dag-l0 Queues.scala:25-32) holding `Signed[Block]`, `StateChannelOutput`, allow-spend/token-lock/stake/collateral/KES blocks — LARGE payloads, serial merge consumer in `GlobalSnapshotEventsPublisherDaemon`. Producer is per-consensus-round (not a firehose), so lower-rate than gossip, but under multi-mg/multi-shard churn the serial merge can lag. **Fix: bound each to ~depth-k (256-512); consider parEvalMap if the publisher I/O is the bottleneck.** Same pattern in dag-l1 (×6) and currency-l1 (×2).
+1. **`GossipStream` sidecar bridge queue** — `Queue.unbounded[Either[Throwable, Option[GossipMessage]]]` (`GossipStream.scala:45-68`). The truthful `SubscribeStarted` lifecycle and exact error propagation do not bound data callbacks. This is directly upstream of rumor and dedicated-topic dispatch, so a network or reachable-sidecar firehose can migrate bounded Go pressure into JVM heap. **Fix: bounded item+encoded-byte queue, manual gRPC `request(n)` flow control, and a termination/error control path that cannot wait behind a full data queue.**
+2. **dag-l0 consensus output queues** — 8× `Queue.unbounded` (dag-l0 `Queues.scala:25-32`) holding `Signed[Block]`, `StateChannelOutput`, allow-spend/token-lock/stake/collateral/KES blocks. This is now a confirmed peer firehose for three native GL1 families: dedicated gossip handlers deserialize and detached-enqueue DAG/allow-spend/token-lock blocks without inner signature/admission validation (`NakamotoSyncDaemon.scala:1002-1013,1883-1963`; `Services.scala:241-259`). The serial publisher re-signs each event with the GL0 key before bounded-mempool rejection (`GlobalSnapshotEventsPublisherDaemon.scala:55-115,120-134`). **Fix: authenticate before enqueue; bound by bytes/items with per-peer/topic quotas; drain through supervised bounded workers. Universal GL0 execution remains mandatory after admission.** Same queue pattern in dag-l1 (×6) and currency-l1 (×2) needs separate ingress analysis.
 
 ### DORMANT HAZARD + SEPARATE CONSUMER DEFECT
 
@@ -27,29 +27,26 @@ never called either start method (`Main.scala` at HEAD `:259-325`). No
 `consumeRumors` fiber invoked those handlers. Starting that consumer alone would
 have activated the hazard, so removal must precede consumer startup.
 
-The source-proven active defect was instead a missing consumer for the **bounded**
+The source-proven baseline defect was a missing consumer for the **bounded**
 shared rumor queue. `SidecarRumorBridge.receive` offered inbound rumors
 (`SidecarRumorBridge.scala:60-105`), but no daemon validated/dispatched them; the
 queue could fill and later input would drop. Exact workflow severity needs an
 integration test because dedicated Nakamoto topics have separate consumers. The
-worktree uses the safe order: remove GL0's six BFT handlers/unbounded loop, then
-start `gossipDaemon.startAsInitialValidator`, whose Nakamoto branch runs only
-`consumeRumors`. GL0 composes only generic/event handlers (`Main.scala:242-258`)
-and starts the consumer after bootstrap, immediately before `Ready`, on both
-startup paths (`Main.scala:347-350,647-650`; `GossipDaemon.scala:56-70,89-116`).
-The focused six-family/no-queue/source regression is green and confirms ML0's
-active BFT loop remains (`GlobalLegacyBftIngressDisabledSuite.scala:26-82`;
-8/8); the broader final receipt/BFT containment selection is 35/35. This reduces
-the missing-consumer defect from the node's full lifetime to a cold-start window,
-but does not close it: `SidecarRumorBridge.receive` starts during consensus
-construction (`GlobalSnapshotConsensus.scala:1121-1129`) before `Main` starts the
-consumer after bootstrap (`Main.scala:347-350,647-650`). The bounded queue can
-still fill and drop during that interval. Keep runtime delivery/drain/reconnect,
-cold-start ordering, and supervision/release qualification open; the dormant
-generic `Consensus` storage/routes compatibility shell is cleanup, not an active
-queue path. Separately, the dedicated-topic `NakamotoSyncDaemon` also starts
-before bootstrap (`GlobalSnapshotConsensus.scala:2192-2276`), a HIGH cold-state
-processing race rather than a queue-boundedness finding.
+worktree removes GL0's six BFT handlers/unbounded loop and adds a three-phase
+`ConsensusInputGate`. Both sidecar receive effects remain inert until root-checked
+local bootstrap and chain seed succeed and the generic consumer, event/collateral
+daemons, and HTTP listeners are running. Main then activates both streams, requires
+typed exact role/topic/session/generation acknowledgements from one sidecar process,
+and publishes `Ready` under the serialized readiness lease. Production starts
+fenced and pauses before committed lane invalidation. ChainSync returns
+`UNAVAILABLE` before seed success. This closes the direct cold queue-fill/mutation
+and local subscription-ordering windows. It does not authenticate a restored disk
+head or establish catch-up, mesh reachability, finality, or economic validity.
+Bounded delivery/drain ownership, durable recovery for traffic missed by delayed
+subscription, and the cold-restart policy remain open. The dormant generic `Consensus` storage/routes
+compatibility shell is cleanup, not an active queue path. Dedicated-topic detached
+workers and the newly confirmed native-block unbounded ingress are separate HIGH
+findings, not closed by the startup gate.
 
 ### TIER 2 — unbounded Ref accumulators with a fragile prune trigger
 3. **`NakamotoSyncDaemon` pendingParentRef** — `Ref[Map[Hash, List[pb.Snapshot]]]` keyed by missing-parent-hash, drained only on parent receipt. If a parent never arrives (stalled peer / orphan chain), it accumulates `pb.Snapshot` forever. **Fix: TTL (age-out) + size cap.**

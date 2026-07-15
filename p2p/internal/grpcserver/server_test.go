@@ -42,6 +42,11 @@ import (
 	pb "github.com/scasplte2/tessellation/p2p/proto"
 )
 
+const (
+	rumorBridgeRole  = pb.SubscriberRole_SUBSCRIBER_ROLE_RUMOR_BRIDGE
+	nakamotoSyncRole = pb.SubscriberRole_SUBSCRIBER_ROLE_NAKAMOTO_SYNC
+)
+
 // ─── fake GossipNode ─────────────────────────────────────────────────
 //
 // Mirrors the two channel classes of the real gossip.Node:
@@ -68,8 +73,14 @@ type fakeNode struct {
 	reconnectCh chan struct{}
 
 	// fraudJoined mirrors gossip.Node's numShards gate: when false,
-	// FraudProofMessages returns nil and PublishFraudProof errors.
+	// FraudProofMessages and PublishFraudProof fail.
 	fraudJoined bool
+
+	// Optional acquisition failure used to prove Started is not emitted before
+	// every requested local subscription succeeds.
+	snapshotSubscribeErr error
+	shardDrainErr        error
+	activeSubscriptions  int
 }
 
 func newFakeNode(fraudJoined bool) *fakeNode {
@@ -81,11 +92,18 @@ func newFakeNode(fraudJoined bool) *fakeNode {
 	}
 }
 
-func (f *fakeNode) register(subs *[]chan []byte) <-chan []byte {
+func (f *fakeNode) register(ctx context.Context, subs *[]chan []byte) <-chan []byte {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	ch := make(chan []byte, 256)
 	*subs = append(*subs, ch)
+	f.activeSubscriptions++
+	f.mu.Unlock()
+	go func() {
+		<-ctx.Done()
+		f.mu.Lock()
+		f.activeSubscriptions--
+		f.mu.Unlock()
+	}()
 	return ch
 }
 
@@ -101,6 +119,12 @@ func (f *fakeNode) subCount(subs *[]chan []byte) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(*subs)
+}
+
+func (f *fakeNode) activeSubCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.activeSubscriptions
 }
 
 // Publish side — only fraud is recorded (the rest are untested pass-throughs).
@@ -129,39 +153,56 @@ func (f *fakeNode) PublishFraudProof(ctx context.Context, data []byte) error {
 }
 
 // Subscribe side.
-func (f *fakeNode) SnapshotMessages(ctx context.Context) <-chan []byte {
-	return f.register(&f.snapshotSubs)
-}
-func (f *fakeNode) AttestationMessages(ctx context.Context) <-chan []byte {
-	return make(chan []byte)
-}
-func (f *fakeNode) RumorMessages(ctx context.Context) <-chan []byte {
-	return f.register(&f.rumorSubs)
-}
-func (f *fakeNode) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
-	return make(chan []byte)
-}
-func (f *fakeNode) MetagraphAttestationMessages(ctx context.Context) <-chan []byte {
-	return make(chan []byte)
-}
-func (f *fakeNode) AllowSpendBlockMessages(ctx context.Context) <-chan []byte {
-	return make(chan []byte)
-}
-func (f *fakeNode) DAGBlockMessages(ctx context.Context) <-chan []byte {
-	return make(chan []byte)
-}
-func (f *fakeNode) TokenLockBlockMessages(ctx context.Context) <-chan []byte {
-	return make(chan []byte)
-}
-func (f *fakeNode) FraudProofMessages(ctx context.Context) <-chan []byte {
-	if !f.fraudJoined {
-		return nil
+func (f *fakeNode) SnapshotMessages(ctx context.Context) (<-chan []byte, error) {
+	if f.snapshotSubscribeErr != nil {
+		return nil, f.snapshotSubscribeErr
 	}
-	return f.register(&f.fraudProofSubs)
+	return f.register(ctx, &f.snapshotSubs), nil
 }
-func (f *fakeNode) ShardCheckpointMessages() <-chan []byte            { return f.shardCheckpointCh }
-func (f *fakeNode) ShardCheckpointAttestationMessages() <-chan []byte { return f.shardCheckpointAttCh }
-func (f *fakeNode) ReconnectCh() <-chan struct{}                      { return f.reconnectCh }
+func (f *fakeNode) AttestationMessages(ctx context.Context) (<-chan []byte, error) {
+	return make(chan []byte), nil
+}
+func (f *fakeNode) RumorMessages(ctx context.Context) (<-chan []byte, error) {
+	return f.register(ctx, &f.rumorSubs), nil
+}
+func (f *fakeNode) MetagraphBinaryMessages(ctx context.Context) (<-chan []byte, error) {
+	return make(chan []byte), nil
+}
+func (f *fakeNode) MetagraphAttestationMessages(ctx context.Context) (<-chan []byte, error) {
+	return make(chan []byte), nil
+}
+func (f *fakeNode) AllowSpendBlockMessages(ctx context.Context) (<-chan []byte, error) {
+	return make(chan []byte), nil
+}
+func (f *fakeNode) DAGBlockMessages(ctx context.Context) (<-chan []byte, error) {
+	return make(chan []byte), nil
+}
+func (f *fakeNode) TokenLockBlockMessages(ctx context.Context) (<-chan []byte, error) {
+	return make(chan []byte), nil
+}
+func (f *fakeNode) FraudProofMessages(ctx context.Context) (<-chan []byte, error) {
+	if !f.fraudJoined {
+		return nil, fmt.Errorf("fraud-proof topic not joined")
+	}
+	return f.register(ctx, &f.fraudProofSubs), nil
+}
+func (f *fakeNode) ShardCheckpointMessages() (<-chan []byte, error) {
+	if !f.fraudJoined {
+		return nil, fmt.Errorf("shard-checkpoint topics not joined")
+	}
+	if f.shardDrainErr != nil {
+		return nil, f.shardDrainErr
+	}
+	return f.shardCheckpointCh, nil
+}
+func (f *fakeNode) ShardCheckpointAttestationMessages() (<-chan []byte, error) {
+	if !f.fraudJoined {
+		return nil, fmt.Errorf("shard-checkpoint-attestation topics not joined")
+	}
+	return f.shardCheckpointAttCh, nil
+}
+func (f *fakeNode) ShardSubscriptionsActive() bool { return f.fraudJoined }
+func (f *fakeNode) ReconnectCh() <-chan struct{}   { return f.reconnectCh }
 func (f *fakeNode) MeshPeerCount() (int, int, int, int, int, int, int, int) {
 	return 0, 0, 0, 0, 0, 0, 0, 0
 }
@@ -213,6 +254,8 @@ type received struct {
 	checkpoints map[uint64]bool // ShardOrdinal
 	rumors      map[string]bool // ContentType
 	frauds      map[string]bool // MetagraphAddress
+	started     *pb.SubscribeStarted
+	protocolErr error
 	streamErr   error
 }
 
@@ -222,16 +265,23 @@ func (r *received) counts() (cp, ru, fp int) {
 	return len(r.checkpoints), len(r.rumors), len(r.frauds)
 }
 
+func (r *received) startedEvent() (*pb.SubscribeStarted, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.started, r.protocolErr
+}
+
 // openStream starts a Subscribe stream with the given topic filter and drains
 // it into a received accumulator until ctx is done or the stream errors.
-func openStream(ctx context.Context, t *testing.T, client pb.SidecarServiceClient, topics []string) *received {
+func openStream(ctx context.Context, t *testing.T, client pb.SidecarServiceClient, topics []string, role pb.SubscriberRole) *received {
 	t.Helper()
 	r := &received{checkpoints: map[uint64]bool{}, rumors: map[string]bool{}, frauds: map[string]bool{}}
-	stream, err := client.Subscribe(ctx, &pb.SubscribeRequest{Topics: topics})
+	stream, err := client.Subscribe(ctx, &pb.SubscribeRequest{Topics: topics, Role: role})
 	if err != nil {
 		t.Fatalf("Subscribe(%v): %v", topics, err)
 	}
 	go func() {
+		first := true
 		for {
 			msg, rerr := stream.Recv()
 			if rerr != nil {
@@ -242,17 +292,46 @@ func openStream(ctx context.Context, t *testing.T, client pb.SidecarServiceClien
 			}
 			r.mu.Lock()
 			switch b := msg.Body.(type) {
+			case *pb.GossipMessage_Started:
+				if !first {
+					r.protocolErr = fmt.Errorf("SubscribeStarted was not the first event")
+				} else {
+					r.started = b.Started
+				}
 			case *pb.GossipMessage_ShardCheckpoint:
+				if first {
+					r.protocolErr = fmt.Errorf("first event was shard checkpoint, want SubscribeStarted")
+				}
 				r.checkpoints[b.ShardCheckpoint.GetShardOrdinal()] = true
 			case *pb.GossipMessage_Rumor:
+				if first {
+					r.protocolErr = fmt.Errorf("first event was rumor, want SubscribeStarted")
+				}
 				r.rumors[b.Rumor.GetContentType()] = true
 			case *pb.GossipMessage_FraudProof:
+				if first {
+					r.protocolErr = fmt.Errorf("first event was fraud proof, want SubscribeStarted")
+				}
 				r.frauds[b.FraudProof.GetMetagraphAddress()] = true
 			}
+			first = false
 			r.mu.Unlock()
 		}
 	}()
 	return r
+}
+
+func requireStarted(t *testing.T, stream pb.SidecarService_SubscribeClient) *pb.SubscribeStarted {
+	t.Helper()
+	msg, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("receive SubscribeStarted: %v", err)
+	}
+	started := msg.GetStarted()
+	if started == nil {
+		t.Fatalf("first Subscribe event was %T, want SubscribeStarted", msg.GetBody())
+	}
+	return started
 }
 
 func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) bool {
@@ -281,16 +360,228 @@ func marshalCheckpoint(t *testing.T, ordinal uint64) []byte {
 // (rumors belong to the SidecarRumorBridge). Mirrors
 // SidecarClient.SubscribeTopics.daemonTopics on the JVM side.
 func daemonTopics() []string {
-	return []string{
+	return daemonTopicsForSharding(true)
+}
+
+func daemonTopicsForSharding(active bool) []string {
+	topics := []string{
 		TopicSnapshot, TopicAttestation,
 		TopicMetagraphBinary, TopicMetagraphAttestation,
 		TopicAllowSpendBlock, TopicDAGBlock, TopicTokenLockBlock,
-		TopicShardCheckpoint, TopicShardCheckpointAttestation,
-		TopicFraudProof,
 	}
+	if active {
+		topics = append(topics, TopicShardCheckpoint, TopicShardCheckpointAttestation, TopicFraudProof)
+	}
+	return topics
 }
 
 // ─── F1: dual-Subscribe shard-checkpoint race ────────────────────────
+
+func TestSubscribe_StartedIsFirstAndCarriesNormalizedLocalAcquisition(t *testing.T) {
+	fake := newFakeNode(true)
+	h := startHarness(t, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	generationBefore := processStreamGeneration.Load()
+	requestedTopics := daemonTopics()
+	for left, right := 0, len(requestedTopics)-1; left < right; left, right = left+1, right-1 {
+		requestedTopics[left], requestedTopics[right] = requestedTopics[right], requestedTopics[left]
+	}
+	requestedTopics = append(requestedTopics, TopicDAGBlock)
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{
+		Topics: requestedTopics,
+		Role:   nakamotoSyncRole,
+	})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	started := requireStarted(t, stream)
+	if got, want := fmt.Sprint(started.GetTopics()), fmt.Sprint(daemonTopics()); got != want {
+		t.Errorf("Started topics = %s, want canonical deduplicated %s", got, want)
+	}
+	if started.GetRole() != nakamotoSyncRole {
+		t.Errorf("Started role = %v, want %v", started.GetRole(), nakamotoSyncRole)
+	}
+	if started.GetStreamGeneration() != generationBefore+1 {
+		t.Errorf("first stream generation = %d, want %d", started.GetStreamGeneration(), generationBefore+1)
+	}
+	if started.GetSidecarSessionId() == "" || started.GetSidecarSessionId() != h.server.sessionID {
+		t.Errorf("Started session ID = %q, want this server session %q", started.GetSidecarSessionId(), h.server.sessionID)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	stream2, err := h.client.Subscribe(ctx2, &pb.SubscribeRequest{Topics: []string{TopicRumor}, Role: rumorBridgeRole})
+	if err != nil {
+		t.Fatalf("second Subscribe: %v", err)
+	}
+	started2 := requireStarted(t, stream2)
+	if started2.GetStreamGeneration() != started.GetStreamGeneration()+1 {
+		t.Errorf("second stream generation = %d, want %d", started2.GetStreamGeneration(), started.GetStreamGeneration()+1)
+	}
+	if started2.GetSidecarSessionId() != started.GetSidecarSessionId() {
+		t.Errorf("session changed within one server: first=%q second=%q", started.GetSidecarSessionId(), started2.GetSidecarSessionId())
+	}
+}
+
+func TestSubscribe_NoStartedWhenRequestedSubscriptionAcquisitionFails(t *testing.T) {
+	fake := newFakeNode(true)
+	fake.snapshotSubscribeErr = fmt.Errorf("injected Subscribe failure")
+	h := startHarness(t, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	generationBefore := processStreamGeneration.Load()
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: daemonTopics(), Role: nakamotoSyncRole})
+	if err != nil {
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("Subscribe acquisition failed with %v, want Unavailable", err)
+		}
+	} else if msg, recvErr := stream.Recv(); status.Code(recvErr) != codes.Unavailable {
+		t.Fatalf("first response = %v err=%v, want no event and Unavailable", msg, recvErr)
+	}
+	if generation := processStreamGeneration.Load(); generation != generationBefore {
+		t.Errorf("failed acquisition changed stream generation from %d to %d", generationBefore, generation)
+	}
+}
+
+func TestSubscribe_DuplicateShardDrainerFailsAndCancellationReleasesLease(t *testing.T) {
+	fake := newFakeNode(true)
+	h := startHarness(t, fake)
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	stream1, err := h.client.Subscribe(ctx1, &pb.SubscribeRequest{Topics: daemonTopics(), Role: nakamotoSyncRole})
+	if err != nil {
+		t.Fatalf("first Subscribe: %v", err)
+	}
+	requireStarted(t, stream1)
+	if got := h.server.shardDrainStreams.Load(); got != 1 {
+		t.Fatalf("shard lease after Started = %d, want 1", got)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	stream2, err := h.client.Subscribe(ctx2, &pb.SubscribeRequest{Topics: daemonTopics(), Role: nakamotoSyncRole})
+	if err == nil {
+		_, err = stream2.Recv()
+	}
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("duplicate shard drainer failed with %v, want AlreadyExists", err)
+	}
+
+	cancel1()
+	if !waitFor(t, 5*time.Second, "shard drain lease released after cancellation", func() bool {
+		return h.server.shardDrainStreams.Load() == 0
+	}) {
+		t.Fatal("cancelled shard stream retained its exclusive drain lease")
+	}
+
+	ctx3, cancel3 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel3()
+	stream3, err := h.client.Subscribe(ctx3, &pb.SubscribeRequest{Topics: daemonTopics(), Role: nakamotoSyncRole})
+	if err != nil {
+		t.Fatalf("replacement Subscribe: %v", err)
+	}
+	requireStarted(t, stream3)
+}
+
+func TestSubscribe_CancellationStopsLocalUniversalSubscriptions(t *testing.T) {
+	fake := newFakeNode(true)
+	h := startHarness(t, fake)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: []string{TopicRumor}, Role: rumorBridgeRole})
+	if err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	requireStarted(t, stream)
+	if got := fake.activeSubCount(); got != 1 {
+		t.Fatalf("active local subscriptions after Started = %d, want 1", got)
+	}
+	cancel()
+	if !waitFor(t, 5*time.Second, "universal subscription cancelled", func() bool {
+		return fake.activeSubCount() == 0
+	}) {
+		t.Fatal("Subscribe cancellation did not cancel the acquired local subscription")
+	}
+}
+
+func TestSubscribe_RoleTopicCompatibilityFailsClosed(t *testing.T) {
+	fake := newFakeNode(true)
+	h := startHarness(t, fake)
+	tests := []struct {
+		name   string
+		topics []string
+		role   pb.SubscriberRole
+	}{
+		{name: "unspecified", topics: []string{TopicRumor}, role: pb.SubscriberRole_SUBSCRIBER_ROLE_UNSPECIFIED},
+		{name: "rumor bridge extra family", topics: []string{TopicRumor, TopicShardCheckpoint}, role: rumorBridgeRole},
+		{name: "nakamoto sync rumor", topics: []string{TopicRumor}, role: nakamotoSyncRole},
+		{name: "nakamoto sync incomplete", topics: []string{TopicSnapshot}, role: nakamotoSyncRole},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: tc.topics, Role: tc.role})
+			if err == nil {
+				_, err = stream.Recv()
+			}
+			if status.Code(err) != codes.InvalidArgument {
+				t.Fatalf("role/topic mismatch failed with %v, want InvalidArgument", err)
+			}
+		})
+	}
+}
+
+func TestSubscribe_InactiveShardFamiliesCannotBeAcknowledged(t *testing.T) {
+	fake := newFakeNode(false)
+	h := startHarness(t, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: daemonTopics(), Role: nakamotoSyncRole})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("sharding-active topic profile on inactive sidecar failed with %v, want InvalidArgument", err)
+	}
+	if got := h.server.shardDrainStreams.Load(); got != 0 {
+		t.Errorf("rejected inactive profile acquired shard lease: %d", got)
+	}
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	stream2, err := h.client.Subscribe(ctx2, &pb.SubscribeRequest{Topics: daemonTopicsForSharding(false), Role: nakamotoSyncRole})
+	if err != nil {
+		t.Fatalf("inactive-profile Subscribe: %v", err)
+	}
+	started := requireStarted(t, stream2)
+	if got, want := fmt.Sprint(started.GetTopics()), fmt.Sprint(daemonTopicsForSharding(false)); got != want {
+		t.Errorf("inactive Started topics = %s, want %s", got, want)
+	}
+}
+
+func TestSubscribe_SharedDrainFailurePreventsStartedAndReleasesLease(t *testing.T) {
+	fake := newFakeNode(true)
+	fake.shardDrainErr = fmt.Errorf("injected shared drain failure")
+	h := startHarness(t, fake)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: daemonTopics(), Role: nakamotoSyncRole})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("shared drain failure returned %v, want Unavailable before Started", err)
+	}
+	if got := h.server.shardDrainStreams.Load(); got != 0 {
+		t.Errorf("failed shared drain acquisition leaked lease: %d", got)
+	}
+}
 
 // With the rumor bridge subscribed rumor-only and the daemon subscribed to the
 // non-rumor families, EVERY shard checkpoint must reach the daemon stream and
@@ -311,8 +602,8 @@ func TestSubscribe_TopicFilter_DualStreamShardCheckpointDelivery(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	bridge := openStream(ctx, t, h.client, []string{TopicRumor})
-	daemon := openStream(ctx, t, h.client, daemonTopics())
+	bridge := openStream(ctx, t, h.client, []string{TopicRumor}, rumorBridgeRole)
+	daemon := openStream(ctx, t, h.client, daemonTopics(), nakamotoSyncRole)
 
 	// Both Subscribe handlers are live once their per-call fan-out
 	// subscriptions are registered on the fake (the bridge registers a rumor
@@ -360,36 +651,23 @@ func TestSubscribe_TopicFilter_DualStreamShardCheckpointDelivery(t *testing.T) {
 	}
 }
 
-// Empty topics = subscribe-all (documented legacy default; debugging aid).
-// Pins backward compatibility of the wire contract.
-func TestSubscribe_EmptyTopicsMeansAll(t *testing.T) {
+// Empty topics are ambiguous and cannot produce a truthful Started event.
+func TestSubscribe_EmptyTopicsFailsLoud(t *testing.T) {
 	fake := newFakeNode(true)
 	h := startHarness(t, fake)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	all := openStream(ctx, t, h.client, nil)
-
-	if !waitFor(t, 5*time.Second, "subscribe-all registered", func() bool {
-		return fake.subCount(&fake.rumorSubs) >= 1
-	}) {
-		t.Fatal("subscribe-all handler did not register")
-	}
-
-	fake.shardCheckpointCh <- marshalCheckpoint(t, 7)
-	data, err := proto.Marshal(&pb.Rumor{ContentType: "r"})
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Role: rumorBridgeRole})
 	if err != nil {
-		t.Fatalf("marshal rumor: %v", err)
+		if status.Code(err) != codes.InvalidArgument {
+			t.Fatalf("Subscribe(empty topics) failed with %v, want InvalidArgument", err)
+		}
+		return
 	}
-	fake.emit(&fake.rumorSubs, data)
-
-	if !waitFor(t, 5*time.Second, "subscribe-all got both families", func() bool {
-		cp, ru, _ := all.counts()
-		return cp == 1 && ru == 1
-	}) {
-		cp, ru, _ := all.counts()
-		t.Errorf("subscribe-all stream: got checkpoints=%d rumors=%d, want 1/1", cp, ru)
+	if _, err := stream.Recv(); status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("Subscribe(empty topics) stream failed with %v, want InvalidArgument", err)
 	}
 }
 
@@ -405,7 +683,7 @@ func TestSubscribe_UnknownTopicLabelFailsLoud(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: []string{"not-a-topic"}})
+	stream, err := h.client.Subscribe(ctx, &pb.SubscribeRequest{Topics: []string{"not-a-topic"}, Role: nakamotoSyncRole})
 	if err != nil {
 		if status.Code(err) != codes.InvalidArgument {
 			t.Errorf("Subscribe(unknown label) failed with %v, want InvalidArgument", status.Code(err))
@@ -497,8 +775,8 @@ func TestSubscribe_FraudProofArmDelivers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	bridge := openStream(ctx, t, h.client, []string{TopicRumor})
-	daemon := openStream(ctx, t, h.client, daemonTopics())
+	bridge := openStream(ctx, t, h.client, []string{TopicRumor}, rumorBridgeRole)
+	daemon := openStream(ctx, t, h.client, daemonTopics(), nakamotoSyncRole)
 
 	if !waitFor(t, 5*time.Second, "fraud sub registered", func() bool {
 		return fake.subCount(&fake.fraudProofSubs) >= 1 && fake.subCount(&fake.rumorSubs) >= 1

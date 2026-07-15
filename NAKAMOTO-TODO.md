@@ -984,24 +984,37 @@ consensus-economic roadmap for dependencies and release gates.
    `GossipDaemon.scala:28-32,56-70,89-116`). The exact workflow impact remains an
    integration question because dedicated Nakamoto topics use separate consumers.
 
-   The worktree applies the required order: remove the six GL0 BFT handlers and
-   `ConsensusEventLoop`, install no-queue fail-closed compatibility objects, then
-   start the consume-only Nakamoto gossip daemon after bootstrap and before
-   `Ready` (`Main.scala:242-258,347-350,647-650`;
-   `GlobalSnapshotConsensus.scala:74-115,2302-2310`). The focused six-family,
-   no-queue, startup-order, and ML0-preservation regression is green
-   (`GlobalLegacyBftIngressDisabledSuite.scala:26-82`; 8/8); the final combined
-   receipt/BFT containment selection is green (35/35). E4.8 still owns
-   deletion of the dormant generic `Consensus` storage/routes shell and GL0-only
-   compatibility/config/API surface. This does **not** make overall sidecar
-   startup safe: `Services` constructs consensus before `Main` bootstrap
-   (`Main.scala:196-225,331-350,647-650`; `Services.scala:257-306`), starting
-   `SidecarRumorBridge.receive` and `NakamotoSyncDaemon` early
-   (`GlobalSnapshotConsensus.scala:1121-1129,2192-2276`). E4.8A must close the
-   MEDIUM pre-consumer bounded-queue fill/drop window and runtime
-   delivery/drain/reconnect/supervision tests. E4.8B must close the pre-existing
-   HIGH dedicated-topic cold-state race with an explicit bootstrap-ready gate or
-   bounded inert quarantine. ML0 BFT remains.
+   Commit `f88d785e8` removed the six GL0 BFT handlers and `ConsensusEventLoop`,
+   installed no-queue fail-closed compatibility objects, and retained ML0 BFT.
+   The current worktree adds a three-phase `ConsensusInputGate`: Main completes
+   root-verified local bootstrap; the leader fiber seeds the restored head and
+   publishes `Right/Left`; Main starts the generic consumer and all event sinks,
+   binds every HTTP listener, releases subscription activation, waits for exact
+   current rumor/Nakamoto acknowledgements from one sidecar process, and publishes
+   `Ready` under the same serialized readiness lease. `ProductionGate` starts
+   paused, pauses before a current lane is invalidated, and resumes only after both
+   lanes are installed. Sidecar acquisition/profile errors retain their exact gRPC
+   status, and valid message silence no longer forces periodic reconnect.
+   Out-of-order release and failed/cancelled chain seed fail closed; ChainSync
+   returns `UNAVAILABLE` before seed success.
+
+   E4.8A/B now have **pre-state mutation and local subscription ordering contained;
+   recovery/integration remains open**. Missing: boot-mode/catch-up policy,
+   authenticated cold-restart authority, hostile early-input tests for every topic,
+   bounded generation-owned topic workers, reconnect/resource-cancellation
+   ownership, and durable recovery for traffic missed before delayed subscription.
+   Restored disk-head authority remains RED:
+   ordinary `chainStore.store` with synthetic slot/VRF metadata is not an
+   authenticated replay/recovery receipt. Dedicated allow-spend/DAG/token-lock
+   handlers also deserialize directly into unbounded queues and detached fibers;
+   bound and validate them before enqueue. E4.8 still owns deletion of the dormant
+   generic `Consensus` storage/routes/config/API shell. ML0 BFT remains.
+
+   Full-snapshot `--rollback-hash` is now explicitly disabled before cleanup. The
+   persisted V1 full snapshot omits the rooted operator/stake/collateral
+   augmentation and cannot reproduce the canonical first incremental by itself.
+   Incremental rollback remains separate from the still-open authenticated
+   restart/replay authority gate.
 
 3. ♻⚠ **Metagraph consensus integration** — original framing ("CL0 needs the same
    VRF+LDD+attestation 1:1") is superseded. ML0 may retain BFT consensus; execution

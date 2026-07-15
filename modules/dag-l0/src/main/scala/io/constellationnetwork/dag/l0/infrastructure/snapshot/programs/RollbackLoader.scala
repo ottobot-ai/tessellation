@@ -1,24 +1,18 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.programs
 
-import java.security.KeyPair
-
 import cats.Parallel
 import cats.effect.Async
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.domain.snapshot.storages.SnapshotDownloadStorage
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotTraverse
-import io.constellationnetwork.dag.l0.modules.{Services, Storages}
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.config.types.SnapshotConfig
-import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
-import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions
 import io.constellationnetwork.node.shared.infrastructure.snapshot.storage._
-import io.constellationnetwork.node.shared.modules.SharedStorages
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.security._
@@ -29,8 +23,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object RollbackLoader {
 
-  def make[F[_]: Async: Parallel: KryoSerializer: JsonSerializer: SecurityProvider: HasherSelector](
-    keyPair: KeyPair,
+  def make[F[_]: Async: Parallel: KryoSerializer: JsonSerializer: HasherSelector](
     snapshotConfig: SnapshotConfig,
     incrementalGlobalSnapshotLocalFileSystemStorage: SnapshotLocalFileSystemStorage[F, GlobalIncrementalSnapshot],
     snapshotInfoLocalFileSystemStorage: SnapshotInfoLocalFileSystemStorage[F, GlobalSnapshotStateProof, GlobalSnapshotInfo],
@@ -48,7 +41,6 @@ object RollbackLoader {
     mptStore: MptStore[F, GlobalStateKey]
   ): RollbackLoader[F] =
     new RollbackLoader[F](
-      keyPair,
       snapshotConfig,
       incrementalGlobalSnapshotLocalFileSystemStorage,
       snapshotStorage: SnapshotDownloadStorage[F],
@@ -63,8 +55,7 @@ object RollbackLoader {
     ) {}
 }
 
-sealed abstract class RollbackLoader[F[_]: Async: Parallel: KryoSerializer: JsonSerializer: HasherSelector: SecurityProvider] private (
-  keyPair: KeyPair,
+sealed abstract class RollbackLoader[F[_]: Async: Parallel: KryoSerializer: JsonSerializer: HasherSelector] private (
   snapshotConfig: SnapshotConfig,
   incrementalGlobalSnapshotLocalFileSystemStorage: SnapshotLocalFileSystemStorage[F, GlobalIncrementalSnapshot],
   snapshotStorage: SnapshotDownloadStorage[F],
@@ -113,19 +104,15 @@ sealed abstract class RollbackLoader[F[_]: Async: Parallel: KryoSerializer: Json
                 )
               snapshotTraverse.loadChain()
             }
-          case Some(fullSnapshot) =>
-            logger.info("Rollback hash points to full global snapshot") >>
-              HasherSelector[F].withCurrent { implicit hasher =>
-                fullSnapshot
-                  .toHashed[F]
-                  .flatMap(GlobalSnapshot.mkFirstIncrementalSnapshot[F](_))
-                  .flatMap { firstIncrementalSnapshot =>
-                    Signed.forAsyncHasher[F, GlobalIncrementalSnapshot](firstIncrementalSnapshot, keyPair).map {
-                      signedFirstIncrementalSnapshot =>
-                        (fullSnapshot.info.toGlobalSnapshotInfo, signedFirstIncrementalSnapshot)
-                    }
-                  }
-              }
+          case Some(_) =>
+            Async[F].raiseError[(GlobalSnapshotInfo, Signed[GlobalIncrementalSnapshot])](
+              new IllegalArgumentException(
+                "Rollback to a full global snapshot is unsupported: the persisted V1 full snapshot does not carry the rooted " +
+                  "operator-key, delegated-stake, and collateral augmentation required to reproduce the canonical first incremental. " +
+                  "Use an incremental snapshot hash. A future full-snapshot rollback must bind and verify the exact genesis manifest " +
+                  "before deriving or installing state. No rollback cleanup has been performed."
+              )
+            )
         }
         .flatTap {
           case (_, lastInc) =>

@@ -86,7 +86,7 @@ object GlobalSnapshot {
     implicit stateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
   ): F[GlobalIncrementalSnapshot] =
-    augmentedInfo.stateProof[F](genesis.ordinal).map { stateProof =>
+    augmentedInfo.stateProof[F](genesis.ordinal.next).map { stateProof =>
       GlobalIncrementalSnapshot(
         genesis.ordinal.next,
         genesis.height,
@@ -115,9 +115,8 @@ object GlobalSnapshot {
       )
     }
 
-  /** Backward-compatible overload — defaults `augmentedInfo` to the pre-augmentation GSI derived from `genesis.info.toGlobalSnapshotInfo`.
-    * Used by call sites where no augmenter is applied (e.g. the RollbackLoader path: rolling back to a previously-persisted full snapshot
-    * whose `info` is already the post-aug GSI by virtue of having been persisted that way).
+  /** Convenience overload for callers that have proved no external genesis augmentation applies. A persisted V1 full snapshot does not
+    * carry this fork's rooted operator-key/stake/collateral augmentation and therefore cannot use this overload as rollback authority.
     */
   def mkFirstIncrementalSnapshot[F[_]: Parallel: Async: Hasher: JsonSerializer](
     genesis: Hashed[GlobalSnapshot]

@@ -101,7 +101,7 @@ object GlobalOptimisticFinalityContainmentSuite extends SimpleIOSuite {
     }
   }
 
-  test("snapshot receive can mark Ready only inside the exact selected-tip projection CAS") {
+  test("snapshot receive records catch-up inside the exact selected-tip projection CAS but cannot publish lifecycle Ready") {
     readSources.map {
       case (syncDaemon, _, _, _) =>
         val processValid = sliceBetween(
@@ -119,11 +119,21 @@ object GlobalOptimisticFinalityContainmentSuite extends SimpleIOSuite {
         )._1
 
         expect.all(
-          readyMutation.findAllIn(processValid).size == 1,
-          readyMutation.findAllIn(selectedProjection).size == 1,
-          readyMutation.findAllIn(exactSelectionCas).size == 1,
+          readyMutation.findAllIn(processValid).isEmpty,
+          readyMutation.findAllIn(selectedProjection).isEmpty,
+          readyMutation.findAllIn(exactSelectionCas).isEmpty,
           exactSelectionCas.contains("localTipOrdinal = canonical.ordinal")
         )
+    }
+  }
+
+  test("a healthy quiet Subscribe stream is not expired by message silence") {
+    readSources.map {
+      case (syncDaemon, _, _, _) =>
+        expect(!syncDaemon.contains("Gossip idle timeout"))
+          .and(expect(!syncDaemon.contains("Gossip stream idle for")))
+          .and(expect(!syncDaemon.contains("concurrently(watchdog)")))
+          .and(expect(!syncDaemon.contains("lastMsgRef")))
     }
   }
 

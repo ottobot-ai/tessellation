@@ -24,7 +24,6 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.nakamoto.{LddConfig, TipAttestation => DomainTipAttestation}
-import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -546,6 +545,7 @@ object NakamotoSyncDaemon {
 
   def run[F[_]: Async: cats.Parallel: JsonSerializer: SecurityProvider: HasherSelector: Metrics](
     channel: ManagedChannel,
+    subscriptionReadiness: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarSubscriptionReadiness[F],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     nodeStorage: NodeStorage[F],
     tipTracker: TipTracker[F],
@@ -828,250 +828,228 @@ object NakamotoSyncDaemon {
                 }
               )
               .flatMap { chainSyncManager =>
-                // Gossip stream with two-layer reconnection:
-                //
-                // Layer 1 (sidecar-triggered): When the sidecar's mesh health monitor
-                //   recovers from degradation, it closes the gRPC Subscribe stream.
-                //   handleErrorWith catches the error and re-subscribes.
-                //
-                // Layer 2 (idle watchdog): If the gRPC connection dies silently (e.g.,
-                //   Docker network disconnect — gRPC Java doesn't propagate channel
-                //   failures to blocking server-stream reads), the stream hangs forever.
-                //   A concurrent watchdog checks the last-received timestamp every 30s
-                //   and raises an error after 120s of idle. In normal operation (messages
-                //   every ~10s), the watchdog never fires.
-                //
-                // Shared state (pendingParentRef, stateRef, chainSyncManager) survives.
+                // The sidecar or gRPC channel terminates this stream on an actual transport failure; the reconnect wrapper below then
+                // resubscribes while preserving pendingParentRef/stateRef/chainSyncManager. Message silence is valid in a quiet or fresh
+                // single-validator network and is never treated as failure. Transport liveness comes from the channel's HTTP/2 keepalive.
                 def gossipStream: fs2.Stream[F, Unit] =
                   fs2.Stream
-                    // Idle-watchdog clock: MONOTONIC via the Clock typeclass (never System.currentTimeMillis — an NTP step
-                    // would fire or suppress the idle timeout spuriously, and the typeclass keeps the effect lawful/testable;
-                    // cats-idiomatic time rule, owner 2026-06-12).
-                    .eval(Clock[F].monotonic.map(_.toMillis).flatMap(Ref.of[F, Long](_)))
-                    .flatMap { lastMsgRef =>
-                      fs2.Stream.eval(cats.effect.std.Queue.bounded[F, pb.Snapshot](1024)).flatMap { snapshotIntakeQ =>
-                        val watchdog = fs2.Stream.fixedRate[F](30.seconds).evalMap { _ =>
-                          Clock[F].monotonic.map(_.toMillis).flatMap { now =>
-                            lastMsgRef.get.flatMap { lastMsg =>
-                              val idleMs = now - lastMsg
-                              if (idleMs > 120000L)
-                                logger.warn(s"Gossip stream idle for ${idleMs / 1000}s, forcing reconnect") >>
-                                  Async[F].raiseError[Unit](new RuntimeException(s"Gossip idle timeout (${idleMs / 1000}s)"))
-                              else
-                                Async[F].unit
+                    .eval(cats.effect.std.Queue.bounded[F, pb.Snapshot](1024))
+                    .flatMap { snapshotIntakeQ =>
+                      // Serial snapshot consumer — preserves the old ordering + semaphore semantics, but on its OWN lane so
+                      // checkpoints/attestations/binaries never wait behind snapshot catch-up (intake demux, run-16).
+                      val snapshotWorker: fs2.Stream[F, Unit] =
+                        fs2.Stream
+                          .fromQueueUnterminated(snapshotIntakeQ)
+                          .evalMap { snap =>
+                            val incomingOrdinal = snap.ordinal
+                            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
+                               else Async[F].unit) >>
+                                snapshotSemaphore.permit.use { _ =>
+                                  handleSnapshot(
+                                    snap,
+                                    stateRef,
+                                    pendingParentRef,
+                                    chainStore,
+                                    nodeStorage,
+                                    tipTracker,
+                                    stakeRegistry,
+                                    operatorKeyRegistry,
+                                    sidecarClient,
+                                    selfId,
+                                    keyPair,
+                                    lddConfig,
+                                    eligibilityChecker,
+                                    lastKnownSlotRef,
+                                    epochStateRef,
+                                    etaRotationSnapshots,
+                                    confirmationDepthK,
+                                    consensusFns,
+                                    snapshotStorage,
+                                    lastGlobalSnapshotStorage,
+                                    lastNGlobalSnapshotStorage,
+                                    productionGate,
+                                    mptStore,
+                                    mptOverlay,
+                                    pendingAccumulatorsRef,
+                                    pendingPostBytesRef,
+                                    eventMempool,
+                                    chainSyncManager,
+                                    channel,
+                                    dataDir,
+                                    operationalKeyMaker,
+                                    shardProducers,
+                                    shardChainStores,
+                                    shardBinaryBuffers,
+                                    shardAssignment,
+                                    shardCommitteeMembership,
+                                    logger
+                                  )
+                                } >>
+                                productionGate.resume(ProductionGate.BetterGossipReceived)
                             }
+
+                          }
+
+                      // FINDING-F1: the daemon declares the exact message families it consumes — every family
+                      // EXCEPT rumor (rumors belong to SidecarRumorBridge). The shard-checkpoint families ride
+                      // the sidecar's SHARED fan-in channels (exactly-one-drainer semantics); before this filter
+                      // the rumor bridge's subscribe-all stream race-drained ~half of them and its `isRumor`
+                      // collect silently discarded the wins. With explicit topic sets on both streams the daemon
+                      // is the shard channels' only drainer by construction.
+                      val gossip = GossipStream
+                        .subscribe[F](
+                          channel,
+                          SidecarClient.SubscriptionProfile.nakamotoSync(shardAcceptanceDeps.isDefined),
+                          subscriptionReadiness
+                        )
+                        .evalMap { msg =>
+                          msg.body match {
+                            case pb.GossipMessage.Body.Snapshot(snap) =>
+                              // INTAKE DEMUX (run-16 post-mortem, 2026-06-12): snapshot processing is seconds-to-minutes during
+                              // catch-up and used to run INLINE here, serializing the ONE gossip stream — on the slowest-booting
+                              // node every checkpoint/attestation queued behind it for MINUTES (gl0-2: sidecar got the genesis
+                              // checkpoint at 03:26:35, the JVM processed it at 03:35:32 — the head-of-line block behind boot
+                              // catch-up that re-forked every staircase run). Snapshots now route to a dedicated bounded queue
+                              // drained serially by `snapshotWorker` below (same semaphore, same ordering); all other bodies
+                              // flow past without waiting. On a full queue the snapshot is DROPPED with a WARN — snapshot
+                              // recovery is pull-based (ChainSync / pullFinalityGated), so a dropped gossip copy is re-fetched,
+                              // whereas blocking here would re-introduce the head-of-line stall this demux removes.
+                              snapshotIntakeQ.tryOffer(snap).flatMap {
+                                case true => Async[F].unit
+                                case false =>
+                                  logger.warn(
+                                    s"Gossip intake: snapshot queue FULL — dropped gossiped ord=${snap.ordinal} (pull-based recovery will refetch)"
+                                  )
+                              }
+
+                            case pb.GossipMessage.Body.Attestation(att) =>
+                              // Background-fire (intake demux completion, run-20): KES + Ed25519 verify per attestation is
+                              // tens of ms; inline on the single gossip `evalMap` thread it serializes EVERY later message —
+                              // during the boot attestation burst that is the exact head-of-line the demux was meant to remove
+                              // (the same skew-rejection failure the MetagraphBinary case documents below, and the channel by
+                              // which a shard genesis checkpoint queued behind the burst waited MINUTES in run-20). The
+                              // tracker mutation is race-safe, but the transitional sticky accumulator is receipt-order
+                              // sensitive. This background path is telemetry-only until a portable sampled transcript
+                              // replaces it; it cannot authorize Phase 2.
+                              Async[F]
+                                .start(handleAttestation(att, tipTracker, operatorKeyRegistry, etaRotationSnapshots, logger))
+                                .void
+
+                            case pb.GossipMessage.Body.MetagraphBinary(mb) =>
+                              // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
+                              // (30s default) waiting for configured `kQuorum` committee attestations. Running it on
+                              // the gossip stream's `evalMap` thread serializes EVERY message behind
+                              // every pending gate — gl0 TipAttestations from peers then arrive past
+                              // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
+                              // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
+                              // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
+                              // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
+                              // The gate-aware processor is also the sole writer to execution-shard buffers. A raw
+                              // gossip receipt is never enough to make a binary eligible for a shard checkpoint.
+                              Async[F]
+                                .start(
+                                  handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger)
+                                )
+                                .void
+
+                            case pb.GossipMessage.Body.MetagraphAttestation(att) =>
+                              // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
+                              // tens of ms per attestation. In bursts (each peer attests each binary),
+                              // this would queue up behind the stream's serial evalMap. Aggregator
+                              // record is concurrent-safe.
+                              Async[F]
+                                .start(
+                                  handleMetagraphAttestation(
+                                    att,
+                                    committeeGate,
+                                    verifyPhase2CurrencyContext,
+                                    etaForPhase2Anchor,
+                                    etaRotationSnapshots,
+                                    senderStakeLookup,
+                                    orphanBuffer,
+                                    logger
+                                  )
+                                )
+                                .void
+
+                            // Background-fire (intake demux completion, run-20): these handlers `enqueue*` into a mempool
+                            // queue (a possibly-bounded `offer`); inline on the gossip `evalMap` a full queue blocks EVERY
+                            // later message behind it (the head-of-line the demux removes for the metagraph/shard cases).
+                            // Block acceptance reorders by parent ref downstream, so a per-fiber enqueue race is harmless.
+                            case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
+                              Async[F].start(handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)).void
+
+                            case pb.GossipMessage.Body.DagBlock(blk) =>
+                              Async[F].start(handleDAGBlock(blk, enqueueDAGBlock, logger)).void
+
+                            case pb.GossipMessage.Body.TokenLockBlock(blk) =>
+                              Async[F].start(handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)).void
+
+                            // Gap B: shard-checkpoint envelope + attestation gossip routing (load-bearing cross-node
+                            // reconstruction). `shardAcceptanceDeps = None` (numShards=1, regression bar) ⇒ both
+                            // handlers drop with a single debug log. When active, the checkpoint is decoded,
+                            // reconstructed into a `Signed[ShardCheckpoint]` (the signed slot is carried on wire; store-only
+                            // VRF output metadata is derived deterministically), replay-validated, then stored into the per-shard chain store.
+                            // Only after replay succeeds are carried committee signatures counted and this node allowed
+                            // to add its own execution signature. Background-fire with
+                            // `Async.start` so the multi-step verify never blocks the gossip evalMap thread (mirrors
+                            // the MetagraphAttestation handling above).
+                            case pb.GossipMessage.Body.ShardCheckpoint(cp) =>
+                              Async[F]
+                                .start(
+                                  handleShardCheckpoint(
+                                    cp,
+                                    shardAcceptanceDeps,
+                                    shardCheckpointAttestationEmitter,
+                                    watchtowerFraudProofEmitter,
+                                    shardCheckpointFetcher,
+                                    pendingShardCheckpointRef,
+                                    MaxShardCheckpointAncestryRecoveryDepth,
+                                    selfId,
+                                    logger
+                                  )
+                                )
+                                .void
+
+                            case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
+                              Async[F].start(handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger)).void
+
+                            case pb.GossipMessage.Body.FraudProof(fp) =>
+                              // WATCHTOWER dispute consumer (part 2): background-fire the DETERMINISTIC verdict. Every gl0 runs the
+                              // identical re-derivation over the disputed checkpoint's own bytes; the verdict is recomputed, never trusted.
+                              // On a locally-UPHELD verdict the validated evidence is OFFERED into `fraudProofPool` so the gl0 leader embeds it
+                              // as the `fraudProofs` consensus artifact (W3a) — where the on-chain GSAM re-validates it + applies the slash.
+                              Async[F]
+                                .start(handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, fraudProofPool, logger))
+                                .void
+
+                            case _: pb.GossipMessage.Body.Rumor =>
+                              // Not requested by `daemonTopics` (rumors are the SidecarRumorBridge's family);
+                              // kept as a defensive no-op should the sidecar ever misroute one.
+                              Async[F].unit
+
+                            case _: pb.GossipMessage.Body.Started =>
+                              Async[F].raiseError[Unit](
+                                GossipStream.SubscriptionProtocolError(
+                                  "SubscribeStarted escaped GossipStream's first-message handshake"
+                                )
+                              )
+
+                            case pb.GossipMessage.Body.Empty =>
+                              Async[F].unit
                           }
                         }
 
-                        // Serial snapshot consumer — preserves the old ordering + semaphore semantics, but on its OWN lane so
-                        // checkpoints/attestations/binaries never wait behind snapshot catch-up (intake demux, run-16).
-                        val snapshotWorker: fs2.Stream[F, Unit] =
-                          fs2.Stream
-                            .fromQueueUnterminated(snapshotIntakeQ)
-                            .evalMap { snap =>
-                              val incomingOrdinal = snap.ordinal
-                              chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-                                val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-                                (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-                                 else Async[F].unit) >>
-                                  snapshotSemaphore.permit.use { _ =>
-                                    handleSnapshot(
-                                      snap,
-                                      stateRef,
-                                      pendingParentRef,
-                                      chainStore,
-                                      nodeStorage,
-                                      tipTracker,
-                                      stakeRegistry,
-                                      operatorKeyRegistry,
-                                      sidecarClient,
-                                      selfId,
-                                      keyPair,
-                                      lddConfig,
-                                      eligibilityChecker,
-                                      lastKnownSlotRef,
-                                      epochStateRef,
-                                      etaRotationSnapshots,
-                                      confirmationDepthK,
-                                      consensusFns,
-                                      snapshotStorage,
-                                      lastGlobalSnapshotStorage,
-                                      lastNGlobalSnapshotStorage,
-                                      productionGate,
-                                      mptStore,
-                                      mptOverlay,
-                                      pendingAccumulatorsRef,
-                                      pendingPostBytesRef,
-                                      eventMempool,
-                                      chainSyncManager,
-                                      channel,
-                                      dataDir,
-                                      operationalKeyMaker,
-                                      shardProducers,
-                                      shardChainStores,
-                                      shardBinaryBuffers,
-                                      shardAssignment,
-                                      shardCommitteeMembership,
-                                      logger
-                                    )
-                                  } >>
-                                  productionGate.resume(ProductionGate.BetterGossipReceived)
-                              }
-
-                            }
-
-                        // FINDING-F1: the daemon declares the exact message families it consumes — every family
-                        // EXCEPT rumor (rumors belong to SidecarRumorBridge). The shard-checkpoint families ride
-                        // the sidecar's SHARED fan-in channels (exactly-one-drainer semantics); before this filter
-                        // the rumor bridge's subscribe-all stream race-drained ~half of them and its `isRumor`
-                        // collect silently discarded the wins. With explicit topic sets on both streams the daemon
-                        // is the shard channels' only drainer by construction.
-                        val gossip = GossipStream
-                          .subscribe[F](channel, SidecarClient.SubscribeTopics.daemonTopics)
-                          .evalMap { msg =>
-                            Clock[F].monotonic.map(_.toMillis).flatMap(lastMsgRef.set) >>
-                              (msg.body match {
-                                case pb.GossipMessage.Body.Snapshot(snap) =>
-                                  // INTAKE DEMUX (run-16 post-mortem, 2026-06-12): snapshot processing is seconds-to-minutes during
-                                  // catch-up and used to run INLINE here, serializing the ONE gossip stream — on the slowest-booting
-                                  // node every checkpoint/attestation queued behind it for MINUTES (gl0-2: sidecar got the genesis
-                                  // checkpoint at 03:26:35, the JVM processed it at 03:35:32 — the head-of-line block behind boot
-                                  // catch-up that re-forked every staircase run). Snapshots now route to a dedicated bounded queue
-                                  // drained serially by `snapshotWorker` below (same semaphore, same ordering); all other bodies
-                                  // flow past without waiting. On a full queue the snapshot is DROPPED with a WARN — snapshot
-                                  // recovery is pull-based (ChainSync / pullFinalityGated), so a dropped gossip copy is re-fetched,
-                                  // whereas blocking here would re-introduce the head-of-line stall this demux removes.
-                                  snapshotIntakeQ.tryOffer(snap).flatMap {
-                                    case true => Async[F].unit
-                                    case false =>
-                                      logger.warn(
-                                        s"Gossip intake: snapshot queue FULL — dropped gossiped ord=${snap.ordinal} (pull-based recovery will refetch)"
-                                      )
-                                  }
-
-                                case pb.GossipMessage.Body.Attestation(att) =>
-                                  // Background-fire (intake demux completion, run-20): KES + Ed25519 verify per attestation is
-                                  // tens of ms; inline on the single gossip `evalMap` thread it serializes EVERY later message —
-                                  // during the boot attestation burst that is the exact head-of-line the demux was meant to remove
-                                  // (the same skew-rejection failure the MetagraphBinary case documents below, and the channel by
-                                  // which a shard genesis checkpoint queued behind the burst waited MINUTES in run-20). The
-                                  // tracker mutation is race-safe, but the transitional sticky accumulator is receipt-order
-                                  // sensitive. This background path is telemetry-only until a portable sampled transcript
-                                  // replaces it; it cannot authorize Phase 2.
-                                  Async[F]
-                                    .start(handleAttestation(att, tipTracker, operatorKeyRegistry, etaRotationSnapshots, logger))
-                                    .void
-
-                                case pb.GossipMessage.Body.MetagraphBinary(mb) =>
-                                  // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
-                                  // (30s default) waiting for configured `kQuorum` committee attestations. Running it on
-                                  // the gossip stream's `evalMap` thread serializes EVERY message behind
-                                  // every pending gate — gl0 TipAttestations from peers then arrive past
-                                  // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
-                                  // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
-                                  // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
-                                  // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
-                                  // The gate-aware processor is also the sole writer to execution-shard buffers. A raw
-                                  // gossip receipt is never enough to make a binary eligible for a shard checkpoint.
-                                  Async[F]
-                                    .start(
-                                      handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger)
-                                    )
-                                    .void
-
-                                case pb.GossipMessage.Body.MetagraphAttestation(att) =>
-                                  // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
-                                  // tens of ms per attestation. In bursts (each peer attests each binary),
-                                  // this would queue up behind the stream's serial evalMap. Aggregator
-                                  // record is concurrent-safe.
-                                  Async[F]
-                                    .start(
-                                      handleMetagraphAttestation(
-                                        att,
-                                        committeeGate,
-                                        verifyPhase2CurrencyContext,
-                                        etaForPhase2Anchor,
-                                        etaRotationSnapshots,
-                                        senderStakeLookup,
-                                        orphanBuffer,
-                                        logger
-                                      )
-                                    )
-                                    .void
-
-                                // Background-fire (intake demux completion, run-20): these handlers `enqueue*` into a mempool
-                                // queue (a possibly-bounded `offer`); inline on the gossip `evalMap` a full queue blocks EVERY
-                                // later message behind it (the head-of-line the demux removes for the metagraph/shard cases).
-                                // Block acceptance reorders by parent ref downstream, so a per-fiber enqueue race is harmless.
-                                case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
-                                  Async[F].start(handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)).void
-
-                                case pb.GossipMessage.Body.DagBlock(blk) =>
-                                  Async[F].start(handleDAGBlock(blk, enqueueDAGBlock, logger)).void
-
-                                case pb.GossipMessage.Body.TokenLockBlock(blk) =>
-                                  Async[F].start(handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)).void
-
-                                // Gap B: shard-checkpoint envelope + attestation gossip routing (load-bearing cross-node
-                                // reconstruction). `shardAcceptanceDeps = None` (numShards=1, regression bar) ⇒ both
-                                // handlers drop with a single debug log. When active, the checkpoint is decoded,
-                                // reconstructed into a `Signed[ShardCheckpoint]` (the signed slot is carried on wire; store-only
-                                // VRF output metadata is derived deterministically), replay-validated, then stored into the per-shard chain store.
-                                // Only after replay succeeds are carried committee signatures counted and this node allowed
-                                // to add its own execution signature. Background-fire with
-                                // `Async.start` so the multi-step verify never blocks the gossip evalMap thread (mirrors
-                                // the MetagraphAttestation handling above).
-                                case pb.GossipMessage.Body.ShardCheckpoint(cp) =>
-                                  Async[F]
-                                    .start(
-                                      handleShardCheckpoint(
-                                        cp,
-                                        shardAcceptanceDeps,
-                                        shardCheckpointAttestationEmitter,
-                                        watchtowerFraudProofEmitter,
-                                        shardCheckpointFetcher,
-                                        pendingShardCheckpointRef,
-                                        MaxShardCheckpointAncestryRecoveryDepth,
-                                        selfId,
-                                        logger
-                                      )
-                                    )
-                                    .void
-
-                                case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
-                                  Async[F].start(handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger)).void
-
-                                case pb.GossipMessage.Body.FraudProof(fp) =>
-                                  // WATCHTOWER dispute consumer (part 2): background-fire the DETERMINISTIC verdict. Every gl0 runs the
-                                  // identical re-derivation over the disputed checkpoint's own bytes; the verdict is recomputed, never trusted.
-                                  // On a locally-UPHELD verdict the validated evidence is OFFERED into `fraudProofPool` so the gl0 leader embeds it
-                                  // as the `fraudProofs` consensus artifact (W3a) — where the on-chain GSAM re-validates it + applies the slash.
-                                  Async[F]
-                                    .start(handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, fraudProofPool, logger))
-                                    .void
-
-                                case _: pb.GossipMessage.Body.Rumor =>
-                                  // Not requested by `daemonTopics` (rumors are the SidecarRumorBridge's family);
-                                  // kept as a defensive no-op should the sidecar ever misroute one.
-                                  Async[F].unit
-
-                                case pb.GossipMessage.Body.Empty =>
-                                  Async[F].unit
-                              })
-                          }
-
-                        gossip.concurrently(watchdog).concurrently(snapshotWorker)
-                      }
+                      gossip.concurrently(snapshotWorker)
                     }
                     .handleErrorWith { e =>
                       fs2.Stream.eval(
                         logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
                       ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
                     } ++ fs2.Stream.eval(
-                    // Normal termination: gRPC StreamObserver.onError puts None in the
-                    // queue, causing fromQueueNoneTerminated to end the stream normally
-                    // (not as an error). This happens when the sidecar connection dies
-                    // during a partition. Restart after a short delay.
+                    // A clean server completion is also reconnectable. gRPC errors retain their exact Throwable and take the error branch.
                     logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
                   ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
 
@@ -1588,7 +1566,6 @@ object NakamotoSyncDaemon {
               selected,
               stateRef,
               chainStore,
-              nodeStorage,
               lastKnownSlotRef,
               snapshotStorage,
               lastGlobalSnapshotStorage,
@@ -1678,7 +1655,6 @@ object NakamotoSyncDaemon {
     selected: Option[NakamotoChainStore.SelectedTip],
     stateRef: Ref[F, SyncState],
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
-    nodeStorage: NodeStorage[F],
     lastKnownSlotRef: Ref[F, Option[Long]],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -1718,19 +1694,16 @@ object NakamotoSyncDaemon {
             }
           } >>
             stateRef.get.flatMap { state =>
-              nodeStorage.getNodeState.flatMap { nodeState =>
-                if (!state.isReady && nodeState =!= NodeState.Ready) {
-                  val caughtUp = state.networkTipOrdinal - canonical.ordinal <= CatchUpThreshold
-                  if (caughtUp)
-                    // Persist the externally observed node state before flipping the local retry guard. A failed NodeStorage write must
-                    // leave `isReady=false` so the exact projection can retry instead of silently skipping readiness forever.
-                    nodeStorage.setNodeState(NodeState.Ready) >>
-                      stateRef
-                        .update(_.copy(isReady = true, localTipOrdinal = canonical.ordinal))
-                        .as(state.networkTipOrdinal.some)
-                  else none[Long].pure[F]
-                } else none[Long].pure[F]
-              }
+              if (!state.isReady) {
+                val caughtUp = state.networkTipOrdinal - canonical.ordinal <= CatchUpThreshold
+                if (caughtUp)
+                  // This is daemon-local catch-up telemetry only. Main is the sole owner of the externally visible Ready transition and
+                  // publishes it only after both current Subscribe lanes acknowledge the same sidecar process.
+                  stateRef
+                    .update(_.copy(isReady = true, localTipOrdinal = canonical.ordinal))
+                    .as(state.networkTipOrdinal.some)
+                else none[Long].pure[F]
+              } else none[Long].pure[F]
             }.flatTap { _ =>
               // Eviction is intentionally the last irreversible projection effect. If any storage or readiness write above fails, inputs
               // remain available for deterministic retry while production stays fenced.
@@ -1756,8 +1729,9 @@ object NakamotoSyncDaemon {
             } >>
             logger.info(s"Mempool reconciliation evicted ${staleHashes.size} stale DAG event(s)") >>
             readyNetworkTip.traverse_ { networkTip =>
-              logger.info(s"Caught up (local=${canonical.ordinal}, network=$networkTip). → Ready.") >>
-                logger.info(s"🟢 Node Ready — VRF production begins")
+              logger.info(
+                s"Receiver reached its local catch-up threshold (local=${canonical.ordinal}, network=$networkTip); lifecycle Ready remains Main-owned"
+              )
             }
         case NakamotoChainStore.CanonicalEffectsOutcome.StaleSelection(current) =>
           logger.info(

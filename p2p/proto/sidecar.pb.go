@@ -21,6 +21,57 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Declares which colocated JVM subsystem owns a Subscribe stream. This is
+// lifecycle metadata only: a role grants no network or consensus authority.
+type SubscriberRole int32
+
+const (
+	SubscriberRole_SUBSCRIBER_ROLE_UNSPECIFIED   SubscriberRole = 0
+	SubscriberRole_SUBSCRIBER_ROLE_RUMOR_BRIDGE  SubscriberRole = 1
+	SubscriberRole_SUBSCRIBER_ROLE_NAKAMOTO_SYNC SubscriberRole = 2
+)
+
+// Enum value maps for SubscriberRole.
+var (
+	SubscriberRole_name = map[int32]string{
+		0: "SUBSCRIBER_ROLE_UNSPECIFIED",
+		1: "SUBSCRIBER_ROLE_RUMOR_BRIDGE",
+		2: "SUBSCRIBER_ROLE_NAKAMOTO_SYNC",
+	}
+	SubscriberRole_value = map[string]int32{
+		"SUBSCRIBER_ROLE_UNSPECIFIED":   0,
+		"SUBSCRIBER_ROLE_RUMOR_BRIDGE":  1,
+		"SUBSCRIBER_ROLE_NAKAMOTO_SYNC": 2,
+	}
+)
+
+func (x SubscriberRole) Enum() *SubscriberRole {
+	p := new(SubscriberRole)
+	*p = x
+	return p
+}
+
+func (x SubscriberRole) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (SubscriberRole) Descriptor() protoreflect.EnumDescriptor {
+	return file_proto_sidecar_proto_enumTypes[0].Descriptor()
+}
+
+func (SubscriberRole) Type() protoreflect.EnumType {
+	return &file_proto_sidecar_proto_enumTypes[0]
+}
+
+func (x SubscriberRole) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use SubscriberRole.Descriptor instead.
+func (SubscriberRole) EnumDescriptor() ([]byte, []int) {
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{0}
+}
+
 // A snapshot produced by a slot winner, broadcast via GossipSub.
 //
 // Fields 11-12 added by #56.8 (ChainSync state-query disposition):
@@ -1187,6 +1238,7 @@ type GossipMessage struct {
 	//	*GossipMessage_ShardCheckpoint
 	//	*GossipMessage_ShardCheckpointAttestation
 	//	*GossipMessage_FraudProof
+	//	*GossipMessage_Started
 	Body          isGossipMessage_Body `protobuf_oneof:"body"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1328,6 +1380,15 @@ func (x *GossipMessage) GetFraudProof() *FraudProofEnvelopeWire {
 	return nil
 }
 
+func (x *GossipMessage) GetStarted() *SubscribeStarted {
+	if x != nil {
+		if x, ok := x.Body.(*GossipMessage_Started); ok {
+			return x.Started
+		}
+	}
+	return nil
+}
+
 type isGossipMessage_Body interface {
 	isGossipMessage_Body()
 }
@@ -1376,6 +1437,10 @@ type GossipMessage_FraudProof struct {
 	FraudProof *FraudProofEnvelopeWire `protobuf:"bytes,11,opt,name=fraud_proof,json=fraudProof,proto3,oneof"` // WATCHTOWER fraud-proof
 }
 
+type GossipMessage_Started struct {
+	Started *SubscribeStarted `protobuf:"bytes,12,opt,name=started,proto3,oneof"`
+}
+
 func (*GossipMessage_Snapshot) isGossipMessage_Body() {}
 
 func (*GossipMessage_Attestation) isGossipMessage_Body() {}
@@ -1398,6 +1463,80 @@ func (*GossipMessage_ShardCheckpointAttestation) isGossipMessage_Body() {}
 
 func (*GossipMessage_FraudProof) isGossipMessage_Body() {}
 
+func (*GossipMessage_Started) isGossipMessage_Body() {}
+
+// The mandatory first Subscribe event. It proves only that this sidecar
+// process acquired the requested local GossipSub subscriptions and shared
+// channel drain leases. It does not assert peer connectivity, mesh membership,
+// retained history, message freshness, or consensus readiness.
+type SubscribeStarted struct {
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Topics           []string               `protobuf:"bytes,1,rep,name=topics,proto3" json:"topics,omitempty"` // Exact validated labels, deduplicated in canonical order.
+	Role             SubscriberRole         `protobuf:"varint,2,opt,name=role,proto3,enum=nakamoto.p2p.SubscriberRole" json:"role,omitempty"`
+	StreamGeneration uint64                 `protobuf:"varint,3,opt,name=stream_generation,json=streamGeneration,proto3" json:"stream_generation,omitempty"`  // Monotonic within sidecar_session_id.
+	SidecarSessionId string                 `protobuf:"bytes,4,opt,name=sidecar_session_id,json=sidecarSessionId,proto3" json:"sidecar_session_id,omitempty"` // Random identifier fixed for this sidecar process.
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
+}
+
+func (x *SubscribeStarted) Reset() {
+	*x = SubscribeStarted{}
+	mi := &file_proto_sidecar_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubscribeStarted) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubscribeStarted) ProtoMessage() {}
+
+func (x *SubscribeStarted) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_sidecar_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubscribeStarted.ProtoReflect.Descriptor instead.
+func (*SubscribeStarted) Descriptor() ([]byte, []int) {
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *SubscribeStarted) GetTopics() []string {
+	if x != nil {
+		return x.Topics
+	}
+	return nil
+}
+
+func (x *SubscribeStarted) GetRole() SubscriberRole {
+	if x != nil {
+		return x.Role
+	}
+	return SubscriberRole_SUBSCRIBER_ROLE_UNSPECIFIED
+}
+
+func (x *SubscribeStarted) GetStreamGeneration() uint64 {
+	if x != nil {
+		return x.StreamGeneration
+	}
+	return 0
+}
+
+func (x *SubscribeStarted) GetSidecarSessionId() string {
+	if x != nil {
+		return x.SidecarSessionId
+	}
+	return ""
+}
+
 type PublishResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Ok            bool                   `protobuf:"varint,1,opt,name=ok,proto3" json:"ok,omitempty"`
@@ -1408,7 +1547,7 @@ type PublishResponse struct {
 
 func (x *PublishResponse) Reset() {
 	*x = PublishResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[14]
+	mi := &file_proto_sidecar_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1420,7 +1559,7 @@ func (x *PublishResponse) String() string {
 func (*PublishResponse) ProtoMessage() {}
 
 func (x *PublishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[14]
+	mi := &file_proto_sidecar_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1433,7 +1572,7 @@ func (x *PublishResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PublishResponse.ProtoReflect.Descriptor instead.
 func (*PublishResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{14}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *PublishResponse) GetOk() bool {
@@ -1459,23 +1598,26 @@ type SubscribeRequest struct {
 	//	"token-lock-block", "shard-checkpoint", "shard-checkpoint-attestation",
 	//	"fraud-proof"
 	//
-	// Empty = all (legacy default / debugging aid). Unknown labels FAIL the
-	// stream (InvalidArgument) — a typo must not silently subscribe to nothing.
+	// The set must be explicit and nonempty. Unknown labels FAIL the stream
+	// (InvalidArgument) — a typo must not silently subscribe to nothing.
 	//
 	// FINDING-F1: the filter is load-bearing for the shard-checkpoint families,
 	// which ride SHARED node-lifetime fan-in channels tolerating exactly ONE
 	// drainer. The JVM's two streams declare disjoint sets (the rumor bridge
-	// takes "rumor"; the NakamotoSyncDaemon takes everything else) so the shard
-	// channels get exactly one drainer by construction. Labels mirror
-	// SidecarClient.SubscribeTopics (JVM) / grpcserver.Topic* (Go).
-	Topics        []string `protobuf:"bytes,1,rep,name=topics,proto3" json:"topics,omitempty"`
+	// takes "rumor"; the NakamotoSyncDaemon takes the exact active non-rumor
+	// profile) so the shard channels get exactly one drainer by construction.
+	// Labels mirror SidecarClient.SubscribeTopics (JVM) / grpcserver.Topic* (Go).
+	Topics []string `protobuf:"bytes,1,rep,name=topics,proto3" json:"topics,omitempty"`
+	// Required owner of this stream. The sidecar echoes the validated role in
+	// SubscribeStarted so a reconnect cannot be confused with another consumer.
+	Role          SubscriberRole `protobuf:"varint,2,opt,name=role,proto3,enum=nakamoto.p2p.SubscriberRole" json:"role,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *SubscribeRequest) Reset() {
 	*x = SubscribeRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[15]
+	mi := &file_proto_sidecar_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1487,7 +1629,7 @@ func (x *SubscribeRequest) String() string {
 func (*SubscribeRequest) ProtoMessage() {}
 
 func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[15]
+	mi := &file_proto_sidecar_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1500,7 +1642,7 @@ func (x *SubscribeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SubscribeRequest.ProtoReflect.Descriptor instead.
 func (*SubscribeRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{15}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *SubscribeRequest) GetTopics() []string {
@@ -1508,6 +1650,13 @@ func (x *SubscribeRequest) GetTopics() []string {
 		return x.Topics
 	}
 	return nil
+}
+
+func (x *SubscribeRequest) GetRole() SubscriberRole {
+	if x != nil {
+		return x.Role
+	}
+	return SubscriberRole_SUBSCRIBER_ROLE_UNSPECIFIED
 }
 
 type PeerCountRequest struct {
@@ -1518,7 +1667,7 @@ type PeerCountRequest struct {
 
 func (x *PeerCountRequest) Reset() {
 	*x = PeerCountRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[16]
+	mi := &file_proto_sidecar_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1530,7 +1679,7 @@ func (x *PeerCountRequest) String() string {
 func (*PeerCountRequest) ProtoMessage() {}
 
 func (x *PeerCountRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[16]
+	mi := &file_proto_sidecar_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1543,7 +1692,7 @@ func (x *PeerCountRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerCountRequest.ProtoReflect.Descriptor instead.
 func (*PeerCountRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{16}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{17}
 }
 
 type PeerCountResponse struct {
@@ -1565,7 +1714,7 @@ type PeerCountResponse struct {
 
 func (x *PeerCountResponse) Reset() {
 	*x = PeerCountResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[17]
+	mi := &file_proto_sidecar_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1577,7 +1726,7 @@ func (x *PeerCountResponse) String() string {
 func (*PeerCountResponse) ProtoMessage() {}
 
 func (x *PeerCountResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[17]
+	mi := &file_proto_sidecar_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1590,7 +1739,7 @@ func (x *PeerCountResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerCountResponse.ProtoReflect.Descriptor instead.
 func (*PeerCountResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{17}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *PeerCountResponse) GetTotal() int32 {
@@ -1687,7 +1836,7 @@ type ConfirmFinalizedRequest struct {
 
 func (x *ConfirmFinalizedRequest) Reset() {
 	*x = ConfirmFinalizedRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[18]
+	mi := &file_proto_sidecar_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1699,7 +1848,7 @@ func (x *ConfirmFinalizedRequest) String() string {
 func (*ConfirmFinalizedRequest) ProtoMessage() {}
 
 func (x *ConfirmFinalizedRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[18]
+	mi := &file_proto_sidecar_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1712,7 +1861,7 @@ func (x *ConfirmFinalizedRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmFinalizedRequest.ProtoReflect.Descriptor instead.
 func (*ConfirmFinalizedRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{18}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *ConfirmFinalizedRequest) GetTopic() string {
@@ -1739,7 +1888,7 @@ type ConfirmFinalizedResponse struct {
 
 func (x *ConfirmFinalizedResponse) Reset() {
 	*x = ConfirmFinalizedResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[19]
+	mi := &file_proto_sidecar_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1751,7 +1900,7 @@ func (x *ConfirmFinalizedResponse) String() string {
 func (*ConfirmFinalizedResponse) ProtoMessage() {}
 
 func (x *ConfirmFinalizedResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[19]
+	mi := &file_proto_sidecar_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1764,7 +1913,7 @@ func (x *ConfirmFinalizedResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ConfirmFinalizedResponse.ProtoReflect.Descriptor instead.
 func (*ConfirmFinalizedResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{19}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *ConfirmFinalizedResponse) GetDropped() int32 {
@@ -1782,7 +1931,7 @@ type HealthRequest struct {
 
 func (x *HealthRequest) Reset() {
 	*x = HealthRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[20]
+	mi := &file_proto_sidecar_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1794,7 +1943,7 @@ func (x *HealthRequest) String() string {
 func (*HealthRequest) ProtoMessage() {}
 
 func (x *HealthRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[20]
+	mi := &file_proto_sidecar_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1807,7 +1956,7 @@ func (x *HealthRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthRequest.ProtoReflect.Descriptor instead.
 func (*HealthRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{20}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{21}
 }
 
 type HealthResponse struct {
@@ -1821,7 +1970,7 @@ type HealthResponse struct {
 
 func (x *HealthResponse) Reset() {
 	*x = HealthResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[21]
+	mi := &file_proto_sidecar_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1833,7 +1982,7 @@ func (x *HealthResponse) String() string {
 func (*HealthResponse) ProtoMessage() {}
 
 func (x *HealthResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[21]
+	mi := &file_proto_sidecar_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1846,7 +1995,7 @@ func (x *HealthResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HealthResponse.ProtoReflect.Descriptor instead.
 func (*HealthResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{21}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *HealthResponse) GetHealthy() bool {
@@ -1881,7 +2030,7 @@ type ChainPoint struct {
 
 func (x *ChainPoint) Reset() {
 	*x = ChainPoint{}
-	mi := &file_proto_sidecar_proto_msgTypes[22]
+	mi := &file_proto_sidecar_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1893,7 +2042,7 @@ func (x *ChainPoint) String() string {
 func (*ChainPoint) ProtoMessage() {}
 
 func (x *ChainPoint) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[22]
+	mi := &file_proto_sidecar_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1906,7 +2055,7 @@ func (x *ChainPoint) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChainPoint.ProtoReflect.Descriptor instead.
 func (*ChainPoint) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{22}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ChainPoint) GetHash() []byte {
@@ -1933,7 +2082,7 @@ type FetchSnapshotsRequest struct {
 
 func (x *FetchSnapshotsRequest) Reset() {
 	*x = FetchSnapshotsRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[23]
+	mi := &file_proto_sidecar_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1945,7 +2094,7 @@ func (x *FetchSnapshotsRequest) String() string {
 func (*FetchSnapshotsRequest) ProtoMessage() {}
 
 func (x *FetchSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[23]
+	mi := &file_proto_sidecar_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1958,7 +2107,7 @@ func (x *FetchSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*FetchSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{23}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *FetchSnapshotsRequest) GetHashes() [][]byte {
@@ -1979,7 +2128,7 @@ type FindIntersectionRequest struct {
 
 func (x *FindIntersectionRequest) Reset() {
 	*x = FindIntersectionRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[24]
+	mi := &file_proto_sidecar_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1991,7 +2140,7 @@ func (x *FindIntersectionRequest) String() string {
 func (*FindIntersectionRequest) ProtoMessage() {}
 
 func (x *FindIntersectionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[24]
+	mi := &file_proto_sidecar_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2004,7 +2153,7 @@ func (x *FindIntersectionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FindIntersectionRequest.ProtoReflect.Descriptor instead.
 func (*FindIntersectionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{24}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *FindIntersectionRequest) GetPoints() []*ChainPoint {
@@ -2027,7 +2176,7 @@ type FindIntersectionResponse struct {
 
 func (x *FindIntersectionResponse) Reset() {
 	*x = FindIntersectionResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[25]
+	mi := &file_proto_sidecar_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2039,7 +2188,7 @@ func (x *FindIntersectionResponse) String() string {
 func (*FindIntersectionResponse) ProtoMessage() {}
 
 func (x *FindIntersectionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[25]
+	mi := &file_proto_sidecar_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2052,7 +2201,7 @@ func (x *FindIntersectionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FindIntersectionResponse.ProtoReflect.Descriptor instead.
 func (*FindIntersectionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{25}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *FindIntersectionResponse) GetFound() bool {
@@ -2098,7 +2247,7 @@ type GetPeerTipRequest struct {
 
 func (x *GetPeerTipRequest) Reset() {
 	*x = GetPeerTipRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[26]
+	mi := &file_proto_sidecar_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2110,7 +2259,7 @@ func (x *GetPeerTipRequest) String() string {
 func (*GetPeerTipRequest) ProtoMessage() {}
 
 func (x *GetPeerTipRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[26]
+	mi := &file_proto_sidecar_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2123,7 +2272,7 @@ func (x *GetPeerTipRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetPeerTipRequest.ProtoReflect.Descriptor instead.
 func (*GetPeerTipRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{26}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{27}
 }
 
 type PeerTipResponse struct {
@@ -2137,7 +2286,7 @@ type PeerTipResponse struct {
 
 func (x *PeerTipResponse) Reset() {
 	*x = PeerTipResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[27]
+	mi := &file_proto_sidecar_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2149,7 +2298,7 @@ func (x *PeerTipResponse) String() string {
 func (*PeerTipResponse) ProtoMessage() {}
 
 func (x *PeerTipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[27]
+	mi := &file_proto_sidecar_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2162,7 +2311,7 @@ func (x *PeerTipResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PeerTipResponse.ProtoReflect.Descriptor instead.
 func (*PeerTipResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{27}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *PeerTipResponse) GetHash() []byte {
@@ -2195,7 +2344,7 @@ type ServeSnapshotsRequest struct {
 
 func (x *ServeSnapshotsRequest) Reset() {
 	*x = ServeSnapshotsRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[28]
+	mi := &file_proto_sidecar_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2207,7 +2356,7 @@ func (x *ServeSnapshotsRequest) String() string {
 func (*ServeSnapshotsRequest) ProtoMessage() {}
 
 func (x *ServeSnapshotsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[28]
+	mi := &file_proto_sidecar_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2220,7 +2369,7 @@ func (x *ServeSnapshotsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeSnapshotsRequest.ProtoReflect.Descriptor instead.
 func (*ServeSnapshotsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{28}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ServeSnapshotsRequest) GetHashes() [][]byte {
@@ -2238,7 +2387,7 @@ type ServeChainPointsRequest struct {
 
 func (x *ServeChainPointsRequest) Reset() {
 	*x = ServeChainPointsRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[29]
+	mi := &file_proto_sidecar_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2250,7 +2399,7 @@ func (x *ServeChainPointsRequest) String() string {
 func (*ServeChainPointsRequest) ProtoMessage() {}
 
 func (x *ServeChainPointsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[29]
+	mi := &file_proto_sidecar_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2263,7 +2412,7 @@ func (x *ServeChainPointsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeChainPointsRequest.ProtoReflect.Descriptor instead.
 func (*ServeChainPointsRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{29}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{30}
 }
 
 type ServeChainPointsResponse struct {
@@ -2277,7 +2426,7 @@ type ServeChainPointsResponse struct {
 
 func (x *ServeChainPointsResponse) Reset() {
 	*x = ServeChainPointsResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[30]
+	mi := &file_proto_sidecar_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2289,7 +2438,7 @@ func (x *ServeChainPointsResponse) String() string {
 func (*ServeChainPointsResponse) ProtoMessage() {}
 
 func (x *ServeChainPointsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[30]
+	mi := &file_proto_sidecar_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2302,7 +2451,7 @@ func (x *ServeChainPointsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ServeChainPointsResponse.ProtoReflect.Descriptor instead.
 func (*ServeChainPointsResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{30}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ServeChainPointsResponse) GetPoints() []*ChainPoint {
@@ -2353,7 +2502,7 @@ type FetchMetagraphBinariesRequest struct {
 
 func (x *FetchMetagraphBinariesRequest) Reset() {
 	*x = FetchMetagraphBinariesRequest{}
-	mi := &file_proto_sidecar_proto_msgTypes[31]
+	mi := &file_proto_sidecar_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2365,7 +2514,7 @@ func (x *FetchMetagraphBinariesRequest) String() string {
 func (*FetchMetagraphBinariesRequest) ProtoMessage() {}
 
 func (x *FetchMetagraphBinariesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[31]
+	mi := &file_proto_sidecar_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2378,7 +2527,7 @@ func (x *FetchMetagraphBinariesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use FetchMetagraphBinariesRequest.ProtoReflect.Descriptor instead.
 func (*FetchMetagraphBinariesRequest) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{31}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *FetchMetagraphBinariesRequest) GetMetagraphAddress() string {
@@ -2410,7 +2559,7 @@ type MetagraphBinaryResponse struct {
 
 func (x *MetagraphBinaryResponse) Reset() {
 	*x = MetagraphBinaryResponse{}
-	mi := &file_proto_sidecar_proto_msgTypes[32]
+	mi := &file_proto_sidecar_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2422,7 +2571,7 @@ func (x *MetagraphBinaryResponse) String() string {
 func (*MetagraphBinaryResponse) ProtoMessage() {}
 
 func (x *MetagraphBinaryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_sidecar_proto_msgTypes[32]
+	mi := &file_proto_sidecar_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2435,7 +2584,7 @@ func (x *MetagraphBinaryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MetagraphBinaryResponse.ProtoReflect.Descriptor instead.
 func (*MetagraphBinaryResponse) Descriptor() ([]byte, []int) {
-	return file_proto_sidecar_proto_rawDescGZIP(), []int{32}
+	return file_proto_sidecar_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *MetagraphBinaryResponse) GetSignedBinary() []byte {
@@ -2536,7 +2685,7 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\x15challenger_derivation\x18\x06 \x01(\fR\x14challengerDerivation\x12/\n" +
 	"\x13reexecution_witness\x18\a \x01(\fR\x12reexecutionWitness\x121\n" +
 	"\x14challenger_signature\x18\b \x01(\fR\x13challengerSignature\x12!\n" +
-	"\fsubmitter_id\x18\t \x01(\fR\vsubmitterId\"\xbc\x06\n" +
+	"\fsubmitter_id\x18\t \x01(\fR\vsubmitterId\"\xf8\x06\n" +
 	"\rGossipMessage\x124\n" +
 	"\bsnapshot\x18\x01 \x01(\v2\x16.nakamoto.p2p.SnapshotH\x00R\bsnapshot\x12@\n" +
 	"\vattestation\x18\x02 \x01(\v2\x1c.nakamoto.p2p.TipAttestationH\x00R\vattestation\x12+\n" +
@@ -2550,13 +2699,20 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\x1cshard_checkpoint_attestation\x18\n" +
 	" \x01(\v2,.nakamoto.p2p.ShardCheckpointAttestationWireH\x00R\x1ashardCheckpointAttestation\x12G\n" +
 	"\vfraud_proof\x18\v \x01(\v2$.nakamoto.p2p.FraudProofEnvelopeWireH\x00R\n" +
-	"fraudProofB\x06\n" +
-	"\x04body\"7\n" +
+	"fraudProof\x12:\n" +
+	"\astarted\x18\f \x01(\v2\x1e.nakamoto.p2p.SubscribeStartedH\x00R\astartedB\x06\n" +
+	"\x04body\"\xb7\x01\n" +
+	"\x10SubscribeStarted\x12\x16\n" +
+	"\x06topics\x18\x01 \x03(\tR\x06topics\x120\n" +
+	"\x04role\x18\x02 \x01(\x0e2\x1c.nakamoto.p2p.SubscriberRoleR\x04role\x12+\n" +
+	"\x11stream_generation\x18\x03 \x01(\x04R\x10streamGeneration\x12,\n" +
+	"\x12sidecar_session_id\x18\x04 \x01(\tR\x10sidecarSessionId\"7\n" +
 	"\x0fPublishResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"*\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\\\n" +
 	"\x10SubscribeRequest\x12\x16\n" +
-	"\x06topics\x18\x01 \x03(\tR\x06topics\"\x12\n" +
+	"\x06topics\x18\x01 \x03(\tR\x06topics\x120\n" +
+	"\x04role\x18\x02 \x01(\x0e2\x1c.nakamoto.p2p.SubscriberRoleR\x04role\"\x12\n" +
 	"\x10PeerCountRequest\"\xad\x04\n" +
 	"\x11PeerCountResponse\x12\x14\n" +
 	"\x05total\x18\x01 \x01(\x05R\x05total\x12%\n" +
@@ -2616,7 +2772,11 @@ const file_proto_sidecar_proto_rawDesc = "" +
 	"\x11metagraph_address\x18\x01 \x01(\tR\x10metagraphAddress\x12#\n" +
 	"\rbinary_hashes\x18\x02 \x03(\fR\fbinaryHashes\">\n" +
 	"\x17MetagraphBinaryResponse\x12#\n" +
-	"\rsigned_binary\x18\x01 \x01(\fR\fsignedBinary2\x8d\n" +
+	"\rsigned_binary\x18\x01 \x01(\fR\fsignedBinary*v\n" +
+	"\x0eSubscriberRole\x12\x1f\n" +
+	"\x1bSUBSCRIBER_ROLE_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cSUBSCRIBER_ROLE_RUMOR_BRIDGE\x10\x01\x12!\n" +
+	"\x1dSUBSCRIBER_ROLE_NAKAMOTO_SYNC\x10\x022\x8d\n" +
 	"\n" +
 	"\x0eSidecarService\x12H\n" +
 	"\x0fPublishSnapshot\x12\x16.nakamoto.p2p.Snapshot\x1a\x1d.nakamoto.p2p.PublishResponse\x12Q\n" +
@@ -2658,108 +2818,114 @@ func file_proto_sidecar_proto_rawDescGZIP() []byte {
 	return file_proto_sidecar_proto_rawDescData
 }
 
-var file_proto_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
+var file_proto_sidecar_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_proto_sidecar_proto_msgTypes = make([]protoimpl.MessageInfo, 34)
 var file_proto_sidecar_proto_goTypes = []any{
-	(*Snapshot)(nil),                       // 0: nakamoto.p2p.Snapshot
-	(*TipAttestation)(nil),                 // 1: nakamoto.p2p.TipAttestation
-	(*Rumor)(nil),                          // 2: nakamoto.p2p.Rumor
-	(*MetagraphBinary)(nil),                // 3: nakamoto.p2p.MetagraphBinary
-	(*AllowSpendBlock)(nil),                // 4: nakamoto.p2p.AllowSpendBlock
-	(*DAGBlock)(nil),                       // 5: nakamoto.p2p.DAGBlock
-	(*TokenLockBlock)(nil),                 // 6: nakamoto.p2p.TokenLockBlock
-	(*MetagraphAttestation)(nil),           // 7: nakamoto.p2p.MetagraphAttestation
-	(*ShardCheckpointWire)(nil),            // 8: nakamoto.p2p.ShardCheckpointWire
-	(*ShardDerivedStateDeltaWire)(nil),     // 9: nakamoto.p2p.ShardDerivedStateDeltaWire
-	(*CommitteeMemberSignatureWire)(nil),   // 10: nakamoto.p2p.CommitteeMemberSignatureWire
-	(*ShardCheckpointAttestationWire)(nil), // 11: nakamoto.p2p.ShardCheckpointAttestationWire
-	(*FraudProofEnvelopeWire)(nil),         // 12: nakamoto.p2p.FraudProofEnvelopeWire
-	(*GossipMessage)(nil),                  // 13: nakamoto.p2p.GossipMessage
-	(*PublishResponse)(nil),                // 14: nakamoto.p2p.PublishResponse
-	(*SubscribeRequest)(nil),               // 15: nakamoto.p2p.SubscribeRequest
-	(*PeerCountRequest)(nil),               // 16: nakamoto.p2p.PeerCountRequest
-	(*PeerCountResponse)(nil),              // 17: nakamoto.p2p.PeerCountResponse
-	(*ConfirmFinalizedRequest)(nil),        // 18: nakamoto.p2p.ConfirmFinalizedRequest
-	(*ConfirmFinalizedResponse)(nil),       // 19: nakamoto.p2p.ConfirmFinalizedResponse
-	(*HealthRequest)(nil),                  // 20: nakamoto.p2p.HealthRequest
-	(*HealthResponse)(nil),                 // 21: nakamoto.p2p.HealthResponse
-	(*ChainPoint)(nil),                     // 22: nakamoto.p2p.ChainPoint
-	(*FetchSnapshotsRequest)(nil),          // 23: nakamoto.p2p.FetchSnapshotsRequest
-	(*FindIntersectionRequest)(nil),        // 24: nakamoto.p2p.FindIntersectionRequest
-	(*FindIntersectionResponse)(nil),       // 25: nakamoto.p2p.FindIntersectionResponse
-	(*GetPeerTipRequest)(nil),              // 26: nakamoto.p2p.GetPeerTipRequest
-	(*PeerTipResponse)(nil),                // 27: nakamoto.p2p.PeerTipResponse
-	(*ServeSnapshotsRequest)(nil),          // 28: nakamoto.p2p.ServeSnapshotsRequest
-	(*ServeChainPointsRequest)(nil),        // 29: nakamoto.p2p.ServeChainPointsRequest
-	(*ServeChainPointsResponse)(nil),       // 30: nakamoto.p2p.ServeChainPointsResponse
-	(*FetchMetagraphBinariesRequest)(nil),  // 31: nakamoto.p2p.FetchMetagraphBinariesRequest
-	(*MetagraphBinaryResponse)(nil),        // 32: nakamoto.p2p.MetagraphBinaryResponse
+	(SubscriberRole)(0),                    // 0: nakamoto.p2p.SubscriberRole
+	(*Snapshot)(nil),                       // 1: nakamoto.p2p.Snapshot
+	(*TipAttestation)(nil),                 // 2: nakamoto.p2p.TipAttestation
+	(*Rumor)(nil),                          // 3: nakamoto.p2p.Rumor
+	(*MetagraphBinary)(nil),                // 4: nakamoto.p2p.MetagraphBinary
+	(*AllowSpendBlock)(nil),                // 5: nakamoto.p2p.AllowSpendBlock
+	(*DAGBlock)(nil),                       // 6: nakamoto.p2p.DAGBlock
+	(*TokenLockBlock)(nil),                 // 7: nakamoto.p2p.TokenLockBlock
+	(*MetagraphAttestation)(nil),           // 8: nakamoto.p2p.MetagraphAttestation
+	(*ShardCheckpointWire)(nil),            // 9: nakamoto.p2p.ShardCheckpointWire
+	(*ShardDerivedStateDeltaWire)(nil),     // 10: nakamoto.p2p.ShardDerivedStateDeltaWire
+	(*CommitteeMemberSignatureWire)(nil),   // 11: nakamoto.p2p.CommitteeMemberSignatureWire
+	(*ShardCheckpointAttestationWire)(nil), // 12: nakamoto.p2p.ShardCheckpointAttestationWire
+	(*FraudProofEnvelopeWire)(nil),         // 13: nakamoto.p2p.FraudProofEnvelopeWire
+	(*GossipMessage)(nil),                  // 14: nakamoto.p2p.GossipMessage
+	(*SubscribeStarted)(nil),               // 15: nakamoto.p2p.SubscribeStarted
+	(*PublishResponse)(nil),                // 16: nakamoto.p2p.PublishResponse
+	(*SubscribeRequest)(nil),               // 17: nakamoto.p2p.SubscribeRequest
+	(*PeerCountRequest)(nil),               // 18: nakamoto.p2p.PeerCountRequest
+	(*PeerCountResponse)(nil),              // 19: nakamoto.p2p.PeerCountResponse
+	(*ConfirmFinalizedRequest)(nil),        // 20: nakamoto.p2p.ConfirmFinalizedRequest
+	(*ConfirmFinalizedResponse)(nil),       // 21: nakamoto.p2p.ConfirmFinalizedResponse
+	(*HealthRequest)(nil),                  // 22: nakamoto.p2p.HealthRequest
+	(*HealthResponse)(nil),                 // 23: nakamoto.p2p.HealthResponse
+	(*ChainPoint)(nil),                     // 24: nakamoto.p2p.ChainPoint
+	(*FetchSnapshotsRequest)(nil),          // 25: nakamoto.p2p.FetchSnapshotsRequest
+	(*FindIntersectionRequest)(nil),        // 26: nakamoto.p2p.FindIntersectionRequest
+	(*FindIntersectionResponse)(nil),       // 27: nakamoto.p2p.FindIntersectionResponse
+	(*GetPeerTipRequest)(nil),              // 28: nakamoto.p2p.GetPeerTipRequest
+	(*PeerTipResponse)(nil),                // 29: nakamoto.p2p.PeerTipResponse
+	(*ServeSnapshotsRequest)(nil),          // 30: nakamoto.p2p.ServeSnapshotsRequest
+	(*ServeChainPointsRequest)(nil),        // 31: nakamoto.p2p.ServeChainPointsRequest
+	(*ServeChainPointsResponse)(nil),       // 32: nakamoto.p2p.ServeChainPointsResponse
+	(*FetchMetagraphBinariesRequest)(nil),  // 33: nakamoto.p2p.FetchMetagraphBinariesRequest
+	(*MetagraphBinaryResponse)(nil),        // 34: nakamoto.p2p.MetagraphBinaryResponse
 }
 var file_proto_sidecar_proto_depIdxs = []int32{
-	9,  // 0: nakamoto.p2p.ShardCheckpointWire.derived_state_delta:type_name -> nakamoto.p2p.ShardDerivedStateDeltaWire
-	10, // 1: nakamoto.p2p.ShardCheckpointWire.committee_signatures:type_name -> nakamoto.p2p.CommitteeMemberSignatureWire
-	10, // 2: nakamoto.p2p.ShardCheckpointAttestationWire.attester_signature:type_name -> nakamoto.p2p.CommitteeMemberSignatureWire
-	0,  // 3: nakamoto.p2p.GossipMessage.snapshot:type_name -> nakamoto.p2p.Snapshot
-	1,  // 4: nakamoto.p2p.GossipMessage.attestation:type_name -> nakamoto.p2p.TipAttestation
-	2,  // 5: nakamoto.p2p.GossipMessage.rumor:type_name -> nakamoto.p2p.Rumor
-	3,  // 6: nakamoto.p2p.GossipMessage.metagraph_binary:type_name -> nakamoto.p2p.MetagraphBinary
-	7,  // 7: nakamoto.p2p.GossipMessage.metagraph_attestation:type_name -> nakamoto.p2p.MetagraphAttestation
-	4,  // 8: nakamoto.p2p.GossipMessage.allow_spend_block:type_name -> nakamoto.p2p.AllowSpendBlock
-	5,  // 9: nakamoto.p2p.GossipMessage.dag_block:type_name -> nakamoto.p2p.DAGBlock
-	6,  // 10: nakamoto.p2p.GossipMessage.token_lock_block:type_name -> nakamoto.p2p.TokenLockBlock
-	8,  // 11: nakamoto.p2p.GossipMessage.shard_checkpoint:type_name -> nakamoto.p2p.ShardCheckpointWire
-	11, // 12: nakamoto.p2p.GossipMessage.shard_checkpoint_attestation:type_name -> nakamoto.p2p.ShardCheckpointAttestationWire
-	12, // 13: nakamoto.p2p.GossipMessage.fraud_proof:type_name -> nakamoto.p2p.FraudProofEnvelopeWire
-	22, // 14: nakamoto.p2p.FindIntersectionRequest.points:type_name -> nakamoto.p2p.ChainPoint
-	22, // 15: nakamoto.p2p.ServeChainPointsResponse.points:type_name -> nakamoto.p2p.ChainPoint
-	0,  // 16: nakamoto.p2p.SidecarService.PublishSnapshot:input_type -> nakamoto.p2p.Snapshot
-	1,  // 17: nakamoto.p2p.SidecarService.PublishAttestation:input_type -> nakamoto.p2p.TipAttestation
-	2,  // 18: nakamoto.p2p.SidecarService.PublishRumor:input_type -> nakamoto.p2p.Rumor
-	3,  // 19: nakamoto.p2p.SidecarService.PublishMetagraphBinary:input_type -> nakamoto.p2p.MetagraphBinary
-	7,  // 20: nakamoto.p2p.SidecarService.PublishMetagraphAttestation:input_type -> nakamoto.p2p.MetagraphAttestation
-	4,  // 21: nakamoto.p2p.SidecarService.PublishAllowSpendBlock:input_type -> nakamoto.p2p.AllowSpendBlock
-	5,  // 22: nakamoto.p2p.SidecarService.PublishDAGBlock:input_type -> nakamoto.p2p.DAGBlock
-	6,  // 23: nakamoto.p2p.SidecarService.PublishTokenLockBlock:input_type -> nakamoto.p2p.TokenLockBlock
-	8,  // 24: nakamoto.p2p.SidecarService.PublishShardCheckpoint:input_type -> nakamoto.p2p.ShardCheckpointWire
-	11, // 25: nakamoto.p2p.SidecarService.PublishShardCheckpointAttestation:input_type -> nakamoto.p2p.ShardCheckpointAttestationWire
-	12, // 26: nakamoto.p2p.SidecarService.PublishFraudProof:input_type -> nakamoto.p2p.FraudProofEnvelopeWire
-	18, // 27: nakamoto.p2p.SidecarService.ConfirmFinalized:input_type -> nakamoto.p2p.ConfirmFinalizedRequest
-	15, // 28: nakamoto.p2p.SidecarService.Subscribe:input_type -> nakamoto.p2p.SubscribeRequest
-	16, // 29: nakamoto.p2p.SidecarService.PeerCount:input_type -> nakamoto.p2p.PeerCountRequest
-	20, // 30: nakamoto.p2p.SidecarService.Health:input_type -> nakamoto.p2p.HealthRequest
-	23, // 31: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:input_type -> nakamoto.p2p.FetchSnapshotsRequest
-	24, // 32: nakamoto.p2p.ChainSyncOutbound.FindIntersection:input_type -> nakamoto.p2p.FindIntersectionRequest
-	26, // 33: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:input_type -> nakamoto.p2p.GetPeerTipRequest
-	31, // 34: nakamoto.p2p.ChainSyncOutbound.FetchMetagraphBinaries:input_type -> nakamoto.p2p.FetchMetagraphBinariesRequest
-	28, // 35: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:input_type -> nakamoto.p2p.ServeSnapshotsRequest
-	29, // 36: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:input_type -> nakamoto.p2p.ServeChainPointsRequest
-	31, // 37: nakamoto.p2p.ChainSyncInbound.ServeMetagraphBinaries:input_type -> nakamoto.p2p.FetchMetagraphBinariesRequest
-	14, // 38: nakamoto.p2p.SidecarService.PublishSnapshot:output_type -> nakamoto.p2p.PublishResponse
-	14, // 39: nakamoto.p2p.SidecarService.PublishAttestation:output_type -> nakamoto.p2p.PublishResponse
-	14, // 40: nakamoto.p2p.SidecarService.PublishRumor:output_type -> nakamoto.p2p.PublishResponse
-	14, // 41: nakamoto.p2p.SidecarService.PublishMetagraphBinary:output_type -> nakamoto.p2p.PublishResponse
-	14, // 42: nakamoto.p2p.SidecarService.PublishMetagraphAttestation:output_type -> nakamoto.p2p.PublishResponse
-	14, // 43: nakamoto.p2p.SidecarService.PublishAllowSpendBlock:output_type -> nakamoto.p2p.PublishResponse
-	14, // 44: nakamoto.p2p.SidecarService.PublishDAGBlock:output_type -> nakamoto.p2p.PublishResponse
-	14, // 45: nakamoto.p2p.SidecarService.PublishTokenLockBlock:output_type -> nakamoto.p2p.PublishResponse
-	14, // 46: nakamoto.p2p.SidecarService.PublishShardCheckpoint:output_type -> nakamoto.p2p.PublishResponse
-	14, // 47: nakamoto.p2p.SidecarService.PublishShardCheckpointAttestation:output_type -> nakamoto.p2p.PublishResponse
-	14, // 48: nakamoto.p2p.SidecarService.PublishFraudProof:output_type -> nakamoto.p2p.PublishResponse
-	19, // 49: nakamoto.p2p.SidecarService.ConfirmFinalized:output_type -> nakamoto.p2p.ConfirmFinalizedResponse
-	13, // 50: nakamoto.p2p.SidecarService.Subscribe:output_type -> nakamoto.p2p.GossipMessage
-	17, // 51: nakamoto.p2p.SidecarService.PeerCount:output_type -> nakamoto.p2p.PeerCountResponse
-	21, // 52: nakamoto.p2p.SidecarService.Health:output_type -> nakamoto.p2p.HealthResponse
-	0,  // 53: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:output_type -> nakamoto.p2p.Snapshot
-	25, // 54: nakamoto.p2p.ChainSyncOutbound.FindIntersection:output_type -> nakamoto.p2p.FindIntersectionResponse
-	27, // 55: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:output_type -> nakamoto.p2p.PeerTipResponse
-	32, // 56: nakamoto.p2p.ChainSyncOutbound.FetchMetagraphBinaries:output_type -> nakamoto.p2p.MetagraphBinaryResponse
-	0,  // 57: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:output_type -> nakamoto.p2p.Snapshot
-	30, // 58: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:output_type -> nakamoto.p2p.ServeChainPointsResponse
-	32, // 59: nakamoto.p2p.ChainSyncInbound.ServeMetagraphBinaries:output_type -> nakamoto.p2p.MetagraphBinaryResponse
-	38, // [38:60] is the sub-list for method output_type
-	16, // [16:38] is the sub-list for method input_type
-	16, // [16:16] is the sub-list for extension type_name
-	16, // [16:16] is the sub-list for extension extendee
-	0,  // [0:16] is the sub-list for field type_name
+	10, // 0: nakamoto.p2p.ShardCheckpointWire.derived_state_delta:type_name -> nakamoto.p2p.ShardDerivedStateDeltaWire
+	11, // 1: nakamoto.p2p.ShardCheckpointWire.committee_signatures:type_name -> nakamoto.p2p.CommitteeMemberSignatureWire
+	11, // 2: nakamoto.p2p.ShardCheckpointAttestationWire.attester_signature:type_name -> nakamoto.p2p.CommitteeMemberSignatureWire
+	1,  // 3: nakamoto.p2p.GossipMessage.snapshot:type_name -> nakamoto.p2p.Snapshot
+	2,  // 4: nakamoto.p2p.GossipMessage.attestation:type_name -> nakamoto.p2p.TipAttestation
+	3,  // 5: nakamoto.p2p.GossipMessage.rumor:type_name -> nakamoto.p2p.Rumor
+	4,  // 6: nakamoto.p2p.GossipMessage.metagraph_binary:type_name -> nakamoto.p2p.MetagraphBinary
+	8,  // 7: nakamoto.p2p.GossipMessage.metagraph_attestation:type_name -> nakamoto.p2p.MetagraphAttestation
+	5,  // 8: nakamoto.p2p.GossipMessage.allow_spend_block:type_name -> nakamoto.p2p.AllowSpendBlock
+	6,  // 9: nakamoto.p2p.GossipMessage.dag_block:type_name -> nakamoto.p2p.DAGBlock
+	7,  // 10: nakamoto.p2p.GossipMessage.token_lock_block:type_name -> nakamoto.p2p.TokenLockBlock
+	9,  // 11: nakamoto.p2p.GossipMessage.shard_checkpoint:type_name -> nakamoto.p2p.ShardCheckpointWire
+	12, // 12: nakamoto.p2p.GossipMessage.shard_checkpoint_attestation:type_name -> nakamoto.p2p.ShardCheckpointAttestationWire
+	13, // 13: nakamoto.p2p.GossipMessage.fraud_proof:type_name -> nakamoto.p2p.FraudProofEnvelopeWire
+	15, // 14: nakamoto.p2p.GossipMessage.started:type_name -> nakamoto.p2p.SubscribeStarted
+	0,  // 15: nakamoto.p2p.SubscribeStarted.role:type_name -> nakamoto.p2p.SubscriberRole
+	0,  // 16: nakamoto.p2p.SubscribeRequest.role:type_name -> nakamoto.p2p.SubscriberRole
+	24, // 17: nakamoto.p2p.FindIntersectionRequest.points:type_name -> nakamoto.p2p.ChainPoint
+	24, // 18: nakamoto.p2p.ServeChainPointsResponse.points:type_name -> nakamoto.p2p.ChainPoint
+	1,  // 19: nakamoto.p2p.SidecarService.PublishSnapshot:input_type -> nakamoto.p2p.Snapshot
+	2,  // 20: nakamoto.p2p.SidecarService.PublishAttestation:input_type -> nakamoto.p2p.TipAttestation
+	3,  // 21: nakamoto.p2p.SidecarService.PublishRumor:input_type -> nakamoto.p2p.Rumor
+	4,  // 22: nakamoto.p2p.SidecarService.PublishMetagraphBinary:input_type -> nakamoto.p2p.MetagraphBinary
+	8,  // 23: nakamoto.p2p.SidecarService.PublishMetagraphAttestation:input_type -> nakamoto.p2p.MetagraphAttestation
+	5,  // 24: nakamoto.p2p.SidecarService.PublishAllowSpendBlock:input_type -> nakamoto.p2p.AllowSpendBlock
+	6,  // 25: nakamoto.p2p.SidecarService.PublishDAGBlock:input_type -> nakamoto.p2p.DAGBlock
+	7,  // 26: nakamoto.p2p.SidecarService.PublishTokenLockBlock:input_type -> nakamoto.p2p.TokenLockBlock
+	9,  // 27: nakamoto.p2p.SidecarService.PublishShardCheckpoint:input_type -> nakamoto.p2p.ShardCheckpointWire
+	12, // 28: nakamoto.p2p.SidecarService.PublishShardCheckpointAttestation:input_type -> nakamoto.p2p.ShardCheckpointAttestationWire
+	13, // 29: nakamoto.p2p.SidecarService.PublishFraudProof:input_type -> nakamoto.p2p.FraudProofEnvelopeWire
+	20, // 30: nakamoto.p2p.SidecarService.ConfirmFinalized:input_type -> nakamoto.p2p.ConfirmFinalizedRequest
+	17, // 31: nakamoto.p2p.SidecarService.Subscribe:input_type -> nakamoto.p2p.SubscribeRequest
+	18, // 32: nakamoto.p2p.SidecarService.PeerCount:input_type -> nakamoto.p2p.PeerCountRequest
+	22, // 33: nakamoto.p2p.SidecarService.Health:input_type -> nakamoto.p2p.HealthRequest
+	25, // 34: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:input_type -> nakamoto.p2p.FetchSnapshotsRequest
+	26, // 35: nakamoto.p2p.ChainSyncOutbound.FindIntersection:input_type -> nakamoto.p2p.FindIntersectionRequest
+	28, // 36: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:input_type -> nakamoto.p2p.GetPeerTipRequest
+	33, // 37: nakamoto.p2p.ChainSyncOutbound.FetchMetagraphBinaries:input_type -> nakamoto.p2p.FetchMetagraphBinariesRequest
+	30, // 38: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:input_type -> nakamoto.p2p.ServeSnapshotsRequest
+	31, // 39: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:input_type -> nakamoto.p2p.ServeChainPointsRequest
+	33, // 40: nakamoto.p2p.ChainSyncInbound.ServeMetagraphBinaries:input_type -> nakamoto.p2p.FetchMetagraphBinariesRequest
+	16, // 41: nakamoto.p2p.SidecarService.PublishSnapshot:output_type -> nakamoto.p2p.PublishResponse
+	16, // 42: nakamoto.p2p.SidecarService.PublishAttestation:output_type -> nakamoto.p2p.PublishResponse
+	16, // 43: nakamoto.p2p.SidecarService.PublishRumor:output_type -> nakamoto.p2p.PublishResponse
+	16, // 44: nakamoto.p2p.SidecarService.PublishMetagraphBinary:output_type -> nakamoto.p2p.PublishResponse
+	16, // 45: nakamoto.p2p.SidecarService.PublishMetagraphAttestation:output_type -> nakamoto.p2p.PublishResponse
+	16, // 46: nakamoto.p2p.SidecarService.PublishAllowSpendBlock:output_type -> nakamoto.p2p.PublishResponse
+	16, // 47: nakamoto.p2p.SidecarService.PublishDAGBlock:output_type -> nakamoto.p2p.PublishResponse
+	16, // 48: nakamoto.p2p.SidecarService.PublishTokenLockBlock:output_type -> nakamoto.p2p.PublishResponse
+	16, // 49: nakamoto.p2p.SidecarService.PublishShardCheckpoint:output_type -> nakamoto.p2p.PublishResponse
+	16, // 50: nakamoto.p2p.SidecarService.PublishShardCheckpointAttestation:output_type -> nakamoto.p2p.PublishResponse
+	16, // 51: nakamoto.p2p.SidecarService.PublishFraudProof:output_type -> nakamoto.p2p.PublishResponse
+	21, // 52: nakamoto.p2p.SidecarService.ConfirmFinalized:output_type -> nakamoto.p2p.ConfirmFinalizedResponse
+	14, // 53: nakamoto.p2p.SidecarService.Subscribe:output_type -> nakamoto.p2p.GossipMessage
+	19, // 54: nakamoto.p2p.SidecarService.PeerCount:output_type -> nakamoto.p2p.PeerCountResponse
+	23, // 55: nakamoto.p2p.SidecarService.Health:output_type -> nakamoto.p2p.HealthResponse
+	1,  // 56: nakamoto.p2p.ChainSyncOutbound.FetchSnapshots:output_type -> nakamoto.p2p.Snapshot
+	27, // 57: nakamoto.p2p.ChainSyncOutbound.FindIntersection:output_type -> nakamoto.p2p.FindIntersectionResponse
+	29, // 58: nakamoto.p2p.ChainSyncOutbound.GetPeerTip:output_type -> nakamoto.p2p.PeerTipResponse
+	34, // 59: nakamoto.p2p.ChainSyncOutbound.FetchMetagraphBinaries:output_type -> nakamoto.p2p.MetagraphBinaryResponse
+	1,  // 60: nakamoto.p2p.ChainSyncInbound.ServeSnapshots:output_type -> nakamoto.p2p.Snapshot
+	32, // 61: nakamoto.p2p.ChainSyncInbound.ServeChainPoints:output_type -> nakamoto.p2p.ServeChainPointsResponse
+	34, // 62: nakamoto.p2p.ChainSyncInbound.ServeMetagraphBinaries:output_type -> nakamoto.p2p.MetagraphBinaryResponse
+	41, // [41:63] is the sub-list for method output_type
+	19, // [19:41] is the sub-list for method input_type
+	19, // [19:19] is the sub-list for extension type_name
+	19, // [19:19] is the sub-list for extension extendee
+	0,  // [0:19] is the sub-list for field type_name
 }
 
 func init() { file_proto_sidecar_proto_init() }
@@ -2779,19 +2945,21 @@ func file_proto_sidecar_proto_init() {
 		(*GossipMessage_ShardCheckpoint)(nil),
 		(*GossipMessage_ShardCheckpointAttestation)(nil),
 		(*GossipMessage_FraudProof)(nil),
+		(*GossipMessage_Started)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_sidecar_proto_rawDesc), len(file_proto_sidecar_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   33,
+			NumEnums:      1,
+			NumMessages:   34,
 			NumExtensions: 0,
 			NumServices:   3,
 		},
 		GoTypes:           file_proto_sidecar_proto_goTypes,
 		DependencyIndexes: file_proto_sidecar_proto_depIdxs,
+		EnumInfos:         file_proto_sidecar_proto_enumTypes,
 		MessageInfos:      file_proto_sidecar_proto_msgTypes,
 	}.Build()
 	File_proto_sidecar_proto = out.File

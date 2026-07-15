@@ -46,8 +46,8 @@ type Node struct {
 	// the eight universal topics above it is joined only when sharding is
 	// active (NumShards > 1): the watchtower is inert at numShards = 1, and
 	// the single-shard regression bar requires zero extra topic joins. nil
-	// when not joined — PublishFraudProof then fails loudly and
-	// FraudProofMessages returns a nil (never-delivering) channel.
+	// when not joined — both publishing and subscription acquisition then fail
+	// loudly.
 	fraudProofTopic *pubsub.Topic
 
 	cfg config.Config
@@ -600,24 +600,17 @@ func (n *Node) PublishFraudProof(ctx context.Context, data []byte) error {
 	return err
 }
 
-// FraudProofMessages returns a channel of incoming fraud-proof messages.
+// FraudProofMessages acquires a subscription for incoming fraud-proof messages.
 // Universal-topic semantics: each call creates its own GossipSub subscription
 // so multiple consumers each receive every dispute independently (fan-out —
-// immune to the shared-channel race the shard families had). Returns a nil
-// channel when the topic is not joined (numShards <= 1): a nil channel never
-// delivers, so a Subscribe select arm over it simply never fires.
-func (n *Node) FraudProofMessages(ctx context.Context) <-chan []byte {
+// immune to the shared-channel race the shard families had). An unavailable
+// topic or Subscribe failure is returned to the caller so it cannot advertise
+// a locally acquired subscription that does not exist.
+func (n *Node) FraudProofMessages(ctx context.Context) (<-chan []byte, error) {
 	if n.fraudProofTopic == nil {
-		return nil
+		return nil, fmt.Errorf("fraud-proof topic not joined (numShards=%d <= 1 — sharding inactive)", n.cfg.NumShards)
 	}
-	ch, err := n.subscribeAndRelay(ctx, n.fraudProofTopic, n.cfg.FraudProofBufferSize, "fraud_proof", false)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe fraud_proof: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+	return n.subscribeAndRelay(ctx, n.fraudProofTopic, n.cfg.FraudProofBufferSize, "fraud_proof", false)
 }
 
 // joinShardCheckpointTopic lazily joins the per-shard checkpoint-envelope
@@ -638,7 +631,11 @@ func (n *Node) joinShardCheckpointTopic(shardID uint32) (*pubsub.Topic, error) {
 		return nil, fmt.Errorf("join shard-checkpoint topic %q: %w", topicName, err)
 	}
 	n.shardCheckpointTopics[shardID] = t
-	n.startShardRelay(t, n.shardCheckpointCh, "shard_checkpoint")
+	if err := n.startShardRelay(t, n.shardCheckpointCh, "shard_checkpoint"); err != nil {
+		delete(n.shardCheckpointTopics, shardID)
+		_ = t.Close()
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -657,7 +654,11 @@ func (n *Node) joinShardCheckpointAttestationTopic(shardID uint32) (*pubsub.Topi
 		return nil, fmt.Errorf("join shard-checkpoint-attestation topic %q: %w", topicName, err)
 	}
 	n.shardCheckpointAttTopics[shardID] = t
-	n.startShardRelay(t, n.shardCheckpointAttCh, "shard_checkpoint_attestation")
+	if err := n.startShardRelay(t, n.shardCheckpointAttCh, "shard_checkpoint_attestation"); err != nil {
+		delete(n.shardCheckpointAttTopics, shardID)
+		_ = t.Close()
+		return nil, err
+	}
 	return t, nil
 }
 
@@ -669,11 +670,10 @@ func (n *Node) joinShardCheckpointAttestationTopic(shardID uint32) (*pubsub.Topi
 // (shardRelayCtx), since there is no per-Subscribe-call channel to key a shard
 // subscription to. Caller holds shardMu (called only from the join helpers on
 // first join), so each topic gets exactly one relay goroutine.
-func (n *Node) startShardRelay(topic *pubsub.Topic, dst chan<- []byte, topicLabel string) {
+func (n *Node) startShardRelay(topic *pubsub.Topic, dst chan<- []byte, topicLabel string) error {
 	sub, err := topic.Subscribe()
 	if err != nil {
-		fmt.Printf("ERROR: subscribe %s topic %q: %v\n", topicLabel, topic.String(), err)
-		return
+		return fmt.Errorf("subscribe %s topic %q: %w", topicLabel, topic.String(), err)
 	}
 	go func() {
 		defer sub.Cancel()
@@ -703,6 +703,7 @@ func (n *Node) startShardRelay(topic *pubsub.Topic, dst chan<- []byte, topicLabe
 			}
 		}
 	}()
+	return nil
 }
 
 // PublishShardCheckpoint publishes raw bytes to the per-shard checkpoint-
@@ -755,14 +756,37 @@ func (n *Node) PublishShardCheckpointAttestation(ctx context.Context, shardID ui
 // separate gl0-wide signed-envelope topic of design doc §6.4) needs a join
 // hook the current proto does not yet expose; that path is part of the
 // deferred Slice 9 receiver-side wiring (NakamotoSyncDaemon).
-func (n *Node) ShardCheckpointMessages() <-chan []byte {
-	return n.shardCheckpointCh
+func (n *Node) ShardCheckpointMessages() (<-chan []byte, error) {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	if len(n.shardCheckpointTopics) == 0 {
+		return nil, fmt.Errorf("no shard-checkpoint topic subscriptions are active")
+	}
+	return n.shardCheckpointCh, nil
 }
 
 // ShardCheckpointAttestationMessages returns the shared channel of incoming
 // shard-checkpoint attestations (Slice 14). See ShardCheckpointMessages.
-func (n *Node) ShardCheckpointAttestationMessages() <-chan []byte {
-	return n.shardCheckpointAttCh
+func (n *Node) ShardCheckpointAttestationMessages() (<-chan []byte, error) {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	if len(n.shardCheckpointAttTopics) == 0 {
+		return nil, fmt.Errorf("no shard-checkpoint-attestation topic subscriptions are active")
+	}
+	return n.shardCheckpointAttCh, nil
+}
+
+// ShardSubscriptionsActive reports whether every configured shard checkpoint
+// topic pair and the fraud-proof topic have acquired their node-lifetime local
+// subscription handles. It is a local capability check only; it says nothing
+// about GossipSub mesh peers or delivery freshness.
+func (n *Node) ShardSubscriptionsActive() bool {
+	n.shardMu.Lock()
+	defer n.shardMu.Unlock()
+	return n.cfg.NumShards > 1 &&
+		n.fraudProofTopic != nil &&
+		len(n.shardCheckpointTopics) == n.cfg.NumShards &&
+		len(n.shardCheckpointAttTopics) == n.cfg.NumShards
 }
 
 // subscribeAndRelay creates a per-caller subscription on the given topic and
@@ -822,102 +846,46 @@ func (n *Node) subscribeAndRelay(ctx context.Context, topic *pubsub.Topic, bufSi
 	return ch, nil
 }
 
-// SnapshotMessages returns a channel of incoming snapshot messages.
+// SnapshotMessages acquires a subscription for incoming snapshot messages.
 // Each call creates its own GossipSub subscription so multiple consumers
 // each receive every message independently.
-func (n *Node) SnapshotMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.snapshotTopic, n.cfg.SnapshotBufferSize, "snapshot", false)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe snapshot: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+func (n *Node) SnapshotMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.snapshotTopic, n.cfg.SnapshotBufferSize, "snapshot", false)
 }
 
-// AttestationMessages returns a channel of incoming attestation messages.
-func (n *Node) AttestationMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.attestationTopic, n.cfg.AttestationBufferSize, "attestation", false)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe attestation: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// AttestationMessages acquires a subscription for incoming attestation messages.
+func (n *Node) AttestationMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.attestationTopic, n.cfg.AttestationBufferSize, "attestation", false)
 }
 
-// RumorMessages returns a channel of incoming rumor messages.
-func (n *Node) RumorMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.rumorTopic, n.cfg.RumorBufferSize, "rumor", false)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe rumor: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// RumorMessages acquires a subscription for incoming rumor messages.
+func (n *Node) RumorMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.rumorTopic, n.cfg.RumorBufferSize, "rumor", false)
 }
 
-// MetagraphBinaryMessages returns a channel of incoming metagraph-binary messages.
-func (n *Node) MetagraphBinaryMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, n.cfg.MetagraphBinaryBufferSize, "metagraph_binary", false)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe metagraph_binary: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// MetagraphBinaryMessages acquires a subscription for incoming metagraph-binary messages.
+func (n *Node) MetagraphBinaryMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.metagraphBinaryTopic, n.cfg.MetagraphBinaryBufferSize, "metagraph_binary", false)
 }
 
-// MetagraphAttestationMessages returns a channel of incoming metagraph-attestation messages.
-func (n *Node) MetagraphAttestationMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.metagraphAttestationTopic, n.cfg.MetagraphAttestationBufferSize, "metagraph_attestation", false)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe metagraph_attestation: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// MetagraphAttestationMessages acquires a subscription for incoming metagraph-attestation messages.
+func (n *Node) MetagraphAttestationMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.metagraphAttestationTopic, n.cfg.MetagraphAttestationBufferSize, "metagraph_attestation", false)
 }
 
-// AllowSpendBlockMessages returns a channel of incoming allow-spend-block messages.
-func (n *Node) AllowSpendBlockMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.allowSpendBlockTopic, n.cfg.AllowSpendBlockBufferSize, "allow_spend_block", true)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe allow_spend_block: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// AllowSpendBlockMessages acquires a subscription for incoming allow-spend-block messages.
+func (n *Node) AllowSpendBlockMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.allowSpendBlockTopic, n.cfg.AllowSpendBlockBufferSize, "allow_spend_block", true)
 }
 
-// DAGBlockMessages returns a channel of incoming dag-block messages.
-func (n *Node) DAGBlockMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.dagBlockTopic, n.cfg.DAGBlockBufferSize, "dag_block", true)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe dag_block: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// DAGBlockMessages acquires a subscription for incoming dag-block messages.
+func (n *Node) DAGBlockMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.dagBlockTopic, n.cfg.DAGBlockBufferSize, "dag_block", true)
 }
 
-// TokenLockBlockMessages returns a channel of incoming token-lock-block messages.
-func (n *Node) TokenLockBlockMessages(ctx context.Context) <-chan []byte {
-	ch, err := n.subscribeAndRelay(ctx, n.tokenLockBlockTopic, n.cfg.TokenLockBlockBufferSize, "token_lock_block", true)
-	if err != nil {
-		fmt.Printf("ERROR: subscribe token_lock_block: %v\n", err)
-		empty := make(chan []byte)
-		close(empty)
-		return empty
-	}
-	return ch
+// TokenLockBlockMessages acquires a subscription for incoming token-lock-block messages.
+func (n *Node) TokenLockBlockMessages(ctx context.Context) (<-chan []byte, error) {
+	return n.subscribeAndRelay(ctx, n.tokenLockBlockTopic, n.cfg.TokenLockBlockBufferSize, "token_lock_block", true)
 }
 
 // MeshPeerCount returns the number of peers in each topic mesh.

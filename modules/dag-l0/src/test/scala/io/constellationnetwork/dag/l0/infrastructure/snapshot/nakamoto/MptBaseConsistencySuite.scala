@@ -17,8 +17,8 @@ import weaver.MutableIOSuite
 /** Unit coverage for `MptBaseConsistency.assertBaseConsistentOrPrune` (#56.10 Phase H).
   *
   * The check is intentionally conservative: it only fires when `mptStore.lastPersistedOrdinal` is `Some(_)` AND that ordinal is strictly
-  * ahead of a non-zero finalized head. A fresh boot (`None` base, finalized=0) and a nominal aligned state (base ≤ finalized) both no-op.
-  * The pathological "base present but finalized=0" case fails loudly because pruning has no anchor and silent rebuild is operator-only.
+  * ahead of a non-zero, root-verified recovery head. A fresh boot (`None` base) and a nominal aligned state (base ≤ anchor) both no-op. The
+  * pathological "base present but anchor=0" case fails loudly because pruning has no authenticated target.
   */
 object MptBaseConsistencySuite extends MutableIOSuite {
 
@@ -40,7 +40,7 @@ object MptBaseConsistencySuite extends MutableIOSuite {
 
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(n))
 
-  test("base = None (fresh boot) → no-op regardless of finalized") { res =>
+  test("base = None (fresh boot) → no-op regardless of recovery anchor") { res =>
     implicit val (h, js) = res
     for {
       store <- mkMptStore
@@ -50,7 +50,7 @@ object MptBaseConsistencySuite extends MutableIOSuite {
     } yield expect(after.isEmpty)
   }
 
-  test("base ≤ finalized → no-op") { res =>
+  test("base ≤ recovery anchor → no-op") { res =>
     implicit val (h, js) = res
     for {
       store <- mkMptStore
@@ -60,7 +60,7 @@ object MptBaseConsistencySuite extends MutableIOSuite {
     } yield expect(after.contains(ord(10)))
   }
 
-  test("base = finalized → no-op") { res =>
+  test("base = recovery anchor → no-op") { res =>
     implicit val (h, js) = res
     for {
       store <- mkMptStore
@@ -70,19 +70,19 @@ object MptBaseConsistencySuite extends MutableIOSuite {
     } yield expect(after.contains(ord(7)))
   }
 
-  test("base ahead of finalized (and finalized > 0) → prune fires") { res =>
+  test("base ahead of non-zero recovery anchor → prune fires") { res =>
     implicit val (h, js) = res
     for {
       store <- mkMptStore
       _ <- store.commit(ord(20)) // base = 20
-      // first call prunes back to finalized=10
+      // first call prunes back to the restored anchor at 10
       _ <- MptBaseConsistency.assertBaseConsistentOrPrune[IO](store, IO.pure(10L))
       // second call is idempotent — still no error, in-memory ref unchanged
       _ <- MptBaseConsistency.assertBaseConsistentOrPrune[IO](store, IO.pure(10L))
     } yield success
   }
 
-  test("base present but finalized = 0 → fail loud (operator-triggered resync)") { res =>
+  test("base present but recovery anchor = 0 → fail loud") { res =>
     implicit val (h, js) = res
     for {
       store <- mkMptStore

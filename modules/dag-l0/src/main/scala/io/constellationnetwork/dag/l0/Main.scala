@@ -10,6 +10,7 @@ import io.constellationnetwork.dag.l0.config.types._
 import io.constellationnetwork.dag.l0.domain.snapshot.ForkRecoveryService
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.{ConsensusInputGate, MptBaseConsistency}
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.cats.effect._
 import io.constellationnetwork.ext.kryo._
@@ -175,6 +176,10 @@ object Main
       shardProofServiceRef <- Ref
         .of[IO, Option[io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[IO]]](None)
         .asResource
+      // Main alone owns the release capability. Consensus construction below may allocate receivers, but their network streams remain
+      // inert until locally persisted state, sessions, and the validator roster have been reconstructed. This lifecycle gate does not
+      // authenticate a restart anchor's signatures, ancestry, or execution history.
+      consensusInputGateControl <- ConsensusInputGate.make[IO].asResource
       storages <- Storages
         .make[IO](
           sharedStorages,
@@ -217,6 +222,8 @@ object Main
           globalFollowSliceServiceRef,
           globalChangeSetServiceRef,
           shardProofServiceRef,
+          consensusInputGateControl.readOnly,
+          consensusInputGateControl.chainSeed,
           // Split-safety (#261, eta axis): install the leader's chain-walk into the follower / `createContext`
           // GSAM's deferred committee-eta resolver (the Ref created in `TessellationIOApp.make`, exposed on
           // `NodeShared`). `GlobalSnapshotConsensus.make` invokes this once the chain store exists so the
@@ -228,7 +235,6 @@ object Main
         sharedPrograms,
         storages,
         services,
-        keyPair,
         cfg,
         cfg.incremental.lastFullGlobalSnapshotOrdinal.getOrElse(cfg.environment, SnapshotOrdinal.MinValue),
         p2pClient,
@@ -266,18 +272,6 @@ object Main
       // Nakamoto GL0: no legacy EventGossipDaemon (P2P gossip is via libp2p sidecar)
       eventGossipDaemon = EventGossipDaemon.noop[IO, GlobalSnapshotEvent, GlobalStateKey]
 
-      _ <- Daemons
-        .startNakamoto(
-          storages,
-          services,
-          queues,
-          sharedServices.gossip,
-          nodeId,
-          keyPair,
-          cfg
-        )
-        .asResource
-
       api <- Resource.eval(
         HttpApi.make[IO, RunNakamoto](
           storages,
@@ -300,10 +294,6 @@ object Main
         )
       )
 
-      _ <- MkHttpServer[IO].newEmber(ServerName("public"), cfg.http.publicHttp, api.publicApp)
-      _ <- MkHttpServer[IO].newEmber(ServerName("p2p"), cfg.http.p2pHttp, api.p2pApp)
-      _ <- MkHttpServer[IO].newEmber(ServerName("cli"), cfg.http.cliHttp, api.cliApp)
-
       gossipDaemon = GossipDaemon.make[IO](
         storages.rumor,
         queues.rumor,
@@ -318,6 +308,67 @@ object Main
         services.collateral,
         nakamotoMode = true
       )
+
+      populateClusterStorage =
+        // Nakamoto has no BFT join handshake, so reconstruct the GL0 peer roster from the seedlist before any inbound validation starts.
+        nodeShared.seedlist match {
+          case Some(entries) =>
+            storages.cluster.getToken.flatMap { maybeToken =>
+              val token = maybeToken.getOrElse(ClusterSessionToken(Generation(1L)))
+              entries.toList
+                .filter(_.peerId =!= nodeId)
+                // Metagraph operators may sign binaries but are not GL0 cluster members.
+                .filterNot(_.alias.exists(_.value.value == "metagraph-op"))
+                .traverse_ { entry =>
+                  entry.connectionInfo match {
+                    case Some(connInfo) =>
+                      val publicPort = com.comcast.ip4s.Port
+                        .fromInt(connInfo.p2pPort.value - 1)
+                        .getOrElse(connInfo.p2pPort)
+                      val sessionGen = eu.timepit.refined.types.numeric.PosLong.unsafeFrom(System.currentTimeMillis())
+                      val peer = Peer(
+                        id = entry.peerId,
+                        ip = com.comcast.ip4s.Host.fromString(connInfo.ipAddress.toString).get,
+                        publicPort = publicPort,
+                        p2pPort = connInfo.p2pPort,
+                        clusterSession = token,
+                        session = SessionToken(Generation(sessionGen)),
+                        state = NodeState.Ready,
+                        responsiveness = Responsive,
+                        jar = Hash.empty
+                      )
+                      storages.cluster.addPeer(peer).void
+                    case None => IO.unit
+                  }
+                }
+            }
+          case None => IO.unit
+        }
+
+      prepareConsensusInput =
+        // The persisted-MPT guard is meaningful only after bootstrap has loaded a restored head whose local state reproduces its signed root.
+        // This is a storage-consistency anchor, not proof of KES/VRF validity, ancestry, or native-transition replay; authenticated restart
+        // authority remains a separate fail-closed protocol requirement. The empty in-memory chain store has no authority at this point.
+        storages.globalSnapshot.head.flatMap {
+          case Some((head, _)) =>
+            MptBaseConsistency.assertBaseConsistentOrPrune[IO](
+              sharedStorages.mptStore,
+              IO.pure(head.value.ordinal.value.value)
+            )
+          case None =>
+            IO.raiseError(new IllegalStateException("GL0 bootstrap completed without a root-verified snapshot head"))
+        } >> consensusInputGateControl.markLocalStateReady.flatMap { released =>
+          IO.raiseError[Unit](new IllegalStateException("GL0 local-state bootstrap gate was already released")).unlessA(released)
+        } >>
+          consensusInputGateControl.awaitChainSeed >>
+          // The generic consumer must exist before its sidecar producer is released later in the Resource chain.
+          gossipDaemon.startAsInitialValidator
+
+      finishRuntimeBootstrap =
+        services.cluster.createSession >>
+          services.session.createSession >>
+          populateClusterStorage >>
+          prepareConsensusInput
 
       // Unified Nakamoto bootstrap: auto-detect the right startup path from the flags
       // provided on the CLI. See cli/method.scala for precedence docs.
@@ -342,12 +393,7 @@ object Main
             ) {
               programs.rollbackLoader.load(hash, programs.download).void
             } >>
-            services.cluster.createSession >>
-            services.session.createSession >>
-            // Bootstrap the economic state before collateral validation can consume inbound rumors.
-            // In Nakamoto mode this starts only the supervised local consumer, never the legacy HTTP gossip rounds.
-            gossipDaemon.startAsInitialValidator >>
-            storages.node.setNodeState(NodeState.Ready)
+            finishRuntimeBootstrap
 
         } else {
           storages.node.tryModifyState(
@@ -599,57 +645,35 @@ object Main
                 }
               }
             }
-          } >>
-            services.cluster.createSession >>
-            services.session.createSession >>
-            // Populate ClusterStorage from the seedlist so /cluster/info returns the
-            // full validator set. In Nakamoto there's no BFT join handshake, so peers
-            // never register via addPeer — we seed them from the seedlist at startup.
-            (nodeShared.seedlist match {
-              case Some(entries) =>
-                storages.cluster.getToken.flatMap { maybeToken =>
-                  val token = maybeToken.getOrElse(ClusterSessionToken(Generation(1L)))
-                  // Drop metagraph-op-marked entries: they're in the seedlist only so gl0
-                  // accepts state-channel binary signatures, but they aren't gl0 cluster
-                  // members. Including them in /cluster/info caused metagraph cl1/dl1 to
-                  // pick them as "global L0 peers" and fail to fetch global snapshots.
-                  entries.toList
-                    .filter(_.peerId =!= nodeId)
-                    .filterNot(_.alias.exists(_.value.value == "metagraph-op"))
-                    .traverse_ { entry =>
-                      entry.connectionInfo match {
-                        case Some(connInfo) =>
-                          val publicPort = com.comcast.ip4s.Port
-                            .fromInt(connInfo.p2pPort.value - 1)
-                            .getOrElse(connInfo.p2pPort)
-                          val sessionGen = eu.timepit.refined.types.numeric.PosLong.unsafeFrom(System.currentTimeMillis())
-                          val peer = Peer(
-                            id = entry.peerId,
-                            ip = com.comcast.ip4s.Host.fromString(connInfo.ipAddress.toString).get,
-                            publicPort = publicPort,
-                            p2pPort = connInfo.p2pPort,
-                            clusterSession = token,
-                            session = SessionToken(Generation(sessionGen)),
-                            state = NodeState.Ready,
-                            responsiveness = Responsive,
-                            jar = Hash.empty
-                          )
-                          storages.cluster.addPeer(peer).void
-                        case None =>
-                          // 1-field seedlist entry (peerId only) — can't add to ClusterStorage
-                          // without connection info. The peer will be absent from /cluster/info.
-                          IO.unit
-                      }
-                    }
-                }
-              case None => IO.unit
-            }) >>
-            // Bootstrap the economic state and validator roster before collateral validation can consume inbound rumors.
-            // In Nakamoto mode this starts only the supervised local consumer, never the legacy HTTP gossip rounds.
-            gossipDaemon.startAsInitialValidator >>
-            storages.node.setNodeState(NodeState.Ready)
+          } >> finishRuntimeBootstrap
         }
       }).asResource
+
+      // No mutating daemon or externally reachable HTTP route starts against cold economic state.
+      _ <- Daemons
+        .startNakamoto(
+          storages,
+          services,
+          queues,
+          sharedServices.gossip,
+          nodeId,
+          keyPair,
+          cfg
+        )
+        .asResource
+
+      // Acquire every externally visible listener before publishing Ready. A bind failure must unwind while the validator is still
+      // ineligible to produce or consume consensus input.
+      _ <- MkHttpServer[IO].newEmber(ServerName("public"), cfg.http.publicHttp, api.publicApp)
+      _ <- MkHttpServer[IO].newEmber(ServerName("p2p"), cfg.http.p2pHttp, api.p2pApp)
+      _ <- MkHttpServer[IO].newEmber(ServerName("cli"), cfg.http.cliHttp, api.cliApp)
+
+      // Runtime ingress is enabled only after the local recovery seed and every local sink/listener exist. Ready is published LAST, after
+      // both Subscribe lanes acknowledge the exact active topic profile from the same sidecar process. That acknowledgement proves only
+      // local drainer acquisition; it does not prove mesh reachability, catch-up, authenticated restart ancestry, or economic validity.
+      _ <- (consensusInputGateControl.releaseInput.flatMap { released =>
+        IO.raiseError[Unit](new IllegalStateException("GL0 consensus input gate was already released")).unlessA(released)
+      } >> services.sidecarSubscriptionReadiness.awaitBothAndRun(_ => storages.node.setNodeState(NodeState.Ready))).asResource
     } yield ()
   }
 }

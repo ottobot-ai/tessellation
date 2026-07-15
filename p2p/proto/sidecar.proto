@@ -297,7 +297,27 @@ message GossipMessage {
     ShardCheckpointWire shard_checkpoint = 9;                  // Slice 14
     ShardCheckpointAttestationWire shard_checkpoint_attestation = 10;  // Slice 14
     FraudProofEnvelopeWire fraud_proof = 11;                   // WATCHTOWER fraud-proof
+    SubscribeStarted started = 12;
   }
+}
+
+// Declares which colocated JVM subsystem owns a Subscribe stream. This is
+// lifecycle metadata only: a role grants no network or consensus authority.
+enum SubscriberRole {
+  SUBSCRIBER_ROLE_UNSPECIFIED = 0;
+  SUBSCRIBER_ROLE_RUMOR_BRIDGE = 1;
+  SUBSCRIBER_ROLE_NAKAMOTO_SYNC = 2;
+}
+
+// The mandatory first Subscribe event. It proves only that this sidecar
+// process acquired the requested local GossipSub subscriptions and shared
+// channel drain leases. It does not assert peer connectivity, mesh membership,
+// retained history, message freshness, or consensus readiness.
+message SubscribeStarted {
+  repeated string topics = 1;       // Exact validated labels, deduplicated in canonical order.
+  SubscriberRole role = 2;
+  uint64 stream_generation = 3;     // Monotonic within sidecar_session_id.
+  string sidecar_session_id = 4;    // Random identifier fixed for this sidecar process.
 }
 
 // ─── gRPC Service: JVM ↔ Sidecar ────────────────────────────────────
@@ -334,18 +354,19 @@ service SidecarService {
   // durable-outbox machinery as #196 / PublishAllowSpendBlock.
   rpc PublishTokenLockBlock(TokenLockBlock) returns (PublishResponse);
 
-  // Slice 14: publish a shard checkpoint to the per-shard topic
-  // `shard-checkpoint-<shardId>`. Only operators sitting in shard `shardId`
-  // subscribe to that topic; non-shard gl0s shed the network load (design doc
-  // §6.4 — sharding payoff). The fully-signed envelope (once `committeeSignatures`
-  // reaches threshold) gets re-published on a separate gl0-wide topic for
-  // consumption by gl0 leaders; that flow lives on top of this primitive.
+  // Publish a raw shard checkpoint to `shard-checkpoint-<shardId>`. The current
+  // transitional sidecar eagerly joins every GL0 to every configured shard;
+  // target transport must restrict this raw lane to the exact current execution
+  // and watchtower assignments. A distinct GL0-wide execution-certified
+  // checkpoint/diff lane for ordinary noncommittee adoption is still required
+  // and is not implemented by this RPC.
   rpc PublishShardCheckpoint(ShardCheckpointWire) returns (PublishResponse);
 
-  // Slice 14: publish a shard checkpoint attestation by a non-producing
-  // committee member. Routed on the same per-shard topic as the checkpoint
-  // envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
-  // (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
+  // Publish an execution-committee signature by a non-producing member on the
+  // per-shard attestation topic. Every signer must independently replay the
+  // exact ordered framework inputs and reproduce the checkpoint result before
+  // signing. Validity requires the configured distinct `kQuorum`; shard depth or
+  // a legacy ceil(2*K_S/3) count cannot substitute for replay signatures.
   rpc PublishShardCheckpointAttestation(ShardCheckpointAttestationWire) returns (PublishResponse);
 
   // WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. EVERY
@@ -359,8 +380,8 @@ service SidecarService {
   // — unknown ids are silently ignored. See task #196.
   rpc ConfirmFinalized(ConfirmFinalizedRequest) returns (ConfirmFinalizedResponse);
 
-  // Subscribe to incoming messages from the network.
-  // Server-streaming: sidecar pushes received gossip to JVM.
+  // Subscribe to incoming messages from the network. The first response is
+  // always GossipMessage.started and later responses are typed deliveries.
   rpc Subscribe(SubscribeRequest) returns (stream GossipMessage);
 
   // Get connected peer count.
@@ -381,16 +402,20 @@ message SubscribeRequest {
   //   "metagraph-attestation", "allow-spend-block", "dag-block",
   //   "token-lock-block", "shard-checkpoint", "shard-checkpoint-attestation",
   //   "fraud-proof"
-  // Empty = all (legacy default / debugging aid). Unknown labels FAIL the
-  // stream (InvalidArgument) — a typo must not silently subscribe to nothing.
+  // The set must be explicit and nonempty. Unknown labels FAIL the stream
+  // (InvalidArgument) — a typo must not silently subscribe to nothing.
   //
   // FINDING-F1: the filter is load-bearing for the shard-checkpoint families,
   // which ride SHARED node-lifetime fan-in channels tolerating exactly ONE
   // drainer. The JVM's two streams declare disjoint sets (the rumor bridge
-  // takes "rumor"; the NakamotoSyncDaemon takes everything else) so the shard
-  // channels get exactly one drainer by construction. Labels mirror
-  // SidecarClient.SubscribeTopics (JVM) / grpcserver.Topic* (Go).
+  // takes "rumor"; the NakamotoSyncDaemon takes the exact active non-rumor
+  // profile) so the shard channels get exactly one drainer by construction.
+  // Labels mirror SidecarClient.SubscribeTopics (JVM) / grpcserver.Topic* (Go).
   repeated string topics = 1;
+
+  // Required owner of this stream. The sidecar echoes the validated role in
+  // SubscribeStarted so a reconnect cannot be confused with another consumer.
+  SubscriberRole role = 2;
 }
 
 message PeerCountRequest {}

@@ -64,17 +64,18 @@ type SidecarServiceClient interface {
 	// Replaces the single-peer HTTP POST from `TokenLock.sendBlockToL0`. Same
 	// durable-outbox machinery as #196 / PublishAllowSpendBlock.
 	PublishTokenLockBlock(ctx context.Context, in *TokenLockBlock, opts ...grpc.CallOption) (*PublishResponse, error)
-	// Slice 14: publish a shard checkpoint to the per-shard topic
-	// `shard-checkpoint-<shardId>`. Only operators sitting in shard `shardId`
-	// subscribe to that topic; non-shard gl0s shed the network load (design doc
-	// §6.4 — sharding payoff). The fully-signed envelope (once `committeeSignatures`
-	// reaches threshold) gets re-published on a separate gl0-wide topic for
-	// consumption by gl0 leaders; that flow lives on top of this primitive.
+	// Publish a raw shard checkpoint to `shard-checkpoint-<shardId>`. The current
+	// transitional sidecar eagerly joins every GL0 to every configured shard;
+	// target transport must restrict this raw lane to the exact current execution
+	// and watchtower assignments. A distinct GL0-wide execution-certified
+	// checkpoint/diff lane for ordinary noncommittee adoption is still required
+	// and is not implemented by this RPC.
 	PublishShardCheckpoint(ctx context.Context, in *ShardCheckpointWire, opts ...grpc.CallOption) (*PublishResponse, error)
-	// Slice 14: publish a shard checkpoint attestation by a non-producing
-	// committee member. Routed on the same per-shard topic as the checkpoint
-	// envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
-	// (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
+	// Publish an execution-committee signature by a non-producing member on the
+	// per-shard attestation topic. Every signer must independently replay the
+	// exact ordered framework inputs and reproduce the checkpoint result before
+	// signing. Validity requires the configured distinct `kQuorum`; shard depth or
+	// a legacy ceil(2*K_S/3) count cannot substitute for replay signatures.
 	PublishShardCheckpointAttestation(ctx context.Context, in *ShardCheckpointAttestationWire, opts ...grpc.CallOption) (*PublishResponse, error)
 	// WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. EVERY
 	// gl0 receives it and independently re-runs the deterministic verdict over the
@@ -85,8 +86,8 @@ type SidecarServiceClient interface {
 	// call arrives the outbox keeps republishing them periodically. Idempotent
 	// — unknown ids are silently ignored. See task #196.
 	ConfirmFinalized(ctx context.Context, in *ConfirmFinalizedRequest, opts ...grpc.CallOption) (*ConfirmFinalizedResponse, error)
-	// Subscribe to incoming messages from the network.
-	// Server-streaming: sidecar pushes received gossip to JVM.
+	// Subscribe to incoming messages from the network. The first response is
+	// always GossipMessage.started and later responses are typed deliveries.
 	Subscribe(ctx context.Context, in *SubscribeRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GossipMessage], error)
 	// Get connected peer count.
 	PeerCount(ctx context.Context, in *PeerCountRequest, opts ...grpc.CallOption) (*PeerCountResponse, error)
@@ -289,17 +290,18 @@ type SidecarServiceServer interface {
 	// Replaces the single-peer HTTP POST from `TokenLock.sendBlockToL0`. Same
 	// durable-outbox machinery as #196 / PublishAllowSpendBlock.
 	PublishTokenLockBlock(context.Context, *TokenLockBlock) (*PublishResponse, error)
-	// Slice 14: publish a shard checkpoint to the per-shard topic
-	// `shard-checkpoint-<shardId>`. Only operators sitting in shard `shardId`
-	// subscribe to that topic; non-shard gl0s shed the network load (design doc
-	// §6.4 — sharding payoff). The fully-signed envelope (once `committeeSignatures`
-	// reaches threshold) gets re-published on a separate gl0-wide topic for
-	// consumption by gl0 leaders; that flow lives on top of this primitive.
+	// Publish a raw shard checkpoint to `shard-checkpoint-<shardId>`. The current
+	// transitional sidecar eagerly joins every GL0 to every configured shard;
+	// target transport must restrict this raw lane to the exact current execution
+	// and watchtower assignments. A distinct GL0-wide execution-certified
+	// checkpoint/diff lane for ordinary noncommittee adoption is still required
+	// and is not implemented by this RPC.
 	PublishShardCheckpoint(context.Context, *ShardCheckpointWire) (*PublishResponse, error)
-	// Slice 14: publish a shard checkpoint attestation by a non-producing
-	// committee member. Routed on the same per-shard topic as the checkpoint
-	// envelope. Receivers tally toward the per-checkpoint `≥ ⌈2/3 K_S⌉` quorum
-	// (see Slice 9's `ShardCheckpointGl0AcceptanceManager`).
+	// Publish an execution-committee signature by a non-producing member on the
+	// per-shard attestation topic. Every signer must independently replay the
+	// exact ordered framework inputs and reproduce the checkpoint result before
+	// signing. Validity requires the configured distinct `kQuorum`; shard depth or
+	// a legacy ceil(2*K_S/3) count cannot substitute for replay signatures.
 	PublishShardCheckpointAttestation(context.Context, *ShardCheckpointAttestationWire) (*PublishResponse, error)
 	// WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. EVERY
 	// gl0 receives it and independently re-runs the deterministic verdict over the
@@ -310,8 +312,8 @@ type SidecarServiceServer interface {
 	// call arrives the outbox keeps republishing them periodically. Idempotent
 	// — unknown ids are silently ignored. See task #196.
 	ConfirmFinalized(context.Context, *ConfirmFinalizedRequest) (*ConfirmFinalizedResponse, error)
-	// Subscribe to incoming messages from the network.
-	// Server-streaming: sidecar pushes received gossip to JVM.
+	// Subscribe to incoming messages from the network. The first response is
+	// always GossipMessage.started and later responses are typed deliveries.
 	Subscribe(*SubscribeRequest, grpc.ServerStreamingServer[GossipMessage]) error
 	// Get connected peer count.
 	PeerCount(context.Context, *PeerCountRequest) (*PeerCountResponse, error)

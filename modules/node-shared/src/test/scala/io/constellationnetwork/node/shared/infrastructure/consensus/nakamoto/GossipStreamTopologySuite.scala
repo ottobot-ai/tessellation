@@ -13,6 +13,7 @@ import scala.jdk.CollectionConverters._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SubscribeTopics
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.schema.gossip.RumorRaw
@@ -54,9 +55,12 @@ object GossipStreamTopologySuite extends MutableIOSuite {
     * real sidecar, whose Subscribe only ends on error/reconnect).
     */
   private final class RecordingService(
-    captured: ConcurrentLinkedQueue[Seq[String]],
+    captured: ConcurrentLinkedQueue[SubscribeRequest],
     cancelled: AtomicBoolean,
-    toSend: Seq[GossipMessage]
+    started: SubscribeRequest => Option[GossipMessage],
+    toSend: Seq[GossipMessage],
+    completeAfterSend: Boolean,
+    terminalError: Option[Throwable]
   ) extends SidecarServiceGrpc.SidecarService {
     def publishSnapshot(request: Snapshot): Future[PublishResponse] = unimpl
     def publishAttestation(request: TipAttestation): Future[PublishResponse] = unimpl
@@ -74,25 +78,42 @@ object GossipStreamTopologySuite extends MutableIOSuite {
     def health(request: HealthRequest): Future[HealthResponse] = unimpl
 
     def subscribe(request: SubscribeRequest, responseObserver: StreamObserver[GossipMessage]): Unit = {
-      captured.add(request.topics)
+      captured.add(request)
       responseObserver match {
         case sso: ServerCallStreamObserver[GossipMessage @unchecked] =>
           sso.setOnCancelHandler(() => cancelled.set(true))
         case _ => ()
       }
+      started(request).foreach(responseObserver.onNext)
       toSend.foreach(responseObserver.onNext)
+      terminalError match {
+        case Some(error) => responseObserver.onError(error)
+        case None        => if (completeAfterSend) responseObserver.onCompleted()
+      }
       // stream intentionally left open — see class doc
     }
   }
 
   private final case class Harness(
     channel: ManagedChannel,
-    captured: ConcurrentLinkedQueue[Seq[String]],
+    captured: ConcurrentLinkedQueue[SubscribeRequest],
     cancelled: AtomicBoolean
   )
 
-  private def harness(toSend: Seq[GossipMessage]): Resource[IO, Harness] = {
-    val captured = new ConcurrentLinkedQueue[Seq[String]]()
+  private def validStarted(request: SubscribeRequest): GossipMessage =
+    GossipMessage(
+      GossipMessage.Body.Started(
+        SubscribeStarted(request.topics, request.role, streamGeneration = 1L, sidecarSessionId = "test-sidecar")
+      )
+    )
+
+  private def harness(
+    toSend: Seq[GossipMessage],
+    started: SubscribeRequest => Option[GossipMessage] = request => validStarted(request).some,
+    completeAfterSend: Boolean = false,
+    terminalError: Option[Throwable] = None
+  ): Resource[IO, Harness] = {
+    val captured = new ConcurrentLinkedQueue[SubscribeRequest]()
     val cancelled = new AtomicBoolean(false)
     for {
       server <- Resource.make(
@@ -101,7 +122,7 @@ object GossipStreamTopologySuite extends MutableIOSuite {
             .forPort(0)
             .addService(
               SidecarServiceGrpc.bindService(
-                new RecordingService(captured, cancelled, toSend),
+                new RecordingService(captured, cancelled, started, toSend, completeAfterSend, terminalError),
                 scala.concurrent.ExecutionContext.global
               )
             )
@@ -133,35 +154,107 @@ object GossipStreamTopologySuite extends MutableIOSuite {
   private def checkpointMsg(shardOrdinal: Long): GossipMessage =
     GossipMessage(body = GossipMessage.Body.ShardCheckpoint(ShardCheckpointWire(shardId = 0, shardOrdinal = shardOrdinal)))
 
+  private def rumorRequest: SubscribeRequest = SubscribeRequest(
+    topics = SidecarClient.SubscriptionProfile.rumorBridge.topics,
+    role = SidecarClient.SubscriptionProfile.rumorBridge.role
+  )
+
+  private def makeReadiness: IO[SidecarSubscriptionReadiness[IO]] =
+    ProductionGate.make[IO].flatMap(SidecarSubscriptionReadiness.make[IO])
+
+  private def failsProtocol(harnessResource: Resource[IO, Harness]): IO[Boolean] =
+    harnessResource.use { h =>
+      makeReadiness.flatMap { readiness =>
+        GossipStream
+          .subscribe[IO](h.channel, SidecarClient.SubscriptionProfile.rumorBridge, readiness)
+          .take(1)
+          .compile
+          .drain
+          .attempt
+          .timeout(5.seconds)
+          .map(_.left.exists(_.isInstanceOf[GossipStream.SubscriptionProtocolError]))
+      }
+    }
+
   // ─── the wire-level filter ─────────────────────────────────────────
 
   test("GossipStream.subscribe puts the requested topic filter on the wire (rumor-only)") { _ =>
     harness(toSend = Seq(rumorMsg("t"))).use { h =>
-      GossipStream
-        .subscribe[IO](h.channel, SubscribeTopics.rumorOnly)
-        .take(1)
-        .compile
-        .drain
-        .timeout(15.seconds) >>
-        IO(h.captured.asScala.toList).map { reqs =>
-          expect.same(List(SubscribeTopics.rumorOnly), reqs)
-        }
+      makeReadiness.flatMap { readiness =>
+        GossipStream
+          .subscribe[IO](h.channel, SidecarClient.SubscriptionProfile.rumorBridge, readiness)
+          .take(1)
+          .compile
+          .drain
+          .timeout(15.seconds) >>
+          IO(h.captured.asScala.toList).map { reqs =>
+            expect
+              .same(List(Seq(SubscribeTopics.Rumor)), reqs.map(_.topics))
+              .and(expect.same(List(SubscriberRole.SUBSCRIBER_ROLE_RUMOR_BRIDGE), reqs.map(_.role)))
+          }
+      }
     }
   }
 
   test("GossipStream.subscribe(daemonTopics) delivers non-rumor bodies (shard checkpoint round-trips)") { _ =>
     harness(toSend = Seq(checkpointMsg(42L))).use { h =>
-      GossipStream
-        .subscribe[IO](h.channel, SubscribeTopics.daemonTopics)
-        .take(1)
-        .compile
-        .lastOrError
-        .timeout(15.seconds)
-        .map { msg =>
-          expect(msg.body.isShardCheckpoint)
-            .and(expect.same(42L, msg.getShardCheckpoint.shardOrdinal))
-            .and(expect.same(List(SubscribeTopics.daemonTopics), h.captured.asScala.toList))
-        }
+      makeReadiness.flatMap { readiness =>
+        val profile = SidecarClient.SubscriptionProfile.nakamotoSync(shardingActive = true)
+        GossipStream
+          .subscribe[IO](h.channel, profile, readiness)
+          .take(1)
+          .compile
+          .lastOrError
+          .timeout(15.seconds)
+          .map { msg =>
+            expect(msg.body.isShardCheckpoint)
+              .and(expect.same(42L, msg.getShardCheckpoint.shardOrdinal))
+              .and(expect.same(List(profile.topics), h.captured.asScala.toList.map(_.topics)))
+              .and(expect.same(List(profile.role), h.captured.asScala.toList.map(_.role)))
+          }
+      }
+    }
+  }
+
+  test("SubscribeStarted is mandatory, first, and unique") { _ =>
+    val duplicate = validStarted(rumorRequest)
+    for {
+      missing <- failsProtocol(harness(Seq.empty, _ => None, completeAfterSend = true))
+      nonFirst <- failsProtocol(harness(Seq(rumorMsg("first")), _ => None))
+      duplicateStarted <- failsProtocol(harness(Seq(duplicate)))
+    } yield expect(missing).and(expect(nonFirst)).and(expect(duplicateStarted))
+  }
+
+  test("SubscribeStarted must echo exact role/topics and carry nonempty session plus positive generation") { _ =>
+    def invalidStarted(modify: SubscribeStarted => SubscribeStarted): SubscribeRequest => Option[GossipMessage] =
+      request => GossipMessage(GossipMessage.Body.Started(modify(validStarted(request).getStarted))).some
+
+    val cases = List(
+      invalidStarted(_.copy(role = SubscriberRole.SUBSCRIBER_ROLE_NAKAMOTO_SYNC)),
+      invalidStarted(_.copy(topics = Seq(SubscribeTopics.Attestation))),
+      invalidStarted(_.copy(sidecarSessionId = "")),
+      invalidStarted(_.copy(streamGeneration = 0L))
+    )
+
+    cases
+      .traverse(started => failsProtocol(harness(Seq.empty, started)))
+      .map(results => expect(results.forall(identity)))
+  }
+
+  test("gRPC Subscribe errors remain observable with their exact status code") { _ =>
+    val unavailable = Status.UNAVAILABLE.withDescription("local gossip subscription acquisition failed").asRuntimeException()
+    harness(Seq.empty, _ => None, terminalError = unavailable.some).use { h =>
+      makeReadiness.flatMap { readiness =>
+        GossipStream
+          .subscribe[IO](h.channel, SidecarClient.SubscriptionProfile.rumorBridge, readiness)
+          .compile
+          .drain
+          .attempt
+          .timeout(5.seconds)
+          .map { result =>
+            expect.same(Status.Code.UNAVAILABLE.some, result.left.toOption.map(Status.fromThrowable).map(_.getCode))
+          }
+      }
     }
   }
 
@@ -174,23 +267,29 @@ object GossipStreamTopologySuite extends MutableIOSuite {
       Supervisor[IO].use { implicit sup =>
         for {
           rumorQueue <- Queue.bounded[IO, Hashed[RumorRaw]](8)
-          _ <- SidecarRumorBridge.receive[IO](h.channel, rumorQueue)
+          readiness <- makeReadiness
+          _ <- SidecarRumorBridge.receive[IO](h.channel, rumorQueue, readiness)
           _ <- awaitTrue("bridge subscribe request captured", 15.seconds)(IO(!h.captured.isEmpty))
           reqs <- IO(h.captured.asScala.toList)
-        } yield expect.same(List(SubscribeTopics.rumorOnly), reqs)
+        } yield
+          expect
+            .same(List(Seq(SubscribeTopics.Rumor)), reqs.map(_.topics))
+            .and(expect.same(List(SubscriberRole.SUBSCRIBER_ROLE_RUMOR_BRIDGE), reqs.map(_.role)))
       }
     }
   }
 
-  pureTest("daemonTopics covers every non-rumor GossipMessage family exactly once and excludes rumor (lockstep with the Go vocabulary)") {
-    val expected = Set(
+  pureTest("daemon topic profile is exact for sharding-active and numShards=1 runtimes") {
+    val base = Set(
       "snapshot",
       "attestation",
       "metagraph-binary",
       "metagraph-attestation",
       "allow-spend-block",
       "dag-block",
-      "token-lock-block",
+      "token-lock-block"
+    )
+    val sharding = Set(
       "shard-checkpoint",
       "shard-checkpoint-attestation",
       "fraud-proof"
@@ -198,11 +297,15 @@ object GossipStreamTopologySuite extends MutableIOSuite {
     // Lockstep check: these literals MUST match grpcserver.Topic* in the Go
     // sidecar (which REJECTS unknown labels). One label per GossipMessage.body
     // arm; rumor belongs to the bridge.
+    val inactive = SubscribeTopics.daemonTopics(shardingActive = false)
+    val active = SubscribeTopics.daemonTopics(shardingActive = true)
     expect
-      .same(expected, SubscribeTopics.daemonTopics.toSet)
-      .and(expect.same(SubscribeTopics.daemonTopics.size, SubscribeTopics.daemonTopics.distinct.size))
-      .and(expect(!SubscribeTopics.daemonTopics.contains(SubscribeTopics.Rumor)))
-      .and(expect.same(Seq("rumor"), SubscribeTopics.rumorOnly))
+      .same(base, inactive.toSet)
+      .and(expect.same(base ++ sharding, active.toSet))
+      .and(expect.same(inactive.size, inactive.distinct.size))
+      .and(expect.same(active.size, active.distinct.size))
+      .and(expect(!active.contains(SubscribeTopics.Rumor)))
+      .and(expect.same(Seq("rumor"), SidecarClient.SubscriptionProfile.rumorBridge.topics))
   }
 
   // ─── the zombie-stream guard ───────────────────────────────────────
@@ -210,11 +313,17 @@ object GossipStreamTopologySuite extends MutableIOSuite {
   test("the underlying gRPC call is CANCELLED when the subscriber's fs2 scope closes (no zombie server-side stream)") { _ =>
     harness(toSend = Seq(rumorMsg("only"))).use { h =>
       for {
+        readiness <- makeReadiness
         // take(1) ends the fs2 scope while the server still holds the stream
         // open — pre-fix the gRPC call leaked (the server kept feeding a dead
         // observer; for a daemon restart that leaked stream kept race-draining
         // the shared shard channels forever).
-        _ <- GossipStream.subscribe[IO](h.channel, SubscribeTopics.rumorOnly).take(1).compile.drain.timeout(15.seconds)
+        _ <- GossipStream
+          .subscribe[IO](h.channel, SidecarClient.SubscriptionProfile.rumorBridge, readiness)
+          .take(1)
+          .compile
+          .drain
+          .timeout(15.seconds)
         _ <- awaitTrue("server observed client cancellation", 10.seconds)(IO(h.cancelled.get()))
       } yield success
     }

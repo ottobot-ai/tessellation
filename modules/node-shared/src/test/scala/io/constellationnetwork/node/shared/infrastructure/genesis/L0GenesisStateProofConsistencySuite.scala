@@ -4,6 +4,7 @@ import cats.effect.{IO, Resource}
 import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
+import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.genesis.types._
@@ -139,7 +140,7 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
       augmentedGsi <- L0GenesisLoader.augmentSnapshotInfo[IO](baseGsi, data)
 
       // 4) Compute stateProof FROM augmented GSI directly (the source of truth at boot).
-      independentProof <- augmentedGsi.stateProof[IO](hashedGenesis.ordinal)
+      independentProof <- augmentedGsi.stateProof[IO](hashedGenesis.ordinal.next)
 
       // 5) Build the ord=1 incremental snapshot via the NEW two-arg overload.
       firstIncr <- GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis, augmentedGsi)
@@ -148,10 +149,12 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
       //    so we can prove (a) the new path is consistent and (b) the old path was inconsistent.
       legacyIncr <- GlobalSnapshot.mkFirstIncrementalSnapshot[IO](hashedGenesis)
 
-      preAugProof <- baseGsi.stateProof[IO](hashedGenesis.ordinal)
+      preAugProof <- baseGsi.stateProof[IO](hashedGenesis.ordinal.next)
     } yield
       // New (fixed) path: snapshot.stateProof == augmentedGsi.stateProof.
       expect.same(firstIncr.stateProof, independentProof) &&
+        // The emitted artifact is ordinal 1, so a boundary of ordinal 0 selects the MPT proof era.
+        expect(firstIncr.stateProof.mptRoot.nonEmpty) &&
         // Sanity: legacy path (single-arg overload) sees the pre-aug GSI's stateProof — confirms
         // the bug exists in the legacy code, and that our augmenter actually changed the GSI.
         expect.same(legacyIncr.stateProof, preAugProof) &&

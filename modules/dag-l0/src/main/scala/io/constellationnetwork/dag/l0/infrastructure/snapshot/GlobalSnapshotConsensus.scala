@@ -288,6 +288,10 @@ object GlobalSnapshotConsensus {
     shardProofServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[F]
     ]],
+    // Await-only process-lifecycle capability. Main owns release and opens it only after verified local bootstrap.
+    consensusInputGate: io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ConsensusInputGate[F],
+    // The leader loop waits for local-state restoration, seeds the exact head, and reports success/failure through this capability.
+    chainSeedGate: io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ConsensusInputGate.ChainSeedGate[F],
     // Invoked by NakamotoSyncDaemon when a metagraph-binary arrives via gossip.
     // Routes the binary through the same pipeline as the HTTP endpoint (stateChannelService.process).
     processMetagraphBinary: io.constellationnetwork.statechannel.StateChannelOutput => F[Unit],
@@ -309,6 +313,11 @@ object GlobalSnapshotConsensus {
     ] => F[Unit],
     // Created in Services.make (hoisted so HTTP routes and stateChannelService can also publish).
     sidecarClient: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra[F],
+    // Truthful local Subscribe lifecycle shared by the rumor and Nakamoto lanes. An acknowledgement proves only local sidecar acquisition;
+    // it is not peer reachability, catch-up, restart authority, consensus validity, or economic validity.
+    sidecarSubscriptionReadiness: io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarSubscriptionReadiness[F],
+    // The same gate bound atomically into sidecarSubscriptionReadiness before ingress can start.
+    productionGate: io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate[F],
     // The atomic genesis KES+VRF registry is owned by `SharedServices`; every consensus consumer resolves one pair from it. No standalone
     // KES or VRF registry crosses this boundary.
     // Split-safety (#261, eta axis): the deferred chain-walk handle the follower / `createContext` GSAM's
@@ -1051,49 +1060,6 @@ object GlobalSnapshotConsensus {
               _.map(stored => io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId(stored.hash))
             )
           ).toResource
-          // #56.10 Phase H: startup base-consistency guard. Runs in the boot Resource chain
-          // (after SharedStorages.make's mptStore and the chainStore just constructed above)
-          // and before any request-serving — this resource block is awaited before the HTTP
-          // servers start in Main.scala. A no-op for fresh nodes; fires only when crash
-          // recovery left MPT base ahead of finalized.
-          _ <- io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.MptBaseConsistency
-            .assertBaseConsistentOrPrune[F](mptStore, chainStore.lastFinalizedOrdinal)(implicitly[Async[F]], nakLogger)
-            .toResource
-          // Seed chain store with the current head snapshot so gossip children can find their parent
-          _ <- globalSnapshotStorage.head.flatMap {
-            case Some((headSigned, headCtx)) =>
-              HasherSelector[F].withCurrent { implicit hasher =>
-                headSigned.toHashed[F].flatMap { hashed =>
-                  nakLogger.info(
-                    s"🌱 Seeding chain store with genesis: ordinal=${hashed.ordinal} hash=${hashed.hash.value.take(16)} " +
-                      s"lastSnapshotHash=${hashed.lastSnapshotHash.value.take(16)}"
-                  ) >>
-                    chainStore
-                      .store(
-                        headSigned,
-                        headCtx,
-                        hashed.ordinal.value.value,
-                        0L, // slot unknown for genesis
-                        hashed.lastSnapshotHash,
-                        Array.empty // no VRF output for genesis
-                      )
-                      .flatMap {
-                        case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.StoreOutcome
-                              .BecameSelected(_, _) =>
-                          Async[F].unit
-                        case io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.StoreOutcome
-                              .Duplicate(_, _) =>
-                          nakLogger.debug("Chain store recovery head was already present")
-                        case other =>
-                          Async[F].raiseError[Unit](
-                            new IllegalStateException(s"Chain store rejected the recovery head: outcome=$other")
-                          )
-                      }
-                }
-              }
-            case None =>
-              Async[F].unit
-          }.toResource
           lastKnownSlotRef <- cats.effect.kernel.Ref.of[F, Option[Long]](None).toResource
           // Shared epoch state: VRF outputs from ALL sources accumulate here for eta rotation.
           // Path 1 (heap-leak workstream): genesis eta lifted to the top-level helper
@@ -1109,7 +1075,6 @@ object GlobalSnapshotConsensus {
           // Shared semaphore: serialize snapshot production and gossip processing
           // so each operation sees correct parent state (Bifrost uses same pattern)
           snapshotSemaphore <- cats.effect.std.Semaphore[F](1).toResource
-          productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F].toResource
           // sidecarClient is now created in Services.make and passed in as a parameter so that
           // the HTTP state-channel route can publish metagraph binaries via the same gRPC channel.
           // Wire rumor gossip onto the sidecar transport. Outbound: every rumor passing through
@@ -1124,8 +1089,12 @@ object GlobalSnapshotConsensus {
                 .publishFn[F](sidecarClient)
             )
             .toResource
-          _ <- io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
-            .receive[F](sidecarClient.channel, rumorQueue)
+          _ <- supervisor
+            .supervise(
+              consensusInputGate.awaitBootstrap >>
+                io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarRumorBridge
+                  .receive[F](sidecarClient.channel, rumorQueue, sidecarSubscriptionReadiness)
+            )
             .toResource
 
           // Slice S3: construct the committee gate. Sender path signs the per-metagraph attestation with
@@ -1860,6 +1829,7 @@ object GlobalSnapshotConsensus {
                   stakeRegistry = stakeRegistry,
                   operatorKeyRegistry = sharedServices.operatorKeyRegistry,
                   nodeStorage = nodeStorage,
+                  chainSeedGate = chainSeedGate,
                   keyPair = keyPair,
                   selfId = selfId,
                   lddConfig = lddConfig,
@@ -2089,49 +2059,50 @@ object GlobalSnapshotConsensus {
           // past the step receivers derive from its registration.
           _ <- supervisor
             .supervise(
-              fs2.Stream
-                .awakeEvery[F](scala.concurrent.duration.DurationInt(2).seconds)
-                .evalMap { _ =>
-                  for {
-                    finalizedOrd <- nakamotoFinalizedOrdinalRef.get
-                    globalPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
-                      .rotationPeriod(finalizedOrd.value.value, etaRotationSnapshots.toLong)
-                    _ <- verifiedLocalOperatorKeys.treeStepFor(globalPeriod) match {
-                      case Left(error) =>
-                        nakLogger.debug(
-                          s"KES proactive evolution deferred at finalizedOrd=${finalizedOrd.value.value}: ${error.getMessage}"
-                        )
-                      case Right(requiredTreeStep) =>
-                        operationalKeyMaker.currentPeriod.flatMap { currentTreeStep =>
-                          if (currentTreeStep > requiredTreeStep)
-                            Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotation_failures_total") >>
-                              nakLogger.warn(
-                                s"KES secret is ahead of its preregistered tree step: current=$currentTreeStep required=$requiredTreeStep " +
-                                  s"globalPeriod=$globalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset}; refusing further evolution"
-                              )
-                          else if (currentTreeStep < requiredTreeStep)
-                            operationalKeyMaker.evolveTo(requiredTreeStep).flatMap {
-                              case Right(_) =>
-                                nakLogger.info(
-                                  s"KES tree step rotated: $currentTreeStep -> $requiredTreeStep " +
-                                    s"(globalPeriod=$globalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset} " +
-                                    s"finalizedOrd=${finalizedOrd.value.value})"
-                                ) >>
-                                  Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotations_total") >>
-                                  Metrics[F].updateGauge("dag_nakamoto_kes_current_period", requiredTreeStep.toLong)
-                              case Left(err) =>
-                                Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotation_failures_total") >>
-                                  nakLogger.warn(
-                                    s"KES evolveTo(treeStep=$requiredTreeStep, globalPeriod=$globalPeriod) failed: $err"
-                                  )
-                            }
-                          else cats.Applicative[F].unit
-                        }
-                    }
-                  } yield ()
-                }
-                .compile
-                .drain
+              consensusInputGate.awaitBootstrap >>
+                fs2.Stream
+                  .awakeEvery[F](scala.concurrent.duration.DurationInt(2).seconds)
+                  .evalMap { _ =>
+                    for {
+                      finalizedOrd <- nakamotoFinalizedOrdinalRef.get
+                      globalPeriod = io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
+                        .rotationPeriod(finalizedOrd.value.value, etaRotationSnapshots.toLong)
+                      _ <- verifiedLocalOperatorKeys.treeStepFor(globalPeriod) match {
+                        case Left(error) =>
+                          nakLogger.debug(
+                            s"KES proactive evolution deferred at finalizedOrd=${finalizedOrd.value.value}: ${error.getMessage}"
+                          )
+                        case Right(requiredTreeStep) =>
+                          operationalKeyMaker.currentPeriod.flatMap { currentTreeStep =>
+                            if (currentTreeStep > requiredTreeStep)
+                              Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotation_failures_total") >>
+                                nakLogger.warn(
+                                  s"KES secret is ahead of its preregistered tree step: current=$currentTreeStep required=$requiredTreeStep " +
+                                    s"globalPeriod=$globalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset}; refusing further evolution"
+                                )
+                            else if (currentTreeStep < requiredTreeStep)
+                              operationalKeyMaker.evolveTo(requiredTreeStep).flatMap {
+                                case Right(_) =>
+                                  nakLogger.info(
+                                    s"KES tree step rotated: $currentTreeStep -> $requiredTreeStep " +
+                                      s"(globalPeriod=$globalPeriod offset=${verifiedLocalOperatorKeys.kesPeriodOffset} " +
+                                      s"finalizedOrd=${finalizedOrd.value.value})"
+                                  ) >>
+                                    Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotations_total") >>
+                                    Metrics[F].updateGauge("dag_nakamoto_kes_current_period", requiredTreeStep.toLong)
+                                case Left(err) =>
+                                  Metrics[F].incrementCounter("dag_nakamoto_kes_period_rotation_failures_total") >>
+                                    nakLogger.warn(
+                                      s"KES evolveTo(treeStep=$requiredTreeStep, globalPeriod=$globalPeriod) failed: $err"
+                                    )
+                              }
+                            else cats.Applicative[F].unit
+                          }
+                      }
+                    } yield ()
+                  }
+                  .compile
+                  .drain
             )
             .toResource
           // Start ChainSyncInbound gRPC server — serves local chain data to peers
@@ -2147,13 +2118,13 @@ object GlobalSnapshotConsensus {
               // orphan-buffer peek.
               lastNGlobalSnapshotStorage,
               orphanBuffer,
+              chainSeedGate,
               nakamotoDataDir,
               chainSyncDispatcher
             )(
               implicitly,
               implicitly,
-              implicitly,
-              scala.concurrent.ExecutionContext.global
+              implicitly
             )
           // Server lifecycle: start it on Resource acquire, shut it down cleanly on release so
           // the listen socket is returned to the OS instead of being held by a leaked Java server.
@@ -2192,86 +2163,88 @@ object GlobalSnapshotConsensus {
           // Start NakamotoSyncDaemon: receives snapshots + attestations from gossip
           _ <- supervisor
             .supervise(
-              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
-                .run[F](
-                  channel = sidecarClient.channel,
-                  chainStore = chainStore,
-                  nodeStorage = nodeStorage,
-                  tipTracker = tipTracker,
-                  stakeRegistry = stakeRegistry,
-                  operatorKeyRegistry = sharedServices.operatorKeyRegistry,
-                  sidecarClient = sidecarClient,
-                  selfId = selfId,
-                  keyPair = keyPair,
-                  lddConfig = lddConfig,
-                  eligibilityChecker = eligibilityChecker,
-                  lastKnownSlotRef = lastKnownSlotRef,
-                  epochStateRef = epochStateRef,
-                  etaRotationSnapshots = etaRotationSnapshots,
-                  // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior module-level
-                  // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside NakamotoSyncDaemon).
-                  confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
-                  consensusFns = consensusFunctions,
-                  snapshotStorage = globalSnapshotStorage,
-                  lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
-                  lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
-                  snapshotSemaphore = snapshotSemaphore,
-                  productionGate = productionGate,
-                  mptStore = mptStore,
-                  mptOverlay = mptOverlay,
-                  // Task #12 slice-2c — same staging Ref the consensus functions (575) + leader loop (1574) hold.
-                  // Lets the daemon's validator-adopt path rekey a NON-producer's staged accumulator
-                  // stripped->canonical so it promotes on finalize (complete served changeset ring).
-                  pendingAccumulatorsRef = pendingAccumulatorsRef,
-                  pendingPostBytesRef = pendingPostBytesRef,
-                  eventMempool = eventMempool,
-                  dataDir = nakamotoDataDir,
-                  enqueueAllowSpendBlock = enqueueAllowSpendBlock,
-                  enqueueDAGBlock = enqueueDAGBlock,
-                  enqueueTokenLockBlock = enqueueTokenLockBlock,
-                  // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
-                  // Always-on; no env flag — verification failures drop the message.
-                  operationalKeyMaker = operationalKeyMaker,
-                  // Gate metagraph binaries on committee threshold. Eta and active key period derive
-                  // from the binary's exact signed Phase-2 GL0 anchor, never its ML0 ordinal or a local head.
-                  committeeGate = committeeGate,
-                  verifyPhase2CurrencyContext = committeeVerifyPhase2CurrencyContext,
-                  etaForPhase2Anchor = committeeEtaForPhase2Anchor,
-                  senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
-                  processOrphanedMetagraphBinary = processOrphanedMetagraphBinary,
-                  // #259: same orphan-buffer instance the processor closure writes into — the
-                  // stuck-detection tick reads its pending parents to drive active recovery.
-                  orphanBuffer = orphanBuffer,
-                  // Gap B — acceptance-side shard deps for the receiver-routing handlers. `None` at
-                  // numShards=1 (regression bar) ⇒ inbound shard-checkpoint gossip is dropped with a
-                  // debug log. The SAME `shardAcceptanceDeps` instance the GSAM acceptance side + the
-                  // Gap-A producers use, so the chain stores incoming checkpoints land in are the ones
-                  // the producers + finality triggers read.
-                  shardAcceptanceDeps = shardAcceptanceDeps,
-                  // Chain-sync recovery (run-20, task #A): the HTTP puller driving the T2 absence stream.
-                  shardCheckpointFetcher = shardCheckpointFetcher,
-                  // Execution-certificate closure: after local replay of the exact checkpoint, sign and gossip our
-                  // execution signature so peers can reach configured `kQuorum`. `None` at numShards=1 means no emit.
-                  shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,
-                  // WATCHTOWER (fraud-proof part 1 + 2): re-execute each adopted checkpoint on the quorum path +
-                  // gossip a FraudProofEnvelope on a per-MG root mismatch; the validator re-runs the deterministic
-                  // verdict on inbound fraud proofs. `None` at numShards=1 / watchtower-disabled.
-                  watchtowerFraudProofEmitter = watchtowerFraudProofEmitter,
-                  invalidStateProofValidator = invalidStateProofValidator,
-                  // Per-ord producer fan-out (decoupled from gl0-leader win): EVERY node fans out shard
-                  // checkpoints for each canonical (best-tip) gl0 ord it receives via gossip. Reuses the
-                  // SAME `shardProducers` the leader loop uses + the `shardAssignment` off `shardAcceptanceDeps`.
-                  // The daemon derives `shardChainStores` in-daemon from `shardAcceptanceDeps.registry`. EMPTY /
-                  // `None` at numShards=1 (regression bar) ⇒ the per-ord hook is `whenA(false)`.
-                  shardProducers = shardProducers,
-                  shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
-                  // WATCHTOWER fraud-proof POOL (W3a): on a locally-UPHELD inbound dispute, `handleFraudProof` OFFERS the validated evidence
-                  // here so the gl0 leader producer embeds it in the next snapshot's `fraudProofs` consensus field. SAME instance the producer
-                  // peeks. `noop` at numShards=1 ⇒ no staging ⇒ byte-identical regression bar.
-                  fraudProofPool = fraudProofPool
-                )
-                .compile
-                .drain
+              consensusInputGate.awaitBootstrap >>
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoSyncDaemon
+                  .run[F](
+                    channel = sidecarClient.channel,
+                    subscriptionReadiness = sidecarSubscriptionReadiness,
+                    chainStore = chainStore,
+                    nodeStorage = nodeStorage,
+                    tipTracker = tipTracker,
+                    stakeRegistry = stakeRegistry,
+                    operatorKeyRegistry = sharedServices.operatorKeyRegistry,
+                    sidecarClient = sidecarClient,
+                    selfId = selfId,
+                    keyPair = keyPair,
+                    lddConfig = lddConfig,
+                    eligibilityChecker = eligibilityChecker,
+                    lastKnownSlotRef = lastKnownSlotRef,
+                    epochStateRef = epochStateRef,
+                    etaRotationSnapshots = etaRotationSnapshots,
+                    // k₁ — typed HOCON `nakamoto.confirmation-depth-k` (replaces the prior module-level
+                    // `sys.env.get("NAKAMOTO_CONFIRMATION_DEPTH")` read inside NakamotoSyncDaemon).
+                    confirmationDepthK = sharedCfg.nakamoto.confirmationDepthK(sharedCfg.environment).value,
+                    consensusFns = consensusFunctions,
+                    snapshotStorage = globalSnapshotStorage,
+                    lastGlobalSnapshotStorage = lastGlobalSnapshotStorage,
+                    lastNGlobalSnapshotStorage = lastNGlobalSnapshotStorage,
+                    snapshotSemaphore = snapshotSemaphore,
+                    productionGate = productionGate,
+                    mptStore = mptStore,
+                    mptOverlay = mptOverlay,
+                    // Task #12 slice-2c — same staging Ref the consensus functions (575) + leader loop (1574) hold.
+                    // Lets the daemon's validator-adopt path rekey a NON-producer's staged accumulator
+                    // stripped->canonical so it promotes on finalize (complete served changeset ring).
+                    pendingAccumulatorsRef = pendingAccumulatorsRef,
+                    pendingPostBytesRef = pendingPostBytesRef,
+                    eventMempool = eventMempool,
+                    dataDir = nakamotoDataDir,
+                    enqueueAllowSpendBlock = enqueueAllowSpendBlock,
+                    enqueueDAGBlock = enqueueDAGBlock,
+                    enqueueTokenLockBlock = enqueueTokenLockBlock,
+                    // §1.2 Slice 5/6/9: KES sender-side signing + receiver-side load-bearing verify.
+                    // Always-on; no env flag — verification failures drop the message.
+                    operationalKeyMaker = operationalKeyMaker,
+                    // Gate metagraph binaries on committee threshold. Eta and active key period derive
+                    // from the binary's exact signed Phase-2 GL0 anchor, never its ML0 ordinal or a local head.
+                    committeeGate = committeeGate,
+                    verifyPhase2CurrencyContext = committeeVerifyPhase2CurrencyContext,
+                    etaForPhase2Anchor = committeeEtaForPhase2Anchor,
+                    senderStakeLookup = (peer: io.constellationnetwork.schema.peer.PeerId) => stakeRegistry.committeeStake(peer),
+                    processOrphanedMetagraphBinary = processOrphanedMetagraphBinary,
+                    // #259: same orphan-buffer instance the processor closure writes into — the
+                    // stuck-detection tick reads its pending parents to drive active recovery.
+                    orphanBuffer = orphanBuffer,
+                    // Gap B — acceptance-side shard deps for the receiver-routing handlers. `None` at
+                    // numShards=1 (regression bar) ⇒ inbound shard-checkpoint gossip is dropped with a
+                    // debug log. The SAME `shardAcceptanceDeps` instance the GSAM acceptance side + the
+                    // Gap-A producers use, so the chain stores incoming checkpoints land in are the ones
+                    // the producers + finality triggers read.
+                    shardAcceptanceDeps = shardAcceptanceDeps,
+                    // Chain-sync recovery (run-20, task #A): the HTTP puller driving the T2 absence stream.
+                    shardCheckpointFetcher = shardCheckpointFetcher,
+                    // Execution-certificate closure: after local replay of the exact checkpoint, sign and gossip our
+                    // execution signature so peers can reach configured `kQuorum`. `None` at numShards=1 means no emit.
+                    shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,
+                    // WATCHTOWER (fraud-proof part 1 + 2): re-execute each adopted checkpoint on the quorum path +
+                    // gossip a FraudProofEnvelope on a per-MG root mismatch; the validator re-runs the deterministic
+                    // verdict on inbound fraud proofs. `None` at numShards=1 / watchtower-disabled.
+                    watchtowerFraudProofEmitter = watchtowerFraudProofEmitter,
+                    invalidStateProofValidator = invalidStateProofValidator,
+                    // Per-ord producer fan-out (decoupled from gl0-leader win): EVERY node fans out shard
+                    // checkpoints for each canonical (best-tip) gl0 ord it receives via gossip. Reuses the
+                    // SAME `shardProducers` the leader loop uses + the `shardAssignment` off `shardAcceptanceDeps`.
+                    // The daemon derives `shardChainStores` in-daemon from `shardAcceptanceDeps.registry`. EMPTY /
+                    // `None` at numShards=1 (regression bar) ⇒ the per-ord hook is `whenA(false)`.
+                    shardProducers = shardProducers,
+                    shardAssignment = shardAcceptanceDeps.map(_.shardAssignment),
+                    // WATCHTOWER fraud-proof POOL (W3a): on a locally-UPHELD inbound dispute, `handleFraudProof` OFFERS the validated evidence
+                    // here so the gl0 leader producer embeds it in the next snapshot's `fraudProofs` consensus field. SAME instance the producer
+                    // peeks. `noop` at numShards=1 ⇒ no staging ⇒ byte-identical regression bar.
+                    fraudProofPool = fraudProofPool
+                  )
+                  .compile
+                  .drain
             )
             .toResource
 
@@ -2283,17 +2256,18 @@ object GlobalSnapshotConsensus {
           // Disabled: emits a single INFO at startup and otherwise no-op.
           _ <- supervisor
             .supervise(
-              io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.RebootstrapOrchestrator
-                .run[F](
-                  enabled = sharedCfg.nakamoto.rebootstrapEnabled,
-                  chainStore = chainStore,
-                  tipTracker = tipTracker,
-                  mptOverlay = mptOverlay,
-                  productionGate = productionGate,
-                  snapshotSemaphore = snapshotSemaphore
-                )
-                .compile
-                .drain
+              consensusInputGate.awaitBootstrap >>
+                io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.RebootstrapOrchestrator
+                  .run[F](
+                    enabled = sharedCfg.nakamoto.rebootstrapEnabled,
+                    chainStore = chainStore,
+                    tipTracker = tipTracker,
+                    mptOverlay = mptOverlay,
+                    productionGate = productionGate,
+                    snapshotSemaphore = snapshotSemaphore
+                  )
+                  .compile
+                  .drain
             )
             .toResource
 

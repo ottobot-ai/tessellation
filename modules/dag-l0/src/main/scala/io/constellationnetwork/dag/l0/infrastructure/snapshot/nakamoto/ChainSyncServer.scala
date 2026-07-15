@@ -4,7 +4,7 @@ import cats.effect.Async
 import cats.effect.std.Dispatcher
 import cats.syntax.all._
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.Future
 
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.MetagraphOrphanBuffer
@@ -35,6 +35,21 @@ object ChainSyncServer {
   private[nakamoto] def validateHashCount(kind: String, count: Int): Either[String, Unit] =
     Either.cond(count <= MaxHashesPerRequest, (), s"too many $kind: $count > $MaxHashesPerRequest")
 
+  private[nakamoto] def chainSeedAvailability(
+    result: Option[Either[Throwable, Unit]]
+  ): Either[Status, Unit] =
+    result match {
+      case Some(Right(_)) => Right(())
+      case Some(Left(error)) =>
+        Left(
+          Status.UNAVAILABLE
+            .withDescription("GL0 chain seed failed; ChainSync is unavailable")
+            .withCause(error)
+        )
+      case None =>
+        Left(Status.UNAVAILABLE.withDescription("GL0 local bootstrap is not complete"))
+    }
+
   def make[F[_]: Async: HasherSelector: JsonSerializer](
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
     snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -45,15 +60,24 @@ object ChainSyncServer {
     // #259: orphan buffer, scanned NON-DESTRUCTIVELY (`peekForValueHash`) so we can also serve a
     // binary that is buffered locally but not yet folded into a finalized snapshot.
     orphanBuffer: MetagraphOrphanBuffer[F],
+    chainSeedStatus: ConsensusInputGate.ChainSeedStatus[F],
     dataDir: java.nio.file.Path,
     dispatcher: Dispatcher[F]
-  )(implicit ec: ExecutionContext): pb.ChainSyncInboundGrpc.ChainSyncInbound = {
+  ): pb.ChainSyncInboundGrpc.ChainSyncInbound = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ChainSyncServer")
 
     def runBounded[A](kind: String, count: Int, responseObserver: StreamObserver[A])(serve: => F[Unit]): Unit =
       validateHashCount(kind, count).fold(
         error => responseObserver.onError(Status.RESOURCE_EXHAUSTED.withDescription(error).asRuntimeException()),
-        _ => dispatcher.unsafeRunAndForget(serve)
+        _ =>
+          dispatcher.unsafeRunAndForget {
+            chainSeedStatus.chainSeedResult.flatMap {
+              chainSeedAvailability(_).fold(
+                status => Async[F].delay(responseObserver.onError(status.asRuntimeException())),
+                _ => serve
+              )
+            }
+          }
       )
 
     new pb.ChainSyncInboundGrpc.ChainSyncInbound {
@@ -210,25 +234,28 @@ object ChainSyncServer {
       override def serveChainPoints(
         request: pb.ServeChainPointsRequest
       ): Future[pb.ServeChainPointsResponse] = {
-        val effect = for {
-          chain <- chainStore.chainFromTip
-          bestTip <- chainStore.bestTip
-        } yield {
-          // Build sparse chain points: every 10th ordinal + tip + genesis
-          val points = chain.zipWithIndex.collect {
-            case (stored, idx) if idx % 10 == 0 || idx == 0 || idx == chain.length - 1 =>
-              pb.ChainPoint(
-                hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
-                ordinal = stored.ordinal
-              )
-          }
+        val effect = chainSeedStatus.chainSeedResult.flatMap { seedResult =>
+          chainSeedAvailability(seedResult).fold(
+            status => Async[F].raiseError[pb.ServeChainPointsResponse](status.asRuntimeException()),
+            _ =>
+              (chainStore.chainFromTip, chainStore.bestTip).mapN { (chain, bestTip) =>
+                // Build sparse chain points: every 10th ordinal + tip + genesis
+                val points = chain.zipWithIndex.collect {
+                  case (stored, idx) if idx % 10 == 0 || idx == 0 || idx == chain.length - 1 =>
+                    pb.ChainPoint(
+                      hash = com.google.protobuf.ByteString.copyFrom(stored.hash.value.getBytes),
+                      ordinal = stored.ordinal
+                    )
+                }
 
-          pb.ServeChainPointsResponse(
-            points = points,
-            tipHash = bestTip
-              .map(t => com.google.protobuf.ByteString.copyFrom(t.hash.value.getBytes))
-              .getOrElse(com.google.protobuf.ByteString.EMPTY),
-            tipOrdinal = bestTip.map(_.ordinal).getOrElse(0L)
+                pb.ServeChainPointsResponse(
+                  points = points,
+                  tipHash = bestTip
+                    .map(t => com.google.protobuf.ByteString.copyFrom(t.hash.value.getBytes))
+                    .getOrElse(com.google.protobuf.ByteString.EMPTY),
+                  tipOrdinal = bestTip.map(_.ordinal).getOrElse(0L)
+                )
+              }
           )
         }
 

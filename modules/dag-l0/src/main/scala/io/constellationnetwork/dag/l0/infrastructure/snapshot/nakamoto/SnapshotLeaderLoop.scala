@@ -1,9 +1,11 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import java.security.KeyPair
+import java.util.concurrent.CancellationException
 
 import cats.effect.kernel.{Async, Ref}
 import cats.effect.std.Supervisor
+import cats.effect.syntax.all._
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -396,6 +398,7 @@ object SnapshotLeaderLoop {
     stakeRegistry: StakeRegistry[F],
     operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
     nodeStorage: NodeStorage[F],
+    chainSeedGate: ConsensusInputGate.ChainSeedGate[F],
     keyPair: KeyPair,
     selfId: PeerId,
     lddConfig: LddConfig,
@@ -689,21 +692,20 @@ object SnapshotLeaderLoop {
     // entries to prevent unbounded memory growth.
     Stream.eval(Ref.of[F, Map[Long, Long]](Map.empty)).flatMap { productionTimestamps =>
       Stream.eval(Ref.of[F, LoopState](LoopState.initial(effectiveGenesisTime))).flatMap { stateRef =>
-        // Seed the chain store with the genesis/initial snapshot so gossip children
-        // can find their parent. Retries until the head is available — the SnapshotLeaderLoop
-        // fiber starts before genesis initialization in Main.scala completes.
+        // Main first reconstructs and root-verifies local state, then releases `awaitLocalState`. Only this fiber seeds the exact restored
+        // head into the Nakamoto store. Main awaits our explicit success before it enables any inbound consensus stream.
         val seedChainStore: Stream[F, Unit] = Stream.eval {
-          def attempt: F[Unit] = snapshotStorage.head.flatMap {
+          val seed = chainSeedGate.awaitLocalState >> snapshotStorage.head.flatMap {
             case Some((headSigned, headCtx)) =>
               HasherSelector[F].withCurrent { implicit hasher =>
                 headSigned.toHashed[F].flatMap { hashed =>
                   chainStore.store(headSigned, headCtx, hashed.ordinal.value.value, 0L, hashed.lastSnapshotHash, Array.empty).flatMap {
                     case NakamotoChainStore.StoreOutcome.BecameSelected(_, _) =>
                       logger.info(
-                        s"🌱 Seeded chain store with genesis: ordinal=${hashed.ordinal} hash=${hashed.hash.value.take(16)}"
+                        s"Seeded chain store with restored head: ordinal=${hashed.ordinal} hash=${hashed.hash.value.take(16)}"
                       )
                     case NakamotoChainStore.StoreOutcome.Duplicate(_, _) =>
-                      logger.debug(s"Chain store already has genesis at ordinal=${hashed.ordinal}")
+                      logger.debug(s"Chain store already has restored head at ordinal=${hashed.ordinal}")
                     case other =>
                       Async[F].raiseError[Unit](
                         new IllegalStateException(s"Recovery head could not become selected: outcome=$other")
@@ -712,9 +714,22 @@ object SnapshotLeaderLoop {
                 }
               }
             case None =>
-              Async[F].sleep(1.second) >> attempt
+              Async[F].raiseError[Unit](
+                new IllegalStateException("Local bootstrap completed without a snapshot head to seed into NakamotoChainStore")
+              )
           }
-          attempt
+
+          seed.attempt.flatMap { result =>
+            chainSeedGate.completeChainSeed(result).flatMap {
+              case true  => result.liftTo[F]
+              case false => Async[F].raiseError[Unit](new IllegalStateException("Nakamoto chain seed result was already completed"))
+            }
+          }
+            .onCancel(
+              chainSeedGate
+                .completeChainSeed(Left(new CancellationException("Nakamoto chain seed was cancelled")))
+                .void
+            )
         }
 
         // Slot duration: the consensus time UNIT (§5.7 — a parameter, not a constant; 1000 ms prod,

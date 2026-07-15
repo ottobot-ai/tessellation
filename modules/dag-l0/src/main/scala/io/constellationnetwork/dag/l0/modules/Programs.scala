@@ -1,11 +1,8 @@
 package io.constellationnetwork.dag.l0.modules
 
-import java.security.KeyPair
-
 import cats.Parallel
 import cats.effect.Async
 import cats.effect.std.Random
-import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.config.types.AppConfig
 import io.constellationnetwork.dag.l0.domain.snapshot.programs.Download
@@ -17,15 +14,12 @@ import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.cluster.programs.{Joining, PeerDiscovery}
 import io.constellationnetwork.node.shared.domain.snapshot.PeerSelect
 import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
-import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{GlobalSnapshotContextFunctions, PeerSelect}
-import io.constellationnetwork.node.shared.modules.{SharedPrograms, SharedStorages}
+import io.constellationnetwork.node.shared.modules.SharedPrograms
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.security.{HashSelect, HasherSelector, SecurityProvider}
-
-import io.circe.Json
+import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
 object Programs {
 
@@ -33,7 +27,6 @@ object Programs {
     sharedPrograms: SharedPrograms[F, R],
     storages: Storages[F],
     services: Services[F, R],
-    keyPair: KeyPair,
     config: AppConfig,
     lastFullGlobalSnapshotOrdinal: SnapshotOrdinal,
     p2pClient: P2PClient[F],
@@ -70,7 +63,6 @@ object Programs {
           sharedPrograms.joining
         )
       val rollbackLoader = RollbackLoader.make(
-        keyPair,
         config.snapshot,
         storages.incrementalGlobalSnapshotLocalFileSystemStorage,
         storages.globalSnapshotInfoLocalFileSystemStorage,

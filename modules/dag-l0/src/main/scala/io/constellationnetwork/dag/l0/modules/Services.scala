@@ -31,7 +31,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSo
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.snapshot.services.AddressService
 import io.constellationnetwork.node.shared.infrastructure.collateral.MptStoreCollateral
-import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
+import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{SidecarClient, SidecarSubscriptionReadiness}
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
 import io.constellationnetwork.node.shared.infrastructure.gossip.event.RecoveryPeerHint
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
@@ -104,6 +104,10 @@ object Services {
     shardProofServiceRef: Ref[F, Option[
       io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardSubtreeProofService[F]
     ]],
+    // Await-only capability. Main retains the release token and opens network consensus input only after verified local bootstrap.
+    consensusInputGate: io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ConsensusInputGate[F],
+    // Leader-loop capability: wait for Main's local-state restore, then publish exact chain-seed success or failure.
+    chainSeedGate: io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.ConsensusInputGate.ChainSeedGate[F],
     // The atomic genesis KES+VRF registry is owned by `SharedServices`. Consensus consumers resolve one pair from that object; no split
     // KES or VRF projection crosses this service boundary.
     // Split-safety (#261, eta axis): setter for the follower / `createContext` GSAM's deferred committee-eta
@@ -187,6 +191,8 @@ object Services {
         grpcPort = sys.env.get("SIDECAR_GRPC_PORT").flatMap(_.toIntOption).getOrElse(50051)
       )
       sidecarClient <- SidecarClient.makeResource[F](sidecarConfig)
+      productionGate <- io.constellationnetwork.node.shared.domain.nakamoto.ProductionGate.make[F].toResource
+      sidecarSubscriptionReadiness <- SidecarSubscriptionReadiness.make[F](productionGate).toResource
 
       // #117/#118 Phase 2: branch-aware reader over the gl0 overlay at the chain's bestTip.
       // Used by HTTP routes and read-path services on gl0 — under MultiBranch the chain's
@@ -296,11 +302,15 @@ object Services {
             globalFollowSliceServiceRef,
             globalChangeSetServiceRef,
             shardProofServiceRef,
+            consensusInputGate,
+            chainSeedGate,
             processMetagraphBinary,
             enqueueAllowSpendBlock,
             enqueueDAGBlock,
             enqueueTokenLockBlock,
             sidecarClient,
+            sidecarSubscriptionReadiness,
+            productionGate,
             setFollowerEtaChainWalk
           )
       }
@@ -332,6 +342,7 @@ object Services {
         recoveryPeerHint = recoveryPeerHintService,
         eventMempool = eventMempoolService,
         sidecarClient = sidecarClient,
+        sidecarSubscriptionReadiness = sidecarSubscriptionReadiness,
         finalityTriggerViewRef = finalityTriggerViewRef,
         settledOrdinalTracker = settledOrdinalTracker,
         nipopowProofProviderRef = nipopowProofProviderRef,
@@ -360,6 +371,8 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val recoveryPeerHint: RecoveryPeerHint[F],
   val eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
   val sidecarClient: SidecarClient.SidecarClientAlgebra[F],
+  // Local Subscribe acquisition state only. It carries no peer, catch-up, consensus, or economic authority.
+  val sidecarSubscriptionReadiness: SidecarSubscriptionReadiness[F],
   // Observability seam for /global-snapshots/{ord}/finality-triggers (#138). Set once by
   // SnapshotLeaderLoop after trigger construction; read by FinalityTriggersRoutes. The
   // route returns 503 while the Ref is empty (pre-startup window).

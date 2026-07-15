@@ -2,6 +2,8 @@ package grpcserver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sync/atomic"
@@ -67,8 +69,8 @@ const (
 //   - ShardCheckpointMessages / ShardCheckpointAttestationMessages return the
 //     SINGLE node-lifetime shared fan-in channel (each message is delivered to
 //     exactly ONE reader — concurrent readers race);
-//   - FraudProofMessages returns nil when the topic is not joined (numShards
-//     <= 1); a nil channel never delivers.
+//   - acquisition methods return errors for inactive or failed subscriptions;
+//     Subscribe must not emit Started after any such error.
 type GossipNode interface {
 	PublishSnapshot(ctx context.Context, data []byte) error
 	PublishAttestation(ctx context.Context, data []byte) error
@@ -82,17 +84,18 @@ type GossipNode interface {
 	PublishShardCheckpointAttestation(ctx context.Context, shardID uint32, data []byte) error
 	PublishFraudProof(ctx context.Context, data []byte) error
 
-	SnapshotMessages(ctx context.Context) <-chan []byte
-	AttestationMessages(ctx context.Context) <-chan []byte
-	RumorMessages(ctx context.Context) <-chan []byte
-	MetagraphBinaryMessages(ctx context.Context) <-chan []byte
-	MetagraphAttestationMessages(ctx context.Context) <-chan []byte
-	AllowSpendBlockMessages(ctx context.Context) <-chan []byte
-	DAGBlockMessages(ctx context.Context) <-chan []byte
-	TokenLockBlockMessages(ctx context.Context) <-chan []byte
-	FraudProofMessages(ctx context.Context) <-chan []byte
-	ShardCheckpointMessages() <-chan []byte
-	ShardCheckpointAttestationMessages() <-chan []byte
+	SnapshotMessages(ctx context.Context) (<-chan []byte, error)
+	AttestationMessages(ctx context.Context) (<-chan []byte, error)
+	RumorMessages(ctx context.Context) (<-chan []byte, error)
+	MetagraphBinaryMessages(ctx context.Context) (<-chan []byte, error)
+	MetagraphAttestationMessages(ctx context.Context) (<-chan []byte, error)
+	AllowSpendBlockMessages(ctx context.Context) (<-chan []byte, error)
+	DAGBlockMessages(ctx context.Context) (<-chan []byte, error)
+	TokenLockBlockMessages(ctx context.Context) (<-chan []byte, error)
+	FraudProofMessages(ctx context.Context) (<-chan []byte, error)
+	ShardCheckpointMessages() (<-chan []byte, error)
+	ShardCheckpointAttestationMessages() (<-chan []byte, error)
+	ShardSubscriptionsActive() bool
 
 	ReconnectCh() <-chan struct{}
 	MeshPeerCount() (snapshots, attestations, rumors, metagraphBinaries, metagraphAttestations, allowSpendBlocks, dagBlocks, tokenLockBlocks int)
@@ -114,15 +117,25 @@ type Server struct {
 	startedAt time.Time
 	grpcSrv   *grpc.Server
 
-	// shardDrainStreams counts live Subscribe streams draining the SHARED
+	// sessionID is regenerated on every sidecar process start. generation is
+	// monotonic only within that session; together they let the JVM distinguish
+	// a reconnect from a sidecar restart without claiming any network readiness.
+	sessionID string
+
+	// shardDrainStreams is an exclusive lease for the SHARED
 	// shard fan-in channels. The channels' semantics tolerate exactly one
-	// drainer (two would race and silently split deliveries — FINDING-F1);
-	// after the SubscribeRequest.topics filter, only the NakamotoSyncDaemon
-	// requests the shard families, so this should never exceed 1. Belt-and-
-	// braces observability: >1 logs loudly + sets the
-	// sidecar_shard_drain_streams gauge so a regression is visible, never
-	// silent.
+	// drainer (two would race and silently split deliveries — FINDING-F1). A
+	// competing Subscribe fails before Started instead of sharing deliveries.
 	shardDrainStreams atomic.Int32
+}
+
+var (
+	sidecarProcessSessionID string
+	processStreamGeneration atomic.Uint64
+)
+
+func init() {
+	sidecarProcessSessionID = mustNewSessionID()
 }
 
 // New creates a gRPC server backed by the gossip node. The outbox is the
@@ -135,7 +148,16 @@ func New(node GossipNode, cs *chainsync.Handler, ob *outbox.Outbox) *Server {
 		chainSync: cs,
 		outbox:    ob,
 		startedAt: time.Now(),
+		sessionID: sidecarProcessSessionID,
 	}
+}
+
+func mustNewSessionID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		panic(fmt.Sprintf("generate sidecar session id: %v", err))
+	}
+	return hex.EncodeToString(raw[:])
 }
 
 // Start begins listening on the given address.
@@ -380,41 +402,100 @@ func (s *Server) ConfirmFinalized(ctx context.Context, req *pb.ConfirmFinalizedR
 	return &pb.ConfirmFinalizedResponse{Dropped: int32(dropped)}, nil
 }
 
-// subscribeTopicSet parses SubscribeRequest.topics into a membership set.
-// nil result = subscribe-all (the documented legacy default for an empty
-// list — kept as a debugging aid; both JVM consumers pass explicit lists).
-// Unknown labels fail the stream LOUDLY (InvalidArgument): a typo'd label
-// silently subscribing to nothing would be a liveness hole harder to spot
-// than the race this filter removes.
-func subscribeTopicSet(topics []string) (map[string]bool, error) {
+var canonicalSubscribeTopics = []string{
+	TopicSnapshot,
+	TopicAttestation,
+	TopicRumor,
+	TopicMetagraphBinary,
+	TopicMetagraphAttestation,
+	TopicAllowSpendBlock,
+	TopicDAGBlock,
+	TopicTokenLockBlock,
+	TopicShardCheckpoint,
+	TopicShardCheckpointAttestation,
+	TopicFraudProof,
+}
+
+// normalizeSubscribeTopics validates an explicit request and returns both a
+// membership set and a deduplicated list in protocol-canonical order. The
+// canonical list is echoed in SubscribeStarted, so the client learns the exact
+// local subscriptions acquired rather than inferring readiness from request
+// receipt.
+func normalizeSubscribeTopics(topics []string) (map[string]bool, []string, error) {
 	if len(topics) == 0 {
-		return nil, nil
+		return nil, nil, status.Error(codes.InvalidArgument, "subscribe topics must be explicit and nonempty")
 	}
-	known := map[string]bool{
-		TopicSnapshot:                   true,
-		TopicAttestation:                true,
-		TopicRumor:                      true,
-		TopicMetagraphBinary:            true,
-		TopicMetagraphAttestation:       true,
-		TopicAllowSpendBlock:            true,
-		TopicDAGBlock:                   true,
-		TopicTokenLockBlock:             true,
-		TopicShardCheckpoint:            true,
-		TopicShardCheckpointAttestation: true,
-		TopicFraudProof:                 true,
+	known := make(map[string]bool, len(canonicalSubscribeTopics))
+	for _, topic := range canonicalSubscribeTopics {
+		known[topic] = true
 	}
 	set := make(map[string]bool, len(topics))
 	for _, tp := range topics {
 		if !known[tp] {
-			return nil, status.Errorf(codes.InvalidArgument, "unknown subscribe topic label %q (vocabulary: snapshot, attestation, rumor, metagraph-binary, metagraph-attestation, allow-spend-block, dag-block, token-lock-block, shard-checkpoint, shard-checkpoint-attestation, fraud-proof)", tp)
+			return nil, nil, status.Errorf(codes.InvalidArgument, "unknown subscribe topic label %q (vocabulary: snapshot, attestation, rumor, metagraph-binary, metagraph-attestation, allow-spend-block, dag-block, token-lock-block, shard-checkpoint, shard-checkpoint-attestation, fraud-proof)", tp)
 		}
 		set[tp] = true
 	}
-	return set, nil
+	normalized := make([]string, 0, len(set))
+	for _, topic := range canonicalSubscribeTopics {
+		if set[topic] {
+			normalized = append(normalized, topic)
+		}
+	}
+	return set, normalized, nil
+}
+
+func canonicalNakamotoTopics(shardSubscriptionsActive bool) []string {
+	topics := make([]string, 0, len(canonicalSubscribeTopics)-1)
+	for _, topic := range canonicalSubscribeTopics {
+		if topic == TopicRumor {
+			continue
+		}
+		shardingOnly := topic == TopicShardCheckpoint ||
+			topic == TopicShardCheckpointAttestation ||
+			topic == TopicFraudProof
+		if shardingOnly && !shardSubscriptionsActive {
+			continue
+		}
+		topics = append(topics, topic)
+	}
+	return topics
+}
+
+func matchesExactTopics(actual map[string]bool, expected []string) bool {
+	if len(actual) != len(expected) {
+		return false
+	}
+	for _, topic := range expected {
+		if !actual[topic] {
+			return false
+		}
+	}
+	return true
+}
+
+func validateSubscriberRole(role pb.SubscriberRole, topics map[string]bool, shardSubscriptionsActive bool) error {
+	switch role {
+	case pb.SubscriberRole_SUBSCRIBER_ROLE_RUMOR_BRIDGE:
+		if len(topics) != 1 || !topics[TopicRumor] {
+			return status.Errorf(codes.InvalidArgument, "rumor-bridge role must request exactly %q", TopicRumor)
+		}
+		return nil
+	case pb.SubscriberRole_SUBSCRIBER_ROLE_NAKAMOTO_SYNC:
+		expected := canonicalNakamotoTopics(shardSubscriptionsActive)
+		if !matchesExactTopics(topics, expected) {
+			return status.Errorf(codes.InvalidArgument, "nakamoto-sync role topics must exactly match the active sidecar profile %v", expected)
+		}
+		return nil
+	case pb.SubscriberRole_SUBSCRIBER_ROLE_UNSPECIFIED:
+		return status.Error(codes.InvalidArgument, "subscriber role must be specified")
+	default:
+		return status.Errorf(codes.InvalidArgument, "unknown subscriber role %d", role)
+	}
 }
 
 // Subscribe streams incoming gossip messages to the JVM, filtered to the
-// message families named in SubscribeRequest.topics (empty = all).
+// message families named in SubscribeRequest.topics.
 //
 // FINDING-F1 fix: the filter exists because the JVM holds TWO concurrent
 // Subscribe streams (the SidecarRumorBridge and the NakamotoSyncDaemon) and
@@ -428,45 +509,94 @@ func subscribeTopicSet(topics []string) (map[string]bool, error) {
 // simply skip the subscription (a nil channel never fires in the select).
 func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_SubscribeServer) error {
 	ctx := stream.Context()
+	relayCtx, cancelRelays := context.WithCancel(ctx)
+	defer cancelRelays()
 
-	set, terr := subscribeTopicSet(req.GetTopics())
+	set, normalizedTopics, terr := normalizeSubscribeTopics(req.GetTopics())
 	if terr != nil {
 		return terr
 	}
-	wants := func(label string) bool { return set == nil || set[label] }
+	if err := validateSubscriberRole(req.GetRole(), set, s.node.ShardSubscriptionsActive()); err != nil {
+		return err
+	}
+	wants := func(label string) bool { return set[label] }
+
+	// The shard channels are node-lifetime fan-in drains, not fan-out
+	// subscriptions. Acquire their exclusive lease before opening any universal
+	// subscriptions. A reconnect must wait for cancellation of the old stream;
+	// overlap would split messages and cannot be acknowledged as Started.
+	drainsShard := wants(TopicShardCheckpoint) || wants(TopicShardCheckpointAttestation)
+	if drainsShard {
+		if !s.shardDrainStreams.CompareAndSwap(0, 1) {
+			return status.Error(codes.AlreadyExists, "a Subscribe stream already owns the shard-checkpoint drain lease")
+		}
+		metrics.ShardDrainStreams.Set(1)
+		defer func() {
+			s.shardDrainStreams.Store(0)
+			metrics.ShardDrainStreams.Set(0)
+		}()
+	}
 
 	// Universal topics: fresh per-call fan-out subscriptions, opened only for
 	// requested families (unrequested = nil channel, never fires).
 	var snCh, atCh, ruCh, mbCh, maCh, asbCh, dagCh, tlbCh, fpCh <-chan []byte
+	var err error
 	if wants(TopicSnapshot) {
-		snCh = s.node.SnapshotMessages(ctx)
+		snCh, err = s.node.SnapshotMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire snapshot subscription: %v", err)
+		}
 	}
 	if wants(TopicAttestation) {
-		atCh = s.node.AttestationMessages(ctx)
+		atCh, err = s.node.AttestationMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire attestation subscription: %v", err)
+		}
 	}
 	if wants(TopicRumor) {
-		ruCh = s.node.RumorMessages(ctx)
+		ruCh, err = s.node.RumorMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire rumor subscription: %v", err)
+		}
 	}
 	if wants(TopicMetagraphBinary) {
-		mbCh = s.node.MetagraphBinaryMessages(ctx)
+		mbCh, err = s.node.MetagraphBinaryMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire metagraph-binary subscription: %v", err)
+		}
 	}
 	if wants(TopicMetagraphAttestation) {
-		maCh = s.node.MetagraphAttestationMessages(ctx)
+		maCh, err = s.node.MetagraphAttestationMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire metagraph-attestation subscription: %v", err)
+		}
 	}
 	if wants(TopicAllowSpendBlock) {
-		asbCh = s.node.AllowSpendBlockMessages(ctx)
+		asbCh, err = s.node.AllowSpendBlockMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire allow-spend-block subscription: %v", err)
+		}
 	}
 	if wants(TopicDAGBlock) {
-		dagCh = s.node.DAGBlockMessages(ctx)
+		dagCh, err = s.node.DAGBlockMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire dag-block subscription: %v", err)
+		}
 	}
 	if wants(TopicTokenLockBlock) {
-		tlbCh = s.node.TokenLockBlockMessages(ctx)
+		tlbCh, err = s.node.TokenLockBlockMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire token-lock-block subscription: %v", err)
+		}
 	}
 	// WATCHTOWER fraud proofs (EPIC-9-NET M4): universal-topic class — per-
-	// call fan-out, immune to the shared-channel race by construction. nil at
-	// numShards <= 1 (topic not joined).
+	// call fan-out, immune to the shared-channel race by construction. A request
+	// fails before Started when the topic is inactive at numShards <= 1.
 	if wants(TopicFraudProof) {
-		fpCh = s.node.FraudProofMessages(ctx)
+		fpCh, err = s.node.FraudProofMessages(relayCtx)
+		if err != nil {
+			return status.Errorf(codes.Unavailable, "acquire fraud-proof subscription: %v", err)
+		}
 	}
 
 	// Slice 14: shared per-shard fan-in channels. Unlike the universal topics
@@ -475,35 +605,45 @@ func (s *Server) Subscribe(req *pb.SubscribeRequest, stream pb.SidecarService_Su
 	// Subscribe stream sees envelopes/attestations from every shard this node
 	// has joined. Each message is delivered to exactly ONE drainer, so at
 	// most one live stream may request these families. The topics filter
-	// guarantees that for the two JVM consumers; the atomic guard below makes
-	// any regression (a second concurrent drainer) loud instead of silently
-	// splitting deliveries — the exact FINDING-F1 failure shape.
+	// guarantees that for the two JVM consumers; the exclusive lease above
+	// rejects a second concurrent drainer instead of silently splitting
+	// deliveries — the exact FINDING-F1 failure shape.
 	var scCh, scaCh <-chan []byte
-	drainsShard := wants(TopicShardCheckpoint) || wants(TopicShardCheckpointAttestation)
 	if drainsShard {
 		if wants(TopicShardCheckpoint) {
-			scCh = s.node.ShardCheckpointMessages()
+			scCh, err = s.node.ShardCheckpointMessages()
+			if err != nil {
+				return status.Errorf(codes.Unavailable, "acquire shard-checkpoint drain: %v", err)
+			}
 		}
 		if wants(TopicShardCheckpointAttestation) {
-			scaCh = s.node.ShardCheckpointAttestationMessages()
+			scaCh, err = s.node.ShardCheckpointAttestationMessages()
+			if err != nil {
+				return status.Errorf(codes.Unavailable, "acquire shard-checkpoint-attestation drain: %v", err)
+			}
 		}
-		n := s.shardDrainStreams.Add(1)
-		metrics.ShardDrainStreams.Set(float64(n))
-		defer func() {
-			metrics.ShardDrainStreams.Set(float64(s.shardDrainStreams.Add(-1)))
-		}()
-		if n > 1 {
-			// Loud, not fatal: during a client reconnect the old handler may
-			// linger until its ctx cancels; refusing here would loop the
-			// reconnect. The gauge + log make a SUSTAINED dual-drain visible.
-			fmt.Printf("WARN: Subscribe: %d concurrent streams draining the SHARED shard-checkpoint channels — deliveries will split between them (FINDING-F1 shape). Check the JVM subscribe topology.\n", n)
-		}
+	}
+
+	generation := processStreamGeneration.Add(1)
+	started := &pb.GossipMessage{
+		Body: &pb.GossipMessage_Started{Started: &pb.SubscribeStarted{
+			Topics:           normalizedTopics,
+			Role:             req.GetRole(),
+			StreamGeneration: generation,
+			SidecarSessionId: s.sessionID,
+		}},
+	}
+	if err := stream.Send(started); err != nil {
+		return err
 	}
 
 	reconnectCh := s.node.ReconnectCh()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
+
 		case <-reconnectCh:
 			fmt.Println("gRPC Subscribe: mesh recovered, closing stream to force client reconnect")
 			return fmt.Errorf("mesh recovered — reconnect required")

@@ -133,8 +133,8 @@ object SidecarClient {
     * '''Why the filter exists (FINDING-F1).''' The JVM holds TWO concurrent Subscribe streams — the [[SidecarRumorBridge]] and the
     * `NakamotoSyncDaemon` — and the sidecar's shard-checkpoint families are SHARED node-lifetime fan-in channels: each message is handed to
     * exactly ONE drainer. Two subscribe-all streams race-drained them and the bridge's `isRumor` collect silently discarded the shard
-    * checkpoints it won (~half). Each consumer now declares exactly what it consumes: the bridge takes [[rumorOnly]], the daemon takes
-    * [[daemonTopics]] (everything else) — so the shared channels get exactly one drainer by construction.
+    * checkpoints it won (~half). Each consumer now declares exactly what it consumes: the bridge profile takes only rumor and the active
+    * daemon profile takes the exact remaining runtime families, so the shared channels get exactly one drainer by construction.
     */
   object SubscribeTopics {
     val Snapshot = "snapshot"
@@ -150,24 +150,47 @@ object SidecarClient {
     val ShardCheckpointAttestation: String = OutboxTopic.ShardCheckpointAttestation
     val FraudProof: String = OutboxTopic.FraudProof
 
-    /** The [[SidecarRumorBridge]]'s filter: rumors and nothing else. */
-    val rumorOnly: Seq[String] = Seq(Rumor)
-
-    /** The `NakamotoSyncDaemon`'s filter: every family EXCEPT rumor (rumors belong to the bridge). Includes the shard-checkpoint families
-      * (the daemon must be their ONLY drainer — see the F1 note above) and the watchtower fraud-proof family (the daemon's
-      * `handleFraudProof` is the dispute consumer).
-      */
-    val daemonTopics: Seq[String] = Seq(
+    private val daemonBase: Seq[String] = Seq(
       Snapshot,
       Attestation,
       MetagraphBinary,
       MetagraphAttestation,
       AllowSpendBlock,
       DAGBlock,
-      TokenLockBlock,
+      TokenLockBlock
+    )
+
+    private val daemonSharding: Seq[String] = Seq(
       ShardCheckpoint,
       ShardCheckpointAttestation,
       FraudProof
+    )
+
+    /** The exact `NakamotoSyncDaemon` profile for the active runtime. `numShards = 1` has no live shard consumers today, so requesting
+      * shard-checkpoint/fraud-proof families there would falsely acknowledge nonexistent sidecar subscriptions. This is a lifecycle truth
+      * fix only; the `numShards = 1` economic-sharding bypass remains a separate production-security gap.
+      */
+    def daemonTopics(shardingActive: Boolean): Seq[String] =
+      daemonBase ++ Option.when(shardingActive)(daemonSharding).getOrElse(Seq.empty)
+  }
+
+  final case class SubscriptionProfile(
+    role: SubscriberRole,
+    lane: SidecarSubscriptionReadiness.Lane,
+    topics: Seq[String]
+  )
+
+  object SubscriptionProfile {
+    val rumorBridge: SubscriptionProfile = SubscriptionProfile(
+      SubscriberRole.SUBSCRIBER_ROLE_RUMOR_BRIDGE,
+      SidecarSubscriptionReadiness.Lane.RumorBridge,
+      Seq(SubscribeTopics.Rumor)
+    )
+
+    def nakamotoSync(shardingActive: Boolean): SubscriptionProfile = SubscriptionProfile(
+      SubscriberRole.SUBSCRIBER_ROLE_NAKAMOTO_SYNC,
+      SidecarSubscriptionReadiness.Lane.NakamotoSync,
+      SubscribeTopics.daemonTopics(shardingActive)
     )
   }
 

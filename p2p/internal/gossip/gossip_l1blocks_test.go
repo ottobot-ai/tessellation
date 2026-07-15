@@ -35,7 +35,10 @@ func TestTokenLockBlock_SelfPublishReachesLocalSubscriber(t *testing.T) {
 	}
 	defer node.Close()
 
-	recvCh := node.TokenLockBlockMessages(ctx)
+	recvCh, err := node.TokenLockBlockMessages(ctx)
+	if err != nil {
+		t.Fatalf("TokenLockBlockMessages: %v", err)
+	}
 
 	payload := []byte("token-lock-block-self-bytes")
 	if err := node.PublishTokenLockBlock(ctx, payload); err != nil {
@@ -77,8 +80,14 @@ func TestTokenLockBlock_SimultaneousIdenticalPublish_BothLocalsReceive(t *testin
 		t.Fatalf("connect A->B: %v", err)
 	}
 
-	recvA := nodeA.TokenLockBlockMessages(ctx)
-	recvB := nodeB.TokenLockBlockMessages(ctx)
+	recvA, err := nodeA.TokenLockBlockMessages(ctx)
+	if err != nil {
+		t.Fatalf("node A TokenLockBlockMessages: %v", err)
+	}
+	recvB, err := nodeB.TokenLockBlockMessages(ctx)
+	if err != nil {
+		t.Fatalf("node B TokenLockBlockMessages: %v", err)
+	}
 
 	// Wait for subscription propagation both ways so the flood-publish can
 	// even attempt remote delivery (mirrors the fraud-proof test).
@@ -126,7 +135,10 @@ func TestRumor_SelfPublishIsNotEchoedLocally(t *testing.T) {
 	}
 	defer node.Close()
 
-	recvCh := node.RumorMessages(ctx)
+	recvCh, err := node.RumorMessages(ctx)
+	if err != nil {
+		t.Fatalf("RumorMessages: %v", err)
+	}
 
 	payload := []byte("rumor-self-bytes")
 	if err := node.PublishRumor(ctx, payload); err != nil {

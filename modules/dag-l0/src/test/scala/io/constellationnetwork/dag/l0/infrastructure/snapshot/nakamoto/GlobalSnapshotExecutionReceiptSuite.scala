@@ -72,9 +72,7 @@ object GlobalSnapshotExecutionReceiptSuite extends SimpleIOSuite {
         null.asInstanceOf[NakamotoSnapshotValidator.ValidationResult],
         forgedValidationResult(null),
         forgedValidationResult(new Object)
-      ).traverse(result =>
-        NakamotoSnapshotValidator.consumeReplayValidated[IO](result) { (_, _) => effects.update(_ + 1) }
-      )
+      ).traverse(result => NakamotoSnapshotValidator.consumeReplayValidated[IO](result)((_, _) => effects.update(_ + 1)))
       observed <- effects.get
     } yield expect.all(consumed.forall(result => !result), observed == 0)
   }

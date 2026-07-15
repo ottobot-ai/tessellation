@@ -1087,45 +1087,61 @@ via one `Rumor` topic. ML0 may carry its own BFT messages over that transport; G
 must not register the legacy BFT rumor families. Added Kademlia DHT for
 decentralized peer discovery. Runtime validation is tracked in task #8.
 
-**2026-07-15 correction:** at HEAD, GL0 constructed `gossipDaemon` but never called
+**2026-07-15 correction:** at the audited baseline, GL0 constructed `gossipDaemon` but never called
 `startAsInitialValidator` or `startAsRegularValidator`. The inbound bridge fed the
 bounded rumor queue, but no `consumeRumors` fiber validated or dispatched its
 generic/event handlers. The dormant GL0 BFT command queue was therefore not
 remotely reachable; it was a latent hazard that would have become reachable if the
-consumer were started without first removing the six BFT handlers. The worktree
-orders the repair correctly: remove GL0 BFT handlers/queue, then start the
-Nakamoto consume-only daemon after bootstrap and immediately before `Ready` on
-both startup paths (`Main.scala:242-258,347-350,647-650`). The focused regression
-rejects all six GL0 BFT families, proves no queue/lifecycle construction, checks
-both startup paths, and preserves ML0 BFT
-(`GlobalLegacyBftIngressDisabledSuite.scala:26-82`; 8/8); the final combined
-receipt/BFT containment selection is green (35/35). Runtime rumor
-delivery/drain/reconnect and supervision/release qualification remains open, as
-does deletion of the dormant generic `Consensus` storage/routes compatibility
-shell.
+consumer were started without first removing the six BFT handlers. Commit
+`f88d785e8` orders that containment correctly and preserves ML0 BFT.
 
-This does not prove overall sidecar startup ordering. `Main` allocates `Services`
-and its consensus resource before rollback/genesis/restart bootstrap
-(`Main.scala:196-225,331-350,647-650`; `Services.scala:257-306`). That allocation
-already starts `SidecarRumorBridge.receive` and the dedicated-topic
-`NakamotoSyncDaemon` (`GlobalSnapshotConsensus.scala:1121-1129,2192-2276`). The
-bridge therefore has a MEDIUM bounded-queue fill/drop window before the new
-generic consumer starts. More seriously, dedicated snapshot processing can race
-cold economic/roster/storage state, a pre-existing HIGH startup-order defect.
-Move both activation points behind one explicit bootstrap-ready capability, or
-define a bounded inert pre-bootstrap quarantine; never validate or mutate from
-that quarantine.
+The current worktree contains the direct pre-state mutation window with a
+three-phase capability rather than a message quarantine. Main alone signals
+local-state completion; `SnapshotLeaderLoop` alone publishes chain-seed
+success/failure; both sidecar subscriptions await the ingress release. Main awaits
+seed success, starts the generic consumer and all event/collateral daemons, and
+binds all Main HTTP listeners before its current handoff. Pre-seed ChainSync
+returns gRPC `UNAVAILABLE`; the gate rejects pre-seed success/release and records
+failed/cancelled seed results even before local-state readiness.
+
+The current worktree also closes the local subscription-order defect. The sidecar
+requires explicit rumor/Nakamoto roles and an exact active topic profile, acquires
+every requested local subscription before sending a mandatory first
+`SubscribeStarted`, and binds that acknowledgement to a process session plus a
+monotonic stream generation. Main now performs exact chain seed -> sinks/listeners
+-> subscription activation -> both same-session acknowledgements -> `Ready` last.
+The readiness owner installs an initially closed `ProductionGate`, pauses before a
+current lane is invalidated, and resumes only after both current lanes are
+installed. Main's one-time `Ready` write runs under the same serialized lease.
+Message silence is valid; HTTP/2 keepalive and real stream termination, not a
+payload-idle timer, drive reconnect. An acknowledgement proves only local drainer
+registration, never mesh reachability, chain freshness, restart authority, or
+economic validity.
+
+Do not call E4.8A/B complete yet. The boot-mode/catch-up rule and authenticated
+cold-restart authority are still open: a root-consistent disk head is not yet a
+signature/KES/VRF/ancestry/native-replay recovery receipt. Delayed subscription can
+still lose ephemeral traffic, and detached handler fibers can survive reconnect or
+cancellation. Native DAG/allow-spend/token-lock topic handlers also feed unbounded
+queues without pre-enqueue inner-signature validation; this is a post-bootstrap
+resource/signing DoS and the next transport tranche. Target shard subscription
+partitioning and a distinct GL0-wide certified-checkpoint adoption lane also remain
+open; the current sidecar truthfully acknowledges its transitional all-shards
+profile when sharding is active.
 
 **What landed:**
 - Sidecar `/tessellation/rumors/1.0.0` GossipSub topic + `PublishRumor` gRPC RPC
 - `SidecarRumorBridge`: outbound `publishFn` (wired into `Gossip.setSidecarPublishFn`) and inbound `receive` daemon (parses `Signed[RumorRaw]` JSON, recomputes hash, offers to `rumorQueue`)
-- Wired during `GlobalSnapshotConsensus` construction after `SidecarClient`
-  allocation; this is currently too early and is gated by the startup-order work
-  above
+- Allocated during `GlobalSnapshotConsensus` construction, but inbound subscription
+  effects await `ConsensusInputGate`; Main releases them only after local state,
+  chain seed, generic consumer, and event sinks are ready
+- Mandatory typed `SubscribeStarted` handshakes for both roles; exact active topic
+  profiles, sidecar session/generation replay checks, serialized production fencing,
+  and `Ready` publication only under the current two-lane lease
 - `GossipDaemon.make` accepts `nakamotoMode: Boolean` — when its start method is
   invoked with `nakamotoMode=true`, it skips legacy peer/common round runners and
-  runs only `consumeRumors`. HEAD omitted that invocation; the worktree adds it
-  after removing GL0 BFT handlers.
+  runs only `consumeRumors`. Main starts it after chain seed and before sidecar
+  ingress release.
 - Kademlia DHT in server mode in the Go sidecar; rendezvous-based discovery loop (`tessellation-nakamoto`); seedlist becomes bootstrap nodes
 - All four Scala modules compile; Go sidecar builds
 
