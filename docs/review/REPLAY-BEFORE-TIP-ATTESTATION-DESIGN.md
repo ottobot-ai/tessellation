@@ -18,11 +18,12 @@ GL1/DAG-token inputs and the deterministic global cross-metagraph settlement
 kernel. For a sharded CL1 checkpoint, the target noncommittee GL0 transition is
 execution-certificate and positive-watchtower-coverage verification, scoped
 diff/root/compare-and-set adoption, and global-kernel execution; it is not
-ordinary currency recreation. Current ordinary noncommittee CL1 replay is a
-temporary backstop until that complete certified-diff path lands. A receipt must
-never be interpreted either as permission to stop universal GL1 execution or as
-a requirement to preserve ordinary noncommittee GL0 recreation of sharded CL1
-checkpoints.
+ordinary currency recreation. Current ordinary noncommittee replay of **sharded
+CL1** framework transitions is a temporary backstop until that complete
+certified-diff path lands. A receipt must never be interpreted either as
+permission to stop universal native GL1/DAG execution by every GL0 node or as a
+requirement to preserve ordinary noncommittee GL0 recreation of sharded CL1 after
+the certified-diff gate is complete.
 
 This is an input boundary for the Avalanche/Snowball optimistic Phase-2 rail. It
 is not economic validation by signature count, and it does not add a global BFT
@@ -48,25 +49,29 @@ The received-snapshot path has the right operations but loses their provenance:
 
 1. The protobuf envelope is bound to the signed hash, ordinal, parent, signer,
    slot certificate, VRF proof/key, eta, and VRF output
-   (`NakamotoSyncDaemon.scala:96-165`, invoked at `:1341-1349`).
+   (`NakamotoSyncDaemon.scala:94-165`, invoked at `:1332-1340`).
 2. The registered operator pair and historical eta are resolved before
-   eligibility (`NakamotoSyncDaemon.scala:1375-1419`).
+   eligibility (`NakamotoSyncDaemon.scala:1366-1410`).
 3. KES is verified before replay and storage
-   (`NakamotoSyncDaemon.scala:1421-1436`).
+   (`NakamotoSyncDaemon.scala:1412-1427`).
 4. `NakamotoSnapshotValidator.validate` verifies VRF, Ed25519, slot-certificate
    lineage, and complete artifact recreation
    (`NakamotoSnapshotValidator.scala:141-279`).
 5. `commitReplayValidated` permits storage and canonical effects only for
-   `Valid` (`NakamotoSyncDaemon.scala:354-366,1546-1593`).
+   `Valid` (`NakamotoSyncDaemon.scala:352-364,1537-1604`).
 
 That ordering is not yet encoded in an opaque execution capability. `Valid`
 remains publicly constructible (`NakamotoSnapshotValidator.scala:32-43`). The
-chain-store boundary is now contained with typed outcomes and an internally
-serialized selected-tip transition: receive and production authorize canonical
-effects only from `BecameSelected`, and rejected replay staging is discarded.
-The remaining gap is that `store` still accepts caller-supplied metadata rather
-than an authenticated-executed receipt, and revisions are neither durable nor
-signing authority. No current signing API consumes either result.
+chain-store boundary has typed outcomes and an internally serialized selected-tip
+transition, but none is execution provenance. `BecameSelected` is only the fresh
+selection signal and still requires the exact branch+lineage canonical-effects
+CAS in RTA-006A. A raw `Duplicate` must never authorize a projection: only future
+`storeValidated` may insert a new receipt-backed validated entry after matching
+exact signed bytes, proofs hash, hash era, and the locally replayed context, then
+remove the matching physically separate recovery seed. It never upgrades a raw
+shared-map entry. The live raw `store` still accepts caller-supplied metadata,
+and revisions are neither durable nor signing authority. No current signing API
+consumes either result.
 
 The pre-containment implementation had three independent authority defects:
 
@@ -98,9 +103,9 @@ them no finalization sink.
 The store also cannot prove replay provenance. `StoredSnapshot` has no validation
 receipt (`NakamotoChainStore.scala:31-46`), and `store` accepts raw snapshot,
 context, ordinal, slot, parent, and VRF output arguments
-(`NakamotoChainStore.scala:124-136`). On startup it is seeded directly from
-`snapshotStorage.head` without full replay
-(`SnapshotLeaderLoop.scala:702-724`). A restored head must therefore be treated
+(`NakamotoChainStore.scala:230-244,490-503`). On startup it is seeded directly
+from `snapshotStorage.head` without full replay
+(`SnapshotLeaderLoop.scala:693-719`). A restored head must therefore be treated
 as unattestable until exact readback validation and replay complete.
 
 The shard signing boundary is the pattern to preserve, not authority for GL0:
@@ -156,6 +161,11 @@ not prove that it is the current selected tip. A second opaque capability,
 that the exact authenticated-executed hash is its current selected tip under the
 current monotone `CanonicalBranchRevision` and `CanonicalLineageRevision`.
 
+The capability also binds its issuing chain-store instance and the exact stored
+representation: body hash, proofs hash, active hash logic, state reference,
+branch revision, and lineage revision. A token from another store, another proof
+variant, another hash era, or an earlier `A -> B -> A` generation is stale.
+
 An alternate branch may retain historical replay evidence but cannot obtain a
 current-preference capability.
 
@@ -187,10 +197,14 @@ Java-serialization, or protobuf codec exists for them. Restarted snapshot bytes,
 an ordinal index, a cached root, or a prior Boolean validation result cannot
 recreate one.
 
-`snapshotStorage.head` may seed ancestry recovery, but that seed is explicitly
-unattestable. Full exact replay of the same stored bytes upgrades the entry. A
-duplicate delivery that fully validates must be able to upgrade an earlier
-unattestable seed without requiring a different hash.
+`snapshotStorage.head` may seed physically separate ancestry-recovery storage,
+but that seed is explicitly unattestable and never inhabits validated chain
+state. Full exact replay of the same bytes inserts a new receipt-backed validated
+entry through `storeValidated`, then removes the matching recovery seed. It does
+not upgrade a raw shared-map `Duplicate`. A same-hash retry can acquire projection
+authority only when the existing entry was already validated with the exact
+signed bytes, proofs hash, hash era, replayed context, and durable projection
+journal identity.
 
 A durable attestation journal may retain an exact signed command and publication
 outcome, but those bytes are historical evidence/outbox state only. They do not
@@ -208,13 +222,121 @@ receipt is carried through exact artifact decoration, Ed25519 signing, registere
 KES signing, self-verification, and chain-store selection. Only the successful
 exact result can become `AuthenticatedExecutedGlobalSnapshot`.
 
-**Containment landed:** the store returns `Duplicate`, `StoredAlternate`,
-`BecameSelected`, or typed rejection. The local path commits its MPT transaction,
-updates canonical storage, removes events, and publishes only for
-`BecameSelected`; receive no longer reconstructs selection with a later
-`bestTip` read. This prevents an alternate from acquiring canonical effects, but
-does not mint current preference: that still requires the opaque execution
-receipt, durable revisions, and exact publication CAS.
+**Partial containment landed:** the store returns `Duplicate`,
+`StoredAlternate`, `BecameSelected`, or typed rejection; receive no longer
+reconstructs selection with a later unbound `bestTip` read. `BecameSelected`
+alone is not canonical-effects authority. The current CAS tranche may serialize
+a local projection while holding the selection lock and rechecking store
+identity, selected body hash, and branch and lineage revisions. That closes the
+stale `A`-after-`B` write race for those callbacks, but it is not multi-sink
+atomic or complete representation identity: a partial callback failure leaves
+production paused, while serving and other node activity are not globally
+latched in `RecoveryRequired`. Network publication or signing must never run
+under the selection lock. Durable crash recovery and atomic visibility still
+require RTA-006A (`NakamotoChainStore.scala:249-264,634-657`; receiver use at
+`NakamotoSyncDaemon.scala:1707-1742`; producer use at
+`SnapshotLeaderLoop.scala:1700-1713`).
+
+### RTA-006A - Canonical effects require exact branch-and-lineage CAS
+
+Every canonical effect derived from a selected snapshot is bound to the same
+`PreferredExecutedTip` identity:
+
+```text
+(storeInstance, stateRef, bodyHash, proofsHash, hashLogic,
+ branchRevision, lineageRevision)
+```
+
+Immutable hash-addressed noncanonical MPT branch and accumulator staging is
+receipt-gated but may precede selection so a retained alternate remains
+replayable. Canonical effects include the selected pointer, MPT promotion/fold or
+canonical reader pointer, `SnapshotStorage`/`LastN`/`LastGlobal` projection,
+staged accumulator promotion, event/mempool removal or return, readiness, and
+downstream serving state. A Boolean precheck followed by unlocked writes, a later
+`bestTip` read, or ordinal equality cannot authorize any canonical effect.
+
+The current selection-lock containment is permitted only as an intermediate
+tranche:
+
+1. the chain store holds its selection lock;
+2. it compares store identity, selected body hash, and both revisions; it does
+   **not** yet compare proofs hash, active hash logic, state reference/root, or a
+   projection digest;
+3. its package-owned callback receives the internally stored entry, but the type
+   does not enforce a bounded effect set;
+4. it returns `Applied` or `Stale`; and
+5. any error after a partial projection leaves production paused and prevents
+   that path from publishing, but a later successful projection can clear the
+   shared reason; this is not a durable global recovery latch.
+
+This intermediate form prevents a stale branch callback from starting after a
+replacement, but holding a lock across fallible multi-sink I/O is not the
+activation target and does not make those sinks crash-atomic.
+
+The current callback-shaped API is package-owned but does not enforce "bounded
+local projection" in its type. Before this containment can be relied on, replace
+the arbitrary callback or add source/API tripwires forbidding signing, network
+I/O, chain-store re-entry, and unrelated work under the selection lock, and add a
+latched `RecoveryRequired` failure state.
+
+The production target is a durable, idempotent, revision-tagged projection
+protocol with two noncircular digests:
+
+```text
+stagedContentDigest = H(
+  "gl0-projection-stage-v1" ||
+  ordered(sinkId, key, codecEra, byteLength, H(exactStagedBytes))
+)
+
+planDigest = H(
+  "gl0-projection-plan-v1" ||
+  PreferredExecutedTipIdentity ||
+  ordered(effectKind, sinkId, key, codecEra, byteLength, H(exactEffectBytes)) ||
+  stagedContentDigest
+)
+```
+
+The ordered effect manifest is complete: it covers the selected pointer, MPT
+promotion/canonical reader pointer, projection stores, accumulator promotion,
+event or mempool effects, readiness, and downstream serving state. Every effect
+byte representation and ordering rule is active-era canonical; sink iteration or
+map order is never implicit. Effects which are represented by a committed
+canonical projection record, rather than copied into a separate sink during the
+CAS, still appear in the manifest as exact typed actions. For every staged
+effect, the `(sinkId, key, codecEra, byteLength, H(bytes))` tuple in the plan
+manifest must be byte-identical to its tuple in the staged-content manifest.
+Consequently `stagedContentDigest` is a deterministic committed submanifest of
+`planDigest`, never a second caller-supplied assertion.
+
+The protocol order is:
+
+1. From the replay receipt and preferred identity, derive the complete canonical
+   effect set and materialize its expensive bytes into hash-addressed,
+   noncanonical staging **outside** the selection lock. This staging is inert and
+   grants no preference, serving, signing, or projection authority.
+2. Read back the exact staged bytes, form the ordered complete effect manifest,
+   compute `stagedContentDigest`, then compute `planDigest` over that manifest plus
+   the staged digest. Reject any effect-set/manifest/staging mismatch. Thus no
+   digest is claimed before the bytes it commits exist.
+3. A short prepare CAS rechecks the exact preferred identity and records one
+   durable prepared intent containing that identity, `planDigest`,
+   `stagedContentDigest`, and the staging object identities. Stale preference
+   leaves only inert garbage-collectable staging.
+4. A short final CAS rereads the intent and staging, recomputes both digests,
+   rechecks exact selected hash, proof/hash-era identity, state reference/root,
+   branch revision, lineage revision, and intent identity, then atomically
+   publishes one canonical projection record and marks the intent committed.
+5. Only readers following that committed canonical projection record observe the
+   new projection. Restart deterministically finishes or rolls back the
+   idempotent intent, or enters `RecoveryRequired`; it never infers success from
+   a subset of updated sinks.
+
+Current unversioned sinks do not satisfy that protocol merely because a
+stage/prepare/final API exists. They must either read one atomically published
+canonical projection record or be made idempotent projections of that committed
+record. Signing, gossip, HTTP publication, and other network I/O are always
+outside the chain-store lock and require their own durable command plus the
+pre/post-publication checks in RTA-009.
 
 ### RTA-007 - Received flow never reconstructs authority from storage
 
@@ -225,13 +347,14 @@ later rebuild signing authority from the protobuf envelope or `bestTip` fields.
 ### RTA-008 - No receiver-invented attestation
 
 Receiving a valid producer-signed snapshot does not authorize this receiver to
-invent optimistic evidence under the producer's identity. Delete the
-receiver-clock `recordAttestation(producerId, ...)` path at
-`NakamotoSyncDaemon.scala:1847-1861`.
+invent optimistic evidence under the producer's identity. The removed
+receiver-clock `recordAttestation(producerId, ...)` path is historical and must
+remain absent; the source tripwire rejects that exact mutation pattern
+(`GlobalOptimisticFinalityContainmentSuite.scala:47-70`).
 
 Only a separately signed and KES-verified attestation received through
 `handleAttestation` may enter the tracker under a remote operator identity
-(`NakamotoSyncDaemon.scala:1918-1989`).
+(`NakamotoSyncDaemon.scala:1781-1855`).
 
 ### RTA-009 - Publish success and a canonical-lineage CAS precede active weight
 
@@ -347,6 +470,9 @@ sealed trait AuthenticatedExecutedGlobalSnapshot {
 
 sealed trait PreferredExecutedTip {
   def executed: AuthenticatedExecutedGlobalSnapshot
+  private[nakamoto] def storeInstance: StoreInstanceId
+  private[nakamoto] def proofsHash: ProofsHash
+  private[nakamoto] def hashLogic: HashLogic
   private[nakamoto] def branchRevision: CanonicalBranchRevision
   private[nakamoto] def lineageRevision: CanonicalLineageRevision
 }
@@ -383,8 +509,12 @@ decode bytes
   -> AuthenticatedExecutedGlobalSnapshot
   -> chainStore.storeValidated
        -> StoredAlternate: retain as valid branch, no optimistic emit
-       -> Duplicate: upgrade an unattestable seed if exact receipt is new
+       -> ValidatedDuplicate: retry only an exact receipt/journal-bound projection
        -> BecameSelected(branchRevision,lineageRevision): acquire PreferredExecutedTip
+  -> materialize inert projection staging outside the selection lock
+  -> read back staging and compute stagedContentDigest + planDigest
+  -> short prepare CAS records the exact revision-tagged projection intent
+  -> short final CAS over exact branch + lineage makes projection visible
   -> Snowball decision path may emit using PreferredExecutedTip
 ```
 
@@ -402,13 +532,15 @@ exact selected executed parent
   -> AuthenticatedExecutedGlobalSnapshot
   -> chainStore.storeValidated
   -> only BecameSelected(branchRevision,lineageRevision) can acquire PreferredExecutedTip
+  -> exact branch+lineage canonical-effects stage/readback/prepare/final protocol
   -> publish snapshot
   -> Snowball decision path may emit using PreferredExecutedTip
 ```
 
-The current producer execution and lineage seams are
-`SnapshotLeaderLoop.scala:1675-1700,1735-1750`; signing and storage are at
-`:1752-1809`.
+The current producer executes at `SnapshotLeaderLoop.scala:1493-1511`, validates
+slot lineage and signs at `:1545-1604`, prepares exact-hash branch state and
+stores/selects at `:1605-1659`, runs canonical effects through the current CAS at
+`:1700-1713`, and publishes only afterward at `:1746-1765`.
 
 ### 5.3 Restart and recovery
 
@@ -417,7 +549,8 @@ stored head bytes
   -> seedUnattestableForRecovery
   -> authenticate exact ancestry/parent/era inputs
   -> full replay and root comparison
-  -> storeValidated upgrades exact entry
+  -> storeValidated inserts a new receipt-backed validated entry
+  -> remove the matching physically separate recovery seed
   -> current branch/lineage check
   -> PreferredExecutedTip may be acquired only for the exact selected tip
   -> inspect durable attestation journal for the exact hash/decision
@@ -507,11 +640,24 @@ cannot authorize signing or satisfy Phase C.
 
 - `NakamotoChainStore.scala`: add the persisted monotone branch and lineage
   revisions, validated storage,
-  explicit unattestable recovery seed, typed `StoreOutcome`, exact duplicate
-  upgrade, preferred-tip acquisition/recheck, and the package-private short
-  lineage transaction used by `recordPublishedIfCanonical`. That transaction owns
-  the exact canonical-membership/lineage comparison and active-tally mutation as
-  one linearization point; it never spans signing, persistence, or network I/O.
+  explicit unattestable recovery seed, typed `StoreOutcome`, validated-duplicate
+  retry/reconciliation only for an already receipt-backed exact entry,
+  preferred-tip acquisition/recheck, and the package-private short lineage
+  transaction used by `recordPublishedIfCanonical`. Recovery is never a duplicate
+  upgrade: exact replay inserts a new validated entry, then removes its matching
+  physically separate seed. The lineage transaction owns the exact
+  canonical-membership/lineage comparison and active-tally mutation as one
+  linearization point; it never spans signing, persistence, or network I/O.
+- Add a distinct revision-tagged canonical-projection journal, `planDigest`, and
+  `stagedContentDigest` with the stage/readback/prepare/final order in RTA-006A.
+  The current selection-lock callback is only temporary stale-write containment;
+  its type does not bound the effect set and its clearable production pause is not
+  a durable fail-stop. Before even temporary reliance, source/API tripwires must
+  restrict it to bounded local effects and a partial error must enter a durable,
+  later-success-proof `RecoveryRequired` latch. The activation target removes the
+  arbitrary callback, stages expensive bytes outside the lock, and uses short
+  prepare/final CAS operations for atomic canonical visibility. Signing and
+  network I/O run under neither CAS.
 - Increment branch revision on every selected-head mutation. Increment lineage
   revision only on rollback, replacement, removal, substitution, clearing, or
   recovery reconstruction. Bound
@@ -555,7 +701,7 @@ cannot authorize signing or satisfy Phase C.
   proposal cannot update canonical storage or attest.
 - `GlobalSnapshotConsensus.scala`: construct one shared emitter/capability service
   and inject it into the leader and receive paths. Current construction sites are
-  `GlobalSnapshotConsensus.scala:1951-2013,2296-2339`.
+  `GlobalSnapshotConsensus.scala:1935-2024,2280-2353`.
 
 ### Phase E - Real optimistic rail
 
@@ -586,12 +732,14 @@ cannot authorize signing or satisfy Phase C.
 | ID | Test |
 |---|---|
 | RTA-RED-005 | A nonzero restored head is seeded for recovery but cannot attest before exact full replay. |
-| RTA-RED-006 | Exact duplicate full validation upgrades an unattestable seed; different bytes/hash cannot. |
+| RTA-RED-006 | Exact replay of a recovery seed inserts a new receipt-backed validated entry and then removes the separate seed. Raw `Duplicate`, different proofs/hash era/context, or partial validation grants no projection or preference authority. |
 | RTA-RED-007 | A replay-valid alternate branch is stored but cannot mint `PreferredExecutedTip`. |
 | RTA-RED-008 | Reorg between capability acquisition and final publication check produces no signature publication or local record. |
 | RTA-RED-009 | `A -> B -> A` rejects the old A revision. Only newly reacquired, revalidated A authority can emit. |
 | RTA-RED-010 | Pure extension advances branch revision and invalidates the old exact-tip capability without advancing lineage or deleting already-published evidence for a still-canonical ancestor. Clearing, rollback/removal, and `unsafe_clearFinality` advance lineage, invalidate old tally/capabilities, and neither revision resets. |
 | RTA-RED-011 | Concurrent local production and better gossip selection returns `StoredAlternate` for the loser; it performs no canonical-head write and no attestation. |
+| RTA-RED-011A | Preferred token for A is acquired, B replaces A, then A's canonical-effects path resumes. The exact branch+lineage CAS returns stale and no A projection becomes canonical. Any temporary-callback partial effect enters durable `RecoveryRequired`, blocks production/mutation/signing/serving, and cannot be cleared by a later successful callback; the current clearable production-pause reason does not satisfy this test. |
+| RTA-RED-011B | Crash or cancellation occurs before/after every staged sink, readback/digest computation, projection-intent prepare, final CAS, and committed marker. Restart exposes the complete prior projection or the complete committed new projection, finishes/rolls back idempotently, or enters recovery; it never infers authority from split sinks. |
 
 ### Evidence and publication
 

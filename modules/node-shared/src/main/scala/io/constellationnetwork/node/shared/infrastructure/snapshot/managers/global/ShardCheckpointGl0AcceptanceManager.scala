@@ -84,8 +84,9 @@ object VerifiedShardCheckpointFailure {
   }
 }
 
-/** Redundant watchtower finding for a per-MG root not reproduced by global re-execution. Primary admission already executes the same check;
-  * this surface exists for independently gossiped fraud evidence.
+/** Redundant watchtower finding for a per-MG root not reproduced by independent CL1 framework replay. Primary checkpoint intake already
+  * executes the same check; this surface exists for independently gossiped fraud evidence. This replay concerns only sharded `CL1 -> ML0 ->
+  * GL0` transitions; it does not replace or narrow universal GL0 execution of native `GL1 -> GL0` DAG-token transitions.
   *
   * @param metagraphAddress
   *   the metagraph whose derivation diverged

@@ -52,7 +52,9 @@ events at `:216-244`, recreates the candidate at `:261-280`, and compares the
 exact artifact at `:282-299`. Native block and global protocol processing enter
 GSAM at `GlobalSnapshotAcceptanceManager.scala:720-771,1889-1939`, and the
 global nullifier engine runs at `:2372-2387`. These responsibilities must not be
-removed when ordinary CL1 recreation is removed.
+removed when ordinary noncommittee GL0 recreation of **sharded CL1** framework
+transitions is removed. That optimization never removes universal native
+GL1/DAG-token execution from any GL0 node.
 
 The live shard path is still transitional. `ShardDerivedStateDelta` carries
 roots and signed inputs but no canonical byte diff
@@ -62,7 +64,9 @@ ordinal execution base, not a complete exact Phase-2 reference
 `deriveAdoptedCurrencyState` and recreates adopted currency snapshots
 (`GlobalSnapshotAcceptanceManager.scala:1034-1085,2083-2117`). That recreation
 must remain until the complete diff-adoption gate lands, then remain available
-only to the producer, execution signers, watchtowers, and adjudication.
+only to the producer, execution signers, assigned watchtowers, and exceptional
+adjudication. **Target rule:** every replay in those roles uses the exact retained
+base and complete ordered inputs; missing data defers and cannot sign or slash.
 
 ## 2. Threats and invariants
 
@@ -133,9 +137,13 @@ for an operator to select a branch.
 
 ### RST-8 Startup cannot manufacture execution authority
 
-A fresh complete genesis may be installed through one pinned genesis capability.
-Every persisted post-genesis head is unattestable recovery input until exact
-forward replay reproduces it.
+A fresh complete genesis may be installed through one issuer-private pinned
+genesis capability. It is a distinct one-shot authority type: it is not an
+`AuthenticatedExecutedGlobalSnapshot`, is not a `PreferredExecutedTip`, and has
+no conversion to either. Every persisted post-genesis head is unattestable
+recovery input until exact forward replay reproduces it. Persisted bytes never
+enter validated ancestry, selected tip, fork choice, finality, serving, or
+signing merely because startup found them.
 
 ### RST-9 Native GL1 validation cannot be bypassed by a shard certificate
 
@@ -145,36 +153,56 @@ recreates those transitions.
 
 ## 3. Opaque capability model
 
-The following shapes are pseudocode. Authority types are sealed, have
-package-private constructors, are not case classes, expose no `copy`, and have
-no Circe, Kryo, Scodec, protobuf, Java, or other serialization instance.
+The following shapes are pseudocode. Authority types are sealed, have concrete
+implementations private and nested inside their sole issuer object, are not case
+classes, expose no `copy`, and have no Circe, Kryo, Scodec, protobuf, Java, or
+other serialization instance. A top-level `private[nakamoto]` concrete class is
+not sufficient because unrelated code in that package could construct it.
 
 ```scala
 sealed trait ReplayStateFailure
 
-final class PinnedCompleteGenesisExecution private[nakamoto] (
-  val stateRef: GlobalSnapshotStateRef
-)
+object FreshGenesisExecution {
+  sealed abstract class PinnedCompleteGenesisExecution private (
+    val stateRef: GlobalSnapshotStateRef
+  )
 
-final class ExactGlobalStateView[F[_]] private[nakamoto] (
-  val ref: GlobalSnapshotStateRef,
-  private[nakamoto] val signed: Signed[GlobalIncrementalSnapshot],
-  private[nakamoto] val context: GlobalSnapshotInfo,
-  private[nakamoto] val state: GlobalStateReader[F],
-  private[nakamoto] val image: SortedMap[Hex, ByteVector],
-  private[nakamoto] val semanticReceipt: ScopedArtifactRef
-)
+  // Sole concrete implementation and allocation site remain private here.
+  private final class IssuedPinnedCompleteGenesisExecution(...)
+      extends PinnedCompleteGenesisExecution(...)
+}
 
-final class CandidateParentReplayView[F[_]] private[nakamoto] (
-  val executed: AuthenticatedExecutedGlobalSnapshot,
-  private[nakamoto] val parentState: ExactGlobalStateView[F],
-  private[nakamoto] val history: CandidateLineageReader[F]
-)
+sealed trait ExactGlobalStateView[F[_]] {
+  def ref: GlobalSnapshotStateRef
+  private[nakamoto] def signed: Signed[GlobalIncrementalSnapshot]
+  private[nakamoto] def context: GlobalSnapshotInfo
+  private[nakamoto] def state: GlobalStateReader[F]
+  private[nakamoto] def image: SortedMap[Hex, ByteVector]
+  private[nakamoto] def semanticReceipt: ScopedArtifactRef
+}
 
-final class OperationalGlobalStateView[F[_]] private[finality] (
-  val lease: CanonicalPhase2Lease,
-  private[finality] val exact: ExactGlobalStateView[F]
-)
+object ExactGlobalStateViewIssuer {
+  private final class IssuedExactGlobalStateView[F[_]](...) extends ExactGlobalStateView[F]
+}
+
+sealed trait CandidateParentReplayView[F[_]] {
+  def executed: AuthenticatedExecutedGlobalSnapshot
+  private[nakamoto] def parentState: ExactGlobalStateView[F]
+  private[nakamoto] def history: CandidateLineageReader[F]
+}
+
+object CandidateParentReplayViewIssuer {
+  private final class IssuedCandidateParentReplayView[F[_]](...) extends CandidateParentReplayView[F]
+}
+
+sealed trait OperationalGlobalStateView[F[_]] {
+  def lease: CanonicalPhase2Lease
+  private[finality] def exact: ExactGlobalStateView[F]
+}
+
+object OperationalGlobalStateViewIssuer {
+  private final class IssuedOperationalGlobalStateView[F[_]](...) extends OperationalGlobalStateView[F]
+}
 
 trait CandidateLineageReader[F[_]] {
   def artifactAt(
@@ -236,7 +264,7 @@ presence cannot mint any of these capabilities.
 
 | Required input | Current source and evidence | Defect | Target source |
 |---|---|---|---|
-| Candidate artifact ancestry | `NakamotoChainStore.walkBackExact` is a bounded, exact hash-linked data walk (`NakamotoChainStore.scala:277-281,934-1110`). | The walk returns artifact links only. It does not authenticate a context or MPT image, and callers must not restart one full walk for every ordinal read. | Keep a bounded, memoized exact artifact walk inside `CandidateLineageReader`; never promote it into a state/context capability. |
+| Candidate artifact ancestry | `NakamotoChainStore.walkBackExact` is a bounded, exact hash-linked data walk (`NakamotoChainStore.scala:338-342,1018-1189`). | The walk returns artifact links only. It does not authenticate a context or MPT image, and callers must not restart one full walk for every ordinal read. | Keep a bounded, memoized exact artifact walk inside `CandidateLineageReader`; never promote it into a state/context capability. |
 | Live tentative parent image | `MptOverlay.captureBranchImage` captures bytes (`MptOverlay.scala:286-292,953-960`). | It explicitly does not authenticate a branch; an unknown branch falls through to base (`:40-43,671-685,897-919`). `BranchEntry` stores only parent, changes, and ordinal (`:421,781-799`). | Add strict exact branch registration and capture keyed by parent and child `GlobalSnapshotStateRef`; unknown or mismatched branch fails. |
 | Candidate context | `StoredSnapshot` carries a raw `GlobalSnapshotInfo` (`NakamotoChainStore.scala:33-42`), and raw `store` accepts caller metadata (`:234-246`). | Stored context can be selected without a sealed local execution receipt. | Context comes only from `AuthenticatedExecutedGlobalSnapshot`; restart must reproduce it. |
 | P2/restart state image | `DurableMptImageStore` can prepare and read an image bound to full `GlobalSnapshotStateRef` (`DurableMptImageStore.scala:30-48,50-104,160-175,748-798`). | The class states that runtime integration is dark and semantic/finality authentication remains external. | Released finality core names the exact receipt, semantic receipt, and authenticated anchor; the reader verifies all three. |
@@ -341,8 +369,9 @@ inputs and missing data defers.
 ### 7.1 Fresh complete genesis
 
 `PinnedCompleteGenesisExecution` is a one-shot exception, not a generic
-constructor. It is minted only when all of these match one configured network
-genesis identity:
+constructor. It is distinct from, and non-convertible to, both ordinary
+authenticated-execution and preferred-tip capabilities. Its issuer mints it only
+when all of these match one configured network genesis identity:
 
 - exact signed genesis bytes and canonical genesis hash;
 - exact initial context and complete MPT image;
@@ -351,7 +380,21 @@ genesis identity:
 - complete committed genesis operator/KES/VRF registry.
 
 Only `installGenesis(PinnedCompleteGenesisExecution)` may initialize an empty
-validated chain store without a parent replay.
+validated chain store without a parent replay. `installGenesis` does not expose a
+general receipt conversion, and the pinned origin cannot authorize an optimistic
+attestation or masquerade as a post-genesis replay result.
+
+**OPEN OWNER DECISION — GEN-PIN-01.** The authoritative commitment for the
+complete configured network genesis identity is not frozen. In particular,
+`L0GenesisProtocolParams` is currently documented as informational rather than a
+consensus input (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/genesis/types.scala:54-77`). The owner must
+choose the normative whole-manifest/parameter commitment and signing rule before
+this capability can be production authority. Candidate directions include a
+normative hash of the complete genesis manifest or a separately signed offline
+manifest that binds the exact ordinal-1 artifact/state reference, network and
+activation identity, complete live consensus parameters, and rooted operator
+registry. The issuer must independently recompute and compare the configured
+genesis; it may not bless arbitrary bytes merely because `Main` just wrote them.
 
 ### 7.2 Persisted heads are recovery-only
 
@@ -381,6 +424,12 @@ The replacement rule is:
 5. Mint one sealed authenticated-executed receipt per successful child.
 6. Enter validated storage and objective fork choice only through the validated
    store path.
+
+Recovery storage is physically and logically separate from validated chain
+state. A recovery seed cannot be returned by validated-parent, selected-tip,
+eta, finality, fork-choice, Phase-2 serving, or signing APIs. Only exact forward
+replay may remove the matching recovery seed and create a new ordinary
+authenticated-execution receipt.
 
 Persisted snapshot/context bytes, old v4 disk history, or a peer bundle may
 supply recovery data. None is live authority without the same exact
@@ -448,9 +497,11 @@ than repeating an unbounded ordinal walk.
    watchtowers, and adjudication through `ShardExecutionReplayView`; delete
    live-head, `LastN`, ordinal-cache, and Boolean P2 adapters from replay.
 8. **Land ordinary diff adoption.** Verify/apply the certified diff and run the
-   universal global kernel. Only then remove universal currency recreation from
-   ordinary checkpoint adoption. Route one-shard operation through the same
-   path.
+   universal global kernel. Only then remove ordinary noncommittee GL0
+   recreation of **sharded CL1** currency transitions from ordinary checkpoint
+   adoption. Every GL0 node continues to execute native GL1/DAG-token blocks and
+   direct global protocol events. Route one-shard operation through the same
+   sharded-CL1 path.
 9. **Land exact restart/reorg recovery.** Exact-forward replay from released
    core, hash-bound invalidation, `commitIfCurrent`, and ordered reorg effects.
 10. **Delete transitional authority paths.** Remove ordinal-only phase checks,
@@ -474,10 +525,10 @@ than repeating an unbounded ordinal walk.
 | ECR-RED-011 | Required state is absent inside or beyond local `k2`. | Defer/recovery, no fallback, invalidity, signature, or slash. |
 | ECR-RED-012 | One MG window contains multiple binaries with different nondecreasing P2 references. | Each global read uses its own signed exact reference while MG-local state threads in order. |
 | ECR-RED-013 | Execution signer receives a quorum-signed checkpoint it has not replayed. | It emits no state-validity signature. |
-| ECR-RED-014 | Ordinary adopter receives a valid certificate/diff. | No currency recreation function is invoked; diff/root/CAS checks and global kernel do run. |
+| ECR-RED-014 | Ordinary adopter receives a valid certificate/diff. | No sharded-CL1 currency recreation function is invoked; diff/root/CAS checks and the global kernel do run. Universal native GL1/DAG execution is unchanged. |
 | ECR-RED-015 | A candidate contains an invalid native GL1 block plus a perfect shard certificate. | Every GL0 validator rejects the candidate through native replay. |
 | ECR-RED-016 | Two certified shards consume the same authorization. | The universal global kernel deterministically records one winner and one permanent nullifier. |
-| ECR-RED-017 | A diff writes another MG or a global partition, or has stale `preRoot/version`. | Atomic rejection before any state mutation. |
+| ECR-RED-017 | A diff writes another MG or a global partition, or has stale `preRoot/version`. | Reject before any canonical-state visibility; isolated staging is discarded. |
 | ECR-RED-018 | `numShards = 1`. | Producer/signers/watchtower/certificate/diff/global-kernel path is exercised identically to a shard in K-shard mode. |
 | ECR-RED-019 | Field-32 replacement witness changes `None` to `Some(empty)`, population, or one byte. | Producer, signer, watchtower, and adjudicator all reject/defer identically; ordinary adopter cannot interpret it as authority. |
 | ECR-RED-020 | Watchtower or adjudicator lacks exact input/base data. | No guilty/innocent verdict and no slash; fetch/defer only. |
@@ -535,5 +586,7 @@ exact reorg effects, the complete diff schema/verifier, and recovery readback.
 
 No further owner choice is needed for the locked GL1/sharded-CL1 split, exact
 hash/root requirement, replay-before-sign rule, missing-history recovery
-semantics, or fresh-genesis versus restored-head distinction. Those are
-implementation invariants, not alternatives.
+semantics, or the non-convertible fresh-genesis versus recovery-only restored-head
+distinction. Those are implementation invariants, not alternatives. The exact
+normative manifest and complete live-parameter commitment that may mint the fresh
+genesis capability remains the explicit `GEN-PIN-01` owner decision above.
