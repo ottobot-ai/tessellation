@@ -1023,7 +1023,7 @@ These are consensus dependencies, not optional cleanup:
 | S1 canonical identity/serde/era | Replace the currently unwired Scodec era scaffold and live JSON/Kryo hashing/proofs with one hash-bound ScodecV1 ordinal-0 service; freeze composite vectors and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
 | S2 deterministic framework oracle/kernel | Authorization, checked arithmetic, conservation, semantic replay protection, ordered execution, resource bounds, independent prefix oracle. | After E0 economic grammar | E4/E5/E8-E11/E13 |
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
-| S4 transport/resource/recovery harness | Bounded gossip/RPC/HTTP, durable outboxes, exact-hash multi-peer recovery, fuzz/fault harness. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
+| S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
 
 Work may be delegated in parallel only with disjoint write sets and frozen shared
 types. Model/RED authors do not approve their own runtime implementation. Shared
@@ -1118,16 +1118,42 @@ payload-idle timer, drive reconnect. An acknowledgement proves only local draine
 registration, never mesh reachability, chain freshness, restart authority, or
 economic validity.
 
+The current transport tranche also bounds the JVM callback bridge with manual
+gRPC demand, encoded-byte/item reservations, a nonblocking terminal path, and a
+generation fence. Eight dedicated family worker lanes are item/byte bounded,
+nonblocking at demultiplexing, and structurally owned by one subscription
+generation. Clean/error source termination seals admission and drains every
+accepted item before reconnect; reconnect cannot overlap the old generation.
+Focused flood, oversize, terminal, offer-vs-seal, clean/error drain, concurrency,
+cancellation, stale-callback, replacement, and sibling-worker tests are green.
+Confirmed malformed Brotli, long-term identity/signature, and canonical KES-shape
+exceptions are now per-message rejects. This is component containment, not an
+end-to-end bounded transport claim.
+
 Do not call E4.8A/B complete yet. The boot-mode/catch-up rule and authenticated
 cold-restart authority are still open: a root-consistent disk head is not yet a
 signature/KES/VRF/ancestry/native-replay recovery receipt. Delayed subscription can
-still lose ephemeral traffic, and detached handler fibers can survive reconnect or
-cancellation. Native DAG/allow-spend/token-lock topic handlers also feed unbounded
-queues without pre-enqueue inner-signature validation; this is a post-bootstrap
-resource/signing DoS and the next transport tranche. Target shard subscription
-partitioning and a distinct GL0-wide certified-checkpoint adoption lane also remain
-open; the current sidecar truthfully acknowledges its transitional all-shards
-profile when sharding is active.
+still lose ephemeral traffic. All eight downstream dag-l0 `Queues.scala` sinks,
+including state-channel and native DAG/allow-spend/token-lock, remain unbounded.
+The native handlers still lack pre-enqueue verification of the original outer
+signature and context-free structure. That future check is resource admission
+only: it can never replace every GL0 validator's universal execution and
+validation of the direct `GL1 -> GL0` transition against the exact proposal
+parent. Exhaustive malformed-family fuzzing remains open, and unexpected worker
+failure or process cancellation does not yet make a handler's multi-sink effects
+resumable. Worker failure deliberately leaves production paused and terminates the
+supervised daemon rather than entering the transport reconnect loop, but operator
+alert/restart policy is not yet explicit. Missing retained eta ancestry must become
+typed `RecoveryRequired` rather than using that fail-stop. The transport also lacks one size contract:
+the application cutter permits 20 MiB aggregate input while GossipSub remains at
+1 MiB, default gRPC receive limits remain 4 MiB, and ChainSync permits 16 MiB.
+Freeze a descriptor/content commitment and authenticated content-addressed
+chunked-pull path instead of raising every push limit. Add a ratified per-family
+decompressed-byte limit and bounded streaming Brotli decode; current budgets charge
+only compressed bytes and do not stop expansion bombs. Target shard subscription
+partitioning and a distinct GL0-wide certified-checkpoint adoption lane also
+remain open; the current sidecar truthfully acknowledges its transitional
+all-shards profile when sharding is active.
 
 **What landed:**
 - Sidecar `/tessellation/rumors/1.0.0` GossipSub topic + `PublishRumor` gRPC RPC
@@ -1138,6 +1164,17 @@ profile when sharding is active.
 - Mandatory typed `SubscribeStarted` handshakes for both roles; exact active topic
   profiles, sidecar session/generation replay checks, serialized production fencing,
   and `Ready` publication only under the current two-lane lease
+- `GossipStream` callback admission uses bounded item/encoded-byte storage and
+  reserved manual gRPC flow-control credits; its terminal signal is not queued
+  behind data and stale callbacks cannot revive a closed generation
+- Dedicated Nakamoto messages demultiplex into eight byte/item-bounded,
+  generation-owned worker lanes with explicit overflow metrics/recovery text;
+  source completion/error seals and drains accepted work before reconnect;
+  downstream consensus/state-channel queues, process-crash durability, and
+  per-handler resumable effects remain outside that bound
+- Shared Brotli and KES ingress is total for the reproduced malformed inputs:
+  invalid compression returns `Left`, canonical KES lengths/counts are enforced,
+  and crypto verification returns false instead of throwing
 - `GossipDaemon.make` accepts `nakamotoMode: Boolean` — when its start method is
   invoked with `nakamotoMode=true`, it skips legacy peer/common round runners and
   runs only `consumeRumors`. Main starts it after chain seed and before sidecar

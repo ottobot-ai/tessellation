@@ -559,6 +559,20 @@ rebuild, and atomic cursor/finalizer/store/provider publication all remain requi
 
 ### 4.10 Permissionless network and resources
 
+**Current transport-tranche evidence is partial.** Focused suites now cover the
+bounded `GossipStream` callback queue/manual flow-control reservation and the
+item/byte-bounded generation-owned dedicated worker lanes. They do not prove
+end-to-end boundedness: dag-l0's downstream native and state-channel queues remain
+unbounded, pre-enqueue outer-signature resource admission is absent, family-wide
+malformed-input fuzzing is incomplete, handler multi-sink effects are not resumable
+across worker/process failure, decompressed bytes are unbounded, and application/
+GossipSub/gRPC/ChainSync size limits conflict. Clean/error source termination now
+seals and drains accepted lane work; reproduced Brotli, identity/signature, and KES
+exceptions reject per message. None of these transport tests may weaken the invariant that every
+GL0 validator universally executes and validates every direct native `GL1 -> GL0`
+transition. Only ordinary noncommittee sharded-CL1 checkpoint adoption is eligible
+for replay-certified diff application.
+
 | Test ID | Required scenario and assertion |
 |---|---|
 | NET-001 | Every topic/RPC/HTTP endpoint enforces hard message/range/cardinality/concurrency/rate/decompression bounds before expensive verification or storage. |
@@ -572,6 +586,9 @@ rebuild, and atomic cursor/finalizer/store/provider publication all remain requi
 | NET-009 | Every dedicated-topic task is owned by one supervised bounded worker generation. Stream error, reconnect, cancellation, shutdown, and restart leave no detached task mutating state; duplicate subscriptions cannot overlap. Subscription-ready acknowledgement and durable retry prove that delayed activation or first-publication loss cannot permanently lose a required artifact. |
 | NET-010 | `SubscribeStarted` is mandatory and first; exact role/topic/session and positive per-lane increasing process generation are checked. Missing, duplicate, reordered, replayed, mixed-session, duplicate-generation, inactive-topic, and acquisition-failure handshakes cannot open production or publish `Ready`. Exact gRPC status propagates, stale finalizers cannot clear/reopen a replacement, committed lane loss pauses before invalidation, and a healthy payload-quiet stream remains registered under HTTP/2 keepalive. |
 | NET-011 | Raw per-shard checkpoint/replay traffic reaches only exact current execution/watchtower assignments, while one distinct GL0-wide certified-checkpoint/diff lane reaches every ordinary adopter. Rotation, reconnect, delayed activation, overlap, stale generation, and M-shard flood tests preserve one owner per raw lane, universal certified adoption, bounded work, and no loss window. `numShards=1` exercises the same economic path rather than disabling it. |
+| NET-012 | The callback queue and every downstream sink are jointly bounded by encoded bytes and items under one accounting invariant, including all eight dag-l0 queues and `stateChannelOutput`. Native DAG/allow-spend/token-lock floods with invalid outer signatures reject before downstream enqueue, GL0 re-signing, or expensive contextual work; compromised-key valid floods remain within per-peer/topic and global budgets. This admission test is not state validity: every admitted direct native transition is still independently executed and validated by every GL0 validator at the exact proposal parent. |
+| NET-013 | For every untrusted message family, malformed/truncated/negative/noncanonical/oversized input is a per-message reject and the current generation continues serving other families. Regress invalid Brotli, off-curve/malformed long-term keys/signatures, and zero/short/noncanonical KES fields on every reachable rail. Clean/error source termination seals admission, drains the exact accepted set, then reconnects without overlap and rethrows the original error. Inject an unexpected worker/infrastructure error separately and prove immediate owned cancellation, no reconnect, production paused, and explicit operator escalation. Missing eta history enters typed `RecoveryRequired`. Cancel/restart each handler between every pair of sink writes; readers observe one complete authority-bearing effect or the prior state, or persisted deterministic recovery completes exactly once. |
+| NET-014 | One canonical descriptor/content-addressed chunk contract is enforced across the 20 MiB application aggregate, 1 MiB GossipSub, 4 MiB gRPC receive defaults, 16 MiB ChainSync, disk, compression, and decompression. Ratify per-family decompressed maxima from valid v4 payloads. Boundary vectors prove exactly-at-limit success and `limit+1` typed rejection, and a high-ratio payload stops during bounded streaming decode without materializing the full expansion. Gossip carries only the bounded descriptor; exact length/content/chunk hashes, index/count, compression domain, duplicate/conflict handling, multi-peer retry, outbox retry, restart, and reassembly are verified before publication or execution. A valid 20 MiB artifact succeeds by authenticated bounded pull and can never be pushed as one oversized envelope. |
 | PERM-001 | Join/activation/exit/unbond/slash/rotation across partitions/restart preserves bonded backing, challenge horizon, and anchored sample/committee sets. |
 | PERM-002 | Bootstrap policy states maximum safe offline time and validates the exact trusted genesis/cached anchor, density proof, set/era/parameter history, and current-chain evidence. Expired or incomparable anchors reject. |
 | PERM-003 | For period `N`, producer, verifier, restart, reorg, and portable-proof paths derive byte-identical eligibility from one exact parent: authorized population/raw weight and active paired records from `N-2`, eta from `N-1`, and parameters for `N`. Same-ordinal sibling bytes, mixed roster/weight roots, local seedlist, current stake, observed peers, receiver head, and missing-history fallback reject or defer before any consensus side effect. |

@@ -524,6 +524,31 @@ criteria are in `NAKAMOTO-PLAN.md`.
 - [ ] **S4 PARTIAL - adversarial transport/resource/recovery harness**
   - Bound every network/decompression/range/concurrency path before expensive
     verification or storage.
+  - **Landed component containment:** `GossipStream` has bounded item/encoded-byte
+    callback storage with reserved manual gRPC demand and a terminal path outside
+    the data queue. Dedicated Nakamoto families use eight item/byte-bounded worker
+    lanes owned by one subscription generation; clean/error termination seals and
+    drains all accepted work before reconnect. Focused flow-control, overflow,
+    offer-vs-seal, drain, cancellation, stale-callback, replacement, and
+    sibling-worker tests are green. Invalid Brotli, long-term identity/signature,
+    and canonical KES-shape exploit cases are contained as per-message rejects.
+    This is not an end-to-end bounded result.
+  - **Open HIGH:** all dag-l0 `Queues.scala` sinks, including state-channel and
+    native DAG/allow-spend/token-lock, remain unbounded. Verify the original outer
+    signature and context-free structure before native enqueue, solely as resource
+    admission; every GL0 validator must still execute and validate every direct
+    `GL1 -> GL0` transition against the exact proposal parent.
+  - Fuzz every remaining untrusted family into typed per-message outcomes, and make
+    multi-sink handler effects atomic or resumable across unexpected worker failure
+    and process restart.
+  - Keep worker failure fail-stop with production paused, but add explicit operator
+    escalation/restart policy. Convert unavailable retained eta ancestry into typed
+    `RecoveryRequired` defer/recovery instead of an undifferentiated worker failure.
+  - Replace the conflicting 20 MiB application aggregate, 1 MiB GossipSub, 4 MiB
+    default gRPC, 16 MiB ChainSync, and 32 MiB local callback limits with one
+    canonical bounded descriptor plus authenticated content-addressed chunked pull.
+    Ratify per-family decompressed maxima from valid v4 payloads and implement
+    bounded streaming Brotli decode; compressed-byte accounting alone is insufficient.
   - Add durable outbox, exact-hash multi-peer recovery, and reproducible fault/
     resource fixtures.
   - **Gate:** `NET-*`, `RESOURCE-001`, `REC-*`.
@@ -1001,13 +1026,20 @@ consensus-economic roadmap for dependencies and release gates.
    E4.8A/B now have **pre-state mutation and local subscription ordering contained;
    recovery/integration remains open**. Missing: boot-mode/catch-up policy,
    authenticated cold-restart authority, hostile early-input tests for every topic,
-   bounded generation-owned topic workers, reconnect/resource-cancellation
-   ownership, and durable recovery for traffic missed before delayed subscription.
+   end-to-end downstream queue bounds, pre-enqueue outer-signature resource
+   admission, exhaustive malformed-family isolation, resumable multi-sink progress, one
+   cross-hop size/chunk contract, and durable recovery for traffic missed before
+   delayed subscription. The callback queue/manual flow control and eight
+   generation-owned bounded worker lanes with seal-and-drain are now implemented and
+   covered by focused tests; reproduced Brotli/identity/KES exceptions are contained,
+   but these do not close the downstream/resource/restart gaps.
    Restored disk-head authority remains RED:
    ordinary `chainStore.store` with synthetic slot/VRF metadata is not an
    authenticated replay/recovery receipt. Dedicated allow-spend/DAG/token-lock
-   handlers also deserialize directly into unbounded queues and detached fibers;
-   bound and validate them before enqueue. E4.8 still owns deletion of the dormant
+   handlers still deserialize into unbounded downstream queues without verifying
+   the original outer signature first. Bound and authenticate them before enqueue,
+   but treat that check only as resource admission: universal GL0 native execution
+   remains mandatory. E4.8 still owns deletion of the dormant
    generic `Consensus` storage/routes/config/API shell. ML0 BFT remains.
 
    Full-snapshot `--rollback-hash` is now explicitly disabled before cleanup. The
