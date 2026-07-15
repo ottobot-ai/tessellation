@@ -54,24 +54,22 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *      last-finalized marker. 3. Reset `mptOverlay.unsafe_reset` — drop pending branches, finalized markers, undo journal. 4. Reset
   *      `chainStore.unsafe_clearFinality` — drop byHash, bestTip, lastFinalizedOrdinal, refuse counter, refuse sample.
   *
-  * After reset, normal gossip buffers parentless snapshots and ChainSync fetches their ancestry. Each transition must pass ordinary global
-  * replay before it can re-enter the chain store. Production resumes once the divergent-refuse counter stays at 0 across the cooldown
-  * window (`RebootstrapCooldown`) — preventing flap if the bug recurs immediately.
+  * After reset, ordinary gossip and ChainSync cannot mutate state because the shared snapshot semaphore remains held. This legacy
+  * orchestrator has no authenticated reconstruction verifier, so it remains fail-stopped. A future recovery coordinator must reconstruct
+  * exact authenticated history in an isolated workspace, atomically promote the complete result, and only then release the semaphore and
+  * clear the `RecoveryRequired` gate.
   *
   * NOTE: the orchestrator does NOT itself touch `lastGlobalSnapshotStorage`, `snapshotStorage`, the `MptStore` base, or every served
-  * finalized projection. Follow-on recovery must fetch ancestry and pass each transition through `NakamotoSyncDaemon.handleSnapshot`'s
-  * normal global replay path. A delivered peer tip or self-consistent root is not authority to rewrite those stores. Until the durable
-  * recovery coordinator owns all of them, this mechanism is containment rather than complete recovery.
+  * finalized projection. A delivered peer tip or self-consistent root is not authority to rewrite those stores. Until a durable recovery
+  * coordinator owns isolated replay plus atomic promotion of every projection, this mechanism is containment rather than complete recovery.
   *
   * ==Enablement (currently ON; target OFF once density-past-k₁ (S3) lands + is e2e-validated)==
   *
   * Gated by typed HOCON `SharedConfig.nakamoto.rebootstrapEnabled` (`application.conf` `rebootstrap-enabled`, default `true`; env override
-  * `${?NAKAMOTO_REBOOTSTRAP_ENABLED}`), passed as the `enabled` param to `run`. It ships ON because a locked-out node otherwise forks the
-  * global mptRoot forever (the sharded data-app-fee reorg storm) — so this is the PRIMARY divergent-self-finalize recovery TODAY. TARGET
-  * STATE = OFF: once the density-past-k₁ deep-reorg path (Track-3 S3, flag `band-density-reorg-enabled`) lands and is e2e-validated,
-  * band-density reorg SUPERSEDES this node-level reset as the primary recovery and the default flips to `false` — the orchestrator is then
-  * RETAINED as a manual last-resort escape hatch (operators flip ON per-node via the env override). Do NOT flip the default until S3+S4 are
-  * e2e-green and the deep-fork sim passes (Track-3 S5 gate).
+  * `${?NAKAMOTO_REBOOTSTRAP_ENABLED}`), passed as the `enabled` param to `run`. It ships ON as fail-stop containment: a locked-out node is
+  * prevented from continuing to mutate a divergent global root, but it does not automatically recover. A complete isolated reconstruction
+  * coordinator must replace this reset before permissionless operation. Once objective density recovery is end-to-end validated, this
+  * heuristic reset should default OFF and remain only an explicitly unsafe/manual diagnostic trigger.
   */
 object RebootstrapOrchestrator {
 
@@ -85,9 +83,9 @@ object RebootstrapOrchestrator {
       .flatMap(_.toLongOption)
       .getOrElse(3L)
 
-  /** Cooldown after a reset before another reset can fire. Prevents flap if the bug recurs (e.g. ChainSync re-seeds something divergent
-    * immediately). Default 5 minutes — long enough for a peer's canonical chain to refill us, short enough that operators don't have to
-    * restart the node if a second divergence happens. Override via `NAKAMOTO_REBOOTSTRAP_COOLDOWN_MS`.
+  /** Legacy cooldown used by the trigger decision. It never resumes recovery or releases the retained semaphore. While this containment
+    * remains fail-stopped after a successful reset, a second reset cannot execute; the value remains only for pre-reset/restart
+    * diagnostics. Override via `NAKAMOTO_REBOOTSTRAP_COOLDOWN_MS`.
     */
   val CooldownMs: Long =
     sys.env
@@ -109,6 +107,11 @@ object RebootstrapOrchestrator {
 
   /** Well-known pause reason for the ProductionGate. */
   val RebootstrapInProgress: String = "rebootstrap-in-progress"
+
+  /** Fail-closed state entered after the legacy reset has discarded canonical in-memory authority. Only a future authenticated forward
+    * replay coordinator may clear this reason and release the shared snapshot-mutation semaphore.
+    */
+  val RecoveryRequired: String = "recovery-required"
 
   /** Orchestrator state. `lastResetAtMs` is wall-clock; absent until first reset. */
   private final case class State(
@@ -157,17 +160,17 @@ object RebootstrapOrchestrator {
     *
     * The reset sequence does the following under the gate-pause:
     *   1. `productionGate.pause(RebootstrapInProgress)` 2. `tipTracker.unsafe_reset` 3. `mptOverlay.unsafe_reset` 4.
-    *      `chainStore.unsafe_clearFinality` 5. Bump `dag_nakamoto_rebootstrap_initiated_total` 6.
-    *      `productionGate.resume(RebootstrapInProgress)` — production reopens immediately; the snapshot-leader-loop's slot-win guard
-    *      already refuses to produce at-or-below finalized, and after the reset finalized=0 with chainStore empty, so production cannot
-    *      mint anything until gossip / ChainSync delivers genesis-like state.
+    *      `chainStore.unsafe_clearFinality` 5. Bump `dag_nakamoto_rebootstrap_initiated_total` 6. Enter [[RecoveryRequired]] while
+    *      retaining the shared snapshot-mutation semaphore. Production and ordinary gossip adoption remain fail-stopped until a future
+    *      recovery coordinator reconstructs exact authenticated history, atomically promotes it, releases the semaphore, and clears the
+    *      recovery gate.
     *
-    * The post-reset chain re-seed is the responsibility of `NakamotoSyncDaemon.handleSnapshot`: the next parentless gossip snapshot is
-    * buffered, ChainSync fetches missing ancestry, and the daemon globally replays each transition before storage.
+    * There is intentionally no ordinary post-reset re-seed: the retained semaphore blocks `NakamotoSyncDaemon` mutation. A future recovery
+    * coordinator must fetch and fully replay exact ancestry in isolation, atomically promote it, then explicitly release recovery.
     *
     * When `enabled == false`, returns an empty Stream — the orchestrator is wired but dormant. NOTE: `false` is NOT the current default
-    * (live default is `true`; see the enablement note above) — dormant-mode is the TARGET state once density-past-k₁ (Track-3 S3)
-    * supersedes this path as primary recovery and is e2e-validated.
+    * (live default is `true`; see the enablement note above). It should default off once complete objective density recovery is
+    * e2e-validated.
     */
   def run[F[_]: Async: Metrics](
     enabled: Boolean,
@@ -258,10 +261,11 @@ object RebootstrapOrchestrator {
     *      reconcile it through the ordinary validator. 6. `chainStore.unsafe_clearFinality` last — clears the refuse counter so a future
     *      different-hash store doesn't immediately re-trip the trigger; also resets `nakamotoFinalizedOrdinalRef` to MinValue so
     *      production's "at-or-below finalized" guard treats any post-recovery ordinal as fresh. 7. INFO log marks the reset complete. 8.
-    *      Production gate resumed — the slot-win guard handles the rest.
+    *      Enter `RecoveryRequired` and retain the shared mutation permit. This legacy reset cannot itself prove a replacement branch, so
+    *      reopening production or ordinary adoption here would reintroduce unauthenticated authority.
     *
-    * If any step throws, the gate is left paused (the orchestrator's resume() is in the happy path). Operators will see production stalled
-    * and can intervene; that's safer than auto-resuming with half-reset state.
+    * Whether reset succeeds or fails, ordinary production/adoption remains paused. Success enters `RecoveryRequired`; failure retains the
+    * rebootstrap pause. Operators will see production stalled until authenticated recovery is available.
     */
   private def runReset[F[_]: Async: Metrics](
     chainStore: NakamotoChainStore.NakamotoChainStoreAlgebra[F],
@@ -296,8 +300,8 @@ object RebootstrapOrchestrator {
           chainStore.unsafe_clearFinality >>
           stateRef.update(s => s.copy(lastResetAtMs = Some(nowMs), totalResets = s.totalResets + 1L)) >>
           logger.info(
-            s"RE-BOOTSTRAP complete — chain store + tipTracker + overlay reset; awaiting canonical " +
-              s"chain re-seed via gossip/ChainSync. Production gate will reopen after this method returns."
+            s"RE-BOOTSTRAP reset complete — chain store + tipTracker + overlay cleared; entering RecoveryRequired. " +
+              s"Production and ordinary snapshot mutation remain paused until authenticated forward reconstruction."
           )
       }
     } yield ()
@@ -323,7 +327,7 @@ object RebootstrapOrchestrator {
           .onCancel(onAcquireCanceled)
           .flatMap { _ =>
             reset.attempt.flatMap {
-              case Right(_)    => snapshotSemaphore.release >> productionGate.resume(RebootstrapInProgress)
+              case Right(_)    => productionGate.pause(RecoveryRequired) >> productionGate.resume(RebootstrapInProgress)
               case Left(error) =>
                 // Intentional permit retention. `ProductionGate` alone does not stop gossip adoption.
                 Async[F].raiseError[Unit](error)

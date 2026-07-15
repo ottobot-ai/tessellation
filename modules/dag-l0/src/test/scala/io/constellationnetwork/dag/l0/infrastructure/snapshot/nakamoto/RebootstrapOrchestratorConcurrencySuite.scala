@@ -22,10 +22,10 @@ object RebootstrapOrchestratorConcurrencySuite extends SimpleIOSuite {
     } yield {
       val gate = new ProductionGate[IO] {
         def pause(reason: String): IO[Unit] =
-          reasons.update(_ + reason) >> events.update(_ :+ "pause") >> paused.complete(()).void
+          reasons.update(_ + reason) >> events.update(_ :+ s"pause:$reason") >> paused.complete(()).void
 
         def resume(reason: String): IO[Unit] =
-          reasons.update(_ - reason) >> events.update(_ :+ "resume")
+          reasons.update(_ - reason) >> events.update(_ :+ s"resume:$reason")
 
         def isOpen: IO[Boolean] = reasons.get.map(_.isEmpty)
 
@@ -34,7 +34,7 @@ object RebootstrapOrchestratorConcurrencySuite extends SimpleIOSuite {
       RecordingGate(gate, paused, reasons)
     }
 
-  test("rebootstrap pauses before waiting and holds the shared semaphore for the complete reset") {
+  test("successful reset retains the shared semaphore and enters RecoveryRequired") {
     for {
       events <- Ref.of[IO, Vector[String]](Vector.empty)
       gate <- recordingGate(events)
@@ -52,21 +52,29 @@ object RebootstrapOrchestratorConcurrencySuite extends SimpleIOSuite {
       reasonsWhileWaiting <- gate.reasons.get
       _ <- semaphore.release
       _ <- resetStarted.get
-      competingStarted <- Deferred[IO, Unit]
-      competitor <- semaphore.permit.use(_ => competingStarted.complete(()).void).start
-      competitorEnteredDuringReset <- competingStarted.tryGet
       _ <- resetRelease.complete(())
       _ <- fiber.joinWithNever
-      _ <- competitor.joinWithNever
       observed <- events.get
       gateOpen <- gate.gate.isOpen
-    } yield expect.all(
-      startedWhilePermitHeld.isEmpty,
-      reasonsWhileWaiting.contains(RebootstrapOrchestrator.RebootstrapInProgress),
-      competitorEnteredDuringReset.isEmpty,
-      observed == Vector("pause", "reset-start", "reset-end", "resume"),
-      gateOpen
-    )
+      reasons <- gate.reasons.get
+      permitAvailable <- semaphore.tryAcquire
+      _ <- IO.whenA(permitAvailable)(semaphore.release)
+    } yield
+      expect.all(
+        startedWhilePermitHeld.isEmpty,
+        reasonsWhileWaiting.contains(RebootstrapOrchestrator.RebootstrapInProgress),
+        !reasons.contains(RebootstrapOrchestrator.RebootstrapInProgress),
+        reasons.contains(RebootstrapOrchestrator.RecoveryRequired),
+        observed == Vector(
+          s"pause:${RebootstrapOrchestrator.RebootstrapInProgress}",
+          "reset-start",
+          "reset-end",
+          s"pause:${RebootstrapOrchestrator.RecoveryRequired}",
+          s"resume:${RebootstrapOrchestrator.RebootstrapInProgress}"
+        ),
+        !gateOpen,
+        !permitAvailable
+      )
   }
 
   test("cancellation while waiting for the shared semaphore leaves production paused") {
@@ -88,15 +96,16 @@ object RebootstrapOrchestratorConcurrencySuite extends SimpleIOSuite {
       reasons <- gate.reasons.get
       observed <- events.get
       _ <- semaphore.release
-    } yield expect.all(
-      outcome.isCanceled,
-      !didResetRun,
-      reasons.contains(RebootstrapOrchestrator.RebootstrapInProgress),
-      observed == Vector("pause")
-    )
+    } yield
+      expect.all(
+        outcome.isCanceled,
+        !didResetRun,
+        reasons.contains(RebootstrapOrchestrator.RebootstrapInProgress),
+        observed == Vector(s"pause:${RebootstrapOrchestrator.RebootstrapInProgress}")
+      )
   }
 
-  test("cancellation after semaphore acquisition cannot interrupt a reset or skip successful resume") {
+  test("cancellation after semaphore acquisition cannot interrupt reset or skip RecoveryRequired") {
     for {
       events <- Ref.of[IO, Vector[String]](Vector.empty)
       gate <- recordingGate(events)
@@ -120,12 +129,20 @@ object RebootstrapOrchestratorConcurrencySuite extends SimpleIOSuite {
       observed <- events.get
       permitAvailable <- semaphore.tryAcquire
       _ <- IO.whenA(permitAvailable)(semaphore.release)
-    } yield expect.all(
-      canceledBeforeResetFinished.isEmpty,
-      reasons.isEmpty,
-      observed == Vector("pause", "reset-start", "reset-end", "resume"),
-      permitAvailable
-    )
+    } yield
+      expect.all(
+        canceledBeforeResetFinished.isEmpty,
+        !reasons.contains(RebootstrapOrchestrator.RebootstrapInProgress),
+        reasons.contains(RebootstrapOrchestrator.RecoveryRequired),
+        observed == Vector(
+          s"pause:${RebootstrapOrchestrator.RebootstrapInProgress}",
+          "reset-start",
+          "reset-end",
+          s"pause:${RebootstrapOrchestrator.RecoveryRequired}",
+          s"resume:${RebootstrapOrchestrator.RebootstrapInProgress}"
+        ),
+        !permitAvailable
+      )
   }
 
   test("reset failure retains the semaphore and leaves every canonical mutation path paused") {
@@ -142,11 +159,13 @@ object RebootstrapOrchestratorConcurrencySuite extends SimpleIOSuite {
       observed <- events.get
       permitAvailable <- semaphore.tryAcquire
       _ <- IO.whenA(permitAvailable)(semaphore.release)
-    } yield expect.all(
-      result == Left(failure),
-      reasons.contains(RebootstrapOrchestrator.RebootstrapInProgress),
-      observed == Vector("pause"),
-      !permitAvailable
-    )
+    } yield
+      expect.all(
+        result == Left(failure),
+        reasons.contains(RebootstrapOrchestrator.RebootstrapInProgress),
+        !reasons.contains(RebootstrapOrchestrator.RecoveryRequired),
+        observed == Vector(s"pause:${RebootstrapOrchestrator.RebootstrapInProgress}"),
+        !permitAvailable
+      )
   }
 }
