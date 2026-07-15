@@ -1,8 +1,8 @@
 package io.constellationnetwork.schema
 
+import cats.Parallel
 import cats.effect.{Async, Sync}
 import cats.syntax.all._
-import cats.{MonadThrow, Parallel}
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
@@ -257,17 +257,15 @@ object GlobalSnapshotInfo {
         case MerklePatriciaFormat =>
           producer match {
             case Some(p) =>
-              // Keep the producer's per-ordinal trie warm (its root-hash cache feeds downstream reads), but DERIVE
-              // the consensus proof from the producer's OWN byte map (`p.entries`, straight from the MPT store) —
-              // NOT from `info.allStateEntriesAsBytes`. `mptStateProofFromBytes` commits every economic SystemNamespace
-              // index and excludes only field-32 observation metadata, so download/traverse/sync compute a byte-identical
-              // global root to the one the accept path bakes into the signed artifact.
+              // Proof construction is a read-only projection of one defensive producer byte snapshot. Explicit MptStore
+              // commit paths own trie construction and per-ordinal root-cache publication; a validator must not advance
+              // either merely by checking a proof. Derive from the producer's OWN byte map (`p.entries`, straight from
+              // the MPT store), NOT from `info.allStateEntriesAsBytes`. `mptStateProofFromBytes` commits every economic
+              // SystemNamespace index and excludes only field-32 observation metadata, so download/traverse/sync compute
+              // a byte-identical global root to the one the accept path bakes into the signed artifact.
               // Optional proof presence is derived from these authenticated bytes, never from the accompanying GSI's
               // `Option` shape. `p.entries` is already `Hex`-keyed, so no toHex.
-              p.buildForOrdinal(ordinal).flatMap {
-                case Left(err) => err.raiseError[F, GlobalSnapshotStateProof]
-                case Right(_)  => p.entries.flatMap(mptStateProofFromBytes[F])
-              }
+              p.entries.flatMap(mptStateProofFromBytes[F])
             case None =>
               mptStateProof[F](info)
           }

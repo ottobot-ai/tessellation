@@ -106,10 +106,11 @@ object FinalityCoordinatorKernel {
         initializeMutation(activePublication).leftMap(FinalityCoordinatorBootstrapError.KernelRejected)
       )
       installed <- finality.initializeCoordinator(mutation)
-    } yield installed match {
-      case FinalityDurableCasResult.Installed(_)        => ()
-      case FinalityDurableCasResult.AlreadyInstalled(_) => ()
-    }
+    } yield
+      installed match {
+        case FinalityDurableCasResult.Installed(_)        => ()
+        case FinalityDurableCasResult.AlreadyInstalled(_) => ()
+      }
 
   def prepare(
     before: CoordinatorHead,

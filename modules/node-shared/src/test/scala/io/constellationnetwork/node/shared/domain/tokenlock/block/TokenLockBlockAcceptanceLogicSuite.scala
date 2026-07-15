@@ -175,15 +175,16 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         expiredGlobalTokenLocks = SortedMap.empty
       )
       applied <- IO.fromEither(finalBalances.leftMap(new AssertionError(_)))
-    } yield expect.all(
-      unrelatedResult.left.exists {
-        case AddressBalanceOutOfRange(address, _) => address === source
-        case _                                    => false
-      },
-      replacementUpdate.balances.get(source).contains(Balance.empty),
-      replacementUpdate.claimedReplacementRefs == Set(existingHashed.hash),
-      applied._1.get(source).contains(Balance.empty)
-    )
+    } yield
+      expect.all(
+        unrelatedResult.left.exists {
+          case AddressBalanceOutOfRange(address, _) => address === source
+          case _                                    => false
+        },
+        replacementUpdate.balances.get(source).contains(Balance.empty),
+        replacementUpdate.claimedReplacementRefs == Set(existingHashed.hash),
+        applied._1.get(source).contains(Balance.empty)
+      )
   }
 
   test("an unavailable replacement reference awaits without advancing balances or claims") { res =>
@@ -218,11 +219,12 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
       )
       txRef <- TokenLockReference.of(replacement)
       currencyTxRef <- TokenLockReference.of(currencyReplacement)
-    } yield expect.all(
-      result == AwaitingReplacementTokenLock(txRef, missingRef).asLeft,
-      currencyResult == AwaitingReplacementTokenLock(currencyTxRef, missingRef).asLeft,
-      !TokenLockBlockNotAcceptedReason.isPermanent(AwaitingReplacementTokenLock(txRef, missingRef))
-    )
+    } yield
+      expect.all(
+        result == AwaitingReplacementTokenLock(txRef, missingRef).asLeft,
+        currencyResult == AwaitingReplacementTokenLock(currencyTxRef, missingRef).asLeft,
+        !TokenLockBlockNotAcceptedReason.isPermanent(AwaitingReplacementTokenLock(txRef, missingRef))
+      )
   }
 
   test("one replacement reference contributes capacity at most once within a block") { res =>
@@ -250,10 +252,11 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         TokenLockBlockAcceptanceContextUpdate.empty
       )
       reason = ReplacementTokenLockAlreadyClaimed(existingHashed.hash)
-    } yield expect.all(
-      result == reason.asLeft,
-      TokenLockBlockNotAcceptedReason.isPermanent(reason)
-    )
+    } yield
+      expect.all(
+        result == reason.asLeft,
+        TokenLockBlockNotAcceptedReason.isPermanent(reason)
+      )
   }
 
   test("found replacement targets with wrong source, currency, or amount are permanent rejections") { res =>
@@ -340,10 +343,11 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
           ReplacementAmountNotIncreased(equalAmountReplacement.amount, equalAmountTarget.amount)
         )
       )
-    } yield expect.all(
-      List(wrongSourceResult, wrongCurrencyResult, equalAmountResult) == reasons.map(_.asLeft),
-      reasons.forall(TokenLockBlockNotAcceptedReason.isPermanent)
-    )
+    } yield
+      expect.all(
+        List(wrongSourceResult, wrongCurrencyResult, equalAmountResult) == reasons.map(_.asLeft),
+        reasons.forall(TokenLockBlockNotAcceptedReason.isPermanent)
+      )
   }
 
   test("replacement target expiry uses the strict less-than execution boundary") { res =>
@@ -390,12 +394,13 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         expiredHashed.hash,
         ReplacementTargetExpired(epoch(0L), epoch(1L))
       )
-    } yield expect.all(
-      expiredResult == expiredReason.asLeft,
-      TokenLockBlockNotAcceptedReason.isPermanent(expiredReason),
-      boundaryUpdate.balances.get(source).contains(balance(5L)),
-      boundaryUpdate.claimedReplacementRefs == Set(boundaryHashed.hash)
-    )
+    } yield
+      expect.all(
+        expiredResult == expiredReason.asLeft,
+        TokenLockBlockNotAcceptedReason.isPermanent(expiredReason),
+        boundaryUpdate.balances.get(source).contains(balance(5L)),
+        boundaryUpdate.claimedReplacementRefs == Set(boundaryHashed.hash)
+      )
   }
 
   test("final application releases each ref once and rejects conflicting duplicate payloads") { res =>
@@ -461,12 +466,13 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
           expiredGlobalTokenLocks = SortedMap(source -> SortedSet(expiredTarget))
         )
         .attempt
-    } yield expect.all(
-      duplicateApplied._1.get(source).contains(Balance.empty),
-      expiryAndReplacementApplied._1.get(source).contains(Balance.empty),
-      conflicting.left.exists(_.isInstanceOf[IllegalStateException]),
-      conflictingWithExpiry.left.exists(_.isInstanceOf[IllegalStateException])
-    )
+    } yield
+      expect.all(
+        duplicateApplied._1.get(source).contains(Balance.empty),
+        expiryAndReplacementApplied._1.get(source).contains(Balance.empty),
+        conflicting.left.exists(_.isInstanceOf[IllegalStateException]),
+        conflictingWithExpiry.left.exists(_.isInstanceOf[IllegalStateException])
+      )
   }
 
   test("final application rejects a newly accepted expired lock and debits the equality boundary") { res =>
@@ -495,10 +501,11 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         expiredGlobalTokenLocks = SortedMap.empty
       )
       boundaryApplied <- IO.fromEither(boundaryResult.leftMap(new AssertionError(_)))
-    } yield expect.all(
-      expiredResult.left.exists(_.isInstanceOf[IllegalStateException]),
-      boundaryApplied._1.get(source).contains(balance(88L))
-    )
+    } yield
+      expect.all(
+        expiredResult.left.exists(_.isInstanceOf[IllegalStateException]),
+        boundaryApplied._1.get(source).contains(balance(88L))
+      )
   }
 
   test("sibling replacement blocks cannot reuse one release across either submission order") { res =>
@@ -546,13 +553,14 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         expiredGlobalTokenLocks = SortedMap.empty
       )
       applied <- IO.fromEither(finalBalances.leftMap(new AssertionError(_)))
-    } yield expect.all(
-      siblingAfterFirst == ReplacementTokenLockAlreadyClaimed(existingHashed.hash).asLeft,
-      siblingBeforeFirst.left.exists(_.isInstanceOf[TokenLockBlockAwaitReason]),
-      siblingRetry == ReplacementTokenLockAlreadyClaimed(existingHashed.hash).asLeft,
-      retryBase.balances == firstUpdate.balances,
-      applied._1.get(source).contains(Balance.empty)
-    )
+    } yield
+      expect.all(
+        siblingAfterFirst == ReplacementTokenLockAlreadyClaimed(existingHashed.hash).asLeft,
+        siblingBeforeFirst.left.exists(_.isInstanceOf[TokenLockBlockAwaitReason]),
+        siblingRetry == ReplacementTokenLockAlreadyClaimed(existingHashed.hash).asLeft,
+        retryBase.balances == firstUpdate.balances,
+        applied._1.get(source).contains(Balance.empty)
+      )
   }
 
   test("replacement claims survive block permutation/retry and an in-round target remains replaceable") { res =>
@@ -571,9 +579,9 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         pending.foldLeftM((update, accepted, List.empty[Signed[TokenLockBlock]])) {
           case ((current, acceptedBlocks, retry), block) =>
             accept(logic, block, acceptanceContext, current).map {
-              case Right(next)                          => (next, acceptedBlocks :+ block, retry)
+              case Right(next)                        => (next, acceptedBlocks :+ block, retry)
               case Left(_: TokenLockBlockAwaitReason) => (current, acceptedBlocks, retry :+ block)
-              case Left(_)                             => (current, acceptedBlocks, retry)
+              case Left(_)                            => (current, acceptedBlocks, retry)
             }
         }
 
@@ -602,12 +610,13 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
       logic = TokenLockBlockAcceptanceLogic.make[IO]
       forward <- runWithRetry(logic, acceptanceContext, List(initialBlock, replacementBlock))
       reverse <- runWithRetry(logic, acceptanceContext, List(replacementBlock, initialBlock))
-    } yield expect.all(
-      forward._2 == List(initialBlock, replacementBlock),
-      reverse._2 == List(initialBlock, replacementBlock),
-      forward._1.balances == reverse._1.balances,
-      forward._1.balances.get(source).contains(Balance.empty)
-    )
+    } yield
+      expect.all(
+        forward._2 == List(initialBlock, replacementBlock),
+        reverse._2 == List(initialBlock, replacementBlock),
+        forward._1.balances == reverse._1.balances,
+        forward._1.balances.get(source).contains(Balance.empty)
+      )
   }
 
   test("manager retries B-before-A and state application preserves order, refs, and Long.MaxValue net balance") { res =>
@@ -681,15 +690,16 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         expiredGlobalTokenLocks = SortedMap.empty
       )
       finalBalances <- IO.fromEither(applied.leftMap(new AssertionError(_)))
-    } yield expect.all(
-      List(replacementBlock, firstBlock).sorted == List(replacementBlock, firstBlock),
-      callOrder == List(replacementBlock.value.roundId, firstBlock.value.roundId, replacementBlock.value.roundId),
-      result.notAccepted.isEmpty,
-      result.accepted == List(firstBlock, replacementBlock),
-      result.contextUpdate.lastTokenLocksRefs.get(source).contains(replacementRef),
-      result.contextUpdate.balances.get(source).contains(Balance.empty),
-      stateAccepted == canonicalTxs,
-      finalBalances._1.get(source).contains(Balance.empty)
-    )
+    } yield
+      expect.all(
+        List(replacementBlock, firstBlock).sorted == List(replacementBlock, firstBlock),
+        callOrder == List(replacementBlock.value.roundId, firstBlock.value.roundId, replacementBlock.value.roundId),
+        result.notAccepted.isEmpty,
+        result.accepted == List(firstBlock, replacementBlock),
+        result.contextUpdate.lastTokenLocksRefs.get(source).contains(replacementRef),
+        result.contextUpdate.balances.get(source).contains(Balance.empty),
+        stateAccepted == canonicalTxs,
+        finalBalances._1.get(source).contains(Balance.empty)
+      )
   }
 }

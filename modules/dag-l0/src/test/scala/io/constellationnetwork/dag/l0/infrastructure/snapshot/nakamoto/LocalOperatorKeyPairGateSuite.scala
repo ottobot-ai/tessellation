@@ -117,22 +117,21 @@ object LocalOperatorKeyPairGateSuite extends IOSuite {
     }
   }
 
-  test("exact preregistered PeerId, KES master key, and VRF key produce a tree-relative signing capability") {
-    implicit securityProvider =>
-      CanonicalOperatorConsensusFixture.make.use { operator =>
-        for {
-          verified <- LocalOperatorKeyPairGate.verify[IO](
-            operator.kesSigner,
-            operator.resolvedPair.operatorPeerId,
-            operator.localLongTermKeyPairForConsensusTest,
-            operator.operatorKeyRegistry
-          )
-          result = (verified.peerId, verified.treeStepFor(9L), verified.treeStepFor(-1L))
-        } yield
-          expect.same(operator.resolvedPair.operatorPeerId, result._1) &&
-            expect.same(Right(9), result._2) &&
-            expect(result._3.left.exists(_.isInstanceOf[LocalOperatorKeyPairGate.InvalidKesPeriod]))
-      }
+  test("exact preregistered PeerId, KES master key, and VRF key produce a tree-relative signing capability") { implicit securityProvider =>
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      for {
+        verified <- LocalOperatorKeyPairGate.verify[IO](
+          operator.kesSigner,
+          operator.resolvedPair.operatorPeerId,
+          operator.localLongTermKeyPairForConsensusTest,
+          operator.operatorKeyRegistry
+        )
+        result = (verified.peerId, verified.treeStepFor(9L), verified.treeStepFor(-1L))
+      } yield
+        expect.same(operator.resolvedPair.operatorPeerId, result._1) &&
+          expect.same(Right(9), result._2) &&
+          expect(result._3.left.exists(_.isInstanceOf[LocalOperatorKeyPairGate.InvalidKesPeriod]))
+    }
   }
 
   test("current-registry signing never promotes a runtime record without exact historical resolution") { implicit securityProvider =>

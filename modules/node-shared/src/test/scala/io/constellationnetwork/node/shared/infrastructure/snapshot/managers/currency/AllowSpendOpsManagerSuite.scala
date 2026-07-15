@@ -135,17 +135,18 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
         shouldPerformMetagraphSpecificValidations = false,
         lastSyncGlobalSnapshotEpochProgress = epoch(10L)
       )
-    } yield expect.all(
-      result.accepted.isEmpty,
-      result.notAccepted.exists {
-        case (`block`, ValidationFailed(reasons)) =>
-          reasons.exists {
-            case InvalidAllowSpend(_, AllowSpendAlreadyExpired) => true
-            case _                                              => false
-          }
-        case _ => false
-      }
-    )
+    } yield
+      expect.all(
+        result.accepted.isEmpty,
+        result.notAccepted.exists {
+          case (`block`, ValidationFailed(reasons)) =>
+            reasons.exists {
+              case InvalidAllowSpend(_, AllowSpendAlreadyExpired) => true
+              case _                                              => false
+            }
+          case _ => false
+        }
+      )
   }
 
   test("consumption and expiration are mutually exclusive terminal releases") { res =>
@@ -185,14 +186,15 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
           )
           .leftMap(error => new AssertionError(error.message))
       )
-    } yield expect.all(
-      expiredForRefund.get(consumedSource).forall(_.isEmpty),
-      expiredForRefund.get(expiredSource).contains(SortedSet(expired)),
-      afterSettlement.get(consumedSource).contains(balance(60L)),
-      afterSettlement.get(expiredSource).contains(balance(100L)),
-      afterSettlement.get(destination).contains(balance(40L)),
-      total(afterSettlement) == 200L
-    )
+    } yield
+      expect.all(
+        expiredForRefund.get(consumedSource).forall(_.isEmpty),
+        expiredForRefund.get(expiredSource).contains(SortedSet(expired)),
+        afterSettlement.get(consumedSource).contains(balance(60L)),
+        afterSettlement.get(expiredSource).contains(balance(100L)),
+        afterSettlement.get(destination).contains(balance(40L)),
+        total(afterSettlement) == 200L
+      )
   }
 
   test("an unrelated no-reference spend cannot suppress expiration") { res =>
@@ -223,13 +225,14 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
           .updateCurrencyBalancesBySpendTransactions(afterExpiry, SortedMap.empty, List(directSpend))
           .leftMap(error => new AssertionError(error.message))
       )
-    } yield expect.all(
-      expiredForRefund.get(reservedSource).contains(SortedSet(expired)),
-      afterSettlement.get(reservedSource).contains(balance(100L)),
-      afterSettlement.get(directSource).contains(balance(40L)),
-      afterSettlement.get(destination).contains(balance(10L)),
-      total(afterSettlement) == 150L
-    )
+    } yield
+      expect.all(
+        expiredForRefund.get(reservedSource).contains(SortedSet(expired)),
+        afterSettlement.get(reservedSource).contains(balance(100L)),
+        afterSettlement.get(directSource).contains(balance(40L)),
+        afterSettlement.get(destination).contains(balance(10L)),
+        total(afterSettlement) == 150L
+      )
   }
 
   test("a no-reference self-transfer proves funds without burning its balance") { res =>
@@ -246,13 +249,14 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
         SortedMap.empty,
         List(spend)
       )
-    } yield expect.all(
-      accepted.contains(initial),
-      insufficient.left.exists {
-        case AllowSpendSettlementError.BalanceArithmetic(_) => true
-        case _                                               => false
-      }
-    )
+    } yield
+      expect.all(
+        accepted.contains(initial),
+        insufficient.left.exists {
+          case AllowSpendSettlementError.BalanceArithmetic(_) => true
+          case _                                              => false
+        }
+      )
   }
 
   test("Some(missing) fails instead of becoming an ordinary balance spend") { res =>
@@ -271,10 +275,11 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
         SortedMap.empty,
         List(spend)
       )
-    } yield expect(result.left.exists {
-      case AllowSpendSettlementError.MissingAllowSpendReference(`source`, `missingRef`) => true
-      case _                                                                            => false
-    })
+    } yield
+      expect(result.left.exists {
+        case AllowSpendSettlementError.MissingAllowSpendReference(`source`, `missingRef`) => true
+        case _                                                                            => false
+      })
   }
 
   test("a spend above the referenced allowance fails instead of using a zero remainder") { res =>
@@ -294,11 +299,12 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
         SortedMap(source -> List(hashed)),
         List(spend)
       )
-    } yield expect(result.left.exists {
-      case AllowSpendSettlementError.SpendAmountExceedsAllowSpend(ref, allowed, attempted) =>
-        ref === hashed.hash && allowed === amount(60L) && attempted === amount(61L)
-      case _ => false
-    })
+    } yield
+      expect(result.left.exists {
+        case AllowSpendSettlementError.SpendAmountExceedsAllowSpend(ref, allowed, attempted) =>
+          ref === hashed.hash && allowed === amount(60L) && attempted === amount(61L)
+        case _ => false
+      })
   }
 
   test("a referenced authorization is retired after one settlement in a batched global inbox") { res =>
@@ -327,10 +333,11 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
         SortedMap(source -> List(hashed)),
         List(firstOrdinalSpend, secondOrdinalReplay)
       )
-    } yield expect(result.left.exists {
-      case AllowSpendSettlementError.ReferencedAllowSpendAlreadyConsumed(`source`, ref) => ref === hashed.hash
-      case _                                                                             => false
-    })
+    } yield
+      expect(result.left.exists {
+        case AllowSpendSettlementError.ReferencedAllowSpendAlreadyConsumed(`source`, ref) => ref === hashed.hash
+        case _                                                                            => false
+      })
   }
 
   test("same-address referenced settlement accumulates amount and remainder without erasing value") { res =>
@@ -357,10 +364,11 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
         SortedMap(source -> List(hashed)),
         List(spend)
       )
-    } yield expect.all(
-      result.exists(_.get(source).contains(balance(113L))),
-      result.exists(total(_) == 113L)
-    )
+    } yield
+      expect.all(
+        result.exists(_.get(source).contains(balance(113L))),
+        result.exists(total(_) == 113L)
+      )
   }
 
   test("last-valid equality remains active and conserves the reserved principal when consumed") { res =>
@@ -387,12 +395,13 @@ object AllowSpendOpsManagerSuite extends MutableIOSuite {
           )
           .leftMap(error => new AssertionError(error.message))
       )
-    } yield expect.all(
-      expired.isEmpty,
-      updatedActive.get(source).forall(_.isEmpty),
-      afterSettlement.get(source).contains(balance(60L)),
-      afterSettlement.get(destination).contains(balance(40L)),
-      total(afterSettlement) == 100L
-    )
+    } yield
+      expect.all(
+        expired.isEmpty,
+        updatedActive.get(source).forall(_.isEmpty),
+        afterSettlement.get(source).contains(balance(60L)),
+        afterSettlement.get(destination).contains(balance(40L)),
+        total(afterSettlement) == 100L
+      )
   }
 }

@@ -111,19 +111,20 @@ object BlockAcceptanceOpsManagerTokenLockLaneSuite extends SimpleIOSuite {
           passedToShared <- seen.get
           epochPassedToShared <- seenEpoch.get
           invalidBlocks = Set(native, wrongCurrency, replacement)
-        } yield expect.all(
-          passedToShared == List(valid),
-          epochPassedToShared.contains(EpochProgress(42L)),
-          result.accepted == List(valid),
-          result.contextUpdate.balances.isEmpty,
-          result.contextUpdate.lastTokenLocksRefs.isEmpty,
-          result.notAccepted.map(_._1).toSet == invalidBlocks,
-          result.notAccepted.forall {
-            case (_, reason @ InvalidMetagraphTokenLockLane(`expectedCurrencyId`)) =>
-              TokenLockBlockNotAcceptedReason.isPermanent(reason)
-            case _ => false
-          }
-        )
+        } yield
+          expect.all(
+            passedToShared == List(valid),
+            epochPassedToShared.contains(EpochProgress(42L)),
+            result.accepted == List(valid),
+            result.contextUpdate.balances.isEmpty,
+            result.contextUpdate.lastTokenLocksRefs.isEmpty,
+            result.notAccepted.map(_._1).toSet == invalidBlocks,
+            result.notAccepted.forall {
+              case (_, reason @ InvalidMetagraphTokenLockLane(`expectedCurrencyId`)) =>
+                TokenLockBlockNotAcceptedReason.isPermanent(reason)
+              case _ => false
+            }
+          )
       }
     }
   }

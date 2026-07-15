@@ -124,16 +124,17 @@ object AllowSpendBlockAcceptanceLogicSuite extends MutableIOSuite {
       )
       applied <- IO.fromEither(finalBalances.leftMap(new AssertionError(_)))
       (appliedBalances, _) = applied
-    } yield expect.all(
-      firstUpdate.balances.get(source).contains(Balance.empty),
-      !firstUpdate.balances.contains(destination),
-      second.left.exists {
-        case AddressBalanceOutOfRange(address, _) => address === destination
-        case _                                    => false
-      },
-      appliedBalances.get(source).contains(Balance.empty),
-      appliedBalances.get(destination).contains(Balance.empty)
-    )
+    } yield
+      expect.all(
+        firstUpdate.balances.get(source).contains(Balance.empty),
+        !firstUpdate.balances.contains(destination),
+        second.left.exists {
+          case AddressBalanceOutOfRange(address, _) => address === destination
+          case _                                    => false
+        },
+        appliedBalances.get(source).contains(Balance.empty),
+        appliedBalances.get(destination).contains(Balance.empty)
+      )
   }
 
   test("allow-spend admission is permutation-stable when the only dependency is a destination credit") { res =>
@@ -159,7 +160,12 @@ object AllowSpendBlockAcceptanceLogicSuite extends MutableIOSuite {
       source = sourceKeyPair.getPublic.toAddress
       destination = destinationKeyPair.getPublic.toAddress
       reservation <- makeAllowSpend(sourceKeyPair, destination, amountValue = 100L, feeValue = 0L)
-      unfundedReservation <- makeAllowSpend(destinationKeyPair, finalDestinationKeyPair.getPublic.toAddress, amountValue = 100L, feeValue = 0L)
+      unfundedReservation <- makeAllowSpend(
+        destinationKeyPair,
+        finalDestinationKeyPair.getPublic.toAddress,
+        amountValue = 100L,
+        feeValue = 0L
+      )
       reservationBlock <- makeBlock(reservation, 11L)
       unfundedBlock <- makeBlock(unfundedReservation, 12L)
       context = AllowSpendBlockAcceptanceContext.fromStaticData[IO](
@@ -171,12 +177,13 @@ object AllowSpendBlockAcceptanceLogicSuite extends MutableIOSuite {
       logic = AllowSpendBlockAcceptanceLogic.make[IO]
       forward <- run(logic, context, List(reservationBlock, unfundedBlock))
       reverse <- run(logic, context, List(unfundedBlock, reservationBlock))
-    } yield expect.all(
-      forward._2 == List(reservationBlock),
-      reverse._2 == List(reservationBlock),
-      forward._1.balances == reverse._1.balances,
-      forward._1.balances.get(source).contains(Balance.empty),
-      !forward._1.balances.contains(destination)
-    )
+    } yield
+      expect.all(
+        forward._2 == List(reservationBlock),
+        reverse._2 == List(reservationBlock),
+        forward._1.balances == reverse._1.balances,
+        forward._1.balances.get(source).contains(Balance.empty),
+        !forward._1.balances.contains(destination)
+      )
   }
 }

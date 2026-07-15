@@ -59,8 +59,8 @@ object LocalOperatorKeyPairGate {
 
   final case class RegisteredSigningKey(operatorKeys: OperatorConsensusKeys, treeStep: Int)
 
-  /** Capability carried into consensus production after the complete local operator-key pair has matched. Only the offset is exposed; public
-    * key arrays remain owned by the registries and cannot be mutated through this value.
+  /** Capability carried into consensus production after the complete local operator-key pair has matched. Only the offset is exposed;
+    * public key arrays remain owned by the registries and cannot be mutated through this value.
     */
   final case class VerifiedLocalOperatorKeys private[nakamoto] (peerId: PeerId, kesPeriodOffset: Long) {
     def treeStepFor(globalEtaPeriod: Long): Either[Rejection, Int] =
@@ -127,8 +127,7 @@ object LocalOperatorKeyPairGate {
       case (_, _, None) =>
         Async[F].raiseError[VerifiedLocalOperatorKeys](MissingOperatorRegistration(selfId))
 
-      case (localKesVk, localKesStep, Some(keys))
-          if !ActiveOperatorConsensusKeys.isValidAt(keys, selfId, keys.effectiveFromPeriod) =>
+      case (localKesVk, localKesStep, Some(keys)) if !ActiveOperatorConsensusKeys.isValidAt(keys, selfId, keys.effectiveFromPeriod) =>
         Async[F].raiseError[VerifiedLocalOperatorKeys](
           InactiveOrInvalidOperatorRegistration(selfId, keys.effectiveFromPeriod.value)
         )
@@ -157,12 +156,11 @@ object LocalOperatorKeyPairGate {
     longTermKeyPair: KeyPair,
     operatorKeyRegistry: OperatorConsensusKeyRegistry[F],
     globalEtaPeriod: Long
-  ): F[Either[Rejection, RegisteredSigningKey]] = {
+  ): F[Either[Rejection, RegisteredSigningKey]] =
     ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, selfId, EtaPeriod(globalEtaPeriod)).flatMap {
       case None       => Async[F].pure(Left(MissingOperatorRegistration(selfId)))
       case Some(keys) => signingKeyFromResolved(keyMaker, selfId, longTermKeyPair, keys, globalEtaPeriod)
     }
-  }
 
   /** Authenticate one pair already resolved from the frozen-genesis compatibility registry. No second registry lookup occurs, so the KES
     * step and VRF proof/signature use the same atomic record.
@@ -182,37 +180,38 @@ object LocalOperatorKeyPairGate {
     val (_, localVrfVk) = VrfKeyDeriver.deriveVrfKeyPair(longTermKeyPair)
     val artifactPeriod = EtaPeriod(globalEtaPeriod)
 
-    (keyMaker.currentPublicKey, keyMaker.currentPeriod).tupled.map { case (localKesVk, localKesStep) =>
-      val registeredKes = keys.kes
-      for {
-        _ <- Either.cond(
-          localPeerId === selfId,
-          (),
-          LongTermIdentityMismatch(selfId, localPeerId): Rejection
-        )
-        _ <- Either.cond(
-          ActiveOperatorConsensusKeys.isValidAt(keys, selfId, artifactPeriod),
-          (),
-          InactiveOrInvalidOperatorRegistration(selfId, globalEtaPeriod): Rejection
-        )
-        _ <- validateKesRegistration(selfId, registeredKes, localKesVk.step, localKesStep)
-        _ <- Either.cond(
-          java.security.MessageDigest.isEqual(localKesVk.value, registeredKes.vk.value),
-          (),
-          KesMasterKeyMismatch(selfId): Rejection
-        )
-        _ <- Either.cond(
-          java.security.MessageDigest.isEqual(localVrfVk, keys.vrfPublicKey.toBytes),
-          (),
-          VrfKeyMismatch(selfId): Rejection
-        )
-        requiredStep <- treeStepFor(globalEtaPeriod, registeredKes.offset)
-        _ <- Either.cond(
-          localKesStep <= requiredStep,
-          (),
-          KesSecretAlreadyAhead(selfId, localKesStep, requiredStep): Rejection
-        )
-      } yield RegisteredSigningKey(keys, requiredStep)
+    (keyMaker.currentPublicKey, keyMaker.currentPeriod).tupled.map {
+      case (localKesVk, localKesStep) =>
+        val registeredKes = keys.kes
+        for {
+          _ <- Either.cond(
+            localPeerId === selfId,
+            (),
+            LongTermIdentityMismatch(selfId, localPeerId): Rejection
+          )
+          _ <- Either.cond(
+            ActiveOperatorConsensusKeys.isValidAt(keys, selfId, artifactPeriod),
+            (),
+            InactiveOrInvalidOperatorRegistration(selfId, globalEtaPeriod): Rejection
+          )
+          _ <- validateKesRegistration(selfId, registeredKes, localKesVk.step, localKesStep)
+          _ <- Either.cond(
+            java.security.MessageDigest.isEqual(localKesVk.value, registeredKes.vk.value),
+            (),
+            KesMasterKeyMismatch(selfId): Rejection
+          )
+          _ <- Either.cond(
+            java.security.MessageDigest.isEqual(localVrfVk, keys.vrfPublicKey.toBytes),
+            (),
+            VrfKeyMismatch(selfId): Rejection
+          )
+          requiredStep <- treeStepFor(globalEtaPeriod, registeredKes.offset)
+          _ <- Either.cond(
+            localKesStep <= requiredStep,
+            (),
+            KesSecretAlreadyAhead(selfId, localKesStep, requiredStep): Rejection
+          )
+        } yield RegisteredSigningKey(keys, requiredStep)
     }
   }
 

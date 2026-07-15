@@ -22,8 +22,7 @@ object DurableFileError {
   final case class AtomicMoveRequired(path: Path, cause0: Throwable)
       extends DurableFileError(s"Atomic replacement is required for durable storage: $path", cause0)
 
-  final case class TargetHasNoParent(path: Path)
-      extends DurableFileError(s"Durable replacement target must have a parent directory: $path")
+  final case class TargetHasNoParent(path: Path) extends DurableFileError(s"Durable replacement target must have a parent directory: $path")
 }
 
 /** Minimal filesystem algebra for crash-safe local artifacts.

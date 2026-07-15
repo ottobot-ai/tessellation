@@ -424,8 +424,8 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       .map(_._1)
 
   /** Store/control-flow witness under a synthetic enabled k/s configuration only: the bodies bind signed ordinal/parent ancestry and every
-    * schedule is parent-first, but this deliberately bypasses NakamotoSnapshotValidator and therefore does not prove
-    * VRF/KES/eta/era-valid network admission or divergence under a shipped environment configuration.
+    * schedule is parent-first, but this deliberately bypasses NakamotoSnapshotValidator and therefore does not prove VRF/KES/eta/era-valid
+    * network admission or divergence under a shipped environment configuration.
     */
   test("activation blocker: parent-first signed-ancestry store schedules over one strict frontier leave three different best tips") { res =>
     val (_, _, j, h, sp) = res
@@ -1138,10 +1138,11 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       _ <- diskByHashRef.set(Map(item.hash -> item.signed))
       position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
       result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
-    } yield expect.same(
-      Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(position, failure.getMessage)),
-      result
-    )
+    } yield
+      expect.same(
+        Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(position, failure.getMessage)),
+        result
+      )
   }
 
   test("walkBackExact: hash selector failures remain inside the typed result") { res =>
@@ -1162,10 +1163,11 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       _ <- diskByHashRef.set(Map(item.hash -> item.signed))
       position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
       result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
-    } yield expect.same(
-      Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(position, failure.getMessage)),
-      result
-    )
+    } yield
+      expect.same(
+        Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(position, failure.getMessage)),
+        result
+      )
   }
 
   test("walkBackExact: exact-hash disk record wins over a same-ordinal sibling") { res =>

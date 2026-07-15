@@ -197,7 +197,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     and the broader recovery matrix remain open. After 1A/1B, field 32 is rejected
     from GL0 recovery rather than synthesized as an empty replay input. Make
     malformed tower/SMT durable keys reject the whole load instead of disappearing
-    (`STOR-02`, `REC-004`).
+    (`STOR-02`, `REC-004`). The strict total decoder, complete tower construction,
+    one-time validated tower index, and isolated historical replay tree swap are
+    green in focused worktree tests; double replay produces identical retained
+    roots, and injected hashing failure/cancellation preserves the prior derived tree. Durable-KV
+    crash atomicity, production boot/disk wiring, `TowerFinalizer` restart refs,
+    and its bounded catch-up cursor remain open: the live loop marks target A
+    settled before asynchronously processing at most 100 ordinals from prior P,
+    so a farther suffix or missing/failed entry is not retried. Restart/compaction,
+    exact-hash density reorg, proof serving, and authenticated clean-rebuild
+    integration remain open.
   - [ ] **5. Integrated qualification:** prove identical GSAM decisions/root from
     identical rooted state under every sidecar mutation, then exercise restart,
     compaction, density reorg/recovery, and shard counts 1/2/K. Include expiry,
@@ -680,7 +689,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `RecoveryRequired`; it never falls back to receiver live head.
   - **Gate:** `BOOT-001..005`, `XMG-006`, `FOLLOW-001..007` plus
     `FOLLOW-008A..P`, `REC-*` including
-    `REC-004/005`, `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02`,
+    `REC-004/005`, `MEMPOOL-001`, `ROOT-002..005`, `ROOT-009`, `STOR-02/03`,
     `GROWTH-001`.
 
 - [ ] **E11 SCAFFOLD ONLY - exceptional replay, adjudication, and slashing**

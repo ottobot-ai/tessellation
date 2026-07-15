@@ -11,7 +11,7 @@ import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshot
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.{Hashed, HashLogic, Hasher, HasherSelector}
+import io.constellationnetwork.security.{HashLogic, Hashed, Hasher, HasherSelector}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
@@ -913,27 +913,24 @@ object NakamotoChainStore {
             Option(error.getMessage).filter(_.nonEmpty).getOrElse(error.getClass.getName)
 
           def rehash(expected: ExactWalkPosition, signed: Signed[GlobalIncrementalSnapshot]): F[Either[ExactWalkError, Hash]] =
-            Async[F]
-              .delay {
-                val selector = HasherSelector[F]
-                val currentHasher = selector.getCurrent
-                val currentLogic = currentHasher.getLogic(expected.ordinal)
-                val ordinalLogic = selector.getForOrdinal(expected.ordinal).getLogic(expected.ordinal)
-                (currentHasher, currentLogic, ordinalLogic)
-              }
-              .attempt
-              .flatMap {
-                case Left(error) =>
-                  Async[F].pure(Left(ContentHashFailed(expected, renderCause(error))))
-                case Right((_, currentLogic, ordinalLogic)) if currentLogic != ordinalLogic =>
-                  Async[F].pure(Left(HashEraUnavailable(expected, currentLogic, ordinalLogic)))
-                case Right((currentHasher, _, _)) =>
-                  implicit val hasher: Hasher[F] = currentHasher
-                  signed.toHashed[F].map(_.hash).attempt.map {
-                    case Right(hash) => Right(hash)
-                    case Left(error) => Left(ContentHashFailed(expected, renderCause(error)))
-                  }
-              }
+            Async[F].delay {
+              val selector = HasherSelector[F]
+              val currentHasher = selector.getCurrent
+              val currentLogic = currentHasher.getLogic(expected.ordinal)
+              val ordinalLogic = selector.getForOrdinal(expected.ordinal).getLogic(expected.ordinal)
+              (currentHasher, currentLogic, ordinalLogic)
+            }.attempt.flatMap {
+              case Left(error) =>
+                Async[F].pure(Left(ContentHashFailed(expected, renderCause(error))))
+              case Right((_, currentLogic, ordinalLogic)) if currentLogic != ordinalLogic =>
+                Async[F].pure(Left(HashEraUnavailable(expected, currentLogic, ordinalLogic)))
+              case Right((currentHasher, _, _)) =>
+                implicit val hasher: Hasher[F] = currentHasher
+                signed.toHashed[F].map(_.hash).attempt.map {
+                  case Right(hash) => Right(hash)
+                  case Left(error) => Left(ContentHashFailed(expected, renderCause(error)))
+                }
+            }
 
           def isCanonicalSnapshotHash(hash: Hash): Boolean = {
             val value = hash.value

@@ -238,8 +238,9 @@ object BalanceReservationLedgerSuite extends FunSuite {
     val accounts = List(dagAlice, dagBob, dagCarol).sorted(BalanceAccount.ordering)
     val reverseAccounts = BalanceAccount.ordering.reverse
     val reverseBalances = List(dagCarol -> BigInt(30), dagAlice -> BigInt(10), dagBob -> BigInt(0))
-      .foldLeft(SortedMap.empty[BalanceAccount, BigInt](reverseAccounts)) { case (acc, (account, balance)) =>
-        acc.updated(account, balance)
+      .foldLeft(SortedMap.empty[BalanceAccount, BigInt](reverseAccounts)) {
+        case (acc, (account, balance)) =>
+          acc.updated(account, balance)
       }
     val restored = BalanceReservationState.restore(reverseBalances, Map.empty, Set.empty, Set.empty).toOption.get
     val forward = claim(
@@ -264,8 +265,9 @@ object BalanceReservationLedgerSuite extends FunSuite {
   test("invalid restart balances report the canonical first account, independent of input ordering") {
     val reverse = BalanceAccount.ordering.reverse
     val invalid = List(dagAlice -> BigInt(-1), dagCarol -> BigInt(-2))
-      .foldLeft(SortedMap.empty[BalanceAccount, BigInt](reverse)) { case (acc, (account, balance)) =>
-        acc.updated(account, balance)
+      .foldLeft(SortedMap.empty[BalanceAccount, BigInt](reverse)) {
+        case (acc, (account, balance)) =>
+          acc.updated(account, balance)
       }
     val expectedFirst = List(dagAlice, dagCarol).min(BalanceAccount.ordering)
     val expectedValue = invalid(expectedFirst)

@@ -68,7 +68,7 @@ object AcceptanceMptMalformedSystemIndexSuite extends MutableIOSuite {
     expect.all(
       outcome match {
         case Left(error: StrictMptRead.MalformedConsensusMptValue) => error.physicalKey == expectedKey
-        case _                                                    => false
+        case _                                                     => false
       },
       unchanged
     )

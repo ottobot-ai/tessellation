@@ -50,11 +50,11 @@ object FinalityEffectCodecs {
   implicit val effectScopeCodec: Codec[EffectScope] =
     (finalityDomainCodec :: intentIdCodec :: releaseGenerationCodec :: strictOption(globalSnapshotStateRefCodec) :: requiredHashCodec ::
       globalSnapshotStateRefCodec).xmap[EffectScope](
-      { case domain :: intent :: generation :: priorState :: transitionDigest :: target :: HNil =>
-        EffectScope(domain, intent, generation, priorState, transitionDigest, target)
+      {
+        case domain :: intent :: generation :: priorState :: transitionDigest :: target :: HNil =>
+          EffectScope(domain, intent, generation, priorState, transitionDigest, target)
       },
-      value =>
-        value.domain :: value.intent :: value.generation :: value.priorState :: value.transitionDigest :: value.target :: HNil
+      value => value.domain :: value.intent :: value.generation :: value.priorState :: value.transitionDigest :: value.target :: HNil
     )
 
   private val rawEffectCommandIdentityCodec: Codec[EffectCommandIdentity] =
@@ -211,28 +211,29 @@ object FinalityEffectCodecs {
   implicit val effectPlanCommitmentCodec: Codec[EffectPlanCommitment] =
     (strictOption(effectManifestPointerCodec) :: commitmentGroupACodec :: commitmentGroupBCodec)
       .xmap[EffectPlanCommitment](
-        { case previous :: a :: b :: HNil =>
-          EffectPlanCommitment(
-            previous,
-            a.chainStore,
-            a.snapshotStorage,
-            a.tipTracker,
-            a.overlayCache,
-            a.serviceAvailabilityWatermark,
-            a.latestSlice,
-            a.followProjectionRing,
-            a.accumulatorChangeset,
-            a.signedBytes,
-            b.sidecarOutbox,
-            b.shardAnchorAndWatermark,
-            b.binaryConfirmationAndRequeue,
-            b.committeeAdmission,
-            b.etaCommitteeAnchor,
-            b.mempool,
-            b.towerIndex,
-            b.downstreamFollowerEvent,
-            b.snapshotRetention
-          )
+        {
+          case previous :: a :: b :: HNil =>
+            EffectPlanCommitment(
+              previous,
+              a.chainStore,
+              a.snapshotStorage,
+              a.tipTracker,
+              a.overlayCache,
+              a.serviceAvailabilityWatermark,
+              a.latestSlice,
+              a.followProjectionRing,
+              a.accumulatorChangeset,
+              a.signedBytes,
+              b.sidecarOutbox,
+              b.shardAnchorAndWatermark,
+              b.binaryConfirmationAndRequeue,
+              b.committeeAdmission,
+              b.etaCommitteeAnchor,
+              b.mempool,
+              b.towerIndex,
+              b.downstreamFollowerEvent,
+              b.snapshotRetention
+            )
         },
         value =>
           value.previous ::
@@ -336,29 +337,30 @@ object FinalityEffectCodecs {
   private val rawFinalityEffectManifestCodec: Codec[FinalityEffectManifest] =
     (effectScopeCodec :: strictOption(effectManifestPointerCodec) :: commandGroupACodec :: commandGroupBCodec)
       .xmap[FinalityEffectManifest](
-        { case scope :: previous :: a :: b :: HNil =>
-          FinalityEffectManifest(
-            scope,
-            previous,
-            a.chainStore,
-            a.snapshotStorage,
-            a.tipTracker,
-            a.overlayCache,
-            a.serviceAvailabilityWatermark,
-            a.latestSlice,
-            a.followProjectionRing,
-            a.accumulatorChangeset,
-            a.signedBytes,
-            b.sidecarOutbox,
-            b.shardAnchorAndWatermark,
-            b.binaryConfirmationAndRequeue,
-            b.committeeAdmission,
-            b.etaCommitteeAnchor,
-            b.mempool,
-            b.towerIndex,
-            b.downstreamFollowerEvent,
-            b.snapshotRetention
-          )
+        {
+          case scope :: previous :: a :: b :: HNil =>
+            FinalityEffectManifest(
+              scope,
+              previous,
+              a.chainStore,
+              a.snapshotStorage,
+              a.tipTracker,
+              a.overlayCache,
+              a.serviceAvailabilityWatermark,
+              a.latestSlice,
+              a.followProjectionRing,
+              a.accumulatorChangeset,
+              a.signedBytes,
+              b.sidecarOutbox,
+              b.shardAnchorAndWatermark,
+              b.binaryConfirmationAndRequeue,
+              b.committeeAdmission,
+              b.etaCommitteeAnchor,
+              b.mempool,
+              b.towerIndex,
+              b.downstreamFollowerEvent,
+              b.snapshotRetention
+            )
         },
         value =>
           value.scope :: value.previous ::
@@ -392,8 +394,9 @@ object FinalityEffectCodecs {
     (effectManifestPointerCodec :: effectIdCodec :: effectStateDigestCodec :: effectSinkRevisionCodec :: effectStateDigestCodec ::
       effectSinkRevisionCodec)
       .xmap[AppliedEffectReceipt](
-        { case manifest :: effectId :: before :: beforeRevision :: state :: revision :: HNil =>
-          AppliedEffectReceipt(manifest, effectId, before, beforeRevision, state, revision)
+        {
+          case manifest :: effectId :: before :: beforeRevision :: state :: revision :: HNil =>
+            AppliedEffectReceipt(manifest, effectId, before, beforeRevision, state, revision)
         },
         value =>
           value.manifest :: value.effectId :: value.observedBefore :: value.observedBeforeRevision :: value.observedState ::
@@ -403,8 +406,9 @@ object FinalityEffectCodecs {
   private val alreadyAppliedReceiptCodec: Codec[AlreadyAppliedEffectReceipt] =
     (effectManifestPointerCodec :: effectIdCodec :: effectStateDigestCodec :: effectSinkRevisionCodec)
       .xmap[AlreadyAppliedEffectReceipt](
-        { case manifest :: effectId :: state :: revision :: HNil =>
-          AlreadyAppliedEffectReceipt(manifest, effectId, state, revision)
+        {
+          case manifest :: effectId :: state :: revision :: HNil =>
+            AlreadyAppliedEffectReceipt(manifest, effectId, state, revision)
         },
         value => value.manifest :: value.effectId :: value.observedState :: value.sinkRevision :: HNil
       )

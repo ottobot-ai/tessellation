@@ -8,11 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import scala.util.Try
 
 import io.constellationnetwork.node.shared.domain.nakamoto.kes._
-import io.constellationnetwork.schema.kes.KesRegistrationCert.{
-  KesRegistrationOrdinal,
-  KesRegistrationRecord,
-  KesRegistrationReference
-}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, StakeDistribution}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
@@ -23,10 +19,10 @@ import io.constellationnetwork.security.{Hasher, HasherSelector}
 
 /** An exact, already-authenticated candidate-parent context.
   *
-  * Implementations must return the `GlobalSnapshotInfo` reproduced while validating the signed snapshot identified by `parentHash`.
-  * A best-tip context, an ordinal-only lookup, an unverified disk placeholder, or an unknown-branch fallback does not satisfy this
-  * contract. Missing authenticated history is represented by `None` and makes consensus work defer/recover; callers must never fall back
-  * to a current registry.
+  * Implementations must return the `GlobalSnapshotInfo` reproduced while validating the signed snapshot identified by `parentHash`. A
+  * best-tip context, an ordinal-only lookup, an unverified disk placeholder, or an unknown-branch fallback does not satisfy this contract.
+  * Missing authenticated history is represented by `None` and makes consensus work defer/recover; callers must never fall back to a current
+  * registry.
   */
 final case class HistoricalOperatorRegistryView(
   parentHash: Hash,
@@ -97,10 +93,8 @@ final case class HistoricalRegistryArithmeticOverflow(operation: String) extends
 final case class InvalidEtaRotationSnapshots(value: Long) extends HistoricalOperatorRegistryError
 final case class CorruptHistoricalOperatorRegistry(candidateParent: Hash, reasons: NonEmptyList[String])
     extends HistoricalOperatorRegistryError
-final case class DelayedStakePopulationUnavailable(candidateParent: Hash, period: EtaPeriod)
-    extends HistoricalOperatorRegistryError
-final case class CanonicalOperatorRosterUnavailable(candidateParent: Hash, period: EtaPeriod)
-    extends HistoricalOperatorRegistryError
+final case class DelayedStakePopulationUnavailable(candidateParent: Hash, period: EtaPeriod) extends HistoricalOperatorRegistryError
+final case class CanonicalOperatorRosterUnavailable(candidateParent: Hash, period: EtaPeriod) extends HistoricalOperatorRegistryError
 final case class CanonicalOperatorRosterIdentityMismatch(
   requestedParent: Hash,
   requestedPeriod: EtaPeriod,
@@ -180,26 +174,27 @@ object HistoricalOperatorConsensusKeyRegistry {
           case Left(error) => error.asLeft[CanonicalEligibleOperatorSet].pure[F]
           case Right(state) =>
             val populationPeriod = period.minus(KesRegistrationCertValidator.ActivationDelayPeriods)
-            populationAt(state, populationPeriod).map(_.map { case (roster, distribution) =>
-              val active = (state.genesis.keySet ++ state.runtimeChains.keySet).toList.sorted.flatMap { operator =>
-                activeFor(operator, state, period).map(operator -> _)
-              }.toMap
-              val eligiblePeers = roster.operators.iterator.filter { operator =>
-                distribution.stakeOf(operator) > 0 && active.contains(operator)
-              }.toList.sorted
-              val eligibleKeys = eligiblePeers.iterator.map(operator => operator -> active(operator)).to(SortedMap)
-              val eligibleStakes = StakeDistribution(
-                eligiblePeers.iterator.map(operator => operator -> distribution.stakeOf(operator)).to(SortedMap)
-              )
+            populationAt(state, populationPeriod).map(_.map {
+              case (roster, distribution) =>
+                val active = (state.genesis.keySet ++ state.runtimeChains.keySet).toList.sorted.flatMap { operator =>
+                  activeFor(operator, state, period).map(operator -> _)
+                }.toMap
+                val eligiblePeers = roster.operators.iterator.filter { operator =>
+                  distribution.stakeOf(operator) > 0 && active.contains(operator)
+                }.toList.sorted
+                val eligibleKeys = eligiblePeers.iterator.map(operator => operator -> active(operator)).to(SortedMap)
+                val eligibleStakes = StakeDistribution(
+                  eligiblePeers.iterator.map(operator => operator -> distribution.stakeOf(operator)).to(SortedMap)
+                )
 
-              CanonicalEligibleOperatorSet(
-                state.view.parentHash,
-                state.view.parentOrdinal,
-                period,
-                populationPeriod,
-                eligibleKeys,
-                eligibleStakes
-              )
+                CanonicalEligibleOperatorSet(
+                  state.view.parentHash,
+                  state.view.parentOrdinal,
+                  period,
+                  populationPeriod,
+                  eligibleKeys,
+                  eligibleStakes
+                )
             })
         }
 
@@ -224,8 +219,7 @@ object HistoricalOperatorConsensusKeyRegistry {
             case Some(stakeSnapshot) =>
               rosters.get(state.view.parentHash, period).map {
                 case None => CanonicalOperatorRosterUnavailable(state.view.parentHash, period).asLeft
-                case Some(roster)
-                    if roster.candidateParent =!= state.view.parentHash || roster.period =!= period =>
+                case Some(roster) if roster.candidateParent =!= state.view.parentHash || roster.period =!= period =>
                   CanonicalOperatorRosterIdentityMismatch(
                     state.view.parentHash,
                     period,
@@ -290,13 +284,16 @@ object HistoricalOperatorConsensusKeyRegistry {
           val genesis = genesisMap.iterator.to(SortedMap)
           val genesisErrors = validateGenesis(genesis)
           val keySetErrors =
-            Option.when(view.info.kesRegistrationCerts.keySet =!= view.info.lastKesRegistrationRefs.keySet)(
-              s"history/pointer operator sets differ: histories=${view.info.kesRegistrationCerts.keySet.mkString(",")}, " +
-                s"pointers=${view.info.lastKesRegistrationRefs.keySet.mkString(",")}"
-            ).toList
+            Option
+              .when(view.info.kesRegistrationCerts.keySet =!= view.info.lastKesRegistrationRefs.keySet)(
+                s"history/pointer operator sets differ: histories=${view.info.kesRegistrationCerts.keySet.mkString(",")}, " +
+                  s"pointers=${view.info.lastKesRegistrationRefs.keySet.mkString(",")}"
+              )
+              .toList
 
-          view.info.kesRegistrationCerts.toList.traverse { case (operator, records) =>
-            validateChain(view, operator, records, view.info.lastKesRegistrationRefs.get(operator))
+          view.info.kesRegistrationCerts.toList.traverse {
+            case (operator, records) =>
+              validateChain(view, operator, records, view.info.lastKesRegistrationRefs.get(operator))
           }.map { chainResults =>
             val chainErrors = chainResults.collect { case Left(errors) => errors }.flatten
             val chains = chainResults.collect { case Right((operator, chain)) => operator -> chain }.to(SortedMap)
@@ -323,13 +320,14 @@ object HistoricalOperatorConsensusKeyRegistry {
         }
 
       private def validateGenesis(genesis: SortedMap[PeerId, OperatorConsensusKeys]): List[String] = {
-        val entryErrors = genesis.toList.flatMap { case (operator, keys) =>
-          val malformed =
-            operator =!= keys.operatorPeerId || keys.registration.nonEmpty || keys.effectiveFromPeriod =!= EtaPeriod.Zero ||
-              keys.kes.vk.step != 0 || keys.kes.offset != 0L ||
-              keys.kes.vk.value.length != KesRegistrationCertValidator.KesMasterVerificationKeyLength ||
-              keys.vrfPublicKey.toBytes.length != io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.ExpectedLength
-          Option.when(malformed)(s"malformed atomic genesis key pair for $operator").toList
+        val entryErrors = genesis.toList.flatMap {
+          case (operator, keys) =>
+            val malformed =
+              operator =!= keys.operatorPeerId || keys.registration.nonEmpty || keys.effectiveFromPeriod =!= EtaPeriod.Zero ||
+                keys.kes.vk.step != 0 || keys.kes.offset != 0L ||
+                keys.kes.vk.value.length != KesRegistrationCertValidator.KesMasterVerificationKeyLength ||
+                keys.vrfPublicKey.toBytes.length != io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.ExpectedLength
+            Option.when(malformed)(s"malformed atomic genesis key pair for $operator").toList
         }
         val negativeStakeErrors = genesisPopulation.stakes.stakes.toList.collect {
           case (operator, amount) if amount < 0 => s"negative genesis stake for $operator"
@@ -366,9 +364,11 @@ object HistoricalOperatorConsensusKeyRegistry {
 
           val chainErrors = walked.left.getOrElse(Nil)
           val chain = walked.toOption.getOrElse(Nil)
-          val completenessErrors = Option.when(chain.size != recordList.size || chain.toSet != recordList.toSet)(
-            s"$prefixes retained history contains records outside the pointer-selected chain"
-          ).toList
+          val completenessErrors = Option
+            .when(chain.size != recordList.size || chain.toSet != recordList.toSet)(
+              s"$prefixes retained history contains records outside the pointer-selected chain"
+            )
+            .toList
           val orderingErrors = chain.sliding(2).toList.flatMap {
             case previous :: current :: Nil =>
               val acceptedMonotonic = previous.acceptedAt.value.value < current.acceptedAt.value.value
@@ -401,8 +401,7 @@ object HistoricalOperatorConsensusKeyRegistry {
             List(s"operator=$operator registration chain does not start at ordinal one")
           )
         else {
-          val ordinalIsNext = checkedAdd(cert.parent.ordinal.value.value, 1L, "registration ordinal + 1")
-            .toOption
+          val ordinalIsNext = checkedAdd(cert.parent.ordinal.value.value, 1L, "registration ordinal + 1").toOption
             .contains(cert.ordinal.value.value)
           if (!ordinalIsNext) Left(List(s"operator=$operator registration ordinal/parent gap"))
           else
@@ -435,20 +434,30 @@ object HistoricalOperatorConsensusKeyRegistry {
 
         Option.when(cert.operatorPeerId =!= operator)(s"record body belongs to ${cert.operatorPeerId}").toList ++
           Option.when(record.acceptedAt.value.value > view.parentOrdinal.value.value)(s"record accepted after candidate parent").toList ++
-          Option.when(record.event.proofs.size != 1 || signerIds != Set(operator))(s"record is not exclusively signed by its operator").toList ++
-          Option.when(kesBytes.forall(_.length != KesRegistrationCertValidator.KesMasterVerificationKeyLength))(
-            s"record has malformed KES master key"
-          ).toList ++
-          Option.when(vrfBytes.forall(_.length != io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.ExpectedLength))(
-            s"record has malformed VRF public key"
-          ).toList ++
-          Option.when(cert.kesMasterVKStep != 0 || cert.offset < 0L || cert.offset != cert.effectiveFromPeriod.value)(
-            s"record has inconsistent KES activation"
-          ).toList ++
+          Option
+            .when(record.event.proofs.size != 1 || signerIds != Set(operator))(s"record is not exclusively signed by its operator")
+            .toList ++
+          Option
+            .when(kesBytes.forall(_.length != KesRegistrationCertValidator.KesMasterVerificationKeyLength))(
+              s"record has malformed KES master key"
+            )
+            .toList ++
+          Option
+            .when(vrfBytes.forall(_.length != io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey.ExpectedLength))(
+              s"record has malformed VRF public key"
+            )
+            .toList ++
+          Option
+            .when(cert.kesMasterVKStep != 0 || cert.offset < 0L || cert.offset != cert.effectiveFromPeriod.value)(
+              s"record has inconsistent KES activation"
+            )
+            .toList ++
           Option.when(cert.effectiveFromPeriod.value < 0L)(s"record has negative activation period").toList ++
-          Option.when(minimumActivation.forall(cert.effectiveFromPeriod.value < _))(
-            s"record violates the two-period preregistration delay"
-          ).toList
+          Option
+            .when(minimumActivation.forall(cert.effectiveFromPeriod.value < _))(
+              s"record violates the two-period preregistration delay"
+            )
+            .toList
       }
 
       private def referenceAt(record: KesRegistrationRecord): F[KesRegistrationReference] =

@@ -172,9 +172,10 @@ object StrictMptEnumerationSuite extends MutableIOSuite {
         _ = prefixed(key)(0) = 0.toByte
         _ = legacy(key)(0) = 0.toByte
         retained <- store.allEntriesStrict
-      } yield expect(
-        retained == List(StrictMptRawEntry(key, Some(ByteVector.view(original.clone()))))
-      )
+      } yield
+        expect(
+          retained == List(StrictMptRawEntry(key, Some(ByteVector.view(original.clone()))))
+        )
     }
   }
 

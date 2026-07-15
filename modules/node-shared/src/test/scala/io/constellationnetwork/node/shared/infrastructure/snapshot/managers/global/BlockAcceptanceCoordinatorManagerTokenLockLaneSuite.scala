@@ -112,15 +112,16 @@ object BlockAcceptanceCoordinatorManagerTokenLockLaneSuite extends SimpleIOSuite
           passedToShared <- seen.get
           epochPassedToShared <- seenEpoch.get
           invalidBlocks = Set(plainCurrency, currencyReplacement, mixed)
-        } yield expect.all(
-          passedToShared == List(validNative),
-          epochPassedToShared.contains(EpochProgress.MinValue),
-          result.accepted == List(validNative),
-          result.contextUpdate == TokenLockBlockAcceptanceContextUpdate.empty,
-          result.notAccepted.map(_._1).toSet == invalidBlocks,
-          result.notAccepted.forall { case (_, reason) => reason == InvalidGlobalTokenLockLane },
-          TokenLockBlockNotAcceptedReason.isPermanent(InvalidGlobalTokenLockLane)
-        )
+        } yield
+          expect.all(
+            passedToShared == List(validNative),
+            epochPassedToShared.contains(EpochProgress.MinValue),
+            result.accepted == List(validNative),
+            result.contextUpdate == TokenLockBlockAcceptanceContextUpdate.empty,
+            result.notAccepted.map(_._1).toSet == invalidBlocks,
+            result.notAccepted.forall { case (_, reason) => reason == InvalidGlobalTokenLockLane },
+            TokenLockBlockNotAcceptedReason.isPermanent(InvalidGlobalTokenLockLane)
+          )
       }
     }
   }

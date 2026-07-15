@@ -60,8 +60,8 @@ object PhysicalTrieKeyValidator {
     validateKeys(materialized.map(_._1)).map(_ => materialized.toMap)
   }
 
-  /** Validate an upsert batch against an already-validated current image. Exact current-key replacements are allowed. This avoids sorting or
-    * copying the complete image on every ordinary insert: terminal collisions are found by checking proper byte-prefix membership in the
+  /** Validate an upsert batch against an already-validated current image. Exact current-key replacements are allowed. This avoids sorting
+    * or copying the complete image on every ordinary insert: terminal collisions are found by checking proper byte-prefix membership in the
     * current and incoming key sets.
     */
   def validateInsertion(currentKeys: Set[Hex], upsertKeys: Iterable[Hex]): Either[PhysicalTrieKeyError, Unit] = {
@@ -109,14 +109,20 @@ object PhysicalTrieKeyValidator {
     (0 until key.value.length by 2).iterator.map(length => Hex(key.value.take(length)))
 
   private def rejectDuplicatePaths(normalized: Vector[(Hex, Hex)]): Either[PhysicalTrieKeyError, Unit] =
-    normalized.zip(normalized.drop(1)).collectFirst {
-      case ((path, first), (nextPath, second)) if path == nextPath =>
-        DuplicatePhysicalTriePath(path, first, second)
-    }.toLeft(())
+    normalized
+      .zip(normalized.drop(1))
+      .collectFirst {
+        case ((path, first), (nextPath, second)) if path == nextPath =>
+          DuplicatePhysicalTriePath(path, first, second)
+      }
+      .toLeft(())
 
   private def rejectTerminalCollisions(normalized: Vector[(Hex, Hex)]): Either[PhysicalTrieKeyError, Unit] =
-    normalized.zip(normalized.drop(1)).collectFirst {
-      case ((path, terminal), (nextPath, descendant)) if nextPath.value.startsWith(path.value) =>
-        TerminalPhysicalTrieKeyCollision(terminal, descendant)
-    }.toLeft(())
+    normalized
+      .zip(normalized.drop(1))
+      .collectFirst {
+        case ((path, terminal), (nextPath, descendant)) if nextPath.value.startsWith(path.value) =>
+          TerminalPhysicalTrieKeyCollision(terminal, descendant)
+      }
+      .toLeft(())
 }

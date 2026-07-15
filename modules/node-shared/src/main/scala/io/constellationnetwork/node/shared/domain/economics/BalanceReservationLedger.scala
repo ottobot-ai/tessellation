@@ -68,8 +68,7 @@ sealed trait NonLiquidDisposition extends Product with Serializable {
 object NonLiquidDisposition {
   final case class Reservation(scope: BalanceScope, semantic: ReservationSemantic, semanticAnchor: Hash, amount: Amount)
       extends NonLiquidDisposition
-  final case class FeeSink(scope: BalanceScope, recipient: Address, policyAnchor: Hash, amount: Amount)
-      extends NonLiquidDisposition
+  final case class FeeSink(scope: BalanceScope, recipient: Address, policyAnchor: Hash, amount: Amount) extends NonLiquidDisposition
 
   implicit val ordering: Ordering[NonLiquidDisposition] = new Ordering[NonLiquidDisposition] {
     def compare(left: NonLiquidDisposition, right: NonLiquidDisposition): Int =
@@ -81,9 +80,9 @@ object NonLiquidDisposition {
             Ordering[Hash].compare(a.semanticAnchor, b.semanticAnchor),
             java.lang.Long.compare(a.amount.value.value, b.amount.value.value)
           )
-        case (_: Reservation, _: FeeSink)      => -1
-        case (_: FeeSink, _: Reservation)      => 1
-        case (a: FeeSink, b: FeeSink)          =>
+        case (_: Reservation, _: FeeSink) => -1
+        case (_: FeeSink, _: Reservation) => 1
+        case (a: FeeSink, b: FeeSink) =>
           firstNonZero(
             Ordering[BalanceScope].compare(a.scope, b.scope),
             Ordering[Address].compare(a.recipient, b.recipient),
@@ -97,9 +96,9 @@ object NonLiquidDisposition {
     (left, right) match {
       case (a: Reservation, b: Reservation) =>
         a.scope == b.scope && a.semantic == b.semantic && a.semanticAnchor == b.semanticAnchor
-      case (a: FeeSink, b: FeeSink)         =>
+      case (a: FeeSink, b: FeeSink) =>
         a.scope == b.scope && a.recipient == b.recipient && a.policyAnchor == b.policyAnchor
-      case _                                => false
+      case _ => false
     }
 
   private def firstNonZero(values: Int*): Int = values.find(_ != 0).getOrElse(0)
@@ -139,11 +138,11 @@ object AuthenticatedReleaseSource {
 
 /** Canonical, conserved claim body.
   *
-  * Construction derives both gross outgoing debits and final liquid-balance deltas from typed components. This dark slice has no issuance or
-  * implicit-burn component: every outgoing debit names an ordinary liquid credit, an exact semantic reservation anchor, or an exact fee
-  * recipient/policy sink. The ledger does not yet persist those non-liquid dispositions, so they are declarations checked by this projection
-  * kernel, not rooted state transitions. Authenticated releases separately return value from a caller-authenticated non-liquid reservation
-  * and may fund gross outgoing checks in the same operation.
+  * Construction derives both gross outgoing debits and final liquid-balance deltas from typed components. This dark slice has no issuance
+  * or implicit-burn component: every outgoing debit names an ordinary liquid credit, an exact semantic reservation anchor, or an exact fee
+  * recipient/policy sink. The ledger does not yet persist those non-liquid dispositions, so they are declarations checked by this
+  * projection kernel, not rooted state transitions. Authenticated releases separately return value from a caller-authenticated non-liquid
+  * reservation and may fund gross outgoing checks in the same operation.
   */
 final case class BalanceReservationClaim private[economics] (
   sourceOperationHash: Hash,
@@ -190,8 +189,9 @@ object BalanceReservationClaim {
       _ <- firstError(componentAccounts.iterator) { account =>
         Option.when(account.scope != scope)(ClaimComponentScopeMismatch(scope, account))
       }
-      _ <- duplicateDisposition.fold[Either[BalanceReservationError, Unit]](Right(())) { case (left, right) =>
-        Left(DuplicateDispositionIdentity(left, right))
+      _ <- duplicateDisposition.fold[Either[BalanceReservationError, Unit]](Right(())) {
+        case (left, right) =>
+          Left(DuplicateDispositionIdentity(left, right))
       }
       _ <- firstError(canonicalDispositions.iterator) { disposition =>
         Option.when(disposition.scope != scope)(DispositionScopeMismatch(scope, disposition))
@@ -232,8 +232,9 @@ object BalanceReservationClaim {
 
   private def aggregate(entries: Iterator[(BalanceAccount, BigInt)]): SortedMap[BalanceAccount, BigInt] =
     entries
-      .foldLeft(SortedMap.empty[BalanceAccount, BigInt](BalanceAccount.ordering)) { case (acc, (account, amount)) =>
-        acc.updated(account, acc.getOrElse(account, BigInt(0)) + amount)
+      .foldLeft(SortedMap.empty[BalanceAccount, BigInt](BalanceAccount.ordering)) {
+        case (acc, (account, amount)) =>
+          acc.updated(account, acc.getOrElse(account, BigInt(0)) + amount)
       }
       .filter { case (_, amount) => amount != 0 }
 
@@ -338,8 +339,8 @@ object BalanceReservationError {
   * requires content-derived release IDs and its source anchors and records to be authenticated in rooted state. Complete sealed
   * framework-operation compilers must derive canonical network/era/type-bound source identities and prove each disposition is the exact
   * rooted lock, allow-spend, or fee transition it names. This state does not persist dispositions or register their future releases; those
-  * atomic non-liquid transitions, authorization checks, and rooted replay/restore wiring remain blockers. Issuance and burn are intentionally
-  * unsupported.
+  * atomic non-liquid transitions, authorization checks, and rooted replay/restore wiring remain blockers. Issuance and burn are
+  * intentionally unsupported.
   */
 final case class BalanceReservationState private[economics] (
   balances: SortedMap[BalanceAccount, BigInt],
@@ -376,15 +377,17 @@ object BalanceReservationState {
     consumedOperationIds: Set[BalanceOperationId],
     consumedReleaseIds: Set[BalanceReleaseId]
   ): Either[BalanceReservationError, BalanceReservationState] = {
-    val canonicalRegistry = canonicalMap(releaseRegistry)(BalanceReleaseId.ordering).map { case (releaseId, release) =>
-      releaseId -> release.copy(credits = canonicalMap(release.credits)(BalanceAccount.ordering))
+    val canonicalRegistry = canonicalMap(releaseRegistry)(BalanceReleaseId.ordering).map {
+      case (releaseId, release) =>
+        releaseId -> release.copy(credits = canonicalMap(release.credits)(BalanceAccount.ordering))
     }
     val canonicalConsumedReleases = canonicalSet(consumedReleaseIds)(BalanceReleaseId.ordering)
 
     for {
       canonicalBalanceState <- canonicalBalances(balances)
-      _ <- firstError(canonicalRegistry.iterator) { case (key, release) =>
-        Option.when(key != release.releaseId)(ReleaseRegistryKeyMismatch(key, release.releaseId))
+      _ <- firstError(canonicalRegistry.iterator) {
+        case (key, release) =>
+          Option.when(key != release.releaseId)(ReleaseRegistryKeyMismatch(key, release.releaseId))
       }
       _ <- firstError(canonicalRegistry.valuesIterator) { release =>
         Option.when(release.credits.isEmpty)(EmptyAuthenticatedRelease(release.releaseId))
@@ -394,11 +397,14 @@ object BalanceReservationState {
           Option.when(account.scope != release.scope)(ReleaseCreditScopeMismatch(release.scope, account))
       }
       _ <- firstError(
-        canonicalRegistry.valuesIterator.flatMap(release => release.credits.iterator.map { case (account, credit) => (release, account, credit) })
-      ) { case (release, account, credit) =>
-        Option.when(credit <= 0 || !inBalanceRange(credit))(
-          RestoredReleaseCreditOutOfRange(release.releaseId, account, credit)
+        canonicalRegistry.valuesIterator.flatMap(release =>
+          release.credits.iterator.map { case (account, credit) => (release, account, credit) }
         )
+      ) {
+        case (release, account, credit) =>
+          Option.when(credit <= 0 || !inBalanceRange(credit))(
+            RestoredReleaseCreditOutOfRange(release.releaseId, account, credit)
+          )
       }
       canonicalOperations <- canonicalOperationHistory(consumedOperationIds)
       _ <- firstError(canonicalConsumedReleases.iterator) { releaseId =>
@@ -419,8 +425,9 @@ object BalanceReservationState {
     balances: Map[BalanceAccount, BigInt]
   ): Either[BalanceReservationError, SortedMap[BalanceAccount, BigInt]] = {
     val canonical = canonicalMap(balances)(BalanceAccount.ordering)
-    firstError(canonical.iterator) { case (account, balance) =>
-      Option.when(!inBalanceRange(balance))(InitialBalanceOutOfRange(account, balance))
+    firstError(canonical.iterator) {
+      case (account, balance) =>
+        Option.when(!inBalanceRange(balance))(InitialBalanceOutOfRange(account, balance))
     }.map(_ => canonical.filter { case (_, balance) => balance != 0 })
   }
 
@@ -436,7 +443,7 @@ object BalanceReservationState {
         bySource.get(operationId.sourceOperationHash) match {
           case Some(existing) if existing != operationId =>
             Left(OperationHistoryEquivocation(operationId.sourceOperationHash, existing, operationId))
-          case _                                          => Right(bySource.updated(operationId.sourceOperationHash, operationId))
+          case _ => Right(bySource.updated(operationId.sourceOperationHash, operationId))
         }
       }
     }
@@ -447,14 +454,15 @@ object BalanceReservationState {
     operations: SortedMap[Hash, BalanceOperationId],
     consumedReleases: SortedSet[BalanceReleaseId]
   ): Either[BalanceReservationError, Unit] =
-    firstError(registry.iterator) { case (releaseId, release) =>
-      operations.get(release.authorizedOperationId.sourceOperationHash).flatMap { accepted =>
-        if (accepted != release.authorizedOperationId)
-          Some(ReleaseOperationHistoryConflict(releaseId, release.authorizedOperationId, accepted))
-        else if (!consumedReleases.contains(releaseId))
-          Some(AcceptedOperationMissingReleaseConsumption(releaseId, accepted))
-        else None
-      }
+    firstError(registry.iterator) {
+      case (releaseId, release) =>
+        operations.get(release.authorizedOperationId.sourceOperationHash).flatMap { accepted =>
+          if (accepted != release.authorizedOperationId)
+            Some(ReleaseOperationHistoryConflict(releaseId, release.authorizedOperationId, accepted))
+          else if (!consumedReleases.contains(releaseId))
+            Some(AcceptedOperationMissingReleaseConsumption(releaseId, accepted))
+          else None
+        }
     }
 
   private[economics] def inBalanceRange(value: BigInt): Boolean = value >= 0 && value <= MaxBalance
@@ -473,9 +481,10 @@ object BalanceReservationLedger {
       _ <- validateRegisteredReleaseClaims(state, claim)
       releases <- resolveReleases(state, claim)
       releaseCredits = aggregateReleaseCredits(releases)
-      _ <- firstError(claim.outgoingDebits.iterator) { case (account, required) =>
-        val available = state.balanceOf(account) + releaseCredits.getOrElse(account, BigInt(0))
-        Option.when(required > available)(InsufficientGrossBalance(account, required, available))
+      _ <- firstError(claim.outgoingDebits.iterator) {
+        case (account, required) =>
+          val available = state.balanceOf(account) + releaseCredits.getOrElse(account, BigInt(0))
+          Option.when(required > available)(InsufficientGrossBalance(account, required, available))
       }
       projected <- projectBalances(state, claim, releaseCredits)
     } yield
@@ -492,20 +501,21 @@ object BalanceReservationLedger {
   ): Either[BalanceReservationError, Unit] =
     state.consumedOperations.get(claim.sourceOperationHash) match {
       case Some(existing) if existing == claim.operationId => Left(DuplicateOperationId(claim.operationId))
-      case Some(existing)                                  =>
+      case Some(existing) =>
         Left(OperationClaimEquivocation(claim.sourceOperationHash, existing, claim.operationId))
-      case None                                            => Right(())
+      case None => Right(())
     }
 
   private def validateRegisteredReleaseClaims(
     state: BalanceReservationState,
     claim: BalanceReservationClaim
   ): Either[BalanceReservationError, Unit] =
-    firstError(state.releaseRegistry.iterator) { case (releaseId, release) =>
-      Option.when(
-        release.authorizedOperationId.sourceOperationHash == claim.sourceOperationHash &&
-          release.authorizedOperationId != claim.operationId
-      )(OperationConflictsWithRegisteredRelease(releaseId, release.authorizedOperationId, claim.operationId))
+    firstError(state.releaseRegistry.iterator) {
+      case (releaseId, release) =>
+        Option.when(
+          release.authorizedOperationId.sourceOperationHash == claim.sourceOperationHash &&
+            release.authorizedOperationId != claim.operationId
+        )(OperationConflictsWithRegisteredRelease(releaseId, release.authorizedOperationId, claim.operationId))
     }
 
   private def resolveReleases(
@@ -519,7 +529,7 @@ object BalanceReservationLedger {
         if (state.consumedReleaseIds.contains(releaseId)) Left(DuplicateReleaseId(releaseId))
         else
           state.releaseRegistry.get(releaseId) match {
-            case None          => Left(UnknownReleaseId(releaseId))
+            case None => Left(UnknownReleaseId(releaseId))
             case Some(release) =>
               if (release.scope != claim.scope) Left(ReleaseScopeMismatch(releaseId, claim.scope, release.scope))
               else if (release.authorizedOperationId != claim.operationId)
@@ -533,8 +543,9 @@ object BalanceReservationLedger {
     releases: SortedMap[BalanceReleaseId, AuthenticatedRelease]
   ): SortedMap[BalanceAccount, BigInt] =
     releases.valuesIterator.foldLeft(SortedMap.empty[BalanceAccount, BigInt](BalanceAccount.ordering)) { (acc, release) =>
-      release.credits.foldLeft(acc) { case (credits, (account, amount)) =>
-        credits.updated(account, credits.getOrElse(account, BigInt(0)) + amount)
+      release.credits.foldLeft(acc) {
+        case (credits, (account, amount)) =>
+          credits.updated(account, credits.getOrElse(account, BigInt(0)) + amount)
       }
     }
 
@@ -607,10 +618,11 @@ private object ClaimCommitment {
 
   private def putAccountAmounts(bytes: ByteArrayOutputStream, values: SortedMap[BalanceAccount, BigInt]): Unit = {
     putInt(bytes, values.size)
-    values.foreach { case (account, amount) =>
-      putScope(bytes, account.scope)
-      putAddress(bytes, account.address)
-      putBytes(bytes, amount.toByteArray)
+    values.foreach {
+      case (account, amount) =>
+        putScope(bytes, account.scope)
+        putAddress(bytes, account.address)
+        putBytes(bytes, amount.toByteArray)
     }
   }
 

@@ -19,13 +19,7 @@ import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
-import io.constellationnetwork.storage.durable.{
-  DurableFileOps,
-  DurableWriteBoundary,
-  DurableWriteEvent,
-  DurableWriteHook,
-  DurableWriteStage
-}
+import io.constellationnetwork.storage.durable._
 
 import scodec.bits.ByteVector
 import weaver.MutableIOSuite
@@ -741,22 +735,18 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
           )
           synchronousRead <- synchronousToken.read.attempt
           failedCapture <- Ref.of[IO, Option[VerifiedActiveMptPublication[IO]]](None)
-          failed <- store
-            .withVerifiedActivePublication { token =>
-              failedCapture.set(token.some) >> IO.raiseError[Unit](new IllegalStateException("lease callback failed"))
-            }
-            .attempt
+          failed <- store.withVerifiedActivePublication { token =>
+            failedCapture.set(token.some) >> IO.raiseError[Unit](new IllegalStateException("lease callback failed"))
+          }.attempt
           failedToken <- failedCapture.get.flatMap(
             _.liftTo[IO](new IllegalStateException("The failed verified-publication callback did not capture its lease"))
           )
           failedResult <- failedToken.read.attempt
           captured <- Ref.of[IO, Option[VerifiedActiveMptPublication[IO]]](None)
           entered <- Deferred[IO, Unit]
-          callback <- store
-            .withVerifiedActivePublication { token =>
-              captured.set(token.some) >> entered.complete(()).void >> IO.never[Unit]
-            }
-            .start
+          callback <- store.withVerifiedActivePublication { token =>
+            captured.set(token.some) >> entered.complete(()).void >> IO.never[Unit]
+          }.start
           _ <- entered.get
           _ <- callback.cancel
           canceledToken <- captured.get.flatMap(
@@ -815,11 +805,9 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
             image = MptActivePublication(MptPublicationRevision(1L), receipt.some)
             leaseEntered <- Deferred[IO, Unit]
             releaseLease <- Deferred[IO, Unit]
-            lease <- store
-              .withVerifiedActivePublication { token =>
-                leaseEntered.complete(()).void >> token.read.flatTap(_ => releaseLease.get)
-              }
-              .start
+            lease <- store.withVerifiedActivePublication { token =>
+              leaseEntered.complete(()).void >> token.read.flatTap(_ => releaseLease.get)
+            }.start
             _ <- leaseEntered.get
             transitionStarted <- Deferred[IO, Unit]
             transitionDone <- Deferred[IO, Unit]
@@ -1009,12 +997,14 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
                 prepare(store, 0L, ordinal0, entries("compensation-journal-only")).flatTap(store.publish(_, None))
               }
               journalOnly = MptActivePublication(MptPublicationRevision(0L), journalOnlyLegacy.some)
-              _ <- IO.blocking(
-                Files.write(
-                  DurableMptImageLayout.activePublication(journalOnlyDirectory),
-                  MptImageEncoding.encodePublication(journalOnly)
+              _ <- IO
+                .blocking(
+                  Files.write(
+                    DurableMptImageLayout.activePublication(journalOnlyDirectory),
+                    MptImageEncoding.encodePublication(journalOnly)
+                  )
                 )
-              ).void
+                .void
               missingMarker <- makeStore(journalOnlyDirectory).use(_.activeReceipt).attempt
               resumed <- makeStore(journalOnlyDirectory).use { store =>
                 for {
@@ -1034,14 +1024,16 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
                 } yield legacy -> other
               }
               (mismatchLegacy, mismatchOther) = mismatch
-              _ <- IO.blocking(
-                Files.write(
-                  DurableMptImageLayout.activePublication(mismatchDirectory),
-                  MptImageEncoding.encodePublication(
-                    MptActivePublication(MptPublicationRevision(0L), mismatchOther.some)
+              _ <- IO
+                .blocking(
+                  Files.write(
+                    DurableMptImageLayout.activePublication(mismatchDirectory),
+                    MptImageEncoding.encodePublication(
+                      MptActivePublication(MptPublicationRevision(0L), mismatchOther.some)
+                    )
                   )
                 )
-              ).void
+                .void
               mismatchResult <- makeStore(mismatchDirectory)
                 .use(_.initializeActivePublication(mismatchLegacy.some))
                 .attempt
@@ -1056,9 +1048,11 @@ object DurableMptImageStoreSuite extends MutableIOSuite {
                 .encodePublication(MptActivePublication(MptPublicationRevision(0L), corruptLegacy.some))
                 .clone()
               _ = corruptBytes(corruptBytes.length - 1) = (corruptBytes.last ^ 1).toByte
-              _ <- IO.blocking(
-                Files.write(DurableMptImageLayout.activePublication(corruptDirectory), corruptBytes)
-              ).void
+              _ <- IO
+                .blocking(
+                  Files.write(DurableMptImageLayout.activePublication(corruptDirectory), corruptBytes)
+                )
+                .void
               corruptResult <- makeStore(corruptDirectory)
                 .use(_.initializeActivePublication(corruptLegacy.some))
                 .attempt

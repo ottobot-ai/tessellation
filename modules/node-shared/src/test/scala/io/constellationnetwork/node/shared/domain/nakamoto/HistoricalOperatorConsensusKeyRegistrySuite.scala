@@ -12,11 +12,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.kes.KesRegistrationCert
-import io.constellationnetwork.schema.kes.KesRegistrationCert.{
-  KesRegistrationOrdinal,
-  KesRegistrationRecord,
-  KesRegistrationReference
-}
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
 import io.constellationnetwork.schema.peer.PeerId
@@ -94,21 +90,24 @@ object HistoricalOperatorConsensusKeyRegistrySuite extends MutableIOSuite {
     historicalStakes: SortedMap[EtaPeriod, HistoricalStakeSnapshot] = SortedMap.empty,
     pointerOverrides: Option[SortedMap[PeerId, KesRegistrationReference]] = None
   )(implicit hasher: Hasher[IO]): IO[HistoricalOperatorRegistryView] =
-    pointerOverrides.fold(
-      histories.toList.traverse { case (operator, records) =>
-        reference(records.last).map(operator -> _)
-      }.map(_.to(SortedMap))
-    )(_.pure[IO]).map { pointers =>
-      HistoricalOperatorRegistryView(
-        parentHash,
-        ordinal(parentOrdinal),
-        GlobalSnapshotInfo.empty.copy(
-          historicalStakeSnapshots = historicalStakes,
-          kesRegistrationCerts = histories,
-          lastKesRegistrationRefs = pointers
+    pointerOverrides
+      .fold(
+        histories.toList.traverse {
+          case (operator, records) =>
+            reference(records.last).map(operator -> _)
+        }.map(_.to(SortedMap))
+      )(_.pure[IO])
+      .map { pointers =>
+        HistoricalOperatorRegistryView(
+          parentHash,
+          ordinal(parentOrdinal),
+          GlobalSnapshotInfo.empty.copy(
+            historicalStakeSnapshots = historicalStakes,
+            kesRegistrationCerts = histories,
+            lastKesRegistrationRefs = pointers
+          )
         )
-      )
-    }
+      }
 
   private def viewSource(
     available: Map[Hash, HistoricalOperatorRegistryView]

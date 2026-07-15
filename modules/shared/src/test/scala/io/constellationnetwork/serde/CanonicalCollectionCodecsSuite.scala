@@ -26,13 +26,15 @@ object CanonicalCollectionCodecsSuite extends FunSuite {
     codec.encode(value).require
 
   private def encodedEntries(entries: List[(Int, Int)]): BitVector =
-    encoded(uint16, entries.size) ++ entries.foldLeft(BitVector.empty) { case (bits, entry) =>
-      bits ++ encoded(entryCodec, entry)
+    encoded(uint16, entries.size) ++ entries.foldLeft(BitVector.empty) {
+      case (bits, entry) =>
+        bits ++ encoded(entryCodec, entry)
     }
 
   private def encodedElements(elements: List[Int]): BitVector =
-    encoded(uint16, elements.size) ++ elements.foldLeft(BitVector.empty) { case (bits, element) =>
-      bits ++ encoded(uint8, element)
+    encoded(uint16, elements.size) ++ elements.foldLeft(BitVector.empty) {
+      case (bits, element) =>
+        bits ++ encoded(uint8, element)
     }
 
   private def rejects[A](codec: Codec[A], bits: BitVector): Boolean =

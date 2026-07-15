@@ -9,6 +9,7 @@ import io.constellationnetwork.security.mpt.{DurableMptImageStore, MptActivePubl
 sealed trait FinalityCoordinatorBootstrapStatus extends Product with Serializable
 
 object FinalityCoordinatorBootstrapStatus {
+
   /** The two local journals matched while the MPT publication lease was held. This is not activation or canonicality authority. */
   case object LocalPublicationBound extends FinalityCoordinatorBootstrapStatus
   final case class RecoveryRequired(record: RecoveryRecordPointer) extends FinalityCoordinatorBootstrapStatus
@@ -72,7 +73,7 @@ object FinalityCoordinatorBootstrap {
       installed <- finality.compareAndSetCoordinator(coordinator, mutation)
       record <- casValue(installed).value.mode match {
         case CoordinatorMode.RecoveryRequired(pointer) => Async[F].pure(pointer)
-        case mode                                       => Async[F].raiseError[RecoveryRecordPointer](UnexpectedCoordinatorMode(mode))
+        case mode                                      => Async[F].raiseError[RecoveryRecordPointer](UnexpectedCoordinatorMode(mode))
       }
     } yield RecoveryRequired(record)
 

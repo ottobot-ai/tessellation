@@ -51,9 +51,8 @@ object FinalityIdentityError {
 
 /** Canonical, domain-separated identities for the greenfield ScodecV1 finality durability layer.
   *
-  * Every identity is derived from complete Scodec payload bytes. Domain and field
-  * lengths are included before their bytes, so concatenation ambiguity cannot
-  * produce the same preimage. This object does not decide finality or canonicality.
+  * Every identity is derived from complete Scodec payload bytes. Domain and field lengths are included before their bytes, so concatenation
+  * ambiguity cannot produce the same preimage. This object does not decide finality or canonicality.
   */
 object FinalityIdentity {
   import FinalityIdentityError._
@@ -105,14 +104,13 @@ object FinalityIdentity {
 
   /** Derive a pointer for externally encoded evidence or payload bytes.
     *
-    * The encoding identifier must be fixed by the artifact's verifier; it is
-    * committed into the ID and cannot be swapped after hashing.
+    * The encoding identifier must be fixed by the artifact's verifier; it is committed into the ID and cannot be swapped after hashing.
     */
   def artifactPointerFromBytes(
     kind: FinalityArtifactKind,
     encoding: ArtifactEncoding,
     bytes: ByteVector
-  ): Either[FinalityIdentityError, ImmutableArtifactPointer] = {
+  ): Either[FinalityIdentityError, ImmutableArtifactPointer] =
     for {
       _ <- Either.cond(bytes.nonEmpty, (), EmptyArtifact(kind))
       digest = ArtifactDigest(Hash.fromBytes(bytes.toArray))
@@ -124,7 +122,6 @@ object FinalityIdentity {
         domainHash(ArtifactIdDomain, kindBytes, encodingBytes, digestBytes, longBytes(byteLength.value))
       )
     } yield ImmutableArtifactPointer(kind, encoding, id, digest, byteLength)
-  }
 
   def verifyArtifactPointer[A](
     pointer: ImmutableArtifactPointer,
@@ -244,9 +241,7 @@ object FinalityIdentity {
     if (
       hash == Hash.empty ||
       hash.value.length != 64 ||
-      !hash.value.forall(character =>
-        character >= '0' && character <= '9' || character >= 'a' && character <= 'f'
-      )
+      !hash.value.forall(character => character >= '0' && character <= '9' || character >= 'a' && character <= 'f')
     ) Left(MalformedHash(label, hash))
     else
       ByteVector

@@ -102,7 +102,8 @@ object OptionShapeStateProofCanonicalizationSuite extends MutableIOSuite {
     val prior = GlobalSnapshotInfo.empty.copy(lastAllowSpendRefs = None)
 
     val producer = prior.copy(
-      lastAllowSpendRefs = era.postTess3(activationOrdinal)(SortedMap.empty[io.constellationnetwork.schema.address.Address, AllowSpendReference])
+      lastAllowSpendRefs =
+        era.postTess3(activationOrdinal)(SortedMap.empty[io.constellationnetwork.schema.address.Address, AllowSpendReference])
     )
     val replayed = GlobalStateConverter.applyAccumulatorToGSI(prior, StateChangesAccumulator())
 

@@ -2,7 +2,6 @@ package io.constellationnetwork.security.mpt
 
 import cats.effect.kernel.Resource
 import cats.effect.{IO, Ref}
-import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
@@ -14,7 +13,7 @@ import io.constellationnetwork.security.mpt.producer.FileSystemMerklePatriciaPro
 import io.constellationnetwork.security.mpt.storages.MptStateStorage
 
 import eu.timepit.refined.types.numeric.NonNegLong
-import fs2.io.file.Path
+import fs2.io.file.{Files, Path}
 import weaver.MutableIOSuite
 
 object MptPersistenceFailureSuite extends MutableIOSuite {
@@ -100,5 +99,25 @@ object MptPersistenceFailureSuite extends MutableIOSuite {
         writeCount == 1,
         cutoffCount == 1
       )
+  }
+
+  test("a stale cutoff never deletes generations newer than its current ordinal") { res =>
+    implicit val jsonSerializer: JsonSerializer[IO] = res._1
+    val current = SnapshotOrdinal(NonNegLong.unsafeFrom(10L))
+    val future1 = SnapshotOrdinal(NonNegLong.unsafeFrom(11L))
+    val future2 = SnapshotOrdinal(NonNegLong.unsafeFrom(12L))
+
+    Files[IO].tempDirectory.use { directory =>
+      for {
+        storage <- MptStateStorage.make[IO](directory)
+        _ <- storage.writeState(current, initial)
+        _ <- storage.writeState(future1, Map(Hex("aa") -> Array[Byte](4)))
+        _ <- storage.writeState(future2, Map(Hex("bb") -> Array[Byte](5)))
+        _ <- storage.applyCutoff(current)
+        currentExists <- storage.exists(current)
+        future1Exists <- storage.exists(future1)
+        future2Exists <- storage.exists(future2)
+      } yield expect.all(currentExists, future1Exists, future2Exists)
+    }
   }
 }

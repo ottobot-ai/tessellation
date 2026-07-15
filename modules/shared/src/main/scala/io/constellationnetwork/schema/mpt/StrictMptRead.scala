@@ -60,7 +60,8 @@ object StrictMptRead {
   /** Stored bytes existed but were null, empty, or undecodable. Non-null bytes are retained immutably for diagnostics. */
   final case class Malformed(reason: String, rawBytes: Option[ByteVector]) extends StrictMptRead[Nothing]
 
-  /** Decode one stored value without collapsing malformed storage into absence. Every non-null value is copied into an immutable byte vector.
+  /** Decode one stored value without collapsing malformed storage into absence. Every non-null value is copied into an immutable byte
+    * vector.
     */
   def fromStoredBytes[V: ImmutableCodec](bytes: Array[Byte]): StrictMptRead[V] =
     if (bytes eq null) Malformed("null stored bytes", None)

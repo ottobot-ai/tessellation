@@ -12,13 +12,12 @@ import weaver.SimpleIOSuite
 
 /** Inverse cutover fuse for consensus byte authority.
   *
-  * This suite freezes the reviewed JSON/Kryo signing, hashing, state-channel, and persistence
-  * surfaces while the Scodec migration is incomplete. It rejects a piecemeal runtime activation:
-  * consensus must not begin selecting Scodec or directly extracting immutable bytes until the
-  * complete atomic cutover removes/replaces the legacy inventory in one reviewed change.
+  * This suite freezes the reviewed JSON/Kryo signing, hashing, state-channel, and persistence surfaces while the Scodec migration is
+  * incomplete. It rejects a piecemeal runtime activation: consensus must not begin selecting Scodec or directly extracting immutable bytes
+  * until the complete atomic cutover removes/replaces the legacy inventory in one reviewed change.
   *
-  * Passing this suite does NOT activate Scodec, prove byte equivalence, or complete SER-005. It
-  * proves only that the known authority boundary has not changed without updating this fuse.
+  * Passing this suite does NOT activate Scodec, prove byte equivalence, or complete SER-005. It proves only that the known authority
+  * boundary has not changed without updating this fuse.
   */
 object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
@@ -60,8 +59,7 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
   private val globalSnapshotSigning =
     """Signed\s*\.\s*forAsyncHasher\s*\[\s*[^,\]]+\s*,\s*Global(?:Incremental)?Snapshot\s*\]""".r
 
-  /** Exact legacy byte-authority markers. These are liabilities to remove atomically, not APIs
-    * approved for expansion.
+  /** Exact legacy byte-authority markers. These are liabilities to remove atomically, not APIs approved for expansion.
     */
   private val reviewedLegacyMarkers: Map[String, List[Marker]] = Map(
     hasherPath -> List(
@@ -420,7 +418,7 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     val expectedCounts = reviewed.view.mapValues(_.count).toMap
     val unexpected = actualCounts.keySet -- expectedCounts.keySet
     val stale = expectedCounts.keySet -- actualCounts.keySet
-    val changed = (actualCounts.keySet intersect expectedCounts.keySet).toList.sorted.collect {
+    val changed = actualCounts.keySet.intersect(expectedCounts.keySet).toList.sorted.collect {
       case path if actualCounts(path) != expectedCounts(path) =>
         s"$label $path expected=${expectedCounts(path)} actual=${actualCounts(path)}"
     }
@@ -434,9 +432,8 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       emptyRationales.map(path => s"empty $label rationale=$path")
   }
 
-  /** Removes line and nested block comments without treating comment delimiters inside literals
-    * as syntax. Literal contents remain searchable so reflective/string-based activation still
-    * crosses the fuse.
+  /** Removes line and nested block comments without treating comment delimiters inside literals as syntax. Literal contents remain
+    * searchable so reflective/string-based activation still crosses the fuse.
     */
   private def withoutScalaComments(input: String): String = {
     val out = new StringBuilder(input.length)
@@ -516,7 +513,9 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
       val stream = Files.walk(root.resolve("modules"))
       try
-        stream.iterator().asScala
+        stream
+          .iterator()
+          .asScala
           .filter(Files.isRegularFile(_))
           .filter(_.getFileName.toString.endsWith(".scala"))
           .filter(_.toString.replace('\\', '/').contains("/src/main/scala/"))
@@ -534,6 +533,6 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     else
       Option(candidate.getParent) match {
         case Some(parent) => repositoryRoot(parent)
-        case None => throw new IllegalStateException(s"Unable to locate repository root from ${sys.props("user.dir")}")
+        case None         => throw new IllegalStateException(s"Unable to locate repository root from ${sys.props("user.dir")}")
       }
 }

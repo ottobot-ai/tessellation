@@ -15,12 +15,10 @@ import derevo.derive
 
 /** Immutable period-zero KES+VRF identity committed by the canonical genesis state root.
   *
-  * This is deliberately not a runtime `KesRegistrationCert`: genesis has no prior registration
-  * history to extend, and inserting a fabricated runtime certificate would give the two artifact
-  * classes incompatible signature domains and parent semantics. The long-term operator identity
-  * signs this complete record (except the signature itself), including its network and activation
-  * context. Possession of this record proves key ownership only; it does not confer validator,
-  * committee, watchtower, or stake eligibility.
+  * This is deliberately not a runtime `KesRegistrationCert`: genesis has no prior registration history to extend, and inserting a
+  * fabricated runtime certificate would give the two artifact classes incompatible signature domains and parent semantics. The long-term
+  * operator identity signs this complete record (except the signature itself), including its network and activation context. Possession of
+  * this record proves key ownership only; it does not confer validator, committee, watchtower, or stake eligibility.
   */
 @derive(encoder, decoder, eqv, show)
 case class GenesisOperatorConsensusKey(

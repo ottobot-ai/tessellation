@@ -42,7 +42,8 @@ object ShardCheckpointChainStoreRecovery {
       .flatMap(_.liftTo[F](new IllegalArgumentException("checkpoint producer VRF proof cannot be converted to a VRF output")))
 
   /** Insert a previously validated checkpoint into a possibly empty local shard store, then prove that the exact signing-preimage hash is
-    * present. A duplicate insert is valid only when that exact hash already resolves. Rejected storage and malformed VRF proofs fail closed.
+    * present. A duplicate insert is valid only when that exact hash already resolves. Rejected storage and malformed VRF proofs fail
+    * closed.
     */
   def ingestValidated[F[_]: Async: Hasher](
     checkpoint: ShardCheckpoint,

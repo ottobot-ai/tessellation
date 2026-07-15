@@ -37,8 +37,7 @@ object FinalityCoordinatorBootstrapSuite extends SimpleIOSuite {
 
   private def stores(
     root: Path,
-    hook: DurableWriteHook[IO, FinalityDurableWriteArtifact] =
-      DurableWriteHook.noop[IO, FinalityDurableWriteArtifact]
+    hook: DurableWriteHook[IO, FinalityDurableWriteArtifact] = DurableWriteHook.noop[IO, FinalityDurableWriteArtifact]
   ): Resource[IO, Stores] = {
     val mptDirectory = root.resolve("mpt")
     val finalityDirectory = root.resolve("finality")

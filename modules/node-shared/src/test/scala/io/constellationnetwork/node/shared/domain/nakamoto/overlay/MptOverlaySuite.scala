@@ -1,6 +1,6 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 
-import cats.effect.{Deferred, IO, Ref, Resource}
+import cats.effect._
 import cats.syntax.all._
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -2534,22 +2534,23 @@ object MptOverlaySuite extends MutableIOSuite {
           rootAfterRetry <- store.build(ord(3L)).rethrow.map(_.rootHash)
           journalAfterRetry <- overlay.journalSizes
           syncedAfterRetry <- store.lastPersistedOrdinal
-        } yield expect.all(
-          // Both reverse writes were staged before the one final build blocked.
-          sameBytes(stagedBeforeBuild, baseAt3),
-          // Cancellation rolls state, trie caches, ordinal bookkeeping, and journal consumption back to tip@5.
-          sameBytes(afterCancel, baseAt5),
-          rootAfterCancel == rootAt5,
-          journalAfterCancel == journalBefore,
-          syncedBefore.contains(ord(5L)),
-          syncedAfterCancel == syncedBefore,
-          // The retained band remains retryable and lands exactly on the fork state/root.
-          retried == RevertOutcome.Shallow(2),
-          sameBytes(afterRetry, baseAt3),
-          rootAfterRetry == rootAt3,
-          journalAfterRetry.undoJournal == journalBefore.undoJournal - 2,
-          syncedAfterRetry.contains(ord(3L))
-        )
+        } yield
+          expect.all(
+            // Both reverse writes were staged before the one final build blocked.
+            sameBytes(stagedBeforeBuild, baseAt3),
+            // Cancellation rolls state, trie caches, ordinal bookkeeping, and journal consumption back to tip@5.
+            sameBytes(afterCancel, baseAt5),
+            rootAfterCancel == rootAt5,
+            journalAfterCancel == journalBefore,
+            syncedBefore.contains(ord(5L)),
+            syncedAfterCancel == syncedBefore,
+            // The retained band remains retryable and lands exactly on the fork state/root.
+            retried == RevertOutcome.Shallow(2),
+            sameBytes(afterRetry, baseAt3),
+            rootAfterRetry == rootAt3,
+            journalAfterRetry.undoJournal == journalBefore.undoJournal - 2,
+            syncedAfterRetry.contains(ord(3L))
+          )
       }
     } yield result
   }

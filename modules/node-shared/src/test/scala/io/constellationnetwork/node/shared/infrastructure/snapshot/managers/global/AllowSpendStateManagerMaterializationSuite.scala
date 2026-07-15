@@ -147,7 +147,12 @@ object AllowSpendStateManagerMaterializationSuite extends MutableIOSuite {
       metagraphKeyPair <- KeyPairGenerator.makeKeyPair[IO]
       source = sourceKeyPair.getPublic.toAddress
       native <- allowSpend(sourceKeyPair, destinationKeyPair.getPublic.toAddress, 10L, none)
-      scoped <- allowSpend(sourceKeyPair, destinationKeyPair.getPublic.toAddress, 11L, CurrencyId(metagraphKeyPair.getPublic.toAddress).some)
+      scoped <- allowSpend(
+        sourceKeyPair,
+        destinationKeyPair.getPublic.toAddress,
+        11L,
+        CurrencyId(metagraphKeyPair.getPublic.toAddress).some
+      )
       store <- freshStore
       key = GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveAllowSpends, none, source)
       _ <- store.insert(key, SortedSet(native, scoped))

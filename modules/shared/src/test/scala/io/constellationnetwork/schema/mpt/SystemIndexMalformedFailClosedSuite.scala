@@ -50,7 +50,7 @@ object SystemIndexMalformedFailClosedSuite extends MutableIOSuite {
   private def isExactMalformed(result: Either[Throwable, Unit], expectedKey: Hex): Boolean =
     result match {
       case Left(error: StrictMptRead.MalformedConsensusMptValue) => error.physicalKey == expectedKey
-      case _                                                    => false
+      case _                                                     => false
     }
 
   test("store address-index RMW rejects malformed bytes without mutation") { res =>

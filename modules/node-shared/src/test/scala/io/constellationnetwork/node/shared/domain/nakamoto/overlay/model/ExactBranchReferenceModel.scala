@@ -97,7 +97,7 @@ object ExactBranchReferenceModel {
 
   def stage(state: State, branch: PendingBranch): Result[Unit] =
     state.pending.get(branch.ref.hash) match {
-      case None => Result.Applied(state.copy(pending = state.pending.updated(branch.ref.hash, branch)), ())
+      case None                                 => Result.Applied(state.copy(pending = state.pending.updated(branch.ref.hash, branch)), ())
       case Some(existing) if existing == branch => Result.Applied(state, ())
       case Some(existing) =>
         Result.RecoveryRequired(state, RecoveryCause.ExactRefMismatch(branch.ref, existing.ref))
@@ -158,21 +158,23 @@ object ExactBranchReferenceModel {
       Right((state.anchor.image, Vector.empty))
     else
       lineage(state, requested).flatMap { path =>
-        path.foldLeft[Either[RecoveryCause, StateImage]](Right(state.anchor.image)) {
-          case (acc, branch) =>
-            acc.flatMap { image =>
-              val reproduced = branch.delta.applyTo(image)
-              if (reproduced.root == branch.ref.stateRoot) Right(reproduced)
-              else Left(RecoveryCause.ReproducedRootMismatch(branch.ref, reproduced.root))
-            }
-        }.map(_ -> path)
+        path
+          .foldLeft[Either[RecoveryCause, StateImage]](Right(state.anchor.image)) {
+            case (acc, branch) =>
+              acc.flatMap { image =>
+                val reproduced = branch.delta.applyTo(image)
+                if (reproduced.root == branch.ref.stateRoot) Right(reproduced)
+                else Left(RecoveryCause.ReproducedRootMismatch(branch.ref, reproduced.root))
+              }
+          }
+          .map(_ -> path)
       }
 
   private def lineage(state: State, requested: SnapshotRef): Either[RecoveryCause, Vector[PendingBranch]] = {
     @tailrec
     def loop(childRef: SnapshotRef, suffix: Vector[PendingBranch]): Either[RecoveryCause, Vector[PendingBranch]] =
       state.pending.get(childRef.hash) match {
-        case None => Left(RecoveryCause.UnknownExactParent(childRef))
+        case None                                   => Left(RecoveryCause.UnknownExactParent(childRef))
         case Some(stored) if stored.ref != childRef => Left(RecoveryCause.ExactRefMismatch(childRef, stored.ref))
         case Some(stored) if stored.ref.parentHash == state.anchor.ref.hash =>
           if (stored.ref.ordinal == state.anchor.ref.ordinal + 1L) Right(stored +: suffix)

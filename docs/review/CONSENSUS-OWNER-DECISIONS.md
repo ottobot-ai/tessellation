@@ -394,6 +394,8 @@ reservation kernel.
 
 ### O-15 Multi-tine Taktikos/Genesis frontier semantics
 
+Owner review packet: [O-15 Multi-Tine Frontier Owner Review](O15-MULTI-TINE-FRONTIER-OWNER-REVIEW.md).
+
 **RATIFIED PROPERTY; OPEN PROTOCOL AND PROOF GATE.** L-04 fixes the binary rule
 boundary: `maxvalid-tk` within `k1` and Genesis-family `maxvalid-bg` beyond `k1`.
 L-24 now fixes the multi-tine semantics: once two nodes have the same
@@ -405,7 +407,7 @@ requires deterministic reselection. This does not yet define the concrete
 objective selector or its portable declared-frontier evidence. No Nakamoto-only
 artifact can prove that an adversary has no unrevealed private tine.
 
-The primary sources do not supply a total frontier order. Taktikos Appendix A.1,
+The primary sources do not supply a total frontier order. Taktikos section 3,
 Algorithm 1 initializes `C <- Cloc`, enumerates `C1..Cj`, and replaces the
 current incumbent only with a valid candidate that forks from that incumbent by
 at most `k` and is longer, or equal-length with a lower head slot. A deeper
@@ -415,10 +417,14 @@ section 3.2.4, Figure 7 likewise initializes `Cmax <- Cloc` and enumerates
 pairwise-MRCA density Condition B to a deep pair. Neither paper specifies the
 enumeration order, proves transitivity/permutation independence, or defines an
 incumbent-independent argmax. Sources: Schutza et al., *Ouroboros Taktikos*,
-Appendix A.1/Algorithm 1 ([DOI](https://doi.org/10.1007/978-981-99-8104-5_20),
-audited manuscript SHA-256
-`9cdb2218db703195483a31ac4ff467b6a28cd76a6d64368e90b616c9c7ad1db6`,
-pp. 22-23); Badertscher et al., *Ouroboros Genesis*, section 3.2.4/Figure 7
+section 3/Algorithm 1 ([DOI](https://doi.org/10.1007/978-981-99-8104-5_20),
+owner-supplied published artifact `Taktikos - BlockSys_2023_paper_4526.pdf`,
+SHA-256
+`63d030d7df3e908985340dc86636f00a2e79e66841e051b83c4516127be1d7cf`,
+p. 6; corroborating prepublication `fc-2023-v7.pdf`, Appendix A.1, pp. 22-23,
+SHA-256
+`9cdb2218db703195483a31ac4ff467b6a28cd76a6d64368e90b616c9c7ad1db6`).
+Badertscher et al., *Ouroboros Genesis*, section 3.2.4/Figure 7
 ([accepted manuscript](https://www.pure.ed.ac.uk/ws/portalfiles/portal/76645278/Ouroboros_Genesis.pdf),
 pp. 11-13).
 
@@ -459,12 +465,13 @@ The following design/proof work remains open and must land coherently:
   collection order. This is a new protocol construction, not a theorem inherited
   from either cited paper.
 - **B - Frontier evidence:** define the bounded observation boundary and portable
-  evidence proving the exact candidate set, ancestry, validity, and parameters
-  supplied to the selector. Receiver-local peer visibility is not authority, and
-  no non-BFT artifact can prove that an adversary has not withheld another valid
-  tine. The protocol must define a cutoff plus bounded-diffusion assumption and
-  deterministic late-reveal reselection, or name another non-circular intake
-  commitment.
+  evidence binding the exact declared candidate manifest, ancestry, validity, and
+  parameters supplied to the selector. Receiver-local arrival time, wall clock,
+  peer visibility/count, first-N receipt, vote, quorum, certificate, or QC is not
+  authority, and no Nakamoto artifact can prove that an adversary has not withheld
+  another valid tine. The protocol must define an authenticated slot/era boundary
+  plus explicit diffusion assumption and deterministic late-reveal reselection,
+  or name another non-circular intake commitment.
 - **C - Security and liveness:** prove or quantitatively bound chain quality,
   common prefix, grinding/withholding leverage, and convergence for the chosen
   cycle-resolution rule under the project's Taktikos/Genesis assumptions.
@@ -480,12 +487,21 @@ The following design/proof work remains open and must land coherently:
 - **E - Exact ties:** define an objective tie result. In particular, ratify or
   reject the current lower-VRF then hash rule; it is not in either cited algorithm
   and must be assessed for precomputation and grinding.
+- **F - Lineage and overflow:** classify arbitrary-depth strict ancestry before
+  any divergent-tine rule so a valid descendant cannot lose to its own prefix.
+  Define objective dominance, expiry, authenticated compaction, or bounded-memory
+  streaming for arbitrarily many valid equivocations; receiver-local eviction,
+  first-N/hash truncation, `k2` caps, and adversarial fail-stop cannot decide the
+  canonical result.
 
 This gate does not reopen L-02 through L-05. GL0 remains Nakamoto/Taktikos/LDD
 without global BFT machinery; Phase 2 remains `T_weight OR k1`, density-reorgable;
 and `k2` remains retention/recovery policy only.
 
 ### O-16 Exact Phase-2 consumer lease and invalidation
+
+Owner review packet:
+[P6 FIN-14 Phase-2 Consumer Lease](P6-FIN14-PHASE2-CONSUMER-LEASE.md#10-owner-review-required).
 
 **PROPOSED, NOT RATIFIED.** `FIN-14` requires more than replacing the ordinal
 watermark with an exact-ref query. A consumer can verify a valid exact P2 anchor,
@@ -548,13 +564,15 @@ The exact-ancestor rule and effect-journal strategy are conformance checks, not
 open alternatives to L-19 or L-23.
 
 The exact contract, current-source interleavings, invalidation inventory, and
-`FOLLOW-008A` through `FOLLOW-008P` matrix are in
-`P6-FIN14-PHASE2-CONSUMER-LEASE.md`. No live lease issuer may land before O-16 is
+`FOLLOW-008A` through `FOLLOW-008P` matrix are in the linked packet. No live lease issuer may land before O-16 is
 ratified and O-15, O-01, released-core readback, ROOT semantic/image gates, and
 consumer effect ordering are independently verified. Wrapping the current Boolean
 adapter in an opaque type is explicitly forbidden.
 
 ### O-17 ROOT-008 GL0 partition grammar
+
+Owner review packet:
+[ROOT-008 GL0 Partition Grammar](ROOT-008-GL0-PARTITION-GRAMMAR.md#8-owner-review-required).
 
 **PROPOSED, NOT RATIFIED.** `ROOT-008` owns canonical physical placement, one
 active-era value codec per field, logical identity/scope reproduction, bounded
@@ -591,8 +609,8 @@ Owner review must freeze these exact anchors before schema activation:
   boundary. This is a conformance gate on locked L-15A, not an option to retain an
   unrooted writable field.
 
-The complete inventory, recommendations, and generated-test contract are in
-`ROOT-008-GL0-PARTITION-GRAMMAR.md`.
+The complete inventory, recommendations, and generated-test contract are in the
+linked packet.
 
 ## Change rule
 

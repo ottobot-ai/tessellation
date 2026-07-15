@@ -188,7 +188,7 @@ non-applicability proof in its manifest.
 | TOWER-003 | Empty/vacuous, truncated, duplicate, unordered, oversized, disconnected, missing-path, forged-tip, and no-progress proofs reject within hard resource bounds. |
 | TOWER-004 | N-2 stake, N-1 eta, active registry/KES/VRF key, period transition, parent/tower pointer, and signature are independently checked. Current-set substitution and uniform-probability approximation reject. |
 | TOWER-005 | One honest peer's complete proof verifies from trusted genesis or cached authenticated commitment. A peer can withhold freshness but cannot forge a heavier chain, state inclusion, or current canonicality. |
-| TOWER-006 | Tower/SMT stores survive crash/restart and every shallow/deep fork-choice replacement. Rebuilt canonical roots/proofs equal clean replay byte-for-byte; append-only stale-branch state is never served. |
+| TOWER-006 | Tower/SMT stores survive crash/restart and every shallow/deep exact-hash fork-choice replacement. Rebuilt canonical roots/proofs equal clean replay byte-for-byte; append-only stale-branch state is never served. `TowerFinalizer` resumes the reconstructed de-duplication watermark and metrics-only level-0 count instead of resetting either ref. A catch-up interval greater than 100, a missing retained snapshot, failure/cancellation at each ordinal, and restart between bounded chunks advance one durable work cursor only through the last successfully appended exact `(ordinal,hash)`; every suffix is retried and clean-replay parity holds. |
 | TOWER-007 | Proof comparison and `maxvalid-bg` agree on generated competing valid chains across era/eta boundaries and divergence beyond local `k2`; missing proof material enters recovery rather than defaulting to a local winner. |
 | LIFE-001 | Capability matrix rejects P0/P1 use, permits only reversible P2 actions, and applies positive watchtower coverage to every checkpoint-derived economic capability. External service confirmation policy cannot change protocol validity or canonical state. |
 
@@ -504,8 +504,22 @@ cross-MG substitution reject before the allow-spend is usable.
 | REC-001 | Corrupt/missing bytes at each retention boundary cause authenticated exact-hash fetch or halt before mutation, never local synthesis. |
 | REC-002 | Crash/restart at checkpoint production/signing/store, diff apply, GL0 compose, P2 transition, retention update, tower/SMT update, density unwind/refold, correction, outbox, evidence, ack, and prune returns exact state. |
 | REC-003 | Genesis sync, authenticated-anchor sync, long offline catch-up, sibling recovery, and multi-peer disagreement produce exact canonical bytes or fail closed. A common ancestor older than local `k2` data exercises verified fetch/rebuild. |
-| REC-004 | Durable tower and historical-SMT enumeration rejects the entire image on a malformed, truncated, oversized, noncanonical, duplicate, negative/out-of-range, or trailing-byte key; it never `flatMap`s/filter-drops the entry and continues with reduced history. Inject each defect across restart, compaction, shallow/deep density reorg, proof serving, and catch-up. The node enters authenticated recovery before publishing a root, tower proof, finality phase, or eligibility result, and a verified clean rebuild exactly matches clean replay. |
+| REC-004 | Durable tower and historical-SMT enumeration rejects the entire image on a malformed, truncated, oversized, noncanonical, duplicate, out-of-range, or trailing-byte key, and rejects a negative replay lag or overflowing derived version before replay mutation; it never `flatMap`s/filter-drops an entry and continues with reduced history. Inject each defect plus failure/cancellation at every subsequent version-fold step across restart, compaction, shallow/deep density reorg, proof serving, and catch-up. The node enters authenticated recovery before publishing a root, tower proof, finality phase, or eligibility result, and a verified clean rebuild exactly matches clean replay. |
 | REC-005 | Peer, disk, reorg, catch-up, and cold-bootstrap raw-state loads use the same staged transactional installer as BOOT-005. In particular, no `clear`/`loadBytes`, snapshot/ref update, or recovery marker becomes visible before full bundle/proof verification and the durable all-or-none commit; failed verification and restart preserve the exact prior root and anchor. |
+
+`REC-004` is partial in the current worktree. The total canonical key grammar,
+one-time complete tower key/value validation with indexed hot reads/updates, and
+historical malformed-input plus `ordinal + k` preflight are green in focused
+suites. Historical replay now builds a fresh derived tree and swaps it only on
+success; double replay produces identical retained roots, and injected hashing
+failure or cancellation preserves the prior tree without exposing a prefix. Durable-KV
+crash atomicity, production boot/disk wiring, `TowerFinalizer` restart-state
+reconstruction, and the live bounded-catch-up cursor remain open. The current
+loop marks archival target A settled before asynchronously processing at most
+100 entries from prior P, permanently skipping a suffix when A is farther ahead
+or any entry is unavailable/fails. Restart/compaction, exact-hash density reorg,
+proof serving, authenticated clean rebuild, and publication-blocking integration
+also remain required.
 
 ### 4.10 Permissionless network and resources
 

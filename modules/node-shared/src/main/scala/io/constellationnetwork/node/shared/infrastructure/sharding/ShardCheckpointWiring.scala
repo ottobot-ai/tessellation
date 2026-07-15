@@ -214,8 +214,8 @@ object ShardCheckpointWiring {
     * prior checkpoint's cumulative per-MG currency state — is already in their overlay best-tip. `priorStateReader` is exactly that
     * best-tip `GlobalStateReader`; `S(N)` is reconstructed from it via [[GlobalStateConverter.reconstructCurrencyInfoFrom]] (all eight
     * serialized `Mg*` fields, including the transitional root-excluded sync view, plus fieldId-7 allow-spends) and the fieldId-5
-    * incremental. Snapshots execute IN ORDER (chain-link), so cumulative state, allow-spends, and
-    * token-locks accumulate. The per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only.
+    * incremental. Snapshots execute IN ORDER (chain-link), so cumulative state, allow-spends, and token-locks accumulate. The
+    * per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only.
     *
     * '''Derivation.''' Runs the SAME full recreation as the global adopter, with finalized global-snapshot lookup, and seeds
     * `priorLastCurrencySnapshots` with `S(N)` (`Right((priorInc, S(N)))`, or `Left(genesis)` at the metagraph's genesis window, or absent

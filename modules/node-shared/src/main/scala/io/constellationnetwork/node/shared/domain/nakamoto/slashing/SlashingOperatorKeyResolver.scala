@@ -17,16 +17,16 @@ import io.constellationnetwork.security.hash.Hash
 /** Exact historical identity boundary used by slashing validators.
   *
   * Slashing may resolve an operator key only from the canonical state that governed the signed offence. A current registry, a frozen
-  * genesis projection, a wire-carried key, or a receiver-selected branch is not an implementation of this interface. Until retained
-  * history can prove a unique context, the resolver must return [[SlashingOperatorKeyResolution.HistoricalStateUnavailable]].
+  * genesis projection, a wire-carried key, or a receiver-selected branch is not an implementation of this interface. Until retained history
+  * can prove a unique context, the resolver must return [[SlashingOperatorKeyResolution.HistoricalStateUnavailable]].
   *
   * Current schema blockers are represented in the contexts rather than hidden:
   *
   *   - admission attestations bind a metagraph parent hash but no exact GL0 `(ordinal, hash, root)` or eta period;
   *   - shard checkpoints bind an epoch and GL0 anchor ordinal but no exact Phase-2 anchor hash or operator-registry witness.
   *
-  * A production resolver therefore needs retained canonical evidence that uniquely connects these signed fields to the exact historical
-  * GL0 key view. If it cannot construct that proof, validation is unverifiable and cannot slash.
+  * A production resolver therefore needs retained canonical evidence that uniquely connects these signed fields to the exact historical GL0
+  * key view. If it cannot construct that proof, validation is unverifiable and cannot slash.
   */
 trait SlashingOperatorKeyResolver[F[_]] {
   def resolve(
@@ -47,8 +47,8 @@ object SlashingOperatorKeyResolver {
         (SlashingOperatorKeyResolution.HistoricalStateUnavailable(reason): SlashingOperatorKeyResolution).pure[F]
     }
 
-  /** Constructor for a branch-historical implementation (and focused tests). The supplied function owns the proof that its resolved
-    * state is the unique state governing `context`; validator-side structural checks still reject malformed or inactive pairs.
+  /** Constructor for a branch-historical implementation (and focused tests). The supplied function owns the proof that its resolved state
+    * is the unique state governing `context`; validator-side structural checks still reject malformed or inactive pairs.
     */
   def make[F[_]](
     resolveF: (PeerId, SlashingOffenceContext) => F[SlashingOperatorKeyResolution]
@@ -118,8 +118,8 @@ object HistoricalStateUnavailableReason {
   case object RegistryStateInvalid extends HistoricalStateUnavailableReason
 }
 
-/** A slashing validator has three semantically distinct results. Only [[SlashingValidationResult.Valid]] proves guilt and may reach a
-  * slash transition. In particular, unavailable history is not an invalid signature and cannot be converted into guilt.
+/** A slashing validator has three semantically distinct results. Only [[SlashingValidationResult.Valid]] proves guilt and may reach a slash
+  * transition. In particular, unavailable history is not an invalid signature and cannot be converted into guilt.
   */
 sealed trait SlashingValidationResult[+R, +A] extends Product with Serializable
 

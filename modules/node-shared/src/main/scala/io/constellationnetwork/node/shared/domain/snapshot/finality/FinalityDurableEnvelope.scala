@@ -1,15 +1,15 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality
 
-import java.io.{ByteArrayOutputStream, DataOutputStream, EOFException, InputStream}
+import java.io._
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.Arrays
 
+import scala.util.control.NonFatal
+
 import scodec.bits.BitVector
 import scodec.{Attempt, Codec}
-
-import scala.util.control.NonFatal
 
 sealed trait FinalityDurableEnvelopeKind extends Product with Serializable {
   def tag: Int
@@ -72,8 +72,7 @@ object FinalityDurableEnvelopeKind {
   def fromTag(tag: Int): Option[FinalityDurableEnvelopeKind] = all.find(_.tag == tag)
 }
 
-sealed abstract class FinalityDurableEnvelopeError(message: String, cause: Throwable = null)
-    extends RuntimeException(message, cause)
+sealed abstract class FinalityDurableEnvelopeError(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
 
 object FinalityDurableEnvelopeError {
   final case class InvalidLimit(maxPayloadBytes: Long)
@@ -90,8 +89,7 @@ object FinalityDurableEnvelopeError {
   final case class UnsupportedVersion(observed: Int)
       extends FinalityDurableEnvelopeError(s"Unsupported finality envelope format version: $observed")
 
-  final case class UnknownKind(observed: Int)
-      extends FinalityDurableEnvelopeError(s"Unknown finality envelope kind tag: $observed")
+  final case class UnknownKind(observed: Int) extends FinalityDurableEnvelopeError(s"Unknown finality envelope kind tag: $observed")
 
   final case class UnexpectedKind(expected: FinalityDurableEnvelopeKind, actual: FinalityDurableEnvelopeKind)
       extends FinalityDurableEnvelopeError(s"Unexpected finality envelope kind: expected=${expected.label} actual=${actual.label}")
@@ -122,9 +120,8 @@ object FinalityDurableEnvelopeError {
 
 /** Canonical local durability envelope for the greenfield ScodecV1 finality store.
   *
-  * The checksum covers magic, format version, kind, payload length, and payload.
-  * Decoding is exact: bounded payloads, complete Scodec consumption, and EOF after
-  * the checksum are all mandatory.
+  * The checksum covers magic, format version, kind, payload length, and payload. Decoding is exact: bounded payloads, complete Scodec
+  * consumption, and EOF after the checksum are all mandatory.
   */
 object FinalityDurableEnvelope {
   import FinalityDurableEnvelopeError._
@@ -137,7 +134,11 @@ object FinalityDurableEnvelope {
 
   final case class Decoded(kind: FinalityDurableEnvelopeKind, payload: Array[Byte])
 
-  def encode(kind: FinalityDurableEnvelopeKind, payload: Array[Byte], maxPayloadBytes: Long): Either[FinalityDurableEnvelopeError, Array[Byte]] =
+  def encode(
+    kind: FinalityDurableEnvelopeKind,
+    payload: Array[Byte],
+    maxPayloadBytes: Long
+  ): Either[FinalityDurableEnvelopeError, Array[Byte]] =
     for {
       _ <- validateLimit(maxPayloadBytes)
       _ <- Either.cond(payload.length.toLong <= maxPayloadBytes, (), PayloadTooLarge(maxPayloadBytes, payload.length.toLong))
@@ -163,7 +164,7 @@ object FinalityDurableEnvelope {
     expectedKind: FinalityDurableEnvelopeKind,
     maxPayloadBytes: Long
   ): Either[FinalityDurableEnvelopeError, Decoded] =
-    try {
+    try
       for {
         _ <- validateLimit(maxPayloadBytes)
         header <- readExact(input, HeaderBytes, "header")
@@ -174,7 +175,7 @@ object FinalityDurableEnvelope {
         actualChecksum = sha256(concat(header, payload))
         _ <- Either.cond(MessageDigest.isEqual(expectedChecksum, actualChecksum), (), ChecksumMismatch)
       } yield Decoded(parsed._1, payload)
-    } catch {
+    catch {
       case error: FinalityDurableEnvelopeError => Left(error)
       case _: EOFException                     => Left(Truncated("stream", 1L, 0L))
       case NonFatal(error)                     => Left(IoFailure(error.getMessage, error))

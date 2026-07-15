@@ -1,7 +1,7 @@
 package io.constellationnetwork.node.shared.domain.nakamoto.nipopow
 
 import cats.Parallel
-import cats.effect.Async
+import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
 import io.constellationnetwork.json.JsonSerializer
@@ -25,6 +25,10 @@ final case class CommitmentKey(ordinal: SnapshotOrdinal)
 
 object CommitmentKey {
 
+  private[nipopow] val PartitionName = "HistoricalCommitmentSmtStore"
+  private val EncodedChars = 16
+  private val MaxOrdinal = BigInt(Long.MaxValue)
+
   /** 16-hex-char (int64, unsigned-padded) encoding of the ordinal — lex order matches numeric ordinal order. This is BOTH the durable MPT
     * key and the SMT leaf key (the SMT hashes it to a uniform 256-bit position), so an inclusion proof is keyed by the same canonical
     * ordinal encoding the durable store uses.
@@ -32,7 +36,31 @@ object CommitmentKey {
   def toHex(ordinal: SnapshotOrdinal): Hex = Hex(f"${ordinal.value.value}%016x")
 
   def toHexF[F[_]: cats.Applicative](key: CommitmentKey): F[Hex] = toHex(key.ordinal).pure[F]
+
+  private[nipopow] def decode(hex: Hex): Either[DurableNipopowRecoveryRequired, CommitmentKey] =
+    decodeCandidate(hex).flatMap(key => DurableNipopowKeyCodec.canonical(PartitionName, hex, toHex(key.ordinal)).as(key))
+
+  private[nipopow] def decodeAll(keys: Iterable[Hex]): Either[DurableNipopowRecoveryRequired, List[(Hex, CommitmentKey)]] =
+    DurableNipopowKeyCodec.decodeAll[CommitmentKey](
+      PartitionName,
+      keys,
+      decodeCandidate,
+      key => toHex(key.ordinal),
+      key => s"ordinal=${key.ordinal.value.value}"
+    )
+
+  private def decodeCandidate(hex: Hex): Either[DurableNipopowRecoveryRequired, CommitmentKey] =
+    for {
+      value <- DurableNipopowKeyCodec.fixedWidthHex(PartitionName, hex, EncodedChars)
+      ordinalLong <- DurableNipopowKeyCodec.boundedUnsigned(PartitionName, hex, "ordinal", value, MaxOrdinal)
+      ordinal <- NonNegLong
+        .from(ordinalLong)
+        .leftMap(reason => MalformedDurableNipopowKey(PartitionName, hex, s"ordinal is out of range: $reason"))
+    } yield CommitmentKey(SnapshotOrdinal(ordinal))
 }
+
+final case class InvalidHistoricalReplayLag(replayK: Long)
+    extends IllegalArgumentException(s"historical commitment replay lag must be nonnegative, got $replayK")
 
 /** §3 NIPoPoW — the UNBOUNDED, on-disk SMT keyed by snapshot ordinal whose single root is anchored as `smtRoot` in the gl0
   * `GlobalSnapshotStateProof`. Each leaf is a [[PerOrdinalCommitment]] (commitment hash) for one currently selected historical ordinal.
@@ -65,8 +93,9 @@ trait HistoricalCommitmentSmtStore[F[_]] {
 
   /** Legacy-named append: record the commitment for current-canonical ordinal `eligibleOrdinal` (`= snapshotOrdinal − k`) as a leaf and
     * snapshot the resulting root under version `snapshotOrdinal`. Persists the commitment hash to the durable KV first (recovery
-    * substrate), then folds it into the live SMT. Idempotent: re-appending the same `(snapshotOrdinal, eligibleOrdinal, commitment)`
-    * reproduces the same root (upsert with the same value; the SMT is order-/repeat-independent). Returns `smtRoot(snapshotOrdinal)`.
+    * substrate), then folds it into the live SMT. Re-appending the exact same tuple is idempotent only while `snapshotOrdinal` is still the
+    * latest derived version. Re-committing an older version after later commits is not supported and exact-hash reorg recovery remains
+    * open. Returns `smtRoot(snapshotOrdinal)`.
     */
   def appendAtFinality(snapshotOrdinal: SnapshotOrdinal, eligibleOrdinal: SnapshotOrdinal, commitment: PerOrdinalCommitment): F[SmtRoot]
 
@@ -86,15 +115,18 @@ trait HistoricalCommitmentSmtStore[F[_]] {
 
   /** Chain-replay recovery: rebuild the in-memory SMT version-roots from the durable commitment KV. Re-applies every persisted `(ordinal i,
     * commitmentHash)` as a leaf and re-snapshots the root under version `i + k` (so `rootForSnapshot` is reproduced for the retained
-    * window). Idempotent for one ordinal-selected history. Called at boot before the first proof is built. `k` is the current k1 lag; this
-    * replay does not yet reconstruct an exact-hash density replacement.
+    * window). The replacement is built from empty in isolation and published in one swap; malformed input, hashing failure, or cancellation
+    * before that swap preserves the complete previously published derived tree. Idempotent for one ordinal-selected history. It is intended
+    * to run at boot before the first proof is built; production boot/disk wiring remains open under REC-004. `k` is the current k1 lag;
+    * this derived-state swap does not make the durable KV crash-atomic and does not yet reconstruct an exact-hash density replacement.
     */
   def replayFrom(k: Long): F[Unit]
 }
 
 object HistoricalCommitmentSmtStore {
 
-  /** Wrap a durable `MptStore[F, CommitmentKey]` + an in-memory [[VersionedSmt]] as a [[HistoricalCommitmentSmtStore]].
+  /** Wrap a durable `MptStore[F, CommitmentKey]` and an internally owned, replaceable [[VersionedSmt]] as a
+    * [[HistoricalCommitmentSmtStore]].
     *
     * The `k` cutoff is owned by the CALLER: [[appendAtFinality]] takes `(snapshotOrdinal, eligibleOrdinal)` explicitly, so the store is a
     * pure ordinal-keyed structure with no snapshot-lookup dependency. The caller (GSAM wiring) computes `eligibleOrdinal = snapshotOrdinal
@@ -103,9 +135,12 @@ object HistoricalCommitmentSmtStore {
     */
   def make[F[_]: Async: Hasher](
     durable: MptStore[F, CommitmentKey],
-    versioned: VersionedSmt[F]
+    versionRetention: Int
   ): F[HistoricalCommitmentSmtStore[F]] =
-    Async[F].delay {
+    for {
+      initial <- VersionedSmt.make[F](versionRetention)
+      current <- Ref.of[F, VersionedSmt[F]](initial)
+    } yield {
       val logger = Slf4jLogger.getLoggerFromName[F]("HistoricalCommitmentSmtStore")
 
       new HistoricalCommitmentSmtStore[F] {
@@ -115,43 +150,79 @@ object HistoricalCommitmentSmtStore {
           eligibleOrdinal: SnapshotOrdinal,
           commitment: PerOrdinalCommitment
         ): F[SmtRoot] =
-          for {
-            commitHash <- PerOrdinalCommitment.commitmentHash[F](commitment)
-            // Durable persist first (recovery substrate), then derive the SMT leaf. The durable KV value is the leaf VALUE bytes the SMT
-            // commits — keep them identical so a replay reproduces byte-identical leaves.
-            _ <- durable.insert[Hash](CommitmentKey(eligibleOrdinal), commitHash)
-            _ <- durable.commit(eligibleOrdinal)
-            leafKey = CommitmentKey.toHex(eligibleOrdinal)
-            leafValue = Hex(commitHash.value).toBytes
-            root <- versioned.commit(snapshotOrdinal, Map(leafKey -> leafValue), Set.empty)
-          } yield root
+          durable.withExclusiveLock {
+            for {
+              commitHash <- PerOrdinalCommitment.commitmentHash[F](commitment)
+              // Durable persist first (recovery substrate), then derive the SMT leaf. The durable KV value is the leaf VALUE bytes the SMT
+              // commits — keep them identical so a replay reproduces byte-identical leaves.
+              _ <- durable.insert[Hash](CommitmentKey(eligibleOrdinal), commitHash)
+              _ <- durable.commit(eligibleOrdinal)
+              leafKey = CommitmentKey.toHex(eligibleOrdinal)
+              leafValue = Hex(commitHash.value).toBytes
+              versioned <- current.get
+              root <- versioned.commit(snapshotOrdinal, Map(leafKey -> leafValue), Set.empty)
+            } yield root
+          }
 
         def rootForSnapshot(snapshotOrdinal: SnapshotOrdinal): F[Option[SmtRoot]] =
-          versioned.rootAt(snapshotOrdinal)
+          durable.withExclusiveLock(current.get.flatMap(_.rootAt(snapshotOrdinal)))
 
         def proveAt(snapshotOrdinal: SnapshotOrdinal, targetOrdinal: SnapshotOrdinal): F[Either[SmtProofError, SmtProof]] =
-          versioned.proveAt(snapshotOrdinal, CommitmentKey.toHex(targetOrdinal))
+          durable.withExclusiveLock(current.get.flatMap(_.proveAt(snapshotOrdinal, CommitmentKey.toHex(targetOrdinal))))
 
         def commitmentHashAt(ordinal: SnapshotOrdinal): F[Option[Hash]] =
-          durable.get[Hash](CommitmentKey(ordinal))
+          durable.withExclusiveLock(durable.get[Hash](CommitmentKey(ordinal)))
 
         def replayFrom(replayK: Long): F[Unit] =
-          durable.getAllForPrefix[Hash](Hex("")).flatMap { all =>
-            // Parse each durable key's ordinal, fold in ascending ordinal order so version-roots are recorded monotonically (the SMT result
-            // is order-independent, but VersionedSmt prunes by version, so ascending keeps the most-recent window correct).
-            val ordered: List[(SnapshotOrdinal, Hash)] =
-              all.toList.flatMap {
-                case (hex, hash) => parseOrdinalFromHex(hex).map(_ -> hash)
-              }.sortBy(_._1.value.value)
-
-            ordered.traverse_ {
-              case (eligibleOrdinal, commitHash) =>
-                val version = SnapshotOrdinal(NonNegLong.unsafeFrom(eligibleOrdinal.value.value + replayK))
-                val leafKey = CommitmentKey.toHex(eligibleOrdinal)
-                val leafValue = Hex(commitHash.value).toBytes
-                versioned.commit(version, Map(leafKey -> leafValue), Set.empty).void
-            } >> logger.debug(s"[HistoricalCommitmentSmtStore] Replayed ${ordered.size} commitments (k=$replayK)")
+          durable.withExclusiveLock {
+            Async[F].uncancelable { poll =>
+              poll {
+                for {
+                  _ <- Either.cond(replayK >= 0L, (), InvalidHistoricalReplayLag(replayK)).liftTo[F]
+                  entries <- validatedDurableEntries
+                  // Validate every derived version before building the replacement. The existing tree remains published while the fresh
+                  // tree is built, so malformed input, hashing failure, or cancellation cannot expose a replay prefix.
+                  ordered <- entries
+                    .sortBy(_._1.ordinal.value.value)
+                    .traverse {
+                      case (key, commitHash) =>
+                        val eligible = key.ordinal.value.value
+                        val version = BigInt(eligible) + BigInt(replayK)
+                        Either
+                          .cond(
+                            version <= BigInt(Long.MaxValue),
+                            (SnapshotOrdinal(NonNegLong.unsafeFrom(version.longValue)), key.ordinal, commitHash),
+                            MalformedDurableNipopowKey(
+                              CommitmentKey.PartitionName,
+                              CommitmentKey.toHex(key.ordinal),
+                              s"eligible ordinal $eligible plus replay lag $replayK exceeds ${Long.MaxValue}"
+                            )
+                          )
+                    }
+                    .liftTo[F]
+                  replacement <- VersionedSmt.make[F](versionRetention)
+                  _ <- ordered.traverse_ {
+                    case (version, eligibleOrdinal, commitHash) =>
+                      val leafKey = CommitmentKey.toHex(eligibleOrdinal)
+                      val leafValue = Hex(commitHash.value).toBytes
+                      replacement.commit(version, Map(leafKey -> leafValue), Set.empty).void
+                  }
+                  _ <- logger.debug(s"[HistoricalCommitmentSmtStore] Prepared ${ordered.size} replayed commitments (k=$replayK)")
+                } yield replacement
+              }.flatMap(current.set)
+            }
           }
+
+        private def validatedDurableEntries: F[List[(CommitmentKey, Hash)]] =
+          for {
+            physicalKeys <- durable.underlying.physicalKeys
+            decoded <- CommitmentKey.decodeAll(physicalKeys).liftTo[F]
+            values <- durable.getAllForPrefix[Hash](Hex(""))
+            expected = decoded.toMap
+            _ <- DurableNipopowEnumerationChanged(CommitmentKey.PartitionName)
+              .raiseError[F, Unit]
+              .whenA(values.keySet != expected.keySet)
+          } yield values.toList.map { case (hex, hash) => expected(hex) -> hash }
       }
     }
 
@@ -165,21 +236,8 @@ object HistoricalCommitmentSmtStore {
     for {
       producer <- InMemoryMerklePatriciaProducer.make[F]()
       durable <- MptStore.make[F, CommitmentKey](producer, CommitmentKey.toHexF[F])
-      versioned <- VersionedSmt.make[F](versionRetention)
-      store <- make[F](durable, versioned)
+      store <- make[F](durable, versionRetention)
     } yield store
-
-  /** Parse the 16-hex ordinal from a [[CommitmentKey]]-encoded hex (length-checked; `None` on malformed). */
-  private[nipopow] def parseOrdinalFromHex(hex: Hex): Option[SnapshotOrdinal] = {
-    val s = hex.value
-    if (s.length != 16) None
-    else
-      scala.util
-        .Try(java.lang.Long.parseUnsignedLong(s, 16))
-        .toOption
-        .flatMap(v => NonNegLong.from(v).toOption)
-        .map(SnapshotOrdinal(_))
-  }
 
   /** A versioned SMT that retains ALL version-roots (no pruning). Convenience for tests that assert on old roots; production passes a
     * bounded `versionRetention`.

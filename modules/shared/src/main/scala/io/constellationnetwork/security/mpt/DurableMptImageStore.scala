@@ -7,12 +7,11 @@ import java.nio.file._
 import java.security.{DigestInputStream, MessageDigest}
 import java.util.Arrays
 
-import cats.Parallel
-import cats.effect.{Async, Ref, Resource}
 import cats.effect.std.Semaphore
 import cats.effect.syntax.all._
+import cats.effect.{Async, Ref, Resource}
 import cats.syntax.all._
-import cats.~>
+import cats.{Parallel, ~>}
 
 import scala.collection.immutable.SortedMap
 import scala.util.control.NonFatal
@@ -24,7 +23,7 @@ import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.PhysicalTrieKeyValidator
-import io.constellationnetwork.storage.durable.{DurableAtomicWriter, DurableFileError, DurableFileOps, DurableWriteHook}
+import io.constellationnetwork.storage.durable._
 
 import scodec.bits.ByteVector
 
@@ -346,15 +345,16 @@ object DurableMptImageStore {
       _ <- Resource.eval(fileOps.forceDirectory(imagesDirectory))
       _ <- Resource.eval(fileOps.forceDirectory(directory))
       mutex <- Resource.eval(Semaphore[F](1L))
-    } yield VerifiedActiveMptPublication.liveStore[F](
-      directory,
-      fileOps,
-      faults,
-      codecEra,
-      rootVerifier,
-      limits,
-      mutex
-    )
+    } yield
+      VerifiedActiveMptPublication.liveStore[F](
+        directory,
+        fileOps,
+        faults,
+        codecEra,
+        rootVerifier,
+        limits,
+        mutex
+      )
   }
 
   private def adaptDurableResource[F[_]: Async, A](resource: Resource[F, A]): Resource[F, A] =

@@ -223,7 +223,16 @@ already has a hard-coded kill switch.
    replay-witness migration, field 32 is rejected from
    every GL0 load rather than converted to a synthetic empty replay input.
    Malformed tower/SMT durable keys fail the whole load instead of
-   disappearing during decode (`STOR-02`, `REC-004`).
+   disappearing during decode (`STOR-02`, `REC-004`). The strict total decoder,
+   one-time validated tower index, and isolated historical replay tree swap are
+   green in focused worktree tests; double replay produces identical retained
+   roots, and injected hashing failure/cancellation preserves the prior derived tree. Durable-KV
+   crash atomicity, production boot/disk wiring, `TowerFinalizer` restart refs,
+   and its bounded catch-up cursor remain open: the live loop marks target A
+   settled before asynchronously processing at most 100 ordinals from prior P,
+   so a farther suffix or missing/failed entry is not retried. Restart/compaction,
+   exact-hash density reorg, proof serving, and authenticated clean-rebuild
+   integration remain open.
 5. **Qualify the integrated state machine.** Run GSAM differential tests from
    identical rooted bytes with every sidecar omission/substitution, then
    restart, compaction, density unwind/refold, authenticated recovery, and
@@ -793,7 +802,7 @@ delivery, rollback, and recovery.
   `FOLLOW-007`, `FOLLOW-008A` through `FOLLOW-008P`, `REC-*` including
   `REC-004`/`REC-005`, `MEMPOOL-001`,
   `ROOT-002` through `ROOT-005`, `ROOT-009`,
-  `STOR-02`, and `GROWTH-001`.
+  `STOR-02`, `STOR-03`, and `GROWTH-001`.
 
 ### E11 - Exceptional challenge replay and sound slashing (`SCAFFOLD ONLY`)
 

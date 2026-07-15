@@ -3,10 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import cats.Functor
 import cats.syntax.functor._
 
-import io.constellationnetwork.node.shared.domain.nakamoto.{
-  HistoricalOperatorRegistryView,
-  HistoricalOperatorRegistryViewSource
-}
+import io.constellationnetwork.node.shared.domain.nakamoto.{HistoricalOperatorRegistryView, HistoricalOperatorRegistryViewSource}
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hash.Hash
 
@@ -37,9 +34,10 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSource {
       if ordinal == signed.ordinal
       if stored.hash == requestedHash
       if stored.parentHash == signed.lastSnapshotHash
-    } yield HistoricalOperatorRegistryView(
-      parentHash = requestedHash,
-      parentOrdinal = ordinal,
-      info = context
-    )
+    } yield
+      HistoricalOperatorRegistryView(
+        parentHash = requestedHash,
+        parentOrdinal = ordinal,
+        info = context
+      )
 }

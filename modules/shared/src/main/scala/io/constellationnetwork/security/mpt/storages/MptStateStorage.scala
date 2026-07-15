@@ -84,7 +84,10 @@ class MptStateStorage[F[_]: Async: JsonSerializer](
     for {
       stored <- listStoredOrdinals
       toKeep = cutoffLogic.cutoff(SnapshotOrdinal.MinValue, currentOrdinal)
-      toDelete = stored.toSet.diff(toKeep).toList
+      // A delayed retention pass for N must never delete a generation newer than N. Publication ordering is repaired separately under
+      // STOR-01/ROOT-005, but preserving future generations here makes stale cleanup non-destructive and retry-safe.
+      eligible = stored.iterator.filter(_ <= currentOrdinal).toSet
+      toDelete = eligible.diff(toKeep).toList
       _ <- toDelete.traverse_(delete)
       _ <- if (toDelete.nonEmpty) logger.debug(s"[MptStateStorage] Cutoff removed ${toDelete.size} old files") else Async[F].unit
     } yield ()

@@ -7,8 +7,8 @@ import eu.timepit.refined.types.numeric.NonNegLong
 
 /** Closed set of durable projections driven by a released GL0 finality generation.
   *
-  * None of these effects decides finality or makes economic state authoritative.
-  * The released core and its exact MPT publication are established separately.
+  * None of these effects decides finality or makes economic state authoritative. The released core and its exact MPT publication are
+  * established separately.
   */
 sealed trait EffectKind extends Product with Serializable
 
@@ -17,6 +17,7 @@ object EffectKind {
   case object SnapshotStorageProjection extends EffectKind
   case object TipTrackerProjection extends EffectKind
   case object OverlayCacheProjection extends EffectKind
+
   /** Rebuildable serving/retention watermark. It is never fork-choice truth. */
   case object ServiceAvailabilityWatermarkProjection extends EffectKind
   case object LatestSliceProjection extends EffectKind
@@ -35,6 +36,7 @@ object EffectKind {
 }
 
 final case class EffectId(value: Hash)
+
 /** Derived in memory from [[EffectId]] for sink retries; never carried in a durable payload. */
 final case class EffectIdempotencyKey private[finality] (value: Hash)
 final case class EffectStateDigest(value: Hash)
@@ -52,9 +54,8 @@ final case class EffectManifestPointer(
 
 /** Scope repeated by every effect command and checked against its manifest.
   *
-  * `priorState` identifies the released state replaced by this generation. The
-  * manifest's `previous` pointer binds the corresponding immutable release-order
-  * history without embedding an unbounded pending queue in the coordinator head.
+  * `priorState` identifies the released state replaced by this generation. The manifest's `previous` pointer binds the corresponding
+  * immutable release-order history without embedding an unbounded pending queue in the coordinator head.
   */
 final case class EffectScope(
   domain: FinalityDomain,
@@ -67,11 +68,9 @@ final case class EffectScope(
 
 /** Exact, idempotent command for one sink.
   *
-  * `predecessor` is the immediately preceding command in the same sink lane.
-  * Commands are processed in release order and every predecessor requires its
-  * own `Applied` or independently read-back `AlreadyApplied` receipt. State and
-  * revision form one compare-and-set boundary: a real mutation advances the
-  * finality-owned sink revision exactly once, while an explicit no-op preserves it.
+  * `predecessor` is the immediately preceding command in the same sink lane. Commands are processed in release order and every predecessor
+  * requires its own `Applied` or independently read-back `AlreadyApplied` receipt. State and revision form one compare-and-set boundary: a
+  * real mutation advances the finality-owned sink revision exactly once, while an explicit no-op preserves it.
   */
 final case class ScopedEffectCommand(
   scope: EffectScope,
@@ -98,8 +97,8 @@ final case class ScopedEffectCommand(
 
   /** Complete scope-independent preimage from which [[effectId]] is derived.
     *
-    * Intent and attempt are deliberately absent: retrying the exact same durable
-    * command retains its identity, while every state-bearing input is committed.
+    * Intent and attempt are deliberately absent: retrying the exact same durable command retains its identity, while every state-bearing
+    * input is committed.
     */
   def identityPreimage: EffectCommandIdentity =
     EffectCommandIdentity(
@@ -120,8 +119,8 @@ final case class ScopedEffectCommand(
 
 /** Canonical input to a durable effect identity.
   *
-  * This product is a protocol preimage, not a second command representation. It
-  * excludes caller-selected identifiers and all retry-only scope.
+  * This product is a protocol preimage, not a second command representation. It excludes caller-selected identifiers and all retry-only
+  * scope.
   */
 final case class EffectCommandIdentity(
   domain: FinalityDomain,
@@ -140,9 +139,8 @@ final case class EffectCommandIdentity(
 
 /** Scope-independent identity of one effect command.
   *
-  * Omitting the intent-scoped wrapper makes this suitable for [[IntentScope]]:
-  * the resulting intent identifier can then scope the exact manifest without a
-  * hash cycle.
+  * Omitting the intent-scoped wrapper makes this suitable for [[IntentScope]]: the resulting intent identifier can then scope the exact
+  * manifest without a hash cycle.
   */
 final case class EffectCommandCommitment(
   kind: EffectKind,
@@ -157,9 +155,8 @@ final case class EffectCommandCommitment(
 
 /** Complete scope-independent effect plan committed by an intent.
   *
-  * This remains an explicit product so every durable projection is mandatory in
-  * the canonical schema. In particular, chain-store indexing and snapshot-byte
-  * publication are separate externally observable sinks.
+  * This remains an explicit product so every durable projection is mandatory in the canonical schema. In particular, chain-store indexing
+  * and snapshot-byte publication are separate externally observable sinks.
   */
 final case class EffectPlanCommitment(
   previous: Option[EffectManifestPointer],
@@ -185,10 +182,8 @@ final case class EffectPlanCommitment(
 
 /** One immutable manifest per successfully released generation.
   *
-  * This is deliberately a product rather than a collection. Omitting, adding,
-  * or reordering a finality sink is a schema change. A sink with no mutation for
-  * a generation still carries an explicit command whose before/after digests are
-  * equal.
+  * This is deliberately a product rather than a collection. Omitting, adding, or reordering a finality sink is a schema change. A sink with
+  * no mutation for a generation still carries an explicit command whose before/after digests are equal.
   */
 final case class FinalityEffectManifest(
   scope: EffectScope,
@@ -263,8 +258,8 @@ final case class AlreadyAppliedEffectReceipt(
 
 final case class EffectOutboxRevision(value: NonNegLong)
 
-/** Highest contiguous generation for which every one of the 18 commands has a
-  * verified terminal receipt. Both fields are absent before the first completion.
+/** Highest contiguous generation for which every one of the 18 commands has a verified terminal receipt. Both fields are absent before the
+  * first completion.
   */
 final case class EffectOutboxCursor(
   completedThrough: Option[ReleaseGeneration],
@@ -273,10 +268,9 @@ final case class EffectOutboxCursor(
 
 /** Mutable outbox scan cursor.
   *
-  * Its canonical codec must use a checksummed envelope. This value is only a
-  * rebuildable progress index: immutable manifests plus per-command receipts are
-  * the authority for whether work remains. It contains no pending-work vector and
-  * cannot advance across a generation with a missing receipt.
+  * Its canonical codec must use a checksummed envelope. This value is only a rebuildable progress index: immutable manifests plus
+  * per-command receipts are the authority for whether work remains. It contains no pending-work vector and cannot advance across a
+  * generation with a missing receipt.
   */
 final case class FinalityEffectOutboxHead(
   revision: EffectOutboxRevision,

@@ -82,9 +82,10 @@ object OperatorConsensusKeyRegistrySuite extends SimpleIOSuite {
       )
     ).attempt
 
-    (duplicateKes, duplicateVrf).mapN { case (kesResult, vrfResult) =>
-      expect(kesResult.swap.exists(_.getMessage.contains("KES key reuse"))) &&
-      expect(vrfResult.swap.exists(_.getMessage.contains("VRF key reuse")))
+    (duplicateKes, duplicateVrf).mapN {
+      case (kesResult, vrfResult) =>
+        expect(kesResult.swap.exists(_.getMessage.contains("KES key reuse"))) &&
+        expect(vrfResult.swap.exists(_.getMessage.contains("VRF key reuse")))
     }
   }
 }

@@ -115,12 +115,13 @@ object NakamotoChainStoreHistoricalOperatorRegistryViewSourceSuite extends Simpl
     for {
       viewA <- views.get(hashA)
       viewB <- views.get(hashB)
-    } yield expect(viewA.exists(_.parentHash == hashA)) &&
-      expect(viewB.exists(_.parentHash == hashB)) &&
-      expect(viewA.exists(_.parentOrdinal == SnapshotOrdinal.unsafeApply(17L))) &&
-      expect(viewB.exists(_.parentOrdinal == SnapshotOrdinal.unsafeApply(17L))) &&
-      expect(viewA.exists(_.info eq contextA)) &&
-      expect(viewB.exists(_.info eq contextB))
+    } yield
+      expect(viewA.exists(_.parentHash == hashA)) &&
+        expect(viewB.exists(_.parentHash == hashB)) &&
+        expect(viewA.exists(_.parentOrdinal == SnapshotOrdinal.unsafeApply(17L))) &&
+        expect(viewB.exists(_.parentOrdinal == SnapshotOrdinal.unsafeApply(17L))) &&
+        expect(viewA.exists(_.info eq contextA)) &&
+        expect(viewB.exists(_.info eq contextB))
   }
 
   test("rejects a chain-store result whose stored hash differs from the requested hash") {

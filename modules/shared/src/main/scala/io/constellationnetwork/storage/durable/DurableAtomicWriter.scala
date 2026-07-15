@@ -46,9 +46,9 @@ object DurableWriteHook {
   * The target becomes visible only through an atomic replace. The temporary file is always offered for deletion and no non-atomic move is
   * attempted. Successful return means temp bytes and the containing directory were forced and the caller's target readback completed.
   * Preparation is cancelable and bracketed cleanup removes the temporary file. Once atomic replacement starts, replacement through verified
-  * readback is uncancelable, so cancellation cannot be observed after the target changed but before its durability was checked.
-  * This is intentionally not an immutable create-or-verify operation: callers which require write-once content addressing must use a
-  * separate create-new primitive which never replaces an existing target.
+  * readback is uncancelable, so cancellation cannot be observed after the target changed but before its durability was checked. This is
+  * intentionally not an immutable create-or-verify operation: callers which require write-once content addressing must use a separate
+  * create-new primitive which never replaces an existing target.
   */
 final class DurableAtomicWriter[F[_]: Async](fileOps: DurableFileOps[F]) {
   import DurableWriteBoundary._

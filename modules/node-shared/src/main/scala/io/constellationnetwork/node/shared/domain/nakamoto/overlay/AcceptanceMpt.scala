@@ -3,7 +3,7 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect.kernel.Sync
 import cats.syntax.all._
 
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, StrictMptEntry, StrictMptRead}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.serde.ImmutableCodec
 

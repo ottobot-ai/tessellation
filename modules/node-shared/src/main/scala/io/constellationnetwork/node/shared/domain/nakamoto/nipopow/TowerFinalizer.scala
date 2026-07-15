@@ -163,7 +163,8 @@ object TowerFinalizer {
                   // Important: gaps are computed in ordinal units, not slot units (proposal §2.1).
                   // The producer-side equivalent in the next slice (S2 phase 2c, deferred) will track these gaps
                   // incrementally; here we recompute from the store on each finalize, which is fine because
-                  // Current tower scheduling visits each eligible snapshot once; the read is a fixed L-1 prefix scan.
+                  // Current tower scheduling visits each eligible snapshot once; the read is a fixed set of
+                  // per-level index lookups.
                   gaps <- (1 to SuperLevelParams.SuperLevelCount).toVector.traverse { µ =>
                     tower.latestAt(µ).map { latest =>
                       val baseOrd = latest.map(_.ordinal.value.value).getOrElse(0L)

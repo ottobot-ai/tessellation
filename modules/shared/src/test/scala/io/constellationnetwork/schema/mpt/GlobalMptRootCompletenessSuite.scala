@@ -230,8 +230,9 @@ object GlobalMptRootCompletenessSuite extends MutableIOSuite {
       base <- stateBytes(gsi)
       active <- activeAddressIndexEntry(GlobalStateFieldId.Balances, gsi.balances.keySet.to(SortedSet))
       expiry <- expiryEntries(gsi.balances.keySet.head)
-      signedBytes = expiry.foldLeft(base.updated(active._1, active._2)) { case (entries, (_, hex, bytes)) =>
-        entries.updated(hex, bytes)
+      signedBytes = expiry.foldLeft(base.updated(active._1, active._2)) {
+        case (entries, (_, hex, bytes)) =>
+          entries.updated(hex, bytes)
       }
       signedCompleteRoot <- completeRoot(signedBytes)
       producer <- InMemoryMerklePatriciaProducer.make[IO]()
@@ -245,6 +246,39 @@ object GlobalMptRootCompletenessSuite extends MutableIOSuite {
         sameBytes(stored, signedBytes),
         storedCompleteRoot == signedCompleteRoot,
         storedConsensusRoot == signedCompleteRoot
+      )
+  }
+
+  test("producer-backed state proof construction is read-only") { res =>
+    implicit val (h, _, j) = res
+    val gsi = sampleGsi
+    val ordinal = SnapshotOrdinal(NonNegLong(1L))
+    val mptSelector = GlobalStateProofSelector(SnapshotOrdinal(NonNegLong(0L)))
+
+    for {
+      entries <- stateBytes(gsi)
+      expectedRoot <- completeRoot(GlobalStateKey.consensusRootEntries(entries))
+      producer <- InMemoryMerklePatriciaProducer.make[IO](entries)
+      rootBefore <- producer.getCurrentRootHash
+      lastBuiltBefore <- producer.getLastBuiltOrdinal
+      ordinalRootBefore <- producer.getRootHashForOrdinal(ordinal)
+      builder = {
+        implicit val globalStateProofSelector: GlobalStateProofSelector = mptSelector
+        GlobalSnapshotInfo.stateProofBuilder[IO](Some(producer))
+      }
+      proof <- builder.buildProof(GlobalSnapshotInfo.empty, ordinal)
+      rootAfter <- producer.getCurrentRootHash
+      lastBuiltAfter <- producer.getLastBuiltOrdinal
+      ordinalRootAfter <- producer.getRootHashForOrdinal(ordinal)
+    } yield
+      expect.all(
+        proof.mptRoot.contains(expectedRoot),
+        rootBefore.isEmpty,
+        rootAfter.isEmpty,
+        lastBuiltBefore.isEmpty,
+        lastBuiltAfter.isEmpty,
+        ordinalRootBefore.isEmpty,
+        ordinalRootAfter.isEmpty
       )
   }
 }

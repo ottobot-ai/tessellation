@@ -12,10 +12,9 @@ import weaver.SimpleIOSuite
 
 /** Source-inventory tripwire for the atomic operator KES+VRF identity boundary.
   *
-  * This is deliberately a reviewed allowlist, not a claim that textual scanning proves consensus
-  * correctness. A new raw VRF/KES primitive consumer, KES lifecycle/sign/verify reference, or
-  * direct atomic-record fixture must fail this suite and receive an explicit registry/history
-  * review before its path is admitted here.
+  * This is deliberately a reviewed allowlist, not a claim that textual scanning proves consensus correctness. A new raw VRF/KES primitive
+  * consumer, KES lifecycle/sign/verify reference, or direct atomic-record fixture must fail this suite and receive an explicit
+  * registry/history review before its path is admitted here.
   */
 object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
 
@@ -278,12 +277,12 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
 
   private val splitRegistryFactoryCall: Regex = {
     val registryNames = Seq("Vrf", "Kes").map(_ + "Registry").mkString("(?:", "|", ")")
-    (s"\\b$registryNames\\s*\\.\\s*(?:make|empty)\\b").r
+    s"\\b$registryNames\\s*\\.\\s*(?:make|empty)\\b".r
   }
 
   private val splitRegistryCompanion: Regex = {
     val registryNames = Seq("Vrf", "Kes").map(_ + "Registry").mkString("(?:", "|", ")")
-    (s"\\bobject\\s+$registryNames\\b").r
+    s"\\bobject\\s+$registryNames\\b".r
   }
 
   test("split KES or VRF registries cannot regain independent factories") {
@@ -415,8 +414,8 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
       val unreviewed = actual -- reviewed
       val staleAllowances = reviewed -- actual
       val countInventoryMismatch =
-        (reviewed -- reviewedRawVrfProductionCounts.keySet) union (reviewedRawVrfProductionCounts.keySet -- reviewed)
-      val changedCounts = (actual intersect reviewed).toList.sorted.collect {
+        (reviewed -- reviewedRawVrfProductionCounts.keySet).union(reviewedRawVrfProductionCounts.keySet -- reviewed)
+      val changedCounts = actual.intersect(reviewed).toList.sorted.collect {
         case path if reviewedRawVrfProductionCounts.get(path).exists(_ != actualCounts(path)) =>
           s"$path expected=${reviewedRawVrfProductionCounts(path)} actual=${actualCounts(path)}"
       }
@@ -452,8 +451,8 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
       val unreviewed = actual -- reviewed
       val staleAllowances = reviewed -- actual
       val countInventoryMismatch =
-        (reviewed -- reviewedRawVrfTestCounts.keySet) union (reviewedRawVrfTestCounts.keySet -- reviewed)
-      val changedCounts = (actual intersect reviewed).toList.sorted.collect {
+        (reviewed -- reviewedRawVrfTestCounts.keySet).union(reviewedRawVrfTestCounts.keySet -- reviewed)
+      val changedCounts = actual.intersect(reviewed).toList.sorted.collect {
         case path if reviewedRawVrfTestCounts.get(path).exists(_ != actualCounts(path)) =>
           s"$path expected=${reviewedRawVrfTestCounts(path)} actual=${actualCounts(path)}"
       }
@@ -482,7 +481,7 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
       val expectedCounts = reviewedDirectRecordFixtures.view.mapValues(_._1).toMap
       val unexpected = actualCounts.keySet -- expectedCounts.keySet
       val staleAllowances = expectedCounts.keySet -- actualCounts.keySet
-      val changedCounts = (actualCounts.keySet intersect expectedCounts.keySet).toList.sorted.collect {
+      val changedCounts = actualCounts.keySet.intersect(expectedCounts.keySet).toList.sorted.collect {
         case path if actualCounts(path) != expectedCounts(path) =>
           s"$path expected=${expectedCounts(path)} actual=${actualCounts(path)}"
       }
@@ -507,7 +506,7 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
       val expectedCounts = reviewedProductionDirectRecordSites.view.mapValues(_._1).toMap
       val unexpected = actualCounts.keySet -- expectedCounts.keySet
       val staleAllowances = expectedCounts.keySet -- actualCounts.keySet
-      val changedCounts = (actualCounts.keySet intersect expectedCounts.keySet).toList.sorted.collect {
+      val changedCounts = actualCounts.keySet.intersect(expectedCounts.keySet).toList.sorted.collect {
         case path if actualCounts(path) != expectedCounts(path) =>
           s"$path expected=${expectedCounts(path)} actual=${actualCounts(path)}"
       }
@@ -539,7 +538,7 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
     val expectedCounts = reviewed.view.mapValues(_._1).toMap
     val unexpected = actualCounts.keySet -- expectedCounts.keySet
     val staleAllowances = expectedCounts.keySet -- actualCounts.keySet
-    val changedCounts = (actualCounts.keySet intersect expectedCounts.keySet).toList.sorted.collect {
+    val changedCounts = actualCounts.keySet.intersect(expectedCounts.keySet).toList.sorted.collect {
       case path if actualCounts(path) != expectedCounts(path) =>
         s"$path expected=${expectedCounts(path)} actual=${actualCounts(path)}"
     }
@@ -558,9 +557,8 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
   private def matchingPaths(sources: List[Source], pattern: Regex): List[String] =
     sources.iterator.filter(source => pattern.findFirstIn(withoutScalaComments(source.contents)).nonEmpty).map(_.path).toList.sorted
 
-  /** Removes line and nested block comments without confusing comment markers inside string or
-    * character literals. Literal contents remain searchable, intentionally: a source exception
-    * that names a raw primitive still requires review even when it is assembled reflectively.
+  /** Removes line and nested block comments without confusing comment markers inside string or character literals. Literal contents remain
+    * searchable, intentionally: a source exception that names a raw primitive still requires review even when it is assembled reflectively.
     */
   private def withoutScalaComments(input: String): String = {
     val out = new StringBuilder(input.length)
@@ -640,7 +638,9 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
       val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
       val stream = Files.walk(root.resolve("modules"))
       try
-        stream.iterator().asScala
+        stream
+          .iterator()
+          .asScala
           .filter(Files.isRegularFile(_))
           .filter(_.getFileName.toString.endsWith(".scala"))
           .filter { path =>
@@ -661,6 +661,6 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
     else
       Option(candidate.getParent) match {
         case Some(parent) => repositoryRoot(parent)
-        case None => throw new IllegalStateException(s"Unable to locate repository root from ${sys.props("user.dir")}")
+        case None         => throw new IllegalStateException(s"Unable to locate repository root from ${sys.props("user.dir")}")
       }
 }

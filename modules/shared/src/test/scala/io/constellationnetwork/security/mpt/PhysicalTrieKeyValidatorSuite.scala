@@ -44,7 +44,7 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
     attempts: Int = 100
   ): IO[Option[Map[Hex, Array[Byte]]]] =
     storage.readState(ordinal).flatMap {
-      case found @ Some(_) => found.pure[IO]
+      case found @ Some(_)      => found.pure[IO]
       case None if attempts > 0 => IO.sleep(10.millis) >> awaitPersistedState(storage, ordinal, attempts - 1)
       case None                 => none[Map[Hex, Array[Byte]]].pure[IO]
     }
@@ -123,13 +123,14 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
         .createFromBytes(Map(Hex("aa") -> value, Hex("aa00") -> value))
         .timeout(1.second)
         .attempt
-    } yield expect.all(
-      uppercaseResult == Left(NonCanonicalPhysicalTrieKey(Hex("AA"), Hex("aa"))),
-      oddResult == Left(OddLengthPhysicalTrieKey(Hex("abc"))),
-      invalidResult == Left(InvalidDigitPhysicalTrieKey(Hex("0g"), 1, 'g')),
-      aliasResult == Left(DuplicatePhysicalTriePath(Hex("aa03"), Hex("AA03"), Hex("aa03"))),
-      prefixResult == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00")))
-    )
+    } yield
+      expect.all(
+        uppercaseResult == Left(NonCanonicalPhysicalTrieKey(Hex("AA"), Hex("aa"))),
+        oddResult == Left(OddLengthPhysicalTrieKey(Hex("abc"))),
+        invalidResult == Left(InvalidDigitPhysicalTrieKey(Hex("0g"), 1, 'g')),
+        aliasResult == Left(DuplicatePhysicalTriePath(Hex("aa03"), Hex("AA03"), Hex("aa03"))),
+        prefixResult == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00")))
+      )
   }
 
   test("parallel builder guard independently rejects a terminal in a multi-entry group") { _ =>
@@ -174,10 +175,11 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       full <- producer.createFromBytes(emptyEntry)
       incremental <- producer.insertFromBytes(emptyTrie, emptyEntry).rethrow
       rejected <- producer.insertFromBytes(incremental, Map(Hex("00") -> Array[Byte](2)))
-    } yield expect.all(
-      incremental.rootHash == full.rootHash,
-      rejected == Left(TerminalPhysicalTrieKeyCollision(Hex(""), Hex("00")))
-    )
+    } yield
+      expect.all(
+        incremental.rootHash == full.rootHash,
+        rejected == Left(TerminalPhysicalTrieKeyCollision(Hex(""), Hex("00")))
+      )
   }
 
   test("public producer paths sort inserts and removals to match canonical full builds") { implicit res =>
@@ -223,17 +225,18 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
         filesystemIncremental <- filesystem.build.rethrow
         _ <- filesystem.remove(removed.reverse).rethrow
         filesystemRemoved <- filesystem.build.rethrow
-      } yield expect.all(
-        parallelIncremental.rootHash == full.rootHash,
-        statelessFull.rootHash == full.rootHash,
-        statelessIncremental.rootHash == statelessTypedFull.rootHash,
-        memoryIncremental.rootHash == full.rootHash,
-        filesystemIncremental.rootHash == full.rootHash,
-        parallelRemoved.rootHash == expectedAfterRemove.rootHash,
-        statelessRemoved.rootHash == expectedAfterRemove.rootHash,
-        memoryRemoved.rootHash == expectedAfterRemove.rootHash,
-        filesystemRemoved.rootHash == expectedAfterRemove.rootHash
-      )
+      } yield
+        expect.all(
+          parallelIncremental.rootHash == full.rootHash,
+          statelessFull.rootHash == full.rootHash,
+          statelessIncremental.rootHash == statelessTypedFull.rootHash,
+          memoryIncremental.rootHash == full.rootHash,
+          filesystemIncremental.rootHash == full.rootHash,
+          parallelRemoved.rootHash == expectedAfterRemove.rootHash,
+          statelessRemoved.rootHash == expectedAfterRemove.rootHash,
+          memoryRemoved.rootHash == expectedAfterRemove.rootHash,
+          filesystemRemoved.rootHash == expectedAfterRemove.rootHash
+        )
     }
   }
 
@@ -249,12 +252,13 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       removeResult <- producer.remove(List(Hex("AA")))
       after <- producer.entries
       afterRoot <- producer.build.rethrow.map(_.rootHash)
-    } yield expect.all(
-      insertResult == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
-      removeResult == Left(NonCanonicalPhysicalTrieKey(Hex("AA"), Hex("aa"))),
-      sameEntries(before, after),
-      beforeRoot == afterRoot
-    )
+    } yield
+      expect.all(
+        insertResult == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+        removeResult == Left(NonCanonicalPhysicalTrieKey(Hex("AA"), Hex("aa"))),
+        sameEntries(before, after),
+        beforeRoot == afterRoot
+      )
   }
 
   test("filesystem producer rejects a colliding insert without changing entries or root") { implicit res =>
@@ -269,11 +273,12 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
         result <- producer.insertBytes(Map(Hex("aa00") -> Array[Byte](3)))
         after <- producer.entries
         afterRoot <- producer.build.rethrow.map(_.rootHash)
-      } yield expect.all(
-        result == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
-        sameEntries(before, after),
-        beforeRoot == afterRoot
-      )
+      } yield
+        expect.all(
+          result == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+          sameEntries(before, after),
+          beforeRoot == afterRoot
+        )
     }
   }
 
@@ -288,12 +293,13 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       entries <- producer.entries
       root <- producer.build.rethrow.map(_.rootHash)
       rebuilt <- ParallelMerklePatriciaProducer[IO].createFromBytes(entries)
-    } yield expect.all(
-      List(results._1, results._2).count(_.isRight) == 1,
-      List(results._1, results._2).count(_.isLeft) == 1,
-      entries.keySet == terminal.keySet || entries.keySet == descendant.keySet,
-      root == rebuilt.rootHash
-    )
+    } yield
+      expect.all(
+        List(results._1, results._2).count(_.isRight) == 1,
+        List(results._1, results._2).count(_.isLeft) == 1,
+        entries.keySet == terminal.keySet || entries.keySet == descendant.keySet,
+        root == rebuilt.rootHash
+      )
   }
 
   test("raw MptStore replacement preflight rejects before clear and keeps its ordinal retryable") { implicit res =>
@@ -311,12 +317,13 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       after <- store.allEntriesAsBytes
       afterRoot <- store.build(ordinal).rethrow.map(_.rootHash)
       synced <- store.lastPersistedOrdinal
-    } yield expect.all(
-      result == Left(TerminalPhysicalTrieKeyCollision(Hex("bb"), Hex("bb00"))),
-      sameEntries(before, after),
-      beforeRoot == afterRoot,
-      synced.isEmpty
-    )
+    } yield
+      expect.all(
+        result == Left(TerminalPhysicalTrieKeyCollision(Hex("bb"), Hex("bb00"))),
+        sameEntries(before, after),
+        beforeRoot == afterRoot,
+        synced.isEmpty
+      )
   }
 
   test("raw MptStore replacement restores its savepoint when canonical-key bytes fail to build") { implicit res =>
@@ -334,12 +341,13 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       after <- store.allEntriesAsBytes
       afterRoot <- store.build(ordinal).rethrow.map(_.rootHash)
       synced <- store.lastPersistedOrdinal
-    } yield expect.all(
-      result.isLeft,
-      sameEntries(before, after),
-      beforeRoot == afterRoot,
-      synced.isEmpty
-    )
+    } yield
+      expect.all(
+        result.isLeft,
+        sameEntries(before, after),
+        beforeRoot == afterRoot,
+        synced.isEmpty
+      )
   }
 
   test("MptStore update validates the post-update image before applying removals") { implicit res =>
@@ -352,10 +360,11 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       before <- store.allEntriesAsBytes
       result <- store.update[Hash](Map(Hex("aa00") -> Hash.empty), Set(Hex("bb"))).attempt
       after <- store.allEntriesAsBytes
-    } yield expect.all(
-      result == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
-      sameEntries(before, after)
-    )
+    } yield
+      expect.all(
+        result == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+        sameEntries(before, after)
+      )
   }
 
   test("MptStore rejects distinct logical keys that encode to one physical path before last-write merge") { implicit res =>
@@ -370,11 +379,12 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       result <- store.insert[Hash](Map("first" -> Hash.empty, "second" -> Hash.empty)).attempt
       after <- store.allEntriesAsBytes
       afterRoot <- producer.build.rethrow.map(_.rootHash)
-    } yield expect.all(
-      result == Left(DuplicatePhysicalTriePath(Hex("aa"), Hex("aa"), Hex("aa"))),
-      sameEntries(before, after),
-      beforeRoot == afterRoot
-    )
+    } yield
+      expect.all(
+        result == Left(DuplicatePhysicalTriePath(Hex("aa"), Hex("aa"), Hex("aa"))),
+        sameEntries(before, after),
+        beforeRoot == afterRoot
+      )
   }
 
   test("MptStore rejects distinct typed GlobalStateKeys that serialize to one physical path before map collapse") { implicit res =>
@@ -394,13 +404,14 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       result <- store.insert[Hash](Map(metagraphKey -> Hash.empty, addressKey -> Hash.empty)).attempt
       after <- store.allEntriesAsBytes
       afterRoot <- producer.build.rethrow.map(_.rootHash)
-    } yield expect.all(
-      metagraphKey != addressKey,
-      metagraphHex == addressHex,
-      result == Left(DuplicatePhysicalTriePath(metagraphHex, metagraphHex, addressHex)),
-      sameEntries(before, after),
-      beforeRoot == afterRoot
-    )
+    } yield
+      expect.all(
+        metagraphKey != addressKey,
+        metagraphHex == addressHex,
+        result == Left(DuplicatePhysicalTriePath(metagraphHex, metagraphHex, addressHex)),
+        sameEntries(before, after),
+        beforeRoot == afterRoot
+      )
   }
 
   test("persisted and wire MPT boundaries reject ambiguous physical-key sets") { implicit res =>
@@ -438,17 +449,18 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
         loadOrBuildResult <- producer.loadOrBuild(ordinal, Map(Hex("cc") -> Array[Byte](4)).pure[IO]).attempt
         after <- producer.entries
         afterRoot <- producer.build.rethrow.map(_.rootHash)
-      } yield expect.all(
-        aliasDecoded.isLeft,
-        prefixDecoded.isLeft,
-        writeResult == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
-        !existsAfterRejectedWrite,
-        readResult.isLeft,
-        loadResult.isLeft,
-        loadOrBuildResult.isLeft,
-        sameEntries(before, after),
-        beforeRoot == afterRoot
-      )
+      } yield
+        expect.all(
+          aliasDecoded.isLeft,
+          prefixDecoded.isLeft,
+          writeResult == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+          !existsAfterRejectedWrite,
+          readResult.isLeft,
+          loadResult.isLeft,
+          loadOrBuildResult.isLeft,
+          sameEntries(before, after),
+          beforeRoot == afterRoot
+        )
     }
   }
 
@@ -466,12 +478,13 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
       _ <- store.syncFullIfNeeded[Hash](valid.pure[IO], ordinal)
       afterRetry <- store.lastPersistedOrdinal
       entries <- store.allEntriesAsBytes
-    } yield expect.all(
-      rejected == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
-      afterRejected.isEmpty,
-      afterRetry.contains(ordinal),
-      entries.keySet == valid.keySet
-    )
+    } yield
+      expect.all(
+        rejected == Left(TerminalPhysicalTrieKeyCollision(Hex("aa"), Hex("aa00"))),
+        afterRejected.isEmpty,
+        afterRetry.contains(ordinal),
+        entries.keySet == valid.keySet
+      )
   }
 
   test("empty replacement persists an explicit empty generation instead of resurrecting prior state") { implicit res =>
@@ -494,13 +507,14 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
         loaded <- restartedStore.loadPersisted(emptyOrdinal)
         afterRestart <- restartedStore.allEntriesAsBytes
         restartedOrdinal <- restartedStore.lastPersistedOrdinal
-      } yield expect.all(
-        before.exists(_.nonEmpty),
-        persistedEmpty.exists(_.isEmpty),
-        loaded,
-        afterRestart.isEmpty,
-        restartedOrdinal.contains(emptyOrdinal)
-      )
+      } yield
+        expect.all(
+          before.exists(_.nonEmpty),
+          persistedEmpty.exists(_.isEmpty),
+          loaded,
+          afterRestart.isEmpty,
+          restartedOrdinal.contains(emptyOrdinal)
+        )
     }
   }
 }

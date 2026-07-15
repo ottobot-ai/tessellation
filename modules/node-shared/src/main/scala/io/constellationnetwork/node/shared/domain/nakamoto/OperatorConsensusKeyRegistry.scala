@@ -12,14 +12,13 @@ import io.constellationnetwork.security.kes.VerificationKeyKesProduct
 
 /** Atomic read-only view of the preregistered KES+VRF identity for each operator.
   *
-  * KES and VRF projections are deliberately derived from this object. They are compatibility
-  * adapters for consumers that have not yet migrated to a branch-historical paired lookup; they
-  * are never independent registration authorities.
+  * KES and VRF projections are deliberately derived from this object. They are compatibility adapters for consumers that have not yet
+  * migrated to a branch-historical paired lookup; they are never independent registration authorities.
   *
-  * `registration=None` is reserved for a committed period-zero genesis pair; a nonzero activation
-  * without an accepted signed record is malformed. This active-view algebra is sufficient for the immutable genesis anchor. Runtime rotation
-  * requires the branch-aware `activeKeysAt(operator, candidateParent, period)` contract tracked by
-  * E2K; a current-view instance must never stand in for that historical lookup.
+  * `registration=None` is reserved for a committed period-zero genesis pair; a nonzero activation without an accepted signed record is
+  * malformed. This active-view algebra is sufficient for the immutable genesis anchor. Runtime rotation requires the branch-aware
+  * `activeKeysAt(operator, candidateParent, period)` contract tracked by E2K; a current-view instance must never stand in for that
+  * historical lookup.
   */
 trait OperatorConsensusKeyRegistry[F[_]] {
 
@@ -34,8 +33,8 @@ trait OperatorConsensusKeyRegistry[F[_]] {
 
 object OperatorConsensusKeyRegistry {
 
-  /** Construct an immutable registry from already authenticated, unique atomic records. The
-    * caller remains responsible for checking the signed genesis/runtime registration artifact.
+  /** Construct an immutable registry from already authenticated, unique atomic records. The caller remains responsible for checking the
+    * signed genesis/runtime registration artifact.
     */
   def make[F[_]: Sync](registrations: Map[PeerId, OperatorConsensusKeys]): OperatorConsensusKeyRegistry[F] = {
     validate(registrations)
@@ -98,12 +97,7 @@ object OperatorConsensusKeyRegistry {
   private def duplicateOwners(
     registrations: Map[PeerId, OperatorConsensusKeys]
   )(key: OperatorConsensusKeys => Array[Byte]): List[String] =
-    registrations.toList
-      .groupBy { case (_, keys) => Hex.fromBytes(key(keys)).value }
-      .values
-      .collect {
-        case owners if owners.sizeCompare(1) > 0 => owners.map(_._1).sorted.mkString(",")
-      }
-      .toList
-      .sorted
+    registrations.toList.groupBy { case (_, keys) => Hex.fromBytes(key(keys)).value }.values.collect {
+      case owners if owners.sizeCompare(1) > 0 => owners.map(_._1).sorted.mkString(",")
+    }.toList.sorted
 }

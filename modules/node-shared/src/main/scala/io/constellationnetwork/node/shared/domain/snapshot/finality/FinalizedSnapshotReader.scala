@@ -43,10 +43,10 @@ trait FinalizedSnapshotReader[F[_], S <: Snapshot, SI <: SnapshotInfo[_]] {
     * [[latestCombinedResponse]]: it resolves the SAME servable ordinal (finalized, or the most recent checkpoint at-or-below finalized) and
     * appends the claimed signed byte map read VERBATIM from `MptStateStorage.readState(thatOrdinal)`, never a re-encode. A follower that
     * loads the third element via `MptStore.loadBytes` must recompute the consensus root and compare it with the authenticated snapshot's
-    * signed root. Byte fidelity prevents codec drift but is not authentication. `None` when no servable combined snapshot
-    * exists yet, OR when the signed byte file for the resolved ordinal is absent (e.g. MPT cutoff pruned it) — in both cases the route
-    * returns the same not-servable status as `/latest/combined`. GLOBAL-only: implementations without an `MptStateStorage` (BFT /
-    * non-global layers) return `None`, leaving their routes byte-identical.
+    * signed root. Byte fidelity prevents codec drift but is not authentication. `None` when no servable combined snapshot exists yet, OR
+    * when the signed byte file for the resolved ordinal is absent (e.g. MPT cutoff pruned it) — in both cases the route returns the same
+    * not-servable status as `/latest/combined`. GLOBAL-only: implementations without an `MptStateStorage` (BFT / non-global layers) return
+    * `None`, leaving their routes byte-identical.
     */
   def latestMptEntriesResponse: F[Option[Response[F]]]
 
@@ -54,8 +54,8 @@ trait FinalizedSnapshotReader[F[_], S <: Snapshot, SI <: SnapshotInfo[_]] {
     * finalized AND the signed store holds bytes there. The by-ordinal sibling of [[latestMptEntriesResponse]] serving ONLY the entries map
     * (no snapshot/GSI: the puller verifies against its OWN locally-committed `stateProof.mptRoot` at that ordinal — see
     * `PinnedCurrencyInfoReader.PinnedByteBackfill`). The finality gate limits serving to eligible ordinals; the puller's root comparison
-    * authenticates the returned bytes and catches corrupt, stale, or mis-associated store content. `None` (→ 404) on a hole /
-    * pruned ordinal / non-global layer (BFT + readers without an `MptStateStorage`), leaving those routes byte-identical.
+    * authenticates the returned bytes and catches corrupt, stale, or mis-associated store content. `None` (→ 404) on a hole / pruned
+    * ordinal / non-global layer (BFT + readers without an `MptStateStorage`), leaving those routes byte-identical.
     */
   def mptEntriesAt(ordinal: SnapshotOrdinal): F[Option[Response[F]]]
 
@@ -258,9 +258,9 @@ object FinalizedSnapshotReader {
   /** 3c-A GLOBAL wiring helper. Builds a READ-ONLY `MptStateStorage` at the given `mptSnapshotInfoPath` and constructs the Nakamoto reader
     * with it so `/latest/combined/mpt-entries` can serve the claimed signed byte map. gl0 passes the SIGNED byte store (`<...>_signed`) the
     * finalize sink in `GlobalSnapshotConsensus` writes; consumers must still authenticate the snapshot and root-check the served bytes.
-    * Effectful only because `MptStateStorage.make` creates/validates the directory; read-only access to the finality-gated files is race-free with the
-    * sink's writes. Use this at the gl0 HTTP wiring site; non-global Nakamoto readers keep using [[nakamoto]] (which defaults
-    * `mptStateStorage = None`, so their `mpt-entries` route 404s).
+    * Effectful only because `MptStateStorage.make` creates/validates the directory; read-only access to the finality-gated files is
+    * race-free with the sink's writes. Use this at the gl0 HTTP wiring site; non-global Nakamoto readers keep using [[nakamoto]] (which
+    * defaults `mptStateStorage = None`, so their `mpt-entries` route 404s).
     */
   def nakamotoF[F[_]: Async: JsonSerializer, S <: Snapshot, SI <: SnapshotInfo[_]](
     finalityGate: FinalityGate[F],
