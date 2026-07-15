@@ -419,7 +419,7 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
 
   // ===== (e) KES-invalid receiver attestation rejected =====
 
-  test("(e) receiver path rejects KES-invalid attestation — no aggregator record") { res =>
+  test("(e) receiver rejects the seven-empty-field KES container without raising or recording") { res =>
     implicit val (h, sp, _, operator) = res
     val mg = mkAddress("mg-e")
     val parent = mkParent("p-e")
@@ -436,8 +436,6 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
       senderVrfVk = operator.resolvedPair.vrfPublicKey.toBytes
       (sortition, agg) <- buildSortition
       (publisher, _) <- stubPublisher
-      // KES verifier rejects everything — simulates an adversary forging a committee attestation
-      // without a valid KES sig. Gate must drop before calling aggregator.record.
       gate = MetagraphCommitteeGate.make[IO](
         selfPeerId = selfId,
         selfVrfSk = vrfSk,
@@ -454,9 +452,8 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         gateTimeoutMs = 200L,
         pollIntervalMs = 25L
       )
-      // Build a fake-but-structurally-valid incoming attestation. The long-term Ed25519 sig
-      // needs to verify against the sender's pubkey, so we sign the canonical message bytes
-      // with the senderKp's private key — then KES rejects regardless.
+      // The long-term Ed25519 signature is valid so this reaches the attacker-controlled KES
+      // decoder. Seven zero Ints previously decoded as seven empty fields and threw in Ed25519.
       msgBytes <- MetagraphCommitteeGate.messageBytes[IO](senderId, mg, parent, binary)
       edSig <- io.constellationnetwork.security.signature.Signing.signData[IO](msgBytes)(senderKp.getPrivate)
       incoming = IncomingAttestation(
@@ -467,14 +464,111 @@ object MetagraphCommitteeGateSuite extends MutableIOSuite {
         binaryHash = binary,
         committeeVrfProof = Array.fill[Byte](64)(0xbb.toByte),
         longTermSignature = edSig,
-        kesSignature = Array.fill[Byte](8)(0xcc.toByte), // present but verifier rejects
+        kesSignature = Array.fill[Byte](7 * Integer.BYTES)(0),
         senderTreeStep = 0
       )
-      _ <- gate.recordReceivedAttestation(incoming, eta, artifactPeriod, _ => IO.pure(Ratio(1, 8)))
+      result <- gate.recordReceivedAttestation(incoming, eta, artifactPeriod, _ => IO.pure(Ratio(1, 8))).attempt
       count <- agg.countFor(mg, parent, binary)
-    } yield
-      // Verifier rejected → aggregator untouched
-      expect(count == 0)
+    } yield expect(result.isRight).and(expect(count == 0))
+  }
+
+  test("receiver rejects a 64-byte off-curve sender PeerId without raising or recording") { res =>
+    implicit val (h, sp, _, operator) = res
+    val mg = mkAddress("mg-off-curve-sender")
+    val parent = mkParent("p-off-curve-sender")
+    val binary = mkBinaryHash("bin-off-curve-sender")
+    val eta = Array.fill[Byte](32)(0x41.toByte)
+
+    for {
+      selfKp <- KeyPairGenerator.makeKeyPair[IO]
+      (sortition, agg) <- buildSortition
+      (publisher, _) <- stubPublisher
+      gate = MetagraphCommitteeGate.make[IO](
+        selfPeerId = PeerId.fromPublic(selfKp.getPublic),
+        selfVrfSk = Array.fill[Byte](32)(0x42.toByte),
+        selfVrfVk = Array.fill[Byte](32)(0x43.toByte),
+        keyPair = selfKp,
+        sortition = sortition,
+        operatorKeyRegistry = operator.operatorKeyRegistry,
+        aggregator = agg,
+        kesSigner = registeredKesSigner(operator),
+        kesVerifier = registeredKesVerifier,
+        publisher = publisher,
+        kDraw = 1,
+        kQuorum = 1,
+        gateTimeoutMs = 100L,
+        pollIntervalMs = 25L
+      )
+      offCurveSender = PeerId(Hex("00" * 64))
+      result <- gate
+        .recordReceivedAttestation(
+          IncomingAttestation(
+            senderPeerId = offCurveSender,
+            senderVrfVk = operator.resolvedPair.vrfPublicKey.toBytes,
+            metagraphAddress = mg,
+            parentHash = parent,
+            binaryHash = binary,
+            committeeVrfProof = Array[Byte](1),
+            longTermSignature = Array[Byte](1),
+            kesSignature = Array[Byte](1),
+            senderTreeStep = 0
+          ),
+          eta,
+          artifactPeriod,
+          _ => IO.pure(Ratio.One)
+        )
+        .attempt
+      count <- agg.countFor(mg, parent, binary)
+    } yield expect(result.isRight).and(expect.same(0, count))
+  }
+
+  test("receiver rejects a malformed long-term signature without raising or recording") { res =>
+    implicit val (h, sp, _, operator) = res
+    val mg = mkAddress("mg-malformed-long-term-signature")
+    val parent = mkParent("p-malformed-long-term-signature")
+    val binary = mkBinaryHash("bin-malformed-long-term-signature")
+    val eta = Array.fill[Byte](32)(0x51.toByte)
+
+    for {
+      selfKp <- KeyPairGenerator.makeKeyPair[IO]
+      (sortition, agg) <- buildSortition
+      (publisher, _) <- stubPublisher
+      gate = MetagraphCommitteeGate.make[IO](
+        selfPeerId = PeerId.fromPublic(selfKp.getPublic),
+        selfVrfSk = Array.fill[Byte](32)(0x52.toByte),
+        selfVrfVk = Array.fill[Byte](32)(0x53.toByte),
+        keyPair = selfKp,
+        sortition = sortition,
+        operatorKeyRegistry = operator.operatorKeyRegistry,
+        aggregator = agg,
+        kesSigner = registeredKesSigner(operator),
+        kesVerifier = registeredKesVerifier,
+        publisher = publisher,
+        kDraw = 1,
+        kQuorum = 1,
+        gateTimeoutMs = 100L,
+        pollIntervalMs = 25L
+      )
+      result <- gate
+        .recordReceivedAttestation(
+          IncomingAttestation(
+            senderPeerId = operator.resolvedPair.operatorPeerId,
+            senderVrfVk = operator.resolvedPair.vrfPublicKey.toBytes,
+            metagraphAddress = mg,
+            parentHash = parent,
+            binaryHash = binary,
+            committeeVrfProof = Array[Byte](1),
+            longTermSignature = Array[Byte](0x30, 0x01),
+            kesSignature = Array[Byte](1),
+            senderTreeStep = 0
+          ),
+          eta,
+          artifactPeriod,
+          _ => IO.pure(Ratio.One)
+        )
+        .attempt
+      count <- agg.countFor(mg, parent, binary)
+    } yield expect(result.isRight).and(expect.same(0, count))
   }
 
   // ===== (f) #213/#290 gate no longer re-resolves the parent ordinal — it trusts the supplied eta =====

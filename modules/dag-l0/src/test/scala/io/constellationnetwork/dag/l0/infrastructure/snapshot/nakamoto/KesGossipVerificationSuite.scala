@@ -236,6 +236,69 @@ object KesGossipVerificationSuite extends SimpleIOSuite {
     }
   }
 
+  test("all gossip verification rails reject the seven-empty-field KES container without raising") {
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      val operatorKeys = operator.resolvedPair
+      val operatorId = operatorKeys.operatorPeerId
+      val emptyFieldContainer = Array.fill[Byte](7 * Integer.BYTES)(0)
+
+      for {
+        (counters, metrics) <- setup
+        attestation <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification
+            .verifyAttestation[IO](
+              messageBytes = testMessageBytes,
+              kesSigBytes = emptyFieldContainer,
+              attesterId = operatorId,
+              attesterHex = operatorId.value,
+              tipOrdinal = testOrdinal,
+              operatorKeys = operatorKeys,
+              etaRotationSnapshots = etaRotationSnapshots,
+              logger = logger
+            )
+            .attempt
+        }
+        snapshot <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification
+            .verifySnapshot[IO](
+              messageBytes = testMessageBytes,
+              kesSigBytes = emptyFieldContainer,
+              producerId = operatorId,
+              producerHex = operatorId.value,
+              ordinal = testOrdinal,
+              operatorKeys = operatorKeys,
+              etaRotationSnapshots = etaRotationSnapshots,
+              logger = logger
+            )
+            .attempt
+        }
+        metagraph <- {
+          implicit val m: Metrics[IO] = metrics
+          KesGossipVerification
+            .verifyAttestationByStep[IO](
+              messageBytes = testMessageBytes,
+              kesSigBytes = emptyFieldContainer,
+              expectedOperatorId = operatorId,
+              operatorKeys = operatorKeys,
+              kesStep = 0,
+              artifactPeriod = EtaPeriod.Zero,
+              logger = logger
+            )
+            .attempt
+        }
+        finalCounters <- counters.get
+      } yield
+        expect(attestation.toOption.contains(false)) &&
+          expect(snapshot.toOption.contains(false)) &&
+          expect(metagraph.toOption.contains(false)) &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_attestations_decode_failed_total")) &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_snapshots_decode_failed_total")) &&
+          expect.same(Some(1), finalCounters.get("dag_nakamoto_kes_mg_attestations_decode_failed_total"))
+    }
+  }
+
   // ============================================================
   // Snapshot path (same matrix)
   // ============================================================

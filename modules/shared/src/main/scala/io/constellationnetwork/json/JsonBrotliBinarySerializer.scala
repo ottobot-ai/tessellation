@@ -1,6 +1,6 @@
 package io.constellationnetwork.json
 
-import java.io.{ByteArrayOutputStream, OutputStream}
+import java.io.{ByteArrayOutputStream, IOException, OutputStream}
 import java.nio.charset.StandardCharsets
 
 import cats.effect.Async
@@ -66,10 +66,19 @@ object JsonBrotliBinarySerializer {
 
         def deserialize[A: Decoder](content: Array[Byte]): F[Either[Throwable, A]] =
           Async[F].blocking {
-            val decompressed = brotliDecompress(content).getDecompressedData
-            parser
-              .parseByteBuffer(java.nio.ByteBuffer.wrap(decompressed))
-              .flatMap[Throwable, A](_.as[A])
+            Either.catchNonFatal {
+              val result = brotliDecompress(content)
+              val decompressed = Option(result)
+                .flatMap(value => Option(value.getDecompressedData))
+                .getOrElse {
+                  val status = Option(result).map(_.getResultStatus.toString).getOrElse("unavailable")
+                  throw new IOException(s"Brotli decompression returned no data (status=$status)")
+                }
+
+              parser
+                .parseByteBuffer(java.nio.ByteBuffer.wrap(decompressed))
+                .flatMap[Throwable, A](_.as[A])
+            }.flatten
           } <* Async[F].cede
       }
     }

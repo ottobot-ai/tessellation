@@ -579,67 +579,72 @@ object MetagraphCommitteeGate {
           // GL0 `(ordinal, hash)` as current Phase 2. The metagraph ordinal never enters this draw.
           for {
             msgBytes <- messageBytes[F](att.senderPeerId, att.metagraphAddress, att.parentHash, att.binaryHash)
-            senderPubKey <- att.senderPeerId.value.toPublicKey[F]
-            edOk <- Signing.verifySignature[F](msgBytes, att.longTermSignature)(senderPubKey)
-            outcome <-
-              if (!edOk) Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
-              else
-                ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, att.senderPeerId, artifactPeriod).flatMap {
-                  case None =>
-                    Async[F].pure(ReceiverOutcome.InvalidOperatorIdentity: ReceiverOutcome)
-                  case Some(keys) if !java.security.MessageDigest.isEqual(keys.vrfPublicKey.toBytes, att.senderVrfVk) =>
-                    Async[F].pure(ReceiverOutcome.MismatchedVrfIdentity: ReceiverOutcome)
-                  case Some(keys) =>
-                    val registeredVrfVk = keys.vrfPublicKey.toBytes
-                    for {
-                      kesOk <- kesVerifier.verify(
-                        messageBytes = msgBytes,
-                        kesSigBytes = att.kesSignature,
-                        expectedOperatorId = att.senderPeerId,
-                        operatorKeys = keys,
-                        kesStep = att.senderTreeStep,
-                        artifactPeriod = artifactPeriod
-                      )
-                      result <-
-                        if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)
-                        else
-                          lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
-                            sortition
-                              .verifyMembershipDetailed(
-                                registeredVrfVk,
-                                eta,
-                                att.metagraphAddress,
-                                att.parentHash,
-                                sigmaSender,
-                                kDraw,
-                                att.committeeVrfProof
-                              )
-                              .flatMap {
-                                case CommitteeSortition.VerifyOutcome.Valid =>
-                                  Async[F].pure(ReceiverOutcome.Recorded: ReceiverOutcome)
-                                case CommitteeSortition.VerifyOutcome.InvalidProof =>
-                                  // The proof is checked against the registry key, never the in-band key.
-                                  logger.warn(
-                                    s"🔬 InvalidCommitteeVrf [InvalidProof] mg=${att.metagraphAddress} parent=${att.parentHash.value
-                                        .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
-                                      s"etaFull=${eta.map("%02x".format(_)).mkString} " +
-                                      s"registeredVrfVkFull=${registeredVrfVk.map("%02x".format(_)).mkString} " +
-                                      s"proofFull=${att.committeeVrfProof.map("%02x".format(_)).mkString} " +
-                                      s"sigmaSender=$sigmaSender kDraw=$kDraw from=${att.senderPeerId.value.value.take(16)}..."
-                                  ) >>
-                                    Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
-                                case CommitteeSortition.VerifyOutcome.BelowThreshold(testValue, thresh) =>
-                                  logger.warn(
-                                    s"🔬 InvalidCommitteeVrf [BelowThreshold] mg=${att.metagraphAddress} parent=${att.parentHash.value
-                                        .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
-                                      s"testValue=$testValue threshold=$thresh " +
-                                      s"sigmaSender=$sigmaSender kDraw=$kDraw from=${att.senderPeerId.value.value.take(16)}..."
-                                  ) >>
-                                    Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
+            senderPublicKey <- att.senderPeerId.value.toPublicKey[F].attempt
+            outcome <- senderPublicKey match {
+              case Left(_) => Async[F].pure(ReceiverOutcome.InvalidOperatorIdentity: ReceiverOutcome)
+              case Right(publicKey) =>
+                Signing.verifySignature[F](msgBytes, att.longTermSignature)(publicKey).attempt.flatMap {
+                  case Left(_) | Right(false) =>
+                    Async[F].pure(ReceiverOutcome.InvalidLongTermSig: ReceiverOutcome)
+                  case Right(true) =>
+                    ActiveOperatorConsensusKeys.resolve(operatorKeyRegistry, att.senderPeerId, artifactPeriod).flatMap {
+                      case None =>
+                        Async[F].pure(ReceiverOutcome.InvalidOperatorIdentity: ReceiverOutcome)
+                      case Some(keys) if !java.security.MessageDigest.isEqual(keys.vrfPublicKey.toBytes, att.senderVrfVk) =>
+                        Async[F].pure(ReceiverOutcome.MismatchedVrfIdentity: ReceiverOutcome)
+                      case Some(keys) =>
+                        val registeredVrfVk = keys.vrfPublicKey.toBytes
+                        for {
+                          kesOk <- kesVerifier.verify(
+                            messageBytes = msgBytes,
+                            kesSigBytes = att.kesSignature,
+                            expectedOperatorId = att.senderPeerId,
+                            operatorKeys = keys,
+                            kesStep = att.senderTreeStep,
+                            artifactPeriod = artifactPeriod
+                          )
+                          result <-
+                            if (!kesOk) Async[F].pure(ReceiverOutcome.InvalidKesSig: ReceiverOutcome)
+                            else
+                              lookupSenderStake(att.senderPeerId).flatMap { sigmaSender =>
+                                sortition
+                                  .verifyMembershipDetailed(
+                                    registeredVrfVk,
+                                    eta,
+                                    att.metagraphAddress,
+                                    att.parentHash,
+                                    sigmaSender,
+                                    kDraw,
+                                    att.committeeVrfProof
+                                  )
+                                  .flatMap {
+                                    case CommitteeSortition.VerifyOutcome.Valid =>
+                                      Async[F].pure(ReceiverOutcome.Recorded: ReceiverOutcome)
+                                    case CommitteeSortition.VerifyOutcome.InvalidProof =>
+                                      // The proof is checked against the registry key, never the in-band key.
+                                      logger.warn(
+                                        s"🔬 InvalidCommitteeVrf [InvalidProof] mg=${att.metagraphAddress} parent=${att.parentHash.value
+                                            .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
+                                          s"etaFull=${eta.map("%02x".format(_)).mkString} " +
+                                          s"registeredVrfVkFull=${registeredVrfVk.map("%02x".format(_)).mkString} " +
+                                          s"proofFull=${att.committeeVrfProof.map("%02x".format(_)).mkString} " +
+                                          s"sigmaSender=$sigmaSender kDraw=$kDraw from=${att.senderPeerId.value.value.take(16)}..."
+                                      ) >>
+                                        Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
+                                    case CommitteeSortition.VerifyOutcome.BelowThreshold(testValue, thresh) =>
+                                      logger.warn(
+                                        s"🔬 InvalidCommitteeVrf [BelowThreshold] mg=${att.metagraphAddress} parent=${att.parentHash.value
+                                            .take(12)}... binary=${att.binaryHash.value.take(12)}... " +
+                                          s"testValue=$testValue threshold=$thresh " +
+                                          s"sigmaSender=$sigmaSender kDraw=$kDraw from=${att.senderPeerId.value.value.take(16)}..."
+                                      ) >>
+                                        Async[F].pure(ReceiverOutcome.InvalidCommitteeVrf: ReceiverOutcome)
+                                  }
                               }
-                          }
-                    } yield result
+                        } yield result
+                    }
                 }
+            }
           } yield outcome
 
       def pruneParents(metagraphAddress: Address, parents: Set[Hash]): F[Unit] =

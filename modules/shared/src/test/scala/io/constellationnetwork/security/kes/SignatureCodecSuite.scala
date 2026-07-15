@@ -66,6 +66,54 @@ object SignatureCodecSuite extends SimpleIOSuite {
     }
   }
 
+  pureTest("decode rejects the seven-empty-field container before cryptographic verification") {
+    val emptyFieldContainer = Array.fill[Byte](7 * Integer.BYTES)(0)
+
+    val internal = SignatureCodec.decodeSignature(emptyFieldContainer)
+    val publicForwarder = OperationalKeyMaker.decodeSignature(emptyFieldContainer)
+
+    expect(internal.isLeft) &&
+    expect(publicForwarder.isLeft) &&
+    expect(internal.left.exists(_.isInstanceOf[KesError.MalformedTree])) &&
+    expect(publicForwarder.left.exists(_.isInstanceOf[KesError.MalformedTree]))
+  }
+
+  pureTest("decode rejects non-canonical fixed field lengths and trailing bytes") {
+    val kes = KesProduct.instance
+    val seed = Array.fill[Byte](32)(0x61.toByte)
+    val (sk, _) = kes.createKeyPair(seed, (2, 2), 0L)
+    val signature = kes.sign(sk, "canonical-shape".getBytes("UTF-8"))
+
+    val malformed = List(
+      signature.copy(superSignature = signature.superSignature.copy(verificationKey = Array.fill[Byte](31)(1))),
+      signature.copy(superSignature = signature.superSignature.copy(signature = Array.fill[Byte](63)(2))),
+      signature.copy(
+        subSignature = signature.subSignature.copy(witness = Vector(Array.fill[Byte](31)(3)))
+      ),
+      signature.copy(
+        subSignature = signature.subSignature.copy(witness = Vector.fill(65)(Array.fill[Byte](32)(4)))
+      ),
+      signature.copy(subRoot = Array.fill[Byte](31)(5))
+    )
+    val malformedResults = malformed.map(sig => SignatureCodec.decodeSignature(SignatureCodec.encodeSignature(sig)))
+    val trailingResult = SignatureCodec.decodeSignature(SignatureCodec.encodeSignature(signature) :+ 0.toByte)
+
+    expect(malformedResults.forall(_.isLeft)) && expect(trailingResult.isLeft)
+  }
+
+  pureTest("OperationalKeyMaker.verify is total for malformed signature objects and verification keys") {
+    val kes = KesProduct.instance
+    val seed = Array.fill[Byte](32)(0x62.toByte)
+    val (_, vk) = kes.createKeyPair(seed, (2, 2), 0L)
+    val malformedSum = SignatureKesSum(Array.emptyByteArray, Array.emptyByteArray, Vector.empty)
+    val malformedSignature = SignatureKesProduct(malformedSum, malformedSum, Array.emptyByteArray)
+    val malformedKey = vk.copy(value = Array.emptyByteArray)
+    val message = "total-verifier".getBytes("UTF-8")
+
+    expect(!OperationalKeyMaker.verify(malformedSignature, message, vk)) &&
+    expect(!OperationalKeyMaker.verify(malformedSignature, message, malformedKey))
+  }
+
   pureTest("OperationalKeyMaker.encodeSignature/decodeSignature forwarders behave identically") {
     val kes = KesProduct.instance
     val seed = Array.fill[Byte](32)(0x55.toByte)

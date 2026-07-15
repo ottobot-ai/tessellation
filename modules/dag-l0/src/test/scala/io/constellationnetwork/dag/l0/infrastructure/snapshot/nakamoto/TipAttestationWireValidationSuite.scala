@@ -7,13 +7,18 @@ import weaver.FunSuite
 
 object TipAttestationWireValidationSuite extends FunSuite {
 
-  private def att(slot: Long = 1L, ordinal: Long = 1L, attestedAt: Long = 1L): TipAttestation =
+  private def att(
+    slot: Long = 1L,
+    ordinal: Long = 1L,
+    attestedAt: Long = 1L,
+    attesterId: Array[Byte] = Array.fill[Byte](64)(1)
+  ): TipAttestation =
     TipAttestation(
       tipHash = ByteString.copyFromUtf8("00" * 32),
       tipSlot = slot,
       tipOrdinal = ordinal,
       attestedAt = attestedAt,
-      attesterId = ByteString.copyFrom(Array.fill[Byte](64)(1)),
+      attesterId = ByteString.copyFrom(attesterId),
       signature = ByteString.copyFromUtf8("signature")
     )
 
@@ -27,6 +32,18 @@ object TipAttestationWireValidationSuite extends FunSuite {
 
   test("SER-002G: negative attestation timestamp is rejected before tracker mutation") {
     expect.same(Left("negative attestedAt=-1"), NakamotoSyncDaemon.decodeTipAttestation(att(attestedAt = -1L)).map(_.domain))
+  }
+
+  test("SER-002G: attester_id must contain exactly 64 raw public-key bytes") {
+    val invalidLengths = List(0, 63, 65)
+    val results = invalidLengths.map { length =>
+      length -> NakamotoSyncDaemon.decodeTipAttestation(att(attesterId = Array.fill[Byte](length)(1)))
+    }
+
+    expect.all(
+      results.forall { case (_, result) => result.isLeft },
+      results.forall { case (length, result) => result.left.exists(_.contains(s"length=$length")) }
+    )
   }
 
   test("SER-002G: nonnegative wire coordinates decode") {

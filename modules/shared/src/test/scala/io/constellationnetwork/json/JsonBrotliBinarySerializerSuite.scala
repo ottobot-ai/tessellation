@@ -68,4 +68,13 @@ object JsonBrotliBinarySerializerSuite extends MutableIOSuite {
       } yield expect.same(true, deserialized.isLeft)
   }
 
+  test("invalid Brotli bytes should return Left without failing the effect") {
+    case (_, _, serializer) =>
+      serializer.deserialize[String](Array[Byte](0x00, 0x01, 0x02, 0x03)).attempt.map {
+        case Right(Left(_))      => success
+        case Right(Right(value)) => failure(s"expected malformed input to be rejected, decoded '$value'")
+        case Left(error)         => failure(s"deserialize failed the effect instead of returning Left: $error")
+      }
+  }
+
 }

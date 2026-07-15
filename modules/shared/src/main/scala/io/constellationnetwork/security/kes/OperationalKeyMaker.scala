@@ -6,6 +6,8 @@ import cats.syntax.either._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 
+import scala.util.control.NonFatal
+
 /** Stateful interpreter that wraps `KesProduct` in a [[OperationalKeyMakerAlgebra]] with read-once persistence.
   *
   * Lifecycle:
@@ -191,16 +193,28 @@ object OperationalKeyMaker {
   }
 
   /** Pure verify helper exposed for callers outside the `kes` package. `KesProduct` itself is package-private so the underlying
-    * `KesProduct.instance.verify` would be unreachable from `dag-l0` (Slice 5 receiver path). This forwards to that method without widening
-    * the package surface. The function is pure (no F[_]) because verify performs no I/O — it's a Merkle-path reconstruction + Ed25519
-    * verify, all CPU-only.
+    * `KesProduct.instance.verify` would be unreachable from `dag-l0` (Slice 5 receiver path). This validates the canonical signature and
+    * root shape before calling the cryptographic verifier, and maps malformed input or verifier exceptions to `false`. The function is pure
+    * (no F[_]) because verify performs no I/O — it's a Merkle-path reconstruction + Ed25519 verify, all CPU-only.
     */
   def verify(
     signature: SignatureKesProduct,
     message: Array[Byte],
     verifyKey: VerificationKeyKesProduct
   ): Boolean =
-    KesProduct.instance.verify(signature, message, verifyKey)
+    if (
+      message == null ||
+      verifyKey == null ||
+      verifyKey.value == null ||
+      verifyKey.value.length != SignatureCodec.HashBytes ||
+      verifyKey.step < 0L ||
+      SignatureCodec.validateSignature(signature).isLeft
+    ) false
+    else
+      try KesProduct.instance.verify(signature, message, verifyKey)
+      catch {
+        case NonFatal(_) => false
+      }
 
   /** Encode a KES product signature to its on-the-wire byte representation. Forwarder for [[SignatureCodec.encodeSignature]], exposed
     * because [[SignatureCodec]] is package-private (the secret-key bits should stay scoped). Slice 5/6 senders call this to fill the

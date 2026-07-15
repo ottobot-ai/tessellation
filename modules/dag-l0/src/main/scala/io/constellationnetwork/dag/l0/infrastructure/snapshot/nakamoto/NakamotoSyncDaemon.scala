@@ -2,8 +2,9 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import java.security.KeyPair
 
-import cats.effect.kernel.{Async, Clock, Ref}
-import cats.effect.std.{Semaphore, Supervisor}
+import cats.effect.kernel._
+import cats.effect.std._
+import cats.effect.syntax.all._
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -60,6 +61,239 @@ object NakamotoSyncDaemon {
   private val MaxShardCheckpointAncestryRecoveryDepth: Int = 16
   private val MaxPendingShardCheckpointCount: Int = 64
   private val MaxPendingShardCheckpointBytes: Long = 16L * 1024L * 1024L
+
+  // Local scheduling bounds only; none of these values participates in artifact validity or execution.
+  // Each subscription attempt allocates fresh lanes, and `runWorkerGeneration` owns every worker for
+  // exactly that attempt. A reconnect therefore cannot leave an old handler mutating current state.
+  private val SnapshotIntakeCapacity = 1024
+  private val TipAttestationCapacity = 4096
+  private val MetagraphBinaryCapacity = 256
+  private val MetagraphAttestationCapacity = 4096
+  private val NativeBlockCapacity = 1024
+  private val ShardCheckpointCapacity = 256
+  private val ShardCheckpointAttestationCapacity = 4096
+  private val FraudProofCapacity = 256
+
+  // The upstream GossipStream permits at most 32 MiB per encoded envelope and 64 MiB per
+  // subscription-generation callback buffer. Each variable-payload lane repeats that 64 MiB
+  // byte budget, so it can retain at most two maximum-size envelopes. The three cryptographic
+  // attestation lanes carry fixed-shape hashes/keys/proofs/signatures (KES is ~700 bytes) and
+  // reserve 8 MiB each with a fail-closed 64 KiB per-envelope ceiling. The aggregate retained
+  // encoded-byte ceiling for all eight daemon lanes is therefore 344 MiB, independent of item count.
+  private val VariableLaneByteCapacity = GossipStream.BufferLimits.Default.maxQueuedBytes
+  private val VariableMessageMaxBytes = GossipStream.BufferLimits.Default.maxMessageBytes.toLong
+  private val AttestationLaneByteCapacity = 8L * 1024L * 1024L
+  private val AttestationMessageMaxBytes = 64L * 1024L
+
+  private val MetagraphBinaryParallelism = 16
+  private val MetagraphAttestationParallelism = 8
+  private val NativeBlockParallelism = 8
+  private val ShardCheckpointParallelism = 4
+  private val ShardCheckpointAttestationParallelism = 8
+  private val FraudProofParallelism = 4
+
+  /** One bounded, generation-owned worker lane.
+    *
+    * The shared subscription demultiplexer must never block on a full family lane: a metagraph-binary handler can be waiting for an
+    * attestation that is later on that same subscription stream. Exposing only `tryOffer` makes overload rejection explicit and prevents
+    * cross-family deadlock/head-of-line blocking. Once sealed, the lane rejects new offers and lets every previously accepted queued or
+    * in-flight handler finish before the subscription generation is replaced. Canceling the generation owner still cancels the lane
+    * immediately.
+    */
+  private[nakamoto] sealed trait GenerationWorkerOfferResult
+
+  private[nakamoto] object GenerationWorkerOfferResult {
+    case object Accepted extends GenerationWorkerOfferResult
+    final case class MessageTooLarge(encodedBytes: Long, maxMessageBytes: Long) extends GenerationWorkerOfferResult
+    final case class ByteCapacityExceeded(encodedBytes: Long, maxQueuedBytes: Long) extends GenerationWorkerOfferResult
+    final case class ItemCapacityExceeded(maxQueuedItems: Int) extends GenerationWorkerOfferResult
+    final case class InvalidEncodedSize(encodedBytes: Long) extends GenerationWorkerOfferResult
+    case object GenerationClosed extends GenerationWorkerOfferResult
+  }
+
+  private[nakamoto] final case class GenerationWorkerFailed(underlying: Throwable)
+      extends RuntimeException("generation worker failed", underlying)
+
+  private[nakamoto] trait GenerationWorker[F[_]] {
+    def seal: F[Unit]
+    def awaitDrained: F[Unit]
+    def awaitFailure: F[Throwable]
+    def run: fs2.Stream[F, Unit]
+  }
+
+  private[nakamoto] final case class GenerationWorkerLane[F[_], A](
+    tryOffer: A => F[GenerationWorkerOfferResult],
+    seal: F[Unit],
+    awaitDrained: F[Unit],
+    awaitFailure: F[Throwable],
+    run: fs2.Stream[F, Unit]
+  ) extends GenerationWorker[F]
+
+  private[nakamoto] object GenerationWorkerLane {
+    private final case class Reserved[A](value: A, encodedBytes: Long)
+    private final case class LaneState(accepting: Boolean, outstanding: Long)
+
+    def bounded[F[_]: Async, A](
+      capacity: Int,
+      maxConcurrent: Int,
+      maxQueuedBytes: Long,
+      maxMessageBytes: Long
+    )(
+      encodedSize: A => Long
+    )(handle: A => F[Unit]): F[GenerationWorkerLane[F, A]] =
+      for {
+        _ <- Async[F].raiseWhen(capacity <= 0)(new IllegalArgumentException(s"worker lane capacity must be positive: $capacity"))
+        _ <- Async[F].raiseWhen(maxConcurrent <= 0)(
+          new IllegalArgumentException(s"worker lane concurrency must be positive: $maxConcurrent")
+        )
+        _ <- Async[F].raiseWhen(maxQueuedBytes <= 0L)(
+          new IllegalArgumentException(s"worker lane byte capacity must be positive: $maxQueuedBytes")
+        )
+        _ <- Async[F].raiseWhen(maxMessageBytes <= 0L || maxMessageBytes > maxQueuedBytes)(
+          new IllegalArgumentException(
+            s"worker lane message limit must be positive and <= byte capacity: message=$maxMessageBytes capacity=$maxQueuedBytes"
+          )
+        )
+        queue <- Queue.bounded[F, Reserved[A]](capacity)
+        bytePermits <- Semaphore[F](maxQueuedBytes)
+        state <- Ref.of[F, LaneState](LaneState(accepting = true, outstanding = 0L))
+        admissionMutex <- Mutex[F]
+        drained <- Deferred[F, Unit]
+        failure <- Deferred[F, Throwable]
+      } yield {
+        def completeDrainWhen(shouldComplete: Boolean): F[Unit] =
+          Async[F].whenA(shouldComplete)(drained.complete(()).void)
+
+        def finishReservation(reserved: Reserved[A]): F[Unit] =
+          Async[F].uncancelable { _ =>
+            bytePermits.releaseN(reserved.encodedBytes) >>
+              state.modify { current =>
+                if (current.outstanding <= 0L)
+                  (
+                    current,
+                    Left[Throwable, Boolean](
+                      new IllegalStateException("generation worker outstanding reservation underflow")
+                    )
+                  )
+                else {
+                  val next = current.copy(outstanding = current.outstanding - 1L)
+                  (next, Right(!next.accepting && next.outstanding == 0L))
+                }
+              }
+                .flatMap(_.liftTo[F])
+                .flatMap(completeDrainWhen)
+          }
+
+        GenerationWorkerLane(
+          value =>
+            admissionMutex.lock.surround {
+              Async[F].uncancelable { _ =>
+                state.get.flatMap {
+                  case LaneState(false, _) =>
+                    Async[F].pure(GenerationWorkerOfferResult.GenerationClosed)
+                  case LaneState(true, _) =>
+                    Async[F].delay(encodedSize(value)).flatMap { rawBytes =>
+                      val chargedBytes = rawBytes.max(1L)
+                      if (rawBytes < 0L)
+                        Async[F].pure(GenerationWorkerOfferResult.InvalidEncodedSize(rawBytes))
+                      else if (chargedBytes > maxMessageBytes)
+                        Async[F].pure(GenerationWorkerOfferResult.MessageTooLarge(chargedBytes, maxMessageBytes))
+                      else
+                        bytePermits.tryAcquireN(chargedBytes).flatMap {
+                          case false =>
+                            Async[F].pure(GenerationWorkerOfferResult.ByteCapacityExceeded(chargedBytes, maxQueuedBytes))
+                          case true =>
+                            state.update(current => current.copy(outstanding = current.outstanding + 1L)) >>
+                              queue.tryOffer(Reserved(value, chargedBytes)).flatMap {
+                                case true => Async[F].pure(GenerationWorkerOfferResult.Accepted)
+                                case false =>
+                                  state.update(current => current.copy(outstanding = current.outstanding - 1L)) >>
+                                    bytePermits
+                                      .releaseN(chargedBytes)
+                                      .as(GenerationWorkerOfferResult.ItemCapacityExceeded(capacity))
+                              }
+                        }
+                    }
+                }
+              }
+            },
+          admissionMutex.lock.surround {
+            Async[F].uncancelable { _ =>
+              state.modify { current =>
+                val sealedState = current.copy(accepting = false)
+                (sealedState, sealedState.outstanding == 0L)
+              }
+                .flatMap(completeDrainWhen)
+            }
+          },
+          drained.get,
+          failure.get,
+          fs2.Stream
+            .fromQueueUnterminated(queue)
+            .parEvalMapUnordered(maxConcurrent)(reserved =>
+              handle(reserved.value)
+                .onError(error => failure.complete(error).void)
+                .guarantee(finishReservation(reserved))
+            )
+        )
+      }
+  }
+
+  /** Couple all workers to one subscription generation. Clean or errored source termination seals admission and drains every accepted
+    * queued/in-flight item before the generation exits; a source error is rethrown only after that drain. An unexpected worker termination
+    * fails the generation immediately and resource finalization cancels the source and sibling workers. Canceling the outer owner also
+    * cancels the complete resource scope immediately, so no worker can outlive its generation.
+    */
+  private[nakamoto] def runWorkerGeneration[F[_]: Async](
+    source: fs2.Stream[F, Unit],
+    workers: List[GenerationWorker[F]]
+  ): fs2.Stream[F, Unit] = {
+    val ownedGeneration: Resource[F, (Deferred[F, Either[Throwable, Unit]], Deferred[F, Throwable])] =
+      for {
+        sourceExit <- Resource.eval(Deferred[F, Either[Throwable, Unit]])
+        workerFailure <- Resource.eval(Deferred[F, Throwable])
+        _ <- source.compile.drain.attempt.flatMap(sourceExit.complete(_).void).background
+        _ <- workers.traverse_ { worker =>
+          worker.awaitFailure.flatMap(workerFailure.complete(_).void).background.void >>
+            worker.run.compile.drain.attempt.flatMap {
+              case Left(error) => workerFailure.complete(error).void
+              case Right(()) =>
+                workerFailure
+                  .complete(new IllegalStateException("generation worker terminated before its owning generation"))
+                  .void
+            }.background.void
+        }
+      } yield (sourceExit, workerFailure)
+
+    fs2.Stream.resource(ownedGeneration).flatMap {
+      case (sourceExit, workerFailure) =>
+        fs2.Stream.eval {
+          Async[F].race(sourceExit.get, workerFailure.get).flatMap {
+            case Right(error) => GenerationWorkerFailed(error).raiseError[F, Unit]
+            case Left(sourceResult) =>
+              workers.traverse_(_.seal) >>
+                Async[F].race(workers.traverse_(_.awaitDrained), workerFailure.get).flatMap {
+                  case Right(error) => GenerationWorkerFailed(error).raiseError[F, Unit]
+                  case Left(())     => sourceResult.liftTo[F]
+                }
+          }
+        }
+    }
+  }
+
+  private sealed trait NativeBlockIngress
+
+  private object NativeBlockIngress {
+    final case class AllowSpend(value: pb.AllowSpendBlock) extends NativeBlockIngress
+    final case class Dag(value: pb.DAGBlock) extends NativeBlockIngress
+    final case class TokenLock(value: pb.TokenLockBlock) extends NativeBlockIngress
+
+    def encodedSize(value: NativeBlockIngress): Long = value match {
+      case AllowSpend(block) => block.serializedSize.toLong
+      case Dag(block)        => block.serializedSize.toLong
+      case TokenLock(block)  => block.serializedSize.toLong
+    }
+  }
 
   /** Per-(metagraph, parentHash) bookkeeping for the #259 stuck-detection tick. `consecutiveTicks` counts how many consecutive ticks this
     * parent has stayed pending in the orphan buffer (reset to 0 — by omission from the carry-forward map — once it resolves);
@@ -831,73 +1065,223 @@ object NakamotoSyncDaemon {
                 // The sidecar or gRPC channel terminates this stream on an actual transport failure; the reconnect wrapper below then
                 // resubscribes while preserving pendingParentRef/stateRef/chainSyncManager. Message silence is valid in a quiet or fresh
                 // single-validator network and is never treated as failure. Transport liveness comes from the channel's HTTP/2 keepalive.
-                def gossipStream: fs2.Stream[F, Unit] =
-                  fs2.Stream
-                    .eval(cats.effect.std.Queue.bounded[F, pb.Snapshot](1024))
-                    .flatMap { snapshotIntakeQ =>
-                      // Serial snapshot consumer — preserves the old ordering + semaphore semantics, but on its OWN lane so
-                      // checkpoints/attestations/binaries never wait behind snapshot catch-up (intake demux, run-16).
-                      val snapshotWorker: fs2.Stream[F, Unit] =
-                        fs2.Stream
-                          .fromQueueUnterminated(snapshotIntakeQ)
-                          .evalMap { snap =>
-                            val incomingOrdinal = snap.ordinal
-                            chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
-                              val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
-                              (if (wouldWin) productionGate.pause(ProductionGate.BetterGossipReceived)
-                               else Async[F].unit) >>
-                                snapshotSemaphore.permit.use { _ =>
-                                  handleSnapshot(
-                                    snap,
-                                    stateRef,
-                                    pendingParentRef,
-                                    chainStore,
-                                    nodeStorage,
-                                    tipTracker,
-                                    stakeRegistry,
-                                    operatorKeyRegistry,
-                                    sidecarClient,
-                                    selfId,
-                                    keyPair,
-                                    lddConfig,
-                                    eligibilityChecker,
-                                    lastKnownSlotRef,
-                                    epochStateRef,
-                                    etaRotationSnapshots,
-                                    confirmationDepthK,
-                                    consensusFns,
-                                    snapshotStorage,
-                                    lastGlobalSnapshotStorage,
-                                    lastNGlobalSnapshotStorage,
-                                    productionGate,
-                                    mptStore,
-                                    mptOverlay,
-                                    pendingAccumulatorsRef,
-                                    pendingPostBytesRef,
-                                    eventMempool,
-                                    chainSyncManager,
-                                    channel,
-                                    dataDir,
-                                    operationalKeyMaker,
-                                    shardProducers,
-                                    shardChainStores,
-                                    shardBinaryBuffers,
-                                    shardAssignment,
-                                    shardCommitteeMembership,
-                                    logger
-                                  )
-                                } >>
-                                productionGate.resume(ProductionGate.BetterGossipReceived)
+                def gossipStream: fs2.Stream[F, Unit] = {
+                  def processSnapshot(snap: pb.Snapshot): F[Unit] = {
+                    val incomingOrdinal = snap.ordinal
+                    chainStore.bestTipOrdinal.flatMap { currentBestOrdinal =>
+                      val wouldWin = incomingOrdinal > currentBestOrdinal.getOrElse(0L)
+                      val handle = snapshotSemaphore.permit.use { _ =>
+                        handleSnapshot(
+                          snap,
+                          stateRef,
+                          pendingParentRef,
+                          chainStore,
+                          nodeStorage,
+                          tipTracker,
+                          stakeRegistry,
+                          operatorKeyRegistry,
+                          sidecarClient,
+                          selfId,
+                          keyPair,
+                          lddConfig,
+                          eligibilityChecker,
+                          lastKnownSlotRef,
+                          epochStateRef,
+                          etaRotationSnapshots,
+                          confirmationDepthK,
+                          consensusFns,
+                          snapshotStorage,
+                          lastGlobalSnapshotStorage,
+                          lastNGlobalSnapshotStorage,
+                          productionGate,
+                          mptStore,
+                          mptOverlay,
+                          pendingAccumulatorsRef,
+                          pendingPostBytesRef,
+                          eventMempool,
+                          chainSyncManager,
+                          channel,
+                          dataDir,
+                          operationalKeyMaker,
+                          shardProducers,
+                          shardChainStores,
+                          shardBinaryBuffers,
+                          shardAssignment,
+                          shardCommitteeMembership,
+                          logger
+                        )
+                      }
+
+                      if (wouldWin)
+                        productionGate.pause(ProductionGate.BetterGossipReceived) >>
+                          handle.guarantee(productionGate.resume(ProductionGate.BetterGossipReceived))
+                      else handle
+                    }
+                  }
+
+                  fs2.Stream.eval {
+                    for {
+                      overflowCounts <- Ref.of[F, Map[String, Long]](Map.empty)
+                      snapshotLane <- GenerationWorkerLane
+                        .bounded[F, pb.Snapshot](
+                          SnapshotIntakeCapacity,
+                          1,
+                          VariableLaneByteCapacity,
+                          VariableMessageMaxBytes
+                        )(_.serializedSize.toLong)(processSnapshot)
+                      tipAttestationLane <- GenerationWorkerLane
+                        .bounded[F, pb.TipAttestation](
+                          TipAttestationCapacity,
+                          1,
+                          AttestationLaneByteCapacity,
+                          AttestationMessageMaxBytes
+                        )(_.serializedSize.toLong)(att =>
+                          handleAttestation(att, tipTracker, operatorKeyRegistry, etaRotationSnapshots, logger)
+                        )
+                      metagraphBinaryLane <- GenerationWorkerLane.bounded[F, pb.MetagraphBinary](
+                        MetagraphBinaryCapacity,
+                        MetagraphBinaryParallelism,
+                        VariableLaneByteCapacity,
+                        VariableMessageMaxBytes
+                      )(_.serializedSize.toLong)(mb => handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger))
+                      metagraphAttestationLane <- GenerationWorkerLane.bounded[F, pb.MetagraphAttestation](
+                        MetagraphAttestationCapacity,
+                        MetagraphAttestationParallelism,
+                        AttestationLaneByteCapacity,
+                        AttestationMessageMaxBytes
+                      )(_.serializedSize.toLong)(att =>
+                        handleMetagraphAttestation(
+                          att,
+                          committeeGate,
+                          verifyPhase2CurrencyContext,
+                          etaForPhase2Anchor,
+                          etaRotationSnapshots,
+                          senderStakeLookup,
+                          orphanBuffer,
+                          logger
+                        )
+                      )
+                      nativeBlockLane <- GenerationWorkerLane.bounded[F, NativeBlockIngress](
+                        NativeBlockCapacity,
+                        NativeBlockParallelism,
+                        VariableLaneByteCapacity,
+                        VariableMessageMaxBytes
+                      )(NativeBlockIngress.encodedSize)(work =>
+                        work match {
+                          case NativeBlockIngress.AllowSpend(asb) =>
+                            handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)
+                          case NativeBlockIngress.Dag(blk) =>
+                            handleDAGBlock(blk, enqueueDAGBlock, logger)
+                          case NativeBlockIngress.TokenLock(blk) =>
+                            handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)
+                        }
+                      )
+                      shardCheckpointLane <- GenerationWorkerLane.bounded[F, pb.ShardCheckpointWire](
+                        ShardCheckpointCapacity,
+                        ShardCheckpointParallelism,
+                        VariableLaneByteCapacity,
+                        VariableMessageMaxBytes
+                      )(_.serializedSize.toLong)(cp =>
+                        handleShardCheckpoint(
+                          cp,
+                          shardAcceptanceDeps,
+                          shardCheckpointAttestationEmitter,
+                          watchtowerFraudProofEmitter,
+                          shardCheckpointFetcher,
+                          pendingShardCheckpointRef,
+                          MaxShardCheckpointAncestryRecoveryDepth,
+                          selfId,
+                          logger
+                        )
+                      )
+                      shardAttestationLane <- GenerationWorkerLane.bounded[F, pb.ShardCheckpointAttestationWire](
+                        ShardCheckpointAttestationCapacity,
+                        ShardCheckpointAttestationParallelism,
+                        AttestationLaneByteCapacity,
+                        AttestationMessageMaxBytes
+                      )(_.serializedSize.toLong)(att => handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger))
+                      fraudProofLane <- GenerationWorkerLane.bounded[F, pb.FraudProofEnvelopeWire](
+                        FraudProofCapacity,
+                        FraudProofParallelism,
+                        VariableLaneByteCapacity,
+                        VariableMessageMaxBytes
+                      )(_.serializedSize.toLong)(fp =>
+                        handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, fraudProofPool, logger)
+                      )
+                    } yield
+                      (
+                        overflowCounts,
+                        snapshotLane,
+                        tipAttestationLane,
+                        metagraphBinaryLane,
+                        metagraphAttestationLane,
+                        nativeBlockLane,
+                        shardCheckpointLane,
+                        shardAttestationLane,
+                        fraudProofLane
+                      )
+                  }.flatMap {
+                    case (
+                          overflowCounts,
+                          snapshotLane,
+                          tipAttestationLane,
+                          metagraphBinaryLane,
+                          metagraphAttestationLane,
+                          nativeBlockLane,
+                          shardCheckpointLane,
+                          shardAttestationLane,
+                          fraudProofLane
+                        ) =>
+                      def enqueueOrReject[A](
+                        lane: GenerationWorkerLane[F, A],
+                        value: A,
+                        family: String,
+                        item: String,
+                        recovery: String
+                      ): F[Unit] =
+                        lane.tryOffer(value).flatMap {
+                          case GenerationWorkerOfferResult.Accepted => Async[F].unit
+                          case rejected =>
+                            val (reason, bound) = rejected match {
+                              case GenerationWorkerOfferResult.MessageTooLarge(actual, maximum) =>
+                                "message_too_large" -> s"encodedBytes=$actual maxMessageBytes=$maximum"
+                              case GenerationWorkerOfferResult.ByteCapacityExceeded(actual, maximum) =>
+                                "byte_capacity" -> s"encodedBytes=$actual maxQueuedBytes=$maximum"
+                              case GenerationWorkerOfferResult.ItemCapacityExceeded(maximum) =>
+                                "item_capacity" -> s"maxQueuedItems=$maximum"
+                              case GenerationWorkerOfferResult.InvalidEncodedSize(actual) =>
+                                "invalid_size" -> s"encodedBytes=$actual"
+                              case GenerationWorkerOfferResult.GenerationClosed =>
+                                "generation_closed" -> "lane admission is sealed"
+                              case GenerationWorkerOfferResult.Accepted =>
+                                "accepted" -> ""
                             }
+                            val countKey = s"$family:$reason"
+                            overflowCounts.updateAndGet { counts =>
+                              counts.updated(countKey, counts.getOrElse(countKey, 0L) + 1L)
+                            }.flatMap { counts =>
+                              val count = counts(countKey)
+                              Metrics[F].incrementCounter(
+                                "dag_nakamoto_gossip_worker_overflow",
+                                Seq(
+                                  Metrics.unsafeLabelName("topic_family") -> family,
+                                  Metrics.unsafeLabelName("reason") -> reason
+                                )
+                              ) >>
+                                Async[F].whenA(count == 1L || count % 1024L == 0L) {
+                                  logger.warn(
+                                    s"Gossip worker rejected input: family=$family reason=$reason rejectionCount=$count $bound " +
+                                      s"item=$item; recovery=$recovery"
+                                  )
+                                }
+                            }
+                        }
 
-                          }
-
-                      // FINDING-F1: the daemon declares the exact message families it consumes — every family
-                      // EXCEPT rumor (rumors belong to SidecarRumorBridge). The shard-checkpoint families ride
-                      // the sidecar's SHARED fan-in channels (exactly-one-drainer semantics); before this filter
-                      // the rumor bridge's subscribe-all stream race-drained ~half of them and its `isRumor`
-                      // collect silently discarded the wins. With explicit topic sets on both streams the daemon
-                      // is the shard channels' only drainer by construction.
+                      // The daemon declares the exact non-rumor families it consumes. Demultiplexing is nonblocking:
+                      // a full metagraph-binary lane must not prevent the attestation needed by an in-flight gate from
+                      // reaching its separately reserved lane. The same rule prevents native/shard/fraud floods from
+                      // starving finality traffic. Overflow is an explicit rejection with a metric and family-specific
+                      // recovery statement; no receipt becomes validity or execution authority here.
                       val gossip = GossipStream
                         .subscribe[F](
                           channel,
@@ -907,127 +1291,99 @@ object NakamotoSyncDaemon {
                         .evalMap { msg =>
                           msg.body match {
                             case pb.GossipMessage.Body.Snapshot(snap) =>
-                              // INTAKE DEMUX (run-16 post-mortem, 2026-06-12): snapshot processing is seconds-to-minutes during
-                              // catch-up and used to run INLINE here, serializing the ONE gossip stream — on the slowest-booting
-                              // node every checkpoint/attestation queued behind it for MINUTES (gl0-2: sidecar got the genesis
-                              // checkpoint at 03:26:35, the JVM processed it at 03:35:32 — the head-of-line block behind boot
-                              // catch-up that re-forked every staircase run). Snapshots now route to a dedicated bounded queue
-                              // drained serially by `snapshotWorker` below (same semaphore, same ordering); all other bodies
-                              // flow past without waiting. On a full queue the snapshot is DROPPED with a WARN — snapshot
-                              // recovery is pull-based (ChainSync / pullFinalityGated), so a dropped gossip copy is re-fetched,
-                              // whereas blocking here would re-introduce the head-of-line stall this demux removes.
-                              snapshotIntakeQ.tryOffer(snap).flatMap {
-                                case true => Async[F].unit
-                                case false =>
-                                  logger.warn(
-                                    s"Gossip intake: snapshot queue FULL — dropped gossiped ord=${snap.ordinal} (pull-based recovery will refetch)"
-                                  )
-                              }
+                              enqueueOrReject(
+                                snapshotLane,
+                                snap,
+                                "snapshot",
+                                s"ordinal=${snap.ordinal}",
+                                "exact-hash/ordinal ChainSync recovery can refetch the candidate"
+                              )
 
                             case pb.GossipMessage.Body.Attestation(att) =>
-                              // Background-fire (intake demux completion, run-20): KES + Ed25519 verify per attestation is
-                              // tens of ms; inline on the single gossip `evalMap` thread it serializes EVERY later message —
-                              // during the boot attestation burst that is the exact head-of-line the demux was meant to remove
-                              // (the same skew-rejection failure the MetagraphBinary case documents below, and the channel by
-                              // which a shard genesis checkpoint queued behind the burst waited MINUTES in run-20). The
-                              // tracker mutation is race-safe, but the transitional sticky accumulator is receipt-order
-                              // sensitive. This background path is telemetry-only until a portable sampled transcript
-                              // replaces it; it cannot authorize Phase 2.
-                              Async[F]
-                                .start(handleAttestation(att, tipTracker, operatorKeyRegistry, etaRotationSnapshots, logger))
-                                .void
+                              // Serial by receipt: the current sticky accumulator is order-sensitive and telemetry-only.
+                              enqueueOrReject(
+                                tipAttestationLane,
+                                att,
+                                "tip_attestation",
+                                s"ordinal=${att.tipOrdinal}",
+                                "the optimistic sample may be incomplete; Nakamoto depth fallback remains available"
+                              )
 
                             case pb.GossipMessage.Body.MetagraphBinary(mb) =>
-                              // Background-fire: the gate's `attestAndAdmit` blocks up to gateTimeoutMs
-                              // (30s default) waiting for configured `kQuorum` committee attestations. Running it on
-                              // the gossip stream's `evalMap` thread serializes EVERY message behind
-                              // every pending gate — gl0 TipAttestations from peers then arrive past
-                              // `TipTracker.MaxAttestationSkewMs` and get rejected (skew=200+s observed
-                              // in iter-s3prep-baseline). Gate work is naturally concurrent-safe: the
-                              // aggregator is a `Ref[F, ...]`, `processMetagraphBinary` writes to a
-                              // queue, and per-binary state is keyed by (mgAddr, parentHash, binaryHash).
-                              // The gate-aware processor is also the sole writer to execution-shard buffers. A raw
-                              // gossip receipt is never enough to make a binary eligible for a shard checkpoint.
-                              Async[F]
-                                .start(
-                                  handleMetagraphBinary(mb, processOrphanedMetagraphBinary, logger)
-                                )
-                                .void
+                              enqueueOrReject(
+                                metagraphBinaryLane,
+                                mb,
+                                "metagraph_binary",
+                                s"address=${mb.address}",
+                                "a later child can trigger parent-hash pull; loss of an unextended tail remains a durable-retry gap"
+                              )
 
                             case pb.GossipMessage.Body.MetagraphAttestation(att) =>
-                              // Background-fire: VRF verify + KES verify + Ed25519 verify add up to
-                              // tens of ms per attestation. In bursts (each peer attests each binary),
-                              // this would queue up behind the stream's serial evalMap. Aggregator
-                              // record is concurrent-safe.
-                              Async[F]
-                                .start(
-                                  handleMetagraphAttestation(
-                                    att,
-                                    committeeGate,
-                                    verifyPhase2CurrencyContext,
-                                    etaForPhase2Anchor,
-                                    etaRotationSnapshots,
-                                    senderStakeLookup,
-                                    orphanBuffer,
-                                    logger
-                                  )
-                                )
-                                .void
+                              enqueueOrReject(
+                                metagraphAttestationLane,
+                                att,
+                                "metagraph_attestation",
+                                s"address=${att.metagraphAddress}",
+                                "execution/admission quorum waits for a later re-emission; receive-side durable retry remains open"
+                              )
 
-                            // Background-fire (intake demux completion, run-20): these handlers `enqueue*` into a mempool
-                            // queue (a possibly-bounded `offer`); inline on the gossip `evalMap` a full queue blocks EVERY
-                            // later message behind it (the head-of-line the demux removes for the metagraph/shard cases).
-                            // Block acceptance reorders by parent ref downstream, so a per-fiber enqueue race is harmless.
+                            // This lane performs only wire decode and enqueue. It does not authenticate economics and cannot
+                            // replace the mandatory universal GL0 execution of admitted native GL1 transitions.
                             case pb.GossipMessage.Body.AllowSpendBlock(asb) =>
-                              Async[F].start(handleAllowSpendBlock(asb, enqueueAllowSpendBlock, logger)).void
+                              enqueueOrReject(
+                                nativeBlockLane,
+                                NativeBlockIngress.AllowSpend(asb),
+                                "native_allow_spend",
+                                s"bytes=${asb.payload.size()}",
+                                "the original GL1 sender must retry; receive-side durable retry and pre-enqueue authentication remain open"
+                              )
 
                             case pb.GossipMessage.Body.DagBlock(blk) =>
-                              Async[F].start(handleDAGBlock(blk, enqueueDAGBlock, logger)).void
+                              enqueueOrReject(
+                                nativeBlockLane,
+                                NativeBlockIngress.Dag(blk),
+                                "native_dag",
+                                s"bytes=${blk.payload.size()}",
+                                "the original GL1 sender must retry; receive-side durable retry and pre-enqueue authentication remain open"
+                              )
 
                             case pb.GossipMessage.Body.TokenLockBlock(blk) =>
-                              Async[F].start(handleTokenLockBlock(blk, enqueueTokenLockBlock, logger)).void
+                              enqueueOrReject(
+                                nativeBlockLane,
+                                NativeBlockIngress.TokenLock(blk),
+                                "native_token_lock",
+                                s"bytes=${blk.payload.size()}",
+                                "the original GL1 sender must retry; receive-side durable retry and pre-enqueue authentication remain open"
+                              )
 
-                            // Gap B: shard-checkpoint envelope + attestation gossip routing (load-bearing cross-node
-                            // reconstruction). `shardAcceptanceDeps = None` (numShards=1, regression bar) ⇒ both
-                            // handlers drop with a single debug log. When active, the checkpoint is decoded,
-                            // reconstructed into a `Signed[ShardCheckpoint]` (the signed slot is carried on wire; store-only
-                            // VRF output metadata is derived deterministically), replay-validated, then stored into the per-shard chain store.
-                            // Only after replay succeeds are carried committee signatures counted and this node allowed
-                            // to add its own execution signature. Background-fire with
-                            // `Async.start` so the multi-step verify never blocks the gossip evalMap thread (mirrors
-                            // the MetagraphAttestation handling above).
                             case pb.GossipMessage.Body.ShardCheckpoint(cp) =>
-                              Async[F]
-                                .start(
-                                  handleShardCheckpoint(
-                                    cp,
-                                    shardAcceptanceDeps,
-                                    shardCheckpointAttestationEmitter,
-                                    watchtowerFraudProofEmitter,
-                                    shardCheckpointFetcher,
-                                    pendingShardCheckpointRef,
-                                    MaxShardCheckpointAncestryRecoveryDepth,
-                                    selfId,
-                                    logger
-                                  )
-                                )
-                                .void
+                              enqueueOrReject(
+                                shardCheckpointLane,
+                                cp,
+                                "shard_checkpoint",
+                                s"shard=${cp.shardId} ordinal=${cp.shardOrdinal}",
+                                "bounded parent/hash and ordinal absence recovery can refetch the checkpoint"
+                              )
 
                             case pb.GossipMessage.Body.ShardCheckpointAttestation(att) =>
-                              Async[F].start(handleShardCheckpointAttestation(att, shardAcceptanceDeps, logger)).void
+                              enqueueOrReject(
+                                shardAttestationLane,
+                                att,
+                                "shard_checkpoint_attestation",
+                                s"shard=${att.shardId} bytes=${att.serializedSize}",
+                                "checkpoint quorum waits for a later replay-backed re-attestation or checkpoint recovery"
+                              )
 
                             case pb.GossipMessage.Body.FraudProof(fp) =>
-                              // WATCHTOWER dispute consumer (part 2): background-fire the DETERMINISTIC verdict. Every gl0 runs the
-                              // identical re-derivation over the disputed checkpoint's own bytes; the verdict is recomputed, never trusted.
-                              // On a locally-UPHELD verdict the validated evidence is OFFERED into `fraudProofPool` so the gl0 leader embeds it
-                              // as the `fraudProofs` consensus artifact (W3a) — where the on-chain GSAM re-validates it + applies the slash.
-                              Async[F]
-                                .start(handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, fraudProofPool, logger))
-                                .void
+                              enqueueOrReject(
+                                fraudProofLane,
+                                fp,
+                                "fraud_proof",
+                                s"bytes=${fp.serializedSize}",
+                                "no slash or state change occurs; challenger retry/receive-side durable evidence recovery remains open"
+                              )
 
                             case _: pb.GossipMessage.Body.Rumor =>
-                              // Not requested by `daemonTopics` (rumors are the SidecarRumorBridge's family);
-                              // kept as a defensive no-op should the sidecar ever misroute one.
                               Async[F].unit
 
                             case _: pb.GossipMessage.Body.Started =>
@@ -1042,16 +1398,31 @@ object NakamotoSyncDaemon {
                           }
                         }
 
-                      gossip.concurrently(snapshotWorker)
-                    }
-                    .handleErrorWith { e =>
+                      runWorkerGeneration(
+                        gossip,
+                        List(
+                          snapshotLane,
+                          tipAttestationLane,
+                          metagraphBinaryLane,
+                          metagraphAttestationLane,
+                          nativeBlockLane,
+                          shardCheckpointLane,
+                          shardAttestationLane,
+                          fraudProofLane
+                        )
+                      )
+                  }.handleErrorWith {
+                    case workerFailure: GenerationWorkerFailed =>
+                      fs2.Stream.raiseError[F](workerFailure)
+                    case e =>
                       fs2.Stream.eval(
                         logger.warn(s"Gossip stream error: ${e.getMessage}. Reconnecting in 5s...")
                       ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
-                    } ++ fs2.Stream.eval(
+                  } ++ fs2.Stream.eval(
                     // A clean server completion is also reconnectable. gRPC errors retain their exact Throwable and take the error branch.
                     logger.warn("Gossip stream terminated (sidecar connection lost). Reconnecting in 5s...")
                   ) ++ fs2.Stream.sleep_[F](5.seconds) ++ gossipStream
+                }
 
                 // #259: stuck-parent active-recovery tick. A metagraph binary whose parent the local
                 // committee gate never admitted (and whose orphan-drain never resolved) sits in the
@@ -1174,29 +1545,25 @@ object NakamotoSyncDaemon {
                                     }.flatMap { due =>
                                       Async[F].whenA(due) {
                                         val nextOrd = io.constellationnetwork.schema.sharding.ShardOrdinal(curOrd + 1L)
-                                        Async[F]
-                                          .start(
-                                            fetcher.fetchByOrdinal(shardId, nextOrd).flatMap {
-                                              case Some(signed) =>
-                                                io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
-                                                  .signedShardCheckpointToWire[F](signed)
-                                                  .flatMap(w =>
-                                                    handleShardCheckpoint(
-                                                      w,
-                                                      shardAcceptanceDeps,
-                                                      shardCheckpointAttestationEmitter,
-                                                      watchtowerFraudProofEmitter,
-                                                      shardCheckpointFetcher,
-                                                      pendingShardCheckpointRef,
-                                                      MaxShardCheckpointAncestryRecoveryDepth,
-                                                      selfId,
-                                                      logger
-                                                    )
-                                                  )
-                                              case None => Async[F].unit
-                                            }
-                                          )
-                                          .void
+                                        fetcher.fetchByOrdinal(shardId, nextOrd).flatMap {
+                                          case Some(signed) =>
+                                            io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
+                                              .signedShardCheckpointToWire[F](signed)
+                                              .flatMap(w =>
+                                                handleShardCheckpoint(
+                                                  w,
+                                                  shardAcceptanceDeps,
+                                                  shardCheckpointAttestationEmitter,
+                                                  watchtowerFraudProofEmitter,
+                                                  shardCheckpointFetcher,
+                                                  pendingShardCheckpointRef,
+                                                  MaxShardCheckpointAncestryRecoveryDepth,
+                                                  selfId,
+                                                  logger
+                                                )
+                                              )
+                                          case None => Async[F].unit
+                                        }
                                       }
                                     }
                                   }
@@ -1777,53 +2144,62 @@ object NakamotoSyncDaemon {
           HasherSelector[F].withCurrent { implicit hasher =>
             for {
               attHash <- decoded.domain.hash
-              publicKey <- decoded.attesterHex.toPublicKey[F]
-              valid <- Signing.verifySignature(attHash.getBytes, decoded.signature)(publicKey)
-              // Chronos-prep: capture OUR local clock when the peer's attestation lands so
-              // `TipTracker.recordAttestation` can compare against the peer's claimed
-              // `attestedAt`. Badly-skewed peers (or attackers forging timestamps) are
-              // dropped inside the tracker before they pollute `T_count` finality (#136).
-              nowMs <- Clock[F].realTime.map(_.toMillis)
-              _ <-
-                if (valid)
-                  ActiveOperatorConsensusKeys
-                    .resolve(
-                      operatorKeyRegistry,
-                      attesterId,
-                      EtaCalculation.globalSnapshotArtifactPeriod(decoded.domain.tipOrdinal, etaRotationSnapshots)
-                    )
-                    .flatMap {
-                      case None =>
-                        logger.warn(
-                          s"Rejecting tip attestation from=${decoded.attesterHex.value.take(16)}...: " +
-                            s"no active preregistered atomic KES+VRF pair"
-                        )
-                      case Some(keys) =>
-                        KesGossipVerification
-                          .verifyAttestation(
-                            messageBytes = attHash.getBytes,
-                            kesSigBytes = decoded.kesSignature,
-                            attesterId = attesterId,
-                            attesterHex = decoded.attesterHex,
-                            tipOrdinal = decoded.domain.tipOrdinal,
-                            operatorKeys = keys,
-                            etaRotationSnapshots = etaRotationSnapshots,
-                            logger = logger
-                          )
-                          .flatMap { kesOk =>
-                            if (kesOk)
-                              tipTracker.recordAttestation(attesterId, decoded.domain, nowMs) >>
-                                logger.info(
-                                  s"📨 Attestation for ordinal=${decoded.domain.tipOrdinal} from=${decoded.attesterHex.value.take(16)}..."
-                                )
-                            else Async[F].unit
-                          }
-                    }
-                else
+              longTermVerification <- decoded.attesterHex
+                .toPublicKey[F]
+                .flatMap(publicKey => Signing.verifySignature[F](attHash.getBytes, decoded.signature)(publicKey))
+                .attempt
+              _ <- longTermVerification match {
+                case Left(error) =>
+                  logger.warn(
+                    s"Rejecting malformed tip-attestation identity/signature for ordinal=${decoded.domain.tipOrdinal} " +
+                      s"from=${decoded.attesterHex.value.take(16)}...: ${Option(error.getMessage).getOrElse(error.getClass.getSimpleName)}"
+                  )
+                case Right(false) =>
                   logger.warn(
                     s"⚠️ Rejecting attestation with invalid signature for ordinal=${decoded.domain.tipOrdinal} " +
                       s"from=${decoded.attesterHex.value.take(16)}..."
                   )
+                case Right(true) =>
+                  // Chronos-prep: capture OUR local clock when the peer's attestation lands so
+                  // `TipTracker.recordAttestation` can compare against the peer's claimed
+                  // `attestedAt`. Badly-skewed peers (or attackers forging timestamps) are
+                  // dropped inside the tracker before they pollute `T_count` finality (#136).
+                  Clock[F].realTime.map(_.toMillis).flatMap { nowMs =>
+                    ActiveOperatorConsensusKeys
+                      .resolve(
+                        operatorKeyRegistry,
+                        attesterId,
+                        EtaCalculation.globalSnapshotArtifactPeriod(decoded.domain.tipOrdinal, etaRotationSnapshots)
+                      )
+                      .flatMap {
+                        case None =>
+                          logger.warn(
+                            s"Rejecting tip attestation from=${decoded.attesterHex.value.take(16)}...: " +
+                              s"no active preregistered atomic KES+VRF pair"
+                          )
+                        case Some(keys) =>
+                          KesGossipVerification
+                            .verifyAttestation(
+                              messageBytes = attHash.getBytes,
+                              kesSigBytes = decoded.kesSignature,
+                              attesterId = attesterId,
+                              attesterHex = decoded.attesterHex,
+                              tipOrdinal = decoded.domain.tipOrdinal,
+                              operatorKeys = keys,
+                              etaRotationSnapshots = etaRotationSnapshots,
+                              logger = logger
+                            )
+                            .flatMap { kesOk =>
+                              if (kesOk)
+                                tipTracker.recordAttestation(attesterId, decoded.domain, nowMs) >>
+                                  logger.info(
+                                    s"📨 Attestation for ordinal=${decoded.domain.tipOrdinal} from=${decoded.attesterHex.value.take(16)}..."
+                                  )
+                              else Async[F].unit
+                            }
+                      }
+                  }
+              }
             } yield ()
           }
         }
@@ -1844,8 +2220,10 @@ object NakamotoSyncDaemon {
       slot <- NonNegLong.from(att.tipSlot).leftMap(_ => s"negative tipSlot=${att.tipSlot}")
       _ <- Either.cond(att.tipOrdinal >= 0L, (), s"negative tipOrdinal=${att.tipOrdinal}")
       _ <- Either.cond(att.attestedAt >= 0L, (), s"negative attestedAt=${att.attestedAt}")
+      attesterBytes = att.attesterId.toByteArray
+      _ <- Either.cond(attesterBytes.length == 64, (), s"invalid attesterId length=${attesterBytes.length}, expected=64")
       tipHash = Hash(new String(att.tipHash.toByteArray, java.nio.charset.StandardCharsets.UTF_8))
-      attesterHex = Hex(att.attesterId.toByteArray.map("%02x".format(_)).mkString)
+      attesterHex = Hex.fromBytes(attesterBytes)
     } yield
       DecodedTipAttestation(
         DomainTipAttestation(tipHash, Slot(slot), att.tipOrdinal, att.attestedAt),
@@ -2198,8 +2576,8 @@ object NakamotoSyncDaemon {
                             // unconditionally, before the checkpoint enters the store or local quorum count. A
                             // `Rejected`/`RejectedReExecutionMismatch` result is DROPPED — not stored as adoptable, signers NOT counted, NO
                             // attestation emitted (a re-exec deviator must not have its checkpoint adopted nor be rewarded with our
-                            // attestation). Per Q4 the handler stays `Async.start`-ed off the gossip thread (see the caller), but WITHIN it
-                            // the emit is gated on re-exec success.
+                            // attestation). The generation-owned shard worker keeps the whole replay/store/emit sequence off the shared
+                            // demultiplexer while retaining cancellation ownership.
                             // S1 — exact-hash GL0 Phase-2 operational anchor. This is density-reorgable, not an immutable finality floor.
                             // Pull GL0's latest Phase-2 checkpoint hash for this shard into fork choice. When the operational anchor IS in
                             // the local store, `noteAnchor` reorgs onto it (the #42 heal). When it is ABSENT — this node followed a divergent
@@ -2207,7 +2585,7 @@ object NakamotoSyncDaemon {
                             // maxvalid-tk kept extending tine β) — `noteAnchor`
                             // silently REFUSES a not-yet-stored hash (`ShardChainStore`: "never replace a known anchor with a
                             // not-yet-stored hash"), so the anchor can never bite and the longer rogue tine wins forever. Fix:
-                            // background-FETCH the Phase-2 anchor by hash and re-feed it; the re-feed recursively pulls its
+                            // fetch the Phase-2 anchor by hash inside the owning shard worker and re-feed it; the re-feed recursively pulls its
                             // ancestry via the T1 trigger above until it connects, and the NEXT receipt's `noteAnchor` then succeeds
                             // and `compareAnchoredMaxvalid` collapses the fork onto the finalized tine. Receipt-piggybacked +
                             // idempotent; the fetch is best-effort/deduped in `ShardCheckpointFetcher`.
@@ -2218,33 +2596,29 @@ object NakamotoSyncDaemon {
                                   case Some(_) => entry.chainStore.noteAnchor(anchorHash)
                                   case None =>
                                     shardCheckpointFetcher.fold(Async[F].unit) { fetcher =>
-                                      Async[F]
-                                        .start(
-                                          fetcher.fetchByHash(checkpoint.shardId, anchorHash).flatMap {
-                                            case Some(anchorSigned) =>
-                                              logger.info(
-                                                s"🧩 ShardCheckpoint Phase-2-anchor FETCH: shard=${checkpoint.shardId.value.value} " +
-                                                  s"anchor=${anchorHash.value.take(12)} absent locally — pulling GL0 operational tine (run-24 S1)"
-                                              ) >>
-                                                io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
-                                                  .signedShardCheckpointToWire[F](anchorSigned)
-                                                  .flatMap(w =>
-                                                    handleShardCheckpoint(
-                                                      w,
-                                                      shardAcceptanceDeps,
-                                                      shardCheckpointAttestationEmitter,
-                                                      watchtowerFraudProofEmitter,
-                                                      shardCheckpointFetcher,
-                                                      pendingShardCheckpointRef,
-                                                      MaxShardCheckpointAncestryRecoveryDepth,
-                                                      selfId,
-                                                      logger
-                                                    )
-                                                  )
-                                            case None => Async[F].unit
-                                          }
-                                        )
-                                        .void
+                                      fetcher.fetchByHash(checkpoint.shardId, anchorHash).flatMap {
+                                        case Some(anchorSigned) =>
+                                          logger.info(
+                                            s"🧩 ShardCheckpoint Phase-2-anchor FETCH: shard=${checkpoint.shardId.value.value} " +
+                                              s"anchor=${anchorHash.value.take(12)} absent locally — pulling GL0 operational tine (run-24 S1)"
+                                          ) >>
+                                            io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWireCodecs
+                                              .signedShardCheckpointToWire[F](anchorSigned)
+                                              .flatMap(w =>
+                                                handleShardCheckpoint(
+                                                  w,
+                                                  shardAcceptanceDeps,
+                                                  shardCheckpointAttestationEmitter,
+                                                  watchtowerFraudProofEmitter,
+                                                  shardCheckpointFetcher,
+                                                  pendingShardCheckpointRef,
+                                                  MaxShardCheckpointAncestryRecoveryDepth,
+                                                  selfId,
+                                                  logger
+                                                )
+                                              )
+                                        case None => Async[F].unit
+                                      }
                                     }
                                 }
                             } >>
@@ -2278,14 +2652,15 @@ object NakamotoSyncDaemon {
                                             val becameBestTip = recovered.inserted && bestTipOpt.exists(_.hash === checkpointHash)
                                             // WATCHTOWER approval-check (fraud-proof part 1): on adopting this checkpoint as canonical best tip,
                                             // re-execute its per-MG derivations EVEN THOUGH it was quorum-admitted (the whole point — catch a
-                                            // quorum-signed wrong root) and gossip a FraudProofEnvelope on any mismatch. Background-fire so the
-                                            // multi-step re-exec + sign + publish never blocks this handler; `None` (numShards=1 / watchtower
-                                            // disabled) ⇒ skipped. Only on becameBestTip: a non-canonical sibling is not adopted, so its effects
-                                            // are never applied — no need to dispute it (and re-deriving it against our S(N) could false-mismatch).
+                                            // quorum-signed wrong root) and gossip a FraudProofEnvelope on any mismatch. It remains inside the
+                                            // bounded generation-owned shard worker, so reconnect/cancellation cannot leave stale replay or
+                                            // publication mutating state. `None` (numShards=1 / watchtower disabled) ⇒ skipped. Only on
+                                            // becameBestTip: a non-canonical sibling is not adopted, so its effects are never applied — no need
+                                            // to dispute it (and re-deriving it against our S(N) could false-mismatch).
                                             Async[F].whenA(becameBestTip) {
                                               watchtowerFraudProofEmitter match {
                                                 case None          => Async[F].unit
-                                                case Some(emitter) => Async[F].start(emitter.emit(checkpoint)).void
+                                                case Some(emitter) => emitter.emit(checkpoint)
                                               }
                                             } >>
                                               // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
@@ -2294,8 +2669,8 @@ object NakamotoSyncDaemon {
                                                 .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
                                               // Execution-certificate closure: sign + gossip after local replay so every other node's tracker
                                               // can reach configured `kQuorum`. `None`
-                                              // emitter (numShards=1 regression bar) ⇒ no emit. Background-fire so the multi-step sign+publish
-                                              // never blocks this handler (the handler is already inside an `Async.start`).
+                                              // emitter (numShards=1 regression bar) ⇒ no emit. The surrounding bounded shard worker owns the
+                                              // multi-step sign/publish lifecycle.
                                               //
                                               // ATTEST ON EVERY ADMISSIBLE RECEIPT, not only on becameBestTip (2026-06-11, run bc5a17r12):
                                               // the best-tip-only gate + the tip-triggered ancestor walk still missed OUT-OF-ORDER arrivals —
