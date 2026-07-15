@@ -24,23 +24,25 @@ object SidecarSubscriptionReadinessSuite extends SimpleIOSuite {
     for {
       reasons <- Ref.of[IO, Set[String]](Set.empty)
       nextPause <- Ref.of[IO, Option[PauseBlock]](None)
-    } yield GateHarness(
-      new ProductionGate[IO] {
-        def pause(reason: String): IO[Unit] =
-          nextPause.getAndSet(None).flatMap(_.traverse_(block => block.entered.complete(()) >> block.continue.get)) >>
-            reasons.update(_ + reason)
+    } yield
+      GateHarness(
+        new ProductionGate[IO] {
+          def pause(reason: String): IO[Unit] =
+            nextPause.getAndSet(None).flatMap(_.traverse_(block => block.entered.complete(()) >> block.continue.get)) >>
+              reasons.update(_ + reason)
 
-        def resume(reason: String): IO[Unit] = reasons.update(_ - reason)
+          def resume(reason: String): IO[Unit] = reasons.update(_ - reason)
 
-        def isOpen: IO[Boolean] = reasons.get.map(_.isEmpty)
+          def isOpen: IO[Boolean] = reasons.get.map(_.isEmpty)
 
-        def pauseReasons: IO[Set[String]] = reasons.get
-      },
-      (Deferred[IO, Unit], Deferred[IO, Unit]).tupled.flatMap { case (entered, continue) =>
-        val block = PauseBlock(entered, continue)
-        nextPause.set(block.some).as(block)
-      }
-    )
+          def pauseReasons: IO[Set[String]] = reasons.get
+        },
+        (Deferred[IO, Unit], Deferred[IO, Unit]).tupled.flatMap {
+          case (entered, continue) =>
+            val block = PauseBlock(entered, continue)
+            nextPause.set(block.some).as(block)
+        }
+      )
 
   private def ack(session: String, generation: Long): Acknowledgement = Acknowledgement(session, generation)
 
@@ -66,9 +68,10 @@ object SidecarSubscriptionReadinessSuite extends SimpleIOSuite {
       nakamoto2 <- readiness.begin(Lane.NakamotoSync)
       _ <- readiness.acknowledge(nakamoto2, ack("session-a", 13L))
       ready <- readiness.awaitBoth.timeout(1.second)
-    } yield expect(mixed.ready.isEmpty)
-      .and(expect(timedOut))
-      .and(expect.same(Ready("session-a", 11L, 13L), ready))
+    } yield
+      expect(mixed.ready.isEmpty)
+        .and(expect(timedOut))
+        .and(expect.same(Ready("session-a", 11L, 13L), ready))
   }
 
   test("stale acknowledgement and teardown cannot overwrite or clear a newer lane attempt") {
@@ -83,9 +86,10 @@ object SidecarSubscriptionReadinessSuite extends SimpleIOSuite {
       afterStaleRelease <- readiness.current
       _ <- readiness.release(current)
       afterCurrentRelease <- readiness.current
-    } yield expect(staleAck.left.exists(_.isInstanceOf[StaleAttempt]))
-      .and(expect.same(ack("new-session", 2L).some, afterStaleRelease.rumor))
-      .and(expect(afterCurrentRelease.rumor.isEmpty))
+    } yield
+      expect(staleAck.left.exists(_.isInstanceOf[StaleAttempt]))
+        .and(expect.same(ack("new-session", 2L).some, afterStaleRelease.rumor))
+        .and(expect(afterCurrentRelease.rumor.isEmpty))
   }
 
   test("beginning a replacement attempt invalidates readiness before it is acknowledged") {
@@ -119,9 +123,10 @@ object SidecarSubscriptionReadinessSuite extends SimpleIOSuite {
       zeroGenerationAttempt <- readiness.begin(Lane.RumorBridge)
       zeroGeneration <- readiness.acknowledge(zeroGenerationAttempt, ack("session", 0L)).attempt
       status <- readiness.current
-    } yield expect(emptySession.left.exists(_.isInstanceOf[InvalidAcknowledgement]))
-      .and(expect(zeroGeneration.left.exists(_.isInstanceOf[InvalidAcknowledgement])))
-      .and(expect(status.rumor.isEmpty))
+    } yield
+      expect(emptySession.left.exists(_.isInstanceOf[InvalidAcknowledgement]))
+        .and(expect(zeroGeneration.left.exists(_.isInstanceOf[InvalidAcknowledgement])))
+        .and(expect(status.rumor.isEmpty))
   }
 
   test("same-session stream generation must strictly increase per lane across reconnects") {
@@ -136,9 +141,10 @@ object SidecarSubscriptionReadinessSuite extends SimpleIOSuite {
       lowerResult <- readiness.acknowledge(lower, ack("session", 4L)).attempt
       higher <- readiness.begin(Lane.RumorBridge)
       higherResult <- readiness.acknowledge(higher, ack("session", 6L)).attempt
-    } yield expect(replayResult.left.exists(_.isInstanceOf[ReplayedGeneration]))
-      .and(expect(lowerResult.left.exists(_.isInstanceOf[ReplayedGeneration])))
-      .and(expect(higherResult.isRight))
+    } yield
+      expect(replayResult.left.exists(_.isInstanceOf[ReplayedGeneration]))
+        .and(expect(lowerResult.left.exists(_.isInstanceOf[ReplayedGeneration])))
+        .and(expect(higherResult.isRight))
   }
 
   test("the two current lanes cannot reuse one process-global stream generation") {
@@ -194,11 +200,12 @@ object SidecarSubscriptionReadinessSuite extends SimpleIOSuite {
       ackResult <- ackFiber.joinWithNever
       after <- readiness.current
       gateOpen <- harness.gate.isOpen
-    } yield expect(whilePauseBlocked.ready.nonEmpty)
-      .and(expect(!ackBeforePauseCompletes))
-      .and(expect(ackResult.left.exists(_.isInstanceOf[StaleAttempt])))
-      .and(expect(after.ready.isEmpty))
-      .and(expect(!gateOpen))
+    } yield
+      expect(whilePauseBlocked.ready.nonEmpty)
+        .and(expect(!ackBeforePauseCompletes))
+        .and(expect(ackResult.left.exists(_.isInstanceOf[StaleAttempt])))
+        .and(expect(after.ready.isEmpty))
+        .and(expect(!gateOpen))
   }
 
   test("awaitBothAndRun rechecks after waiting for the mutex and retries instead of publishing from a stale await") {

@@ -11,8 +11,8 @@ import fs2.concurrent.SignallingRef
 
 /** Process-local lifecycle state for the two sidecar Subscribe streams.
   *
-  * An active acknowledgement proves only that the current sidecar process acquired the requested local subscriptions. It says nothing
-  * about peers, mesh reachability, message freshness, chain catch-up, consensus validity, or economic validity.
+  * An active acknowledgement proves only that the current sidecar process acquired the requested local subscriptions. It says nothing about
+  * peers, mesh reachability, message freshness, chain catch-up, consensus validity, or economic validity.
   *
   * Lifecycle effects are the local linearization boundary. A remote partition may occur before gRPC reports it; once the callback's
   * serialized `release` commits, production is paused before the lane is invalidated. Instantaneous connectivity is not a validity input.
@@ -107,12 +107,12 @@ object SidecarSubscriptionReadiness {
     nakamoto: LaneState
   ) {
     def lane(lane: Lane): LaneState = lane match {
-      case Lane.RumorBridge => rumor
+      case Lane.RumorBridge  => rumor
       case Lane.NakamotoSync => nakamoto
     }
 
     def updateLane(lane: Lane, value: LaneState): State = lane match {
-      case Lane.RumorBridge => copy(rumor = value)
+      case Lane.RumorBridge  => copy(rumor = value)
       case Lane.NakamotoSync => copy(nakamoto = value)
     }
 
@@ -127,8 +127,8 @@ object SidecarSubscriptionReadiness {
     )
   }
 
-  /** Constructs the sole lifecycle owner for `productionGate` and installs the initial fail-closed pause before returning. Callers must
-    * not release ingress before this effect completes.
+  /** Constructs the sole lifecycle owner for `productionGate` and installs the initial fail-closed pause before returning. Callers must not
+    * release ingress before this effect completes.
     */
   def make[F[_]: Async](productionGate: SnapshotProductionGate[F]): F[SidecarSubscriptionReadiness[F]] =
     for {
@@ -169,7 +169,7 @@ object SidecarSubscriptionReadiness {
               stateRef.get.flatMap { state =>
                 val laneState = state.lane(attempt.lane)
                 val otherAcknowledgement = attempt.lane match {
-                  case Lane.RumorBridge => state.nakamoto.acknowledgement
+                  case Lane.RumorBridge  => state.nakamoto.acknowledgement
                   case Lane.NakamotoSync => state.rumor.acknowledgement
                 }
 

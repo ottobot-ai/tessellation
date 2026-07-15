@@ -43,39 +43,39 @@ object ConsensusInputGate {
   def make[F[_]: Concurrent]: F[Control[F]] =
     (Deferred[F, Unit], Deferred[F, Either[Throwable, Unit]], Deferred[F, Unit]).mapN {
       case (localStateReady, chainSeedReady, inputReady) =>
-      new Control[F] {
-        val readOnly: ConsensusInputGate[F] = new ConsensusInputGate[F] {
-          def awaitBootstrap: F[Unit] = inputReady.get
-        }
+        new Control[F] {
+          val readOnly: ConsensusInputGate[F] = new ConsensusInputGate[F] {
+            def awaitBootstrap: F[Unit] = inputReady.get
+          }
 
-        val chainSeed: ChainSeedGate[F] = new ChainSeedGate[F] {
-          def awaitLocalState: F[Unit] = localStateReady.get
-          def awaitChainSeed: F[Unit] = chainSeedReady.get.flatMap(_.liftTo[F])
-          def chainSeedResult: F[Option[Either[Throwable, Unit]]] = chainSeedReady.tryGet
-          def completeChainSeed(result: Either[Throwable, Unit]): F[Boolean] =
-            result match {
-              case Left(_) => chainSeedReady.complete(result)
-              case Right(_) =>
-                localStateReady.tryGet.flatMap {
-                  case Some(_) => chainSeedReady.complete(result)
-                  case None =>
-                    Concurrent[F].raiseError(new IllegalStateException("Cannot seed GL0 chain before local state is ready"))
-                }
+          val chainSeed: ChainSeedGate[F] = new ChainSeedGate[F] {
+            def awaitLocalState: F[Unit] = localStateReady.get
+            def awaitChainSeed: F[Unit] = chainSeedReady.get.flatMap(_.liftTo[F])
+            def chainSeedResult: F[Option[Either[Throwable, Unit]]] = chainSeedReady.tryGet
+            def completeChainSeed(result: Either[Throwable, Unit]): F[Boolean] =
+              result match {
+                case Left(_) => chainSeedReady.complete(result)
+                case Right(_) =>
+                  localStateReady.tryGet.flatMap {
+                    case Some(_) => chainSeedReady.complete(result)
+                    case None =>
+                      Concurrent[F].raiseError(new IllegalStateException("Cannot seed GL0 chain before local state is ready"))
+                  }
+              }
+          }
+
+          def markLocalStateReady: F[Boolean] = localStateReady.complete(())
+          def awaitChainSeed: F[Unit] = chainSeed.awaitChainSeed
+          def releaseInput: F[Boolean] =
+            chainSeedReady.tryGet.flatMap {
+              case Some(Right(_)) => inputReady.complete(())
+              case Some(Left(error)) =>
+                Concurrent[F].raiseError(
+                  new IllegalStateException("Cannot release GL0 consensus input after chain seed failure", error)
+                )
+              case None =>
+                Concurrent[F].raiseError(new IllegalStateException("Cannot release GL0 consensus input before chain seed succeeds"))
             }
         }
-
-        def markLocalStateReady: F[Boolean] = localStateReady.complete(())
-        def awaitChainSeed: F[Unit] = chainSeed.awaitChainSeed
-        def releaseInput: F[Boolean] =
-          chainSeedReady.tryGet.flatMap {
-            case Some(Right(_)) => inputReady.complete(())
-            case Some(Left(error)) =>
-              Concurrent[F].raiseError(
-                new IllegalStateException("Cannot release GL0 consensus input after chain seed failure", error)
-              )
-            case None =>
-              Concurrent[F].raiseError(new IllegalStateException("Cannot release GL0 consensus input before chain seed succeeds"))
-          }
-      }
     }
 }

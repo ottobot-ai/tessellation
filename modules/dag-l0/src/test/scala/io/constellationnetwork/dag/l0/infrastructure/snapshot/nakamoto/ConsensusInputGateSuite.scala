@@ -28,16 +28,17 @@ object ConsensusInputGateSuite extends SimpleIOSuite {
       runsAfter <- runs.get
       secondRelease <- control.releaseInput
       _ <- fiber.joinWithNever
-    } yield expect.all(
-      before.isEmpty,
-      runsBefore == 0,
-      localStateRelease,
-      seedVisible,
-      seedRelease,
-      firstRelease,
-      runsAfter == 1,
-      !secondRelease
-    )
+    } yield
+      expect.all(
+        before.isEmpty,
+        runsBefore == 0,
+        localStateRelease,
+        seedVisible,
+        seedRelease,
+        firstRelease,
+        runsAfter == 1,
+        !secondRelease
+      )
   }
 
   test("one release wakes every await-only consumer") {
@@ -75,12 +76,13 @@ object ConsensusInputGateSuite extends SimpleIOSuite {
       seedRelease <- control.chainSeed.completeChainSeed(Left(failure))
       result <- control.awaitChainSeed.attempt
       inputRelease <- control.releaseInput.attempt
-    } yield expect.all(
-      localStateRelease,
-      seedRelease,
-      result == Left(failure),
-      inputRelease.isLeft
-    )
+    } yield
+      expect.all(
+        localStateRelease,
+        seedRelease,
+        result == Left(failure),
+        inputRelease.isLeft
+      )
   }
 
   test("out-of-order chain seed and input release fail closed") {
@@ -90,12 +92,13 @@ object ConsensusInputGateSuite extends SimpleIOSuite {
       inputBeforeSeed <- control.releaseInput.attempt
       localStateRelease <- control.markLocalStateReady
       inputBeforeSuccessfulSeed <- control.releaseInput.attempt
-    } yield expect.all(
-      seedBeforeState.isLeft,
-      inputBeforeSeed.isLeft,
-      localStateRelease,
-      inputBeforeSuccessfulSeed.isLeft
-    )
+    } yield
+      expect.all(
+        seedBeforeState.isLeft,
+        inputBeforeSeed.isLeft,
+        localStateRelease,
+        inputBeforeSuccessfulSeed.isLeft
+      )
   }
 
   test("chain seed cancellation wakes Main with failure") {
@@ -109,9 +112,10 @@ object ConsensusInputGateSuite extends SimpleIOSuite {
       _ <- seedFiber.cancel
       observed <- control.awaitChainSeed.attempt
       inputRelease <- control.releaseInput.attempt
-    } yield expect.all(
-      observed == Left(cancelled),
-      inputRelease.isLeft
-    )
+    } yield
+      expect.all(
+        observed == Left(cancelled),
+        inputRelease.isLeft
+      )
   }
 }
