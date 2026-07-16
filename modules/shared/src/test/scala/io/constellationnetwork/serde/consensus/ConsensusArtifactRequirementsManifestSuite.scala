@@ -21,9 +21,11 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
     val artifactLabels = ConsensusArtifactKind.all.map(_.semanticLabel)
     val transcriptLabels = ConsensusTranscriptKind.all.map(_.semanticLabel)
     val finalityPayloadLabels = ConsensusFinalityPayloadKind.all.map(_.semanticLabel)
+    val carrierLabels = ConsensusCarrierKind.all.map(_.semanticLabel)
+    val chainSyncWireLabels = ConsensusChainSyncWireKind.all.map(_.semanticLabel)
     val allLabels =
-      artifactLabels ++ transcriptLabels ++ finalityPayloadLabels ++ ArtifactBinding.all.map(_.semanticLabel) ++
-        ArtifactAuthority.all.map(_.semanticLabel)
+      artifactLabels ++ transcriptLabels ++ finalityPayloadLabels ++ carrierLabels ++ chainSyncWireLabels ++
+        ArtifactBinding.all.map(_.semanticLabel) ++ ArtifactAuthority.all.map(_.semanticLabel)
     val forbiddenBftWords = Set("vote", "voted", "lock", "locked", "qc")
     val forbiddenBftPhrases = Set("quorum-certificate", "view-change")
     val containsGlobalBftVocabulary = allLabels.exists { label =>
@@ -37,6 +39,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       validation.isEmpty,
       transcriptValidation.isEmpty,
       finalityPayloadValidation.isEmpty,
+      carrierValidation.isEmpty,
       entries.size == 48,
       entries.map(_.kind).toSet == ConsensusArtifactKind.all.toSet,
       artifactLabels.distinct.size == artifactLabels.size,
@@ -51,9 +54,424 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       finalityPayloadEntries.size == 14,
       finalityPayloadEntries.map(_.kind).toSet == ConsensusFinalityPayloadKind.all.toSet,
       finalityPayloadLabels.distinct.size == finalityPayloadLabels.size,
+      ConsensusCarrierKind.all.size == 29,
+      carrierEntries.size == 29,
+      carrierEntries.map(_.kind).toSet == ConsensusCarrierKind.all.toSet,
+      carrierLabels.distinct.size == carrierLabels.size,
+      carrierEntries.forall(_.authority == ArtifactAuthority.TransportCoordinationOnly),
+      ConsensusChainSyncWireKind.all.size == 12,
+      chainSyncWireLabels.distinct.size == chainSyncWireLabels.size,
+      ConsensusChainSyncWireKind.all.map(_.parentCarrier).toSet == Set(
+        ConsensusCarrierKind.ChainSyncSnapshotCarrier,
+        ConsensusCarrierKind.ChainSyncMetagraphBinaryCarrier,
+        ConsensusCarrierKind.ChainSyncSelectionHint
+      ),
       !containsGlobalBftVocabulary,
       codecStatus == ManifestCodecStatus.Open,
       activationStatus == ManifestActivationStatus.DarkOnly
+    )
+  }
+
+  test("transport carriers bind their exact target without inheriting nested authority") {
+    val nestedArtifact = Set[ArtifactBinding](ExactNestedArtifactIdentity, ExactNestedArtifactType)
+    val sequencedNestedArtifact = nestedArtifact + OriginAndSequence
+    val requestResponse = Set[ArtifactBinding](ExactRequestResponseCorrelation)
+    val expectedSpecificBindings: Map[ConsensusCarrierKind, Set[ArtifactBinding]] = Map(
+      ConsensusCarrierKind.PeerRumorEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.CommonRumorEnvelope -> nestedArtifact,
+      ConsensusCarrierKind.SidecarRumorEnvelope -> nestedArtifact,
+      ConsensusCarrierKind.EventGossipEnvelope -> nestedArtifact,
+      ConsensusCarrierKind.EventGossipIHave -> requestResponse,
+      ConsensusCarrierKind.EventGossipIWantRequest -> requestResponse,
+      ConsensusCarrierKind.EventGossipIWantResponse -> (requestResponse ++ nestedArtifact),
+      ConsensusCarrierKind.Ml0EventAnnouncementEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0FacilityEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0ProposalEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0MajoritySignatureEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0BinarySignatureEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0AckEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0WithdrawEnvelope -> sequencedNestedArtifact,
+      ConsensusCarrierKind.Ml0ArtifactAnnouncementEnvelope -> nestedArtifact,
+      ConsensusCarrierKind.PeerRumorInquiryRequest -> (requestResponse + OriginAndSequence),
+      ConsensusCarrierKind.CommonRumorOfferResponse -> requestResponse,
+      ConsensusCarrierKind.QueryCommonRumorsRequest -> requestResponse,
+      ConsensusCarrierKind.CommonRumorInitResponse -> requestResponse,
+      ConsensusCarrierKind.PeerRumorResponseStream -> (requestResponse ++ sequencedNestedArtifact),
+      ConsensusCarrierKind.CommonRumorResponseStream -> (requestResponse ++ nestedArtifact),
+      ConsensusCarrierKind.SidecarSubscribeRequest -> (requestResponse + SubscriptionProfile),
+      ConsensusCarrierKind.SidecarSubscribeStarted ->
+        (requestResponse ++ Set(SubscriptionProfile, SubscriptionSessionAndGeneration)),
+      ConsensusCarrierKind.ChainSyncSnapshotCarrier -> (requestResponse ++ nestedArtifact),
+      ConsensusCarrierKind.ChainSyncMetagraphBinaryCarrier -> (requestResponse ++ nestedArtifact),
+      ConsensusCarrierKind.ChainSyncSelectionHint -> requestResponse,
+      ConsensusCarrierKind.BootstrapMetadataHint -> (requestResponse ++ nestedArtifact),
+      ConsensusCarrierKind.BootstrapPhase2StateBundle -> (requestResponse ++ nestedArtifact ++ Set(
+        ExactPhase2Checkpoint,
+        ExactPhase2QualificationEvidence,
+        ComponentCompleteness,
+        ChainSelectionWitness
+      )),
+      ConsensusCarrierKind.BootstrapGenesisBundle -> (requestResponse ++ nestedArtifact ++ Set(
+        GenesisDeclaration,
+        ComponentCompleteness
+      ))
+    )
+    val actualBindings = carrierEntries.map(contract => contract.kind -> contract.bindings).toMap
+    val expectedBindings = expectedSpecificBindings.view.mapValues(ArtifactBinding.carrierCommon ++ _).toMap
+    val forbiddenAuthorities = ArtifactAuthority.all.toSet - ArtifactAuthority.TransportCoordinationOnly
+
+    expect.all(
+      actualBindings == expectedBindings,
+      carrierEntries.forall(_.knownGaps.contains(O18TransportByteContractOpen)),
+      carrierEntries.forall(contract => !forbiddenAuthorities.contains(contract.authority)),
+      carrierEntries.forall(_.authority != ArtifactAuthority.StateValidity),
+      carrierEntries.forall(_.authority != ArtifactAuthority.FinalityQualification),
+      carrierEntries.forall(_.authority != ArtifactAuthority.ObjectiveEvidence),
+      carrierEntries.forall(_.authority != ArtifactAuthority.SourceAuthorization)
+    )
+  }
+
+  test("carrier validation rejects authority upgrades and every target-binding mutation") {
+    val duplicate = carrierEntries.head :: carrierEntries
+    val missing = carrierEntries.filterNot(_.kind == ConsensusCarrierKind.BootstrapGenesisBundle)
+    val withoutCommon = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.PeerRumorEnvelope =>
+        contract.copy(bindings = contract.bindings - CarrierKind)
+      case contract => contract
+    }
+    val withoutOrigin = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.Ml0EventAnnouncementEnvelope =>
+        contract.copy(bindings = contract.bindings - OriginAndSequence)
+      case contract => contract
+    }
+    val withoutNestedType = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.EventGossipEnvelope =>
+        contract.copy(bindings = contract.bindings - ExactNestedArtifactType)
+      case contract => contract
+    }
+    val withoutCorrelation = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.ChainSyncSnapshotCarrier =>
+        contract.copy(bindings = contract.bindings - ExactRequestResponseCorrelation)
+      case contract => contract
+    }
+    val withoutPhase2Evidence = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.BootstrapPhase2StateBundle =>
+        contract.copy(bindings = contract.bindings - ExactPhase2QualificationEvidence)
+      case contract => contract
+    }
+    val withoutPhase2Checkpoint = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.BootstrapPhase2StateBundle =>
+        contract.copy(bindings = contract.bindings - ExactPhase2Checkpoint)
+      case contract => contract
+    }
+    val withoutCurrentChainWitness = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.BootstrapPhase2StateBundle =>
+        contract.copy(bindings = contract.bindings - ChainSelectionWitness)
+      case contract => contract
+    }
+    val withoutCompleteness = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.BootstrapGenesisBundle =>
+        contract.copy(bindings = contract.bindings - ComponentCompleteness)
+      case contract => contract
+    }
+    val withoutO18 = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.EventGossipEnvelope =>
+        contract.copy(knownGaps = contract.knownGaps - O18TransportByteContractOpen)
+      case contract => contract
+    }
+    val withoutDedupFloodGap = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.SidecarRumorEnvelope =>
+        contract.copy(knownGaps = contract.knownGaps - GossipSubFullProtoDedupMutationFlood)
+      case contract => contract
+    }
+    val withoutAggregateGap = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.ChainSyncMetagraphBinaryCarrier =>
+        contract.copy(knownGaps = contract.knownGaps - UnboundedAggregateTransportResponse)
+      case contract => contract
+    }
+    val withoutLiveRumorAuthGap = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.PeerRumorEnvelope =>
+        contract.copy(knownGaps = contract.knownGaps - LiveRumorSourceAuthenticationUndecomposed)
+      case contract => contract
+    }
+    val withoutSubscriptionProfile = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.SidecarSubscribeStarted =>
+        contract.copy(bindings = contract.bindings - SubscriptionSessionAndGeneration)
+      case contract => contract
+    }
+    val wrongStatus = carrierEntries.map {
+      case contract if contract.kind == ConsensusCarrierKind.BootstrapGenesisBundle =>
+        contract.copy(definitionStatus = ArtifactDefinitionStatus.ExistingShapeNeedsAudit)
+      case contract => contract
+    }
+    val authorityUpgrades = (ArtifactAuthority.all.toSet - ArtifactAuthority.TransportCoordinationOnly).toList.map { authority =>
+      carrierEntries.map {
+        case contract if contract.kind == ConsensusCarrierKind.PeerRumorEnvelope => contract.copy(authority = authority)
+        case contract                                                            => contract
+      }
+    }
+    val allBindingRemovalMutants = carrierEntries.flatMap { target =>
+      target.bindings.toList.map { removed =>
+        val mutant = carrierEntries.map {
+          case contract if contract.kind == target.kind => contract.copy(bindings = contract.bindings - removed)
+          case contract                                 => contract
+        }
+        (target.kind, removed, mutant)
+      }
+    }
+
+    expect.all(
+      validateCarrierEntries(duplicate).exists(_.isInstanceOf[DuplicateCarrierKind]),
+      validateCarrierEntries(duplicate).exists(_.isInstanceOf[DuplicateCarrierSemanticLabel]),
+      validateCarrierEntries(missing).exists(_.isInstanceOf[MissingCarrierKind]),
+      validateCarrierEntries(withoutCommon).exists(_.isInstanceOf[MissingCarrierCommonBindings]),
+      validateCarrierEntries(withoutOrigin).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutNestedType).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutCorrelation).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutPhase2Evidence).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutPhase2Checkpoint).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutCurrentChainWitness).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutCompleteness).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(withoutO18).exists(_.isInstanceOf[MissingCarrierGap]),
+      validateCarrierEntries(withoutDedupFloodGap).exists(_.isInstanceOf[MissingCarrierGap]),
+      validateCarrierEntries(withoutAggregateGap).exists(_.isInstanceOf[MissingCarrierGap]),
+      validateCarrierEntries(withoutLiveRumorAuthGap).exists(_.isInstanceOf[MissingCarrierGap]),
+      validateCarrierEntries(withoutSubscriptionProfile).exists(_.isInstanceOf[MissingCarrierBindings]),
+      validateCarrierEntries(wrongStatus).exists(_.isInstanceOf[InvalidCarrierDefinitionStatus]),
+      authorityUpgrades.forall(contracts => validateCarrierEntries(contracts).exists(_.isInstanceOf[InvalidCarrierAuthority])),
+      allBindingRemovalMutants.forall {
+        case (kind, removed, contracts) =>
+          validateCarrierEntries(contracts).exists {
+            case MissingCarrierCommonBindings(observed, missing) => observed == kind && missing.contains(removed)
+            case MissingCarrierBindings(observed, missing)       => observed == kind && missing.contains(removed)
+            case _                                               => false
+          }
+      }
+    )
+  }
+
+  test("carrier rows preserve the audited current transport gaps") {
+    val byKind = carrierEntries.map(contract => contract.kind -> contract).toMap
+    val rumorGaps = Set[ArtifactGap](
+      DelimiterFreeRumorSignaturePreimage,
+      RuntimeScalaTypeStringDiscriminator,
+      LiveRumorSourceAuthenticationUndecomposed,
+      O18TransportByteContractOpen
+    )
+    val ml0RumorKinds = Set[ConsensusCarrierKind](
+      ConsensusCarrierKind.Ml0EventAnnouncementEnvelope,
+      ConsensusCarrierKind.Ml0FacilityEnvelope,
+      ConsensusCarrierKind.Ml0ProposalEnvelope,
+      ConsensusCarrierKind.Ml0MajoritySignatureEnvelope,
+      ConsensusCarrierKind.Ml0BinarySignatureEnvelope,
+      ConsensusCarrierKind.Ml0AckEnvelope,
+      ConsensusCarrierKind.Ml0WithdrawEnvelope,
+      ConsensusCarrierKind.Ml0ArtifactAnnouncementEnvelope
+    )
+
+    expect.all(
+      byKind(ConsensusCarrierKind.PeerRumorEnvelope).knownGaps == rumorGaps,
+      byKind(ConsensusCarrierKind.CommonRumorEnvelope).knownGaps == rumorGaps,
+      byKind(ConsensusCarrierKind.SidecarRumorEnvelope).knownGaps == Set(
+        TransportHintLacksPortableArtifactBinding,
+        GossipSubFullProtoDedupMutationFlood,
+        LossyPeerRumorGapRepairMissing,
+        O18TransportByteContractOpen
+      ),
+      ml0RumorKinds.forall(kind => byKind(kind).knownGaps == rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+      byKind(ConsensusCarrierKind.EventGossipEnvelope).knownGaps == Set(
+        NestedArtifactIdentityNotEnforced,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.EventGossipIHave).knownGaps == Set(
+        TransportHintLacksPortableArtifactBinding,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.EventGossipIWantRequest).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.EventGossipIWantResponse).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        NestedArtifactIdentityNotEnforced,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.PeerRumorInquiryRequest).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.CommonRumorOfferResponse).knownGaps == Set(
+        TransportHintLacksPortableArtifactBinding,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.QueryCommonRumorsRequest).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.CommonRumorInitResponse).knownGaps == Set(
+        TransportHintLacksPortableArtifactBinding,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.PeerRumorResponseStream).knownGaps ==
+        rumorGaps ++ Set(MissingTransportRequestIdentity, UnboundedAggregateTransportResponse),
+      byKind(ConsensusCarrierKind.CommonRumorResponseStream).knownGaps ==
+        rumorGaps ++ Set(MissingTransportRequestIdentity, UnboundedAggregateTransportResponse),
+      byKind(ConsensusCarrierKind.SidecarSubscribeRequest).knownGaps == Set(
+        LocalSubscriptionProductionGateControl,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.SidecarSubscribeStarted).knownGaps == Set(
+        LocalSubscriptionProductionGateControl,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.ChainSyncSnapshotCarrier).knownGaps == Set(
+        TransportDispositionLacksPortableArtifactBinding,
+        MissingTransportRequestIdentity,
+        NestedArtifactIdentityNotEnforced,
+        UnboundedAggregateTransportResponse,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.ChainSyncMetagraphBinaryCarrier).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        NestedArtifactIdentityNotEnforced,
+        UnboundedAggregateTransportResponse,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.ChainSyncSelectionHint).knownGaps == Set(
+        TransportHintLacksPortableArtifactBinding,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.BootstrapMetadataHint).knownGaps == Set(
+        TransportHintLacksPortableArtifactBinding,
+        MissingTransportRequestIdentity,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.BootstrapPhase2StateBundle).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        BootstrapPhase2BundleSchemaOpen,
+        BootstrapCurrentChainWitnessSchemaOpen,
+        O18TransportByteContractOpen
+      ),
+      byKind(ConsensusCarrierKind.BootstrapGenesisBundle).knownGaps == Set(
+        MissingTransportRequestIdentity,
+        BootstrapGenesisBundleSchemaOpen,
+        O18TransportByteContractOpen
+      )
+    )
+  }
+
+  test("sidecar rumor dedup and ChainSync aggregate gaps remain source-grounded") {
+    val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+    def source(path: String): String =
+      new String(Files.readAllBytes(root.resolve(path)), StandardCharsets.UTF_8)
+
+    val sidecarProto = source("p2p/proto/sidecar.proto")
+    val gossipGo = source("p2p/internal/gossip/gossip.go")
+    val rumorBridge = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/consensus/nakamoto/SidecarRumorBridge.scala"
+    )
+    val chainSyncGo = source("p2p/internal/chainsync/protocol.go")
+    val chainSyncManager = source(
+      "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/ChainSyncManager.scala"
+    )
+    val carrierByKind = carrierEntries.map(contract => contract.kind -> contract).toMap
+
+    expect.all(
+      sidecarProto.contains("string content_type = 2;"),
+      sidecarProto.contains("bytes origin_id = 3;"),
+      gossipGo.contains("contentMessageID(pmsg.GetTopic(), pmsg.GetData())"),
+      gossipGo.contains("digest.Write(data)"),
+      rumorBridge.contains("val bytes = rumor.signedRumorBytes.toByteArray"),
+      carrierByKind(ConsensusCarrierKind.SidecarRumorEnvelope).knownGaps.contains(GossipSubFullProtoDedupMutationFlood),
+      chainSyncGo.contains("MaxMessageSize      = 16 * 1024 * 1024"),
+      !chainSyncGo.contains("MaxAggregateFetchBytes"),
+      chainSyncGo.contains("for {\n\t\tdata, err := readLengthPrefixed(s)"),
+      chainSyncManager.contains("stub.fetchSnapshots(request).toList"),
+      chainSyncManager.contains("stub.fetchMetagraphBinaries(request).toList"),
+      carrierByKind(ConsensusCarrierKind.ChainSyncSnapshotCarrier).knownGaps.contains(UnboundedAggregateTransportResponse),
+      carrierByKind(ConsensusCarrierKind.ChainSyncMetagraphBinaryCarrier).knownGaps.contains(UnboundedAggregateTransportResponse)
+    )
+  }
+
+  test("live rumor authentication, response streams, and subscription production control remain explicit") {
+    val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+    def source(path: String): String =
+      new String(Files.readAllBytes(root.resolve(path)), StandardCharsets.UTF_8)
+
+    val daemon = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/gossip/GossipDaemon.scala"
+    )
+    val validator = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/gossip/RumorValidator.scala"
+    )
+    val gossipClient = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/gossip/p2p/GossipClient.scala"
+    )
+    val rumorBridge = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/consensus/nakamoto/SidecarRumorBridge.scala"
+    )
+    val gossipStream = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/consensus/nakamoto/GossipStream.scala"
+    )
+    val readiness = source(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/consensus/nakamoto/SidecarSubscriptionReadiness.scala"
+    )
+    val byKind = carrierEntries.map(contract => contract.kind -> contract).toMap
+
+    expect.all(
+      daemon.contains("validateRumor(hashedRumor)"),
+      daemon.contains(".evalMap(handleRumor)"),
+      validator.contains(".productR(validateOrigin(signedRumor))"),
+      validator.contains(".productR(validateSeedlist(signedRumor))"),
+      byKind(ConsensusCarrierKind.PeerRumorEnvelope).knownGaps.contains(LiveRumorSourceAuthenticationUndecomposed),
+      byKind(ConsensusCarrierKind.CommonRumorEnvelope).knownGaps.contains(LiveRumorSourceAuthenticationUndecomposed),
+      gossipClient.contains("PeerResponse[Stream[F, *], Signed[PeerRumorRaw]]"),
+      gossipClient.contains("PeerResponse[Stream[F, *], Signed[CommonRumorRaw]]"),
+      rumorBridge.contains("rumorQueue.tryOffer(hashed)"),
+      daemon.contains("if (nakamotoMode) consumeRumors"),
+      byKind(ConsensusCarrierKind.SidecarRumorEnvelope).knownGaps.contains(LossyPeerRumorGapRepairMissing),
+      gossipStream.contains("validateStarted(profile, started) >> readiness.acknowledge"),
+      readiness.contains("productionGate.pause(SnapshotProductionGate.InboundSubscriptionsUnavailable)"),
+      readiness.contains("productionGate.resume(SnapshotProductionGate.InboundSubscriptionsUnavailable)"),
+      byKind(ConsensusCarrierKind.SidecarSubscribeStarted).knownGaps.contains(LocalSubscriptionProductionGateControl)
+    )
+  }
+
+  test("the ChainSync source-shape inventory is closed over the current protobuf services") {
+    val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+    val proto = new String(Files.readAllBytes(root.resolve("p2p/proto/sidecar.proto")), StandardCharsets.UTF_8)
+    val expectedMessages = Set(
+      "ChainPoint",
+      "FetchSnapshotsRequest",
+      "Snapshot",
+      "FindIntersectionRequest",
+      "FindIntersectionResponse",
+      "GetPeerTipRequest",
+      "PeerTipResponse",
+      "ServeSnapshotsRequest",
+      "ServeChainPointsRequest",
+      "ServeChainPointsResponse",
+      "FetchMetagraphBinariesRequest",
+      "MetagraphBinaryResponse"
+    )
+    val chainSyncSection = proto.substring(proto.indexOf("message ChainPoint"))
+    val declaredChainSyncMessages = "(?m)^message ([A-Za-z][A-Za-z0-9]*)".r
+      .findAllMatchIn(chainSyncSection)
+      .map(_.group(1))
+      .toSet
+
+    expect.all(
+      ConsensusChainSyncWireKind.all.size == expectedMessages.size,
+      declaredChainSyncMessages == expectedMessages - "Snapshot",
+      proto.contains("message Snapshot"),
+      proto.contains("rpc FetchSnapshots(FetchSnapshotsRequest) returns (stream Snapshot)"),
+      proto.contains("rpc ServeMetagraphBinaries(FetchMetagraphBinariesRequest) returns (stream MetagraphBinaryResponse)")
     )
   }
 
@@ -275,6 +693,8 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
     val reviewedMetadataPaths = Set(
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ArtifactAuthority.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ArtifactBinding.scala",
+      "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusCarrierKind.scala",
+      "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusChainSyncWireKind.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusFinalityPayloadKind.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusArtifactKind.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusArtifactStatus.scala",
@@ -289,12 +709,15 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       "ManifestCodecStatus",
       "ManifestActivationStatus",
       "ConsensusArtifactKind",
+      "ConsensusCarrierKind",
+      "ConsensusChainSyncWireKind",
       "ConsensusFinalityPayloadKind",
       "FinalityPayloadShape",
       "FinalityPayloadCodecStatus",
       "FinalityPayloadVectorStatus",
       "ConsensusTranscriptKind",
       "TranscriptContract",
+      "CarrierContract",
       "FinalityPayloadContract",
       "ConsensusArtifactRequirementsManifest"
     )

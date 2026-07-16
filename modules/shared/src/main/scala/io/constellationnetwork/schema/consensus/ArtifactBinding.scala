@@ -20,6 +20,7 @@ object ArtifactBinding {
   case object ParameterHash extends ArtifactBinding { val semanticLabel: String = "parameter-hash" }
   case object ArtifactKind extends ArtifactBinding { val semanticLabel: String = "artifact-kind" }
   case object TranscriptKind extends ArtifactBinding { val semanticLabel: String = "transcript-kind" }
+  case object CarrierKind extends ArtifactBinding { val semanticLabel: String = "carrier-kind" }
   case object CanonicalContent extends ArtifactBinding { val semanticLabel: String = "canonical-content" }
 
   case object GenesisDeclaration extends ExactAnchor { val semanticLabel: String = "genesis-declaration" }
@@ -40,6 +41,15 @@ object ArtifactBinding {
   case object DurabilityScope extends ExactAnchor { val semanticLabel: String = "durability-scope" }
   case object MigrationSource extends ExactAnchor { val semanticLabel: String = "migration-source" }
   case object MigrationTarget extends ExactAnchor { val semanticLabel: String = "migration-target" }
+  case object ExactNestedArtifactIdentity extends ExactAnchor { val semanticLabel: String = "exact-nested-artifact-identity" }
+  case object ExactNestedArtifactType extends ExactAnchor { val semanticLabel: String = "exact-nested-artifact-type" }
+  case object ExactRequestResponseCorrelation extends ExactAnchor {
+    val semanticLabel: String = "exact-request-response-correlation"
+  }
+  case object ExactPhase2Checkpoint extends ExactAnchor { val semanticLabel: String = "exact-phase2-checkpoint" }
+  case object ExactPhase2QualificationEvidence extends ExactAnchor {
+    val semanticLabel: String = "exact-phase2-qualification-evidence"
+  }
 
   case object RegistryView extends ArtifactBinding { val semanticLabel: String = "registry-view" }
   case object EtaAndSlot extends ArtifactBinding { val semanticLabel: String = "eta-and-slot" }
@@ -61,10 +71,20 @@ object ArtifactBinding {
   case object RetentionScope extends ArtifactBinding { val semanticLabel: String = "retention-scope" }
   case object AccusedArtifacts extends ArtifactBinding { val semanticLabel: String = "accused-artifacts" }
   case object NamespaceAndPreRoot extends ArtifactBinding { val semanticLabel: String = "namespace-and-pre-root" }
+  case object OriginAndSequence extends ArtifactBinding { val semanticLabel: String = "origin-and-sequence" }
+  case object ComponentCompleteness extends ArtifactBinding { val semanticLabel: String = "component-completeness" }
+  case object SubscriptionProfile extends ArtifactBinding {
+    val semanticLabel: String = "subscription-profile"
+  }
+  case object SubscriptionSessionAndGeneration extends ArtifactBinding {
+    val semanticLabel: String = "subscription-session-and-generation"
+  }
 
   val artifactCommon: Set[ArtifactBinding] = Set(Network, Genesis, ProtocolEra, ParameterHash, ArtifactKind, CanonicalContent)
 
   val transcriptCommon: Set[ArtifactBinding] = Set(Network, Genesis, ProtocolEra, ParameterHash, TranscriptKind, CanonicalContent)
+
+  val carrierCommon: Set[ArtifactBinding] = Set(Network, Genesis, ProtocolEra, ParameterHash, CarrierKind, CanonicalContent)
 
   val eligibilityCommon: Set[ArtifactBinding] =
     Set(
@@ -83,6 +103,7 @@ object ArtifactBinding {
     ParameterHash,
     ArtifactKind,
     TranscriptKind,
+    CarrierKind,
     CanonicalContent,
     GenesisDeclaration,
     ExactLayerParent,
@@ -102,6 +123,11 @@ object ArtifactBinding {
     DurabilityScope,
     MigrationSource,
     MigrationTarget,
+    ExactNestedArtifactIdentity,
+    ExactNestedArtifactType,
+    ExactRequestResponseCorrelation,
+    ExactPhase2Checkpoint,
+    ExactPhase2QualificationEvidence,
     RegistryView,
     EtaAndSlot,
     AtomicKesVrfPair,
@@ -121,6 +147,10 @@ object ArtifactBinding {
     CustodiedArtifact,
     RetentionScope,
     AccusedArtifacts,
-    NamespaceAndPreRoot
+    NamespaceAndPreRoot,
+    OriginAndSequence,
+    ComponentCompleteness,
+    SubscriptionProfile,
+    SubscriptionSessionAndGeneration
   )
 }

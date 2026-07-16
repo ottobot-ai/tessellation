@@ -5,16 +5,17 @@ import io.constellationnetwork.serde.consensus.ConsensusArtifactRequirementsMani
 
 import weaver.FunSuite
 
-/** Keeps the dark payload requirements subtype-total with the runtime pointer union without making the metadata reachable from production. */
+/** Keeps the dark payload requirements subtype-total with the runtime pointer union without making the metadata reachable from production.
+  */
 object FinalityArtifactRequirementsParitySuite extends FunSuite {
 
   private def manifestKind(kind: FinalityArtifactKind): ManifestKind =
     kind match {
-      case FinalityArtifactKind.CoreBatch                  => ManifestKind.CoreBatch
-      case FinalityArtifactKind.ReleasedCoreRecord         => ManifestKind.ReleasedCoreRecord
-      case FinalityArtifactKind.PathManifest               => ManifestKind.PathManifest
-      case FinalityArtifactKind.PathChunk                  => ManifestKind.PathChunk
-      case FinalityArtifactKind.DecidedAttestationEvidence => ManifestKind.DecidedAttestationEvidence
+      case FinalityArtifactKind.CoreBatch                   => ManifestKind.CoreBatch
+      case FinalityArtifactKind.ReleasedCoreRecord          => ManifestKind.ReleasedCoreRecord
+      case FinalityArtifactKind.PathManifest                => ManifestKind.PathManifest
+      case FinalityArtifactKind.PathChunk                   => ManifestKind.PathChunk
+      case FinalityArtifactKind.DecidedAttestationEvidence  => ManifestKind.DecidedAttestationEvidence
       case FinalityArtifactKind.DepthK1Evidence             => ManifestKind.DepthK1Evidence
       case FinalityArtifactKind.ForkChoiceDecisionEvidence  => ManifestKind.ForkChoiceDecisionEvidence
       case FinalityArtifactKind.PreparedSemanticState       => ManifestKind.PreparedSemanticState

@@ -75,6 +75,51 @@ object ArtifactGap {
   case object O19MigrationPolicyOpen extends ArtifactGap {
     val semanticLabel: String = "o19-migration-policy-open"
   }
+  case object DelimiterFreeRumorSignaturePreimage extends ArtifactGap {
+    val semanticLabel: String = "delimiter-free-rumor-signature-preimage"
+  }
+  case object RuntimeScalaTypeStringDiscriminator extends ArtifactGap {
+    val semanticLabel: String = "runtime-scala-type-string-discriminator"
+  }
+  case object TransportDispositionLacksPortableArtifactBinding extends ArtifactGap {
+    val semanticLabel: String = "transport-disposition-lacks-portable-artifact-binding"
+  }
+  case object TransportHintLacksPortableArtifactBinding extends ArtifactGap {
+    val semanticLabel: String = "transport-hint-lacks-portable-artifact-binding"
+  }
+  case object MissingTransportRequestIdentity extends ArtifactGap {
+    val semanticLabel: String = "missing-transport-request-identity"
+  }
+  case object BootstrapPhase2BundleSchemaOpen extends ArtifactGap {
+    val semanticLabel: String = "bootstrap-phase2-bundle-schema-open"
+  }
+  case object BootstrapGenesisBundleSchemaOpen extends ArtifactGap {
+    val semanticLabel: String = "bootstrap-genesis-bundle-schema-open"
+  }
+  case object GossipSubFullProtoDedupMutationFlood extends ArtifactGap {
+    val semanticLabel: String = "gossipsub-full-proto-dedup-mutation-flood"
+  }
+  case object UnboundedAggregateTransportResponse extends ArtifactGap {
+    val semanticLabel: String = "unbounded-aggregate-transport-response"
+  }
+  case object BootstrapCurrentChainWitnessSchemaOpen extends ArtifactGap {
+    val semanticLabel: String = "bootstrap-current-chain-witness-schema-open"
+  }
+  case object NestedMl0ConsensusArtifactManifestOpen extends ArtifactGap {
+    val semanticLabel: String = "nested-ml0-consensus-artifact-manifest-open"
+  }
+  case object NestedArtifactIdentityNotEnforced extends ArtifactGap {
+    val semanticLabel: String = "nested-artifact-identity-not-enforced"
+  }
+  case object LiveRumorSourceAuthenticationUndecomposed extends ArtifactGap {
+    val semanticLabel: String = "live-rumor-source-authentication-undecomposed"
+  }
+  case object LocalSubscriptionProductionGateControl extends ArtifactGap {
+    val semanticLabel: String = "local-subscription-production-gate-control"
+  }
+  case object LossyPeerRumorGapRepairMissing extends ArtifactGap {
+    val semanticLabel: String = "lossy-peer-rumor-gap-repair-missing"
+  }
 }
 
 sealed trait ManifestCodecStatus extends Product with Serializable

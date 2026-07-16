@@ -5,6 +5,7 @@ import io.constellationnetwork.schema.consensus.ArtifactBinding._
 import io.constellationnetwork.schema.consensus.ArtifactDefinitionStatus._
 import io.constellationnetwork.schema.consensus.ArtifactGap._
 import io.constellationnetwork.schema.consensus.ConsensusArtifactKind._
+import io.constellationnetwork.schema.consensus.ConsensusCarrierKind._
 import io.constellationnetwork.schema.consensus.ConsensusTranscriptKind._
 import io.constellationnetwork.schema.consensus._
 
@@ -28,6 +29,14 @@ object ConsensusArtifactRequirementsManifest {
     authority: ArtifactAuthority,
     bindings: Set[ArtifactBinding],
     definitionStatus: ArtifactDefinitionStatus
+  )
+
+  final case class CarrierContract(
+    kind: ConsensusCarrierKind,
+    authority: ArtifactAuthority,
+    bindings: Set[ArtifactBinding],
+    definitionStatus: ArtifactDefinitionStatus,
+    knownGaps: Set[ArtifactGap]
   )
 
   final case class FinalityPayloadContract(
@@ -134,6 +143,36 @@ object ConsensusArtifactRequirementsManifest {
     final case class MissingFinalityPayloadGap(kind: ConsensusFinalityPayloadKind, gap: ArtifactGap) extends Violation {
       val description: String = s"missing ${gap.semanticLabel} gap for finality payload ${kind.semanticLabel}"
     }
+    final case class DuplicateCarrierKind(kind: ConsensusCarrierKind) extends Violation {
+      val description: String = s"duplicate carrier kind: ${kind.semanticLabel}"
+    }
+    final case class DuplicateCarrierSemanticLabel(label: String) extends Violation {
+      val description: String = s"duplicate carrier semantic label: $label"
+    }
+    final case class MissingCarrierKind(kind: ConsensusCarrierKind) extends Violation {
+      val description: String = s"missing carrier kind: ${kind.semanticLabel}"
+    }
+    final case class InvalidCarrierSemanticLabel(kind: ConsensusCarrierKind) extends Violation {
+      val description: String = s"invalid carrier semantic label: ${kind.semanticLabel}"
+    }
+    final case class InvalidCarrierAuthority(kind: ConsensusCarrierKind, observed: ArtifactAuthority) extends Violation {
+      val description: String =
+        s"carrier ${kind.semanticLabel} has non-transport authority: ${observed.semanticLabel}"
+    }
+    final case class MissingCarrierCommonBindings(kind: ConsensusCarrierKind, missing: Set[ArtifactBinding]) extends Violation {
+      val description: String =
+        s"missing carrier common bindings for ${kind.semanticLabel}: ${missing.toList.map(_.semanticLabel).sorted.mkString(",")}"
+    }
+    final case class MissingCarrierBindings(kind: ConsensusCarrierKind, missing: Set[ArtifactBinding]) extends Violation {
+      val description: String =
+        s"missing carrier bindings for ${kind.semanticLabel}: ${missing.toList.map(_.semanticLabel).sorted.mkString(",")}"
+    }
+    final case class MissingCarrierGap(kind: ConsensusCarrierKind, gap: ArtifactGap) extends Violation {
+      val description: String = s"missing ${gap.semanticLabel} gap for carrier ${kind.semanticLabel}"
+    }
+    final case class InvalidCarrierDefinitionStatus(kind: ConsensusCarrierKind) extends Violation {
+      val description: String = s"invalid definition status for carrier ${kind.semanticLabel}"
+    }
   }
 
   val codecStatus: ManifestCodecStatus = ManifestCodecStatus.Open
@@ -145,6 +184,9 @@ object ConsensusArtifactRequirementsManifest {
   private val globalRef = Set[ArtifactBinding](ExactGlobalSnapshotRef)
   private val ml0Parent = Set[ArtifactBinding](ExactMl0Parent, ExactPhase2Base)
   private val shardBase = Set[ArtifactBinding](ExactShardParent, ExactExecutionBase)
+  private val nestedArtifact = Set[ArtifactBinding](ExactNestedArtifactIdentity, ExactNestedArtifactType)
+  private val sequencedNestedArtifact = nestedArtifact + OriginAndSequence
+  private val requestResponse = Set[ArtifactBinding](ExactRequestResponseCorrelation)
 
   private def contract(
     kind: ConsensusArtifactKind,
@@ -154,6 +196,181 @@ object ConsensusArtifactRequirementsManifest {
     gaps: Set[ArtifactGap] = Set.empty
   ): ArtifactContract =
     ArtifactContract(kind, authority, ArtifactBinding.artifactCommon ++ specificBindings, status, gaps)
+
+  private val carrierSpecificBindings: Map[ConsensusCarrierKind, Set[ArtifactBinding]] = Map(
+    PeerRumorEnvelope -> sequencedNestedArtifact,
+    CommonRumorEnvelope -> nestedArtifact,
+    SidecarRumorEnvelope -> nestedArtifact,
+    EventGossipEnvelope -> nestedArtifact,
+    EventGossipIHave -> requestResponse,
+    EventGossipIWantRequest -> requestResponse,
+    EventGossipIWantResponse -> (requestResponse ++ nestedArtifact),
+    Ml0EventAnnouncementEnvelope -> sequencedNestedArtifact,
+    Ml0FacilityEnvelope -> sequencedNestedArtifact,
+    Ml0ProposalEnvelope -> sequencedNestedArtifact,
+    Ml0MajoritySignatureEnvelope -> sequencedNestedArtifact,
+    Ml0BinarySignatureEnvelope -> sequencedNestedArtifact,
+    Ml0AckEnvelope -> sequencedNestedArtifact,
+    Ml0WithdrawEnvelope -> sequencedNestedArtifact,
+    Ml0ArtifactAnnouncementEnvelope -> nestedArtifact,
+    PeerRumorInquiryRequest -> (requestResponse + OriginAndSequence),
+    CommonRumorOfferResponse -> requestResponse,
+    QueryCommonRumorsRequest -> requestResponse,
+    CommonRumorInitResponse -> requestResponse,
+    PeerRumorResponseStream -> (requestResponse ++ sequencedNestedArtifact),
+    CommonRumorResponseStream -> (requestResponse ++ nestedArtifact),
+    SidecarSubscribeRequest -> (requestResponse + SubscriptionProfile),
+    SidecarSubscribeStarted -> (requestResponse ++ Set(SubscriptionProfile, SubscriptionSessionAndGeneration)),
+    ChainSyncSnapshotCarrier -> (requestResponse ++ nestedArtifact),
+    ChainSyncMetagraphBinaryCarrier -> (requestResponse ++ nestedArtifact),
+    ChainSyncSelectionHint -> requestResponse,
+    BootstrapMetadataHint -> (requestResponse ++ nestedArtifact),
+    BootstrapPhase2StateBundle -> (requestResponse ++ nestedArtifact ++ Set(
+      ExactPhase2Checkpoint,
+      ExactPhase2QualificationEvidence,
+      ComponentCompleteness,
+      ChainSelectionWitness
+    )),
+    BootstrapGenesisBundle -> (requestResponse ++ nestedArtifact ++ Set(GenesisDeclaration, ComponentCompleteness))
+  )
+
+  private val carrierDefinitionStatuses: Map[ConsensusCarrierKind, ArtifactDefinitionStatus] = Map(
+    PeerRumorEnvelope -> KnownIncomplete,
+    CommonRumorEnvelope -> KnownIncomplete,
+    SidecarRumorEnvelope -> KnownIncomplete,
+    EventGossipEnvelope -> KnownIncomplete,
+    EventGossipIHave -> KnownIncomplete,
+    EventGossipIWantRequest -> KnownIncomplete,
+    EventGossipIWantResponse -> KnownIncomplete,
+    Ml0EventAnnouncementEnvelope -> KnownIncomplete,
+    Ml0FacilityEnvelope -> KnownIncomplete,
+    Ml0ProposalEnvelope -> KnownIncomplete,
+    Ml0MajoritySignatureEnvelope -> KnownIncomplete,
+    Ml0BinarySignatureEnvelope -> KnownIncomplete,
+    Ml0AckEnvelope -> KnownIncomplete,
+    Ml0WithdrawEnvelope -> KnownIncomplete,
+    Ml0ArtifactAnnouncementEnvelope -> KnownIncomplete,
+    PeerRumorInquiryRequest -> KnownIncomplete,
+    CommonRumorOfferResponse -> KnownIncomplete,
+    QueryCommonRumorsRequest -> KnownIncomplete,
+    CommonRumorInitResponse -> KnownIncomplete,
+    PeerRumorResponseStream -> KnownIncomplete,
+    CommonRumorResponseStream -> KnownIncomplete,
+    SidecarSubscribeRequest -> KnownIncomplete,
+    SidecarSubscribeStarted -> KnownIncomplete,
+    ChainSyncSnapshotCarrier -> KnownIncomplete,
+    ChainSyncMetagraphBinaryCarrier -> KnownIncomplete,
+    ChainSyncSelectionHint -> KnownIncomplete,
+    BootstrapMetadataHint -> KnownIncomplete,
+    BootstrapPhase2StateBundle -> TargetShapeOpen,
+    BootstrapGenesisBundle -> TargetShapeOpen
+  )
+
+  private val rumorGaps: Set[ArtifactGap] =
+    Set(
+      DelimiterFreeRumorSignaturePreimage,
+      RuntimeScalaTypeStringDiscriminator,
+      LiveRumorSourceAuthenticationUndecomposed,
+      O18TransportByteContractOpen
+    )
+
+  private val carrierKnownGaps: Map[ConsensusCarrierKind, Set[ArtifactGap]] = Map(
+    PeerRumorEnvelope -> rumorGaps,
+    CommonRumorEnvelope -> rumorGaps,
+    SidecarRumorEnvelope -> Set(
+      TransportHintLacksPortableArtifactBinding,
+      GossipSubFullProtoDedupMutationFlood,
+      LossyPeerRumorGapRepairMissing,
+      O18TransportByteContractOpen
+    ),
+    EventGossipEnvelope -> Set(NestedArtifactIdentityNotEnforced, O18TransportByteContractOpen),
+    EventGossipIHave -> Set(
+      TransportHintLacksPortableArtifactBinding,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    EventGossipIWantRequest -> Set(MissingTransportRequestIdentity, O18TransportByteContractOpen),
+    EventGossipIWantResponse -> Set(
+      MissingTransportRequestIdentity,
+      NestedArtifactIdentityNotEnforced,
+      O18TransportByteContractOpen
+    ),
+    Ml0EventAnnouncementEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0FacilityEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0ProposalEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0MajoritySignatureEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0BinarySignatureEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0AckEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0WithdrawEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    Ml0ArtifactAnnouncementEnvelope -> (rumorGaps + NestedMl0ConsensusArtifactManifestOpen),
+    PeerRumorInquiryRequest -> Set(MissingTransportRequestIdentity, O18TransportByteContractOpen),
+    CommonRumorOfferResponse -> Set(
+      TransportHintLacksPortableArtifactBinding,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    QueryCommonRumorsRequest -> Set(MissingTransportRequestIdentity, O18TransportByteContractOpen),
+    CommonRumorInitResponse -> Set(
+      TransportHintLacksPortableArtifactBinding,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    PeerRumorResponseStream -> (rumorGaps ++ Set(MissingTransportRequestIdentity, UnboundedAggregateTransportResponse)),
+    CommonRumorResponseStream -> (rumorGaps ++ Set(MissingTransportRequestIdentity, UnboundedAggregateTransportResponse)),
+    SidecarSubscribeRequest -> Set(
+      LocalSubscriptionProductionGateControl,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    SidecarSubscribeStarted -> Set(
+      LocalSubscriptionProductionGateControl,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    ChainSyncSnapshotCarrier -> Set(
+      TransportDispositionLacksPortableArtifactBinding,
+      MissingTransportRequestIdentity,
+      NestedArtifactIdentityNotEnforced,
+      UnboundedAggregateTransportResponse,
+      O18TransportByteContractOpen
+    ),
+    ChainSyncMetagraphBinaryCarrier -> Set(
+      MissingTransportRequestIdentity,
+      NestedArtifactIdentityNotEnforced,
+      UnboundedAggregateTransportResponse,
+      O18TransportByteContractOpen
+    ),
+    ChainSyncSelectionHint -> Set(
+      TransportHintLacksPortableArtifactBinding,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    BootstrapMetadataHint -> Set(
+      TransportHintLacksPortableArtifactBinding,
+      MissingTransportRequestIdentity,
+      O18TransportByteContractOpen
+    ),
+    BootstrapPhase2StateBundle -> Set(
+      MissingTransportRequestIdentity,
+      BootstrapPhase2BundleSchemaOpen,
+      BootstrapCurrentChainWitnessSchemaOpen,
+      O18TransportByteContractOpen
+    ),
+    BootstrapGenesisBundle -> Set(
+      MissingTransportRequestIdentity,
+      BootstrapGenesisBundleSchemaOpen,
+      O18TransportByteContractOpen
+    )
+  )
+
+  private def carrierContract(kind: ConsensusCarrierKind): CarrierContract =
+    CarrierContract(
+      kind,
+      TransportCoordinationOnly,
+      ArtifactBinding.carrierCommon ++ carrierSpecificBindings(kind),
+      carrierDefinitionStatuses(kind),
+      carrierKnownGaps(kind)
+    )
 
   private val transcriptSpecificBindings: Map[ConsensusTranscriptKind, Set[ArtifactBinding]] = Map(
     Gl0LeaderVrf -> Set(ExactGlobalParent),
@@ -441,6 +658,7 @@ object ConsensusArtifactRequirementsManifest {
   val transcriptEntries: List[TranscriptContract] = ConsensusTranscriptKind.all.map(transcriptContract)
   val finalityPayloadEntries: List[FinalityPayloadContract] =
     ConsensusFinalityPayloadKind.all.map(finalityPayloadContract)
+  val carrierEntries: List[CarrierContract] = ConsensusCarrierKind.all.map(carrierContract)
 
   def validateEntries(contracts: List[ArtifactContract]): List[Violation] = {
     import Violation._
@@ -561,6 +779,47 @@ object ConsensusArtifactRequirementsManifest {
 
   val finalityPayloadValidation: List[Violation] = validateFinalityPayloadEntries(finalityPayloadEntries)
 
+  def validateCarrierEntries(contracts: List[CarrierContract]): List[Violation] = {
+    import Violation._
+
+    val duplicateKinds = contracts.groupBy(_.kind).collect {
+      case (kind, values) if values.sizeCompare(1) > 0 => DuplicateCarrierKind(kind)
+    }
+    val duplicateLabels = contracts
+      .groupBy(_.kind.semanticLabel)
+      .collect { case (label, values) if values.sizeCompare(1) > 0 => DuplicateCarrierSemanticLabel(label) }
+    val missingKinds = (ConsensusCarrierKind.all.toSet -- contracts.map(_.kind).toSet).toList.map(MissingCarrierKind)
+    val invalidLabels = contracts.collect {
+      case contract if !contract.kind.semanticLabel.matches("[a-z0-9]+(?:[.-][a-z0-9]+)*") =>
+        InvalidCarrierSemanticLabel(contract.kind)
+    }
+    val invalidAuthorities = contracts.collect {
+      case contract if contract.authority != TransportCoordinationOnly =>
+        InvalidCarrierAuthority(contract.kind, contract.authority)
+    }
+    val missingCommon = contracts.flatMap { contract =>
+      val missing = ArtifactBinding.carrierCommon -- contract.bindings
+      Option.when(missing.nonEmpty)(MissingCarrierCommonBindings(contract.kind, missing))
+    }
+    val missingBindings = contracts.flatMap { contract =>
+      val missing = carrierSpecificBindings.getOrElse(contract.kind, Set.empty) -- contract.bindings
+      Option.when(missing.nonEmpty)(MissingCarrierBindings(contract.kind, missing))
+    }
+    val missingGaps = contracts.flatMap { contract =>
+      val missing = carrierKnownGaps.getOrElse(contract.kind, Set.empty) -- contract.knownGaps
+      missing.toList.map(MissingCarrierGap(contract.kind, _))
+    }
+    val invalidDefinitionStatuses = contracts.collect {
+      case contract if carrierDefinitionStatuses.get(contract.kind).exists(_ != contract.definitionStatus) =>
+        InvalidCarrierDefinitionStatus(contract.kind)
+    }
+
+    (duplicateKinds ++ duplicateLabels ++ missingKinds ++ invalidLabels ++ invalidAuthorities ++ missingCommon ++ missingBindings ++
+      missingGaps ++ invalidDefinitionStatuses).toList.sortBy(_.description)
+  }
+
+  val carrierValidation: List[Violation] = validateCarrierEntries(carrierEntries)
+
   private def hasAuthorityBindings(contract: ArtifactContract): Boolean = {
     val hasAnchor = contract.bindings.exists(_.isExactAnchor)
 
@@ -576,10 +835,11 @@ object ConsensusArtifactRequirementsManifest {
         contract.bindings.contains(RegistryView) &&
         contract.bindings.contains(CustodiedArtifact) &&
         contract.bindings.contains(RetentionScope)
-      case ObjectiveEvidence => hasAnchor
-      case Commitment        => hasAnchor
-      case LocalDurability   => contract.bindings.contains(DurabilityScope)
-      case MigrationGenesis  => contract.bindings.contains(MigrationSource) && contract.bindings.contains(MigrationTarget)
+      case ObjectiveEvidence         => hasAnchor
+      case Commitment                => hasAnchor
+      case LocalDurability           => contract.bindings.contains(DurabilityScope)
+      case MigrationGenesis          => contract.bindings.contains(MigrationSource) && contract.bindings.contains(MigrationTarget)
+      case TransportCoordinationOnly => false
     }
   }
 

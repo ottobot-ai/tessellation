@@ -45,6 +45,15 @@ object ArtifactAuthority {
     val semanticLabel: String = "migration-genesis"
   }
 
+  /** Routing, delivery, request correlation, or bootstrap carriage only.
+    *
+    * This authority proves no state validity, finality qualification, fork choice, execution, source admission, or nested-payload
+    * authority. A carrier cannot be counted as, or upgraded into, any of those claims.
+    */
+  case object TransportCoordinationOnly extends ArtifactAuthority {
+    val semanticLabel: String = "transport-coordination-only"
+  }
+
   val all: List[ArtifactAuthority] = List(
     StateValidity,
     FinalityQualification,
@@ -54,6 +63,7 @@ object ArtifactAuthority {
     ObjectiveEvidence,
     Commitment,
     LocalDurability,
-    MigrationGenesis
+    MigrationGenesis,
+    TransportCoordinationOnly
   )
 }

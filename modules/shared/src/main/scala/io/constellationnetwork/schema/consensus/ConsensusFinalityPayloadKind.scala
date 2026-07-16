@@ -12,19 +12,14 @@ object ConsensusFinalityPayloadKind {
   case object ReleasedCoreRecord extends ConsensusFinalityPayloadKind("gl0.finality.payload.released-core-record")
   case object PathManifest extends ConsensusFinalityPayloadKind("gl0.finality.payload.path-manifest")
   case object PathChunk extends ConsensusFinalityPayloadKind("gl0.finality.payload.path-chunk")
-  case object DecidedAttestationEvidence
-      extends ConsensusFinalityPayloadKind("gl0.finality.payload.decided-attestation-evidence")
+  case object DecidedAttestationEvidence extends ConsensusFinalityPayloadKind("gl0.finality.payload.decided-attestation-evidence")
   case object DepthK1Evidence extends ConsensusFinalityPayloadKind("gl0.finality.payload.depth-k1-evidence")
-  case object ForkChoiceDecisionEvidence
-      extends ConsensusFinalityPayloadKind("gl0.finality.payload.fork-choice-decision-evidence")
+  case object ForkChoiceDecisionEvidence extends ConsensusFinalityPayloadKind("gl0.finality.payload.fork-choice-decision-evidence")
   case object PreparedSemanticState extends ConsensusFinalityPayloadKind("gl0.finality.payload.prepared-semantic-state")
   case object AuthenticatedTargetAnchor extends ConsensusFinalityPayloadKind("gl0.finality.payload.authenticated-target-anchor")
-  case object AppliedSemanticStateReceipt
-      extends ConsensusFinalityPayloadKind("gl0.finality.payload.applied-semantic-state-receipt")
-  case object AuthenticatedAnchorReceipt
-      extends ConsensusFinalityPayloadKind("gl0.finality.payload.authenticated-anchor-receipt")
-  case object PriorSemanticStateReceipt
-      extends ConsensusFinalityPayloadKind("gl0.finality.payload.prior-semantic-state-receipt")
+  case object AppliedSemanticStateReceipt extends ConsensusFinalityPayloadKind("gl0.finality.payload.applied-semantic-state-receipt")
+  case object AuthenticatedAnchorReceipt extends ConsensusFinalityPayloadKind("gl0.finality.payload.authenticated-anchor-receipt")
+  case object PriorSemanticStateReceipt extends ConsensusFinalityPayloadKind("gl0.finality.payload.prior-semantic-state-receipt")
   case object PriorAnchorReceipt extends ConsensusFinalityPayloadKind("gl0.finality.payload.prior-anchor-receipt")
   case object EffectPayload extends ConsensusFinalityPayloadKind("gl0.finality.payload.effect")
 
