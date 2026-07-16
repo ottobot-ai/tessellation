@@ -14,11 +14,6 @@ package io.constellationnetwork
   * of consensus bug a compile error.
   *
   * Import `serde.implicits._` to get all syntax at once.
-  *
-  * Era coexistence — historical JSON / Kryo bytes are decoded via [[serde.legacy.LegacyBridgeSerde]]; those bridges are READ-ONLY by
-  * design. No implicit conversion maps a legacy decoder back into the write path.
-  *
-  * See `.workspace/serde-design-notes.md` for the full design rationale.
   */
 package object serde {
 

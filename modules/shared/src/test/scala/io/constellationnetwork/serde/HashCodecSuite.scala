@@ -9,8 +9,8 @@ import weaver.FunSuite
 
 /** Golden + round-trip suite for Hash. Wire layout: 32 raw bytes, fixed-width.
   *
-  * The legacy JSON / Kryo eras travelled Hash over the wire as 64 ASCII hex chars (64 bytes). The scodec era uses the raw 32-byte digest.
-  * Legacy bytes are still decodable via `legacy.JsonBridge` / `legacy.KryoBridge`; scodec-era writes produce only the 32-byte form.
+  * ScodecV1 uses the raw 32-byte digest. Historical source formats are outside this active codec and belong in the isolated offline
+  * importer.
   */
 object HashCodecSuite extends FunSuite {
 

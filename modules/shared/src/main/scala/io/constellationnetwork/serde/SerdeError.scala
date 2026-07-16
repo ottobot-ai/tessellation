@@ -20,25 +20,4 @@ object SerdeError {
 
   /** Brotli decompression failed — corrupt or non-brotli input. */
   final case class BrotliFailure(message: String) extends SerdeError
-
-  /** Legacy bridge (JSON / Kryo) decode reported a structural problem. */
-  final case class LegacyDecodeFailure(eraName: String, cause: String) extends SerdeError {
-    def message: String = s"[$eraName] $cause"
-  }
-
-  /** No era codec is registered for the requested `SnapshotOrdinal`. Indicates a config gap, not a data problem — every ordinal must fall
-    * inside some era's half-open range.
-    */
-  final case class NoEraCodec(ordinalValue: Long, typeName: String) extends SerdeError {
-    def message: String =
-      s"No codec era registered for type '$typeName' at ordinal $ordinalValue — check hash-eras config."
-  }
-
-  /** A value was successfully decoded under a legacy era but the consumer asked for write access (Signable / Persistable encode). Legacy
-    * bridges are decode-only.
-    */
-  final case class LegacyWriteAttempt(eraName: String) extends SerdeError {
-    def message: String =
-      s"Attempted to encode via legacy era '$eraName'; legacy bridges are decode-only."
-  }
 }

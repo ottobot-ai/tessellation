@@ -14,10 +14,9 @@ import scodec.{Attempt, Codec, Err}
   *   - Encode: take the 64-char hex string, parse to 32 bytes.
   *   - Decode: take 32 bytes, render as 64-char lowercase hex.
   *
-  * This is a deliberate departure from the JSON / Kryo era, where hash bytes travelled over the wire as UTF-8-encoded ASCII hex (64 bytes
-  * per hash). The scodec era halves hash storage cost and uses the same 32-byte representation as every other content-address system in the
-  * industry. Historical JSON / Kryo bytes are decoded through `legacy.JsonBridge` / `legacy.KryoBridge`, which parse the hex-string form;
-  * scodec-era writes only produce 32-byte form.
+  * This is a deliberate departure from legacy JSON / Kryo encodings, where hash bytes travelled as UTF-8-encoded ASCII hex (64 bytes per
+  * hash). ScodecV1 halves hash storage cost and uses the same 32-byte representation as other content-address systems. Legacy source data
+  * is outside this active codec and belongs in the isolated offline importer.
   *
   * Consensus contract: FROZEN. 32 bytes, length-prefixed? NO — we use a fixed-width 32 bytes; every `Hash` is exactly 32 bytes on the wire.
   * Any byte sequence of length != 32 is a decode failure.

@@ -1,6 +1,5 @@
 package io.constellationnetwork.serde
 
-import io.constellationnetwork.serde.era.{EraCodecRegistry, OrdinalRange, SerdeEra}
 import io.constellationnetwork.serde.implicits._
 import io.constellationnetwork.serde.storage.BrotliPersistable
 
@@ -80,63 +79,4 @@ object SerdeShimSuite extends FunSuite {
     }
   }
 
-  test("EraCodecRegistry dispatches by ordinal range") {
-    val registry = EraCodecRegistry
-      .fromRanges(
-        List(
-          OrdinalRange(0L, 100L) -> SerdeEra.Kryo,
-          OrdinalRange(100L, 200L) -> SerdeEra.Json,
-          OrdinalRange.from(200L) -> SerdeEra.Scodec
-        )
-      )
-      .fold(e => throw new IllegalStateException(s"registry build failed: $e"), identity)
-
-    expect(registry.eraForOrDie(0L) == SerdeEra.Kryo)
-      .and(expect(registry.eraForOrDie(99L) == SerdeEra.Kryo))
-      .and(expect(registry.eraForOrDie(100L) == SerdeEra.Json))
-      .and(expect(registry.eraForOrDie(199L) == SerdeEra.Json))
-      .and(expect(registry.eraForOrDie(200L) == SerdeEra.Scodec))
-      .and(expect(registry.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec))
-  }
-
-  test("EraCodecRegistry rejects overlapping ranges") {
-    val result = EraCodecRegistry.fromRanges(
-      List(
-        OrdinalRange(0L, 100L) -> SerdeEra.Kryo,
-        OrdinalRange(50L, 200L) -> SerdeEra.Json,
-        OrdinalRange.from(200L) -> SerdeEra.Scodec
-      )
-    )
-    expect(result.isLeft)
-  }
-
-  test("EraCodecRegistry rejects gaps") {
-    val result = EraCodecRegistry.fromRanges(
-      List(
-        OrdinalRange(0L, 100L) -> SerdeEra.Kryo,
-        OrdinalRange(150L, 200L) -> SerdeEra.Json,
-        OrdinalRange.from(200L) -> SerdeEra.Scodec
-      )
-    )
-    expect(result.isLeft)
-  }
-
-  test("EraCodecRegistry rejects non-zero start") {
-    val result = EraCodecRegistry.fromRanges(
-      List(OrdinalRange.from(10L) -> SerdeEra.Scodec)
-    )
-    expect(result.isLeft)
-  }
-
-  test("EraCodecRegistry rejects closed last range") {
-    val result = EraCodecRegistry.fromRanges(
-      List(OrdinalRange(0L, 100L) -> SerdeEra.Scodec)
-    )
-    expect(result.isLeft)
-  }
-
-  test("defaultScodec registry covers everything as Scodec") {
-    val r = EraCodecRegistry.defaultScodec
-    expect(r.eraForOrDie(0L) == SerdeEra.Scodec).and(expect(r.eraForOrDie(Long.MaxValue - 1) == SerdeEra.Scodec))
-  }
 }

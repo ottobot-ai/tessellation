@@ -213,6 +213,17 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
   private val signedImplementationPath =
     "modules/shared/src/main/scala/io/constellationnetwork/security/signature/Signed.scala"
 
+  private val protocolEraIdentityPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/era/ProtocolEraId.scala"
+  private val protocolEraCodecPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/ProtocolEraIdCodec.scala"
+
+  private val reviewedProtocolEraIdentityPaths: Set[String] =
+    Set(protocolEraIdentityPath, protocolEraCodecPath)
+
+  private val protocolEraIdentityReference =
+    """\bProtocolEraId\b|\bio\.constellationnetwork\.schema\.era\b""".r
+
   private val consensusSensitivePaths: Set[String] =
     List(
       reviewedLegacyMarkers.keySet,
@@ -220,19 +231,12 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       reviewedEvidencePreimageHashes.keySet
     ).foldLeft(Set(signedImplementationPath))(_ union _)
 
-  private val serdeScaffoldPaths: Set[String] = Set(
-    "modules/shared/src/main/scala/io/constellationnetwork/serde/era/EraCodecRegistry.scala",
-    "modules/shared/src/main/scala/io/constellationnetwork/serde/era/SerdeEra.scala"
-  )
-
   private val forbiddenRuntimeActivations: List[(String, Regex)] = List(
-    "EraCodecRegistry runtime use" -> """\bEraCodecRegistry\b""".r,
-    "SerdeEra.Scodec runtime selection" -> """\bSerdeEra\s*\.\s*Scodec\b""".r,
     "ScodecHash runtime selection" -> """\bScodecHash\b""".r,
     "Hasher.forScodec runtime selection" -> """\bHasher\s*\.\s*forScodec\b""".r
   )
 
-  test("runtime Scodec activation remains absent outside the unwired serde scaffold") {
+  test("runtime Scodec activation remains absent") {
     productionSources.map { sources =>
       val violations = sources.flatMap { source =>
         activationLabels(source).toList.sorted.map(label => s"${source.path}: $label")
@@ -240,6 +244,23 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
       if (violations.isEmpty) success
       else failure(s"partial Scodec activation crossed the atomic-cutover fuse: ${violations.mkString(", ")}")
+    }
+  }
+
+  test("ProtocolEraId remains dark outside its reviewed identity and codec sources") {
+    productionSources.map { sources =>
+      val actualPaths = sources.collect {
+        case source if protocolEraIdentityReference.findFirstIn(withoutScalaComments(source.contents)).nonEmpty => source.path
+      }.toSet
+      val unexpected = actualPaths -- reviewedProtocolEraIdentityPaths
+      val missing = reviewedProtocolEraIdentityPaths -- actualPaths
+
+      if (unexpected.isEmpty && missing.isEmpty) success
+      else
+        failure(
+          s"ProtocolEraId production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
+            s"missing=${missing.toList.sorted.mkString(",")}"
+        )
     }
   }
 
@@ -290,19 +311,15 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     }
   }
 
-  pureTest("activation parser distinguishes comments, scaffolding, current hashing, and unsafe activation") {
+  pureTest("activation parser distinguishes comments, ordinary codecs, and unsafe activation") {
     val sensitivePath =
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala"
     val commentOnly = Source(
       sensitivePath,
-      """// Hasher.forScodec and SerdeEra.Scodec are not active
-        |/* EraCodecRegistry.defaultScodec /* ScodecHash */ */
+      """// Hasher.forScodec is not active
+        |/* ScodecHash */
         |Hasher[F].hash(checkpoint.signingPreimage)
         |""".stripMargin
-    )
-    val scaffold = Source(
-      "modules/shared/src/main/scala/io/constellationnetwork/serde/era/EraCodecRegistry.scala",
-      "val defaultScodec: EraCodecRegistry = select(SerdeEra.Scodec)"
     )
     val ordinaryCodec = Source(
       "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/ExampleCodec.scala",
@@ -310,21 +327,16 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     )
     val partialActivation = Source(
       sensitivePath,
-      """val registry = EraCodecRegistry.defaultScodec
-        |val era = SerdeEra.Scodec
-        |val mode = ScodecHash
+      """val mode = ScodecHash
         |val hasher = Hasher.forScodec[F]
         |checkpoint.signingPreimage.immutableBytes
         |""".stripMargin
     )
 
     expect(activationLabels(commentOnly).isEmpty) &&
-    expect(activationLabels(scaffold).isEmpty) &&
     expect(activationLabels(ordinaryCodec).isEmpty) &&
     expect(
       activationLabels(partialActivation) == Set(
-        "EraCodecRegistry runtime use",
-        "SerdeEra.Scodec runtime selection",
         "ScodecHash runtime selection",
         "Hasher.forScodec runtime selection",
         "direct immutable-byte activation"
@@ -349,11 +361,9 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
   private def activationLabels(source: Source): Set[String] = {
     val stripped = withoutScalaComments(source.contents)
     val runtimeLabels =
-      if (serdeScaffoldPaths.contains(source.path)) Set.empty[String]
-      else
-        forbiddenRuntimeActivations.collect {
-          case (label, pattern) if pattern.findFirstIn(stripped).nonEmpty => label
-        }.toSet
+      forbiddenRuntimeActivations.collect {
+        case (label, pattern) if pattern.findFirstIn(stripped).nonEmpty => label
+      }.toSet
     val directImmutableCount = directImmutableBytes.findAllIn(stripped).size
     val reviewedDirectImmutableCount = reviewedDirectImmutableBytes.get(source.path).fold(0)(_.count)
     val immutableLabel =
