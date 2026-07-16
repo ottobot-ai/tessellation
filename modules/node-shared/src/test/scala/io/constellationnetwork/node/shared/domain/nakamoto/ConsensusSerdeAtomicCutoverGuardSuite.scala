@@ -200,6 +200,26 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       Reviewed(2, "slashable evidence signing and verification hash the explicit evidence preimage")
   )
 
+  private val mptJsonCommitmentHash =
+    """(?s)\bHasher\s*\[\s*F\s*\]\s*\.\s*prefixedHash\s*\(\s*[^,\n]+\.asJson\s*,""".r
+
+  private val reviewedMptJsonCommitmentHashes: Map[String, Reviewed] = Map(
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/MerklePatriciaNode.scala" ->
+      Reviewed(3, "live leaf, branch, and extension construction hashes JSON commitments"),
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/prover/MerklePatriciaAbsenceProver.scala" ->
+      Reviewed(3, "live absence proof construction reproduces JSON commitment hashes"),
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/prover/MerklePatriciaSingleInclusionProver.scala" ->
+      Reviewed(3, "live inclusion proof construction reproduces JSON commitment hashes"),
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/verifier/MerklePatriciaAbsenceVerifier.scala" ->
+      Reviewed(5, "live absence verification reproduces JSON commitment hashes on every proof shape"),
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/verifier/MerklePatriciaBatchInclusionVerifier.scala" ->
+      Reviewed(3, "live batch inclusion verification reproduces JSON commitment hashes"),
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/verifier/MerklePatriciaInclusionVerifier.scala" ->
+      Reviewed(3, "live inclusion verification reproduces JSON commitment hashes"),
+    "modules/shared/src/main/scala/io/constellationnetwork/security/mpt/verifier/MerklePatriciaRangeVerifier.scala" ->
+      Reviewed(3, "live range verification reproduces JSON commitment hashes")
+  )
+
   private val directImmutableBytes = """\b(?:immutableBytes|fromImmutableBytes)\b""".r
 
   private val reviewedDirectImmutableBytes: Map[String, Reviewed] = Map(
@@ -218,17 +238,24 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
   private val protocolEraCodecPath =
     "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/ProtocolEraIdCodec.scala"
 
+  private val mptCommitmentScodecV1CodecPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/MerklePatriciaCommitmentScodecV1Codec.scala"
+
   private val reviewedProtocolEraIdentityPaths: Set[String] =
     Set(protocolEraIdentityPath, protocolEraCodecPath)
 
   private val protocolEraIdentityReference =
     """\bProtocolEraId\b|\bio\.constellationnetwork\.schema\.era\b""".r
 
+  private val mptCommitmentScodecV1Reference =
+    """\bMerklePatriciaCommitmentScodecV1Codec\b|\b(?:ImmutableCodec|Codec)\s*\[\s*MerklePatriciaCommitment\s*\]""".r
+
   private val consensusSensitivePaths: Set[String] =
     List(
       reviewedLegacyMarkers.keySet,
       reviewedCheckpointPreimageHashes.keySet,
-      reviewedEvidencePreimageHashes.keySet
+      reviewedEvidencePreimageHashes.keySet,
+      reviewedMptJsonCommitmentHashes.keySet
     ).foldLeft(Set(signedImplementationPath))(_ union _)
 
   private val forbiddenRuntimeActivations: List[(String, Regex)] = List(
@@ -264,6 +291,24 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     }
   }
 
+  test("MPT commitment ScodecV1 bytes remain dark outside their standalone codec source") {
+    productionSources.map { sources =>
+      val actualPaths = sources.collect {
+        case source if mptCommitmentScodecV1Reference.findFirstIn(withoutScalaComments(source.contents)).nonEmpty => source.path
+      }.toSet
+      val expectedPaths = Set(mptCommitmentScodecV1CodecPath)
+      val unexpected = actualPaths -- expectedPaths
+      val missing = expectedPaths -- actualPaths
+
+      if (unexpected.isEmpty && missing.isEmpty) success
+      else
+        failure(
+          s"MPT commitment ScodecV1 production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
+            s"missing=${missing.toList.sorted.mkString(",")}"
+        )
+    }
+  }
+
   test("legacy consensus byte-authority markers remain an exact atomic-cutover inventory") {
     productionSources.map { sources =>
       val mismatches = reviewedMarkerMismatches(sources, reviewedLegacyMarkers)
@@ -283,6 +328,16 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
       if (mismatches.isEmpty) success
       else failure(s"reviewed consensus preimage inventory changed: ${mismatches.mkString(", ")}")
+    }
+  }
+
+  test("live MPT commitment hashing remains an exact JSON authority inventory") {
+    productionSources.map { sources =>
+      val mismatches =
+        exactInventoryMismatches(sources, mptJsonCommitmentHash, reviewedMptJsonCommitmentHashes, "MPT JSON commitment hash")
+
+      if (mismatches.isEmpty) success
+      else failure(s"live MPT commitment byte authority changed: ${mismatches.mkString(", ")}")
     }
   }
 
