@@ -16,6 +16,7 @@ import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.NonEmptyListCodec.nonEmptyList
 import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
+import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotStateRefCodec.{codec => globalSnapshotStateRefCodec}
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
 import io.constellationnetwork.serde.codecs.instances.HexContentCodec.{codec => hexCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
@@ -103,11 +104,11 @@ object ShardingScodecCodecs {
       shardDerivedStateDeltaCodec ::
       committeeSignaturesCodec ::
       etaPeriodCodec ::
-      snapshotOrdinalCodec)
+      globalSnapshotStateRefCodec)
       .xmap[ShardCheckpoint](
         {
           case shardId :: parentHash :: shardOrdinal :: gl0AnchorOrdinal :: slot :: delta :: signatures :: epoch ::
-              executionBaseOrdinal :: HNil =>
+              executionBase :: HNil =>
             ShardCheckpoint(
               shardId,
               parentHash,
@@ -117,7 +118,7 @@ object ShardingScodecCodecs {
               delta,
               signatures,
               epoch,
-              executionBaseOrdinal
+              executionBase
             )
         },
         checkpoint =>
@@ -129,7 +130,7 @@ object ShardingScodecCodecs {
             checkpoint.derivedStateDelta ::
             checkpoint.committeeSignatures ::
             checkpoint.epoch ::
-            checkpoint.executionBaseOrdinal ::
+            checkpoint.executionBase ::
             HNil
       )
 

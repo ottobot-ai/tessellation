@@ -140,6 +140,7 @@ object V4EconomicGrammarManifest {
     val globalSnapshot = "modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshot.scala"
     val globalIncrementalSnapshot = "modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalIncrementalSnapshot.scala"
     val stateChannelOutput = "modules/shared/src/main/scala/io/constellationnetwork/statechannel/StateChannelOutput.scala"
+    val shardCheckpoint = "modules/shared/src/main/scala/io/constellationnetwork/schema/sharding/ShardCheckpoint.scala"
     val applicationConfig = "modules/node-shared/src/main/resources/application.conf"
   }
 
@@ -731,6 +732,10 @@ object V4EconomicGrammarManifest {
       SourceAnchor(stateChannelOutput, "StateChannelOutput"),
       allStateChannelBinaryIds
     ),
+    WireCarrier(
+      SourceAnchor(shardCheckpoint, "ShardCheckpoint"),
+      allStateChannelBinaryIds ++ slashingIds
+    ),
     WireCarrier(SourceAnchor(currencyEvent, "CurrencySnapshotEvent"), currencyEventIds),
     WireCarrier(SourceAnchor(globalEvent, "GlobalSnapshotEvent"), currentRootedEconomicIds -- Set("ECO-GENESIS-ISSUANCE"))
   )
@@ -1141,7 +1146,25 @@ object V4EconomicGrammarManifest {
       "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/ShardingScodecCodecs.scala",
       Set(Codec),
       currencyFrameworkIds ++ stateChannelIds ++ Set("ECO-INVALID-STATE-SLASH"),
-      "0c4f8112bde772ef825d7857f70761906e589a7fc633418a8fee2190498d57c1"
+      "b5c3279c2bb4c3d3f53e7ac0e2ddf5fae36bb9b694fb12dec1ef39cd384184fa"
+    ),
+    ReviewedSource(
+      "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/GlobalSnapshotStateRefCodec.scala",
+      Set(Codec),
+      allStateChannelBinaryIds ++ slashingIds,
+      "770b2acf0cfce9ae744f26829883b58171fbf0160b0cee578c68e679d3291a6c"
+    ),
+    ReviewedSource(
+      "modules/shared/src/main/scala/io/constellationnetwork/schema/nakamoto/GlobalSnapshotStateRef.scala",
+      Set(Ingress, Codec),
+      currentRootedEconomicIds ++ allStateChannelBinaryIds,
+      "09118a3b1d1e154ae6c25c36fdcaae7b170ca641c0c67ebb05ebe1016f20ff5f"
+    ),
+    ReviewedSource(
+      "modules/shared/src/main/scala/io/constellationnetwork/schema/sharding/ShardCheckpoint.scala",
+      Set(Ingress, Codec),
+      allStateChannelBinaryIds ++ slashingIds,
+      "6e5505ebbf6319e3edc5e7798cd189f717c740887f01237ce8c046beae2c713c"
     ),
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/SharedArtifactCodec.scala",
@@ -1345,7 +1368,13 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofValidator.scala",
       Set(Validation),
       Set("ECO-INVALID-STATE-SLASH"),
-      "e22f2617c04607693750df5e9371a2a54d8d017f332a7232c9e37972e8971fe1"
+      "82592648f211ddf910ab088793daa7390fe73b03e4b5673498f1395ffd15ac14"
+    ),
+    ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/PinnedCurrencyInfoReader.scala",
+      Set(Validation),
+      allStateChannelBinaryIds ++ slashingIds,
+      "2d8d322027c3f70eedadaecb3316467a1ed836a4e1475d287e32d99adb41e965"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/node/UpdateNodeParametersAcceptanceManager.scala",
@@ -1477,7 +1506,7 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/ShardCheckpointGl0AcceptanceManager.scala",
       Set(Validation),
       allStateChannelBinaryIds,
-      "fe39ee69a1aac7d55c22cb908c80a549c825409563becb0b93af034ce979d145"
+      "fb6b76032d169aa23ca37c6dfad7ff015ee0cb786d25ff1bddb488cf4924dd8c"
     ),
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala",
@@ -1645,7 +1674,7 @@ object V4EconomicGrammarManifest {
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala",
       Set(Ingress, Validation, ConfigurationAuthority),
       currentRootedEconomicIds ++ allStateChannelBinaryIds,
-      "90d94370b751632944a2d17ba70aa92f6c3f8a3f6e9faea574def98b0ffdbc45"
+      "68d1a1071863a5155fda42966b9bc9cae7c726c811d08b7a776c7d0a31ae8b45"
     ),
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoSyncDaemon.scala",
@@ -1738,16 +1767,28 @@ object V4EconomicGrammarManifest {
       "cedb40b9b97eb101f274faf9917e8af10d186cd9dab3aa51da97936b501e3084"
     ),
     ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/sharding/ShardCheckpointProducerDutyValidator.scala",
+      Set(Validation),
+      allStateChannelBinaryIds,
+      "449302e62dbe5c48f770305bf3951fca1f20437de42f868e4f3ee3a25f42eb5c"
+    ),
+    ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointWiring.scala",
       Set(Ingress, Validation),
       allStateChannelBinaryIds ++ slashingIds,
-      "2ab88b1003155b4837d9c633495527bad1cdfc70e60e24a4b28fdeab2faf70b1"
+      "8a8ca5c3a712940ae4cb007e35df26dae3e35eb2b037def9dacbccb51c128d92"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducer.scala",
       Set(Ingress, Validation),
       allStateChannelBinaryIds,
-      "63dedf7053c31287a7f0142f8067e562705f636340ccf37a9653278a169533b1"
+      "b34da0ac59e093a19536057ce1fe3a73d511cd84d7587471222570166c0315c5"
+    ),
+    ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointWireCodecs.scala",
+      Set(DecoderIngress, Codec, Validation),
+      allStateChannelBinaryIds ++ slashingIds,
+      "175fe5f6dd34851cdd02b14bb6c87afeab310b6cd23f3f7ffff139b283a5db37"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/WatchtowerFraudProofEmitter.scala",
@@ -1819,7 +1860,7 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedServices.scala",
       Set(Validation, ConfigurationAuthority),
       currentRootedEconomicIds ++ allStateChannelBinaryIds,
-      "078eff1e6518724b5f87a34606668428f5c7a3d3a414882d082e3809c7720669"
+      "22666d0fb85dcc9a56aa794ca2d631268624c6be4fe71290337ca1d70d2eb0e6"
     ),
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/schema/nakamoto/follow/SyncedField.scala",

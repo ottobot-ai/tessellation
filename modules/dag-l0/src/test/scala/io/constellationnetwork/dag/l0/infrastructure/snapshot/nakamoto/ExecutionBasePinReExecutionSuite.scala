@@ -39,8 +39,8 @@ import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageO
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt._
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
@@ -49,6 +49,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.{Hash, ProofsHash}
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
@@ -66,7 +67,7 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.io.file.Files
 import weaver.MutableIOSuite
 
-/** The checkpoint execution prior is the wire-carried `executionBaseOrdinal`, never a node's mutable live MPT view.
+/** The checkpoint execution prior is the wire-carried `executionBase`, never a node's mutable live MPT view.
   *
   * Every window in this suite is a real currency transition: the next incremental is created by the same
   * [[io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencySnapshotCreator]] used by the verifier, and both the incremental
@@ -92,7 +93,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   private def ord(n: Long): SnapshotOrdinal = SnapshotOrdinal.unsafeApply(n)
 
   private val account: Address = addr("execution-base-acct-1")
-  private val executionBase: SnapshotOrdinal = ord(10L)
+  private val executionBaseOrdinal: SnapshotOrdinal = ord(10L)
   private val liveAhead: SnapshotOrdinal = ord(13L)
   private val anchorOrd: SnapshotOrdinal = ord(1000L)
   private val shardZero: ShardId = ShardId.unsafeApply(0)
@@ -152,6 +153,11 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   private val aheadInfo: CurrencySnapshotInfo = info(250L)
 
   private type MgState = SortedMap[Address, Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]]
+
+  private final case class PinnedHistory(
+    reader: PinnedCurrencyInfoReader[IO],
+    stateRef: GlobalSnapshotStateRef
+  )
 
   private def mgState(mg: Address, baseIncremental: Signed[CurrencyIncrementalSnapshot], currencyInfo: CurrencySnapshotInfo): MgState =
     SortedMap(mg -> Right((baseIncremental, currencyInfo)))
@@ -235,7 +241,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
     stateChannelTipIndex: SortedSet[Address],
     currencyIndex: SortedSet[Address],
     globalBalances: SortedMap[Address, Balance]
-  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedHistory] =
     for {
       baseBytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](state)
       producer <- InMemoryMerklePatriciaProducer.make[IO](baseBytes)
@@ -257,10 +263,17 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       pinnedBytes <- store.allEntriesAsBytes
       baseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](pinnedBytes)
       byteStore <- MptStateStorage.make[IO](dir)
-      _ <- byteStore.writeState(executionBase, pinnedBytes)
-      pinnedSnap <- mkHashed(executionBase, Some(baseRoot))
-      resolver = (o: SnapshotOrdinal) => (if (o === executionBase) pinnedSnap.some else none).pure[IO]
-    } yield PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+      _ <- byteStore.writeState(executionBaseOrdinal, pinnedBytes)
+      pinnedSnap <- mkHashed(executionBaseOrdinal, Some(baseRoot))
+      resolver = (o: SnapshotOrdinal) => (if (o === executionBaseOrdinal) pinnedSnap.some else none).pure[IO]
+      reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+      stateRef = GlobalSnapshotStateRef(
+        executionBaseOrdinal,
+        pinnedSnap.hash,
+        pinnedSnap.signed.value.lastSnapshotHash,
+        MptRoot(baseRoot)
+      )
+    } yield PinnedHistory(reader, stateRef)
 
   private def mkPinnedHistory(
     dir: fs2.io.file.Path,
@@ -270,7 +283,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
     includeStateChannelTipIndexMember: Boolean = true,
     includeCurrencyIndexMember: Boolean = true,
     globalBalances: SortedMap[Address, Balance] = SortedMap.empty
-  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedHistory] =
     mkPinnedHistoryForState(
       dir,
       mgState(mg, baseIncremental, baseInfo),
@@ -280,11 +293,11 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       globalBalances
     )
 
-  private def liveReaderAt(live: MptStore[IO, GlobalStateKey]): SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]] =
+  private def liveReaderAt(live: MptStore[IO, GlobalStateKey]): GlobalSnapshotStateRef => IO[Option[GlobalStateReader[IO]]] =
     _ => GlobalStateReader.fromMptStore[IO](live).some.pure[IO]
 
-  private def productionReaderAt(pinned: PinnedCurrencyInfoReader[IO]): SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]] =
-    ShardCheckpointWiring.pinnedPriorReaderAt[IO](pinned)
+  private def productionReaderAt(pinned: PinnedHistory): GlobalSnapshotStateRef => IO[Option[GlobalStateReader[IO]]] =
+    ShardCheckpointWiring.pinnedPriorReaderAt[IO](pinned.reader)
 
   private def globalSnapshotLookup(
     snapshot: Hashed[GlobalIncrementalSnapshot]
@@ -293,11 +306,11 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
 
   private def mkReplay(
     harness: ProcessorHarness,
-    readerAt: SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]]
+    readerAt: GlobalSnapshotStateRef => IO[Option[GlobalStateReader[IO]]]
   )(
     implicit h: Hasher[IO],
     js: JsonSerializer[IO]
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => IO[Option[Hash]] =
     ShardCheckpointWiring.reExecDerivationAtPinnedBase[IO](
       harness.processor,
       readerAt,
@@ -380,7 +393,8 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   private def mkCheckpoint(
     mg: Address,
     window: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-    attestedRoot: Hash
+    attestedRoot: Hash,
+    executionBase: GlobalSnapshotStateRef
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[RegisteredCheckpoint] =
     for {
       checkpointSigner <- RegisteredCheckpointSigner.make
@@ -400,7 +414,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         ),
         committeeSignatures = NonEmptyList.one(placeholder),
         epoch = epochZero,
-        executionBaseOrdinal = executionBase
+        executionBase = executionBase
       )
       signature <- checkpointSigner.sign(shell, committeeKeyPair, committeeId, checkpointSigner.defaultShardEta)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.one(signature))
@@ -463,15 +477,15 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
         window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
         pinned <- mkPinnedHistory(dir, mg, baseIncremental)
-        liveAtBase <- mkLiveStore(mgState(mg, baseIncremental, baseInfo), executionBase)
+        liveAtBase <- mkLiveStore(mgState(mg, baseIncremental, baseInfo), executionBaseOrdinal)
         liveAheadStore <- mkLiveStore(mgState(mg, baseIncremental, aheadInfo), liveAhead)
         liveBaseReplay = mkReplay(harness, liveReaderAt(liveAtBase))
         liveAheadReplay = mkReplay(harness, liveReaderAt(liveAheadStore))
         pinnedReplay = mkReplay(harness, productionReaderAt(pinned))
-        liveBaseRoot <- liveBaseReplay(mg, window, anchorOrd, executionBase)
-        liveAheadRoot <- liveAheadReplay(mg, window, anchorOrd, executionBase)
-        pinnedBaseRoot <- pinnedReplay(mg, window, anchorOrd, executionBase)
-        pinnedAheadRoot <- pinnedReplay(mg, window, anchorOrd, executionBase)
+        liveBaseRoot <- liveBaseReplay(mg, window, anchorOrd, pinned.stateRef)
+        liveAheadRoot <- liveAheadReplay(mg, window, anchorOrd, pinned.stateRef)
+        pinnedBaseRoot <- pinnedReplay(mg, window, anchorOrd, pinned.stateRef)
+        pinnedAheadRoot <- pinnedReplay(mg, window, anchorOrd, pinned.stateRef)
       } yield
         expect.all(
           liveBaseRoot.exists(_ =!= Hash.empty),
@@ -500,8 +514,8 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         incompleteWindow = NonEmptyList.fromListUnsafe(validWindow.toList :+ invalidChild)
         pinned <- mkPinnedHistory(dir, mg, baseIncremental)
         replay = mkReplay(harness, productionReaderAt(pinned))
-        validRoot <- replay(mg, validWindow, anchorOrd, executionBase)
-        incompleteRoot <- replay(mg, incompleteWindow, anchorOrd, executionBase)
+        validRoot <- replay(mg, validWindow, anchorOrd, pinned.stateRef)
+        incompleteRoot <- replay(mg, incompleteWindow, anchorOrd, pinned.stateRef)
       } yield
         expect.all(
           validRoot.exists(_ =!= Hash.empty),
@@ -521,11 +535,11 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
         window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
         pinned <- mkPinnedHistory(dir, mg, baseIncremental)
-        skewedLive <- mkLiveStore(mgState(mg, baseIncremental, aheadInfo), executionBase)
+        skewedLive <- mkLiveStore(mgState(mg, baseIncremental, aheadInfo), executionBaseOrdinal)
         unpinnedReplay = mkReplay(harness, liveReaderAt(skewedLive))
         pinnedReplay = mkReplay(harness, productionReaderAt(pinned))
-        unpinnedSkewRoot <- unpinnedReplay(mg, window, anchorOrd, executionBase)
-        pinnedRoot <- pinnedReplay(mg, window, anchorOrd, executionBase)
+        unpinnedSkewRoot <- unpinnedReplay(mg, window, anchorOrd, pinned.stateRef)
+        pinnedRoot <- pinnedReplay(mg, window, anchorOrd, pinned.stateRef)
       } yield
         expect.all(
           pinnedRoot.exists(_ =!= Hash.empty),
@@ -534,7 +548,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
     }
   }
 
-  test("honest checkpoint is not an InvalidStateProof target when the follower live tip is ahead of executionBaseOrdinal") { res =>
+  test("honest checkpoint is not an InvalidStateProof target when the follower live tip is ahead of executionBase") { res =>
     implicit val (ks, h, js, sp) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -546,9 +560,9 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         pinned <- mkPinnedHistory(dir, mg, baseIncremental)
         followerLive <- mkLiveStore(mgState(mg, baseIncremental, aheadInfo), liveAhead)
         replay = mkReplay(harness, productionReaderAt(pinned))
-        attestedRootOpt <- replay(mg, window, anchorOrd, executionBase)
+        attestedRootOpt <- replay(mg, window, anchorOrd, pinned.stateRef)
         attestedRoot = attestedRootOpt.getOrElse(Hash.empty)
-        checkpointRig <- mkCheckpoint(mg, window, attestedRoot)
+        checkpointRig <- mkCheckpoint(mg, window, attestedRoot, pinned.stateRef)
         checkpoint = checkpointRig.checkpoint
         followerReplay = ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
           harness.processor,
@@ -586,9 +600,9 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
         corruptPinned <- mkPinnedHistory(dir, mg, baseIncremental, includeStateChannelTipTarget = false)
         replay = mkReplay(harness, productionReaderAt(corruptPinned))
-        replayed <- replay(mg, window, anchorOrd, executionBase)
+        replayed <- replay(mg, window, anchorOrd, corruptPinned.stateRef)
         attestedRoot = Hash("c3" * 32)
-        checkpointRig <- mkCheckpoint(mg, window, attestedRoot)
+        checkpointRig <- mkCheckpoint(mg, window, attestedRoot, corruptPinned.stateRef)
         checkpoint = checkpointRig.checkpoint
         validator = InvalidStateProofValidator.make[IO](
           ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
@@ -641,7 +655,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
           productionReaderAt(pinned),
           globalSnapshotLookup(failingHarness.initialGlobalSnapshot)
         )
-        result <- replay(SortedMap(mg -> window), anchorOrd, executionBase)
+        result <- replay(SortedMap(mg -> window), anchorOrd, pinned.stateRef)
       } yield expect(result == InvalidStateProofBatchReplay.Unavailable)
     }
   }
@@ -670,8 +684,8 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         )
         currencyOnlyReplay = mkReplay(harness, productionReaderAt(currencyOnly))
         tipOnlyReplay = mkReplay(harness, productionReaderAt(tipOnly))
-        currencyOnlyRoot <- currencyOnlyReplay(mg, window, anchorOrd, executionBase)
-        tipOnlyRoot <- tipOnlyReplay(mg, window, anchorOrd, executionBase)
+        currencyOnlyRoot <- currencyOnlyReplay(mg, window, anchorOrd, currencyOnly.stateRef)
+        tipOnlyRoot <- tipOnlyReplay(mg, window, anchorOrd, tipOnly.stateRef)
       } yield expect.all(currencyOnlyRoot.isEmpty, tipOnlyRoot.isEmpty)
     }
   }
@@ -687,7 +701,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
         window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
         pinned <- mkPinnedHistory(dir, mg, baseIncremental)
-        delegateOpt <- productionReaderAt(pinned)(executionBase)
+        delegateOpt <- productionReaderAt(pinned)(pinned.stateRef)
         delegate <- IO.fromOption(delegateOpt)(new IllegalStateException("missing retained test reader"))
         currencyIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
         tipIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastStateChannelSnapshotHashes)
@@ -712,7 +726,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
           _ => counting.some.pure[IO],
           globalSnapshotLookup(harness.initialGlobalSnapshot)
         )
-        roots <- replay(SortedMap(mg -> window, otherMg -> window), anchorOrd, executionBase)
+        roots <- replay(SortedMap(mg -> window, otherMg -> window), anchorOrd, pinned.stateRef)
         currencyReads <- currencyIndexReads.get
         tipReads <- tipIndexReads.get
         balanceReads <- balanceIndexReads.get
@@ -829,8 +843,8 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
           productionReaderAt(overspentPinned),
           globalSnapshotLookup(harness.initialGlobalSnapshot)
         )
-        fundedRoots <- fundedReplay(windows, anchorOrd, executionBase)
-        fundedFraudDisposition <- fundedFraudReplay(windows, anchorOrd, executionBase)
+        fundedRoots <- fundedReplay(windows, anchorOrd, fundedPinned.stateRef)
+        fundedFraudDisposition <- fundedFraudReplay(windows, anchorOrd, fundedPinned.stateRef)
         rawOverspent <- harness.processor.processCurrencySnapshots(
           anchorOrd,
           SortedMap(payer -> Balance(10L)),
@@ -838,8 +852,8 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
           windows.map { case (mg, binaries) => mg -> binaries.reverse },
           globalSnapshotLookup(harness.initialGlobalSnapshot)
         )
-        overspentRoots <- overspentReplay(windows, anchorOrd, executionBase)
-        overspentFraudDisposition <- overspentFraudReplay(windows, anchorOrd, executionBase)
+        overspentRoots <- overspentReplay(windows, anchorOrd, overspentPinned.stateRef)
+        overspentFraudDisposition <- overspentFraudReplay(windows, anchorOrd, overspentPinned.stateRef)
         canonicalFirst = windows.firstKey
       } yield
         expect.all(

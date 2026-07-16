@@ -12,15 +12,15 @@ import derevo.derive
 
 /** WATCHTOWER fraud-proof envelope — a non-committee gl0 node's challenge to a quorum-signed shard checkpoint whose attested per-metagraph
   * derivation it could not reproduce by re-executing the SAME committee derivation
-  * (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md` §10.2 "wrong-derivation"; `docs/nakamoto/WATCHTOWER-FRAUD-PROOF-DESIGN.md`).
+  * (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`; `docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md` E8.7A).
   *
-  * '''The threat this closes.''' A committee may sign a root that GL0 replay does not reproduce. Signatures never authorize that state:
-  * `ShardCheckpointGl0AcceptanceManager.verifyEmbedded` re-executes every included CL1 transition and rejects the mismatch before adoption.
-  * This envelope makes the already-detected, affirmative mismatch self-contained so every GL0 node can independently verify the evidence
-  * and slash the signers without trusting the challenger.
+  * '''The threat this targets.''' A committee may sign a root that replay does not reproduce. Current transitional primary acceptance
+  * replays and rejects a mismatch. The target noncommittee diff-adoption design instead relies on positive watchtower coverage plus this
+  * exceptional universal adjudication path. The envelope carries the challenged checkpoint identity and diagnostic claim, but portable
+  * adjudication still requires bounded retrieval of its exact authenticated history; missing history defers and cannot slash.
   *
   * '''Determinism of the verdict (the load-bearing invariant).''' The dispute consumer recomputes from the checkpoint's signed binaries at
-  * its signed execution-base ordinal, using the same retained finalized GL0 prior as producer and adopter. The challenger's
+  * its signed exact execution-base reference, using the same retained GL0 prior as producer and adopter. The challenger's
   * [[challengerDerivation]] and [[claimedDerivation]] are diagnostic hints only; the verdict never trusts them. If the pinned base is not
   * locally available, verification fails closed without slashing.
   *
@@ -28,9 +28,8 @@ import derevo.derive
   * class" (same choice as `MetagraphAttestation.kesSignature`, `CommitteeMemberSignature.vrfProof`). Here it carries the canonical
   * independently recreated per-metagraph MPT root. It is a hint, not trusted.
   *
-  * '''Frozen wire shape (consensus-load-bearing once a wrapping evidence tx exists).''' Field set + order participate in
-  * [[InvalidStateProofEvidence]]'s canonical bytes. Adding/reordering/wrapping a field silently changes the digest. Bump explicitly
-  * (`FraudProofEnvelopeV2`) — never mutate the field set. Same discipline as `SlashableEvidence.BountyDigestPreimage`.
+  * '''Greenfield canonical shape.''' Field set + order participate in [[InvalidStateProofEvidence]]'s canonical bytes. Change every
+  * encoder, decoder, signing preimage, and test together before activation; there is no legacy decoder branch.
   *
   * @param shardId
   *   which shard's checkpoint is being disputed
@@ -38,8 +37,8 @@ import derevo.derive
   *   `Hasher` of the disputed [[ShardCheckpointSigPreimage]] — names the specific checkpoint the dispute targets. The verdict resolves the
   *   full signed envelope by this hash (from the local shard chain store or the carried evidence) and re-derives from ITS bytes.
   * @param metagraphAddress
-  *   the metagraph inside the checkpoint whose per-MG derivation is disputed. The verdict re-derives ONLY this MG's root from
-  *   `includedSnapshots(metagraphAddress)` — a checkpoint can carry many MGs but a fraud proof targets one wrong derivation.
+  *   the metagraph whose claimed root selects the dispute. The verdict replays the complete ordered multi-metagraph checkpoint batch once
+  *   so shared payer/dependency ordering cannot be erased, then compares this metagraph's reproduced root.
   * @param gl0AnchorOrdinal
   *   the disputed checkpoint's wire-carried `gl0AnchorOrdinal` — the derivation context (fee-cutover ordinal) the verdict MUST pass to
   *   pinned-base replay to reproduce the producer's root. Read off the signed checkpoint; carried here so the verdict can sanity-check.

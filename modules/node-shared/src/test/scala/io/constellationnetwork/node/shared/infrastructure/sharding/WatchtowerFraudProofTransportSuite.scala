@@ -104,7 +104,8 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
       slot = Slot.unsafeApply(1L),
       derivedStateDelta = delta,
       committeeSignatures = NonEmptyList.of(placeholder),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
     checkpointSigner

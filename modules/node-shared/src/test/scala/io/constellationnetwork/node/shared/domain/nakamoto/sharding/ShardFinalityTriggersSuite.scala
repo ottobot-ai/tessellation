@@ -93,7 +93,8 @@ object ShardFinalityTriggersSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       committeeSignatures = NonEmptyList.of(constructionScaffold(producer)),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   private def mkSignedCheckpoint(

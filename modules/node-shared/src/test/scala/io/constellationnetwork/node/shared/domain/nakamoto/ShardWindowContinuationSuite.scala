@@ -71,7 +71,8 @@ object ShardWindowContinuationSuite extends SimpleIOSuite {
         includedSnapshots = windows
       ),
       committeeSignatures = NonEmptyList.of(committeeSignature),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   pureTest("Continue: a window binary continues GL0's tip at the head") {

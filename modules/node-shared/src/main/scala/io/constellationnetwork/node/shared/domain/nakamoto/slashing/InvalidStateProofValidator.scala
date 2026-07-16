@@ -8,6 +8,7 @@ import scala.collection.immutable.SortedMap
 
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.schema.sharding.{FraudProofSigPreimage, ShardCheckpoint}
 import io.constellationnetwork.schema.slashing.{InvalidStateProofEvidence, InvalidStateProofRejection}
 import io.constellationnetwork.security.hash.Hash
@@ -28,18 +29,17 @@ object InvalidStateProofBatchReplay {
   *
   * '''The single non-negotiable: the verdict must be a byte-identical function of portable evidence and a uniquely identified canonical
   * base on every honest node.''' Current exceptional adjudication makes every GL0 node independently replay the disputed signed inputs at
-  * the carried base ordinal and decides UPHELD iff the checkpoint result differs. Exact Phase-2 `(ordinal,hash,root)` binding is still
-  * open, so activation cannot yet claim this invariant across same-ordinal density replacement. Never trust the challenger's claimed roots.
-  * Ordinary target adoption does not universally replay: execution signers replay before signing, positive watchtower coverage is required
-  * pre-inclusion, and other GL0 nodes verify the certificate/coverage/base/namespace/diff/root.
+  * the carried exact base and decides UPHELD iff the checkpoint result differs. Never trust the challenger's claimed roots. Ordinary target
+  * adoption does not universally replay: execution signers replay before signing, positive watchtower coverage is required pre-inclusion,
+  * and other GL0 nodes verify the certificate/coverage/base/namespace/diff/root.
   *
-  * '''The re-derivation primitive (`replayCheckpoint`).''' Injected as the SAME `(includedChains, gl0AnchorOrdinal, executionBaseOrdinal)
-  * \=> F[InvalidStateProofBatchReplay]` closure the
+  * '''The re-derivation primitive (`replayCheckpoint`).''' Injected as the same `(includedChains, gl0AnchorOrdinal, executionBase) \=>
+  * F[InvalidStateProofBatchReplay]` closure the
   * [[io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager]] uses for every
   * complete checkpoint replay (production: `ShardCheckpointWiring.reExecCheckpointAtPinnedBase`, the PIN-1 component-addressable
-  * `currencySnapshotMgRoot` encoding, seeded from the reader `ShardCheckpointWiring.pinnedPriorReaderAt` resolves AT the disputed
-  * checkpoint's own `executionBaseOrdinal` — Track-1 execution-base-pin, FINDING-B1). Two facts make this deterministic cluster-wide:
-  *   1. The `S(N)` prior is read at the wire-carried, committee-signed `executionBaseOrdinal` — NEVER this node's live base (a validator
+  * `currencySnapshotMgRoot` encoding, seeded from the reader `ShardCheckpointWiring.pinnedPriorReaderAt` resolves at the disputed
+  * checkpoint's exact `executionBase` — Track-1 execution-base-pin, FINDING-B1). Two facts make this deterministic cluster-wide:
+  *   1. The `S(N)` prior is read at the wire-carried, committee-signed exact execution base — NEVER this node's live base (a validator
   *      whose tip ran ahead of the checkpoint's base would otherwise recompute a different root and false-uphold against an honest
   *      committee). Any referenced historical GL0 snapshot that cannot be resolved marks the complete replay `Unavailable`.
   *   1. Live code gates disputes to a `depth-k1` window and expects the pinned base `S(N)` to resolve identically. This is a transitional
@@ -55,9 +55,9 @@ object InvalidStateProofBatchReplay {
   * attested root (`perMetagraphMptRoots(mg)`) are both read off the cryptographically-bound envelope — the challenger cannot move them. The
   * [[io.constellationnetwork.schema.sharding.FraudProofEnvelope.challengerDerivation]] / `claimedDerivation` fields are HINTS only; this
   * validator never reads them for the verdict. A forged fraud proof carrying lies about the roots simply fails the UPHELD check (the honest
-  * re-derivation reproduces the attested root) ⇒ [[InvalidStateProofRejection.DisputeNotUpheld]] ⇒ no slash. Under the exact signed base
-  * and input identity supplied to this validator, a reproduced honest root is therefore not slashable. Exact Phase-2 `(ordinal,hash,root)`
-  * binding remains a separate consensus prerequisite.
+  * re-derivation reproduces the attested root) ⇒ [[InvalidStateProofRejection.DisputeNotUpheld]] ⇒ no slash. Under the exact signed state
+  * claim and input identity supplied to this validator, a reproduced honest root is therefore not slashable. Authenticating that claim as
+  * current Phase-2 authority with its historical eligibility context remains a separate consensus prerequisite.
   *
   * '''Safety bar.''' Every check is cryptographically verifiable or a pure recomputation: header equality, the canonical checkpoint-hash
   * binding, the challenger Ed25519 signature, the double-slash MPT guard, and the load-bearing honest-re-derivation comparison. No
@@ -105,12 +105,12 @@ object InvalidStateProofValidator {
     *   `InvalidStateProofSlashedReader.neverSlashed` is only for isolated tests.
     */
   def make[F[_]: Async: SecurityProvider: Hasher](
-    // Track-1 execution-base-pin: the 3rd arg is the disputed checkpoint's `executionBaseOrdinal`, so replay reads S(N) at the SAME pinned
+    // Track-1 execution-base-pin: the 3rd arg is the disputed checkpoint's exact `executionBase`, so replay reads S(N) at the same pinned
     // base the committee executed over. Replaying the complete SortedMap once preserves the transition's canonical cross-MG order.
     replayCheckpoint: (
       SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
       SnapshotOrdinal,
-      SnapshotOrdinal
+      GlobalSnapshotStateRef
     ) => F[InvalidStateProofBatchReplay],
     slashedReader: InvalidStateProofSlashedReader[F],
     verifyExecutionCertificate: ShardCheckpoint => F[Either[String, Unit]]
@@ -192,7 +192,7 @@ object InvalidStateProofValidator {
       // replay and local inability to replay are Unavailable and never slash evidence. Never trusts the challenger's carried roots.
       def step8: F[Either[InvalidStateProofRejection, Unit]] = {
         val attested: Option[Hash] = cp.derivedStateDelta.perMetagraphMptRoots.get(mg)
-        replayCheckpoint(cp.derivedStateDelta.includedSnapshots, cp.gl0AnchorOrdinal, cp.executionBaseOrdinal).map {
+        replayCheckpoint(cp.derivedStateDelta.includedSnapshots, cp.gl0AnchorOrdinal, cp.executionBase).map {
           case InvalidStateProofBatchReplay.Unavailable =>
             Left(InvalidStateProofRejection.CannotRederive(mg))
           case InvalidStateProofBatchReplay.ProvenInvalidTransition =>

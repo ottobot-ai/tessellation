@@ -185,12 +185,9 @@ message MetagraphAttestation {
 //     acceptance (`ShardCheckpointGl0AcceptanceManager`, Slice 9) needs them
 //     in a structured form for VRF + Ed25519 + KES verification.
 //
-// Greenfield rule: no compat ceremony. Field set and field numbers are pinned
-// to v1; reordering, renaming, or wrapping in `Option`/`optional` silently
-// changes the bytes producers signed (sig pre-image is the JSON-encoded
-// `ShardCheckpointSigPreimage`, not the wire bytes — but the wire shape itself
-// is also frozen at v1 to keep sidecar-bridge parsing stable). Add a new
-// `ShardCheckpointWireV2` if a future evolution is needed.
+// Greenfield rule: no legacy decoder. The complete current field set is
+// mandatory at the JVM boundary. The sig pre-image is the schema-side
+// `ShardCheckpointSigPreimage`, not these transport bytes.
 message ShardCheckpointWire {
   uint32 shard_id = 1;
   uint64 shard_ordinal = 2;
@@ -200,7 +197,10 @@ message ShardCheckpointWire {
   ShardDerivedStateDeltaWire derived_state_delta = 6;
   repeated CommitteeMemberSignatureWire committee_signatures = 7;
   uint64 slot = 8;                       // wall-clock slot of the scheduled producer duty
-  uint64 execution_base_ordinal = 9;     // finalized GL0 state used by producer and every verifier for CL1 replay
+  uint64 execution_base_ordinal = 9;     // ordinal of the claimed exact GL0 state used for CL1 replay
+  bytes execution_base_hash = 10;        // UTF-8 canonical snapshot hash hex
+  bytes execution_base_parent_hash = 11; // UTF-8 canonical parent hash hex
+  bytes execution_base_mpt_root = 12;    // UTF-8 canonical committed MPT root hex
 }
 
 // `ShardDerivedStateDelta` carried as opaque JSON bytes. The inner type has

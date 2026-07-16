@@ -23,9 +23,10 @@ import org.typelevel.log4cats.Logger
   * global GL0 leader win.
   *
   * Production is called from the ready branch of `SnapshotLeaderLoop` on every slot. Each eligible GL0 operator checks public execution
-  * membership and the producer's staircase duty; a shard with no content emits nothing. The GL0 base is the latest exact Phase-2 state, so
-  * several slots may attempt against the same base while the single-outstanding checkpoint rule and chain store prevent duplicate
-  * advancement. There is no checkpoint pipeline-depth parameter.
+  * membership and the producer's staircase duty; a shard with no content emits nothing. The GL0 base is a complete retained state claim
+  * accepted by the current transitional finality resolver; the target hash-bound Phase-2 lease remains open. Several slots may attempt
+  * against the same base while the single-outstanding checkpoint rule and chain store prevent duplicate advancement. There is no checkpoint
+  * pipeline-depth parameter.
   *
   * '''numShards = 1 regression bar.''' Both call sites gate this on `shardProducers.nonEmpty && shardAssignment.isDefined`. At numShards=1
   * those are `Map.empty` / `None` ⇒ the call site is `whenA(false)` ⇒ this helper is never entered (no allocation, no log). Even if entered

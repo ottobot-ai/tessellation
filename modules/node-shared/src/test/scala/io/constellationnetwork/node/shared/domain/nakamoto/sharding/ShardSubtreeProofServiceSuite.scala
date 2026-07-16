@@ -167,7 +167,8 @@ object ShardSubtreeProofServiceSuite extends MutableIOSuite {
         includedSnapshots = SortedMap.empty
       ),
       committeeSignatures = NonEmptyList.of(sentinelCommitteeSig),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   /** Wrap a value in a [[Signed]] envelope with the sentinel proof. */

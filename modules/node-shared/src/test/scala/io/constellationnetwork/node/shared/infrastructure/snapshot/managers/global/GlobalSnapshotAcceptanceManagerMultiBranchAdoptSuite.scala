@@ -208,7 +208,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       ),
       committeeSignatures = NonEmptyList.one(unsignedTemplateSeed(committeeIdentity.peerId)),
       epoch = epochZero,
-      executionBaseOrdinal = executionBaseOrdinal
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.executionBaseAt(executionBaseOrdinal)
     )
 
     committeeIdentity.checkpointSigner
@@ -893,7 +893,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       verifier = StubAcceptanceManager(
         callsRef,
         cp =>
-          if (cp.executionBaseOrdinal === executionBase) ShardCheckpointAcceptResult.Accepted
+          if (cp.executionBase.ordinal === executionBase) ShardCheckpointAcceptResult.Accepted
           else ShardCheckpointAcceptResult.Rejected("wrong execution base")
       )
       mgr <- mkManager(
@@ -906,7 +906,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       replayCount <- replayCalls.get
     } yield
       expect.all(
-        calls.map(_.executionBaseOrdinal) == List(executionBase),
+        calls.map(_.executionBase.ordinal) == List(executionBase),
         replayCount == 1,
         advancedTo(gsi, mg, nextInfo)
       )
@@ -942,7 +942,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
       calls <- callsRef.get
     } yield
       expect.all(
-        calls.map(_.executionBaseOrdinal) == List(executionBase),
+        calls.map(_.executionBase.ordinal) == List(executionBase),
         !advancedTo(gsi, mg, nextInfo),
         !gsi.lastStateChannelSnapshotHashes.contains(mg),
         afterInfo.balances == basePrior.balances

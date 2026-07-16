@@ -22,7 +22,7 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glob
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.GlobalStateConverter
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.ShardId
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal, StateProofSelector}
@@ -149,11 +149,12 @@ object ShardCheckpointWiring {
     *     local inability to replay.
     */
   def noReExecDerivation[F[_]: Async]
-    : (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
-    (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) => Async[F].pure(Hash.empty)
+    : (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => F[Hash] =
+    (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: GlobalSnapshotStateRef) =>
+      Async[F].pure(Hash.empty)
 
-  /** The single reader-resolution recipe for every [[reExecDerivationAtPinnedBase]] caller: resolve the finalized [[GlobalStateReader]] AT
-    * the wire-carried, committee-signed pinned ordinal (`executionBaseOrdinal`), NEVER at this node's live base when the two differ.
+  /** The single reader-resolution recipe for every [[reExecDerivationAtPinnedBase]] caller: resolve the finalized [[GlobalStateReader]] at
+    * the wire-carried, committee-signed exact `executionBase`, never at this node's live base when the two differ.
     *
     * '''Why one definition.''' Full currency recreation is base-dependent: balances, references, active sets, and messages all begin at the
     * pinned prior, and `currencySnapshotMgRoot` commits the recreated result. So every rail that recomputes the root for comparison against
@@ -170,10 +171,10 @@ object ShardCheckpointWiring {
     * store is a MUTABLE VIEW whose content-vs-watermark relationship is unsynchronized. In Passthrough overlay mode the accept-path writes
     * land in the base store THROUGHOUT an ordinal's processing and `MptStore.commit(ordinal)` bumps `lastPersistedOrdinal` only at the very
     * end, so `lastPersistedOrdinal == N` holds while the content is anywhere from state@N to a MID-FOLD/POST-FOLD state of N+1+. Live wedge
-    * (2026-07-08, 2mg/2shard token-lock e2e): gl0-1 minted shard-0 `shardOrdinal=8` stamped `executionBaseOrdinal=18` while its live store
-    * already carried the shardOrd-7 adopt (prior read `inc@10,bal=15`; the TRUE committed state@18 was `inc@7,bal=14`) — the diff was cut
-    * over the drifted content, quorum attested it (every committee member's fast path saw the same drifted view), and every honest adopter
-    * — applying the wire diff onto the verified state@18 — recomputed a root that never matched the attested one. The checkpoint re-offered
+    * (2026-07-08, 2mg/2shard token-lock e2e): gl0-1 minted shard-0 `shardOrdinal=8` stamped base ordinal 18 while its live store already
+    * carried the shardOrd-7 adopt (prior read `inc@10,bal=15`; the TRUE committed state@18 was `inc@7,bal=14`) — the diff was cut over the
+    * drifted content, quorum attested it (every committee member's fast path saw the same drifted view), and every honest adopter —
+    * applying the wire diff onto the verified state@18 — recomputed a root that never matched the attested one. The checkpoint re-offered
     * and dropped at EVERY gl0 ordinal, the per-MG mirror froze, and the metagraph's `activeTokenLocks` never reached gl0. The pinned read
     * is the only version-pinned source; the fast path's byte-map-materialization saving was never worth an unpinned prior. (Forcing test:
     * `ExecutionBasePinReExecutionSuite` "forcing (iii)" — mid-fold watermark skew.)
@@ -185,38 +186,39 @@ object ShardCheckpointWiring {
     */
   def pinnedPriorReaderAt[F[_]](
     pinnedReader: PinnedCurrencyInfoReader[F]
-  ): SnapshotOrdinal => F[Option[GlobalStateReader[F]]] =
-    (ord: SnapshotOrdinal) => pinnedReader.pinnedReaderAt(ord)
+  ): GlobalSnapshotStateRef => F[Option[GlobalStateReader[F]]] =
+    (executionBase: GlobalSnapshotStateRef) => pinnedReader.pinnedReaderAt(executionBase)
 
-  /** Track-1 execution-base-pin — the ordinal the producer STAMPS as
-    * [[io.constellationnetwork.schema.sharding.ShardCheckpoint.executionBaseOrdinal]] and cuts every per-MG diff over: the NEWEST ordinal
-    * the version-retained signed byte store can actually SERVE (its latest persisted state), NOT the live `mptStore.lastPersistedOrdinal`.
+  /** Locate the newest retained ordinal that can be considered as an execution-base candidate. This ordinal is not replay authority: the
+    * producer must resolve it to a complete [[GlobalSnapshotStateRef]] before replay or signing. The current caller checks that claim
+    * against its transitional finality view; the target hash-bound Phase-2 lease remains separate. The locator reads the version-retained
+    * signed byte store's latest persisted state, not the live `mptStore.lastPersistedOrdinal`.
     *
     * '''Why not the live watermark.''' [[pinnedPriorReaderAt]] resolves the diff prior EXCLUSIVELY through the version-retained,
     * root-verified pinned reader (see its scaladoc for the mid-fold-skew wedge the live fast path caused). The signed byte store is written
     * at the FINALIZE sink and therefore TRAILS `lastPersistedOrdinal` by a few ordinals — stamping the live watermark would make the pinned
     * read miss on almost every mint (`cannot resolve pinned execution-base — OMIT (defer)`, the DAG4Bawb producer chase in the 2026-07-08
-    * run) and stall checkpoint production. Stamping the store's own latest ordinal makes the base resolvable-by-construction on the minting
-    * node; committee re-executors and gl0 adopters resolve it from their own (finalize-synchronized) signed stores.
+    * run) and stall checkpoint production. Selecting the store's own latest ordinal makes the candidate locally retained; complete identity
+    * resolution and byte/root verification still decide whether it can become a signed claim. Phase-2 authority is a separate prerequisite.
     *
     * `SnapshotOrdinal.MinValue` before the first finalize-sink write — `produceInner` then OMITs (defers) until history exists, which is
     * exactly the fail-closed contract. `numShards = 1` never builds checkpoints, so this is dead there (regression bar preserved).
     */
-  def pinnedExecutionBaseOrdinal[F[_]: Async](signedBytesStore: MptStateStorage[F]): F[SnapshotOrdinal] =
+  def latestRetainedExecutionBaseCandidateOrdinal[F[_]: Async](signedBytesStore: MptStateStorage[F]): F[SnapshotOrdinal] =
     signedBytesStore.findLatestOrdinal.map(_.getOrElse(SnapshotOrdinal.MinValue))
 
-  /** Capture the execution ordinal, complete currency state, every rooted state-channel tip, and all rooted global balances from the same
-    * retained reader view. A missing reader yields `None`; strict index/entry decoding failures remain effect failures, so neither replay
-    * nor a validity signature can follow malformed state.
+  /** Capture the exact execution-base identity, complete currency state, every rooted state-channel tip, and all rooted global balances
+    * from the same retained reader view. A missing reader yields `None`; strict index/entry decoding failures remain effect failures, so
+    * neither replay nor a validity signature can follow malformed state.
     */
   def pinnedExecutionBase[F[_]: Async: Hasher](
-    executionBaseOrdinalF: F[SnapshotOrdinal],
-    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]]
+    executionBaseF: F[GlobalSnapshotStateRef],
+    priorReaderAt: GlobalSnapshotStateRef => F[Option[GlobalStateReader[F]]]
   ): F[Option[ShardCheckpointProducer.PinnedExecutionBase]] = {
     import GlobalStateReaderOps._
 
-    executionBaseOrdinalF.flatMap { ordinal =>
-      priorReaderAt(ordinal).flatMap(
+    executionBaseF.flatMap { stateRef =>
+      priorReaderAt(stateRef).flatMap(
         _.traverse(reader =>
           (
             reader.materializeLastCurrencySnapshots,
@@ -224,7 +226,7 @@ object ShardCheckpointWiring {
             SpendTransactionBalanceManager.make(reader).materializeAllBalancesFromMpt
           ).tupled.map {
             case (priorCurrencySnapshots, perMgTips, balances) =>
-              ShardCheckpointProducer.PinnedExecutionBase(ordinal, perMgTips, priorCurrencySnapshots, balances)
+              ShardCheckpointProducer.PinnedExecutionBase(stateRef, perMgTips, priorCurrencySnapshots, balances)
           }
         )
       )
@@ -345,19 +347,19 @@ object ShardCheckpointWiring {
   /** Receiver batch replay resolves and strictly materializes one retained base for the complete checkpoint, then reuses it across MGs. */
   def reExecDerivationsAtPinnedBaseBatch[F[_]: Async: Parallel: Hasher: JsonSerializer](
     processor: GlobalSnapshotStateChannelEventsProcessor[F],
-    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
+    priorReaderAt: GlobalSnapshotStateRef => F[Option[GlobalStateReader[F]]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
     implicit stateProofSelector: StateProofSelector
   ): (
     SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     SnapshotOrdinal,
-    SnapshotOrdinal
+    GlobalSnapshotStateRef
   ) => F[SortedMap[Address, Option[Hash]]] = {
     val replayResolved = reExecDerivationsAtResolvedBase(processor, getGlobalSnapshotByOrdinal)
 
-    (windows, gl0AnchorOrdinal, executionBaseOrdinal) =>
-      pinnedExecutionBase(executionBaseOrdinal.pure[F], priorReaderAt).flatMap {
+    (windows, gl0AnchorOrdinal, executionBase) =>
+      pinnedExecutionBase(executionBase.pure[F], priorReaderAt).flatMap {
         case Some(executionBase) => replayResolved(windows, gl0AnchorOrdinal, executionBase)
         case None                => windows.keysIterator.map(_ -> Option.empty[Hash]).to(SortedMap).pure[F]
       }
@@ -369,17 +371,17 @@ object ShardCheckpointWiring {
     */
   def reExecCheckpointAtPinnedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
     processor: GlobalSnapshotStateChannelEventsProcessor[F],
-    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
+    priorReaderAt: GlobalSnapshotStateRef => F[Option[GlobalStateReader[F]]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
     implicit stateProofSelector: StateProofSelector
   ): (
     SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     SnapshotOrdinal,
-    SnapshotOrdinal
+    GlobalSnapshotStateRef
   ) => F[InvalidStateProofBatchReplay] =
-    (windows, gl0AnchorOrdinal, executionBaseOrdinal) =>
-      pinnedExecutionBase(executionBaseOrdinal.pure[F], priorReaderAt).flatMap {
+    (windows, gl0AnchorOrdinal, executionBase) =>
+      pinnedExecutionBase(executionBase.pure[F], priorReaderAt).flatMap {
         case Some(executionBase) =>
           replayCheckpointAtResolvedBase(processor, getGlobalSnapshotByOrdinal, windows, gl0AnchorOrdinal, executionBase)
         case None => Async[F].pure[InvalidStateProofBatchReplay](InvalidStateProofBatchReplay.Unavailable)
@@ -392,15 +394,15 @@ object ShardCheckpointWiring {
     */
   def reExecDerivationAtPinnedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
     processor: GlobalSnapshotStateChannelEventsProcessor[F],
-    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
+    priorReaderAt: GlobalSnapshotStateRef => F[Option[GlobalStateReader[F]]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
     implicit stateProofSelector: StateProofSelector
-  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Option[Hash]] = {
+  ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => F[Option[Hash]] = {
     val replayBatch = reExecDerivationsAtPinnedBaseBatch(processor, priorReaderAt, getGlobalSnapshotByOrdinal)
 
-    (mg, binaries, gl0AnchorOrdinal, executionBaseOrdinal) =>
-      replayBatch(SortedMap(mg -> binaries), gl0AnchorOrdinal, executionBaseOrdinal).map(_.getOrElse(mg, None))
+    (mg, binaries, gl0AnchorOrdinal, executionBase) =>
+      replayBatch(SortedMap(mg -> binaries), gl0AnchorOrdinal, executionBase).map(_.getOrElse(mg, None))
   }
 
   /** Build the acceptance-side sharding dependencies, gated on `cfg.numShards > 1`.
@@ -463,19 +465,19 @@ object ShardCheckpointWiring {
     activeValidators: F[Set[PeerId]],
     etaForEpoch: EtaPeriod => F[Array[Byte]],
     reExecuteDerivation: Option[
-      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash]
+      (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => F[Hash]
     ] = None,
     reExecuteDerivations: Option[
       (
         SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => F[SortedMap[Address, Hash]]
     ] = None,
     slashCooldownReader: Option[SlashCooldownReader[F]] = None
   ): F[Option[AcceptanceDeps[F]]] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring")
-    val reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
+    val reExec: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => F[Hash] =
       reExecuteDerivation.getOrElse(noReExecDerivation[F])
     val slashCooldown: SlashCooldownReader[F] =
       slashCooldownReader.getOrElse(SlashCooldownReader.noExclusion[F])

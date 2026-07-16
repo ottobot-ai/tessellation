@@ -11,13 +11,14 @@ import scala.collection.immutable.SortedMap
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.schema.address.{Address, DAGAddressRefined}
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.{SnapshotOrdinal, address}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
@@ -70,6 +71,12 @@ object ShardCheckpointWireCodecs {
 
   private def bytesToHash(b: ByteString): Hash =
     Hash(new String(b.toByteArray, StandardCharsets.UTF_8))
+
+  private def canonicalHashFromBytes(label: String, bytes: ByteString): Either[Throwable, Hash] = {
+    val value = new String(bytes.toByteArray, StandardCharsets.UTF_8)
+    if (value.length === 64 && value.forall(c => c >= '0' && c <= '9' || c >= 'a' && c <= 'f')) Hash(value).asRight
+    else new RuntimeException(s"ShardCheckpointWire: $label must be 64-character lowercase hexadecimal").asLeft
+  }
 
   // ===========================================================================
   // PeerId ⇄ bytes
@@ -165,8 +172,11 @@ object ShardCheckpointWireCodecs {
         derivedStateDelta = Some(derivedDelta),
         committeeSignatures = cp.committeeSignatures.toList.map(committeeSignatureToWire),
         slot = cp.slot.value.value,
-        // Finalized execution base used by producer and every verifier. It is signed and must round-trip exactly.
-        executionBaseOrdinal = cp.executionBaseOrdinal.value.value
+        // Exact claimed execution-state identity used by producer and every verifier. Phase-2 authority is authenticated separately.
+        executionBaseOrdinal = cp.executionBase.ordinal.value.value,
+        executionBaseHash = hashToBytes(cp.executionBase.hash),
+        executionBaseParentHash = hashToBytes(cp.executionBase.parentHash),
+        executionBaseMptRoot = hashToBytes(cp.executionBase.mptRoot.value)
       )
 
   def shardCheckpointFromWire[F[_]: Async: JsonSerializer](
@@ -177,8 +187,8 @@ object ShardCheckpointWireCodecs {
     val gl0OrdOpt = NonNegLong.from(w.gl0AnchorOrdinal).toOption.map(SnapshotOrdinal(_))
     val slotOpt = Slot(w.slot)
     val epochOpt = Option.when(w.epoch >= 0L)(EtaPeriod(w.epoch))
-    val executionBaseOpt = NonNegLong.from(w.executionBaseOrdinal).toOption.map(SnapshotOrdinal(_))
-    (shardIdOpt, shardOrdinalOpt, gl0OrdOpt, slotOpt, epochOpt, executionBaseOpt) match {
+    val executionBaseOrdinalOpt = NonNegLong.from(w.executionBaseOrdinal).toOption.map(SnapshotOrdinal(_))
+    (shardIdOpt, shardOrdinalOpt, gl0OrdOpt, slotOpt, epochOpt, executionBaseOrdinalOpt) match {
       case (None, _, _, _, _, _) =>
         Async[F].raiseError[ShardCheckpoint](
           new RuntimeException(s"ShardCheckpointWire: invalid shard_id ${w.shardId} (must be non-negative)")
@@ -205,8 +215,28 @@ object ShardCheckpointWireCodecs {
             s"ShardCheckpointWire: invalid execution_base_ordinal ${w.executionBaseOrdinal} (must be non-negative)"
           )
         )
-      case (Some(sid), Some(shardOrdinal), Some(gl0Ord), Some(slotV), Some(epoch), Some(executionBase)) =>
+      case (Some(sid), Some(shardOrdinal), Some(gl0Ord), Some(slotV), Some(epoch), Some(executionBaseOrdinal)) =>
         for {
+          executionBaseHash <- canonicalHashFromBytes("execution_base_hash", w.executionBaseHash)
+            .ensure(
+              new RuntimeException("ShardCheckpointWire: execution_base_hash must not be Hash.empty")
+            )(_ =!= Hash.empty)
+            .liftTo[F]
+          executionBaseParentHash <- canonicalHashFromBytes("execution_base_parent_hash", w.executionBaseParentHash).liftTo[F]
+          _ <- Either
+            .cond(
+              executionBaseOrdinal === SnapshotOrdinal.MinValue || executionBaseParentHash =!= Hash.empty,
+              (),
+              new RuntimeException(
+                "ShardCheckpointWire: execution_base_parent_hash may be Hash.empty only at execution base ordinal zero"
+              )
+            )
+            .liftTo[F]
+          executionBaseMptRoot <- canonicalHashFromBytes("execution_base_mpt_root", w.executionBaseMptRoot)
+            .ensure(
+              new RuntimeException("ShardCheckpointWire: execution_base_mpt_root must not be Hash.empty")
+            )(_ =!= Hash.empty)
+            .liftTo[F]
           // The derived-state-delta wire is required; a None is wire-shape-level invalid.
           deltaWire <- w.derivedStateDelta
             .liftTo[F](
@@ -233,7 +263,12 @@ object ShardCheckpointWireCodecs {
             derivedStateDelta = delta,
             committeeSignatures = sigsNel,
             epoch = epoch,
-            executionBaseOrdinal = executionBase
+            executionBase = GlobalSnapshotStateRef(
+              executionBaseOrdinal,
+              executionBaseHash,
+              executionBaseParentHash,
+              MptRoot(executionBaseMptRoot)
+            )
           )
     }
   }

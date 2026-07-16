@@ -62,8 +62,8 @@ import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.round.RoundId
@@ -75,6 +75,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.signature.SignedValidator.SignedValidationErrorOr
@@ -1004,7 +1005,12 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         ),
         committeeSignatures = NonEmptyList.one(committeeSignature),
         epoch = EtaPeriod(0L),
-        executionBaseOrdinal = SnapshotOrdinal.MinValue
+        executionBase = GlobalSnapshotStateRef(
+          SnapshotOrdinal.MinValue,
+          Hash("41" * 32),
+          Hash.empty,
+          MptRoot(Hash("42" * 32))
+        )
       )
       signedCheckpoint <- Signed.forAsyncHasher[IO, ShardCheckpoint](checkpoint, checkpointKeyPair)
       chainStore <- ShardChainStore.make[IO](shardId)
@@ -1163,7 +1169,12 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         ),
         committeeSignatures = NonEmptyList.one(committeeSignature),
         epoch = EtaPeriod(0L),
-        executionBaseOrdinal = SnapshotOrdinal.MinValue
+        executionBase = GlobalSnapshotStateRef(
+          SnapshotOrdinal.MinValue,
+          Hash("43" * 32),
+          Hash.empty,
+          MptRoot(Hash("44" * 32))
+        )
       )
       signedCheckpoint <- Signed.forAsyncHasher[IO, ShardCheckpoint](checkpoint, checkpointKeyPair)
       parent <- mkRootedParent(

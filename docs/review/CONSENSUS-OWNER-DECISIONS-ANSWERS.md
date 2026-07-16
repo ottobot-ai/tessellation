@@ -307,9 +307,14 @@ requires that GL0 snapshot Phase-2, extracts the parent under the same shardId, 
 child's `parentCheckpointHash`; carry the parent artifact/header or inclusion proof; slot ≤ the
 including GL0 snapshot's slot cert; single genesis sentinel. `[OWNER-RATIFIED DIRECTION]`
 
-**Status:** impl is `SHARD-C-009` (**CRITICAL**) — parent resolved from a receiver-local shard
-store; the checkpoint binds an execution-base ordinal but **not** the exact Phase-2 `(ordinal,hash)`;
-and **no slot cap exists**. Target pattern exists on the ML0-binary side already. Scheduling and
+**Status:** impl is `SHARD-C-009` (**CRITICAL**) — the checkpoint now signs a
+complete claimed execution-state reference `(ordinal,hash,parentHash,mptRoot)`,
+but that is not the child's portable shard-parent duty witness. The parent is
+still resolved from a receiver-local shard store; the child carries no
+authenticated exact containing-Phase-2 parent reference/header or inclusion
+proof, and **no slot cap exists**. Hash-bound Phase-2 qualification,
+freshness/lease, and historical eta/registry/roster context also remain open.
+The target pattern exists on the ML0-binary side already. Scheduling and
 implementation are open engineering. **Re-exec:** OK.
 
 ## O-11 — Operator roster 🔴

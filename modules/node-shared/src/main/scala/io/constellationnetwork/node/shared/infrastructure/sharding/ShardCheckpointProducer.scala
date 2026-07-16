@@ -18,8 +18,8 @@ import io.constellationnetwork.node.shared.domain.nakamoto.{ActiveOperatorConsen
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
@@ -32,6 +32,7 @@ import io.constellationnetwork.serde.codecs.SortedMapCodec.sortedMap
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{codec => addressCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotCodecs.{currencyIncrementalSnapshotCodec, currencySnapshotCodec}
 import io.constellationnetwork.serde.codecs.instances.CurrencySnapshotInfoCodecs.currencySnapshotInfoCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotStateRefCodec.{codec => globalSnapshotStateRefCodec}
 import io.constellationnetwork.serde.codecs.instances.HashCodec.{codec => hashCodec}
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.SignedCodec.{codecFor => signedCodecFor}
@@ -174,8 +175,9 @@ trait ShardCheckpointProducer[F[_]] {
     * Inputs:
     *   - `pendingSnapshots`: per-MG queued SC binary chains for the MGs in this shard. Caller manages the queue; producer reads it once,
     *     emits the checkpoint, leaves the queue alone (caller drops accepted entries after observing the produced envelope).
-    *   - `gl0AnchorOrdinal`: legacy-named inclusion-height hint and current ordinal component of the replay base. It never permits
-    *     execution against a later receiver head; the target schema must bind the complete exact Phase-2 `(ordinal, hash, root)` base.
+    *   - `gl0AnchorOrdinal`: legacy-named inclusion-height hint. It is not the replay base and never permits execution against a later
+    *     receiver head; [[ShardCheckpoint.executionBase]] carries the complete claimed replay-state identity, whose Phase-2 authority must
+    *     be authenticated separately.
     *   - `epoch`: the sortition epoch the local committee was drawn from (passed through to the envelope's `epoch` field so verifiers can
     *     look up the right active set for VRF verification).
     *
@@ -204,18 +206,18 @@ object ShardCheckpointProducer {
     */
   private final case class HeldCheckpoint(signed: Signed[ShardCheckpoint], lastPublishedTick: Long)
 
-  /** Exact retained GL0 execution base used by one checkpoint attempt. The ordinal, rooted state-channel tips, complete prior currency
-    * states, and rooted global balances must be materialized from the same immutable reader view; `None` means that view is unavailable and
-    * production must defer without replaying or signing.
+  /** Exact retained GL0 execution base used by one checkpoint attempt. The state reference, rooted state-channel tips, complete prior
+    * currency states, and rooted global balances must be materialized from the same immutable reader view; `None` means that view is
+    * unavailable and production must defer without replaying or signing.
     */
   final case class PinnedExecutionBase(
-    ordinal: SnapshotOrdinal,
+    stateRef: GlobalSnapshotStateRef,
     perMgTips: SortedMap[Address, Hash],
     priorCurrencySnapshots: SortedMap[
       Address,
       Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
-    ] = SortedMap.empty,
-    balances: SortedMap[Address, Balance] = SortedMap.empty
+    ],
+    balances: SortedMap[Address, Balance]
   )
 
   private type CurrencyState =
@@ -234,13 +236,13 @@ object ShardCheckpointProducer {
   private val currencyStateCodec: Codec[CurrencyState] =
     either(signedCurrencySnapshotCodec, incrementalWithInfoCodec)
   private val pinnedExecutionBaseCodec: Codec[PinnedExecutionBase] =
-    (Codec[SnapshotOrdinal] ::
+    (globalSnapshotStateRefCodec ::
       sortedMap(addressCodec, hashCodec) ::
       sortedMap(addressCodec, currencyStateCodec) ::
       sortedMap(addressCodec, Codec[Balance]))
       .xmap[PinnedExecutionBase](
-        { case ordinal :: tips :: currency :: balances :: HNil => PinnedExecutionBase(ordinal, tips, currency, balances) },
-        base => base.ordinal :: base.perMgTips :: base.priorCurrencySnapshots :: base.balances :: HNil
+        { case stateRef :: tips :: currency :: balances :: HNil => PinnedExecutionBase(stateRef, tips, currency, balances) },
+        base => base.stateRef :: base.perMgTips :: base.priorCurrencySnapshots :: base.balances :: HNil
       )
   private val pinnedExecutionBaseIdentityDomainV1: ByteVector =
     ByteVector.view("tessellation/shard-checkpoint/pinned-execution-base/v1\u0000".getBytes(StandardCharsets.US_ASCII))
@@ -332,11 +334,11 @@ object ShardCheckpointProducer {
       * retained views. `None` defers without replay or signature.
       */
     executionBaseF: F[Option[PinnedExecutionBase]],
-    /** Re-resolves the exact captured execution-base ordinal immediately before signing. This must not resolve "latest": a newer finalized
+    /** Re-resolves the exact captured execution-base identity immediately before signing. This must not resolve "latest": a newer canonical
       * descendant appearing during replay does not invalidate immutable base N and must not starve checkpoint production. Missing,
-      * malformed, or byte-different state at the captured ordinal still defers before every signature.
+      * malformed, or byte-different state at the captured reference still defers before every signature.
       */
-    executionBaseAt: SnapshotOrdinal => F[Option[PinnedExecutionBase]],
+    executionBaseAt: GlobalSnapshotStateRef => F[Option[PinnedExecutionBase]],
     /** '''NEWNESS GATE — chain-wide per-MG checkpoint frontier (S2-deadlock fix, 2026-06-15; ord-26 re-freeze fix).''' Per-MG the latest
       * binary this chain has CHECKPOINTED across the noteAnchor-followed bestTip ancestry (`chainStore.lastCheckpointedPerMgTip`). Used
       * SOLELY to decide WHETHER an MG has content gl0 has not yet adopted; it does NOT anchor the window (that stays on the pinned
@@ -372,7 +374,7 @@ object ShardCheckpointProducer {
       Address,
       NonEmptyList[Signed[StateChannelSnapshotBinary]],
       SnapshotOrdinal,
-      SnapshotOrdinal
+      GlobalSnapshotStateRef
     ) => F[Option[Hash]],
     derivePerMgStates: Option[
       (
@@ -421,12 +423,13 @@ object ShardCheckpointProducer {
         beforeIdentity: Array[Byte],
         gl0AnchorOrdinal: SnapshotOrdinal
       )(onStable: => F[Option[Signed[ShardCheckpoint]]]): F[Option[Signed[ShardCheckpoint]]] =
-        executionBaseAt(beforeBase.ordinal).flatMap {
+        executionBaseAt(beforeBase.stateRef).flatMap {
           case None =>
             logger
               .info(
                 s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=execution-base-moved " +
-                  s"before=(${beforeBase.ordinal.value.value},${beforeBase.perMgTips.size}) after=None; defer to next slot"
+                  s"before=(${beforeBase.stateRef.ordinal.value.value},${beforeBase.stateRef.hash.value.take(12)},${beforeBase.perMgTips.size}) " +
+                  "after=None; defer to next slot"
               )
               .as(None: Option[Signed[ShardCheckpoint]])
           case Some(afterBase) =>
@@ -442,8 +445,9 @@ object ShardCheckpointProducer {
                 logger
                   .info(
                     s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=execution-base-moved " +
-                      s"before=(${beforeBase.ordinal.value.value},${beforeBase.perMgTips.size}) " +
-                      s"after=(${afterBase.ordinal.value.value},${afterBase.perMgTips.size}); defer to next slot"
+                      s"before=(${beforeBase.stateRef.ordinal.value.value},${beforeBase.stateRef.hash.value.take(12)},${beforeBase.perMgTips.size}) " +
+                      s"after=(${afterBase.stateRef.ordinal.value.value},${afterBase.stateRef.hash.value.take(12)},${afterBase.perMgTips.size}); " +
+                      "defer to next slot"
                   )
                   .as(None: Option[Signed[ShardCheckpoint]])
               case Right(_) => onStable
@@ -595,7 +599,6 @@ object ShardCheckpointProducer {
             )
             .as(None: Option[Signed[ShardCheckpoint]])
         case Some(executionBase) =>
-          val executionBaseOrdinal = executionBase.ordinal
           val windowAnchorTips = executionBase.perMgTips
           // Capture one retained gl0 reader view, use its complete currency/tip/balance state for the checkpoint batch, stamp the ordinal,
           // then re-read and byte-compare the complete canonical base identity after replay. Any change defers before validity signing.
@@ -706,8 +709,8 @@ object ShardCheckpointProducer {
                                       // threading the signing into the case-class constructor.
                                       committeeSignatures = NonEmptyList.of(placeholderSig),
                                       epoch = epoch,
-                                      // Pinned finalized base used by producer and verifier for the same snapshot re-execution.
-                                      executionBaseOrdinal = executionBaseOrdinal
+                                      // Pinned claimed state identity used by producer and verifier for the same snapshot re-execution.
+                                      executionBase = executionBase.stateRef
                                     )
                                     for {
                                       // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
@@ -776,7 +779,7 @@ object ShardCheckpointProducer {
           .fold(
             orderedSnapshots.toList.traverse {
               case (mg, snaps) =>
-                derivePerMgState(mg, snaps, gl0AnchorOrdinal, executionBase.ordinal).map(mg -> _)
+                derivePerMgState(mg, snaps, gl0AnchorOrdinal, executionBase.stateRef).map(mg -> _)
             }
           )(_(orderedSnapshots, gl0AnchorOrdinal, executionBase).map(_.toList))
           .flatMap { perMgPairs =>

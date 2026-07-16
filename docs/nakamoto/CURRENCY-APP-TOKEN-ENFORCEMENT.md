@@ -43,7 +43,9 @@ CL1 execution.
 ## Historical rejected ordinary-adopter path
 
 1. Decode the included currency snapshot and cryptographically validate its signatures.
-2. Resolve its prior currency state at the checkpoint's signed `executionBaseOrdinal`.
+2. Resolve its prior currency state at the checkpoint's signed exact
+   `executionBase(ordinal,hash,parentHash,mptRoot)`; an ordinal sibling or live
+   head is never a substitute.
 3. Resolve the signed `globalSyncView` through finalized GL0 history and verify the referenced hash.
 4. Recreate the proposal artifact through `CurrencySnapshotValidator` and `CurrencySnapshotContextFunctions.createContext`.
 5. Require exact artifact equality and a valid rebuilt state proof.

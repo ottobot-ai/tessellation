@@ -140,7 +140,8 @@ object ShardCheckpointEquivocationValidatorSuite extends MutableIOSuite {
         slot = SlotT.unsafeApply(gl0AnchorOrdinal.value.value),
         derivedStateDelta = ShardDerivedStateDelta.empty,
         committeeSignatures = NonEmptyList.of(placeholderSig),
-        epoch = epoch
+        epoch = epoch,
+        executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
       )
       for {
         preimageHash <- Hasher[IO].hash(shell.signingPreimage)

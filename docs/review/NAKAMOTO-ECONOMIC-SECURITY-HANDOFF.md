@@ -12,10 +12,15 @@
 > defect described below is closed in the live tree. `evaluateForSigning` runs
 > mandatory pinned-base replay and can mint `VerifiedShardCheckpoint` only after
 > the claimed per-metagraph roots match; `ShardCheckpointAttestationEmitter`
-> accepts only that capability. Embedded adoption also replays today. The live
-> gaps are the target canonical root-covered checkpoint byte diff, complete
-> exact-hash base/CAS binding, and separately domain-separated positive assigned
-> watchtower coverage before GL0 inclusion. Until those land, ordinary GL0 nodes
+> accepts only that capability. Embedded adoption also replays today. The signed
+> checkpoint now carries the complete claimed execution-state reference
+> `(ordinal,hash,parentHash,mptRoot)`, and retained-state replay compares all four
+> fields and the recomputed root. That reference is not yet hash-bound Phase-2
+> authority: qualification, freshness/lease/CAS, density-reorg invalidation, and
+> branch-historical eta/registry/roster/parameter resolution remain open. The
+> other live gaps are the target canonical root-covered checkpoint byte diff and
+> separately domain-separated positive assigned watchtower coverage before GL0
+> inclusion. Until those land, ordinary GL0 nodes
 > still recreate sharded CL1 transitions as a transitional backstop. Any removal
 > of universal replay means only that ordinary noncommittee sharded-CL1
 > recreation. Every GL0 node must continue executing and validating native
@@ -68,7 +73,27 @@
 - **◆ AGENT** — gathered by a sub-agent that re-read the lines; where I spot-checked, it says **✅ spot-checked**.
 - **[INFERRED]** — an inference from surrounding code, not a direct statement in it. Treat as a hypothesis to confirm.
 
-**Current summary (rechecked 2026-07-16).** Metagraph processing is sharded, but every GL0 node still executes native GL1/DAG-token movement and the current, incomplete global conflict/settlement kernel; E9 remains the target kernel closure. On the sharded CL1 path, the producer derives the checkpoint root and every execution signer must independently reproduce the processor's accepted output before `VerifiedShardCheckpoint` can reach the signing API. The signed checkpoint binds the exact ordered input windows, and checkpoint replay now withholds the complete batch unless every exact signed input and outer parent link is consumed against one materialized base image. The current embedded-adoption path also invokes that replay on each GL0 node. That universal **sharded-CL1** recreation is additional transitional enforcement, not a production-safety proof or the target cost model: the current checkpoint has no canonical namespace-confined byte diff, exact hash/root-bound Phase-2 base, or pre-inclusion positive assigned-watchtower coverage certificate. Explicit signed framework/custom-data lane isolation is also a target, not live enforcement; current payload semantics remain decoder-selected. Cross-shard reads remain finality-first. See §4 for the current enforcement boundary and remaining gaps.
+**Current summary (rechecked 2026-07-16).** Metagraph processing is sharded, but
+every GL0 node still executes native GL1/DAG-token movement and the current,
+incomplete global conflict/settlement kernel; E9 remains the target kernel
+closure. On the sharded CL1 path, the producer derives the checkpoint root and
+every execution signer must independently reproduce the processor's accepted
+output before `VerifiedShardCheckpoint` can reach the signing API. The signed
+checkpoint binds the exact ordered input windows and a complete claimed
+execution-state reference `(ordinal,hash,parentHash,mptRoot)`. Replay compares
+that reference to the retained bytes and withholds the complete batch unless
+every exact signed input and outer parent link is consumed against the one
+materialized base image. The current embedded-adoption path also invokes that
+replay on each GL0 node. That universal **sharded-CL1** recreation is additional
+transitional enforcement, not a production-safety proof or the target cost
+model: the current checkpoint has no canonical namespace-confined byte diff or
+pre-inclusion positive assigned-watchtower coverage certificate, and its signed
+state claim is not yet hash-bound Phase-2 authority with freshness/lease/CAS,
+density-reorg invalidation, or branch-historical eligibility and parameter
+context. Explicit signed framework/custom-data lane isolation is also a target,
+not live enforcement; current payload semantics remain decoder-selected.
+Cross-shard reads remain finality-first. See §4 for the current enforcement
+boundary and remaining gaps.
 
 ---
 
@@ -90,13 +115,54 @@ Inbound dag-l1 block → gl0 `l1Output` queue (`dag-l0/.../modules/Services.scal
 
 ### 2b. Metagraph CL1 — producer and every execution signer replay before signing (current) ✅ RECHECKED
 
-The producer and verifier share the checkpoint-batch replay in `ShardCheckpointWiring`. It materializes complete currency state, every rooted state-channel tip, and all rooted balances from one retained reader (`ShardCheckpointWiring.scala:208-231`), invokes `processCurrencySnapshotsWithCompleteConsumption` once for the full `SortedMap` window, and withholds every root on a one-sided prior, incomplete/unexpected result, absent state, or derivation failure (`:239-314`). The processor validates the first outer parent against the pinned tip and every later parent against the canonical value hash of the preceding signed binary, then compares the exact ordered `Signed` envelopes returned by the transition function (`GlobalSnapshotStateChannelEventsProcessor.scala:72-115,145-183,194-220,224-261`). The producer also canonical-Scodec-encodes the complete materialized base before replay and re-resolves/re-encodes that exact captured ordinal before any signature; changed, missing, or unencodable bytes defer, while a newer finalized descendant does not invalidate immutable base N. Production verification wires the batch closure through `SharedServices`. This closes the former accepted-prefix, cross-metagraph shared-fee-payer, intra-signing base-drift, and latest-head restart holes for the current replay path. It does **not** bind an exact Phase-2 snapshot hash/root on wire, provide the target canonical diff/decision/intent/lane/DA commitments, prove transition-function authorization/conservation, or require positive assigned-watchtower coverage.
+The producer and verifier share the checkpoint-batch replay in
+`ShardCheckpointWiring`. It materializes complete currency state, every rooted
+state-channel tip, and all rooted balances from one retained reader
+(`ShardCheckpointWiring.scala:208-231`), invokes
+`processCurrencySnapshotsWithCompleteConsumption` once for the full `SortedMap`
+window, and withholds every root on a one-sided prior, incomplete/unexpected
+result, absent state, or derivation failure (`:239-314`). The processor validates
+the first outer parent against the pinned tip and every later parent against the
+canonical value hash of the preceding signed binary, then compares the exact
+ordered `Signed` envelopes returned by the transition function
+(`GlobalSnapshotStateChannelEventsProcessor.scala:72-115,145-183,194-220,224-261`).
+The producer also canonical-Scodec-encodes the complete materialized base before
+replay and re-resolves/re-encodes the signed
+`(ordinal,hash,parentHash,mptRoot)` reference before any signature; changed,
+missing, mismatching, or unencodable bytes defer. Production verification wires
+the batch closure through `SharedServices`. This closes the former
+accepted-prefix, cross-metagraph shared-fee-payer, intra-signing base-drift,
+latest-head restart, and same-ordinal sibling-substitution holes for the current
+replay path. It does **not** authenticate the signed state claim as canonical
+Phase-2 authority with freshness/lease/CAS and historical
+eta/registry/roster/parameter context, provide the target canonical
+diff/decision/intent/lane/DA commitments, prove transition-function
+authorization/conservation, or require positive assigned-watchtower coverage.
 
 The former best-tip blind-sign path is archived historical evidence, not current behavior. Intake calls `evaluateForSigning`; it runs `evaluateIntake -> verifyForIntake -> reExecPath`, and only `Accepted` or `PendingMoreAttestations` can mint the private `VerifiedImpl` capability (`ShardCheckpointGl0AcceptanceManager.scala:221-224,312-380`). `reExecPath` compares every locally reproduced root with the checkpoint claim and rejects unavailable or mismatching replay (`:633-732`). `ShardCheckpointAttestationEmitter.emit` accepts only `VerifiedShardCheckpoint` (`ShardCheckpointAttestationEmitter.scala:47-53,128-154`). In the receive path, only the successful capability branch calls naked-checkpoint `ingestValidated`, then requires the recovered hash to equal the capability hash before continuing (`NakamotoSyncDaemon.scala:2641-2668`). The storage API is not itself capability-typed and remains an API-hardening gap. The signer reuses that capability for the received checkpoint or calls `evaluateForSigning` again for each stored ancestor; the emitter receives only the resulting capability (`:2732-2767`).
 
-This proves that signing is gated on complete-window replay of the exact signed inputs at the current API boundary. It does **not** yet prove an exact hash/root-bound Phase-2 base or that the transition function has complete authorization, conservation, replay protection, or root-input coverage. Those gaps can stall honest signing or falsely classify an honest historical committee as divergent. The target canonical diff and positive assigned-watchtower coverage discussed in §4 are also absent.
+This proves that signing is gated on complete-window replay of the exact signed
+inputs and complete claimed state reference at the current API boundary. It does
+**not** prove that the reference is canonical Phase-2 authority for the relevant
+branch and historical eligibility context, or that the transition function has
+complete authorization, conservation, replay protection, or root-input coverage.
+Those gaps can stall honest signing or falsely classify an honest historical
+committee as divergent. The target canonical diff and positive assigned-
+watchtower coverage discussed in §4 are also absent.
 
-`ShardCommitteeReExecutionSuite` asserts **producer-root == independent verifier replay root** for a real currency binary. `ExecutionBasePinReExecutionSuite` covers one-sided priors, one-reader materialization, shared fee-payer threading, and complete-batch withholding. `ShardCheckpointProducerSuite` covers independently decoded framework-with-data canonical base identity and one-byte mutation. `ShardCheckpointGl0AcceptanceManagerSuite` asserts that a reproduced root differing from the checkpoint claim deterministically yields `RejectedReExecutionMismatch`. These tests close the narrow accepted-prefix/base-drift regressions above; they do not close exact Phase-2 hash/root binding or the remaining transition-validity and artifact gaps.
+`ShardCommitteeReExecutionSuite` asserts **producer-root == independent verifier
+replay root** for a real currency binary. `ExecutionBasePinReExecutionSuite`
+covers one-sided priors, one-reader materialization, shared fee-payer threading,
+and complete-batch withholding. `ShardCheckpointProducerSuite` covers
+independently decoded framework-with-data canonical base identity and one-byte
+mutation. `PinnedCurrencyInfoReaderSuite` rejects wrong hash, parent hash, and
+MPT root for a retained execution-state reference.
+`ShardCheckpointGl0AcceptanceManagerSuite` asserts that a reproduced root
+differing from the checkpoint claim deterministically yields
+`RejectedReExecutionMismatch`. These tests close the narrow accepted-prefix,
+base-drift, and same-ordinal sibling regressions above; they do not establish
+hash-bound Phase-2 authority, its historical eligibility context, or the
+remaining transition-validity and artifact properties.
 
 ### 2c. Metagraph DL1 — target commitment/DA lane; explicit isolation is NOT live
 
@@ -119,10 +185,11 @@ registered deterministic active-era verifier.
 
 The current `ShardCheckpoint` contains `shardId`, `parentCheckpointHash`,
 `shardOrdinal`, `gl0AnchorOrdinal`, `slot`, `derivedStateDelta`,
-`committeeSignatures`, `epoch`, and `executionBaseOrdinal`
-(`ShardCheckpoint.scala:68-77`). The signing preimage includes every field except
-`committeeSignatures` (`:85-105`), so the root claims and ordered inputs are
-consensus-load-bearing.
+`committeeSignatures`, `epoch`, and
+`executionBase: GlobalSnapshotStateRef(ordinal,hash,parentHash,mptRoot)`
+(`ShardCheckpoint.scala:70-80`). The signing preimage includes every field except
+`committeeSignatures` (`:97-107`), so the root claims, ordered inputs, and complete
+claimed execution-state reference are consensus-load-bearing.
 
 The current `ShardDerivedStateDelta` contains only
 `perMetagraphMptRoots` and the committed ordered `includedSnapshots`
@@ -131,9 +198,10 @@ canonical byte diff or signed per-input decision/disposition. The current replay
 API nevertheless requires every exact committed input and outer parent link to be
 consumed before exposing any root
 (`GlobalSnapshotStateChannelEventsProcessor.scala:72-115,145-183,194-220`).
-`ShardCheckpoint` also carries only ordinal base fields,
-not a complete exact Phase-2 `(ordinal, hash, root)` reference
-(`ShardCheckpoint.scala:14-25,49-77`). Any older description in this packet of
+`ShardCheckpoint` carries a complete exact state claim, but that claim is not yet
+authenticated as canonical Phase-2 authority and does not bind the historical
+eta/registry/roster/parameter context used for committee verification
+(`ShardCheckpoint.scala:14-27,63-80`). Any older description in this packet of
 `perMetagraphStateDiff`, `ShardCurrencyStateDiff`, token-lock deltas, artifacts,
 or sync deltas is archived fork-only schema history and creates no compatibility
 requirement.
@@ -146,11 +214,22 @@ The historical quorum-only happy path is no longer live:
 
 - **Signing requires local replay.** `evaluateForSigning` can mint only the private replay-backed `VerifiedImpl`, and the emitter has no naked checkpoint/hash signing overload (`ShardCheckpointGl0AcceptanceManager.scala:221-224,312-332`; `ShardCheckpointAttestationEmitter.scala:47-53`).
 - **Quorum is mandatory but not sufficient for embedded adoption.** `verifyForAdoption` first verifies the execution certificate and then unconditionally calls `reExecPath`; the locally reproduced roots decide acceptance (`ShardCheckpointGl0AcceptanceManager.scala:361-380,633-732`).
-- **Current ordinary GL0 adoption still recreates sharded CL1.** GSAM calls the complete-consumption batch replay for the included checkpoint inputs and releases no checkpoint-derived state, tip, or fee unless the whole checkpoint group applies (`GlobalSnapshotAcceptanceManager.scala:985-1060`). The consensus artifact is independently post-filtered to checkpoint groups proven fully applied (`GlobalSnapshotConsensusFunctions.scala:966-981,1005-1011`). This is additional transitional enforcement, not proof of production safety and not the target execution-sharding cost model. The wire base is still ordinal-only, and a density reorg can make honest historical execution diverge from the verifier's later same-ordinal base.
-- **The target canonical diff is absent.** The current delta has only roots and ordered inputs, and the checkpoint has no exact-hash Phase-2 base (`ShardDerivedStateDelta.scala:17-38`; `ShardCheckpoint.scala:14-25,49-77`). Noncommittee GL0 nodes therefore cannot yet verify/apply a namespace-confined canonical diff and recompute its root without recreating the CL1 transition.
+- **Current ordinary GL0 adoption still recreates sharded CL1.** GSAM calls the complete-consumption batch replay for the included checkpoint inputs and releases no checkpoint-derived state, tip, or fee unless the whole checkpoint group applies (`GlobalSnapshotAcceptanceManager.scala:985-1060`). The consensus artifact is independently post-filtered to checkpoint groups proven fully applied (`GlobalSnapshotConsensusFunctions.scala:966-981,1005-1011`). This is additional transitional enforcement, not proof of production safety and not the target execution-sharding cost model. The wire binds the complete claimed state reference and rejects a different same-ordinal retained sibling, but it does not yet prove Phase-2 qualification/freshness/lease/CAS or invalidate authority and historical eligibility context across a density reorg.
+- **The target canonical diff is absent.** The current delta has only roots and ordered inputs. The checkpoint has a complete exact state claim, but not an authenticated Phase-2 capability (`ShardDerivedStateDelta.scala:17-38`; `ShardCheckpoint.scala:14-27,63-80`). Noncommittee GL0 nodes therefore cannot yet verify/apply a namespace-confined canonical diff and recompute its root without recreating the CL1 transition.
 - **Positive assigned-watchtower coverage is absent.** The live negative-evidence trigger is broader than the former best-tip-only description: a typed affirmative intake mismatch invokes the fraud emitter before storage/attestation (`NakamotoSyncDaemon.scala:2641-2653`), while a replay-valid checkpoint invokes it again only when it becomes local best tip (`:2672-2686`). The emitter independently authenticates the complete execution certificate before watchtower replay or publication (`WatchtowerFraudProofEmitter.scala:90-109`). Neither path selects an assigned noncommittee population or emits a separately domain-separated positive-coverage capability/certificate, and no pre-inclusion coverage threshold exists. This remains the execution-threshold collusion backstop gap; later slashing cannot make an already usable invalid derivative safe.
 
-**Current verdict:** signing and current adoption require complete replay/root comparison of the exact ordered checkpoint windows, but the wire does not yet bind the exact historical Phase-2 `(ordinal, hash, root)` base. A local replay mismatch is not portable slash evidence and now rejects without slashing. The remaining target work is exact Phase-2 base binding, canonical diff/decision/intent/lane/DA construction and verification, transition-validity closure, pre-inclusion positive assigned-watchtower coverage, and zero-recreation ordinary noncommittee adoption. Removing universal replay in that final step means only ordinary noncommittee replay of **sharded CL1** framework transitions. Universal native GL1/DAG execution and the global kernel remain mandatory on every GL0 node.
+**Current verdict:** signing and current adoption require complete replay/root
+comparison of the exact ordered checkpoint windows against the signed complete
+state claim. A local replay mismatch is not portable slash evidence and now
+rejects without slashing. The remaining target work is to authenticate that
+claim as exact Phase-2 authority with freshness/lease/CAS, reorg invalidation,
+and branch-historical eligibility and parameter context; build and verify the
+canonical diff/decision/intent/lane/DA artifact; close transition validity;
+require pre-inclusion positive assigned-watchtower coverage; and reach zero-
+recreation ordinary noncommittee adoption. Removing universal replay in that
+final step means only ordinary noncommittee replay of **sharded CL1** framework
+transitions. Universal native GL1/DAG execution and the global kernel remain
+mandatory on every GL0 node.
 
 ---
 
@@ -165,7 +244,7 @@ The historical quorum-only happy path is no longer live:
 - **HIGH OPEN — certificate authentication is coupled to structural validity.** `verifyExecutionCertificate` calls `preCheck`, whose included/root keyset check seeds the signature fold with `Left` before signer authentication runs (`ShardCheckpointGl0AcceptanceManager.scala:336-345,462-528`). A quorum-signed checkpoint that includes an MG but omits its root is therefore rejected by ordinary adoption, but the emitter stops before publication (`WatchtowerFraudProofEmitter.scala:90-109`) and portable adjudication stops at `InvalidCheckpointCertificate` before reaching its explicit missing-attested-root conviction branch (`InvalidStateProofValidator.scala:168-215`). Guilty signers escape despite fail-closed adoption. Split a typed authenticated execution-signature/quorum proof from structural checkpoint validity; retain all structural checks in ordinary acceptance, then permit portable adjudication to convict authenticated signers for deterministic structural invalidity. Identity, committee membership, Ed25519, KES/VRF, distinctness, quorum, and missing-history checks remain mandatory (`WT-002B`, RED).
 - Emitter and validator are constructed behind the shard/watchtower gates (`GlobalSnapshotConsensus.scala:1701-1748`). Live gossip subscribes the GL0-wide `fraud-proof` topic (`SidecarClient.scala:123-126,151-174`); the daemon's bounded lane dispatches to the validator (`NakamotoSyncDaemon.scala:1217-1224`), and an upheld local verdict is offered to the shared pool (`:2948-2966`). The leader folds and embeds that same pool value in `fraudProofs` (`GlobalSnapshotConsensusFunctions.scala:926-934,1030-1035`), and GSAM re-validates every carried item against its proposal-parent slash reader before constructing slash requests (`GlobalSnapshotAcceptanceManager.scala:2039-2085`).
 - **Consensus-load-bearing sink (✅ spot-checked):** `applyWatchtowerSlashes` (`GlobalSnapshotAcceptanceManager.scala:381-445`) calls `InvalidStateProofSlashManager.applySlash`; the accepted slash records are applied at `:2655-2675` and inserted with **`mpt.insert[SlashedRegistryEntry](…)` at `:2983`** (Slashings partition, fieldId 34), so they feed the MPT root.
-- One portable slash path reaches the sink: a watchtower fraud proof must be carried in the consensus artifact and independently re-adjudicated by every GL0 node before its authenticated submitter and slash targets can create a `WatchtowerSlashRequest` (`GlobalSnapshotAcceptanceManager.scala:2059-2085`). A local embedded-adoption `RejectedReExecutionMismatch` rejects the complete checkpoint and creates no slash because the final artifact may omit that checkpoint; slashing from uncarried local observation would split leader and follower state (`:971-981`). Config remains `slash-fraction = "1/1"`, `bounty-fraction = "1/20"`, `cooldown-epochs = 100`, and `watchtower-enabled = true`. Exact Phase-2 hash/root binding is still required before a retained same-ordinal view can be sound portable evidence.
+- One portable slash path reaches the sink: a watchtower fraud proof must be carried in the consensus artifact and independently re-adjudicated by every GL0 node before its authenticated submitter and slash targets can create a `WatchtowerSlashRequest` (`GlobalSnapshotAcceptanceManager.scala:2059-2085`). A local embedded-adoption `RejectedReExecutionMismatch` rejects the complete checkpoint and creates no slash because the final artifact may omit that checkpoint; slashing from uncarried local observation would split leader and follower state (`:971-981`). Config remains `slash-fraction = "1/1"`, `bounty-fraction = "1/20"`, `cooldown-epochs = 100`, and `watchtower-enabled = true`. Hash-bound Phase-2 authority plus exact historical eligibility context is still required before the signed retained-state claim can be sound portable evidence.
 - [INFERRED / agent] Stale scaladoc at `NakamotoSyncDaemon.scala:2907-2910` still calls pool submission "remaining wiring"; the live pool offer at `:2955-2961` plus the pool→embed→apply chain above supersedes it.
 
 ---
@@ -185,7 +264,7 @@ The gl0 accept path reads cross-shard values off gl0's own consensus-pinned **fi
 These mechanisms help current universal sharded-CL1 replay reproduce the same
 per-metagraph root. They do not constitute the absent canonical diff protocol:
 
-- **Replay-base pin** — producer and verifier resolve the signed ordinal base through a version-retained pinned reader, never a receiver live head (`ShardCheckpointWiring.scala:186-205,212-231,345-387`; production verifier wiring `SharedServices.scala:331-378`). An unresolvable base defers/fails closed.
+- **Replay-base pin** — producer and verifier resolve the signed exact state reference through a version-retained pinned reader, never a receiver live head (`ShardCheckpointWiring.scala:186-205,212-231,345-387`; production verifier wiring `SharedServices.scala:331-378`). An unresolvable base defers/fails closed.
 - **Replay-first staging** — proposal/validation stages captured signed post-state bytes under the replayed artifact hash (`GlobalSnapshotConsensusFunctions.scala:954-968`); the receiver rekeys stripped-hash staging to the exact signed snapshot hash only after full content validation (`NakamotoSnapshotValidator.scala:260-277`); the finalization sink promotes only the exact finalized hash and otherwise skips (`SnapshotLeaderLoop.scala:638-654`). This is retained replay data, not authoritative diff adoption.
 - **Read-time backfill** — on a pinned-read miss, fetch peer bytes, **strip to `consensusRootEntries`**, verify `consensusMptRoot === committed stateProof.mptRoot`, persist+serve only on match else fail-closed: `PinnedCurrencyInfoReader.scala:360,369,370-371,374-377,381,386`. Wired gl0-only: `GlobalSnapshotConsensus.scala:577-595,706`. This proves the imported global entry set, but it also strips field 32; without the `ECO-F32` replay witness, a nonempty locally staged prior and a stripped backfill can still recreate different currency proofs.
 
@@ -232,7 +311,7 @@ authorization across the target exact-Phase-2 lease recheck.
 
 ## 10. ⭐ Open questions for external review (ranked)
 
-1. **Q1 — Committee blind-signing (§4) — CLOSED at the live API boundary, replay soundness still OPEN.** `VerifiedShardCheckpoint` is minted only after `reExecPath`, and the emitter accepts only that capability. Preserve compile-negative coverage for every sign/attest entry point. Exact ordered signed-input consumption and outer lineage are now mandatory on the checkpoint path. Activation still requires exact Phase-2 hash/root binding, authenticated field-32 replay material, the canonical diff/decision/intent/lane/DA verifier, and pre-inclusion positive assigned-watchtower coverage. Until then a replay-backed signature or mismatch is not automatically sound.
+1. **Q1 — Committee blind-signing (§4) — CLOSED at the live API boundary, replay soundness still OPEN.** `VerifiedShardCheckpoint` is minted only after `reExecPath`, and the emitter accepts only that capability. Preserve compile-negative coverage for every sign/attest entry point. Exact ordered signed-input consumption, outer lineage, and the complete claimed state reference are now mandatory on the checkpoint path. Activation still requires hash-bound Phase-2 authority and historical eligibility context for that reference, authenticated field-32 replay material, the canonical diff/decision/intent/lane/DA verifier, and pre-inclusion positive assigned-watchtower coverage. Until then a replay-backed signature or mismatch is not automatically sound.
 2. **Q2 — Complete CL1 economic grammar remains open.** The current shared replay calls `processCurrencySnapshots` against a pinned prior and root-compares the output. Audit and repair the shared transition function's authorization, conservation, replay protection, complete root-input coverage, and deterministic failure semantics; replaying a defective function does not make it economically correct.
 3. **Q3 — numShards=1 default (§5,§9).** The entire committee/watchtower/cross-shard economic-security apparatus is inert at the production default `num-shards = 1`. Is single-shard the intended launch posture, and if so what provides metagraph economic security there?
 4. **Q4 — Replay-input completeness.** Pinned-base replay is live, but `ECO-F32` remains open: the optional full framework replay view and explicit ML0 operator population are not completely bound by the current root/input schema. Missing material must defer and cannot produce a signature or slash.
@@ -245,12 +324,12 @@ authorization across the target exact-Phase-2 lease recheck.
 The historical §4 blind-sign defect is closed at the current shard signing API, but it remains a useful regression pattern. Sweep for the same class of bug: **a node signing or attesting to state it did not itself reproduce, or an adopter treating a certificate as sufficient without performing the validation its role requires.**
 
 1. **Global-snapshot Nakamoto attestation.** Current containment removes local GL0 optimistic signing rather than treating replay as sufficient provenance. Future emission must consume both a sealed `AuthenticatedExecutedGlobalSnapshot` and an exact current `PreferredExecutedTip`; best-tip, storage, or a public validation result cannot reach signing.
-2. **Canonical diff and positive coverage.** Confirm that future ordinary noncommittee adoption cannot activate until the checkpoint binds the exact base, complete inputs, canonical namespace-confined diff, extracted global intents, execution threshold, and separately domain-separated positive assigned-watchtower coverage. Signature count or post-adoption fraud detection is insufficient.
+2. **Canonical diff and positive coverage.** Confirm that future ordinary noncommittee adoption cannot activate until the checkpoint's signed exact base is authenticated as current Phase-2 authority and it binds complete inputs, canonical namespace-confined diff, extracted global intents, execution threshold, and separately domain-separated positive assigned-watchtower coverage. Signature count or post-adoption fraud detection is insufficient.
 3. **ml0 diff-adopt follow** (`project_ml0_diff_adopt_design`): ml0 adopts GSI + verifies `mptRoot === signed` instead of re-running createContext. Is root-equality sufficient, or does it trust fields not covered by that root?
 4. **gl1 stake-root follow** (`project_gl1_historicalstake_carryforward_blocker`): inclusion-proof follow of gl0's stake root — verify the proof is checked against a *finalized* root, not accepted on assertion.
 5. **Cross-shard `http` proof consumer (§6):** verifies against gl0's finalized checkpoint — confirm no path trusts the peer's *self-claimed* checkpoint/root.
 6. **Historical paths labelled "authoritative."** Treat ML0-origin balance or framework-state authority as forbidden. Framework economics must pass CL1 replay/certificate/diff/root/global-kernel enforcement. Only protocol/global GL0 correction authority may flow downward; dropped sub-state cannot carry a stale or empty prior.
-7. **Attestation crypto completeness.** Current `preCheck` verifies committee membership, Ed25519, KES, and registered-key VRF possession for every carried signature (`ShardCheckpointGl0AcceptanceManager.scala:462-627`). Remaining work is exact historical active-key/roster resolution and exact Phase-2 anchor/freshness binding; a receiver-current registry or ordinal-only base cannot authorize a signer.
+7. **Attestation crypto completeness.** Current `preCheck` verifies committee membership, Ed25519, KES, and registered-key VRF possession for every carried signature (`ShardCheckpointGl0AcceptanceManager.scala:462-627`). Remaining work is exact historical active-key/roster resolution and exact Phase-2 anchor/freshness binding; a receiver-current registry or unauthenticated exact-state claim cannot authorize a signer.
 8. **DL1 commitment/DA carriage (§2c).** Confirm opaque custom bytes cannot affect framework state and that GL0 claims only authenticated custody, availability, and ordering. No custom semantic-proof claim exists unless a separately registered deterministic verifier is active for that era.
 
 The grep pattern: an `emit` / `sign` / `attest` / `adopt` / `Accepted` gated on *receipt / best-tip / signature-count* rather than on *this node re-computing the thing it's vouching for.*

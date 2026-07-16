@@ -22,13 +22,14 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.{
 }
 import io.constellationnetwork.schema.ID.IdOps
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId, ShardOrdinal}
 import io.constellationnetwork.schema.{GlobalStateProofSelector, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
@@ -41,8 +42,8 @@ import weaver.MutableIOSuite
 /** Executable regression for `ECO-OPAQUE-SHARD-001`.
   *
   * Standalone opaque state-channel bytes may be authenticated carriage, but they cannot produce a framework-currency root or acquire a
-  * shard execution-validity signature. The fixture routes a genuinely signed, nondecodable binary through the production checkpoint
-  * replay adapter and then injects that exact adapter into the production checkpoint producer.
+  * shard execution-validity signature. The fixture routes a genuinely signed, nondecodable binary through the production checkpoint replay
+  * adapter and then injects that exact adapter into the production checkpoint producer.
   */
 object OpaqueShardReplayAuthoritySuite extends MutableIOSuite {
 
@@ -63,6 +64,8 @@ object OpaqueShardReplayAuthoritySuite extends MutableIOSuite {
   private val shardZero: ShardId = ShardId.unsafeApply(0)
   private val gl0AnchorOrdinal: SnapshotOrdinal = SnapshotOrdinal.unsafeApply(1L)
   private val executionBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
+  private val executionBaseRef: GlobalSnapshotStateRef =
+    GlobalSnapshotStateRef(executionBaseOrdinal, Hash("41" * 32), Hash.empty, MptRoot(Hash("42" * 32)))
 
   test("ECO-OPAQUE-SHARD-001: signed standalone opaque carriage derives no root and cannot be signed or published") { res =>
     implicit val (kryo, hasher, json, securityProvider) = res
@@ -87,7 +90,7 @@ object OpaqueShardReplayAuthoritySuite extends MutableIOSuite {
           Map(metagraph -> metagraphOperators)
         )
         executionBase = ShardCheckpointProducer.PinnedExecutionBase(
-          ordinal = executionBaseOrdinal,
+          stateRef = executionBaseRef,
           perMgTips = SortedMap.empty,
           priorCurrencySnapshots = SortedMap.empty,
           balances = SortedMap.empty

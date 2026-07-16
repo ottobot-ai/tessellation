@@ -110,7 +110,7 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
     val valid =
       duplicateIds.isEmpty && duplicateSources.isEmpty && danglingSourceIds.isEmpty && invalidMissingAuthority.isEmpty &&
         unexplainedMissingCurrentAuthority.isEmpty && unsafeWithoutRed.isEmpty && featureIdentityCollapsed.isEmpty &&
-        frozenCounts == ((40, 12, 185))
+        frozenCounts == ((40, 13, 191))
     if (valid) success
     else
       failure(

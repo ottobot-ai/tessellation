@@ -41,7 +41,8 @@ object RegisteredCheckpointSignerSuite extends MutableIOSuite {
       slot = Slot.unsafeApply(1L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       committeeSignatures = NonEmptyList.one(CommitteeMemberSignature(peerId, Hex(""), Hex(""), Hex(""), kesTreeStep = 0)),
-      epoch = epoch
+      epoch = epoch,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   test("signing is rejected when identity is not in the atomic genesis registry") { res =>

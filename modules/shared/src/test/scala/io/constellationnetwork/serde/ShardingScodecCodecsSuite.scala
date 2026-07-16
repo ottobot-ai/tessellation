@@ -11,14 +11,15 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.slashing.InvalidStateProofEvidence
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.serde.codecs.instances.GlobalSnapshotCodecs._
@@ -73,7 +74,12 @@ object ShardingScodecCodecsSuite extends FunSuite {
     derivedStateDelta = delta,
     committeeSignatures = NonEmptyList.of(signature),
     epoch = EtaPeriod(3L),
-    executionBaseOrdinal = SnapshotOrdinal.unsafeApply(89L)
+    executionBase = GlobalSnapshotStateRef(
+      SnapshotOrdinal.unsafeApply(89L),
+      hash('6'),
+      hash('7'),
+      MptRoot(hash('8'))
+    )
   )
 
   private val fraudProof = FraudProofEnvelope(
@@ -117,9 +123,43 @@ object ShardingScodecCodecsSuite extends FunSuite {
       .and(roundTrip(evidence))
   }
 
-  test("ShardCheckpoint binary encoding commits to executionBaseOrdinal") {
-    val changed = checkpoint.copy(executionBaseOrdinal = SnapshotOrdinal.unsafeApply(88L))
-    expect(checkpoint.immutableBytes != changed.immutableBytes)
+  test("ShardCheckpoint binary encoding commits to every exact execution-base component") {
+    val original = checkpoint.immutableBytes
+    val base = checkpoint.executionBase
+    val changedBases = List(
+      base.copy(ordinal = SnapshotOrdinal.unsafeApply(88L)),
+      base.copy(hash = hash('9')),
+      base.copy(parentHash = hash('a')),
+      base.copy(mptRoot = MptRoot(hash('b')))
+    )
+
+    expect(changedBases.forall(changed => checkpoint.copy(executionBase = changed).immutableBytes != original))
+  }
+
+  test("ShardCheckpoint binary encoding rejects zero-authority execution-base identities") {
+    val base = checkpoint.executionBase
+    val invalidBases = List(
+      base.copy(hash = Hash.empty),
+      base.copy(mptRoot = MptRoot(Hash.empty)),
+      base.copy(parentHash = Hash.empty)
+    )
+    val genesisParent = base.copy(ordinal = SnapshotOrdinal.MinValue, parentHash = Hash.empty)
+
+    expect.all(
+      invalidBases.forall(invalid => shardCheckpointCodec.encode(checkpoint.copy(executionBase = invalid)).toEither.isLeft),
+      shardCheckpointCodec.encode(checkpoint.copy(executionBase = genesisParent)).toEither.isRight
+    )
+  }
+
+  test("ShardCheckpoint binary encoding rejects noncanonical execution-base hash spellings") {
+    val base = checkpoint.executionBase
+    val invalidBases = List(
+      base.copy(hash = Hash("A" * 64)),
+      base.copy(parentHash = Hash("B" * 64)),
+      base.copy(mptRoot = MptRoot(Hash("C" * 64)))
+    )
+
+    expect(invalidBases.forall(invalid => shardCheckpointCodec.encode(checkpoint.copy(executionBase = invalid)).toEither.isLeft))
   }
 
   private val stateProof = GlobalSnapshotStateProof(

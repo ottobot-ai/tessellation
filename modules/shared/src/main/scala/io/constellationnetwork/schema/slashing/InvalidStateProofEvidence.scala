@@ -147,7 +147,7 @@ object InvalidStateProofRejection {
   final case class DisputeNotUpheld(honestReDerivedRoot: Hash, attestedRoot: Hash) extends InvalidStateProofRejection
 
   /** FAIL-CLOSED (Track-1 execution-base-pin, FINDING-B1): the honest re-derivation is UNAVAILABLE on this node — the injected
-    * `reDerivePerMgRoot` returned the `Hash.empty` "cannot re-derive" sentinel (the disputed checkpoint's pinned `executionBaseOrdinal` is
+    * `reDerivePerMgRoot` returned the `Hash.empty` "cannot re-derive" sentinel (the disputed checkpoint's exact `executionBase` is
     * unresolvable below this node's byte-store retention / not yet reached, or the derivation OMITted/deferred). "This node can't check" is
     * NOT evidence the committee deviated, so an unverifiable dispute is NEVER upheld — upholding demands an affirmative pinned-base
     * re-derivation that mismatches the attested root. Mirrors the node-local watchtower trigger

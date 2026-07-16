@@ -69,7 +69,8 @@ object ShardCheckpointPullRoundTripSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(7), mkCommitteeSig(9)),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
     Signed(cp, NonEmptySet.of(sentinelProof))
   }

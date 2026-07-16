@@ -315,8 +315,10 @@ authority for all production consumers. Those consumers remain
 frozen-genesis or unavailable because the branch-bound operator roster is not
 rooted. The live population/weight services still admit receiver-local seedlist
 and current-state inputs, so they cannot be substituted for that resolver.
-Checkpoint artifacts do not commit the exact Phase-2 GL0 hash/root needed to
-select historical state.
+`ShardCheckpoint` now signs a claimed exact GL0 state reference
+`(ordinal,hash,parentHash,mptRoot)`, but the reference is not a hash-bound Phase-2
+capability and production does not use it to select branch-historical
+eta/registry/roster/parameter state.
 The exact-hash hot-chain view adapter distinguishes same-ordinal siblings by
 requested hash and rejects a mismatched, malformed, or missing chain-store
 result, but production does not construct it as the registry authority.
@@ -332,11 +334,13 @@ history defers and neither producer-carried nor bootstrap eta is substituted.
 `EtaStateManager.getEtaAt(period,parentHash)` bypasses receiver-current MPT state
 and ambient memoization; GSAM supplies the exact parent `BranchId`, and admission
 walks the exact Phase-2 anchor. The remaining exact-branch defect is the shard
-artifact boundary: `ShardCheckpoint` carries an anchor ordinal and epoch but no
-exact GL0 hash/root, so SharedServices committee selection and shard
-producer/attester proof eta still use ambient `getEta(period)`. The signed
-checkpoint must bind exact Phase-2 `(ordinal,hash,mptRoot)` and every shard VRF
-consumer must use that parent. A separate engineering/reference-model gate must
+authority boundary: `ShardCheckpoint` now carries both its legacy anchor
+ordinal/epoch and a signed exact execution-state claim, but SharedServices
+committee selection and shard producer/attester proof eta still use ambient
+`getEta(period)` rather than a historical view authenticated from that exact
+reference. The reference must first become hash-bound Phase-2 authority, and
+every shard VRF consumer must use its exact historical context. A separate
+engineering/reference-model gate must
 derive and freeze one portable canonical result for a genuinely complete empty
 source period while preserving the owner-ratified N-2/N-1 and fail-closed rules.
 Until that gate closes, complete-empty remains typed unavailable/defer; it cannot

@@ -123,7 +123,8 @@ object ShardChainStoreSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(slot),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       committeeSignatures = NonEmptyList.of(constructionScaffold(peerId)),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   private def mkSignedCheckpoint(

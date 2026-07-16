@@ -13,6 +13,7 @@ import scala.concurrent.duration._
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.ShardCheckpointTestFixtures
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardBinaryBuffer, ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
@@ -21,7 +22,7 @@ import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInter
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
@@ -70,6 +71,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   // ===========================================================================
 
   private val numShards: Int = 4
+  private val defaultExecutionBase: GlobalSnapshotStateRef = ShardCheckpointTestFixtures.defaultExecutionBase
 
   private val random = {
     val r = SecureRandom.getInstance("SHA1PRNG")
@@ -115,7 +117,7 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     mg: Address,
     snaps: NonEmptyList[Signed[StateChannelSnapshotBinary]],
     anchor: SnapshotOrdinal,
-    executionBase: SnapshotOrdinal
+    executionBase: GlobalSnapshotStateRef
   ): IO[Option[Hash]] = {
     val _ = (anchor, executionBase)
     IO.pure(Some(hashFromString(s"derived-${mg.value.value}-${snaps.head.value.lastSnapshotHash.value.take(8)}")))
@@ -149,7 +151,8 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       val executionBase =
-        chainStore.perMgTip.map(tips => ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, tips).some)
+        chainStore.perMgTip
+          .map(tips => ShardCheckpointProducer.PinnedExecutionBase(defaultExecutionBase, tips, SortedMap.empty, SortedMap.empty).some)
       ShardCheckpointProducer.make[IO](
         shardId = shardId,
         chainStore = chainStore,
@@ -337,7 +340,8 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         storedContentTips.forall { t =>
           t.signed.value.shardOrdinal.value >= 1L &&
           t.signed.value.gl0AnchorOrdinal.value.value >= lo &&
-          t.signed.value.gl0AnchorOrdinal.value.value <= hi
+          t.signed.value.gl0AnchorOrdinal.value.value <= hi &&
+          t.signed.value.executionBase == defaultExecutionBase
         },
         // Every empty shard produced nothing — no empty checkpoint to gl0.
         tipsForEmptyShards.forall(_._2.isEmpty)

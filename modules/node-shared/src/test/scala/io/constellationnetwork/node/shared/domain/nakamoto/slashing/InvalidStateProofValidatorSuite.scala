@@ -17,8 +17,8 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.{RegisteredCh
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.slashing.{InvalidStateProofEvidence, InvalidStateProofRejection}
@@ -85,7 +85,8 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       slot = Slot.unsafeApply(1L),
       derivedStateDelta = delta,
       committeeSignatures = NonEmptyList.one(placeholder),
-      epoch = epochZero
+      epoch = epochZero,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
   }
 
@@ -181,7 +182,7 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
   private type BatchReplay = (
     SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     SnapshotOrdinal,
-    SnapshotOrdinal
+    GlobalSnapshotStateRef
   ) => IO[InvalidStateProofBatchReplay]
 
   private def reproduced(root: Hash): BatchReplay =
@@ -241,7 +242,7 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
           replayCalls.update(_ + 1) >>
             replayedKeys.set(windows.keySet) >>
             IO.raiseWhen(replayAnchor =!= expanded.gl0AnchorOrdinal)(new IllegalStateException("wrong anchor")) >>
-            IO.raiseWhen(replayBase =!= expanded.executionBaseOrdinal)(new IllegalStateException("wrong execution base")) >>
+            IO.raiseWhen(replayBase =!= expanded.executionBase)(new IllegalStateException("wrong execution base")) >>
             IO.pure(InvalidStateProofBatchReplay.ProvenInvalidTransition)
         validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)

@@ -3,8 +3,8 @@ package io.constellationnetwork.schema.sharding
 import cats.data.NonEmptyList
 
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.security.hash.Hash
 
 import derevo.cats.{eqv, show}
@@ -15,14 +15,16 @@ import derevo.derive
   *
   * Produced by an execution-shard committee using deterministic staircase duty (`docs/nakamoto/HIERARCHICAL-SHARD-CHECKPOINTS-DESIGN.md`).
   * The current envelope is transitional: for CL1 it carries exact ordered signed snapshot inputs and reproducible root claims, but it does
-  * not yet carry the target canonical namespace-confined byte diff or a complete exact-hash Phase-2 execution-base reference.
+  * not yet carry the target canonical namespace-confined byte diff. Its execution base is a signed claim naming one exact snapshot state;
+  * the reference does not by itself prove Phase-2 qualification or freshness.
   *
   * Checkpoints are content-bearing. A shard with no replayable state-channel binary emits no checkpoint; receivers reject empty windows so
   * a signed no-op cannot advance fork choice or finality.
   *
   * [[gl0AnchorOrdinal]] is a legacy-named inclusion-height hint only. It must never authorize execution, weaken the pinned base, or rebase
-  * a checkpoint onto the receiver's live head. The target schema binds execution to an exact Phase-2 `(ordinal, hash, root)` reference; the
-  * current ordinal-only base fields are an implementation gap, not an alternative validity rule.
+  * a checkpoint onto the receiver's live head. The schema binds replay to a claimed exact `(ordinal, hash, parentHash, mptRoot)` reference;
+  * a consumer must separately authenticate canonical Phase-2 status. Once authenticated, the signed [[executionBase]] is the only replay
+  * prior; ordinal equality alone is never sufficient.
   *
   * '''Hash exclusion for signatures.''' The [[committeeSignatures]] field is excluded when computing the bytes a signer signs; see
   * [[ShardCheckpointSigPreimage]] for the canonical pre-image case class. Every signer hashes that pre-image via `Hasher[F]`, signs the
@@ -58,10 +60,10 @@ import derevo.derive
   *   quorum alone never substitutes for execution, and positive watchtower replay coverage is required before target GL0 inclusion
   * @param epoch
   *   execution-membership epoch, used to reproduce the public VK-hash committee set and shard-eta proof domain
-  * @param executionBaseOrdinal
-  *   transitional ordinal component of the pinned execution base. The producer and replaying verifier currently resolve prior state at this
-  *   ordinal before re-executing [[ShardDerivedStateDelta.includedSnapshots]]. The target must also bind the exact Phase-2 snapshot hash
-  *   and state root; this ordinal alone cannot disambiguate a density reorg. Consensus-load-bearing because it is part of the signed
+  * @param executionBase
+  *   claimed exact GL0 state replayed by the producer, every execution signer, and every watchtower. Replay consumers require all four
+  *   fields to match the resolved snapshot and retained bytes to reproduce `mptRoot`; a same-ordinal sibling cannot silently replace it.
+  *   This check proves state identity, not Phase-2 qualification/freshness. Consensus-load-bearing because it is part of the signed
   *   preimage
   */
 @derive(encoder, decoder, eqv, show)
@@ -74,7 +76,7 @@ final case class ShardCheckpoint(
   derivedStateDelta: ShardDerivedStateDelta,
   committeeSignatures: NonEmptyList[CommitteeMemberSignature],
   epoch: EtaPeriod,
-  executionBaseOrdinal: SnapshotOrdinal = SnapshotOrdinal.MinValue
+  executionBase: GlobalSnapshotStateRef
 ) {
 
   /** Nominal checkpoint producer under the transitional head convention. Receive-side staircase validation checks this signer before
@@ -101,7 +103,7 @@ final case class ShardCheckpoint(
       slot = slot,
       derivedStateDelta = derivedStateDelta,
       epoch = epoch,
-      executionBaseOrdinal = executionBaseOrdinal
+      executionBase = executionBase
     )
 }
 
@@ -124,5 +126,5 @@ final case class ShardCheckpointSigPreimage(
   slot: Slot,
   derivedStateDelta: ShardDerivedStateDelta,
   epoch: EtaPeriod,
-  executionBaseOrdinal: SnapshotOrdinal
+  executionBase: GlobalSnapshotStateRef
 )

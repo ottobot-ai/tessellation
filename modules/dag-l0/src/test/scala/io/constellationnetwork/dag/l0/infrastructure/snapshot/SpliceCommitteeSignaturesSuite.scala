@@ -10,12 +10,13 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.infrastructure.sharding.RegisteredCheckpointSigner
 import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 
 import eu.timepit.refined.types.all.NonNegLong
@@ -79,7 +80,13 @@ object SpliceCommitteeSignaturesSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(5L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       committeeSignatures = NonEmptyList.of(constructionScaffold(producer)),
-      epoch = EtaPeriod(0L)
+      epoch = EtaPeriod(0L),
+      executionBase = GlobalSnapshotStateRef(
+        SnapshotOrdinal.MinValue,
+        Hash("41" * 32),
+        Hash.empty,
+        MptRoot(Hash("42" * 32))
+      )
     )
 
   private def sign(

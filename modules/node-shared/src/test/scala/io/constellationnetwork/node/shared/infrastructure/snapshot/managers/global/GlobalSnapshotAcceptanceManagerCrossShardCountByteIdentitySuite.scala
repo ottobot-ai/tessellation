@@ -514,7 +514,8 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
         includedSnapshots = windows
       ),
       committeeSignatures = NonEmptyList.one(unsignedTemplateSeed(committeeIdentity.peerId)),
-      epoch = epochZero
+      epoch = epochZero,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
     committeeIdentity.checkpointSigner

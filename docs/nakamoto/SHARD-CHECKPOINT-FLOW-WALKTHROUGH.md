@@ -42,10 +42,17 @@ SHARD-03/SHARD-09 remain RED.
 The scheduled producer:
 
 1. selects a chain-linked binary window from the shard buffer;
-2. pins a finalized GL0 `executionBaseOrdinal`;
+2. signs an exact GL0 execution-state claim
+   `(ordinal,hash,parentHash,mptRoot)` selected from the current Phase-2
+   projection;
 3. recreates every included CL1 transition against that exact prior and finalized GL0 references;
 4. computes each metagraph MPT root;
 5. signs the checkpoint containing the roots and all replay inputs.
+
+The four-field reference closes ordinal-sibling substitution for replay state,
+but it is not itself Phase-2 evidence. Hash-bound FinalityGate evidence,
+freshness/purpose, historical eta/registry/committee resolution, and reorg lease
+invalidation remain open.
 
 Every execution-committee signature is a state-validity claim: its signer must independently recreate the exact checkpoint result before
 signing. Admission/custody attestations are separately typed availability claims and can never satisfy execution `kQuorum`.

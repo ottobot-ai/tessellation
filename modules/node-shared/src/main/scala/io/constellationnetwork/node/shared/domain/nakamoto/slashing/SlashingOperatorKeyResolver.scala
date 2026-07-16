@@ -23,7 +23,8 @@ import io.constellationnetwork.security.hash.Hash
   * Current schema blockers are represented in the contexts rather than hidden:
   *
   *   - admission attestations bind a metagraph parent hash but no exact GL0 `(ordinal, hash, root)` or eta period;
-  *   - shard checkpoints bind an epoch and GL0 anchor ordinal but no exact Phase-2 anchor hash or operator-registry witness.
+  *   - shard checkpoints bind an exact execution-state claim, but this offence context still carries only the legacy GL0 anchor ordinal and
+  *     no authenticated Phase-2 capability or operator-registry witness.
   *
   * A production resolver therefore needs retained canonical evidence that uniquely connects these signed fields to the exact historical GL0
   * key view. If it cannot construct that proof, validation is unverifiable and cannot slash.
@@ -71,8 +72,9 @@ object SlashingOffenceContext {
     binaryHash: Hash
   ) extends SlashingOffenceContext
 
-  /** Signed execution-checkpoint identity. `declaredPeriod` and `gl0AnchorOrdinal` are in the checkpoint preimage. The current checkpoint
-    * schema still lacks the exact Phase-2 GL0 anchor hash/root needed to make ordinal lookup branch-unambiguous.
+  /** Signed execution-checkpoint identity. `declaredPeriod` and `gl0AnchorOrdinal` are in the checkpoint preimage. Although the checkpoint
+    * now carries an exact execution-state claim, this context does not yet carry or authenticate it and therefore cannot select a unique
+    * branch-historical registry view.
     */
   final case class ShardCheckpointExecution(
     shardId: ShardId,

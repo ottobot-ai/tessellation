@@ -11,13 +11,14 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.kes.KesRegistrationCert.KesRegistrationOrdinal
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
@@ -113,7 +114,13 @@ object GlobalIncrementalSnapshotShardCheckpointsSuite extends FunSuite {
       slot = SlotT.unsafeApply(99L),
       derivedStateDelta = mkDelta(mgAddr),
       committeeSignatures = NonEmptyList.of(mkCommitteeSig(1, 7), mkCommitteeSig(2, 8)),
-      epoch = EtaPeriod(5L)
+      epoch = EtaPeriod(5L),
+      executionBase = GlobalSnapshotStateRef(
+        SnapshotOrdinal.unsafeApply(98L),
+        hash('e'),
+        hash('f'),
+        MptRoot(hash('9'))
+      )
     )
 
   // ---- Build a `GlobalIncrementalSnapshot` ---------------------------------

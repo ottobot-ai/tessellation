@@ -20,8 +20,8 @@ import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord}
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT, VrfPublicKey}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security._
@@ -160,7 +160,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           kesTreeStep = 0
         )
       ),
-      epoch = epochZero
+      epoch = epochZero,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   /** Build a `ShardDerivedStateDelta` with one MG carrying `(mgAddr → mptRoot, mgAddr → headBinary)`. The included-snapshots map drives the
@@ -197,13 +198,17 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     operatorKeyRegistryOverride: Option[OperatorConsensusKeyRegistry[IO]] = None,
     shardEtaFor: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]] = (_, _) => IO.pure(realShardEta.some),
     producerDutyValidator: ShardCheckpointProducerDutyValidator[IO] = TestCheckpointDutyValidator.allow[IO],
-    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-      (_, _, _, _) => IO.pure(Hash("11" * 32)),
+    reExecuteDerivation: (
+      Address,
+      NonEmptyList[Signed[StateChannelSnapshotBinary]],
+      SnapshotOrdinal,
+      GlobalSnapshotStateRef
+    ) => IO[Hash] = (_, _, _, _) => IO.pure(Hash("11" * 32)),
     reExecuteDerivations: Option[
       (
         SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => IO[SortedMap[Address, Hash]]
     ] = None
   )(
@@ -699,13 +704,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
-          _: SnapshotOrdinal
+          _: GlobalSnapshotStateRef
         ) => reExecCalledRef.set(true).as(mptRoot)
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => IO[Hash]
 
       mgr <- mkManager(
@@ -744,13 +749,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
-          _: SnapshotOrdinal
+          _: GlobalSnapshotStateRef
         ) => reExecCalled.set(true).as(mptRoot)
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => IO[Hash]
 
       mgr <- mkManager(
@@ -791,13 +796,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
-          _: SnapshotOrdinal
+          _: GlobalSnapshotStateRef
         ) => IO.pure(wrongRoot)
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => IO[Hash]
 
       mgr <- mkManager(
@@ -844,13 +849,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
-          _: SnapshotOrdinal
+          _: GlobalSnapshotStateRef
         ) => IO.pure(Hash.empty)
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => IO[Hash]
 
       mgr <- mkManager(
@@ -949,13 +954,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
             a: Address,
             _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
             _: SnapshotOrdinal,
-            _: SnapshotOrdinal
+            _: GlobalSnapshotStateRef
           ) => IO.pure(if (a === mgBad) Hash("ff" * 32) else Hash.empty)
         ): (
           Address,
           NonEmptyList[Signed[StateChannelSnapshotBinary]],
           SnapshotOrdinal,
-          SnapshotOrdinal
+          GlobalSnapshotStateRef
         ) => IO[Hash]
 
         mgr <- mkManager(
@@ -1157,9 +1162,9 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
-          _: SnapshotOrdinal
+          _: GlobalSnapshotStateRef
         ) => reExecCalledRef.set(true).as(Hash("11" * 32))
-      ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[
+      ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => IO[
         Hash
       ]
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2, sig3))
@@ -1192,13 +1197,13 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
           _: Address,
           _: NonEmptyList[Signed[StateChannelSnapshotBinary]],
           _: SnapshotOrdinal,
-          _: SnapshotOrdinal
+          _: GlobalSnapshotStateRef
         ) => IO.pure(Hash("ff" * 32))
       ): (
         Address,
         NonEmptyList[Signed[StateChannelSnapshotBinary]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => IO[Hash]
 
       mgrA <- mkManager(

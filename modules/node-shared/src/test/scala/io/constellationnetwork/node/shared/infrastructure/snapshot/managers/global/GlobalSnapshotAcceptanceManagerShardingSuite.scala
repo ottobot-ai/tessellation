@@ -163,7 +163,8 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(gl0Anchor),
       derivedStateDelta = delta,
       committeeSignatures = NonEmptyList.of(placeholderSig),
-      epoch = epochZero
+      epoch = epochZero,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
   }
 

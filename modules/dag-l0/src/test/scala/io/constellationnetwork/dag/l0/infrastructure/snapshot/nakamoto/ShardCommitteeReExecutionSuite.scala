@@ -25,14 +25,15 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.{
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.{ShardCheckpoint, ShardId}
 import io.constellationnetwork.schema.{GlobalStateProofSelector, SnapshotOrdinal, StateProofSelector}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.kes.OperationalKeyMaker
 import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
@@ -71,6 +72,8 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
   private val epochZero: EtaPeriod = EtaPeriod(0L)
   private val anchorStart: Long = 1000L
   private val fixedShardEta: Array[Byte] = Array.fill[Byte](32)(0x7a.toByte)
+  private val executionBase: GlobalSnapshotStateRef =
+    GlobalSnapshotStateRef(SnapshotOrdinal.MinValue, Hash("41" * 32), Hash.empty, MptRoot(Hash("42" * 32)))
 
   private def mkCurrencyGenesisBinary(
     metagraphKey: KeyPair
@@ -97,7 +100,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     js: JsonSerializer[IO],
     ks: KryoSerializer[IO],
     sp: SecurityProvider[IO]
-  ): IO[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]]] =
+  ): IO[(Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => IO[Option[Hash]]] =
     GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessor(Map.empty).map { processor =>
       ShardCheckpointWiring.reExecDerivationAtPinnedBase[IO](processor, _ => reader.some.pure[IO], _ => none.pure[IO])
     }
@@ -106,7 +109,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     slotLeader: ShardSlotLeader[IO],
     chainStore: ShardChainStore[IO],
     operator: CanonicalOperatorConsensusFixture,
-    replay: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]]
+    replay: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => IO[Option[Hash]]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] = {
     val selfPeerId = operator.resolvedPair.operatorPeerId
     val selfVrfVk = operator.resolvedPair.vrfPublicKey.toBytes
@@ -131,9 +134,15 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = chainStore,
-      executionBaseF = ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, SortedMap.empty[Address, Hash]).some.pure[IO],
-      executionBaseAt =
-        _ => ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, SortedMap.empty[Address, Hash]).some.pure[IO],
+      executionBaseF = ShardCheckpointProducer
+        .PinnedExecutionBase(executionBase, SortedMap.empty[Address, Hash], SortedMap.empty, SortedMap.empty)
+        .some
+        .pure[IO],
+      executionBaseAt = _ =>
+        ShardCheckpointProducer
+          .PinnedExecutionBase(executionBase, SortedMap.empty[Address, Hash], SortedMap.empty, SortedMap.empty)
+          .some
+          .pure[IO],
       adoptedPerMgTip = SortedMap.empty[Address, Hash].pure[IO],
       slotLeader = slotLeader,
       publisher = ShardCheckpointPublisher.noop[IO],
@@ -187,7 +196,7 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
           metagraph,
           checkpoint.value.derivedStateDelta.includedSnapshots(metagraph),
           checkpoint.value.gl0AnchorOrdinal,
-          checkpoint.value.executionBaseOrdinal
+          checkpoint.value.executionBase
         )
         addressOnlySentinel <- Hasher[IO].hash(metagraph)
       } yield

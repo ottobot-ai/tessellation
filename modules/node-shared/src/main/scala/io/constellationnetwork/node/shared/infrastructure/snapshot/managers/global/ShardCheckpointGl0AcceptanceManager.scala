@@ -13,8 +13,8 @@ import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardMetrics
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
@@ -180,13 +180,12 @@ trait ShardCheckpointGl0AcceptanceManager[F[_]] {
     * or a typed affirmative-mismatch intake candidate; the fraud emitter verifies the complete certificate before invoking this method.
     *
     * This reuses the exact complete-batch replay used by primary admission (`ShardCheckpointWiring.reExecDerivationsAtPinnedBaseBatch`,
-    * PIN-1 encoding, seeded from the checkpoint's retained execution-base ordinal), so the recomputed roots are byte-comparable against the
+    * PIN-1 encoding, seeded from the checkpoint's exact retained execution base), so the recomputed roots are byte-comparable against the
     * attested ones. The scalar closure is only the compatibility fallback for focused callers.
     *
-    * '''Determinism / no-false-positive contract.''' The closure resolves the checkpoint's retained `executionBaseOrdinal` and replays the
+    * '''Determinism / no-false-positive contract.''' The closure resolves the checkpoint's exact signed `executionBase` and replays the
     * complete signed binary batch; it does not read the receiver's live head. A non-derivable/contiguity-gap batch maps every root to
-    * `Hash.empty`, so unavailable local state yields "I can't check" rather than mismatch evidence. Exact Phase-2 `(ordinal,hash,root)`
-    * binding remains required before a same-ordinal density replacement can be treated as sound slash evidence. The on-chain VERDICT
+    * `Hash.empty`, so unavailable local state yields "I can't check" rather than mismatch evidence. The on-chain VERDICT
     * ([[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator]]) is the deterministic adjudicator; this
     * method is the node-local TRIGGER and may be conservative.
     *
@@ -268,14 +267,14 @@ object ShardCheckpointGl0AcceptanceManager {
     shardAssignment: ShardAssignment[F],
     shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
     producerDutyValidator: ShardCheckpointProducerDutyValidator[F],
-    // The 4th arg is the checkpoint's `executionBaseOrdinal`, so mandatory replay seeds S(N) at the same pinned
-    // base the producer executed over (call sites pass `checkpoint.executionBaseOrdinal`).
-    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash],
+    // The 4th arg is the checkpoint's exact `executionBase`, so mandatory replay seeds S(N) at the same pinned
+    // base the producer executed over.
+    reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, GlobalSnapshotStateRef) => F[Hash],
     reExecuteDerivations: Option[
       (
         SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         SnapshotOrdinal,
-        SnapshotOrdinal
+        GlobalSnapshotStateRef
       ) => F[SortedMap[Address, Hash]]
     ] = None
   ): F[ShardCheckpointGl0AcceptanceManager[F]] = {
@@ -399,10 +398,10 @@ object ShardCheckpointGl0AcceptanceManager {
             .fold(
               included.toList.traverse {
                 case (mg, snaps) =>
-                  reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal, checkpoint.executionBaseOrdinal).map(mg -> _)
+                  reExecuteDerivation(mg, snaps, checkpoint.gl0AnchorOrdinal, checkpoint.executionBase).map(mg -> _)
               }
                 .map(SortedMap.from(_))
-            )(_(included, checkpoint.gl0AnchorOrdinal, checkpoint.executionBaseOrdinal))
+            )(_(included, checkpoint.gl0AnchorOrdinal, checkpoint.executionBase))
             .map { derived =>
               if (derived.keySet === included.keySet) derived
               else SortedMap.from(included.keysIterator.map(_ -> Hash.empty))
@@ -641,13 +640,13 @@ object ShardCheckpointGl0AcceptanceManager {
           * diagnostics are more valuable than the trivial CPU saved on this exceptional path.
           *
           * '''CANNOT-RE-DERIVE fail-closed (Track-1 execution-base-pin, FINDING-B1).''' `Hash.empty` from the closure is the wiring's
-          * fail-closed "cannot re-derive" sentinel (`reExecDerivationAtPinnedBase` OMITted: the pinned `executionBaseOrdinal` is
-          * unresolvable below this node's retention / not yet reached, the derivation deferred/crashed, or no closure is wired) — "THIS
-          * NODE can't check", NOT "the committee deviated". Exactly the reading [[watchtowerReExec]] applies when it filters `Hash.empty`.
-          * Such an MG must NOT feed `RejectedReExecutionMismatch`: that result means an affirmative mismatch and may trigger construction
-          * of separately portable fraud evidence, while a sentinel from an unwired or unavailable local base is not evidence of committee
-          * deviation. Instead the checkpoint is REJECTED plain (fail-closed — never admitted unverified, never falsely slashed); it
-          * re-offers once the node can serve the pinned base or quorum returns.
+          * fail-closed "cannot re-derive" sentinel (`reExecDerivationAtPinnedBase` OMITted: the exact `executionBase` is unresolvable below
+          * this node's retention / not yet reached, the derivation deferred/crashed, or no closure is wired) — "THIS NODE can't check", NOT
+          * "the committee deviated". Exactly the reading [[watchtowerReExec]] applies when it filters `Hash.empty`. Such an MG must NOT
+          * feed `RejectedReExecutionMismatch`: that result means an affirmative mismatch and may trigger construction of separately
+          * portable fraud evidence, while a sentinel from an unwired or unavailable local base is not evidence of committee deviation.
+          * Instead the checkpoint is REJECTED plain (fail-closed — never admitted unverified, never falsely slashed); it re-offers once the
+          * node can serve the pinned base or quorum returns.
           */
         private def reExecPath(checkpoint: ShardCheckpoint): F[ShardCheckpointAcceptResult] = {
           val included = checkpoint.derivedStateDelta.includedSnapshots
@@ -663,7 +662,7 @@ object ShardCheckpointGl0AcceptanceManager {
             reExecuteAll(checkpoint).map { reDerivedByMg =>
               included.toList.map {
                 case (mg, _) =>
-                  // Full per-MG chain + the checkpoint's wire-carried `gl0AnchorOrdinal` + pinned `executionBaseOrdinal`. Mirrors
+                  // Full per-MG chain + the checkpoint's wire-carried `gl0AnchorOrdinal` + exact pinned `executionBase`. Mirrors
                   // `ShardCheckpointProducer.assembleDelta` — the producer derives the per-MG root off the whole included chain at the same
                   // anchor over the same pinned base, and the gl0 verifier re-runs the SAME derivation off the SAME inputs. Byte-identical
                   // inputs ⇒ byte-identical roots (the S3 no-false-slashing contract).
@@ -675,7 +674,8 @@ object ShardCheckpointGl0AcceptanceManager {
                       Left(
                         (
                           mg,
-                          s"cannot re-derive MG $mg at pinned executionBase=${checkpoint.executionBaseOrdinal.value.value} " +
+                          s"cannot re-derive MG $mg at pinned executionBase=${checkpoint.executionBase.ordinal.value.value}/" +
+                            s"${checkpoint.executionBase.hash.value.take(12)} " +
                             s"(re-exec unavailable: pinned base unresolvable/OMIT) — fail-closed drop, NO slash",
                           false
                         )

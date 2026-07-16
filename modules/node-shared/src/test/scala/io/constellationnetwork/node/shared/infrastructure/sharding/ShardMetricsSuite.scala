@@ -139,7 +139,8 @@ object ShardMetricsSuite extends MutableIOSuite {
           kesTreeStep = 0
         )
       ),
-      epoch = epochZero
+      epoch = epochZero,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   /** Seed a linear chain of `n` checkpoints into the store. Same shape as the gl0 acceptance suite's `seedChain`. */
@@ -163,7 +164,8 @@ object ShardMetricsSuite extends MutableIOSuite {
                 kesTreeStep = 0
               )
             ),
-            epoch = epochZero
+            epoch = epochZero,
+            executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
           )
           val sentinelProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
           val signed = Signed(cp, NonEmptySet.of(sentinelProof))

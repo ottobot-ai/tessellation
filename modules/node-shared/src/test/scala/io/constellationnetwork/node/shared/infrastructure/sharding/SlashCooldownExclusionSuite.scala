@@ -218,7 +218,8 @@ object SlashCooldownExclusionSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(100L),
       derivedStateDelta = ShardDerivedStateDelta.empty,
       committeeSignatures = NonEmptyList.of(CommitteeMemberSignature(placeholder, Hex(""), Hex(""), Hex(""), 0)),
-      epoch = epoch5
+      epoch = epoch5,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
   private def mkManager(membership: (ShardId, EtaPeriod) => IO[Set[PeerId]])(

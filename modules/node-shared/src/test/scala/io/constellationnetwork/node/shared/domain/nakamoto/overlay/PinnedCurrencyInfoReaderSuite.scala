@@ -16,10 +16,12 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.semver.SnapshotVersion
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed
@@ -166,6 +168,14 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
       .toHashed[IO]
   }
 
+  private def executionBase(snapshot: Hashed[GlobalIncrementalSnapshot], mptRoot: Hash): GlobalSnapshotStateRef =
+    GlobalSnapshotStateRef(
+      ordinal = snapshot.signed.value.ordinal,
+      hash = snapshot.hash,
+      parentHash = snapshot.signed.value.lastSnapshotHash,
+      mptRoot = MptRoot(mptRoot)
+    )
+
   /** Produce the per-MG committed byte map, its consensus `mptRoot`, and the ORACLE (a direct reconstruction over the same bytes). */
   private def buildBytesAndOracle(
     implicit h: Hasher[IO],
@@ -266,11 +276,13 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
   }
 
+  import PinnedCurrencyInfoReader.PinnedAnchorRead
+
   // ===========================================================================
-  // Track-1 execution-base-pin: readAtOrdinal + pinnedReaderAt (SELF-RESOLVING — no independently-carried pin hash)
+  // Track-1 execution-base-pin: exact signed GlobalSnapshotStateRef + pinnedReaderAt
   // ===========================================================================
 
-  test("execution-base-pin readAtOrdinal HAPPY: self-resolves the pin (no expected hash) ⇒ == readAt(pinned.hash) == oracle") { res =>
+  test("execution-base-pin readAtExecutionBase HAPPY: verifies the full signed base reference and returns the oracle") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -279,27 +291,28 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         pinned <- mkHashed(10L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        // The adopter's read: no carried hash — the reader resolves the finalized snapshot at ord(10) itself and pins to it.
-        got <- reader.readAtOrdinal(ord(10L), mg)
+        got <- reader.readAtExecutionBase(base, mg)
       } yield
         expect(oracle.isDefined) &&
-          expect.same(got, oracle) // byte-identical to a hash-carrying readAt / a live finalized read at the pinned base
+          expect.same(got, oracle)
     }
   }
 
-  test("execution-base-pin readAtOrdinal NO-SNAPSHOT: base not resolvable on this chain ⇒ None (never a head fallback)") { res =>
+  test("execution-base-pin readAtExecutionBase NO-SNAPSHOT: exact base unavailable ⇒ None (never a head fallback)") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
         boe <- buildBytesAndOracle
-        (bytes, _, _) = boe
+        (bytes, root, _) = boe
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         resolver = (_: SnapshotOrdinal) => none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.readAtOrdinal(ord(10L), mg)
+        base = GlobalSnapshotStateRef(ord(10L), Hash("ab" * 32), Hash("cd" * 32), MptRoot(root))
+        got <- reader.readAtExecutionBase(base, mg)
       } yield expect(got.isEmpty)
     }
   }
@@ -313,10 +326,11 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         pinned <- mkHashed(10L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
         // The committee/watchtower `reExecDerivationAtPinnedBase` prior reader — a full GlobalStateReader pinned at the execution base.
-        pinnedReaderOpt <- reader.pinnedReaderAt(ord(10L))
+        pinnedReaderOpt <- reader.pinnedReaderAt(base)
         gotInfo <- pinnedReaderOpt.traverse(_.getCurrencySnapshotInfo(mg))
       } yield
         expect(pinnedReaderOpt.isDefined) &&
@@ -334,23 +348,58 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         _ <- byteStore.writeState(ord(10L), bytes)
         wrongRoot = Hash("00" * 32)
         pinned <- mkHashed(10L, Some(wrongRoot))
+        base = executionBase(pinned, wrongRoot)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.pinnedReaderAt(ord(10L))
+        got <- reader.pinnedReaderAt(base)
       } yield expect(wrongRoot =!= root) && expect(got.isEmpty)
     }
   }
 
+  test("execution-base exact identity: same-ordinal wrong hash, parent, or root fails closed") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, Some(root))
+        base = executionBase(pinned, root)
+        wrongHash = Hash("de" * 32)
+        wrongParent = Hash("ca" * 32)
+        wrongRoot = MptRoot(Hash("00" * 32))
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        hashResult <- reader.readAtExecutionBaseVerified(base.copy(hash = wrongHash), mg)
+        parentResult <- reader.readAtExecutionBaseVerified(base.copy(parentHash = wrongParent), mg)
+        rootResult <- reader.readAtExecutionBaseVerified(base.copy(mptRoot = wrongRoot), mg)
+        wholeReaders <- List(
+          base.copy(hash = wrongHash),
+          base.copy(parentHash = wrongParent),
+          base.copy(mptRoot = wrongRoot)
+        ).traverse(reader.pinnedReaderAt)
+      } yield
+        expect.all(
+          wrongHash =!= base.hash,
+          wrongParent =!= base.parentHash,
+          wrongRoot =!= base.mptRoot,
+          hashResult == PinnedAnchorRead.AnchorUnreadable,
+          parentResult == PinnedAnchorRead.AnchorUnreadable,
+          rootResult == PinnedAnchorRead.AnchorUnreadable,
+          wholeReaders.forall(_.isEmpty)
+        )
+    }
+  }
+
   // ===========================================================================
-  // Track-1 execution-base-pin GENESIS SEAM: readAtOrdinalVerified — the THREE-VALUED read for the byteDiff-adopt consumer.
+  // Track-1 execution-base-pin GENESIS SEAM: readAtExecutionBaseVerified — the THREE-VALUED read for the byteDiff-adopt consumer.
   // The anchor-vs-absent split: every anchor failure ⇒ AnchorUnreadable (fail-closed); a clean verify carries the per-MG
   // reconstruction's own Option verbatim (None = the MG has no committed state under the VERIFIED root — a pinned fact,
   // the brand-new-MG first advance the old Option view conflated with the failures).
   // ===========================================================================
 
-  import PinnedCurrencyInfoReader.PinnedAnchorRead
-
-  test("readAtOrdinalVerified VERIFIED-PRESENT: clean verify + MG committed at the anchor ⇒ AnchorVerified(Some(oracle))") { res =>
+  test("readAtExecutionBaseVerified VERIFIED-PRESENT: exact base + MG committed ⇒ AnchorVerified(Some(oracle))") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -359,16 +408,17 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         pinned <- mkHashed(10L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.readAtOrdinalVerified(ord(10L), mg)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
       } yield
         expect(oracle.isDefined) &&
           expect(got == PinnedAnchorRead.AnchorVerified(oracle))
     }
   }
 
-  test("readAtOrdinalVerified VERIFIED-ABSENT: clean verify but the queried MG has NO state at the anchor ⇒ AnchorVerified(None)") { res =>
+  test("readAtExecutionBaseVerified VERIFIED-ABSENT: clean verify but queried MG has no state ⇒ AnchorVerified(None)") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       val mgAbsent = addr("mg-never-seen-at-anchor")
@@ -378,65 +428,68 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         pinned <- mkHashed(10L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.readAtOrdinalVerified(ord(10L), mgAbsent)
+        got <- reader.readAtExecutionBaseVerified(base, mgAbsent)
         // BLAST-RADIUS GUARD: the legacy Option view still collapses this to None (I-PIN-style consumers unchanged).
-        gotOption <- reader.readAtOrdinal(ord(10L), mgAbsent)
+        gotOption <- reader.readAtExecutionBase(base, mgAbsent)
       } yield
         expect(got == PinnedAnchorRead.AnchorVerified(none[CurrencySnapshotInfo])) &&
           expect(gotOption.isEmpty)
     }
   }
 
-  test("readAtOrdinalVerified UNREADABLE (no snapshot): nothing resolvable at the anchor ordinal ⇒ AnchorUnreadable") { res =>
+  test("readAtExecutionBaseVerified UNREADABLE (no snapshot): exact base unavailable ⇒ AnchorUnreadable") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
         boe <- buildBytesAndOracle
-        (bytes, _, _) = boe
+        (bytes, root, _) = boe
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         resolver = (_: SnapshotOrdinal) => none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.readAtOrdinalVerified(ord(10L), mg)
+        base = GlobalSnapshotStateRef(ord(10L), Hash("ab" * 32), Hash("cd" * 32), MptRoot(root))
+        got <- reader.readAtExecutionBaseVerified(base, mg)
       } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
     }
   }
 
-  test("readAtOrdinalVerified UNREADABLE (no mptRoot): pinned snapshot carries no committed root (BFT/pre-MPT) ⇒ AnchorUnreadable") { res =>
+  test("readAtExecutionBaseVerified UNREADABLE (no mptRoot): snapshot has no committed root ⇒ AnchorUnreadable") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
         boe <- buildBytesAndOracle
-        (bytes, _, _) = boe
+        (bytes, root, _) = boe
         byteStore <- MptStateStorage.make[IO](dir)
         _ <- byteStore.writeState(ord(10L), bytes)
         pinned <- mkHashed(10L, mptRoot = None)
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(10L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.readAtOrdinalVerified(ord(10L), mg)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
       } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
     }
   }
 
-  test("readAtOrdinalVerified UNREADABLE (evicted bytes): no retained state bytes at the anchor ⇒ AnchorUnreadable, NOT verified-absent") {
-    res =>
-      implicit val (h, _, js) = res
-      Files[IO].tempDirectory.use { dir =>
-        for {
-          boe <- buildBytesAndOracle
-          (_, root, _) = boe
-          byteStore <- MptStateStorage.make[IO](dir) // deliberately EMPTY at the anchor
-          pinned <- mkHashed(20L, Some(root))
-          resolver = (o: SnapshotOrdinal) => (if (o === ord(20L)) pinned.some else none).pure[IO]
-          reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-          got <- reader.readAtOrdinalVerified(ord(20L), mg)
-        } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
-      }
+  test("readAtExecutionBaseVerified UNREADABLE (evicted bytes): no retained bytes ⇒ AnchorUnreadable, NOT verified-absent") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (_, root, _) = boe
+        byteStore <- MptStateStorage.make[IO](dir) // deliberately EMPTY at the anchor
+        pinned <- mkHashed(20L, Some(root))
+        base = executionBase(pinned, root)
+        resolver = (o: SnapshotOrdinal) => (if (o === ord(20L)) pinned.some else none).pure[IO]
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
+      } yield expect(got == PinnedAnchorRead.AnchorUnreadable)
+    }
   }
 
-  test("readAtOrdinalVerified UNREADABLE (root mismatch): retained bytes don't reproduce the pinned root ⇒ AnchorUnreadable") { res =>
+  test("readAtExecutionBaseVerified UNREADABLE (root mismatch): retained bytes don't reproduce the pinned root ⇒ AnchorUnreadable") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>
       for {
@@ -446,9 +499,10 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         _ <- byteStore.writeState(ord(30L), bytes)
         wrongRoot = Hash("00" * 32)
         pinned <- mkHashed(30L, Some(wrongRoot))
+        base = executionBase(pinned, wrongRoot)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(30L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        got <- reader.readAtOrdinalVerified(ord(30L), mg)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
       } yield expect(wrongRoot =!= root) && expect(got == PinnedAnchorRead.AnchorUnreadable)
     }
   }
@@ -456,7 +510,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
   // ===========================================================================
   // Signed-byte-store read-time BACKFILL (2026-07-09) — the hole healer. A creation-side staging race (fail-closed reorg adopt /
   // same-ordinal proposal-race loss / catch-up jump) leaves an ordinal MISSING from the signed store even though the node's own
-  // canonical chain finalized it; a shard checkpoint stamping that ordinal as `executionBaseOrdinal` then fail-closed forever (the
+  // canonical chain finalized it; a shard checkpoint stamping that exact `executionBase` then fail-closes until the bytes are recovered (the
   // 2mg/2shard token-lock mirror freeze: hole at ord 227 ⇒ `pinned ANCHOR ... unreadable` ×106). The backfill fetches the byte map
   // from a peer AT READ TIME, verifies it against the LOCALLY-committed `stateProof.mptRoot`, strips to `consensusRootEntries`,
   // persists, and serves. Wrong-root / missing peer bytes stay fail-closed with the store UNTOUCHED.
@@ -482,23 +536,24 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         // node's own finalized chain DOES resolve the snapshot there (root = the local verification anchor).
         byteStore <- MptStateStorage.make[IO](dir)
         pinned <- mkHashed(227L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
 
         // RED — the pre-backfill behavior (exactly what froze the mirror): fail-closed unreadable at the hole.
         readerNoBackfill = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
-        red <- readerNoBackfill.readAtOrdinalVerified(ord(227L), mg)
+        red <- readerNoBackfill.readAtExecutionBaseVerified(base, mg)
 
         // GREEN — same store, same resolver, backfill wired: the peer serves the finalized bytes for ord 227.
         fetches <- IO.ref(0)
         backfill = backfillOf(o => fetches.update(_ + 1) *> (if (o === ord(227L)) bytes.some else none).pure[IO])
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfill))
-        green <- reader.readAtOrdinalVerified(ord(227L), mg)
+        green <- reader.readAtExecutionBaseVerified(base, mg)
 
         // Healed ON DISK: the store now serves the ordinal, so a later read works with NO backfill at all.
         persisted <- byteStore.readState(ord(227L))
-        afterHeal <- readerNoBackfill.readAtOrdinalVerified(ord(227L), mg)
+        afterHeal <- readerNoBackfill.readAtExecutionBaseVerified(base, mg)
         // And the whole-global pinned replay reader resolves too.
-        pinnedReaderOpt <- reader.pinnedReaderAt(ord(227L))
+        pinnedReaderOpt <- reader.pinnedReaderAt(base)
         fetchCount <- fetches.get
       } yield
         expect(red == PinnedAnchorRead.AnchorUnreadable) &&
@@ -532,12 +587,13 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         wrongBytesRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](wrongBytes)
         byteStore <- MptStateStorage.make[IO](dir) // hole at the anchor
         pinned <- mkHashed(227L, Some(root)) // the local committed fixture root does not authorize `wrongBytes`
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
         backfill = backfillOf(_ => wrongBytes.some.pure[IO])
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfill))
-        got <- reader.readAtOrdinalVerified(ord(227L), mg)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
         persisted <- byteStore.readState(ord(227L))
-        gotAgain <- reader.readAtOrdinalVerified(ord(227L), mg)
+        gotAgain <- reader.readAtExecutionBaseVerified(base, mg)
       } yield
         expect(wrongBytesRoot =!= root) && // the adversarial map genuinely recomputes a different root
           expect(got == PinnedAnchorRead.AnchorUnreadable) && // rejected, fail-closed
@@ -559,9 +615,10 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         fetchedRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](fetched)
         byteStore <- MptStateStorage.make[IO](dir)
         pinned <- mkHashed(227L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfillOf(_ => fetched.some.pure[IO])))
-        got <- reader.readAtOrdinalVerified(ord(227L), mg)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
         persisted <- byteStore.readState(ord(227L))
       } yield
         expect(fetchedRoot =!= root) &&
@@ -578,9 +635,10 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
         (_, root, _) = boe
         byteStore <- MptStateStorage.make[IO](dir)
         pinned <- mkHashed(227L, Some(root))
+        base = executionBase(pinned, root)
         resolver = (o: SnapshotOrdinal) => (if (o === ord(227L)) pinned.some else none).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver, backfill = Some(backfillOf(_ => none.pure[IO])))
-        got <- reader.readAtOrdinalVerified(ord(227L), mg)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
         persisted <- byteStore.readState(ord(227L))
       } yield expect(got == PinnedAnchorRead.AnchorUnreadable) && expect(persisted.isEmpty)
     }
@@ -593,7 +651,7 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     Files[IO].tempDirectory.use { dir =>
       for {
         boe <- buildBytesAndOracle
-        (bytes, _, _) = boe
+        (bytes, root, _) = boe
         byteStore <- MptStateStorage.make[IO](dir)
         resolver = (_: SnapshotOrdinal) => none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
         fetches <- IO.ref(0)
@@ -602,7 +660,8 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
           resolver,
           backfill = Some(backfillOf(_ => fetches.update(_ + 1) *> bytes.some.pure[IO]))
         )
-        got <- reader.readAtOrdinalVerified(ord(999L), mg)
+        base = GlobalSnapshotStateRef(ord(999L), Hash("ab" * 32), Hash("cd" * 32), MptRoot(root))
+        got <- reader.readAtExecutionBaseVerified(base, mg)
         fetchCount <- fetches.get
       } yield expect(got == PinnedAnchorRead.AnchorUnreadable) && expect.same(0, fetchCount)
     }

@@ -62,7 +62,8 @@ object WatchtowerFraudProofCertificateGateSuite extends MutableIOSuite {
       slot = io.constellationnetwork.schema.nakamoto.slot.Slot.unsafeApply(1L),
       derivedStateDelta = delta,
       committeeSignatures = NonEmptyList.one(CommitteeMemberSignature(peerId, Hex(""), Hex(""), Hex(""), 0)),
-      epoch = io.constellationnetwork.schema.nakamoto.EtaPeriod.Zero
+      epoch = io.constellationnetwork.schema.nakamoto.EtaPeriod.Zero,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
   }
 

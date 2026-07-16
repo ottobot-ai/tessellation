@@ -530,7 +530,7 @@ object NakamotoSyncDaemon {
 
   /** Signed-byte-store backfill transport (2026-07-09) — pull a peer's SIGNED MPT byte map at an EXACT finalized `ordinal` over the
     * by-ordinal `/global-snapshots/<ord>/mpt-entries` route. Consumed by `PinnedCurrencyInfoReader.PinnedByteBackfill` to heal HOLES in the
-    * local signed store at a stamped shard-checkpoint `executionBaseOrdinal`.
+    * local signed store at the ordinal component of a stamped shard-checkpoint execution base.
     *
     * TRANSPORT-ONLY, deliberately UNVERIFIED here: the pinned reader verifies `consensusMptRoot(fetched) === its OWN locally-committed
     * `stateProof.mptRoot@ordinal`` before anything is staged or served. Byte integrity comes from that root gate, not the transport. Tries
@@ -664,7 +664,7 @@ object NakamotoSyncDaemon {
     ],
     // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
     // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09 — adopted ordinals must not stay permanent holes in
-    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(executionBaseOrdinal)` fail-closes on every node that adopted that ordinal).
+    // `mpt_snapshot_info_signed`, or exact execution-base reads fail closed on every node that adopted that ordinal).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],
@@ -1635,7 +1635,7 @@ object NakamotoSyncDaemon {
     ],
     // 3c-A enabler — signed-bytes staging map. NO LONGER validate-only: the ADOPT paths (reorg / realign / legacy catch-up) now stage
     // their root-verified byte maps here too (signed-byte-store FIDELITY, 2026-07-09 — adopted ordinals must not stay permanent holes in
-    // `mpt_snapshot_info_signed`, or `pinnedReaderAt(executionBaseOrdinal)` fail-closes on every node that adopted that ordinal).
+    // `mpt_snapshot_info_signed`, or exact execution-base reads fail closed on every node that adopted that ordinal).
     pendingPostBytesRef: Ref[F, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     chainSyncManager: ChainSyncManager.ChainSyncManagerAlgebra[F],

@@ -274,8 +274,8 @@ object GlobalSnapshotConsensus {
     // committee-eta resolver reads (created in `TessellationIOApp.make`, threaded here via `Services.make`).
     // Set ONCE below — right after the leader's own `chainStoreForLookupRef` — to the SAME
     // `chainStore.vrfOutputRangeForPeriodFrom`-backed exact walk the leader uses, so candidate replay calls
-    // `EtaStateManager.getEtaAt(P, parentHash)` against the same branch. Ambient `getEta(P)` remains only for shard code whose wire schema
-    // still lacks an exact GL0 hash/root and is tracked as an open protocol gap.
+    // `EtaStateManager.getEtaAt(P, parentHash)` against the same branch. Ambient `getEta(P)` remains only for shard code that has not yet
+    // threaded the checkpoint's signed exact GL0 execution base into committee selection and is tracked as an open protocol gap.
     // gl0 is the only layer that sets it; a missing range is incomplete and cannot become eta for N >= 2.
     setFollowerEtaChainWalk: ((Long, Option[io.constellationnetwork.security.hash.Hash]) => F[EtaSourceRange]) => F[Unit]
   )(
@@ -409,6 +409,42 @@ object GlobalSnapshotConsensus {
                   }
                 case None => Async[F].pure(None: Option[Hashed[GlobalIncrementalSnapshot]])
               }
+          }
+      }
+      getCanonicalPhase2GlobalSnapshotByOrdinal: (SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]) = {
+        (ordinal: SnapshotOrdinal) =>
+          (nakamotoFinalizedOrdinalRef.get, chainStoreForLookupRef.get).tupled.flatMap {
+            case (phase2Ordinal, Some(cs)) if ordinal <= phase2Ordinal =>
+              cs.bestTip.flatMap {
+                case Some(tip) =>
+                  val start =
+                    io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.ExactWalkPosition(
+                      tip.hash,
+                      SnapshotOrdinal.unsafeApply(tip.ordinal)
+                    )
+                  val maxSteps = GlobalSnapshotConsensus.signedBytesRetentionDepth(
+                    sharedCfg.nakamoto.keepDepthBehindFinalized(sharedCfg.environment).value
+                  )
+
+                  cs.walkBackExact(start, ordinal, maxSteps).flatMap {
+                    case Right(
+                          io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.NakamotoChainStore.ExactWalkResult.Complete(path)
+                        ) =>
+                      path
+                        .find(_.position.ordinal === ordinal)
+                        .traverse { link =>
+                          cs.getWithOrdinalFallback(link.position.hash, ordinal.value.value)
+                            .flatMap(
+                              _.traverse(stored => HasherSelector[F].withCurrent(implicit hasher => stored.signedSnapshot.toHashed[F]))
+                            )
+                            .map(_.filter(_.hash === link.position.hash))
+                        }
+                        .map(_.flatten)
+                    case _ => Async[F].pure(None)
+                  }
+                case None => Async[F].pure(None)
+              }
+            case _ => Async[F].pure(None)
           }
       }
 
@@ -551,7 +587,7 @@ object GlobalSnapshotConsensus {
       // ─── Signed-byte-store read-time BACKFILL (2026-07-09): heals HOLES in the contiguous `signedBytesStore` at the pinned-read miss
       // seam. Creation-side staging races (fail-closed reorg adopts whose carried GSI can't reproduce the fork's signed root,
       // same-ordinal proposal-race losses where the winner's bytes were never staged under the finalized hash, catch-up jumps) leave
-      // ordinals permanently missing; when a peer stamps such an ordinal as a shard checkpoint's `executionBaseOrdinal`, the adopt-verify
+      // ordinals permanently missing; when a peer stamps a checkpoint execution base at such an ordinal, adopt verification
       // fail-closes on EVERY subsequent checkpoint and the metagraph mirror freezes (the 2mg/2shard token-lock e2e residual: ord 227
       // holed on gl0-0/gl0-1 ⇒ `pinned ANCHOR ... unreadable` ×106/×101). The backfill pulls the signed byte map for the EXACT missing
       // ordinal from up to `nakamoto.pinned-backfill-max-peers` peers via the by-ordinal `/global-snapshots/<ord>/mpt-entries` route
@@ -575,11 +611,11 @@ object GlobalSnapshotConsensus {
       gl0PinnedReader = {
         implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
         io.constellationnetwork.node.shared.domain.nakamoto.overlay.PinnedCurrencyInfoReader
-          .make[F](signedBytesStore, getGlobalSnapshotByOrdinalWithFallback, backfill = Some(gl0PinnedBackfill))
+          .make[F](signedBytesStore, getCanonicalPhase2GlobalSnapshotByOrdinal, backfill = Some(gl0PinnedBackfill))
       }
-      // Resolve the current Phase-2 state reader at a pinned ordinal through the version-retained, root-verified
-      // signed-byte store. Ordinal-only lookup is transitional; the target checkpoint also binds the exact hash
-      // and state root so a density reorg cannot make the reference ambiguous. `None` defers without signing.
+      // Resolve a checkpoint's exact state reader through selected-tine ancestry and the version-retained, root-verified signed-byte store.
+      // The reference binds ordinal/hash/parent/root, so an ordinal sibling cannot be substituted. Current Phase-2 qualification still uses
+      // the transitional ordinal watermark; this resolver is not FIN-14/O-16 evidence or a reorg-safe lease. `None` defers without signing.
       // NO live fast path: `lastPersistedOrdinal == ord` does NOT imply the live store's content is state@ord (Passthrough accept
       // writes land before the watermark bumps), and that skew minted quorum-attested checkpoints whose root no honest verifier could
       // reproduce — the 2026-07-08 shard-0 shardOrd=8 wedge (see `ShardCheckpointWiring.pinnedPriorReaderAt` scaladoc).
@@ -1516,16 +1552,34 @@ object GlobalSnapshotConsensus {
               val gl0EtaBytesForPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod => F[Array[Byte]] =
                 (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
                   etaForPeriodCallback(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes)
-              val executionBaseOrdinalF =
+              val executionBaseCandidateOrdinalF =
                 io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-                  .pinnedExecutionBaseOrdinal[F](signedBytesStore)
+                  .latestRetainedExecutionBaseCandidateOrdinal[F](signedBytesStore)
+              val executionBaseRefF = executionBaseCandidateOrdinalF.flatMap { ordinal =>
+                getCanonicalPhase2GlobalSnapshotByOrdinal(ordinal).map(
+                  _.flatMap { snapshot =>
+                    snapshot.signed.value.stateProof.mptRoot.map { mptRoot =>
+                      io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef(
+                        ordinal = ordinal,
+                        hash = snapshot.hash,
+                        parentHash = snapshot.signed.value.lastSnapshotHash,
+                        mptRoot = io.constellationnetwork.security.mpt.MptRoot(mptRoot)
+                      )
+                    }
+                  }
+                )
+              }
               val executionBaseF =
-                io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-                  .pinnedExecutionBase[F](executionBaseOrdinalF, finalizedReaderAt)
+                executionBaseRefF.flatMap(
+                  _.traverse(ref =>
+                    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+                      .pinnedExecutionBase[F](ref.pure[F], finalizedReaderAt)
+                  ).map(_.flatten)
+                )
               val executionBaseAt =
-                (ordinal: SnapshotOrdinal) =>
+                (stateRef: io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef) =>
                   io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-                    .pinnedExecutionBase[F](ordinal.pure[F], finalizedReaderAt)
+                    .pinnedExecutionBase[F](stateRef.pure[F], finalizedReaderAt)
               deps.registry.toList.traverse {
                 case (shardId, entry) =>
                   // Per-shard closure: resolve the rotated gl0 eta for the checkpoint's epoch, then domain-separate to
@@ -1538,11 +1592,11 @@ object GlobalSnapshotConsensus {
                     .make[F](
                       shardId = shardId,
                       chainStore = entry.chainStore,
-                      // S2 — PINNED BASE-ANCHORED window (VERSION-MODEL §4): both the stamped execution ordinal and the per-MG
+                      // S2 — PINNED BASE-ANCHORED window (VERSION-MODEL §4): both the stamped exact execution identity and the per-MG
                       // `lastStateChannelSnapshotHashes` come from one retained immutable reader. The window anchor therefore cannot race
                       // ahead of the prior that producer/signers/watchtowers replay. Missing or malformed retained state defers before sign.
                       executionBaseF = executionBaseF,
-                      // Re-check the exact captured ordinal before signing. Resolving latest here would turn ordinary Phase-2 descendant
+                      // Re-check the exact captured identity before signing. Resolving latest here would turn ordinary canonical descendant
                       // advancement during replay into an unbounded checkpoint restart loop.
                       executionBaseAt = executionBaseAt,
                       // NEWNESS GATE (S2-deadlock fix, runs 19-22 + ord-26 re-freeze): the gate reference is this chain's CHAIN-WIDE
@@ -1578,7 +1632,7 @@ object GlobalSnapshotConsensus {
                       // So best-tip S(N) ≠ adopted S(N) even in the happy path and the producer root cannot be reproduced (run-26:
                       // ~890 ADOPT-VERIFY/node, all 8 nodes agree bit-for-bit on the recomputed root; only the producer's attested
                       // root diverged — proving gl0's prior is deterministic-finalized and the producer was the lone outlier).
-                      // The compatibility scalar resolves the execution prior AT the per-checkpoint `executionBaseOrdinal` (4th closure
+                      // The compatibility scalar resolves the execution prior at the per-checkpoint exact `executionBase` (4th closure
                       // arg) through the version-retained pinned reader. There is no mutable live-reader fast path. Production checkpoint
                       // construction uses the batch callback below with the already captured complete `executionBaseF` value.
                       derivePerMgState = ShardCheckpointWiring
@@ -1605,12 +1659,9 @@ object GlobalSnapshotConsensus {
                           globalStateProofSelector
                         )
                       ),
-                      // Pinned execution-base savepoint: the base ordinal the producer stamps and executes every per-MG window over.
-                      // = the signed byte store's NEWEST persisted ordinal (`pinnedExecutionBaseOrdinal`), NOT the live
-                      // `mptStore.lastPersistedOrdinal`: the diff prior is resolved EXCLUSIVELY through the version-retained pinned
-                      // reader now (no live fast path — the 2026-07-08 mid-fold-skew wedge), and the signed store trails the live
-                      // watermark by the finalize lag, so stamping the watermark would OMIT-defer almost every mint while stamping the
-                      // store's own latest is resolvable-by-construction on the minting node and finalize-synchronized on every verifier.
+                      // Candidate execution-base savepoint: locate the signed byte store's newest retained ordinal, then resolve and stamp
+                      // its exact canonical Phase-2 identity. The locator is NOT authority and the live `mptStore.lastPersistedOrdinal` is
+                      // never substituted: exact hash/parent/root plus retained bytes must verify before replay or signing.
                       // V1 permits one outstanding checkpoint per shard. Only the exact Phase-2 checkpoint anchor releases its successor.
                       lastPhase2Checkpoint = deps.acceptanceManager.lastAdoptedCheckpoint(shardId),
                       // Tier-1 idempotence cadence (task #45): re-publish a held checkpoint's bytes every N ticks

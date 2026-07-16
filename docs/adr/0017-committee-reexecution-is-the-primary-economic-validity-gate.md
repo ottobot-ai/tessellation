@@ -199,8 +199,12 @@ ML0 `CurrencySnapshotInfo`.
   economic backstop until canonical diff adoption and positive watchtower
   coverage land. This replacement never removes any GL0 validator's independent
   execution and validation of direct native GL1/DAG-token transitions.
-- the signed checkpoint binds an execution-base ordinal but not the exact Phase-2
-  hash/root or network/genesis/era/parameter domain.
+- the signed checkpoint now binds a complete claimed execution-state reference
+  `(ordinal,hash,parentHash,mptRoot)` in the committee preimage. This closes
+  ordinal-sibling substitution at the retained-state reader, but the reference is
+  not yet hash-bound Phase-2 evidence and carries no
+  network/genesis/era/parameter, freshness/lease, or historical
+  eta/registry/roster context.
 - field 32 remains writable, removable, and reconstructible in GL0. Pinned peer
   backfill strips it to the global root entry set, while a locally staged base can
   retain it. `ShardCheckpointWiring.reExecDerivationAtPinnedBase` consumes the

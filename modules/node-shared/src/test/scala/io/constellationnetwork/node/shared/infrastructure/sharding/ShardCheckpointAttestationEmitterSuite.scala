@@ -198,7 +198,8 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
       slot = Slot.unsafeApply(5L),
       derivedStateDelta = delta,
       committeeSignatures = NonEmptyList.one(placeholder),
-      epoch = checkpointEpoch
+      epoch = checkpointEpoch,
+      executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
     )
 
     checkpointSigner

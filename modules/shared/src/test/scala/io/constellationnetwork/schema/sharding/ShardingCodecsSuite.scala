@@ -10,11 +10,12 @@ import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
@@ -126,7 +127,13 @@ object ShardingCodecsSuite extends FunSuite {
       slot = SlotT.unsafeApply(99L),
       derivedStateDelta = sampleDelta,
       committeeSignatures = NonEmptyList.of(mkSig(1, 7), mkSig(2, 8), mkSig(3, 9)),
-      epoch = EtaPeriod(5L)
+      epoch = EtaPeriod(5L),
+      executionBase = GlobalSnapshotStateRef(
+        SnapshotOrdinal.unsafeApply(98L),
+        hash('e'),
+        hash('f'),
+        MptRoot(hash('9'))
+      )
     )
 
   // ---- FraudProofEnvelope --------------------------------------------------
@@ -270,9 +277,22 @@ object ShardingCodecsSuite extends FunSuite {
       preimage.slot === sampleCheckpoint.slot,
       preimage.derivedStateDelta === sampleCheckpoint.derivedStateDelta,
       preimage.epoch === sampleCheckpoint.epoch,
-      // The pinned execution base is signed and verified as part of the canonical preimage.
-      preimage.executionBaseOrdinal === sampleCheckpoint.executionBaseOrdinal
+      // The exact pinned execution base is signed and verified as part of the canonical preimage.
+      preimage.executionBase === sampleCheckpoint.executionBase
     )
+  }
+
+  test("ShardCheckpoint.signingPreimage commits to every exact execution-base component") {
+    val original = sampleCheckpoint.signingPreimage.asJson.noSpaces
+    val base = sampleCheckpoint.executionBase
+    val changedBases = List(
+      base.copy(ordinal = SnapshotOrdinal.unsafeApply(base.ordinal.value.value - 1L)),
+      base.copy(hash = hash('7')),
+      base.copy(parentHash = hash('8')),
+      base.copy(mptRoot = MptRoot(hash('0')))
+    )
+
+    expect(changedBases.forall(changed => sampleCheckpoint.copy(executionBase = changed).signingPreimage.asJson.noSpaces != original))
   }
 
   test("ShardCheckpoint.signingPreimage encodes to JSON that does NOT contain `committeeSignatures` key") {

@@ -49,6 +49,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.generation.Generation
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
@@ -315,8 +316,8 @@ object SharedServices {
         // `GlobalStateReader`, identical to the producer's. Same shared processor as GSAM means producer and verifier roots are byte-identical.
         reExecuteDerivation = Some {
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
-          // Track-1 execution-base-pin (FINDING-B1): resolve the derivation prior AT the wire-carried, committee-signed `executionBaseOrdinal` —
-          // NEVER at this node's live base when the two differ. The re-derived per-MG root is base-DEPENDENT
+          // Track-1 execution-base-pin (FINDING-B1): resolve the derivation prior at the wire-carried, committee-signed exact
+          // `executionBase` — NEVER at this node's live base when the two differ. The re-derived per-MG root is base-dependent
           // (full recreation starts from cumulative balances/refs/active-sets and messages in the seed prior), so a live read on a node
           // whose finalized tip ≠ the checkpoint's base recomputes a DIFFERENT root for the SAME
           // honest checkpoint → false `RejectedReExecutionMismatch` + adopt-decision split. The local result cannot slash; a divergent
@@ -346,14 +347,14 @@ object SharedServices {
             mg: Address,
             binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
             anchor: SnapshotOrdinal,
-            executionBaseOrdinal: SnapshotOrdinal
+            executionBase: GlobalSnapshotStateRef
           ) =>
             // OMIT-ON-CAN'T-DERIVE: the pinned-base derivation returns `None` when it cannot derive a real state (pinned base
             // unresolvable, derivation deferred/crashed) — it OMITS the MG rather than emit an empty-state sentinel. Map that to
             // `Hash.empty`, the fail-closed CANNOT-RE-DERIVE sentinel: `ShardCheckpointGl0AcceptanceManager.reExecPath` buckets it as
             // "can't check" (plain `Rejected` — dropped, never admitted unverified, NO slash targets) and `watchtowerReExec` filters it —
             // never a deterministic-mismatch false slash.
-            reExec(mg, binaries, anchor, executionBaseOrdinal).map(_.getOrElse(io.constellationnetwork.security.hash.Hash.empty))
+            reExec(mg, binaries, anchor, executionBase).map(_.getOrElse(io.constellationnetwork.security.hash.Hash.empty))
         },
         reExecuteDerivations = Some {
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
@@ -374,8 +375,8 @@ object SharedServices {
           (
             windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
             anchor: SnapshotOrdinal,
-            executionBaseOrdinal: SnapshotOrdinal
-          ) => reExecBatch(windows, anchor, executionBaseOrdinal).map(_.map { case (mg, root) => mg -> root.getOrElse(Hash.empty) })
+            executionBase: GlobalSnapshotStateRef
+          ) => reExecBatch(windows, anchor, executionBase).map(_.map { case (mg, root) => mg -> root.getOrElse(Hash.empty) })
         },
         // FINDING-002/EPIC-3.1 — slash-cooldown committee exclusion. Reads the `Slashings` (fieldId 34) records off the SAME
         // finalized-base `storages.mptStore` the committee draw's eta resolver (`sharedEtaForPeriod` → HistoricalStakeReader) reads,
@@ -399,7 +400,7 @@ object SharedServices {
         case Some(deps) =>
           implicit val h: Hasher[F] = HasherSelector[F].getCurrent
           // Track-1 execution-base-pin (FINDING-B1): the SAME pinned reader-resolution as `reExecuteDerivation` above — the honest
-          // re-derivation reads S(N) at the DISPUTED checkpoint's own `executionBaseOrdinal`, never this follower's live base. A follower
+          // re-derivation reads S(N) at the disputed checkpoint's exact `executionBase`, never this follower's live base. A follower
           // whose live tip ran AHEAD of the pinned base would otherwise recompute a different root, false-UPHOLD the fraud proof, and
           // write a slash (fieldId-34 + stake maps) into its consensus root that the pinned leader didn't → StateProofMismatch
           // mirror-freeze fork. Unresolvable anchor/history ⇒ fail-closed batch `Unavailable` ⇒ `InvalidStateProofValidator` rejects the

@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.infrastructure.sharding
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.{IO, Resource}
 import cats.kernel.Eq
+import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
@@ -14,13 +15,14 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpoi
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
@@ -135,7 +137,13 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       slot = SlotT.unsafeApply(99L),
       derivedStateDelta = sampleDelta,
       committeeSignatures = NonEmptyList.of(mkSig(1, 7), mkSig(2, 8), mkSig(3, 9)),
-      epoch = EtaPeriod(5L)
+      epoch = EtaPeriod(5L),
+      executionBase = GlobalSnapshotStateRef(
+        SnapshotOrdinal(NonNegLong.unsafeFrom(77L)),
+        hash('d'),
+        hash('e'),
+        MptRoot(hash('f'))
+      )
     )
 
   // ===========================================================================
@@ -170,7 +178,76 @@ object ShardCheckpointWireCodecsSuite extends MutableIOSuite {
       wire <- ShardCheckpointWireCodecs.shardCheckpointToWire[IO](cp)
       reparsed = viaProtoBytes(wire, pb.ShardCheckpointWire)
       decoded <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](reparsed)
-    } yield assertEq("ShardCheckpoint", cp, decoded)
+    } yield
+      assertEq("ShardCheckpoint", cp, decoded) &&
+        expect.all(
+          decoded.executionBase.ordinal === cp.executionBase.ordinal,
+          decoded.executionBase.hash === cp.executionBase.hash,
+          decoded.executionBase.parentHash === cp.executionBase.parentHash,
+          decoded.executionBase.mptRoot === cp.executionBase.mptRoot
+        )
+  }
+
+  test("ShardCheckpoint rejects missing or malformed exact execution-base components") { res =>
+    implicit val (_, j) = res
+    val upperHex = ByteString.copyFromUtf8("A" * 64)
+    val nonHex = ByteString.copyFromUtf8("g" * 64)
+    val shortHex = ByteString.copyFromUtf8("a" * 63)
+
+    for {
+      wire <- ShardCheckpointWireCodecs.shardCheckpointToWire[IO](sampleCheckpoint)
+      malformed = List(
+        wire.copy(executionBaseOrdinal = -1L),
+        wire.copy(executionBaseHash = ByteString.EMPTY),
+        wire.copy(executionBaseParentHash = ByteString.EMPTY),
+        wire.copy(executionBaseMptRoot = ByteString.EMPTY),
+        wire.copy(executionBaseHash = upperHex),
+        wire.copy(executionBaseParentHash = nonHex),
+        wire.copy(executionBaseMptRoot = shortHex)
+      )
+      attempts <- malformed.traverse(ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](_).attempt)
+    } yield expect(attempts.forall(_.isLeft))
+  }
+
+  test("ShardCheckpoint rejects protobuf all-zero execution-base authority except the ordinal-zero parent sentinel") { res =>
+    implicit val (_, j) = res
+    val zero = ByteString.copyFromUtf8(Hash.empty.value)
+
+    for {
+      wire <- ShardCheckpointWireCodecs.shardCheckpointToWire[IO](sampleCheckpoint)
+      emptyHash <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](wire.copy(executionBaseHash = zero)).attempt
+      emptyRoot <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](wire.copy(executionBaseMptRoot = zero)).attempt
+      nonGenesisEmptyParent <- ShardCheckpointWireCodecs
+        .shardCheckpointFromWire[IO](wire.copy(executionBaseParentHash = zero))
+        .attempt
+      genesisParent <- ShardCheckpointWireCodecs.shardCheckpointFromWire[IO](
+        wire.copy(executionBaseOrdinal = 0L, executionBaseParentHash = zero)
+      )
+    } yield
+      expect.all(
+        emptyHash.isLeft,
+        emptyRoot.isLeft,
+        nonGenesisEmptyParent.isLeft,
+        genesisParent.executionBase.ordinal === SnapshotOrdinal.MinValue,
+        genesisParent.executionBase.parentHash === Hash.empty
+      )
+  }
+
+  test("every exact execution-base component is load-bearing in the checkpoint signing preimage") { res =>
+    implicit val (h, _) = res
+    val checkpoint = sampleCheckpoint
+    val base = checkpoint.executionBase
+    val variants = List(
+      checkpoint.copy(executionBase = base.copy(ordinal = SnapshotOrdinal(NonNegLong.unsafeFrom(78L)))),
+      checkpoint.copy(executionBase = base.copy(hash = hash('1'))),
+      checkpoint.copy(executionBase = base.copy(parentHash = hash('2'))),
+      checkpoint.copy(executionBase = base.copy(mptRoot = MptRoot(hash('3'))))
+    )
+
+    for {
+      original <- h.hash(checkpoint.signingPreimage)
+      mutated <- variants.traverse(cp => h.hash(cp.signingPreimage))
+    } yield expect(mutated.forall(_ =!= original))
   }
 
   // ===========================================================================

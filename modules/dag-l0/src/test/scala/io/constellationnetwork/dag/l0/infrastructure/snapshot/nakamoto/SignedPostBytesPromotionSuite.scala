@@ -13,9 +13,11 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.generators.addressGen
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, WithdrawalTimeLimit}
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.storages.MptStateStorage
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -216,6 +218,14 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
     Signed(unsigned, NonEmptySet.of(SignatureProof(PeerId(Hex("0d" * 64)).toId, Signature(Hex("0e" * 64))))).toHashed[IO]
   }
 
+  private def stateRef(snapshot: Hashed[GlobalIncrementalSnapshot]): GlobalSnapshotStateRef =
+    GlobalSnapshotStateRef(
+      snapshot.ordinal,
+      snapshot.hash,
+      snapshot.signed.value.lastSnapshotHash,
+      MptRoot(snapshot.signed.value.stateProof.mptRoot.getOrElse(Hash.empty))
+    )
+
   /** The finalize sink's postBytes leg VERBATIM (`SnapshotLeaderLoop.recordFinalizedAccumulator` L679-696): atomically pull the finalized
     * hash's staged bytes + watermark-prune, then write the store on a hit and SKIP on a miss (the skip is the hole mechanism).
     */
@@ -268,9 +278,9 @@ object SignedPostBytesPromotionSuite extends MutableIOSuite {
             case _   => none[Hashed[GlobalIncrementalSnapshot]]
           }).pure[IO]
         reader = PinnedCurrencyInfoReader.make[IO](store, resolver)
-        at31 <- reader.pinnedReaderAt(ord(31L))
-        at32 <- reader.pinnedReaderAt(ord(32L))
-        at33 <- reader.pinnedReaderAt(ord(33L))
+        at31 <- reader.pinnedReaderAt(stateRef(snap31))
+        at32 <- reader.pinnedReaderAt(stateRef(snap32))
+        at33 <- reader.pinnedReaderAt(stateRef(snap33))
       } yield
         expect.same(stored, Set(31L, 33L)) && // the hole: 32 was finalized but never written (adopt skipped staging)
           expect(at31.isDefined) && expect(at33.isDefined) && // neighbors read fine — 32 is WITHIN retention, not evicted
