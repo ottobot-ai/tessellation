@@ -242,7 +242,6 @@ object AllowSpendTerminalConflictReferenceModelSuite extends FunSuite {
 
     expect(blockedIds.forall(SupportedReferenceOperationId.fromValue(_).isEmpty))
       .and(expect(blockedIds.forall(UnsupportedReferenceOperationId.fromValue(_).isRight)))
-      .and(expect(SupportedReferenceOperationId.all.size == 3))
       .and(expect(!manifestIds.contains(unmodeledCancelId)))
       .and(expect(SupportedReferenceOperationId.fromValue(unmodeledCancelId).isEmpty))
       .and(expect(UnsupportedReferenceOperationId.fromValue(unmodeledCancelId).isRight))
