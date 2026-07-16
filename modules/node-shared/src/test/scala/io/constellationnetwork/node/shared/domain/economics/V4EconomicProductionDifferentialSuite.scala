@@ -14,23 +14,29 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.config.types.AddressesConfig
-import io.constellationnetwork.node.shared.domain.block.processing.{BlockAwaitReason => TransferBlockAwaitReason, BlockRejectionReason => TransferBlockRejectionReason, _}
+import io.constellationnetwork.node.shared.domain.block.processing.{
+  BlockAwaitReason => TransferBlockAwaitReason,
+  BlockRejectionReason => TransferBlockRejectionReason,
+  _
+}
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.swap.{AllowSpendChainValidator, AllowSpendValidator}
 import io.constellationnetwork.node.shared.domain.tokenlock.block.{
-  TokenLockBlockAcceptanceManager,
-  TokenLockBlockValidator
+  InvalidTokenLock => InvalidTokenLockTransaction,
+  ParentHashNotEqLastTxHash => TokenLockParentHashMismatch,
+  ValidationFailed => TokenLockValidationFailed,
+  _
 }
 import io.constellationnetwork.node.shared.domain.tokenlock.{TokenLockChainValidator, TokenLockValidator}
 import io.constellationnetwork.node.shared.domain.transaction.{TransactionChainValidator, TransactionValidator}
 import io.constellationnetwork.node.shared.infrastructure.block.processing.{BlockAcceptanceManager, BlockValidator}
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.currency.{AllowSpendOpsManager, BlockAcceptanceOpsManager}
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
-  AllowSpendStateManager,
-  BlockAcceptanceCoordinatorManager,
-  TipUsageManager
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.currency.{
+  AllowSpendOpsManager,
+  BlockAcceptanceOpsManager,
+  TokenLockOpsManager
 }
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, AmountUnderflow, Balance}
@@ -38,6 +44,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.Height
 import io.constellationnetwork.schema.round.RoundId
 import io.constellationnetwork.schema.swap._
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.security.hash.{Hash, ProofsHash}
 import io.constellationnetwork.security.key.ops.PublicKeyOps
@@ -53,12 +60,7 @@ import weaver.MutableIOSuite
 object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
   import ReferenceBalanceScope.{Dag, Metagraph}
   import ReferenceDecision.{Accepted, Rejected}
-  import ReferenceRejection.{
-    AllowSpendEpochOutsideWindow,
-    InsufficientBalance,
-    InvalidAllowSpendApprovers,
-    SelfTransfer
-  }
+  import ReferenceRejection.{AllowSpendEpochOutsideWindow, InsufficientBalance, InvalidAllowSpendApprovers, SelfTransfer}
   import TransferLane.{CurrencyCl1, NativeGl1}
   import V4EconomicProductionProjection._
 
@@ -72,6 +74,7 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
     signedValidator: SignedValidator[IO],
     blockAcceptanceManager: io.constellationnetwork.node.shared.domain.block.processing.BlockAcceptanceManager[IO],
     allowSpendAcceptanceManager: AllowSpendBlockAcceptanceManager[IO],
+    tokenLockAcceptanceManager: TokenLockBlockAcceptanceManager[IO],
     currencyAcceptanceManager: BlockAcceptanceOpsManager[IO],
     globalAcceptanceManager: BlockAcceptanceCoordinatorManager[IO]
   )
@@ -87,6 +90,7 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
 
   private val domain = ReferenceDomain(Hash("11" * 32), Hash("22" * 32), Hash("33" * 32))
   private val epochWindow = ReferenceAllowSpendEpochWindow(100, 5, 20)
+  private val tokenLockEpochRule = ReferenceTokenLockEpochRule(100, 5)
   private val snapshotOrdinal = SnapshotOrdinal.MinValue
   private val parentA = BlockReference(Height(1L), ProofsHash("44" * 32))
   private val parentB = BlockReference(Height(1L), ProofsHash("55" * 32))
@@ -98,6 +102,8 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
   private def transactionFee(value: Long): TransactionFee = TransactionFee(NonNegLong.unsafeFrom(value))
   private def swapAmount(value: Long): SwapAmount = SwapAmount(PosLong.unsafeFrom(value))
   private def allowSpendFee(value: Long): AllowSpendFee = AllowSpendFee(NonNegLong.unsafeFrom(value))
+  private def tokenLockAmount(value: Long): TokenLockAmount = TokenLockAmount(PosLong.unsafeFrom(value))
+  private def tokenLockFee(value: Long): TokenLockFee = TokenLockFee(NonNegLong.unsafeFrom(value))
 
   private def managers(resources: Resources): Managers = {
     implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
@@ -147,21 +153,20 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       signedValidator,
       blockAcceptanceManager,
       allowSpendAcceptanceManager,
+      tokenLockAcceptanceManager,
       currencyAcceptanceManager,
       globalAcceptanceManager
     )
   }
 
-  private def sign[A: Encoder](value: A, keyPair: KeyPair, hasher: Hasher[IO])(implicit
-    securityProvider: SecurityProvider[IO]
+  private def sign[A: Encoder](value: A, keyPair: KeyPair, hasher: Hasher[IO])(
+    implicit securityProvider: SecurityProvider[IO]
   ): IO[Signed[A]] = {
     implicit val scopedHasher: Hasher[IO] = hasher
     Signed.forAsyncHasher(value, keyPair)
   }
 
-  private def signWithThree[A: Encoder](value: A, hasher: Hasher[IO])(implicit
-    securityProvider: SecurityProvider[IO]
-  ): IO[Signed[A]] =
+  private def signWithThree[A: Encoder](value: A, hasher: Hasher[IO])(implicit securityProvider: SecurityProvider[IO]): IO[Signed[A]] =
     for {
       firstKey <- KeyPairGenerator.makeKeyPair[IO]
       secondKey <- KeyPairGenerator.makeKeyPair[IO]
@@ -237,6 +242,41 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       currentHasher
     )
 
+  private def signedTokenLock(
+    source: Address,
+    signerKey: KeyPair,
+    currencyId: Option[CurrencyId],
+    parent: TokenLockReference,
+    amount: Long,
+    fee: Long,
+    unlockEpoch: Option[Long],
+    replaceTokenLockRef: Option[Hash],
+    currentHasher: Hasher[IO]
+  )(implicit securityProvider: SecurityProvider[IO]): IO[Signed[TokenLock]] =
+    sign(
+      TokenLock(
+        source,
+        tokenLockAmount(amount),
+        tokenLockFee(fee),
+        parent,
+        currencyId,
+        unlockEpoch.map(epoch),
+        replaceTokenLockRef
+      ),
+      signerKey,
+      currentHasher
+    )
+
+  private def signedTokenLockBlock(
+    tokenLock: Signed[TokenLock],
+    round: Long,
+    currentHasher: Hasher[IO]
+  )(implicit securityProvider: SecurityProvider[IO]): IO[Signed[TokenLockBlock]] =
+    signWithThree(
+      TokenLockBlock(RoundId(new UUID(1L, round)), NonEmptySet.one(tokenLock)),
+      currentHasher
+    )
+
   private def acceptNativeTransfer(
     transaction: Signed[Transaction],
     balances: SortedMap[Address, Balance],
@@ -280,11 +320,43 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       )
     } yield result
 
+  private def acceptNativeTokenLock(
+    tokenLock: Signed[TokenLock],
+    balances: SortedMap[Address, Balance],
+    lastReference: TokenLockReference,
+    round: Long,
+    managers: Managers,
+    resources: Resources
+  )(
+    implicit securityProvider: SecurityProvider[IO],
+    currentHasher: Hasher[IO]
+  ): IO[(Signed[TokenLockBlock], TokenLockBlockAcceptanceResult)] =
+    for {
+      block <- signedTokenLockBlock(tokenLock, round, resources.currentHasher)
+      context = TokenLockBlockAcceptanceContext.fromStaticData[IO](
+        balances,
+        Map(tokenLock.source -> lastReference),
+        Amount.empty,
+        TokenLockReference.empty,
+        List.empty,
+        epoch(100L)
+      )
+      result <- managers.tokenLockAcceptanceManager.acceptBlocksIteratively(
+        List(block),
+        context,
+        snapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations = true,
+        lastGlobalSnapshotEpochProgress = epoch(100L).some
+      )
+    } yield block -> result
+
   private def currencySnapshotContext(
     metagraphId: Address,
     balances: SortedMap[Address, Balance],
     lastTxRefs: SortedMap[Address, TransactionReference] = SortedMap.empty,
-    lastAllowSpendRefs: SortedMap[Address, AllowSpendReference] = SortedMap.empty
+    lastAllowSpendRefs: SortedMap[Address, AllowSpendReference] = SortedMap.empty,
+    lastTokenLockRefs: SortedMap[Address, TokenLockReference] = SortedMap.empty,
+    activeTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] = SortedMap.empty
   ): CurrencySnapshotContext =
     CurrencySnapshotContext(
       metagraphId,
@@ -296,8 +368,8 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         lastAllowSpendRefs = lastAllowSpendRefs.some,
         activeAllowSpends = none,
         globalSnapshotSyncView = none,
-        lastTokenLockRefs = none,
-        activeTokenLocks = none
+        lastTokenLockRefs = lastTokenLockRefs.some,
+        activeTokenLocks = activeTokenLocks.some
       )
     )
 
@@ -308,8 +380,9 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
     IO.fromEither(
       ReferenceState
         .initial(
-          balances.iterator.map { case (address, value) =>
-            ReferenceBalanceAccount(scope, address) -> BigInt(value.value.value)
+          balances.iterator.map {
+            case (address, value) =>
+              ReferenceBalanceAccount(scope, address) -> BigInt(value.value.value)
           }.toMap
         )
         .leftMap(error => new AssertionError(error.toString))
@@ -346,6 +419,19 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
     IO.fromEither(
       executeAllowSpends(ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some), base, bindings)
         .leftMap(error => new AssertionError(error.toString))
+    )
+
+  private def executeTokenLockReference(
+    lane: TransferLane,
+    base: ReferenceState,
+    bindings: Vector[SourceValidatedTokenLock]
+  ): IO[ReferenceExecution] =
+    IO.fromEither(
+      executeTokenLocks(
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        bindings
+      ).leftMap(error => new AssertionError(error.toString))
     )
 
   private def acceptedAt(execution: ReferenceExecution, index: Int): IO[Accepted] =
@@ -429,6 +515,69 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       .flatMap(result => IO.fromEither(result.leftMap(error => new AssertionError(error.toString))))
   }
 
+  private def groupedTokenLocks(
+    tokenLocks: SortedSet[Signed[TokenLock]]
+  ): SortedMap[Address, SortedSet[Signed[TokenLock]]] =
+    tokenLocks.toVector.groupBy(_.source).view.mapValues(values => SortedSet.from(values)).to(SortedMap)
+
+  private def nativeActiveTokenLocks(
+    tokenLocks: SortedSet[Signed[TokenLock]],
+    resources: Resources
+  ): IO[SortedMap[Address, SortedSet[Signed[TokenLock]]]] = {
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    TokenLockStateManager
+      .make[IO](GlobalStateReader.empty[IO])
+      .acceptTokenLocksWithExpired(
+        epoch(100L),
+        groupedTokenLocks(tokenLocks),
+        SortedMap.empty,
+        Map.empty,
+        SortedMap.empty
+      )
+      .flatMap(result => IO.pure(result.fullState))
+  }
+
+  private def nativeTokenLockBalances(
+    balances: SortedMap[Address, Balance],
+    tokenLocks: SortedSet[Signed[TokenLock]],
+    resources: Resources
+  ): IO[SortedMap[Address, Balance]] = {
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    TokenLockStateManager
+      .make[IO](GlobalStateReader.empty[IO])
+      .updateGlobalBalancesByTokenLocksWithExpired(
+        epoch(100L),
+        balances,
+        groupedTokenLocks(tokenLocks),
+        Map.empty,
+        SortedMap.empty
+      )
+      .flatMap(result => IO.fromEither(result.leftMap(error => new AssertionError(error.toString))))
+      .map(_._1)
+  }
+
+  private def currencyActiveTokenLocks(
+    tokenLocks: SortedSet[Signed[TokenLock]],
+    resources: Resources
+  ): IO[SortedMap[Address, SortedSet[Signed[TokenLock]]]] = {
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    TokenLockOpsManager
+      .make[IO]
+      .acceptTokenLocks(epoch(100L), groupedTokenLocks(tokenLocks), SortedMap.empty, SortedSet.empty)
+      .flatMap(result => IO.pure(result._1))
+  }
+
+  private def currencyTokenLockBalances(
+    balances: SortedMap[Address, Balance],
+    tokenLocks: SortedSet[Signed[TokenLock]]
+  ): IO[SortedMap[Address, Balance]] =
+    IO.fromEither(
+      TokenLockOpsManager
+        .make[IO]
+        .updateBalancesByTokenLocks(epoch(100L), balances, groupedTokenLocks(tokenLocks), SortedMap.empty, SortedSet.empty)
+        .leftMap(error => new AssertionError(error.toString))
+    )
+
   test("native zero-fee transfer compares exact production and reference semantic state and successor identity") { resources =>
     implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
     implicit val currentHasher: Hasher[IO] = resources.currentHasher
@@ -463,37 +612,39 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       nextCorrespondence <- IO.fromEither(
         correspondence.advance(observation).leftMap(error => new AssertionError(error.toString))
       )
-    } yield expect.all(
-      binding.operationId == SupportedReferenceOperationId.NativeTransfer,
-      binding.signerFromProof == source,
-      binding.allProofOwners == Vector(source),
-      binding.domainBinding == UnboundLegacyPayload,
-      accepted.identity == binding.identity,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, destination)) == 60,
-      reference.finalState.lastTxRefOf(ReferenceChainAccount(lane, source)) == binding.structuralSuccessor,
-      observation.semanticDelta.referenceAfter == binding.productionSuccessor,
-      observation.semanticDelta.balances.keySet == Set(source, destination),
-      observedBalanceMatchesReference(
-        observation.semanticDelta.balances,
-        source,
-        balance(100L),
-        balance(40L),
-        ReferenceBalanceAccount(Dag, source),
-        reference
-      ),
-      observedBalanceMatchesReference(
-        observation.semanticDelta.balances,
-        destination,
-        Balance.empty,
-        balance(60L),
-        ReferenceBalanceAccount(Dag, destination),
-        reference
-      ),
-      nextCorrespondence.production == update.lastTxRefs.get(source).getOrElse(TransactionReference.empty),
-      nextCorrespondence.structural == binding.structuralSuccessor,
-      reference.rejected.isEmpty
-    )
+    } yield
+      expect.all(
+        binding.operationId == SupportedReferenceOperationId.NativeTransfer,
+        binding.signerFromProof == source,
+        binding.allProofOwners == Vector(source),
+        !binding.isInstanceOf[Product],
+        binding.domainBinding == UnboundLegacyPayload,
+        accepted.identity == binding.identity,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, destination)) == 60,
+        reference.finalState.lastTxRefOf(ReferenceChainAccount(lane, source)) == binding.structuralSuccessor,
+        observation.semanticDelta.referenceAfter == binding.productionSuccessor,
+        observation.semanticDelta.balances.keySet == Set(source, destination),
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          source,
+          balance(100L),
+          balance(40L),
+          ReferenceBalanceAccount(Dag, source),
+          reference
+        ),
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          destination,
+          Balance.empty,
+          balance(60L),
+          ReferenceBalanceAccount(Dag, destination),
+          reference
+        ),
+        nextCorrespondence.production == update.lastTxRefs.get(source).getOrElse(TransactionReference.empty),
+        nextCorrespondence.structural == binding.structuralSuccessor,
+        reference.rejected.isEmpty
+      )
   }
 
   test("currency zero-fee transfer uses the real ML0 wrapper and exact successor reference") { resources =>
@@ -561,35 +712,36 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       base <- referenceBase(Metagraph(metagraphId), initialBalances)
       reference <- executeTransferReference(lane, base, Vector(binding))
       accepted <- acceptedAt(reference, 0)
-    } yield expect.all(
-      result.accepted.map(_._1) == List(block),
-      result.notAccepted.isEmpty,
-      binding.operationId == SupportedReferenceOperationId.CurrencyTransfer,
-      result.contextUpdate.lastTxRefs.get(source).contains(binding.productionSuccessor),
-      unrelatedObservation == Left(TransferBatchPayloadMismatch(transaction, Vector(unrelatedTransaction))),
-      unrelatedAdvance == Left(TransferBatchPayloadMismatch(transaction, Vector(unrelatedTransaction))),
-      accepted.identity == binding.identity,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), destination)) == 60,
-      reference.finalState.lastTxRefOf(ReferenceChainAccount(lane, source)) == binding.structuralSuccessor,
-      observation.semanticDelta.referenceAfter == binding.productionSuccessor,
-      observedBalanceMatchesReference(
-        observation.semanticDelta.balances,
-        source,
-        balance(100L),
-        balance(40L),
-        ReferenceBalanceAccount(Metagraph(metagraphId), source),
-        reference
-      ),
-      observedBalanceMatchesReference(
-        observation.semanticDelta.balances,
-        destination,
-        Balance.empty,
-        balance(60L),
-        ReferenceBalanceAccount(Metagraph(metagraphId), destination),
-        reference
+    } yield
+      expect.all(
+        result.accepted.map(_._1) == List(block),
+        result.notAccepted.isEmpty,
+        binding.operationId == SupportedReferenceOperationId.CurrencyTransfer,
+        result.contextUpdate.lastTxRefs.get(source).contains(binding.productionSuccessor),
+        unrelatedObservation == Left(TransferBatchPayloadMismatch(transaction, Vector(unrelatedTransaction))),
+        unrelatedAdvance == Left(TransferBatchPayloadMismatch(transaction, Vector(unrelatedTransaction))),
+        accepted.identity == binding.identity,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), destination)) == 60,
+        reference.finalState.lastTxRefOf(ReferenceChainAccount(lane, source)) == binding.structuralSuccessor,
+        observation.semanticDelta.referenceAfter == binding.productionSuccessor,
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          source,
+          balance(100L),
+          balance(40L),
+          ReferenceBalanceAccount(Metagraph(metagraphId), source),
+          reference
+        ),
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          destination,
+          Balance.empty,
+          balance(60L),
+          ReferenceBalanceAccount(Metagraph(metagraphId), destination),
+          reference
+        )
       )
-    )
   }
 
   test("native zero-fee allow-spend compares exact admission, reservation, and successor state") { resources =>
@@ -644,27 +796,29 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       base <- referenceBase(Dag, initialBalances)
       reference <- executeAllowSpendReference(lane, base, Vector(binding))
       accepted <- acceptedAt(reference, 0)
-    } yield expect.all(
-      binding.operationId == SupportedReferenceOperationId.AllowSpendCreation,
-      binding.signerFromProof == source,
-      binding.allProofOwners == Vector(source),
-      update.balances == finalBalances,
-      activeBySource == SortedMap(source -> SortedSet(allowSpend)),
-      accepted.identity == binding.identity,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
-      reference.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(lane, source)) == binding.structuralSuccessor,
-      reference.finalState.allowSpendReservationOf(binding.identity).contains(binding.reservation),
-      observation.semanticDelta.activeAdded == SortedSet(allowSpend),
-      observedBalanceMatchesReference(
-        observation.semanticDelta.balances,
-        source,
-        balance(100L),
-        balance(40L),
-        ReferenceBalanceAccount(Dag, source),
-        reference
-      ),
-      reference.rejected.isEmpty
-    )
+    } yield
+      expect.all(
+        binding.operationId == SupportedReferenceOperationId.AllowSpendCreation,
+        binding.signerFromProof == source,
+        binding.allProofOwners == Vector(source),
+        !binding.isInstanceOf[Product],
+        update.balances == finalBalances,
+        activeBySource == SortedMap(source -> SortedSet(allowSpend)),
+        accepted.identity == binding.identity,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        reference.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(lane, source)) == binding.structuralSuccessor,
+        reference.finalState.allowSpendReservationOf(binding.identity).contains(binding.reservation),
+        observation.semanticDelta.activeAdded == SortedSet(allowSpend),
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          source,
+          balance(100L),
+          balance(40L),
+          ReferenceBalanceAccount(Dag, source),
+          reference
+        ),
+        reference.rejected.isEmpty
+      )
   }
 
   test("currency zero-fee allow-spend uses the real ML0 wrapper and exact active record") { resources =>
@@ -744,28 +898,29 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       base <- referenceBase(Metagraph(metagraphId), initialBalances)
       reference <- executeAllowSpendReference(lane, base, Vector(binding))
       accepted <- acceptedAt(reference, 0)
-    } yield expect.all(
-      result.accepted == List(block),
-      result.notAccepted.isEmpty,
-      result.contextUpdate.balances == finalBalances,
-      result.contextUpdate.lastTxRefs.get(source).contains(binding.productionSuccessor),
-      unrelatedObservation == Left(AllowSpendBatchPayloadMismatch(allowSpend, Vector(unrelatedAllowSpend))),
-      unrelatedAdvance == Left(AllowSpendBatchPayloadMismatch(allowSpend, Vector(unrelatedAllowSpend))),
-      active == SortedSet(allowSpend),
-      accepted.identity == binding.identity,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
-      reference.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(lane, source)) == binding.structuralSuccessor,
-      reference.finalState.allowSpendReservationOf(binding.identity).contains(binding.reservation),
-      observation.semanticDelta.referenceAfter == binding.productionSuccessor,
-      observedBalanceMatchesReference(
-        observation.semanticDelta.balances,
-        source,
-        balance(100L),
-        balance(40L),
-        ReferenceBalanceAccount(Metagraph(metagraphId), source),
-        reference
+    } yield
+      expect.all(
+        result.accepted == List(block),
+        result.notAccepted.isEmpty,
+        result.contextUpdate.balances == finalBalances,
+        result.contextUpdate.lastTxRefs.get(source).contains(binding.productionSuccessor),
+        unrelatedObservation == Left(AllowSpendBatchPayloadMismatch(allowSpend, Vector(unrelatedAllowSpend))),
+        unrelatedAdvance == Left(AllowSpendBatchPayloadMismatch(allowSpend, Vector(unrelatedAllowSpend))),
+        active == SortedSet(allowSpend),
+        accepted.identity == binding.identity,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
+        reference.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(lane, source)) == binding.structuralSuccessor,
+        reference.finalState.allowSpendReservationOf(binding.identity).contains(binding.reservation),
+        observation.semanticDelta.referenceAfter == binding.productionSuccessor,
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          source,
+          balance(100L),
+          balance(40L),
+          ReferenceBalanceAccount(Metagraph(metagraphId), source),
+          reference
+        )
       )
-    )
   }
 
   test("claimed structural genesis is created only from the exact native or currency canonical reference") { resources =>
@@ -825,24 +980,25 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         currencyAllowSpendGenesis,
         resources.currentHasher
       )
-    } yield expect.all(
-      nativeTransfer == Left(InvalidTransferCanonicalGenesis(NativeGl1, TransactionReference.empty, forgedTransfer)),
-      currencyTransfer == Left(InvalidTransferCanonicalGenesis(currencyLane, currencyTransferGenesis, forgedTransfer)),
-      nativeAllowSpend == Left(InvalidAllowSpendCanonicalGenesis(NativeGl1, AllowSpendReference.empty, forgedAllowSpend)),
-      currencyAllowSpend == Left(InvalidAllowSpendCanonicalGenesis(currencyLane, currencyAllowSpendGenesis, forgedAllowSpend)),
-      canonicalNativeTransfer.exists(value =>
-        value.production == TransactionReference.empty && value.structural == StructuralReference.genesis
-      ),
-      canonicalCurrencyTransfer.exists(value =>
-        value.production == currencyTransferGenesis && value.structural == StructuralReference.genesis
-      ),
-      canonicalNativeAllowSpend.exists(value =>
-        value.production == AllowSpendReference.empty && value.structural == StructuralAllowSpendReference.genesis
-      ),
-      canonicalCurrencyAllowSpend.exists(value =>
-        value.production == currencyAllowSpendGenesis && value.structural == StructuralAllowSpendReference.genesis
+    } yield
+      expect.all(
+        nativeTransfer == Left(InvalidTransferCanonicalGenesis(NativeGl1, TransactionReference.empty, forgedTransfer)),
+        currencyTransfer == Left(InvalidTransferCanonicalGenesis(currencyLane, currencyTransferGenesis, forgedTransfer)),
+        nativeAllowSpend == Left(InvalidAllowSpendCanonicalGenesis(NativeGl1, AllowSpendReference.empty, forgedAllowSpend)),
+        currencyAllowSpend == Left(InvalidAllowSpendCanonicalGenesis(currencyLane, currencyAllowSpendGenesis, forgedAllowSpend)),
+        canonicalNativeTransfer.exists(value =>
+          value.production == TransactionReference.empty && value.structural == StructuralReference.genesis
+        ),
+        canonicalCurrencyTransfer.exists(value =>
+          value.production == currencyTransferGenesis && value.structural == StructuralReference.genesis
+        ),
+        canonicalNativeAllowSpend.exists(value =>
+          value.production == AllowSpendReference.empty && value.structural == StructuralAllowSpendReference.genesis
+        ),
+        canonicalCurrencyAllowSpend.exists(value =>
+          value.production == currencyAllowSpendGenesis && value.structural == StructuralAllowSpendReference.genesis
+        )
       )
-    )
   }
 
   test("wrong-owner production proofs reject before any transfer or allow-spend reference input can be minted") { resources =>
@@ -919,30 +1075,31 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         implicit val allowSpendHasher: Hasher[IO] = resources.currentHasher
         AllowSpendReference.of[IO](forgedAllow)
       }
-    } yield expect.all(
-      transferProduction == Left(
-        io.constellationnetwork.node.shared.domain.block.processing.ValidationFailed(
-          NonEmptyList.one(
-            io.constellationnetwork.node.shared.domain.block.processing.InvalidTransaction(
-              forgedTransferReference,
-              TransactionValidator.NotSignedBySourceAddressOwner
+    } yield
+      expect.all(
+        transferProduction == Left(
+          io.constellationnetwork.node.shared.domain.block.processing.ValidationFailed(
+            NonEmptyList.one(
+              io.constellationnetwork.node.shared.domain.block.processing.InvalidTransaction(
+                forgedTransferReference,
+                TransactionValidator.NotSignedBySourceAddressOwner
+              )
             )
           )
-        )
-      ),
-      transferBinding == Left(ProductionSourceOwnerValidationRejected("ECO-TRANSFER-NATIVE")),
-      allowProduction == Left(
-        io.constellationnetwork.node.shared.domain.swap.block.ValidationFailed(
-          NonEmptyList.one(
-            InvalidAllowSpend(
-              forgedAllowReference,
-              AllowSpendValidator.NotSignedBySourceAddressOwner
+        ),
+        transferBinding == Left(ProductionSourceOwnerValidationRejected("ECO-TRANSFER-NATIVE")),
+        allowProduction == Left(
+          io.constellationnetwork.node.shared.domain.swap.block.ValidationFailed(
+            NonEmptyList.one(
+              InvalidAllowSpend(
+                forgedAllowReference,
+                AllowSpendValidator.NotSignedBySourceAddressOwner
+              )
             )
           )
-        )
-      ),
-      allowBinding == Left(ProductionSourceOwnerValidationRejected("ECO-ALLOW-CREATE"))
-    )
+        ),
+        allowBinding == Left(ProductionSourceOwnerValidationRejected("ECO-ALLOW-CREATE"))
+      )
   }
 
   test("same-ordinal wrong-parent hashes reject in production and at exact correspondence binding") { resources =>
@@ -1011,28 +1168,29 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         implicit val allowSpendHasher: Hasher[IO] = resources.currentHasher
         AllowSpendReference.of[IO](allowSpend)
       }
-    } yield expect.all(
-      transferProduction == Left(
-        RejectedTransaction(
-          transferReference,
-          io.constellationnetwork.node.shared.domain.block.processing.ParentHashNotEqLastTxHash(
-            wrongTxParent.hash,
-            txCorrespondence.production.hash
+    } yield
+      expect.all(
+        transferProduction == Left(
+          RejectedTransaction(
+            transferReference,
+            io.constellationnetwork.node.shared.domain.block.processing.ParentHashNotEqLastTxHash(
+              wrongTxParent.hash,
+              txCorrespondence.production.hash
+            )
           )
-        )
-      ),
-      transferBinding == Left(TransferParentBindingMismatch(TransactionReference.empty, wrongTxParent)),
-      allowProduction == Left(
-        RejectedAllowSpend(
-          allowSpendReference,
-          io.constellationnetwork.node.shared.domain.swap.block.ParentHashNotEqLastTxHash(
-            wrongAllowParent.hash,
-            allowCorrespondence.production.hash
+        ),
+        transferBinding == Left(TransferParentBindingMismatch(TransactionReference.empty, wrongTxParent)),
+        allowProduction == Left(
+          RejectedAllowSpend(
+            allowSpendReference,
+            io.constellationnetwork.node.shared.domain.swap.block.ParentHashNotEqLastTxHash(
+              wrongAllowParent.hash,
+              allowCorrespondence.production.hash
+            )
           )
-        )
-      ),
-      allowBinding == Left(AllowSpendParentBindingMismatch(AllowSpendReference.empty, wrongAllowParent))
-    )
+        ),
+        allowBinding == Left(AllowSpendParentBindingMismatch(AllowSpendReference.empty, wrongAllowParent))
+      )
   }
 
   test("rejected validly signed operations cannot advance correspondence; insufficient balance divergence stays exact") { resources =>
@@ -1189,58 +1347,59 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       )
       insufficientAllowReference <- executeAllowSpendReference(NativeGl1, allowBase, Vector(insufficientAllowBinding))
       insufficientAllowRejected <- rejectedAt(insufficientAllowReference, 0)
-    } yield expect.all(
-      insufficientTransferProduction == Left(
-        io.constellationnetwork.node.shared.domain.block.processing.AddressBalanceOutOfRange(source, AmountUnderflow)
-      ),
-      insufficientTransferObservation == Left(
-        ProductionTransferNotAccepted(
-          insufficientTransferId,
+    } yield
+      expect.all(
+        insufficientTransferProduction == Left(
           io.constellationnetwork.node.shared.domain.block.processing.AddressBalanceOutOfRange(source, AmountUnderflow)
-        )
-      ),
-      insufficientTransferRejected.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 11, 10),
-      insufficientTransferReference.finalState == transferBase,
-      txCorrespondence.production == TransactionReference.empty,
-      txCorrespondence.structural == StructuralReference.genesis,
-      selfTransferProduction == Left(
-        io.constellationnetwork.node.shared.domain.block.processing.ValidationFailed(
-          NonEmptyList.one(
-            io.constellationnetwork.node.shared.domain.block.processing.InvalidTransaction(
-              selfTransferId,
-              TransactionValidator.SameSourceAndDestinationAddress(source)
+        ),
+        insufficientTransferObservation == Left(
+          ProductionTransferNotAccepted(
+            insufficientTransferId,
+            io.constellationnetwork.node.shared.domain.block.processing.AddressBalanceOutOfRange(source, AmountUnderflow)
+          )
+        ),
+        insufficientTransferRejected.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 11, 10),
+        insufficientTransferReference.finalState == transferBase,
+        txCorrespondence.production == TransactionReference.empty,
+        txCorrespondence.structural == StructuralReference.genesis,
+        selfTransferProduction == Left(
+          io.constellationnetwork.node.shared.domain.block.processing.ValidationFailed(
+            NonEmptyList.one(
+              io.constellationnetwork.node.shared.domain.block.processing.InvalidTransaction(
+                selfTransferId,
+                TransactionValidator.SameSourceAndDestinationAddress(source)
+              )
             )
           )
-        )
-      ),
-      selfTransferRejected.reason == SelfTransfer(source),
-      selfTransferReference.finalState == transferBase,
-      invalidApproverProduction == Left(
-        io.constellationnetwork.node.shared.domain.swap.block.ValidationFailed(
-          NonEmptyList.one(
-            InvalidAllowSpend(
-              invalidApproverId,
-              AllowSpendValidator.InvalidApprover(List(otherApproverKey.getPublic.toAddress), destination)
+        ),
+        selfTransferRejected.reason == SelfTransfer(source),
+        selfTransferReference.finalState == transferBase,
+        invalidApproverProduction == Left(
+          io.constellationnetwork.node.shared.domain.swap.block.ValidationFailed(
+            NonEmptyList.one(
+              InvalidAllowSpend(
+                invalidApproverId,
+                AllowSpendValidator.InvalidApprover(List(otherApproverKey.getPublic.toAddress), destination)
+              )
             )
           )
-        )
-      ),
-      invalidApproverRejected.reason == InvalidAllowSpendApprovers(destination, Vector(otherApproverKey.getPublic.toAddress)),
-      invalidApproverReference.finalState == allowBase,
-      insufficientAllowProduction == Left(
-        io.constellationnetwork.node.shared.domain.swap.block.AddressBalanceOutOfRange(source, AmountUnderflow)
-      ),
-      insufficientAllowObservation == Left(
-        ProductionAllowSpendNotAccepted(
-          insufficientAllowId,
+        ),
+        invalidApproverRejected.reason == InvalidAllowSpendApprovers(destination, Vector(otherApproverKey.getPublic.toAddress)),
+        invalidApproverReference.finalState == allowBase,
+        insufficientAllowProduction == Left(
           io.constellationnetwork.node.shared.domain.swap.block.AddressBalanceOutOfRange(source, AmountUnderflow)
-        )
-      ),
-      insufficientAllowRejected.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 11, 10),
-      insufficientAllowReference.finalState == allowBase,
-      allowCorrespondence.production == AllowSpendReference.empty,
-      allowCorrespondence.structural == StructuralAllowSpendReference.genesis
-    )
+        ),
+        insufficientAllowObservation == Left(
+          ProductionAllowSpendNotAccepted(
+            insufficientAllowId,
+            io.constellationnetwork.node.shared.domain.swap.block.AddressBalanceOutOfRange(source, AmountUnderflow)
+          )
+        ),
+        insufficientAllowRejected.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 11, 10),
+        insufficientAllowReference.finalState == allowBase,
+        allowCorrespondence.production == AllowSpendReference.empty,
+        allowCorrespondence.structural == StructuralAllowSpendReference.genesis
+      )
   }
 
   test("native and currency allow-spend lane mismatches reject before semantic input creation") { resources =>
@@ -1314,16 +1473,17 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         managerBundle.signedValidator,
         resources.currentHasher
       )
-    } yield expect.all(
-      nativeProduction.accepted.isEmpty,
-      nativeProduction.contextUpdate == AllowSpendBlockAcceptanceContextUpdate.empty,
-      nativeProduction.notAccepted == List(nativeBlock -> InvalidGlobalAllowSpendLane),
-      nativeBinding == Left(PayloadLaneMismatch(NativeGl1, CurrencyId(metagraphId).some)),
-      currencyProduction.accepted.isEmpty,
-      currencyProduction.contextUpdate == AllowSpendBlockAcceptanceContextUpdate.empty,
-      currencyProduction.notAccepted == List(currencyBlock -> InvalidMetagraphAllowSpendLane(CurrencyId(metagraphId))),
-      currencyBinding == Left(PayloadLaneMismatch(CurrencyCl1(metagraphId), none))
-    )
+    } yield
+      expect.all(
+        nativeProduction.accepted.isEmpty,
+        nativeProduction.contextUpdate == AllowSpendBlockAcceptanceContextUpdate.empty,
+        nativeProduction.notAccepted == List(nativeBlock -> InvalidGlobalAllowSpendLane),
+        nativeBinding == Left(PayloadLaneMismatch(NativeGl1, CurrencyId(metagraphId).some)),
+        currencyProduction.accepted.isEmpty,
+        currencyProduction.contextUpdate == AllowSpendBlockAcceptanceContextUpdate.empty,
+        currencyProduction.notAccepted == List(currencyBlock -> InvalidMetagraphAllowSpendLane(CurrencyId(metagraphId))),
+        currencyBinding == Left(PayloadLaneMismatch(CurrencyCl1(metagraphId), none))
+      )
   }
 
   test("nonzero fees fail at the helper boundary for all four lane-operation combinations") { resources =>
@@ -1400,12 +1560,13 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         managerBundle.signedValidator,
         resources.currentHasher
       )
-    } yield expect.all(
-      nativeTransferResult == Left(NonZeroFeeOutOfScope("ECO-TRANSFER-NATIVE", 1)),
-      currencyTransferResult == Left(NonZeroFeeOutOfScope("ECO-TRANSFER-CURRENCY", 1)),
-      nativeAllowResult == Left(NonZeroFeeOutOfScope("ECO-ALLOW-CREATE", 1)),
-      currencyAllowResult == Left(NonZeroFeeOutOfScope("ECO-ALLOW-CREATE", 1))
-    )
+    } yield
+      expect.all(
+        nativeTransferResult == Left(NonZeroFeeOutOfScope("ECO-TRANSFER-NATIVE", 1)),
+        currencyTransferResult == Left(NonZeroFeeOutOfScope("ECO-TRANSFER-CURRENCY", 1)),
+        nativeAllowResult == Left(NonZeroFeeOutOfScope("ECO-ALLOW-CREATE", 1)),
+        currencyAllowResult == Left(NonZeroFeeOutOfScope("ECO-ALLOW-CREATE", 1))
+      )
   }
 
   test("real transfer batch preserves accepted, rejected, dependent-valid, and awaiting outcomes with exact aggregate state") { resources =>
@@ -1540,40 +1701,41 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       acceptedBindings = projection.bindings.zip(projection.dispositions).collect {
         case (binding, TransferBatchAccepted) => binding
       }
-    } yield expect.all(
-      production.accepted.map(_._1) == List(thirdBlock, firstBlock),
-      production.notAccepted.map(_._1) == List(awaitingBlock, rejectedBlock),
-      projection.dispositions == Vector(
-        TransferBatchAccepted,
-        TransferBatchRejected(rejectedReference, productionRejection),
-        TransferBatchAccepted,
-        TransferBatchAwaiting(awaitingReference, productionAwait)
-      ),
-      mismatchedPayloadProjection == Left(TransferBatchPayloadMismatch(rejected, Vector(first))),
-      productionReason == io.constellationnetwork.node.shared.domain.block.processing.ValidationFailed(
-        NonEmptyList.one(
-          io.constellationnetwork.node.shared.domain.block.processing.InvalidTransaction(
-            rejectedReference,
-            TransactionValidator.SameSourceAndDestinationAddress(source)
+    } yield
+      expect.all(
+        production.accepted.map(_._1) == List(thirdBlock, firstBlock),
+        production.notAccepted.map(_._1) == List(awaitingBlock, rejectedBlock),
+        projection.dispositions == Vector(
+          TransferBatchAccepted,
+          TransferBatchRejected(rejectedReference, productionRejection),
+          TransferBatchAccepted,
+          TransferBatchAwaiting(awaitingReference, productionAwait)
+        ),
+        mismatchedPayloadProjection == Left(TransferBatchPayloadMismatch(rejected, Vector(first))),
+        productionReason == io.constellationnetwork.node.shared.domain.block.processing.ValidationFailed(
+          NonEmptyList.one(
+            io.constellationnetwork.node.shared.domain.block.processing.InvalidTransaction(
+              rejectedReference,
+              TransactionValidator.SameSourceAndDestinationAddress(source)
+            )
           )
-        )
-      ),
-      rejectedDecision.reason == SelfTransfer(source),
-      productionAwaitReason == io.constellationnetwork.node.shared.domain.block.processing.AddressBalanceOutOfRange(
-        source,
-        AmountUnderflow
-      ),
-      awaitingDecision.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 50),
-      reference.acceptedIds == acceptedBindings.map(_.identity),
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 50,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, firstDestination)) == 30,
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, thirdDestination)) == 20,
-      projection.semanticDelta.get(source).exists(_.after == balance(50L)),
-      projection.semanticDelta.get(firstDestination).exists(_.after == balance(30L)),
-      projection.semanticDelta.get(thirdDestination).exists(_.after == balance(20L)),
-      !projection.semanticDelta.contains(awaitingDestination),
-      production.contextUpdate.lastTxRefs.get(source).contains(thirdSuccessor)
-    )
+        ),
+        rejectedDecision.reason == SelfTransfer(source),
+        productionAwaitReason == io.constellationnetwork.node.shared.domain.block.processing.AddressBalanceOutOfRange(
+          source,
+          AmountUnderflow
+        ),
+        awaitingDecision.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 50),
+        reference.acceptedIds == acceptedBindings.map(_.identity),
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 50,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, firstDestination)) == 30,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, thirdDestination)) == 20,
+        projection.semanticDelta.get(source).exists(_.after == balance(50L)),
+        projection.semanticDelta.get(firstDestination).exists(_.after == balance(30L)),
+        projection.semanticDelta.get(thirdDestination).exists(_.after == balance(20L)),
+        !projection.semanticDelta.contains(awaitingDestination),
+        production.contextUpdate.lastTxRefs.get(source).contains(thirdSuccessor)
+      )
   }
 
   test("real allow-spend batch preserves all outcomes and exact exposed aggregate balance/reference state") { resources =>
@@ -1715,47 +1877,48 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       )(new AssertionError("missing rejected allow-spend block decision"))
       productionRejection <- productionReason match {
         case reason: AllowSpendBlockRejectionReason => IO.pure(reason)
-        case other => IO.raiseError(new AssertionError(s"expected allow-spend rejection, got $other"))
+        case other                                  => IO.raiseError(new AssertionError(s"expected allow-spend rejection, got $other"))
       }
       productionAwaitReason <- IO.fromOption(
         production.notAccepted.collectFirst { case (`awaitingBlock`, reason) => reason }
       )(new AssertionError("missing awaiting allow-spend block decision"))
       productionAwait <- productionAwaitReason match {
         case reason: AllowSpendBlockAwaitReason => IO.pure(reason)
-        case other => IO.raiseError(new AssertionError(s"expected allow-spend await reason, got $other"))
+        case other                              => IO.raiseError(new AssertionError(s"expected allow-spend await reason, got $other"))
       }
       acceptedBindings = projection.bindings.zip(projection.dispositions).collect {
         case (binding, AllowSpendBatchAccepted) => binding
       }
-    } yield expect.all(
-      production.accepted == List(thirdBlock, firstBlock),
-      production.notAccepted.map(_._1) == List(awaitingBlock, rejectedBlock),
-      projection.dispositions == Vector(
-        AllowSpendBatchAccepted,
-        AllowSpendBatchRejected(rejectedReference, productionRejection),
-        AllowSpendBatchAccepted,
-        AllowSpendBatchAwaiting(awaitingReference, productionAwait)
-      ),
-      mismatchedPayloadProjection == Left(AllowSpendBatchPayloadMismatch(rejected, Vector(first))),
-      productionReason == io.constellationnetwork.node.shared.domain.swap.block.ValidationFailed(
-        NonEmptyList.one(
-          InvalidAllowSpend(
-            rejectedReference,
-            AllowSpendValidator.InvalidApprover(List(firstDestination), rejectedDestination)
+    } yield
+      expect.all(
+        production.accepted == List(thirdBlock, firstBlock),
+        production.notAccepted.map(_._1) == List(awaitingBlock, rejectedBlock),
+        projection.dispositions == Vector(
+          AllowSpendBatchAccepted,
+          AllowSpendBatchRejected(rejectedReference, productionRejection),
+          AllowSpendBatchAccepted,
+          AllowSpendBatchAwaiting(awaitingReference, productionAwait)
+        ),
+        mismatchedPayloadProjection == Left(AllowSpendBatchPayloadMismatch(rejected, Vector(first))),
+        productionReason == io.constellationnetwork.node.shared.domain.swap.block.ValidationFailed(
+          NonEmptyList.one(
+            InvalidAllowSpend(
+              rejectedReference,
+              AllowSpendValidator.InvalidApprover(List(firstDestination), rejectedDestination)
+            )
           )
-        )
-      ),
-      rejectedDecision.reason == InvalidAllowSpendApprovers(rejectedDestination, Vector(firstDestination)),
-      productionAwaitReason == io.constellationnetwork.node.shared.domain.swap.block.AddressBalanceOutOfRange(
-        source,
-        AmountUnderflow
-      ),
-      awaitingDecision.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 50),
-      reference.acceptedIds == acceptedBindings.map(_.identity),
-      reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 50,
-      projection.semanticDelta.get(source).exists(_.after == balance(50L)),
-      production.contextUpdate.lastTxRefs.get(source).contains(thirdSuccessor)
-    )
+        ),
+        rejectedDecision.reason == InvalidAllowSpendApprovers(rejectedDestination, Vector(firstDestination)),
+        productionAwaitReason == io.constellationnetwork.node.shared.domain.swap.block.AddressBalanceOutOfRange(
+          source,
+          AmountUnderflow
+        ),
+        awaitingDecision.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 50),
+        reference.acceptedIds == acceptedBindings.map(_.identity),
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 50,
+        projection.semanticDelta.get(source).exists(_.after == balance(50L)),
+        production.contextUpdate.lastTxRefs.get(source).contains(thirdSuccessor)
+      )
   }
 
   test("GL0 allow-spend epoch-window divergence remains explicit and is not normalized") { resources =>
@@ -1802,11 +1965,454 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       base <- referenceBase(Dag, initialBalances)
       reference <- executeAllowSpendReference(lane, base, Vector(binding))
       rejected <- rejectedAt(reference, 0)
-    } yield expect.all(
-      production.isRight,
-      rejected.reason == AllowSpendEpochOutsideWindow(102, 105, 120),
-      reference.finalState == base,
-      binding.domainBinding == UnboundLegacyPayload
-    )
+    } yield
+      expect.all(
+        production.isRight,
+        rejected.reason == AllowSpendEpochOutsideWindow(102, 105, 120),
+        reference.finalState == base,
+        binding.domainBinding == UnboundLegacyPayload
+      )
+  }
+
+  test("native zero-fee nonreplacement token lock binds the exact accepted payload and complete active state") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence = TokenLockReferenceCorrespondence.nativeGenesis
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      acceptedPair <- acceptNativeTokenLock(
+        tokenLock,
+        initialBalances,
+        correspondence.production,
+        20L,
+        managerBundle,
+        resources
+      )
+      (block, production) = acceptedPair
+      binding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        correspondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      activeAfter <- nativeActiveTokenLocks(SortedSet(tokenLock), resources)
+      finalBalances <- nativeTokenLockBalances(initialBalances, SortedSet(tokenLock), resources)
+      observation <- IO.fromEither(
+        observeBatchAcceptedTokenLock(binding, block, initialBalances, production, SortedMap.empty, activeAfter)
+          .leftMap(error => new AssertionError(error.toString))
+      )
+      nextCorrespondence <- IO.fromEither(correspondence.advance(observation).leftMap(error => new AssertionError(error.toString)))
+      unrelated <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        1L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      unrelatedBlock <- signedTokenLockBlock(unrelated, 21L, resources.currentHasher)
+      payloadMismatch = observeBatchAcceptedTokenLock(
+        binding,
+        unrelatedBlock,
+        initialBalances,
+        production.copy(accepted = List(unrelatedBlock)),
+        SortedMap.empty,
+        activeAfter
+      )
+      blockedAdvance = payloadMismatch.flatMap(correspondence.advance)
+      extraAcceptedProduction = production.copy(accepted = List(block, unrelatedBlock))
+      extraAcceptedObservation = observeBatchAcceptedTokenLock(
+        binding,
+        block,
+        initialBalances,
+        extraAcceptedProduction,
+        SortedMap.empty,
+        activeAfter
+      )
+      base <- referenceBase(Dag, initialBalances)
+      reference <- executeTokenLockReference(lane, base, Vector(binding))
+      accepted <- acceptedAt(reference, 0)
+    } yield
+      expect.all(
+        production.accepted == List(block),
+        production.notAccepted.isEmpty,
+        production.contextUpdate.balances == finalBalances,
+        production.contextUpdate.lastTokenLocksRefs == Map(source -> binding.productionSuccessor),
+        binding.operationId == SupportedReferenceOperationId.TokenLockCreation,
+        binding.signerFromProof == source,
+        binding.allProofOwners == Vector(source),
+        !binding.isInstanceOf[Product],
+        binding.domainBinding == UnboundLegacyPayload,
+        activeAfter == SortedMap(source -> SortedSet(tokenLock)),
+        observation.semanticDelta.activeAfter == activeAfter,
+        payloadMismatch == Left(TokenLockBatchPayloadMismatch(tokenLock, Vector(unrelated))),
+        blockedAdvance == Left(TokenLockBatchPayloadMismatch(tokenLock, Vector(unrelated))),
+        extraAcceptedObservation == Left(
+          UnexpectedTokenLockBatchDecisions(block, List(block, unrelatedBlock), List.empty)
+        ),
+        accepted.identity == binding.identity,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        reference.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) == binding.structuralSuccessor,
+        reference.finalState.activeTokenLocks == Vector(binding.activeTokenLock),
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          source,
+          balance(100L),
+          balance(40L),
+          ReferenceBalanceAccount(Dag, source),
+          reference
+        ),
+        nextCorrespondence.production == binding.productionSuccessor,
+        nextCorrespondence.structural == binding.structuralSuccessor,
+        reference.rejected.isEmpty
+      )
+  }
+
+  test("currency zero-fee nonreplacement token lock uses the ML0 wrapper and exact metagraph scope") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+
+    for {
+      metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphId = metagraphKey.getPublic.toAddress
+      lane = CurrencyCl1(metagraphId)
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence <- TokenLockReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        CurrencyId(metagraphId).some,
+        correspondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      block <- signedTokenLockBlock(tokenLock, 22L, resources.currentHasher)
+      production <- managerBundle.currencyAcceptanceManager.acceptTokenLockBlocks(
+        List(block),
+        currencySnapshotContext(
+          metagraphId,
+          initialBalances,
+          lastTokenLockRefs = SortedMap(source -> correspondence.production)
+        ),
+        snapshotOrdinal,
+        correspondence.production,
+        shouldPerformMetagraphSpecificValidations = true,
+        lastSyncGlobalSnapshotEpochProgress = epoch(100L)
+      )
+      binding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        correspondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      activeAfter <- currencyActiveTokenLocks(SortedSet(tokenLock), resources)
+      finalBalances <- currencyTokenLockBalances(initialBalances, SortedSet(tokenLock))
+      observation <- IO.fromEither(
+        observeBatchAcceptedTokenLock(binding, block, initialBalances, production, SortedMap.empty, activeAfter)
+          .leftMap(error => new AssertionError(error.toString))
+      )
+      base <- referenceBase(Metagraph(metagraphId), initialBalances)
+      reference <- executeTokenLockReference(lane, base, Vector(binding))
+      accepted <- acceptedAt(reference, 0)
+    } yield
+      expect.all(
+        production.accepted == List(block),
+        production.notAccepted.isEmpty,
+        production.contextUpdate.balances == finalBalances,
+        production.contextUpdate.lastTokenLocksRefs == Map(source -> binding.productionSuccessor),
+        activeAfter == SortedMap(source -> SortedSet(tokenLock)),
+        observation.semanticDelta.activeAfter == SortedMap(source -> SortedSet(tokenLock)),
+        binding.signed.value.currencyId.contains(CurrencyId(metagraphId)),
+        binding.activeTokenLock.scope == Metagraph(metagraphId),
+        accepted.identity == binding.identity,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
+        reference.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) == binding.structuralSuccessor,
+        reference.finalState.activeTokenLocks == Vector(binding.activeTokenLock),
+        observedBalanceMatchesReference(
+          observation.semanticDelta.balances,
+          source,
+          balance(100L),
+          balance(40L),
+          ReferenceBalanceAccount(Metagraph(metagraphId), source),
+          reference
+        ),
+        reference.rejected.isEmpty
+      )
+  }
+
+  test("token-lock production authority checks and helper-only genesis, fee, and replacement boundaries fail closed") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+
+    for {
+      metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+      otherMetagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      attackerKey <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphId = metagraphKey.getPublic.toAddress
+      otherMetagraphId = otherMetagraphKey.getPublic.toAddress
+      source = sourceKey.getPublic.toAddress
+      nativeCorrespondence = TokenLockReferenceCorrespondence.nativeGenesis
+      currencyCorrespondence <- TokenLockReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      wrongOwner <- signedTokenLock(
+        source,
+        attackerKey,
+        none,
+        nativeCorrespondence.production,
+        1L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      wrongOwnerProduction <- acceptNativeTokenLock(
+        wrongOwner,
+        SortedMap(source -> balance(100L)),
+        nativeCorrespondence.production,
+        23L,
+        managerBundle,
+        resources
+      )
+      wrongOwnerReference <- TokenLockReference.of[IO](wrongOwner)
+      wrongOwnerBinding <- bindTokenLock(
+        wrongOwner,
+        domain,
+        NativeGl1,
+        nativeCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      laneMismatch <- signedTokenLock(
+        source,
+        sourceKey,
+        CurrencyId(otherMetagraphId).some,
+        currencyCorrespondence.production,
+        1L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      laneMismatchBlock <- signedTokenLockBlock(laneMismatch, 24L, resources.currentHasher)
+      laneMismatchProduction <- managerBundle.currencyAcceptanceManager.acceptTokenLockBlocks(
+        List(laneMismatchBlock),
+        currencySnapshotContext(metagraphId, SortedMap(source -> balance(100L))),
+        snapshotOrdinal,
+        currencyCorrespondence.production,
+        shouldPerformMetagraphSpecificValidations = true,
+        lastSyncGlobalSnapshotEpochProgress = epoch(100L)
+      )
+      globalLaneMismatchProduction <- managerBundle.globalAcceptanceManager.acceptTokenLockBlocks(
+        List(laneMismatchBlock),
+        GlobalSnapshotInfo.empty,
+        snapshotOrdinal,
+        epoch(100L)
+      )
+      laneMismatchBinding <- bindTokenLock(
+        laneMismatch,
+        domain,
+        CurrencyCl1(metagraphId),
+        currencyCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      forgedParent = TokenLockReference(TokenLockOrdinal(NonNegLong.unsafeFrom(0L)), Hash("ab" * 32))
+      wrongParent <- signedTokenLock(source, sourceKey, none, forgedParent, 1L, 0L, 110L.some, none, resources.currentHasher)
+      wrongParentProduction <- acceptNativeTokenLock(
+        wrongParent,
+        SortedMap(source -> balance(100L)),
+        nativeCorrespondence.production,
+        25L,
+        managerBundle,
+        resources
+      )
+      wrongParentReference <- TokenLockReference.of[IO](wrongParent)
+      wrongParentBinding <- bindTokenLock(
+        wrongParent,
+        domain,
+        NativeGl1,
+        nativeCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      forgedNativeGenesis <- TokenLockReferenceCorrespondence.fromClaimedGenesis(
+        NativeGl1,
+        forgedParent,
+        resources.currentHasher
+      )
+      forgedCurrencyGenesis <- TokenLockReferenceCorrespondence.fromClaimedGenesis(
+        CurrencyCl1(metagraphId),
+        forgedParent,
+        resources.currentHasher
+      )
+      canonicalNativeGenesis <- TokenLockReferenceCorrespondence.fromClaimedGenesis(
+        NativeGl1,
+        TokenLockReference.empty,
+        resources.currentHasher
+      )
+      canonicalCurrencyGenesis <- TokenLockReferenceCorrespondence.fromClaimedGenesis(
+        CurrencyCl1(metagraphId),
+        currencyCorrespondence.production,
+        resources.currentHasher
+      )
+      nonzeroFee <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        nativeCorrespondence.production,
+        1L,
+        1L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      nonzeroFeeProjectionBinding <- bindTokenLock(
+        nonzeroFee,
+        domain,
+        NativeGl1,
+        nativeCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      replacementRef = Hash("cd" * 32)
+      replacement <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        nativeCorrespondence.production,
+        2L,
+        0L,
+        110L.some,
+        replacementRef.some,
+        resources.currentHasher
+      )
+      replacementProjectionBinding <- bindTokenLock(
+        replacement,
+        domain,
+        NativeGl1,
+        nativeCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+    } yield
+      expect.all(
+        wrongOwnerProduction._2.accepted.isEmpty,
+        wrongOwnerProduction._2.notAccepted == List(
+          wrongOwnerProduction._1 -> TokenLockValidationFailed(
+            NonEmptyList.one(
+              InvalidTokenLockTransaction(wrongOwnerReference, TokenLockValidator.NotSignedBySourceAddressOwner)
+            )
+          )
+        ),
+        wrongOwnerBinding == Left(ProductionSourceOwnerValidationRejected("ECO-TOKEN-LOCK-CREATE")),
+        laneMismatchProduction.accepted.isEmpty,
+        laneMismatchProduction.notAccepted == List(
+          laneMismatchBlock -> InvalidMetagraphTokenLockLane(CurrencyId(metagraphId))
+        ),
+        globalLaneMismatchProduction.accepted.isEmpty,
+        globalLaneMismatchProduction.notAccepted == List(laneMismatchBlock -> InvalidGlobalTokenLockLane),
+        laneMismatchBinding == Left(PayloadLaneMismatch(CurrencyCl1(metagraphId), CurrencyId(otherMetagraphId).some)),
+        wrongParentProduction._2.accepted.isEmpty,
+        wrongParentProduction._2.notAccepted == List(
+          wrongParentProduction._1 -> RejectedTokenLock(
+            wrongParentReference,
+            TokenLockParentHashMismatch(forgedParent.hash, nativeCorrespondence.production.hash)
+          )
+        ),
+        wrongParentBinding == Left(TokenLockParentBindingMismatch(nativeCorrespondence.production, forgedParent)),
+        forgedNativeGenesis == Left(InvalidTokenLockCanonicalGenesis(NativeGl1, TokenLockReference.empty, forgedParent)),
+        forgedCurrencyGenesis == Left(
+          InvalidTokenLockCanonicalGenesis(CurrencyCl1(metagraphId), currencyCorrespondence.production, forgedParent)
+        ),
+        canonicalNativeGenesis.exists(value =>
+          value.production == TokenLockReference.empty && value.structural == StructuralTokenLockReference.genesis
+        ),
+        canonicalCurrencyGenesis.exists(value =>
+          value.production == currencyCorrespondence.production && value.structural == StructuralTokenLockReference.genesis
+        ),
+        nonzeroFeeProjectionBinding == Left(NonZeroFeeOutOfScope("ECO-TOKEN-LOCK-CREATE", 1)),
+        replacementProjectionBinding == Left(TokenLockReplacementOutOfScope(replacementRef))
+      )
+  }
+
+  test("snapshot token-lock acceptance remains weaker than the target contextual minimum-duration rule") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence = TokenLockReferenceCorrespondence.nativeGenesis
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        1L,
+        0L,
+        104L.some,
+        none,
+        resources.currentHasher
+      )
+      production <- acceptNativeTokenLock(
+        tokenLock,
+        initialBalances,
+        correspondence.production,
+        26L,
+        managerBundle,
+        resources
+      )
+      binding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        correspondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      base <- referenceBase(Dag, initialBalances)
+      reference <- executeTokenLockReference(lane, base, Vector(binding))
+      rejected <- rejectedAt(reference, 0)
+    } yield
+      expect.all(
+        production._2.accepted == List(production._1),
+        production._2.notAccepted.isEmpty,
+        rejected.reason == ReferenceRejection.TokenLockUnlockEpochTooShort(104, 105),
+        reference.finalState == base,
+        binding.domainBinding == UnboundLegacyPayload
+      )
   }
 }

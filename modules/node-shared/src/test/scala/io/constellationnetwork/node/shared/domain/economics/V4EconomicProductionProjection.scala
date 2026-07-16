@@ -7,13 +7,16 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.swap.block._
+import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.schema.Block
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.swap._
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.{Transaction, TransactionReference}
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
-import io.constellationnetwork.security.{Hasher, SecurityProvider}
+import io.constellationnetwork.security.{Hashed, Hasher, SecurityProvider}
 
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.Encoder
@@ -27,7 +30,9 @@ import io.circe.Encoder
   * binds the exact production parent to a lane-derived canonical correspondence, and retains that capability through reference execution.
   * Production acceptance APIs expose aggregate semantic state updates, not execution write order or a distinct replay-ID write. This helper
   * therefore compares only fields actually observed from production. In particular, batch allow-spend acceptance exposes balances and
-  * references but no active-record delta, so the batch projection makes no active-record parity claim.
+  * references but no active-record delta, so the batch projection makes no active-record parity claim. Token-lock coverage is restricted to
+  * one zero-fee, nonreplacement payload; its final active state is observed through the current native/currency state manager after exact
+  * block acceptance. It makes no full-GL0-path, batch-parity, production-write-order, replay-ID, or E2.8-completion claim.
   */
 object V4EconomicProductionProjection {
 
@@ -42,6 +47,8 @@ object V4EconomicProductionProjection {
   final case class ResolvedProofOwnerMismatch(operationId: String, expected: Address, actual: Vector[Address]) extends ProjectionError
   final case class TransferParentBindingMismatch(expected: TransactionReference, actual: TransactionReference) extends ProjectionError
   final case class AllowSpendParentBindingMismatch(expected: AllowSpendReference, actual: AllowSpendReference) extends ProjectionError
+  final case class TokenLockParentBindingMismatch(expected: TokenLockReference, actual: TokenLockReference) extends ProjectionError
+  final case class TokenLockReplacementOutOfScope(replaceTokenLockRef: Hash) extends ProjectionError
   final case class InvalidTransferCanonicalGenesis(
     lane: TransferLane,
     expected: TransactionReference,
@@ -52,6 +59,11 @@ object V4EconomicProductionProjection {
     expected: AllowSpendReference,
     actual: AllowSpendReference
   ) extends ProjectionError
+  final case class InvalidTokenLockCanonicalGenesis(
+    lane: TransferLane,
+    expected: TokenLockReference,
+    actual: TokenLockReference
+  ) extends ProjectionError
   final case class TransferCorrespondenceAdvanceMismatch(
     expected: TransactionReference,
     actual: TransactionReference
@@ -60,11 +72,23 @@ object V4EconomicProductionProjection {
     expected: AllowSpendReference,
     actual: AllowSpendReference
   ) extends ProjectionError
+  final case class TokenLockCorrespondenceAdvanceMismatch(
+    expected: TokenLockReference,
+    actual: TokenLockReference
+  ) extends ProjectionError
   final case class ProductionTransferNotAccepted(target: TransactionReference, reason: BlockNotAcceptedReason) extends ProjectionError
   final case class ProductionAllowSpendNotAccepted(target: AllowSpendReference, reason: AllowSpendBlockNotAcceptedReason)
       extends ProjectionError
+  final case class ProductionTokenLockNotAccepted(target: TokenLockReference, reason: TokenLockBlockNotAcceptedReason)
+      extends ProjectionError
   final case class TransferBlockNotAcceptedByBatch(block: Signed[Block]) extends ProjectionError
   final case class AllowSpendBlockNotAcceptedByBatch(block: Signed[AllowSpendBlock]) extends ProjectionError
+  final case class TokenLockBlockNotAcceptedByBatch(block: Signed[TokenLockBlock]) extends ProjectionError
+  final case class UnexpectedTokenLockBatchDecisions(
+    expected: Signed[TokenLockBlock],
+    accepted: List[Signed[TokenLockBlock]],
+    notAccepted: List[(Signed[TokenLockBlock], TokenLockBlockNotAcceptedReason)]
+  ) extends ProjectionError
   final case class UnexpectedTransferBalanceKeys(expected: Set[Address], actual: Set[Address]) extends ProjectionError
   final case class UnexpectedTransferReferenceUpdates(
     expected: Map[Address, TransactionReference],
@@ -79,6 +103,20 @@ object V4EconomicProductionProjection {
     expected: SortedSet[Signed[AllowSpend]],
     actual: SortedSet[Signed[AllowSpend]]
   ) extends ProjectionError
+  final case class UnexpectedTokenLockBalanceKeys(expected: Set[Address], actual: Set[Address]) extends ProjectionError
+  final case class UnexpectedTokenLockReferenceUpdates(
+    expected: Map[Address, TokenLockReference],
+    actual: Map[Address, TokenLockReference]
+  ) extends ProjectionError
+  final case class UnexpectedTokenLockClaimedReplacementRefs(expected: Set[Hash], actual: Set[Hash]) extends ProjectionError
+  final case class UnexpectedInRoundTokenLockState(
+    expected: Map[Hash, Hashed[TokenLock]],
+    actual: Map[Hash, Hashed[TokenLock]]
+  ) extends ProjectionError
+  final case class UnexpectedActiveTokenLockState(
+    expected: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    actual: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  ) extends ProjectionError
   final case class TransferBatchDecisionMissing(block: Signed[Block]) extends ProjectionError
   final case class AllowSpendBatchDecisionMissing(block: Signed[AllowSpendBlock]) extends ProjectionError
   final case class TransferBatchPayloadMismatch(
@@ -88,6 +126,10 @@ object V4EconomicProductionProjection {
   final case class AllowSpendBatchPayloadMismatch(
     expected: Signed[AllowSpend],
     actual: Vector[Signed[AllowSpend]]
+  ) extends ProjectionError
+  final case class TokenLockBatchPayloadMismatch(
+    expected: Signed[TokenLock],
+    actual: Vector[Signed[TokenLock]]
   ) extends ProjectionError
   final case class TransferBatchRequiresSingleSource(actual: Set[Address]) extends ProjectionError
   final case class AllowSpendBatchRequiresSingleSource(actual: Set[Address]) extends ProjectionError
@@ -114,7 +156,9 @@ object V4EconomicProductionProjection {
       implicit val scopedHasher: Hasher[IO] = currentHasher
       TransactionReference
         .emptyCurrency[IO](metagraphId)
-        .map(reference => new TransferReferenceCorrespondence(TransferLane.CurrencyCl1(metagraphId), reference, StructuralReference.genesis))
+        .map(reference =>
+          new TransferReferenceCorrespondence(TransferLane.CurrencyCl1(metagraphId), reference, StructuralReference.genesis)
+        )
     }
 
     def fromClaimedGenesis(
@@ -171,7 +215,47 @@ object V4EconomicProductionProjection {
       }
   }
 
-  sealed trait SourceValidatedTransfer extends Product with Serializable {
+  final class TokenLockReferenceCorrespondence private[V4EconomicProductionProjection] (
+    val lane: TransferLane,
+    val production: TokenLockReference,
+    val structural: StructuralTokenLockReference
+  ) {
+    def advance(observation: AcceptedTokenLockObservation): Either[ProjectionError, TokenLockReferenceCorrespondence] = {
+      val binding = observation.binding
+      if (binding.lane == lane && binding.productionParent == production && binding.structuralParent == structural)
+        Right(new TokenLockReferenceCorrespondence(lane, binding.productionSuccessor, binding.structuralSuccessor))
+      else Left(TokenLockCorrespondenceAdvanceMismatch(production, binding.productionParent))
+    }
+  }
+
+  object TokenLockReferenceCorrespondence {
+    val nativeGenesis: TokenLockReferenceCorrespondence =
+      new TokenLockReferenceCorrespondence(TransferLane.NativeGl1, TokenLockReference.empty, StructuralTokenLockReference.genesis)
+
+    def currencyGenesis(metagraphId: Address, currentHasher: Hasher[IO]): IO[TokenLockReferenceCorrespondence] = {
+      implicit val scopedHasher: Hasher[IO] = currentHasher
+      TokenLockReference
+        .emptyCurrency[IO](metagraphId)
+        .map(reference =>
+          new TokenLockReferenceCorrespondence(TransferLane.CurrencyCl1(metagraphId), reference, StructuralTokenLockReference.genesis)
+        )
+    }
+
+    def fromClaimedGenesis(
+      lane: TransferLane,
+      claimed: TokenLockReference,
+      currentHasher: Hasher[IO]
+    ): IO[Either[ProjectionError, TokenLockReferenceCorrespondence]] =
+      canonicalTokenLockGenesis(lane, currentHasher).map { expected =>
+        Either.cond(
+          claimed == expected,
+          new TokenLockReferenceCorrespondence(lane, expected, StructuralTokenLockReference.genesis),
+          InvalidTokenLockCanonicalGenesis(lane, expected, claimed)
+        )
+      }
+  }
+
+  sealed trait SourceValidatedTransfer {
     def signed: Signed[Transaction]
     def lane: TransferLane
     def operationId: SupportedReferenceOperationId
@@ -185,21 +269,21 @@ object V4EconomicProductionProjection {
     final def domainBinding: PayloadDomainBinding = UnboundLegacyPayload
   }
 
-  private final case class SourceValidatedTransferImpl(
-    signed: Signed[Transaction],
-    lane: TransferLane,
-    operationId: SupportedReferenceOperationId,
-    signerFromProof: Address,
-    allProofOwners: Vector[Address],
-    referenceInput: ReferenceInput.Transfer,
-    identity: StructuralSemanticIdentity,
-    productionParent: TransactionReference,
-    productionSuccessor: TransactionReference,
-    structuralParent: StructuralReference,
-    structuralSuccessor: StructuralReference
+  private final class SourceValidatedTransferImpl(
+    val signed: Signed[Transaction],
+    val lane: TransferLane,
+    val operationId: SupportedReferenceOperationId,
+    val signerFromProof: Address,
+    val allProofOwners: Vector[Address],
+    private[V4EconomicProductionProjection] val referenceInput: ReferenceInput.Transfer,
+    val identity: StructuralSemanticIdentity,
+    val productionParent: TransactionReference,
+    val productionSuccessor: TransactionReference,
+    val structuralParent: StructuralReference,
+    val structuralSuccessor: StructuralReference
   ) extends SourceValidatedTransfer
 
-  sealed trait SourceValidatedAllowSpend extends Product with Serializable {
+  sealed trait SourceValidatedAllowSpend {
     def signed: Signed[AllowSpend]
     def lane: TransferLane
     def operationId: SupportedReferenceOperationId
@@ -214,20 +298,52 @@ object V4EconomicProductionProjection {
     final def domainBinding: PayloadDomainBinding = UnboundLegacyPayload
   }
 
-  private final case class SourceValidatedAllowSpendImpl(
-    signed: Signed[AllowSpend],
-    lane: TransferLane,
-    operationId: SupportedReferenceOperationId,
-    signerFromProof: Address,
-    allProofOwners: Vector[Address],
-    referenceInput: ReferenceInput.AllowSpendCreate,
-    identity: AllowSpendSemanticIdentity,
-    reservation: ReferenceAllowSpendReservation,
-    productionParent: AllowSpendReference,
-    productionSuccessor: AllowSpendReference,
-    structuralParent: StructuralAllowSpendReference,
-    structuralSuccessor: StructuralAllowSpendReference
+  private final class SourceValidatedAllowSpendImpl(
+    val signed: Signed[AllowSpend],
+    val lane: TransferLane,
+    val operationId: SupportedReferenceOperationId,
+    val signerFromProof: Address,
+    val allProofOwners: Vector[Address],
+    private[V4EconomicProductionProjection] val referenceInput: ReferenceInput.AllowSpendCreate,
+    val identity: AllowSpendSemanticIdentity,
+    val reservation: ReferenceAllowSpendReservation,
+    val productionParent: AllowSpendReference,
+    val productionSuccessor: AllowSpendReference,
+    val structuralParent: StructuralAllowSpendReference,
+    val structuralSuccessor: StructuralAllowSpendReference
   ) extends SourceValidatedAllowSpend
+
+  sealed trait SourceValidatedTokenLock {
+    def signed: Signed[TokenLock]
+    def lane: TransferLane
+    def operationId: SupportedReferenceOperationId
+    def signerFromProof: Address
+    def allProofOwners: Vector[Address]
+    def productionHashed: Hashed[TokenLock]
+    def identity: TokenLockSemanticIdentity
+    def activeTokenLock: ReferenceActiveTokenLock
+    def productionParent: TokenLockReference
+    def productionSuccessor: TokenLockReference
+    def structuralParent: StructuralTokenLockReference
+    def structuralSuccessor: StructuralTokenLockReference
+    final def domainBinding: PayloadDomainBinding = UnboundLegacyPayload
+  }
+
+  private final class SourceValidatedTokenLockImpl(
+    val signed: Signed[TokenLock],
+    val lane: TransferLane,
+    val operationId: SupportedReferenceOperationId,
+    val signerFromProof: Address,
+    val allProofOwners: Vector[Address],
+    val productionHashed: Hashed[TokenLock],
+    private[V4EconomicProductionProjection] val referenceInput: ReferenceInput.TokenLockCreate,
+    val identity: TokenLockSemanticIdentity,
+    val activeTokenLock: ReferenceActiveTokenLock,
+    val productionParent: TokenLockReference,
+    val productionSuccessor: TokenLockReference,
+    val structuralParent: StructuralTokenLockReference,
+    val structuralSuccessor: StructuralTokenLockReference
+  ) extends SourceValidatedTokenLock
 
   final case class ObservedBalanceDelta(before: Balance, after: Balance)
   final case class ObservedTransferSemanticDelta(
@@ -240,6 +356,12 @@ object V4EconomicProductionProjection {
     referenceBefore: AllowSpendReference,
     referenceAfter: AllowSpendReference,
     activeAdded: SortedSet[Signed[AllowSpend]]
+  )
+  final case class ObservedTokenLockSemanticDelta(
+    balances: SortedMap[Address, ObservedBalanceDelta],
+    referenceBefore: TokenLockReference,
+    referenceAfter: TokenLockReference,
+    activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]]
   )
 
   sealed trait AcceptedTransferObservation extends Product with Serializable {
@@ -261,6 +383,16 @@ object V4EconomicProductionProjection {
     binding: SourceValidatedAllowSpend,
     semanticDelta: ObservedAllowSpendSemanticDelta
   ) extends AcceptedAllowSpendObservation
+
+  sealed trait AcceptedTokenLockObservation extends Product with Serializable {
+    def binding: SourceValidatedTokenLock
+    def semanticDelta: ObservedTokenLockSemanticDelta
+  }
+
+  private final case class AcceptedTokenLockObservationImpl(
+    binding: SourceValidatedTokenLock,
+    semanticDelta: ObservedTokenLockSemanticDelta
+  ) extends AcceptedTokenLockObservation
 
   sealed trait TransferBatchDisposition extends Product with Serializable
   case object TransferBatchAccepted extends TransferBatchDisposition
@@ -345,7 +477,7 @@ object V4EconomicProductionProjection {
               correspondence.structural.lineage :+ atom
             )
             Right(
-              SourceValidatedTransferImpl(
+              new SourceValidatedTransferImpl(
                 signed,
                 lane,
                 operationId,
@@ -419,7 +551,7 @@ object V4EconomicProductionProjection {
               correspondence.structural.lineage :+ atom
             )
             Right(
-              SourceValidatedAllowSpendImpl(
+              new SourceValidatedAllowSpendImpl(
                 signed,
                 lane,
                 operationId,
@@ -434,6 +566,84 @@ object V4EconomicProductionProjection {
                 structuralSuccessor
               )
             )
+          }
+      }
+  }
+
+  def bindTokenLock(
+    signed: Signed[TokenLock],
+    domain: ReferenceDomain,
+    lane: TransferLane,
+    correspondence: TokenLockReferenceCorrespondence,
+    signedValidator: SignedValidator[IO],
+    currentHasher: Hasher[IO]
+  )(implicit securityProvider: SecurityProvider[IO]): IO[Either[ProjectionError, SourceValidatedTokenLock]] = {
+    val operationId = SupportedReferenceOperationId.TokenLockCreation
+    val tokenLock = signed.value
+    val fee = BigInt(tokenLock.fee.value.value)
+    val laneMatches = lane match {
+      case TransferLane.NativeGl1                => tokenLock.currencyId.isEmpty
+      case TransferLane.CurrencyCl1(metagraphId) => tokenLock.currencyId.contains(CurrencyId(metagraphId))
+    }
+
+    if (!laneMatches) IO.pure(Left(PayloadLaneMismatch(lane, tokenLock.currencyId)))
+    else if (fee != 0) IO.pure(Left(NonZeroFeeOutOfScope(operationId.value, fee)))
+    else
+      tokenLock.replaceTokenLockRef match {
+        case Some(reference) => IO.pure(Left(TokenLockReplacementOutOfScope(reference)))
+        case None if lane != correspondence.lane =>
+          IO.pure(Left(TokenLockParentBindingMismatch(correspondence.production, tokenLock.parent)))
+        case None if tokenLock.parent != correspondence.production =>
+          IO.pure(Left(TokenLockParentBindingMismatch(correspondence.production, tokenLock.parent)))
+        case None =>
+          verifySourceProof(signed, tokenLock.source, operationId.value, signedValidator, currentHasher).flatMap {
+            case Left(error) => IO.pure(Left(error))
+            case Right((signer, allProofOwners)) =>
+              val atom = TokenLockAtom(
+                domain,
+                lane,
+                tokenLock.source,
+                BigInt(tokenLock.amount.value.value),
+                fee,
+                tokenLock.unlockEpoch.map(value => BigInt(value.value.value)),
+                tokenLock.replaceTokenLockRef
+              )
+              val preimage = TokenLockPreimage(correspondence.structural, atom)
+              val identity = TokenLockSemanticIdentity.derive(preimage)
+              val input = ReferenceInput.TokenLockCreate(preimage, StructurallyBoundTokenLockSourceProof(signer, preimage))
+              val activeTokenLock = ReferenceActiveTokenLock(
+                identity,
+                lane.scope,
+                tokenLock.source,
+                BigInt(tokenLock.amount.value.value),
+                tokenLock.unlockEpoch.map(value => BigInt(value.value.value))
+              )
+
+              implicit val scopedHasher: Hasher[IO] = currentHasher
+              signed.toHashed[IO].map { productionHashed =>
+                val productionSuccessor = TokenLockReference.of(productionHashed)
+                val structuralSuccessor = StructuralTokenLockReference(
+                  correspondence.structural.ordinal + 1,
+                  correspondence.structural.lineage :+ atom
+                )
+                Right(
+                  new SourceValidatedTokenLockImpl(
+                    signed,
+                    lane,
+                    operationId,
+                    signer,
+                    allProofOwners,
+                    productionHashed,
+                    input,
+                    identity,
+                    activeTokenLock,
+                    correspondence.production,
+                    productionSuccessor,
+                    correspondence.structural,
+                    structuralSuccessor
+                  )
+                )
+              }
           }
       }
   }
@@ -516,6 +726,32 @@ object V4EconomicProductionProjection {
       )
   }
 
+  def observeBatchAcceptedTokenLock(
+    binding: SourceValidatedTokenLock,
+    block: Signed[TokenLockBlock],
+    balancesBefore: SortedMap[Address, Balance],
+    production: TokenLockBlockAcceptanceResult,
+    activeBefore: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  ): Either[ProjectionError, AcceptedTokenLockObservation] = {
+    val blockTokenLocks = block.value.tokenLocks.toNonEmptyList.toList.toVector
+
+    Either
+      .cond(
+        blockTokenLocks == Vector(binding.signed),
+        (),
+        TokenLockBatchPayloadMismatch(binding.signed, blockTokenLocks)
+      )
+      .flatMap(_ =>
+        Either.cond(
+          production.accepted == List(block) && production.notAccepted.isEmpty,
+          (),
+          UnexpectedTokenLockBatchDecisions(block, production.accepted, production.notAccepted)
+        )
+      )
+      .flatMap(_ => observeAcceptedTokenLockUpdate(binding, balancesBefore, production.contextUpdate, activeBefore, activeAfter))
+  }
+
   def projectTransferBatch(
     domain: ReferenceDomain,
     lane: TransferLane,
@@ -566,33 +802,35 @@ object V4EconomicProductionProjection {
 
     val initialCursor = BatchCursor(correspondence.production, correspondence.structural)
     loop(items.toList, initialCursor, Vector.empty, Vector.empty).map {
-      _.flatMap { case (finalCursor, bindings, dispositions) =>
-        val sources = items.iterator.map(_.signed.value.source).toSet
-        for {
-          source <- sources.toList match {
-            case only :: Nil => Right(only)
-            case _           => Left(TransferBatchRequiresSingleSource(sources))
-          }
-          expectedReferences = Map(source -> finalCursor.production)
-          _ <- Either.cond(
-            production.contextUpdate.lastTxRefs == expectedReferences,
-            (),
-            UnexpectedTransferReferenceUpdates(expectedReferences, production.contextUpdate.lastTxRefs)
-          )
-          acceptedTransactions = items.zip(dispositions).collect {
-            case (item, TransferBatchAccepted) => item.signed.value
-          }
-          expectedBalanceKeys = acceptedTransactions.iterator.flatMap(tx => Iterator(tx.source, tx.destination)).toSet
-          _ <- Either.cond(
-            production.contextUpdate.balances.keySet == expectedBalanceKeys,
-            (),
-            UnexpectedTransferBalanceKeys(expectedBalanceKeys, production.contextUpdate.balances.keySet)
-          )
-          semanticDelta = SortedMap.from(production.contextUpdate.balances.iterator.map { case (address, after) =>
-            address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
-          })
-          execution <- executeTransfers(referenceContext, referenceBase, bindings).leftMap(ReferenceExecutionProjectionFailed)
-        } yield TransferBatchProjectionImpl(bindings, dispositions, semanticDelta, execution)
+      _.flatMap {
+        case (finalCursor, bindings, dispositions) =>
+          val sources = items.iterator.map(_.signed.value.source).toSet
+          for {
+            source <- sources.toList match {
+              case only :: Nil => Right(only)
+              case _           => Left(TransferBatchRequiresSingleSource(sources))
+            }
+            expectedReferences = Map(source -> finalCursor.production)
+            _ <- Either.cond(
+              production.contextUpdate.lastTxRefs == expectedReferences,
+              (),
+              UnexpectedTransferReferenceUpdates(expectedReferences, production.contextUpdate.lastTxRefs)
+            )
+            acceptedTransactions = items.zip(dispositions).collect {
+              case (item, TransferBatchAccepted) => item.signed.value
+            }
+            expectedBalanceKeys = acceptedTransactions.iterator.flatMap(tx => Iterator(tx.source, tx.destination)).toSet
+            _ <- Either.cond(
+              production.contextUpdate.balances.keySet == expectedBalanceKeys,
+              (),
+              UnexpectedTransferBalanceKeys(expectedBalanceKeys, production.contextUpdate.balances.keySet)
+            )
+            semanticDelta = SortedMap.from(production.contextUpdate.balances.iterator.map {
+              case (address, after) =>
+                address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
+            })
+            execution <- executeTransfers(referenceContext, referenceBase, bindings).leftMap(ReferenceExecutionProjectionFailed)
+          } yield TransferBatchProjectionImpl(bindings, dispositions, semanticDelta, execution)
       }
     }
   }
@@ -647,30 +885,32 @@ object V4EconomicProductionProjection {
 
     val initialCursor = BatchCursor(correspondence.production, correspondence.structural)
     loop(items.toList, initialCursor, Vector.empty, Vector.empty).map {
-      _.flatMap { case (finalCursor, bindings, dispositions) =>
-        val sources = items.iterator.map(_.signed.value.source).toSet
-        for {
-          source <- sources.toList match {
-            case only :: Nil => Right(only)
-            case _           => Left(AllowSpendBatchRequiresSingleSource(sources))
-          }
-          expectedReferences = Map(source -> finalCursor.production)
-          _ <- Either.cond(
-            production.contextUpdate.lastTxRefs == expectedReferences,
-            (),
-            UnexpectedAllowSpendReferenceUpdates(expectedReferences, production.contextUpdate.lastTxRefs)
-          )
-          expectedBalanceKeys = Set(source)
-          _ <- Either.cond(
-            production.contextUpdate.balances.keySet == expectedBalanceKeys,
-            (),
-            UnexpectedAllowSpendBalanceKeys(expectedBalanceKeys, production.contextUpdate.balances.keySet)
-          )
-          semanticDelta = SortedMap.from(production.contextUpdate.balances.iterator.map { case (address, after) =>
-            address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
-          })
-          execution <- executeAllowSpends(referenceContext, referenceBase, bindings).leftMap(ReferenceExecutionProjectionFailed)
-        } yield AllowSpendBatchProjectionImpl(bindings, dispositions, semanticDelta, execution)
+      _.flatMap {
+        case (finalCursor, bindings, dispositions) =>
+          val sources = items.iterator.map(_.signed.value.source).toSet
+          for {
+            source <- sources.toList match {
+              case only :: Nil => Right(only)
+              case _           => Left(AllowSpendBatchRequiresSingleSource(sources))
+            }
+            expectedReferences = Map(source -> finalCursor.production)
+            _ <- Either.cond(
+              production.contextUpdate.lastTxRefs == expectedReferences,
+              (),
+              UnexpectedAllowSpendReferenceUpdates(expectedReferences, production.contextUpdate.lastTxRefs)
+            )
+            expectedBalanceKeys = Set(source)
+            _ <- Either.cond(
+              production.contextUpdate.balances.keySet == expectedBalanceKeys,
+              (),
+              UnexpectedAllowSpendBalanceKeys(expectedBalanceKeys, production.contextUpdate.balances.keySet)
+            )
+            semanticDelta = SortedMap.from(production.contextUpdate.balances.iterator.map {
+              case (address, after) =>
+                address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
+            })
+            execution <- executeAllowSpends(referenceContext, referenceBase, bindings).leftMap(ReferenceExecutionProjectionFailed)
+          } yield AllowSpendBatchProjectionImpl(bindings, dispositions, semanticDelta, execution)
       }
     }
   }
@@ -688,6 +928,13 @@ object V4EconomicProductionProjection {
     bindings: Vector[SourceValidatedAllowSpend]
   ): Either[ReferenceStateError, ReferenceExecution] =
     V4EconomicReferenceInterpreter.execute(context, base, bindings.map(allowSpendInput))
+
+  def executeTokenLocks(
+    context: ReferenceContext,
+    base: ReferenceState,
+    bindings: Vector[SourceValidatedTokenLock]
+  ): Either[ReferenceStateError, ReferenceExecution] =
+    V4EconomicReferenceInterpreter.execute(context, base, bindings.map(tokenLockInput))
 
   private def observeAcceptedTransferUpdate(
     binding: SourceValidatedTransfer,
@@ -709,8 +956,9 @@ object V4EconomicProductionProjection {
         (),
         UnexpectedTransferReferenceUpdates(expectedReferenceUpdates, update.lastTxRefs)
       )
-      observedBalances = SortedMap.from(update.balances.iterator.map { case (address, after) =>
-        address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
+      observedBalances = SortedMap.from(update.balances.iterator.map {
+        case (address, after) =>
+          address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
       })
       semanticDelta = ObservedTransferSemanticDelta(
         observedBalances,
@@ -764,6 +1012,67 @@ object V4EconomicProductionProjection {
     } yield AcceptedAllowSpendObservationImpl(binding, semanticDelta)
   }
 
+  private def observeAcceptedTokenLockUpdate(
+    binding: SourceValidatedTokenLock,
+    balancesBefore: SortedMap[Address, Balance],
+    update: TokenLockBlockAcceptanceContextUpdate,
+    activeBefore: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+  ): Either[ProjectionError, AcceptedTokenLockObservation] = {
+    val tokenLock = binding.signed.value
+    val expectedBalanceKeys = Set(tokenLock.source)
+    val expectedReferenceUpdates = Map(tokenLock.source -> binding.productionSuccessor)
+    val expectedClaimedReplacementRefs = Set.empty[Hash]
+    val expectedInRoundTokenLocks = binding.lane match {
+      case TransferLane.NativeGl1      => Map(binding.productionHashed.hash -> binding.productionHashed)
+      case _: TransferLane.CurrencyCl1 => Map.empty[Hash, Hashed[TokenLock]]
+    }
+    val expectedActiveAfter = activeBefore.updated(
+      tokenLock.source,
+      activeBefore.getOrElse(tokenLock.source, SortedSet.empty[Signed[TokenLock]]) + binding.signed
+    )
+
+    for {
+      _ <- Either.cond(
+        update.balances.keySet == expectedBalanceKeys,
+        (),
+        UnexpectedTokenLockBalanceKeys(expectedBalanceKeys, update.balances.keySet)
+      )
+      _ <- Either.cond(
+        update.lastTokenLocksRefs == expectedReferenceUpdates,
+        (),
+        UnexpectedTokenLockReferenceUpdates(expectedReferenceUpdates, update.lastTokenLocksRefs)
+      )
+      _ <- Either.cond(
+        update.claimedReplacementRefs == expectedClaimedReplacementRefs,
+        (),
+        UnexpectedTokenLockClaimedReplacementRefs(expectedClaimedReplacementRefs, update.claimedReplacementRefs)
+      )
+      _ <- Either.cond(
+        update.inRoundTokenLocksByHash == expectedInRoundTokenLocks,
+        (),
+        UnexpectedInRoundTokenLockState(expectedInRoundTokenLocks, update.inRoundTokenLocksByHash)
+      )
+      _ <- Either.cond(
+        activeAfter == expectedActiveAfter,
+        (),
+        UnexpectedActiveTokenLockState(expectedActiveAfter, activeAfter)
+      )
+      after <- update.balances
+        .get(tokenLock.source)
+        .toRight(UnexpectedTokenLockBalanceKeys(expectedBalanceKeys, update.balances.keySet))
+      observedBalances = SortedMap(
+        tokenLock.source -> ObservedBalanceDelta(balancesBefore.getOrElse(tokenLock.source, Balance.empty), after)
+      )
+      semanticDelta = ObservedTokenLockSemanticDelta(
+        observedBalances,
+        binding.productionParent,
+        binding.productionSuccessor,
+        activeAfter
+      )
+    } yield AcceptedTokenLockObservationImpl(binding, semanticDelta)
+  }
+
   private def transferInput(binding: SourceValidatedTransfer): ReferenceInput.Transfer =
     binding match {
       case value: SourceValidatedTransferImpl => value.referenceInput
@@ -774,6 +1083,11 @@ object V4EconomicProductionProjection {
       case value: SourceValidatedAllowSpendImpl => value.referenceInput
     }
 
+  private def tokenLockInput(binding: SourceValidatedTokenLock): ReferenceInput.TokenLockCreate =
+    binding match {
+      case value: SourceValidatedTokenLockImpl => value.referenceInput
+    }
+
   private def transferBatchDisposition(
     block: Signed[Block],
     target: TransactionReference,
@@ -782,10 +1096,10 @@ object V4EconomicProductionProjection {
     val accepted = production.accepted.exists(_._1 == block)
     val notAccepted = production.notAccepted.collectFirst { case (`block`, reason) => reason }
     (accepted, notAccepted) match {
-      case (true, None)                             => Right(TransferBatchAccepted)
+      case (true, None)                                => Right(TransferBatchAccepted)
       case (false, Some(reason: BlockRejectionReason)) => Right(TransferBatchRejected(target, reason))
       case (false, Some(reason: BlockAwaitReason))     => Right(TransferBatchAwaiting(target, reason))
-      case _                                       => Left(TransferBatchDecisionMissing(block))
+      case _                                           => Left(TransferBatchDecisionMissing(block))
     }
   }
 
@@ -797,10 +1111,10 @@ object V4EconomicProductionProjection {
     val accepted = production.accepted.contains(block)
     val notAccepted = production.notAccepted.collectFirst { case (`block`, reason) => reason }
     (accepted, notAccepted) match {
-      case (true, None)                                       => Right(AllowSpendBatchAccepted)
+      case (true, None)                                          => Right(AllowSpendBatchAccepted)
       case (false, Some(reason: AllowSpendBlockRejectionReason)) => Right(AllowSpendBatchRejected(target, reason))
-      case (false, Some(reason: AllowSpendBlockAwaitReason))      => Right(AllowSpendBatchAwaiting(target, reason))
-      case _                                                 => Left(AllowSpendBatchDecisionMissing(block))
+      case (false, Some(reason: AllowSpendBlockAwaitReason))     => Right(AllowSpendBatchAwaiting(target, reason))
+      case _                                                     => Left(AllowSpendBatchDecisionMissing(block))
     }
   }
 
@@ -818,6 +1132,14 @@ object V4EconomicProductionProjection {
       case TransferLane.CurrencyCl1(metagraphId) =>
         implicit val scopedHasher: Hasher[IO] = currentHasher
         AllowSpendReference.emptyCurrency[IO](metagraphId)
+    }
+
+  private def canonicalTokenLockGenesis(lane: TransferLane, currentHasher: Hasher[IO]): IO[TokenLockReference] =
+    lane match {
+      case TransferLane.NativeGl1 => IO.pure(TokenLockReference.empty)
+      case TransferLane.CurrencyCl1(metagraphId) =>
+        implicit val scopedHasher: Hasher[IO] = currentHasher
+        TokenLockReference.emptyCurrency[IO](metagraphId)
     }
 
   private def verifySourceProof[A: Encoder](
