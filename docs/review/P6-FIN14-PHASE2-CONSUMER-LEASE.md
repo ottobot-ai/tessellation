@@ -482,6 +482,13 @@ Every test uses authenticated complete snapshots once O-15/O-01 fixtures exist.
 Until then, a pure reference model may establish expected state transitions, but
 cannot close the runtime gate.
 
+Current nonactivating evidence: `Phase2ConsumerLeaseReferenceModel` reuses the
+real `GlobalSnapshotStateRef` and existing release/branch/lineage revision types.
+Its focused suite covers exact four-field identity and the mechanism portions of
+`FOLLOW-008A/C/D/I/J/K/P`. It does not verify either qualification rail, immutable
+artifact readbacks, purpose/freshness policy, or durable multi-sink effects; it
+does not model `FOLLOW-008B/E/F/G/H/L/M/N/O` and cannot mint a production lease.
+
 | ID | Schedule | Required assertion |
 |---|---|---|
 | FOLLOW-008A | A at N qualifies by `T_weight`; unqualified B replaces A at N. | B cannot acquire a lease or create any derivative. A's ordinal/generation/evidence never transfers. |

@@ -846,6 +846,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
     exact released-core evidence and MPT/semantic/anchor readback,
     ROOT gates, durable consumer effect ordering, and the complete RED matrix close.
     An opaque wrapper around the current Boolean is still FIN-14.
+    A test-only mechanism model now reuses the real `GlobalSnapshotStateRef` and
+    existing release/branch/lineage revision types to exercise descriptor capture,
+    unlocked verification, acquisition CAS, and `commitIfCurrent`. Its focused
+    suite covers exact four-field identity plus `FOLLOW-008A/C/D/I/J/K/P`. This is
+    not a lease issuer or evidence/readback verifier; purpose/freshness policy and
+    `FOLLOW-008B/E/F/G/H/L/M/N/O` remain open, as do every live consumer and
+    invalidation path.
   - Before activation, add authenticated finality-evidence/fork-choice authority and
     hold/recheck the exact branch revision through publication; package-own the
     MPT-plus-semantic-plus-anchor readback capability that may advance

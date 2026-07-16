@@ -1006,6 +1006,13 @@ delivery, rollback, and recovery.
   core readback, ROOT semantic/image gates, and consumer effect ordering block any
   live issuer. Wrapping the current watermark/best-tip Boolean in an opaque type
   does not close FIN-14.
+- A test-only `Phase2ConsumerLeaseReferenceModel` now reuses the canonical
+  structural reference and existing release/branch/lineage revision types. It
+  covers the exact-ref, same-height replacement, acquisition race, pre-commit
+  replacement, descendant extension, surviving-ancestor reacquisition, ABA, and
+  idempotent-command mechanisms (`FOLLOW-001`, `FOLLOW-008A/C/D/I/J/K/P`). It
+  does not verify Phase-2 evidence or readbacks, freeze purpose/freshness policy,
+  issue a runtime lease, or close the remaining `FOLLOW-008` schedules.
 - Activation requires an authenticated evidence/fork-choice capability and an exact
   branch-revision hold through durable publication; MPT, semantic-state, and anchor
   compare-and-set readback before `CoreApplied`/`Released`; objective restoration;
