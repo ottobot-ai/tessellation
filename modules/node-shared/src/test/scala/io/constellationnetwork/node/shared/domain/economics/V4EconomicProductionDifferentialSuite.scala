@@ -23,8 +23,10 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.swap.{AllowSpendChainValidator, AllowSpendValidator}
 import io.constellationnetwork.node.shared.domain.tokenlock.block.{
+  AddressBalanceOutOfRange => TokenLockAddressBalanceOutOfRange,
   InvalidTokenLock => InvalidTokenLockTransaction,
   ParentHashNotEqLastTxHash => TokenLockParentHashMismatch,
+  ParentOrdinalBelowLastTxOrdinal => TokenLockParentOrdinalBelowLastTxOrdinal,
   ValidationFailed => TokenLockValidationFailed,
   _
 }
@@ -350,6 +352,49 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       )
     } yield block -> result
 
+  private def acceptTokenLockBatch(
+    lane: TransferLane,
+    source: Address,
+    blocks: List[Signed[TokenLockBlock]],
+    balances: SortedMap[Address, Balance],
+    lastReference: TokenLockReference,
+    managers: Managers
+  )(
+    implicit currentHasher: Hasher[IO]
+  ): IO[TokenLockBlockAcceptanceResult] =
+    lane match {
+      case NativeGl1 =>
+        val context = TokenLockBlockAcceptanceContext.fromStaticData[IO](
+          balances,
+          Map(source -> lastReference),
+          Amount.empty,
+          TokenLockReference.empty,
+          List.empty,
+          epoch(100L)
+        )
+        managers.tokenLockAcceptanceManager.acceptBlocksIteratively(
+          blocks,
+          context,
+          snapshotOrdinal,
+          shouldPerformMetagraphSpecificValidations = true,
+          lastGlobalSnapshotEpochProgress = epoch(100L).some
+        )
+
+      case CurrencyCl1(metagraphId) =>
+        managers.currencyAcceptanceManager.acceptTokenLockBlocks(
+          blocks,
+          currencySnapshotContext(
+            metagraphId,
+            balances,
+            lastTokenLockRefs = SortedMap(source -> lastReference)
+          ),
+          snapshotOrdinal,
+          lastReference,
+          shouldPerformMetagraphSpecificValidations = true,
+          lastSyncGlobalSnapshotEpochProgress = epoch(100L)
+        )
+    }
+
   private def currencySnapshotContext(
     metagraphId: Address,
     balances: SortedMap[Address, Balance],
@@ -577,6 +622,54 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         .updateBalancesByTokenLocks(epoch(100L), balances, groupedTokenLocks(tokenLocks), SortedMap.empty, SortedSet.empty)
         .leftMap(error => new AssertionError(error.toString))
     )
+
+  private def activeTokenLocksForLane(
+    lane: TransferLane,
+    tokenLocks: SortedSet[Signed[TokenLock]],
+    resources: Resources
+  ): IO[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
+    lane match {
+      case NativeGl1      => nativeActiveTokenLocks(tokenLocks, resources)
+      case _: CurrencyCl1 => currencyActiveTokenLocks(tokenLocks, resources)
+    }
+
+  private def tokenLockBalancesForLane(
+    lane: TransferLane,
+    balances: SortedMap[Address, Balance],
+    tokenLocks: SortedSet[Signed[TokenLock]],
+    resources: Resources
+  ): IO[SortedMap[Address, Balance]] =
+    lane match {
+      case NativeGl1      => nativeTokenLockBalances(balances, tokenLocks, resources)
+      case _: CurrencyCl1 => currencyTokenLockBalances(balances, tokenLocks)
+    }
+
+  private def projectTokenLockBatchOrRaise(
+    lane: TransferLane,
+    correspondence: TokenLockReferenceCorrespondence,
+    items: Vector[TokenLockBatchItem],
+    balancesBefore: SortedMap[Address, Balance],
+    production: TokenLockBlockAcceptanceResult,
+    activeBefore: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    referenceBase: ReferenceState,
+    managers: Managers,
+    resources: Resources
+  )(implicit securityProvider: SecurityProvider[IO]): IO[TokenLockBatchProjection] =
+    projectTokenLockBatch(
+      domain,
+      lane,
+      correspondence,
+      items,
+      balancesBefore,
+      production,
+      activeBefore,
+      activeAfter,
+      ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+      referenceBase,
+      managers.signedValidator,
+      resources.currentHasher
+    ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
 
   test("native zero-fee transfer compares exact production and reference semantic state and successor identity") { resources =>
     implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
@@ -2359,6 +2452,702 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
         ),
         nonzeroFeeProjectionBinding == Left(NonZeroFeeOutOfScope("ECO-TOKEN-LOCK-CREATE", 1)),
         replacementProjectionBinding == Left(TokenLockReplacementOutOfScope(replacementRef))
+      )
+  }
+
+  test("native token-lock batch retries child-before-parent and matches every accepted prefix exactly") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence = TokenLockReferenceCorrespondence.nativeGenesis
+      first <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        30L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      firstRef <- TokenLockReference.of[IO](first)
+      child <- signedTokenLock(source, sourceKey, none, firstRef, 20L, 0L, 111L.some, none, resources.currentHasher)
+      childRef <- TokenLockReference.of[IO](child)
+      firstBlock <- signedTokenLockBlock(first, 2L, resources.currentHasher)
+      childBlock <- signedTokenLockBlock(child, 1L, resources.currentHasher)
+      items = Vector(TokenLockBatchItem(first, firstBlock), TokenLockBatchItem(child, childBlock))
+      prefixProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(firstBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      forwardProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(firstBlock, childBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      reverseProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(childBlock, firstBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      prefixActive <- activeTokenLocksForLane(lane, SortedSet(first), resources)
+      fullActive <- activeTokenLocksForLane(lane, SortedSet(first, child), resources)
+      prefixBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first), resources)
+      fullBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first, child), resources)
+      base <- referenceBase(Dag, initialBalances)
+      prefixProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items.take(1),
+        initialBalances,
+        prefixProduction,
+        SortedMap.empty,
+        prefixActive,
+        base,
+        managerBundle,
+        resources
+      )
+      forwardProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        forwardProduction,
+        SortedMap.empty,
+        fullActive,
+        base,
+        managerBundle,
+        resources
+      )
+      reverseProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        reverseProduction,
+        SortedMap.empty,
+        fullActive,
+        base,
+        managerBundle,
+        resources
+      )
+      third <- signedTokenLock(source, sourceKey, none, childRef, 1L, 0L, 112L.some, none, resources.currentHasher)
+      thirdBlock <- signedTokenLockBlock(third, 3L, resources.currentHasher)
+      substituted <- projectTokenLockBatch(
+        domain,
+        lane,
+        correspondence,
+        Vector(TokenLockBatchItem(child, firstBlock), TokenLockBatchItem(child, childBlock)),
+        initialBalances,
+        forwardProduction,
+        SortedMap.empty,
+        fullActive,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      missingDecisionProduction = forwardProduction.copy(accepted = List(firstBlock))
+      missingDecision <- projectTokenLockBatch(
+        domain,
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        missingDecisionProduction,
+        SortedMap.empty,
+        fullActive,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      extraDecisionProduction = forwardProduction.copy(accepted = forwardProduction.accepted :+ thirdBlock)
+      extraDecision <- projectTokenLockBatch(
+        domain,
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        extraDecisionProduction,
+        SortedMap.empty,
+        fullActive,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+    } yield
+      expect.all(
+        List(childBlock, firstBlock).sorted == List(childBlock, firstBlock),
+        prefixProduction.accepted == List(firstBlock),
+        prefixProduction.notAccepted.isEmpty,
+        prefixProduction.contextUpdate.balances == prefixBalances,
+        prefixProduction.contextUpdate.lastTokenLocksRefs == Map(source -> firstRef),
+        forwardProduction.accepted == List(firstBlock, childBlock),
+        forwardProduction.notAccepted.isEmpty,
+        forwardProduction == reverseProduction,
+        forwardProduction.contextUpdate.balances == fullBalances,
+        forwardProduction.contextUpdate.lastTokenLocksRefs == Map(source -> childRef),
+        forwardProduction.contextUpdate.claimedReplacementRefs.isEmpty,
+        forwardProduction.contextUpdate.inRoundTokenLocksByHash.keySet ==
+          forwardProjection.bindings.map(_.productionHashed.hash).toSet,
+        prefixActive == SortedMap(source -> SortedSet(first)),
+        fullActive == SortedMap(source -> SortedSet(first, child)),
+        prefixProjection.bindings.map(_.signed) == Vector(first),
+        prefixProjection.dispositions == Vector(TokenLockBatchAccepted),
+        prefixProjection.semanticDelta == SortedMap(source -> ObservedBalanceDelta(balance(100L), balance(70L))),
+        prefixProjection.referenceExecution.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 70,
+        prefixProjection.referenceExecution.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          prefixProjection.bindings.last.structuralSuccessor,
+        prefixProjection.referenceExecution.finalState.activeTokenLocks == prefixProjection.bindings.map(_.activeTokenLock),
+        forwardProjection.bindings.map(_.signed) == Vector(first, child),
+        forwardProjection.dispositions == Vector(TokenLockBatchAccepted, TokenLockBatchAccepted),
+        forwardProjection.semanticDelta == SortedMap(source -> ObservedBalanceDelta(balance(100L), balance(50L))),
+        forwardProjection.activeAfter == fullActive,
+        forwardProjection.referenceExecution.rejected.isEmpty,
+        forwardProjection.referenceExecution.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 50,
+        forwardProjection.referenceExecution.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          forwardProjection.bindings.last.structuralSuccessor,
+        forwardProjection.referenceExecution.finalState.activeTokenLocks == forwardProjection.bindings.map(_.activeTokenLock),
+        forwardProjection.referenceExecution.finalState.acceptedTokenLockHistory == forwardProjection.bindings.map(_.identity),
+        reverseProjection.bindings.map(_.signed) == forwardProjection.bindings.map(_.signed),
+        reverseProjection.dispositions == forwardProjection.dispositions,
+        reverseProjection.semanticDelta == forwardProjection.semanticDelta,
+        reverseProjection.activeAfter == forwardProjection.activeAfter,
+        reverseProjection.referenceExecution.finalState == forwardProjection.referenceExecution.finalState,
+        substituted == Left(TokenLockBatchPayloadMismatch(child, Vector(first))),
+        missingDecision == Left(
+          UnexpectedTokenLockBatchDecisionSet(items.map(_.block), missingDecisionProduction.accepted, List.empty)
+        ),
+        extraDecision == Left(
+          UnexpectedTokenLockBatchDecisionSet(items.map(_.block), extraDecisionProduction.accepted, List.empty)
+        )
+      )
+  }
+
+  test("currency token-lock batch preserves ML0 scope, retry order, and accepted-prefix parity") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+
+    for {
+      metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphId = metagraphKey.getPublic.toAddress
+      lane = CurrencyCl1(metagraphId)
+      scope = Metagraph(metagraphId)
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence <- TokenLockReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      first <- signedTokenLock(
+        source,
+        sourceKey,
+        CurrencyId(metagraphId).some,
+        correspondence.production,
+        25L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      firstRef <- TokenLockReference.of[IO](first)
+      child <- signedTokenLock(
+        source,
+        sourceKey,
+        CurrencyId(metagraphId).some,
+        firstRef,
+        15L,
+        0L,
+        111L.some,
+        none,
+        resources.currentHasher
+      )
+      childRef <- TokenLockReference.of[IO](child)
+      firstBlock <- signedTokenLockBlock(first, 4L, resources.currentHasher)
+      childBlock <- signedTokenLockBlock(child, 3L, resources.currentHasher)
+      items = Vector(TokenLockBatchItem(first, firstBlock), TokenLockBatchItem(child, childBlock))
+      prefixProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(firstBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      forwardProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(firstBlock, childBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      reverseProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(childBlock, firstBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      prefixActive <- activeTokenLocksForLane(lane, SortedSet(first), resources)
+      fullActive <- activeTokenLocksForLane(lane, SortedSet(first, child), resources)
+      prefixBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first), resources)
+      fullBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first, child), resources)
+      base <- referenceBase(scope, initialBalances)
+      prefixProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items.take(1),
+        initialBalances,
+        prefixProduction,
+        SortedMap.empty,
+        prefixActive,
+        base,
+        managerBundle,
+        resources
+      )
+      forwardProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        forwardProduction,
+        SortedMap.empty,
+        fullActive,
+        base,
+        managerBundle,
+        resources
+      )
+      reverseProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        reverseProduction,
+        SortedMap.empty,
+        fullActive,
+        base,
+        managerBundle,
+        resources
+      )
+    } yield
+      expect.all(
+        List(childBlock, firstBlock).sorted == List(childBlock, firstBlock),
+        prefixProduction.accepted == List(firstBlock),
+        prefixProduction.notAccepted.isEmpty,
+        prefixProduction.contextUpdate.balances == prefixBalances,
+        prefixProduction.contextUpdate.lastTokenLocksRefs == Map(source -> firstRef),
+        prefixProduction.contextUpdate.inRoundTokenLocksByHash.isEmpty,
+        forwardProduction.accepted == List(firstBlock, childBlock),
+        forwardProduction.notAccepted.isEmpty,
+        forwardProduction == reverseProduction,
+        forwardProduction.contextUpdate.balances == fullBalances,
+        forwardProduction.contextUpdate.lastTokenLocksRefs == Map(source -> childRef),
+        forwardProduction.contextUpdate.claimedReplacementRefs.isEmpty,
+        forwardProduction.contextUpdate.inRoundTokenLocksByHash.isEmpty,
+        prefixActive == SortedMap(source -> SortedSet(first)),
+        fullActive == SortedMap(source -> SortedSet(first, child)),
+        prefixProjection.bindings.map(_.signed) == Vector(first),
+        prefixProjection.dispositions == Vector(TokenLockBatchAccepted),
+        prefixProjection.semanticDelta == SortedMap(source -> ObservedBalanceDelta(balance(100L), balance(75L))),
+        prefixProjection.referenceExecution.finalState.balanceOf(ReferenceBalanceAccount(scope, source)) == 75,
+        prefixProjection.referenceExecution.finalState.activeTokenLocks == prefixProjection.bindings.map(_.activeTokenLock),
+        forwardProjection.bindings.map(_.signed) == Vector(first, child),
+        forwardProjection.bindings.forall(_.activeTokenLock.scope == scope),
+        forwardProjection.dispositions == Vector(TokenLockBatchAccepted, TokenLockBatchAccepted),
+        forwardProjection.semanticDelta == SortedMap(source -> ObservedBalanceDelta(balance(100L), balance(60L))),
+        forwardProjection.activeAfter == fullActive,
+        forwardProjection.referenceExecution.rejected.isEmpty,
+        forwardProjection.referenceExecution.finalState.balanceOf(ReferenceBalanceAccount(scope, source)) == 60,
+        forwardProjection.referenceExecution.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          forwardProjection.bindings.last.structuralSuccessor,
+        forwardProjection.referenceExecution.finalState.activeTokenLocks == forwardProjection.bindings.map(_.activeTokenLock),
+        reverseProjection.bindings.map(_.signed) == forwardProjection.bindings.map(_.signed),
+        reverseProjection.dispositions == forwardProjection.dispositions,
+        reverseProjection.semanticDelta == forwardProjection.semanticDelta,
+        reverseProjection.activeAfter == forwardProjection.activeAfter,
+        reverseProjection.referenceExecution.finalState == forwardProjection.referenceExecution.finalState
+      )
+  }
+
+  test("token-lock batch preserves typed production awaiting versus reference rejection without partial state") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence = TokenLockReferenceCorrespondence.nativeGenesis
+      first <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      firstRef <- TokenLockReference.of[IO](first)
+      second <- signedTokenLock(source, sourceKey, none, firstRef, 60L, 0L, 111L.some, none, resources.currentHasher)
+      secondRef <- TokenLockReference.of[IO](second)
+      firstBlock <- signedTokenLockBlock(first, 5L, resources.currentHasher)
+      secondBlock <- signedTokenLockBlock(second, 6L, resources.currentHasher)
+      items = Vector(TokenLockBatchItem(first, firstBlock), TokenLockBatchItem(second, secondBlock))
+      production <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(firstBlock, secondBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      activeAfter <- activeTokenLocksForLane(lane, SortedSet(first), resources)
+      finalBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first), resources)
+      base <- referenceBase(Dag, initialBalances)
+      projection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        production,
+        SortedMap.empty,
+        activeAfter,
+        base,
+        managerBundle,
+        resources
+      )
+      referenceRejection <- rejectedAt(projection.referenceExecution, 1)
+    } yield
+      expect.all(
+        production.accepted == List(firstBlock),
+        production.notAccepted == List(secondBlock -> TokenLockAddressBalanceOutOfRange(source, AmountUnderflow)),
+        production.contextUpdate.balances == finalBalances,
+        production.contextUpdate.balances == Map(source -> balance(40L)),
+        production.contextUpdate.lastTokenLocksRefs == Map(source -> firstRef),
+        production.contextUpdate.claimedReplacementRefs.isEmpty,
+        production.contextUpdate.inRoundTokenLocksByHash.keySet == Set(projection.bindings.head.productionHashed.hash),
+        projection.bindings.map(_.signed) == Vector(first, second),
+        projection.dispositions == Vector(
+          TokenLockBatchAccepted,
+          TokenLockBatchAwaiting(secondRef, TokenLockAddressBalanceOutOfRange(source, AmountUnderflow))
+        ),
+        referenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 40),
+        projection.referenceExecution.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        projection.referenceExecution.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          projection.bindings.head.structuralSuccessor,
+        projection.referenceExecution.finalState.activeTokenLocks == Vector(projection.bindings.head.activeTokenLock),
+        projection.referenceExecution.finalState.acceptedTokenLockHistory == Vector(projection.bindings.head.identity),
+        projection.activeAfter == SortedMap(source -> SortedSet(first)),
+        projection.semanticDelta == SortedMap(source -> ObservedBalanceDelta(balance(100L), balance(40L)))
+      )
+  }
+
+  test("token-lock batch preserves exact accepted then mixed awaiting and rejected production order") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      rejectedBlockKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence = TokenLockReferenceCorrespondence.nativeGenesis
+      first <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      firstRef <- TokenLockReference.of[IO](first)
+      awaiting <- signedTokenLock(source, sourceKey, none, firstRef, 60L, 0L, 111L.some, none, resources.currentHasher)
+      rejected <- signedTokenLock(source, sourceKey, none, firstRef, 70L, 0L, 112L.some, none, resources.currentHasher)
+      awaitingRef <- TokenLockReference.of[IO](awaiting)
+      rejectedRef <- TokenLockReference.of[IO](rejected)
+      firstBlock <- signedTokenLockBlock(first, 21L, resources.currentHasher)
+      awaitingBlock <- signedTokenLockBlock(awaiting, 22L, resources.currentHasher)
+      rejectedBlock <- sign(
+        TokenLockBlock(RoundId(new UUID(1L, 20L)), NonEmptySet.one(rejected)),
+        rejectedBlockKey,
+        resources.currentHasher
+      )
+      items = Vector(
+        TokenLockBatchItem(first, firstBlock),
+        TokenLockBatchItem(awaiting, awaitingBlock),
+        TokenLockBatchItem(rejected, rejectedBlock)
+      )
+      production <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(awaitingBlock, rejectedBlock, firstBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      validationRejection = TokenLockValidationFailed(
+        NonEmptyList.one(
+          io.constellationnetwork.node.shared.domain.tokenlock.block.InvalidSigned(
+            SignedValidator.NotEnoughSignatures(1L, 3)
+          )
+        )
+      )
+      expectedNotAccepted = List(
+        awaitingBlock -> TokenLockAddressBalanceOutOfRange(source, AmountUnderflow),
+        rejectedBlock -> validationRejection
+      )
+      activeAfter <- activeTokenLocksForLane(lane, SortedSet(first), resources)
+      finalBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first), resources)
+      base <- referenceBase(Dag, initialBalances)
+      projection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        production,
+        SortedMap.empty,
+        activeAfter,
+        base,
+        managerBundle,
+        resources
+      )
+      duplicateAcceptedProduction = production.copy(accepted = production.accepted :+ firstBlock)
+      duplicateAccepted <- projectTokenLockBatch(
+        domain,
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        duplicateAcceptedProduction,
+        SortedMap.empty,
+        activeAfter,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      duplicateNotAcceptedProduction = production.copy(notAccepted = production.notAccepted :+ production.notAccepted.head)
+      duplicateNotAccepted <- projectTokenLockBatch(
+        domain,
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        duplicateNotAcceptedProduction,
+        SortedMap.empty,
+        activeAfter,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      overlappingProduction = production.copy(accepted = production.accepted :+ awaitingBlock)
+      overlap <- projectTokenLockBatch(
+        domain,
+        lane,
+        correspondence,
+        items,
+        initialBalances,
+        overlappingProduction,
+        SortedMap.empty,
+        activeAfter,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        base,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      awaitingReferenceRejection <- rejectedAt(projection.referenceExecution, 1)
+      rejectedReferenceRejection <- rejectedAt(projection.referenceExecution, 2)
+    } yield
+      expect.all(
+        List(rejectedBlock, firstBlock, awaitingBlock).sorted == List(rejectedBlock, firstBlock, awaitingBlock),
+        production.accepted == List(firstBlock),
+        production.notAccepted == expectedNotAccepted,
+        production.contextUpdate.balances == finalBalances,
+        production.contextUpdate.lastTokenLocksRefs == Map(source -> firstRef),
+        projection.bindings.map(_.signed) == Vector(first, awaiting, rejected),
+        projection.dispositions == Vector(
+          TokenLockBatchAccepted,
+          TokenLockBatchAwaiting(awaitingRef, TokenLockAddressBalanceOutOfRange(source, AmountUnderflow)),
+          TokenLockBatchRejected(rejectedRef, validationRejection)
+        ),
+        projection.referenceExecution.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        projection.referenceExecution.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          projection.bindings.head.structuralSuccessor,
+        awaitingReferenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 40),
+        rejectedReferenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 70, 40),
+        projection.activeAfter == SortedMap(source -> SortedSet(first)),
+        duplicateAccepted == Left(
+          UnexpectedTokenLockBatchDecisionSet(items.map(_.block), duplicateAcceptedProduction.accepted, expectedNotAccepted)
+        ),
+        duplicateNotAccepted == Left(
+          UnexpectedTokenLockBatchDecisionSet(
+            items.map(_.block),
+            production.accepted,
+            duplicateNotAcceptedProduction.notAccepted
+          )
+        ),
+        overlap == Left(
+          UnexpectedTokenLockBatchDecisionSet(items.map(_.block), overlappingProduction.accepted, expectedNotAccepted)
+        )
+      )
+  }
+
+  test("token-lock batch stale and wrong-parent decisions are permanent and cannot mint reference inputs") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      correspondence = TokenLockReferenceCorrespondence.nativeGenesis
+      first <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        30L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      firstBlock <- signedTokenLockBlock(first, 7L, resources.currentHasher)
+      firstProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(firstBlock),
+        initialBalances,
+        correspondence.production,
+        managerBundle
+      )
+      firstActive <- activeTokenLocksForLane(lane, SortedSet(first), resources)
+      firstBalances <- tokenLockBalancesForLane(lane, initialBalances, SortedSet(first), resources)
+      base <- referenceBase(Dag, initialBalances)
+      firstProjection <- projectTokenLockBatchOrRaise(
+        lane,
+        correspondence,
+        Vector(TokenLockBatchItem(first, firstBlock)),
+        initialBalances,
+        firstProduction,
+        SortedMap.empty,
+        firstActive,
+        base,
+        managerBundle,
+        resources
+      )
+      firstBinding = firstProjection.bindings.head
+      firstObservation <- IO.fromEither(
+        observeBatchAcceptedTokenLock(firstBinding, firstBlock, initialBalances, firstProduction, SortedMap.empty, firstActive)
+          .leftMap(error => new AssertionError(error.toString))
+      )
+      advanced <- IO.fromEither(correspondence.advance(firstObservation).leftMap(error => new AssertionError(error.toString)))
+      stale <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        correspondence.production,
+        1L,
+        0L,
+        111L.some,
+        none,
+        resources.currentHasher
+      )
+      forgedParent = TokenLockReference(advanced.production.ordinal, Hash("ef" * 32))
+      wrongParent <- signedTokenLock(source, sourceKey, none, forgedParent, 1L, 0L, 111L.some, none, resources.currentHasher)
+      staleRef <- TokenLockReference.of[IO](stale)
+      wrongParentRef <- TokenLockReference.of[IO](wrongParent)
+      staleBlock <- signedTokenLockBlock(stale, 8L, resources.currentHasher)
+      wrongParentBlock <- signedTokenLockBlock(wrongParent, 9L, resources.currentHasher)
+      staleProduction <- acceptTokenLockBatch(lane, source, List(staleBlock), firstBalances, advanced.production, managerBundle)
+      wrongParentProduction <- acceptTokenLockBatch(
+        lane,
+        source,
+        List(wrongParentBlock),
+        firstBalances,
+        advanced.production,
+        managerBundle
+      )
+      staleProjection <- projectTokenLockBatch(
+        domain,
+        lane,
+        advanced,
+        Vector(TokenLockBatchItem(stale, staleBlock)),
+        firstBalances,
+        staleProduction,
+        firstActive,
+        firstActive,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        firstProjection.referenceExecution.finalState,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      wrongParentProjection <- projectTokenLockBatch(
+        domain,
+        lane,
+        advanced,
+        Vector(TokenLockBatchItem(wrongParent, wrongParentBlock)),
+        firstBalances,
+        wrongParentProduction,
+        firstActive,
+        firstActive,
+        ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+        firstProjection.referenceExecution.finalState,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      )
+      staleReason = RejectedTokenLock(
+        staleRef,
+        TokenLockParentOrdinalBelowLastTxOrdinal(correspondence.production.ordinal, advanced.production.ordinal)
+      )
+      wrongParentReason = RejectedTokenLock(
+        wrongParentRef,
+        TokenLockParentHashMismatch(forgedParent.hash, advanced.production.hash)
+      )
+    } yield
+      expect.all(
+        staleProduction.accepted.isEmpty,
+        staleProduction.notAccepted == List(staleBlock -> staleReason),
+        TokenLockBlockNotAcceptedReason.isPermanent(staleReason),
+        staleProduction.contextUpdate == TokenLockBlockAcceptanceContextUpdate.empty,
+        staleProjection == Left(TokenLockParentBindingMismatch(advanced.production, correspondence.production)),
+        wrongParentProduction.accepted.isEmpty,
+        wrongParentProduction.notAccepted == List(wrongParentBlock -> wrongParentReason),
+        TokenLockBlockNotAcceptedReason.isPermanent(wrongParentReason),
+        wrongParentProduction.contextUpdate == TokenLockBlockAcceptanceContextUpdate.empty,
+        wrongParentProjection == Left(TokenLockParentBindingMismatch(advanced.production, forgedParent))
       )
   }
 

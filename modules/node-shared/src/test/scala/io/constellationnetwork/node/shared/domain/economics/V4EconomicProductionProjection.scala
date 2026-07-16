@@ -31,8 +31,10 @@ import io.circe.Encoder
   * Production acceptance APIs expose aggregate semantic state updates, not execution write order or a distinct replay-ID write. This helper
   * therefore compares only fields actually observed from production. In particular, batch allow-spend acceptance exposes balances and
   * references but no active-record delta, so the batch projection makes no active-record parity claim. Token-lock coverage is restricted to
-  * one zero-fee, nonreplacement payload; its final active state is observed through the current native/currency state manager after exact
-  * block acceptance. It makes no full-GL0-path, batch-parity, production-write-order, replay-ID, or E2.8-completion claim.
+  * zero-fee, nonreplacement payloads; final active state is observed through the current native/currency state manager after exact block
+  * acceptance. The bounded token-lock batch projection checks aggregate state and exact emitted accepted-then-not-accepted decision order,
+  * but production still exposes neither an independent write-order trace nor a replay-ID write. It makes no full-GL0-path, E2.8-completion,
+  * or cross-platform claim.
   */
 object V4EconomicProductionProjection {
 
@@ -130,6 +132,18 @@ object V4EconomicProductionProjection {
   final case class TokenLockBatchPayloadMismatch(
     expected: Signed[TokenLock],
     actual: Vector[Signed[TokenLock]]
+  ) extends ProjectionError
+  final case class UnexpectedTokenLockBatchDecisionSet(
+    expected: Vector[Signed[TokenLockBlock]],
+    accepted: List[Signed[TokenLockBlock]],
+    notAccepted: List[(Signed[TokenLockBlock], TokenLockBlockNotAcceptedReason)]
+  ) extends ProjectionError
+  final case class TokenLockBatchDecisionMissing(block: Signed[TokenLockBlock]) extends ProjectionError
+  final case class TokenLockBatchRequiresSingleSource(actual: Set[Address]) extends ProjectionError
+  final case class UnexpectedTokenLockBatchBalance(address: Address, expected: BigInt, actual: BigInt) extends ProjectionError
+  final case class UnexpectedTokenLockBatchReference(
+    expected: StructuralTokenLockReference,
+    actual: StructuralTokenLockReference
   ) extends ProjectionError
   final case class TransferBatchRequiresSingleSource(actual: Set[Address]) extends ProjectionError
   final case class AllowSpendBatchRequiresSingleSource(actual: Set[Address]) extends ProjectionError
@@ -406,8 +420,15 @@ object V4EconomicProductionProjection {
   final case class AllowSpendBatchAwaiting(target: AllowSpendReference, reason: AllowSpendBlockAwaitReason)
       extends AllowSpendBatchDisposition
 
+  sealed trait TokenLockBatchDisposition extends Product with Serializable
+  case object TokenLockBatchAccepted extends TokenLockBatchDisposition
+  final case class TokenLockBatchRejected(target: TokenLockReference, reason: TokenLockBlockRejectionReason)
+      extends TokenLockBatchDisposition
+  final case class TokenLockBatchAwaiting(target: TokenLockReference, reason: TokenLockBlockAwaitReason) extends TokenLockBatchDisposition
+
   final case class TransferBatchItem(signed: Signed[Transaction], block: Signed[Block])
   final case class AllowSpendBatchItem(signed: Signed[AllowSpend], block: Signed[AllowSpendBlock])
+  final case class TokenLockBatchItem(signed: Signed[TokenLock], block: Signed[TokenLockBlock])
 
   sealed trait TransferBatchProjection extends Product with Serializable {
     def bindings: Vector[SourceValidatedTransfer]
@@ -436,6 +457,22 @@ object V4EconomicProductionProjection {
     semanticDelta: SortedMap[Address, ObservedBalanceDelta],
     referenceExecution: ReferenceExecution
   ) extends AllowSpendBatchProjection
+
+  sealed trait TokenLockBatchProjection extends Product with Serializable {
+    def bindings: Vector[SourceValidatedTokenLock]
+    def dispositions: Vector[TokenLockBatchDisposition]
+    def semanticDelta: SortedMap[Address, ObservedBalanceDelta]
+    def activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]]
+    def referenceExecution: ReferenceExecution
+  }
+
+  private final case class TokenLockBatchProjectionImpl(
+    bindings: Vector[SourceValidatedTokenLock],
+    dispositions: Vector[TokenLockBatchDisposition],
+    semanticDelta: SortedMap[Address, ObservedBalanceDelta],
+    activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    referenceExecution: ReferenceExecution
+  ) extends TokenLockBatchProjection
 
   def bindTransfer(
     signed: Signed[Transaction],
@@ -915,6 +952,173 @@ object V4EconomicProductionProjection {
     }
   }
 
+  def projectTokenLockBatch(
+    domain: ReferenceDomain,
+    lane: TransferLane,
+    correspondence: TokenLockReferenceCorrespondence,
+    items: Vector[TokenLockBatchItem],
+    balancesBefore: SortedMap[Address, Balance],
+    production: TokenLockBlockAcceptanceResult,
+    activeBefore: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    activeAfter: SortedMap[Address, SortedSet[Signed[TokenLock]]],
+    referenceContext: ReferenceContext,
+    referenceBase: ReferenceState,
+    signedValidator: SignedValidator[IO],
+    currentHasher: Hasher[IO]
+  )(implicit securityProvider: SecurityProvider[IO]): IO[Either[ProjectionError, TokenLockBatchProjection]] = {
+    final case class BatchCursor(
+      production: TokenLockReference,
+      structural: StructuralTokenLockReference
+    )
+
+    def loop(
+      remaining: List[TokenLockBatchItem],
+      cursor: BatchCursor,
+      bindings: Vector[SourceValidatedTokenLock],
+      dispositions: Vector[TokenLockBatchDisposition]
+    ): IO[Either[ProjectionError, (BatchCursor, Vector[SourceValidatedTokenLock], Vector[TokenLockBatchDisposition])]] =
+      remaining match {
+        case Nil => IO.pure(Right((cursor, bindings, dispositions)))
+        case item :: tail =>
+          val blockTokenLocks = item.block.value.tokenLocks.toNonEmptyList.toList.toVector
+          if (blockTokenLocks != Vector(item.signed))
+            IO.pure(Left(TokenLockBatchPayloadMismatch(item.signed, blockTokenLocks)))
+          else {
+            val claimed = new TokenLockReferenceCorrespondence(lane, cursor.production, cursor.structural)
+            bindTokenLock(item.signed, domain, lane, claimed, signedValidator, currentHasher).flatMap {
+              case Left(error) => IO.pure(Left(error))
+              case Right(binding) =>
+                tokenLockBatchDisposition(item.block, binding.productionSuccessor, production) match {
+                  case Left(error) => IO.pure(Left(error))
+                  case Right(disposition) =>
+                    val next = disposition match {
+                      case TokenLockBatchAccepted =>
+                        BatchCursor(binding.productionSuccessor, binding.structuralSuccessor)
+                      case _ => cursor
+                    }
+                    loop(tail, next, bindings :+ binding, dispositions :+ disposition)
+                }
+            }
+          }
+      }
+
+    val expectedBlocks = items.map(_.block)
+    val acceptedBlocks = production.accepted.toVector
+    val notAcceptedBlocks = production.notAccepted.map(_._1).toVector
+    val exactDecisionSet =
+      expectedBlocks.nonEmpty &&
+        expectedBlocks.distinct.size == expectedBlocks.size &&
+        acceptedBlocks.distinct.size == acceptedBlocks.size &&
+        notAcceptedBlocks.distinct.size == notAcceptedBlocks.size &&
+        acceptedBlocks.toSet.intersect(notAcceptedBlocks.toSet).isEmpty &&
+        (acceptedBlocks ++ notAcceptedBlocks).toSet == expectedBlocks.toSet &&
+        acceptedBlocks.size + notAcceptedBlocks.size == expectedBlocks.size
+
+    if (!exactDecisionSet)
+      IO.pure(Left(UnexpectedTokenLockBatchDecisionSet(expectedBlocks, production.accepted, production.notAccepted)))
+    else {
+      val itemsByBlock = items.iterator.map(item => item.block -> item).toMap
+      val acceptedItems = production.accepted.iterator.map(itemsByBlock).toVector
+      val notAcceptedItems = production.notAccepted.iterator.map { case (block, _) => itemsByBlock(block) }.toVector
+      val orderedItems = acceptedItems ++ notAcceptedItems
+      val initialCursor = BatchCursor(correspondence.production, correspondence.structural)
+
+      loop(orderedItems.toList, initialCursor, Vector.empty, Vector.empty).map {
+        _.flatMap {
+          case (_, bindings, dispositions) =>
+            val sources = items.iterator.map(_.signed.value.source).toSet
+            for {
+              source <- sources.toList match {
+                case only :: Nil => Right(only)
+                case _           => Left(TokenLockBatchRequiresSingleSource(sources))
+              }
+              acceptedBindings = bindings.zip(dispositions).collect {
+                case (binding, TokenLockBatchAccepted) => binding
+              }
+              expectedReferences = acceptedBindings.lastOption
+                .map(binding => Map(source -> binding.productionSuccessor))
+                .getOrElse(Map.empty[Address, TokenLockReference])
+              _ <- Either.cond(
+                production.contextUpdate.lastTokenLocksRefs == expectedReferences,
+                (),
+                UnexpectedTokenLockReferenceUpdates(expectedReferences, production.contextUpdate.lastTokenLocksRefs)
+              )
+              expectedBalanceKeys = acceptedBindings.iterator.map(_.signed.value.source).toSet
+              _ <- Either.cond(
+                production.contextUpdate.balances.keySet == expectedBalanceKeys,
+                (),
+                UnexpectedTokenLockBalanceKeys(expectedBalanceKeys, production.contextUpdate.balances.keySet)
+              )
+              expectedClaimedReplacementRefs = Set.empty[Hash]
+              _ <- Either.cond(
+                production.contextUpdate.claimedReplacementRefs == expectedClaimedReplacementRefs,
+                (),
+                UnexpectedTokenLockClaimedReplacementRefs(
+                  expectedClaimedReplacementRefs,
+                  production.contextUpdate.claimedReplacementRefs
+                )
+              )
+              expectedInRoundTokenLocks = lane match {
+                case TransferLane.NativeGl1 =>
+                  acceptedBindings.iterator.map(binding => binding.productionHashed.hash -> binding.productionHashed).toMap
+                case _: TransferLane.CurrencyCl1 => Map.empty[Hash, Hashed[TokenLock]]
+              }
+              _ <- Either.cond(
+                production.contextUpdate.inRoundTokenLocksByHash == expectedInRoundTokenLocks,
+                (),
+                UnexpectedInRoundTokenLockState(expectedInRoundTokenLocks, production.contextUpdate.inRoundTokenLocksByHash)
+              )
+              expectedActiveAfter = acceptedBindings.foldLeft(activeBefore) { (acc, binding) =>
+                val bindingSource = binding.signed.value.source
+                acc.updated(
+                  bindingSource,
+                  acc.getOrElse(bindingSource, SortedSet.empty[Signed[TokenLock]]) + binding.signed
+                )
+              }
+              _ <- Either.cond(
+                activeAfter == expectedActiveAfter,
+                (),
+                UnexpectedActiveTokenLockState(expectedActiveAfter, activeAfter)
+              )
+              execution <- executeTokenLocks(referenceContext, referenceBase, bindings)
+                .leftMap(ReferenceExecutionProjectionFailed)
+              expectedStructuralReference = acceptedBindings.lastOption
+                .map(_.structuralSuccessor)
+                .getOrElse(correspondence.structural)
+              actualStructuralReference = execution.finalState.lastTokenLockRefOf(
+                ReferenceTokenLockChainAccount(lane, source)
+              )
+              _ <- Either.cond(
+                actualStructuralReference == expectedStructuralReference,
+                (),
+                UnexpectedTokenLockBatchReference(expectedStructuralReference, actualStructuralReference)
+              )
+              _ <- acceptedBindings.lastOption match {
+                case None => Right(())
+                case Some(_) =>
+                  val referenceBalance = execution.finalState.balanceOf(ReferenceBalanceAccount(lane.scope, source))
+                  production.contextUpdate.balances
+                    .get(source)
+                    .toRight(UnexpectedTokenLockBalanceKeys(Set(source), production.contextUpdate.balances.keySet))
+                    .flatMap { productionBalance =>
+                      val actual = BigInt(productionBalance.value.value)
+                      Either.cond(
+                        actual == referenceBalance,
+                        (),
+                        UnexpectedTokenLockBatchBalance(source, referenceBalance, actual)
+                      )
+                    }
+              }
+              semanticDelta = SortedMap.from(production.contextUpdate.balances.iterator.map {
+                case (address, after) =>
+                  address -> ObservedBalanceDelta(balancesBefore.getOrElse(address, Balance.empty), after)
+              })
+            } yield TokenLockBatchProjectionImpl(bindings, dispositions, semanticDelta, activeAfter, execution)
+        }
+      }
+    }
+  }
+
   def executeTransfers(
     context: ReferenceContext,
     base: ReferenceState,
@@ -1115,6 +1319,21 @@ object V4EconomicProductionProjection {
       case (false, Some(reason: AllowSpendBlockRejectionReason)) => Right(AllowSpendBatchRejected(target, reason))
       case (false, Some(reason: AllowSpendBlockAwaitReason))     => Right(AllowSpendBatchAwaiting(target, reason))
       case _                                                     => Left(AllowSpendBatchDecisionMissing(block))
+    }
+  }
+
+  private def tokenLockBatchDisposition(
+    block: Signed[TokenLockBlock],
+    target: TokenLockReference,
+    production: TokenLockBlockAcceptanceResult
+  ): Either[ProjectionError, TokenLockBatchDisposition] = {
+    val accepted = production.accepted.contains(block)
+    val notAccepted = production.notAccepted.collectFirst { case (`block`, reason) => reason }
+    (accepted, notAccepted) match {
+      case (true, None)                                         => Right(TokenLockBatchAccepted)
+      case (false, Some(reason: TokenLockBlockRejectionReason)) => Right(TokenLockBatchRejected(target, reason))
+      case (false, Some(reason: TokenLockBlockAwaitReason))     => Right(TokenLockBatchAwaiting(target, reason))
+      case _                                                    => Left(TokenLockBatchDecisionMissing(block))
     }
   }
 
