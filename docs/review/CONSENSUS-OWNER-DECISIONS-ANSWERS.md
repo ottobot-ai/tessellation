@@ -1,7 +1,7 @@
 # Consensus Owner Decision Register — Answers & Ratified Directions (v2)
 
 **Companion to:** [`CONSENSUS-OWNER-DECISIONS.md`](CONSENSUS-OWNER-DECISIONS.md)
-**Revised:** 2026-07-14 · source-audit baseline `ad13026d1`
+**Revised:** 2026-07-15 · settled-answer source-audit baseline `ad13026d1`
 **Supersedes:** the v1 draft that was rejected by adversarial audit at HEAD `e26ad406e`.
 This revision reworks every gate against that audited source baseline, dispositions all
 15 audit findings, and folds in the owner's refinement dialogue.
@@ -10,9 +10,11 @@ This revision reworks every gate against that audited source baseline, dispositi
 recommendations and directions recorded here. Ratification does **not** assert that missing
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
-document records which direction is settled and which executable freeze gates remain.
-**Owner-question completeness:** `17/17` (`O-01` through `O-17`) dispositioned; no O-item awaits
-an owner response.
+document records which direction is settled and which executable freeze gates remain. `O-18` was
+added after that ratification pass and is not answered by this document.
+**Owner-question completeness:** `17/18` dispositioned. `O-01` through `O-17` are ratified;
+`O-18` awaits an owner response in
+[`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md).
 
 ---
 
@@ -107,6 +109,7 @@ test, never a freeze.
 | O-15 | Multi-tine frontier | 🔴 | L-24/L-04 and the single-common-anchor density/tower-evidence-only direction are ratified; exact selector, boundary, metric, tie, evidence, overflow rule, and proof remain stop-the-line research. |
 | O-16 | Phase-2 consumer lease | 🔴 | Conservative invalidation, raw-byte re-verification, L-19/L-23 conformance, and full signed exact-ref direction are ratified; freshness policy, purpose inventory, schema, and dependencies remain stop-the-line engineering. |
 | O-17 | ROOT-008 partition grammar | 🔴 | Numeric gaps/offline import, self-authenticating fields, token-lock scope, and field-32 direction are ratified; identity functions, resource parameters, codecs, and proofs remain stop-the-line engineering. |
+| O-18 | Transport and DA byte contract | 🔴 | **OWNER RESPONSE REQUIRED:** active-era maxima, migration scope, canonical bytes/compression, descriptor/chunk delivery, and the `512000`/`20 MiB` rule semantics are not ratified. Bounded helpers are unwired. |
 
 ---
 
@@ -556,6 +559,23 @@ functions remain an engineering freeze gate.
 separate (this is the "MPT-as-byte-source = representation, not re-exec removal" distinction).
 ECO-F32 = HIGH.
 
+## O-18 — Transport and DA byte contract 🔴
+
+**Status:** **OWNER RESPONSE REQUIRED.** This answers document does not infer a disposition.
+The focused packet is
+[`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md).
+
+The pending choices are `O18-01` active-era per-family canonical/transport maxima; `O18-02`
+selected-source-chain migration scope; `O18-03` canonical byte identity and compression domain;
+`O18-04` descriptor/chunk/fetch/retention proof; `O18-05` always-pull versus threshold delivery;
+`O18-06` the `512000` state-channel size/fee rule; `O18-07` the `20 MiB` event-cutter rule; and
+`O18-08` mandatory absolute decompression caps versus optional ratio limits.
+
+The new bounded Brotli decoder and reserved ingress queue are unwired preparation, not a live
+closure. O-18 cannot alter economic authority: every GL0 validator still executes direct native
+`GL1 -> GL0`; ordinary sharded-CL1 adoption still requires replay-backed certificates, scoped diff
+application, and root reproduction; transport and DA receipts satisfy neither threshold.
+
 ---
 
 ## Cross-cutting caveats
@@ -594,7 +614,8 @@ ECO-F32 = HIGH.
    quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
    A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
    activation proofs. These are not unanswered owner choices and may not be filled by local
-   configuration or an implementation shortcut.
+   configuration or an implementation shortcut. O-18 is different: its eight choices are newly
+   surfaced and still await an owner response.
 
 ## Provenance
 

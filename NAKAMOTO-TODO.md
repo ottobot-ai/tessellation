@@ -48,9 +48,11 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `O-01` through `O-17` are `17/17`
-> dispositioned in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. Open
-> O-item work below is an engineering, research, schema, parameter, or proof
+> **Owner-decision status:** `17/18` dispositioned. `O-01` through `O-17` are
+> ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; the newly
+> surfaced `O-18` transport/DA byte contract awaits an owner response in
+> `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`. Open work under
+> O-01 through O-17 is an engineering, research, schema, parameter, or proof
 > gate under a ratified direction, not a request for another owner answer.
 
 ---
@@ -465,7 +467,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     complete empty source remains a protocol liveness/proof freeze gate: derive
     one deterministic canonical result distinct from unavailable history and add
     cross-implementation vectors before enabling that path. It is not an
-    unanswered O-01..O-17 owner decision.
+    unanswered owner decision; O-18 does not govern eta derivation.
   - **Current fixture status:** the currently inventoried operative snapshot,
     admission, committee, execution, tower, and slashing fixtures use the
     canonical committed-genesis fixture. Remaining direct
@@ -547,8 +549,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - Replace the conflicting 20 MiB application aggregate, 1 MiB GossipSub, 4 MiB
     default gRPC, 16 MiB ChainSync, and 32 MiB local callback limits with one
     canonical bounded descriptor plus authenticated content-addressed chunked pull.
-    Ratify per-family decompressed maxima from valid v4 payloads and implement
-    bounded streaming Brotli decode; compressed-byte accounting alone is insufficient.
+    Ratify active-era per-family canonical-uncompressed, compressed-envelope,
+    cardinality, chunk, and aggregate-retrieval maxima through O-18. The
+    theoretically schema-valid v4 set has no finite payload maximum; a future
+    hard-fork migration inventories the exact selected source chain plus explicit
+    headroom. Wire bounded streaming Brotli decode only after those limits freeze;
+    compressed-byte accounting alone is insufficient.
   - Add durable outbox, exact-hash multi-peer recovery, and reproducible fault/
     resource fixtures.
   - **Gate:** `NET-*`, `RESOURCE-001`, `REC-*`.
@@ -659,6 +665,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     after malformed-artifact gates pass. Preserve signer/watchtower replay and
     universal native GL1 execution; make the target global kernel universal as
     part of this epic.
+  - Retain the native DAG producer/follower execution regression and add
+    equivalent producer-plus-independent-follower parity and divergent-follower
+    rejection for native `AllowSpendEvent` and `TokenLockEvent`. These are
+    permanent universal `GL1 -> GL0` tests and must never route through a
+    sharded-CL1 execution certificate or diff-adoption path (`NET-008A`).
   - Run one deterministic GL0 conflict/nullifier/settlement kernel over signed
     intents and atomically compose per-MG mirrors with GL0-owned overlays.
   - Replace bounded `GlobalSnapshotsProcessed` reconstruction with a rooted,
@@ -809,8 +820,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 - [ ] **E11 SCAFFOLD ONLY - exceptional replay, adjudication, and slashing**
   - Accept only assigned, bonded, rate/resource-limited exact-data challenges.
-  - Bounded universal GL0 replay, not the assertion, decides mismatch, rollback/
-    quarantine, signer debit, and reward.
+  - Bounded exceptional replay by every GL0 validator of the challenged
+    sharded-CL1 checkpoint's exact retained base and ordered framework inputs,
+    not the assertion, decides mismatch, rollback/quarantine, signer debit, and
+    reward. This is not the ordinary sharded-CL1 adoption path; native GL1
+    transitions and the global kernel remain universal execution paths.
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.
   - **Gate:** `WT-001..007`, `CRYPTO-001`, `REC-*`, flood/resource tests.
@@ -1067,7 +1081,7 @@ consensus-economic roadmap for dependencies and release gates.
 
 9. ⏳ **Mempool Reinsertion on Finalize** — no clear landing commit found. Round-cancellation logging landed (`948d2b2e1`) but event recycling on orphan/finalize appears unimplemented. Keep.
 
-10. ⚠ **Partition Recovery (Fork Recovery)** — the GL0 design changed after the reported runs: direct peer-state/GSI installs are removed. A receiver buffers a missing-parent snapshot, fetches ancestry, and exact-replays every transition through the ordinary validator. Shard-checkpoint pull recovery remains, but the combined replay-only flow needs fresh partition/restart e2e validation. Confirm per-sub-item:
+10. ⚠ **Partition Recovery (Fork Recovery)** — the GL0 design changed after the reported runs: direct peer-state/GSI installs are removed. A receiver buffers a missing-parent snapshot, fetches authenticated ancestry, and revalidates it through the ordinary validator. Every recovered native GL1 transition and the deterministic global conflict/nullifier/settlement kernel are locally re-executed by every GL0 validator. Recovered sharded-CL1 state is accepted only through its replay-backed execution certificate, scoped diff application, and adopter root reproduction after E9; recovery never installs a peer-claimed root or turns ordinary sharded-CL1 adoption into all-GL0 checkpoint execution. Shard-checkpoint pull recovery remains, but the combined flow needs fresh partition/restart e2e validation. Confirm per-sub-item:
     - **10a.** Sidecar GossipSub mesh re-establishment after partition — ❓ verify (sidecar reconnection/mesh re-graft).
     - **10b.** Missing-parent ancestry request + buffered replay — ⚠ confirm recursive completion and prove no peer-carried context/state can be installed.
     - **10c.** ProductionGate stale-fork detection / pause-if-behind — ⚠ confirm.

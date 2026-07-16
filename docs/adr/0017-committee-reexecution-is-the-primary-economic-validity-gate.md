@@ -127,7 +127,8 @@ same complete checkpoint. They detect a colluding execution threshold and submit
 challenge only when exact inputs/base are available and their reproduced diff/root
 differs. An unavailable base is not evidence of fraud. The assertion is not itself
 objective: the ratified adjudicator must independently compute the mismatch, with
-exceptional bounded GL0 replay of the challenged checkpoint as the initial
+exceptional bounded replay by all GL0 validators of the challenged sharded-CL1
+checkpoint's exact retained framework inputs/base as the initial
 recommendation. Happy-path ordinary adoption remains zero-replay.
 
 Evidence identifies and can slash actual checkpoint signers. Detection, evidence

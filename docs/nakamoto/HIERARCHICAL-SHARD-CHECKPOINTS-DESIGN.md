@@ -228,7 +228,8 @@ A challenge binds exact base, inputs, signed checkpoint, signer set, reproduced
 diff/root, and mismatch. Only actual signers are liable. Missing history, transport
 timeout, or an unresolvable base cannot slash. The watchtower assertion is not a
 verdict; a ratified deterministic adjudicator computes the mismatch, initially by
-exceptional bounded universal GL0 replay of the challenged exact checkpoint.
+exceptional bounded replay by all GL0 validators of the challenged sharded-CL1
+checkpoint's exact retained framework inputs/base.
 
 O-03/L-09 ratify positive assigned-watchtower replay coverage as a prerequisite
 for GL0-inclusion eligibility; a post-release challenge window is not an

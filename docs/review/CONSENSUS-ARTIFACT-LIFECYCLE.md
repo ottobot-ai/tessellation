@@ -554,7 +554,8 @@ checkpoint. Valid evidence binds exact base, inputs, checkpoint, signer set,
 locally reproduced diff/root, and mismatch. Unavailable history is not fraud. A
 watchtower's assertion alone is not objective evidence: adjudication must be a
 ratified deterministic step/fraud proof, succinct proof, or exceptional bounded
-universal GL0 replay of the challenged exact inputs. Happy-path ordinary adoption
+replay by all GL0 validators of the challenged sharded-CL1 checkpoint's exact
+retained framework inputs/base. Happy-path ordinary sharded-CL1 adoption
 still does not replay.
 
 Watchtower selection is a deterministic noncommittee complement/sample with a
@@ -580,8 +581,9 @@ slash or select a replacement state; the bounded objective replay/proof below
 decides whether the checkpoint or claimant is faulty.
 
 A mismatch assertion is assigned, bonded, rate-limited, and resource-bounded. In
-the first implementation, exceptional bounded universal GL0 replay of the exact
-challenged inputs/base decides the result. Missing data defers and cannot slash.
+the first implementation, exceptional bounded replay by all GL0 validators of
+the challenged sharded-CL1 checkpoint's exact retained framework inputs/base
+decides the result. Missing data defers and cannot slash.
 The deterministic replay result, never the assertion or a timeout, decides
 rollback and signer penalties. A verified step or succinct proof may replace this
 only after an independent specification and resource-bound tests.

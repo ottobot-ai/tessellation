@@ -1,12 +1,13 @@
 # Consensus Owner Decision Register
 
 **Status:** Active. Owner directions in this register and
-`CONSENSUS-OWNER-DECISIONS-ANSWERS.md` are ratified. Runtime packets may not silently invent a
+`CONSENSUS-OWNER-DECISIONS-ANSWERS.md` are ratified for `O-01` through `O-17`. Runtime packets may not silently invent a
 missing parameter, schema, reference model, or proof needed to close an engineering freeze gate.
-Every owner question formerly posed by this register is dispositioned by the answers document;
-none remains awaiting an owner response.
-**Owner-question completeness:** `17/17` (`O-01` through `O-17`) dispositioned.
-**Updated:** 2026-07-14
+`O-18` was surfaced by the transport/resource audit and awaits an owner response; no implementation
+may infer its byte, compression, chunking, retention, or migration choices.
+**Owner-question completeness:** `17/18` dispositioned. `O-01` through `O-17` are ratified;
+`O-18` is pending.
+**Updated:** 2026-07-15
 
 This register uses project phases only where the owner has ratified them:
 Phase 0 `Pending`, Phase 1 `Provisional`, and Phase 2 `Operational`. `k2` is a
@@ -24,7 +25,7 @@ retention/recovery recommendation, not a separate consensus-finality floor.
 | L-06 | Metagraphs and checkpoint execution reference only exact canonical Phase-2 `(ordinal, hash, parentHash, mptRoot)` GL0 state. Inbound binaries may stage while the live GL0 head is ahead, but execution and global reads never use an unqualified live head. |
 | L-07 | Every execution-committee signer independently replays the exact ordered framework inputs at the exact signed Phase-2 base and signs only when its byte-identical diff, extracted intents, and resulting root match. Missing inputs mean defer/no-sign. |
 | L-08 | Ordinary noncommittee GL0 nodes verify the distinct execution `kQuorum`, exact base, scope, continuity, diff, and resulting root, then adopt the diff without recreating the ordinary currency snapshot. Shard depth never substitutes for missing replay signatures. |
-| L-09 | Deterministically assigned noncommittee watchtower replay provides the execution-threshold collusion backstop. Positive required replay coverage precedes GL0 inclusion eligibility. A valid challenge triggers exceptional bounded universal GL0 replay of the exact retained base and inputs; the replay result, not the assertion, decides rollback/slash. |
+| L-09 | Deterministically assigned noncommittee watchtower replay provides the execution-threshold collusion backstop. Positive required replay coverage precedes GL0 inclusion eligibility. A valid challenge triggers exceptional bounded replay by every GL0 validator of the challenged sharded-CL1 checkpoint's exact retained base and ordered framework inputs; the replay result, not the assertion, decides rollback/slash. This exceptional path is distinct from ordinary sharded-CL1 certificate/diff adoption; native GL1 and global-kernel execution remain universal independently of a challenge. |
 | L-10 | Target: per-metagraph diffs are namespace-confined and every GL0 node executes the small deterministic global conflict/nullifier/settlement kernel over committee-extracted signed intents. No shard or metagraph writes another metagraph's namespace or the GL0-owned global settlement namespace directly. E9 remains planned and the live `numShards <= 1` path still bypasses shard processing. |
 | L-11 | One shard has at most one checkpoint whose exact containing GL0 snapshot has not reached Phase 2. That checkpoint may batch multiple metagraphs and a contiguous ordered list of binaries for each metagraph. Its successor is released only by the exact Phase-2 checkpoint hash, never tentative embedding or ordinal equality. Remove configurable checkpoint `pipelineDepth` and shard-depth validity fallback; staircase duty still selects the producer for the next checkpoint. |
 | L-12 | The binary-intake committee and execution committee are distinct draws over eligible GL0 operators. ML0 operators authenticate the metagraph binary but are not committee members by virtue of running ML0. Intake receipts can claim only authenticated source, checked parent/ordinal/envelope, durable custody, and availability; they never satisfy execution quorum. |
@@ -99,7 +100,7 @@ mutation and the builder must independently terminate with a typed collision err
 
 ## Ratified direction with engineering freeze gates
 
-The owner has ratified the direction recorded for every O-item below. These sections enumerate
+The owner has ratified the direction recorded for `O-01` through `O-17` below. Those sections enumerate
 the executable constants, schemas, reference models, RED vectors, and proofs still required
 before activation. They do not reopen the locked architecture above, and incomplete engineering
 cannot be filled by a local configuration value or caller-specific shortcut.
@@ -633,6 +634,27 @@ Engineering must encode and verify these ratified anchors before schema activati
 
 The complete inventory, ratified directions, and generated-test contract are in the
 linked packet.
+
+### O-18 Transport and DA byte contract
+
+Owner-review packet:
+[O-18 Transport and DA Byte Contract Owner Review](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md).
+
+**OWNER RESPONSE REQUIRED; LIVE WIRING FROZEN.** The current stack has incompatible application,
+GossipSub, gRPC, ChainSync, callback, compression, and downstream-retention limits. The additive
+bounded Brotli decoder and reserved ingress queue are unwired preparation only. They neither close
+the transport finding nor change artifact validity.
+
+The owner must disposition `O18-01` through `O18-08`: active-era per-family canonical and transport
+maxima; exact-source-chain migration scope; canonical byte identity versus compression; descriptor,
+chunk, fetch, and retention proof; always-pull versus threshold delivery; the fate and byte basis of
+the existing `512000` state-channel rule; the fate and byte basis of the `20 MiB` event-cutter rule;
+and mandatory absolute decompression caps versus optional ratio rules.
+
+This is a resource/availability contract only. Every GL0 validator still executes and validates
+every direct native `GL1 -> GL0` transition. For sharded CL1, producer/every execution signer replay,
+watchtower replay, and ordinary noncommittee certificate/diff/root verification remain unchanged.
+No transport or DA receipt can satisfy a state-validity threshold.
 
 ## Change rule
 

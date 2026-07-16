@@ -14,11 +14,13 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `O-01` through `O-17` are `17/17`
-dispositioned in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. Every O-item
-dependency below means implementation of its ratified direction and closure of
-its explicitly listed engineering, research, schema, parameter, or proof gates;
-none means that an owner response is pending.
+**Owner-decision status:** `17/18` dispositioned. `O-01` through `O-17` are
+ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
+byte choices await an owner response in
+`docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`. Dependencies under
+O-01 through O-17 mean implementation of their ratified direction and closure of
+their listed engineering, research, schema, parameter, or proof gates. O-18 is
+the only pending owner response.
 
 ## Active objective
 
@@ -960,9 +962,11 @@ delivery, rollback, and recovery.
 - An assigned, bonded, rate-limited challenge names exact retained inputs/base,
   checkpoint, signers, and reproduced mismatch. An assertion alone never rolls
   back or slashes.
-- First version performs bounded exceptional universal GL0 replay; its result
-  decides mismatch, rollback/quarantine, signer-specific debit, and reward.
-  Missing data defers and cannot slash.
+- First version has all GL0 validators perform bounded exceptional replay of the
+  challenged sharded-CL1 checkpoint's exact retained framework inputs/base; its
+  result decides mismatch, rollback/quarantine, signer-specific debit, and
+  reward. This adjudication path never replaces or narrows universal native
+  `GL1 -> GL0` execution. Missing data defers and cannot slash.
 - Evidence is deterministic, permanent/exact-once, branch-aware, and distinguishes
   an honest replay on a later-orphaned Phase-2 base from execution fraud.
 - Gates: `WT-001` through `WT-007`, `CRYPTO-001`, `REC-*`, resource/flood tests.
