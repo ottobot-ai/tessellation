@@ -147,31 +147,32 @@ object FinalityCoordinatorCodecs {
       .typecase(2, recoveryRequiredCodec)
 
   private val rawCoordinatorHeadCodec: Codec[CoordinatorHead] =
-    (headRevisionCodec :: strictOption(intentAttemptCodec) :: coordinatorModeCodec :: strictOption(releasedCoreCodec) ::
-      strictOption(activeCoreIntentCodec) :: mptActivePublicationCodec :: effectsIndexCodec :: strictOption(auditPointerCodec))
-      .xmap[CoordinatorHead](
-        {
-          case revision :: lastAttempt :: mode :: released :: active :: publication :: effects :: auditTail :: HNil =>
-            CoordinatorHead(revision, lastAttempt, mode, released, active, publication, effects, auditTail)
-        },
-        value =>
-          value.revision :: value.lastAttempt :: value.mode :: value.released :: value.active :: value.publication ::
-            value.effects :: value.auditTail :: HNil
-      )
+    (headRevisionCodec :: canonicalLineageRevisionCodec :: strictOption(intentAttemptCodec) :: coordinatorModeCodec ::
+      strictOption(releasedCoreCodec) :: strictOption(activeCoreIntentCodec) :: mptActivePublicationCodec :: effectsIndexCodec ::
+      strictOption(auditPointerCodec)).xmap[CoordinatorHead](
+      {
+        case revision :: lineageRevision :: lastAttempt :: mode :: released :: active :: publication :: effects :: auditTail :: HNil =>
+          CoordinatorHead(revision, lineageRevision, lastAttempt, mode, released, active, publication, effects, auditTail)
+      },
+      value =>
+        value.revision :: value.lineageRevision :: value.lastAttempt :: value.mode :: value.released :: value.active ::
+          value.publication :: value.effects :: value.auditTail :: HNil
+    )
 
   val coordinatorHeadPayloadCodec: Codec[CoordinatorHead] = rawCoordinatorHeadCodec.complete
 
   implicit val coordinatorHeadCommitmentCodec: Codec[CoordinatorHeadCommitment] =
-    (headRevisionCodec :: strictOption(intentAttemptCodec) :: coordinatorModeCodec :: strictOption(releasedCoreCodec) ::
-      strictOption(activeCoreIntentCodec) :: mptActivePublicationCodec :: effectsIndexCodec).xmap[CoordinatorHeadCommitment](
-      {
-        case revision :: lastAttempt :: mode :: released :: active :: publication :: effects :: HNil =>
-          CoordinatorHeadCommitment(revision, lastAttempt, mode, released, active, publication, effects)
-      },
-      value =>
-        value.revision :: value.lastAttempt :: value.mode :: value.released :: value.active :: value.publication ::
-          value.effects :: HNil
-    )
+    (headRevisionCodec :: canonicalLineageRevisionCodec :: strictOption(intentAttemptCodec) :: coordinatorModeCodec ::
+      strictOption(releasedCoreCodec) :: strictOption(activeCoreIntentCodec) :: mptActivePublicationCodec :: effectsIndexCodec)
+      .xmap[CoordinatorHeadCommitment](
+        {
+          case revision :: lineageRevision :: lastAttempt :: mode :: released :: active :: publication :: effects :: HNil =>
+            CoordinatorHeadCommitment(revision, lineageRevision, lastAttempt, mode, released, active, publication, effects)
+        },
+        value =>
+          value.revision :: value.lineageRevision :: value.lastAttempt :: value.mode :: value.released :: value.active ::
+            value.publication :: value.effects :: HNil
+      )
 
   private val rawCoordinatorAuditRecordCodec: Codec[CoordinatorAuditRecord] =
     (coordinatorMutationKindCodec :: strictOption(coordinatorHeadCommitmentCodec) :: coordinatorHeadCommitmentCodec ::

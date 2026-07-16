@@ -5,7 +5,6 @@ import cats.effect.Async
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
-import scala.concurrent.duration.DurationInt
 
 import io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
 import io.constellationnetwork.node.shared.config.types.LastGlobalSnapshotsSyncConfig
@@ -15,45 +14,28 @@ import io.constellationnetwork.schema.artifact.{GlobalSnapshotsProcessed, Shared
 import io.constellationnetwork.security.Hashed
 
 import fs2.concurrent.SignallingRef
-import org.typelevel.log4cats.SelfAwareStructuredLogger
-import org.typelevel.log4cats.slf4j.Slf4jLogger
-import retry.RetryPolicies
-import retry.implicits.retrySyntaxError
 
 class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
   lastGlobalSnapshotsSyncConfig: LastGlobalSnapshotsSyncConfig,
   lastGlobalSnapshotsCached: SignallingRef[F, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]]
 ) {
-  val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F]("GlobalSnapshotOps")
 
+  /** Resolve one required historical snapshot through the caller-owned resolver exactly once.
+    *
+    * The method retains its existing name until the candidate-scoped replay-view API replaces the ordinal-only callback. It performs no
+    * retry and never consults `lastGlobalSnapshotsCached`: manager-owned retry timing and an ordinal-keyed local cache cannot choose replay
+    * inputs. The supplied callback remains an ordinal-only authority boundary until the next replay-view slice.
+    */
   def getGlobalSnapshotWithRetry(
     ordinal: SnapshotOrdinal,
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
-  ): F[Hashed[GlobalIncrementalSnapshot]] = {
-    val retryPolicy = RetryPolicies.exponentialBackoff[F](1.second).join(RetryPolicies.limitRetries(5))
-    getGlobalSnapshotByOrdinal(ordinal)
-      .retryingOnFailuresAndAllErrors(
-        wasSuccessful = maybeSnapshot => maybeSnapshot.isDefined.pure[F],
-        policy = retryPolicy,
-        onFailure = (_, retryDetails) =>
-          logger.warn(s"Got None when trying to fetch incremental global snapshot $ordinal {attempt=${retryDetails.retriesSoFar}}"),
-        onError = (err, retryDetails) =>
-          logger.error(err)(s"Error when trying to fetch incremental global snapshot $ordinal {attempt=${retryDetails.retriesSoFar}}")
-      )
-      .flatMap {
-        case Some(snapshot) => snapshot.pure[F]
-        case None           =>
-          // Last resort: check the in-memory snapshot cache (populated by prior successful lookups)
-          lastGlobalSnapshotsCached.get.map(_.get(ordinal)).flatMap {
-            case Some(snapshot) =>
-              logger.info(s"Recovered ordinal $ordinal from lastGlobalSnapshotsCached after retry exhaustion") >>
-                snapshot.pure[F]
-            case None =>
-              new RuntimeException(s"Global snapshot not found for ordinal $ordinal after retries")
-                .raiseError[F, Hashed[GlobalIncrementalSnapshot]]
-          }
-      }
-  }
+  ): F[Hashed[GlobalIncrementalSnapshot]] =
+    Async[F].defer(getGlobalSnapshotByOrdinal(ordinal)).flatMap {
+      case Some(snapshot) => snapshot.pure[F]
+      case None =>
+        new RuntimeException(s"Required global snapshot not found for ordinal $ordinal")
+          .raiseError[F, Hashed[GlobalIncrementalSnapshot]]
+    }
 
   /** Select which cross-shard global-snapshot ordinals to apply for this metagraph and return their combined `SpendAction`s.
     *
@@ -104,35 +86,42 @@ class GlobalSnapshotOpsManager[F[_]: Async: Parallel](
 
             if (unappliedGlobalOrdinalsToProcess.isEmpty)
               (emptySpendActions, emptyProcessedGlobalSnapshots).pure[F]
-            else
+            else {
+              // Compatibility input only. An ordinal-keyed LastN entry is not candidate-lineage evidence and must never outrank the
+              // caller-owned resolver. The next replay-view slice will remove this parameter when it replaces the ordinal-only callback.
+              val _ = lastGlobalSnapshots
+
               processUnappliedOrdinals(
                 unappliedGlobalOrdinalsToProcess,
-                lastGlobalSnapshots,
                 getGlobalSnapshotByOrdinal
               ).flatMap(spendActions => (spendActions, unappliedGlobalOrdinalsToProcess).pure[F])
+            }
         }
     }
   }
 
   private def processUnappliedOrdinals(
     unappliedOrdinals: SortedSet[SnapshotOrdinal],
-    lastGlobalSnapshots: List[Hashed[GlobalIncrementalSnapshot]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
-  ): F[SortedMap[Address, List[SpendAction]]] = {
-    val snapshotCache = lastGlobalSnapshots.map(s => s.ordinal -> s).toMap
-    val (cached, missing) = unappliedOrdinals.partition(snapshotCache.contains)
-
-    val fromCache = cached.toList.map { ordinal =>
-      ordinal -> snapshotCache(ordinal).spendActions.getOrElse(SortedMap.empty[Address, List[SpendAction]])
+  ): F[SortedMap[Address, List[SpendAction]]] =
+    // `unappliedOrdinals` is a SortedSet, so each required ordinal is attempted once. Capturing each outcome prevents one miss/error from
+    // cancelling the remaining bounded lookups; only after all attempts finish do we fail closed at the first ordinal in deterministic order.
+    unappliedOrdinals.toList.parTraverse { ordinal =>
+      Async[F].defer(getGlobalSnapshotByOrdinal(ordinal)).attempt.map(ordinal -> _)
     }
-
-    val fetchMissing = missing.toList.parTraverse { ordinal =>
-      getGlobalSnapshotWithRetry(ordinal, getGlobalSnapshotByOrdinal)
-        .map(snapshot => ordinal -> snapshot.spendActions.getOrElse(SortedMap.empty[Address, List[SpendAction]]))
-    }
-
-    fetchMissing.map(fromFetched => combineSpendActions(fromCache.concat(fromFetched)))
-  }
+      .flatMap(
+        _.traverse {
+          case (ordinal, Right(Some(snapshot))) =>
+            (ordinal -> snapshot.spendActions.getOrElse(SortedMap.empty[Address, List[SpendAction]])).pure[F]
+          case (ordinal, Right(None)) =>
+            new RuntimeException(s"Required global snapshot not found for ordinal $ordinal")
+              .raiseError[F, (SnapshotOrdinal, SortedMap[Address, List[SpendAction]])]
+          case (ordinal, Left(error)) =>
+            new RuntimeException(s"Failed to resolve required global snapshot at ordinal $ordinal", error)
+              .raiseError[F, (SnapshotOrdinal, SortedMap[Address, List[SpendAction]])]
+        }
+      )
+      .map(combineSpendActions)
 
   /** Every ordinal returned in `GlobalSnapshotsProcessed` must have every one of its actions replayed. Merge in ordinal order and
     * concatenate producer collisions explicitly; right-biased `Map.++` would acknowledge an earlier ordinal while silently dropping its

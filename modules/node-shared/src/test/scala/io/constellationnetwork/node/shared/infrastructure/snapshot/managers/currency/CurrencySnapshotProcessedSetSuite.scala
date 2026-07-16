@@ -1,7 +1,7 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.currency
 
 import cats.data.{NonEmptyList, NonEmptySet}
-import cats.effect.{IO, Resource}
+import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
@@ -36,10 +36,10 @@ import weaver.MutableIOSuite
   * input (reconstructed in-band from the retained CL0 chain by the caller). Observable = the returned "processed" set (the second element
   * of the result), which is exactly the `GlobalSnapshotsProcessed(A)` the acceptance manager emits into the snapshot.
   *
-  * Cases: (a) gaps in `U`; (b) same-ordinal retry determinism; (c) below-view injection (the ordinal-below-an-advanced-view case a scalar
-  * interval `(prior_view, view]` drops permanently — the set-valued `P` applies it); and (d) node-local-ness (Step-5b): two sequential
-  * calls on ONE manager vs a fresh manager yield the same applied-set (impossible with the removed mutable cache). A final pure test pins
-  * the reconstruction `P = ⋃ GlobalSnapshotsProcessed.ordinals`.
+  * Cases: (a) gaps in `U`; (b) repeated same-ordinal replay determinism; (c) below-view injection (the ordinal-below-an-advanced-view case
+  * a scalar interval `(prior_view, view]` drops permanently — the set-valued `P` applies it); and (d) node-local-ness (Step-5b): two
+  * sequential calls on ONE manager vs a fresh manager yield the same applied-set (impossible with the removed mutable cache). A final pure
+  * test pins the reconstruction `P = ⋃ GlobalSnapshotsProcessed.ordinals`.
   */
 object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
 
@@ -62,9 +62,11 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
 
   private val syncConfig = LastGlobalSnapshotsSyncConfig(NonNegLong(2L), PosInt(10))
 
-  private def mkGsom: IO[GlobalSnapshotOpsManager[IO]] =
+  private def mkGsom(
+    cached: Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]] = Map.empty
+  ): IO[GlobalSnapshotOpsManager[IO]] =
     SignallingRef
-      .of[IO, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]](Map.empty)
+      .of[IO, Map[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]](cached)
       .map(cache => GlobalSnapshotOpsManager.make[IO](syncConfig, cache))
 
   private def mkGlobalInfoEmpty: GlobalSnapshotInfo =
@@ -89,9 +91,8 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       SortedMap.empty
     )
 
-  /** A benign `Hashed[GlobalIncrementalSnapshot]` at `ordinal` — enough for `processUnappliedOrdinals` to resolve every applied ordinal
-    * from the `lastGlobalSnapshots` cache (so no network fetch / retry). Most tests leave `spendActions` empty; the lossless-ack regression
-    * supplies them explicitly.
+  /** A benign `Hashed[GlobalIncrementalSnapshot]` at `ordinal` — enough for the caller-owned resolver to resolve every applied ordinal.
+    * Most tests leave `spendActions` empty; the lossless-ack regression supplies them explicitly.
     */
   private def mkGlobalSnapshotAt(
     ordinal: SnapshotOrdinal,
@@ -128,7 +129,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     }
 
   /** Invoke the exact 1a call: `A = { o ∈ U : o ≤ view ∧ o ∉ P }`; returns the applied/processed ordinal set. All `U` ordinals are seeded
-    * into `lastGlobalSnapshots` so any applied ordinal resolves from cache (no fetch).
+    * into the caller-owned resolver.
     */
   private def appliedSet(
     gsom: GlobalSnapshotOpsManager[IO],
@@ -138,16 +139,17 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     p: SortedSet[SnapshotOrdinal]
   )(implicit h: Hasher[IO], j: JsonSerializer[IO]): IO[SortedSet[SnapshotOrdinal]] =
     u.toList.traverse(mkGlobalSnapshotAt(_)).flatMap { seeded =>
+      val snapshotsByOrdinal = seeded.map(snapshot => snapshot.ordinal -> snapshot).toMap
       gsom
         .getLastGlobalSnapshotsSpendActions(
           globalSnapshotViewOrdinal = view,
-          lastGlobalSnapshots = seeded,
-          getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+          lastGlobalSnapshots = Nil,
+          getGlobalSnapshotByOrdinal = ordinal => snapshotsByOrdinal.get(ordinal).pure[IO],
           currencyId = metagraphId,
           metagraphSyncData = Some(SortedMap(metagraphId -> MetagraphSyncDataInfo(ord(0L), EpochProgress.MinValue, u))),
           alreadyProcessedGlobalOrdinals = p
         )
-        .map { case (_, processed) => processed }
+        .flatMap { case (_, processed) => processed.pure[IO] }
     }
 
   test("(a) gaps in U: applied-set = U ∩ (≤ view) \\ P, preserving non-contiguous gaps") { res =>
@@ -155,20 +157,20 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       mgId = PublicKeyOps(kp.getPublic).toAddress
-      gsom <- mkGsom
+      gsom <- mkGsom()
       // U is non-contiguous; 102 already processed (in P); 108 is ABOVE the view and must be excluded.
       a <- appliedSet(gsom, mgId, view = ord(105L), u = oset(100L, 102L, 105L, 108L), p = oset(102L))
     } yield expect(a == oset(100L, 105L))
   }
 
   test(
-    "(b) same-ordinal retry: two invocations with identical (U, view, P) return the identical applied-set (no per-ordinal cache state)"
+    "(b) same-ordinal replay: two invocations with identical (U, view, P) return the identical applied-set (no per-ordinal cache state)"
   ) { res =>
     implicit val (h, j, sp) = res
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       mgId = PublicKeyOps(kp.getPublic).toAddress
-      gsom <- mkGsom
+      gsom <- mkGsom()
       first <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 103L), p = oset(103L))
       second <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 103L), p = oset(103L))
     } yield expect(first == oset(101L)) && expect(first == second)
@@ -182,7 +184,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       mgId = PublicKeyOps(kp.getPublic).toAddress
-      gsom <- mkGsom
+      gsom <- mkGsom()
       // view advanced to 110; 105 already processed (P). 101 is injected below the view. A scalar interval (105, 110] would MISS 101.
       a <- appliedSet(gsom, mgId, view = ord(110L), u = oset(101L, 105L), p = oset(105L))
     } yield expect(a == oset(101L))
@@ -195,10 +197,10 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
     for {
       kp <- KeyPairGenerator.makeKeyPair[IO]
       mgId = PublicKeyOps(kp.getPublic).toAddress
-      shared <- mkGsom
+      shared <- mkGsom()
       seq1 <- appliedSet(shared, mgId, view = ord(200L), u = oset(150L, 175L), p = oset(150L))
       seq2 <- appliedSet(shared, mgId, view = ord(200L), u = oset(150L, 175L), p = oset(150L))
-      fresh <- mkGsom
+      fresh <- mkGsom()
       freshA <- appliedSet(fresh, mgId, view = ord(200L), u = oset(150L, 175L), p = oset(150L))
     } yield expect(seq1 == oset(175L)) && expect(seq1 == seq2) && expect(seq2 == freshA)
   }
@@ -220,12 +222,13 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       )
       firstSnapshot <- mkGlobalSnapshotAt(ord(10L), SortedMap(producer -> List(first)))
       secondSnapshot <- mkGlobalSnapshotAt(ord(11L), SortedMap(producer -> List(second)))
-      gsom <- mkGsom
+      gsom <- mkGsom()
+      snapshotsByOrdinal = Map(firstSnapshot.ordinal -> firstSnapshot, secondSnapshot.ordinal -> secondSnapshot)
       result <- gsom.getLastGlobalSnapshotsSpendActions(
         globalSnapshotViewOrdinal = ord(11L),
-        // Deliberately reverse the cache input: replay order is the consensus ordinal, not local list order.
+        // Deliberately reverse the non-authoritative LastN input: it cannot choose inputs or replay order.
         lastGlobalSnapshots = List(secondSnapshot, firstSnapshot),
-        getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+        getGlobalSnapshotByOrdinal = ordinal => snapshotsByOrdinal.get(ordinal).pure[IO],
         currencyId = owner,
         metagraphSyncData = Some(SortedMap(owner -> MetagraphSyncDataInfo(ord(0L), EpochProgress.MinValue, oset(10L, 11L)))),
         alreadyProcessedGlobalOrdinals = SortedSet.empty
@@ -236,6 +239,93 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
         processed == oset(10L, 11L),
         actions.getOrElse(producer, Nil) == List(first, second)
       )
+  }
+
+  test("historical SpendAction replay uses the caller resolver once and ignores same-ordinal LastN/cache siblings") { res =>
+    implicit val (h, j, sp) = res
+    for {
+      ownerKp <- KeyPairGenerator.makeKeyPair[IO]
+      producerKp <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKp <- KeyPairGenerator.makeKeyPair[IO]
+      owner = PublicKeyOps(ownerKp.getPublic).toAddress
+      producer = PublicKeyOps(producerKp.getPublic).toAddress
+      destination = PublicKeyOps(destinationKp.getPublic).toAddress
+      target = ord(41L)
+      canonicalAction = SpendAction(
+        NonEmptyList.one(SpendTransaction(None, Some(CurrencyId(owner)), SwapAmount(PosLong.unsafeFrom(1L)), producer, destination))
+      )
+      siblingAction = SpendAction(
+        NonEmptyList.one(SpendTransaction(None, Some(CurrencyId(owner)), SwapAmount(PosLong.unsafeFrom(2L)), producer, destination))
+      )
+      canonical <- mkGlobalSnapshotAt(target, SortedMap(producer -> List(canonicalAction)))
+      sibling <- mkGlobalSnapshotAt(target, SortedMap(producer -> List(siblingAction)))
+      calls <- Ref.of[IO, Int](0)
+      gsom <- mkGsom(Map(target -> sibling))
+      result <- gsom.getLastGlobalSnapshotsSpendActions(
+        globalSnapshotViewOrdinal = target,
+        lastGlobalSnapshots = List(sibling),
+        getGlobalSnapshotByOrdinal = ordinal => calls.update(_ + 1).as(Option.when(ordinal === target)(canonical)),
+        currencyId = owner,
+        metagraphSyncData = Some(
+          SortedMap(owner -> MetagraphSyncDataInfo(SnapshotOrdinal.MinValue, EpochProgress.MinValue, SortedSet(target)))
+        ),
+        alreadyProcessedGlobalOrdinals = SortedSet.empty
+      )
+      callCount <- calls.get
+      (actions, processed) = result
+    } yield
+      expect.all(
+        canonical.hash =!= sibling.hash,
+        callCount == 1,
+        processed == SortedSet(target),
+        actions.getOrElse(producer, Nil) == List(canonicalAction)
+      )
+  }
+
+  test("a resolver miss is attempted once and cannot fall back to the ordinal-keyed manager cache") { res =>
+    implicit val (h, j, _) = res
+    val target = ord(52L)
+
+    for {
+      sibling <- mkGlobalSnapshotAt(target)
+      calls <- Ref.of[IO, Int](0)
+      gsom <- mkGsom(Map(target -> sibling))
+      outcome <- gsom
+        .getGlobalSnapshotWithRetry(target, _ => calls.update(_ + 1).as(none[Hashed[GlobalIncrementalSnapshot]]))
+        .attempt
+      callCount <- calls.get
+    } yield expect(outcome.isLeft) && expect(callCount == 1)
+  }
+
+  test("missing historical SpendAction inputs attempt every unique required ordinal once and fail closed") { res =>
+    implicit val (_, _, sp) = res
+
+    for {
+      ownerKp <- KeyPairGenerator.makeKeyPair[IO]
+      owner = PublicKeyOps(ownerKp.getPublic).toAddress
+      targets = oset(61L, 62L, 63L)
+      attempts <- Ref.of[IO, Map[SnapshotOrdinal, Int]](Map.empty)
+      gsom <- mkGsom()
+      outcome <- gsom
+        .getLastGlobalSnapshotsSpendActions(
+          globalSnapshotViewOrdinal = targets.last,
+          lastGlobalSnapshots = Nil,
+          getGlobalSnapshotByOrdinal = ordinal =>
+            attempts
+              .update(current => current.updated(ordinal, current.getOrElse(ordinal, 0) + 1))
+              .as(none[Hashed[GlobalIncrementalSnapshot]]),
+          currencyId = owner,
+          metagraphSyncData = Some(
+            SortedMap(owner -> MetagraphSyncDataInfo(SnapshotOrdinal.MinValue, EpochProgress.MinValue, targets))
+          ),
+          alreadyProcessedGlobalOrdinals = SortedSet.empty
+        )
+        .attempt
+      counts <- attempts.get
+    } yield
+      expect(outcome.isLeft) &&
+        expect(counts.keySet == targets) &&
+        expect(counts == targets.iterator.map(_ -> 1).toMap)
   }
 
   test("ECO-05 / XMG-005B remains RED: retained-window eviction re-enables an already applied global delivery") { res =>
@@ -252,7 +342,8 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
         NonEmptyList.one(SpendTransaction(None, Some(CurrencyId(owner)), SwapAmount(PosLong.unsafeFrom(1L)), producer, destination))
       )
       pendingSnapshot <- mkGlobalSnapshotAt(pendingOrdinal, SortedMap(producer -> List(pendingAction)))
-      gsom <- mkGsom
+      gsom <- mkGsom()
+      snapshotResolver = (ordinal: SnapshotOrdinal) => Option.when(ordinal === pendingOrdinal)(pendingSnapshot).pure[IO]
       syncData = Some(SortedMap(owner -> MetagraphSyncDataInfo(ord(0L), EpochProgress.MinValue, oset(10L))))
       retainedP = GlobalSnapshotOpsManager.reconstructProcessedGlobalOrdinals(
         List(mkCurrencySnapshotWithProcessed(1L, oset(10L)))
@@ -261,7 +352,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       whileRetained <- gsom.getLastGlobalSnapshotsSpendActions(
         globalSnapshotViewOrdinal = pendingOrdinal,
         lastGlobalSnapshots = List(pendingSnapshot),
-        getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+        getGlobalSnapshotByOrdinal = snapshotResolver,
         currencyId = owner,
         metagraphSyncData = syncData,
         alreadyProcessedGlobalOrdinals = retainedP
@@ -269,7 +360,7 @@ object CurrencySnapshotProcessedSetSuite extends MutableIOSuite {
       afterEviction <- gsom.getLastGlobalSnapshotsSpendActions(
         globalSnapshotViewOrdinal = pendingOrdinal,
         lastGlobalSnapshots = List(pendingSnapshot),
-        getGlobalSnapshotByOrdinal = _ => IO.pure(none[Hashed[GlobalIncrementalSnapshot]]),
+        getGlobalSnapshotByOrdinal = snapshotResolver,
         currencyId = owner,
         metagraphSyncData = syncData,
         alreadyProcessedGlobalOrdinals = evictedP

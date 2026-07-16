@@ -96,14 +96,14 @@ object FinalityScodecV1VectorsSuite extends FunSuite {
       FrozenVector(
         "CoordinatorHeadPayload",
         encode(coordinatorHeadPayloadCodec, coordinatorHead),
-        9764,
-        "7dd9633e95a7b23f5ec0f12cd999f32c523921d11c0b0ecffd41f68ff4a197c8"
+        9772,
+        "fd8bc51996bf66262b6ab68d10b0f4363aebaa7e8d3663165d1d4060f09e8eb0"
       ),
       FrozenVector(
         "CoordinatorAuditRecordPayload",
         encode(coordinatorAuditRecordPayloadCodec, auditRecord),
-        19465,
-        "0bb1ce4c963798cd7d11a11f178e34aab670e726ce584e625c9d522fcec89bac"
+        19481,
+        "cf7f35ecf5d0c231b0eece88403d8440cece5fb557dd6517a56fe2874f265d8a"
       )
     )
 

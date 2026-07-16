@@ -375,10 +375,12 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       fallbackOrdinal
     )
 
-    lastSyncGlobalSnapshot <- lastGlobalSnapshots.find(_.ordinal === ordinalToFetchGlobalSnapshot) match {
-      case Some(value) => value.pure[F]
-      case None        => globalSnapshotOps.getGlobalSnapshotWithRetry(ordinalToFetchGlobalSnapshot, getGlobalSnapshotByOrdinal)
-    }
+    // LastN is ordinal-keyed and can contain a sibling of the pinned candidate. The caller-owned resolver is the sole source for this
+    // execution input. Its callback is still ordinal-only; exact candidate ancestry is closed by the next replay-view slice, not here.
+    lastSyncGlobalSnapshot <- globalSnapshotOps.getGlobalSnapshotWithRetry(
+      ordinalToFetchGlobalSnapshot,
+      getGlobalSnapshotByOrdinal
+    )
 
     // The committed view is only an execution-input locator. The located snapshot must exactly match finalized GL0 history; submitted hash
     // and epoch values are never copied into recreated state.
@@ -394,9 +396,9 @@ private class CurrencySnapshotAcceptanceManagerImpl[F[_]: Async: Parallel: JsonS
       )
     }
 
-    // Track-1 I-PIN (Step-1): `updateGlobalSnapshotCache` REMOVED from the consensus path — populating a manager-instance-local cache
-    // from acceptance made `accept()` self-mutating (an impurity). The last-resort cache read in `getGlobalSnapshotWithRetry` still works;
-    // it simply no longer depends on a side effect of a prior `accept()`.
+    // Track-1 I-PIN (Step-1): `updateGlobalSnapshotCache` REMOVED from the consensus path. Historical execution reads never consult the
+    // manager cache, so manager-cache population and manager-internal retry timing cannot choose these inputs. The injected callback remains
+    // ordinal-only until the next exact replay-view slice.
 
     lastGlobalSnapshotEpochProgress = lastSyncGlobalSnapshot.epochProgress
     lastGlobalSnapshotOrdinal = lastSyncGlobalSnapshot.ordinal

@@ -12,6 +12,7 @@ import scala.reflect.ClassTag
 
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityBaseCodecs.{pathChunkPayloadCodec, pathManifestPayloadCodec}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCodecFixtures._
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoordinatorCodecs.coordinatorAuditRecordPayloadCodec
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableCasResult.{AlreadyInstalled, Installed}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableEnvelopeKind.ImmutableArtifact
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableStoreError._
@@ -770,10 +771,36 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
       } yield
         expect.all(
           restored._1.value == expected._1.value,
+          restored._1.value.lineageRevision == expected._1.value.lineageRevision,
+          restored._1.value.lineageRevision.value.value == 0L,
           restored._1.payloadDigest == expected._1.payloadDigest,
           restored._1.audit == expected._1.audit,
           restored._2 == expected._2
         )
+    }
+  }
+
+  test("audit-chain reconstruction retains a nonzero lineage revision from canonical durable bytes") {
+    IO.fromEither(
+      for {
+        payload <- FinalityDurableEnvelope.encodePayload(
+          "CoordinatorAuditRecord",
+          coordinatorAuditRecordPayloadCodec,
+          auditRecord
+        )
+        decoded <- FinalityDurableEnvelope.decodePayload(
+          "CoordinatorAuditRecord",
+          coordinatorAuditRecordPayloadCodec,
+          payload
+        )
+      } yield decoded
+    ).map { decoded =>
+      val reconstructed = CoordinatorHead.fromCommitment(decoded.after, coordinatorHead.auditTail)
+
+      expect.all(
+        reconstructed == coordinatorHead,
+        reconstructed.lineageRevision == CanonicalLineageRevision(nonNeg(7L))
+      )
     }
   }
 

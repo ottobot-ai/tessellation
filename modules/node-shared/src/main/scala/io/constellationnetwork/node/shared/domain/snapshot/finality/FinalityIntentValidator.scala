@@ -493,6 +493,11 @@ object FinalityIntentValidator {
           List(
             validateCoordinatorHead(prior).void,
             check(next(prior.revision.value.value, after.revision.value.value), "head.revision", "must advance by exactly one"),
+            check(
+              after.lineageRevision == prior.lineageRevision,
+              "head.lineageRevision",
+              "the current mutation graph cannot advance canonical lineage authority"
+            ),
             validateModeTransition(prior, after, audit, recoveryRecord),
             validateMutation(prior, after, audit.mutation)
           )
@@ -1279,6 +1284,7 @@ object FinalityIntentValidator {
       List(
         check(audit.mutation == CoordinatorMutationKind.Initialized, "audit.mutation", "must be Initialized when no prior head exists"),
         check(after.revision.value.value == 0L, "head.revision", "initial revision must be zero"),
+        check(after.lineageRevision.value.value == 0L, "head.lineageRevision", "initial lineage revision must be zero"),
         check(after.lastAttempt.isEmpty, "head.lastAttempt", "must be empty initially"),
         check(after.mode == Running, "head.mode", "must start Running"),
         check(after.released.isEmpty, "head.released", "must be empty initially"),

@@ -100,6 +100,37 @@ object FinalityPayloadCodecsSuite extends FunSuite {
     )
   }
 
+  test("coordinator codecs retain the exact nonzero canonical lineage revision") {
+    val expected = CanonicalLineageRevision(nonNeg(7L))
+    val changed = coordinatorHead.copy(lineageRevision = CanonicalLineageRevision(nonNeg(8L)))
+    val headBits = encoded(coordinatorHeadPayloadCodec, coordinatorHead)
+    val commitmentBits = encoded(coordinatorHeadCommitmentCodec.complete, coordinatorHead.commitment)
+
+    expect.all(
+      coordinatorHead.lineageRevision == expected,
+      coordinatorHeadPayloadCodec.decodeValue(headBits).toEither.toOption.exists(_.lineageRevision == expected),
+      coordinatorHeadCommitmentCodec.complete
+        .decodeValue(commitmentBits)
+        .toEither
+        .toOption
+        .exists(_.lineageRevision == expected),
+      headBits != encoded(coordinatorHeadPayloadCodec, changed),
+      commitmentBits != encoded(coordinatorHeadCommitmentCodec.complete, changed.commitment)
+    )
+  }
+
+  test("pre-lineage coordinator shapes have no default-to-zero compatibility decoder") {
+    def removeLineage(bits: BitVector): BitVector = bits.take(64L) ++ bits.drop(128L)
+
+    val headWithoutLineage = removeLineage(encoded(coordinatorHeadPayloadCodec, coordinatorHead))
+    val commitmentWithoutLineage = removeLineage(encoded(coordinatorHeadCommitmentCodec.complete, coordinatorHead.commitment))
+
+    expect.all(
+      rejects(coordinatorHeadPayloadCodec, headWithoutLineage),
+      rejects(coordinatorHeadCommitmentCodec.complete, commitmentWithoutLineage)
+    )
+  }
+
   test("strict options reject every tag except zero and one") {
     val optionCodec = strictOption(intentAttemptCodec).complete
 

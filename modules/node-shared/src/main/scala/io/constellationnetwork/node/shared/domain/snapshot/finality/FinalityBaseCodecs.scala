@@ -87,6 +87,8 @@ private[finality] object FinalityBaseCodecs {
     Primitives.nonNegLongCodec.xmap(HeadRevision(_), _.value)
   implicit val canonicalBranchRevisionCodec: Codec[CanonicalBranchRevision] =
     Primitives.nonNegLongCodec.xmap(CanonicalBranchRevision(_), _.value)
+  implicit val canonicalLineageRevisionCodec: Codec[CanonicalLineageRevision] =
+    Primitives.nonNegLongCodec.xmap(CanonicalLineageRevision(_), _.value)
 
   implicit val intentIdCodec: Codec[IntentId] = requiredHashCodec.xmap(IntentId(_), _.value)
   implicit val artifactIdCodec: Codec[ArtifactId] = requiredHashCodec.xmap(ArtifactId(_), _.value)

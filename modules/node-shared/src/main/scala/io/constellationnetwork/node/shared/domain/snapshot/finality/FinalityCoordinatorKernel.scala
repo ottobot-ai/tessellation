@@ -79,6 +79,7 @@ object FinalityCoordinatorKernel {
   private def initializeMutation(initialPublication: MptActivePublication): Result = {
     val draft = CoordinatorHead(
       revision = HeadRevision(NonNegLong.MinValue),
+      lineageRevision = CanonicalLineageRevision(NonNegLong.MinValue),
       lastAttempt = None,
       mode = CoordinatorMode.Running,
       released = None,

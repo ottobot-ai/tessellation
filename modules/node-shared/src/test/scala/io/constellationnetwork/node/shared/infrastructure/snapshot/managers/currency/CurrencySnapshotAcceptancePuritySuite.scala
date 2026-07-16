@@ -194,7 +194,8 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
   private def mkManager(
     environment: AppEnvironment,
     fieldsAddedOrdinals: FieldsAddedOrdinals,
-    head: (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)
+    head: (Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo),
+    lastN: SortedMap[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]] = SortedMap.empty
   )(
     implicit h: Hasher[IO],
     j: JsonSerializer[IO],
@@ -228,7 +229,7 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
 
     for {
       lastNSnapR <- SignallingRef.of[IO, Option[(Hashed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]](None)
-      incLastNSnapR <- SignallingRef.of[IO, SortedMap[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]](SortedMap.empty)
+      incLastNSnapR <- SignallingRef.of[IO, SortedMap[SnapshotOrdinal, Hashed[GlobalIncrementalSnapshot]]](lastN)
       lastNSnapshotStorage = LastNGlobalSnapshotStorage.make[IO](syncConfig, lastNSnapR, incLastNSnapR)
       lastGlobalSnapshotStorage <- LastSnapshotStorage.make[IO, GlobalIncrementalSnapshot, GlobalSnapshotInfo](head.some)
       manager <- CurrencySnapshotAcceptanceManager.make[IO](
@@ -303,6 +304,7 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
 
       // The pinned anchor at ord=100 carries the cross-shard SpendAction. Both managers resolve it identically.
       anchor <- mkGlobalSnapshot(anchorOrdinal, mkGlobalInfo(None), anchorSpendActions)
+      sameOrdinalSibling <- mkGlobalSnapshot(anchorOrdinal, mkGlobalInfo(None), None)
       anchorView = GlobalSyncView(anchorOrdinal, anchor.hash, anchor.epochProgress)
       getGlobalSnapshotByOrdinal = (o: SnapshotOrdinal) =>
         if (o === anchorOrdinal) anchor.some.pure[IO] else none[Hashed[GlobalIncrementalSnapshot]].pure[IO]
@@ -339,12 +341,18 @@ object CurrencySnapshotAcceptancePuritySuite extends MutableIOSuite {
       headB <- mkGlobalSnapshot(headBOrdinal, mkGlobalInfo(None), None)
       headBInfo = mkGlobalInfo(None)
 
-      managerA <- mkManager(Dev, allEmptyFieldsAddedOrdinals, (headA, headAInfo))
+      // A same-ordinal LastN sibling cannot outrank the caller resolver that returns `anchor`.
+      managerA <- mkManager(
+        Dev,
+        allEmptyFieldsAddedOrdinals,
+        (headA, headAInfo),
+        SortedMap(anchorOrdinal -> sameOrdinalSibling)
+      )
       managerB <- mkManager(Dev, allEmptyFieldsAddedOrdinals, (headB, headBInfo))
 
       rA <- runAccept(managerA, ctx, getGlobalSnapshotByOrdinal, anchorView)
       rB <- runAccept(managerB, ctx, getGlobalSnapshotByOrdinal, anchorView)
-    } yield expect.eql(rA, rB)
+    } yield expect(anchor.hash =!= sameOrdinalSibling.hash) && expect.eql(rA, rB)
   }
 
   test(

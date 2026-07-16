@@ -1244,7 +1244,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
           "supplied audit or recovery record differs from the installed mutation"
         )
       )
-      before = mutation.audit.before.map(commitment => coordinatorHead(commitment, mutation.audit.priorAudit))
+      before = mutation.audit.before.map(commitment => CoordinatorHead.fromCommitment(commitment, mutation.audit.priorAudit))
       _ <- validate(
         FinalityIntentValidator.validateCoordinatorTransition(
           before,
@@ -1622,7 +1622,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
               case CoordinatorMode.Running                  => Async[F].pure(Option.empty[RecoveryRecord])
               case CoordinatorMode.RecoveryRequired(record) => readRecovery(record).map(_.some)
             }
-            before = audit.before.map(commitment => coordinatorHead(commitment, audit.priorAudit))
+            before = audit.before.map(commitment => CoordinatorHead.fromCommitment(commitment, audit.priorAudit))
             _ <- validate(
               FinalityIntentValidator.validateCoordinatorTransition(before, scan.expected, audit, recovery)
             )
@@ -1728,18 +1728,6 @@ private final class LiveFinalityDurableStore[F[_]: Async](
           )
         )
     } yield ()
-
-  private def coordinatorHead(commitment: CoordinatorHeadCommitment, audit: Option[AuditPointer]): CoordinatorHead =
-    CoordinatorHead(
-      commitment.revision,
-      commitment.lastAttempt,
-      commitment.mode,
-      commitment.released,
-      commitment.active,
-      commitment.publication,
-      commitment.effects,
-      audit
-    )
 
   private def withCurrentCoordinator[A](
     expected: DurablyVerifiedCoordinatorHead,

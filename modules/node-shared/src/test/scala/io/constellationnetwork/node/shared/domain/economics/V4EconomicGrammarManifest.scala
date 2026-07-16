@@ -887,13 +887,13 @@ object V4EconomicGrammarManifest {
         "ECO-DATA-FEE",
         "ECO-GLOBAL-PROCESSED-ACK"
       ),
-      "b57c1dca23c699cc1656aa581838d0797a569d38860345da16216c72c6b9d95e"
+      "0745f3aa074ac398e41419cf50fc3498c5df2ee38c30ef96e66ebc0a7a45780d"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/GlobalSnapshotOpsManager.scala",
       Set(Validation, ReferenceWriter),
       Set("ECO-GLOBAL-PROCESSED-ACK", "ECO-CROSS-MG-NULLIFIER"),
-      "3a5b81580889334f977c560e45c10391d6b6bfdad08e4d0b83c1d13106722276"
+      "5d76e3b01c7ced682ebe1f78be0f6e036dfc297e5b553332e5c5a52d51599f1b"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/RewardAcceptanceManager.scala",
@@ -1746,7 +1746,13 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalityDurableStore.scala",
       Set(Ingress),
       currentRootedEconomicIds,
-      "be03e67cacd25c5a47e71e1acb1489095a55fb9a6ddb20a7d3db4075893a3db0"
+      "f781068ded3a47b1c5e524ea12e7a73faa951f3b68b41aea7870899c1b3f2679"
+    ),
+    ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/snapshot/finality/FinalityConsumerLease.scala",
+      Set(Ingress, Validation),
+      currentRootedEconomicIds,
+      "225816dfcd9be7141aeecf95d2f87d83f6acc84c1a397b5832d6731246ca728b"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/swap/block/AllowSpendBlockStorage.scala",

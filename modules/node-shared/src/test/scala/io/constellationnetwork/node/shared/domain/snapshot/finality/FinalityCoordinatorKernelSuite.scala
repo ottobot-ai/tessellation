@@ -331,6 +331,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
   private def initializedHead: CoordinatorHead = {
     val draft = CoordinatorHead(
       revision = HeadRevision(nonNeg(0L)),
+      lineageRevision = CanonicalLineageRevision(nonNeg(0L)),
       lastAttempt = None,
       mode = CoordinatorMode.Running,
       released = None,
@@ -362,6 +363,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     expect.all(
       prepare.audit.mutation == CoordinatorMutationKind.Prepared,
       prepare.head.revision.value.value == 1L,
+      prepare.head.lineageRevision == initializedHead.lineageRevision,
       auditIsDerived(prepare),
       bundle.batch == value.batch,
       bundle.effectManifest == value.manifest,
@@ -413,6 +415,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     expect.all(
       recovery.audit.mutation == CoordinatorMutationKind.RecoveryEntered,
       recovery.head.mode == derived.map(CoordinatorMode.RecoveryRequired).get,
+      recovery.head.lineageRevision == prepare.head.lineageRevision,
       record.enteredAt == recovery.head.revision,
       record.lastAttempt == prepare.head.lastAttempt,
       record.released == prepare.head.released,

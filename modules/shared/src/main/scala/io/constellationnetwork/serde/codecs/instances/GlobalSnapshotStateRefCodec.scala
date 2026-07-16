@@ -11,9 +11,9 @@ import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import scodec.{Attempt, Codec, Err}
 import shapeless.{::, HNil}
 
-/** Canonical ScodecV1 shape of an exact global snapshot state identity. In addition to the fixed-width representation, this boundary rejects
-  * empty authority sentinels outside the genesis parent exception. Semantic consumers must still authenticate exact branch membership and
-  * Phase-2 status. The finality domain owns a separate codec and semantic validator for its evidence types.
+/** Canonical ScodecV1 shape of an exact global snapshot state identity. In addition to the fixed-width representation, this boundary
+  * rejects empty authority sentinels outside the genesis parent exception. Semantic consumers must still authenticate exact branch
+  * membership and Phase-2 status. The finality domain owns a separate codec and semantic validator for its evidence types.
   */
 object GlobalSnapshotStateRefCodec {
   private val snapshotOrdinalCodec: Codec[SnapshotOrdinal] = Codec[SnapshotOrdinal]

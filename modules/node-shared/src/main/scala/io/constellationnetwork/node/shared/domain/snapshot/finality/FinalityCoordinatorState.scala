@@ -103,6 +103,10 @@ final case class EffectsIndex(
 
 /** Mutable coordinator journal head.
   *
+  * `lineageRevision` is a local crash-consistent invalidation generation. It is committed by the audit chain and must never be interpreted
+  * as portable finality or fork-choice evidence. The current dark coordinator mutation graph preserves it; a future verified canonical
+  * replacement/reconstruction transition will be the only boundary allowed to advance it.
+  *
   * `publication` is the exact effective MPT CAS cursor. It is independent of the immutable last released record because restoring an
   * unreleased applied target republishes the prior image at a newer revision.
   *
@@ -113,6 +117,7 @@ final case class EffectsIndex(
   */
 final case class CoordinatorHead(
   revision: HeadRevision,
+  lineageRevision: CanonicalLineageRevision,
   lastAttempt: Option[IntentAttempt],
   mode: CoordinatorMode,
   released: Option[ReleasedCore],
@@ -122,7 +127,26 @@ final case class CoordinatorHead(
   auditTail: Option[AuditPointer]
 ) {
   def commitment: CoordinatorHeadCommitment =
-    CoordinatorHeadCommitment(revision, lastAttempt, mode, released, active, publication, effects)
+    CoordinatorHeadCommitment(revision, lineageRevision, lastAttempt, mode, released, active, publication, effects)
+}
+
+object CoordinatorHead {
+
+  /** Structural reconstruction used while traversing the durable audit chain. This does not validate the reconstructed head; the durable
+    * store must still verify the complete audit transition before treating it as state.
+    */
+  private[finality] def fromCommitment(commitment: CoordinatorHeadCommitment, auditTail: Option[AuditPointer]): CoordinatorHead =
+    CoordinatorHead(
+      commitment.revision,
+      commitment.lineageRevision,
+      commitment.lastAttempt,
+      commitment.mode,
+      commitment.released,
+      commitment.active,
+      commitment.publication,
+      commitment.effects,
+      auditTail
+    )
 }
 
 /** Exact mutable-head content excluding its audit pointer.
@@ -132,6 +156,7 @@ final case class CoordinatorHead(
   */
 final case class CoordinatorHeadCommitment(
   revision: HeadRevision,
+  lineageRevision: CanonicalLineageRevision,
   lastAttempt: Option[IntentAttempt],
   mode: CoordinatorMode,
   released: Option[ReleasedCore],

@@ -325,6 +325,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
 
     CoordinatorHead(
       HeadRevision(nonNeg(0L)),
+      CanonicalLineageRevision(nonNeg(0L)),
       Some(batch.scope.attempt),
       CoordinatorMode.Running,
       None,
@@ -582,6 +583,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     def head(stage: CoreStage): CoordinatorHead =
       CoordinatorHead(
         HeadRevision(nonNeg(0L)),
+        CanonicalLineageRevision(nonNeg(0L)),
         Some(fixture.batch.scope.attempt),
         CoordinatorMode.Running,
         None,
@@ -1205,6 +1207,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val priorAudit = AuditPointer(AuditRecordId(hash("prior-audit-id")), AuditRecordDigest(hash("prior-audit-digest")))
     val before = CoordinatorHead(
       HeadRevision(nonNeg(0L)),
+      CanonicalLineageRevision(nonNeg(0L)),
       None,
       CoordinatorMode.Running,
       None,
@@ -1238,6 +1241,22 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val entered = afterWithoutAudit.copy(auditTail = Some(FinalityIdentity.auditPointer(entryAudit).fold(throw _, identity)))
     val entry = validateCoordinatorTransition(Some(before), entered, entryAudit, Some(record))
 
+    val changedLineageWithoutAudit = afterWithoutAudit.copy(
+      lineageRevision = CanonicalLineageRevision(nonNeg(1L)),
+      auditTail = None
+    )
+    val changedLineageAudit = CoordinatorAuditRecord(
+      CoordinatorMutationKind.RecoveryEntered,
+      Some(before.commitment),
+      changedLineageWithoutAudit.commitment,
+      before.auditTail
+    )
+    val changedLineage = changedLineageWithoutAudit.copy(
+      auditTail = Some(FinalityIdentity.auditPointer(changedLineageAudit).fold(throw _, identity))
+    )
+    val unauthorizedLineageAdvance =
+      validateCoordinatorTransition(Some(before), changedLineage, changedLineageAudit, Some(record))
+
     val illegalWithoutAudit = entered.copy(revision = HeadRevision(nonNeg(2L)), auditTail = None)
     val illegalAudit = CoordinatorAuditRecord(
       CoordinatorMutationKind.RecoveryEntered,
@@ -1248,7 +1267,11 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val illegal = illegalWithoutAudit.copy(auditTail = Some(FinalityIdentity.auditPointer(illegalAudit).fold(throw _, identity)))
     val exit = validateCoordinatorTransition(Some(entered), illegal, illegalAudit, None)
 
-    expect.all(entry.isValid, violations(exit).exists(_.path == "head.mode"))
+    expect.all(
+      entry.isValid,
+      violations(unauthorizedLineageAdvance).exists(_.path == "head.lineageRevision"),
+      violations(exit).exists(_.path == "head.mode")
+    )
   }
 
   pureTest("startup dependency recovery requires a canonical nonzero diagnostic digest") {
@@ -1258,6 +1281,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
     val before = CoordinatorHead(
       HeadRevision(nonNeg(0L)),
+      CanonicalLineageRevision(nonNeg(0L)),
       None,
       CoordinatorMode.Running,
       None,
@@ -1328,6 +1352,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val priorAudit = AuditPointer(AuditRecordId(hash("release-prior-audit-id")), AuditRecordDigest(hash("release-prior-audit-digest")))
     val before = CoordinatorHead(
       HeadRevision(nonNeg(0L)),
+      CanonicalLineageRevision(nonNeg(0L)),
       Some(fixture.batch.scope.attempt),
       CoordinatorMode.Running,
       None,
@@ -1338,6 +1363,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     )
     val afterWithoutAudit = CoordinatorHead(
       HeadRevision(nonNeg(1L)),
+      CanonicalLineageRevision(nonNeg(0L)),
       Some(fixture.batch.scope.attempt),
       CoordinatorMode.Running,
       Some(exactReleased),

@@ -94,6 +94,7 @@ object FinalityCoordinatorBootstrapSuite extends SimpleIOSuite {
             second == LocalPublicationBound,
             firstHead == secondHead,
             firstHead.value.mode == CoordinatorMode.Running,
+            firstHead.value.lineageRevision.value.value == 0L,
             firstHead.value.publication == active,
             firstHead.audit.mutation == CoordinatorMutationKind.Initialized,
             firstOutbox.isEmpty,

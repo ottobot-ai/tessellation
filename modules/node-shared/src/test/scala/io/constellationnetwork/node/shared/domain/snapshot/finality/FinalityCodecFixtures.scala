@@ -287,6 +287,7 @@ private[finality] object FinalityCodecFixtures {
   val coordinatorHead: CoordinatorHead =
     CoordinatorHead(
       HeadRevision(nonNeg(34L)),
+      CanonicalLineageRevision(nonNeg(7L)),
       Some(attempt),
       CoordinatorMode.RecoveryRequired(recoveryPointer),
       Some(releasedCore),
