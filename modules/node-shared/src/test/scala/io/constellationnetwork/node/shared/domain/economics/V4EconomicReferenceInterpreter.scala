@@ -14,9 +14,9 @@ object ReferenceBalanceScope {
   implicit val ordering: Ordering[ReferenceBalanceScope] = new Ordering[ReferenceBalanceScope] {
     def compare(left: ReferenceBalanceScope, right: ReferenceBalanceScope): Int =
       (left, right) match {
-        case (Dag, Dag)                         => 0
-        case (Dag, _: Metagraph)                => -1
-        case (_: Metagraph, Dag)                => 1
+        case (Dag, Dag)                              => 0
+        case (Dag, _: Metagraph)                     => -1
+        case (_: Metagraph, Dag)                     => 1
         case (Metagraph(leftId), Metagraph(rightId)) => Ordering[Address].compare(leftId, rightId)
       }
   }
@@ -51,9 +51,9 @@ object TransferLane {
   implicit val ordering: Ordering[TransferLane] = new Ordering[TransferLane] {
     def compare(left: TransferLane, right: TransferLane): Int =
       (left, right) match {
-        case (NativeGl1, NativeGl1)                                 => 0
-        case (NativeGl1, _: CurrencyCl1)                            => -1
-        case (_: CurrencyCl1, NativeGl1)                            => 1
+        case (NativeGl1, NativeGl1)                      => 0
+        case (NativeGl1, _: CurrencyCl1)                 => -1
+        case (_: CurrencyCl1, NativeGl1)                 => 1
         case (CurrencyCl1(leftId), CurrencyCl1(rightId)) => Ordering[Address].compare(leftId, rightId)
       }
   }
@@ -146,7 +146,7 @@ final class ReferenceState private (
     other match {
       case that: ReferenceState =>
         acceptedDomain == that.acceptedDomain && balances == that.balances && lastTxRefs == that.lastTxRefs &&
-          acceptedHistory == that.acceptedHistory
+        acceptedHistory == that.acceptedHistory
       case _ => false
     }
 
@@ -312,10 +312,12 @@ object ReferenceState {
   private def totals(
     balances: SortedMap[ReferenceBalanceAccount, BigInt]
   ): SortedMap[ReferenceBalanceScope, BigInt] =
-    balances.foldLeft(SortedMap.empty[ReferenceBalanceScope, BigInt](ReferenceBalanceScope.ordering)) {
-      case (acc, (account, balance)) =>
-        acc.updated(account.scope, acc.getOrElse(account.scope, BigInt(0)) + balance)
-    }.filter { case (_, total) => total != 0 }
+    balances
+      .foldLeft(SortedMap.empty[ReferenceBalanceScope, BigInt](ReferenceBalanceScope.ordering)) {
+        case (acc, (account, balance)) =>
+          acc.updated(account.scope, acc.getOrElse(account.scope, BigInt(0)) + balance)
+      }
+      .filter { case (_, total) => total != 0 }
 }
 
 sealed trait ReferenceRejection extends Product with Serializable
@@ -393,8 +395,8 @@ final case class ReferenceExecution(
 
 /** Independent, test-only transition oracle for the first bounded E2.1 tranche.
   *
-  * It intentionally supports only zero-fee native and currency transfers. It performs no production hashing, signature verification, balance
-  * arithmetic, transition-manager calls, serialization, MPT writes, or root computation.
+  * It intentionally supports only zero-fee native and currency transfers. It performs no production hashing, signature verification,
+  * balance arithmetic, transition-manager calls, serialization, MPT writes, or root computation.
   */
 object V4EconomicReferenceInterpreter {
   def execute(

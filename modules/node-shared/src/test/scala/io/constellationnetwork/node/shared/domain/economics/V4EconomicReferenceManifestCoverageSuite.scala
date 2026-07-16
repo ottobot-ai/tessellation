@@ -57,6 +57,6 @@ object V4EconomicReferenceManifestCoverageSuite extends FunSuite {
       .toSet
 
     expect((supportedTransferIds ++ unsupportedIds) == manifestIds)
-      .and(expect((supportedTransferIds intersect unsupportedIds).isEmpty))
+      .and(expect(supportedTransferIds.intersect(unsupportedIds).isEmpty))
   }
 }
