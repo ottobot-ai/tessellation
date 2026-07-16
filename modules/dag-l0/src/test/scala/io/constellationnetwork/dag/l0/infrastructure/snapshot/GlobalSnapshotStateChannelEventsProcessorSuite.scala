@@ -341,6 +341,53 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
     } yield expect(accepted.contains(address)).and(expect(rejected.isEmpty))
   }
 
+  test("checkpoint replay marks a valid currency prefix followed by an undecodable child as incomplete") { res =>
+    implicit val (ks, h, j, sp) = res
+    import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.GlobalSnapshotStateChannelEventsProcessor.CurrencyWindowConsumption
+    import io.constellationnetwork.security.signature.Signed.SignedOps
+
+    for {
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      address = keyPair.getPublic.toAddress
+      genesis = CurrencySnapshot.mkGenesis(Map.empty, None, None)
+      signedGenesis <- forAsyncHasher(genesis, keyPair)
+      genesisContent <- j.serialize(signedGenesis)
+      genesisBinary <- forAsyncHasher(
+        StateChannelSnapshotBinary(Hash.empty, genesisContent, SnapshotFee.MinValue),
+        keyPair
+      )
+      genesisBinaryHash <- genesisBinary.toHashed[IO].map(_.hash)
+      undecodableBinary <- forAsyncHasher(
+        StateChannelSnapshotBinary(genesisBinaryHash, Array[Byte](0x01, 0x02, 0x03), SnapshotFee.MinValue),
+        keyPair
+      )
+      processor <- mkProcessor(Map(address -> genesisBinary.proofs.map(_.id.toPeerId)))
+      orderedWindow = NonEmptyList.of(genesisBinary, undecodableBinary)
+      raw <- processor.processCurrencySnapshots(
+        SnapshotOrdinal(1L),
+        SortedMap.empty,
+        SortedMap.empty,
+        SortedMap(address -> orderedWindow.reverse),
+        _ => none.pure[IO]
+      )
+      replay <- processor.processCurrencySnapshotsWithCompleteConsumption(
+        SnapshotOrdinal(1L),
+        SortedMap.empty,
+        SortedMap.empty,
+        SortedMap(address -> orderedWindow),
+        _ => none.pure[IO]
+      )
+      returned = raw.get(address).map(_._1.toList.map(_._1))
+    } yield
+      expect.all(
+        // The legacy transition function still exposes its valid prefix to ordinary callers.
+        returned.exists(binaries => binaries.size == 1 && binaries.head.value.content.sameElements(genesisBinary.value.content)),
+        // The checkpoint-specific boundary separately proves that the exact two-input signed window was not consumed.
+        replay.consumption(address).contains(CurrencyWindowConsumption.Incomplete(expectedInputs = 2, processedInputs = 1)),
+        replay.completeResult(address).isEmpty
+      )
+  }
+
   test("shared fee payer debits are serialized in canonical metagraph order") { res =>
     implicit val (ks, h, j, sp) = res
     implicit val currencySelector: CurrencyStateProofSelector = CurrencyStateProofSelector.instance

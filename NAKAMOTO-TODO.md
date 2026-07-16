@@ -523,10 +523,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
     not a common runtime adapter or a historical branch proof. `KEYREG-006`,
     `KEYREG-010`, and `KEYREG-011` remain open until qualification proves every
     allowlisted consumer's exact-parent historical semantics and positive runtime
-    path. Complete committed-window consumption, an exact hash/root-bound
-    execution base, a durable pre-publication checkpoint outbox, and historical
-    committee/membership/runtime activation also remain open. The textual and
-    semantic inventories remain review tripwires.
+    path. The separate checkpoint replay boundary now exposes a per-MG root or
+    adoption result only when the legacy processor returns the exact complete
+    oldest-first signed-envelope window; incomplete, reordered, and substituted
+    prefixes fail closed, and unexpected MG output is excluded. This does not
+    prove CL1 replay correctness or decisions/diff/intents parity. An exact hash/
+    root-bound execution base, a durable pre-publication checkpoint outbox, and
+    historical committee/membership/runtime activation remain open. The textual
+    and semantic inventories remain review tripwires.
   - **Portable evidence remains open:** for every suffix and upper-level tower
     occurrence, the verifier now resolves the current atomic period-zero pair,
     verifies the VRF proof over the header's exact carried `eta || slot` bytes,

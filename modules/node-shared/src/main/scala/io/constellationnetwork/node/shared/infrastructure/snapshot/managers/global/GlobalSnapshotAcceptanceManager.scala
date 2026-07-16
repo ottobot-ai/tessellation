@@ -1045,39 +1045,39 @@ object GlobalSnapshotAcceptanceManager {
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
         )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] =
           stateChannelEventsProcessor
-            .processCurrencySnapshots(
+            .processCurrencySnapshotsWithCompleteConsumption(
               ordinal,
               currentBalances,
               priorLastCurrencySnapshots,
-              // ORDER CONTRACT (2026-06-10): `processCurrencySnapshots` expects NEWEST-FIRST input (it reverses
-              // internally — the legacy chain-link path's prepend-built convention) and returns oldest-first.
-              // Shard-checkpoint windows are built OLDEST-FIRST (`ShardCheckpointProducer.chainLinkOrder` unfolds
-              // anchor→tip), so reverse each window here. Without this, multi-binary windows were processed
-              // newest-first: the genesis-decode branch saw the newest incremental as "head" (the seeding failure
-              // on backlog windows — singleton windows were unaffected, which is why the flake varied by window
-              // size), the state fold ran in reverse, and the resulting NEL's `.last` (the SC-tip setter) was the
-              // OLDEST hash.
-              adoptedScSnapshots.map { case (mg, nel) => mg -> nel.reverse },
+              // The checkpoint carries canonical OLDEST-FIRST windows. The structured boundary performs the legacy order conversion and
+              // separately proves that recreation returned every exact Signed input in that same order. Root equality over an accepted
+              // prefix is insufficient: the checkpoint signature covers the whole window.
+              adoptedScSnapshots,
               getGlobalSnapshotByOrdinal
             )
-            .flatMap { accepted =>
+            .flatMap { replay =>
+              // Incomplete, reordered, substituted, and unexpected output is structurally unavailable to checkpoint adoption.
+              val completelyAccepted = replay.completeResults
               // The accepted map is the output of full CurrencySnapshotValidator recreation. Checkpoints carry execution inputs and root
               // claims only; they cannot replace balances, references, active sets, or any other economic state.
               val unverifiedResult =
-                stateChannelEventsProcessor.assembleAcceptanceResult(accepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+                stateChannelEventsProcessor
+                  .assembleAcceptanceResult(completelyAccepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
 
               adoptedScSnapshots.keys.toList.traverse { mg =>
                 (unverifiedResult.calculatedCurrencyState.get(mg), attestedRoots.get(mg)) match {
-                  case (Some(state), Some(attestedRoot)) =>
+                  case (Some(state), Some(attestedRoot)) if completelyAccepted.contains(mg) =>
                     GlobalStateConverter
                       .currencySnapshotMgRoot[F](SortedMap(mg -> state))
                       .map(recreatedRoot => Option.when(recreatedRoot === attestedRoot)(mg))
                   case _ => none[Address].pure[F]
                 }
               }.map { verified =>
-                val rejected = adoptedScSnapshots.keySet -- verified.flatten.toSet
+                val verifiedMgs = verified.flatten.toSet
                 stateChannelEventsProcessor.assembleAcceptanceResult(
-                  accepted -- rejected,
+                  // Filter positively rather than subtracting rejected checkpoint keys: an unexpected processor output is never an
+                  // independently authorized checkpoint input and therefore cannot enter the accepted result.
+                  completelyAccepted.filter { case (mg, _) => verifiedMgs.contains(mg) },
                   priorLastCurrencySnapshots,
                   Set.empty[StateChannelOutput]
                 )

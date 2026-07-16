@@ -302,70 +302,79 @@ object ShardCheckpointWiring {
               s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
                 s"priorOpt=${descPrior(priorOpt)}"
             ) >>
-              // Full currency recreation against the checkpoint's pinned prior and the snapshot's pinned finalized GL0 view.
-              // ORDER CONTRACT: processCurrencySnapshots expects NEWEST-FIRST; checkpoint windows arrive
-              // OLDEST-FIRST (chainLinkOrder unfolds anchor→tip), so reverse here.
+              // Full currency recreation against the checkpoint's pinned prior and the snapshot's pinned finalized GL0 view. The structured
+              // checkpoint boundary takes the canonical OLDEST-FIRST input and refuses to derive a root unless the processor returned that
+              // exact complete Signed-binary sequence. A valid prefix followed by an invalid binary is not execution of the signed window.
               processor
-                .processCurrencySnapshots(
+                .processCurrencySnapshotsWithCompleteConsumption(
                   gl0AnchorOrdinal,
                   SortedMap.empty[Address, Balance],
                   priorMap,
-                  SortedMap(mg -> binaries.reverse),
+                  SortedMap(mg -> binaries),
                   getGlobalSnapshotByOrdinal
-                )(Hasher[F])
-                .flatMap { accepted =>
-                  // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the re-executed chain is `next`.
-                  val lastStateOpt: Option[CurrencyState] =
-                    accepted.get(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption }
-                  lastStateOpt match {
-                    case Some(next) =>
-                      // The root and optional transport diff are cut over the full recreation output. No metagraph or committee field
-                      // replaces `infoOf(next)`.
-                      // CONTIGUITY (I3 / run-27b) — RELAXED to advisory. The window anchors at `finalizedBasePerMgTip` (S2 §4) and the diff prior
-                      // is read at `executionBaseOrdinal` — the SAME finalized base by construction — so a window chaining from the base advances
-                      // `base.ordinal` by EXACTLY `windowSize`; the old OMIT is now an invariant. Keep the check as a diagnostic only (a violation
-                      // means a base read-skew, caught fail-closed downstream by the adopter's now-unconditional GAP-1 balances/refs compare — a
-                      // drop, never silent corruption) and PROCEED to derive rather than defer (removing a false-defer liveness hazard).
-                      val contiguousWithBase: Boolean = (priorOpt, next) match {
-                        case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
-                          nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
-                        case _ => true
-                      }
-                      for {
-                        _ <-
-                          if (contiguousWithBase) Async[F].unit
-                          else
-                            reExecDiagLogger.warn(
-                              s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with pinned execution-base " +
-                                s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
-                                    .map(_._1.value.ordinal.value.value)
-                                    .getOrElse(-1L)}) — base read-skew; proceeding (the adopter's full re-exec root check is fail-closed)"
-                            )
-                        // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
-                        // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. The gl0 follower
-                        // recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state — all three PIN-1 sites route through that
-                        // one helper, so the bytes are identical by construction.
-                        root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> next))
-                        // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
-                        // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
-                        cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
-                        _ <- reExecDiagLogger.info(
-                          s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
-                        )
-                      } yield Some(root): Option[Hash]
+                )
+                .flatMap { replay =>
+                  replay.completeResult(mg) match {
                     case None =>
-                      // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
-                      // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
-                      // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
-                      // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s genesis-window
-                      // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
-                      // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
-                      // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
-                      // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
-                      // on a later checkpoint once the prior is adopted (the pipeline self-heals).
                       reExecDiagLogger
-                        .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
+                        .warn(
+                          s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} checkpoint window was only partially or ambiguously processed " +
+                            s"(windowSize=${binaries.size}, disposition=${replay.consumption(mg)}) — OMIT (defer)"
+                        )
                         .as(None: Option[Hash])
+                    case Some((pairs, _)) =>
+                      // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the completely re-executed chain is `next`.
+                      val lastStateOpt: Option[CurrencyState] = pairs.toList.flatMap(_._2).lastOption
+                      lastStateOpt match {
+                        case Some(next) =>
+                          // The root and optional transport diff are cut over the full recreation output. No metagraph or committee field
+                          // replaces `infoOf(next)`.
+                          // CONTIGUITY (I3 / run-27b) — RELAXED to advisory. The window anchors at `finalizedBasePerMgTip` (S2 §4) and the diff prior
+                          // is read at `executionBaseOrdinal` — the SAME finalized base by construction — so a window chaining from the base advances
+                          // `base.ordinal` by EXACTLY `windowSize`; the old OMIT is now an invariant. Keep the check as a diagnostic only (a violation
+                          // means a base read-skew, caught fail-closed downstream by the adopter's now-unconditional GAP-1 balances/refs compare — a
+                          // drop, never silent corruption) and PROCEED to derive rather than defer (removing a false-defer liveness hazard).
+                          val contiguousWithBase: Boolean = (priorOpt, next) match {
+                            case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
+                              nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
+                            case _ => true
+                          }
+                          for {
+                            _ <-
+                              if (contiguousWithBase) Async[F].unit
+                              else
+                                reExecDiagLogger.warn(
+                                  s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with pinned execution-base " +
+                                    s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
+                                        .map(_._1.value.ordinal.value.value)
+                                        .getOrElse(-1L)}) — base read-skew; proceeding (the adopter's full re-exec root check is fail-closed)"
+                                )
+                            // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
+                            // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. The gl0 follower
+                            // recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state — all three PIN-1 sites route through that
+                            // one helper, so the bytes are identical by construction.
+                            root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> next))
+                            // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
+                            // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
+                            cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
+                            _ <- reExecDiagLogger.info(
+                              s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
+                            )
+                          } yield Some(root): Option[Hash]
+                        case None =>
+                          // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
+                          // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
+                          // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
+                          // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s genesis-window
+                          // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
+                          // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
+                          // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
+                          // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
+                          // on a later checkpoint once the prior is adopted (the pipeline self-heals).
+                          reExecDiagLogger
+                            .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
+                            .as(None: Option[Hash])
+                      }
                   }
                 }
                 .handleErrorWith { e =>

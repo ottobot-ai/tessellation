@@ -397,11 +397,15 @@ is claimed. Neither inventory nor
 that lexical anchor mapping is an AST/call-graph proof, and the generated matrix
 does not prove branch-historical qualification, so K7 remains open.
 
-K7b-2 also leaves the producer protocol blockers explicit: complete committed-
-window consumption is not proven before signing, the execution base is ordinal-
-only rather than exact hash/root-bound Phase-2 evidence, held retry has no durable
-pre-publication outbox, and historical committee/membership/runtime-key authority
-is unavailable.
+K7b-2 itself does not prove replay semantics. Separately, the checkpoint replay
+boundary now hash-compares the exact oldest-first signed-envelope sequence returned
+by the legacy processor. An incomplete, reordered, or substituted MG window exposes
+no producer-root or transitional-GL0-adoption result, and unexpected MG output is
+excluded. This closes the accepted-prefix authorization bug only; complete CL1
+grammar, decisions/diff/intents parity, and the target E4 replay contract remain
+open. The execution base is still ordinal-only rather than exact hash/root-bound
+Phase-2 evidence, held retry has no durable pre-publication outbox, and historical
+committee/membership/runtime-key authority is unavailable.
 
 The tower verifier resolves every suffix and upper-level occurrence through the
 current atomic period-zero pair, verifies its VRF proof over the header's exact

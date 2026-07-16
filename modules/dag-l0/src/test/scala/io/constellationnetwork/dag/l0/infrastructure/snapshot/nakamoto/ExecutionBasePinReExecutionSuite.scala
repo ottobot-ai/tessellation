@@ -392,6 +392,34 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
     }
   }
 
+  test("checkpoint replay derives no root when a valid currency transition is followed by an undecodable signed child") { res =>
+    implicit val (ks, h, js, sp) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        mg = PublicKeyOps(metagraphKey.getPublic).toAddress
+        baseIncremental <- signedIncremental(5L, metagraphKey)
+        harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
+        validWindow <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
+        validBinaryHash <- validWindow.last.toHashed[IO].map(_.hash)
+        invalidChild <- forAsyncHasher[IO, StateChannelSnapshotBinary](
+          StateChannelSnapshotBinary(validBinaryHash, Array[Byte](0x01, 0x02, 0x03), SnapshotFee.MinValue),
+          metagraphKey
+        )
+        incompleteWindow = NonEmptyList.fromListUnsafe(validWindow.toList :+ invalidChild)
+        pinned <- mkPinnedHistory(dir, mg, baseIncremental)
+        replay = mkReplay(harness, productionReaderAt(pinned))
+        validRoot <- replay(mg, validWindow, anchorOrd, executionBase)
+        incompleteRoot <- replay(mg, incompleteWindow, anchorOrd, executionBase)
+      } yield
+        expect.all(
+          validRoot.exists(_ =!= Hash.empty),
+          // The processor can recreate the valid prefix, but the shared checkpoint boundary withholds it from root/signature callers.
+          incompleteRoot.isEmpty
+        )
+    }
+  }
+
   test("mid-fold skew: live content ahead of its watermark cannot change the pinned replay root") { res =>
     implicit val (ks, h, js, sp) = res
     Files[IO].tempDirectory.use { dir =>

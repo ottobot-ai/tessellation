@@ -1,9 +1,9 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global
 
-import cats.Parallel
 import cats.data._
 import cats.effect.Async
 import cats.syntax.all._
+import cats.{Monad, Parallel}
 
 import scala.collection.immutable.SortedMap
 
@@ -34,9 +34,9 @@ import io.circe.Decoder
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
-  type BinaryCurrencyPair = (Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])
-  type BalanceUpdate = SortedMap[Address, Balance]
-  type MetagraphAcceptanceResult = (NonEmptyList[BinaryCurrencyPair], BalanceUpdate)
+  type BinaryCurrencyPair = GlobalSnapshotStateChannelEventsProcessor.BinaryCurrencyPair
+  type BalanceUpdate = GlobalSnapshotStateChannelEventsProcessor.BalanceUpdate
+  type MetagraphAcceptanceResult = GlobalSnapshotStateChannelEventsProcessor.MetagraphAcceptanceResult
 
   def process(
     snapshotOrdinal: SnapshotOrdinal,
@@ -52,10 +52,10 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
 
   /** ORDER CONTRACT: `events` NELs must be NEWEST-FIRST (the legacy chain-link path's prepend-built convention — the implementation
     * reverses internally and processes oldest-first); the returned NELs are OLDEST-FIRST (`.last` = the newest binary, which is what the
-    * SC-tip setter reads). Callers holding oldest-first windows (shard-checkpoint `chainLinkOrder` output) MUST reverse before calling —
-    * see `deriveAdoptedCurrencyState` and `ShardCheckpointWiring.reExecDerivationAtPinnedBase`. Feeding oldest-first silently breaks
-    * multi-binary windows: the genesis-decode branch sees the newest incremental as "head" and the state fold runs in reverse (the
-    * 2026-06-10 seeding failure).
+    * SC-tip setter reads). Direct callers holding oldest-first windows MUST reverse before calling. Checkpoint callers instead use
+    * [[processCurrencySnapshotsWithCompleteConsumption]], which owns that conversion and verifies exact complete consumption. Feeding
+    * oldest-first directly silently breaks multi-binary windows: the genesis-decode branch sees the newest incremental as "head" and the
+    * state fold runs in reverse (the 2026-06-10 seeding failure).
     */
   def processCurrencySnapshots(
     snapshotOrdinal: SnapshotOrdinal,
@@ -68,6 +68,38 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
   )(
     implicit hasher: Hasher[F]
   ): F[SortedMap[Address, MetagraphAcceptanceResult]]
+
+  /** Checkpoint replay boundary over the exact canonical OLDEST-FIRST signed-binary windows.
+    *
+    * [[processCurrencySnapshots]] deliberately retains the upstream-v4 partial-acceptance behavior: when a later binary cannot be decoded,
+    * recreated, authorized, or charged, it may return the valid prefix. That behavior is useful to ordinary non-checkpoint callers, but a
+    * shard execution signature covers the complete checkpoint window. Consequently, a prefix result must never be mistaken for complete
+    * execution merely because its last recreated state has a well-formed root.
+    *
+    * This method preserves the legacy transition function and adds a structured consumption disposition. It reverses each canonical
+    * checkpoint window for [[processCurrencySnapshots]]'s NEWEST-FIRST input contract, then hashes and compares the returned OLDEST-FIRST
+    * `Signed[StateChannelSnapshotBinary]` sequence against every exact original signed input. Hashing the complete `Signed` envelope binds
+    * content, parent, fee, and proofs; a same-length substitution is incomplete just like a missing suffix.
+    */
+  final def processCurrencySnapshotsWithCompleteConsumption(
+    snapshotOrdinal: SnapshotOrdinal,
+    currentBalances: SortedMap[Address, Balance],
+    priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+      CurrencySnapshot
+    ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+    orderedEvents: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(
+    implicit hasher: Hasher[F],
+    F: Monad[F]
+  ): F[GlobalSnapshotStateChannelEventsProcessor.CurrencySnapshotProcessingResult] =
+    processCurrencySnapshots(
+      snapshotOrdinal,
+      currentBalances,
+      priorLastCurrencySnapshots,
+      orderedEvents.map { case (address, binaries) => address -> binaries.reverse },
+      getGlobalSnapshotByOrdinal
+    ).flatMap(GlobalSnapshotStateChannelEventsProcessor.classifyCheckpointConsumption(orderedEvents, _))
 
   /** Assemble a [[StateChannelAcceptanceResult]] from the per-MG output of [[processCurrencySnapshots]].
     *
@@ -92,6 +124,82 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
 }
 
 object GlobalSnapshotStateChannelEventsProcessor {
+
+  type BinaryCurrencyPair = (Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])
+  type BalanceUpdate = SortedMap[Address, Balance]
+  type MetagraphAcceptanceResult = (NonEmptyList[BinaryCurrencyPair], BalanceUpdate)
+
+  sealed trait CurrencyWindowConsumption extends Product with Serializable {
+    final def isComplete: Boolean = this match {
+      case CurrencyWindowConsumption.Complete => true
+      case _                                  => false
+    }
+  }
+
+  object CurrencyWindowConsumption {
+    case object Complete extends CurrencyWindowConsumption
+    final case class Incomplete(expectedInputs: Int, processedInputs: Int) extends CurrencyWindowConsumption
+    case object UnexpectedOutput extends CurrencyWindowConsumption
+  }
+
+  final class CurrencySnapshotProcessingResult private[global] (
+    private val processed: SortedMap[Address, MetagraphAcceptanceResult],
+    private val windowConsumption: SortedMap[Address, CurrencyWindowConsumption]
+  ) {
+    def consumption(address: Address): Option[CurrencyWindowConsumption] = windowConsumption.get(address)
+
+    def completelyConsumed(address: Address): Boolean =
+      consumption(address).exists(_.isComplete)
+
+    def allInputsCompletelyConsumed: Boolean =
+      windowConsumption.nonEmpty && windowConsumption.values.forall(_.isComplete)
+
+    /** The only checkpoint-validity accessor: no per-MG replay result is exposed unless every exact ordered Signed input was consumed. */
+    def completeResult(address: Address): Option[MetagraphAcceptanceResult] =
+      Option.when(completelyConsumed(address))(()).flatMap(_ => processed.get(address))
+
+    /** All and only exact, completely consumed checkpoint windows. Unexpected or incomplete processor output is excluded. */
+    def completeResults: SortedMap[Address, MetagraphAcceptanceResult] =
+      processed.filter { case (address, _) => completelyConsumed(address) }
+  }
+
+  private[global] object CurrencySnapshotProcessingResult {
+    def apply(
+      processed: SortedMap[Address, MetagraphAcceptanceResult],
+      windowConsumption: SortedMap[Address, CurrencyWindowConsumption]
+    ): CurrencySnapshotProcessingResult =
+      new CurrencySnapshotProcessingResult(processed, windowConsumption)
+  }
+
+  /** Compare returned OLDEST-FIRST signed envelopes with the exact checkpoint inputs. Package-visible for focused substitution/reordering
+    * tests; checkpoint callers consume only [[CurrencySnapshotProcessingResult.completeResult]].
+    */
+  private[global] def classifyCheckpointConsumption[F[_]: Monad: Hasher](
+    orderedEvents: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    processed: SortedMap[Address, MetagraphAcceptanceResult]
+  ): F[CurrencySnapshotProcessingResult] = {
+    import CurrencyWindowConsumption._
+
+    orderedEvents.toList.traverse {
+      case (address, expected) =>
+        val actual = processed.get(address).map { case (pairs, _) => pairs.map(_._1) }
+        val expectedHashesF = expected.toList.traverse(Hasher[F].hash(_))
+        val actualHashesF = actual.traverse(_.toList.traverse(Hasher[F].hash(_)))
+
+        (expectedHashesF, actualHashesF).mapN {
+          case (expectedHashes, Some(actualHashes)) if expectedHashes === actualHashes =>
+            address -> Complete
+          case (_, actualHashes) =>
+            address -> Incomplete(expected.size, actualHashes.fold(0)(_.size))
+        }
+    }.map { expectedDispositions =>
+      val unexpectedDispositions = (processed.keySet -- orderedEvents.keySet).toList.map { address =>
+        address -> UnexpectedOutput
+      }
+
+      CurrencySnapshotProcessingResult(processed, SortedMap.from(expectedDispositions ++ unexpectedDispositions))
+    }
+  }
 
   def make[F[_]: Async: JsonSerializer: Parallel](
     stateChannelValidator: StateChannelValidator[F],

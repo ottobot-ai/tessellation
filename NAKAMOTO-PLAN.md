@@ -578,9 +578,15 @@ only. Registration proves key ownership and never grants operator eligibility.
   inventory tracks same-file line motion or same-kind substitution. The adapter
   anchor mapping is not control-flow proof and the generated matrix is not
   historical authority, so K7 still needs cross-consumer branch qualification.
-  K7b-2 also leaves complete committed-window consumption, an exact hash/root-
-  bound execution base, a durable pre-publication held-checkpoint outbox, and
-  historical committee/membership/runtime-key activation open.
+  K7b-2 itself does not prove replay semantics. Separately, the checkpoint replay
+  boundary now hash-compares the exact oldest-first signed-envelope sequence
+  returned by the legacy processor: an incomplete, reordered, or substituted MG
+  window exposes no root/adoption result, and unexpected MG output is excluded.
+  This closes the accepted-prefix authorization bug only; complete CL1 grammar,
+  decisions/diff/intents parity, and the target E4 replay contract remain open.
+  An exact hash/root-bound execution base, a durable pre-publication held-
+  checkpoint outbox, and historical committee/membership/runtime-key activation
+  also remain open.
 - Tower verification now resolves the current atomic period-zero pair for every
   header occurrence, cryptographically binds each proof to the header's exact
   carried `eta || slot`
@@ -688,9 +694,13 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    hook invocation only. Per-adapter
    effect instrumentation remains incomplete. They deliberately
    do not activate or simulate a common runtime adapter.
-   Complete committed-window consumption, exact hash/root-bound execution bases,
-   durable pre-publication checkpoint outbox recovery, and historical committee/
-   membership/runtime activation remain open.
+   The separate checkpoint replay boundary now withholds per-MG root/adoption
+   results unless the legacy processor returns the exact complete ordered signed-
+   envelope window. This closes accepted-prefix, reordering, and substitution
+   authorization, not CL1 replay correctness or decisions/diff/intents parity.
+   Exact hash/root-bound execution bases, durable pre-publication checkpoint
+   outbox recovery, and historical committee/membership/runtime activation remain
+   open.
    Complete the historical generated-branch/consumer matrix, positive historical
    runtime consumers, and exact-parent no-side-effect vectors; an allowlisted path
    is not automatically correct. Gates: `KEYREG-006`, `KEYREG-010`, `KEYREG-011`,

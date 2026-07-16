@@ -235,7 +235,9 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
 
   /** Deterministic processor fixture that reports a supplied recreated currency state for every replayed binary. */
   private def mkSuccessfulReplayProcessor(
-    recreatedState: CurrencySnapshotWithState
+    recreatedState: CurrencySnapshotWithState,
+    acceptedPrefixLength: Option[Int] = None,
+    onReplay: IO[Unit] = IO.unit
   ): GlobalSnapshotStateChannelEventsProcessor[IO] =
     new GlobalSnapshotStateChannelEventsProcessor[IO] {
       override def process(
@@ -268,7 +270,16 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
         getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
       )(implicit hasher: Hasher[IO]): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
-        IO.pure(events.map { case (mg, binaries) => mg -> (binaries.map(_ -> recreatedState.some), SortedMap.empty[Address, Balance]) })
+        onReplay.as(
+          SortedMap.from(events.toList.flatMap {
+            case (mg, newestFirst) =>
+              val oldestFirst = newestFirst.reverse.toList
+              val selected = acceptedPrefixLength.fold(oldestFirst)(oldestFirst.take)
+              NonEmptyList
+                .fromList(selected)
+                .map(binaries => mg -> (binaries.map(_ -> recreatedState.some), SortedMap.empty[Address, Balance]))
+          })
+        )
 
       override def assembleAcceptanceResult(
         processed: SortedMap[Address, MetagraphAcceptanceResult],
@@ -684,16 +695,15 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       )
       .void
 
-  /** Like [[invokeAccept]] but returns the accepted `scSnapshots` map (6th tuple element) and the resulting GSI's mptRoot — the two
-    * observables a follower/validator must reproduce byte-identically to the leader (`stateChannelSnapshots` + state proof). Used by the
-    * three-paths-identical determinism test.
+  /** Like [[invokeAccept]] but returns the accepted `scSnapshots` map (6th tuple element), resulting state-proof MPT root, and resulting
+    * GSI. These expose both byte identity and whether a rejected checkpoint leaked currency/tip state.
     */
   private def invokeAcceptCapturing(
     mgr: GlobalSnapshotAcceptanceManager[IO],
     scEvents: List[StateChannelOutput],
     shardCheckpoints: SortedMap[ShardId, ShardCheckpoint],
     lastSnapshotInfo: GlobalSnapshotInfo
-  ): IO[(SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Option[Hash])] =
+  ): IO[(SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Option[Hash], GlobalSnapshotInfo)] =
     mgr
       .accept(
         ordinal = SnapshotOrdinal(2L),
@@ -717,7 +727,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         parentTip = io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
         shardCheckpoints = shardCheckpoints
       )
-      .map(result => (result._6, result._10.mptRoot))
+      .map(result => (result._6, result._10.mptRoot, result._9))
 
   /** Minimal `GlobalSnapshotInfo` — only what's needed to satisfy `accept()`'s prior-state reads. */
   private val emptyGsi: GlobalSnapshotInfo =
@@ -932,6 +942,50 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         _ <- invokeAccept(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
         recorded <- adoptions.get
       } yield expect(recorded.isEmpty)
+    }
+  }
+
+  test("an attested root matching only a valid prefix cannot adopt a checkpoint window with an invalid suffix") { res =>
+    implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("61" * 64)), Signature(Hex("62" * 70)))
+      val prefixState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(stateProof)))
+
+      for {
+        mg <- IO.pure(mkAddress("accepted-prefix-must-not-adopt"))
+        validN = mkSignedBinary("valid-currency-N".getBytes("UTF-8"))
+        nondecodableN1 = mkSignedBinary(Array[Byte](0x01, 0x02, 0x03))
+        prefixRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> prefixState))
+        delta = ShardDerivedStateDelta(
+          // Adversarial claim: this root is exactly correct for N, but says nothing about the unprocessed N+1 input also covered by the
+          // checkpoint signature. The processor fixture models the real prefix disposition proven with a nondecodable child in
+          // GlobalSnapshotStateChannelEventsProcessorSuite.
+          perMetagraphMptRoots = SortedMap(mg -> prefixRoot),
+          includedSnapshots = SortedMap(mg -> NonEmptyList.of(validN, nondecodableN1))
+        )
+        cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, delta)
+        calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+        adoptions <- Ref.of[IO, List[(ShardId, ShardOrdinal, Hash)]](Nil)
+        replayCalls <- Ref.of[IO, Int](0)
+        stub = StubAcceptanceManager(calls, _ => ShardCheckpointAcceptResult.Accepted, Some(adoptions))
+        prefixProcessor = mkSuccessfulReplayProcessor(
+          prefixState,
+          acceptedPrefixLength = Some(1),
+          onReplay = replayCalls.update(_ + 1)
+        )
+        mgr <- mkSuiteManagerWithProcessor(Some(mkShardingConfig(numShards = 4)), Some(stub), prefixProcessor)
+        accepted <- invokeAcceptCapturing(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+        recordedAdoptions <- adoptions.get
+        replayCount <- replayCalls.get
+      } yield
+        expect.all(
+          replayCount == 1,
+          !accepted._1.contains(mg),
+          !accepted._3.lastCurrencySnapshots.contains(mg),
+          !accepted._3.lastStateChannelSnapshotHashes.contains(mg),
+          recordedAdoptions.isEmpty
+        )
     }
   }
 

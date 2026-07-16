@@ -73,10 +73,12 @@ positive loader-validated A controls prove the probes are live. Here the manifes
 injected derivation hook: the suite's deterministic hook is not framework CL1 execution and proves neither replay semantics nor economic
 correctness. K7b-2 does not claim store, adopt, slash, historical committee/membership authority, or runtime-key activation.
 
-Four producer protocol blockers remain outside this identity qualification: the producer does not prove complete consumption of the
-committed input window before signing; its execution base is ordinal-only rather than exact hash/root-bound Phase-2 evidence; first
-publication and held-checkpoint retry lack a durable pre-publication outbox; and committee membership/duty/runtime key selection are not
-resolved from historical branch authority. K7b-2 must not be used to close any of those gates.
+K7b-2 itself does not prove replay semantics. Separately, the checkpoint replay boundary now hash-compares the exact oldest-first signed-
+envelope sequence returned by the legacy processor. An incomplete, reordered, or substituted MG window exposes no producer-root or
+transitional-GL0-adoption result, and unexpected MG output is excluded. This closes the accepted-prefix authorization bug only; complete
+CL1 grammar, decisions/diff/intents parity, and the target E4 replay contract remain open. The execution base is still ordinal-only rather
+than exact hash/root-bound Phase-2 evidence; first publication and held-checkpoint retry lack a durable pre-publication outbox; and committee
+membership/duty/runtime key selection is not resolved from historical branch authority. K7b-2 must not be used to close those gates.
 
 Two target roles are deliberately recorded as absent:
 
