@@ -591,21 +591,28 @@ criteria are in `NAKAMOTO-PLAN.md`.
     backing, and resource-limit findings for every enabled economic operation.
   - Differential-check decisions and exact writes after every input prefix.
   - **Landed nonactivating E2.1 slice (2026-07-16):** the test-only reference
-    interpreter supports exactly three typed operation IDs: zero-fee native
-    transfer, zero-fee currency transfer, and zero-fee allow-spend creation.
+    interpreter supports exactly four typed operation IDs: zero-fee native
+    transfer, zero-fee currency transfer, zero-fee allow-spend creation, and
+    zero-fee nonreplacement token-lock creation.
     Allow-spend creation binds the complete source-signed preimage, exact
     domain/lane/per-source parent, and an explicit supplied epoch window; uses
     checked `BigInt` arithmetic; reserves value without crediting the
     destination; advances its separate reference chain; and rejects replay or
-    any invalid prefix atomically. The closed supported-ID set maps each ID to a
-    positive input constructor, refuses those IDs in the unsupported sentinel,
-    and dynamically fails closed every remaining manifest row. The 31 focused
-    tests are green.
+    any invalid prefix atomically. Token-lock creation likewise binds its
+    complete source-signed preimage, exact domain/lane/per-source parent, and an
+    explicit supplied epoch rule; reserves active principal without destination
+    credit; advances a separate reference chain; and participates in the same
+    ordered conserved balance ledger. The closed supported-ID set maps each ID
+    to a positive input constructor, refuses those IDs in the unsupported
+    sentinel, and dynamically fails closed every remaining manifest row. The 41
+    focused tests are green.
   - This slice is not the production kernel, production/reference differential
     adapter, canonical hash/signature/Scodec encoding, MPT/root integration, or
     runtime activation. Nonzero fee disposition remains unfrozen and fail-closed.
-    Allow-spend consume/expiry/refund remain blocked on O-13 terminal ordering;
-    all other E2 grammar rows remain open.
+    Live snapshot acceptance does not yet enforce the reference row's contextual
+    token-lock minimum-duration rule. Token-lock replacement, expiry/refund, and
+    manual unlock remain open. Allow-spend consume/expiry/refund remain blocked
+    on O-13 terminal ordering; all other E2 grammar rows remain open.
   - **Gate:** `ECON-D/C/A/R/O/B/F/G-*`.
 
 - [ ] **S3 PARTIAL - signed payload lanes and data availability**

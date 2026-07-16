@@ -1128,17 +1128,23 @@ close S1, SER-005, SER-006, or ERA-001.
 
 Current S2 evidence is intentionally narrow. A nonactivating test reference
 interpreter supports exactly the typed IDs for zero-fee native transfer,
-zero-fee currency transfer, and zero-fee allow-spend creation. The allow-spend
-row enforces complete source-preimage binding, exact domain/lane/per-source
-parent, an explicit epoch window, checked arithmetic, reservation conservation,
-no destination credit, permanent semantic replay identity, and atomic failure.
-The closed supported-ID partition maps all three IDs to positive constructors;
-the unsupported sentinel refuses them and dynamically fails closed every other
-manifest row. Its 31 focused tests are green. This is not production/reference
-differential evidence, runtime execution, canonical Scodec/hash/signature bytes,
-or MPT/root integration. Nonzero fees remain fail-closed pending an explicit
-source/sink rule, allow-spend consume/expiry/refund remain blocked on O-13, and
-every other S2 grammar row remains open.
+zero-fee currency transfer, zero-fee allow-spend creation, and zero-fee
+nonreplacement token-lock creation. The allow-spend row enforces complete
+source-preimage binding, exact domain/lane/per-source parent, an explicit epoch
+window, checked arithmetic, reservation conservation, no destination credit,
+permanent semantic replay identity, and atomic failure. The token-lock row adds
+the corresponding source/preimage, domain/lane/parent, explicit epoch-policy,
+active-principal conservation, separate-reference, and permanent-replay rules
+over the same ordered balance ledger. The closed supported-ID partition maps all
+four IDs to positive constructors; the unsupported sentinel refuses them and
+dynamically fails closed every other manifest row. Its 41 focused tests are
+green. This is not production/reference differential evidence, runtime
+execution, canonical Scodec/hash/signature bytes, or MPT/root integration.
+Nonzero fees remain fail-closed pending an explicit source/sink rule. Live
+snapshot acceptance still lacks the reference row's contextual token-lock
+minimum-duration rule; token-lock replacement, expiry/refund, and manual unlock
+remain open. Allow-spend consume/expiry/refund remain blocked on O-13, and every
+other S2 grammar row remains open.
 
 Work may be delegated in parallel only with disjoint write sets and frozen shared
 types. Model/RED authors do not approve their own runtime implementation. Shared

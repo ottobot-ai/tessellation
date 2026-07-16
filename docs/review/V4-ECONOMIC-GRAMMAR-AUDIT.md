@@ -408,26 +408,36 @@ downstream rebase behavior.
 
 ### 5.1 Landed nonactivating reference slice
 
-As of 2026-07-16, the test-only reference interpreter supports exactly three
-typed operation IDs: zero-fee native transfer, zero-fee currency transfer, and
-zero-fee allow-spend creation. Allow-spend creation requires a complete
+As of 2026-07-16, the test-only reference interpreter supports exactly four
+typed operation IDs: zero-fee native transfer, zero-fee currency transfer,
+zero-fee allow-spend creation, and zero-fee nonreplacement token-lock creation.
+Allow-spend creation requires a complete
 source-bound preimage, exact domain and lane, exact per-source parent, and an
 explicit supplied epoch window. It uses checked `BigInt` arithmetic, moves the
 amount from spendable balance into an active reservation without crediting the
 destination, advances a separate allow-spend reference, retains a permanent
 semantic identity, and rejects invalid/replayed prefixes atomically.
 
+Token-lock creation requires the corresponding complete source/preimage,
+domain/lane/parent, and explicit supplied epoch policy. It moves principal from
+spendable balance into the active-lock ledger, advances a separate token-lock
+reference, retains permanent replay identity, and shares the ordered conserved
+balance accumulator with transfers and allow-spends.
+
 The supported-ID set is closed: each supported ID has exactly one positive
 constructor mapping, and the unsupported sentinel cannot represent a supported
 ID. Every remaining manifest row is discovered dynamically and fails closed.
-The interpreter, allow-spend, and manifest-coverage suites pass 31 focused
-tests.
+The interpreter, allow-spend, token-lock, and manifest-coverage suites pass 41
+focused tests.
 
 This is not production-kernel implementation, production/reference
 differential evidence, canonical Scodec/hash/signature binding, MPT/root
 integration, or runtime activation. Nonzero fees remain fail-closed because
-their disposition is not frozen. Allow-spend consume, expiry, and refund remain
-blocked on O-13 terminal ordering. Every other grammar row remains open.
+their disposition is not frozen. Live snapshot acceptance does not yet enforce
+the reference row's contextual token-lock minimum-duration rule. Token-lock
+replacement, expiry/refund, and manual unlock remain open. Allow-spend consume,
+expiry, and refund remain blocked on O-13 terminal ordering. Every other grammar
+row remains open.
 
 ## 6. Required RED and oracle tests
 
