@@ -115,9 +115,14 @@ and tower eligibility. Their transcript bytes and domains remain open.
   `GlobalStateKey.scala:265-310`). `GlobalChangeSetResponse` therefore cannot yet
   satisfy its claim to carry the exact applied global delta
   (`GlobalChangeSetResponse.scala:11-13,34-39`).
-- `GlobalStateKeyCodec` encodes five namespace variants and omits the live
-  `SystemNamespace` variant (`GlobalStateKeyCodec.scala:13-23,58-66` versus
-  `GlobalStateKey.scala:112-117`).
+- The dark typed `GlobalStateKeyCodec` now gives `SystemNamespace` outer tag
+  `0x05` and closed label tags `0x00` through `0x03`, with exact vectors,
+  unknown/trailing rejection, and a source guard that forbids production use
+  outside the codec (`GlobalStateKeyCodec.scala:14-43,65-84`). This does not
+  implement the consensus physical-key grammar: live MPT keys still use the
+  separate lossy `GlobalStateKey.toHex` path, and ROOT-008 whole-image shape,
+  key/value identity, and duplicate-logical-identity enforcement remain open
+  (`GlobalStateKey.scala:603-680`; `ROOT-008-GL0-PARTITION-GRAMMAR.md:3-28`).
 - `SlashedRegistryEntry` MPT values still use hand-written Circe JSON bytes under
   an `ImmutableCodec` facade (`InvalidStateProofSlashedReader.scala:52-67`).
 - The live `TipAttestation` body omits the exact parent/root/era/parameter context

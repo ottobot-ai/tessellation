@@ -1235,9 +1235,9 @@ the exact eligibility parent, atomic KES/VRF pair, N-2 roster/stake/key view, N-
 eta evidence, period/slot, purpose, and exact subsystem context. It defines no
 codec, wire tag, preimage bytes, signature, or runtime authority. Confirmed
 blockers include accumulator omissions for rooted field 33
-`ConsumedAllowSpends` and field 34 `Slashings`, missing `SystemNamespace` key
-encoding, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard diff/
-positive replay-coverage, exact optimistic-tip attestation, and finality/tower
+`ConsumedAllowSpends` and field 34 `Slashings`, the unenforced ROOT-008 physical
+MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard
+diff/positive replay-coverage, exact optimistic-tip attestation, and finality/tower
 proof schemas, plus the pending O-18 transport/DA and O-19 migration-policy
 decisions. A separate explicit,
 non-implicit MPT commitment codec freezes strict leaf/branch/extension bytes and
@@ -1248,6 +1248,11 @@ a syntactic fuse, not semantic non-reachability proof. Live hashing/signing,
 state-proof selection, MPT roots/proofs, disk reads, and lane decoding remain
 JSON/Kryo/legacy and are guarded against piecemeal activation. E1.1 and E1.3
 remain OPEN, S1 remains PARTIAL, and SER-005, SER-006, and ERA-001 remain OPEN.
+The separate dark typed `GlobalStateKeyCodec` now covers all six namespace
+variants with outer `SystemNamespace` tag `0x05`, four closed inner label tags,
+exact vectors, and strict unknown/trailing rejection. Its source tripwire proves
+no production consumer exists outside that codec; live `GlobalStateKey.toHex`,
+MPT roots, disk keys, and ROOT-008 enforcement are unchanged.
 E1.1 next expands generic rumor and ChainSync/bootstrap transport families, all
 14 finality payload variants, and a total per-kind binding/codec/vector table with
 removal-mutation gates; the 48 semantic families do not substitute for that work.

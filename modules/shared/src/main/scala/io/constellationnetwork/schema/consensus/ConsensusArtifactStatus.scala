@@ -51,8 +51,8 @@ object ArtifactGap {
   case object ChangeSetCannotCarryCompleteGlobalDelta extends ArtifactGap {
     val semanticLabel: String = "change-set-cannot-carry-complete-global-delta"
   }
-  case object GlobalStateKeyCodecOmitsSystemNamespace extends ArtifactGap {
-    val semanticLabel: String = "global-state-key-codec-omits-system-namespace"
+  case object GlobalMptPhysicalKeyGrammarUnenforced extends ArtifactGap {
+    val semanticLabel: String = "global-mpt-physical-key-grammar-unenforced"
   }
   case object SlashingValueCodecUsesJson extends ArtifactGap {
     val semanticLabel: String = "slashing-value-codec-uses-json"

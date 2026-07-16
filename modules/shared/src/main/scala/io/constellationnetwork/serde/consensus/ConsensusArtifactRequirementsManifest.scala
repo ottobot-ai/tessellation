@@ -300,7 +300,7 @@ object ConsensusArtifactRequirementsManifest {
       KnownIncomplete,
       Set(PortableTowerHistoricalEligibilityMissing)
     ),
-    contract(GlobalMptKey, Commitment, embedded, KnownIncomplete, Set(GlobalStateKeyCodecOmitsSystemNamespace)),
+    contract(GlobalMptKey, Commitment, embedded, KnownIncomplete, Set(GlobalMptPhysicalKeyGrammarUnenforced)),
     contract(GlobalMptValue, Commitment, embedded, KnownIncomplete, Set(SlashingValueCodecUsesJson)),
     contract(MptNodeCommitment, Commitment, embedded, ExistingShapeNeedsAudit),
     contract(GlobalMptRoot, Commitment, embedded),
@@ -395,17 +395,17 @@ object ConsensusArtifactRequirementsManifest {
     val hasAnchor = contract.bindings.exists(_.isExactAnchor)
 
     contract.authority match {
-      case StateValidity          => hasAnchor
+      case StateValidity => hasAnchor
       case FinalityQualification =>
         contract.bindings.contains(ExactGlobalSnapshotRef) &&
-          (contract.bindings.contains(AttestationDecisionContext) || contract.bindings.contains(ChainSelectionWitness))
-      case SourceAuthorization    => hasAnchor
-      case Eligibility            => hasAnchor && contract.bindings.contains(RegistryView) && contract.bindings.contains(EtaAndSlot)
+        (contract.bindings.contains(AttestationDecisionContext) || contract.bindings.contains(ChainSelectionWitness))
+      case SourceAuthorization => hasAnchor
+      case Eligibility         => hasAnchor && contract.bindings.contains(RegistryView) && contract.bindings.contains(EtaAndSlot)
       case CustodyAvailability =>
         contract.bindings.contains(ExactSourceParent) &&
-          contract.bindings.contains(RegistryView) &&
-          contract.bindings.contains(CustodiedArtifact) &&
-          contract.bindings.contains(RetentionScope)
+        contract.bindings.contains(RegistryView) &&
+        contract.bindings.contains(CustodiedArtifact) &&
+        contract.bindings.contains(RetentionScope)
       case ObjectiveEvidence => hasAnchor
       case Commitment        => hasAnchor
       case LocalDurability   => contract.bindings.contains(DurabilityScope)

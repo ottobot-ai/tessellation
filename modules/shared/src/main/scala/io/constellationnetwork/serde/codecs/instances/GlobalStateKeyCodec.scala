@@ -2,7 +2,8 @@ package io.constellationnetwork.serde.codecs.instances
 
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.PartitionNamespace._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, PartitionNamespace}
+import io.constellationnetwork.schema.mpt.SystemNamespaceLabel._
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.ImmutableCodec
 
@@ -10,9 +11,9 @@ import scodec.codecs.{discriminated, provide, uint8}
 import scodec.{Attempt, Codec, Err}
 import shapeless.{::, HNil}
 
-/** Canonical scodec codec for the MPT-as-primary key types:
-  *   - `PartitionNamespace` — sealed ADT (5 variants) via 1-byte discriminator.
-  *   - `GlobalStateFieldId` — sealed ADT (19 case objects) via 1-byte id.
+/** Dark typed scodec codec for the MPT key-description types:
+  *   - `PartitionNamespace` — sealed ADT (6 variants) via 1-byte discriminator.
+  *   - `GlobalStateFieldId` — sealed ADT (35 case objects) via 1-byte id.
   *   - `GlobalStateKey` — 4-field compound.
   *
   * PartitionNamespace discriminator layout:
@@ -21,19 +22,25 @@ import shapeless.{::, HNil}
   *   - 0x02: MetagraphNamespace (+ Address)
   *   - 0x03: AddressNamespace (+ Address)
   *   - 0x04: HashNamespace (+ 32-byte Hash)
+  *   - 0x05: SystemNamespace (+ 1-byte closed label tag)
   *
   * These are NEW discriminator bytes, unrelated to the existing `PartitionKeyType.toByte` (which is used by the hex-derivation path in
   * `GlobalStateKey.toHex`). Keeping them separate means the two semantic concerns — "what shape of key does this namespace produce in the
   * MPT" (PartitionKeyType) vs. "which ADT variant is this on the wire" (discriminator) — don't coincidentally collide. The two tag families
   * must be allowed to evolve independently.
   *
-  * GlobalStateFieldId: 1-byte id via `fromInt`. 19 variants today (0..18); 1-byte headroom to 255 is ample. When the registry ever grows
+  * SystemNamespaceLabel discriminator layout:
+  *   - 0x00: ExpiryIndexAllowSpends
+  *   - 0x01: ExpiryIndexTokenLocks
+  *   - 0x02: ExpiryIndexNodeCollateralWithdrawals
+  *   - 0x03: ActiveAddressIndex
+  *
+  * GlobalStateFieldId: 1-byte id via `fromInt`. 35 variants today (0..34); 1-byte headroom to 255 is ample. When the registry ever grows
   * past 255, introduce `GlobalStateKeyCodecV2` with uint16.
   *
-  * Consensus contract: FROZEN. Discriminator bytes, field-id width, and field-order in `GlobalStateKey` are all persistent — every MPT key
-  * written by the scodec era depends on them being stable.
-  *
-  * First sum-type codec: unlocks MPT-as-primary write path.
+  * This codec is not the live physical-trie key derivation. `GlobalStateKey.toHex` remains that separate, lossy path, including a
+  * `PKTSystem` byte followed by `HASH32(label.canonicalName)`. Runtime use of these typed bytes remains forbidden until the atomic ScodecV1
+  * cutover and the ROOT-008 physical-key grammar are complete.
   */
 object GlobalStateKeyCodec {
 
@@ -55,6 +62,17 @@ object GlobalStateKeyCodec {
   private val hashNsCodec: Codec[HashNamespace] =
     hashCodec.xmap(HashNamespace(_), _.hash)
 
+  private val systemNamespaceLabelCodec: Codec[SystemNamespaceLabel] =
+    discriminated[SystemNamespaceLabel]
+      .by(uint8)
+      .typecase(0, provide(ExpiryIndexAllowSpends))
+      .typecase(1, provide(ExpiryIndexTokenLocks))
+      .typecase(2, provide(ExpiryIndexNodeCollateralWithdrawals))
+      .typecase(3, provide(ActiveAddressIndex))
+
+  private val systemNsCodec: Codec[SystemNamespace] =
+    systemNamespaceLabelCodec.xmap(SystemNamespace(_), _.label)
+
   implicit val partitionNamespaceCodec: Codec[PartitionNamespace] =
     discriminated[PartitionNamespace]
       .by(uint8)
@@ -63,6 +81,7 @@ object GlobalStateKeyCodec {
       .typecase(2, metagraphNsCodec)
       .typecase(3, addressNsCodec)
       .typecase(4, hashNsCodec)
+      .typecase(5, systemNsCodec)
 
   implicit val partitionNamespaceImmutableCodec: ImmutableCodec[PartitionNamespace] =
     ImmutableCodec.fromScodecCodec(partitionNamespaceCodec)

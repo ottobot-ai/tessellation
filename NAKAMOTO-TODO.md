@@ -606,17 +606,23 @@ criteria are in `NAKAMOTO-PLAN.md`.
     signatures, or runtime authority; codec status remains `Open` and activation
     remains `DarkOnly`.
   - **Confirmed E1.1a blockers:** `StateChangesAccumulator` omits rooted field 33
-    `ConsumedAllowSpends` and field 34 `Slashings`; `GlobalStateKeyCodec` omits
-    live `SystemNamespace`; `SlashedRegistryEntry` still uses JSON bytes under an
-    `ImmutableCodec` facade; signed state-channel lanes, canonical shard diff,
-    positive replay coverage, the exact optimistic-tip attestation body, and
-    portable finality/tower proof schemas remain open. O-18 controls transport/DA
-    bytes and O-19 controls migration transform, conservation, and target-genesis
-    policy.
+    `ConsumedAllowSpends` and field 34 `Slashings`; ROOT-008 physical MPT-key
+    grammar enforcement remains open; `SlashedRegistryEntry` still uses JSON
+    bytes under an `ImmutableCodec` facade; signed state-channel lanes, canonical
+    shard diff, positive replay coverage, the exact optimistic-tip attestation
+    body, and portable finality/tower proof schemas remain open. O-18 controls
+    transport/DA bytes and O-19 controls migration transform, conservation, and
+    target-genesis policy.
+  - **Landed nonactivating typed-key completeness slice (2026-07-16):**
+    `GlobalStateKeyCodec` now covers all six namespace variants. `SystemNamespace`
+    uses outer tag `0x05` and four closed inner label tags with exact vectors and
+    strict unknown/trailing rejection. A source tripwire keeps these bytes dark;
+    live `GlobalStateKey.toHex`, MPT roots, disk keys, and ROOT-008 enforcement are
+    unchanged.
   - **Landed nonactivating E1b byte contract (2026-07-16):** added an explicit,
     non-implicit ScodecV1 codec for the complete MPT commitment ADT with frozen
     leaf/branch/extension vectors and strict tag, path, nibble, hash, branch,
-    truncation, and trailing-byte rejection. Fifteen codec tests and nine
+    truncation, and trailing-byte rejection. Fifteen codec tests and ten
     atomic-cutover guards passed. The guard freezes all 23 current JSON MPT
     commitment-hash sites and rejects ordinary production references to the dark
     codec. This is a syntactic fuse, not semantic non-reachability proof.

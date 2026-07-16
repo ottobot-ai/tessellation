@@ -3,7 +3,8 @@ package io.constellationnetwork.serde
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.mpt.GlobalStateFieldId._
 import io.constellationnetwork.schema.mpt.PartitionNamespace._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, PartitionNamespace}
+import io.constellationnetwork.schema.mpt.SystemNamespaceLabel._
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.codecs.instances.AddressCodec
 import io.constellationnetwork.serde.codecs.instances.AddressCodec.{immutableCodec => addressImmutableCodec}
@@ -13,13 +14,16 @@ import io.constellationnetwork.serde.implicits._
 import scodec.bits.ByteVector
 import weaver.FunSuite
 
-/** Suite for the first sum-type codec: `PartitionNamespace` (5-variant ADT), `GlobalStateFieldId` (19 case objects), and the
+/** Suite for the typed key-description codec: `PartitionNamespace` (6-variant ADT), `GlobalStateFieldId` (35 case objects), and the
   * `GlobalStateKey` compound that binds them together.
   *
   * Byte-layout contract:
-  *   - uint8 discriminator for `PartitionNamespace`: {Hypergraph=0, Empty=1, Metagraph=2, Address=3, Hash=4}
-  *   - uint8 id for `GlobalStateFieldId` (0..18)
+  *   - uint8 discriminator for `PartitionNamespace`: {Hypergraph=0, Empty=1, Metagraph=2, Address=3, Hash=4, System=5}
+  *   - System carries a second uint8 label tag: {AllowSpendExpiry=0, TokenLockExpiry=1, CollateralExpiry=2, ActiveAddress=3}
+  *   - uint8 id for `GlobalStateFieldId` (0..34)
   *   - `GlobalStateKey` is four fields concatenated: network | fieldId | contract | user.
+  *
+  * These are dark typed bytes. The live physical trie remains keyed by `GlobalStateKey.toHex` and has separate vectors.
   */
 object GlobalStateKeyCodecSuite extends FunSuite {
 
@@ -58,12 +62,33 @@ object GlobalStateKeyCodecSuite extends FunSuite {
     expect(bytes.head == 0x04.toByte).and(expect(bytes.tail == ByteVector.fromValidHex("ab" * 32))).and(expect(bytes.length == 33L))
   }
 
+  test("SystemNamespace uses outer tag 0x05 and one closed label tag") {
+    val vectors: Seq[(PartitionNamespace, String)] = Seq(
+      SystemNamespace(ExpiryIndexAllowSpends) -> "0500",
+      SystemNamespace(ExpiryIndexTokenLocks) -> "0501",
+      SystemNamespace(ExpiryIndexNodeCollateralWithdrawals) -> "0502",
+      SystemNamespace(ActiveAddressIndex) -> "0503"
+    )
+
+    expect(vectors.forall { case (namespace, hex) => namespace.immutableBytes == ByteVector.fromValidHex(hex) })
+  }
+
   test("Unknown discriminator byte fails decode") {
     val bad = ByteVector.fromValidHex("ff")
     bad.fromImmutableBytes[PartitionNamespace] match {
       case Left(_: SerdeError.ScodecFailure) => success
       case other                             => failure(s"expected ScodecFailure, got $other")
     }
+  }
+
+  test("Unknown SystemNamespace label and trailing bytes fail decode") {
+    val unknownLabel = ByteVector.fromValidHex("05ff").fromImmutableBytes[PartitionNamespace]
+    val trailing = ByteVector.fromValidHex("050000").fromImmutableBytes[PartitionNamespace]
+
+    expect.all(
+      unknownLabel.isLeft,
+      trailing.isLeft
+    )
   }
 
   test("PartitionNamespace round-trips for every variant") {
@@ -73,7 +98,7 @@ object GlobalStateKeyCodecSuite extends FunSuite {
       MetagraphNamespace(addr),
       AddressNamespace(addr),
       HashNamespace(Hash("0" * 64))
-    )
+    ) ++ SystemNamespaceLabel.all.map(SystemNamespace(_))
     val decoded = samples.map(_.immutableBytes.fromImmutableBytes[PartitionNamespace])
     expect(decoded == samples.map(Right(_)))
   }
@@ -144,6 +169,21 @@ object GlobalStateKeyCodecSuite extends FunSuite {
       userNamespace = AddressNamespace(addr)
     )
     expect(key.immutableBytes.fromImmutableBytes[GlobalStateKey] == Right(key))
+  }
+
+  test("SystemNamespace full typed key has one exact vector") {
+    val key = GlobalStateKey(
+      networkNamespace = SystemNamespace(ActiveAddressIndex),
+      fieldId = SystemIndex,
+      contractNamespace = EmptyNamespace,
+      userNamespace = HashNamespace(Hash("ab" * 32))
+    )
+    val expected = ByteVector.fromValidHex("0503130104" + "ab" * 32)
+
+    expect.all(
+      key.immutableBytes == expected,
+      expected.fromImmutableBytes[GlobalStateKey] == Right(key)
+    )
   }
 
   test("Swapping contract ↔ user namespaces produces different bytes (field-order invariant)") {

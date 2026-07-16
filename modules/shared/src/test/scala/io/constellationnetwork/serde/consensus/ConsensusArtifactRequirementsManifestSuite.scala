@@ -61,7 +61,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
         AccumulatorOmitsSlashings,
         ChangeSetCannotCarryCompleteGlobalDelta
       ),
-      gaps(GlobalMptKey) == Set(GlobalStateKeyCodecOmitsSystemNamespace),
+      gaps(GlobalMptKey) == Set(GlobalMptPhysicalKeyGrammarUnenforced),
       gaps(GlobalMptValue) == Set(SlashingValueCodecUsesJson),
       gaps(OptimisticTipAttestation) == Set(
         OptimisticTipAttestationMissingExactContext,

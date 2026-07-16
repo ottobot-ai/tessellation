@@ -361,6 +361,8 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
   private val mptCommitmentScodecV1CodecPath =
     "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/MerklePatriciaCommitmentScodecV1Codec.scala"
+  private val globalStateKeyScodecCodecPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/GlobalStateKeyCodec.scala"
 
   private val reviewedProtocolEraIdentityPaths: Set[String] =
     Set(protocolEraIdentityPath, protocolEraCodecPath)
@@ -370,6 +372,9 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
   private val mptCommitmentScodecV1Reference =
     """\bMerklePatriciaCommitmentScodecV1Codec\b|\b(?:ImmutableCodec|Codec)\s*\[\s*MerklePatriciaCommitment\s*\]""".r
+
+  private val globalStateKeyScodecReference =
+    """\bGlobalStateKeyCodec\b|\b(?:ImmutableCodec|Codec)\s*\[\s*(?:GlobalStateKey|PartitionNamespace)\s*\]""".r
 
   private val consensusSensitivePaths: Set[String] =
     List(
@@ -432,6 +437,24 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       else
         failure(
           s"MPT commitment ScodecV1 production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
+            s"missing=${missing.toList.sorted.mkString(",")}"
+        )
+    }
+  }
+
+  test("typed GlobalStateKey Scodec bytes remain dark outside their standalone codec source") {
+    productionSources.map { sources =>
+      val actualPaths = sources.collect {
+        case source if globalStateKeyScodecReference.findFirstIn(withoutScalaComments(source.contents)).nonEmpty => source.path
+      }.toSet
+      val expectedPaths = Set(globalStateKeyScodecCodecPath)
+      val unexpected = actualPaths -- expectedPaths
+      val missing = expectedPaths -- actualPaths
+
+      if (unexpected.isEmpty && missing.isEmpty) success
+      else
+        failure(
+          s"typed GlobalStateKey Scodec production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
             s"missing=${missing.toList.sorted.mkString(",")}"
         )
     }
