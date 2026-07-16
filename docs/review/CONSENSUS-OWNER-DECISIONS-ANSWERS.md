@@ -363,9 +363,10 @@ and non-load-bearing for V1; V1 safety cannot assume escrow or `k2` secret rollb
 **Pending owner packet:**
 [`O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md`](O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md).
 Its candidate-universe, conflict, expiry, partial-consume, ML0 application, and
-same-proposal recommendations require owner disposition; its exact source-locator
-and native-versus-checkpoint ordering schema remains an explicit implementation
-gate.
+same-proposal recommendations require owner disposition. O13-A3 additionally
+requires a domain-bound framework spend-intent schema, strict authority sequence,
+and equivocation disposition; checkpoint/binary coordinates are provenance and
+must not order economic winners.
 
 **Owner-ratified direction** (`CONSENSUS-OWNER-DECISIONS.md:350-386`): hash-linked
 per-destination sequence, rooted outbox head + permanent nullifier, ML0 applied-`(sequence,

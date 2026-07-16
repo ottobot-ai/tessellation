@@ -76,6 +76,11 @@ signature count, data availability, receipt, or checkpoint depth never creates
 an economic candidate. If rooted expiry enumeration is incomplete or malformed,
 the proposal is invalid; receiver-local scans cannot fill the gap.
 
+The current native GL1 schema has transfer transactions and allow-spend creation
+blocks but no native allow-spend consume. A future native consume enters this
+universe only through an explicitly signed framework-operation schema that every
+GL0 validator executes; a checkpoint-shaped locator cannot be invented for it.
+
 **Owner response:** ACCEPT / REVISE.
 
 ### O13-A2: candidate identity, duplicates, and conflicts
@@ -83,7 +88,8 @@ the proposal is invalid; receiver-local scans cannot fill the gap.
 **Recommendation:** before ordering, GL0 resolves every candidate against the
 same exact proposal-parent reservation record and retains a normalized semantic
 record containing the reservation hash, owner scope, source, destination,
-amount, expiry, approver set, terminal kind, and authenticated source locator.
+amount, expiry, approver set, terminal kind, and authenticated semantic intent.
+Packaging provenance is retained separately as an authenticated evidence set.
 The existing currency, destination, approver, source, and amount checks remain
 prerequisites (`SpendActionValidator.scala:543-573`).
 
@@ -91,8 +97,8 @@ An exact duplicate means the same semantic consumption identity and the same
 fully bound economic effect. It is coalesced and has no second write. Signature
 bytes, artifact bytes, arrival position, and transport copies do not create a
 distinct consumption identity. Duplicate copies observed at multiple
-authenticated locators retain a sorted evidence set or the minimum locator under
-the frozen O13-A3 order; arrival never chooses the retained locator.
+authenticated locators retain the complete sorted evidence set; a locator never
+selects the winner and arrival never chooses retained evidence.
 
 The conflict classes are distinct:
 
@@ -101,39 +107,69 @@ The conflict classes are distinct:
 - one semantic consumption identity resolving to different normalized effects
   invalidates the whole proposal; and
 - different semantic consumption identities against the same valid reservation
-  are competing candidates ordered by O13-A3, not malformed bindings.
+  are conflicting authority successors handled by O13-A3's eventual
+  owner-ratified equivocation disposition, not malformed bindings or
+  locator-ordered candidates.
 
 The winning terminal effect atomically writes one permanent nullifier, so no
 later proposal can replay it.
 
 **Owner response:** ACCEPT / REVISE.
 
-### O13-A3: exact order among simultaneous valid consumes
+### O13-A3: semantic consume identity and conflicting-successor disposition
 
 This decision is still open and blocks production implementation. The previous
 phrase "for example" did not freeze a consensus rule. The selected rule must
 specify all of the following:
 
-- an explicit source discriminator and category priority for native versus
-  checkpoint-extracted candidates;
-- the exact normalized locator fields for each source class;
-- the exact comparison of multiple distinct, otherwise-valid consumes of one
-  reservation; and
-- the domain-separated semantic identifier and byte ordering used as the final
-  objective tie-break.
+- the exact signed semantic-intent schema, hash domain, and canonical bytes;
+- evidence-locator schemas for provenance only, including how duplicate evidence
+  is retained and normalized;
+- the authority registry plus strict operation-parent/sequence state; and
+- the exact disposition of conflicting authority successors and its liveness,
+  expiry, and slashing consequences.
 
-**Recommendation:** derive the locator only from authenticated, signed canonical
-proposal contents: native block/transaction coordinates for the native lane and
-`(shardId, checkpointHash, metagraphId, binaryIndex, operationIndex)` for the
-checkpoint lane. Compare a frozen tagged union of those locators, then a
-domain-separated hash of the normalized semantic consumption record. Do not use
-arrival time, receiver head, map/set traversal, local store order, signature
-bytes, committee arrival, shard arrival, or an unconstrained producer-supplied
-tie value. The source tags, native locator schema, hash domain, and category
-priority require an explicit owner/schema freeze; `ACCEPT` here is not approval
-to let implementation invent them.
+**Audit correction:** checkpoint coordinates are provenance, not an objective
+economic order. The same semantic consume can move to a different checkpoint
+hash or binary position through batching, retained-window overlap after reorg,
+or proof-envelope selection. Ordering first by checkpoint hash/position would
+therefore give ML0/checkpoint packaging an economic tie-break. The current GL0
+fold also discards these coordinates, and current signed currency binaries do
+not themselves bind the outer metagraph map key.
 
-**Owner response:** ACCEPT RECOMMENDATION AND REQUEST THE EXACT SCHEMA / REVISE.
+**Recommendation:** make these two structures explicit and separate:
+
+1. `CheckpointEvidence(shardId, checkpointHash, metagraphId,
+   currencySnapshotOrdinal, currencySnapshotValueHash, artifactIndex,
+   spendTransactionIndex)` proves where GL0 extracted an intent. Multiple copies
+   retain a sorted evidence set. It never selects the economic winner.
+2. A new directly authenticated `FrameworkSpendIntentV1` binds the network and
+   genesis, protocol era, lane, metagraph, operation kind, exact Phase-2
+   `(ordinal,hash,mptRoot)` read reference, allow-spend reference, source,
+   destination, currency, amount, and a strict per-authority operation parent or
+   sequence. Its domain-separated `intentId` hashes canonical semantic fields
+   and excludes signatures, checkpoint/binary packaging, transport, and arrival.
+
+A lexicographic minimum `intentId` alone is not recommended because an authorized
+producer can grind otherwise-valid intent fields. Under the V1 recommendation,
+a non-equivocating destination authority has at most one successor for a
+reservation under the strict signed operation-parent/sequence rule. A signer can
+still create conflicting successors; they are portable equivocation evidence and
+make that reservation nonsettleable in the proposal while unrelated GL0 work
+continues. Whether a later adjudication selects one or the reservation waits for
+expiry/refund is still an owner decision. Any randomized rank would require
+precommitment before branch-bound randomness and a separate adaptive-grinding
+proof.
+
+Do not use arrival time, receiver head, map/set traversal, local store order,
+signature bytes, committee arrival, shard arrival, checkpoint packaging, or an
+unconstrained producer-supplied value. The exact intent codec/hash domain,
+authority registry, operation-parent state, equivocation disposition, and future
+native source tag require an explicit owner/schema freeze; `ACCEPT` here is not
+approval to let implementation invent them.
+
+**Owner response:** ACCEPT THE INTENT/PROVENANCE SPLIT; SELECT EQUIVOCATION
+DISPOSITION; REQUEST EXACT SCHEMA / REVISE.
 
 ### O13-B: consume versus expiry deadline
 
@@ -219,7 +255,7 @@ Until O13-A1 through O13-F are frozen, including an exact O13-A3 schema:
 - the existing reject-all behavior remains a confirmed liveness/censorship
   defect, not target semantics.
 
-After approval, implementation proceeds in this order: pure total-order model,
+After approval, implementation proceeds in this order: pure terminal-disposition model,
 reference interpreter rows, production/reference differential corpus, GL0
 settlement kernel, rooted delivery sequence, ML0 inbox-first fold, restart/reorg
 tests, and independent adversarial review.
