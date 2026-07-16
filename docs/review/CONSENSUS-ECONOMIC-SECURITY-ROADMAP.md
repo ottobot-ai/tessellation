@@ -240,6 +240,14 @@ references to the dark codec. That regex inventory is a syntactic fuse, not a
 semantic non-reachability proof. Live MPT hashing, proof bytes, roots, aggregate
 bounds, and runtime selection remain unchanged; E1/SER-005/SER-006 stay open.
 
+The first E1.12 substep is likewise nonactivating. `V4SourceContext` lives only
+under the one-way `modules/tools` dependency boundary and derives the exact
+upstream-v4 Kryo-versus-Brotli-JSON source encoding from frozen inclusive
+environment/ordinal boundaries; callers cannot supply the encoding. It does not
+yet decode or verify legacy bytes, preserve a source proof, emit unsigned
+migration state, or remove any active runtime fallback. E1.12/ERA-004 remain
+open until those behaviors and frozen source fixtures land.
+
 ### E2 - Deterministic conservative framework kernel
 
 **Depends on:** E0 grammar; final codecs integrate after E1.

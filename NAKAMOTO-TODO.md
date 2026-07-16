@@ -157,7 +157,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
         `E1.4`, `E1.10`, `E1.12`, `SER-005`, `ERA-001`, `ERA-004`. The collision
         characterization is GREEN: a Kryo signature transfers across a changed
         `activeAllowSpends` commitment because the V1 projection omits it
-        (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`).
+        (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`). The
+        first importer-only substep is also GREEN: `V4SourceContext` freezes the
+        exact upstream-v4 inclusive Kryo boundaries for all four environments in
+        `modules/tools`, and callers cannot supply or copy an encoding. Source
+        DTOs, exact byte/hash/signature/root verification, deterministic unsigned
+        migration state, frozen fixtures, and removal of every live fallback are
+        still OPEN; this does not close `E1.12` or `ERA-004`.
     - [ ] **1B. Remove the GL0 mirror:** only after 1A is green, remove field 32
       from every GL0 MPT/diff/load/reorg path and reject it at those boundaries.
       Retain it in ML0 `CurrencySnapshotInfo` and its state proof. Gate:

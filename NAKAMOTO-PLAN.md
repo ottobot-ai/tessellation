@@ -210,8 +210,13 @@ already has a hard-coded kill switch.
    `TessellationIOApp.scala:126-129`; `application.conf:57-62`). The resulting
    authority collision is executable: a real Kryo signature remains valid after
    `activeAllowSpends` changes, while the current JSON signature does not
-   (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`). A witness
-   that can be erased from its signed preimage is not a witness.
+   (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`). The initial
+   offline-only boundary now freezes upstream-v4 environment/ordinal encoding
+   selection in `modules/tools` (`V4SourceContext.scala`), including the inclusive
+   ordinal-zero dev Kryo rule. It intentionally cannot verify or convert a source
+   snapshot yet; exact DTOs, bytes/hash/signature/root verification, unsigned
+   migration output, fixtures, and runtime fallback removal remain open. A
+   witness that can be erased from its signed preimage is not a witness.
 2. **Land one strict key-aware reader.** Point, prefix, and raw reads return
    typed absent/present/malformed results with the physical MPT key/path and
    exact immutable copied value bytes. Decoding never drops an entry; reconstruction
