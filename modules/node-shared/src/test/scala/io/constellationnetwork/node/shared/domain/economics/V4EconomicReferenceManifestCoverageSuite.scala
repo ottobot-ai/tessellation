@@ -4,13 +4,9 @@ import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.node.shared.domain.economics.InputProvenance.FrameworkLane
 import io.constellationnetwork.node.shared.domain.economics.ReferenceBalanceScope.Dag
-import io.constellationnetwork.node.shared.domain.economics.ReferenceInput.{AllowSpendCreate, Transfer, UnsupportedManifestOperation}
+import io.constellationnetwork.node.shared.domain.economics.ReferenceInput._
 import io.constellationnetwork.node.shared.domain.economics.ReferenceRejection.UnsupportedOperation
-import io.constellationnetwork.node.shared.domain.economics.SupportedReferenceOperationId.{
-  AllowSpendCreation,
-  CurrencyTransfer,
-  NativeTransfer
-}
+import io.constellationnetwork.node.shared.domain.economics.SupportedReferenceOperationId._
 import io.constellationnetwork.node.shared.domain.economics.TransferLane.{CurrencyCl1, NativeGl1}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.security.hash.Hash
@@ -47,18 +43,27 @@ object V4EconomicReferenceManifestCoverageSuite extends FunSuite {
     AllowSpendCreate(preimage, StructurallyBoundAllowSpendSourceProof(alice, preimage))
   }
 
-  test("the bounded positive subset names exactly the three refrozen reference rows") {
+  private val tokenLockInput = {
+    val preimage = TokenLockPreimage(
+      StructuralTokenLockReference.genesis,
+      TokenLockAtom(domain, NativeGl1, alice, BigInt(1), BigInt(0), Some(BigInt(1)), None)
+    )
+    TokenLockCreate(preimage, StructurallyBoundTokenLockSourceProof(alice, preimage))
+  }
+
+  test("the bounded positive subset names exactly the four refrozen reference rows") {
     val manifestIds = V4EconomicGrammarManifest.operations.iterator.map(_.id).toSet
 
     expect(supportedOperationIds.subsetOf(manifestIds))
-      .and(expect(supportedOperationIds.size == 3))
+      .and(expect(supportedOperationIds.size == 4))
   }
 
   test("each supported manifest ID is owned by exactly one positive input constructor mapping") {
     val positiveMappings = Vector(
       transferInput(NativeGl1).operationId -> NativeTransfer,
       transferInput(CurrencyCl1(metagraphId)).operationId -> CurrencyTransfer,
-      allowSpendInput.operationId -> AllowSpendCreation
+      allowSpendInput.operationId -> AllowSpendCreation,
+      tokenLockInput.operationId -> TokenLockCreation
     )
 
     expect(positiveMappings.forall { case (actual, expected) => actual == expected })

@@ -41,6 +41,11 @@ final case class ReferenceAllowSpendEpochWindow(
   maxOffset: BigInt
 )
 
+final case class ReferenceTokenLockEpochRule(
+  currentEpochProgress: BigInt,
+  minEpochProgressesToLock: BigInt
+)
+
 sealed trait TransferLane extends Product with Serializable {
   def scope: ReferenceBalanceScope
 }
@@ -69,7 +74,8 @@ final case class ReferenceContext(
   domain: ReferenceDomain,
   lane: TransferLane,
   lockedAddresses: SortedSet[Address],
-  allowSpendEpochWindow: Option[ReferenceAllowSpendEpochWindow] = None
+  allowSpendEpochWindow: Option[ReferenceAllowSpendEpochWindow] = None,
+  tokenLockEpochRule: Option[ReferenceTokenLockEpochRule] = None
 )
 
 final case class TransferAtom(
@@ -166,6 +172,59 @@ final case class ReferenceAllowSpendReservation(
   approvers: Vector[Address]
 )
 
+final case class TokenLockAtom(
+  domain: ReferenceDomain,
+  lane: TransferLane,
+  source: Address,
+  amount: BigInt,
+  fee: BigInt,
+  unlockEpoch: Option[BigInt],
+  replaceTokenLockRef: Option[Hash]
+)
+
+final case class StructuralTokenLockReference(ordinal: BigInt, lineage: Vector[TokenLockAtom])
+
+object StructuralTokenLockReference {
+  val genesis: StructuralTokenLockReference = StructuralTokenLockReference(BigInt(0), Vector.empty)
+}
+
+final case class TokenLockPreimage(parent: StructuralTokenLockReference, atom: TokenLockAtom)
+
+/** Test-only evidence for an exact token-lock preimage exclusively bound to its source owner. */
+final case class StructurallyBoundTokenLockSourceProof(
+  signer: Address,
+  signedPreimage: TokenLockPreimage
+)
+
+final case class TokenLockSemanticIdentity private (
+  parent: StructuralTokenLockReference,
+  atom: TokenLockAtom
+) extends ReferenceSemanticIdentity
+
+object TokenLockSemanticIdentity {
+  def derive(preimage: TokenLockPreimage): TokenLockSemanticIdentity =
+    TokenLockSemanticIdentity(preimage.parent, preimage.atom)
+}
+
+final case class ReferenceTokenLockChainAccount(lane: TransferLane, source: Address)
+
+object ReferenceTokenLockChainAccount {
+  implicit val ordering: Ordering[ReferenceTokenLockChainAccount] = new Ordering[ReferenceTokenLockChainAccount] {
+    def compare(left: ReferenceTokenLockChainAccount, right: ReferenceTokenLockChainAccount): Int = {
+      val laneComparison = Ordering[TransferLane].compare(left.lane, right.lane)
+      if (laneComparison != 0) laneComparison else Ordering[Address].compare(left.source, right.source)
+    }
+  }
+}
+
+final case class ReferenceActiveTokenLock(
+  identity: TokenLockSemanticIdentity,
+  scope: ReferenceBalanceScope,
+  source: Address,
+  amount: BigInt,
+  unlockEpoch: Option[BigInt]
+)
+
 sealed trait InputProvenance extends Product with Serializable
 
 object InputProvenance {
@@ -194,7 +253,11 @@ object SupportedReferenceOperationId {
     val value: String = "ECO-ALLOW-CREATE"
   }
 
-  val all: Set[SupportedReferenceOperationId] = Set(NativeTransfer, CurrencyTransfer, AllowSpendCreation)
+  case object TokenLockCreation extends SupportedReferenceOperationId {
+    val value: String = "ECO-TOKEN-LOCK-CREATE"
+  }
+
+  val all: Set[SupportedReferenceOperationId] = Set(NativeTransfer, CurrencyTransfer, AllowSpendCreation, TokenLockCreation)
 
   def fromValue(value: String): Option[SupportedReferenceOperationId] =
     all.find(_.value == value)
@@ -227,6 +290,13 @@ object ReferenceInput {
     proof: StructurallyBoundAllowSpendSourceProof
   ) extends ReferenceInput {
     val operationId: SupportedReferenceOperationId = SupportedReferenceOperationId.AllowSpendCreation
+  }
+
+  final case class TokenLockCreate(
+    preimage: TokenLockPreimage,
+    proof: StructurallyBoundTokenLockSourceProof
+  ) extends ReferenceInput {
+    val operationId: SupportedReferenceOperationId = SupportedReferenceOperationId.TokenLockCreation
   }
 
   final case class UnsupportedManifestOperation private (
@@ -266,9 +336,12 @@ final class ReferenceState private (
   val balances: SortedMap[ReferenceBalanceAccount, BigInt],
   val lastTxRefs: SortedMap[ReferenceChainAccount, StructuralReference],
   val lastAllowSpendRefs: SortedMap[ReferenceAllowSpendChainAccount, StructuralAllowSpendReference],
+  val lastTokenLockRefs: SortedMap[ReferenceTokenLockChainAccount, StructuralTokenLockReference],
   val activeAllowSpendReservations: Vector[ReferenceAllowSpendReservation],
+  val activeTokenLocks: Vector[ReferenceActiveTokenLock],
   val acceptedHistory: Vector[StructuralSemanticIdentity],
-  val acceptedAllowSpendHistory: Vector[AllowSpendSemanticIdentity]
+  val acceptedAllowSpendHistory: Vector[AllowSpendSemanticIdentity],
+  val acceptedTokenLockHistory: Vector[TokenLockSemanticIdentity]
 ) extends Serializable {
   def balanceOf(account: ReferenceBalanceAccount): BigInt = balances.getOrElse(account, BigInt(0))
 
@@ -278,15 +351,23 @@ final class ReferenceState private (
   def lastAllowSpendRefOf(account: ReferenceAllowSpendChainAccount): StructuralAllowSpendReference =
     lastAllowSpendRefs.getOrElse(account, StructuralAllowSpendReference.genesis)
 
+  def lastTokenLockRefOf(account: ReferenceTokenLockChainAccount): StructuralTokenLockReference =
+    lastTokenLockRefs.getOrElse(account, StructuralTokenLockReference.genesis)
+
   def allowSpendReservationOf(identity: AllowSpendSemanticIdentity): Option[ReferenceAllowSpendReservation] =
     activeAllowSpendReservations.find(_.identity == identity)
+
+  def activeTokenLockOf(identity: TokenLockSemanticIdentity): Option[ReferenceActiveTokenLock] =
+    activeTokenLocks.find(_.identity == identity)
 
   override def equals(other: Any): Boolean =
     other match {
       case that: ReferenceState =>
         acceptedDomain == that.acceptedDomain && balances == that.balances && lastTxRefs == that.lastTxRefs &&
-        lastAllowSpendRefs == that.lastAllowSpendRefs && activeAllowSpendReservations == that.activeAllowSpendReservations &&
-        acceptedHistory == that.acceptedHistory && acceptedAllowSpendHistory == that.acceptedAllowSpendHistory
+        lastAllowSpendRefs == that.lastAllowSpendRefs && lastTokenLockRefs == that.lastTokenLockRefs &&
+        activeAllowSpendReservations == that.activeAllowSpendReservations && activeTokenLocks == that.activeTokenLocks &&
+        acceptedHistory == that.acceptedHistory && acceptedAllowSpendHistory == that.acceptedAllowSpendHistory &&
+        acceptedTokenLockHistory == that.acceptedTokenLockHistory
       case _ => false
     }
 
@@ -296,13 +377,16 @@ final class ReferenceState private (
       balances,
       lastTxRefs,
       lastAllowSpendRefs,
+      lastTokenLockRefs,
       activeAllowSpendReservations,
+      activeTokenLocks,
       acceptedHistory,
-      acceptedAllowSpendHistory
+      acceptedAllowSpendHistory,
+      acceptedTokenLockHistory
     ).##
 
   override def toString: String =
-    s"ReferenceState($acceptedDomain,$balances,$lastTxRefs,$lastAllowSpendRefs,$activeAllowSpendReservations,$acceptedHistory,$acceptedAllowSpendHistory)"
+    s"ReferenceState($acceptedDomain,$balances,$lastTxRefs,$lastAllowSpendRefs,$lastTokenLockRefs,$activeAllowSpendReservations,$activeTokenLocks,$acceptedHistory,$acceptedAllowSpendHistory,$acceptedTokenLockHistory)"
 }
 
 object ReferenceState {
@@ -329,6 +413,9 @@ object ReferenceState {
             canonical.filter { case (_, balance) => balance != 0 },
             SortedMap.empty(ReferenceChainAccount.ordering),
             SortedMap.empty(ReferenceAllowSpendChainAccount.ordering),
+            SortedMap.empty(ReferenceTokenLockChainAccount.ordering),
+            Vector.empty,
+            Vector.empty,
             Vector.empty,
             Vector.empty,
             Vector.empty
@@ -343,7 +430,7 @@ object ReferenceState {
     inputs: Vector[ReferenceInput]
   ): Either[ReferenceStateError, ReferenceExecution] =
     validate(context, base).map { _ =>
-      val conservedTotals = totals(base.balances, base.activeAllowSpendReservations)
+      val conservedTotals = totals(base.balances, base.activeAllowSpendReservations, base.activeTokenLocks)
       val (finalState, decisions) = inputs.zipWithIndex.foldLeft((base, Vector.empty[ReferenceDecision])) {
         case ((state, accumulated), (input, inputIndex)) =>
           val (nextState, decision) = attempt(context, state, conservedTotals, input, inputIndex)
@@ -385,6 +472,14 @@ object ReferenceState {
       case AllowSpendCreate(preimage, proof) =>
         val identity = AllowSpendSemanticIdentity.derive(preimage)
         validateAllowSpendCreate(context, state, conservedTotals, preimage, proof, identity) match {
+          case Left(reason) => state -> Rejected(inputIndex, Some(identity), reason)
+          case Right((nextState, writes)) =>
+            nextState -> Accepted(inputIndex, identity, writes, conservedTotals)
+        }
+
+      case TokenLockCreate(preimage, proof) =>
+        val identity = TokenLockSemanticIdentity.derive(preimage)
+        validateTokenLockCreate(context, state, conservedTotals, preimage, proof, identity) match {
           case Left(reason) => state -> Rejected(inputIndex, Some(identity), reason)
           case Right((nextState, writes)) =>
             nextState -> Accepted(inputIndex, identity, writes, conservedTotals)
@@ -438,7 +533,7 @@ object ReferenceState {
       projectedBalances = state.balances
         .updated(sourceAccount, sourceAfter)
         .updated(destinationAccount, destinationAfter)
-      projectedTotals = totals(projectedBalances, state.activeAllowSpendReservations)
+      projectedTotals = totals(projectedBalances, state.activeAllowSpendReservations, state.activeTokenLocks)
       _ <- Either.cond(projectedTotals == conservedTotals, (), ConservationViolation(conservedTotals, projectedTotals))
       successor = StructuralReference(preimage.parent.ordinal + 1, preimage.parent.lineage :+ atom)
       nextState = new ReferenceState(
@@ -446,9 +541,12 @@ object ReferenceState {
         projectedBalances.filter { case (_, balance) => balance != 0 },
         state.lastTxRefs.updated(chainAccount, successor),
         state.lastAllowSpendRefs,
+        state.lastTokenLockRefs,
         state.activeAllowSpendReservations,
+        state.activeTokenLocks,
         state.acceptedHistory :+ identity,
-        state.acceptedAllowSpendHistory
+        state.acceptedAllowSpendHistory,
+        state.acceptedTokenLockHistory
       )
       balanceWrites = Vector(
         Balance(sourceAccount, sourceBefore, sourceAfter),
@@ -515,7 +613,7 @@ object ReferenceState {
       )
       projectedBalances = state.balances.updated(sourceAccount, sourceAfter)
       projectedReservations = state.activeAllowSpendReservations :+ reservation
-      projectedTotals = totals(projectedBalances, projectedReservations)
+      projectedTotals = totals(projectedBalances, projectedReservations, state.activeTokenLocks)
       _ <- Either.cond(projectedTotals == conservedTotals, (), ConservationViolation(conservedTotals, projectedTotals))
       successor = StructuralAllowSpendReference(preimage.parent.ordinal + 1, preimage.parent.lineage :+ atom)
       nextState = new ReferenceState(
@@ -523,14 +621,85 @@ object ReferenceState {
         projectedBalances.filter { case (_, balance) => balance != 0 },
         state.lastTxRefs,
         state.lastAllowSpendRefs.updated(chainAccount, successor),
+        state.lastTokenLockRefs,
         projectedReservations,
+        state.activeTokenLocks,
         state.acceptedHistory,
-        state.acceptedAllowSpendHistory :+ identity
+        state.acceptedAllowSpendHistory :+ identity,
+        state.acceptedTokenLockHistory
       )
       writes = Vector(
         Balance(sourceAccount, sourceBefore, sourceAfter),
         AllowSpendReservationCreated(reservation),
         AllowSpendReference(chainAccount, expectedParent, successor),
+        ReplayIdentity(identity)
+      )
+    } yield (nextState, writes)
+  }
+
+  private def validateTokenLockCreate(
+    context: ReferenceContext,
+    state: ReferenceState,
+    conservedTotals: SortedMap[ReferenceBalanceScope, BigInt],
+    preimage: TokenLockPreimage,
+    proof: StructurallyBoundTokenLockSourceProof,
+    identity: TokenLockSemanticIdentity
+  ): Either[ReferenceRejection, (ReferenceState, Vector[ReferenceWrite])] = {
+    val atom = preimage.atom
+    val chainAccount = ReferenceTokenLockChainAccount(atom.lane, atom.source)
+    val sourceAccount = ReferenceBalanceAccount(atom.lane.scope, atom.source)
+
+    for {
+      _ <- Either.cond(!state.acceptedTokenLockHistory.contains(identity), (), DuplicateSemanticIdentity(identity))
+      _ <- Either.cond(atom.domain == context.domain, (), UnexpectedDomain(context.domain, atom.domain))
+      _ <- Either.cond(atom.lane == context.lane, (), UnexpectedLane(context.lane, atom.lane))
+      _ <- Either.cond(proof.signedPreimage == preimage, (), TokenLockProofPreimageMismatch(preimage, proof.signedPreimage))
+      _ <- Either.cond(proof.signer == atom.source, (), TokenLockProofSignerMismatch(atom.source, proof.signer))
+      _ <- Either.cond(atom.amount > 0, (), AmountNotPositive(atom.amount))
+      _ <- validateScalar("amount", atom.amount)
+      _ <- validateScalar("fee", atom.fee)
+      _ <- Either.cond(atom.fee == 0, (), FeeDispositionUnfrozen(atom.fee))
+      _ <- atom.replaceTokenLockRef.toLeft(()).left.map(TokenLockReplacementUnsupported)
+      _ <- Either.cond(!context.lockedAddresses.contains(atom.source), (), LockedSource(atom.source))
+      _ <- validateTokenLockEpoch(context.tokenLockEpochRule, atom.unlockEpoch)
+      _ <- Either.cond(
+        preimage.parent.ordinal == BigInt(preimage.parent.lineage.size),
+        (),
+        MalformedTokenLockParentReference(preimage.parent.ordinal, preimage.parent.lineage.size)
+      )
+      expectedParent = state.lastTokenLockRefOf(chainAccount)
+      _ <- Either.cond(
+        preimage.parent == expectedParent,
+        (),
+        TokenLockParentReferenceMismatch(expectedParent, preimage.parent)
+      )
+      sourceBefore = state.balanceOf(sourceAccount)
+      gross = atom.amount + atom.fee
+      _ <- Either.cond(sourceBefore >= gross, (), InsufficientBalance(sourceAccount, gross, sourceBefore))
+      sourceAfter = sourceBefore - gross
+      _ <- validateProjected(sourceAccount, sourceAfter)
+      activeTokenLock = ReferenceActiveTokenLock(identity, atom.lane.scope, atom.source, atom.amount, atom.unlockEpoch)
+      projectedBalances = state.balances.updated(sourceAccount, sourceAfter)
+      projectedTokenLocks = state.activeTokenLocks :+ activeTokenLock
+      projectedTotals = totals(projectedBalances, state.activeAllowSpendReservations, projectedTokenLocks)
+      _ <- Either.cond(projectedTotals == conservedTotals, (), ConservationViolation(conservedTotals, projectedTotals))
+      successor = StructuralTokenLockReference(preimage.parent.ordinal + 1, preimage.parent.lineage :+ atom)
+      nextState = new ReferenceState(
+        Some(atom.domain),
+        projectedBalances.filter { case (_, balance) => balance != 0 },
+        state.lastTxRefs,
+        state.lastAllowSpendRefs,
+        state.lastTokenLockRefs.updated(chainAccount, successor),
+        state.activeAllowSpendReservations,
+        projectedTokenLocks,
+        state.acceptedHistory,
+        state.acceptedAllowSpendHistory,
+        state.acceptedTokenLockHistory :+ identity
+      )
+      writes = Vector(
+        Balance(sourceAccount, sourceBefore, sourceAfter),
+        ActiveTokenLockCreated(activeTokenLock),
+        TokenLockReference(chainAccount, expectedParent, successor),
         ReplayIdentity(identity)
       )
     } yield (nextState, writes)
@@ -573,6 +742,42 @@ object ReferenceState {
         } yield ()
     }
 
+  private def validateTokenLockEpoch(
+    maybeRule: Option[ReferenceTokenLockEpochRule],
+    unlockEpoch: Option[BigInt]
+  ): Either[ReferenceRejection, Unit] =
+    maybeRule match {
+      case None => Left(MissingTokenLockEpochRule)
+      case Some(rule) =>
+        for {
+          _ <- validateScalar("currentEpochProgress", rule.currentEpochProgress)
+          _ <- validateScalar("minEpochProgressesToLock", rule.minEpochProgressesToLock)
+          minimumUnlockEpoch = rule.currentEpochProgress + rule.minEpochProgressesToLock
+          _ <- Either.cond(
+            minimumUnlockEpoch <= MaxBalance,
+            (),
+            InvalidTokenLockEpochRule(rule)
+          )
+          _ <- unlockEpoch match {
+            case None => Right(())
+            case Some(value) =>
+              for {
+                _ <- validateScalar("unlockEpoch", value)
+                _ <- Either.cond(
+                  value > rule.currentEpochProgress,
+                  (),
+                  TokenLockAlreadyUnlocked(value, rule.currentEpochProgress)
+                )
+                _ <- Either.cond(
+                  value >= minimumUnlockEpoch,
+                  (),
+                  TokenLockUnlockEpochTooShort(value, minimumUnlockEpoch)
+                )
+              } yield ()
+          }
+        } yield ()
+    }
+
   private def validateScalar(field: String, value: BigInt): Either[ReferenceRejection, Unit] =
     Either.cond(value >= 0 && value <= MaxBalance, (), ScalarOutOfRange(field, value))
 
@@ -584,7 +789,8 @@ object ReferenceState {
 
   private def totals(
     balances: SortedMap[ReferenceBalanceAccount, BigInt],
-    reservations: Vector[ReferenceAllowSpendReservation]
+    reservations: Vector[ReferenceAllowSpendReservation],
+    tokenLocks: Vector[ReferenceActiveTokenLock]
   ): SortedMap[ReferenceBalanceScope, BigInt] = {
     val spendable = balances
       .foldLeft(SortedMap.empty[ReferenceBalanceScope, BigInt](ReferenceBalanceScope.ordering)) {
@@ -592,9 +798,14 @@ object ReferenceState {
           acc.updated(account.scope, acc.getOrElse(account.scope, BigInt(0)) + balance)
       }
 
-    reservations
+    val withReservations = reservations
       .foldLeft(spendable) { (acc, reservation) =>
         acc.updated(reservation.scope, acc.getOrElse(reservation.scope, BigInt(0)) + reservation.amount)
+      }
+
+    tokenLocks
+      .foldLeft(withReservations) { (acc, tokenLock) =>
+        acc.updated(tokenLock.scope, acc.getOrElse(tokenLock.scope, BigInt(0)) + tokenLock.amount)
       }
       .filter { case (_, total) => total != 0 }
   }
@@ -610,6 +821,8 @@ object ReferenceRejection {
   final case class ProofSignerMismatch(expected: Address, actual: Address) extends ReferenceRejection
   final case class AllowSpendProofPreimageMismatch(expected: AllowSpendPreimage, actual: AllowSpendPreimage) extends ReferenceRejection
   final case class AllowSpendProofSignerMismatch(expected: Address, actual: Address) extends ReferenceRejection
+  final case class TokenLockProofPreimageMismatch(expected: TokenLockPreimage, actual: TokenLockPreimage) extends ReferenceRejection
+  final case class TokenLockProofSignerMismatch(expected: Address, actual: Address) extends ReferenceRejection
   final case class AmountNotPositive(amount: BigInt) extends ReferenceRejection
   final case class ScalarOutOfRange(field: String, value: BigInt) extends ReferenceRejection
   final case class FeeDispositionUnfrozen(fee: BigInt) extends ReferenceRejection
@@ -621,12 +834,22 @@ object ReferenceRejection {
   final case class AllowSpendAlreadyExpired(lastValidEpochProgress: BigInt, currentEpochProgress: BigInt) extends ReferenceRejection
   final case class AllowSpendEpochOutsideWindow(lastValidEpochProgress: BigInt, lowerBound: BigInt, upperBound: BigInt)
       extends ReferenceRejection
+  final case class TokenLockReplacementUnsupported(replaceTokenLockRef: Hash) extends ReferenceRejection
+  case object MissingTokenLockEpochRule extends ReferenceRejection
+  final case class InvalidTokenLockEpochRule(rule: ReferenceTokenLockEpochRule) extends ReferenceRejection
+  final case class TokenLockAlreadyUnlocked(unlockEpoch: BigInt, currentEpochProgress: BigInt) extends ReferenceRejection
+  final case class TokenLockUnlockEpochTooShort(unlockEpoch: BigInt, minimumUnlockEpoch: BigInt) extends ReferenceRejection
   final case class MalformedParentReference(ordinal: BigInt, lineageSize: Int) extends ReferenceRejection
   final case class ParentReferenceMismatch(expected: StructuralReference, actual: StructuralReference) extends ReferenceRejection
   final case class MalformedAllowSpendParentReference(ordinal: BigInt, lineageSize: Int) extends ReferenceRejection
   final case class AllowSpendParentReferenceMismatch(
     expected: StructuralAllowSpendReference,
     actual: StructuralAllowSpendReference
+  ) extends ReferenceRejection
+  final case class MalformedTokenLockParentReference(ordinal: BigInt, lineageSize: Int) extends ReferenceRejection
+  final case class TokenLockParentReferenceMismatch(
+    expected: StructuralTokenLockReference,
+    actual: StructuralTokenLockReference
   ) extends ReferenceRejection
   final case class InsufficientBalance(account: ReferenceBalanceAccount, required: BigInt, available: BigInt) extends ReferenceRejection
   final case class ProjectedBalanceOutOfRange(account: ReferenceBalanceAccount, projected: BigInt) extends ReferenceRejection
@@ -655,6 +878,12 @@ object ReferenceWrite {
     account: ReferenceAllowSpendChainAccount,
     before: StructuralAllowSpendReference,
     after: StructuralAllowSpendReference
+  ) extends ReferenceWrite
+  final case class ActiveTokenLockCreated(tokenLock: ReferenceActiveTokenLock) extends ReferenceWrite
+  final case class TokenLockReference(
+    account: ReferenceTokenLockChainAccount,
+    before: StructuralTokenLockReference,
+    after: StructuralTokenLockReference
   ) extends ReferenceWrite
   final case class ReplayIdentity(identity: ReferenceSemanticIdentity) extends ReferenceWrite
 }
@@ -692,11 +921,11 @@ final case class ReferenceExecution(
   }
 }
 
-/** Independent, test-only transition oracle for the bounded E2.1 transfer and allow-spend-create tranches.
+/** Independent, test-only transition oracle for the bounded E2.1 transfer, allow-spend-create, and token-lock-create tranches.
   *
-  * It intentionally supports only zero-fee native/currency transfers and zero-fee native/currency allow-spend creation. It performs no
-  * production hashing, signature verification, balance arithmetic, transition-manager calls, serialization, MPT writes, or root
-  * computation.
+  * It intentionally supports only zero-fee native/currency transfers, zero-fee native/currency allow-spend creation, and zero-fee
+  * nonreplacement native/currency token-lock creation. It performs no production hashing, signature verification, balance arithmetic,
+  * transition-manager calls, serialization, MPT writes, or root computation.
   */
 object V4EconomicReferenceInterpreter {
   def execute(
