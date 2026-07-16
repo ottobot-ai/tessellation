@@ -277,6 +277,8 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     hash: Hash
   )
 
+  private val retainedExactParentHash: Hash = Hash("ab" * 32)
+
   private final case class StrictCycleNode(
     name: String,
     ordinal: Long,
@@ -372,7 +374,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
   /** Build snapshots whose signed ordinal and signed parent hash match the chain-store metadata. The older `seedChainOfLength` fixture is
     * intentionally metadata-only and must not be used to prove exact signed ancestry.
     */
-  private def mkSignedLinkedChain(length: Int)(
+  private def mkSignedLinkedChain(length: Int, initialParentHash: Hash = Hash.empty)(
     implicit H: Hasher[IO],
     S: SecurityProvider[IO],
     j: JsonSerializer[IO]
@@ -381,7 +383,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       templatePair <- mkGenesis
       (template, context) = templatePair
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
-      result <- (1 to length).toList.foldLeftM[IO, (List[LinkedSnapshot], Hash)]((Nil, Hash.empty)) {
+      result <- (1 to length).toList.foldLeftM[IO, (List[LinkedSnapshot], Hash)]((Nil, initialParentHash)) {
         case ((acc, parentHash), ordinal) =>
           val value = template.value.copy(
             ordinal = SnapshotOrdinal.unsafeApply(ordinal.toLong),
@@ -1733,7 +1735,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStore()
       (chainStore, _, _, _) = r
-      chain <- mkSignedLinkedChain(3)
+      chain <- mkSignedLinkedChain(3, retainedExactParentHash)
       _ <- chain.traverse_ { item =>
         chainStore
           .store(
@@ -1759,6 +1761,64 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       }
   }
 
+  test("walkBackExact: accepts Hash.empty as the signed parent only at ordinal zero") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      template <- mkSignedLinkedChain(1, retainedExactParentHash).map(_.head)
+      keyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
+        template.signed.value.copy(
+          ordinal = SnapshotOrdinal.MinValue,
+          lastSnapshotHash = Hash.empty,
+          epochProgress = EpochProgress.MinValue
+        ),
+        keyPair
+      )
+      hashed <- genesis.toHashed[IO]
+      _ <- diskByHashRef.set(Map(hashed.hash -> genesis))
+      position = NakamotoChainStore.ExactWalkPosition(hashed.hash, SnapshotOrdinal.MinValue)
+      result <- chainStore.walkBackExact(position, SnapshotOrdinal.MinValue, maxSteps = 1)
+    } yield
+      expect.same(
+        Right(NakamotoChainStore.ExactWalkResult.Complete(Vector(NakamotoChainStore.ExactWalkLink(position, Hash.empty)))),
+        result
+      )
+  }
+
+  test("walkBackExact: rejects Hash.empty as a signed parent above ordinal zero") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      r <- mkChainStoreWithDisk()
+      (chainStore, _, _, diskByHashRef) = r
+      item <- mkSignedLinkedChain(1).map(_.head)
+      _ <- diskByHashRef.set(Map(item.hash -> item.signed))
+      position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
+      result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
+    } yield
+      expect.same(
+        Left(
+          NakamotoChainStore.ExactWalkError.NonCanonicalSnapshotHash(
+            position,
+            NakamotoChainStore.ExactWalkHashRole.SignedParent,
+            Hash.empty
+          )
+        ),
+        result
+      )
+  }
+
   test("walkBackExact: cross-era reconstruction rejects until canonical identity migrates end to end") { res =>
     val (_, _, j, h, sp) = res
     implicit val jSer: JsonSerializer[IO] = j
@@ -1781,13 +1841,13 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStore()
       (chainStore, _, _, _) = r
-      item <- mkSignedLinkedChain(1).map(_.head)
+      item <- mkSignedLinkedChain(1, retainedExactParentHash).map(_.head)
       stored <- chainStore.store(
         item.signed,
         item.context,
         ordinal = 1L,
         slot = 1L,
-        parentHash = Hash.empty,
+        parentHash = item.signed.value.lastSnapshotHash,
         vrfOutput = Array.empty
       )
       storedByHistoricalHash <- chainStore.get(historicalHash)
@@ -1840,7 +1900,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, _, diskByHashRef) = r
-      item <- mkSignedLinkedChain(1).map(_.head)
+      item <- mkSignedLinkedChain(1, retainedExactParentHash).map(_.head)
       _ <- diskByHashRef.set(Map(item.hash -> item.signed))
       position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
       result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
@@ -1865,7 +1925,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, _, diskByHashRef) = r
-      item <- mkSignedLinkedChain(1).map(_.head)
+      item <- mkSignedLinkedChain(1, retainedExactParentHash).map(_.head)
       _ <- diskByHashRef.set(Map(item.hash -> item.signed))
       position = NakamotoChainStore.ExactWalkPosition(item.hash, item.signed.value.ordinal)
       result <- chainStore.walkBackExact(position, position.ordinal, maxSteps = 1)
@@ -1885,7 +1945,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, diskRef, diskByHashRef) = r
-      chain <- mkSignedLinkedChain(1)
+      chain <- mkSignedLinkedChain(1, retainedExactParentHash)
       original = chain.head
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       siblingSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
@@ -1919,7 +1979,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, diskRef, _) = r
-      chain <- mkSignedLinkedChain(1)
+      chain <- mkSignedLinkedChain(1, retainedExactParentHash)
       requested = chain.head
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       siblingSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
@@ -1977,7 +2037,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStore()
       (chainStore, _, _, _) = r
-      chain <- mkSignedLinkedChain(3)
+      chain <- mkSignedLinkedChain(3, retainedExactParentHash)
       child = chain.last
       _ <- chainStore.store(
         child.signed,
@@ -2015,7 +2075,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
       (ordinalStore, _, _, _) = ordinalStoreFixture
       parentStoreFixture <- mkChainStore()
       (parentStore, _, _, _) = parentStoreFixture
-      chain <- mkSignedLinkedChain(1)
+      chain <- mkSignedLinkedChain(1, retainedExactParentHash)
       item = chain.head
       _ <- ordinalStore.store(item.signed, item.context, 2L, 2L, item.signed.value.lastSnapshotHash, Array.empty)
       ordinalResult <- ordinalStore.walkBackExact(
@@ -2046,7 +2106,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, _, diskByHashRef) = r
-      chain <- mkSignedLinkedChain(1)
+      chain <- mkSignedLinkedChain(1, retainedExactParentHash)
       item = chain.head
       _ <- diskByHashRef.set(Map(requestedHash -> item.signed))
       result <- chainStore.walkBackExact(
@@ -2073,7 +2133,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
         ordinal,
         maxSteps = 1
       )
-      chain <- mkSignedLinkedChain(1)
+      chain <- mkSignedLinkedChain(1, retainedExactParentHash)
       template = chain.head
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       invalidParentSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
@@ -2118,7 +2178,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStore()
       (chainStore, _, _, _) = r
-      chain <- mkSignedLinkedChain(1)
+      chain <- mkSignedLinkedChain(1, retainedExactParentHash)
       parent = chain.head
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       childSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
@@ -2161,7 +2221,7 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     for {
       r <- mkChainStoreWithDisk()
       (chainStore, _, _, diskByHashRef) = r
-      template <- mkSignedLinkedChain(1).map(_.head)
+      template <- mkSignedLinkedChain(1, retainedExactParentHash).map(_.head)
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       cyclicSigned <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](
         template.signed.value.copy(

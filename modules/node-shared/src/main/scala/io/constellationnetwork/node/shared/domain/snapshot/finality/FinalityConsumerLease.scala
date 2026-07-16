@@ -12,9 +12,9 @@ import eu.timepit.refined.types.numeric.NonNegLong
 /** Closed registry implemented by the dark exact-ancestor slice.
   *
   * This ADT deliberately has no generic/string escape hatch and no wire codec. It is not the activation-complete O-16B registry:
-  * current-Phase-2-head `/latest` serving is deliberately absent until that separate policy is implemented and tested. `ExactServing`
-  * means an exact-reference request and must never be used for `/latest`. Adding a consumer requires adding a distinct case and updating
-  * the exhaustive policy match in [[Phase2ReferencePolicy.forScope]].
+  * current-Phase-2-head `/latest` serving is deliberately absent until that separate policy is implemented and tested. `ExactServing` means
+  * an exact-reference request and must never be used for `/latest`. Adding a consumer requires adding a distinct case and updating the
+  * exhaustive policy match in [[Phase2ReferencePolicy.forScope]].
   */
 sealed trait Phase2UseScope extends Product with Serializable
 
@@ -42,8 +42,8 @@ object Phase2UseScope {
 /** Local reference-use policy. This dark first slice has only exact, still-canonical Phase-2 ancestors.
   *
   * In particular there is no latest-head substitution policy: a new head or same-ordinal replacement cannot satisfy a capability captured
-  * for another exact reference. This does not classify or activate `/latest` serving; that O-16B policy remains an explicit activation
-  * gate rather than being guessed by this kernel.
+  * for another exact reference. This does not classify or activate `/latest` serving; that O-16B policy remains an explicit activation gate
+  * rather than being guessed by this kernel.
   */
 sealed trait Phase2ReferencePolicy extends Product with Serializable
 
@@ -53,24 +53,24 @@ object Phase2ReferencePolicy {
   /** Compiler-visible exhaustive policy assignment. Do not replace this with a default branch. */
   def forScope(scope: Phase2UseScope): Phase2ReferencePolicy =
     scope match {
-      case _: Phase2UseScope.BinaryAdmission                   => ExactCanonicalAncestor
-      case _: Phase2UseScope.BinaryConfirmationRequeue         => ExactCanonicalAncestor
-      case _: Phase2UseScope.ShardExecutionBase                => ExactCanonicalAncestor
-      case _: Phase2UseScope.CheckpointInclusion               => ExactCanonicalAncestor
-      case _: Phase2UseScope.CheckpointAnchorAdvancement       => ExactCanonicalAncestor
-      case _: Phase2UseScope.AssignedWatchtowerReplay          => ExactCanonicalAncestor
-      case _: Phase2UseScope.ChallengeAdjudication             => ExactCanonicalAncestor
-      case _: Phase2UseScope.CrossMetagraphSettlement          => ExactCanonicalAncestor
-      case _: Phase2UseScope.HistoricalEconomicRead            => ExactCanonicalAncestor
-      case _: Phase2UseScope.OptimisticSamplerRegistryContext  => ExactCanonicalAncestor
-      case _: Phase2UseScope.TowerEligibilityRegistryContext   => ExactCanonicalAncestor
-      case _: Phase2UseScope.TowerProofServing                 => ExactCanonicalAncestor
-      case _: Phase2UseScope.ProtocolCorrection                => ExactCanonicalAncestor
-      case _: Phase2UseScope.FollowerAdoption                  => ExactCanonicalAncestor
-      case _: Phase2UseScope.ExactServing                      => ExactCanonicalAncestor
-      case _: Phase2UseScope.BootstrapBundleServing            => ExactCanonicalAncestor
-      case _: Phase2UseScope.RetentionRecovery                 => ExactCanonicalAncestor
-      case _: Phase2UseScope.DownstreamEventDelivery           => ExactCanonicalAncestor
+      case _: Phase2UseScope.BinaryAdmission                  => ExactCanonicalAncestor
+      case _: Phase2UseScope.BinaryConfirmationRequeue        => ExactCanonicalAncestor
+      case _: Phase2UseScope.ShardExecutionBase               => ExactCanonicalAncestor
+      case _: Phase2UseScope.CheckpointInclusion              => ExactCanonicalAncestor
+      case _: Phase2UseScope.CheckpointAnchorAdvancement      => ExactCanonicalAncestor
+      case _: Phase2UseScope.AssignedWatchtowerReplay         => ExactCanonicalAncestor
+      case _: Phase2UseScope.ChallengeAdjudication            => ExactCanonicalAncestor
+      case _: Phase2UseScope.CrossMetagraphSettlement         => ExactCanonicalAncestor
+      case _: Phase2UseScope.HistoricalEconomicRead           => ExactCanonicalAncestor
+      case _: Phase2UseScope.OptimisticSamplerRegistryContext => ExactCanonicalAncestor
+      case _: Phase2UseScope.TowerEligibilityRegistryContext  => ExactCanonicalAncestor
+      case _: Phase2UseScope.TowerProofServing                => ExactCanonicalAncestor
+      case _: Phase2UseScope.ProtocolCorrection               => ExactCanonicalAncestor
+      case _: Phase2UseScope.FollowerAdoption                 => ExactCanonicalAncestor
+      case _: Phase2UseScope.ExactServing                     => ExactCanonicalAncestor
+      case _: Phase2UseScope.BootstrapBundleServing           => ExactCanonicalAncestor
+      case _: Phase2UseScope.RetentionRecovery                => ExactCanonicalAncestor
+      case _: Phase2UseScope.DownstreamEventDelivery          => ExactCanonicalAncestor
     }
 }
 
@@ -96,10 +96,10 @@ private[finality] object Phase2ConsumerSink {
 
 /** Immutable coordinator view consumed by the dark pure kernel.
   *
-  * This is not finality evidence. A future runtime must construct it under the finality coordinator's serialization boundary from a
-  * durably verified head, exact canonical lineage, and retained released records. `currentSelectionByTarget` is deliberately target
-  * indexed: each retained operational ancestor binds the current decision and exact target-to-selected-tip lineage. A singleton token
-  * would incorrectly make only the newest operational target usable. No live runtime constructs this view today.
+  * This is not finality evidence. A future runtime must construct it under the finality coordinator's serialization boundary from a durably
+  * verified head, exact canonical lineage, and retained released records. `currentSelectionByTarget` is deliberately target indexed: each
+  * retained operational ancestor binds the current decision and exact target-to-selected-tip lineage. A singleton token would incorrectly
+  * make only the newest operational target usable. No live runtime constructs this view today.
   */
 private[finality] final case class FinalityConsumerLeaseState(
   mode: CoordinatorMode,
@@ -145,13 +145,10 @@ private[finality] sealed trait Phase2CanonicalLineageDefect extends Product with
 private[finality] object Phase2CanonicalLineageDefect {
   case object Empty extends Phase2CanonicalLineageDefect
   final case class DuplicateHash(hash: Hash) extends Phase2CanonicalLineageDefect
-  final case class DuplicateOrdinal(left: GlobalSnapshotStateRef, right: GlobalSnapshotStateRef)
-      extends Phase2CanonicalLineageDefect
-  final case class NonConsecutiveOrdinal(parent: GlobalSnapshotStateRef, child: GlobalSnapshotStateRef)
-      extends Phase2CanonicalLineageDefect
+  final case class DuplicateOrdinal(left: GlobalSnapshotStateRef, right: GlobalSnapshotStateRef) extends Phase2CanonicalLineageDefect
+  final case class NonConsecutiveOrdinal(parent: GlobalSnapshotStateRef, child: GlobalSnapshotStateRef) extends Phase2CanonicalLineageDefect
   final case class OrdinalExhausted(parent: GlobalSnapshotStateRef) extends Phase2CanonicalLineageDefect
-  final case class BrokenParent(parent: GlobalSnapshotStateRef, child: GlobalSnapshotStateRef)
-      extends Phase2CanonicalLineageDefect
+  final case class BrokenParent(parent: GlobalSnapshotStateRef, child: GlobalSnapshotStateRef) extends Phase2CanonicalLineageDefect
   final case class InvalidReference(reference: GlobalSnapshotStateRef) extends Phase2CanonicalLineageDefect
 }
 
@@ -178,10 +175,8 @@ private[finality] object FinalityConsumerLeaseFailure {
       extends Phase2MissingFailure
       with Phase2EvidenceFailure
 
-  final case class ReferenceReplaced(target: GlobalSnapshotStateRef, replacement: GlobalSnapshotStateRef)
-      extends Phase2ReplacementFailure
-  final case class LineageReplaced(expected: CanonicalLineageRevision, observed: CanonicalLineageRevision)
-      extends Phase2ReplacementFailure
+  final case class ReferenceReplaced(target: GlobalSnapshotStateRef, replacement: GlobalSnapshotStateRef) extends Phase2ReplacementFailure
+  final case class LineageReplaced(expected: CanonicalLineageRevision, observed: CanonicalLineageRevision) extends Phase2ReplacementFailure
 
   final case class AcquisitionStale(
     expectedBranch: CanonicalBranchRevision,
@@ -191,24 +186,19 @@ private[finality] object FinalityConsumerLeaseFailure {
   ) extends Phase2StaleFailure
   final case class BranchRevisionRegressed(expectedAtLeast: CanonicalBranchRevision, observed: CanonicalBranchRevision)
       extends Phase2StaleFailure
-  final case class SinkRevisionStale(expected: Phase2ConsumerSinkRevision, observed: Phase2ConsumerSinkRevision)
-      extends Phase2StaleFailure
+  final case class SinkRevisionStale(expected: Phase2ConsumerSinkRevision, observed: Phase2ConsumerSinkRevision) extends Phase2StaleFailure
 
   final case class WrongPurpose(expected: Phase2UseScope, observed: Phase2UseScope) extends Phase2WrongPurposeFailure
-  final case class WrongTarget(expected: GlobalSnapshotStateRef, observed: GlobalSnapshotStateRef)
-      extends Phase2WrongPurposeFailure
+  final case class WrongTarget(expected: GlobalSnapshotStateRef, observed: GlobalSnapshotStateRef) extends Phase2WrongPurposeFailure
 
-  final case class EvidenceMismatch(target: GlobalSnapshotStateRef, component: Phase2EvidenceComponent)
-      extends Phase2EvidenceFailure
-  final case class ReleasedCoreChanged(expected: ReleasedCorePointer, observed: Option[ReleasedCorePointer])
-      extends Phase2EvidenceFailure
+  final case class EvidenceMismatch(target: GlobalSnapshotStateRef, component: Phase2EvidenceComponent) extends Phase2EvidenceFailure
+  final case class ReleasedCoreChanged(expected: ReleasedCorePointer, observed: Option[ReleasedCorePointer]) extends Phase2EvidenceFailure
   final case class MalformedCanonicalLineage(defect: Phase2CanonicalLineageDefect) extends Phase2EvidenceFailure
   final case class LineageIdentityFailed(error: FinalityIdentityError) extends Phase2EvidenceFailure
 
   final case class InvalidCommandIdentity(field: Phase2CommandIdentityField) extends FinalityConsumerLeaseFailure
 
-  final case class CommandIdCollision(existing: Phase2AppliedCommand, attempted: Phase2AppliedCommand)
-      extends FinalityConsumerLeaseFailure
+  final case class CommandIdCollision(existing: Phase2AppliedCommand, attempted: Phase2AppliedCommand) extends FinalityConsumerLeaseFailure
   final case class RevisionExhausted(revision: Phase2ConsumerSinkRevision) extends FinalityConsumerLeaseFailure
 }
 
@@ -259,8 +249,7 @@ private[finality] object Phase2CommitResult {
   final case class Committed(state: FinalityConsumerLeaseState, command: Phase2AppliedCommand) extends Phase2CommitResult
   final case class AlreadyCommitted(state: FinalityConsumerLeaseState, command: Phase2AppliedCommand) extends Phase2CommitResult
   final case class Stale(state: FinalityConsumerLeaseState, failure: FinalityConsumerLeaseFailure) extends Phase2CommitResult
-  final case class RecoveryRequired(state: FinalityConsumerLeaseState, failure: FinalityConsumerLeaseFailure)
-      extends Phase2CommitResult
+  final case class RecoveryRequired(state: FinalityConsumerLeaseState, failure: FinalityConsumerLeaseFailure) extends Phase2CommitResult
 }
 
 /** Dark, pure O-16 race kernel.
@@ -402,11 +391,11 @@ private[finality] object FinalityConsumerLeaseKernel {
     currentForCommit(state, lease, command) match {
       case Left(failure @ FinalityConsumerLeaseFailure.RecoveryRequired(_)) =>
         Phase2CommitResult.RecoveryRequired(state, failure)
-      case Left(failure)                       => Stale(state, failure)
+      case Left(failure) => Stale(state, failure)
       case Right(_) =>
         state.sink.applied.get(command.commandId) match {
           case Some(existing) if existing == attempted => AlreadyCommitted(state, existing)
-          case Some(existing)                           => Phase2CommitResult.RecoveryRequired(state, CommandIdCollision(existing, attempted))
+          case Some(existing) => Phase2CommitResult.RecoveryRequired(state, CommandIdCollision(existing, attempted))
           case None if state.sink.revision != lease.sinkRevision =>
             Stale(state, SinkRevisionStale(lease.sinkRevision, state.sink.revision))
           case None =>
@@ -617,7 +606,9 @@ private[finality] object FinalityConsumerLeaseKernel {
       canonical.headOption match {
         case None => Some(Empty: Phase2CanonicalLineageDefect)
         case Some(_) =>
-          canonical.find(reference => !stateRefIsNonEmpty(reference)).map(InvalidReference)
+          canonical
+            .find(reference => !stateRefIsNonEmpty(reference))
+            .map(InvalidReference)
             .orElse(
               canonical
                 .groupBy(_.hash)

@@ -990,6 +990,24 @@ delivery, rollback, and recovery.
   recovery. Chain-store admission must also derive ordinal, parent, slot, and VRF
   metadata from the authenticated signed snapshot instead of trusting parallel
   caller arguments.
+- A dark P6/E10 candidate-scoped exact replay-history prerequisite now requests
+  exact `(hash,ordinal)` chain-store artifacts, performs a one-link exact walk,
+  re-reads and content-rehashes the signed snapshot, and ignores
+  `StoredSnapshot.context`
+  (`NakamotoChainStoreExactReplayHistorySource.scala:16-20,29-61,65-146`). Its
+  session anchors the complete `GlobalSnapshotStateRef`, validates all four
+  fields, bounds the parent walk and target batch, deduplicates requests, rejects
+  ordinal-sibling substitution, and caches each exact position's typed result,
+  raised error, or cancellation (`ExactReplayHistory.scala:18-36,189-230,
+  253-392,395-505`; `ExactReplayHistorySessionSuite.scala:144-337,339-510`). It
+  has no codec or live caller and conveys structural history only, not Phase-2,
+  state-image validity, or economic replay authority.
+- Activation still requires the P6 exact Phase-2 lease/evidence and density-reorg
+  invalidation, a signed complete `GlobalSyncView`, P10's exact root-verified
+  historical `GlobalStateReader`/MPT image, pinning message validation and every
+  economic read to the same candidate session, live migration, and hash-era
+  crossing. Missing history defers or enters authenticated recovery. This dark
+  slice closes neither FIN-14 nor E10.
 - The first dark L-23 durability slice originally landed without changing the
   then-live finality rails. The later containment described above disabled the
   unsafe optimistic sink independently of this still-dark store. ScodecV1

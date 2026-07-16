@@ -898,6 +898,25 @@ criteria are in `NAKAMOTO-PLAN.md`.
     canonical-identity migration across every producer, verifier, KES, overlay,
     gossip, storage, and recovery path, using a discriminator stronger than the
     current coarse `HashLogic`.
+  - [ ] **P6/E10 DARK PREREQUISITE - candidate-scoped exact replay history,
+    without authority.** The chain-store source requests exact `(hash,ordinal)`,
+    performs a one-link exact walk, re-reads and content-rehashes the signed
+    snapshot, and ignores `StoredSnapshot.context`
+    (`NakamotoChainStoreExactReplayHistorySource.scala:16-20,29-61,65-146`). The
+    session anchors the complete `GlobalSnapshotStateRef`, validates all four
+    fields, bounds the parent walk and unique targets, batches/deduplicates reads,
+    rejects ordinal-sibling substitution, and caches each exact position's typed
+    result, raised error, or cancellation (`ExactReplayHistory.scala:18-36,189-230,
+    253-392,395-505`; `ExactReplayHistorySessionSuite.scala:144-337,339-510`). It
+    has no codec or live caller and is not a Phase-2 lease, state-validity proof,
+    root-verified MPT image, or economic replay capability.
+  - [ ] Keep the activation boundary open until P6 supplies exact Phase-2
+    lease/evidence and density-reorg invalidation; the signed complete
+    `GlobalSyncView` exists; P10 supplies an exact root-verified historical
+    `GlobalStateReader`/MPT image; message validation and every economic read are
+    pinned to the same candidate session; and live migration plus hash-era
+    crossing are complete. Until then unavailable history defers/enters
+    authenticated recovery and neither FIN-14 nor E10 is closed.
   - [ ] Harden live chain-store admission so ordinal, parent hash, slot, and VRF
     metadata are derived from and checked against the authenticated signed snapshot;
     the dark ancestry walk is detection/recovery infrastructure, not that boundary.

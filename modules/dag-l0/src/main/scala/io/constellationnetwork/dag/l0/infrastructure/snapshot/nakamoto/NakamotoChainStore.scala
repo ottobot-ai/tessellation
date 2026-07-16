@@ -1070,6 +1070,9 @@ object NakamotoChainStore {
             value.length == 64 && value.forall(c => c >= '0' && c <= '9' || c >= 'a' && c <= 'f')
           }
 
+          def isCanonicalParentHash(expected: ExactWalkPosition, hash: Hash): Boolean =
+            isCanonicalSnapshotHash(hash) && (hash =!= Hash.empty || expected.ordinal == SnapshotOrdinal.MinValue)
+
           def validate(
             expected: ExactWalkPosition,
             candidate: LookupCandidate
@@ -1086,9 +1089,9 @@ object NakamotoChainStore {
                 Some(StoredOrdinalMismatch(expected, stored.ordinal))
               case _ if signedOrdinal =!= expected.ordinal =>
                 Some(SignedOrdinalMismatch(expected, signedOrdinal))
-              case Some(stored) if !isCanonicalSnapshotHash(stored.parentHash) =>
+              case Some(stored) if !isCanonicalParentHash(expected, stored.parentHash) =>
                 Some(NonCanonicalSnapshotHash(expected, StoredParent, stored.parentHash))
-              case _ if !isCanonicalSnapshotHash(signedParent) =>
+              case _ if !isCanonicalParentHash(expected, signedParent) =>
                 Some(NonCanonicalSnapshotHash(expected, SignedParent, signedParent))
               case Some(stored) if stored.parentHash =!= signedParent =>
                 Some(StoredParentMismatch(expected, stored.parentHash, signedParent))
