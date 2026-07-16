@@ -9,6 +9,7 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.currency.schema.currency._
+import io.constellationnetwork.currency.schema.globalSnapshotSync.{GlobalSnapshotSync, GlobalSnapshotSyncOrdinal}
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotStateChannelEventsProcessorSuite
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotStateChannelEventsProcessorSuite.ProcessorHarness
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -31,12 +32,14 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.{
 }
 import io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencySnapshotContextFunctions
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager
-import io.constellationnetwork.node.shared.snapshot.currency.CurrencySnapshotEvent
+import io.constellationnetwork.node.shared.snapshot.currency.{CurrencySnapshotEvent, GlobalSnapshotSyncEvent}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.cluster.SessionToken
 import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageOrdinal, MessageType}
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.generation.Generation
 import io.constellationnetwork.schema.height.{Height, SubHeight}
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
@@ -136,7 +139,10 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[Signed[CurrencyIncrementalSnapshot]] =
     forAsyncHasher[IO, CurrencyIncrementalSnapshot](unsignedIncremental(snapOrdinal), metagraphKey)
 
-  private def info(balance: Long): CurrencySnapshotInfo =
+  private def info(
+    balance: Long,
+    globalSnapshotSyncView: Option[SortedMap[PeerId, Signed[GlobalSnapshotSync]]] = None
+  ): CurrencySnapshotInfo =
     CurrencySnapshotInfo(
       lastTxRefs = SortedMap.empty,
       balances = SortedMap(account -> Balance(NonNegLong.unsafeFrom(balance))),
@@ -144,7 +150,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       lastFeeTxRefs = None,
       lastAllowSpendRefs = None,
       activeAllowSpends = None,
-      globalSnapshotSyncView = None,
+      globalSnapshotSyncView = globalSnapshotSyncView,
       lastTokenLockRefs = None,
       activeTokenLocks = None
     )
@@ -157,6 +163,16 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   private final case class PinnedHistory(
     reader: PinnedCurrencyInfoReader[IO],
     stateRef: GlobalSnapshotStateRef
+  )
+
+  private final case class RootInvisibleSyncHistories(
+    local: PinnedHistory,
+    backfilled: PinnedHistory,
+    backfilledStore: MptStateStorage[IO],
+    fullBytes: Map[Hex, Array[Byte]],
+    strippedBytes: Map[Hex, Array[Byte]],
+    fullRoot: Hash,
+    strippedRoot: Hash
   )
 
   private def mgState(mg: Address, baseIncremental: Signed[CurrencyIncrementalSnapshot], currencyInfo: CurrencySnapshotInfo): MgState =
@@ -293,6 +309,53 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       globalBalances
     )
 
+  private def mkRootInvisibleSyncHistories(
+    dir: fs2.io.file.Path,
+    mg: Address,
+    baseIncremental: Signed[CurrencyIncrementalSnapshot],
+    currencyInfo: CurrencySnapshotInfo
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[RootInvisibleSyncHistories] =
+    for {
+      source <- mkLiveStore(mgState(mg, baseIncremental, currencyInfo), executionBaseOrdinal)
+      _ <- GlobalStateConverter.writeCurrencyInfo[IO](
+        mg,
+        currencyInfo,
+        currencyInfo,
+        GlobalStateConverter.CurrencyInfoMpt.fromMptStore(source)
+      )
+      _ <- source.commit(executionBaseOrdinal)
+      fullBytes <- source.allEntriesAsBytes
+      strippedBytes = GlobalStateKey.consensusRootEntries(fullBytes)
+      fullRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](fullBytes)
+      strippedRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](strippedBytes)
+      pinnedSnapshot <- mkHashed(executionBaseOrdinal, Some(fullRoot))
+      resolver = (o: SnapshotOrdinal) => (if (o === executionBaseOrdinal) pinnedSnapshot.some else none).pure[IO]
+      stateRef = GlobalSnapshotStateRef(
+        executionBaseOrdinal,
+        pinnedSnapshot.hash,
+        pinnedSnapshot.signed.value.lastSnapshotHash,
+        MptRoot(fullRoot)
+      )
+      localStore <- MptStateStorage.make[IO](dir / "local")
+      _ <- localStore.writeState(executionBaseOrdinal, fullBytes)
+      backfilledStore <- MptStateStorage.make[IO](dir / "backfilled")
+      backfill = new PinnedCurrencyInfoReader.PinnedByteBackfill[IO] {
+        def fetch(ordinal: SnapshotOrdinal): IO[Option[Map[Hex, Array[Byte]]]] =
+          Option.when(ordinal === executionBaseOrdinal)(fullBytes).pure[IO]
+      }
+      localReader = PinnedCurrencyInfoReader.make[IO](localStore, resolver)
+      backfilledReader = PinnedCurrencyInfoReader.make[IO](backfilledStore, resolver, Some(backfill))
+    } yield
+      RootInvisibleSyncHistories(
+        PinnedHistory(localReader, stateRef),
+        PinnedHistory(backfilledReader, stateRef),
+        backfilledStore,
+        fullBytes,
+        strippedBytes,
+        fullRoot,
+        strippedRoot
+      )
+
   private def liveReaderAt(live: MptStore[IO, GlobalStateKey]): GlobalSnapshotStateRef => IO[Option[GlobalStateReader[IO]]] =
     _ => GlobalStateReader.fromMptStore[IO](live).some.pure[IO]
 
@@ -321,7 +384,9 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
     harness: ProcessorHarness,
     mg: Address,
     metagraphKey: KeyPair,
-    baseIncremental: Signed[CurrencyIncrementalSnapshot]
+    baseIncremental: Signed[CurrencyIncrementalSnapshot],
+    baseCurrencyInfo: CurrencySnapshotInfo = baseInfo,
+    events: Set[CurrencySnapshotEvent] = Set.empty
   )(
     implicit h: Hasher[IO],
     js: JsonSerializer[IO],
@@ -331,10 +396,10 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       creation <- harness.creator.createProposalArtifact(
         lastKey = baseIncremental.ordinal,
         lastArtifact = baseIncremental,
-        lastContext = CurrencySnapshotContext(mg, baseInfo),
+        lastContext = CurrencySnapshotContext(mg, baseCurrencyInfo),
         lastArtifactHasher = Hasher.forJson[IO],
         trigger = TimeTrigger,
-        events = Set.empty[CurrencySnapshotEvent],
+        events = events,
         rewards = None,
         facilitators = Set(PeerId.fromPublic(metagraphKey.getPublic)),
         feeTransactionFn = None,
@@ -351,6 +416,17 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         metagraphKey
       )
     } yield NonEmptyList.one(binary)
+
+  private def signedGlobalSnapshotSync(
+    parentOrdinal: GlobalSnapshotSyncOrdinal,
+    globalOrdinal: SnapshotOrdinal,
+    globalHash: Hash,
+    metagraphKey: KeyPair
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[Signed[GlobalSnapshotSync]] =
+    forAsyncHasher[IO, GlobalSnapshotSync](
+      GlobalSnapshotSync(parentOrdinal, globalOrdinal, globalHash, SessionToken(Generation.MinValue)),
+      metagraphKey
+    )
 
   private def mkPositiveFeeWindow(
     metagraphKey: KeyPair,
@@ -493,6 +569,77 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
           pinnedBaseRoot.exists(_ =!= Hash.empty),
           pinnedAheadRoot.exists(_ =!= Hash.empty),
           pinnedBaseRoot === pinnedAheadRoot
+        )
+    }
+  }
+
+  test("ROOT-010 characterization: root-valid field-32 backfill cannot reproduce the locally staged replay base") { res =>
+    implicit val (ks, h, js, sp) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        mg = PublicKeyOps(metagraphKey.getPublic).toAddress
+        peer = PeerId.fromPublic(metagraphKey.getPublic)
+        harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
+        syncTargetOrdinal = ord(harness.initialGlobalSnapshot.ordinal.value.value + 2L)
+        previousSync <- signedGlobalSnapshotSync(
+          GlobalSnapshotSyncOrdinal.MinValue,
+          syncTargetOrdinal,
+          harness.initialGlobalSnapshot.hash,
+          metagraphKey
+        )
+        stagedInfo = info(100L, Some(SortedMap(peer -> previousSync)))
+        baseProof <- stagedInfo.stateProof[IO](ord(5L))
+        baseIncremental <- forAsyncHasher[IO, CurrencyIncrementalSnapshot](
+          unsignedIncremental(5L).copy(stateProof = baseProof),
+          metagraphKey
+        )
+        nextSync <- signedGlobalSnapshotSync(
+          previousSync.ordinal,
+          syncTargetOrdinal,
+          harness.initialGlobalSnapshot.hash,
+          metagraphKey
+        )
+        window <- mkRealWindow(
+          harness,
+          mg,
+          metagraphKey,
+          baseIncremental,
+          stagedInfo,
+          Set[CurrencySnapshotEvent](GlobalSnapshotSyncEvent(nextSync))
+        )
+        histories <- mkRootInvisibleSyncHistories(dir, mg, baseIncremental, stagedInfo)
+        localRead <- histories.local.reader.readAtExecutionBaseVerified(histories.local.stateRef, mg)
+        backfilledRead <- histories.backfilled.reader.readAtExecutionBaseVerified(histories.backfilled.stateRef, mg)
+        persistedAfterBackfill <- histories.backfilledStore.readState(executionBaseOrdinal)
+        localReplay = mkReplay(harness, productionReaderAt(histories.local))
+        backfilledReplay = mkReplay(harness, productionReaderAt(histories.backfilled))
+        localRoot <- localReplay(mg, window, anchorOrd, histories.local.stateRef)
+        backfilledRoot <- backfilledReplay(mg, window, anchorOrd, histories.backfilled.stateRef)
+        noneProof <- info(100L, None).stateProof[IO](ord(5L))
+        emptyProof <- info(
+          100L,
+          Some(SortedMap.empty[PeerId, Signed[GlobalSnapshotSync]])
+        ).stateProof[IO](ord(5L))
+        localInfo = localRead.toOption
+        backfilledInfo = backfilledRead.toOption
+      } yield
+        expect.all(
+          histories.local.stateRef === histories.backfilled.stateRef,
+          histories.fullRoot === histories.strippedRoot,
+          histories.fullBytes.keys.exists(GlobalStateKey.fieldIdFromHex(_).contains(GlobalStateFieldId.MgGlobalSnapshotSyncView)),
+          !histories.strippedBytes.keys.exists(
+            GlobalStateKey.fieldIdFromHex(_).contains(GlobalStateFieldId.MgGlobalSnapshotSyncView)
+          ),
+          persistedAfterBackfill.exists(_.keySet == histories.strippedBytes.keySet),
+          localInfo.flatMap(_.globalSnapshotSyncView).exists(_.get(peer).contains(previousSync)),
+          backfilledInfo
+            .flatMap(_.globalSnapshotSyncView)
+            .contains(SortedMap.empty[PeerId, Signed[GlobalSnapshotSync]]),
+          noneProof.globalSnapshotSync.isEmpty,
+          emptyProof.globalSnapshotSync.nonEmpty,
+          localRoot.exists(_ =!= Hash.empty),
+          backfilledRoot.isEmpty
         )
     }
   }

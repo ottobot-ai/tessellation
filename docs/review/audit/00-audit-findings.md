@@ -246,6 +246,12 @@ result is **FINDING-S01** (a flag-independent cross-shard double-spend).
   proof/root. L can sign while B refuses or disputes, preventing execution quorum or freezing that
   metagraph. Root exclusion prevents a direct global-root fork but does not make a consumed replay
   input reproducible.
+- **Executable characterization (2026-07-16):** `ExecutionBasePinReExecutionSuite.scala:573-643`
+  constructs those two readers at the same exact `GlobalSnapshotStateRef` using the production
+  `PinnedByteBackfill` path. The full and stripped maps reproduce the same committed GL0 root, but
+  local replay returns a currency root while the stripped/backfilled replay returns no result for the
+  same signed binary. The suite also proves `None` and `Some(empty)` produce distinct
+  `globalSnapshotSync` proof shapes. This confirms the failure mechanism; it does not close it.
 - **Direction:** first bind an exact optional full-view replay witness and explicit ML0 operator
   population into the signed/root-bound framework artifact; preserve `None` versus `Some(empty)` and
   verify the witness against `CurrencySnapshotStateProof.globalSnapshotSync`. Missing material
