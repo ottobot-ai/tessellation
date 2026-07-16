@@ -60,6 +60,24 @@ verification cannot reach tracker record or publication. Production source order
 the emitter accepts only that capability; this cut exercises that ordering and the emitter-owned frozen identity boundary without claiming
 the stub proves replay. It does not prove zero draw, store, adopt, slash, or a historical runtime-key path.
 
+K7b-2 qualifies the frozen-genesis `ShardCheckpointProducer` identity boundary with loader-validated A/B controls. Missing authority,
+loader-validated B's VRF substituted for A, loader-validated B's long-term key paired with A's VRF, an explicitly unrooted dummy runtime-
+shaped record, and malformed 31-byte local VRF evidence reject fresh mint. Held re-publication separately rejects authority disappearance,
+loader-validated B's VRF bytes substituted into the live local array, and the unrooted runtime-shaped A record; the immutable constructor
+inputs leave B-long-term and malformed-length held cases out of scope without adding a production seam. The matrix directly observes zero
+eta lookup, duty-order draw, possession proof, per-metagraph derivation-hook invocation, KES signing, and publication; it also probes the
+execution-base reads. A positive held A control re-publishes the exact bytes without a second eta/duty/proof/hook/base/KES effect.
+Scheduled-duty selection is source-order dominated by the zero duty-order invocation; Ed25519 and outer-envelope signing are source-order
+dominated by zero KES. Outer signing has no manifest effect label or direct counter, so no direct outer-signature evidence is claimed. The
+positive loader-validated A controls prove the probes are live. Here the manifest's `Replay` effect means only invocation of the caller-
+injected derivation hook: the suite's deterministic hook is not framework CL1 execution and proves neither replay semantics nor economic
+correctness. K7b-2 does not claim store, adopt, slash, historical committee/membership authority, or runtime-key activation.
+
+Four producer protocol blockers remain outside this identity qualification: the producer does not prove complete consumption of the
+committed input window before signing; its execution base is ordinal-only rather than exact hash/root-bound Phase-2 evidence; first
+publication and held-checkpoint retry lack a durable pre-publication outbox; and committee membership/duty/runtime key selection are not
+resolved from historical branch authority. K7b-2 must not be used to close any of those gates.
+
 Two target roles are deliberately recorded as absent:
 
 - deterministic assigned-watchtower selection and its positive replay-coverage identity;
@@ -94,15 +112,16 @@ while this manifest catches reviewed higher-level API spellings.
 The generated matrix and adapter mappings are intentionally separate. The generated matrix executes the shared frozen atomic-pair
 boundary. Snapshot intake, admission, producer, attester, checkpoint adoption, tower, and slashing retain their own concrete negative
 anchors because those adapters have different inputs and side effects. The `required_zero_effects` column is the remaining instrumentation
-contract, not evidence that the named anchor observes every effect. Only `KSEM-EXEC-008..011` currently carry reviewed direct or dominated
-evidence, and only for the effects listed in their evidence columns. Treating the mappings as one executable runtime abstraction would hide
-those differences and would be a false proof.
+contract, not evidence that the named anchor observes every effect. Only `KSEM-EXEC-003..011` currently carry reviewed direct or dominated
+evidence, and only for the effects listed in their evidence columns. The producer rows' `Replay` label records a derivation-hook counter,
+not proof of CL1 replay. Treating the mappings as one executable runtime abstraction would hide those differences and would be a false
+proof.
 
 ## Remaining activation blockers
 
 `KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open. K7a qualifies frozen-genesis resolver rejection and inventories the current
-adapter anchors and zero-effect obligations; K7b-1 qualifies only the frozen execution-attester effects described above. Closing those
-gates still requires executable instrumentation for the remaining adapter/effect rows, the generated
+adapter anchors and zero-effect obligations; K7b-1 and K7b-2 qualify only the frozen execution-attester and shard-producer effects described
+above. Closing those gates still requires executable instrumentation for the remaining adapter/effect rows, the generated
 historical branch/era/operator cross-consumer matrix, exact N-2 pair plus
 roster/stake resolution, exact N-1 eta, exact Phase-2 shard references, runtime local secret-bundle selection, assigned watchtower coverage,
 the optimistic sampler, portable nonempty-tower membership evidence, and positive exact-offence-parent slashing/runtime consumers. No row

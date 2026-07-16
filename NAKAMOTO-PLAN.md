@@ -556,16 +556,31 @@ only. Registration proves key ownership and never grants operator eligibility.
   wrong-VRF and wrong-long-term-key cases plus missing, unrooted dummy runtime-
   shaped, and malformed identities then stop before emitter-owned
   eta/proof/KES/tracker/publish effects. This exercises capability-before-sign
-  ordering, not CL1 replay semantics or economic correctness. The mapping does not
-  prove other effects or adapters are instrumented by the named test. A generated two-operator frozen-view
-  matrix proves that a
-  loader-registered control outside the authority view, its complete pair
+  ordering, not CL1 replay semantics or economic correctness. K7b-2 adds the
+  frozen shard-producer identity boundary: loader-validated A/B plus missing,
+  unrooted dummy runtime-shaped, and malformed identities reject fresh mint.
+  Held re-publication separately rejects missing authority, loader-validated B's
+  VRF bytes substituted into the live local array, and the unrooted runtime-
+  shaped A record. Immutable local long-term and array-length constructor inputs
+  leave those two held variants out of scope without a production seam. Rejections
+  stop before directly observed eta lookup, duty-order draw, possession proof,
+  per-MG derivation-hook invocation, execution-base reads, KES, or publication;
+  positive held A re-publishes exact bytes without another upstream effect.
+  Scheduled-duty selection plus Ed and outer-envelope signing are source-
+  dominated. Outer signing has no manifest effect label or direct counter.
+  Its `Replay` label means derivation-hook invocation only, not actual CL1 replay.
+  The mapping does not prove other effects or adapters are instrumented by the
+  named test. A generated two-operator frozen-view matrix proves that a loader-
+  registered control outside the authority view, its complete pair
   substituted for the authority operator, an unrooted runtime-shaped record, and
   malformed wire key all fail the real genesis-only resolver; see
   `docs/review/OPERATOR-CONSENSUS-KEY-SEMANTIC-MANIFEST.md`. Neither source
   inventory tracks same-file line motion or same-kind substitution. The adapter
   anchor mapping is not control-flow proof and the generated matrix is not
   historical authority, so K7 still needs cross-consumer branch qualification.
+  K7b-2 also leaves complete committed-window consumption, an exact hash/root-
+  bound execution base, a durable pre-publication held-checkpoint outbox, and
+  historical committee/membership/runtime-key activation open.
 - Tower verification now resolves the current atomic period-zero pair for every
   header occurrence, cryptographically binds each proof to the header's exact
   carried `eta || slot`
@@ -663,9 +678,19 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    landed. K7b-1 qualifies only the frozen execution-attester's directly
    observed eta/proof/KES/tracker/publish effects and source-dominated Ed signing
    after the concrete manager invokes its re-execution hook once and produces the
-   private capability; the injected hook does not prove CL1 replay semantics. Per-adapter
+   private capability. K7b-2 qualifies only the frozen shard-producer's directly
+   observed eta/duty-order/proof/derivation-hook/KES/publish effects for the five-
+   vector fresh matrix and the missing-authority/B-VRF/unrooted held matrix, with
+   scheduled duty plus Ed and outer-envelope signing source-dominated. Outer
+   signing has no manifest effect label or direct counter. Positive held A re-
+   publishes exact bytes without a second upstream effect. Neither
+   injected hook proves CL1 replay semantics; the producer's `Replay` label means
+   hook invocation only. Per-adapter
    effect instrumentation remains incomplete. They deliberately
    do not activate or simulate a common runtime adapter.
+   Complete committed-window consumption, exact hash/root-bound execution bases,
+   durable pre-publication checkpoint outbox recovery, and historical committee/
+   membership/runtime activation remain open.
    Complete the historical generated-branch/consumer matrix, positive historical
    runtime consumers, and exact-parent no-side-effect vectors; an allowlisted path
    is not automatically correct. Gates: `KEYREG-006`, `KEYREG-010`, `KEYREG-011`,

@@ -51,11 +51,17 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
 
   private val allowedStatuses = Set("FROZEN_GENESIS", "FAIL_CLOSED_SCAFFOLD", "BLOCKED")
 
-  /** Reviewed K7b evidence is deliberately bounded to the frozen execution-attester adapter. The exact source and test anchor are frozen
-    * together with the reviewed effects, so TSV-only anchor substitution cannot preserve a qualification claim. Direct effects have a
-    * concrete counter or queried sink in the named test. `EdSign` is control-flow dominated by the directly observed zero KES call; no
-    * production signing injection is added merely to expose a test counter.
+  /** Reviewed K7b evidence is deliberately bounded to the frozen shard-producer and execution-attester adapters. The exact source and test
+    * anchor are frozen together with the reviewed effects, so TSV-only anchor substitution cannot preserve a qualification claim. Direct
+    * effects have a concrete counter or queried sink in the named test. Producer `Replay` is only the injected derivation-hook counter;
+    * scheduled-duty selection is source-dominated by the directly counted zero duty-order call. `EdSign` and outer-envelope signing are
+    * control-flow dominated by the directly observed zero KES call; outer signing has no manifest effect label or direct counter, and no
+    * production signing injection is added merely to expose one.
     */
+  private val shardProducerQualificationSource =
+    "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducerSuite.scala"
+  private val shardProducerIdentityQualificationAnchor =
+    "K7b-2: frozen shard-producer identity rejects fresh mint and held re-publish before eta, duty, possession proof, derivation hook, KES signing, or publish"
   private val executionAttesterQualificationSource =
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointAttestationEmitterSuite.scala"
   private val executionIdentityQualificationAnchor =
@@ -64,6 +70,36 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
     "reject: an unverified local execution signature is neither recorded nor published"
 
   private val reviewedQualifiedEvidence: Map[String, ReviewedEvidence] = Map(
+    "KSEM-EXEC-003" -> ReviewedEvidence(
+      shardProducerQualificationSource,
+      shardProducerIdentityQualificationAnchor,
+      Set("EtaLookup", "Draw", "PossessionProof", "Replay", "KesSign", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-004" -> ReviewedEvidence(
+      shardProducerQualificationSource,
+      shardProducerIdentityQualificationAnchor,
+      Set("EtaLookup", "Draw", "PossessionProof", "Replay", "KesSign", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-005" -> ReviewedEvidence(
+      shardProducerQualificationSource,
+      shardProducerIdentityQualificationAnchor,
+      Set("EtaLookup", "Draw", "PossessionProof", "Replay", "KesSign", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-006" -> ReviewedEvidence(
+      shardProducerQualificationSource,
+      shardProducerIdentityQualificationAnchor,
+      Set("EtaLookup", "Draw", "PossessionProof", "Replay", "KesSign", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-007" -> ReviewedEvidence(
+      shardProducerQualificationSource,
+      shardProducerIdentityQualificationAnchor,
+      Set("EtaLookup", "Draw", "PossessionProof", "Replay", "KesSign", "Publish"),
+      Set("EdSign")
+    ),
     "KSEM-EXEC-008" -> ReviewedEvidence(
       executionAttesterQualificationSource,
       executionIdentityQualificationAnchor,
@@ -344,6 +380,40 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
         baseline == reviewedQualifiedEvidence,
         swapped != reviewedQualifiedEvidence,
         swapped.get("KSEM-EXEC-008").exists(_.qualificationAnchor == localVerificationQualificationAnchor)
+      )
+    }
+  }
+
+  test("reviewed evidence binding rejects K7b-2 producer source, anchor, and effect mutations") {
+    manifestRows.map { rows =>
+      val baseline = qualifiedEvidence(rows)
+      val sourceMutated = qualifiedEvidence(
+        rows.map {
+          case row if row.id == "KSEM-EXEC-003" =>
+            row.copy(qualificationSource = executionAttesterQualificationSource)
+          case row => row
+        }
+      )
+      val anchorMutated = qualifiedEvidence(
+        rows.map {
+          case row if row.id == "KSEM-EXEC-004" =>
+            row.copy(qualificationAnchor = executionIdentityQualificationAnchor)
+          case row => row
+        }
+      )
+      val effectMutated = qualifiedEvidence(
+        rows.map {
+          case row if row.id == "KSEM-EXEC-005" =>
+            row.copy(directZeroEffects = "EtaLookup|Draw|PossessionProof|KesSign|Publish")
+          case row => row
+        }
+      )
+
+      expect.all(
+        baseline == reviewedQualifiedEvidence,
+        sourceMutated != reviewedQualifiedEvidence,
+        anchorMutated != reviewedQualifiedEvidence,
+        effectMutated != reviewedQualifiedEvidence
       )
     }
   }

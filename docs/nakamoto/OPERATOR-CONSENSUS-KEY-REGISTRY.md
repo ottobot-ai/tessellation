@@ -377,9 +377,31 @@ the emitter probes are live, and staged missing-KES and local-verification failu
 stop record/publication. This exercises the production capability-before-sign
 order, but the injected hook is a stub and proves neither CL1 replay semantics nor
 economic correctness. It does not claim zero draw, store, adopt, slash, or
-historical qualification. Neither inventory nor
+historical qualification. K7b-2 separately qualifies the frozen shard-producer
+identity boundary. Loader-validated A/B, missing, unrooted dummy runtime-shaped,
+and malformed local-key cases reject fresh mint. Held re-publication separately
+rejects authority disappearance, loader-validated B's VRF bytes substituted into
+the live local array, and the unrooted runtime-shaped A record. B-long-term and
+malformed-length held cases remain out of scope because those are immutable
+constructor inputs and the test adds no production seam. These cases stop before
+directly observed eta lookup, duty-order draw, possession proof, per-MG derivation-
+hook invocation, KES signing, execution-base reads, or publication. A positive held
+A control re-publishes exact bytes without another eta/duty/proof/hook/base/KES effect.
+Scheduled-duty selection is source-dominated by zero duty-order invocation, and
+Ed25519 plus outer-envelope signing are source-dominated by zero KES. Outer signing
+has no manifest effect label or direct counter, so no direct outer-signature
+evidence is claimed. The `Replay` evidence label means only derivation-hook
+invocation; the stub does not prove CL1 replay or economic correctness. No store,
+adopt, slash, historical committee/membership, or runtime-activation qualification
+is claimed. Neither inventory nor
 that lexical anchor mapping is an AST/call-graph proof, and the generated matrix
 does not prove branch-historical qualification, so K7 remains open.
+
+K7b-2 also leaves the producer protocol blockers explicit: complete committed-
+window consumption is not proven before signing, the execution base is ordinal-
+only rather than exact hash/root-bound Phase-2 evidence, held retry has no durable
+pre-publication outbox, and historical committee/membership/runtime-key authority
+is unavailable.
 
 The tower verifier resolves every suffix and upper-level occurrence through the
 current atomic period-zero pair, verifies its VRF proof over the header's exact
@@ -425,10 +447,12 @@ This is not runtime completion. The following remain merge gates:
    wrong-key cases use another registered identity and repeated statistical trials
    vary canonical draw inputs instead of minting disposable keys. The K7a matrix
    qualifies the frozen resolver and the manifest pins concrete adapter-negative
-   anchors plus the complete zero-effect obligation vocabulary. K7b-1 adds
-   reviewed direct/source-dominated evidence only for `KSEM-EXEC-008..011` at
-   the frozen execution-attester boundary. Per-adapter instrumentation of the
-   remaining obligations remains incomplete. The manifest fails on new
+   anchors plus the complete zero-effect obligation vocabulary. K7b-1 and K7b-2
+   add reviewed direct/source-dominated evidence only for `KSEM-EXEC-003..011`
+   at the frozen shard-producer and execution-attester boundaries. Producer
+   `Replay` evidence is only a derivation-hook invocation, not CL1 replay proof.
+   Per-adapter instrumentation of the remaining obligations remains incomplete.
+   The manifest fails on new
    matched spellings in unmanifested files, file/count changes, and stale negative
    or qualification test-shaped declarations; it is not proof of historical
    semantics. `KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open until every

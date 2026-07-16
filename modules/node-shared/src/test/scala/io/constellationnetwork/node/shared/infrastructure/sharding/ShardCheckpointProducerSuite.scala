@@ -1,9 +1,9 @@
 package io.constellationnetwork.node.shared.infrastructure.sharding
 
-import java.security.{KeyPair, SecureRandom}
+import java.security.{KeyPair, MessageDigest, SecureRandom}
 
-import cats.data.NonEmptyList
-import cats.effect.{IO, Resource}
+import cats.data.{NonEmptyList, NonEmptySet}
+import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
@@ -17,20 +17,23 @@ import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainS
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
+import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.Slot
-import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT, VrfPublicKey}
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
+import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes.OperationalKeyMaker
-import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.signature.signature.verifySignatureProof
-import io.constellationnetwork.security.{Hasher, SecurityProvider}
+import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof, verifySignatureProof}
+import io.constellationnetwork.security.vrf.VrfKeyDeriver
+import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -186,13 +189,120 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     kesSigner: ShardCheckpointProducer.KesSigner[IO]
   )
 
-  private def replacementVrfRegistry(
-    operatorKeys: OperatorConsensusKeys,
-    replacementVrfVk: Array[Byte]
-  ): OperatorConsensusKeyRegistry[IO] =
-    OperatorConsensusKeyRegistry.make[IO](
-      Map(operatorKeys.operatorPeerId -> operatorKeys.copy(vrfPublicKey = VrfPublicKey.fromBytes(replacementVrfVk)))
+  private final case class LoaderValidatedProducerPopulation(
+    checkpointSigner: RegisteredCheckpointSigner,
+    authorityKeyPair: KeyPair,
+    authorityId: PeerId,
+    authorityKeys: OperatorConsensusKeys,
+    authorityVrfSecret: Array[Byte],
+    authorityVrfPublic: Array[Byte],
+    controlKeyPair: KeyPair,
+    controlKeys: OperatorConsensusKeys,
+    controlVrfSecret: Array[Byte],
+    controlVrfPublic: Array[Byte]
+  )
+
+  private final case class LocalProducerIdentity(
+    name: String,
+    keyPair: KeyPair,
+    vrfSecret: Array[Byte],
+    vrfPublic: Array[Byte],
+    registry: OperatorConsensusKeyRegistry[IO]
+  )
+
+  private final case class ProducerEffectCounts(
+    etaLookup: Int,
+    dutyOrder: Int,
+    possessionProof: Int,
+    derivationHook: Int,
+    executionBaseRead: Int,
+    kesSign: Int,
+    publish: Int
+  )
+
+  private final case class ProducerProbe(
+    producer: ShardCheckpointProducer[IO],
+    counts: IO[ProducerEffectCounts]
+  )
+
+  /** Deliberately unrooted runtime-shaped negative. Its dummy proof is not loader- or cryptographically validated. */
+  private def unrootedRuntimeShapedPair(genesis: OperatorConsensusKeys): OperatorConsensusKeys = {
+    val cert = KesRegistrationCert(
+      operatorPeerId = genesis.operatorPeerId,
+      kesMasterVK = Hex.fromBytes(genesis.kes.vk.value),
+      kesMasterVKStep = genesis.kes.vk.step,
+      offset = 0L,
+      vrfPublicKey = Hex.fromBytes(genesis.vrfPublicKey.toBytes),
+      effectiveFromPeriod = EtaPeriod.Zero,
+      registrationParentHash = Hash("aa" * 32),
+      ordinal = KesRegistrationOrdinal(NonNegLong.unsafeFrom(1L)),
+      parent = KesRegistrationReference.empty
     )
+    val dummyProof = SignatureProof(Id(genesis.operatorPeerId.value), Signature(Hex("7f" * 64)))
+    val record = KesRegistrationRecord(Signed(cert, NonEmptySet.one(dummyProof)), SnapshotOrdinal.unsafeApply(1L))
+
+    genesis.copy(registration = record.some)
+  }
+
+  private def loaderValidatedProducerPopulation(
+    implicit sp: SecurityProvider[IO]
+  ): IO[LoaderValidatedProducerPopulation] =
+    for {
+      checkpointSigner <- RegisteredCheckpointSigner.make
+      authorityKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      controlKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      authorityId = PeerId.fromPublic(authorityKeyPair.getPublic)
+      controlId = PeerId.fromPublic(controlKeyPair.getPublic)
+      _ <- checkpointSigner.preregisterGenesis(authorityKeyPair, authorityId)
+      _ <- checkpointSigner.preregisterGenesis(controlKeyPair, controlId)
+      authorityKeys <- checkpointSigner.operatorKeyRegistry
+        .get(authorityId)
+        .flatMap(IO.fromOption(_)(new IllegalStateException("missing loader-validated authority identity")))
+      controlKeys <- checkpointSigner.operatorKeyRegistry
+        .get(controlId)
+        .flatMap(IO.fromOption(_)(new IllegalStateException("missing loader-validated control identity")))
+      authorityVrf = VrfKeyDeriver.deriveVrfKeyPair(authorityKeyPair)
+      controlVrf = VrfKeyDeriver.deriveVrfKeyPair(controlKeyPair)
+      _ <- IO.raiseUnless(
+        MessageDigest.isEqual(authorityKeys.vrfPublicKey.toBytes, authorityVrf._2) &&
+          MessageDigest.isEqual(controlKeys.vrfPublicKey.toBytes, controlVrf._2) &&
+          !MessageDigest.isEqual(authorityKeys.kes.vk.value, controlKeys.kes.vk.value) &&
+          !MessageDigest.isEqual(authorityKeys.vrfPublicKey.toBytes, controlKeys.vrfPublicKey.toBytes)
+      )(new IllegalStateException("loader-validated A/B controls are not distinct and correctly bound"))
+    } yield
+      LoaderValidatedProducerPopulation(
+        checkpointSigner,
+        authorityKeyPair,
+        authorityId,
+        authorityKeys,
+        authorityVrf._1,
+        authorityVrf._2,
+        controlKeyPair,
+        controlKeys,
+        controlVrf._1,
+        controlVrf._2
+      )
+
+  private def producerRig(
+    population: LoaderValidatedProducerPopulation,
+    identity: LocalProducerIdentity
+  )(implicit h: Hasher[IO]): IO[TestRig] =
+    for {
+      store <- ShardChainStore.make[IO](shardZero)
+      pubPair <- ShardCheckpointPublisher.recording[IO]
+    } yield
+      TestRig(
+        store,
+        pubPair._1,
+        pubPair._2,
+        identity.keyPair,
+        population.authorityId,
+        identity.vrfSecret,
+        identity.vrfPublic,
+        population.authorityKeys,
+        identity.registry,
+        population.checkpointSigner.producerKesSigner
+      )
 
   private def mutableOperatorRegistry(
     entries: cats.effect.kernel.Ref[IO, Map[PeerId, OperatorConsensusKeys]]
@@ -261,7 +371,9 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     selfVrfVk: Option[Array[Byte]] = None,
     operatorKeyRegistry: Option[OperatorConsensusKeyRegistry[IO]] = None,
     kesSigner: Option[ShardCheckpointProducer.KesSigner[IO]] = None,
-    publisher: Option[ShardCheckpointPublisher[IO]] = None
+    publisher: Option[ShardCheckpointPublisher[IO]] = None,
+    shardEtaFor: Option[EtaPeriod => IO[Array[Byte]]] = None,
+    executionBaseOrdinalF: IO[SnapshotOrdinal] = IO.pure(SnapshotOrdinal.MinValue)
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       ShardCheckpointProducer.make[IO](
@@ -280,14 +392,81 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         // Slice S4: producer takes an epoch-keyed eta resolver. Tests pass a fixed precomputed shardEta regardless of
         // epoch — the producer/verifier-agreement property is exercised in ShardSlotLeaderSuite; here we only assert the
         // producer threads the resolved eta through its leader draw, so a constant is sufficient.
-        shardEtaFor = _ => IO.pure(shardEta),
+        shardEtaFor = shardEtaFor.getOrElse(_ => IO.pure(shardEta)),
         staircaseDeltaSlots = 5,
         derivePerMgState = derive,
-        executionBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
+        executionBaseOrdinalF = executionBaseOrdinalF,
         lastPhase2Checkpoint = lastPhase2Checkpoint,
         republishEveryTicks = republishEveryTicks
       )
     }
+
+  /** Directly instrument the producer-owned effects used by the K7b-2 frozen-identity qualification. `derivationHook` records only that the
+    * injected hook ran; because this suite deliberately stubs the hook, it is not evidence that framework CL1 replay consumed every input.
+    * Ed25519 and outer-envelope signing remain un-injected production operations and are therefore source-dominated by a zero KES call.
+    */
+  private def probedProducer(
+    ssl: ShardSlotLeader[IO],
+    rig: TestRig,
+    shardEta: Array[Byte],
+    derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
+      deterministicDerive,
+    baseOrdinalF: IO[SnapshotOrdinal] = IO.pure(SnapshotOrdinal.MinValue),
+    kesSigner: Option[ShardCheckpointProducer.KesSigner[IO]] = None,
+    operatorKeyRegistry: Option[OperatorConsensusKeyRegistry[IO]] = None,
+    selfVrfVk: Option[Array[Byte]] = None,
+    republishEveryTicks: Int = 1
+  )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ProducerProbe] =
+    for {
+      etaCalls <- Ref.of[IO, Int](0)
+      dutyCalls <- Ref.of[IO, Int](0)
+      proofCalls <- Ref.of[IO, Int](0)
+      derivationCalls <- Ref.of[IO, Int](0)
+      baseCalls <- Ref.of[IO, Int](0)
+      kesCalls <- Ref.of[IO, Int](0)
+      publishCalls <- Ref.of[IO, Int](0)
+      countingSlotLeader = new ShardSlotLeader[IO] {
+        def computeShardEta(shardId: ShardId, gl0Eta: Array[Byte])(implicit hasher: Hasher[IO]): IO[Array[Byte]] =
+          ssl.computeShardEta(shardId, gl0Eta)(hasher)
+        def dutyOrder(
+          committee: List[PeerId],
+          eta: Array[Byte],
+          shardOrdinal: ShardOrdinal
+        )(implicit hasher: Hasher[IO]): IO[List[PeerId]] =
+          dutyCalls.update(_ + 1) >> ssl.dutyOrder(committee, eta, shardOrdinal)(hasher)
+        def membershipProof(vrfSk: Array[Byte], eta: Array[Byte], slot: Slot): IO[Array[Byte]] =
+          proofCalls.update(_ + 1) >> ssl.membershipProof(vrfSk, eta, slot)
+      }
+      countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+          kesCalls.update(_ + 1) >> kesSigner.getOrElse(rig.kesSigner).sign(operatorKeys, checkpointEpoch, message)
+      }
+      countingPublisher = new ShardCheckpointPublisher[IO] {
+        def publish(checkpoint: Signed[ShardCheckpoint]): IO[Unit] =
+          publishCalls.update(_ + 1) >> rig.publisher.publish(checkpoint)
+      }
+      producer <- makeProducer(
+        countingSlotLeader,
+        rig,
+        Ratio.One,
+        shardEta,
+        derive = (mg, snapshots, anchor, executionBase) => derivationCalls.update(_ + 1) >> derive(mg, snapshots, anchor, executionBase),
+        republishEveryTicks = republishEveryTicks,
+        selfVrfVk = selfVrfVk,
+        operatorKeyRegistry = operatorKeyRegistry,
+        kesSigner = Some(countingKesSigner),
+        publisher = Some(countingPublisher),
+        shardEtaFor = Some(_ => etaCalls.update(_ + 1).as(shardEta)),
+        executionBaseOrdinalF = baseCalls.update(_ + 1) >> baseOrdinalF
+      )
+      counts = (etaCalls.get, dutyCalls.get, proofCalls.get, derivationCalls.get, baseCalls.get, kesCalls.get, publishCalls.get).mapN(
+        ProducerEffectCounts.apply
+      )
+    } yield ProducerProbe(producer, counts)
 
   // ===========================================================================
   // Test 1 — Happy path: produce + publish when slot leader
@@ -359,98 +538,254 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     } yield expect.all(out.isEmpty, recorded.isEmpty)
   }
 
-  test("missing or mismatched registered VRF identity has zero proof, derivation, signature, and publish effects") { res =>
+  test(
+    "K7b-2: frozen shard-producer identity rejects fresh mint and held re-publish before eta, duty, possession proof, derivation hook, KES signing, or publish"
+  ) { res =>
     implicit val (h, sp, ssl) = res
 
-    List("missing", "mismatched").traverse { mode =>
-      for {
-        rig <- freshRig
-        shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
-        deriveCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
-        proofCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
-        signatureCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
-        publishCalls <- cats.effect.kernel.Ref.of[IO, Int](0)
-        wrongVrfVk = rig.vrfVk.updated(0, (rig.vrfVk(0) ^ 0xff).toByte)
-        registry =
-          if (mode == "missing") OperatorConsensusKeyRegistry.empty[IO]
-          else replacementVrfRegistry(rig.operatorKeys, wrongVrfVk)
-        countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
-          def sign(
-            operatorKeys: OperatorConsensusKeys,
-            checkpointEpoch: EtaPeriod,
-            message: Array[Byte]
-          ): IO[Option[ShardCheckpointProducer.KesSignature]] =
-            signatureCalls.update(_ + 1).as(Some(ShardCheckpointProducer.KesSignature(0, Array[Byte](0x7))))
-        }
-        countingPublisher = new ShardCheckpointPublisher[IO] {
-          def publish(checkpoint: Signed[ShardCheckpoint]): IO[Unit] = publishCalls.update(_ + 1)
-        }
-        countingSlotLeader = new ShardSlotLeader[IO] {
-          def computeShardEta(shardId: ShardId, gl0Eta: Array[Byte])(implicit hasher: Hasher[IO]): IO[Array[Byte]] =
-            ssl.computeShardEta(shardId, gl0Eta)(hasher)
-          def dutyOrder(
-            committee: List[PeerId],
-            eta: Array[Byte],
-            shardOrdinal: ShardOrdinal
-          )(implicit hasher: Hasher[IO]): IO[List[PeerId]] =
-            ssl.dutyOrder(committee, eta, shardOrdinal)(hasher)
-          def membershipProof(vrfSk: Array[Byte], eta: Array[Byte], slot: Slot): IO[Array[Byte]] =
-            proofCalls.update(_ + 1) *> ssl.membershipProof(vrfSk, eta, slot)
-        }
-        producer <- makeProducer(
-          countingSlotLeader,
-          rig,
-          Ratio.One,
-          shardEta,
-          derive = (mg, snaps, anchor, executionBase) => deriveCalls.update(_ + 1) >> deterministicDerive(mg, snaps, anchor, executionBase),
-          operatorKeyRegistry = Some(registry),
-          kesSigner = Some(countingKesSigner),
-          publisher = Some(countingPublisher)
+    for {
+      population <- loaderValidatedProducerPopulation
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      runtimePair = unrootedRuntimeShapedPair(population.authorityKeys)
+      runtimeRegistry = OperatorConsensusKeyRegistry.make[IO](Map(population.authorityId -> runtimePair))
+      candidates = List(
+        LocalProducerIdentity(
+          "missing-authority",
+          population.authorityKeyPair,
+          population.authorityVrfSecret,
+          population.authorityVrfPublic,
+          OperatorConsensusKeyRegistry.empty[IO]
+        ),
+        LocalProducerIdentity(
+          "loader-validated-B-vrf-for-A",
+          population.authorityKeyPair,
+          population.controlVrfSecret,
+          population.controlVrfPublic,
+          population.checkpointSigner.operatorKeyRegistry
+        ),
+        LocalProducerIdentity(
+          "loader-validated-B-long-term-for-A",
+          population.controlKeyPair,
+          population.authorityVrfSecret,
+          population.authorityVrfPublic,
+          population.checkpointSigner.operatorKeyRegistry
+        ),
+        LocalProducerIdentity(
+          "unrooted-dummy-runtime-shaped-record",
+          population.authorityKeyPair,
+          population.authorityVrfSecret,
+          population.authorityVrfPublic,
+          runtimeRegistry
+        ),
+        LocalProducerIdentity(
+          "malformed-31-byte-local-vrf-evidence",
+          population.authorityKeyPair,
+          population.authorityVrfSecret,
+          Array.fill[Byte](31)(0x7f.toByte),
+          population.checkpointSigner.operatorKeyRegistry
         )
-        result <- producer.produce(
-          mkPendingSnapshots(1),
-          mkOrd(1L),
-          EtaPeriod(0L),
-          Slot.unsafeApply(1L),
-          Set(rig.selfPeerId)
+      )
+      runFreshCandidate = (candidate: LocalProducerIdentity) =>
+        for {
+          rig <- producerRig(population, candidate)
+          probe <- probedProducer(ssl, rig, shardEta)
+          result <- probe.producer.produce(
+            mkPendingSnapshots(1),
+            mkOrd(1L),
+            EtaPeriod.Zero,
+            Slot.unsafeApply(1L),
+            Set(population.authorityId)
+          )
+          counts <- probe.counts
+        } yield (candidate.name, result, counts)
+      attacks <- candidates.traverse(runFreshCandidate)
+      positive <- runFreshCandidate(
+        LocalProducerIdentity(
+          "loader-validated-A-positive",
+          population.authorityKeyPair,
+          population.authorityVrfSecret,
+          population.authorityVrfPublic,
+          population.checkpointSigner.operatorKeyRegistry
         )
-        derives <- deriveCalls.get
-        proofs <- proofCalls.get
-        signatures <- signatureCalls.get
-        publishes <- publishCalls.get
-      } yield expect.all(result.isEmpty, proofs == 0, derives == 0, signatures == 0, publishes == 0)
-    }.map(_.combineAll)
+      )
+
+      // Held-path qualification is necessarily stateful. The producer has no private-key reload seam, so the complete A/B matrix above
+      // covers fresh mint. Here we mutate only inputs that the live held-path identity gate can observe without minting a replacement:
+      // authority disappearance, loader-validated B's VRF evidence, and an unrooted runtime-shaped A record.
+      heldLocalVrf = population.authorityVrfPublic.clone()
+      heldRegistryEntries <- Ref.of[IO, Map[PeerId, OperatorConsensusKeys]](
+        Map(population.authorityId -> population.authorityKeys)
+      )
+      heldIdentity = LocalProducerIdentity(
+        "held-loader-validated-A",
+        population.authorityKeyPair,
+        population.authorityVrfSecret,
+        heldLocalVrf,
+        mutableOperatorRegistry(heldRegistryEntries)
+      )
+      heldRig <- producerRig(population, heldIdentity)
+      heldProbe <- probedProducer(ssl, heldRig, shardEta, republishEveryTicks = 1)
+      firstHeld <- heldProbe.producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(10L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(10L),
+        Set(population.authorityId)
+      )
+      heldBaseline <- heldProbe.counts
+      _ <- heldRegistryEntries.set(Map.empty)
+      missingHeld <- heldProbe.producer.produce(
+        SortedMap.empty,
+        mkOrd(11L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(11L),
+        Set(population.authorityId)
+      )
+      _ <- heldRegistryEntries.set(Map(population.authorityId -> population.authorityKeys))
+      _ <- IO(System.arraycopy(population.controlVrfPublic, 0, heldLocalVrf, 0, heldLocalVrf.length))
+      wrongVrfHeld <- heldProbe.producer.produce(
+        SortedMap.empty,
+        mkOrd(12L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(12L),
+        Set(population.authorityId)
+      )
+      _ <- IO(System.arraycopy(population.authorityVrfPublic, 0, heldLocalVrf, 0, heldLocalVrf.length))
+      _ <- heldRegistryEntries.set(Map(population.authorityId -> runtimePair))
+      runtimeHeld <- heldProbe.producer.produce(
+        SortedMap.empty,
+        mkOrd(13L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(13L),
+        Set(population.authorityId)
+      )
+      heldAfterRejections <- heldProbe.counts
+      _ <- heldRegistryEntries.set(Map(population.authorityId -> population.authorityKeys))
+      republishedHeld <- heldProbe.producer.produce(
+        SortedMap.empty,
+        mkOrd(14L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(14L),
+        Set(population.authorityId)
+      )
+      heldFinal <- heldProbe.counts
+      heldPublished <- heldRig.recorded
+      heldHashes <- heldPublished.traverse(checkpoint => Hasher[IO].hash(checkpoint.value.signingPreimage))
+    } yield {
+      val noEffects = ProducerEffectCounts(0, 0, 0, 0, 0, 0, 0)
+      val oneFreshMint = ProducerEffectCounts(1, 1, 1, 1, 2, 1, 1)
+      val expectedAttackNames = Set(
+        "missing-authority",
+        "loader-validated-B-vrf-for-A",
+        "loader-validated-B-long-term-for-A",
+        "unrooted-dummy-runtime-shaped-record",
+        "malformed-31-byte-local-vrf-evidence"
+      )
+
+      expect.all(
+        attacks.map(_._1).toSet == expectedAttackNames,
+        attacks.forall { case (_, result, counts) => result.isEmpty && counts == noEffects },
+        positive._1 == "loader-validated-A-positive",
+        positive._2.nonEmpty,
+        positive._3 == oneFreshMint,
+        firstHeld.nonEmpty,
+        heldBaseline == oneFreshMint,
+        missingHeld.isEmpty,
+        wrongVrfHeld.isEmpty,
+        runtimeHeld.isEmpty,
+        heldAfterRejections == heldBaseline,
+        republishedHeld == firstHeld,
+        heldFinal == heldBaseline.copy(publish = heldBaseline.publish + 1),
+        heldPublished.size == 2,
+        heldHashes.distinct.size == 1
+      )
+    }
   }
 
-  test("a held checkpoint is not republished after its registered VRF identity disappears") { res =>
+  test("K7b-2 staged controls prove each fresh producer effect probe is live and fail-closed") { res =>
     implicit val (h, sp, ssl) = res
+
     for {
-      rig <- freshRig
+      population <- loaderValidatedProducerPopulation
       shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
-      registryEntries <- cats.effect.kernel.Ref.of[IO, Map[PeerId, OperatorConsensusKeys]](
-        Map(rig.selfPeerId -> rig.operatorKeys)
+      authorityIdentity = LocalProducerIdentity(
+        "loader-validated-A",
+        population.authorityKeyPair,
+        population.authorityVrfSecret,
+        population.authorityVrfPublic,
+        population.checkpointSigner.operatorKeyRegistry
       )
-      mutableRegistry = mutableOperatorRegistry(registryEntries)
-      producer <- makeProducer(
-        ssl,
-        rig,
-        Ratio.One,
-        shardEta,
-        operatorKeyRegistry = Some(mutableRegistry),
-        republishEveryTicks = 1
-      )
-      first <- tryProduceUntilSome(producer, 1000L, EtaPeriod(0L), 100, Set(rig.selfPeerId))
-      publishedBefore <- rig.recorded.map(_.size)
-      _ <- registryEntries.set(Map.empty)
-      afterRemoval <- producer.produce(
+      offDutyRig <- producerRig(population, authorityIdentity)
+      offDutyProbe <- probedProducer(ssl, offDutyRig, shardEta)
+      offDuty <- offDutyProbe.producer.produce(
         mkPendingSnapshots(1),
-        mkOrd(2000L),
-        EtaPeriod(0L),
-        Slot.unsafeApply(2000L),
-        Set(rig.selfPeerId)
+        mkOrd(20L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(20L),
+        Set(population.controlKeys.operatorPeerId)
       )
-      publishedAfter <- rig.recorded.map(_.size)
-    } yield expect.all(first.nonEmpty, publishedBefore == 1, afterRemoval.isEmpty, publishedAfter == 1)
+      offDutyCounts <- offDutyProbe.counts
+
+      deriveNoneRig <- producerRig(population, authorityIdentity)
+      deriveNoneProbe <- probedProducer(
+        ssl,
+        deriveNoneRig,
+        shardEta,
+        derive = (_, _, _, _) => IO.pure(None)
+      )
+      deriveNone <- deriveNoneProbe.producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(21L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(21L),
+        Set(population.authorityId)
+      )
+      deriveNoneCounts <- deriveNoneProbe.counts
+
+      movingBaseRead <- Ref.of[IO, Int](0)
+      movingBase = movingBaseRead.modify { reads =>
+        val ordinal = if (reads == 0) SnapshotOrdinal.MinValue else SnapshotOrdinal.unsafeApply(1L)
+        (reads + 1, ordinal)
+      }
+      movingBaseRig <- producerRig(population, authorityIdentity)
+      movingBaseProbe <- probedProducer(ssl, movingBaseRig, shardEta, baseOrdinalF = movingBase)
+      movedBase <- movingBaseProbe.producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(22L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(22L),
+        Set(population.authorityId)
+      )
+      movingBaseCounts <- movingBaseProbe.counts
+
+      noKesRig <- producerRig(population, authorityIdentity)
+      noKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] = IO.pure(None)
+      }
+      noKesProbe <- probedProducer(ssl, noKesRig, shardEta, kesSigner = Some(noKesSigner))
+      noKes <- noKesProbe.producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(23L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(23L),
+        Set(population.authorityId)
+      )
+      noKesCounts <- noKesProbe.counts
+    } yield
+      expect.all(
+        offDuty.isEmpty,
+        offDutyCounts == ProducerEffectCounts(1, 1, 0, 0, 1, 0, 0),
+        deriveNone.isEmpty,
+        deriveNoneCounts == ProducerEffectCounts(1, 1, 1, 1, 1, 0, 0),
+        movedBase.isEmpty,
+        movingBaseCounts == ProducerEffectCounts(1, 1, 1, 1, 2, 0, 0),
+        noKes.isEmpty,
+        noKesCounts == ProducerEffectCounts(1, 1, 1, 1, 2, 1, 0)
+      )
   }
 
   test("Phase-2 checkpoint anchor ahead of local shard tip defers instead of recreating an old ordinal") { res =>

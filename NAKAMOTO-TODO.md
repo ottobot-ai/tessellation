@@ -505,13 +505,28 @@ criteria are in `NAKAMOTO-PLAN.md`.
     dominated by the zero KES call. Positive and staged KES/local-verification
     controls prove the bounded emitter probes. This exercises the production
     capability-before-sign order, but the injected hook does not prove CL1 replay
-    semantics or economic correctness. This proves the frozen atomic-pair boundary
-    and pins current adapter test names; it does not prove
-    draw/store/adopt/slash effects or that each remaining obligation is instrumented. It is
+    semantics or economic correctness. K7b-2 separately qualifies the frozen
+    shard-producer identity boundary. Loader-validated A/B plus missing, unrooted
+    dummy runtime-shaped, and malformed local identities reject fresh mint. Held
+    re-publication separately rejects missing authority, loader-validated B's VRF
+    bytes substituted into the live local array, and the unrooted runtime-shaped A
+    record; immutable local long-term and array-length inputs remain fresh-only.
+    Rejections stop before directly observed eta lookup, duty-order draw,
+    possession proof, per-MG derivation-hook invocation, execution-base reads,
+    KES, or publication, while positive held A re-publishes exact bytes without a
+    second upstream effect. Scheduled-duty selection plus Ed and outer-envelope
+    signing are source-dominated. Outer signing has no manifest effect label or
+    direct counter. The producer's `Replay` evidence is only derivation-hook
+    invocation, not CL1 replay proof. These cuts prove the frozen atomic-pair boundaries and
+    pin current adapter test names; they do not prove other adapters' draw/store/
+    adopt/slash effects or that each remaining obligation is instrumented. This is
     not a common runtime adapter or a historical branch proof. `KEYREG-006`,
     `KEYREG-010`, and `KEYREG-011` remain open until qualification proves every
     allowlisted consumer's exact-parent historical semantics and positive runtime
-    path. The textual and semantic inventories remain review tripwires.
+    path. Complete committed-window consumption, an exact hash/root-bound
+    execution base, a durable pre-publication checkpoint outbox, and historical
+    committee/membership/runtime activation also remain open. The textual and
+    semantic inventories remain review tripwires.
   - **Portable evidence remains open:** for every suffix and upper-level tower
     occurrence, the verifier now resolves the current atomic period-zero pair,
     verifies the VRF proof over the header's exact carried `eta || slot` bytes,
