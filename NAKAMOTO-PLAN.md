@@ -1264,9 +1264,17 @@ The greenfield finality durability union is also compacted in place: its 14 live
 artifact kinds use contiguous tags `1..14`, the deleted draft density-evidence
 tag is not reserved, and storage prefixes plus frozen aggregate vectors match the
 new bytes. No compatibility decoder or legacy path alias remains.
-E1.1 next expands generic rumor and ChainSync/bootstrap transport families, all
-14 finality payload variants, and a total per-kind binding/codec/vector table with
-removal-mutation gates; the 48 semantic families do not substitute for that work.
+Its shared `FinalityDomain` now also binds a nonzero consensus-parameter hash in
+every intent/effect/durable identity, closing the previously underbound
+network/genesis/era-only domain. Parameter-object bytes and runtime activation
+remain open.
+The dark manifest now also has one validated row for every one of the 14 live
+finality payload kinds, plus exhaustive runtime-enum parity. Only four rows have
+concrete codecs/frozen vectors; the other ten are expressly schema-less opaque
+pointers. E1.1 next expands generic rumor and ChainSync/bootstrap carrier
+families and closes those ten payload schemas with total binding/codec/vector
+tables and mutation gates; the 48 semantic families do not substitute for that
+work.
 
 Current S2 evidence is intentionally narrow. A nonactivating test reference
 interpreter supports exactly the typed IDs for zero-fee native transfer,

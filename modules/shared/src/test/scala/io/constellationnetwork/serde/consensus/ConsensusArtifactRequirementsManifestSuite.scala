@@ -20,8 +20,10 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
   test("the declaration-only requirements inventories are structurally valid") {
     val artifactLabels = ConsensusArtifactKind.all.map(_.semanticLabel)
     val transcriptLabels = ConsensusTranscriptKind.all.map(_.semanticLabel)
+    val finalityPayloadLabels = ConsensusFinalityPayloadKind.all.map(_.semanticLabel)
     val allLabels =
-      artifactLabels ++ transcriptLabels ++ ArtifactBinding.all.map(_.semanticLabel) ++ ArtifactAuthority.all.map(_.semanticLabel)
+      artifactLabels ++ transcriptLabels ++ finalityPayloadLabels ++ ArtifactBinding.all.map(_.semanticLabel) ++
+        ArtifactAuthority.all.map(_.semanticLabel)
     val forbiddenBftWords = Set("vote", "voted", "lock", "locked", "qc")
     val forbiddenBftPhrases = Set("quorum-certificate", "view-change")
     val containsGlobalBftVocabulary = allLabels.exists { label =>
@@ -34,6 +36,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
     expect.all(
       validation.isEmpty,
       transcriptValidation.isEmpty,
+      finalityPayloadValidation.isEmpty,
       entries.size == 48,
       entries.map(_.kind).toSet == ConsensusArtifactKind.all.toSet,
       artifactLabels.distinct.size == artifactLabels.size,
@@ -44,9 +47,132 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       transcriptEntries.forall(_.authority == ArtifactAuthority.Eligibility),
       transcriptEntries.forall(_.bindings.contains(ExactEligibilityParent)),
       transcriptEntries.forall(_.bindings.contains(N2RosterStakeAndKeyView)),
+      ConsensusFinalityPayloadKind.all.size == 14,
+      finalityPayloadEntries.size == 14,
+      finalityPayloadEntries.map(_.kind).toSet == ConsensusFinalityPayloadKind.all.toSet,
+      finalityPayloadLabels.distinct.size == finalityPayloadLabels.size,
       !containsGlobalBftVocabulary,
       codecStatus == ManifestCodecStatus.Open,
       activationStatus == ManifestActivationStatus.DarkOnly
+    )
+  }
+
+  test("finality payload authority and concrete codec/vector evidence stay narrowly scoped") {
+    val byKind = finalityPayloadEntries.map(contract => contract.kind -> contract).toMap
+    val qualificationKinds = finalityPayloadEntries.collect {
+      case contract if contract.authority == ArtifactAuthority.FinalityQualification => contract.kind
+    }.toSet
+    val concreteKinds = finalityPayloadEntries.collect {
+      case contract if contract.codecStatus == FinalityPayloadCodecStatus.ConcreteCanonicalCodec => contract.kind
+    }.toSet
+    val vectorKinds = finalityPayloadEntries.collect {
+      case contract if contract.vectorStatus == FinalityPayloadVectorStatus.ConcreteFrozenVector => contract.kind
+    }.toSet
+    val concreteSourceTypes = finalityPayloadEntries.collect {
+      case contract @ FinalityPayloadContract(_, FinalityPayloadShape.ConcreteSourceType(sourceType), _, _, _, _, _, _) =>
+        contract.kind -> sourceType
+    }.toMap
+    val expectedConcrete = Set[ConsensusFinalityPayloadKind](
+      ConsensusFinalityPayloadKind.CoreBatch,
+      ConsensusFinalityPayloadKind.ReleasedCoreRecord,
+      ConsensusFinalityPayloadKind.PathManifest,
+      ConsensusFinalityPayloadKind.PathChunk
+    )
+    val expectedSourceTypes = Map[ConsensusFinalityPayloadKind, String](
+      ConsensusFinalityPayloadKind.CoreBatch ->
+        "io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityCoreBatch",
+      ConsensusFinalityPayloadKind.ReleasedCoreRecord ->
+        "io.constellationnetwork.node.shared.domain.snapshot.finality.ReleasedCoreRecordPayload",
+      ConsensusFinalityPayloadKind.PathManifest ->
+        "io.constellationnetwork.node.shared.domain.snapshot.finality.PathManifestPayload",
+      ConsensusFinalityPayloadKind.PathChunk ->
+        "io.constellationnetwork.node.shared.domain.snapshot.finality.PathChunk"
+    )
+
+    expect.all(
+      qualificationKinds == Set[ConsensusFinalityPayloadKind](
+        ConsensusFinalityPayloadKind.DecidedAttestationEvidence,
+        ConsensusFinalityPayloadKind.DepthK1Evidence
+      ),
+      byKind(ConsensusFinalityPayloadKind.ForkChoiceDecisionEvidence).authority == ArtifactAuthority.ObjectiveEvidence,
+      byKind(ConsensusFinalityPayloadKind.PathManifest).authority == ArtifactAuthority.Commitment,
+      byKind(ConsensusFinalityPayloadKind.PathChunk).authority == ArtifactAuthority.Commitment,
+      finalityPayloadEntries
+        .filterNot(contract => qualificationKinds.contains(contract.kind))
+        .forall(_.authority != ArtifactAuthority.FinalityQualification),
+      finalityPayloadEntries.forall(_.authority != ArtifactAuthority.StateValidity),
+      concreteKinds == expectedConcrete,
+      vectorKinds == expectedConcrete,
+      concreteSourceTypes == expectedSourceTypes,
+      finalityPayloadEntries.filter(contract => expectedConcrete.contains(contract.kind)).forall(_.knownGaps.isEmpty),
+      finalityPayloadEntries
+        .filterNot(contract => expectedConcrete.contains(contract.kind))
+        .forall(contract =>
+          contract.payloadShape == FinalityPayloadShape.OpaquePointerOnly &&
+            contract.knownGaps.contains(FinalityOpaquePayloadSchemaMissing)
+        )
+    )
+  }
+
+  test("finality payload validation rejects missing, duplicate, underbound, and overstated rows") {
+    val duplicate = finalityPayloadEntries.head :: finalityPayloadEntries
+    val missing = finalityPayloadEntries.filterNot(_.kind == ConsensusFinalityPayloadKind.EffectPayload)
+    val wrongAuthority = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.ForkChoiceDecisionEvidence =>
+        contract.copy(authority = ArtifactAuthority.FinalityQualification)
+      case contract => contract
+    }
+    val withoutCommonBinding = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.CoreBatch =>
+        contract.copy(bindings = contract.bindings - ParameterHash)
+      case contract => contract
+    }
+    val withoutQualificationContext = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.DecidedAttestationEvidence =>
+        contract.copy(bindings = contract.bindings - AttestationDecisionContext)
+      case contract => contract
+    }
+    val opaqueClaimingConcrete = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.EffectPayload =>
+        contract.copy(
+          payloadShape = FinalityPayloadShape.ConcreteSourceType("invented.EffectPayload"),
+          codecStatus = FinalityPayloadCodecStatus.ConcreteCanonicalCodec,
+          vectorStatus = FinalityPayloadVectorStatus.ConcreteFrozenVector
+        )
+      case contract => contract
+    }
+    val concreteClaimingOpaque = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.CoreBatch =>
+        contract.copy(
+          payloadShape = FinalityPayloadShape.OpaquePointerOnly,
+          codecStatus = FinalityPayloadCodecStatus.NoCanonicalPayloadCodec,
+          vectorStatus = FinalityPayloadVectorStatus.NoCanonicalPayloadVector
+        )
+      case contract => contract
+    }
+    val wrongDefinitionStatus = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.PathChunk =>
+        contract.copy(definitionStatus = ArtifactDefinitionStatus.TargetShapeOpen)
+      case contract => contract
+    }
+    val withoutOpaqueGap = finalityPayloadEntries.map {
+      case contract if contract.kind == ConsensusFinalityPayloadKind.PriorAnchorReceipt =>
+        contract.copy(knownGaps = contract.knownGaps - FinalityOpaquePayloadSchemaMissing)
+      case contract => contract
+    }
+
+    expect.all(
+      validateFinalityPayloadEntries(duplicate).exists(_.isInstanceOf[DuplicateFinalityPayloadKind]),
+      validateFinalityPayloadEntries(duplicate).exists(_.isInstanceOf[DuplicateFinalityPayloadSemanticLabel]),
+      validateFinalityPayloadEntries(missing).exists(_.isInstanceOf[MissingFinalityPayloadKind]),
+      validateFinalityPayloadEntries(wrongAuthority).exists(_.isInstanceOf[InvalidFinalityPayloadAuthority]),
+      validateFinalityPayloadEntries(withoutCommonBinding).exists(_.isInstanceOf[MissingFinalityPayloadCommonBindings]),
+      validateFinalityPayloadEntries(withoutQualificationContext)
+        .exists(_.isInstanceOf[MissingFinalityPayloadAuthorityBindings]),
+      validateFinalityPayloadEntries(opaqueClaimingConcrete).exists(_.isInstanceOf[InvalidFinalityPayloadEvidence]),
+      validateFinalityPayloadEntries(concreteClaimingOpaque).exists(_.isInstanceOf[InvalidFinalityPayloadEvidence]),
+      validateFinalityPayloadEntries(wrongDefinitionStatus).exists(_.isInstanceOf[InvalidFinalityPayloadDefinitionStatus]),
+      validateFinalityPayloadEntries(withoutOpaqueGap).exists(_.isInstanceOf[MissingFinalityPayloadGap])
     )
   }
 
@@ -149,6 +275,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
     val reviewedMetadataPaths = Set(
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ArtifactAuthority.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ArtifactBinding.scala",
+      "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusFinalityPayloadKind.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusArtifactKind.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusArtifactStatus.scala",
       "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusTranscriptKind.scala",
@@ -162,8 +289,13 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       "ManifestCodecStatus",
       "ManifestActivationStatus",
       "ConsensusArtifactKind",
+      "ConsensusFinalityPayloadKind",
+      "FinalityPayloadShape",
+      "FinalityPayloadCodecStatus",
+      "FinalityPayloadVectorStatus",
       "ConsensusTranscriptKind",
       "TranscriptContract",
+      "FinalityPayloadContract",
       "ConsensusArtifactRequirementsManifest"
     )
     val metadataReferences = sources.collect {

@@ -647,6 +647,19 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `ForkChoiceDecisionEvidence` at `7`; exact aggregate vectors and durable-store
     paths were regenerated in place. No compatibility decoder or stale directory
     alias remains because these fork-only bytes were never deployed.
+  - **Landed finality-domain parameter binding (2026-07-16):** every dark
+    finality intent, effect, artifact pointer graph, and durable-store identity now
+    commits the exact consensus-parameter hash alongside network, genesis, and
+    protocol era. The field is Scodec-bound, required nonzero by both core and
+    effect validation, and covered by identity-mutation and restart-domain tests.
+    This does not define the parameter-object codec or activate finality.
+  - **Landed subtype-total finality payload inventory (2026-07-16):** all 14
+    live `FinalityArtifactKind` variants have one dark requirements row and an
+    exhaustive runtime-enum parity test. Only CoreBatch, ReleasedCoreRecord,
+    PathManifest, and PathChunk have concrete codecs/frozen vectors. The other ten
+    remain explicitly opaque-pointer-only with no canonical payload codec/vector.
+    Only decided-attestation and depth-k1 evidence are finality qualification;
+    fork-choice evidence is objective evidence, and no row is state validity.
   - E1b does not select hash preimages, compute a target MPT root, encode proof
     aggregates, or activate Scodec in hashing/signing/storage. Aggregate proof and
     message bounds plus the atomic domain-bound runtime cutover remain open.
@@ -666,9 +679,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **Status honesty:** E1.1 and E1.3 remain OPEN; S1 remains PARTIAL;
     `SER-005`, `SER-006`, and `ERA-001` remain OPEN.
   - **Next E1.1 manifest closure:** add generic rumor and ChainSync/bootstrap
-    transport families, expand all 14 finality payload variants, and replace the
-    remaining authority-class fallback with a total per-kind binding/codec/vector
-    table plus removal-mutation tests.
+    transport families, define codecs/verifiers for the ten pointer-only finality
+    payload variants, and replace the remaining authority-class fallback with a
+    total per-kind binding/codec/vector table plus removal-mutation tests.
   - **Gate:** `SER-*`, `ERA-*`, `PARAM-001`, `CRYPTO-001`.
 
 - [ ] **S2 PARTIAL - deterministic framework oracle and kernel**

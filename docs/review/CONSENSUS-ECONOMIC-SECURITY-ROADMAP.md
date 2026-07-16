@@ -239,6 +239,15 @@ period/slot, and purpose at every inventoried VRF/sortition use. It records know
 accumulator/change-set, MPT-key, slashing-value, optimistic-attestation, tower,
 genesis, lane, O18, O19, and O20 blockers; it does not close E1.1 or E1.3.
 
+That inventory is now subtype-total over all 14 live finality artifact kinds.
+Only CoreBatch, ReleasedCoreRecord, PathManifest, and PathChunk have concrete
+payload codecs and frozen vectors. The other ten are explicitly opaque pointers
+with no canonical payload codec/vector. Exactly the decided-attestation and
+depth-k1 rows have finality-qualification authority; fork-choice is objective
+evidence and no subtype row claims state validity. Runtime-enum parity and
+missing/duplicate/underbound/overclaim mutation tests pass. This inventories the
+gap; it does not implement the ten missing payload schemas or their verifiers.
+
 A passing follower characterization now proves each native-field omission
 independently: a signed target root containing field 33 or opaque field-34 bytes
 cannot be reproduced from the 31-field accumulator, returns no installable GSI,
@@ -251,6 +260,12 @@ tag. Its 14 active kinds are contiguous at `1..14`; the corresponding storage
 prefixes and frozen composite vectors were replaced in place, with no legacy
 decoder or directory alias. This is greenfield schema cleanup, not finality
 activation or evidence verification.
+
+The same dark domain now commits a required nonzero consensus-parameter hash in
+addition to network, genesis, and protocol era. Core/effect validation rejects a
+missing value, and identity mutation plus durable restart tests cover the
+binding. This closes the structural domain omission only; it does not freeze the
+parameter-object codec or make the coordinator a finality decider.
 
 The dark typed `GlobalStateKeyCodec` now covers all six namespace variants:
 `SystemNamespace` uses outer tag `0x05` plus four closed label tags, exact vectors,

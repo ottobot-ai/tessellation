@@ -66,6 +66,9 @@ object ArtifactGap {
   case object PortableTowerHistoricalEligibilityMissing extends ArtifactGap {
     val semanticLabel: String = "portable-tower-historical-eligibility-missing"
   }
+  case object FinalityOpaquePayloadSchemaMissing extends ArtifactGap {
+    val semanticLabel: String = "finality-opaque-payload-schema-missing"
+  }
   case object O18TransportByteContractOpen extends ArtifactGap {
     val semanticLabel: String = "o18-transport-byte-contract-open"
   }

@@ -100,6 +100,42 @@ VK-hash draw, shard-eta derivation, staircase rank, checkpoint VRF possession,
 execution-signature VRF possession, watchtower assignment, optimistic sampling,
 and tower eligibility. Their transcript bytes and domains remain open.
 
+## Finality Payload Subtypes
+
+The broader `FinalityDurabilityRecord` family is not evidence that every payload
+named by `FinalityArtifactKind` has a schema. The dark subtype inventory is total
+over all 14 live kinds:
+
+| Kind | Authority requirement | Current payload evidence | Status |
+|---|---|---|---|
+| CoreBatch | Local durability | `FinalityCoreBatch` codec and frozen vector | Existing shape needs audit |
+| ReleasedCoreRecord | Local durability | `ReleasedCoreRecordPayload` codec and frozen vector | Existing shape needs audit |
+| PathManifest | Commitment | `PathManifestPayload` codec and frozen vector | Existing shape needs audit |
+| PathChunk | Commitment | `PathChunk` codec and frozen vector | Existing shape needs audit |
+| DecidedAttestationEvidence | Finality qualification | Opaque pointer only; no payload codec/vector | Target shape open |
+| DepthK1Evidence | Finality qualification | Opaque pointer only; no payload codec/vector | Target shape open |
+| ForkChoiceDecisionEvidence | Objective evidence | Opaque pointer only; no payload codec/vector | Target shape open |
+| PreparedSemanticState | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+| AuthenticatedTargetAnchor | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+| AppliedSemanticStateReceipt | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+| AuthenticatedAnchorReceipt | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+| PriorSemanticStateReceipt | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+| PriorAnchorReceipt | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+| EffectPayload | Local durability | Opaque pointer only; no payload codec/vector | Target shape open |
+
+An opaque pointer commits kind, encoding identifier, digest, and byte length. It
+does not make the bytes canonical and does not verify their semantics. Only the
+decided-attestation and depth-k1 rows may qualify Phase 2. Fork-choice evidence
+remains a separately verified objective chain-selection input; it is not a third
+qualification rail and is not a QC, vote, or lock.
+
+Every row declares the eventual common network/genesis/era/parameter/content
+bindings. The dark finality composite domain now actually commits a required
+nonzero consensus-parameter hash alongside network, genesis, and era, and exact
+identity/vector tests cover that field. The four concrete payload rows remain
+`ExistingShapeNeedsAudit`; having a codec/vector does not prove every declared
+binding or activate runtime finality.
+
 ## Recorded Blockers
 
 - Ordinal-zero GL0 and ML0 full genesis objects still embed legacy V1 state
@@ -139,8 +175,9 @@ and tower eligibility. Their transcript bytes and domains remain open.
   policy. The manifest declares one migration family but chooses none of those
   policies.
 - O18 still requires explicit generic-rumor and ChainSync/bootstrap transport
-  families, and the finality durability umbrella does not substitute for exact
-  subordinate contracts for all 14 `FinalityArtifactKind` payload variants.
+  families. The finality durability umbrella now has exact subordinate inventory
+  coverage for all 14 `FinalityArtifactKind` variants, but ten payload schemas and
+  their semantic verifiers remain open.
 - The validator's authority-class fallback is intentionally coarse outside the
   critical shard, optimistic-tip, and tower rows. E1.1 must make the per-kind
   binding table total and mutation-test every family.
