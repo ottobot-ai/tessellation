@@ -6,8 +6,8 @@ import io.constellationnetwork.security.hex.Hex
   *
   * [[Generic]] preserves the complete ROOT-011 terminal-collision validation for arbitrary-length keys. [[FixedWidth]] is an explicit,
   * construction-time capability for dedicated stores whose complete image and every later mutation use one exact key width. Distinct
-  * canonical keys of equal width cannot be proper prefixes, so insertion validates the incoming batch without enumerating the retained
-  * key set. Initial images and loaded images still receive complete validation.
+  * canonical keys of equal width cannot be proper prefixes, so insertion validates the incoming batch without enumerating the retained key
+  * set. Initial images and loaded images still receive complete validation.
   */
 sealed trait PhysicalTrieKeyPolicy extends Serializable {
   def exactWidthBytes: Option[Int]
@@ -56,10 +56,12 @@ object PhysicalTrieKeyPolicy {
 
     private[producer] def validateComplete(keys: Iterable[Hex]): Either[PhysicalTrieKeyError, Unit] = {
       val captured = keys.iterator.toVector
-      captured.foldLeft[Either[PhysicalTrieKeyError, Unit]](Right(())) {
-        case (Right(_), key)     => validateOne(key)
-        case (left @ Left(_), _) => left
-      }.flatMap(_ => PhysicalTrieKeyValidator.validateKeys(captured))
+      captured
+        .foldLeft[Either[PhysicalTrieKeyError, Unit]](Right(())) {
+          case (Right(_), key)     => validateOne(key)
+          case (left @ Left(_), _) => left
+        }
+        .flatMap(_ => PhysicalTrieKeyValidator.validateKeys(captured))
     }
 
     private[producer] def validateEach(keys: Iterable[Hex]): Either[PhysicalTrieKeyError, Unit] =

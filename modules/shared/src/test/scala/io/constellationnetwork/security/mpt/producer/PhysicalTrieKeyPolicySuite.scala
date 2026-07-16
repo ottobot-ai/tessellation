@@ -37,7 +37,7 @@ object PhysicalTrieKeyPolicySuite extends SimpleIOSuite {
           val source = new String(Files.readAllBytes(path), StandardCharsets.UTF_8)
           val declaration = source.linesIterator.find(_.startsWith(s"final class $name")).getOrElse("")
           expect(declaration.endsWith(" private (")) &&
-            expect(source.sliding(s"new $name".length).count(_ == s"new $name") == 1)
+          expect(source.sliding(s"new $name".length).count(_ == s"new $name") == 1)
       }.reduce(_ && _)
     }
   }
