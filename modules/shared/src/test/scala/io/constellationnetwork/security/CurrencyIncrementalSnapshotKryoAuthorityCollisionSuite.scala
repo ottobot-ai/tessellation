@@ -76,8 +76,9 @@ object CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite extends MutableIOS
       kryoHashB <- res.kryoHasher.hash(snapshotB)
       jsonHashA <- res.jsonHasher.hash(snapshotA)
       jsonHashB <- res.jsonHasher.hash(snapshotB)
-    } yield expect.eql(kryoHashA, kryoHashB) &&
-      expect(jsonHashA != jsonHashB)
+    } yield
+      expect.eql(kryoHashA, kryoHashB) &&
+        expect(jsonHashA != jsonHashB)
   }
 
   test("a Kryo signature transfers across the dropped commitment while a current JSON signature does not") { res =>
@@ -109,9 +110,10 @@ object CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite extends MutableIOS
         implicit val hasher: Hasher[IO] = res.jsonHasher
         jsonSignedA.copy(value = snapshotB).hasValidSignature[IO]
       }
-    } yield expect(kryoAValid) &&
-      expect(kryoBValid) &&
-      expect(jsonAValid) &&
-      expect(!jsonBValid)
+    } yield
+      expect(kryoAValid) &&
+        expect(kryoBValid) &&
+        expect(jsonAValid) &&
+        expect(!jsonBValid)
   }
 }
