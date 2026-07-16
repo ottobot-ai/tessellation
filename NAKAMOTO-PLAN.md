@@ -1041,6 +1041,25 @@ delivery, rollback, and recovery.
   pre-work observation until a live exact Phase-2 lease is followed by mandatory
   post-replay `commitIfCurrent`; otherwise density replacement can authorize a
   signature over an orphaned base. This recheck is containment, not FIN-14 closure.
+- The shard producer now applies the same conservative process-local lineage
+  containment to checkpoint mint and retry. A present
+  `CanonicalLineageRevision` is required before replay; the same generation is
+  re-read after replay and exact-base stability but before KES, Ed25519, outer
+  signing, or first publication. Held retries re-read immediately before
+  publication, and any replacement, unavailable observation, or mismatch clears
+  the volatile held memo. Descendant extension preserves the generation. Focused
+  tests prove unavailable-before-replay has zero replay/sign/publish effects,
+  replacement-during-replay has replay but zero sign/publish effects, unchanged
+  generation retries exact bytes, and replacement plus forced ABA cannot revive
+  them (`ShardCheckpointProducerSuite.scala`). This is discard-only containment,
+  not a portable lease or finality proof: replacement can still race the final
+  read and signature/publication, the first publish is not a durable atomic
+  outbox commit, the separately read lineage generation is not atomically bound
+  to the retained execution-base reference, and clearing one producer cannot
+  revoke copies already received by execution attesters. A locally stored orphan
+  checkpoint deliberately leaves the producer fail-stopped until authenticated
+  old/new/MRCA shard-reorg effects replace its chain tip. `FOLLOW-008N`,
+  `SHARD-C-008`, `SHARD-C-012`, and FIN-14 remain open.
 - A package-private dark identity-composition model now requires the real
   `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
   the exact-history session, and matching exact-image, semantic, field-32, and

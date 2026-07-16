@@ -155,6 +155,10 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       shardEtaFor = _ => fixedShardEta.pure[IO],
       staircaseDeltaSlots = 5,
       derivePerMgState = replay,
+      localGlobalLineageRevision = io.constellationnetwork.node.shared.domain.snapshot.finality
+        .CanonicalLineageRevision(NonNegLong.MinValue)
+        .some
+        .pure[IO],
       lastPhase2Checkpoint = none.pure[IO],
       republishEveryTicks = 1
     )

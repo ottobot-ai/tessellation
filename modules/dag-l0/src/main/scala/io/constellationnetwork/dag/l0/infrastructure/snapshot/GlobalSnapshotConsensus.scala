@@ -1659,6 +1659,10 @@ object GlobalSnapshotConsensus {
                           globalStateProofSelector
                         )
                       ),
+                      // Discard-only retry containment. This process-local generation changes on GL0 lineage replacement/reconstruction
+                      // but remains stable across descendant extension. It is never serialized or treated as checkpoint/finality evidence.
+                      // The producer re-reads it immediately before a held retry and clears stale bytes on mismatch/unavailability.
+                      localGlobalLineageRevision = chainStore.selectedTip.map(_.map(_.lineageRevision)),
                       // Candidate execution-base savepoint: locate the signed byte store's newest retained ordinal, then resolve and stamp
                       // its exact canonical Phase-2 identity. The locator is NOT authority and the live `mptStore.lastPersistedOrdinal` is
                       // never substituted: exact hash/parent/root plus retained bytes must verify before replay or signing.

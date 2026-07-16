@@ -172,6 +172,10 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         shardEtaFor = _ => IO.pure(shardEta),
         staircaseDeltaSlots = 5,
         derivePerMgState = deterministicDerive,
+        localGlobalLineageRevision = io.constellationnetwork.node.shared.domain.snapshot.finality
+          .CanonicalLineageRevision(eu.timepit.refined.types.numeric.NonNegLong.MinValue)
+          .some
+          .pure[IO],
         lastPhase2Checkpoint = cats.effect.IO.pure(None),
         republishEveryTicks = 1
       )

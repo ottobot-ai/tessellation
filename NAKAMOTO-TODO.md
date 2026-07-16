@@ -1087,6 +1087,15 @@ criteria are in `NAKAMOTO-PLAN.md`.
     not a lease issuer or evidence/readback verifier; purpose/freshness policy and
     `FOLLOW-008B/E/F/G/H/L/M/N/O` remain open, as do every live consumer and
     invalidation path.
+    The live shard producer has only a conservative local precursor: it requires a
+    present GL0 `CanonicalLineageRevision` before replay, rechecks the same
+    generation after replay before every first validity signature/publication, and
+    rechecks before a held retry. Mismatch or unavailability clears the volatile
+    held memo. This prevents known stale signing/retry schedules but is not a
+    `CanonicalPhase2Lease`, portable evidence, durable outbox, or atomic
+    `commitIfCurrent`. A locally stored orphan shard tip intentionally fail-stops
+    until authenticated old/new/MRCA reorg orchestration lands; FIN-14,
+    `FOLLOW-008N`, `SHARD-C-008`, and `SHARD-C-012` remain open.
   - Before activation, add authenticated finality-evidence/fork-choice authority and
     hold/recheck the exact branch revision through publication; package-own the
     MPT-plus-semantic-plus-anchor readback capability that may advance

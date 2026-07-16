@@ -15,6 +15,7 @@ import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnap
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
 import io.constellationnetwork.node.shared.domain.nakamoto.{ActiveOperatorConsensusKeys, OperatorConsensusKeyRegistry}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
@@ -204,7 +205,11 @@ object ShardCheckpointProducer {
     * becomes operational or the Phase-2 shard anchor moves out from under it (detected via `parentCheckpointHash`, including sibling
     * reorg).
     */
-  private final case class HeldCheckpoint(signed: Signed[ShardCheckpoint], lastPublishedTick: Long)
+  private final case class HeldCheckpoint(
+    signed: Signed[ShardCheckpoint],
+    lastPublishedTick: Long,
+    localGlobalLineageRevision: CanonicalLineageRevision
+  )
 
   /** Exact retained GL0 execution base used by one checkpoint attempt. The state reference, rooted state-channel tips, complete prior
     * currency states, and rooted global balances must be materialized from the same immutable reader view; `None` means that view is
@@ -383,6 +388,11 @@ object ShardCheckpointProducer {
         PinnedExecutionBase
       ) => F[SortedMap[Address, Option[Hash]]]
     ] = None,
+    /** Process-local GL0 canonical-lineage observation. This is conservative retry invalidation only: the value is never serialized or
+      * treated as portable finality evidence. A held checkpoint may be re-published only when both its mint observation and the current
+      * observation are present and equal. Replacement, missing observation, or mismatch discards the held bytes without publishing.
+      */
+    localGlobalLineageRevision: F[Option[CanonicalLineageRevision]],
     /** Atomic `(ordinal, checkpointHash)` of the latest shard checkpoint whose exact containing GL0 snapshot reached Phase 2. Production
       * policy input only, never an artifact-validity condition. V1 permits exactly one outstanding checkpoint per shard: a producer may
       * mint the successor only when the selected shard tip exactly matches this anchor.
@@ -474,8 +484,8 @@ object ShardCheckpointProducer {
             // binary buffer is empty: an already-held checkpoint is an outbox item and must continue to be re-published until its exact
             // Phase-2 anchor arrives. Empty input prevents only a NEW mint. The identity gate above intentionally also covers this re-publish.
             tickRef.updateAndGet(_ + 1L).flatMap { tick =>
-              (chainStore.bestTip, adoptedPerMgTip, lastPhase2Checkpoint, heldRef.get).tupled.flatMap {
-                case (bestTipOpt, adoptedTips, phase2CheckpointOpt, heldOpt) =>
+              (chainStore.bestTip, adoptedPerMgTip, lastPhase2Checkpoint, localGlobalLineageRevision, heldRef.get).tupled.flatMap {
+                case (bestTipOpt, adoptedTips, phase2CheckpointOpt, currentLineageRevision, heldOpt) =>
                   val phase2Ordinal = phase2CheckpointOpt.map(_._1.value).getOrElse(ShardOrdinal.Root.value)
                   val bestOrdinal = bestTipOpt.map(_.signed.value.shardOrdinal.value).getOrElse(ShardOrdinal.Root.value)
                   val bestMatchesPhase2 = (bestTipOpt, phase2CheckpointOpt) match {
@@ -513,31 +523,69 @@ object ShardCheckpointProducer {
                         .info(s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=empty-pending")
                         .as(None: Option[Signed[ShardCheckpoint]])
                     else
-                      produceInner(
-                        bestTipOpt,
-                        adoptedTips,
-                        pendingSnapshots,
-                        gl0AnchorOrdinal,
-                        epoch,
-                        currentSlot,
-                        committee,
-                        operatorKeys
-                      ).flatMap {
-                        case some @ Some(signed) => heldRef.set(Some(HeldCheckpoint(signed, tick))).as(some)
-                        case None                => Async[F].pure(None: Option[Signed[ShardCheckpoint]])
+                      currentLineageRevision match {
+                        case None =>
+                          logger
+                            .warn(
+                              s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                                "reason=global-lineage-unavailable-before-replay"
+                            )
+                            .as(None: Option[Signed[ShardCheckpoint]])
+                        case Some(mintLineageRevision) =>
+                          produceInner(
+                            bestTipOpt,
+                            adoptedTips,
+                            pendingSnapshots,
+                            gl0AnchorOrdinal,
+                            epoch,
+                            currentSlot,
+                            committee,
+                            operatorKeys,
+                            mintLineageRevision
+                          ).flatMap {
+                            case some @ Some(signed) =>
+                              heldRef.set(Some(HeldCheckpoint(signed, tick, mintLineageRevision))).as(some)
+                            case None => Async[F].pure(None: Option[Signed[ShardCheckpoint]])
+                          }
                       }
+
+                  def sameAvailableLineage(
+                    minted: CanonicalLineageRevision,
+                    observed: Option[CanonicalLineageRevision]
+                  ): Boolean =
+                    observed.contains(minted)
+
+                  def discardHeldForLineage(
+                    held: HeldCheckpoint,
+                    observed: Option[CanonicalLineageRevision]
+                  ): F[Option[Signed[ShardCheckpoint]]] =
+                    heldRef.set(None) *>
+                      logger
+                        .warn(
+                          s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} reason=global-lineage-moved-or-unavailable " +
+                            s"shardOrdinal=${held.signed.value.shardOrdinal.value} " +
+                            s"mintLineage=${held.localGlobalLineageRevision.value.value} " +
+                            s"currentLineage=${observed.map(_.value.value)}; discarded held checkpoint"
+                        )
+                        .as(None: Option[Signed[ShardCheckpoint]])
 
                   def republish(held: HeldCheckpoint): F[Option[Signed[ShardCheckpoint]]] =
                     if (tick - held.lastPublishedTick >= republishEveryTicks.toLong)
-                      publisher.publish(held.signed) *>
-                        heldRef.set(Some(held.copy(lastPublishedTick = tick))) *>
-                        logger
-                          .info(
-                            s"produce: re-publish-held shardOrdinal=${held.signed.value.shardOrdinal.value} " +
-                              s"gl0Anchor=${held.signed.value.gl0AnchorOrdinal.value.value} slot=${held.signed.value.slot.value.value} " +
-                              s"tick=$tick (single outstanding checkpoint)"
-                          )
-                          .as(Some(held.signed): Option[Signed[ShardCheckpoint]])
+                      // Re-read immediately before the side effect. This local generation is a discard-only containment check, not a
+                      // portable lease or consensus proof; full publish commit-if-current remains separate work.
+                      localGlobalLineageRevision.flatMap { observedLineageRevision =>
+                        if (sameAvailableLineage(held.localGlobalLineageRevision, observedLineageRevision))
+                          publisher.publish(held.signed) *>
+                            heldRef.set(Some(held.copy(lastPublishedTick = tick))) *>
+                            logger
+                              .info(
+                                s"produce: re-publish-held shardOrdinal=${held.signed.value.shardOrdinal.value} " +
+                                  s"gl0Anchor=${held.signed.value.gl0AnchorOrdinal.value.value} " +
+                                  s"slot=${held.signed.value.slot.value.value} tick=$tick (single outstanding checkpoint)"
+                              )
+                              .as(Some(held.signed): Option[Signed[ShardCheckpoint]])
+                        else discardHeldForLineage(held, observedLineageRevision)
+                      }
                     else
                       logger
                         .info(
@@ -553,6 +601,9 @@ object ShardCheckpointProducer {
                     else awaitEmbed
 
                   heldOpt match {
+                    case Some(held) if !sameAvailableLineage(held.localGlobalLineageRevision, currentLineageRevision) =>
+                      discardHeldForLineage(held, currentLineageRevision)
+
                     case Some(held) =>
                       Hasher[F].hash(held.signed.value.signingPreimage).flatMap { heldHash =>
                         val heldIsSelected = bestTipOpt match {
@@ -590,7 +641,8 @@ object ShardCheckpointProducer {
         epoch: EtaPeriod,
         currentSlot: Slot,
         committee: Set[PeerId],
-        operatorKeys: OperatorConsensusKeys
+        operatorKeys: OperatorConsensusKeys,
+        expectedGlobalLineageRevision: CanonicalLineageRevision
       ): F[Option[Signed[ShardCheckpoint]]] = executionBaseF.flatMap {
         case None =>
           logger
@@ -697,56 +749,70 @@ object ShardCheckpointProducer {
                                   (None: Option[Signed[ShardCheckpoint]]).pure[F]
                                 case Some(delta) =>
                                   withStableExecutionBase(executionBase, beforeBaseIdentity, gl0AnchorOrdinal) {
-                                    val checkpoint = ShardCheckpoint(
-                                      shardId = shardId,
-                                      parentCheckpointHash = parentHash,
-                                      shardOrdinal = nextShardOrdinal,
-                                      gl0AnchorOrdinal = gl0AnchorOrdinal,
-                                      slot = currentSlot,
-                                      derivedStateDelta = delta,
-                                      // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
-                                      // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
-                                      // threading the signing into the case-class constructor.
-                                      committeeSignatures = NonEmptyList.of(placeholderSig),
-                                      epoch = epoch,
-                                      // Pinned claimed state identity used by producer and verifier for the same snapshot re-execution.
-                                      executionBase = executionBase.stateRef
-                                    )
-                                    for {
-                                      // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
-                                      preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
-                                      msgBytes = preimageHash.getBytes
-                                      kesEvidence <- kesSigner.sign(operatorKeys, epoch, msgBytes)
-                                      result <- kesEvidence match {
-                                        case None =>
-                                          logger
-                                            .warn(
-                                              s"produce-skip shard=${shardId.value.value} reason=no-preregistered-kes-signing-capability " +
-                                                s"checkpointEpoch=${epoch.value}"
-                                            )
-                                            .as(None: Option[Signed[ShardCheckpoint]])
-                                        case Some(KesSignature(kesStep, kesSig)) =>
-                                          for {
-                                            // The KES period gate above is passed before any long-term or outer-envelope signature is emitted.
-                                            edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
-                                            committeeSig = CommitteeMemberSignature(
-                                              peerId = selfPeerId,
-                                              vrfProof = Hex.fromBytes(vrfProof),
-                                              ed25519Sig = Hex.fromBytes(edSig),
-                                              kesProductSig = Hex.fromBytes(kesSig),
-                                              kesTreeStep = kesStep
-                                            )
-                                            finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
-                                            proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
-                                            signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
-                                            _ <- publisher.publish(signedCheckpoint)
-                                            _ <- logger.info(
-                                              s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
-                                                s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
-                                            )
-                                          } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
-                                      }
-                                    } yield result
+                                    // Replay may span a density replacement. Re-read the local lineage generation after replay and exact-base
+                                    // stability, before any validity signature or publication. This remains a best-effort containment check;
+                                    // only the future short commit-if-current can close the final check-to-sign/publish race.
+                                    localGlobalLineageRevision.flatMap {
+                                      case Some(current) if current == expectedGlobalLineageRevision =>
+                                        val checkpoint = ShardCheckpoint(
+                                          shardId = shardId,
+                                          parentCheckpointHash = parentHash,
+                                          shardOrdinal = nextShardOrdinal,
+                                          gl0AnchorOrdinal = gl0AnchorOrdinal,
+                                          slot = currentSlot,
+                                          derivedStateDelta = delta,
+                                          // Placeholder — populated below by replacing with the real committee-member sig. NonEmptyList requires at
+                                          // least one element to construct; we use a throwaway sentinel and overwrite in `.copy(...)`. Cleaner than
+                                          // threading the signing into the case-class constructor.
+                                          committeeSignatures = NonEmptyList.of(placeholderSig),
+                                          epoch = epoch,
+                                          // Pinned claimed state identity used by producer and verifier for the same snapshot re-execution.
+                                          executionBase = executionBase.stateRef
+                                        )
+                                        for {
+                                          // Compute the canonical preimage hash via Hasher[F]. This is the bytes every committee member signs (§3.3).
+                                          preimageHash <- Hasher[F].hash(checkpoint.signingPreimage)
+                                          msgBytes = preimageHash.getBytes
+                                          kesEvidence <- kesSigner.sign(operatorKeys, epoch, msgBytes)
+                                          result <- kesEvidence match {
+                                            case None =>
+                                              logger
+                                                .warn(
+                                                  s"produce-skip shard=${shardId.value.value} reason=no-preregistered-kes-signing-capability " +
+                                                    s"checkpointEpoch=${epoch.value}"
+                                                )
+                                                .as(None: Option[Signed[ShardCheckpoint]])
+                                            case Some(KesSignature(kesStep, kesSig)) =>
+                                              for {
+                                                // The KES period gate above is passed before any long-term or outer-envelope signature is emitted.
+                                                edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
+                                                committeeSig = CommitteeMemberSignature(
+                                                  peerId = selfPeerId,
+                                                  vrfProof = Hex.fromBytes(vrfProof),
+                                                  ed25519Sig = Hex.fromBytes(edSig),
+                                                  kesProductSig = Hex.fromBytes(kesSig),
+                                                  kesTreeStep = kesStep
+                                                )
+                                                finalCheckpoint = checkpoint.copy(committeeSignatures = NonEmptyList.of(committeeSig))
+                                                proof <- SignatureProof.fromHash(selfKeyPair, preimageHash)
+                                                signedCheckpoint = Signed(finalCheckpoint, NonEmptySet.of(proof))
+                                                _ <- publisher.publish(signedCheckpoint)
+                                                _ <- logger.info(
+                                                  s"produce: emitted shardOrdinal=${nextShardOrdinal.value} gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                                                    s"slot=${currentSlot.value.value} mgs=${orderedSnapshots.keys.size} kesStep=$kesStep"
+                                                )
+                                              } yield Some(signedCheckpoint): Option[Signed[ShardCheckpoint]]
+                                          }
+                                        } yield result
+                                      case observed =>
+                                        logger
+                                          .warn(
+                                            s"produce-skip gl0Anchor=${gl0AnchorOrdinal.value.value} " +
+                                              s"reason=global-lineage-moved-after-replay expected=${expectedGlobalLineageRevision.value.value} " +
+                                              s"observed=${observed.map(_.value.value)}"
+                                          )
+                                          .as(None: Option[Signed[ShardCheckpoint]])
+                                    }
                                   } // close canonical execution-base stability re-check
                               } // close assembleDelta.flatMap
                           } // close before-base identity capture

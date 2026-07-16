@@ -15,6 +15,7 @@ import io.constellationnetwork.node.shared.ShardCheckpointTestFixtures
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.{ShardChainStore, ShardSlotLeader}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
@@ -388,7 +389,8 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     shardEtaFor: Option[EtaPeriod => IO[Array[Byte]]] = None,
     executionBaseRefF: IO[GlobalSnapshotStateRef] = IO.pure(defaultExecutionBase),
     executionBaseOverride: Option[IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None,
-    executionBaseAtOverride: Option[GlobalSnapshotStateRef => IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None
+    executionBaseAtOverride: Option[GlobalSnapshotStateRef => IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None,
+    localGlobalLineageRevision: IO[Option[CanonicalLineageRevision]] = CanonicalLineageRevision(NonNegLong.MinValue).some.pure[IO]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
       val executionBase = executionBaseOverride.getOrElse(
@@ -421,6 +423,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         staircaseDeltaSlots = 5,
         derivePerMgState = derive,
         derivePerMgStates = deriveBatch,
+        localGlobalLineageRevision = localGlobalLineageRevision,
         lastPhase2Checkpoint = lastPhase2Checkpoint,
         republishEveryTicks = republishEveryTicks
       )
@@ -1542,6 +1545,175 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         firstHash.nonEmpty,
         replayHash == firstHash,
         recorded.size == 2
+      )
+  }
+
+  test("missing GL0 lineage observation defers before checkpoint replay, signing, and publication") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      rig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      replayCalls <- Ref.of[IO, Int](0)
+      kesCalls <- Ref.of[IO, Int](0)
+      countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+          kesCalls.update(_ + 1) *> rig.kesSigner.sign(operatorKeys, checkpointEpoch, message)
+      }
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        derive = (mg, snapshots, anchor, base) => replayCalls.update(_ + 1) *> deterministicDerive(mg, snapshots, anchor, base),
+        kesSigner = countingKesSigner.some,
+        localGlobalLineageRevision = none[CanonicalLineageRevision].pure[IO]
+      )
+      result <- producer.produce(
+        mkPendingSnapshots(2),
+        mkOrd(3240L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3240L),
+        Set(rig.selfPeerId)
+      )
+      replays <- replayCalls.get
+      kes <- kesCalls.get
+      recorded <- rig.recorded
+    } yield
+      expect.all(
+        result.isEmpty,
+        replays == 0,
+        kes == 0,
+        recorded.isEmpty
+      )
+  }
+
+  test("GL0 lineage replacement during replay suppresses every checkpoint validity signature and publication") { res =>
+    implicit val (h, sp, ssl) = res
+    val lineage0 = CanonicalLineageRevision(NonNegLong.unsafeFrom(0L))
+    val lineage1 = CanonicalLineageRevision(NonNegLong.unsafeFrom(1L))
+
+    for {
+      rig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      lineageReads <- Ref.of[IO, Int](0)
+      replayCalls <- Ref.of[IO, Int](0)
+      kesCalls <- Ref.of[IO, Int](0)
+      countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+          kesCalls.update(_ + 1) *> rig.kesSigner.sign(operatorKeys, checkpointEpoch, message)
+      }
+      lineageRevision = lineageReads.modify { reads =>
+        val observed = if (reads == 0) lineage0 else lineage1
+        (reads + 1, observed.some)
+      }
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        derive = (mg, snapshots, anchor, base) => replayCalls.update(_ + 1) *> deterministicDerive(mg, snapshots, anchor, base),
+        kesSigner = countingKesSigner.some,
+        localGlobalLineageRevision = lineageRevision
+      )
+      result <- producer.produce(
+        mkPendingSnapshots(2),
+        mkOrd(3245L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3245L),
+        Set(rig.selfPeerId)
+      )
+      lineageReadCount <- lineageReads.get
+      replays <- replayCalls.get
+      kes <- kesCalls.get
+      recorded <- rig.recorded
+    } yield
+      expect.all(
+        result.isEmpty,
+        lineageReadCount == 2,
+        replays > 0,
+        kes == 0,
+        recorded.isEmpty
+      )
+  }
+
+  test("held checkpoint is discarded after a GL0 lineage replacement and cannot revive after ABA") { res =>
+    implicit val (h, sp, ssl) = res
+    val lineage0 = CanonicalLineageRevision(NonNegLong.unsafeFrom(0L))
+    val lineage1 = CanonicalLineageRevision(NonNegLong.unsafeFrom(1L))
+
+    for {
+      rig <- freshRig
+      shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+      lineageRevision <- Ref.of[IO, Option[CanonicalLineageRevision]](lineage0.some)
+      producer <- makeProducer(
+        ssl,
+        rig,
+        Ratio.One,
+        shardEta,
+        republishEveryTicks = 1,
+        localGlobalLineageRevision = lineageRevision.get
+      )
+      first <- producer.produce(
+        mkPendingSnapshots(2),
+        mkOrd(3250L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3250L),
+        Set(rig.selfPeerId)
+      )
+      firstCp <- IO.fromOption(first)(new RuntimeException("first checkpoint should be produced"))
+      _ <- insertIntoStore(rig.chainStore, firstCp, parentHash = Hash.empty)
+      unchangedRetry <- producer.produce(
+        SortedMap.empty,
+        mkOrd(3251L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3251L),
+        Set(rig.selfPeerId)
+      )
+      beforeReplacement <- rig.recorded
+      _ <- lineageRevision.set(lineage1.some)
+      replacementTick <- producer.produce(
+        SortedMap.empty,
+        mkOrd(3252L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3252L),
+        Set(rig.selfPeerId)
+      )
+      afterReplacement <- rig.recorded
+      // A local generation must never move backward in production. Force it here to prove the mismatch cleared the memo instead of merely
+      // suppressing one publish; otherwise an ABA observation could revive stale signed bytes.
+      _ <- lineageRevision.set(lineage0.some)
+      abaTick <- producer.produce(
+        mkPendingSnapshots(2),
+        mkOrd(3253L),
+        EtaPeriod(0L),
+        Slot.unsafeApply(3253L),
+        Set(rig.selfPeerId)
+      )
+      afterAba <- rig.recorded
+      shardTipAfterAba <- rig.chainStore.bestTip
+      firstHash <- first.traverse(cp => Hasher[IO].hash(cp.value.signingPreimage))
+      unchangedHash <- unchangedRetry.traverse(cp => Hasher[IO].hash(cp.value.signingPreimage))
+    } yield
+      expect.all(
+        firstHash.nonEmpty,
+        unchangedHash == firstHash,
+        beforeReplacement.size == 2,
+        replacementTick.isEmpty,
+        afterReplacement.size == 2,
+        abaTick.isEmpty,
+        afterAba.size == 2,
+        // The old-lineage checkpoint remains the local shard tip, so this containment fails closed instead of silently reminting a sibling.
+        // Authenticated old/new/MRCA reorg orchestration is required to recover progress (SHARD-C-012 remains open).
+        afterAba.lastOption.exists(_.value === firstCp.value),
+        shardTipAfterAba.exists(_.signed.value === firstCp.value)
       )
   }
 

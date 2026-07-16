@@ -160,6 +160,10 @@ object OpaqueShardReplayAuthoritySuite extends MutableIOSuite {
           staircaseDeltaSlots = 5,
           derivePerMgState = (_, _, _, _) => none.pure[IO],
           derivePerMgStates = Some((batch, anchor, base) => replayCalls.update(_ + 1) >> realReplay(batch, anchor, base)),
+          localGlobalLineageRevision = io.constellationnetwork.node.shared.domain.snapshot.finality
+            .CanonicalLineageRevision(NonNegLong.MinValue)
+            .some
+            .pure[IO],
           lastPhase2Checkpoint = none[(ShardOrdinal, Hash)].pure[IO],
           republishEveryTicks = 1
         )
