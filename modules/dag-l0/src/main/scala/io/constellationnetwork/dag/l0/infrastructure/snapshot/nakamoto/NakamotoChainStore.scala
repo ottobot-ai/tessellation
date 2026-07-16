@@ -915,7 +915,7 @@ object NakamotoChainStore {
           mutationLock.permit.use { _ =>
             stateRef.get.flatMap { state =>
               val currentSelection = selectedFrom(state)
-              val selectionMatches = currentSelection.exists { current =>
+              val selectionMatches = expected.belongsTo(storeIdentity) && currentSelection.exists { current =>
                 current.snapshot.hash === expected.snapshot.hash &&
                 current.branchRevision == expected.branchRevision &&
                 current.lineageRevision == expected.lineageRevision

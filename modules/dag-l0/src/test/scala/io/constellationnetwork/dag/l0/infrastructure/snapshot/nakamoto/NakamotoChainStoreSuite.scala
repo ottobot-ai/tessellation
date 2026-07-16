@@ -738,6 +738,39 @@ object NakamotoChainStoreSuite extends MutableIOSuite {
     }
   }
 
+  test("selected token cannot authorize finalization in another chain-store instance") { res =>
+    val (_, _, j, h, sp) = res
+    implicit val jSer: JsonSerializer[IO] = j
+    implicit val hh: Hasher[IO] = h
+    implicit val spp: SecurityProvider[IO] = sp
+    implicit val hs: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      firstStoreTuple <- mkChainStore()
+      secondStoreTuple <- mkChainStore()
+      firstStore = firstStoreTuple._1
+      secondStore = secondStoreTuple._1
+      snapshot <- mkSignedLinkedChain(length = 1).map(_.head)
+      firstOutcome <- firstStore.store(snapshot.signed, snapshot.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      foreignSelection <- becameSelected(firstOutcome)
+      secondOutcome <- secondStore.store(snapshot.signed, snapshot.context, 1L, 1L, Hash.empty, Array.emptyByteArray)
+      localSelection <- becameSelected(secondOutcome)
+      foreignFinalize <- secondStore.finalizeSelectedAt(foreignSelection, targetOrdinal = 1L)
+      afterForeign <- secondStore.lastFinalizedOrdinal
+      localFinalize <- secondStore.finalizeSelectedAt(localSelection, targetOrdinal = 1L)
+      afterLocal <- secondStore.lastFinalizedOrdinal
+    } yield {
+      val rejectedForeign = foreignFinalize match {
+        case NakamotoChainStore.FinalizeOutcome.StaleSelection(Some(current)) =>
+          current.snapshot.hash == foreignSelection.snapshot.hash && current != foreignSelection
+        case _ => false
+      }
+      val acceptedLocal = localFinalize.isInstanceOf[NakamotoChainStore.FinalizeOutcome.Finalized]
+
+      expect.all(rejectedForeign, afterForeign == 0L, acceptedLocal, afterLocal == 1L)
+    }
+  }
+
   test("canonical effects exclude concurrent store mutation until the callback completes") { res =>
     val (_, _, j, h, sp) = res
     implicit val jSer: JsonSerializer[IO] = j
