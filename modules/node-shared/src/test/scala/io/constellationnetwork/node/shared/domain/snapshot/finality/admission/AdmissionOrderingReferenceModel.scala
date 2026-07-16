@@ -109,10 +109,8 @@ private[finality] object AdmissionStaleReason {
 private[finality] sealed trait AdmissionRetryReason extends Product with Serializable
 
 private[finality] object AdmissionRetryReason {
-  final case class RevisionChanged(expected: AdmissionOrderingRevision, actual: AdmissionOrderingRevision)
-      extends AdmissionRetryReason
-  final case class UnexpectedStage(actual: AdmissionOrderingStage, requested: AdmissionOrderingTransition)
-      extends AdmissionRetryReason
+  final case class RevisionChanged(expected: AdmissionOrderingRevision, actual: AdmissionOrderingRevision) extends AdmissionRetryReason
+  final case class UnexpectedStage(actual: AdmissionOrderingStage, requested: AdmissionOrderingTransition) extends AdmissionRetryReason
 }
 
 private[finality] sealed trait AdmissionRecoveryReason extends Product with Serializable
@@ -123,8 +121,7 @@ private[finality] object AdmissionRecoveryReason {
     recorded: AdmissionOrderingCommand,
     conflicting: AdmissionOrderingCommand
   ) extends AdmissionRecoveryReason
-  final case class IdempotencyLookupMismatch(expected: EffectIdempotencyKey, observed: EffectIdempotencyKey)
-      extends AdmissionRecoveryReason
+  final case class IdempotencyLookupMismatch(expected: EffectIdempotencyKey, observed: EffectIdempotencyKey) extends AdmissionRecoveryReason
   final case class IdempotencyHistoryUnavailable(key: EffectIdempotencyKey) extends AdmissionRecoveryReason
   final case class InvalidIdempotencyRecord(record: AdmissionIdempotencyRecord) extends AdmissionRecoveryReason
   final case class IdempotencyStateConflict(
@@ -145,8 +142,7 @@ private[finality] sealed trait AdmissionOrderingOutcome extends Product with Ser
 }
 
 private[finality] object AdmissionOrderingOutcome {
-  final case class Applied(state: AdmissionOrderingState, idempotencyRecord: AdmissionIdempotencyRecord)
-      extends AdmissionOrderingOutcome
+  final case class Applied(state: AdmissionOrderingState, idempotencyRecord: AdmissionIdempotencyRecord) extends AdmissionOrderingOutcome
 
   /** The current state is exactly equal to the record's committed after-state. */
   final case class AlreadyAppliedCurrent(state: AdmissionOrderingState, idempotencyRecord: AdmissionIdempotencyRecord)
@@ -157,19 +153,18 @@ private[finality] object AdmissionOrderingOutcome {
       extends AdmissionOrderingOutcome
   final case class Stale(state: AdmissionOrderingState, reason: AdmissionStaleReason) extends AdmissionOrderingOutcome
   final case class Retry(state: AdmissionOrderingState, reason: AdmissionRetryReason) extends AdmissionOrderingOutcome
-  final case class RecoveryRequired(state: AdmissionOrderingState, reason: AdmissionRecoveryReason)
-      extends AdmissionOrderingOutcome
+  final case class RecoveryRequired(state: AdmissionOrderingState, reason: AdmissionRecoveryReason) extends AdmissionOrderingOutcome
 }
 
 /** Test-only ordering and invalidation reference model.
   *
-  * This model intentionally does not implement P6's `CanonicalPhase2Lease` or `commitIfCurrent`. It has no exact
-  * `GlobalSnapshotStateRef`, exhaustive purpose scope, released-core/readback identity, immutable pointer/digest/length verification,
-  * independent consumer-sink digest/revision capability, explicit complete durable command identity, readback proof, signature, quorum,
-  * economic authority, persistence adapter, or live integration. It only tests abstract current-scope mutation ordering, replacement
-  * invalidation, inverse-before-requeue cleanup, sequential revision outcomes, and idempotency. It does not model sink execution,
-  * readback, crash boundaries, or concurrent linearizability. It does not model or alter direct GL1-to-GL0 DAG-token acceptance, which
-  * remains universally executed by GL0 validators.
+  * This model intentionally does not implement P6's `CanonicalPhase2Lease` or `commitIfCurrent`. It has no exact `GlobalSnapshotStateRef`,
+  * exhaustive purpose scope, released-core/readback identity, immutable pointer/digest/length verification, independent consumer-sink
+  * digest/revision capability, explicit complete durable command identity, readback proof, signature, quorum, economic authority,
+  * persistence adapter, or live integration. It only tests abstract current-scope mutation ordering, replacement invalidation,
+  * inverse-before-requeue cleanup, sequential revision outcomes, and idempotency. It does not model sink execution, readback, crash
+  * boundaries, or concurrent linearizability. It does not model or alter direct GL1-to-GL0 DAG-token acceptance, which remains universally
+  * executed by GL0 validators.
   */
 private[finality] object AdmissionOrderingReferenceModel {
   import AdmissionCleanupProgress._
@@ -236,10 +231,10 @@ private[finality] object AdmissionOrderingReferenceModel {
       Retry(before, RevisionChanged(command.expectedRevision, before.revision))
     else
       command.transition match {
-        case ApplyForwardMutation => applyForward(before, command)
+        case ApplyForwardMutation    => applyForward(before, command)
         case Invalidate(replacement) => invalidate(before, command, replacement)
-        case OrderInverse             => orderInverse(before, command)
-        case OrderRequeue             => orderRequeue(before, command)
+        case OrderInverse            => orderInverse(before, command)
+        case OrderRequeue            => orderRequeue(before, command)
       }
 
   private def applyForward(

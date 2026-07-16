@@ -579,7 +579,7 @@ object AdmissionOrderingReferenceModelSuite extends SimpleIOSuite with Checkers 
 
       invoke(invalidated, currentScopeForward) match {
         case Stale(state, _: AdmissionStaleReason.ScopeInvalidated) => expect.same(invalidated, state)
-        case other                                                  => failure(s"Expected invalidated scope to reject forward work, got $other")
+        case other => failure(s"Expected invalidated scope to reject forward work, got $other")
       }
     }
   }
