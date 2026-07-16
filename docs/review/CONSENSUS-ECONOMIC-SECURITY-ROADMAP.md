@@ -240,12 +240,18 @@ references to the dark codec. That regex inventory is a syntactic fuse, not a
 semantic non-reachability proof. Live MPT hashing, proof bytes, roots, aggregate
 bounds, and runtime selection remain unchanged; E1/SER-005/SER-006 stay open.
 
-The first E1.12 substep is likewise nonactivating. `V4SourceContext` lives only
+The first E1.12 substeps are likewise nonactivating. `V4SourceContext` lives only
 under the one-way `modules/tools` dependency boundary and derives the exact
 upstream-v4 Kryo-versus-Brotli-JSON source encoding from frozen inclusive
-environment/ordinal boundaries; callers cannot supply the encoding. It does not
-yet decode or verify legacy bytes, preserve a source proof, emit unsigned
-migration state, or remove any active runtime fallback. E1.12/ERA-004 remain
+environment/ordinal boundaries; callers cannot supply the encoding. The
+tools-only currency JSON envelope verifier then applies explicit compressed and
+expanded bounds, rejects noncanonical envelope bytes/top-level keys/proof order,
+and verifies the source ordinal, externally pinned value hash, and every
+cryptographic proof. Its result retains defensive byte copies and exposes no
+parsed or active snapshot type. It deliberately does not validate the recursive
+v4 schema, historical populations/finality, GL0 inclusion, state root, or replay;
+there is no upstream-generated golden corpus or Kryo verifier yet. It emits no
+migration state and changes no active runtime fallback. E1.12/ERA-004 remain
 open until those behaviors and frozen source fixtures land.
 
 ### E2 - Deterministic conservative framework kernel

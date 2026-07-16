@@ -1,7 +1,7 @@
 # Consensus Owner Decision Register — Answers & Ratified Directions (v2)
 
 **Companion to:** [`CONSENSUS-OWNER-DECISIONS.md`](CONSENSUS-OWNER-DECISIONS.md)
-**Revised:** 2026-07-15 · settled-answer source-audit baseline `ad13026d1`
+**Revised:** 2026-07-16 · settled-answer source-audit baseline `ad13026d1`
 **Supersedes:** the v1 draft that was rejected by adversarial audit at HEAD `e26ad406e`.
 This revision reworks every gate against that audited source baseline, dispositions all
 15 audit findings, and folds in the owner's refinement dialogue.
@@ -10,11 +10,13 @@ This revision reworks every gate against that audited source baseline, dispositi
 recommendations and directions recorded here. Ratification does **not** assert that missing
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
-document records which direction is settled and which executable freeze gates remain. `O-18` was
-added after that ratification pass and is not answered by this document.
-**Owner-question completeness:** `17/18` dispositioned. `O-01` through `O-17` are ratified;
+document records which direction is settled and which executable freeze gates remain. `O-18` and
+`O-19` were added after that ratification pass and are not answered by this document.
+**Owner-question completeness:** `17/19` dispositioned. `O-01` through `O-17` are ratified;
 `O-18` awaits an owner response in
-[`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md).
+[`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md),
+and `O-19` awaits an owner response in
+[`O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`](O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md).
 
 ---
 
@@ -110,6 +112,7 @@ test, never a freeze.
 | O-16 | Phase-2 consumer lease | 🔴 | Conservative invalidation, raw-byte re-verification, L-19/L-23 conformance, and full signed exact-ref direction are ratified; freshness policy, purpose inventory, schema, and dependencies remain stop-the-line engineering. |
 | O-17 | ROOT-008 partition grammar | 🔴 | Numeric gaps/offline import, self-authenticating fields, token-lock scope, and field-32 direction are ratified; identity functions, resource parameters, codecs, and proofs remain stop-the-line engineering. |
 | O-18 | Transport and DA byte contract | 🔴 | **OWNER RESPONSE REQUIRED:** active-era maxima, migration scope, canonical bytes/compression, descriptor/chunk delivery, and the `512000`/`20 MiB` rule semantics are not ratified. Bounded helpers are unwired. |
+| O-19 | Upstream-v4 snapshot migration policy | 🔴 | **OWNER RESPONSE REQUIRED:** all 17 source fields require explicit dispositions; source-unrooted fields, metagraph continuity, epoch/eta, registries, malformed source state, and per-asset conservation are not ratified. The raw tools-only envelope verifier is not an authorized importer or transform. |
 
 ---
 
@@ -592,6 +595,33 @@ closure. O-18 cannot alter economic authority: every GL0 validator still execute
 `GL1 -> GL0`; ordinary sharded-CL1 adoption still requires replay-backed certificates, scoped diff
 application, and root reproduction; transport and DA receipts satisfy neither threshold.
 
+## O-19 — Upstream-v4 snapshot migration policy 🔴
+
+**Status:** **OWNER RESPONSE REQUIRED.** This answers document does not infer a disposition from
+the migration audit, the 17-field matrix, the conservative exact-preservation baseline, or the
+non-negotiable safety constraints. The focused packet is
+[`O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`](O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md).
+
+The pending choices are `O19-01` old-domain live allow-spends, locks, stake/collateral, and pending
+withdrawals; `O19-02` per-metagraph exact-head continuation versus epoch restart plus opaque DL1
+retention; `O19-03` source epoch-progress preservation versus a fixed translation; `O19-04` source
+replay versus deliberate reset for `updateNodeParameters` and `priceState`; `O19-05` rooted target
+operator and metagraph registries; `O19-06` initial target stake history/eta and source-stake
+eligibility under fresh KES/VRF; `O19-07` preservation versus accounted correction of malformed but
+release-selected source state; and `O19-08` exact per-asset conservation including pending rewards and
+reservations.
+
+No answer is implied by the packet's non-normative manifest sketch. O-06's already-ratified
+binary/social hard-fork release selects the exact source checkpoint and must bind the eventual
+manifest, target root, and genesis; neither peer/signature count nor historical operator statements
+are a second checkpoint authority. Exact GL0 inclusion and the ancestry/data needed for a continued
+metagraph remain mandatory. Historical GL0/ML0 population reconstruction is optional audit evidence
+unless the report separately claims source-protocol finality or exact historical signer membership.
+Until the owner dispositions all eight choices, every source field remains explicit; source
+signatures are evidence only; a post-MPT-unrooted field requires authenticated replay or an explicit
+reset; and no migration path may silently drop/default/re-sign state, synthesize a stipend, or install
+target economic state. O-18 remains independently pending.
+
 ---
 
 ## Cross-cutting caveats
@@ -630,8 +660,8 @@ application, and root reproduction; transport and DA receipts satisfy neither th
    quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
    A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
    activation proofs. These are not unanswered owner choices and may not be filled by local
-   configuration or an implementation shortcut. O-18 is different: its eight choices are newly
-   surfaced and still await an owner response.
+   configuration or an implementation shortcut. O-18 and O-19 are different: each packet's eight
+   choices are newly surfaced and still await an owner response.
 
 ## Provenance
 
@@ -642,3 +672,6 @@ and the sim suite in `~/repos/research-nipopos-2026/sims` (calibration evidence,
 provisional). Comparable-network references (Polkadot approval-checking/parachains, Cardano
 pledge, Cosmos self-delegation, Zcash nullifier accumulator, Ethereum gas/state-growth) are
 architectural analogs, not citations to this repo.
+
+O-19 was appended from a separate migration-coverage audit revalidated against current-source
+baseline `d9268886a` and upstream `v4.0.0` peeled commit `22953a1ee`; it adds no settled answer.

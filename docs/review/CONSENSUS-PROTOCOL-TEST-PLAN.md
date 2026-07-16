@@ -664,12 +664,16 @@ for replay-certified diff application.
 
 | Test ID | Required scenario and assertion |
 |---|---|
-| MIG-001 | Exporter verifies exact upstream network/genesis/finalized ordinal/hash/root/evidence and rejects nonfinal/wrong-network snapshots. |
-| MIG-002 | Transform has an explicit disposition for every source namespace/field, including balances, supply, locks, reservations, live authorizations/nullifiers, registrations, and custom data. |
+| MIG-001 | Exporter verifies the exact O-06 release-pinned upstream network/genesis/checkpoint, ordinal/hash/root, and retained-head inclusion; wrong-network, peer/signature-count-selected, mismatched, or unrooted sources reject. Calling the checkpoint finalized under historical v4 GL0 additionally requires authenticated outcomes, facilitator populations, and ancestry because terminal snapshot proofs do not carry that population. |
+| MIG-001A | Frozen source-era fixtures verify exact codec selection, bytes, hash/proofs, ancestry, state proof, required replay, and GL0 inclusion. Wrong era/boundary/bytes/parent or a source selected by peer/signature count rejects. Historical ML0 population evidence is required only for a separate signer-authorization audit claim, not to override GL0-rooted source state. |
+| MIG-002 | Transform has a mandatory typed disposition for every source namespace/field, including balances, supply, locks, reservations, live authorizations/nullifiers, registrations, and custom data. The product has no default/catch-all; independent field mutation proves the source-era commitment or explicitly reproduces and dispositions every historical omission/materialization collision, including post-MPT unrooted fields, `None` versus empty maps, and equivalent full versus incremental currency representations. |
 | MIG-003 | Independent implementations produce byte-identical ScodecV1 manifest, MPT, root, and new ordinal-0 genesis. |
 | MIG-004 | Conservation report proves imported value plus declared conversions/burns equals source state; no unknown value appears/disappears. |
+| MIG-004A | Every retained stake/collateral/lock/reservation and pending withdrawal has exactly one authenticated backing and release path. Synthetic signatures, stipends, double counting, double release, missing release, overflow, and mismatched derived balances/proofs reject. |
 | MIG-005 | New network/genesis domain rejects old messages/signatures/replays while preserving intended addresses/ownership according to the ratified migration policy. |
 | MIG-005A | Every source-signed live authorization/order/delegation follows its declared expire/refund/inert/reauthorize rule; no old-domain signature can create a new-chain spend. |
+| MIG-005B | Exact-head metagraphs prove the migrated head and first target successor under the rooted target registry; restarted metagraphs reject every old-domain successor and enforce the ratified opaque-DL1 retention policy. |
+| MIG-005C | Any manifest/source/target/conservation/registry/epoch/release/genesis mutation prevents startup, and repeated import is idempotent with no repeated issuance, refund, settlement, or correction. |
 | MIG-006 | Full cutover rehearsal covers source freeze, export, public verification, launch, restart/bootstrap, abort procedure, and post-launch comparison. |
 
 ## 5. Assignment manifests and merge gates

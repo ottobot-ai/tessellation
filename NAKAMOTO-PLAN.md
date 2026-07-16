@@ -213,10 +213,15 @@ already has a hard-coded kill switch.
    (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`). The initial
    offline-only boundary now freezes upstream-v4 environment/ordinal encoding
    selection in `modules/tools` (`V4SourceContext.scala`), including the inclusive
-   ordinal-zero dev Kryo rule. It intentionally cannot verify or convert a source
-   snapshot yet; exact DTOs, bytes/hash/signature/root verification, unsigned
-   migration output, fixtures, and runtime fallback removal remain open. A
-   witness that can be erased from its signed preimage is not a witness.
+   ordinal-zero dev Kryo rule. A second tools-only slice recognizes the frozen v4
+   currency top-level JSON grammar, requires canonical Brotli envelope bytes, and
+   verifies the explicit ordinal, externally pinned value hash, and every
+   cryptographic proof under explicit decode bounds. It exposes neither parsed JSON
+   nor an active snapshot type. This is not recursive v4 schema validation,
+   source authorization, GL0 inclusion/finality, root verification, or replay.
+   The recursive source graph, upstream golden corpus, Kryo verifier, migration
+   output, and runtime fallback removal remain open. A witness that can be erased
+   from its signed preimage is not a witness.
 2. **Land one strict key-aware reader.** Point, prefix, and raw reads return
    typed absent/present/malformed results with the physical MPT key/path and
    exact immutable copied value bytes. Decoding never drops an entry; reconstruction

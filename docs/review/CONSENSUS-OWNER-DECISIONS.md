@@ -4,10 +4,13 @@
 `CONSENSUS-OWNER-DECISIONS-ANSWERS.md` are ratified for `O-01` through `O-17`. Runtime packets may not silently invent a
 missing parameter, schema, reference model, or proof needed to close an engineering freeze gate.
 `O-18` was surfaced by the transport/resource audit and awaits an owner response; no implementation
-may infer its byte, compression, chunking, retention, or migration choices.
-**Owner-question completeness:** `17/18` dispositioned. `O-01` through `O-17` are ratified;
-`O-18` is pending.
-**Updated:** 2026-07-15
+may infer its byte, compression, chunking, retention, or migration choices. `O-19` was surfaced by
+the upstream-v4 migration-coverage audit and also awaits an owner response; no implementation may
+infer a field disposition, source-authentication exception, registry, epoch/eta mapping, or
+conservation rule.
+**Owner-question completeness:** `17/19` dispositioned. `O-01` through `O-17` are ratified;
+`O-18` and `O-19` are pending.
+**Updated:** 2026-07-16
 
 This register uses project phases only where the owner has ratified them:
 Phase 0 `Pending`, Phase 1 `Provisional`, and Phase 2 `Operational`. `k2` is a
@@ -662,6 +665,34 @@ This is a resource/availability contract only. Every GL0 validator still execute
 every direct native `GL1 -> GL0` transition. For sharded CL1, producer/every execution signer replay,
 watchtower replay, and ordinary noncommittee certificate/diff/root verification remain unchanged.
 No transport or DA receipt can satisfy a state-validity threshold.
+
+### O-19 Upstream-v4 snapshot migration policy
+
+Owner-review packet:
+[O-19 V4 Snapshot Migration Policy Owner Review](O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md).
+
+**OWNER RESPONSE REQUIRED; MIGRATION AUTHORITY FROZEN.** Upstream v4 carries 17
+`GlobalSnapshotInfo` field families. The post-MPT v4 state root omits
+`updateNodeParameters` and `priceState`, so a selected signed tip plus a supplied
+state object cannot authenticate those values. The current fresh-genesis loader
+is not a migration transform: it has no exhaustive field plan, uses approximate
+balance/stake/collateral fixture behavior, and cannot establish source-to-target
+conservation or replay safety. Terminal v4 metagraph signatures are also
+insufficient by themselves: the inner receiver derived facilitators from the
+proofs while GL0 outer admission used seedlist/allowance intersections rather
+than a portable metagraph quorum.
+
+The owner must disposition `O19-01` through `O19-08`: old-domain live economic
+state; per-metagraph exact-head continuation versus epoch restart and separate
+opaque retention; epoch-progress mapping; replay versus reset for the two
+post-MPT-unrooted source fields; rooted target operator/metagraph registries;
+initial stake history/eta and fresh KES+VRF eligibility; treatment of malformed
+release-selected source state; and the exact per-asset conservation policy.
+
+Until those decisions are answered, every source field must remain explicit,
+source signatures are evidence only, unrooted fields require replay or an
+explicit reset, and no importer may silently drop/default/re-sign state, add a
+stipend, or install target economic state.
 
 ## Change rule
 

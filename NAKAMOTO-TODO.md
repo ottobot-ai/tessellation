@@ -158,12 +158,18 @@ criteria are in `NAKAMOTO-PLAN.md`.
         characterization is GREEN: a Kryo signature transfers across a changed
         `activeAllowSpends` commitment because the V1 projection omits it
         (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`). The
-        first importer-only substep is also GREEN: `V4SourceContext` freezes the
-        exact upstream-v4 inclusive Kryo boundaries for all four environments in
-        `modules/tools`, and callers cannot supply or copy an encoding. Source
-        DTOs, exact byte/hash/signature/root verification, deterministic unsigned
-        migration state, frozen fixtures, and removal of every live fallback are
-        still OPEN; this does not close `E1.12` or `ERA-004`.
+        first importer-only substep is GREEN: `V4SourceContext` freezes the exact
+        upstream-v4 inclusive Kryo boundaries for all four environments in
+        `modules/tools`, and callers cannot supply or copy an encoding. The second
+        nonactivating substep is also GREEN: the tools-only Brotli-JSON currency
+        envelope verifier enforces the frozen v4 top-level key grammar, canonical
+        compressed bytes, source ordinal, externally pinned value hash, and every
+        cryptographic proof under explicit decode bounds while exposing no parsed
+        or active snapshot type. It does not validate the recursive currency
+        schema, signer population, GL0 inclusion/finality, state root, or replay.
+        The frozen recursive DTO graph, upstream-generated golden corpus, Kryo
+        source verification, deterministic migration state, and removal of every
+        live fallback remain OPEN; this does not close `E1.12` or `ERA-004`.
     - [ ] **1B. Remove the GL0 mirror:** only after 1A is green, remove field 32
       from every GL0 MPT/diff/load/reorg path and reject it at those boundaries.
       Retain it in ML0 `CurrencySnapshotInfo` and its state proof. Gate:
