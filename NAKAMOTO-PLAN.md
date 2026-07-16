@@ -1060,6 +1060,23 @@ delivery, rollback, and recovery.
   checkpoint deliberately leaves the producer fail-stopped until authenticated
   old/new/MRCA shard-reorg effects replace its chain tip. `FOLLOW-008N`,
   `SHARD-C-008`, `SHARD-C-012`, and FIN-14 remain open.
+- The execution attester now applies the same conservative process-local lineage
+  containment. A private, nonserializable capability is minted only when a present
+  `CanonicalLineageRevision` remains equal across the complete
+  `evaluateForSigning` replay. The post-read also covers replay rejection, so a
+  density replacement observed across acquisition cannot expose that stale local
+  mismatch as portable fraud authority. The emitter rechecks the same generation
+  before KES, after KES before Ed25519, and after local signature verification
+  before tracker/publish effects. Missing pre-read or movement observed across
+  acquisition suppresses replay-derived store and evidence; the tested emitter
+  schedules suppress KES/tracker/publish after later movement. This is still
+  discard-only containment: the local revision is neither portable nor atomically
+  bound to the checkpoint's signed execution base, the SharedServices replay
+  resolver is still ordinal/cache based, and post-return daemon store/carried-
+  signature recording, stable-rejection-to-separate-watchtower-replay, and final
+  emitter check-to-act races remain. It does not issue a
+  `CanonicalPhase2Lease`, revoke already-gossiped bytes, or close FIN-14,
+  `FOLLOW-008N`, `SHARD-C-008`, or `SHARD-C-012`.
 - A package-private dark identity-composition model now requires the real
   `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
   the exact-history session, and matching exact-image, semantic, field-32, and

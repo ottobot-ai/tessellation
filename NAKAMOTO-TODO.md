@@ -1096,6 +1096,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `commitIfCurrent`. A locally stored orphan shard tip intentionally fail-stops
     until authenticated old/new/MRCA reorg orchestration lands; FIN-14,
     `FOLLOW-008N`, `SHARD-C-008`, and `SHARD-C-012` remain open.
+    The execution attester now has the matching local containment: a private,
+    nonserializable capability requires one present `CanonicalLineageRevision` to
+    remain unchanged across replay, and the rejection result is withheld when
+    movement is observed across that acquisition. The emitter rechecks before KES,
+    after KES before Ed25519, and after local verification before tracker/publish.
+    This is not exact-base Phase-2 authority or an atomic `commitIfCurrent`: the
+    generation and execution base are separately read, SharedServices still uses
+    an ordinal/cache resolver, and post-return daemon store/carried-signature
+    recording, stable-rejection-to-separate-watchtower-replay, and final emitter
+    check-to-act races remain. FIN-14 and the same shard recovery gates stay open.
   - Before activation, add authenticated finality-evidence/fork-choice authority and
     hold/recheck the exact branch revision through publication; package-own the
     MPT-plus-semantic-plus-anchor readback capability that may advance

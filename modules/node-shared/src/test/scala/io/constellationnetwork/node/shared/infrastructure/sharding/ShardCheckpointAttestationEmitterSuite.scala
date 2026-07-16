@@ -16,6 +16,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardTipTracker
 import io.constellationnetwork.node.shared.domain.nakamoto.{EligibilityChecker, OperatorConsensusKeyRegistry, ShardAssignment}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient.SidecarClientAlgebra
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
@@ -117,6 +118,19 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
     }
 
   private val replayedRoot = Hash("11" * 32)
+  private val stableLineage = CanonicalLineageRevision(NonNegLong.MinValue)
+  private val stableLineageRead: IO[Option[CanonicalLineageRevision]] = IO.pure(stableLineage.some)
+
+  private def acquireStable(
+    manager: ShardCheckpointGl0AcceptanceManager[IO],
+    checkpoint: ShardCheckpoint
+  ): IO[LineageBoundVerifiedShardCheckpoint] =
+    ShardCheckpointAttestationEmitter
+      .acquireLineageBound(stableLineageRead)(manager.evaluateForSigning(checkpoint))
+      .flatMap {
+        case LineageBoundCheckpointEvaluation.ReplayVerified(capability) => IO.pure(capability)
+        case other => IO.raiseError(new RuntimeException(s"expected lineage-bound replay capability, got $other"))
+      }
 
   private final case class EmitterEffectCounts(
     replay: Int,
@@ -212,7 +226,8 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
     committeeMember: PeerId,
     executionQuorum: Int,
     reExecuteTo: Hash,
-    replayCount: Ref[IO, Int]
+    replayCount: Ref[IO, Int],
+    onReplay: IO[Unit] = IO.unit
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointGl0AcceptanceManager[IO]] =
     ShardCheckpointGl0AcceptanceManager.make[IO](
       executionQuorum = executionQuorum,
@@ -222,7 +237,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
       shardAssignment = ShardAssignment.make[IO](numShards = 1),
       shardEtaFor = (_, _) => IO.pure(Some(checkpointSigner.defaultShardEta)),
       producerDutyValidator = TestCheckpointDutyValidator.allow[IO],
-      reExecuteDerivation = (_, _, _, _) => replayCount.update(_ + 1).as(reExecuteTo)
+      reExecuteDerivation = (_, _, _, _) => replayCount.update(_ + 1) >> onReplay.as(reExecuteTo)
     )
 
   /** An arbitrary manager can claim `Accepted`, but cannot construct the private capability implementation. */
@@ -247,7 +262,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
       def lastAdoptedCheckpoint(shardId: ShardId): IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None)
     }
 
-  test("pending after one concrete-manager re-execution-hook invocation can emit a verifiable execution signature") { res =>
+  test("stable GL0 lineage plus one concrete-manager replay can emit a verifiable execution signature") { res =>
     implicit val (h, sp, ec, checkpointSigner) = res
     val shardEta = checkpointSigner.defaultShardEta
     for {
@@ -277,10 +292,10 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         tipTrackerFor = sid => if (sid == shardZero) Some(tracker) else None,
         // Slice S4: epoch-keyed eta resolver. Fixed precomputed eta for shardZero regardless of epoch — the emitter
         // threads the resolved eta into its VRF membership proof; rotation correctness is covered in ShardSlotLeaderSuite.
-        shardEtaFor = (sid, _) => IO.pure(if (sid == shardZero) Some(shardEta) else None)
+        shardEtaFor = (sid, _) => IO.pure(if (sid == shardZero) Some(shardEta) else None),
+        localGlobalLineageRevision = stableLineageRead
       )
-      verifiedEither <- manager.evaluateForSigning(cp)
-      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      verified <- acquireStable(manager, cp)
       checkpointHash <- h.hash(cp.signingPreimage)
       _ <- emitter.emit(verified)
       wires <- published.get
@@ -330,7 +345,8 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         verifyCommitteeSignature = (_, _) => verificationCalls.update(_ + 1).as(Left("invalid local signature evidence")),
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = _ => Some(tracker),
-        shardEtaFor = (_, _) => IO.pure(Some(shardEta))
+        shardEtaFor = (_, _) => IO.pure(Some(shardEta)),
+        localGlobalLineageRevision = stableLineageRead
       )
       manager <- concreteAcceptanceManager(
         checkpointSigner,
@@ -339,8 +355,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         reExecuteTo = replayedRoot,
         replayCount = replayCount
       )
-      verifiedEither <- manager.evaluateForSigning(cp)
-      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      verified <- acquireStable(manager, cp)
       _ <- emitter.emit(verified)
       wires <- published.get
       records <- tracker.attestationCountFor(verified.signingPreimageHash, excludeSelf = false)
@@ -376,10 +391,10 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         verifyCommitteeSignature = manager.verifyCommitteeSignature,
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = _ => Some(tracker),
-        shardEtaFor = (_, _) => IO.pure(Option.empty[Array[Byte]]) // no eta for any shard ⇒ skip
+        shardEtaFor = (_, _) => IO.pure(Option.empty[Array[Byte]]), // no eta for any shard ⇒ skip
+        localGlobalLineageRevision = stableLineageRead
       )
-      verifiedEither <- manager.evaluateForSigning(cp)
-      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      verified <- acquireStable(manager, cp)
       checkpointHash = verified.signingPreimageHash
       _ <- emitter.emit(verified)
       wires <- published.get
@@ -435,7 +450,8 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
             (_, _) => IO.raiseError(new AssertionError("committee verification must not run after local VRF identity rejection")),
           sidecarClient = recordingSidecar(published),
           tipTrackerFor = _ => Some(tracker),
-          shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(randomShardEta()))
+          shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(randomShardEta())),
+          localGlobalLineageRevision = stableLineageRead
         )
         manager <- concreteAcceptanceManager(
           checkpointSigner,
@@ -444,8 +460,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
           reExecuteTo = replayedRoot,
           replayCount = replayCount
         )
-        verifiedEither <- manager.evaluateForSigning(cp)
-        verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+        verified <- acquireStable(manager, cp)
         _ <- emitter.emit(verified)
         wires <- published.get
         etas <- etaCalls.get
@@ -486,8 +501,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         reExecuteTo = replayedRoot,
         replayCount = replayCount
       )
-      verifiedEither <- manager.evaluateForSigning(checkpointUnderTest)
-      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      verified <- acquireStable(manager, checkpointUnderTest)
       runtimePair = unrootedRuntimeShapedPair(authorityKeys)
       runtimeRegistry = OperatorConsensusKeyRegistry.make[IO](Map(authorityId -> runtimePair))
       candidates = List(
@@ -556,7 +570,8 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
               (cp, signature) => verificationCalls.update(_ + 1) >> manager.verifyCommitteeSignature(cp, signature),
             sidecarClient = recordingSidecar(published),
             tipTrackerFor = _ => Some(tracker),
-            shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(checkpointSigner.defaultShardEta))
+            shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(checkpointSigner.defaultShardEta)),
+            localGlobalLineageRevision = stableLineageRead
           )
           _ <- emitter.emit(verified)
           replay <- replayCount.get
@@ -638,8 +653,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         reExecuteTo = replayedRoot,
         replayCount = replayCount
       )
-      verifiedEither <- manager.evaluateForSigning(checkpointUnderTest)
-      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      verified <- acquireStable(manager, checkpointUnderTest)
       etaCalls <- Ref.of[IO, Int](0)
       proofCalls = new AtomicInteger(0)
       eligibility <- countingEligibilityChecker(proofCalls)
@@ -665,7 +679,8 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         verifyCommitteeSignature = (_, _) => verificationCalls.update(_ + 1).as(Right(())),
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = _ => Some(tracker),
-        shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(checkpointSigner.defaultShardEta))
+        shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(checkpointSigner.defaultShardEta)),
+        localGlobalLineageRevision = stableLineageRead
       )
       _ <- emitter.emit(verified)
       replay <- replayCount.get
@@ -685,6 +700,188 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         records == 0,
         wires.isEmpty
       )
+  }
+
+  test("lineage unavailable before replay has zero replay, KES, tracker, and publish effects") { res =>
+    implicit val (h, sp, ec, checkpointSigner) = res
+    for {
+      (keyPair, selfId) <- registeredSigner(checkpointSigner)
+      checkpointUnderTest <- checkpoint(keyPair, selfId, checkpointSigner)
+      selfVrf = VrfKeyDeriver.deriveVrfKeyPair(keyPair)
+      replayCount <- Ref.of[IO, Int](0)
+      kesCalls <- Ref.of[IO, Int](0)
+      published <- Ref.of[IO, List[ShardCheckpointAttestationWire]](Nil)
+      tracker <- ShardTipTracker.make[IO](shardZero, selfId)
+      manager <- concreteAcceptanceManager(
+        checkpointSigner,
+        selfId,
+        executionQuorum = 2,
+        reExecuteTo = replayedRoot,
+        replayCount = replayCount
+      )
+      countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+          kesCalls.update(_ + 1) >> checkpointSigner.producerKesSigner.sign(operatorKeys, checkpointEpoch, message)
+      }
+      lineageUnavailable = IO.pure(Option.empty[CanonicalLineageRevision])
+      emitter = ShardCheckpointAttestationEmitter.make[IO](
+        selfPeerId = selfId,
+        selfKeyPair = keyPair,
+        selfVrfSk = selfVrf._1,
+        selfVrfVk = selfVrf._2,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
+        kesSigner = countingKesSigner,
+        eligibilityChecker = ec,
+        verifyCommitteeSignature = manager.verifyCommitteeSignature,
+        sidecarClient = recordingSidecar(published),
+        tipTrackerFor = _ => Some(tracker),
+        shardEtaFor = (_, _) => IO.pure(Some(checkpointSigner.defaultShardEta)),
+        localGlobalLineageRevision = lineageUnavailable
+      )
+      evaluation <- ShardCheckpointAttestationEmitter
+        .acquireLineageBound(lineageUnavailable)(manager.evaluateForSigning(checkpointUnderTest))
+      _ <- evaluation match {
+        case LineageBoundCheckpointEvaluation.ReplayVerified(capability) => emitter.emit(capability)
+        case _                                                           => IO.unit
+      }
+      checkpointHash <- h.hash(checkpointUnderTest.signingPreimage)
+      replays <- replayCount.get
+      kes <- kesCalls.get
+      records <- tracker.attestationCountFor(checkpointHash, excludeSelf = false)
+      wires <- published.get
+    } yield
+      expect.all(
+        evaluation == LineageBoundCheckpointEvaluation.LineageUnavailable,
+        replays == 0,
+        kes == 0,
+        records == 0,
+        wires.isEmpty
+      )
+  }
+
+  test("lineage replacement during mismatching replay suppresses both signing and Rejected mismatch authority") { res =>
+    implicit val (h, sp, ec, checkpointSigner) = res
+    val replacementLineage = CanonicalLineageRevision(NonNegLong.unsafeFrom(1L))
+    for {
+      (keyPair, selfId) <- registeredSigner(checkpointSigner)
+      checkpointUnderTest <- checkpoint(keyPair, selfId, checkpointSigner)
+      selfVrf = VrfKeyDeriver.deriveVrfKeyPair(keyPair)
+      lineage <- Ref.of[IO, Option[CanonicalLineageRevision]](stableLineage.some)
+      replayCount <- Ref.of[IO, Int](0)
+      kesCalls <- Ref.of[IO, Int](0)
+      published <- Ref.of[IO, List[ShardCheckpointAttestationWire]](Nil)
+      tracker <- ShardTipTracker.make[IO](shardZero, selfId)
+      manager <- concreteAcceptanceManager(
+        checkpointSigner,
+        selfId,
+        executionQuorum = 2,
+        reExecuteTo = Hash("22" * 32),
+        replayCount = replayCount,
+        onReplay = lineage.set(replacementLineage.some)
+      )
+      countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+          kesCalls.update(_ + 1) >> checkpointSigner.producerKesSigner.sign(operatorKeys, checkpointEpoch, message)
+      }
+      emitter = ShardCheckpointAttestationEmitter.make[IO](
+        selfPeerId = selfId,
+        selfKeyPair = keyPair,
+        selfVrfSk = selfVrf._1,
+        selfVrfVk = selfVrf._2,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
+        kesSigner = countingKesSigner,
+        eligibilityChecker = ec,
+        verifyCommitteeSignature = manager.verifyCommitteeSignature,
+        sidecarClient = recordingSidecar(published),
+        tipTrackerFor = _ => Some(tracker),
+        shardEtaFor = (_, _) => IO.pure(Some(checkpointSigner.defaultShardEta)),
+        localGlobalLineageRevision = lineage.get
+      )
+      evaluation <- ShardCheckpointAttestationEmitter
+        .acquireLineageBound(lineage.get)(manager.evaluateForSigning(checkpointUnderTest))
+      _ <- evaluation match {
+        case LineageBoundCheckpointEvaluation.ReplayVerified(capability) => emitter.emit(capability)
+        case _                                                           => IO.unit
+      }
+      checkpointHash <- h.hash(checkpointUnderTest.signingPreimage)
+      replays <- replayCount.get
+      kes <- kesCalls.get
+      records <- tracker.attestationCountFor(checkpointHash, excludeSelf = false)
+      wires <- published.get
+    } yield
+      expect.all(
+        evaluation == LineageBoundCheckpointEvaluation.LineageUnavailable,
+        !evaluation.isInstanceOf[LineageBoundCheckpointEvaluation.Rejected],
+        replays == 1,
+        kes == 0,
+        records == 0,
+        wires.isEmpty
+      )
+  }
+
+  test("lineage replacement after capability acquisition but before emit has zero KES, tracker, and publish effects") { res =>
+    implicit val (h, sp, ec, checkpointSigner) = res
+    val replacementLineage = CanonicalLineageRevision(NonNegLong.unsafeFrom(1L))
+    for {
+      (keyPair, selfId) <- registeredSigner(checkpointSigner)
+      checkpointUnderTest <- checkpoint(keyPair, selfId, checkpointSigner)
+      selfVrf = VrfKeyDeriver.deriveVrfKeyPair(keyPair)
+      lineage <- Ref.of[IO, Option[CanonicalLineageRevision]](stableLineage.some)
+      replayCount <- Ref.of[IO, Int](0)
+      kesCalls <- Ref.of[IO, Int](0)
+      published <- Ref.of[IO, List[ShardCheckpointAttestationWire]](Nil)
+      tracker <- ShardTipTracker.make[IO](shardZero, selfId)
+      manager <- concreteAcceptanceManager(
+        checkpointSigner,
+        selfId,
+        executionQuorum = 2,
+        reExecuteTo = replayedRoot,
+        replayCount = replayCount
+      )
+      countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+          kesCalls.update(_ + 1) >> checkpointSigner.producerKesSigner.sign(operatorKeys, checkpointEpoch, message)
+      }
+      emitter = ShardCheckpointAttestationEmitter.make[IO](
+        selfPeerId = selfId,
+        selfKeyPair = keyPair,
+        selfVrfSk = selfVrf._1,
+        selfVrfVk = selfVrf._2,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
+        kesSigner = countingKesSigner,
+        eligibilityChecker = ec,
+        verifyCommitteeSignature = manager.verifyCommitteeSignature,
+        sidecarClient = recordingSidecar(published),
+        tipTrackerFor = _ => Some(tracker),
+        shardEtaFor = (_, _) => IO.pure(Some(checkpointSigner.defaultShardEta)),
+        localGlobalLineageRevision = lineage.get
+      )
+      evaluation <- ShardCheckpointAttestationEmitter
+        .acquireLineageBound(lineage.get)(manager.evaluateForSigning(checkpointUnderTest))
+      capability <- evaluation match {
+        case LineageBoundCheckpointEvaluation.ReplayVerified(value) => IO.pure(value)
+        case other => IO.raiseError(new RuntimeException(s"expected lineage-bound replay capability, got $other"))
+      }
+      _ <- lineage.set(replacementLineage.some)
+      _ <- emitter.emit(capability)
+      checkpointHash <- h.hash(checkpointUnderTest.signingPreimage)
+      replays <- replayCount.get
+      kes <- kesCalls.get
+      records <- tracker.attestationCountFor(checkpointHash, excludeSelf = false)
+      wires <- published.get
+    } yield expect.all(replays == 1, kes == 0, records == 0, wires.isEmpty)
   }
 
   test("reject: a mismatched re-execution-hook result cannot mint a capability or reach the emitter") { res =>
@@ -715,27 +912,35 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
         verifyCommitteeSignature = manager.verifyCommitteeSignature,
         sidecarClient = recordingSidecar(published),
         tipTrackerFor = _ => Some(tracker),
-        shardEtaFor = (_, _) => IO.pure(Some(shardEta))
+        shardEtaFor = (_, _) => IO.pure(Some(shardEta)),
+        localGlobalLineageRevision = stableLineageRead
       )
-      verifiedEither <- manager.evaluateForSigning(cp)
-      _ <- verifiedEither.toOption.traverse_(emitter.emit)
+      evaluation <- ShardCheckpointAttestationEmitter
+        .acquireLineageBound(stableLineageRead)(manager.evaluateForSigning(cp))
+      _ <- evaluation match {
+        case LineageBoundCheckpointEvaluation.ReplayVerified(capability) => emitter.emit(capability)
+        case _                                                           => IO.unit
+      }
       wires <- published.get
       evaluations <- replayCount.get
-    } yield expect.all(verifiedEither.isLeft, wires.isEmpty, evaluations == 1)
+    } yield expect.all(evaluation.isInstanceOf[LineageBoundCheckpointEvaluation.Rejected], wires.isEmpty, evaluations == 1)
   }
 
-  test("API: emitter accepts one VerifiedShardCheckpoint capability, not naked hash/routing fields") { _ =>
+  test("API: emitter accepts only the nonserializable lineage-bound replay capability, never naked replay/hash fields") { _ =>
     illTyped("""VerifiedShardCheckpoint.evaluate[IO](null, null)""")
     illTyped("""new VerifiedShardCheckpoint { def checkpoint: ShardCheckpoint = null; def signingPreimageHash: Hash = null }""")
+    illTyped("""(null: ShardCheckpointAttestationEmitter[IO]).emit(null: VerifiedShardCheckpoint)""")
+    illTyped(
+      """new LineageBoundVerifiedShardCheckpoint { def checkpoint: ShardCheckpoint = null; def signingPreimageHash: Hash = null; private[sharding] def replayCapability: VerifiedShardCheckpoint = null; private[sharding] def lineageRevision: CanonicalLineageRevision = null }"""
+    )
     val emitMethods = classOf[ShardCheckpointAttestationEmitter[IO]].getDeclaredMethods.filter(_.getName == "emit")
-    val publicCapabilityCompanion = Try(
-      Class.forName("io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.VerifiedShardCheckpoint$")
-    ).isSuccess
+    val publicCapabilityCompanion = Try(Class.forName(classOf[LineageBoundVerifiedShardCheckpoint].getName + "$")).isSuccess
     IO.pure(
       expect.all(
         emitMethods.length == 1,
-        emitMethods.head.getParameterTypes.toList == List(classOf[VerifiedShardCheckpoint]),
-        !publicCapabilityCompanion
+        emitMethods.head.getParameterTypes.toList == List(classOf[LineageBoundVerifiedShardCheckpoint]),
+        !publicCapabilityCompanion,
+        !classOf[java.io.Serializable].isAssignableFrom(classOf[LineageBoundVerifiedShardCheckpoint])
       )
     )
   }

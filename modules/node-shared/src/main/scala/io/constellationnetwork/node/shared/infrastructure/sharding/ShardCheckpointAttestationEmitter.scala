@@ -9,9 +9,10 @@ import cats.syntax.all._
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding.ShardTipTracker
 import io.constellationnetwork.node.shared.domain.nakamoto.{ActiveOperatorConsensusKeys, EligibilityChecker, OperatorConsensusKeyRegistry}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer.{KesSignature, KesSigner}
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.VerifiedShardCheckpoint
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{VerifiedShardCheckpoint, VerifiedShardCheckpointFailure}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.sharding.{CommitteeMemberSignature, ShardId}
@@ -44,16 +45,79 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * block on a publish failure. A persistent failure is observable in cluster-level metrics (the checkpoint never reaches execution quorum),
   * not by raising errors on the receive path.
   *
-  * '''Replay capability.''' The only input is [[VerifiedShardCheckpoint]], minted by the acceptance manager after mandatory replay. It
-  * carries the exact checkpoint and `Hasher[F].hash(checkpoint.signingPreimage)`; no naked hash signing API exists.
+  * '''Replay capability.''' The only signing input is [[LineageBoundVerifiedShardCheckpoint]], privately minted when an acceptance-manager
+  * replay and its rejection/success result are bracketed by one unchanged process-local GL0 lineage generation. It carries the exact
+  * checkpoint and `Hasher[F].hash(checkpoint.signingPreimage)`; no naked hash or naked replay-capability signing API exists.
   */
+sealed trait LineageBoundVerifiedShardCheckpoint {
+  def checkpoint: io.constellationnetwork.schema.sharding.ShardCheckpoint
+  def signingPreimageHash: io.constellationnetwork.security.hash.Hash
+
+  private[sharding] def replayCapability: VerifiedShardCheckpoint
+  private[sharding] def lineageRevision: CanonicalLineageRevision
+}
+
+sealed trait LineageBoundCheckpointEvaluation extends Product
+
+object LineageBoundCheckpointEvaluation {
+  final case class Rejected(failure: VerifiedShardCheckpointFailure) extends LineageBoundCheckpointEvaluation
+  final case class ReplayVerified(capability: LineageBoundVerifiedShardCheckpoint) extends LineageBoundCheckpointEvaluation
+  case object LineageUnavailable extends LineageBoundCheckpointEvaluation
+}
+
 trait ShardCheckpointAttestationEmitter[F[_]] {
 
   /** Sign, record locally, and gossip an attestation for an exact checkpoint this node independently replayed. */
-  def emit(verified: VerifiedShardCheckpoint): F[Unit]
+  def emit(verified: LineageBoundVerifiedShardCheckpoint): F[Unit]
 }
 
 object ShardCheckpointAttestationEmitter {
+
+  private final class LineageBoundVerifiedImpl(
+    val replayCapability: VerifiedShardCheckpoint,
+    val lineageRevision: CanonicalLineageRevision
+  ) extends LineageBoundVerifiedShardCheckpoint {
+    val checkpoint: io.constellationnetwork.schema.sharding.ShardCheckpoint = replayCapability.checkpoint
+    val signingPreimageHash: io.constellationnetwork.security.hash.Hash = replayCapability.signingPreimageHash
+  }
+
+  /** Conservatively bind one replay attempt to a process-local GL0 canonical-lineage generation.
+    *
+    * The replay effect is by-name so an unavailable pre-read cannot accidentally execute it. A post-read is performed for both successful
+    * and rejected replay results: only a stable generation may expose either a signing capability or portable mismatch authority. A moved
+    * or unavailable generation discards the result as locally stale.
+    *
+    * This is nonportable discard-only containment. It neither authenticates the checkpoint's exact execution base as Phase 2 nor closes any
+    * post-return or final check-to-act race; the live `CanonicalPhase2Lease.commitIfCurrent` integration remains required for FIN-14
+    * closure.
+    */
+  def acquireLineageBound[F[_]: Async](
+    localGlobalLineageRevision: F[Option[CanonicalLineageRevision]]
+  )(
+    evaluateForSigning: => F[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]]
+  ): F[LineageBoundCheckpointEvaluation] = {
+    import LineageBoundCheckpointEvaluation._
+
+    def readLineage: F[Option[CanonicalLineageRevision]] =
+      localGlobalLineageRevision.handleError(_ => None)
+
+    readLineage.flatMap {
+      case None => Async[F].pure(LineageUnavailable)
+      case Some(before) =>
+        Async[F].attempt(evaluateForSigning).flatMap { evaluated =>
+          readLineage.flatMap {
+            case Some(after) if after == before =>
+              evaluated match {
+                case Left(error)          => Async[F].raiseError(error)
+                case Right(Left(failure)) => Async[F].pure(Rejected(failure))
+                case Right(Right(verified)) =>
+                  Async[F].pure(ReplayVerified(new LineageBoundVerifiedImpl(verified, before)))
+              }
+            case _ => Async[F].pure(LineageUnavailable)
+          }
+        }
+    }
+  }
 
   /** Construct an emitter capturing this operator's signing material + the per-shard VRF domains.
     *
@@ -106,7 +170,8 @@ object ShardCheckpointAttestationEmitter {
     ) => F[Either[String, Unit]],
     sidecarClient: SidecarClient.SidecarClientAlgebra[F],
     tipTrackerFor: ShardId => Option[ShardTipTracker[F]],
-    shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]]
+    shardEtaFor: (ShardId, EtaPeriod) => F[Option[Array[Byte]]],
+    localGlobalLineageRevision: F[Option[CanonicalLineageRevision]]
   ): ShardCheckpointAttestationEmitter[F] = {
     val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointAttestationEmitter")
 
@@ -125,102 +190,129 @@ object ShardCheckpointAttestationEmitter {
             )
           )
 
-      def emit(verified: VerifiedShardCheckpoint): F[Unit] = {
+      private def remainsOnLineage(verified: LineageBoundVerifiedShardCheckpoint): F[Boolean] =
+        localGlobalLineageRevision.map(_.contains(verified.lineageRevision)).handleError(_ => false)
+
+      private def staleLineageLog(
+        verified: LineageBoundVerifiedShardCheckpoint,
+        stage: String
+      ): F[Unit] =
+        logger.warn(
+          s"emit-skip shard=${verified.checkpoint.shardId.value.value} " +
+            s"checkpoint=${verified.signingPreimageHash.value.take(12)} reason=global-lineage-moved-or-unavailable stage=$stage " +
+            s"replayLineage=${verified.lineageRevision.value.value}"
+        )
+
+      def emit(verified: LineageBoundVerifiedShardCheckpoint): F[Unit] = {
         val checkpoint = verified.checkpoint
         val shardId = checkpoint.shardId
         val checkpointHash = verified.signingPreimageHash
         val slot = checkpoint.slot
         val epoch = checkpoint.epoch
 
-        resolveLocalOperatorKeys(epoch).flatMap {
-          case None =>
-            logger.warn(
-              s"emit-skip shard=${shardId.value.value} reason=unregistered-or-mismatched-local-vrf-identity " +
-                s"peer=${selfPeerId.value.value.take(16)}"
-            )
-          case Some(operatorKeys) =>
-            // Resolve shard eta keyed on the checkpoint's wire-carried epoch, not a wall-clock period. The producer signed its possession proof under `computeShardEta(shardId, etaForPeriod(epoch))`;
-            // every verifier MUST re-derive the SAME eta for the SAME `epoch` or registered-key proof verification disagrees and the shard chain
-            // stalls. The epoch eta remains resolvable after a boundary.
-            shardEtaFor(shardId, epoch).flatMap {
-              case None =>
-                // No shard proof eta means this node does not track the shard. Skip silently; this is the
-                // same "shard not tracked locally" disposition the acceptance side uses; we simply don't attest.
-                logger.debug(s"emit: shard=${shardId.value.value} has no shardEta (not a tracked committee shard); skipping attestation")
-              case Some(shardEta) =>
-                val currentSlot = slot // the envelope's wire slot (design §5.7) — same field every verifier reads
-                // The canonical hash bytes every committee member signs (design doc §3.3). UTF-8 of the hex Hash string — identical to the
-                // producer's `preimageHash.getBytes` path.
-                val msgBytes = checkpointHash.value.getBytes(StandardCharsets.UTF_8)
-                for {
-                  // Registered-key possession proof over `(shardEta, slot)`. This is neither the public VK-hash membership draw nor a producer
-                  // duty claim; any registered committee member can produce a valid proof for its own attestation.
-                  vrfProof <- Async[F].delay(eligibilityChecker.vrfProofForSlot(selfVrfSk, currentSlot, shardEta))
-                  kesEvidence <- kesSigner.sign(operatorKeys, epoch, msgBytes)
-                  _ <- kesEvidence match {
-                    case None =>
-                      logger.warn(
-                        s"ShardCheckpointAttestation refusing local signature: shard=${shardId.value.value} " +
-                          s"checkpoint=${checkpointHash.value.take(12)} reason=no-preregistered-kes-signing-capability " +
-                          s"checkpointEpoch=${epoch.value}"
-                      )
-                    case Some(KesSignature(kesStep, kesSig)) =>
-                      for {
-                        // The artifact-period KES gate above is passed before the long-term signature is emitted.
-                        edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
-                        committeeSig = CommitteeMemberSignature(
-                          peerId = selfPeerId,
-                          vrfProof = Hex.fromBytes(vrfProof),
-                          ed25519Sig = Hex.fromBytes(edSig),
-                          kesProductSig = Hex.fromBytes(kesSig),
-                          kesTreeStep = kesStep
-                        )
-                        attestation = ShardCheckpointWireCodecs.ShardCheckpointAttestation(
-                          shardId = shardId,
-                          checkpointHash = checkpointHash,
-                          attesterSignature = committeeSig
-                        )
-                        signatureVerification <- verifyCommitteeSignature(checkpoint, committeeSig)
-                        _ <- signatureVerification match {
-                          case Left(reason) =>
+        remainsOnLineage(verified).ifM(
+          resolveLocalOperatorKeys(epoch).flatMap {
+            case None =>
+              logger.warn(
+                s"emit-skip shard=${shardId.value.value} reason=unregistered-or-mismatched-local-vrf-identity " +
+                  s"peer=${selfPeerId.value.value.take(16)}"
+              )
+            case Some(operatorKeys) =>
+              // Resolve shard eta keyed on the checkpoint's wire-carried epoch, not a wall-clock period. The producer signed its possession proof under `computeShardEta(shardId, etaForPeriod(epoch))`;
+              // every verifier MUST re-derive the SAME eta for the SAME `epoch` or registered-key proof verification disagrees and the shard chain
+              // stalls. The epoch eta remains resolvable after a boundary.
+              shardEtaFor(shardId, epoch).flatMap {
+                case None =>
+                  // No shard proof eta means this node does not track the shard. Skip silently; this is the
+                  // same "shard not tracked locally" disposition the acceptance side uses; we simply don't attest.
+                  logger.debug(s"emit: shard=${shardId.value.value} has no shardEta (not a tracked committee shard); skipping attestation")
+                case Some(shardEta) =>
+                  val currentSlot = slot // the envelope's wire slot (design §5.7) — same field every verifier reads
+                  // The canonical hash bytes every committee member signs (design doc §3.3). UTF-8 of the hex Hash string — identical to the
+                  // producer's `preimageHash.getBytes` path.
+                  val msgBytes = checkpointHash.value.getBytes(StandardCharsets.UTF_8)
+                  for {
+                    // Registered-key possession proof over `(shardEta, slot)`. This is neither the public VK-hash membership draw nor a producer
+                    // duty claim; any registered committee member can produce a valid proof for its own attestation.
+                    vrfProof <- Async[F].delay(eligibilityChecker.vrfProofForSlot(selfVrfSk, currentSlot, shardEta))
+                    lineageBeforeKes <- remainsOnLineage(verified)
+                    _ <-
+                      if (!lineageBeforeKes) staleLineageLog(verified, "before-kes")
+                      else
+                        kesSigner.sign(operatorKeys, epoch, msgBytes).flatMap {
+                          case None =>
                             logger.warn(
-                              s"ShardCheckpointAttestation refusing unverified local signature: shard=${shardId.value.value} " +
-                                s"checkpoint=${checkpointHash.value.take(12)} reason=$reason"
+                              s"ShardCheckpointAttestation refusing local signature: shard=${shardId.value.value} " +
+                                s"checkpoint=${checkpointHash.value.take(12)} reason=no-preregistered-kes-signing-capability " +
+                                s"checkpointEpoch=${epoch.value}"
                             )
-                          case Right(()) =>
-                            // The exact signature has now passed the same membership, Ed25519, KES, and registered-VRF checks as a remote
-                            // attestation. Only verified evidence may enter the tracker or gossip.
-                            val record = tipTrackerFor(shardId) match {
-                              case Some(tracker) => tracker.recordAttestation(checkpointHash, selfPeerId, committeeSig)
-                              case None          => Async[F].unit
+                          case Some(KesSignature(kesStep, kesSig)) =>
+                            remainsOnLineage(verified).flatMap {
+                              case false => staleLineageLog(verified, "after-kes-before-ed25519")
+                              case true =>
+                                for {
+                                  // The artifact-period KES gate above is passed before the long-term signature is emitted.
+                                  edSig <- Signing.signData[F](msgBytes)(selfKeyPair.getPrivate)
+                                  committeeSig = CommitteeMemberSignature(
+                                    peerId = selfPeerId,
+                                    vrfProof = Hex.fromBytes(vrfProof),
+                                    ed25519Sig = Hex.fromBytes(edSig),
+                                    kesProductSig = Hex.fromBytes(kesSig),
+                                    kesTreeStep = kesStep
+                                  )
+                                  attestation = ShardCheckpointWireCodecs.ShardCheckpointAttestation(
+                                    shardId = shardId,
+                                    checkpointHash = checkpointHash,
+                                    attesterSignature = committeeSig
+                                  )
+                                  signatureVerification <- verifyCommitteeSignature(checkpoint, committeeSig)
+                                  _ <- signatureVerification match {
+                                    case Left(reason) =>
+                                      logger.warn(
+                                        s"ShardCheckpointAttestation refusing unverified local signature: shard=${shardId.value.value} " +
+                                          s"checkpoint=${checkpointHash.value.take(12)} reason=$reason"
+                                      )
+                                    case Right(()) =>
+                                      remainsOnLineage(verified).flatMap {
+                                        case false => staleLineageLog(verified, "after-local-verification-before-record-publish")
+                                        case true  =>
+                                          // The exact signature has now passed the same membership, Ed25519, KES, and registered-VRF checks as a remote
+                                          // attestation. Only verified evidence on the still-observed lineage may enter the tracker or gossip.
+                                          val record = tipTrackerFor(shardId) match {
+                                            case Some(tracker) => tracker.recordAttestation(checkpointHash, selfPeerId, committeeSig)
+                                            case None          => Async[F].unit
+                                          }
+                                          val wire = ShardCheckpointWireCodecs.shardCheckpointAttestationToWire(attestation)
+                                          record >> sidecarClient
+                                            .publishShardCheckpointAttestation(wire)
+                                            .flatMap { resp =>
+                                              if (resp.ok)
+                                                logger.info(
+                                                  s"🧩 ShardCheckpointAttestation emit: shard=${shardId.value.value} " +
+                                                    s"checkpoint=${checkpointHash.value.take(12)} slot=${slot.value.value} kesStep=$kesStep"
+                                                )
+                                              else
+                                                logger.warn(
+                                                  s"⚠️ ShardCheckpointAttestation publish returned not-ok: shard=${shardId.value.value} " +
+                                                    s"checkpoint=${checkpointHash.value.take(12)}: ${resp.error}"
+                                                )
+                                            }
+                                            .handleErrorWith { err =>
+                                              logger.warn(
+                                                s"⚠️ ShardCheckpointAttestation publish failed: shard=${shardId.value.value} " +
+                                                  s"checkpoint=${checkpointHash.value.take(12)}: ${err.getMessage}"
+                                              )
+                                            }
+                                      }
+                                  }
+                                } yield ()
                             }
-                            val wire = ShardCheckpointWireCodecs.shardCheckpointAttestationToWire(attestation)
-                            record >> sidecarClient
-                              .publishShardCheckpointAttestation(wire)
-                              .flatMap { resp =>
-                                if (resp.ok)
-                                  logger.info(
-                                    s"🧩 ShardCheckpointAttestation emit: shard=${shardId.value.value} " +
-                                      s"checkpoint=${checkpointHash.value.take(12)} slot=${slot.value.value} kesStep=$kesStep"
-                                  )
-                                else
-                                  logger.warn(
-                                    s"⚠️ ShardCheckpointAttestation publish returned not-ok: shard=${shardId.value.value} " +
-                                      s"checkpoint=${checkpointHash.value.take(12)}: ${resp.error}"
-                                  )
-                              }
-                              .handleErrorWith { err =>
-                                logger.warn(
-                                  s"⚠️ ShardCheckpointAttestation publish failed: shard=${shardId.value.value} " +
-                                    s"checkpoint=${checkpointHash.value.take(12)}: ${err.getMessage}"
-                                )
-                              }
                         }
-                      } yield ()
-                  }
-                } yield ()
-            }
-        }
+                  } yield ()
+              }
+          },
+          staleLineageLog(verified, "emit-entry")
+        )
       }
     }
   }

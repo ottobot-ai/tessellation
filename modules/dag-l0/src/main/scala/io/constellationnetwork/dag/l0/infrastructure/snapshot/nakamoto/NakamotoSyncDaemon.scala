@@ -15,14 +15,19 @@ import io.constellationnetwork.ext.crypto._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.sharding.{
+  LineageBoundCheckpointEvaluation,
+  LineageBoundVerifiedShardCheckpoint,
+  ShardCheckpointAttestationEmitter
+}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   ShardCheckpointAcceptResult,
-  VerifiedShardCheckpoint,
   VerifiedShardCheckpointFailure
 }
 import io.constellationnetwork.schema._
@@ -1200,6 +1205,7 @@ object NakamotoSyncDaemon {
                           cp,
                           shardAcceptanceDeps,
                           shardCheckpointAttestationEmitter,
+                          chainStore.selectedTip.map(_.map(_.lineageRevision)),
                           watchtowerFraudProofEmitter,
                           shardCheckpointFetcher,
                           pendingShardCheckpointRef,
@@ -1568,6 +1574,7 @@ object NakamotoSyncDaemon {
                                                   w,
                                                   shardAcceptanceDeps,
                                                   shardCheckpointAttestationEmitter,
+                                                  chainStore.selectedTip.map(_.map(_.lineageRevision)),
                                                   watchtowerFraudProofEmitter,
                                                   shardCheckpointFetcher,
                                                   pendingShardCheckpointRef,
@@ -2458,9 +2465,11 @@ object NakamotoSyncDaemon {
     *      Re-wrap the bare `ShardCheckpoint` into a `Signed[ShardCheckpoint]` from the committee signatures present (the codec scaladoc
     *      describes the re-wrap — the producer's own committee `ed25519Sig` IS `signData(preimageHash)`, byte-identical to the outer
     *      `Signed` proof it built).
-    *   1. Run `deps.acceptanceManager.evaluateForSigning(checkpoint)`, including framework replay. Receive a [[VerifiedShardCheckpoint]]
-    *      only for `Accepted` or `PendingMoreAttestations`; an affirmative mismatch may trigger certificate-gated portable fraud evidence
-    *      but never storage or attestation.
+    *   1. Bracket `deps.acceptanceManager.evaluateForSigning(checkpoint)` with one process-local GL0 lineage generation. Receive a
+    *      [[LineageBoundVerifiedShardCheckpoint]] only when framework replay succeeds and that generation remains unchanged; expose an
+    *      affirmative mismatch for certificate-gated portable fraud evidence only when the same post-read remains unchanged. Movement or
+    *      unavailability observed across this acquisition permits neither storage, attestation, nor evidence; post-return store/record and
+    *      separate watchtower-replay check-to-act races remain open until the live Phase-2 lease owns those effects.
     *   1. For a verified checkpoint only, store it in `entry.chainStore` and record its carried committee signatures.
     *   1. Before each missing execution signature, reuse that exact receipt capability or replay the corresponding stored ancestor once.
     *
@@ -2479,6 +2488,7 @@ object NakamotoSyncDaemon {
     shardCheckpointAttestationEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
     ],
+    localGlobalLineageRevision: F[Option[CanonicalLineageRevision]],
     // WATCHTOWER (fraud-proof part 1): re-execute a certificate-authenticated checkpoint and gossip a FraudProofEnvelope
     // on a per-MG root mismatch. `None` at numShards=1 or when watchtower-enabled=false ⇒ no approval-check. Fired
     // directly for the typed affirmative-mismatch rejection (before storage/attestation), and defensively on the
@@ -2541,6 +2551,7 @@ object NakamotoSyncDaemon {
                                           w,
                                           shardAcceptanceDeps,
                                           shardCheckpointAttestationEmitter,
+                                          localGlobalLineageRevision,
                                           watchtowerFraudProofEmitter,
                                           shardCheckpointFetcher,
                                           pendingShardCheckpointRef,
@@ -2625,6 +2636,7 @@ object NakamotoSyncDaemon {
                                                   w,
                                                   shardAcceptanceDeps,
                                                   shardCheckpointAttestationEmitter,
+                                                  localGlobalLineageRevision,
                                                   watchtowerFraudProofEmitter,
                                                   shardCheckpointFetcher,
                                                   pendingShardCheckpointRef,
@@ -2638,175 +2650,208 @@ object NakamotoSyncDaemon {
                                     }
                                 }
                             } >>
-                              deps.acceptanceManager.evaluateForSigning(checkpoint).flatMap {
-                                case Left(failure) =>
-                                  val emitPortableEvidence = shardCheckpointFraudEvidenceEligible(failure)
-                                  logger.info(
-                                    s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
-                                      s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
-                                      s"signers=${checkpoint.committeeSignatures.size} evaluate=${failure.acceptanceResult} " +
-                                      (if (emitPortableEvidence)
-                                         s"— NOT adopted/attested; emitting only certificate-authenticated portable mismatch evidence"
-                                       else s"— NOT adopted/attested (re-exec unavailable or pre-check/structural reject; no evidence)")
-                                  ) >> Async[F].whenA(emitPortableEvidence) {
-                                    watchtowerFraudProofEmitter.fold(Async[F].unit)(_.emit(checkpoint))
-                                  }
-                                case Right(verifiedCheckpoint) =>
-                                  // The capability above was minted by this exact intake replay. Store/count/sign are unreachable for a
-                                  // rejected or mismatching checkpoint, and the received checkpoint is not replayed a second time merely to
-                                  // satisfy the emitter API.
-                                  val checkpointHash = verifiedCheckpoint.signingPreimageHash
-                                  val adoptAndAttest =
-                                    io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointChainStoreRecovery
-                                      .ingestValidated(checkpoint, entry.chainStore)
-                                      .flatMap { recovered =>
-                                        Async[F].raiseUnless(recovered.checkpointHash === checkpointHash) {
-                                          new IllegalStateException(
-                                            s"verified checkpoint recovery hash mismatch: capability=${checkpointHash.value} " +
-                                              s"recovered=${recovered.checkpointHash.value}"
-                                          )
-                                        } >>
-                                          // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash ===
-                                          // thisHash)` seam. `store` returns `isNew`; if the (re-exec-validated) checkpoint is now the canonical
-                                          // bestTip (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
-                                          entry.chainStore.bestTip.flatMap { bestTipOpt =>
-                                            val becameBestTip = recovered.inserted && bestTipOpt.exists(_.hash === checkpointHash)
-                                            // WATCHTOWER approval-check (fraud-proof part 1): on adopting this checkpoint as canonical best tip,
-                                            // defensively re-execute its complete batch after the emitter re-verifies the execution certificate,
-                                            // and gossip a FraudProofEnvelope on any mismatch. Affirmative intake mismatches take the earlier
-                                            // rejection branch and emit without adoption. This successful-path replay remains inside the
-                                            // bounded generation-owned shard worker, so reconnect/cancellation cannot leave stale replay or
-                                            // publication mutating state. `None` (numShards=1 / watchtower disabled) ⇒ skipped. Only on
-                                            // becameBestTip: a non-canonical sibling is not adopted, so its effects are never applied — no need
-                                            // to dispute it (and re-deriving it against our S(N) could false-mismatch).
-                                            Async[F].whenA(becameBestTip) {
-                                              watchtowerFraudProofEmitter match {
-                                                case None          => Async[F].unit
-                                                case Some(emitter) => emitter.emit(checkpoint)
-                                              }
-                                            } >>
-                                              // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
-                                              // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
-                                              checkpoint.committeeSignatures.toList
-                                                .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
-                                              // Execution-certificate closure: sign + gossip after local replay so every other node's tracker
-                                              // can reach configured `kQuorum`. `None`
-                                              // emitter (numShards=1 regression bar) ⇒ no emit. The surrounding bounded shard worker owns the
-                                              // multi-step sign/publish lifecycle.
-                                              //
-                                              // ATTEST ON EVERY ADMISSIBLE RECEIPT, not only on becameBestTip (2026-06-11, run bc5a17r12):
-                                              // the best-tip-only gate + the tip-triggered ancestor walk still missed OUT-OF-ORDER arrivals —
-                                              // when ord 12 gossips in before ord 11, 12 becomes best tip while 11 is unknown (the ancestor
-                                              // walk hits getByHash=None and stops), and when 11 lands later it is NOT a new best tip, so no
-                                              // emit ever fires for it. Checkpoints 11/12 then sat below quorum for ~3 min (19 consecutive
-                                              // embed-none ords) — the admission plateaus that expired DoubleUse's allow-spend mid-flight.
-                                              // The canonical-chain walk below starts from the CURRENT best tip on every receipt and attests
-                                              // anything stored + not yet self-attested, so a late-arriving parent is attested the moment it
-                                              // lands. Idempotent (tracker self-record) and cheap (≤16 tracker lookups per received envelope).
-                                              Async[F]
-                                                .whenA(true) {
-                                                  shardCheckpointAttestationEmitter match {
-                                                    case None          => Async[F].unit
-                                                    case Some(emitter) =>
-                                                      // ATTEST THE CHAIN, NOT JUST THE TIP (2026-06-11, run bp4wrh5zq): members previously attested
-                                                      // only the checkpoint that was the best tip AT THE MOMENT IT ARRIVED. During bootstrap, nodes
-                                                      // join the shard topics staggered over minutes while the producer keeps extending, so early
-                                                      // shardOrds scroll past before most members are listening — the genesis checkpoint sat at
-                                                      // signers=1 for 7+ minutes, and because gl0 embedding is ancestor-first, the WHOLE shard chain's
-                                                      // admission was blocked behind the under-attested ancestor (the run-6 DoubleUse spend-action
-                                                      // timeout). On becoming best tip, also attest every stored canonical ancestor this node has not
-                                                      // yet attested. The membership gate is deliberately per ancestor and uses that ancestor's OWN
-                                                      // epoch: gating the whole walk on the received checkpoint's committee would skip valid older
-                                                      // duties across committee rotation. Verifiers dedupe by peerId and independently check membership.
-                                                      def attestMissingAncestors(h: Hash, remaining: Int): F[Unit] =
-                                                        if (remaining <= 0 || h === Hash.empty) Async[F].unit
-                                                        else
-                                                          entry.chainStore.getByHash(h).flatMap {
-                                                            case None => Async[F].unit // deeper than our stored view — stop
-                                                            case Some(anc) =>
-                                                              val ancCp = anc.signed.value
-                                                              entry.tipTracker.signaturesFor(anc.hash).flatMap { sigs =>
-                                                                Async[F].whenA(!sigs.contains(selfId)) {
-                                                                  deps.committeeMembership(ancCp.shardId, ancCp.epoch).flatMap { ancCommittee =>
-                                                                    Async[F].whenA(ancCommittee.contains(selfId)) {
-                                                                      // Ancestors are subject to the same intake replay gate as the received tip. `verifyEmbedded`
-                                                                      // is deliberately wrong here because it requires a completed kQuorum, while these signatures
-                                                                      // are what close that quorum. Reuse the received checkpoint's capability when it is this
-                                                                      // ancestor; every other signing attempt calls `evaluate` exactly once before emit.
-                                                                      val verifiedAncestorF =
-                                                                        if (anc.hash === verifiedCheckpoint.signingPreimageHash)
-                                                                          (Some(verifiedCheckpoint): Option[VerifiedShardCheckpoint])
-                                                                            .pure[F]
-                                                                        else
-                                                                          deps.acceptanceManager
-                                                                            .evaluateForSigning(ancCp)
-                                                                            .flatMap {
-                                                                              case Right(verifiedAncestor) =>
-                                                                                (Some(verifiedAncestor): Option[
-                                                                                  VerifiedShardCheckpoint
-                                                                                ])
-                                                                                  .pure[F]
-                                                                              case Left(failure) =>
-                                                                                logger
-                                                                                  .warn(
-                                                                                    s"ShardCheckpoint skip ancestor attestation: " +
-                                                                                      s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value} " +
-                                                                                      s"executionResult=${failure.acceptanceResult}"
-                                                                                  )
-                                                                                  .as(Option.empty[VerifiedShardCheckpoint])
-                                                                            }
-
-                                                                      verifiedAncestorF.flatMap {
-                                                                        case None => Async[F].unit
-                                                                        case Some(verifiedAncestor) =>
-                                                                          logger.info(
-                                                                            s"ShardCheckpoint attest-ancestor after re-exec: " +
-                                                                              s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value} " +
-                                                                              s"slot=${ancCp.slot.value.value}"
-                                                                          ) >> emitter.emit(verifiedAncestor)
-                                                                      }
-                                                                    }
-                                                                  }
-                                                                } >> attestMissingAncestors(ancCp.parentCheckpointHash, remaining - 1)
-                                                              }
-                                                          }
-
-                                                      // Walk from the CURRENT canonical tip (not the received envelope): covers the received
-                                                      // checkpoint when it IS the tip, late-arriving ancestors when it is not, and any other
-                                                      // unattested canonical entries in between.
-                                                      entry.chainStore.bestTip.flatMap {
-                                                        case None      => Async[F].unit
-                                                        case Some(tip) => attestMissingAncestors(tip.hash, MaxAncestorAttestWalk)
-                                                      }
-                                                  }
-                                                }
-                                                .as(becameBestTip)
-                                          }
-                                      }
-                                  adoptAndAttest.flatMap { becameBestTip =>
+                              ShardCheckpointAttestationEmitter
+                                .acquireLineageBound(localGlobalLineageRevision)(
+                                  deps.acceptanceManager.evaluateForSigning(checkpoint)
+                                )
+                                .flatMap {
+                                  case LineageBoundCheckpointEvaluation.Rejected(failure) =>
+                                    val emitPortableEvidence = shardCheckpointFraudEvidenceEligible(failure)
                                     logger.info(
                                       s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
                                         s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
-                                        s"signers=${checkpoint.committeeSignatures.size} becameBestTip=$becameBestTip " +
-                                        s"evaluate=replay-valid (capability minted)"
-                                    ) >>
-                                      drainBoundedPendingCheckpointChildren(checkpointHash, pendingShardCheckpointRef).flatMap {
-                                        _.traverse_(pendingChild =>
-                                          handleShardCheckpoint(
-                                            pendingChild,
-                                            shardAcceptanceDeps,
-                                            shardCheckpointAttestationEmitter,
-                                            watchtowerFraudProofEmitter,
-                                            shardCheckpointFetcher,
-                                            pendingShardCheckpointRef,
-                                            MaxShardCheckpointAncestryRecoveryDepth,
-                                            selfId,
-                                            logger
+                                        s"signers=${checkpoint.committeeSignatures.size} evaluate=${failure.acceptanceResult} " +
+                                        (if (emitPortableEvidence)
+                                           s"— NOT adopted/attested; emitting only certificate-authenticated portable mismatch evidence"
+                                         else s"— NOT adopted/attested (re-exec unavailable or pre-check/structural reject; no evidence)")
+                                    ) >> Async[F].whenA(emitPortableEvidence) {
+                                      watchtowerFraudProofEmitter.fold(Async[F].unit)(_.emit(checkpoint))
+                                    }
+                                  case LineageBoundCheckpointEvaluation.LineageUnavailable =>
+                                    logger.warn(
+                                      s"ShardCheckpoint rx deferred after GL0 lineage moved or became unavailable: " +
+                                        s"shard=${checkpoint.shardId.value.value} shardOrd=${checkpoint.shardOrdinal.value}; " +
+                                        "NOT stored/attested and no portable mismatch evidence emitted"
+                                    )
+                                  case LineageBoundCheckpointEvaluation.ReplayVerified(verifiedCheckpoint) =>
+                                    // The private capability above binds this exact intake replay to one unchanged process-local GL0 lineage.
+                                    // A rejected/mismatching checkpoint, or lineage movement observed across acquisition, cannot reach
+                                    // store/count/sign/evidence. Post-return effects are not atomic with that observation and remain open.
+                                    val checkpointHash = verifiedCheckpoint.signingPreimageHash
+                                    val adoptAndAttest =
+                                      io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointChainStoreRecovery
+                                        .ingestValidated(checkpoint, entry.chainStore)
+                                        .flatMap { recovered =>
+                                          Async[F].raiseUnless(recovered.checkpointHash === checkpointHash) {
+                                            new IllegalStateException(
+                                              s"verified checkpoint recovery hash mismatch: capability=${checkpointHash.value} " +
+                                                s"recovered=${recovered.checkpointHash.value}"
+                                            )
+                                          } >>
+                                            // Became-best-tip gate — byte-identical to the gl0 `becameBest = isNew && bestTipOpt.exists(_.hash ===
+                                            // thisHash)` seam. `store` returns `isNew`; if the (re-exec-validated) checkpoint is now the canonical
+                                            // bestTip (per ShardChainStore maxvalid-tk fork choice), THIS node attests once for this winning hash.
+                                            entry.chainStore.bestTip.flatMap { bestTipOpt =>
+                                              val becameBestTip = recovered.inserted && bestTipOpt.exists(_.hash === checkpointHash)
+                                              // WATCHTOWER approval-check (fraud-proof part 1): on adopting this checkpoint as canonical best tip,
+                                              // defensively re-execute its complete batch after the emitter re-verifies the execution certificate,
+                                              // and gossip a FraudProofEnvelope on any mismatch. Affirmative intake mismatches take the earlier
+                                              // rejection branch and emit without adoption. This successful-path replay remains inside the
+                                              // bounded generation-owned shard worker, so reconnect/cancellation cannot leave stale replay or
+                                              // publication mutating state. `None` (numShards=1 / watchtower disabled) ⇒ skipped. Only on
+                                              // becameBestTip: a non-canonical sibling is not adopted, so its effects are never applied — no need
+                                              // to dispute it (and re-deriving it against our S(N) could false-mismatch).
+                                              Async[F].whenA(becameBestTip) {
+                                                watchtowerFraudProofEmitter match {
+                                                  case None          => Async[F].unit
+                                                  case Some(emitter) => emitter.emit(checkpoint)
+                                                }
+                                              } >>
+                                                // Record every committee signer (the producer's own sig seeds 1 attestation) into the tip tracker —
+                                                // only now that re-exec validated the checkpoint (so a wrong-derivation envelope never inflates quorum).
+                                                checkpoint.committeeSignatures.toList
+                                                  .traverse_(sig => entry.tipTracker.recordAttestation(checkpointHash, sig.peerId, sig)) >>
+                                                // Execution-certificate closure: sign + gossip after local replay so every other node's tracker
+                                                // can reach configured `kQuorum`. `None`
+                                                // emitter (numShards=1 regression bar) ⇒ no emit. The surrounding bounded shard worker owns the
+                                                // multi-step sign/publish lifecycle.
+                                                //
+                                                // ATTEST ON EVERY ADMISSIBLE RECEIPT, not only on becameBestTip (2026-06-11, run bc5a17r12):
+                                                // the best-tip-only gate + the tip-triggered ancestor walk still missed OUT-OF-ORDER arrivals —
+                                                // when ord 12 gossips in before ord 11, 12 becomes best tip while 11 is unknown (the ancestor
+                                                // walk hits getByHash=None and stops), and when 11 lands later it is NOT a new best tip, so no
+                                                // emit ever fires for it. Checkpoints 11/12 then sat below quorum for ~3 min (19 consecutive
+                                                // embed-none ords) — the admission plateaus that expired DoubleUse's allow-spend mid-flight.
+                                                // The canonical-chain walk below starts from the CURRENT best tip on every receipt and attests
+                                                // anything stored + not yet self-attested, so a late-arriving parent is attested the moment it
+                                                // lands. Idempotent (tracker self-record) and cheap (≤16 tracker lookups per received envelope).
+                                                Async[F]
+                                                  .whenA(true) {
+                                                    shardCheckpointAttestationEmitter match {
+                                                      case None          => Async[F].unit
+                                                      case Some(emitter) =>
+                                                        // ATTEST THE CHAIN, NOT JUST THE TIP (2026-06-11, run bp4wrh5zq): members previously attested
+                                                        // only the checkpoint that was the best tip AT THE MOMENT IT ARRIVED. During bootstrap, nodes
+                                                        // join the shard topics staggered over minutes while the producer keeps extending, so early
+                                                        // shardOrds scroll past before most members are listening — the genesis checkpoint sat at
+                                                        // signers=1 for 7+ minutes, and because gl0 embedding is ancestor-first, the WHOLE shard chain's
+                                                        // admission was blocked behind the under-attested ancestor (the run-6 DoubleUse spend-action
+                                                        // timeout). On becoming best tip, also attest every stored canonical ancestor this node has not
+                                                        // yet attested. The membership gate is deliberately per ancestor and uses that ancestor's OWN
+                                                        // epoch: gating the whole walk on the received checkpoint's committee would skip valid older
+                                                        // duties across committee rotation. Verifiers dedupe by peerId and independently check membership.
+                                                        def attestMissingAncestors(h: Hash, remaining: Int): F[Unit] =
+                                                          if (remaining <= 0 || h === Hash.empty) Async[F].unit
+                                                          else
+                                                            entry.chainStore.getByHash(h).flatMap {
+                                                              case None => Async[F].unit // deeper than our stored view — stop
+                                                              case Some(anc) =>
+                                                                val ancCp = anc.signed.value
+                                                                entry.tipTracker.signaturesFor(anc.hash).flatMap { sigs =>
+                                                                  Async[F].whenA(!sigs.contains(selfId)) {
+                                                                    deps.committeeMembership(ancCp.shardId, ancCp.epoch).flatMap {
+                                                                      ancCommittee =>
+                                                                        Async[F].whenA(ancCommittee.contains(selfId)) {
+                                                                          // Ancestors are subject to the same intake replay gate as the received tip. `verifyEmbedded`
+                                                                          // is deliberately wrong here because it requires a completed kQuorum, while these signatures
+                                                                          // are what close that quorum. Reuse the received checkpoint's capability when it is this
+                                                                          // ancestor; every other signing attempt calls `evaluate` exactly once before emit.
+                                                                          val verifiedAncestorF =
+                                                                            if (anc.hash === verifiedCheckpoint.signingPreimageHash)
+                                                                              (Some(verifiedCheckpoint): Option[
+                                                                                LineageBoundVerifiedShardCheckpoint
+                                                                              ])
+                                                                                .pure[F]
+                                                                            else
+                                                                              ShardCheckpointAttestationEmitter
+                                                                                .acquireLineageBound(localGlobalLineageRevision)(
+                                                                                  deps.acceptanceManager.evaluateForSigning(ancCp)
+                                                                                )
+                                                                                .flatMap {
+                                                                                  case LineageBoundCheckpointEvaluation.ReplayVerified(
+                                                                                        verifiedAncestor
+                                                                                      ) =>
+                                                                                    (Some(verifiedAncestor): Option[
+                                                                                      LineageBoundVerifiedShardCheckpoint
+                                                                                    ])
+                                                                                      .pure[F]
+                                                                                  case LineageBoundCheckpointEvaluation.Rejected(failure) =>
+                                                                                    logger
+                                                                                      .warn(
+                                                                                        s"ShardCheckpoint skip ancestor attestation: " +
+                                                                                          s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value} " +
+                                                                                          s"executionResult=${failure.acceptanceResult}"
+                                                                                      )
+                                                                                      .as(
+                                                                                        Option.empty[
+                                                                                          LineageBoundVerifiedShardCheckpoint
+                                                                                        ]
+                                                                                      )
+                                                                                  case LineageBoundCheckpointEvaluation.LineageUnavailable =>
+                                                                                    logger
+                                                                                      .warn(
+                                                                                        s"ShardCheckpoint skip ancestor attestation after GL0 lineage moved or became unavailable: " +
+                                                                                          s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value}"
+                                                                                      )
+                                                                                      .as(
+                                                                                        Option.empty[
+                                                                                          LineageBoundVerifiedShardCheckpoint
+                                                                                        ]
+                                                                                      )
+                                                                                }
+
+                                                                          verifiedAncestorF.flatMap {
+                                                                            case None => Async[F].unit
+                                                                            case Some(verifiedAncestor) =>
+                                                                              logger.info(
+                                                                                s"ShardCheckpoint attest-ancestor after re-exec: " +
+                                                                                  s"shard=${ancCp.shardId.value.value} shardOrd=${ancCp.shardOrdinal.value} " +
+                                                                                  s"slot=${ancCp.slot.value.value}"
+                                                                              ) >> emitter.emit(verifiedAncestor)
+                                                                          }
+                                                                        }
+                                                                    }
+                                                                  } >> attestMissingAncestors(ancCp.parentCheckpointHash, remaining - 1)
+                                                                }
+                                                            }
+
+                                                        // Walk from the CURRENT canonical tip (not the received envelope): covers the received
+                                                        // checkpoint when it IS the tip, late-arriving ancestors when it is not, and any other
+                                                        // unattested canonical entries in between.
+                                                        entry.chainStore.bestTip.flatMap {
+                                                          case None      => Async[F].unit
+                                                          case Some(tip) => attestMissingAncestors(tip.hash, MaxAncestorAttestWalk)
+                                                        }
+                                                    }
+                                                  }
+                                                  .as(becameBestTip)
+                                            }
+                                        }
+                                    adoptAndAttest.flatMap { becameBestTip =>
+                                      logger.info(
+                                        s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
+                                          s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
+                                          s"signers=${checkpoint.committeeSignatures.size} becameBestTip=$becameBestTip " +
+                                          s"evaluate=replay-valid (capability minted)"
+                                      ) >>
+                                        drainBoundedPendingCheckpointChildren(checkpointHash, pendingShardCheckpointRef).flatMap {
+                                          _.traverse_(pendingChild =>
+                                            handleShardCheckpoint(
+                                              pendingChild,
+                                              shardAcceptanceDeps,
+                                              shardCheckpointAttestationEmitter,
+                                              localGlobalLineageRevision,
+                                              watchtowerFraudProofEmitter,
+                                              shardCheckpointFetcher,
+                                              pendingShardCheckpointRef,
+                                              MaxShardCheckpointAncestryRecoveryDepth,
+                                              selfId,
+                                              logger
+                                            )
                                           )
-                                        )
-                                      }
-                                  }
-                              }
+                                        }
+                                    }
+                                }
                         }
                       )
                     }.flatMap {

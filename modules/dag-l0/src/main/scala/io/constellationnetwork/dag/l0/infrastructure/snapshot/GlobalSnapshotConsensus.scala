@@ -1745,7 +1745,11 @@ object GlobalSnapshotConsensus {
                       verifyCommitteeSignature = deps.acceptanceManager.verifyCommitteeSignature,
                       sidecarClient = sidecarClient,
                       tipTrackerFor = tipTrackerFor,
-                      shardEtaFor = shardEtaFor
+                      shardEtaFor = shardEtaFor,
+                      // Process-local discard-only containment. A density replacement/reconstruction advances this generation while a pure
+                      // descendant extension preserves it. The attester samples it around replay and again before every signature side effect;
+                      // it is neither transported finality evidence nor an exact Phase-2 lease.
+                      localGlobalLineageRevision = chainStore.selectedTip.map(_.map(_.lineageRevision))
                     )
                   ): Option[io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]]
                 )
