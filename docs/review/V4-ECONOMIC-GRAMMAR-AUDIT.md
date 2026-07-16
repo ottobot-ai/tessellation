@@ -1,12 +1,14 @@
 # Tessellation v4.0.0 Economic Grammar Audit
 
-**Status:** Partial, source-only, non-ratifying audit input
+**Status:** Current-source inventory guarded; policy/oracle and activation gates open
 
-**Date:** 2026-07-12
+**Date:** 2026-07-15
 
-**Scope:** Upstream framework grammar and authority provenance for `TokenUnlock`,
-no-reference `SpendTransaction`, and operations that the current E2 grammar
-collapses or omits.
+**Scope:** Upstream-v4 framework grammar, current-fork constructors and wire
+carriers, codec/decoder reachability, validation and writer boundaries,
+configuration/genesis/migration issuance, and authority provenance. The
+`TokenUnlock` and no-reference `SpendTransaction` investigations remain the
+deep source case studies.
 
 This document is not a protocol specification, owner decision, implementation
 claim, or production-readiness finding. O-06, O-07, and O-09 are owner-ratified
@@ -26,14 +28,140 @@ The audited upstream baseline is Constellation Labs Tessellation `v4.0.0`:
 | Peeled commit | `v4.0.0^{commit}` = `22953a1ee835d4d93fb6a0b193599d18c82a284c` |
 | Commit subject | `chore: align develop config with release/mainnet (#1464)` |
 
-The current-fork comparison was performed at HEAD
-`184f7863df212a38b6eea380258c81870a218d89`. The relevant fork hardening
+The current-fork comparison packet was refreshed from tranche-start HEAD
+`4b09a795e131e328cce165d0e106bea35ba2d487`. The relevant fork hardening
 commit is `c610a0740c34833e563f8a94c2ab820186a75897`,
 `refactor(consensus): enforce GL0 economic replay`.
 
-This was a source and history audit. No test was executed for this packet. An
-upstream test is evidence of intended and tested behavior, but this packet does
-not claim that the test currently passes on either tree.
+The upstream comparison was a source and history audit; no upstream test was
+executed for that historical packet. An upstream test is evidence of intended
+and tested behavior, but this packet does not claim that the test currently
+passes on either tree. The current-fork completeness tripwire described below
+is a separate executable suite and was run against the current worktree.
+
+### 1.1 Current-fork source tripwire
+
+E2.9 now has a production-dark structured manifest at
+`modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/economics/V4EconomicGrammarManifest.scala`
+and a CI guard at
+`modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/economics/V4EconomicGrammarCompletenessGuardSuite.scala`.
+At the frozen baseline they classify 39 operation identities, 12 economic wire
+carriers, and 182 reviewed current-fork sources. V4 feature identity is kept
+separate from current activation, so retaining a v4 capability does not approve
+its current authority path. Every row records intended and current authority as
+separate mandatory fields; an unsafe or missing implementation cannot inherit
+the intended authority by default.
+
+The guard resolves operation and carrier declarations, exhaustively checks the
+current sealed `SharedArtifact`, `GlobalSnapshotEvent`, delegated-stake,
+node-collateral, and slash-reason variants, and scans production sources for new
+economic constructors, codecs, decoder ingress, validators, writer-shaped
+authority, reward construction, configuration, genesis, and migration gates.
+Each classified source has a SHA-256 fingerprint over comment/whitespace-free
+lexical tokens. A semantic branch change or a newly discovered unclassified
+source fails CI; comment and scalafmt churn does not.
+
+Discovery treats compound `validate*`/`verify*`/`accept*` methods and snapshot
+`ConsensusFunctions` as validation boundaries. This is required to cover the
+actual `CurrencySnapshotValidator`, `CurrencySnapshotConsensusFunctions`, and
+generic `SnapshotConsensusFunctions`; an exact-token search for a method named
+only `validate` previously missed them. Fee decision sources are independently
+discovered and classified, including `FeeCalculator`,
+`SnapshotBinaryFeeCalculator`, and the ML0 `StateChannelSnapshotService` that
+constructs the signed outer fee claim.
+The broadened pass surfaced and froze eight additional existing boundaries that
+the old exact-token/path predicates missed: the DL1 data-consensus engine, block
+acceptance manager, generic consensus contract, delegated-stake validator,
+node-collateral validator, shared data-transaction validator, shared fee
+validator, and fee-prioritized global event cutter.
+
+This is a source tripwire, not the economic reference interpreter, conservation
+oracle, authorization proof, or activation gate. In particular, the manifest
+marks offline upstream-v4-to-new-chain migration issuance `MissingFailClosed`;
+there is no runtime source row claiming that missing transform exists. Passing
+this suite does not make any `ActiveNeedsOracle`, `ActiveSourceProvenUnsafe`, or
+`ActiveWithOpenConservationGate` operation production-safe.
+
+The suite pins these current unsafe behaviors as RED evidence:
+
+- manual `TokenUnlock` has no owner-signed framework intent or permanent replay
+  identity;
+- no-reference metagraph-source spend has no rooted ML0 operator threshold and
+  writes no permanent nullifier/replay identity;
+- `GlobalSnapshotsProcessed` replay memory is reconstructed from caller-supplied
+  bounded history instead of an exact consensus-pinned GL0 replay cursor;
+- framework data fees have a source signature but no parent/reference head and
+  do not advance `lastFeeTxRefs`; the current effect therefore does not claim a
+  `ReferenceAdvance` that source never performs;
+- a state-channel binary may claim any fee at or above the deterministic
+  recommendation; GL0 debits that full claim from the owner-message address but
+  credits no recipient and adjusts no supply field, making the current branch
+  an overchargeable burn/unaccounted sink rather than a transfer;
+- genesis/full and first-incremental state-channel binaries pass the same
+  outer-signature and minimum-fee validation without requiring an owner message,
+  but take a distinct processor branch that performs no fee debit at all; only
+  subsequent incrementals require an owner-message payer for the debit/burn
+  branch;
+- native/currency transfer, allow-spend, and token-lock fees are debited without
+  a matching recipient credit or supply-accounting write. The inventory records
+  those current sinks as `Burn`, not `FeeTransfer`; only framework data-fee
+  transactions currently move the fee from a source to a destination;
+- delegated-stake and node-collateral create requests bind an already-funded
+  `tokenLockRef`; their acceptance managers do not debit the balance or consume
+  their request `fee` field again. Withdrawal requests update backing records,
+  not spendable balances. Delegated-stake expiry later generates a canonical
+  `TokenUnlock`; node-collateral expiry currently has no analogous release path,
+  so `ECO-NODE-COLLATERAL-RELEASE` is explicitly `MissingFailClosed`;
+- an absent pricing allowlist authorizes every metagraph;
+- total supply is not a rooted field or writable accumulator. The API derives it
+  from balances, active token locks, and delegated-stake rewards. Manifest rows
+  therefore record actual balance mint/burn effects and do not claim a
+  `SupplyDeclaration`/`SupplyWriter` that source does not contain;
+- invalid-state slashing reduces or removes stake/collateral records, leaves the
+  backing token locks in place, uses its computed principal `burned` value only
+  in a log, and credits the submitter bounty into balances. A full delegated-
+  stake slash also removes the record's accumulated rewards, which the derived
+  supply calculation counts, so the current effect union contains both the
+  bounty `Mint` and that reward `Burn`. Neither effect makes the claimed
+  principal burn real;
+- current GL0 wiring supplies no deterministic currency-reward implementation.
+  Re-execution substitutes an empty reward set, so exact artifact comparison
+  rejects a non-empty metagraph reward claim. `ECO-REWARD-CURRENCY` is
+  `MissingFailClosed`, not active;
+- the L0 genesis loader signs arbitrary delegated-stake and node-collateral
+  fixture events and installs them as active records while token-lock state is
+  empty; a one-unit address stipend is not backing for the event amount. The
+  delegated-stake fixture also installs arbitrary accumulated rewards counted by
+  derived supply, so its genesis-only row records a `Mint`. The two genesis-only
+  backing operations are separate unsafe rows and are excluded from ordinary
+  incremental/event carrier sets;
+- standalone opaque state-channel binaries are retained only before fee
+  activation or while fees are waived. Once fees are required the processor has
+  no authenticated opaque fee-payer lane and drops/stops the opaque chain, so a
+  distinct fee-era row is `MissingFailClosed`;
+- framework-with-data `DataApplicationBlock` carriage and standalone opaque
+  state-channel carriage are distinct rows and carrier sets. The full
+  `CurrencySnapshot` carrier is limited to fields it actually contains rather
+  than inheriting the full incremental framework grammar;
+- allow-spend-backed settlement, whether local or cross-metagraph, is authorized
+  by an unsigned `SpendAction` / `SpendTransaction` checked against the
+  referenced rooted signed `AllowSpend`. `ConsumedAllowSpend` is the resulting
+  cross-metagraph permanent spent-set record, not the constructor or source of
+  authority; and
+- custom data execution can synthesize framework effects. Specifically,
+  `DataApplicationSnapshotAcceptanceManager.scala` accepts
+  `newDataState.sharedArtifacts`, calls
+  `service.getTokenUnlocks(newDataState)`, and unions both into the framework
+  acceptance input. Arbitrary DL1 application output can therefore currently
+  reach `SpendAction`, allow-spend expiry, pricing, and unsigned token-unlock
+  framework transitions. The exact live site is
+  `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/DataApplicationSnapshotAcceptanceManager.scala:245-251`;
+  `ECON-LANE-001` remains open and the opaque lane is carriage-only by target
+  policy. `GlobalSnapshotsProcessed` is not injectable through this path:
+  `CurrencySnapshotAcceptanceManager.filterFrameworkGeneratedArtifacts` removes
+  any supplied acknowledgement and the manager regenerates it from the exact
+  GL0 ordinals actually processed at
+  `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/CurrencySnapshotAcceptanceManager.scala:82-87,296-300,631-645`.
 
 ## 2. Exact upstream path
 
@@ -264,12 +392,13 @@ replay, source/sink, or state transition differs.
 | `PricingUpdate` | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:48-56`; validation at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/priceOracle/PricingUpdateValidator.scala:39-110`; application at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala:1051-1055` | This is an existing named v4 operation affecting consensus price state. Its allowed-source and frequency policy must be explicit; do not invent a differently named authority. |
 | Protocol balance correction | V4 `BalanceAdjustment` at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:58-72`; v4 application at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/CurrencySnapshotAcceptanceManager.scala:490-515` | Preserve the capability, not the upward ML0 authority. The target is a separately typed, root-covered GL0 protocol correction under locked decision L-18 and O-06's deferred engineering schema gate; no owner answer remains pending. |
 | Node parameter update | `v4.0.0@22953a1e:modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotEvent.scala:33-34`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/node.scala:162-181` | Changes reward fraction and requires source, reference, replay, and activation rules. |
-| Delegated stake create/withdraw | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/delegatedStake.scala:80-100` | Backing lock, amount, fee, replacement, withdrawal delay, and reward payout cannot be one generic `stake` rule. |
-| Node collateral create/withdraw | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:67-87` | Backing and eligibility lifecycle differ from delegated stake. |
-| Reward subtypes | Base value at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/transaction.scala:144-152` | Operator, delegator, reserved-address, withdrawal, and configured one-time rewards need named mint source, cap, and order. |
+| Delegated stake create/withdraw/release | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/delegatedStake.scala:80-100` | Create and withdrawal requests mutate records backed by a pre-funded token lock; they do not debit or refund principal. Deterministic withdrawal expiry separately generates the `TokenUnlock` that releases the lock. |
+| Node collateral create/withdraw/missing release | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:67-87` | Create and withdrawal requests mutate collateral records backed by a pre-funded token lock. The current expiry path drops pending withdrawals but does not generate the analogous token unlock, so release is a named missing operation rather than a false request-side balance credit. |
+| Genesis stake and collateral backing | Current loader at `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/genesis/L0GenesisLoader.scala:167-235`; fixture balances at `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/genesis/types.scala:189-221` | Genesis installs active stake/collateral records independently of empty token-lock state. These genesis-only operations cannot be conflated with runtime creates that validate a pre-funded lock. |
+| Reward subtypes | Base value at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/transaction.scala:144-152` | Operator, delegator, reserved-address, withdrawal, and configured one-time rewards need named mint source, cap, and order. Current GL0 wiring rejects non-empty currency rewards because no deterministic implementation is registered, so retained wire syntax is not current activation. |
 | Currency owner/staking messages | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/currencyMessage.scala:23-32,60-73,87-97` | They select fee and staking addresses, so signature, sequence, and activation are economically relevant. |
 | Global sync and delivery acknowledgement | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/currency/schema/globalSnapshotSync.scala:27-42,52-74`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:74-98` | Exact hash-bound cursor, application acknowledgement, and permanent replay state must not be collapsed to bounded history. |
-| State-channel inclusion and snapshot fee | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/currency/schema/currency.scala:166-174`; binary creation at `v4.0.0@22953a1e:modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/services/StateChannelSnapshotService.scala:68-137` | Full genesis, incremental, framework-with-data, DA, and fee-debit semantics differ. Decoder success cannot select authority. |
+| State-channel inclusion and snapshot fee | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/currency/schema/currency.scala:166-174`; binary creation at `v4.0.0@22953a1e:modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/services/StateChannelSnapshotService.scala:68-137` | Full genesis and first incremental accept a fee claim without debiting it; subsequent incrementals debit the owner-message address and credit nobody. Those are distinct grammar rows. Framework-with-data and opaque DA carriage also remain distinct. Current standalone opaque carriage stops when fees activate because it has no fee-payer lane; decoder success cannot select authority. |
 
 The current fork deleted v4's `BalanceAdjustment` in `c610a0740`. The target
 must not restore that metagraph-originated schema. A replacement GL0 correction
@@ -295,6 +424,15 @@ reference interpreter and production kernel.
 | `ECON-REPLAY-MGSPEND-001` | Re-include the same metagraph-source semantic ID in another binary, checkpoint, shard, and GL0 branch. At most one canonical effect occurs. |
 | `ECON-RESERVE-001 cumulative-no-ref-spends` | Two spends of 60 from 100 are evaluated in canonical order against one accumulator. No exception occurs; accepted/rejected prefix and exact balance are deterministic under every input permutation normalization. |
 | `ECON-LANE-001 custom-cannot-construct-framework` | Arbitrary DL1 output containing bytes that decode to `TokenUnlock`, `SpendAction`, fee, reward, or correction cannot enter the framework input ADT without its separately valid framework authorization. |
+| `ECON-F-004 exact-snapshot-fee-and-sink` | A subsequent incremental accepts only the exact deterministic fee under the target rule. The current minimum-only overcharge and debit-without-recipient behavior stays RED until the fee sink and supply equation are ratified. |
+| `ECON-F-004A first-incremental-no-debit` | Full/genesis and first-incremental fee claims take their explicitly classified no-debit path. They cannot be mistaken for a paid fee or satisfy a conservation assertion that assumes the subsequent-incremental debit. |
+| `ECON-F-005 fee-source-sink` | For every fee-bearing operation, the oracle names the debited source, credited recipient, and supply delta. Current debit-only transaction, allow-spend, and token-lock fees are burn/unaccounted sinks; a `FeeTransfer` classification requires a matching destination credit. |
+| `ECON-F-006 pre-funded-backing-no-double-debit` | Delegated-stake and node-collateral create/withdraw requests bind the canonical pre-funded token lock and perform no second principal/fee debit or immediate refund. Delegated expiry releases exactly that lock once. |
+| `ECON-COLLATERAL-RELEASE-001` | An expired node-collateral withdrawal must generate and apply the canonical token-lock release exactly once. Until that path exists, the release operation remains `MissingFailClosed` and the request path cannot claim a balance credit. |
+| `ECON-SUPPLY-001 derived-supply-and-slash` | Every accepted transition preserves the explicit equation over balances, active token locks, and delegated-stake rewards. A slash cannot reduce only a backing record, retain the backing lock, log a fictitious burn, and mint a bounty balance. |
+| `ECON-REWARD-CURRENCY-001 deterministic-registration` | A non-empty currency reward set rejects while no deterministic active-era reward implementation is registered. Once registered, every execution signer recreates the exact reward set and GL0 adoption verifies the same diff/root. |
+| `ECON-OPAQUE-FEE-001 fee-era-carriage` | Fee activation cannot silently drop a previously supported opaque chain. Either a separately authenticated fee-payer mechanism accepts it as carriage-only or the fee-era lane remains explicitly unavailable. |
+| `ECON-GENESIS-BACKING-001` | Every genesis stake/collateral amount is backed by an exact genesis token lock or an explicit genesis issuance/conservation rule. An arbitrary fixture event plus one-unit signer stipend cannot create unbacked eligibility weight. |
 | `ECON-CORRECTION-001 trust-direction` | ML0/CL1/DL1 attempts to construct a correction reject. The active-era GL0 protocol rule applies the same root-covered correction on every GL0 node and downstream nodes rebase from the exact containing Phase-2 hash. |
 | `V4-GRAMMAR-PARITY-*` | Golden v4 fixtures for every retained operation reproduce intended valid functionality. Fixtures that encode upstream authorization, inflation, replay, or ordering defects must reject under a named new rule rather than silently disappear. |
 | `V4-GRAMMAR-UNSUPPORTED-001` | Every v4/fork economic constructor absent from the frozen grammar fails closed before diff construction or signing. |
@@ -308,23 +446,39 @@ the final root.
 
 ## 7. Residual unknowns
 
-1. O-07's direction is owner-ratified, but its engineering grammar gate remains
-   open: this packet is not a mechanically exhaustive inventory of every v4
-   economic constructor, configuration-driven issuance path, migration repair,
-   or route. Freeze requires an automated ADT/codec/event/acceptance reachability
-   inventory and human classification.
+1. O-07's direction is owner-ratified. The current ADT/carrier/codec/decoder/
+   validator/writer/configuration/genesis/migration source inventory is now
+   mechanically guarded at its frozen worktree baseline, but scanner discovery
+   plus human source classification is only a completeness tripwire. The
+   operation semantics, conservation equations, authorization domains, exact
+   ordering, replay identities, and v4 golden vectors still require the E2
+   reference interpreter and differential oracle before activation.
 2. The canonical ML0 operator registry, threshold, rotation, and emergency
    replacement policy for metagraph-source authority is not frozen here.
 3. O-06's direction is owner-ratified, but its engineering schema and activation
    mechanism for a GL0 protocol correction remain unresolved.
    Metagraph-originated authority is excluded by locked decision L-18.
-4. `PricingUpdate` exists and mutates v4 consensus state, but this packet does
-   not establish whether it ships unchanged or its exact allowed-source policy.
-5. O-09's pure opaque/data-only lane remains an engineering/schema gate. This
-   does not affect the locked `FrameworkCurrency` and
-   `FrameworkCurrencyWithData` lanes.
-6. No runtime, differential, cross-JVM, or adversarial test was run for this
-   source-only packet.
+4. Offline v4 state export/transform into new-chain genesis is explicitly
+   `MissingFailClosed`. The current genesis loaders and ordinal reward-migration
+   switch are classified, but they are not that hard-fork migration pipeline.
+5. The live DL1 shared-artifact injection, unsigned manual unlock, no-reference
+   metagraph spend, bounded global-processing acknowledgement, replayable data
+   fee, debit-only fee sinks, overchargeable/unaccounted state-channel fee sink,
+   first-incremental no-debit fee branch, missing node-collateral release,
+   optional-empty pricing allowlist, disabled currency rewards, fee-era opaque
+   rejection, unbacked genesis stake/collateral, derived-supply accounting, and
+   inflationary slash-conservation gates remain open defects. The tripwire
+   prevents silent drift; it does not repair them.
+6. `PricingUpdate` exists and mutates v4 consensus state. Current source treats
+   an absent allowlist as permission for every metagraph; the intended rooted
+   active-era allowlist and activation policy remain open.
+7. O-09's pure opaque/data-only lane remains an engineering/schema gate. Current
+   source carries it only before fee activation/while fee-waived; the fee-era
+   row is `MissingFailClosed`. This is distinct from the locked
+   `FrameworkCurrency` and `FrameworkCurrencyWithData` lanes.
+8. No runtime economic oracle, differential production/reference-kernel,
+   cross-JVM, or full adversarial corpus was run for this source inventory. The
+   20-test tripwire suite is structural and RED evidence only.
 
 Until these items and the required oracle vectors are closed, this document is
 evidence for planning E2.1/E2.2/E2.9 only. It is not evidence that the current
