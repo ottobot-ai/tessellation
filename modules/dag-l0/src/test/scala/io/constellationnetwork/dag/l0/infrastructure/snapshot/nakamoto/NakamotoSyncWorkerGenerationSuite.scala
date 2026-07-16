@@ -35,10 +35,11 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- completed.get.timeout(5.seconds)
       values <- observed.get
       _ <- fiber.cancel
-    } yield expect.all(
-      admissions.forall(_ == GenerationWorkerOfferResult.Accepted),
-      values == Vector(1, 2, 3)
-    )
+    } yield
+      expect.all(
+        admissions.forall(_ == GenerationWorkerOfferResult.Accepted),
+        values == Vector(1, 2, 3)
+      )
   }
 
   test("parallel lane never exceeds declared handler concurrency") {
@@ -68,10 +69,11 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- release.complete(())
       _ <- allCompleted.get.timeout(5.seconds)
       _ <- fiber.cancel
-    } yield expect.all(
-      admissions.forall(_ == GenerationWorkerOfferResult.Accepted),
-      observedMaximum == 2
-    )
+    } yield
+      expect.all(
+        admissions.forall(_ == GenerationWorkerOfferResult.Accepted),
+        observedMaximum == 2
+      )
   }
 
   test("item capacity rejects without blocking the shared demultiplexer") {
@@ -85,11 +87,12 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       first <- lane.tryOffer(1)
       second <- lane.tryOffer(2)
       overflow <- lane.tryOffer(3)
-    } yield expect.all(
-      first == GenerationWorkerOfferResult.Accepted,
-      second == GenerationWorkerOfferResult.Accepted,
-      overflow == GenerationWorkerOfferResult.ItemCapacityExceeded(2)
-    )
+    } yield
+      expect.all(
+        first == GenerationWorkerOfferResult.Accepted,
+        second == GenerationWorkerOfferResult.Accepted,
+        overflow == GenerationWorkerOfferResult.ItemCapacityExceeded(2)
+      )
   }
 
   test("encoded-byte budget includes queued and in-flight messages and releases after completion") {
@@ -108,11 +111,12 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- processed.get.timeout(5.seconds)
       admittedAfterRelease <- lane.tryOffer(6L)
       _ <- worker.cancel
-    } yield expect.all(
-      acceptedBeforeDrain == 1,
-      byteRejected == 99,
-      admittedAfterRelease == GenerationWorkerOfferResult.Accepted
-    )
+    } yield
+      expect.all(
+        acceptedBeforeDrain == 1,
+        byteRejected == 99,
+        admittedAfterRelease == GenerationWorkerOfferResult.Accepted
+      )
   }
 
   test("one message larger than the lane maximum never reserves queue or byte capacity") {
@@ -125,10 +129,11 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       )(identity)(_ => IO.unit)
       oversized <- lane.tryOffer(9L)
       valid <- lane.tryOffer(8L)
-    } yield expect.all(
-      oversized == GenerationWorkerOfferResult.MessageTooLarge(9L, 8L),
-      valid == GenerationWorkerOfferResult.Accepted
-    )
+    } yield
+      expect.all(
+        oversized == GenerationWorkerOfferResult.MessageTooLarge(9L, 8L),
+        valid == GenerationWorkerOfferResult.Accepted
+      )
   }
 
   test("clean source completion seals admission and drains every accepted item") {
@@ -147,15 +152,16 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- release.complete(())
       outcome <- generation.join.timeout(5.seconds)
       values <- observed.get
-    } yield outcome match {
-      case Outcome.Succeeded(_) =>
-        expect.all(
-          completionBeforeRelease.isEmpty,
-          rejectedAfterSeal == GenerationWorkerOfferResult.GenerationClosed,
-          values == Set(1, 2, 3)
-        )
-      case other => failure(s"expected successfully drained generation, got $other")
-    }
+    } yield
+      outcome match {
+        case Outcome.Succeeded(_) =>
+          expect.all(
+            completionBeforeRelease.isEmpty,
+            rejectedAfterSeal == GenerationWorkerOfferResult.GenerationClosed,
+            values == Set(1, 2, 3)
+          )
+        case other => failure(s"expected successfully drained generation, got $other")
+      }
   }
 
   test("source error is rethrown only after accepted work drains") {
@@ -175,11 +181,12 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- release.complete(())
       outcome <- generation.join.timeout(5.seconds)
       wasHandled <- handled.get
-    } yield outcome match {
-      case Outcome.Errored(error) =>
-        expect.all(completionBeforeRelease.isEmpty, wasHandled, error eq sourceError)
-      case other => failure(s"expected errored generation after drain, got $other")
-    }
+    } yield
+      outcome match {
+        case Outcome.Errored(error) =>
+          expect.all(completionBeforeRelease.isEmpty, wasHandled, error eq sourceError)
+        case other => failure(s"expected errored generation after drain, got $other")
+      }
   }
 
   test("offer and seal are linearizable and every accepted reservation drains exactly once") {
@@ -188,9 +195,7 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
     for {
       observed <- Ref.of[IO, Set[Int]](Set.empty)
       startRace <- Deferred[IO, Unit]
-      lane <- GenerationWorkerLane.bounded[IO, Int](values.size, 8, values.size.toLong, 1L)(_ => 1L)(value =>
-        observed.update(_ + value)
-      )
+      lane <- GenerationWorkerLane.bounded[IO, Int](values.size, 8, values.size.toLong, 1L)(_ => 1L)(value => observed.update(_ + value))
       worker <- lane.run.compile.drain.start
       offers <- (startRace.get >> values.parTraverse(value => lane.tryOffer(value).tupleLeft(value))).start
       sealing <- (startRace.get >> lane.seal).start
@@ -204,13 +209,14 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       accepted = results.collect { case (value, GenerationWorkerOfferResult.Accepted) => value }.toSet
       dispositionsValid = results.forall {
         case (_, GenerationWorkerOfferResult.Accepted | GenerationWorkerOfferResult.GenerationClosed) => true
-        case _                                                                                          => false
+        case _                                                                                        => false
       }
-    } yield expect.all(
-      dispositionsValid,
-      processed == accepted,
-      closed == GenerationWorkerOfferResult.GenerationClosed
-    )
+    } yield
+      expect.all(
+        dispositionsValid,
+        processed == accepted,
+        closed == GenerationWorkerOfferResult.GenerationClosed
+      )
   }
 
   test("a sealed lane rejects without reserving queue, byte, or outstanding capacity") {
@@ -224,11 +230,12 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- lane.awaitDrained.timeout(5.seconds)
       processed <- observed.get
       _ <- worker.cancel
-    } yield expect.all(
-      accepted == GenerationWorkerOfferResult.Accepted,
-      closed.forall(_ == GenerationWorkerOfferResult.GenerationClosed),
-      processed == Vector(1)
-    )
+    } yield
+      expect.all(
+        accepted == GenerationWorkerOfferResult.Accepted,
+        closed.forall(_ == GenerationWorkerOfferResult.GenerationClosed),
+        processed == Vector(1)
+      )
   }
 
   test("a replacement generation cannot start until the prior clean generation drains") {
@@ -254,10 +261,11 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- releaseOld.complete(())
       overlapped <- replacementStarted.get.timeout(5.seconds)
       outcome <- fiber.join.timeout(5.seconds)
-    } yield outcome match {
-      case Outcome.Succeeded(_) => expect.all(replacementBeforeRelease.isEmpty, !overlapped)
-      case other                => failure(s"expected both generations to complete, got $other")
-    }
+    } yield
+      outcome match {
+        case Outcome.Succeeded(_) => expect.all(replacementBeforeRelease.isEmpty, !overlapped)
+        case other                => failure(s"expected both generations to complete, got $other")
+      }
   }
 
   test("canceling a subscription generation cancels old in-flight work before a replacement runs") {
@@ -275,9 +283,7 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- oldGeneration.cancel
       _ <- oldCanceled.get.timeout(5.seconds)
       replacementCompleted <- Deferred[IO, Int]
-      replacementLane <- GenerationWorkerLane.bounded[IO, Int](1, 1, 1L, 1L)(_ => 1L)(value =>
-        replacementCompleted.complete(value).void
-      )
+      replacementLane <- GenerationWorkerLane.bounded[IO, Int](1, 1, 1L, 1L)(_ => 1L)(value => replacementCompleted.complete(value).void)
       replacementGeneration <- NakamotoSyncDaemon
         .runWorkerGeneration(source(replacementLane, 2), List(replacementLane))
         .compile
@@ -315,10 +321,11 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- failNow.complete(())
       outcome <- generation.join.timeout(5.seconds)
       _ <- siblingCanceled.get.timeout(5.seconds)
-    } yield outcome match {
-      case Outcome.Errored(NakamotoSyncDaemon.GenerationWorkerFailed(error)) => expect(error eq workerError)
-      case other => failure(s"expected errored generation, got $other")
-    }
+    } yield
+      outcome match {
+        case Outcome.Errored(NakamotoSyncDaemon.GenerationWorkerFailed(error)) => expect(error eq workerError)
+        case other                                                             => failure(s"expected errored generation, got $other")
+      }
   }
 
   test("a failing final handler cannot be masked by clean-source drain completion") {
@@ -336,9 +343,10 @@ object NakamotoSyncWorkerGenerationSuite extends SimpleIOSuite {
       _ <- lane.tryOffer(2).iterateUntil(_ == GenerationWorkerOfferResult.GenerationClosed).timeout(5.seconds)
       _ <- failHandler.complete(())
       outcome <- generation.join.timeout(5.seconds)
-    } yield outcome match {
-      case Outcome.Errored(NakamotoSyncDaemon.GenerationWorkerFailed(error)) => expect(error eq handlerError)
-      case other => failure(s"expected final handler failure after clean source completion, got $other")
-    }
+    } yield
+      outcome match {
+        case Outcome.Errored(NakamotoSyncDaemon.GenerationWorkerFailed(error)) => expect(error eq handlerError)
+        case other => failure(s"expected final handler failure after clean source completion, got $other")
+      }
   }
 }

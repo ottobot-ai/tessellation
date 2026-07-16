@@ -22,16 +22,17 @@ object ReservedIngressQueueSuite extends SimpleIOSuite {
       after <- queue.usage
       replacement <- queue.tryOffer("third", 4L)
       finalUsage <- queue.usage
-    } yield expect.all(
-      first == OfferResult.Accepted,
-      second == OfferResult.Accepted,
-      full == OfferResult.ItemCapacityExceeded(2),
-      before == Usage(2, 10L),
-      processed == "first",
-      after == Usage(1, 6L),
-      replacement == OfferResult.Accepted,
-      finalUsage == Usage(2, 10L)
-    )
+    } yield
+      expect.all(
+        first == OfferResult.Accepted,
+        second == OfferResult.Accepted,
+        full == OfferResult.ItemCapacityExceeded(2),
+        before == Usage(2, 10L),
+        processed == "first",
+        after == Usage(1, 6L),
+        replacement == OfferResult.Accepted,
+        finalUsage == Usage(2, 10L)
+      )
   }
 
   test("byte capacity, per-item size, and invalid sizes reject without changing usage") {
@@ -43,14 +44,15 @@ object ReservedIngressQueueSuite extends SimpleIOSuite {
       zero <- queue.tryOffer("zero", 0L)
       negative <- queue.tryOffer("negative", -1L)
       usage <- queue.usage
-    } yield expect.all(
-      accepted == OfferResult.Accepted,
-      byteFull == OfferResult.ByteCapacityExceeded(actual = 5L, available = 4L, maximum = 10L),
-      tooLarge == OfferResult.ItemTooLarge(actual = 9L, maximum = 8L),
-      zero == OfferResult.InvalidRetainedBytes(0L),
-      negative == OfferResult.InvalidRetainedBytes(-1L),
-      usage == Usage(1, 6L)
-    )
+    } yield
+      expect.all(
+        accepted == OfferResult.Accepted,
+        byteFull == OfferResult.ByteCapacityExceeded(actual = 5L, available = 4L, maximum = 10L),
+        tooLarge == OfferResult.ItemTooLarge(actual = 9L, maximum = 8L),
+        zero == OfferResult.InvalidRetainedBytes(0L),
+        negative == OfferResult.InvalidRetainedBytes(-1L),
+        usage == Usage(1, 6L)
+      )
   }
 
   test("an in-flight item remains reserved and blocks replacement admission") {
@@ -66,12 +68,13 @@ object ReservedIngressQueueSuite extends SimpleIOSuite {
       _ <- continue.complete(())
       result <- fiber.joinWithNever
       after <- queue.usage
-    } yield expect.all(
-      whileInFlight == Usage(1, 8L),
-      rejected == OfferResult.ItemCapacityExceeded(1),
-      result == "held",
-      after == Usage(0, 0L)
-    )
+    } yield
+      expect.all(
+        whileInFlight == Usage(1, 8L),
+        rejected == OfferResult.ItemCapacityExceeded(1),
+        result == "held",
+        after == Usage(0, 0L)
+      )
   }
 
   test("processing failure releases the reservation without masking the error") {
@@ -128,10 +131,11 @@ object ReservedIngressQueueSuite extends SimpleIOSuite {
       peak <- queue.usage
       _ <- List.fill(accepted)(queue.takeAndUse(IO.pure)).parSequence
       after <- queue.usage
-    } yield expect(peak.outstandingItems <= 16)
-      .and(expect(peak.outstandingBytes <= 64L))
-      .and(expect.same(accepted, peak.outstandingItems))
-      .and(expect.same(Usage(0, 0L), after))
+    } yield
+      expect(peak.outstandingItems <= 16)
+        .and(expect(peak.outstandingBytes <= 64L))
+        .and(expect.same(accepted, peak.outstandingItems))
+        .and(expect.same(Usage(0, 0L), after))
   }
 
   test("Long.MaxValue byte limits do not overflow accounting") {
@@ -144,10 +148,12 @@ object ReservedIngressQueueSuite extends SimpleIOSuite {
       atMaximum <- queue.usage
       _ <- queue.takeAndUse(IO.pure)
       after <- queue.usage
-    } yield expect.same(OfferResult.Accepted, accepted)
-      .and(expect.same(OfferResult.ByteCapacityExceeded(1L, 0L, Long.MaxValue), rejected))
-      .and(expect.same(Usage(1, Long.MaxValue), atMaximum))
-      .and(expect.same(Usage(0, 0L), after))
+    } yield
+      expect
+        .same(OfferResult.Accepted, accepted)
+        .and(expect.same(OfferResult.ByteCapacityExceeded(1L, 0L, Long.MaxValue), rejected))
+        .and(expect.same(Usage(1, Long.MaxValue), atMaximum))
+        .and(expect.same(Usage(0, 0L), after))
   }
 
   test("invalid limits fail construction") {

@@ -1,6 +1,6 @@
 package io.constellationnetwork.json
 
-import java.io.{ByteArrayInputStream, ByteArrayOutputStream, IOException, OutputStream}
+import java.io._
 import java.nio.charset.StandardCharsets
 
 import cats.effect.Async
