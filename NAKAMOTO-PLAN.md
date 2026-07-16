@@ -14,14 +14,16 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `17/19` dispositioned. `O-01` through `O-17` are
+**Owner-decision status:** `17/20` dispositioned. `O-01` through `O-17` are
 ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
-bytes and `O-19` upstream-v4 migration policy await owner responses in
+bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34 slash-record schema
+await owner responses in
 `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
-`docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`. Dependencies under
+`docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
+`docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. Dependencies under
 O-01 through O-17 mean implementation of their ratified direction and closure of
-their listed engineering, research, schema, parameter, or proof gates. O-18 and
-O-19 are the only pending owner responses.
+their listed engineering, research, schema, parameter, or proof gates. O-18,
+O-19, and O-20 are the only pending owner responses.
 
 ## Active objective
 
@@ -1238,8 +1240,8 @@ blockers include accumulator omissions for rooted field 33
 `ConsumedAllowSpends` and field 34 `Slashings`, the unenforced ROOT-008 physical
 MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard
 diff/positive replay-coverage, exact optimistic-tip attestation, and finality/tower
-proof schemas, plus the pending O-18 transport/DA and O-19 migration-policy
-decisions. A separate explicit,
+proof schemas, plus the pending O-18 transport/DA, O-19 migration-policy, and O-20
+field-34 slash-record decisions. A separate explicit,
 non-implicit MPT commitment codec freezes strict leaf/branch/extension bytes and
 passes 15 focused tests. The atomic-cutover guard now inventories ordinal-selected
 hash/state-proof authority, direct hash selection, legacy field-erasing snapshot

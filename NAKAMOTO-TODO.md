@@ -48,11 +48,13 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `17/19` dispositioned. `O-01` through `O-17` are
+> **Owner-decision status:** `17/20` dispositioned. `O-01` through `O-17` are
 > ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18`
-> transport/DA bytes and `O-19` upstream-v4 migration policy await owner responses
+> transport/DA bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34
+> slash-record schema await owner responses
 > in `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
-> `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`. Open work under
+> `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
+> `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. Open work under
 > O-01 through O-17 is an engineering, research, schema, parameter, or proof gate
 > under a ratified direction, not a request for another owner answer.
 
@@ -611,8 +613,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
     bytes under an `ImmutableCodec` facade; signed state-channel lanes, canonical
     shard diff, positive replay coverage, the exact optimistic-tip attestation
     body, and portable finality/tower proof schemas remain open. O-18 controls
-    transport/DA bytes and O-19 controls migration transform, conservation, and
-    target-genesis policy.
+    transport/DA bytes, O-19 controls migration transform/conservation/target-genesis
+    policy, and O-20 must select the field-34 V1 record shape before the JSON leaf
+    and accumulator omission can be replaced by active Scodec bytes.
+  - [ ] **O-20 OWNER RESPONSE REQUIRED / FIELD-34 SCHEMA FREEZE:** review
+    `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. The recommendation is an
+    invalid-state-proof-only V1 record plus future variant-specific ADT payloads and
+    keys. Do not infer acceptance, activate latent slash reasons, retain JSON bytes,
+    or encode sentinel/optional future contexts before `O20-01` is answered.
   - **Landed nonactivating typed-key completeness slice (2026-07-16):**
     `GlobalStateKeyCodec` now covers all six namespace variants. `SystemNamespace`
     uses outer tag `0x05` and four closed inner label tags with exact vectors and

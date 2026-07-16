@@ -10,13 +10,15 @@ This revision reworks every gate against that audited source baseline, dispositi
 recommendations and directions recorded here. Ratification does **not** assert that missing
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
-document records which direction is settled and which executable freeze gates remain. `O-18` and
-`O-19` were added after that ratification pass and are not answered by this document.
-**Owner-question completeness:** `17/19` dispositioned. `O-01` through `O-17` are ratified;
+document records which direction is settled and which executable freeze gates remain. `O-18`,
+`O-19`, and `O-20` were added after that ratification pass and are not answered by this document.
+**Owner-question completeness:** `17/20` dispositioned. `O-01` through `O-17` are ratified;
 `O-18` awaits an owner response in
 [`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md),
 and `O-19` awaits an owner response in
 [`O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`](O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md).
+`O-20` awaits an owner response in
+[`O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
 
 ---
 
@@ -113,6 +115,7 @@ test, never a freeze.
 | O-17 | ROOT-008 partition grammar | 🔴 | Numeric gaps/offline import, self-authenticating fields, token-lock scope, and field-32 direction are ratified; identity functions, resource parameters, codecs, and proofs remain stop-the-line engineering. |
 | O-18 | Transport and DA byte contract | 🔴 | **OWNER RESPONSE REQUIRED:** active-era maxima, migration scope, canonical bytes/compression, descriptor/chunk delivery, and the `512000`/`20 MiB` rule semantics are not ratified. Bounded helpers are unwired. |
 | O-19 | Upstream-v4 snapshot migration policy | 🔴 | **OWNER RESPONSE REQUIRED:** all 17 source fields require explicit dispositions; source-unrooted fields, metagraph continuity, epoch/eta, registries, malformed source state, and per-asset conservation are not ratified. The raw tools-only envelope verifier is not an authorized importer or transform. |
+| O-20 | Field-34 slash record schema | 🔴 | **OWNER RESPONSE REQUIRED:** V1 invalid-state-proof-only versus a generalized multi-reason record is not ratified. The recommendation is a narrow invalid-state-proof V1 plus future variant-specific ADT payloads/keys; it has no authority until answered. |
 
 ---
 
@@ -622,6 +625,25 @@ signatures are evidence only; a post-MPT-unrooted field requires authenticated r
 reset; and no migration path may silently drop/default/re-sign state, synthesize a stipend, or install
 target economic state. O-18 remains independently pending.
 
+## O-20 - Field-34 slash record schema 🔴
+
+**Status:** **OWNER RESPONSE REQUIRED.** This answers document does not infer a disposition from
+the presence of four `SlashReason` case objects or from the existing invalid-state-proof writer.
+The focused packet is
+[`O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
+
+The pending `O20-01` choice is between an invalid-state-proof-only V1 field-34 record followed by
+future variant-specific ADT records/keys, and one generalized multi-reason V1 record whose complete
+required-field, key, duplicate, evidence, effect, and invalid-combination semantics must be frozen
+now. The packet recommends the first option because the only production constructor hard-codes
+`InvalidStateProof`, while the current payload and key require invalid-checkpoint-specific context.
+That recommendation is not an answer.
+
+Until the owner dispositions `O20-01`, field-34 JSON removal, canonical Scodec value/key activation,
+and the field-34 accumulator/change-set repair remain blocked at the schema freeze. RED tests and
+dark codec experiments may proceed. No future reason tag may reach a consensus writer merely
+because it already exists in the source enum. O-18 and O-19 remain independently pending.
+
 ---
 
 ## Cross-cutting caveats
@@ -660,7 +682,7 @@ target economic state. O-18 remains independently pending.
    quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
    A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
    activation proofs. These are not unanswered owner choices and may not be filled by local
-   configuration or an implementation shortcut. O-18 and O-19 are different: each packet's eight
+   configuration or an implementation shortcut. O-18, O-19, and O-20 are different: their focused
    choices are newly surfaced and still await an owner response.
 
 ## Provenance
@@ -675,3 +697,5 @@ architectural analogs, not citations to this repo.
 
 O-19 was appended from a separate migration-coverage audit revalidated against current-source
 baseline `d9268886a` and upstream `v4.0.0` peeled commit `22953a1ee`; it adds no settled answer.
+O-20 was appended from the field-34 accumulator/schema audit against the current source on
+2026-07-16; it adds no settled answer.

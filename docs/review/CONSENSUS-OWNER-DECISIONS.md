@@ -7,9 +7,11 @@ missing parameter, schema, reference model, or proof needed to close an engineer
 may infer its byte, compression, chunking, retention, or migration choices. `O-19` was surfaced by
 the upstream-v4 migration-coverage audit and also awaits an owner response; no implementation may
 infer a field disposition, source-authentication exception, registry, epoch/eta mapping, or
-conservation rule.
-**Owner-question completeness:** `17/19` dispositioned. `O-01` through `O-17` are ratified;
-`O-18` and `O-19` are pending.
+conservation rule. `O-20` was surfaced by the field-34 slash-record audit and awaits an owner
+response; no implementation may infer a generalized slash-record schema or activate a latent slash
+reason.
+**Owner-question completeness:** `17/20` dispositioned. `O-01` through `O-17` are ratified;
+`O-18`, `O-19`, and `O-20` are pending.
 **Updated:** 2026-07-16
 
 This register uses project phases only where the owner has ratified them:
@@ -693,6 +695,29 @@ Until those decisions are answered, every source field must remain explicit,
 source signatures are evidence only, unrooted fields require replay or an
 explicit reset, and no importer may silently drop/default/re-sign state, add a
 stipend, or install target economic state.
+
+### O-20 Field-34 slash record schema
+
+Owner-review packet:
+[O-20 Field-34 Slash Record Schema Owner Review](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
+
+**OWNER RESPONSE REQUIRED; FIELD-34 SCODEC FREEZE BLOCKED.** The only production
+`SlashedRegistryEntry` constructor is the invalid-state-proof ledger sink and it
+hard-codes `SlashReason.InvalidStateProof`. The shared record nevertheless exposes
+three future reason tags while requiring invalid-checkpoint-specific `shardId` and
+`disputedCheckpointHash` fields. Its physical key is the same checkpoint-specific
+triple, and its value still uses a hand-written JSON `ImmutableCodec`.
+
+The owner must disposition `O20-01`: either freeze an invalid-state-proof-only V1
+record and require future slash kinds to add variant-specific ADT payloads/keys, or
+freeze one generalized multi-reason record now together with complete required-field,
+identity, deduplication, evidence, effect, and invalid-combination rules for every
+reason. The packet recommends the narrow V1 plus future variant-specific ADT, but
+that recommendation has no authority until answered.
+
+Until then, RED tests and dark codec experiments may proceed, but no implementation
+may activate field-34 Scodec bytes, use sentinels/optional combinations to fill
+undefined future contexts, or treat enum presence as a designed slash consequence.
 
 ## Change rule
 
