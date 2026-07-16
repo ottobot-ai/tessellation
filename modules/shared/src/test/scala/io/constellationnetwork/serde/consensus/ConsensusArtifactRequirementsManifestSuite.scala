@@ -179,9 +179,9 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
         contract.copy(knownGaps = contract.knownGaps - O18TransportByteContractOpen)
       case contract => contract
     }
-    val withoutDedupFloodGap = carrierEntries.map {
+    val withoutCanonicalRumorBytesGap = carrierEntries.map {
       case contract if contract.kind == ConsensusCarrierKind.SidecarRumorEnvelope =>
-        contract.copy(knownGaps = contract.knownGaps - GossipSubFullProtoDedupMutationFlood)
+        contract.copy(knownGaps = contract.knownGaps - SignedRumorTransportBytesNotCanonical)
       case contract => contract
     }
     val withoutAggregateGap = carrierEntries.map {
@@ -233,7 +233,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       validateCarrierEntries(withoutCurrentChainWitness).exists(_.isInstanceOf[MissingCarrierBindings]),
       validateCarrierEntries(withoutCompleteness).exists(_.isInstanceOf[MissingCarrierBindings]),
       validateCarrierEntries(withoutO18).exists(_.isInstanceOf[MissingCarrierGap]),
-      validateCarrierEntries(withoutDedupFloodGap).exists(_.isInstanceOf[MissingCarrierGap]),
+      validateCarrierEntries(withoutCanonicalRumorBytesGap).exists(_.isInstanceOf[MissingCarrierGap]),
       validateCarrierEntries(withoutAggregateGap).exists(_.isInstanceOf[MissingCarrierGap]),
       validateCarrierEntries(withoutLiveRumorAuthGap).exists(_.isInstanceOf[MissingCarrierGap]),
       validateCarrierEntries(withoutSubscriptionProfile).exists(_.isInstanceOf[MissingCarrierBindings]),
@@ -274,7 +274,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       byKind(ConsensusCarrierKind.CommonRumorEnvelope).knownGaps == rumorGaps,
       byKind(ConsensusCarrierKind.SidecarRumorEnvelope).knownGaps == Set(
         TransportHintLacksPortableArtifactBinding,
-        GossipSubFullProtoDedupMutationFlood,
+        SignedRumorTransportBytesNotCanonical,
         LossyPeerRumorGapRepairMissing,
         O18TransportByteContractOpen
       ),
@@ -366,7 +366,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
     )
   }
 
-  test("sidecar rumor dedup and ChainSync aggregate gaps remain source-grounded") {
+  test("sidecar rumor ID containment and ChainSync aggregate gaps remain source-grounded") {
     val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
     def source(path: String): String =
       new String(Files.readAllBytes(root.resolve(path)), StandardCharsets.UTF_8)
@@ -385,10 +385,16 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
     expect.all(
       sidecarProto.contains("string content_type = 2;"),
       sidecarProto.contains("bytes origin_id = 3;"),
-      gossipGo.contains("contentMessageID(pmsg.GetTopic(), pmsg.GetData())"),
-      gossipGo.contains("digest.Write(data)"),
+      gossipGo.contains("gossipMessageID(pmsg.GetTopic(), cfg.RumorTopic, pmsg.GetData())"),
+      gossipGo.contains("func rumorEnvelopeSignedBytes(data []byte) ([]byte, bool)"),
+      gossipGo.contains("tagLength < 0 || !number.IsValid() || tagLength != protowire.SizeTag(number)"),
+      gossipGo.contains("number <= lastNumber || number > 3 || wireType != protowire.BytesType"),
+      gossipGo.contains("lengthSize < 0 || lengthSize != protowire.SizeVarint(length)"),
+      gossipGo.contains("if !utf8.Valid(value)"),
+      gossipGo.contains("rumorInvalidMessageIDDomain"),
+      !gossipGo.contains("return contentMessageID(pmsg.GetTopic(), pmsg.GetData())"),
       rumorBridge.contains("val bytes = rumor.signedRumorBytes.toByteArray"),
-      carrierByKind(ConsensusCarrierKind.SidecarRumorEnvelope).knownGaps.contains(GossipSubFullProtoDedupMutationFlood),
+      carrierByKind(ConsensusCarrierKind.SidecarRumorEnvelope).knownGaps.contains(SignedRumorTransportBytesNotCanonical),
       chainSyncGo.contains("MaxMessageSize      = 16 * 1024 * 1024"),
       !chainSyncGo.contains("MaxAggregateFetchBytes"),
       chainSyncGo.contains("for {\n\t\tdata, err := readLengthPrefixed(s)"),

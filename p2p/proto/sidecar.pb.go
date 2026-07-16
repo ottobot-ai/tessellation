@@ -341,8 +341,8 @@ type Rumor struct {
 	// Content type discriminator (e.g. "io.constellationnetwork...Event").
 	// Carried alongside the bytes for cheap routing/metrics on the sidecar.
 	ContentType string `protobuf:"bytes,2,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`
-	// Origin peer id (for logging/dedup hints — authoritative origin is in the
-	// signed envelope).
+	// Origin peer id for logging/routing hints. Authoritative origin is in the
+	// signed envelope; this field is excluded from the GossipSub message id.
 	OriginId      []byte `protobuf:"bytes,3,opt,name=origin_id,json=originId,proto3" json:"origin_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

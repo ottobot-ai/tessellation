@@ -96,8 +96,8 @@ object ArtifactGap {
   case object BootstrapGenesisBundleSchemaOpen extends ArtifactGap {
     val semanticLabel: String = "bootstrap-genesis-bundle-schema-open"
   }
-  case object GossipSubFullProtoDedupMutationFlood extends ArtifactGap {
-    val semanticLabel: String = "gossipsub-full-proto-dedup-mutation-flood"
+  case object SignedRumorTransportBytesNotCanonical extends ArtifactGap {
+    val semanticLabel: String = "signed-rumor-transport-bytes-not-canonical"
   }
   case object UnboundedAggregateTransportResponse extends ArtifactGap {
     val semanticLabel: String = "unbounded-aggregate-transport-response"

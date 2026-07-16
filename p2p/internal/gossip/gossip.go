@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/libp2p/go-libp2p"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
@@ -22,6 +23,7 @@ import (
 	discutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	rcmgr "github.com/libp2p/go-libp2p/p2p/host/resource-manager"
 	"github.com/multiformats/go-multiaddr"
+	"google.golang.org/protobuf/encoding/protowire"
 
 	"github.com/scasplte2/tessellation/p2p/internal/config"
 	"github.com/scasplte2/tessellation/p2p/internal/metrics"
@@ -206,10 +208,11 @@ func New(ctx context.Context, cfg config.Config) (*Node, error) {
 		// Several protobuf wrappers have the same one-field wire shape, so a
 		// payload-only ID lets a wrong-topic publish poison the seen cache for
 		// the later correct-topic message. Same-topic outbox republishes still
-		// dedupe. All sidecars redeploy together (greenfield), so the
+		// dedupe. Rumors additionally exclude unsigned routing hints from their
+		// identity. All sidecars redeploy together (greenfield), so the
 		// network-wide ID function stays consistent.
 		pubsub.WithMessageIdFn(func(pmsg *pubsub_pb.Message) string {
-			return contentMessageID(pmsg.GetTopic(), pmsg.GetData())
+			return gossipMessageID(pmsg.GetTopic(), cfg.RumorTopic, pmsg.GetData())
 		}),
 	)
 	if err != nil {
@@ -373,6 +376,98 @@ func contentMessageID(topic string, data []byte) string {
 	_, _ = digest.Write([]byte{0})
 	_, _ = digest.Write(data)
 	return string(digest.Sum(nil))
+}
+
+const (
+	rumorSignedBytesMessageIDDomain = "rumor-signed-bytes-v1"
+	rumorInvalidMessageIDDomain     = "rumor-invalid-envelope-v1"
+)
+
+// gossipMessageID keeps the existing full-wire identity for every topic except
+// generic rumors. A Rumor's content_type and origin_id are unsigned hints, while
+// receivers consume only signed_rumor_bytes. Hashing the full wrapper lets an
+// attacker mutate either hint (or append unknown fields) to bypass GossipSub's
+// seen cache without changing the signed rumor.
+func gossipMessageID(topic, rumorTopic string, data []byte) string {
+	if topic != rumorTopic {
+		return contentMessageID(topic, data)
+	}
+
+	signedBytes, ok := rumorEnvelopeSignedBytes(data)
+	if !ok {
+		return namespacedContentMessageID(topic, rumorInvalidMessageIDDomain, nil)
+	}
+	return namespacedContentMessageID(topic, rumorSignedBytesMessageIDDomain, signedBytes)
+}
+
+func namespacedContentMessageID(topic, domain string, data []byte) string {
+	digest := sha256.New()
+	_, _ = digest.Write([]byte(topic))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write([]byte(domain))
+	_, _ = digest.Write([]byte{0})
+	_, _ = digest.Write(data)
+	return string(digest.Sum(nil))
+}
+
+// rumorEnvelopeSignedBytes extracts field 1 without unmarshalling or copying the
+// nested signed rumor. The valid-ID domain accepts only the strict current
+// Rumor wire form: one nonempty field 1 followed by optional fields 2 and 3, all
+// length-delimited, strictly ordered, and minimally encoded. Honest publications
+// have this form because PublishRumor re-marshals the gRPC value before gossip.
+// Every other encoding shares the invalid domain and cannot poison the honest
+// rumor's seen-cache entry across Go and Scala protobuf decoder differences.
+func rumorEnvelopeSignedBytes(data []byte) ([]byte, bool) {
+	var signedBytes []byte
+	lastNumber := protowire.Number(0)
+
+	for len(data) > 0 {
+		number, wireType, tagLength := protowire.ConsumeTag(data)
+		if tagLength < 0 || !number.IsValid() || tagLength != protowire.SizeTag(number) {
+			return nil, false
+		}
+		data = data[tagLength:]
+
+		if number <= lastNumber || number > 3 || wireType != protowire.BytesType {
+			return nil, false
+		}
+		lastNumber = number
+
+		value, remaining, ok := consumeCanonicalBytes(data)
+		if !ok {
+			return nil, false
+		}
+		data = remaining
+
+		switch number {
+		case 1:
+			if len(value) == 0 {
+				return nil, false
+			}
+			signedBytes = value
+		case 2:
+			if !utf8.Valid(value) {
+				return nil, false
+			}
+		case 3:
+		default:
+			return nil, false
+		}
+	}
+
+	return signedBytes, len(signedBytes) > 0
+}
+
+func consumeCanonicalBytes(data []byte) (value, remaining []byte, ok bool) {
+	length, lengthSize := protowire.ConsumeVarint(data)
+	if lengthSize < 0 || lengthSize != protowire.SizeVarint(length) {
+		return nil, nil, false
+	}
+	data = data[lengthSize:]
+	if length > uint64(len(data)) {
+		return nil, nil, false
+	}
+	return data[:int(length)], data[int(length):], true
 }
 
 // mdnsNotifee handles mDNS peer discovery events.

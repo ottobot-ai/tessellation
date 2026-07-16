@@ -69,8 +69,8 @@ message Rumor {
   // Content type discriminator (e.g. "io.constellationnetwork...Event").
   // Carried alongside the bytes for cheap routing/metrics on the sidecar.
   string content_type = 2;
-  // Origin peer id (for logging/dedup hints — authoritative origin is in the
-  // signed envelope).
+  // Origin peer id for logging/routing hints. Authoritative origin is in the
+  // signed envelope; this field is excluded from the GossipSub message id.
   bytes origin_id = 3;
 }
 

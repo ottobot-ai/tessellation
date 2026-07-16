@@ -279,7 +279,7 @@ object ConsensusArtifactRequirementsManifest {
     CommonRumorEnvelope -> rumorGaps,
     SidecarRumorEnvelope -> Set(
       TransportHintLacksPortableArtifactBinding,
-      GossipSubFullProtoDedupMutationFlood,
+      SignedRumorTransportBytesNotCanonical,
       LossyPeerRumorGapRepairMissing,
       O18TransportByteContractOpen
     ),
