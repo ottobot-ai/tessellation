@@ -34,7 +34,7 @@ private[finality] object FinalityCodecFixtures {
   val generation: ReleaseGeneration = ReleaseGeneration(nonNeg(5L))
   val attempt: IntentAttempt = IntentAttempt(nonNeg(9L))
   val intentId: IntentId = IntentId(hash(1))
-  val finalityDomain: FinalityDomain = FinalityDomain(hash(400), hash(401), hash(402))
+  val finalityDomain: FinalityDomain = FinalityDomain(hash(400), hash(401), hash(402), hash(403))
 
   val priorState: GlobalSnapshotStateRef = state(40L, 40, 39)
   val targetState: GlobalSnapshotStateRef = state(41L, 41, 40)

@@ -17,6 +17,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDura
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableEnvelopeKind.ImmutableArtifact
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityDurableStoreError._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityIntentValidator._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt._
 import io.constellationnetwork.storage.durable._
@@ -549,20 +550,45 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
     StoredPathFixture(intentId, commitment, List(first -> firstBytes, terminal -> terminalBytes))
   }
 
-  test("configured domain mismatch fails without mutating persisted store bytes") {
+  test("configured network or parameter mismatch fails without mutating persisted store bytes") {
     Files[IO].tempDirectory.use { temporary =>
       val root = temporary.toNioPath.resolve("finality")
-      val wrongDomain = finalityDomain.copy(networkId = hash(999))
+      val wrongNetwork = finalityDomain.copy(networkId = hash(999))
+      val wrongParameters = finalityDomain.copy(parameterHash = hash(998))
 
       for {
         _ <- store(root).use(_ => IO.unit)
         before <- persistedFiles(root)
-        reopened <- store(root, wrongDomain).use(_ => IO.unit).attempt
-        after <- persistedFiles(root)
+        networkReopened <- store(root, wrongNetwork).use(_ => IO.unit).attempt
+        afterNetwork <- persistedFiles(root)
+        parametersReopened <- store(root, wrongParameters).use(_ => IO.unit).attempt
+        afterParameters <- persistedFiles(root)
       } yield
         expect.all(
-          errorIs[IdentityMismatch](reopened),
-          before == after
+          errorIs[IdentityMismatch](networkReopened),
+          errorIs[IdentityMismatch](parametersReopened),
+          before == afterNetwork,
+          before == afterParameters
+        )
+    }
+  }
+
+  test("zero or malformed parameter identity fails before creating the durable store") {
+    Files[IO].tempDirectory.use { temporary =>
+      val root = temporary.toNioPath.resolve("finality")
+      val invalidDomains = List(
+        finalityDomain.copy(parameterHash = Hash.empty),
+        finalityDomain.copy(parameterHash = Hash("A" * 64)),
+        finalityDomain.copy(parameterHash = Hash("ab"))
+      )
+
+      for {
+        results <- invalidDomains.traverse(domain => store(root, domain).use(_ => IO.unit).attempt)
+        rootExists <- IO.blocking(NioFiles.exists(root, LinkOption.NOFOLLOW_LINKS))
+      } yield
+        expect.all(
+          results.forall(errorIs[InvalidDomain]),
+          !rootExists
         )
     }
   }

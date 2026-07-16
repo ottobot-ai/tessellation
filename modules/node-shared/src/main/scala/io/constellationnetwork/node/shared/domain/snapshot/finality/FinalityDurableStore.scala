@@ -337,7 +337,8 @@ object FinalityDurableStore {
     val fields = List(
       "networkId" -> domain.networkId,
       "genesisHash" -> domain.genesisHash,
-      "protocolEra" -> domain.protocolEra
+      "protocolEra" -> domain.protocolEra,
+      "parameterHash" -> domain.parameterHash
     )
     val invalid = fields.collect {
       case (name, hash) if !isCanonicalNonZeroHash(hash) => name
@@ -2234,7 +2235,7 @@ private final class LiveFinalityDurableStore[F[_]: Async](
       domainBytes <- encodePayload("FinalityDomain", finalityDomainCodec, domain)
       expected = markerPayload(domainBytes, suffix)
       _ <- Async[F].raiseUnless(Arrays.equals(payload, expected))(
-        IdentityMismatch("initialization marker domain", "network/genesis/protocol-era or marker role differs")
+        IdentityMismatch("initialization marker domain", "network/genesis/protocol-era/parameters or marker role differs")
       )
     } yield ()
 

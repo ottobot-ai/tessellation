@@ -343,9 +343,12 @@ private[finality] object FinalityBaseCodecs {
       )
 
   implicit val finalityDomainCodec: Codec[FinalityDomain] =
-    (requiredHashCodec :: requiredHashCodec :: requiredHashCodec).xmap[FinalityDomain](
-      { case networkId :: genesisHash :: protocolEra :: HNil => FinalityDomain(networkId, genesisHash, protocolEra) },
-      value => value.networkId :: value.genesisHash :: value.protocolEra :: HNil
+    (requiredHashCodec :: requiredHashCodec :: requiredHashCodec :: requiredHashCodec).xmap[FinalityDomain](
+      {
+        case networkId :: genesisHash :: protocolEra :: parameterHash :: HNil =>
+          FinalityDomain(networkId, genesisHash, protocolEra, parameterHash)
+      },
+      value => value.networkId :: value.genesisHash :: value.protocolEra :: value.parameterHash :: HNil
     )
 
   private val mptImageIdCodec: Codec[MptImageId] = requiredHashCodec.xmap(MptImageId(_), _.value)

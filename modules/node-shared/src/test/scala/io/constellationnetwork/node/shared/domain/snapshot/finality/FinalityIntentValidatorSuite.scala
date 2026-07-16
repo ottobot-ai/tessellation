@@ -165,7 +165,7 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
     val semanticState = artifact(FinalityArtifactKind.PreparedSemanticState, s"semantic-${target.hash.value}")
     val authenticatedAnchor = artifact(FinalityArtifactKind.AuthenticatedTargetAnchor, s"anchor-${target.hash.value}")
     val placeholder = IntentId(hash("placeholder-intent"))
-    val domain = FinalityDomain(hash("network"), hash("genesis"), hash("protocol-era"))
+    val domain = FinalityDomain(hash("network"), hash("genesis"), hash("protocol-era"), hash("parameters"))
     val generation = ReleaseGeneration(nonNeg(previous.fold(0L)(_._1.pointer.generation.value.value + 1L)))
     val attempt = IntentAttempt(nonNeg(attemptNumber))
     val transitionShape = TransitionShape.Advance(adopted.commitment)
@@ -1103,13 +1103,16 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
         desiredAfter = EffectStateDigest(hash("mutated-command-state"))
       )
     )
-    val wrongDomain = FinalityDomain(hash("other-network"), hash("other-genesis"), hash("other-era"))
+    val wrongDomain = FinalityDomain(hash("other-network"), hash("other-genesis"), hash("other-era"), hash("other-parameters"))
     val wrongDomainScope = current.manifest.scope.copy(domain = wrongDomain)
     val wrongDomainCommands = current.commands.map { command =>
       val draft = command.copy(scope = wrongDomainScope)
       draft.copy(effectId = FinalityIdentity.effectId(draft.identityPreimage).fold(throw _, identity))
     }
     val wrongDomainManifest = manifest(wrongDomainScope, current.manifest.previous, wrongDomainCommands)
+    val zeroParameterBatch = current.batch.copy(
+      scope = current.batch.scope.copy(domain = current.batch.scope.domain.copy(parameterHash = Hash.empty))
+    )
     val wrongExpectedRevision = current.manifest.copy(
       chainStoreProjection = current.manifest.chainStoreProjection.copy(expectedRevision = EffectSinkRevision(nonNeg(0L)))
     )
@@ -1131,6 +1134,8 @@ object FinalityIntentValidatorSuite extends SimpleIOSuite {
         .exists(_.path == "effectManifest.chainStoreProjection.effectId"),
       violations(validateCoreBatch(current.batch, wrongDomainManifest, current.paths, current.context))
         .exists(_.path == "effectManifest.scope.domain"),
+      violations(validateCoreBatch(zeroParameterBatch, current.manifest, current.paths, current.context))
+        .exists(_.path == "batch.scope.domain.parameterHash"),
       violations(validateCoreBatch(current.batch, wrongExpectedRevision, current.paths, current.context))
         .exists(_.path == "effectManifest.chainStoreProjection.expectedRevision"),
       violations(validateCoreBatch(current.batch, wrongDesiredRevision, current.paths, current.context))

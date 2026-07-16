@@ -283,8 +283,12 @@ final case class ReleasedCorePointer(
   record: ImmutableArtifactPointer
 )
 
-/** Domain separation for local intent identifiers. */
-final case class FinalityDomain(networkId: Hash, genesisHash: Hash, protocolEra: Hash)
+/** Domain separation for local intent identifiers.
+  *
+  * `parameterHash` names the exact consensus-parameter object in force for the artifact. A receiver's local configuration is never a
+  * substitute for this committed identity.
+  */
+final case class FinalityDomain(networkId: Hash, genesisHash: Hash, protocolEra: Hash, parameterHash: Hash)
 
 /** Scope hashed to form [[IntentId]].
   *

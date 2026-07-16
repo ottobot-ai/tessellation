@@ -158,7 +158,7 @@ object FinalityCoordinatorKernelSuite extends FunSuite {
     val target = state(1L, 20, 19)
     val generation = ReleaseGeneration(nonNeg(0L))
     val attempt = IntentAttempt(nonNeg(0L))
-    val domain = FinalityDomain(hash(300), hash(301), hash(302))
+    val domain = FinalityDomain(hash(300), hash(301), hash(302), hash(303))
     val lineage = path(PathRole.CanonicalLineage, NonEmptyList.one(target))
     val adopted = path(PathRole.Adopted, NonEmptyList.one(target))
     val selectionEvidence = artifact(FinalityArtifactKind.ForkChoiceDecisionEvidence, 100)

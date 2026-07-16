@@ -69,6 +69,7 @@ object FinalityIntentValidator {
         validateHash(batch.scope.domain.networkId, "batch.scope.domain.networkId", rejectZero = true),
         validateHash(batch.scope.domain.genesisHash, "batch.scope.domain.genesisHash", rejectZero = true),
         validateHash(batch.scope.domain.protocolEra, "batch.scope.domain.protocolEra", rejectZero = true),
+        validateHash(batch.scope.domain.parameterHash, "batch.scope.domain.parameterHash", rejectZero = true),
         check(
           isExpectedGeneration(batch.scope.generation, context.priorReleased),
           "batch.scope.generation",
@@ -738,6 +739,7 @@ object FinalityIntentValidator {
         validateHash(manifest.scope.domain.networkId, s"$path.scope.domain.networkId", rejectZero = true),
         validateHash(manifest.scope.domain.genesisHash, s"$path.scope.domain.genesisHash", rejectZero = true),
         validateHash(manifest.scope.domain.protocolEra, s"$path.scope.domain.protocolEra", rejectZero = true),
+        validateHash(manifest.scope.domain.parameterHash, s"$path.scope.domain.parameterHash", rejectZero = true),
         validateHash(manifest.scope.transitionDigest, s"$path.scope.transitionDigest", rejectZero = true),
         validateStateRef(manifest.scope.target, s"$path.scope.target"),
         manifest.previous.fold(validUnit)(validateEffectManifestPointer(_, s"$path.previous")),

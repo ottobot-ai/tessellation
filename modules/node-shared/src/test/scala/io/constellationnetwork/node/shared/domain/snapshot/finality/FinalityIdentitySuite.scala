@@ -14,6 +14,7 @@ object FinalityIdentitySuite extends SimpleIOSuite {
     val original = FinalityIdentity.effectId(command.identityPreimage)
     val changedInputs = List(
       command.copy(scope = command.scope.copy(domain = command.scope.domain.copy(networkId = hash(9400)))),
+      command.copy(scope = command.scope.copy(domain = command.scope.domain.copy(parameterHash = hash(9407)))),
       command.copy(scope = command.scope.copy(generation = ReleaseGeneration(nonNeg(6L)))),
       command.copy(scope = command.scope.copy(priorState = None)),
       command.copy(scope = command.scope.copy(transitionDigest = hash(9401))),
@@ -45,6 +46,9 @@ object FinalityIdentitySuite extends SimpleIOSuite {
       intentScope.copy(attempt = IntentAttempt(nonNeg(intentScope.attempt.value.value + 1L)))
     )
     val changedTarget = FinalityIdentity.intentId(intentScope.copy(target = state(42L, 42, 41)))
+    val changedParameters = FinalityIdentity.intentId(
+      intentScope.copy(domain = intentScope.domain.copy(parameterHash = hash(9001)))
+    )
     val changedEffect = FinalityIdentity.intentId(
       intentScope.copy(
         effects = intentScope.effects.copy(
@@ -60,6 +64,7 @@ object FinalityIdentitySuite extends SimpleIOSuite {
       original == FinalityIdentity.intentId(intentScope),
       changedAttempt.isRight && changedAttempt != original,
       changedTarget.isRight && changedTarget != original,
+      changedParameters.isRight && changedParameters != original,
       changedEffect.isRight && changedEffect != original
     )
   }
