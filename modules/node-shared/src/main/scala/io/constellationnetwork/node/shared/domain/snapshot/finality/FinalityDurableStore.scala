@@ -507,14 +507,14 @@ private final class FinalityDurableLayout(root: Path) {
       case FinalityArtifactKind.PathChunk                   => "04-path-chunk"
       case FinalityArtifactKind.DecidedAttestationEvidence  => "05-decided-attestation"
       case FinalityArtifactKind.DepthK1Evidence             => "06-depth-k1"
-      case FinalityArtifactKind.ForkChoiceDecisionEvidence  => "08-fork-choice-decision"
-      case FinalityArtifactKind.PreparedSemanticState       => "09-prepared-semantic"
-      case FinalityArtifactKind.AuthenticatedTargetAnchor   => "10-authenticated-target"
-      case FinalityArtifactKind.AppliedSemanticStateReceipt => "11-applied-semantic"
-      case FinalityArtifactKind.AuthenticatedAnchorReceipt  => "12-authenticated-anchor"
-      case FinalityArtifactKind.PriorSemanticStateReceipt   => "13-prior-semantic"
-      case FinalityArtifactKind.PriorAnchorReceipt          => "14-prior-anchor"
-      case FinalityArtifactKind.EffectPayload               => "15-effect-payload"
+      case FinalityArtifactKind.ForkChoiceDecisionEvidence  => "07-fork-choice-decision"
+      case FinalityArtifactKind.PreparedSemanticState       => "08-prepared-semantic"
+      case FinalityArtifactKind.AuthenticatedTargetAnchor   => "09-authenticated-target"
+      case FinalityArtifactKind.AppliedSemanticStateReceipt => "10-applied-semantic"
+      case FinalityArtifactKind.AuthenticatedAnchorReceipt  => "11-authenticated-anchor"
+      case FinalityArtifactKind.PriorSemanticStateReceipt   => "12-prior-semantic"
+      case FinalityArtifactKind.PriorAnchorReceipt          => "13-prior-anchor"
+      case FinalityArtifactKind.EffectPayload               => "14-effect-payload"
     }
 
   private def hex(label: String, hash: Hash): String = {

@@ -641,6 +641,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
     atomic-cutover guards passed. The guard freezes all 23 current JSON MPT
     commitment-hash sites and rejects ordinary production references to the dark
     codec. This is a syntactic fuse, not semantic non-reachability proof.
+  - **Landed greenfield finality-tag cleanup (2026-07-16):** removed the retired
+    draft `DensityDecisionEvidence` wire/storage hole. The 14 live
+    `FinalityArtifactKind` variants now have contiguous tags `1..14`, with
+    `ForkChoiceDecisionEvidence` at `7`; exact aggregate vectors and durable-store
+    paths were regenerated in place. No compatibility decoder or stale directory
+    alias remains because these fork-only bytes were never deployed.
   - E1b does not select hash preimages, compute a target MPT root, encode proof
     aggregates, or activate Scodec in hashing/signing/storage. Aggregate proof and
     message bounds plus the atomic domain-bound runtime cutover remain open.

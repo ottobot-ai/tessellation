@@ -1260,6 +1260,10 @@ independent root containing either field 33 or opaque field-34 bytes makes
 incremental adoption return no result while restoring exact entries, root, and
 persisted ordinal. This is liveness/heavy-resync evidence only; neither native
 field is yet represented and no field-34 schema is implied.
+The greenfield finality durability union is also compacted in place: its 14 live
+artifact kinds use contiguous tags `1..14`, the deleted draft density-evidence
+tag is not reserved, and storage prefixes plus frozen aggregate vectors match the
+new bytes. No compatibility decoder or legacy path alias remains.
 E1.1 next expands generic rumor and ChainSync/bootstrap transport families, all
 14 finality payload variants, and a total per-kind binding/codec/vector table with
 removal-mutation gates; the 48 semantic families do not substitute for that work.

@@ -49,37 +49,37 @@ object FinalityScodecV1VectorsSuite extends FunSuite {
         "IntentScopePayload",
         encode(intentScopePayloadCodec, intentScope),
         6949,
-        "48421fa22242232e1f7a35d9f5908554bb1809525fd3ca2957878e44859d2d3c"
+        "056ffdde2f035094a92731cb70961bb01d20a82146a7d4af375a37d706f29356"
       ),
       FrozenVector(
         "FinalityCoreBatchPayload",
         encode(finalityCoreBatchPayloadCodec, coreBatch),
         8921,
-        "238de2d25e63fdd787a47a1cf56debb75fb52b84cf7dcaa9e420c36fc8b11ce0"
+        "ad400432e434196d6f1c57f584adbdb8282bed64d0b3d565a7e3cc7ea8515d1c"
       ),
       FrozenVector(
         "ReleasedCoreRecordPayload",
         encode(releasedCoreRecordPayloadCodec, releasedRecordPayload),
         1103,
-        "8e2a1818b965d68429150f6b1f63552a86c4460482c7f9d7ab697a959246090b"
+        "2a9352ba60c5ad3a0a5ae9597e2d16c2ba674e9bd8e6518b84633d5b567f7f82"
       ),
       FrozenVector(
         "EffectCommandIdentity",
         encode(effectCommandIdentityCodec, effectCommands.head.identityPreimage),
         532,
-        "1539c7567683f592c1ae33d2c06e106f2c314a20223c61fce962430355d203a6"
+        "3582c2f536526a2156e10cea422e4e304a2f8528e81fbf05d3f020d8b5f956b4"
       ),
       FrozenVector(
         "FinalityEffectManifestPayload",
         encode(finalityEffectManifestPayloadCodec, effectManifest),
         12298,
-        "25beb0e7aa289464eb21e586ae0df506ec95de1358a12c64f21e984fea11b57b"
+        "2ddf0ee8bf992a04ae848d04b30964358c69c674200c4b769162b517096d1d73"
       ),
       FrozenVector(
         "TerminalEffectReceiptPayload",
         encode(terminalEffectReceiptPayloadCodec, terminalEffectReceipt),
         185,
-        "f65d5ea2a78e32096250e8cad373844c3701424d84fe15e338524b5e095c7474"
+        "e7dc26412dbb13854f0dd01dc2c780e6621cad5efbb041eee61c5786fd401be1"
       ),
       FrozenVector(
         "FinalityEffectOutboxHeadPayload",
@@ -91,19 +91,19 @@ object FinalityScodecV1VectorsSuite extends FunSuite {
         "RecoveryRecordPayload",
         encode(recoveryRecordPayloadCodec, recoveryRecord),
         9765,
-        "5aba40ef8417d55c373b50ae76d25a8a808316285b7a6a72eca7914d95c3917f"
+        "d257744df0d3ffdba09b331abc5392cef1c89222fa35d43ac8cbf8f85fe8e146"
       ),
       FrozenVector(
         "CoordinatorHeadPayload",
         encode(coordinatorHeadPayloadCodec, coordinatorHead),
         9772,
-        "fd8bc51996bf66262b6ab68d10b0f4363aebaa7e8d3663165d1d4060f09e8eb0"
+        "4ed39d8be8f36451a86e78296ca97d1acb4f6636fbd7fbfb990e66c86761f2de"
       ),
       FrozenVector(
         "CoordinatorAuditRecordPayload",
         encode(coordinatorAuditRecordPayloadCodec, auditRecord),
         19481,
-        "cf7f35ecf5d0c231b0eece88403d8440cece5fb557dd6517a56fe2874f265d8a"
+        "d0ac748ff3ab830b4c3da9efea63c876d2b1292563d76210e290c2b82c6322ca"
       )
     )
 

@@ -62,6 +62,23 @@ object FinalityArtifactKind {
   case object PriorSemanticStateReceipt extends FinalityArtifactKind
   case object PriorAnchorReceipt extends FinalityArtifactKind
   case object EffectPayload extends FinalityArtifactKind
+
+  val all: List[FinalityArtifactKind] = List(
+    CoreBatch,
+    ReleasedCoreRecord,
+    PathManifest,
+    PathChunk,
+    DecidedAttestationEvidence,
+    DepthK1Evidence,
+    ForkChoiceDecisionEvidence,
+    PreparedSemanticState,
+    AuthenticatedTargetAnchor,
+    AppliedSemanticStateReceipt,
+    AuthenticatedAnchorReceipt,
+    PriorSemanticStateReceipt,
+    PriorAnchorReceipt,
+    EffectPayload
+  )
 }
 
 /** Immutable content-addressed pointer. The pointed-to bytes are verified against both `id` and `digest` before they are interpreted.

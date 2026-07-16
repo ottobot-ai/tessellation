@@ -134,7 +134,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
   private def artifactPath(root: Path, pointer: ImmutableArtifactPointer): Path =
     root
       .resolve("immutable")
-      .resolve("15-effect-payload")
+      .resolve("14-effect-payload")
       .resolve(s"${pointer.id.value.value}.bin")
 
   private def pathLocator(root: Path, intentId: IntentId, manifestId: ArtifactId, index: Long): Path =
@@ -1376,7 +1376,7 @@ object FinalityDurableStoreSuite extends SimpleIOSuite {
         _ <- IO.blocking {
           NioFiles.createDirectory(outsideDirectory)
           NioFiles.createSymbolicLink(
-            ancestorRoot.resolve("immutable").resolve("15-effect-payload"),
+            ancestorRoot.resolve("immutable").resolve("14-effect-payload"),
             outsideDirectory
           )
         }

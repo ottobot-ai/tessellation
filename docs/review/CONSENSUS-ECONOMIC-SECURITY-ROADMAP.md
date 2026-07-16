@@ -246,6 +246,12 @@ and transactionally restores the prior entries, root, and persisted ordinal. The
 current path therefore fails closed at an availability/resync cost. It neither
 defines field-34 bytes nor fixes either accumulator omission.
 
+The undeployed finality durability union no longer preserves a deleted draft
+tag. Its 14 active kinds are contiguous at `1..14`; the corresponding storage
+prefixes and frozen composite vectors were replaced in place, with no legacy
+decoder or directory alias. This is greenfield schema cleanup, not finality
+activation or evidence verification.
+
 The dark typed `GlobalStateKeyCodec` now covers all six namespace variants:
 `SystemNamespace` uses outer tag `0x05` plus four closed label tags, exact vectors,
 and strict unknown/trailing rejection. A source tripwire keeps those bytes outside

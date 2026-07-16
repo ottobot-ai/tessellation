@@ -141,8 +141,12 @@ object FinalityPayloadCodecsSuite extends FunSuite {
     )
   }
 
-  test("closed unions reject zero and unknown tags, including removed variants") {
+  test("closed unions reject zero and unknown tags") {
+    val artifactTags = FinalityArtifactKind.all.map(kind => encoded(finalityArtifactKindCodec, kind).toByteVector.head)
+
     expect.all(
+      artifactTags == (1 to 14).map(_.toByte).toList,
+      FinalityArtifactKind.all.distinct.size == FinalityArtifactKind.all.size,
       rejectsTags(finalityArtifactKindCodec),
       rejectsTags(pathRoleCodec),
       rejectsTags(operationalRailCodec),
@@ -156,21 +160,19 @@ object FinalityPayloadCodecsSuite extends FunSuite {
       rejectsTags(coordinatorMutationKindCodec),
       rejectsTags(recoveryReasonCodec),
       rejectsTags(coordinatorModeCodec),
-      rejects(finalityArtifactKindCodec.complete, encoded(uint8, 7)),
-      (16 to 19).forall(tag => rejects(finalityArtifactKindCodec.complete, encoded(uint8, tag))),
+      (15 to 19).forall(tag => rejects(finalityArtifactKindCodec.complete, encoded(uint8, tag))),
       rejects(terminalEffectReceiptPayloadCodec, encoded(uint8, 3)),
       rejects(coordinatorMutationKindCodec.complete, encoded(uint8, 9))
     )
   }
 
-  test("fork-choice decision binds one opaque tag-8 evidence commitment") {
+  test("fork-choice decision binds one opaque tag-7 evidence commitment") {
     val decision = ForkChoiceDecision(selectionEvidenceArtifact)
 
     expect.all(
       roundTripsAndRejectsTrailing(forkChoiceDecisionCodec.complete, decision),
-      encoded(finalityArtifactKindCodec, FinalityArtifactKind.ForkChoiceDecisionEvidence).toByteVector.headOption.contains(8.toByte),
-      finalityArtifactKindCodec.decodeValue(encoded(uint8, 8)).toEither.toOption.contains(FinalityArtifactKind.ForkChoiceDecisionEvidence),
-      rejects(finalityArtifactKindCodec.complete, encoded(uint8, 7))
+      encoded(finalityArtifactKindCodec, FinalityArtifactKind.ForkChoiceDecisionEvidence).toByteVector.headOption.contains(7.toByte),
+      finalityArtifactKindCodec.decodeValue(encoded(uint8, 7)).toEither.toOption.contains(FinalityArtifactKind.ForkChoiceDecisionEvidence)
     )
   }
 
