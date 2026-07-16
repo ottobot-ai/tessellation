@@ -9,23 +9,23 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.CanonicalOperatorConsensusFixture
+import io.constellationnetwork.node.shared.domain.nakamoto.{CanonicalOperatorConsensusFixture, EligibilityChecker}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.{sidecar => pb}
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
+import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
-import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot._
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, LddConfig}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
-import io.constellationnetwork.security.vrf.EcVrf25519
 
 import com.google.protobuf.ByteString
 import eu.timepit.refined.auto._
@@ -163,26 +163,33 @@ object CatchUpVerificationSuite extends MutableIOSuite {
 
   // Two distinct valid DAG addresses (concrete values irrelevant; only their presence in `balances` matters for the rebuilt proof).
   private val addrA: Address = Address("DAG2FGeUYivtEo9EjvpELY4ZS7zDQWvJzQYVzXkX")
-  private val vrf = new EcVrf25519()
 
   private def mkCertifiedEnvelope(
     info: GlobalSnapshotInfo,
-    keyPair: java.security.KeyPair
+    operator: CanonicalOperatorConsensusFixture
   )(
     implicit h: Hasher[IO],
     j: JsonSerializer[IO],
     sp: SecurityProvider[IO]
   ): IO[(Signed[GlobalIncrementalSnapshot], pb.Snapshot)] = {
-    val vrfSk = Array.tabulate[Byte](32)(i => (i + 1).toByte)
-    val vrfPk = vrf.getVerificationKey(vrfSk)
-    val proof = vrf.vrfProof(vrfSk, "snapshot-envelope".getBytes(java.nio.charset.StandardCharsets.UTF_8))
-    val output = vrf.vrfProofToHash(proof).getOrElse(throw new IllegalStateException("test VRF proof did not derive output"))
     val etaBytes = Array.fill[Byte](32)(0x5a.toByte)
     val etaHash = Hash(Hex.fromBytes(etaBytes).value)
     val slot = Slot.unsafeApply(10L)
     val parentSlot = Slot.unsafeApply(9L)
+    val eligibilityChecker = new EligibilityChecker[IO](null, null)
+    val lddConfig = LddConfig(1, 0, Ratio.One, Ratio.One)
+    val keyPair = operator.localLongTermKeyPairForConsensusTest
+    val vrfPk = operator.resolvedPair.vrfPublicKey.toBytes
 
     for {
+      vrfMaterial <- eligibilityChecker
+        .checkEligibility(operator.localVrfSecret, slot, 2L, etaBytes, Ratio.One, lddConfig)
+        .flatMap(
+          IO.fromOption(_)(
+            new IllegalStateException("canonical registered operator was not eligible in an always-eligible test slot")
+          )
+        )
+      (proof, output) = vrfMaterial
       base <- mkSnapshot(info)
       certified = base.copy(
         slotCertificate = Some(
@@ -291,25 +298,26 @@ object CatchUpVerificationSuite extends MutableIOSuite {
   test("snapshot transport metadata is bound to the signed body and certificate") { res =>
     implicit val (_, j, h, sp, hs) = res
 
-    for {
-      keyPair <- KeyPairGenerator.makeKeyPair[IO]
-      tuple <- mkCertifiedEnvelope(mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L)))), keyPair)
-      (signed, envelope) = tuple
-      valid <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](envelope, signed)
-      wrongOrdinal <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](envelope.copy(ordinal = envelope.ordinal + 1L), signed)
-      wrongParent <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
-        envelope.copy(parentHash = ByteString.copyFromUtf8("f" * 64)),
-        signed
-      )
-      wrongProducer <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
-        envelope.copy(producerId = ByteString.copyFrom(Array.fill[Byte](32)(9))),
-        signed
-      )
-      wrongEta <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
-        envelope.copy(eta = ByteString.copyFrom(Array.fill[Byte](32)(7))),
-        signed
-      )
-    } yield expect.all(valid.isRight, wrongOrdinal.isLeft, wrongParent.isLeft, wrongProducer.isLeft, wrongEta.isLeft)
+    CanonicalOperatorConsensusFixture.make.use { operator =>
+      for {
+        tuple <- mkCertifiedEnvelope(mkInfo(SortedMap(addrA -> Balance(NonNegLong(100L)))), operator)
+        (signed, envelope) = tuple
+        valid <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](envelope, signed)
+        wrongOrdinal <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](envelope.copy(ordinal = envelope.ordinal + 1L), signed)
+        wrongParent <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
+          envelope.copy(parentHash = ByteString.copyFromUtf8("f" * 64)),
+          signed
+        )
+        wrongProducer <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
+          envelope.copy(producerId = ByteString.copyFrom(Array.fill[Byte](32)(9))),
+          signed
+        )
+        wrongEta <- NakamotoSyncDaemon.validateSnapshotEnvelope[IO](
+          envelope.copy(eta = ByteString.copyFrom(Array.fill[Byte](32)(7))),
+          signed
+        )
+      } yield expect.all(valid.isRight, wrongOrdinal.isLeft, wrongParent.isLeft, wrongProducer.isLeft, wrongEta.isLeft)
+    }
   }
 
   test("slot lineage uses the retained parent and bounds embedded checkpoint slots") { _ =>

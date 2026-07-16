@@ -351,9 +351,15 @@ fails on split-registry factories, unreviewed raw VRF production consumers, and
 new or count-changed direct pair fixtures. It is deliberately a reviewed textual
 allowlist, not proof that an allowlisted path resolves the correct branch history.
 It scans split factories, raw `EcVrf25519`/`VrfKeyDeriver` references, and direct
-`OperatorConsensusKeys` constructors. It does not discover every higher-level
-`CommitteeSortition`, eligibility, duty, proof, or verifier call, so K7 still
-needs a complete semantic consumer manifest/denylist.
+`OperatorConsensusKeys` constructors. A separate checked semantic manifest now
+inventories reviewed lexical spellings for current higher-level sortition,
+eligibility, duty, signing, proof, tower, and evidence calls at file/count
+granularity, and requires uncommented/unquoted negative-vector test-shaped
+declarations. Same-file line motion or same-kind substitution is not detected,
+and the lexer does not resolve Weaver symbols. It also records the
+intentionally absent watchtower and optimistic-sampler consumers. Neither
+inventory is an AST/call-graph proof or proves branch-historical qualification,
+so K7 remains open.
 
 The tower verifier resolves every suffix and upper-level occurrence through the
 current atomic period-zero pair, verifies its VRF proof over the header's exact
@@ -393,11 +399,13 @@ This is not runtime completion. The following remain merge gates:
 8. canonical duplicate and partial-rotation semantics consistent with the
    ratified atomic N-2 preregistration boundary, plus completion of
    duplicate/rotation/reorg/restart proofs and `KEYREG-001..015`; and
-9. cross-consumer semantic qualification behind the landed static source/fixture
-   inventory tripwire. `CommitteeSortitionSuite`, `CommitteeShardSortitionSuite`,
+9. cross-consumer semantic qualification behind the landed raw source/fixture
+   tripwire and checked higher-level consumer manifest. `CommitteeSortitionSuite`, `CommitteeShardSortitionSuite`,
    and `EligibilityCheckerSuite` use loader-validated period-zero paired identities;
    wrong-key cases use another registered identity and repeated statistical trials
-   vary canonical draw inputs instead of minting disposable keys. `KEYREG-011`
-   remains open until the complete semantic consumer inventory exists and every
-   allowlisted path passes historical-branch and generated-unregistered-key
-   no-side-effect vectors.
+   vary canonical draw inputs instead of minting disposable keys. The manifest
+   fails on new matched spellings in unmanifested files, file/count changes, and
+   stale negative-vector test-shaped declarations; it is not proof of historical
+   semantics. `KEYREG-011` remains open until every
+   allowlisted path passes the generated historical-branch and unregistered-key
+   no-side-effect matrix.

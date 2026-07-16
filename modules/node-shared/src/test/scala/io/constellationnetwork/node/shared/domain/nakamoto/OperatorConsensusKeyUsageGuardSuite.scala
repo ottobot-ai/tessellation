@@ -107,8 +107,6 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
         "constructs registered checkpoint proofs for high-level GL0 acceptance and explicit mismatch rejection"
     ),
     "explicit attacker/negative evidence" -> Map(
-      "modules/dag-l0/src/test/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/CatchUpVerificationSuite.scala" ->
-        "constructs a cryptographically coherent transport envelope so metadata mutations can be rejected independently",
       "modules/dag-l0/src/test/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/LocalOperatorKeyPairGateSuite.scala" ->
         "derives a substituted key specifically to prove local material cannot replace the preregistered pair",
       "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/TowerVerifierSuite.scala" ->
@@ -119,7 +117,6 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
   )
 
   private val reviewedRawVrfTestCounts: Map[String, Int] = Map(
-    "modules/dag-l0/src/test/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/CatchUpVerificationSuite.scala" -> 2,
     "modules/dag-l0/src/test/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/LocalOperatorKeyPairGateSuite.scala" -> 2,
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/CanonicalOperatorConsensusFixture.scala" -> 2,
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/MetagraphCommitteeGateSuite.scala" -> 1,
@@ -232,7 +229,7 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducerSuite.scala" ->
       (1 -> "verifies the producer happy path's KES evidence under its complete registered pair"),
     "modules/shared/src/test/scala/io/constellationnetwork/security/kes/SignatureCodecSuite.scala" ->
-      (1 -> "isolated KES signature-codec roundtrip through the public verification wrapper")
+      (4 -> "isolated codec/public-wrapper verification coverage, including malformed-input totality and decoded-forwarder parity")
   )
 
   private val reviewedKesPrimitiveProduction: Map[String, (Int, String)] = Map(
@@ -252,7 +249,7 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
     "modules/shared/src/test/scala/io/constellationnetwork/security/kes/SecretKeyCodecSuite.scala" ->
       (2 -> "isolated KES secret-key codec coverage"),
     "modules/shared/src/test/scala/io/constellationnetwork/security/kes/SignatureCodecSuite.scala" ->
-      (4 -> "isolated KES signature codec coverage")
+      (6 -> "isolated KES signature-codec shape, roundtrip, malformed-totality, and public-forwarder parity coverage")
   )
 
   private val rawVrfUse: Regex =
