@@ -184,8 +184,6 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       Reviewed(4, "production, held-candidate comparison, emission, and signed recovery derive checkpoint identifiers"),
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/WatchtowerFraudProofEmitter.scala" ->
       Reviewed(2, "watchtower binds both the disputed checkpoint and its fraud-proof preimage"),
-    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala" ->
-      Reviewed(2, "global acceptance binds both checkpoint-processing paths to derived state"),
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/ShardCheckpointGl0AcceptanceManager.scala" ->
       Reviewed(2, "checkpoint validation derives identifiers on both acceptance paths")
   )
@@ -198,6 +196,124 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       Reviewed(1, "fraud-proof signature verification hashes its explicit evidence preimage"),
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/SlashableEvidenceValidator.scala" ->
       Reviewed(2, "slashable evidence signing and verification hash the explicit evidence preimage")
+  )
+
+  private val ordinalHasherSelection =
+    """(?:HasherSelector\s*\[\s*F\s*\]|\bselector)\s*\.\s*(?:forOrdinal|getForOrdinal)\s*\(""".r
+
+  /** Every live call that lets a snapshot ordinal choose JSON versus Kryo bytes.
+    *
+    * These calls must disappear in the same change that installs the branch-bound active-era service. Moving one call to current JSON or
+    * Scodec while another still selects by ordinal is not a migration.
+    */
+  private val reviewedOrdinalHasherSelections: Map[String, Reviewed] = Map(
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStore.scala" ->
+      Reviewed(1, "exact branch walking checks the stored snapshot against ordinal-selected legacy hash authority"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStoreExactReplayHistorySource.scala" ->
+      Reviewed(1, "exact replay-history verification compares current and ordinal-selected legacy hash authority"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/TowerCatchupCoordinator.scala" ->
+      Reviewed(1, "tower catch-up rehashes a historical snapshot with ordinal-selected legacy bytes"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/HistoricalOperatorConsensusKeyRegistry.scala" ->
+      Reviewed(1, "historical KES registration references use the accepting ordinal's legacy hash authority"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala" ->
+      Reviewed(2, "snapshot context reconstruction selects legacy bytes for parent tips and parent identity"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala" ->
+      Reviewed(1, "global acceptance selects the candidate ordinal's legacy hashing authority")
+  )
+
+  private val currentHasherPromotion =
+    """(?s)HasherSelector\s*\[\s*F\s*\]\s*\.\s*withCurrent\s*\{.{0,512}?\bmovePersistedToTmp\s*\(""".r
+
+  private val reviewedCurrentHasherPromotions: Map[String, Reviewed] = Map(
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotLocalFileSystemStorage.scala" ->
+      Reviewed(1, "snapshot disk promotion validates under the current JSON-backed hasher authority")
+  )
+
+  private val directHashSelect =
+    """\bhashSelect\s*\.\s*select\s*\(""".r
+
+  private val reviewedDirectHashSelections: Map[String, Reviewed] = Map(
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/SnapshotDownloadStorage.scala" ->
+      Reviewed(2, "download state/info reconstruction directly branches between JSON and Kryo by ordinal"),
+    hasherPath ->
+      Reviewed(1, "HasherSelector itself converts the local ordinal boundary into consensus byte authority")
+  )
+
+  private val directStateProofSelection =
+    """\b(?:globalStateProofSelector|stateProofSelector|selector)\s*\.\s*select\s*\(\s*ordinal\s*\)""".r
+
+  private val reviewedDirectStateProofSelections: Map[String, Reviewed] = Map(
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala" ->
+      Reviewed(1, "acceptance branches state-proof validation on a locally selected ordinal format"),
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotInfo.scala" ->
+      Reviewed(2, "state-proof construction directly selects legacy Merkle versus MPT format by ordinal")
+  )
+
+  private val legacySnapshotProjection =
+    """\b(?:CurrencyIncrementalSnapshotV1\s*\.\s*fromCurrencyIncrementalSnapshot|CurrencySnapshotInfoV1\s*\.\s*fromCurrencySnapshotInfo|GlobalIncrementalSnapshotV1\s*\.\s*fromGlobalIncrementalSnapshot|GlobalSnapshotInfoV2\s*\.\s*fromGlobalSnapshotInfo|GlobalSnapshotStateProofV1\s*\.\s*fromGlobalSnapshotStateProof|CurrencySnapshotStateProofV1\s*\.\s*fromCurrencySnapshotStateProof)|(?<!FollowVerifyCore)\.\s*(?:toGlobalSnapshotInfo|toCurrencySnapshotInfo|toCurrencyIncrementalSnapshot)\b""".r
+
+  /** Projections that erase active fields or resurrect legacy full-state shapes on live paths.
+    *
+    * Schema conversion helpers are included because leaving one reachable after the active cutover would preserve a second byte/state
+    * interpretation even if the top-level selector disappeared.
+    */
+  private val reviewedLegacySnapshotProjections: Map[String, Reviewed] = Map(
+    "modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/programs/Genesis.scala" ->
+      Reviewed(1, "ML0 genesis converts the retained full currency snapshot into runtime state"),
+    "modules/currency-l1/src/main/scala/io/constellationnetwork/currency/l1/domain/snapshot/programs/CurrencySnapshotProcessor.scala" ->
+      Reviewed(1, "currency follower processing converts a retained legacy full snapshot shape"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/Main.scala" ->
+      Reviewed(1, "GL0 genesis wiring converts the current full snapshot into runtime state"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/domain/snapshot/programs/Download.scala" ->
+      Reviewed(1, "GL0 download converts a retained full snapshot shape"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala" ->
+      Reviewed(1, "GL0 proposal construction hashes a field-erasing GlobalIncrementalSnapshotV1 projection"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotTraverse.scala" ->
+      Reviewed(2, "rollback traversal converts full state and projects current state into the legacy proof shape"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/SnapshotDownloadStorage.scala" ->
+      Reviewed(2, "download storage converts Kryo-era state and carries a legacy/current disjunction"),
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStore.scala" ->
+      Reviewed(1, "chain-store reconstruction converts a retained full snapshot shape"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/overlay/AcceptanceMptStateChanges.scala" ->
+      Reviewed(1, "MPT state-change extraction converts a retained full currency snapshot info shape"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/CurrencySnapshotValidator.scala" ->
+      Reviewed(2, "currency signature validation retries after projecting away and then restoring active snapshot fields"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala" ->
+      Reviewed(2, "global acceptance projects current incrementals and info into the legacy Merkle commitment shape"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelEventsProcessor.scala" ->
+      Reviewed(1, "state-channel processing converts a retained full currency snapshot into runtime info"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotInfoLocalFileSystemStorage.scala" ->
+      Reviewed(4, "snapshot-info persistence projects and promotes retained legacy shapes"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotLocalFileSystemStorage.scala" ->
+      Reviewed(1, "snapshot persistence promotes retained V1 currency incrementals"),
+    "modules/shared/src/main/scala/io/constellationnetwork/currency/dataApplication/storage/TraverseLocalFileSystemTempStorage.scala" ->
+      Reviewed(1, "data-application temp traversal promotes a retained V1 currency incremental"),
+    "modules/shared/src/main/scala/io/constellationnetwork/currency/schema/currency.scala" ->
+      Reviewed(1, "the retained full currency snapshot projects its state proof into V1"),
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalIncrementalSnapshot.scala" ->
+      Reviewed(2, "global incremental V1 conversion projects both state proof and retained full state"),
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshot.scala" ->
+      Reviewed(1, "full snapshot helpers define the current runtime-state conversion"),
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotInfo.scala" ->
+      Reviewed(5, "the current state schema retains legacy state-proof, currency incremental, and currency-info projections"),
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/mpt/GlobalStateConverter.scala" ->
+      Reviewed(5, "MPT construction converts retained full currency snapshot info shapes"),
+    hasherPath ->
+      Reviewed(2, "Kryo hashing projects current global and currency state into field-erasing legacy shapes")
+  )
+
+  private val liveKryoDeserialize =
+    """\bKryoSerializer\s*(?:\[[^]]+\])?\s*\.\s*deserialize""".r
+
+  private val reviewedLiveKryoDeserializers: Map[String, Reviewed] = Map(
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotInfoLocalFileSystemStorage.scala" ->
+      Reviewed(3, "snapshot-info disk reads probe retained Kryo formats"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/storage/SnapshotLocalFileSystemStorage.scala" ->
+      Reviewed(3, "snapshot disk reads probe retained Kryo formats"),
+    "modules/shared/src/main/scala/io/constellationnetwork/currency/dataApplication/storage/TraverseLocalFileSystemTempStorage.scala" ->
+      Reviewed(1, "data-application temp traversal promotes a Kryo fallback"),
+    "modules/shared/src/main/scala/io/constellationnetwork/ext/kryo.scala" ->
+      Reviewed(2, "generic Kryo syntax exposes live deserialize entry points")
   )
 
   private val mptJsonCommitmentHash =
@@ -227,6 +343,11 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       Reviewed(
         1,
         "encodes an InvalidStateProofSlashedReader MPT value for replay comparison; it is not artifact/signing byte activation"
+      ),
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/mpt/GlobalStateConverter.scala" ->
+      Reviewed(
+        7,
+        "encodes typed MPT leaf values on the already-live MPT state path; it does not select artifact/signature/hash preimages"
       )
   )
 
@@ -255,7 +376,14 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       reviewedLegacyMarkers.keySet,
       reviewedCheckpointPreimageHashes.keySet,
       reviewedEvidencePreimageHashes.keySet,
-      reviewedMptJsonCommitmentHashes.keySet
+      reviewedOrdinalHasherSelections.keySet,
+      reviewedCurrentHasherPromotions.keySet,
+      reviewedDirectHashSelections.keySet,
+      reviewedDirectStateProofSelections.keySet,
+      reviewedLegacySnapshotProjections.keySet,
+      reviewedLiveKryoDeserializers.keySet,
+      reviewedMptJsonCommitmentHashes.keySet,
+      reviewedDirectImmutableBytes.keySet
     ).foldLeft(Set(signedImplementationPath))(_ union _)
 
   private val forbiddenRuntimeActivations: List[(String, Regex)] = List(
@@ -328,6 +456,37 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
       if (mismatches.isEmpty) success
       else failure(s"reviewed consensus preimage inventory changed: ${mismatches.mkString(", ")}")
+    }
+  }
+
+  test("ordinal-selected hash and state-proof authority remains an exact atomic-cutover inventory") {
+    productionSources.map { sources =>
+      val mismatches = List(
+        exactInventoryMismatches(sources, ordinalHasherSelection, reviewedOrdinalHasherSelections, "ordinal hasher selection"),
+        exactInventoryMismatches(sources, currentHasherPromotion, reviewedCurrentHasherPromotions, "current-hasher promotion"),
+        exactInventoryMismatches(sources, directHashSelect, reviewedDirectHashSelections, "direct hash selection"),
+        exactInventoryMismatches(
+          sources,
+          directStateProofSelection,
+          reviewedDirectStateProofSelections,
+          "direct state-proof selection"
+        )
+      ).flatten
+
+      if (mismatches.isEmpty) success
+      else failure(s"ordinal-selected consensus authority inventory changed: ${mismatches.mkString(", ")}")
+    }
+  }
+
+  test("legacy snapshot projections and Kryo promotion remain an exact atomic-cutover inventory") {
+    productionSources.map { sources =>
+      val mismatches = List(
+        exactInventoryMismatches(sources, legacySnapshotProjection, reviewedLegacySnapshotProjections, "legacy snapshot projection"),
+        exactInventoryMismatches(sources, liveKryoDeserialize, reviewedLiveKryoDeserializers, "live Kryo deserialize")
+      ).flatten
+
+      if (mismatches.isEmpty) success
+      else failure(s"legacy projection/promotion inventory changed: ${mismatches.mkString(", ")}")
     }
   }
 
