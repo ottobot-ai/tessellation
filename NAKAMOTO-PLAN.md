@@ -171,7 +171,12 @@ value must be canonical rooted protocol state, not a local fallback.
 Separately, field 32 is excluded from that root but remains a writable GL0 mirror
 and a confirmed input to framework checkpoint replay. A local staged base and a
 root-verified backfilled base can therefore recreate different currency state
-proofs at the same signed root (`ECO-F32`, HIGH).
+proofs at the same signed root (`ECO-F32`, HIGH). The production-path
+characterization is now committed: two readers over the same exact signed GL0
+state reference/root retain `Some(nonempty)` versus reconstruct `Some(empty)`,
+and the same signed currency binary replays only from the local image
+(`ExecutionBasePinReExecutionSuite.scala:573-643`; commit `87c43c3cb`). This
+proves the defect; witness parity and field-32 removal remain open.
 Until the following sequence closes, runtime stake eligibility, tower
 activation, ordinary checkpoint diff adoption, and every economic deployment
 must remain deployment-disabled. Nonactivating schema, model, and RED-test work
@@ -195,7 +200,18 @@ already has a hard-coded kill switch.
    mismatched material defers and cannot slash. Only after that gate passes,
    delete field 32 from every GL0 MPT, diff, load, and reorg path while retaining
    it in ML0 `CurrencySnapshotInfo`. Gates: `ECO-IDX-03`, `ECO-F32`, `ROOT-007`,
-   `ROOT-010`, `SHARD-E-006`.
+   `ROOT-010`, `SHARD-E-006`. **Serialization prerequisite:** before adding the
+   required witness to the live current incremental, quarantine upstream-v4
+   `CurrencyIncrementalSnapshotV1` behind the read-only offline importer and
+   remove every active current-to-V1 hash, signature-validation, Merkle, and disk
+   promotion path. The inherited Kryo projection drops modern framework fields,
+   and dev ordinal zero still selects it through an inclusive local boundary
+   (`Hasher.scala:75-80`; `CurrencySnapshotValidator.scala:96-113`;
+   `TessellationIOApp.scala:126-129`; `application.conf:57-62`). The resulting
+   authority collision is executable: a real Kryo signature remains valid after
+   `activeAllowSpends` changes, while the current JSON signature does not
+   (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`). A witness
+   that can be erased from its signed preimage is not a witness.
 2. **Land one strict key-aware reader.** Point, prefix, and raw reads return
    typed absent/present/malformed results with the physical MPT key/path and
    exact immutable copied value bytes. Decoding never drops an entry; reconstruction

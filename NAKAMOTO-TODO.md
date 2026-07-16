@@ -119,7 +119,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
     and reject local/join mismatch.
   - Field 32 is still excluded while GL0 writes/reconstructs it and checkpoint
     replay consumes it; local staged and root-verified stripped-backfill bases can
-    therefore derive different state proofs (`ECO-F32`, HIGH, confirmed).
+    therefore derive different state proofs (`ECO-F32`, HIGH, confirmed). The
+    current failure is now executable: the same exact signed GL0 state reference
+    and signed currency binary replay from locally staged `Some(nonempty)` bytes
+    but not from the root-valid stripped/backfilled `Some(empty)` image
+    (`ExecutionBasePinReExecutionSuite.scala:573-643`; `87c43c3cb`). The fixed
+    witness/removal half remains open.
     Stake/committee eligibility, tower activation, ordinary checkpoint diff
     adoption, and economic deployment must remain deployment-disabled until this
     entire checklist closes. This is a release
@@ -141,6 +146,18 @@ criteria are in `NAKAMOTO-PLAN.md`.
       `CurrencySnapshotStateProof.globalSnapshotSync`; a missing/mismatched
       witness defers and cannot slash. The current binary's hash plus accepted
       sync delta is insufficient. Gates: `ECO-F32`, `ROOT-010`, `SHARD-E-006`.
+      - [ ] **1A.0 Legacy-authority quarantine prerequisite:** retain exact
+        upstream-v4 V1/Kryo and pre-witness Brotli-JSON decoding only in a
+        read-only offline importer. Active current artifacts must never be hashed,
+        signature-validated, Merkle-folded, or disk-promoted through
+        `CurrencyIncrementalSnapshotV1`; active ordinal zero must not select
+        Kryo from a local inclusive boundary. Add hash/signature collision
+        characterization, importer fixtures, active-era guards, and current-only
+        transport tests before the required witness field lands. Gates:
+        `E1.4`, `E1.10`, `E1.12`, `SER-005`, `ERA-001`, `ERA-004`. The collision
+        characterization is GREEN: a Kryo signature transfers across a changed
+        `activeAllowSpends` commitment because the V1 projection omits it
+        (`CurrencyIncrementalSnapshotKryoAuthorityCollisionSuite.scala`).
     - [ ] **1B. Remove the GL0 mirror:** only after 1A is green, remove field 32
       from every GL0 MPT/diff/load/reorg path and reject it at those boundaries.
       Retain it in ML0 `CurrencySnapshotInfo` and its state proof. Gate:
