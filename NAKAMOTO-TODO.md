@@ -48,13 +48,15 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `17/20` dispositioned. `O-01` through `O-17` are
+> **Owner-decision status:** `17/21` dispositioned. `O-01` through `O-17` are
 > ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18`
 > transport/DA bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34
 > slash-record schema await owner responses
 > in `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
 > `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
-> `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. Open work under
+> `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `O-21` optimistic
+> decision evidence awaits a response in
+> `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. Open work under
 > O-01 through O-17 is an engineering, research, schema, parameter, or proof gate
 > under a ratified direction, not a request for another owner answer.
 
@@ -628,6 +630,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
     invalid-state-proof-only V1 record plus future variant-specific ADT payloads and
     keys. Do not infer acceptance, activate latent slash reasons, retain JSON bytes,
     or encode sentinel/optional future contexts before `O20-01` is answered.
+  - [ ] **O-21 OWNER RESPONSE REQUIRED / OPTIMISTIC EVIDENCE FREEZE:** review
+    `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. The
+    recommendation is sorted unique exact signed local cascade-decision
+    statements, with query transcripts audit-only. This does not introduce a
+    global vote, lock, QC, view change, or fork-choice path. Canonical `k1` remains
+    the only live state-changing Phase-2 rail until the full optimistic proof and
+    exact-hash gate close.
   - **Landed nonactivating typed-key completeness slice (2026-07-16):**
     `GlobalStateKeyCodec` now covers all six namespace variants. `SystemNamespace`
     uses outer tag `0x05` and four closed inner label tags with exact vectors and
@@ -763,6 +772,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     signature and context-free structure before native enqueue, solely as resource
     admission; every GL0 validator must still execute and validate every direct
     `GL1 -> GL0` transition against the exact proposal parent.
+  - **Landed narrow bootstrap containment, HIGH residual remains:** peer selection
+    now carries one exact tuple, restricts hash queries to the unique largest
+    ordinal cohort, and rejects tied largest cohorts. GL0 rejects a selected
+    peer's changed metadata and invalid/wrong full genesis; ML0 rejects a changed
+    or invalidly signed selected snapshot and a context that does not reproduce
+    its signed state proof. This does not authenticate an eclipsed plurality or
+    ML0 facilitator quorum. GL0 still clears state before staging/authenticating
+    the complete replacement. Add orchestration-level recording-store tests,
+    historical ML0 membership/quorum verification, objective GL0 chain
+    comparison, and one all-sink staged atomic switch before closing recovery.
   - Fuzz every remaining untrusted family into typed per-message outcomes, and make
     multi-sink handler effects atomic or resumable across unexpected worker failure
     and process restart.

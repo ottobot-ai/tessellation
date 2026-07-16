@@ -9,9 +9,10 @@ the upstream-v4 migration-coverage audit and also awaits an owner response; no i
 infer a field disposition, source-authentication exception, registry, epoch/eta mapping, or
 conservation rule. `O-20` was surfaced by the field-34 slash-record audit and awaits an owner
 response; no implementation may infer a generalized slash-record schema or activate a latent slash
-reason.
-**Owner-question completeness:** `17/20` dispositioned. `O-01` through `O-17` are ratified;
-`O-18`, `O-19`, and `O-20` are pending.
+reason. `O-21` was surfaced by the optimistic-finality evidence audit and awaits an owner response;
+no implementation may infer that gossip counts or an opaque digest prove a completed sampled cascade.
+**Owner-question completeness:** `17/21` dispositioned. `O-01` through `O-17` are ratified;
+`O-18`, `O-19`, `O-20`, and `O-21` are pending.
 **Updated:** 2026-07-16
 
 This register uses project phases only where the owner has ratified them:
@@ -718,6 +719,29 @@ that recommendation has no authority until answered.
 Until then, RED tests and dark codec experiments may proceed, but no implementation
 may activate field-34 Scodec bytes, use sentinels/optional combinations to fill
 undefined future contexts, or treat enum presence as a designed slash consequence.
+
+### O-21 Optimistic decision evidence
+
+Owner-review packet:
+[O-21 Optimistic Decision Evidence Owner Review](O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md).
+
+**OWNER RESPONSE REQUIRED; OPTIMISTIC RAIL REMAINS DARK.** The owner has already
+ratified `decided-attestation T_weight OR canonical k1 depth`, with no global BFT
+lock/QC and no optimistic fork-choice or economic-validity authority. The missing
+decision is whether the required sorted unique signed local decision statements
+are sufficient alone or require additional authoritative complete sampling
+transcripts or transcript commitments with mandatory retrieval.
+
+The packet recommends exact signed local decision statements, with query
+transcripts retained only as non-authoritative audit material. Every statement
+must bind the exact state ref, domain/parameter identity, signer and historical
+KES step, N-2 roster/stake/key view, N-1 eta, and exact cascade context. The
+verifier derives historical `T_weight`; `T_count`, receiver-observed liveness,
+wall clock, and current local state have no authority.
+
+Until `O21-01` is answered and the O-01/O-11/O-12/O-15/O-16/O-18 engineering gates close,
+`TipAttestation`, `SnowballAccumulator`, and `TWeightTrigger` remain telemetry,
+and `DecidedAttestationEvidence` remains opaque and nonactivating.
 
 ## Change rule
 

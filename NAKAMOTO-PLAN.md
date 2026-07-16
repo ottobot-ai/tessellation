@@ -14,16 +14,18 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `17/20` dispositioned. `O-01` through `O-17` are
+**Owner-decision status:** `17/21` dispositioned. `O-01` through `O-17` are
 ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
 bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34 slash-record schema
 await owner responses in
 `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
 `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
-`docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. Dependencies under
+`docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `O-21` optimistic decision
+evidence awaits a response in
+`docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. Dependencies under
 O-01 through O-17 mean implementation of their ratified direction and closure of
 their listed engineering, research, schema, parameter, or proof gates. O-18,
-O-19, and O-20 are the only pending owner responses.
+O-19, O-20, and O-21 are the only pending owner responses.
 
 ## Active objective
 
@@ -1226,6 +1228,16 @@ These are consensus dependencies, not optional cleanup:
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
 
+The bootstrap selector now returns an exact peer/ordinal/hash tuple, restricts
+hash queries to a unique largest ordinal cohort, and rejects tied largest
+cohorts. GL0 binds fresh metadata to that tuple and verifies cached/fetched full
+genesis against the child-linked identity; ML0 binds the selected signed snapshot
+and supplied state proof. This is narrow TOCTOU/self-consistency containment. A
+peer-reported plurality is not consensus evidence, ML0 historical facilitator
+quorum is not yet proved, and GL0 cleanup still precedes complete authenticated
+staging. S4/E11 must stage, objectively authenticate/compare, and atomically
+switch every sink before abandoning the prior generation.
+
 Current S1 evidence is cleanup, identity, and one dark byte contract only. The
 stale configurable Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
 deleted. `ProtocolEraId.ScodecV1` is frozen to strict tag `0x01`; empty,
@@ -1240,8 +1252,8 @@ blockers include accumulator omissions for rooted field 33
 `ConsumedAllowSpends` and field 34 `Slashings`, the unenforced ROOT-008 physical
 MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard
 diff/positive replay-coverage, exact optimistic-tip attestation, and finality/tower
-proof schemas, plus the pending O-18 transport/DA, O-19 migration-policy, and O-20
-field-34 slash-record decisions. A separate explicit,
+proof schemas, plus the pending O-18 transport/DA, O-19 migration-policy, O-20
+field-34 slash-record, and O-21 optimistic-decision-evidence decisions. A separate explicit,
 non-implicit MPT commitment codec freezes strict leaf/branch/extension bytes and
 passes 15 focused tests. The atomic-cutover guard now inventories ordinal-selected
 hash/state-proof authority, direct hash selection, legacy field-erasing snapshot
