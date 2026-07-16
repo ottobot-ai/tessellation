@@ -239,6 +239,13 @@ period/slot, and purpose at every inventoried VRF/sortition use. It records know
 accumulator/change-set, MPT-key, slashing-value, optimistic-attestation, tower,
 genesis, lane, O18, O19, and O20 blockers; it does not close E1.1 or E1.3.
 
+A passing follower characterization now proves each native-field omission
+independently: a signed target root containing field 33 or opaque field-34 bytes
+cannot be reproduced from the 31-field accumulator, returns no installable GSI,
+and transactionally restores the prior entries, root, and persisted ordinal. The
+current path therefore fails closed at an availability/resync cost. It neither
+defines field-34 bytes nor fixes either accumulator omission.
+
 The dark typed `GlobalStateKeyCodec` now covers all six namespace variants:
 `SystemNamespace` uses outer tag `0x05` plus four closed label tags, exact vectors,
 and strict unknown/trailing rejection. A source tripwire keeps those bytes outside

@@ -14,19 +14,23 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake._
+import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.generators._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.swap.{AllowSpendOrdinal, AllowSpendReference}
+import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.sharding.ShardId
+import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.ConsumedAllowSpendCodec
 
 import eu.timepit.refined.auto._
-import eu.timepit.refined.types.numeric.NonNegLong
+import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
 /** Task #12 slice 4 — tests for the ml0 ADOPT-AND-VERIFY follow primitives:
@@ -332,6 +336,135 @@ object ApplyAccumulatorToGSISuite extends MutableIOSuite {
   // ---------------------------------------------------------------------------------------------------------------------------------------
   // (c) NEGATIVE safety guard — verify-before-adopt must roll back on mismatch
   // ---------------------------------------------------------------------------------------------------------------------------------------
+
+  test(
+    "(c) current accumulator omits MPT-native fields 33/34: each signed-root mismatch returns None and rolls back every representable change"
+  ) { res =>
+    implicit val (j, h, sp) = res
+
+    val priorOrd = SnapshotOrdinal(NonNegLong(999L))
+    val prior = GlobalSnapshotInfo.empty.copy(balances = SortedMap(addr1 -> Balance(1000L)))
+    val delta = StateChangesAccumulator(balances = SortedMap(addr1 -> Balance(1500L), addr2 -> Balance(500L)))
+    val consumedHash = testHash("consumed-native-only")
+    val consumed = ConsumedAllowSpend(
+      allowSpendHash = consumedHash,
+      source = addr1,
+      destination = addr2,
+      currencyId = none,
+      amount = SwapAmount(PosLong.unsafeFrom(1L)),
+      lastValidEpochProgress = EpochProgress(NonNegLong(10L)),
+      consumedAtOrdinal = ord,
+      consumingSpendRef = testHash("spend-ref")
+    )
+
+    final case class OmissionOutcome(
+      nativeField: GlobalStateFieldId,
+      nativeKeyPresent: Boolean,
+      nativeLeafChangesRoot: Boolean,
+      deltaUpsertFields: Set[GlobalStateFieldId],
+      deltaRemovalFields: Set[GlobalStateFieldId],
+      candidateDiffersFromPrior: Boolean,
+      result: Option[GlobalSnapshotInfo],
+      entriesRestored: Boolean,
+      rootRestored: Boolean,
+      ordinalRestored: Boolean
+    )
+
+    def exercise(
+      writeNativeLeaf: MptStore[IO, GlobalStateKey] => IO[Hex]
+    ): IO[OmissionOutcome] =
+      for {
+        // This is the complete typed delta emitted for the otherwise ordinary balance update. Its observable key set is the honest
+        // characterization seam: neither native field has an upsert or removal representation.
+        typedUpserts <- GlobalStateConverter.toAccumulatorBytesDelta[IO](delta)
+        typedRemovals <- GlobalStateConverter.toAccumulatorRemovalKeys[IO](delta)
+
+        // Independent producer image: apply the representable delta, then add exactly one MPT-native consensus leaf and compute the root
+        // the snapshot would sign. Field 33 uses its existing typed codec; field 34 deliberately remains opaque bytes in this test.
+        targetProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+        targetStore <- MptStore.make[IO, GlobalStateKey](targetProducer, GlobalStateKey.toHex[IO])
+        _ <- targetStore.syncFromGlobalSnapshotInfo(prior, priorOrd)
+        _ <- targetStore.syncFromStateChanges(delta, ord)
+        deltaOnlyEntries <- targetStore.allEntriesAsBytes
+        deltaOnlyRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](deltaOnlyEntries)
+        nativeHex <- writeNativeLeaf(targetStore)
+        _ <- targetStore.commit(ord)
+        targetEntries <- targetStore.allEntriesAsBytes
+        targetRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](targetEntries)
+
+        // Follower has the exact parent but receives only the current 31-field accumulator. It temporarily applies the balance update,
+        // cannot reproduce the native leaf, and must roll the transaction back instead of partially advancing MPT or returning a GSI.
+        followerProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+        followerStore <- MptStore.make[IO, GlobalStateKey](followerProducer, GlobalStateKey.toHex[IO])
+        _ <- followerStore.syncFromGlobalSnapshotInfo(prior, priorOrd)
+        priorEntries <- followerStore.allEntriesAsBytes
+        priorRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](priorEntries)
+        priorPersistedOrdinal <- followerStore.lastPersistedOrdinal
+        candidate = GlobalStateConverter.applyAccumulatorToGSI(prior, delta)
+        result <- GlobalStateConverter.adoptAndVerifyChangeSetDelta[IO](followerStore, prior, delta, targetRoot.some, ord)
+        afterEntries <- followerStore.allEntriesAsBytes
+        afterRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](afterEntries)
+        afterPersistedOrdinal <- followerStore.lastPersistedOrdinal
+      } yield
+        OmissionOutcome(
+          nativeField = GlobalStateKey.fieldIdFromHex(nativeHex).get,
+          nativeKeyPresent = targetEntries.contains(nativeHex),
+          nativeLeafChangesRoot = targetRoot =!= deltaOnlyRoot,
+          deltaUpsertFields = typedUpserts.keysIterator.map(_.fieldId).toSet,
+          deltaRemovalFields = typedRemovals.iterator.map(_.fieldId).toSet,
+          candidateDiffersFromPrior = candidate =!= prior,
+          result = result,
+          entriesRestored = entriesEqual(priorEntries, afterEntries),
+          rootRestored = afterRoot === priorRoot,
+          ordinalRestored = afterPersistedOrdinal === priorPersistedOrdinal
+        )
+
+    val field33 = exercise { store =>
+      val key = GlobalStateKey.consumedAllowSpendKey(consumedHash)
+      store
+        .insert[ConsumedAllowSpend](key, consumed)(ConsumedAllowSpendCodec.immutableCodec)
+        .productR(GlobalStateKey.toHex[IO](key))
+    }
+    val field34 = exercise { store =>
+      for {
+        key <- GlobalStateKey.slashingsKey[IO](PeerId(Hex("ab" * 64)), ShardId.unsafeApply(0), testHash("slash-checkpoint"))
+        hex <- GlobalStateKey.toHex[IO](key)
+        // Bytes-level only: this test must not choose or freeze the future field-34 value schema.
+        _ <- store.underlying.insertBytes(Map(hex -> Array[Byte](1, 2, 3, 4))).flatMap(_.liftTo[IO])
+      } yield hex
+    }
+
+    for {
+      spentSet <- field33
+      slashLedger <- field34
+      nativeFields = GlobalStateFieldId.mptNativeConsensusFields
+    } yield
+      expect.all(
+        nativeFields == Set(GlobalStateFieldId.ConsumedAllowSpends, GlobalStateFieldId.Slashings),
+        spentSet.nativeField == GlobalStateFieldId.ConsumedAllowSpends,
+        slashLedger.nativeField == GlobalStateFieldId.Slashings,
+        spentSet.nativeKeyPresent,
+        slashLedger.nativeKeyPresent,
+        spentSet.nativeLeafChangesRoot,
+        slashLedger.nativeLeafChangesRoot,
+        spentSet.deltaUpsertFields.contains(GlobalStateFieldId.Balances),
+        slashLedger.deltaUpsertFields.contains(GlobalStateFieldId.Balances),
+        spentSet.deltaUpsertFields.intersect(nativeFields).isEmpty,
+        slashLedger.deltaUpsertFields.intersect(nativeFields).isEmpty,
+        spentSet.deltaRemovalFields.intersect(nativeFields).isEmpty,
+        slashLedger.deltaRemovalFields.intersect(nativeFields).isEmpty,
+        spentSet.candidateDiffersFromPrior,
+        slashLedger.candidateDiffersFromPrior,
+        spentSet.result.isEmpty,
+        slashLedger.result.isEmpty,
+        spentSet.entriesRestored,
+        slashLedger.entriesRestored,
+        spentSet.rootRestored,
+        slashLedger.rootRestored,
+        spentSet.ordinalRestored,
+        slashLedger.ordinalRestored
+      )
+  }
 
   test("(c) adoptAndVerifyChangeSetDelta NEGATIVE: wrong signed mptRoot ⇒ None and store ROLLED BACK to prior") { res =>
     implicit val (j, h, sp) = res

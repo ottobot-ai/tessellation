@@ -616,6 +616,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
     transport/DA bytes, O-19 controls migration transform/conservation/target-genesis
     policy, and O-20 must select the field-34 V1 record shape before the JSON leaf
     and accumulator omission can be replaced by active Scodec bytes.
+  - **Landed fail-closed accumulator characterization (2026-07-16):** an
+    independent target root containing either a typed field-33 leaf or opaque
+    field-34 bytes cannot be reproduced from the current 31-field accumulator.
+    `adoptAndVerifyChangeSetDelta` returns no installable result and restores the
+    follower's exact entries, root, and persisted ordinal. This proves the current
+    omission is a liveness/heavy-resync defect rather than silent partial adoption;
+    it does not define field-34 bytes or close either omission.
   - [ ] **O-20 OWNER RESPONSE REQUIRED / FIELD-34 SCHEMA FREEZE:** review
     `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. The recommendation is an
     invalid-state-proof-only V1 record plus future variant-specific ADT payloads and
