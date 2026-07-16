@@ -1113,6 +1113,20 @@ These are consensus dependencies, not optional cleanup:
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
 
+Current S2 evidence is intentionally narrow. A nonactivating test reference
+interpreter supports exactly the typed IDs for zero-fee native transfer,
+zero-fee currency transfer, and zero-fee allow-spend creation. The allow-spend
+row enforces complete source-preimage binding, exact domain/lane/per-source
+parent, an explicit epoch window, checked arithmetic, reservation conservation,
+no destination credit, permanent semantic replay identity, and atomic failure.
+The closed supported-ID partition maps all three IDs to positive constructors;
+the unsupported sentinel refuses them and dynamically fails closed every other
+manifest row. Its 31 focused tests are green. This is not production/reference
+differential evidence, runtime execution, canonical Scodec/hash/signature bytes,
+or MPT/root integration. Nonzero fees remain fail-closed pending an explicit
+source/sink rule, allow-spend consume/expiry/refund remain blocked on O-13, and
+every other S2 grammar row remains open.
+
 Work may be delegated in parallel only with disjoint write sets and frozen shared
 types. Model/RED authors do not approve their own runtime implementation. Shared
 hotspots (`FinalityGate`, checkpoint schema/codecs, GSAM, MPT transaction code,

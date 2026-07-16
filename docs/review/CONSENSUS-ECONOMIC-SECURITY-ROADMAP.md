@@ -259,6 +259,25 @@ it distinguishes their required target authorities. It is explicitly partial:
 until the mechanical reachability inventory and every RED/oracle row close,
 E2.9 and O-07's engineering grammar/oracle gate remain open.
 
+The landed E2.1 reference slice is test-only and nonactivating. It supports
+exactly three typed operation IDs: zero-fee native transfer, zero-fee currency
+transfer, and zero-fee allow-spend creation. The allow-spend row binds the
+complete source-signed preimage, exact domain/lane/per-source parent, and an
+explicit supplied epoch window; applies checked `BigInt` arithmetic; reserves
+the amount without destination credit; advances a distinct allow-spend
+reference chain; retains a permanent semantic identity; and rejects invalid or
+replayed inputs without partial state. A closed supported-ID set maps each ID to
+a positive constructor, prevents those IDs from entering the unsupported
+sentinel path, and dynamically fails closed every other manifest row. The three
+focused suites pass 31 tests.
+
+This evidence does not implement or validate the production kernel,
+production/reference differential adapter, canonical Scodec/hash/signature
+bytes, MPT writes, complete-root calculation, or runtime activation. Nonzero
+fee disposition remains unfrozen and fail-closed. Allow-spend
+consume/expiry/refund remain blocked on O-13 terminal ordering, and every other
+E2 operation row remains open.
+
 ### E3 - Pure finality and fork-choice model
 
 **Depends on:** E0 phase decisions. Pure model can run in parallel with E1/E2.
