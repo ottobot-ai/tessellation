@@ -214,9 +214,13 @@ object V4EconomicReferenceTokenLockSuite extends FunSuite {
 
     expect(replay.rejected.head.reason == DuplicateSemanticIdentity(firstIdentity))
       .and(expect(replay.finalState == acceptedState))
-      .and(expect(siblingResult.rejected.head.reason == TokenLockParentReferenceMismatch(expectedParent, StructuralTokenLockReference.genesis)))
+      .and(
+        expect(siblingResult.rejected.head.reason == TokenLockParentReferenceMismatch(expectedParent, StructuralTokenLockReference.genesis))
+      )
       .and(expect(siblingResult.finalState == acceptedState))
-      .and(expect(phantomResult.rejected.head.reason == TokenLockParentReferenceMismatch(StructuralTokenLockReference.genesis, phantomParent)))
+      .and(
+        expect(phantomResult.rejected.head.reason == TokenLockParentReferenceMismatch(StructuralTokenLockReference.genesis, phantomParent))
+      )
       .and(expect(phantomResult.finalState == base))
       .and(expect(successorResult.decisions.head.isInstanceOf[Accepted]))
       .and(
@@ -288,12 +292,11 @@ object V4EconomicReferenceTokenLockSuite extends FunSuite {
       preimage(NativeGl1, parent = malformedParent) -> MalformedTokenLockParentReference(2, 1)
     )
 
-    cases
-      .map {
-        case (p, expected) =>
-          val result = execute(context(NativeGl1), base, create(p))
-          expect(result.rejected.head.reason == expected).and(expect(result.finalState == base))
-      }
+    cases.map {
+      case (p, expected) =>
+        val result = execute(context(NativeGl1), base, create(p))
+        expect(result.rejected.head.reason == expected).and(expect(result.finalState == base))
+    }
       .reduce(_ and _)
   }
 
@@ -350,7 +353,11 @@ object V4EconomicReferenceTokenLockSuite extends FunSuite {
       .and(expect(result.conservedTotals(Dag) == 100))
       .and(
         expect(
-          result.decisions.collect { case accepted: Accepted => accepted.conservedTotals(Dag) } == Vector(BigInt(100), BigInt(100), BigInt(100))
+          result.decisions.collect { case accepted: Accepted => accepted.conservedTotals(Dag) } == Vector(
+            BigInt(100),
+            BigInt(100),
+            BigInt(100)
+          )
         )
       )
   }
