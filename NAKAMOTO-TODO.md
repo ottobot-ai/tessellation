@@ -606,9 +606,24 @@ criteria are in `NAKAMOTO-PLAN.md`.
     to a positive input constructor, refuses those IDs in the unsupported
     sentinel, and dynamically fails closed every remaining manifest row. The 41
     focused tests are green.
-  - This slice is not the production kernel, production/reference differential
-    adapter, canonical hash/signature/Scodec encoding, MPT/root integration, or
-    runtime activation. Nonzero fee disposition remains unfrozen and fail-closed.
+  - **Landed bounded production/reference characterization (2026-07-16):** a
+    test-only adapter exercises the real lower native acceptance managers and
+    currency ML0 wrappers for zero-fee transfer and allow-spend creation. It
+    verifies production signatures/source ownership, canonical lane genesis,
+    exact parents, accepted-block payload binding, exact exposed balances and
+    successor references, single-operation active allow-spends, and real
+    one-call batch accepted/rejected/dependent/awaiting outcomes. Thirteen tests
+    are green. Raw reference inputs remain private to the adapter.
+  - This evidence is not the production kernel, full GL0 acceptance path, E2.8
+    completion, cross-platform property corpus, canonical
+    hash/signature/Scodec encoding, MPT/root integration, or runtime activation.
+    Production batch insufficiency is `Awaiting` while the reference row rejects;
+    live GL0 accepts an allow-spend outside the target reference epoch window.
+    Legacy payload signatures do not bind domain/lane, production exposes no
+    independent replay-ID or write-order evidence, and batch allow-spend APIs do
+    not expose active-record deltas. Single-result observers consume
+    caller-supplied production results and prove no invocation provenance.
+    Nonzero fee disposition remains unfrozen and fail-closed.
     Live snapshot acceptance does not yet enforce the reference row's contextual
     token-lock minimum-duration rule. Token-lock replacement, expiry/refund, and
     manual unlock remain open. Allow-spend consume/expiry/refund remain blocked

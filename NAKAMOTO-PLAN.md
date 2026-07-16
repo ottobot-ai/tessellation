@@ -1138,13 +1138,25 @@ active-principal conservation, separate-reference, and permanent-replay rules
 over the same ordered balance ledger. The closed supported-ID partition maps all
 four IDs to positive constructors; the unsupported sentinel refuses them and
 dynamically fails closed every other manifest row. Its 41 focused tests are
-green. This is not production/reference differential evidence, runtime
-execution, canonical Scodec/hash/signature bytes, or MPT/root integration.
-Nonzero fees remain fail-closed pending an explicit source/sink rule. Live
-snapshot acceptance still lacks the reference row's contextual token-lock
-minimum-duration rule; token-lock replacement, expiry/refund, and manual unlock
-remain open. Allow-spend consume/expiry/refund remain blocked on O-13, and every
-other S2 grammar row remains open.
+green.
+
+A bounded test-only adapter supplies initial context and runs the real lower
+native acceptance managers and currency ML0 wrappers for the transfer and
+allow-spend rows. It binds accepted blocks to their exact payload, keeps raw
+reference inputs private, and compares exact exposed balance/reference state and
+single-operation active allow-spends across 13 green tests, including real
+one-call mixed-outcome batches. This is conditional characterization, not full
+GL0-kernel evidence or E2.8 completion: batch insufficiency is production
+`Awaiting` versus reference rejection; live GL0's allow-spend epoch rule differs
+from the target window; legacy signatures omit domain/lane; production exposes
+no independent replay-ID/write-order evidence or batch active-record delta; and
+single-result observers consume caller-supplied results. Runtime kernel
+activation, cross-platform properties, canonical Scodec/hash/signature bytes,
+MPT/root integration, and nonzero fees remain open. Live snapshot acceptance
+still lacks the reference row's contextual token-lock minimum-duration rule;
+token-lock replacement, expiry/refund, and manual unlock remain open. Allow-spend
+consume/expiry/refund remain blocked on O-13, and every other S2 grammar row
+remains open.
 
 Work may be delegated in parallel only with disjoint write sets and frozen shared
 types. Model/RED authors do not approve their own runtime implementation. Shared

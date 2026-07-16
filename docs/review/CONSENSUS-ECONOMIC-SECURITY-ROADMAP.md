@@ -291,14 +291,28 @@ ledger. A closed supported-ID set maps each ID to a positive constructor,
 prevents those IDs from entering the unsupported sentinel path, and dynamically
 fails closed every other manifest row. The four focused suites pass 41 tests.
 
-This evidence does not implement or validate the production kernel,
-production/reference differential adapter, canonical Scodec/hash/signature
-bytes, MPT writes, complete-root calculation, or runtime activation. Nonzero
-fee disposition remains unfrozen and fail-closed. Live snapshot acceptance does
-not yet enforce the reference row's contextual token-lock minimum-duration rule;
-token-lock replacement, expiry/refund, and manual unlock remain open.
-Allow-spend consume/expiry/refund remain blocked on O-13 terminal ordering, and
-every other E2 operation row remains open.
+A bounded test-only production adapter now exercises the real lower native
+acceptance managers and currency ML0 wrappers for zero-fee transfer and
+allow-spend creation. It verifies production signatures/source ownership,
+canonical lane genesis, exact parents, accepted-block payload binding, exact
+exposed balances and successor references, single-operation active
+allow-spends, and real one-call batch accepted/rejected/dependent/awaiting
+outcomes. Raw reference inputs remain private to the adapter. Its 13 tests pass.
+
+This evidence does not implement or validate the production kernel, complete
+GL0 acceptance path, E2.8 cross-platform property corpus, canonical
+Scodec/hash/signature bytes, MPT writes, complete-root calculation, or runtime
+activation. Production batch insufficiency is `Awaiting` while the reference
+row rejects, and live GL0 accepts an allow-spend outside the target reference
+epoch window. Legacy payload signatures do not bind domain/lane; production
+exposes no independent replay-ID or write-order evidence; batch allow-spend APIs
+do not expose active-record deltas; single-result observers consume
+caller-supplied results and prove no invocation provenance; and nonzero fees
+remain out of scope. Live snapshot acceptance does not yet enforce the reference
+row's contextual token-lock minimum-duration rule; token-lock replacement,
+expiry/refund, and manual unlock remain open. Allow-spend consume/expiry/refund
+remain blocked on O-13 terminal ordering, and every other E2 operation row
+remains open.
 
 ### E3 - Pure finality and fork-choice model
 

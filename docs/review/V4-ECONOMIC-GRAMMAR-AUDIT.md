@@ -430,14 +430,26 @@ ID. Every remaining manifest row is discovered dynamically and fails closed.
 The interpreter, allow-spend, token-lock, and manifest-coverage suites pass 41
 focused tests.
 
-This is not production-kernel implementation, production/reference
-differential evidence, canonical Scodec/hash/signature binding, MPT/root
-integration, or runtime activation. Nonzero fees remain fail-closed because
-their disposition is not frozen. Live snapshot acceptance does not yet enforce
-the reference row's contextual token-lock minimum-duration rule. Token-lock
-replacement, expiry/refund, and manual unlock remain open. Allow-spend consume,
-expiry, and refund remain blocked on O-13 terminal ordering. Every other grammar
-row remains open.
+A bounded test-only production adapter exercises the real lower native
+acceptance managers and currency ML0 wrappers for zero-fee transfer and
+allow-spend creation. It checks production signature/source ownership,
+canonical lane genesis, exact parents, accepted-block payload binding, exact
+exposed balance/reference state, single-operation active allow-spends, and real
+one-call mixed-outcome batches against the reference model. Raw reference inputs
+are not exposed. The 13 focused characterization tests pass.
+
+This is not production-kernel implementation, the complete GL0 acceptance path,
+E2.8 completion, canonical Scodec/hash/signature binding, MPT/root integration,
+or runtime activation. Production batch insufficiency awaits while the reference
+row rejects; live GL0's allow-spend epoch rule differs from the target window;
+legacy signatures omit domain/lane; production exposes no independent replay-ID
+or write-order evidence and no batch allow-spend active-record delta; and
+single-result observers accept caller-supplied production results. Nonzero fees
+remain fail-closed because their disposition is not frozen. Live snapshot
+acceptance does not yet enforce the reference row's contextual token-lock
+minimum-duration rule. Token-lock replacement, expiry/refund, and manual unlock
+remain open. Allow-spend consume, expiry, and refund remain blocked on O-13
+terminal ordering. Every other grammar row remains open.
 
 ## 6. Required RED and oracle tests
 
