@@ -387,6 +387,11 @@ No active field number is assigned here. Greenfield active state uses the frozen
 Scodec era from ordinal zero; upstream v4 data remains read-only import input and
 cannot silently default a missing cursor into signable state.
 
+The remaining terminal-order decisions are isolated for owner review in
+[`O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md`](O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md).
+That packet is not an executable rule: O13-A3 still requires an exact schema
+freeze before production terminal settlement may select a winner.
+
 ### O-14 Framework fee sequence and opaque-data binding
 
 **Owner-ratified direction; schema not frozen.** Reuse the already rooted per-metagraph

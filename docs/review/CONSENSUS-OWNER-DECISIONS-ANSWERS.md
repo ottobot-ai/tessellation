@@ -360,6 +360,13 @@ and non-load-bearing for V1; V1 safety cannot assume escrow or `k2` secret rollb
 
 ## O-13 — Durable delivery sequence 🟡
 
+**Pending owner packet:**
+[`O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md`](O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md).
+Its candidate-universe, conflict, expiry, partial-consume, ML0 application, and
+same-proposal recommendations require owner disposition; its exact source-locator
+and native-versus-checkpoint ordering schema remains an explicit implementation
+gate.
+
 **Owner-ratified direction** (`CONSENSUS-OWNER-DECISIONS.md:350-386`): hash-linked
 per-destination sequence, rooted outbox head + permanent nullifier, ML0 applied-`(sequence,
 deliveryId)` cursor, contiguous execution from one exact Phase-2 ref, CAS ack, pending records as
