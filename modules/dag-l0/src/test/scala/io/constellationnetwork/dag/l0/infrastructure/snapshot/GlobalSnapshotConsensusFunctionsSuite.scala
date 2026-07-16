@@ -1,5 +1,7 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
+import java.util.UUID
+
 import cats.data.Validated.Valid
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect._
@@ -18,7 +20,7 @@ import io.constellationnetwork.dag.l0.domain.snapshot.programs.{
   UpdateNodeParametersCutter
 }
 import io.constellationnetwork.dag.l0.infrastructure.rewards.RewardsService
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.{DAGEvent, GlobalSnapshotEvent, StateChannelEvent}
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment.Dev
 import io.constellationnetwork.ext.cats.effect.ResourceIO
@@ -60,7 +62,8 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.tokenLock.TokenLockBlock
+import io.constellationnetwork.schema.round.RoundId
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.schema.{GlobalStateProofSelector, _}
 import io.constellationnetwork.security._
@@ -74,7 +77,7 @@ import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSna
 import io.constellationnetwork.syntax.sortedCollection._
 
 import eu.timepit.refined.auto._
-import eu.timepit.refined.types.numeric.{NonNegLong, PosInt}
+import eu.timepit.refined.types.numeric.{NonNegLong, PosInt, PosLong}
 import io.circe.{Encoder, Json}
 import weaver.MutableIOSuite
 import weaver.scalacheck.Checkers
@@ -227,6 +230,186 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       signedBlock <- Signed.forAsyncHasher[IO, Block](block, sourceKeyPair)
     } yield signedBlock
   }
+
+  private final case class NativeAllowSpendAcceptanceCall(
+    blocks: List[Signed[swap.AllowSpendBlock]],
+    ordinal: SnapshotOrdinal,
+    shouldPerformMetagraphSpecificValidations: Boolean,
+    lastGlobalSnapshotEpochProgress: Option[EpochProgress]
+  )
+
+  private def isExpectedNativeAllowSpendAcceptance(
+    calls: List[NativeAllowSpendAcceptanceCall],
+    block: Signed[swap.AllowSpendBlock],
+    ordinal: SnapshotOrdinal,
+    epochProgress: EpochProgress
+  ): Boolean =
+    calls match {
+      case List(call) =>
+        call.blocks == List(block) &&
+        call.ordinal == ordinal &&
+        call.shouldPerformMetagraphSpecificValidations &&
+        call.lastGlobalSnapshotEpochProgress.contains(epochProgress)
+      case _ => false
+    }
+
+  private def recordingNativeAllowSpendAcceptanceManager(
+    calls: Ref[IO, List[NativeAllowSpendAcceptanceCall]],
+    reproducedBalances: Map[Address, Balance],
+    accept: Boolean = true
+  ): AllowSpendBlockAcceptanceManager[IO] =
+    new AllowSpendBlockAcceptanceManager[IO] {
+      override def acceptBlocksIteratively(
+        blocks: List[Signed[swap.AllowSpendBlock]],
+        context: AllowSpendBlockAcceptanceContext[IO],
+        snapshotOrdinal: SnapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations: Boolean = true,
+        lastGlobalSnapshotEpochProgress: Option[EpochProgress]
+      )(implicit hasher: Hasher[IO]): IO[AllowSpendBlockAcceptanceResult] =
+        calls
+          .update(
+            _ :+ NativeAllowSpendAcceptanceCall(
+              blocks,
+              snapshotOrdinal,
+              shouldPerformMetagraphSpecificValidations,
+              lastGlobalSnapshotEpochProgress
+            )
+          )
+          .as(
+            AllowSpendBlockAcceptanceResult(
+              AllowSpendBlockAcceptanceContextUpdate(
+                if (accept) reproducedBalances else Map.empty,
+                Map.empty
+              ),
+              if (accept) blocks else List.empty,
+              List.empty
+            )
+          )
+
+      override def acceptBlock(
+        block: Signed[swap.AllowSpendBlock],
+        context: AllowSpendBlockAcceptanceContext[IO],
+        snapshotOrdinal: SnapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations: Boolean = true,
+        lastGlobalSnapshotEpochProgress: Option[EpochProgress]
+      )(implicit hasher: Hasher[IO]): IO[Either[AllowSpendBlockNotAcceptedReason, AllowSpendBlockAcceptanceContextUpdate]] =
+        IO.raiseError(new IllegalStateException("The global acceptance path must use iterative native allow-spend acceptance"))
+    }
+
+  private def mkNativeAllowSpendBlock(
+    sourceKeyPair: java.security.KeyPair,
+    destination: Address
+  )(
+    implicit sp: SecurityProvider[IO],
+    hasher: Hasher[IO]
+  ): IO[Signed[swap.AllowSpendBlock]] =
+    for {
+      signedAllowSpend <- Signed.forAsyncHasher[IO, swap.AllowSpend](
+        swap.AllowSpend(
+          source = PublicKeyOps(sourceKeyPair.getPublic).toAddress,
+          destination = destination,
+          currencyId = None,
+          amount = swap.SwapAmount(PosLong.unsafeFrom(10L)),
+          fee = swap.AllowSpendFee(1L),
+          parent = swap.AllowSpendReference.empty,
+          lastValidEpochProgress = EpochProgress(100L),
+          approvers = List(destination)
+        ),
+        sourceKeyPair
+      )
+      block = swap.AllowSpendBlock(RoundId(new UUID(0L, 1L)), NonEmptySet.one(signedAllowSpend))
+      signedBlock <- Signed.forAsyncHasher[IO, swap.AllowSpendBlock](block, sourceKeyPair)
+    } yield signedBlock
+
+  private final case class NativeTokenLockAcceptanceCall(
+    blocks: List[Signed[TokenLockBlock]],
+    ordinal: SnapshotOrdinal,
+    shouldPerformMetagraphSpecificValidations: Boolean,
+    lastGlobalSnapshotEpochProgress: Option[EpochProgress]
+  )
+
+  private def isExpectedNativeTokenLockAcceptance(
+    calls: List[NativeTokenLockAcceptanceCall],
+    block: Signed[TokenLockBlock],
+    ordinal: SnapshotOrdinal,
+    epochProgress: EpochProgress
+  ): Boolean =
+    calls match {
+      case List(call) =>
+        call.blocks == List(block) &&
+        call.ordinal == ordinal &&
+        call.shouldPerformMetagraphSpecificValidations &&
+        call.lastGlobalSnapshotEpochProgress.contains(epochProgress)
+      case _ => false
+    }
+
+  private def recordingNativeTokenLockAcceptanceManager(
+    calls: Ref[IO, List[NativeTokenLockAcceptanceCall]],
+    reproducedBalances: Map[Address, Balance],
+    accept: Boolean = true
+  ): TokenLockBlockAcceptanceManager[IO] =
+    new TokenLockBlockAcceptanceManager[IO] {
+      override def acceptBlocksIteratively(
+        blocks: List[Signed[TokenLockBlock]],
+        context: TokenLockBlockAcceptanceContext[IO],
+        snapshotOrdinal: SnapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations: Boolean = true,
+        lastGlobalSnapshotEpochProgress: Option[EpochProgress]
+      )(implicit hasher: Hasher[IO]): IO[TokenLockBlockAcceptanceResult] =
+        calls
+          .update(
+            _ :+ NativeTokenLockAcceptanceCall(
+              blocks,
+              snapshotOrdinal,
+              shouldPerformMetagraphSpecificValidations,
+              lastGlobalSnapshotEpochProgress
+            )
+          )
+          .as(
+            TokenLockBlockAcceptanceResult(
+              TokenLockBlockAcceptanceContextUpdate(
+                if (accept) reproducedBalances else Map.empty,
+                Map.empty,
+                Set.empty,
+                Map.empty
+              ),
+              if (accept) blocks else List.empty,
+              List.empty
+            )
+          )
+
+      override def acceptBlock(
+        block: Signed[TokenLockBlock],
+        context: TokenLockBlockAcceptanceContext[IO],
+        snapshotOrdinal: SnapshotOrdinal,
+        shouldPerformMetagraphSpecificValidations: Boolean = true,
+        lastGlobalSnapshotEpochProgress: Option[EpochProgress]
+      )(implicit hasher: Hasher[IO]): IO[Either[TokenLockBlockNotAcceptedReason, TokenLockBlockAcceptanceContextUpdate]] =
+        IO.raiseError(new IllegalStateException("The global acceptance path must use iterative native token-lock acceptance"))
+    }
+
+  private def mkNativeTokenLockBlock(
+    sourceKeyPair: java.security.KeyPair
+  )(
+    implicit sp: SecurityProvider[IO],
+    hasher: Hasher[IO]
+  ): IO[Signed[TokenLockBlock]] =
+    for {
+      signedTokenLock <- Signed.forAsyncHasher[IO, TokenLock](
+        TokenLock(
+          source = PublicKeyOps(sourceKeyPair.getPublic).toAddress,
+          amount = TokenLockAmount(PosLong.unsafeFrom(10L)),
+          fee = TokenLockFee(1L),
+          parent = TokenLockReference.empty,
+          currencyId = None,
+          unlockEpoch = Some(EpochProgress(100L)),
+          replaceTokenLockRef = None
+        ),
+        sourceKeyPair
+      )
+      block = TokenLockBlock(RoundId(new UUID(0L, 1L)), NonEmptySet.one(signedTokenLock))
+      signedBlock <- Signed.forAsyncHasher[IO, TokenLockBlock](block, sourceKeyPair)
+    } yield signedBlock
 
   val asbam: AllowSpendBlockAcceptanceManager[IO] = new AllowSpendBlockAcceptanceManager[IO] {
     override def acceptBlock(
@@ -428,7 +611,9 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     shardAcceptanceDeps: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring.AcceptanceDeps[IO]
     ] = None,
-    blockAcceptanceManager: BlockAcceptanceManager[IO] = bam
+    blockAcceptanceManager: BlockAcceptanceManager[IO] = bam,
+    allowSpendBlockAcceptanceManager: AllowSpendBlockAcceptanceManager[IO] = asbam,
+    tokenLockBlockAcceptanceManager: TokenLockBlockAcceptanceManager[IO] = tlbam
   )(
     implicit j: JsonSerializer[IO],
     sp: SecurityProvider[IO],
@@ -479,8 +664,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           MetagraphsSyncConfig(PosInt(100)),
           Dev,
           blockAcceptanceManager,
-          asbam,
-          tlbam,
+          allowSpendBlockAcceptanceManager,
+          tokenLockBlockAcceptanceManager,
           scProcessor,
           updateNodeParametersAcceptanceManager,
           updateDelegatedStakeAcceptanceManager,
@@ -780,6 +965,296 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
   }
 
   // ───────────────────────────────────────────────────────────────────────────────────────────────
+  test("native GL1 allow-spends are independently accepted and executed by GL0 producer and follower paths") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      producerCalls <- Ref.of[IO, List[NativeAllowSpendAcceptanceCall]](List.empty)
+      followerCalls <- Ref.of[IO, List[NativeAllowSpendAcceptanceCall]](List.empty)
+      producerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      followerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+      destination = PublicKeyOps(destinationKeyPair.getPublic).toAddress
+      block <- mkNativeAllowSpendBlock(sourceKeyPair, destination)
+      seededBalances = SortedMap(source -> Balance(100L), destination -> Balance.empty)
+      reproducedBalances = SortedMap(source -> Balance(89L), destination -> Balance.empty)
+      producer <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(producerBlockCalls, seededBalances),
+        allowSpendBlockAcceptanceManager = recordingNativeAllowSpendAcceptanceManager(producerCalls, reproducedBalances)
+      )
+      follower <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(followerBlockCalls, seededBalances),
+        allowSpendBlockAcceptanceManager = recordingNativeAllowSpendAcceptanceManager(followerCalls, reproducedBalances)
+      )
+      genesisKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
+      producerReceipt <- producer.createProposalArtifactWithExecutionReceipt(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(AllowSpendEvent(block)),
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      producerExecution <- IO.fromOption(producer.consumeProposalExecutionReceipt(producerReceipt))(
+        new IllegalStateException("producer rejected its own execution receipt")
+      )
+      (artifact, producerContext, _) = producerExecution
+      followerResult <- follower.validateArtifactWithReplayReceipt(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      observedProducerCalls <- producerCalls.get
+      observedFollowerCalls <- followerCalls.get
+      followerContext = followerResult.toOption.flatMap(follower.consumeReplayReceipt).map(_._2)
+    } yield
+      expect(
+        isExpectedNativeAllowSpendAcceptance(
+          observedProducerCalls,
+          block,
+          SnapshotOrdinal.MinValue.next,
+          EpochProgress.MinValue
+        )
+      ) &&
+        expect(
+          isExpectedNativeAllowSpendAcceptance(
+            observedFollowerCalls,
+            block,
+            SnapshotOrdinal.MinValue.next,
+            EpochProgress.MinValue
+          )
+        ) &&
+        expect(artifact.allowSpendBlocks.exists(_.contains(block))) &&
+        expect(artifact.tokenLockBlocks.forall(_.isEmpty)) &&
+        expect(artifact.shardCheckpoints.isEmpty) &&
+        expect(artifact.stateChannelSnapshots.isEmpty) &&
+        expect.eql(reproducedBalances, producerContext.balances) &&
+        expect.eql(Some(reproducedBalances), followerContext.map(_.balances))
+  }
+
+  test("a GL0 follower rejects a leader artifact when native GL1 allow-spend execution differs") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      producerCalls <- Ref.of[IO, List[NativeAllowSpendAcceptanceCall]](List.empty)
+      followerCalls <- Ref.of[IO, List[NativeAllowSpendAcceptanceCall]](List.empty)
+      producerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      followerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+      destination = PublicKeyOps(destinationKeyPair.getPublic).toAddress
+      block <- mkNativeAllowSpendBlock(sourceKeyPair, destination)
+      producerSeededBalances = SortedMap(source -> Balance(100L), destination -> Balance.empty)
+      followerSeededBalances = SortedMap(source -> Balance(101L), destination -> Balance.empty)
+      producerBalances = SortedMap(source -> Balance(99L), destination -> Balance.empty)
+      producer <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(producerBlockCalls, producerSeededBalances),
+        allowSpendBlockAcceptanceManager = recordingNativeAllowSpendAcceptanceManager(producerCalls, producerBalances)
+      )
+      follower <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(followerBlockCalls, followerSeededBalances),
+        allowSpendBlockAcceptanceManager = recordingNativeAllowSpendAcceptanceManager(followerCalls, producerBalances)
+      )
+      genesisKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
+      (artifact, _, _) <- producer.createProposalArtifact(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(AllowSpendEvent(block)),
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerResult <- follower.validateArtifactWithReplayReceipt(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      observedProducerCalls <- producerCalls.get
+      observedFollowerCalls <- followerCalls.get
+    } yield
+      expect(
+        isExpectedNativeAllowSpendAcceptance(
+          observedProducerCalls,
+          block,
+          SnapshotOrdinal.MinValue.next,
+          EpochProgress.MinValue
+        )
+      ) &&
+        expect(
+          isExpectedNativeAllowSpendAcceptance(
+            observedFollowerCalls,
+            block,
+            SnapshotOrdinal.MinValue.next,
+            EpochProgress.MinValue
+          )
+        ) &&
+        expect(followerResult.isLeft)
+  }
+
+  test("native GL1 token-locks are independently accepted and executed by GL0 producer and follower paths") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      producerCalls <- Ref.of[IO, List[NativeTokenLockAcceptanceCall]](List.empty)
+      followerCalls <- Ref.of[IO, List[NativeTokenLockAcceptanceCall]](List.empty)
+      producerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      followerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+      block <- mkNativeTokenLockBlock(sourceKeyPair)
+      seededBalances = SortedMap(source -> Balance(100L))
+      reproducedBalances = SortedMap(source -> Balance(89L))
+      producer <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(producerBlockCalls, seededBalances),
+        tokenLockBlockAcceptanceManager = recordingNativeTokenLockAcceptanceManager(producerCalls, reproducedBalances)
+      )
+      follower <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(followerBlockCalls, seededBalances),
+        tokenLockBlockAcceptanceManager = recordingNativeTokenLockAcceptanceManager(followerCalls, reproducedBalances)
+      )
+      genesisKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
+      producerReceipt <- producer.createProposalArtifactWithExecutionReceipt(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(TokenLockEvent(block)),
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      producerExecution <- IO.fromOption(producer.consumeProposalExecutionReceipt(producerReceipt))(
+        new IllegalStateException("producer rejected its own execution receipt")
+      )
+      (artifact, producerContext, _) = producerExecution
+      followerResult <- follower.validateArtifactWithReplayReceipt(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      observedProducerCalls <- producerCalls.get
+      observedFollowerCalls <- followerCalls.get
+      followerContext = followerResult.toOption.flatMap(follower.consumeReplayReceipt).map(_._2)
+    } yield
+      expect(
+        isExpectedNativeTokenLockAcceptance(
+          observedProducerCalls,
+          block,
+          SnapshotOrdinal.MinValue.next,
+          EpochProgress.MinValue
+        )
+      ) &&
+        expect(
+          isExpectedNativeTokenLockAcceptance(
+            observedFollowerCalls,
+            block,
+            SnapshotOrdinal.MinValue.next,
+            EpochProgress.MinValue
+          )
+        ) &&
+        expect(artifact.tokenLockBlocks.exists(_.contains(block))) &&
+        expect(artifact.allowSpendBlocks.forall(_.isEmpty)) &&
+        expect(artifact.shardCheckpoints.isEmpty) &&
+        expect(artifact.stateChannelSnapshots.isEmpty) &&
+        expect.eql(reproducedBalances, producerContext.balances) &&
+        expect.eql(Some(reproducedBalances), followerContext.map(_.balances))
+  }
+
+  test("a GL0 follower rejects a leader artifact when native GL1 token-lock execution differs") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      producerCalls <- Ref.of[IO, List[NativeTokenLockAcceptanceCall]](List.empty)
+      followerCalls <- Ref.of[IO, List[NativeTokenLockAcceptanceCall]](List.empty)
+      producerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      followerBlockCalls <- Ref.of[IO, List[NativeBlockAcceptanceCall]](List.empty)
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = PublicKeyOps(sourceKeyPair.getPublic).toAddress
+      block <- mkNativeTokenLockBlock(sourceKeyPair)
+      producerSeededBalances = SortedMap(source -> Balance(100L))
+      followerSeededBalances = SortedMap(source -> Balance(101L))
+      producerBalances = SortedMap(source -> Balance(89L))
+      producer <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(producerBlockCalls, producerSeededBalances),
+        tokenLockBlockAcceptanceManager = recordingNativeTokenLockAcceptanceManager(producerCalls, producerBalances)
+      )
+      follower <- mkGlobalSnapshotConsensusFunctions(
+        blockAcceptanceManager = recordingNativeBlockAcceptanceManager(followerBlockCalls, followerSeededBalances),
+        tokenLockBlockAcceptanceManager = recordingNativeTokenLockAcceptanceManager(followerCalls, producerBalances)
+      )
+      genesisKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      genesis = GlobalSnapshot.mkGenesis(Map.empty, EpochProgress.MinValue)
+      signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, genesisKeyPair)
+      lastArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
+      signedLastArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](lastArtifact, genesisKeyPair)
+      (artifact, _, _) <- producer.createProposalArtifact(
+        SnapshotOrdinal.MinValue,
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        h,
+        EventTrigger,
+        Set(TokenLockEvent(block)),
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerResult <- follower.validateArtifactWithReplayReceipt(
+        signedLastArtifact,
+        signedGenesis.value.info.toGlobalSnapshotInfo,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      observedProducerCalls <- producerCalls.get
+      observedFollowerCalls <- followerCalls.get
+    } yield
+      expect(
+        isExpectedNativeTokenLockAcceptance(
+          observedProducerCalls,
+          block,
+          SnapshotOrdinal.MinValue.next,
+          EpochProgress.MinValue
+        )
+      ) &&
+        expect(
+          isExpectedNativeTokenLockAcceptance(
+            observedFollowerCalls,
+            block,
+            SnapshotOrdinal.MinValue.next,
+            EpochProgress.MinValue
+          )
+        ) &&
+        expect(followerResult.isLeft)
+  }
+
   // TRANSITIONAL R2 — current follower behavior, not the target economic architecture:
   // `validateArtifact` re-derives with `sourceShardCheckpoints = false`. A follower whose shard deps are
   // PRESENT (numShards > 1) but whose local shard chain is EMPTY currently validates a leader's artifact
