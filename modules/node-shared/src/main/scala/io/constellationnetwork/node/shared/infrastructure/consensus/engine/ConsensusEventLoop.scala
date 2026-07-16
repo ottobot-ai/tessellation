@@ -89,8 +89,7 @@ object ConsensusEventLoop {
     consensusClient: ConsensusClient[F, Key, Outcome],
     config: ConsensusConfig,
     facilitatorSelector: FacilitatorSelector,
-    peerQualityTracker: PeerQualityTracker[F],
-    nakamotoMode: Boolean = false
+    peerQualityTracker: PeerQualityTracker[F]
   )(
     implicit _key: monocle.Lens[Outcome, Key],
     _context: monocle.Lens[Outcome, Ctx],
@@ -143,8 +142,7 @@ object ConsensusEventLoop {
         ctx,
         stallDetector,
         roundFibersRef,
-        cancelSignalRef,
-        nakamotoMode
+        cancelSignalRef
       )
       fsm = new ConsensusFSM[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](ctx, roundRunner)
       manager <- ConsensusManager.make[F, Event, Key, Artifact, Ctx, Status, Outcome, Kind](

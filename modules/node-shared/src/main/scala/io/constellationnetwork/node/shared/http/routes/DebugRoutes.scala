@@ -26,7 +26,7 @@ import org.http4s.server.Router
 
 final case class DebugRoutes[F[_]: Async](
   clusterStorage: ClusterStorage[F],
-  consensusService: SnapshotConsensus[F, _, _, _, _, _, _],
+  consensusService: Option[SnapshotConsensus[F, _, _, _, _, _, _]],
   gossipService: Gossip[F],
   sessionService: Session[F],
   additionalRoutes: HttpRoutes[F]*
@@ -35,7 +35,7 @@ final case class DebugRoutes[F[_]: Async](
 
   protected[routes] val prefixPath: InternalUrlPrefix = "/debug"
 
-  protected val public: HttpRoutes[F] = HttpRoutes.of[F] {
+  private val baseRoutes: HttpRoutes[F] = HttpRoutes.of[F] {
     case GET -> Root           => Ok()
     case GET -> Root / "peers" => Ok(clusterStorage.getPeers)
     case POST -> Root / "create-session" =>
@@ -47,18 +47,25 @@ final case class DebugRoutes[F[_]: Async](
       gossipService.spread(intContent.some) >> Ok()
     case POST -> Root / "gossip" / "spread" / strContent =>
       gossipService.spreadCommon(strContent) >> Ok()
-    case GET -> Root / "consensus" / SnapshotOrdinalVar(ordinal) / "resources" =>
-      consensusService.storage
-        .getResources(ordinal)
-        .map(ConsensusResourcesView.fromResources)
-        .flatMap(Ok(_))
-    case GET -> Root / "consensus" / SnapshotOrdinalVar(ordinal) / "facilitators" =>
-      consensusService.storage.getState(ordinal).map(_.map(_.facilitators)).flatMap {
-        _.map(Ok(_)).getOrElse(NotFound())
-      }
-    case GET -> Root / "consensus" / SnapshotOrdinalVar(ordinal) / "candidates" =>
-      consensusService.storage.getCandidates(ordinal).flatMap(Ok(_))
   }
+
+  private val consensusRoutes: HttpRoutes[F] = consensusService.fold(HttpRoutes.empty[F]) { service =>
+    HttpRoutes.of[F] {
+      case GET -> Root / "consensus" / SnapshotOrdinalVar(ordinal) / "resources" =>
+        service.storage
+          .getResources(ordinal)
+          .map(ConsensusResourcesView.fromResources)
+          .flatMap(Ok(_))
+      case GET -> Root / "consensus" / SnapshotOrdinalVar(ordinal) / "facilitators" =>
+        service.storage.getState(ordinal).map(_.map(_.facilitators)).flatMap {
+          _.map(Ok(_)).getOrElse(NotFound())
+        }
+      case GET -> Root / "consensus" / SnapshotOrdinalVar(ordinal) / "candidates" =>
+        service.storage.getCandidates(ordinal).flatMap(Ok(_))
+    }
+  }
+
+  protected val public: HttpRoutes[F] = baseRoutes <+> consensusRoutes
 
   @derive(encoder, decoder)
   case class ConsensusResourcesView(

@@ -190,7 +190,7 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: HasherSelector: Met
 
   private val debugRoutes = DebugRoutes[F](
     storages.cluster,
-    services.consensus,
+    Some(services.consensus),
     services.gossip,
     services.session
   ).publicRoutes

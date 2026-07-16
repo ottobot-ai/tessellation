@@ -5,14 +5,14 @@ import cats.effect.Async
 import cats.effect.std.Supervisor
 import cats.syntax.all._
 
-import io.constellationnetwork.dag.l0.config.types.IncrementalConfig
+import io.constellationnetwork.dag.l0.config.types.{GlobalSnapshotConfig, IncrementalConfig}
 import io.constellationnetwork.dag.l0.domain.snapshot.storages.SnapshotDownloadStorage
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.SnapshotDownloadStorage
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
-import io.constellationnetwork.node.shared.config.types.{SharedConfig, SnapshotConfig}
+import io.constellationnetwork.node.shared.config.types.SharedConfig
 import io.constellationnetwork.node.shared.domain.cluster.storage.{ClusterStorage, SessionStorage}
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
@@ -32,7 +32,7 @@ object Storages {
     sharedStorages: SharedStorages[F],
     sharedConfig: SharedConfig,
     seedlist: Option[Set[SeedlistEntry]],
-    snapshotConfig: SnapshotConfig,
+    snapshotConfig: GlobalSnapshotConfig,
     incrementalConfig: IncrementalConfig,
     environment: AppEnvironment,
     hashSelect: HashSelect,

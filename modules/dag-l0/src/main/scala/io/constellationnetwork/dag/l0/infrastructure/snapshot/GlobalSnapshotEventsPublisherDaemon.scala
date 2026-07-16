@@ -3,18 +3,15 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot
 import java.security.KeyPair
 
 import cats.effect.Async
-import cats.effect.kernel.Ref
 import cats.effect.std.{Queue, Supervisor}
 import cats.syntax.all._
 
 import io.constellationnetwork.dag.l0.domain.delegatedStake.{CreateDelegatedStakeOutput, DelegatedStakeOutput, WithdrawDelegatedStakeOutput}
 import io.constellationnetwork.dag.l0.domain.nodeCollateral.{CreateNodeCollateralOutput, NodeCollateralOutput, WithdrawNodeCollateralOutput}
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
-import io.constellationnetwork.node.shared.config.types.ConsensusConfig
 import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
-import io.constellationnetwork.node.shared.infrastructure.snapshot.EventTriggerGuard
 import io.constellationnetwork.schema.Block
 import io.constellationnetwork.schema.kes.KesRegistrationCert
 import io.constellationnetwork.schema.mpt.GlobalStateKey
@@ -43,13 +40,8 @@ object GlobalSnapshotEventsPublisherDaemon {
     kesRegistrationCertQueue: Queue[F, Signed[KesRegistrationCert]],
     keyPair: KeyPair,
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
-    gossip: Gossip[F],
-    triggerEventConsensus: Option[F[Unit]],
-    getLastFacilitatorCount: F[Int],
-    consensusConfig: ConsensusConfig
+    gossip: Gossip[F]
   ): Daemon[F] = {
-    val eventTriggerThreshold = consensusConfig.eventTriggerThreshold
-    val eventTriggerCooldown = consensusConfig.eventTriggerCooldown
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromClass[F](GlobalSnapshotEventsPublisherDaemon.getClass)
 
     val events: Stream[F, GlobalSnapshotEvent] = Stream
@@ -98,26 +90,13 @@ object GlobalSnapshotEventsPublisherDaemon {
       )
 
     Daemon.spawn {
-      Ref.of[F, Long](0L).flatMap { lastTriggerRef =>
-        HasherSelector[F].withCurrent { implicit hasher =>
-          events.evalMap { event =>
-            signAndPublish(event, keyPair, eventMempool, gossip, logger) >>
-              EventTriggerGuard(
-                eventMempool,
-                triggerEventConsensus,
-                getLastFacilitatorCount,
-                lastTriggerRef,
-                logger,
-                eventTriggerThreshold,
-                eventTriggerCooldown
-              )
-          }.compile.drain
-        }
+      HasherSelector[F].withCurrent { implicit hasher =>
+        events.evalMap(signAndPublish(_, keyPair, eventMempool, gossip, logger)).compile.drain
       }
     }
   }
 
-  private def signAndPublish[F[_]: Async: SecurityProvider, E: scala.reflect.runtime.universe.TypeTag, K](
+  private[snapshot] def signAndPublish[F[_]: Async: SecurityProvider, E: scala.reflect.runtime.universe.TypeTag, K](
     event: E,
     keyPair: KeyPair,
     eventMempool: EventMempool[F, E, K],

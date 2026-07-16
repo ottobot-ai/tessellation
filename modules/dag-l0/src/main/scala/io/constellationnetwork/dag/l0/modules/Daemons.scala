@@ -7,14 +7,12 @@ import cats.effect.std.Supervisor
 import cats.syntax.functor._
 import cats.syntax.traverse._
 
-import io.constellationnetwork.dag.l0.config.types.AppConfig
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotEventsPublisherDaemon
 import io.constellationnetwork.node.shared.cli.CliMethod
 import io.constellationnetwork.node.shared.domain.Daemon
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.infrastructure.cluster.daemon.NodeStateDaemon
 import io.constellationnetwork.node.shared.infrastructure.collateral.daemon.CollateralDaemon
-import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
 object Daemons {
@@ -32,9 +30,7 @@ object Daemons {
     services: Services[F, R],
     queues: Queues[F],
     gossip: Gossip[F],
-    nodeId: PeerId,
-    keyPair: KeyPair,
-    cfg: AppConfig
+    keyPair: KeyPair
   ): F[Unit] =
     List[Daemon[F]](
       NodeStateDaemon.make(storages.node, services.gossip),
@@ -50,10 +46,7 @@ object Daemons {
           queues.kesRegistrationCertOutput,
           keyPair,
           services.eventMempool,
-          gossip,
-          triggerEventConsensus = None, // No BFT consensus to trigger
-          services.consensus.storage.getLastConsensusOutcome.map(_.fold(0)(_.facilitators.value.size)),
-          cfg.snapshot.consensus
+          gossip
         ),
       CollateralDaemon.make(services.collateral, storages.globalSnapshot, storages.cluster)
     ).traverse(_.start).void

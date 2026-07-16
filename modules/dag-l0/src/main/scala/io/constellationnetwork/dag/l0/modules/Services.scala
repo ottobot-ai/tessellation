@@ -260,7 +260,7 @@ object Services {
         io.constellationnetwork.schema.tokenLock.TokenLockBlock
       ]) => queues.l1TokenLockOutput.offer(signed)
 
-      consensus <- HasherSelector[F].withCurrent { implicit hs =>
+      _ <- HasherSelector[F].withCurrent { implicit hs =>
         GlobalSnapshotConsensus
           .make[F, R](
             sharedCfg,
@@ -333,7 +333,6 @@ object Services {
         cluster = sharedServices.cluster,
         session = sharedServices.session,
         gossip = sharedServices.gossip,
-        consensus = consensus,
         address = addressService,
         collateral = collateralService,
         stateChannel = stateChannelService,
@@ -362,7 +361,6 @@ sealed abstract class Services[F[_], R <: CliMethod] private (
   val cluster: Cluster[F],
   val session: Session[F],
   val gossip: Gossip[F],
-  val consensus: GlobalSnapshotConsensus[F],
   val address: AddressService[F, GlobalIncrementalSnapshot],
   val collateral: Collateral[F],
   val stateChannel: StateChannelService[F],

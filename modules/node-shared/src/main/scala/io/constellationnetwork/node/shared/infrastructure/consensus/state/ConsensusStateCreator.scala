@@ -29,7 +29,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - How to build facility info
   *
   * @see
-  *   GlobalSnapshotConsensusStateCreator for global L0 implementation
+  *   io.constellationnetwork.currency.l0.snapshot.CurrencySnapshotConsensusStateCreator for the CurrencyL0 implementation
   */
 abstract class ConsensusStateCreator[F[_]: Sync, Key: Show, Artifact, Context, Status: Show, Outcome, Kind: Show] {
 

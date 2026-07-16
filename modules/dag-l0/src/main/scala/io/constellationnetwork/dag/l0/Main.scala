@@ -656,9 +656,7 @@ object Main
           services,
           queues,
           sharedServices.gossip,
-          nodeId,
-          keyPair,
-          cfg
+          keyPair
         )
         .asResource
 

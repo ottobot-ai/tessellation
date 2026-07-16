@@ -1,132 +1,182 @@
 package io.constellationnetwork.dag.l0.infrastructure.snapshot
 
+import java.lang.reflect.{InvocationHandler, Proxy}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths}
 
 import cats.effect.IO
 
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.GlobalConsensusKind
-import io.constellationnetwork.node.shared.infrastructure.consensus.declaration.{Facility, MajoritySignature, Proposal}
-import io.constellationnetwork.node.shared.infrastructure.consensus.message._
-import io.constellationnetwork.schema.gossip._
-import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
-import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.dag.l0.config.types.AppConfigReader
+import io.constellationnetwork.node.shared.domain.cluster.services.Session
+import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
+import io.constellationnetwork.node.shared.domain.gossip.Gossip
+import io.constellationnetwork.node.shared.ext.pureconfig._
+import io.constellationnetwork.node.shared.http.routes.DebugRoutes
 
-import io.circe.Json
+import com.typesafe.config.ConfigFactory
+import eu.timepit.refined.pureconfig._
+import org.http4s.{Method, Request, Uri}
+import pureconfig.ConfigSource
+import pureconfig.generic.auto._
+import pureconfig.module.enumeratum._
 import weaver.SimpleIOSuite
 
 object GlobalLegacyBftIngressDisabledSuite extends SimpleIOSuite {
 
-  private val peerId = PeerId(Hex("0d" * 64))
-
-  private def peerRumor(contentType: ContentType): RumorRaw =
-    PeerRumorRaw(peerId, Ordinal.MinValue, Json.Null, contentType)
-
-  private val legacyRumors: List[(String, RumorRaw)] = List(
-    "facility" -> peerRumor(ContentType.of[ConsensusPeerDeclaration[SnapshotOrdinal, Facility]]),
-    "proposal" -> peerRumor(ContentType.of[ConsensusPeerDeclaration[SnapshotOrdinal, Proposal]]),
-    "majority-signature" -> peerRumor(ContentType.of[ConsensusPeerDeclaration[SnapshotOrdinal, MajoritySignature]]),
-    "declaration-ack" -> peerRumor(ContentType.of[ConsensusPeerDeclarationAck[SnapshotOrdinal, GlobalConsensusKind]]),
-    "artifact" -> CommonRumorRaw(Json.Null, ContentType.of[ConsensusArtifact[SnapshotOrdinal, GlobalIncrementalSnapshot]]),
-    "withdraw" -> peerRumor(ContentType.of[ConsensusWithdrawPeerDeclaration[SnapshotOrdinal, GlobalConsensusKind]])
+  private val retiredGl0BftSources = List(
+    "GlobalSnapshotConsensusStateCreator.scala",
+    "GlobalSnapshotConsensusStateAdvancer.scala",
+    "GlobalSnapshotConsensusStateRemover.scala",
+    "GlobalSnapshotConsensusOps.scala",
+    "schema.scala"
   )
 
-  legacyRumors.foreach {
-    case (family, rumor) =>
-      test(s"Nakamoto GL0 has no handler for legacy $family rumors") {
-        GlobalSnapshotConsensus.disabledLegacyHandler[IO].run((rumor, peerId)).value.map { handled =>
-          expect(handled.isEmpty)
-        }
-      }
-  }
-
-  test("the disabled GL0 lifecycle manager owns no queue and fails closed") {
-    val manager = GlobalSnapshotConsensus.disabledLegacyManager[IO]
-
-    for {
-      register <- manager.registerForConsensus(SnapshotOrdinal.MinValue).attempt
-      reset <- manager.resetForRecovery.attempt
-      withdraw <- manager.withdrawFromConsensus.attempt
-      fieldTypes = manager.getClass.getDeclaredFields.iterator.map(_.getType.getName).toList
-    } yield
-      expect.all(
-        register.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
-        reset.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
-        withdraw.left.exists(_.isInstanceOf[GlobalSnapshotConsensus.LegacyBftConsensusDisabled]),
-        !fieldTypes.exists(_.contains("cats.effect.std.Queue"))
-      )
-  }
-
-  test("GL0 starts bounded rumor consumption without registering the generic BFT engine") {
+  test("GL0 runtime exposes no generic BFT storage, routes, manager, or result") {
     readSources.map {
-      case (main, consensus, currencyConsensus, currencyMain, oldHandlerExists) =>
+      case Sources(
+            main,
+            consensus,
+            services,
+            httpApi,
+            download,
+            daemons,
+            publisher,
+            packageObject,
+            debugRoutes,
+            currencyConsensus,
+            currencyHttp,
+            currencyMain
+          ) =>
         val ingress = sliceBetween(main, "rumorHandler =", "forkRecoveryService =")
-        val bootstrapStart = main.indexOf("// Unified Nakamoto bootstrap")
-        val bootstrapEnd = main.indexOf("}).asResource", bootstrapStart)
-        val daemonsStart = main.indexOf("Daemons\n        .startNakamoto", bootstrapEnd)
-        val inputRelease = main.indexOf("consensusInputGateControl.releaseInput", daemonsStart)
-        val subscriptionAck = main.indexOf("services.sidecarSubscriptionReadiness.awaitBothAndRun", inputRelease)
-        val readyHandoff = main.indexOf("storages.node.setNodeState(NodeState.Ready)", subscriptionAck)
-        val publicServer = main.indexOf("MkHttpServer[IO].newEmber(ServerName(\"public\")", daemonsStart)
-        val p2pServer = main.indexOf("MkHttpServer[IO].newEmber(ServerName(\"p2p\")", publicServer)
-        val cliServer = main.indexOf("MkHttpServer[IO].newEmber(ServerName(\"cli\")", p2pServer)
 
         expect.all(
-          ingress.contains("eventRumorHandler"),
           !ingress.contains("services.consensus.handler"),
-          main.sliding("gossipDaemon.startAsInitialValidator".length).count(_ == "gossipDaemon.startAsInitialValidator") == 1,
-          main.contains("consensusInputGateControl.awaitChainSeed"),
-          main.contains("consensusInputGateControl.markLocalStateReady"),
-          bootstrapStart >= 0,
-          bootstrapEnd > bootstrapStart,
-          daemonsStart > bootstrapEnd,
-          publicServer > daemonsStart,
-          p2pServer > publicServer,
-          cliServer > p2pServer,
-          inputRelease > cliServer,
-          subscriptionAck > inputRelease,
-          readyHandoff > subscriptionAck,
-          consensus.sliding("consensusInputGate.awaitBootstrap".length).count(_ == "consensusInputGate.awaitBootstrap") >= 2,
-          consensus.contains("chainSeedGate = chainSeedGate"),
-          !consensus.contains("ConsensusEventLoop"),
-          !consensus.contains("Queue.unbounded"),
-          !consensus.contains("GlobalConsensusHandler"),
-          !consensus.contains("ConsensusManager.make"),
-          !consensus.contains("ConsensusDirectSender"),
-          !consensus.contains("loop.queue"),
-          !consensus.contains("loop.manager"),
-          !oldHandlerExists,
+          !consensus.contains("ConsensusStorage"),
+          !consensus.contains("ConsensusRoutes"),
+          !consensus.contains("ConsensusManager"),
+          !consensus.contains("new Consensus("),
+          !consensus.contains("LegacyBftConsensusDisabled"),
+          !services.contains("val consensus:"),
+          !httpApi.contains("ConsensusInfoRoutes"),
+          !httpApi.contains("services.consensus"),
+          httpApi.contains("DebugRoutes[F]("),
+          httpApi.contains("None,"),
+          !download.contains("consensus.manager"),
+          !daemons.contains("ConsensusConfig"),
+          !daemons.contains("getLastConsensusOutcome"),
+          publisher.contains("events.evalMap(signAndPublish"),
+          !publisher.contains("EventTriggerGuard"),
+          !publisher.contains("ConsensusConfig"),
+          !packageObject.contains("GlobalSnapshotConsensus[F[_]]"),
+          !packageObject.contains("GlobalConsensusStorage"),
+          !packageObject.contains("GlobalConsensusManager"),
+          debugRoutes.contains("Option[SnapshotConsensus"),
           currencyConsensus.contains("ConsensusEventLoop.build["),
+          currencyHttp.contains("ConsensusInfoRoutes"),
+          currencyHttp.contains("Some(services.consensus)"),
           currencyMain.contains("services.consensus.handler")
         )
     }
   }
 
-  private def readSources: IO[(String, String, String, String, Boolean)] =
+  test("compiled GL0 services omit the generic consensus API") {
+    IO.blocking {
+      val gl0Methods = Class
+        .forName("io.constellationnetwork.dag.l0.modules.Services")
+        .getMethods
+        .iterator
+        .map(_.getName)
+        .toSet
+      expect(!gl0Methods.contains("consensus"))
+    }
+  }
+
+  test("GL0 debug routing does not expose generic consensus endpoints") {
+    val routes = DebugRoutes[IO](
+      unreachable(classOf[ClusterStorage[IO]]),
+      None,
+      unreachable(classOf[Gossip[IO]]),
+      unreachable(classOf[Session[IO]])
+    ).publicRoutes
+
+    routes
+      .run(Request[IO](method = Method.GET, uri = Uri.unsafeFromString("/debug/consensus/1/resources")))
+      .value
+      .map(result => expect(result.isEmpty))
+  }
+
+  test("GL0 config has no BFT consensus subtree and retains proposal bounds") {
     IO.blocking {
       val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+      val config = ConfigFactory.parseFile(root.resolve("modules/dag-l0/src/main/resources/dag-l0.conf").toFile).resolve()
+      val startupConfig = ConfigSource.resources("dag-l0.conf").withFallback(ConfigSource.default).load[AppConfigReader]
 
-      def read(relative: String): String =
-        new String(Files.readAllBytes(root.resolve(relative)), StandardCharsets.UTF_8)
-
-      val oldHandler =
-        root.resolve(
-          "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalConsensusHandler.scala"
-        )
-
-      (
-        read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/Main.scala"),
-        read(
-          "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala"
-        ),
-        read(
-          "modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/CurrencySnapshotConsensus.scala"
-        ),
-        read("modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/CurrencyL0App.scala"),
-        Files.exists(oldHandler)
+      expect.all(
+        !config.hasPath("snapshot.consensus"),
+        config.getInt("snapshot.event-cutter.max-binary-size-bytes") == 20971520,
+        config.getInt("snapshot.event-cutter.max-update-node-parameters-size") == 100,
+        startupConfig.exists(_.snapshot.eventCutter.maxBinarySizeBytes.value == 20971520),
+        startupConfig.exists(_.snapshot.eventCutter.maxUpdateNodeParametersSize.value == 100)
       )
     }
+  }
+
+  test("retired GL0 BFT state sources are absent and CurrencyL0 state sources remain") {
+    IO.blocking {
+      val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+      val gl0SnapshotDir = root.resolve("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot")
+      val currencySnapshotDir =
+        root.resolve("modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot")
+
+      expect.all(
+        retiredGl0BftSources.forall(name => Files.notExists(gl0SnapshotDir.resolve(name))),
+        Files.exists(currencySnapshotDir.resolve("CurrencySnapshotConsensusStateCreator.scala")),
+        Files.exists(currencySnapshotDir.resolve("CurrencySnapshotConsensusStateAdvancer.scala")),
+        Files.exists(currencySnapshotDir.resolve("CurrencySnapshotConsensusStateRemover.scala")),
+        Files.exists(currencySnapshotDir.resolve("CurrencySnapshotConsensusOps.scala")),
+        Files.exists(currencySnapshotDir.resolve("schema.scala"))
+      )
+    }
+  }
+
+  private final case class Sources(
+    main: String,
+    consensus: String,
+    services: String,
+    httpApi: String,
+    download: String,
+    daemons: String,
+    publisher: String,
+    packageObject: String,
+    debugRoutes: String,
+    currencyConsensus: String,
+    currencyHttp: String,
+    currencyMain: String
+  )
+
+  private def readSources: IO[Sources] = IO.blocking {
+    val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+
+    def read(relative: String): String =
+      new String(Files.readAllBytes(root.resolve(relative)), StandardCharsets.UTF_8)
+
+    Sources(
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/Main.scala"),
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala"),
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/modules/Services.scala"),
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/modules/HttpApi.scala"),
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/domain/snapshot/programs/Download.scala"),
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/modules/Daemons.scala"),
+      read(
+        "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotEventsPublisherDaemon.scala"
+      ),
+      read("modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/package.scala"),
+      read("modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/http/routes/DebugRoutes.scala"),
+      read("modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/CurrencySnapshotConsensus.scala"),
+      read("modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/modules/HttpApi.scala"),
+      read("modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/CurrencyL0App.scala")
+    )
+  }
 
   private def repositoryRoot(start: Path): Path =
     Iterator
@@ -142,4 +192,16 @@ object GlobalLegacyBftIngressDisabledSuite extends SimpleIOSuite {
     require(end >= 0, s"Missing source anchor after '$startAnchor': $endAnchor")
     source.substring(start, end)
   }
+
+  private def unreachable[A](interface: Class[A]): A =
+    Proxy
+      .newProxyInstance(
+        interface.getClassLoader,
+        Array(interface),
+        new InvocationHandler {
+          def invoke(_proxy: AnyRef, method: java.lang.reflect.Method, _args: Array[AnyRef]): AnyRef =
+            throw new AssertionError(s"GL0 debug consensus route unexpectedly invoked ${interface.getName}.${method.getName}")
+        }
+      )
+      .asInstanceOf[A]
 }

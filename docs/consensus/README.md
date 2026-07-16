@@ -1,6 +1,8 @@
-# Tessellation Consensus Process
+# Metagraph L0 BFT Consensus Process
 
-This document provides an in-depth walkthrough of the Tessellation consensus mechanism. It is the definitive reference for how Tessellation consensus works.
+This document describes the generic BFT engine retained by CurrencyL0/ML0. It does not describe GL0 consensus. GL0 uses the
+Nakamoto/Taktikos/LDD `SnapshotLeaderLoop` plus the hash-bound optimistic/depth finality gadget and constructs none of the storage,
+manager, routes, round state, or facilitator machinery below.
 
 ## Table of Contents
 
@@ -283,11 +285,11 @@ Understanding how `Outcome`, `Key`, and the `outcomeKey` lens work together is c
 
 ### What is an Outcome?
 
-An `Outcome` (e.g., `GlobalConsensusOutcome`) represents the **result of a completed consensus round**:
+An `Outcome` (for example, `CurrencyConsensusOutcome`) represents the **result of a completed consensus round**:
 
 ```scala
-final case class GlobalConsensusOutcome(
-  key: GlobalSnapshotKey,                    // The ordinal (e.g., 42)
+final case class CurrencyConsensusOutcome(
+  key: CurrencySnapshotKey,                  // The ordinal (e.g., 42)
   facilitators: Facilitators,                // Who participated
   removedFacilitators: RemovedFacilitators,  // Who was evicted
   withdrawnFacilitators: WithdrawnFacilitators, // Who left voluntarily
@@ -1136,13 +1138,13 @@ clusterQuorum=5).
 | `PeerQualityTracker.scala` | Score-based peer assessment |
 | `TrailingCommonAncestorFilter.scala` | Proof-based peer quality, removal penalties |
 
-### Global Snapshot Specific (`dag-l0/infrastructure/snapshot/`)
+### Currency Snapshot Specific (`currency-l0/snapshot/`)
 
 | File | Purpose |
 |------|---------|
-| `GlobalSnapshotConsensusStateCreator.scala` | Facilitator selection pipeline |
-| `GlobalSnapshotConsensusStateAdvancer.scala` | Phase transitions for global snapshots |
-| `GlobalSnapshotConsensusFunctions.scala` | Artifact creation, validation |
+| `CurrencySnapshotConsensusStateCreator.scala` | Facilitator selection pipeline |
+| `CurrencySnapshotConsensusStateAdvancer.scala` | Phase transitions for currency snapshots |
+| `CurrencySnapshotConsensusFunctions.scala` | Artifact creation and validation |
 
 ### Fork Recovery & Download
 

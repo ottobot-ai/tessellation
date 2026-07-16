@@ -52,7 +52,6 @@ object Programs {
           lastFullGlobalSnapshotOrdinal,
           globalSnapshotContextFns: GlobalSnapshotContextFunctions[F],
           storages.node,
-          services.consensus,
           peerSelect,
           lastNGlobalSnapshotStorage,
           lastGlobalSnapshotStorage,

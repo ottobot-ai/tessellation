@@ -9,15 +9,13 @@ import io.constellationnetwork.dag.l0.domain.cell.{L0Cell, L0CellInput}
 import io.constellationnetwork.dag.l0.domain.delegatedStake.DelegatedStakeOutput
 import io.constellationnetwork.dag.l0.domain.nodeCollateral.NodeCollateralOutput
 import io.constellationnetwork.dag.l0.http.routes._
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotKey
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.GlobalConsensusOutcome
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.env.AppEnvironment._
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
-import io.constellationnetwork.node.shared.config.types.{HttpConfig, RouteRateLimiterConfig, SharedConfig}
+import io.constellationnetwork.node.shared.config.types.{HttpConfig, SharedConfig}
 import io.constellationnetwork.node.shared.domain.nakamoto.EtaCalculation
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.RegistrationEvaluationContext
@@ -333,20 +331,9 @@ sealed abstract class HttpApi[
     io.constellationnetwork.dag.l0.http.routes.ShardProofRoutes[F](services.shardProofServiceRef)
 
   private val walletRoutes = WalletRoutes[F, GlobalIncrementalSnapshot]("/dag", services.address)
-  private val consensusInfoRoutes =
-    HasherSelector[F].withCurrent { implicit hasher =>
-      new ConsensusInfoRoutes[F, GlobalSnapshotKey, GlobalConsensusOutcome](
-        services.cluster,
-        services.consensus.storage,
-        selfId,
-        services.consensus.healthRef
-      )
-    }
-  private val consensusRoutes = services.consensus.routes.p2pRoutes
-
   private val debugRoutes = DebugRoutes[F](
     storages.cluster,
-    services.consensus,
+    None,
     services.gossip,
     services.session
   ).publicRoutes
@@ -376,7 +363,6 @@ sealed abstract class HttpApi[
                 shardProofRoutes.publicRoutes <+>
                 walletRoutes.publicRoutes <+>
                 nodeRoutes.publicRoutes <+>
-                consensusInfoRoutes.publicRoutes <+>
                 tokenLockRoutes.publicRoutes <+>
                 currencyBalanceRoutes.publicRoutes <+>
                 nodeParametersRoutes.publicRoutes <+>

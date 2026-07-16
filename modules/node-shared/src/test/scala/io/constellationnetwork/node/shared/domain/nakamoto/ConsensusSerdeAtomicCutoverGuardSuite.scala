@@ -29,14 +29,10 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     "modules/shared/src/main/scala/io/constellationnetwork/security/Hasher.scala"
   private val appPath =
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/app/TessellationIOApp.scala"
-  private val stateAdvancerPath =
-    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusStateAdvancer.scala"
   private val dagL0MainPath =
     "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/Main.scala"
   private val snapshotLeaderPath =
     "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/SnapshotLeaderLoop.scala"
-  private val rollbackLoaderPath =
-    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/programs/RollbackLoader.scala"
   private val stateChannelServicePath =
     "modules/currency-l0/src/main/scala/io/constellationnetwork/currency/l0/snapshot/services/StateChannelSnapshotService.scala"
   private val stateChannelProcessorPath =
@@ -72,22 +68,11 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       Marker("runtime state-proof selector", """GlobalStateProofSelector\s*\(""".r, 1, "independent legacy state-proof era selector"),
       Marker("Kryo hash boundary input", """\blastKryoHashOrdinal\b""".r, 1, "configuration input for legacy hash selection")
     ),
-    stateAdvancerPath -> List(
-      Marker(
-        "current-hasher artifact hash",
-        """HasherSelector\s*\[\s*F\s*\]\s*\.\s*withCurrent\s*\(\s*implicit\s+h\s*=>\s*artifact\s*\.\s*hash\s*\)""".r,
-        1,
-        "global consensus artifact hashing still uses the current legacy hasher"
-      )
-    ),
     dagL0MainPath -> List(
       Marker("global snapshot signing", globalSnapshotSigning, 2, "genesis and first incremental signing use AsyncHasher")
     ),
     snapshotLeaderPath -> List(
       Marker("global snapshot signing", globalSnapshotSigning, 1, "leader signs the produced incremental through AsyncHasher")
-    ),
-    rollbackLoaderPath -> List(
-      Marker("global snapshot signing", globalSnapshotSigning, 1, "rollback reconstruction signs through AsyncHasher")
     ),
     stateChannelServicePath -> List(
       Marker(

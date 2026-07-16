@@ -4,11 +4,11 @@ import cats.Parallel
 import cats.effect.Async
 import cats.syntax.all._
 
+import io.constellationnetwork.dag.l0.config.types.GlobalSnapshotConfig
 import io.constellationnetwork.dag.l0.domain.snapshot.storages.SnapshotDownloadStorage
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotTraverse
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
-import io.constellationnetwork.node.shared.config.types.SnapshotConfig
 import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
 import io.constellationnetwork.node.shared.domain.snapshot.storage.{LastNGlobalSnapshotStorage, LastSnapshotStorage, SnapshotStorage}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.GlobalSnapshotContextFunctions
@@ -24,7 +24,7 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 object RollbackLoader {
 
   def make[F[_]: Async: Parallel: KryoSerializer: JsonSerializer: HasherSelector](
-    snapshotConfig: SnapshotConfig,
+    snapshotConfig: GlobalSnapshotConfig,
     incrementalGlobalSnapshotLocalFileSystemStorage: SnapshotLocalFileSystemStorage[F, GlobalIncrementalSnapshot],
     snapshotInfoLocalFileSystemStorage: SnapshotInfoLocalFileSystemStorage[F, GlobalSnapshotStateProof, GlobalSnapshotInfo],
     snapshotStorage: SnapshotDownloadStorage[F],
@@ -56,7 +56,7 @@ object RollbackLoader {
 }
 
 sealed abstract class RollbackLoader[F[_]: Async: Parallel: KryoSerializer: JsonSerializer: HasherSelector] private (
-  snapshotConfig: SnapshotConfig,
+  snapshotConfig: GlobalSnapshotConfig,
   incrementalGlobalSnapshotLocalFileSystemStorage: SnapshotLocalFileSystemStorage[F, GlobalIncrementalSnapshot],
   snapshotStorage: SnapshotDownloadStorage[F],
   snapshotContextFunctions: GlobalSnapshotContextFunctions[F],

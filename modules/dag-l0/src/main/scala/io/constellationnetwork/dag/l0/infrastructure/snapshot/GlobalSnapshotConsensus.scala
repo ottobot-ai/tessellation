@@ -19,7 +19,6 @@ import io.constellationnetwork.dag.l0.domain.snapshot.programs.{
 }
 import io.constellationnetwork.dag.l0.infrastructure.rewards.RewardsService
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event._
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.schema.{GlobalConsensusKind, GlobalConsensusOutcome}
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.cli.CliMethod
@@ -35,9 +34,6 @@ import io.constellationnetwork.node.shared.domain.statechannel.{FeeCalculator, F
 import io.constellationnetwork.node.shared.domain.swap.block.AllowSpendBlockAcceptanceManager
 import io.constellationnetwork.node.shared.domain.tokenlock.block.TokenLockBlockAcceptanceManager
 import io.constellationnetwork.node.shared.infrastructure.block.processing.BlockAcceptanceManager
-import io.constellationnetwork.node.shared.infrastructure.consensus._
-import io.constellationnetwork.node.shared.infrastructure.consensus.engine.ConsensusManager
-import io.constellationnetwork.node.shared.infrastructure.gossip.RumorHandler
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
@@ -61,58 +57,12 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import org.http4s.client.Client
 
-/** Factory and wiring surface for the Global L0 consensus runtime.
+/** Factory and wiring surface for the Global L0 Nakamoto runtime.
   *
-  * Wires together the Nakamoto consensus services. The returned generic [[Consensus]] value is a temporary route/storage compatibility
-  * shell; its legacy BFT handler and lifecycle manager are deliberately disabled and own no command queue.
-  *
-  * GL0 consensus is Nakamoto/Taktikos/LDD with VRF slot leadership and an exact-hash Phase-2 gadget. It must not run the inherited
-  * facility/proposal/vote/lock/QC/view-change BFT lifecycle. ML0 may continue using the separate shared BFT engine.
+  * GL0 consensus is Nakamoto/Taktikos/LDD with VRF slot leadership and an exact-hash Phase-2 gadget. This factory deliberately exposes no
+  * generic BFT storage, manager, handler, routes, or result object. ML0 continues using the separate shared BFT engine.
   */
 object GlobalSnapshotConsensus {
-
-  final case class LegacyBftConsensusDisabled(operation: String)
-      extends IllegalStateException(s"Legacy BFT consensus operation '$operation' is disabled for Nakamoto GL0")
-
-  /** Compatibility implementation for the inherited `Consensus` return type. It fails closed and, critically, has no queue. */
-  private[snapshot] def disabledLegacyManager[F[_]: Async]: GlobalConsensusManager[F] =
-    new ConsensusManager[
-      F,
-      GlobalSnapshotEvent,
-      GlobalSnapshotKey,
-      GlobalSnapshotArtifact,
-      GlobalSnapshotContext,
-      GlobalSnapshotStatus,
-      GlobalConsensusOutcome,
-      GlobalConsensusKind
-    ] {
-      private def disabled(operation: String): F[Unit] =
-        Async[F].raiseError(LegacyBftConsensusDisabled(operation))
-
-      def registerForConsensus(observationKey: GlobalSnapshotKey): F[Unit] =
-        disabled("registerForConsensus")
-
-      def resetForRecovery: F[Unit] =
-        disabled("resetForRecovery")
-
-      def startFacilitatingAfterDownload(
-        key: GlobalSnapshotKey,
-        lastArtifact: io.constellationnetwork.security.signature.Signed[GlobalSnapshotArtifact],
-        lastContext: GlobalSnapshotContext,
-        isRecovery: Boolean
-      ): F[Unit] =
-        disabled("startFacilitatingAfterDownload")
-
-      def startFacilitatingAfterRollback(lastKey: GlobalSnapshotKey, initialOutcome: GlobalConsensusOutcome): F[Unit] =
-        disabled("startFacilitatingAfterRollback")
-
-      def withdrawFromConsensus: F[Unit] =
-        disabled("withdrawFromConsensus")
-    }
-
-  /** The compatibility `Consensus.handler` is not registered by GL0 Main and recognizes no rumor family. */
-  private[snapshot] def disabledLegacyHandler[F[_]: Async]: RumorHandler[F] =
-    cats.data.Kleisli(_ => cats.data.OptionT.none[F, Unit])
 
   // GL0 is Nakamoto-only. No env var check needed — the run-nakamoto CLI command
   // is the single source of truth. Tunables come from NAKAMOTO_* env vars below.
@@ -332,7 +282,7 @@ object GlobalSnapshotConsensus {
     implicit supervisor: Supervisor[F],
     globalStateProofSelector: GlobalStateProofSelector,
     withdrawalTimeLimit: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit
-  ): Resource[F, GlobalSnapshotConsensus[F]] =
+  ): Resource[F, Unit] =
     for {
       globalStateChannelManager <- GlobalSnapshotStateChannelAcceptanceManager
         .make[F](stateChannelAllowanceLists, pullDelay = stateChannelPullDelay, purgeDelay = stateChannelPurgeDelay)
@@ -743,19 +693,6 @@ object GlobalSnapshotConsensus {
         )
         .toResource
 
-      consensusStorage <- ConsensusStorage
-        .make[
-          F,
-          GlobalSnapshotEvent,
-          GlobalSnapshotKey,
-          GlobalSnapshotArtifact,
-          GlobalSnapshotContext,
-          GlobalSnapshotStatus,
-          GlobalConsensusOutcome,
-          GlobalConsensusKind
-        ](appConfig.snapshot.consensus)
-        .toResource
-
       // WATCHTOWER fraud-proof POOL (W3a) — the single shared node-local staging area. The daemon's `handleFraudProof` OFFERS
       // locally-UPHELD disputes into it; the gl0 leader producer PEEKS it to embed the `fraudProofs` consensus field. `noop` at
       // numShards=1 (no shard deps) ⇒ always-empty ⇒ no fraud proofs embedded ⇒ byte-identical regression bar.
@@ -774,10 +711,10 @@ object GlobalSnapshotConsensus {
           collateral,
           rewardsService,
           GlobalSnapshotEventCutter.make(
-            appConfig.snapshot.consensus.eventCutter.maxBinarySizeBytes,
+            appConfig.snapshot.eventCutter.maxBinarySizeBytes,
             SnapshotBinaryFeeCalculator.make(appConfig.shared.feeConfigs, pendingReader)
           ),
-          UpdateNodeParametersCutter.make(appConfig.snapshot.consensus.eventCutter.maxUpdateNodeParametersSize),
+          UpdateNodeParametersCutter.make(appConfig.snapshot.eventCutter.maxUpdateNodeParametersSize),
           appConfig.environment,
           DefaultDelegatedRewardsConfigProvider,
           sharedCfg.fieldsAddedOrdinals.tessellation3Migration
@@ -821,16 +758,6 @@ object GlobalSnapshotConsensus {
               )
           }
       }.toResource
-
-      routes = new ConsensusRoutes[
-        F,
-        GlobalSnapshotKey,
-        GlobalSnapshotArtifact,
-        GlobalSnapshotContext,
-        GlobalSnapshotStatus,
-        GlobalConsensusOutcome,
-        GlobalConsensusKind
-      ](consensusStorage, rumorQueue)
 
       // Nakamoto LDD + VRF config. `baseline`/`amplitude` arrive from HOCON as exact `Ratio` (parsed from
       // `"n/d"` strings — never Double), so the threshold computation is exact and reproducible across all
@@ -2273,14 +2200,5 @@ object GlobalSnapshotConsensus {
 
         } yield ()
       }
-      consensus = new Consensus(
-        disabledLegacyHandler[F],
-        consensusStorage,
-        disabledLegacyManager[F],
-        routes,
-        consensusFunctions,
-        healthRef = None,
-        triggerEventConsensus = None
-      )
-    } yield consensus
+    } yield ()
 }

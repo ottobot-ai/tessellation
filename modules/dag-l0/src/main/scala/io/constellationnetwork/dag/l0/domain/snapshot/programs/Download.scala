@@ -3,19 +3,18 @@ package io.constellationnetwork.dag.l0.domain.snapshot.programs
 import cats.effect.Async
 import cats.effect.std.Random
 import cats.syntax.all._
-import cats.{Applicative, MonadError, Parallel}
+import cats.{Applicative, Parallel}
 
 import scala.concurrent.duration._
 import scala.util.control.NoStackTrace
 
 import io.constellationnetwork.dag.l0.domain.snapshot.storages.SnapshotDownloadStorage
 import io.constellationnetwork.dag.l0.http.p2p.P2PClient
+import io.constellationnetwork.dag.l0.infrastructure.snapshot.GlobalSnapshotContext
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapshotEvent
-import io.constellationnetwork.dag.l0.infrastructure.snapshot.{GlobalSnapshotConsensus, GlobalSnapshotContext}
 import io.constellationnetwork.ext.cats.kernel.PartialPrevious
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.cluster.programs.Joining
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
@@ -35,25 +34,22 @@ import io.constellationnetwork.schema.snapshot.SnapshotMetadata
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.CompatCodecs._
 import io.constellationnetwork.validator.{GlobalSnapshotActiveEraValidator, StateProofValidator}
 
 import eu.timepit.refined.cats._
 import eu.timepit.refined.types.numeric.NonNegLong
-import io.circe.Json
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import retry.RetryPolicies._
 import retry._
 
 object Download {
-  def make[F[_]: Async: Parallel: Random: KryoSerializer: JsonSerializer: SecurityProvider](
+  def make[F[_]: Async: Parallel: Random: JsonSerializer: SecurityProvider](
     snapshotStorage: SnapshotDownloadStorage[F],
     p2pClient: P2PClient[F],
     clusterStorage: ClusterStorage[F],
     lastFullGlobalSnapshotOrdinal: SnapshotOrdinal,
     globalSnapshotContextFns: GlobalSnapshotContextFunctions[F],
     nodeStorage: NodeStorage[F],
-    consensus: GlobalSnapshotConsensus[F],
     peerSelect: PeerSelect[F],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -129,15 +125,10 @@ object Download {
       nodeStorage
         .tryModifyState(NodeState.WaitingForDownload, NodeState.DownloadInProgress, NodeState.WaitingForObserving)(start)
         .flatMap(observe)
-        .flatMap { result =>
-          val ((snapshot, context), observationLimit) = result
-          for {
-            _ <- consensus.manager.startFacilitatingAfterDownload(observationLimit, snapshot, context)
-          } yield ()
-        }
+        .void
         .onError(logger.error(_)("Unexpected failure during download!"))
         .handleErrorWith { err =>
-          // If download fails after start() succeeded (e.g. during observe() or startFacilitatingAfterDownload),
+          // If download fails after start() succeeded (for example, during observation or a storage update),
           // the node may be stuck in WaitingForObserving/Observing with nobody to retry.
           // Revert to WaitingForDownload so the DownloadDaemon can retry from scratch.
           nodeStorage.getNodeState.flatMap {
@@ -156,15 +147,13 @@ object Download {
       *   - Does NOT clear the event mempool — forked events from a minority fork will be rejected by consensus validation when proposed, so
       *     stale mempool entries are harmless
       *   - Does NOT clear the MPT store
-      *   - Observes exactly one round (waits for the next snapshot) before facilitating
+      *   - Observes a bounded number of subsequent snapshots before returning
       *   - Uses setForRecovery on lastNGlobalSnapshotStorage (sets single snapshot, no backfill)
       *
       * Falls back to full download if no local persisted state exists (fresh join scenario).
       *
-      * Recovery download still goes through the same state machine transitions: WaitingForDownload → DownloadInProgress →
-      * WaitingForObserving → Observing → WaitingForReady → Ready. It observes exactly one round (waits for the next snapshot to appear) to
-      * ensure the node starts facilitating at the beginning of a round rather than mid-flight, avoiding a race condition where the node
-      * joins a round already in progress and misses declarations/proposals.
+      * This legacy peer-download program does not authorize Nakamoto production or mutate a BFT round manager. GL0 startup and recovery
+      * must pass the separate authenticated chain-seed, subscription-readiness, and production gates before becoming `Ready`.
       */
     def recoveryDownload(implicit hasherSelector: HasherSelector[F]): F[Unit] = {
       def getLatestMetadata: F[SnapshotMetadata] = {
@@ -193,9 +182,6 @@ object Download {
           // chain canonical ordinal N+1 onto a forked ordinal N (hash mismatch in set()).
           _ <- lastNGlobalSnapshotStorage.clear
           _ <- lastGlobalSnapshotStorage.clear
-          // Reset consensus manager state (observation key, last outcome) so the fresh
-          // initFromDownload can set them cleanly.
-          _ <- consensus.manager.resetForRecovery
           // Fetch only the gap: the download() hash-chain walker already stops at persisted snapshots
           result <- download(metadata.hash, metadata.ordinal, none)
           _ <- logger.info(
@@ -206,8 +192,7 @@ object Download {
       def recoveryObserve(result: DownloadResult): F[(DownloadResult, ObservationLimit)] = {
         val (lastSnapshot, lastContext) = result
         for {
-          // Random 1-5 rounds observation to stagger recovery re-entry and mitigate thundering herd.
-          // Minimum of 1 ensures at least one round is observed before rejoining consensus.
+          // Random 1-5 snapshot observation to stagger transport re-entry and mitigate thundering herd.
           recoveryRounds <- Random[F].betweenLong(1L, 6L)
           recoveryOffset = NonNegLong.unsafeFrom(recoveryRounds)
           // Reset storage heads to the downloaded snapshot so the normal observe
@@ -219,7 +204,7 @@ object Download {
             globalSnapshotConsensusStorage.setHeadForRecovery(lastSnapshot, lastContext)
           }
           _ <- logger.info(
-            s"[RecoveryDownload] Storage reset to ordinal ${lastSnapshot.ordinal.show}, entering observe for $recoveryOffset rounds (random 1-5)"
+            s"[RecoveryDownload] Storage reset to ordinal ${lastSnapshot.ordinal.show}, entering observe for $recoveryOffset snapshots"
           )
           // Reuse the normal observe path — after setForRecovery, snapshots are sequential.
           // observe updates lastN and lastGlobal storages but NOT the consensus SnapshotStorage head.
@@ -228,9 +213,9 @@ object Download {
             val recoveryObservationLimit = SnapshotOrdinal(lastSnapshot.ordinal.value |+| recoveryOffset)
             observeWithLimit(result, recoveryObservationLimit)
           }
-          (observedResult, observationLimit) = observeResult
+          observedResult = observeResult._1
           (observedSnapshot, observedContext) = observedResult
-          // Sync consensus SnapshotStorage head to observed tip so prepend works on the next round
+          // Sync the persisted SnapshotStorage head to the observed tip so the next prepend is sequential.
           _ <- hasherSelector.withCurrent { implicit hs =>
             globalSnapshotConsensusStorage.setHeadForRecovery(observedSnapshot, observedContext)
           }
@@ -243,15 +228,11 @@ object Download {
       nodeStorage
         .tryModifyState(NodeState.WaitingForDownload, NodeState.DownloadInProgress, NodeState.WaitingForObserving)(recoveryStart)
         .flatMap(recoveryObserve)
-        .flatMap { result =>
-          val ((snapshot, context), observationLimit) = result
-          consensus.manager.startFacilitatingAfterDownload(observationLimit, snapshot, context, isRecovery = true)
-        }
+        .void
         .flatTap { _ =>
           // Re-announce to cluster peers so they re-add us to their peer lists.
           // During isolation, LocalHealthcheck removes unresponsive peers from cluster storage.
-          // Without this, the recovered node can fetch snapshots but can't participate in
-          // consensus because other nodes don't route gossip declarations to it.
+          // Without this, the recovered node can fetch snapshots but peers do not route transport traffic to it.
           joining.rejoinAfterRecovery.handleErrorWith { err =>
             logger.warn(err)("[RecoveryDownload] Cluster rejoin failed, continuing anyway")
           }
@@ -291,7 +272,6 @@ object Download {
             mptStore.deleteAbove(metadata.ordinal) >>
             lastNGlobalSnapshotStorage.clear >>
             lastGlobalSnapshotStorage.clear >>
-            consensus.manager.resetForRecovery >>
             eventMempool.clear >>
             logger.info("[Download] Cleared event mempool for recovery")
         )
@@ -347,8 +327,7 @@ object Download {
         } yield result
       }
 
-      consensus.manager.registerForConsensus(observationLimit) >>
-        go(result).map((_, observationLimit))
+      go(result).map((_, observationLimit))
     }
 
     def observe(result: DownloadResult)(implicit hasherSelector: HasherSelector[F]): F[(DownloadResult, ObservationLimit)] = {

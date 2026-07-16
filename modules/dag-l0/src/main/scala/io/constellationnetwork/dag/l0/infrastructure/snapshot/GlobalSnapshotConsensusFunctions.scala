@@ -430,16 +430,15 @@ object GlobalSnapshotConsensusFunctions {
       *
       * The pipeline:
       *   1. Extract and sort events by type (DAG blocks, state channels, allow spends, token locks, etc.) 2. Cut events to fit within
-      *      bounds (eventCutter) 3. Derive facilitators from the consensus facility declarations (not from proof signatures) 4. Pass sorted
-      *      event lists to `GlobalSnapshotAcceptanceManager.accept()` 5. Build the `GlobalIncrementalSnapshot` artifact with all accepted
-      *      data
+      *      bounds (eventCutter) 3. Bind the producing GL0 operator set used by reward calculation 4. Pass sorted event lists to
+      *      `GlobalSnapshotAcceptanceManager.accept()` 5. Build the `GlobalIncrementalSnapshot` artifact with all accepted data
       *
       * @param events
       *   Unordered set of events — iteration order is non-deterministic. Events are sorted after extraction to ensure deterministic
       *   acceptance.
       * @param facilitators
-      *   Current round's facilitators (deterministic: all nodes must receive all facility declarations before advancing from
-      *   CollectingFacilities).
+      *   Nakamoto producer identities used by the existing reward-calculation interface. The live single-producer path passes only the
+      *   locally eligible producer; this is not a BFT facilitator set.
       */
     // Public trait entry point (the genuine produce path — SnapshotLeaderLoop). Sources finalized
     // shard checkpoints (Gap C) so they fold into accept(). The follower re-derivation path
@@ -643,14 +642,8 @@ object GlobalSnapshotConsensusFunctions {
         lastActiveTips <- lastArtifact.activeTips(Async[F], lastArtifactHasher)
         lastDeprecatedTips = lastArtifact.tips.deprecated
 
-        // Derive lastFacilitators from the current-round facilitators set rather than
-        // lastArtifact.proofs. Different nodes collect different numbers of signatures
-        // for the same snapshot (gossip is non-deterministic), so proofs.size varies
-        // per node. This causes divergent nodeOperatorRewards counts (and amounts)
-        // because the facilitator pool is split by facilitators.size. Using the
-        // current-round facilitators is deterministic: all nodes must receive all
-        // facility declarations before advancing from CollectingFacilities, so
-        // state.facilitators is identical across all consensus participants.
+        // The inherited reward interface still names this set `facilitators`; under GL0 Nakamoto it is the exact producer identity set
+        // supplied by the proposal path, never a facility declaration or signature quorum.
         lastFacilitators <- facilitators.toList.traverse { peerId =>
           PeerId._Id.get(peerId).toAddress.map(_ -> peerId)
         }
