@@ -1,6 +1,6 @@
 # Nakamoto Consensus — Status & Remaining Work
 
-**Last updated:** 2026-07-14 (active epic decomposition)
+**Last updated:** 2026-07-16 (active epic decomposition)
 
 ---
 
@@ -48,12 +48,13 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `17/18` dispositioned. `O-01` through `O-17` are
-> ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; the newly
-> surfaced `O-18` transport/DA byte contract awaits an owner response in
-> `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`. Open work under
-> O-01 through O-17 is an engineering, research, schema, parameter, or proof
-> gate under a ratified direction, not a request for another owner answer.
+> **Owner-decision status:** `17/19` dispositioned. `O-01` through `O-17` are
+> ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18`
+> transport/DA bytes and `O-19` upstream-v4 migration policy await owner responses
+> in `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
+> `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`. Open work under
+> O-01 through O-17 is an engineering, research, schema, parameter, or proof gate
+> under a ratified direction, not a request for another owner answer.
 
 ---
 
@@ -595,6 +596,23 @@ criteria are in `NAKAMOTO-PLAN.md`.
     disk reads, or lane decoding. The atomic Scodec runtime cutover, composite
     vectors, bounded signed lanes, exact parameters, and verified upstream-v4
     offline importer remain open.
+  - **Landed nonactivating E1.1a requirements manifest (2026-07-16):**
+    `docs/nakamoto/CONSENSUS-ARTIFACT-REQUIREMENTS-MANIFEST.md` lands a dark
+    declaration inventory over 48 grounded artifact families, nine distinct
+    authority meanings, and ten typed selection/randomness transcript contracts.
+    Every transcript requires the exact eligibility parent, atomic KES/VRF pair,
+    N-2 roster/stake/key view, N-1 eta evidence, period/slot, purpose, and exact
+    subsystem context. Its labels are not codecs, wire tags, preimage bytes,
+    signatures, or runtime authority; codec status remains `Open` and activation
+    remains `DarkOnly`.
+  - **Confirmed E1.1a blockers:** `StateChangesAccumulator` omits rooted field 33
+    `ConsumedAllowSpends` and field 34 `Slashings`; `GlobalStateKeyCodec` omits
+    live `SystemNamespace`; `SlashedRegistryEntry` still uses JSON bytes under an
+    `ImmutableCodec` facade; signed state-channel lanes, canonical shard diff,
+    positive replay coverage, the exact optimistic-tip attestation body, and
+    portable finality/tower proof schemas remain open. O-18 controls transport/DA
+    bytes and O-19 controls migration transform, conservation, and target-genesis
+    policy.
   - **Landed nonactivating E1b byte contract (2026-07-16):** added an explicit,
     non-implicit ScodecV1 codec for the complete MPT commitment ADT with frozen
     leaf/branch/extension vectors and strict tag, path, nibble, hash, branch,
@@ -605,6 +623,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - E1b does not select hash preimages, compute a target MPT root, encode proof
     aggregates, or activate Scodec in hashing/signing/storage. Aggregate proof and
     message bounds plus the atomic domain-bound runtime cutover remain open.
+  - **Expanded atomic-cutover authority inventory:** the guard now freezes every
+    reviewed ordinal-selected hasher/state-proof branch, direct hash selection,
+    field-erasing legacy snapshot projection, live Kryo promotion, and the prior
+    JSON MPT/preimage surfaces. This is a syntactic change detector, not a proof of
+    semantic non-reachability or an activated migration.
   - Replace JSON state-channel content and decoder-success classification with an
     explicit signed framework-currency / framework-currency-with-data lane.
   - Delete undeployed fork-only compatibility paths; isolate historical disk/
@@ -613,6 +636,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - Freeze composite byte/hash/signature/root vectors and strict negative vectors;
     round-trip-only codec tests do not close activation.
   - Bind network/genesis/era/parameters and exact parent/base into artifacts.
+  - **Status honesty:** E1.1 and E1.3 remain OPEN; S1 remains PARTIAL;
+    `SER-005`, `SER-006`, and `ERA-001` remain OPEN.
+  - **Next E1.1 manifest closure:** add generic rumor and ChainSync/bootstrap
+    transport families, expand all 14 finality payload variants, and replace the
+    remaining authority-class fallback with a total per-kind binding/codec/vector
+    table plus removal-mutation tests.
   - **Gate:** `SER-*`, `ERA-*`, `PARAM-001`, `CRYPTO-001`.
 
 - [ ] **S2 PARTIAL - deterministic framework oracle and kernel**

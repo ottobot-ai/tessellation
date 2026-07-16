@@ -2,7 +2,7 @@
 
 **Historical branch at time of writing:** `feature/serde-typeclass-shim`
 **Historical content date:** 2026-05-16
-**Active architecture/build sequence:** 2026-07-12
+**Active architecture/build sequence:** 2026-07-16
 
 > **ACTIVE PLAN.** Execute the sequenced epics below. The source-cited security
 > baseline remains `docs/review/CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`.
@@ -14,13 +14,14 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `17/18` dispositioned. `O-01` through `O-17` are
+**Owner-decision status:** `17/19` dispositioned. `O-01` through `O-17` are
 ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
-byte choices await an owner response in
-`docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`. Dependencies under
+bytes and `O-19` upstream-v4 migration policy await owner responses in
+`docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
+`docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`. Dependencies under
 O-01 through O-17 mean implementation of their ratified direction and closure of
-their listed engineering, research, schema, parameter, or proof gates. O-18 is
-the only pending owner response.
+their listed engineering, research, schema, parameter, or proof gates. O-18 and
+O-19 are the only pending owner responses.
 
 ## Active objective
 
@@ -1227,14 +1228,29 @@ Current S1 evidence is cleanup, identity, and one dark byte contract only. The
 stale configurable Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
 deleted. `ProtocolEraId.ScodecV1` is frozen to strict tag `0x01`; empty,
 trailing, and every other one-byte tag reject, and a source tripwire keeps the
-identity dark outside its schema and codec. A separate explicit, non-implicit
-MPT commitment codec freezes strict leaf/branch/extension bytes and passes 15
-focused tests; nine atomic-cutover guards freeze all 23 current JSON MPT hash
-sites and ordinary production references to the dark codec. The guard is a
-syntactic fuse, not semantic non-reachability proof. Live hashing/signing,
+identity dark outside its schema and codec. The dark E1.1a requirements manifest
+now lands a declaration inventory over 48 grounded artifact families, nine
+authority meanings, and ten typed transcript contracts. Every transcript requires
+the exact eligibility parent, atomic KES/VRF pair, N-2 roster/stake/key view, N-1
+eta evidence, period/slot, purpose, and exact subsystem context. It defines no
+codec, wire tag, preimage bytes, signature, or runtime authority. Confirmed
+blockers include accumulator omissions for rooted field 33
+`ConsumedAllowSpends` and field 34 `Slashings`, missing `SystemNamespace` key
+encoding, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard diff/
+positive replay-coverage, exact optimistic-tip attestation, and finality/tower
+proof schemas, plus the pending O-18 transport/DA and O-19 migration-policy
+decisions. A separate explicit,
+non-implicit MPT commitment codec freezes strict leaf/branch/extension bytes and
+passes 15 focused tests. The atomic-cutover guard now inventories ordinal-selected
+hash/state-proof authority, direct hash selection, legacy field-erasing snapshot
+projections, live Kryo promotion, and the prior JSON MPT/preimage surfaces. It is
+a syntactic fuse, not semantic non-reachability proof. Live hashing/signing,
 state-proof selection, MPT roots/proofs, disk reads, and lane decoding remain
-JSON/Kryo/legacy and are guarded against piecemeal activation. This does not
-close S1, SER-005, SER-006, or ERA-001.
+JSON/Kryo/legacy and are guarded against piecemeal activation. E1.1 and E1.3
+remain OPEN, S1 remains PARTIAL, and SER-005, SER-006, and ERA-001 remain OPEN.
+E1.1 next expands generic rumor and ChainSync/bootstrap transport families, all
+14 finality payload variants, and a total per-kind binding/codec/vector table with
+removal-mutation gates; the 48 semantic families do not substitute for that work.
 
 Current S2 evidence is intentionally narrow. A nonactivating test reference
 interpreter supports exactly the typed IDs for zero-fee native transfer,

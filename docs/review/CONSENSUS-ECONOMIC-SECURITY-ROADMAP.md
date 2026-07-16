@@ -230,6 +230,15 @@ trailing-byte rejection. Live JSON/Kryo hashing, signing, state-proof selection,
 disk probing, MPT hashing, and lane decoding are unchanged and remain guarded
 against piecemeal Scodec activation. E1/SER-005/ERA-001 therefore remain open.
 
+E1.1a now also has a dark requirements inventory in
+`docs/nakamoto/CONSENSUS-ARTIFACT-REQUIREMENTS-MANIFEST.md`. Its semantic artifact,
+authority, binding, and transcript labels have no codecs, wire tags, preimage
+bytes, or runtime reachability. Typed transcript contracts require the exact
+branch-historical N-2 atomic KES/VRF pair plus roster/stake view, N-1 eta,
+period/slot, and purpose at every inventoried VRF/sortition use. It records known
+accumulator/change-set, MPT-key, slashing-value, optimistic-attestation, tower,
+genesis, lane, O18, and O19 blockers; it does not close E1.1 or E1.3.
+
 The E1b slice is also deliberately nonactivating. It freezes one explicit,
 non-implicit ScodecV1 byte contract for the complete MPT commitment ADT: tags
 `0/1/2`, bounded packed nibble paths with zero odd padding, 32-byte digests, and
