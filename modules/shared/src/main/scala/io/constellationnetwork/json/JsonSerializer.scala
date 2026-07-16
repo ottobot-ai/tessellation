@@ -8,6 +8,10 @@ import io.circe.{Decoder, Encoder, Printer}
 trait JsonSerializer[F[_]] {
   def serialize[A: Encoder](content: A): F[Array[Byte]]
   def deserialize[A: Decoder](content: Array[Byte]): F[Either[Throwable, A]]
+  def deserializeBounded[A: Decoder](
+    content: Array[Byte],
+    limits: JsonBrotliBinarySerializer.BrotliDecodeLimits
+  ): F[Either[Throwable, A]]
 }
 
 object JsonSerializer {
@@ -22,6 +26,12 @@ object JsonSerializer {
 
         override def deserialize[A: Decoder](content: Array[Byte]): F[Either[Throwable, A]] =
           brotli.deserialize(content)
+
+        override def deserializeBounded[A: Decoder](
+          content: Array[Byte],
+          limits: JsonBrotliBinarySerializer.BrotliDecodeLimits
+        ): F[Either[Throwable, A]] =
+          brotli.deserializeBounded(content, limits)
       }
     }
   }
