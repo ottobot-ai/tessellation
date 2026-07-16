@@ -79,12 +79,11 @@ private[node] final class MetagraphBinaryCustodyUsage private[custody] (
   val totalBytes: Long
 )
 
-/**
-  * An unforgeable store-bound witness that one exact byte string completed local durable write and verified readback.
+/** An unforgeable store-bound witness that one exact byte string completed local durable write and verified readback.
   *
   * This deliberately is not a case class, does not implement `Serializable`, has no codec, and is bound to one live store instance. It is
-  * not source authentication, binary admission, DA evidence, an execution receipt, a signature preimage, a quorum contribution, or
-  * economic authority.
+  * not source authentication, binary admission, DA evidence, an execution receipt, a signature preimage, a quorum contribution, or economic
+  * authority.
   */
 private[node] final class DurablyStoredBinary private[custody] (
   val contentAddress: LocalCustodyAddress,
@@ -99,8 +98,7 @@ private[node] sealed abstract class MetagraphBinaryCustodyRejected(message: Stri
     extends MetagraphBinaryCustodyError(message, cause)
 
 private[node] object MetagraphBinaryCustodyRejected {
-  final case class InvalidArtifact(detail: String)
-      extends MetagraphBinaryCustodyRejected(s"Rejected metagraph-binary bytes: $detail")
+  final case class InvalidArtifact(detail: String) extends MetagraphBinaryCustodyRejected(s"Rejected metagraph-binary bytes: $detail")
 
   final case class InvalidContentAddress(detail: String)
       extends MetagraphBinaryCustodyRejected(s"Rejected local custody content address: $detail")
@@ -126,8 +124,7 @@ private[node] object MetagraphBinaryCustodyUnavailable {
         s"Metagraph-binary custody lock path is unsafe at $path: $detail"
       )
 
-  final case class StoreClosed(path: Path)
-      extends MetagraphBinaryCustodyUnavailable(s"Metagraph-binary custody store is closed: $path")
+  final case class StoreClosed(path: Path) extends MetagraphBinaryCustodyUnavailable(s"Metagraph-binary custody store is closed: $path")
 
   final case class SecureStorageUnsupported(path: Path, detail: String, cause0: Throwable = null)
       extends MetagraphBinaryCustodyUnavailable(
@@ -237,14 +234,12 @@ private[node] object MetagraphBinaryCustodyRecoveryRequired {
       )
 }
 
-/**
-  * Dark exact-byte custody primitive. Nothing in this interface can emit a portable receipt, signature, quorum result, or state-validity
+/** Dark exact-byte custody primitive. Nothing in this interface can emit a portable receipt, signature, quorum result, or state-validity
   * claim, and this store is intentionally not wired to intake, shard buffering, checkpoint production, or GL0 acceptance.
   */
 private[node] trait MetagraphBinaryCustodyStore[F[_]] {
 
-  /**
-    * Store the exact caller-supplied bytes by SHA-256 content address. A successful return is possible only after file and directory force,
+  /** Store the exact caller-supplied bytes by SHA-256 content address. A successful return is possible only after file and directory force,
     * atomic installation, and exact readback verification. Repeating the same bytes is idempotent and consumes no additional capacity.
     */
   def putExact(bytes: Array[Byte]): F[DurablyStoredBinary]
@@ -304,11 +299,10 @@ private[node] object MetagraphBinaryCustodyStore {
 
   private final case class StablePathIdentity(path: Path, fileKey: AnyRef)
 
-  /**
-    * Authority for the dedicated local directory is held through one secure directory descriptor, not through the caller's pathname.
-    * Java cannot exclude a malicious process running as the same OS identity from unlink/ABA attacks inside an owner-writable directory;
-    * this local store therefore requires a trusted host account with no concurrent out-of-band mutator. Stable identity checks turn
-    * accidental replacement or a violated host precondition into a fail-closed local Unavailable error.
+  /** Authority for the dedicated local directory is held through one secure directory descriptor, not through the caller's pathname. Java
+    * cannot exclude a malicious process running as the same OS identity from unlink/ABA attacks inside an owner-writable directory; this
+    * local store therefore requires a trusted host account with no concurrent out-of-band mutator. Stable identity checks turn accidental
+    * replacement or a violated host precondition into a fail-closed local Unavailable error.
     */
   private final class PinnedCustodyDirectory[F[_]: Async] private (
     val root: Path,
@@ -594,8 +588,7 @@ private[node] object MetagraphBinaryCustodyStore {
       }
   }
 
-  /**
-    * Exclusively own an already-created dedicated directory. The caller must durably install the directory entry in its parent before
+  /** Exclusively own an already-created dedicated directory. The caller must durably install the directory entry in its parent before
     * constructing this store; creating a directory here and forcing only its contents would make the first successful capability claim
     * stronger crash durability than the filesystem establishes.
     */
@@ -1022,31 +1015,33 @@ private[node] object MetagraphBinaryCustodyStore {
     val path = pinned.artifactPath(leaf)
 
     Resource.eval(pinned.readAttributes(leaf)).flatMap { before =>
-      Resource.eval(
-        Async[F].raiseUnless(before.isRegularFile && !before.isSymbolicLink)(
-          MetagraphBinaryCustodyRecoveryRequired.CorruptArtifact(expectedAddress, path, "not a no-follow regular file")
-        ) >> Async[F].delay(requireFileKey(before, path))
-      ).flatMap { expectedKey =>
-        Resource.eval(artifactOpenHook.beforeOpen(path)) >>
-          pinned
-            .openFile(leaf, Set[OpenOption](StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))
-            .evalMap { channel =>
-            for {
-              afterOpen <- pinned.readAttributes(leaf)
-              _ <- Async[F].raiseUnless(
-                afterOpen.isRegularFile &&
-                  !afterOpen.isSymbolicLink &&
-                  requireFileKey(afterOpen, path) == expectedKey
-              )(
-                MetagraphBinaryCustodyUnavailable.OwnershipIdentityChanged(
-                  path,
-                  "artifact directory entry changed while its no-follow channel was opened"
-                )
-              )
-              size <- Async[F].blocking(channel.size())
-            } yield (Channels.newInputStream(channel), size, expectedKey)
-          }
-      }
+      Resource
+        .eval(
+          Async[F].raiseUnless(before.isRegularFile && !before.isSymbolicLink)(
+            MetagraphBinaryCustodyRecoveryRequired.CorruptArtifact(expectedAddress, path, "not a no-follow regular file")
+          ) >> Async[F].delay(requireFileKey(before, path))
+        )
+        .flatMap { expectedKey =>
+          Resource.eval(artifactOpenHook.beforeOpen(path)) >>
+            pinned
+              .openFile(leaf, Set[OpenOption](StandardOpenOption.READ, LinkOption.NOFOLLOW_LINKS))
+              .evalMap { channel =>
+                for {
+                  afterOpen <- pinned.readAttributes(leaf)
+                  _ <- Async[F].raiseUnless(
+                    afterOpen.isRegularFile &&
+                      !afterOpen.isSymbolicLink &&
+                      requireFileKey(afterOpen, path) == expectedKey
+                  )(
+                    MetagraphBinaryCustodyUnavailable.OwnershipIdentityChanged(
+                      path,
+                      "artifact directory entry changed while its no-follow channel was opened"
+                    )
+                  )
+                  size <- Async[F].blocking(channel.size())
+                } yield (Channels.newInputStream(channel), size, expectedKey)
+              }
+        }
     }
   }
 
@@ -1225,11 +1220,12 @@ private[node] object MetagraphBinaryCustodyStore {
     ): F[DurablyStoredBinary] =
       Async[F]
         .delay(Math.addExact(current.totalBytes, captured.length.toLong))
-        .adaptError { case _: ArithmeticException =>
-          MetagraphBinaryCustodyRecoveryRequired.InventoryByteCountOverflow(
-            current.totalBytes,
-            captured.length.toLong
-          )
+        .adaptError {
+          case _: ArithmeticException =>
+            MetagraphBinaryCustodyRecoveryRequired.InventoryByteCountOverflow(
+              current.totalBytes,
+              captured.length.toLong
+            )
         }
         .flatMap { newTotal =>
           if (current.entries.size >= limits.maxItems || newTotal > limits.maxTotalBytes)

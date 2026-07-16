@@ -115,15 +115,16 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           usage <- store.usage
           serializable = stored.asInstanceOf[AnyRef].isInstanceOf[java.io.Serializable]
           addressSerializable = stored.contentAddress.asInstanceOf[AnyRef].isInstanceOf[java.io.Serializable]
-        } yield expect.all(
-          stored.contentAddress == LocalCustodyAddress.fromExactBytes(expected),
-          stored.byteLength == expected.length.toLong,
-          read.sameElements(expected),
-          usage.items == 1,
-          usage.totalBytes == expected.length.toLong,
-          !serializable,
-          !addressSerializable
-        )
+        } yield
+          expect.all(
+            stored.contentAddress == LocalCustodyAddress.fromExactBytes(expected),
+            stored.byteLength == expected.length.toLong,
+            read.sameElements(expected),
+            usage.items == 1,
+            usage.totalBytes == expected.length.toLong,
+            !serializable,
+            !addressSerializable
+          )
       }
     }
   }
@@ -138,11 +139,12 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           first <- store.putExact(bytes)
           second <- store.putExact(bytes.clone())
           usage <- store.usage
-        } yield expect.all(
-          first.contentAddress == second.contentAddress,
-          usage.items == 1,
-          usage.totalBytes == bytes.length.toLong
-        )
+        } yield
+          expect.all(
+            first.contentAddress == second.contentAddress,
+            usage.items == 1,
+            usage.totalBytes == bytes.length.toLong
+          )
       } >> MetagraphBinaryCustodyStore.resource[IO](directory, limits).use { reopened =>
         for {
           usage <- reopened.usage
@@ -177,16 +179,17 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           } yield (stale, read, full, usage)
         }
         (stale, read, full, usage) = reopened
-      } yield expect.all(
-        List(putAfterClose, openAfterClose, readAfterClose, usageAfterClose).forall(
-          _.left.exists(_.isInstanceOf[StoreClosed])
-        ),
-        stale.left.exists(_.isInstanceOf[ForeignCapability]),
-        read.sameElements(bytes),
-        full.left.exists(_.isInstanceOf[CapacityExceeded]),
-        usage.items == 1,
-        usage.totalBytes == bytes.length.toLong
-      )
+      } yield
+        expect.all(
+          List(putAfterClose, openAfterClose, readAfterClose, usageAfterClose).forall(
+            _.left.exists(_.isInstanceOf[StoreClosed])
+          ),
+          stale.left.exists(_.isInstanceOf[ForeignCapability]),
+          read.sameElements(bytes),
+          full.left.exists(_.isInstanceOf[CapacityExceeded]),
+          usage.items == 1,
+          usage.totalBytes == bytes.length.toLong
+        )
     }
   }
 
@@ -209,10 +212,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
         _ <- put.joinWithNever.timeout(3.seconds)
         _ <- releasing.joinWithNever.timeout(3.seconds)
         afterClose <- store.usage.attempt
-      } yield expect.all(
-        releasedWhileBusy.isEmpty,
-        afterClose.left.exists(_.isInstanceOf[StoreClosed])
-      )
+      } yield
+        expect.all(
+          releasedWhileBusy.isEmpty,
+          afterClose.left.exists(_.isInstanceOf[StoreClosed])
+        )
     }
   }
 
@@ -240,33 +244,36 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
     tempDirectory.use { itemDirectory =>
       tempDirectory.use { byteDirectory =>
         for {
-          oversized <- MetagraphBinaryCustodyStore.resource[IO](itemDirectory, oneItem).use(
-            _.putExact(new Array[Byte](11)).attempt
-          )
+          oversized <- MetagraphBinaryCustodyStore
+            .resource[IO](itemDirectory, oneItem)
+            .use(
+              _.putExact(new Array[Byte](11)).attempt
+            )
           itemFull <- MetagraphBinaryCustodyStore.resource[IO](itemDirectory, oneItem).use { store =>
             store.putExact(Array[Byte](1)) >> store.putExact(Array[Byte](2)).attempt
           }
           byteFull <- MetagraphBinaryCustodyStore.resource[IO](byteDirectory, fourBytes).use { store =>
             store.putExact(Array[Byte](1, 2, 3)) >> store.putExact(Array[Byte](4, 5)).attempt
           }
-        } yield expect.all(
-          oversized.left.exists(error =>
-            error.isInstanceOf[ArtifactTooLarge] &&
-              error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
-              !error.isInstanceOf[MetagraphBinaryCustodyRejected]
-          ),
-          itemFull.left.exists(error =>
-            error.isInstanceOf[CapacityExceeded] &&
-              error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
-              !error.isInstanceOf[MetagraphBinaryCustodyRejected]
-          ),
-          byteFull.left.exists(error =>
-            error.isInstanceOf[CapacityExceeded] &&
-              error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
-              !error.isInstanceOf[MetagraphBinaryCustodyRejected]
-          ),
-          invalid.left.exists(error => error.detail.contains("maxItems") && error.detail.contains("maxTotalBytes"))
-        )
+        } yield
+          expect.all(
+            oversized.left.exists(error =>
+              error.isInstanceOf[ArtifactTooLarge] &&
+                error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
+                !error.isInstanceOf[MetagraphBinaryCustodyRejected]
+            ),
+            itemFull.left.exists(error =>
+              error.isInstanceOf[CapacityExceeded] &&
+                error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
+                !error.isInstanceOf[MetagraphBinaryCustodyRejected]
+            ),
+            byteFull.left.exists(error =>
+              error.isInstanceOf[CapacityExceeded] &&
+                error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
+                !error.isInstanceOf[MetagraphBinaryCustodyRejected]
+            ),
+            invalid.left.exists(error => error.detail.contains("maxItems") && error.detail.contains("maxTotalBytes"))
+          )
       }
     }
   }
@@ -283,10 +290,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           tooMany <- MetagraphBinaryCustodyStore.resource[IO](itemDirectory, oneItem).use(_ => IO.unit).attempt
           _ <- writeArtifact(byteDirectory, Array[Byte](1, 2, 3))
           tooLarge <- MetagraphBinaryCustodyStore.resource[IO](byteDirectory, twoBytes).use(_ => IO.unit).attempt
-        } yield expect.all(
-          tooMany.left.exists(_.isInstanceOf[InventoryEnumerationLimitExceeded]),
-          tooLarge.left.exists(_.isInstanceOf[ExistingInventoryExceedsLimits])
-        )
+        } yield
+          expect.all(
+            tooMany.left.exists(_.isInstanceOf[InventoryEnumerationLimitExceeded]),
+            tooLarge.left.exists(_.isInstanceOf[ExistingInventoryExceedsLimits])
+          )
       }
     }
   }
@@ -299,11 +307,13 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
     tempDirectory.use { directory =>
       MetagraphBinaryCustodyStore.resource[IO](directory, initialLimits).use(_.putExact(bytes).void) >>
         MetagraphBinaryCustodyStore.resource[IO](directory, loweredLimits).use(_ => IO.unit).attempt.map { result =>
-          expect(result.left.exists(error =>
-            error.isInstanceOf[ExistingArtifactExceedsLimit] &&
-              error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
-              !error.isInstanceOf[MetagraphBinaryCustodyRecoveryRequired]
-          ))
+          expect(
+            result.left.exists(error =>
+              error.isInstanceOf[ExistingArtifactExceedsLimit] &&
+                error.isInstanceOf[MetagraphBinaryCustodyUnavailable] &&
+                !error.isInstanceOf[MetagraphBinaryCustodyRecoveryRequired]
+            )
+          )
         }
     }
   }
@@ -335,13 +345,14 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
         _ <- IO.blocking(Files.createSymbolicLink(lockPath, lockTarget))
         rootResult <- MetagraphBinaryCustodyStore.resource[IO](linkedRoot, limits).use(_ => IO.unit).attempt
         lockResult <- MetagraphBinaryCustodyStore.resource[IO](lockRoot, limits).use(_ => IO.unit).attempt
-      } yield expect.all(
-        rootResult.left.exists {
-          case DirectoryPreconditionFailed(path, detail) => path.isAbsolute && detail.contains("symbolic-link")
-          case _                                         => false
-        },
-        lockResult.left.exists(_.isInstanceOf[LockPreconditionFailed])
-      )
+      } yield
+        expect.all(
+          rootResult.left.exists {
+            case DirectoryPreconditionFailed(path, detail) => path.isAbsolute && detail.contains("symbolic-link")
+            case _                                         => false
+          },
+          lockResult.left.exists(_.isInstanceOf[LockPreconditionFailed])
+        )
     }
   }
 
@@ -370,14 +381,15 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
         ancestorOperation <- ancestorStore.usage.attempt
         ancestorReplacementEntries <- directoryEntries(ancestorRoot)
         ancestorRelease <- releaseAncestor.attempt
-      } yield expect.all(
-        rootOperation.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
-        rootReplacementEntries.isEmpty,
-        rootRelease.left.exists(containsOwnershipChange),
-        ancestorOperation.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
-        ancestorReplacementEntries.isEmpty,
-        ancestorRelease.left.exists(containsOwnershipChange)
-      )
+      } yield
+        expect.all(
+          rootOperation.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
+          rootReplacementEntries.isEmpty,
+          rootRelease.left.exists(containsOwnershipChange),
+          ancestorOperation.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
+          ancestorReplacementEntries.isEmpty,
+          ancestorRelease.left.exists(containsOwnershipChange)
+        )
     }
   }
 
@@ -395,12 +407,13 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
         secondUsage <- second.usage
         firstRelease <- releaseFirst.attempt
         secondRelease <- releaseSecond.attempt
-      } yield expect.all(
-        firstOperation.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
-        secondUsage.items == 0,
-        firstRelease.left.exists(containsOwnershipChange),
-        secondRelease.isRight
-      )
+      } yield
+        expect.all(
+          firstOperation.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
+          secondUsage.items == 0,
+          firstRelease.left.exists(containsOwnershipChange),
+          secondRelease.isRight
+        )
     }
   }
 
@@ -418,10 +431,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
       for {
         result <- resourceWith[IO](directory, limits, hook, nonSecureOpen).use(_ => IO.unit).attempt
         entries <- directoryEntries(directory)
-      } yield expect.all(
-        result.left.exists(_.isInstanceOf[SecureStorageUnsupported]),
-        entries.isEmpty
-      )
+      } yield
+        expect.all(
+          result.left.exists(_.isInstanceOf[SecureStorageUnsupported]),
+          entries.isEmpty
+        )
     }
   }
 
@@ -448,10 +462,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
             read <- store.readExact(stored).attempt
           } yield read
         }
-      } yield expect.all(
-        startup.left.exists(_.isInstanceOf[CorruptArtifact]),
-        runtime.left.exists(_.isInstanceOf[CorruptArtifact])
-      )
+      } yield
+        expect.all(
+          startup.left.exists(_.isInstanceOf[CorruptArtifact]),
+          runtime.left.exists(_.isInstanceOf[CorruptArtifact])
+        )
     }
   }
 
@@ -488,10 +503,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           } yield replacedDuringOpen -> stableRead
         }
         (replacedDuringOpen, stableRead) = result
-      } yield expect.all(
-        replacedDuringOpen.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
-        stableRead.sameElements(bytes)
-      )
+      } yield
+        expect.all(
+          replacedDuringOpen.left.exists(_.isInstanceOf[OwnershipIdentityChanged]),
+          stableRead.sameElements(bytes)
+        )
     }
   }
 
@@ -502,10 +518,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
       for {
         _ <- (0 until 64).toList.traverse_(index => writeStaleTemporary(directory, index))
         result <- MetagraphBinaryCustodyStore.resource[IO](directory, twoItems).use(_ => IO.unit).attempt
-      } yield expect(result.left.exists {
-        case DirectoryEnumerationLimitExceeded(observed, maximum) => observed == 4L && maximum == 3L
-        case _                                                     => false
-      })
+      } yield
+        expect(result.left.exists {
+          case DirectoryEnumerationLimitExceeded(observed, maximum) => observed == 4L && maximum == 3L
+          case _                                                    => false
+        })
     }
   }
 
@@ -535,10 +552,11 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
               result <- store.readExact(stored).attempt
             } yield result
           }
-        } yield expect.all(
-          missing.left.exists(_.isInstanceOf[MissingArtifact]),
-          corrupt.left.exists(_.isInstanceOf[CorruptArtifact])
-        )
+        } yield
+          expect.all(
+            missing.left.exists(_.isInstanceOf[MissingArtifact]),
+            corrupt.left.exists(_.isInstanceOf[CorruptArtifact])
+          )
       }
     }
   }
@@ -589,18 +607,19 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           } yield (readB, usage)
         }
         (readB, reopenedUsage) = reopened
-      } yield expect.all(
-        poisonedUsage.left.exists(_ eq latched),
-        poisonedOpen.left.exists(_ eq latched),
-        poisonedRead.left.exists(_ eq latched),
-        poisonedPutB.left.exists(_ eq latched),
-        aExists,
-        !bExists,
-        releaseResult.isRight,
-        readB.sameElements(bytesB),
-        reopenedUsage.items == 1,
-        reopenedUsage.totalBytes == bytesB.length.toLong
-      )
+      } yield
+        expect.all(
+          poisonedUsage.left.exists(_ eq latched),
+          poisonedOpen.left.exists(_ eq latched),
+          poisonedRead.left.exists(_ eq latched),
+          poisonedPutB.left.exists(_ eq latched),
+          aExists,
+          !bExists,
+          releaseResult.isRight,
+          readB.sameElements(bytesB),
+          reopenedUsage.items == 1,
+          reopenedUsage.totalBytes == bytesB.length.toLong
+        )
     }
   }
 
@@ -649,13 +668,14 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           store.putExact(Array[Byte](4, 3, 2, 1)).attempt
         }
         entries <- directoryEntries(directory)
-      } yield expect.all(
-        result.left.exists {
-          case error: DurableWriteFailed => error.getCause eq failure
-          case _                         => false
-        },
-        entries.forall(path => path.getFileName.toString == ".metagraph-binary-custody.lock")
-      )
+      } yield
+        expect.all(
+          result.left.exists {
+            case error: DurableWriteFailed => error.getCause eq failure
+            case _                         => false
+          },
+          entries.forall(path => path.getFileName.toString == ".metagraph-binary-custody.lock")
+        )
     }
   }
 
@@ -690,13 +710,14 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
         }
         (result, usage, remaining) = outcome
         externalAfter <- IO.blocking(Files.readAllBytes(external))
-      } yield expect.all(
-        result.left.exists(_.isInstanceOf[DurableWriteFailed]),
-        externalAfter.sameElements(externalBytes),
-        usage.items == 0,
-        usage.totalBytes == 0L,
-        remaining.forall(_.getFileName.toString == ".metagraph-binary-custody.lock")
-      )
+      } yield
+        expect.all(
+          result.left.exists(_.isInstanceOf[DurableWriteFailed]),
+          externalAfter.sameElements(externalBytes),
+          usage.items == 0,
+          usage.totalBytes == 0L,
+          remaining.forall(_.getFileName.toString == ".metagraph-binary-custody.lock")
+        )
     }
   }
 
@@ -740,15 +761,16 @@ object MetagraphBinaryCustodyStoreSuite extends SimpleIOSuite {
           } yield (failed, read, usage)
         }
         (failed, read, usage) = result
-      } yield expect.all(
-        failed.left.exists {
-          case error: DurableWriteFailed => error.getCause eq failure
-          case _                         => false
-        },
-        read.sameElements(bytes),
-        usage.items == 1,
-        usage.totalBytes == bytes.length.toLong
-      )
+      } yield
+        expect.all(
+          failed.left.exists {
+            case error: DurableWriteFailed => error.getCause eq failure
+            case _                         => false
+          },
+          read.sameElements(bytes),
+          usage.items == 1,
+          usage.totalBytes == bytes.length.toLong
+        )
     }
   }
 
