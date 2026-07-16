@@ -85,8 +85,10 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
     private val stopped = new AtomicBoolean(false)
     val calls = new ConcurrentLinkedQueue[ScriptedCall]()
 
-    override def newCall[RequestT, ResponseT](method: MethodDescriptor[RequestT, ResponseT], options: CallOptions)
-      : ClientCall[RequestT, ResponseT] = {
+    override def newCall[RequestT, ResponseT](
+      method: MethodDescriptor[RequestT, ResponseT],
+      options: CallOptions
+    ): ClientCall[RequestT, ResponseT] = {
       val script = Option(remaining.poll()).getOrElse(throw new IllegalStateException("no scripted Subscribe call remained"))
       val call = new ScriptedCall(script)
       calls.add(call)
@@ -148,7 +150,8 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
       received <- GossipStream.subscribe[IO](channel, profile, readiness, limits).compile.toVector.timeout(3.seconds)
       status <- readiness.current
     } yield
-      expect.same(payloads.map(_.getRumor.contentType), received.map(_.getRumor.contentType))
+      expect
+        .same(payloads.map(_.getRumor.contentType), received.map(_.getRumor.contentType))
         .and(expect(status.rumor.isEmpty))
   }
 
@@ -176,7 +179,8 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
       _ <- fiber.cancel
       _ <- awaitCondition("call cancellation", IO(call.cancelled.get()))
     } yield
-      expect.same(4, stableAt)
+      expect
+        .same(4, stableAt)
         .and(expect.same(stableAt, stillStable))
         .and(expect(call.requested.get() < messages.size))
         .and(expect(call.cancelled.get()))
@@ -220,7 +224,8 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
         .timeout(3.seconds)
       oversizeCall <- IO(oversizeChannel.calls.element())
     } yield
-      expect.same(4, stableAt)
+      expect
+        .same(4, stableAt)
         .and(expect.same(stableAt, stillStable))
         .and(expect(oversizeResult.left.exists(_.isInstanceOf[GossipStream.InboundBufferError])))
         .and(expect(oversizeCall.cancelled.get()))
@@ -254,7 +259,8 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
       _ <- release.complete(())
       result <- fiber.joinWithNever.timeout(3.seconds)
     } yield
-      expect.same(4, call.delivered.get())
+      expect
+        .same(4, call.delivered.get())
         .and(expect.same(Status.Code.UNAVAILABLE.some, result.left.toOption.map(Status.fromThrowable).map(_.getCode)))
   }
 
@@ -322,7 +328,8 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
       _ <- release.complete(())
       received <- fiber.joinWithNever.timeout(3.seconds)
     } yield
-      expect.same(payloads.map(_.getRumor.contentType), received.map(_.getRumor.contentType))
+      expect
+        .same(payloads.map(_.getRumor.contentType), received.map(_.getRumor.contentType))
         .and(expect.same(messages.size, call.delivered.get()))
   }
 
@@ -356,7 +363,8 @@ object GossipStreamFlowControlSuite extends SimpleIOSuite {
       afterLate <- readiness.current
       _ <- secondFiber.cancel
     } yield
-      expect.same("rumor-1", first.getRumor.contentType)
+      expect
+        .same("rumor-1", first.getRumor.contentType)
         .and(expect.same(2L.some, beforeLate.rumor.map(_.streamGeneration)))
         .and(expect.same(beforeLate.rumor, afterLate.rumor))
   }
