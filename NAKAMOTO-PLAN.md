@@ -549,8 +549,15 @@ only. Registration proves key ownership and never grants operator eligibility.
   calls at file/count granularity, and binds each row to an uncommented/unquoted
   negative-vector test-shaped declaration. K7a now also maps every present
   consumer to a concrete adapter-negative test and a checked vocabulary of
-  zero-authority-effect obligations. The mapping does not prove those effects
-  are instrumented by the named test. A generated two-operator frozen-view
+  zero-authority-effect obligations. K7b-1 now adds reviewed direct/source-
+  dominated evidence for the frozen execution-attester rows only: one invocation
+  of the concrete acceptance manager's injected re-execution hook returns the
+  fixture-selected matching root and produces the private capability; distinct
+  wrong-VRF and wrong-long-term-key cases plus missing, unrooted dummy runtime-
+  shaped, and malformed identities then stop before emitter-owned
+  eta/proof/KES/tracker/publish effects. This exercises capability-before-sign
+  ordering, not CL1 replay semantics or economic correctness. The mapping does not
+  prove other effects or adapters are instrumented by the named test. A generated two-operator frozen-view
   matrix proves that a
   loader-registered control outside the authority view, its complete pair
   substituted for the authority operator, an unrooted runtime-shaped record, and
@@ -653,7 +660,11 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    wrong-key cases use another registered identity and statistical coverage varies
    canonical draw inputs instead of minting disposable keys. K7a's generated
    frozen-view matrix and adapter-specific zero-effect obligation inventory are
-   landed, but per-adapter effect instrumentation is incomplete. They deliberately
+   landed. K7b-1 qualifies only the frozen execution-attester's directly
+   observed eta/proof/KES/tracker/publish effects and source-dominated Ed signing
+   after the concrete manager invokes its re-execution hook once and produces the
+   private capability; the injected hook does not prove CL1 replay semantics. Per-adapter
+   effect instrumentation remains incomplete. They deliberately
    do not activate or simulate a common runtime adapter.
    Complete the historical generated-branch/consumer matrix, positive historical
    runtime consumers, and exact-parent no-side-effect vectors; an allowlisted path

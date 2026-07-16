@@ -18,7 +18,8 @@ import weaver.SimpleIOSuite
   * `FROZEN_GENESIS` row records the current containment boundary, while a `BLOCKED` row records an intentionally absent target consumer.
   * Runtime branch-historical qualification remains covered by KEYREG-006..010 and is not inferred from this suite passing. Likewise, a
   * required-zero-effect entry is an instrumentation obligation; checking that its adapter-negative test name exists does not prove that the
-  * test observes each named effect.
+  * test observes each named effect. Direct/dominated evidence columns are hard-coded review metadata bound to that exact test anchor; this
+  * suite checks the reviewed mapping but does not parse the test's assertions.
   */
 object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
 
@@ -36,10 +37,58 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
     qualificationSource: String,
     qualificationAnchor: String,
     requiredZeroEffects: String,
-    limitation: String
+    limitation: String,
+    directZeroEffects: String,
+    dominatedZeroEffects: String
+  )
+
+  private final case class ReviewedEvidence(
+    qualificationSource: String,
+    qualificationAnchor: String,
+    directEffects: Set[String],
+    dominatedEffects: Set[String]
   )
 
   private val allowedStatuses = Set("FROZEN_GENESIS", "FAIL_CLOSED_SCAFFOLD", "BLOCKED")
+
+  /** Reviewed K7b evidence is deliberately bounded to the frozen execution-attester adapter. The exact source and test anchor are frozen
+    * together with the reviewed effects, so TSV-only anchor substitution cannot preserve a qualification claim. Direct effects have a
+    * concrete counter or queried sink in the named test. `EdSign` is control-flow dominated by the directly observed zero KES call; no
+    * production signing injection is added merely to expose a test counter.
+    */
+  private val executionAttesterQualificationSource =
+    "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointAttestationEmitterSuite.scala"
+  private val executionIdentityQualificationAnchor =
+    "K7b: frozen execution-attester identity rejects before eta, proof, signing, verification, tracking, or publish after one concrete-manager re-execution-hook invocation"
+  private val localVerificationQualificationAnchor =
+    "reject: an unverified local execution signature is neither recorded nor published"
+
+  private val reviewedQualifiedEvidence: Map[String, ReviewedEvidence] = Map(
+    "KSEM-EXEC-008" -> ReviewedEvidence(
+      executionAttesterQualificationSource,
+      executionIdentityQualificationAnchor,
+      Set("EtaLookup", "PossessionProof", "KesSign", "TrackerRecord", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-009" -> ReviewedEvidence(
+      executionAttesterQualificationSource,
+      executionIdentityQualificationAnchor,
+      Set("EtaLookup", "PossessionProof", "KesSign", "TrackerRecord", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-010" -> ReviewedEvidence(
+      executionAttesterQualificationSource,
+      executionIdentityQualificationAnchor,
+      Set("EtaLookup", "PossessionProof", "KesSign", "TrackerRecord", "Publish"),
+      Set("EdSign")
+    ),
+    "KSEM-EXEC-011" -> ReviewedEvidence(
+      executionAttesterQualificationSource,
+      localVerificationQualificationAnchor,
+      Set("TrackerRecord", "Publish"),
+      Set.empty
+    )
+  )
 
   /** These are semantic API calls, not primitive names. A consumer remains visible even when it delegates VRF/KES work through a helper and
     * never mentions `EcVrf25519` or `OperationalKeyMaker` directly.
@@ -214,7 +263,7 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
     }
   }
 
-  test("every non-blocked row records zero-effect obligations beside an executable adapter negative anchor") {
+  test("every row records bounded reviewed zero-effect metadata beside its adapter obligation") {
     manifestRows.flatMap { rows =>
       rows
         .filterNot(_.status == "BLOCKED")
@@ -229,32 +278,73 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
               new String(Files.readAllBytes(path), StandardCharsets.UTF_8)
             )
             val anchorFound = contents.exists(source => executableTestAnchors(source).contains(row.qualificationAnchor))
-            val effectNames = row.requiredZeroEffects.split("\\|", -1).toList
-            val distinctEffects = effectNames.distinct.sizeCompare(effectNames.size) == 0
-            val unknownEffects = effectNames.toSet -- OperatorConsensusKeyQualificationMatrix.EffectObligation.byManifestName.keySet
-            (row.id, insideRoot, isTestSource, Files.isRegularFile(path), anchorFound, distinctEffects, unknownEffects)
+            val requiredEffects = parseEffects(row.requiredZeroEffects)
+            val directEffects = parseEffects(row.directZeroEffects)
+            val dominatedEffects = parseEffects(row.dominatedZeroEffects)
+            val allDeclaredEffects = requiredEffects ++ directEffects ++ dominatedEffects
+            val distinctEffects =
+              List(requiredEffects, directEffects, dominatedEffects).forall(values => values.distinct.size == values.size)
+            val unknownEffects = allDeclaredEffects.toSet -- OperatorConsensusKeyQualificationMatrix.EffectObligation.byManifestName.keySet
+            val evidenceIsRequired = (directEffects.toSet ++ dominatedEffects.toSet).subsetOf(requiredEffects.toSet)
+            val evidenceKindsDisjoint = directEffects.toSet.intersect(dominatedEffects.toSet).isEmpty
+            (
+              row.id,
+              insideRoot,
+              isTestSource,
+              Files.isRegularFile(path),
+              anchorFound,
+              distinctEffects,
+              unknownEffects,
+              evidenceIsRequired,
+              evidenceKindsDisjoint
+            )
           }
         }
         .map { results =>
           val failures = results.collect {
-            case (id, inside, testSource, regular, anchor, distinct, unknown)
-                if !inside || !testSource || !regular || !anchor || !distinct || unknown.nonEmpty =>
+            case (id, inside, testSource, regular, anchor, distinct, unknown, required, disjoint)
+                if !inside || !testSource || !regular || !anchor || !distinct || unknown.nonEmpty || !required || !disjoint =>
               s"$id(inside=$inside testSource=$testSource regular=$regular anchor=$anchor distinct=$distinct " +
-                s"unknown=${unknown.toList.sorted.mkString("|")})"
+                s"unknown=${unknown.toList.sorted.mkString("|")} evidenceRequired=$required evidenceDisjoint=$disjoint)"
           }
           val coveredEffects = rows
             .filterNot(_.status == "BLOCKED")
-            .flatMap(_.requiredZeroEffects.split("\\|", -1))
+            .flatMap(row => parseEffects(row.requiredZeroEffects))
             .toSet
           val expectedEffects = OperatorConsensusKeyQualificationMatrix.EffectObligation.byManifestName.keySet
+          val actualQualifiedEvidence = qualifiedEvidence(rows)
 
-          if (failures.isEmpty && coveredEffects == expectedEffects) success
+          if (
+            failures.isEmpty &&
+            coveredEffects == expectedEffects &&
+            actualQualifiedEvidence == reviewedQualifiedEvidence
+          ) success
           else
             failure(
               s"invalid adapter obligation mappings=${failures.mkString(",")} " +
-                s"covered=${coveredEffects.toList.sorted.mkString("|")} expected=${expectedEffects.toList.sorted.mkString("|")}"
+                s"covered=${coveredEffects.toList.sorted.mkString("|")} expected=${expectedEffects.toList.sorted.mkString("|")} " +
+                s"qualified=$actualQualifiedEvidence reviewed=$reviewedQualifiedEvidence"
             )
         }
+    }
+  }
+
+  test("reviewed evidence binding rejects an EXEC-008 to EXEC-011 qualification-anchor swap") {
+    manifestRows.map { rows =>
+      val baseline = qualifiedEvidence(rows)
+      val swapped = qualifiedEvidence(
+        rows.map {
+          case row if row.id == "KSEM-EXEC-008" =>
+            row.copy(qualificationAnchor = localVerificationQualificationAnchor)
+          case row => row
+        }
+      )
+
+      expect.all(
+        baseline == reviewedQualifiedEvidence,
+        swapped != reviewedQualifiedEvidence,
+        swapped.get("KSEM-EXEC-008").exists(_.qualificationAnchor == localVerificationQualificationAnchor)
+      )
     }
   }
 
@@ -289,7 +379,9 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
               row.qualificationSource,
               row.qualificationAnchor,
               row.requiredZeroEffects,
-              row.limitation
+              row.limitation,
+              row.directZeroEffects,
+              row.dominatedZeroEffects
             )
               .exists(_.trim.isEmpty) =>
           row.id
@@ -300,7 +392,11 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
       val badBlockedQualificationShape = rows.collect {
         case row
             if row.status == "BLOCKED" &&
-              (row.qualificationSource != "-" || row.qualificationAnchor != "-" || row.requiredZeroEffects != "-") =>
+              (row.qualificationSource != "-" ||
+                row.qualificationAnchor != "-" ||
+                row.requiredZeroEffects != "-" ||
+                row.directZeroEffects != "-" ||
+                row.dominatedZeroEffects != "-") =>
           row.id
       }
       val badActiveQualificationShape = rows.collect {
@@ -327,12 +423,12 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
       val path = root.resolve("docs/review/OPERATOR-CONSENSUS-KEY-SEMANTIC-MANIFEST.tsv")
       val lines = Files.readAllLines(path, StandardCharsets.UTF_8).asScala.toList
       val expectedHeader =
-        "id\tstatus\tsubsystem\tkind\tsource\texpected_count\tnegative_source\tnegative_anchor\tqualification_source\tqualification_anchor\trequired_zero_effects\tlimitation"
+        "id\tstatus\tsubsystem\tkind\tsource\texpected_count\tnegative_source\tnegative_anchor\tqualification_source\tqualification_anchor\trequired_zero_effects\tlimitation\tdirect_zero_effects\tdominated_zero_effects"
       require(lines.headOption.contains(expectedHeader), s"Unexpected semantic manifest header in $path")
       lines.drop(1).filter(_.trim.nonEmpty).map { line =>
         val fields = line.split("\t", -1).toList
-        require(fields.size == 12, s"Expected 12 tab-separated fields, got ${fields.size}: $line")
-        val id :: status :: subsystem :: kind :: source :: expected :: negativeSource :: negativeAnchor :: qualificationSource :: qualificationAnchor :: requiredZeroEffects :: limitation :: Nil =
+        require(fields.size == 14, s"Expected 14 tab-separated fields, got ${fields.size}: $line")
+        val id :: status :: subsystem :: kind :: source :: expected :: negativeSource :: negativeAnchor :: qualificationSource :: qualificationAnchor :: requiredZeroEffects :: limitation :: directZeroEffects :: dominatedZeroEffects :: Nil =
           fields
         val expectedCount = Try(expected.toInt).getOrElse(throw new IllegalArgumentException(s"Invalid expected_count for $id: $expected"))
         ManifestRow(
@@ -347,10 +443,29 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
           qualificationSource,
           qualificationAnchor,
           requiredZeroEffects,
-          limitation
+          limitation,
+          directZeroEffects,
+          dominatedZeroEffects
         )
       }
     }
+
+  private def parseEffects(value: String): List[String] =
+    if (value == "-") Nil else value.split("\\|", -1).toList
+
+  private def qualifiedEvidence(rows: List[ManifestRow]): Map[String, ReviewedEvidence] =
+    rows.flatMap { row =>
+      val direct = parseEffects(row.directZeroEffects).toSet
+      val dominated = parseEffects(row.dominatedZeroEffects).toSet
+      Option.when(direct.nonEmpty || dominated.nonEmpty)(
+        row.id -> ReviewedEvidence(
+          row.qualificationSource,
+          row.qualificationAnchor,
+          direct,
+          dominated
+        )
+      )
+    }.toMap
 
   private def productionSources: IO[List[Source]] =
     IO.blocking {

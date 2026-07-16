@@ -365,7 +365,19 @@ shaped record with a dummy proof, and a malformed carried VRF key. That runtime-
 shaped negative is not loader- or cryptographically validated. Every present
 semantic row also names a concrete adapter-negative test and required zero-
 authority-effect obligations. Anchor existence does not prove that test
-instruments every listed effect. Neither inventory nor
+instruments every listed effect. K7b-1 now qualifies the frozen execution-
+attester boundary only: for the fixture's one included metagraph, one invocation
+of the concrete acceptance manager's injected re-execution hook returns the
+fixture-selected matching root and produces the private capability. Distinct
+missing, wrong-VRF, wrong-long-term-key, unrooted dummy runtime-shaped, and
+malformed local identity cases then directly produce zero eta lookup, possession
+proof, KES signature, tracker record, and publication effects. Ed25519 signing is
+source-order dominated by the observed zero KES call. A positive A control proves
+the emitter probes are live, and staged missing-KES and local-verification failures
+stop record/publication. This exercises the production capability-before-sign
+order, but the injected hook is a stub and proves neither CL1 replay semantics nor
+economic correctness. It does not claim zero draw, store, adopt, slash, or
+historical qualification. Neither inventory nor
 that lexical anchor mapping is an AST/call-graph proof, and the generated matrix
 does not prove branch-historical qualification, so K7 remains open.
 
@@ -413,8 +425,10 @@ This is not runtime completion. The following remain merge gates:
    wrong-key cases use another registered identity and repeated statistical trials
    vary canonical draw inputs instead of minting disposable keys. The K7a matrix
    qualifies the frozen resolver and the manifest pins concrete adapter-negative
-   anchors plus the complete zero-effect obligation vocabulary. Per-adapter
-   instrumentation of those obligations remains incomplete. The manifest fails on new
+   anchors plus the complete zero-effect obligation vocabulary. K7b-1 adds
+   reviewed direct/source-dominated evidence only for `KSEM-EXEC-008..011` at
+   the frozen execution-attester boundary. Per-adapter instrumentation of the
+   remaining obligations remains incomplete. The manifest fails on new
    matched spellings in unmanifested files, file/count changes, and stale negative
    or qualification test-shaped declarations; it is not proof of historical
    semantics. `KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open until every

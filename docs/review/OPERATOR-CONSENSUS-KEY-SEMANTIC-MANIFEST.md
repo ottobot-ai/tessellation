@@ -13,11 +13,14 @@ roster, stake, eta, or Phase-2 witness required by `KEYREG-006..010`.
 The `qualification_source`, `qualification_anchor`, and `required_zero_effects` columns add a bounded K7a obligation inventory. Every
 non-`BLOCKED` row names an existing adapter-specific negative test and the authority effects that a completed qualification must keep zero
 after that adapter rejects an unqualified identity. The checked obligation vocabulary is `Draw`, `EtaLookup`, `PossessionProof`, `Replay`,
-`KesSign`, `EdSign`,
-`AggregatorRecord`, `TrackerRecord`, `Store`, `Adopt`, `Publish`, and `Slash`. The semantic suite proves that the source and exact
-test-shaped anchor exist and that every effect name is known; it does not infer control flow or prove that an assertion instruments every
-listed effect. For example, the GL0 identity anchor proves resolver rejection but does not itself instrument replay, storage, adoption, or
-publication. Those entries remain explicit unproved obligations.
+`KesSign`, `EdSign`, `AggregatorRecord`, `TrackerRecord`, `Store`, `Adopt`, `Publish`, and `Slash`. The additional
+`direct_zero_effects` and `dominated_zero_effects` columns record only reviewed K7b evidence metadata. A direct effect has a counter or
+queried sink in the named test. A dominated effect is zero because a directly observed earlier gate was zero and the production source
+orders that gate before the dominated effect. The semantic suite checks this evidence against a hard-coded reviewed
+`(row ID, qualification source, qualification anchor, direct effects, dominated effects)` tuple; neither an unreviewed row nor a TSV-only
+source/anchor substitution can acquire or preserve an evidence claim. Rows with `-` in both evidence columns retain unproved obligations.
+The suite binds metadata to the exact test anchor but does not parse its assertions. This remains bounded reviewed evidence, not inferred
+control flow for the whole adapter.
 
 ## Status meanings
 
@@ -45,6 +48,18 @@ for A, an unrooted runtime-shaped record with a dummy proof presented to the fro
 shaped negative is not loader- or cryptographically validated. This is fixture and frozen-resolver qualification only. It is not a common
 adapter layered over the distinct production consumers.
 
+K7b-1 additionally qualifies the frozen-genesis `ShardCheckpointAttestationEmitter` boundary. For the fixture's one included metagraph, the
+concrete acceptance manager invokes its injected re-execution hook once, receives the fixture-selected matching root, and mints the
+otherwise-unconstructible verified capability. This exercises the production capability-construction order; the injected hook is a stub
+and does not prove CL1 replay semantics or economic correctness. Against that same capability, the emitter separately rejects missing
+authority, loader-validated B's VRF substituted for A, loader-validated B's long-term key paired with A's VRF, an explicitly unrooted dummy
+runtime-shaped record, and malformed 31-byte local VRF evidence. Each rejection directly observes zero eta lookup, possession proof, KES
+signing, tracker record, and publication; Ed25519 signing is source-order dominated by the zero KES call. The positive loader-validated A
+control proves all emitter counters and sinks are live. Separate staged negatives prove missing KES capability and failed local certificate
+verification cannot reach tracker record or publication. Production source orders `reExecPath` before private capability construction and
+the emitter accepts only that capability; this cut exercises that ordering and the emitter-owned frozen identity boundary without claiming
+the stub proves replay. It does not prove zero draw, store, adopt, slash, or a historical runtime-key path.
+
 Two target roles are deliberately recorded as absent:
 
 - deterministic assigned-watchtower selection and its positive replay-coverage identity;
@@ -62,8 +77,9 @@ The semantic suite fails when:
 2. a reviewed call moves between files, is renamed, or changes occurrence count without a manifest review;
 3. an explicitly blocked selector matching a reviewed spelling silently appears;
 4. an uncommented/unquoted `test`/`pureTest` call shape is removed or its exact test name changes without updating the row;
-5. a non-blocked row lacks a real adapter-negative source/anchor, uses an unknown or duplicated zero-effect obligation, or the manifest no
-   longer covers the complete obligation vocabulary;
+5. a non-blocked row lacks a real adapter-negative source/anchor, uses an unknown or duplicated zero-effect obligation, claims evidence
+   outside its required obligation, changes a reviewed K7b source/anchor/effect tuple, or the manifest no longer covers the complete
+   obligation vocabulary;
 6. a blocked row claims an adapter anchor or obligation that cannot exist while the consumer remains absent;
 7. a row omits the explicit `not qualified` limitation.
 
@@ -78,13 +94,15 @@ while this manifest catches reviewed higher-level API spellings.
 The generated matrix and adapter mappings are intentionally separate. The generated matrix executes the shared frozen atomic-pair
 boundary. Snapshot intake, admission, producer, attester, checkpoint adoption, tower, and slashing retain their own concrete negative
 anchors because those adapters have different inputs and side effects. The `required_zero_effects` column is the remaining instrumentation
-contract, not evidence that the named anchor observes every effect. Treating the mappings as one executable runtime abstraction would hide
+contract, not evidence that the named anchor observes every effect. Only `KSEM-EXEC-008..011` currently carry reviewed direct or dominated
+evidence, and only for the effects listed in their evidence columns. Treating the mappings as one executable runtime abstraction would hide
 those differences and would be a false proof.
 
 ## Remaining activation blockers
 
-`KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open. K7a qualifies only frozen-genesis resolver rejection and inventories the current
-adapter anchors and unproved zero-effect obligations. Closing those gates still requires executable adapter instrumentation, the generated
+`KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open. K7a qualifies frozen-genesis resolver rejection and inventories the current
+adapter anchors and zero-effect obligations; K7b-1 qualifies only the frozen execution-attester effects described above. Closing those
+gates still requires executable instrumentation for the remaining adapter/effect rows, the generated
 historical branch/era/operator cross-consumer matrix, exact N-2 pair plus
 roster/stake resolution, exact N-1 eta, exact Phase-2 shard references, runtime local secret-bundle selection, assigned watchtower coverage,
 the optimistic sampler, portable nonempty-tower membership evidence, and positive exact-offence-parent slashing/runtime consumers. No row

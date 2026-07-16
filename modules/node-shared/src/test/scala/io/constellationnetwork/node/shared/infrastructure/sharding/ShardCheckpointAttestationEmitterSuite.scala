@@ -1,6 +1,7 @@
 package io.constellationnetwork.node.shared.infrastructure.sharding
 
 import java.security.{KeyPair, SecureRandom}
+import java.util.concurrent.atomic.AtomicInteger
 
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.{IO, Ref, Resource}
@@ -20,8 +21,11 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.pro
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global._
 import io.constellationnetwork.numerics.interpreters.{ExpInterpreter, Log1pInterpreter}
+import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
+import io.constellationnetwork.schema.kes.KesRegistrationCert
+import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationOrdinal, KesRegistrationRecord, KesRegistrationReference}
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot, VrfPublicKey}
 import io.constellationnetwork.schema.peer.PeerId
@@ -114,6 +118,55 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
 
   private val replayedRoot = Hash("11" * 32)
 
+  private final case class EmitterEffectCounts(
+    replay: Int,
+    etaLookup: Int,
+    possessionProof: Int,
+    kesSign: Int,
+    localVerification: Int,
+    trackerRecord: Int,
+    publish: Int
+  )
+
+  private final case class LocalIdentityCandidate(
+    name: String,
+    keyPair: KeyPair,
+    vrfSecret: Array[Byte],
+    vrfPublic: Array[Byte],
+    registry: OperatorConsensusKeyRegistry[IO]
+  )
+
+  private def countingEligibilityChecker(proofCalls: AtomicInteger): IO[EligibilityChecker[IO]] =
+    for {
+      log1p <- Log1pInterpreter.make[IO](maxIterations = 10000, precision = 8)
+      exp <- ExpInterpreter.make[IO](maxIterations = 10000, precision = 38)
+    } yield
+      new EligibilityChecker[IO](log1p, exp) {
+        override def vrfProofForSlot(vrfSK: Array[Byte], slot: Slot, eta: Array[Byte]): Array[Byte] = {
+          proofCalls.incrementAndGet()
+          super.vrfProofForSlot(vrfSK, slot, eta)
+        }
+      }
+
+  /** Deliberately unrooted runtime-shaped negative. Its dummy long-term proof is not loader- or cryptographically validated. */
+  private def unrootedRuntimeShapedPair(genesis: OperatorConsensusKeys): OperatorConsensusKeys = {
+    val cert = KesRegistrationCert(
+      operatorPeerId = genesis.operatorPeerId,
+      kesMasterVK = Hex.fromBytes(genesis.kes.vk.value),
+      kesMasterVKStep = genesis.kes.vk.step,
+      offset = 0L,
+      vrfPublicKey = Hex.fromBytes(genesis.vrfPublicKey.toBytes),
+      effectiveFromPeriod = EtaPeriod.Zero,
+      registrationParentHash = Hash("aa" * 32),
+      ordinal = KesRegistrationOrdinal(NonNegLong.unsafeFrom(1L)),
+      parent = KesRegistrationReference.empty
+    )
+    val dummyProof = SignatureProof(Id(genesis.operatorPeerId.value), Signature(Hex("7f" * 64)))
+    val record = KesRegistrationRecord(Signed(cert, NonEmptySet.one(dummyProof)), SnapshotOrdinal.unsafeApply(1L))
+
+    genesis.copy(registration = record.some)
+  }
+
   private def signedBinary: Signed[StateChannelSnapshotBinary] = {
     val proof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("11" * 64)), Signature(Hex("22" * 70)))
     Signed(
@@ -193,7 +246,7 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
       def lastAdoptedCheckpoint(shardId: ShardId): IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None)
     }
 
-  test("pending after one concrete-manager replay can emit a verifiable execution signature") { res =>
+  test("pending after one concrete-manager re-execution-hook invocation can emit a verifiable execution signature") { res =>
     implicit val (h, sp, ec, checkpointSigner) = res
     val shardEta = checkpointSigner.defaultShardEta
     for {
@@ -401,7 +454,239 @@ object ShardCheckpointAttestationEmitterSuite extends MutableIOSuite {
     }.map(_.combineAll)
   }
 
-  test("reject: failed replay cannot mint a capability or reach the emitter") { res =>
+  test(
+    "K7b: frozen execution-attester identity rejects before eta, proof, signing, verification, tracking, or publish after one concrete-manager re-execution-hook invocation"
+  ) { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+
+    for {
+      (authorityKeyPair, authorityId) <- registeredSigner(checkpointSigner)
+      (controlKeyPair, controlId) <- registeredSigner(checkpointSigner)
+      checkpointUnderTest <- checkpoint(authorityKeyPair, authorityId, checkpointSigner)
+      authorityVrf = VrfKeyDeriver.deriveVrfKeyPair(authorityKeyPair)
+      controlVrf = VrfKeyDeriver.deriveVrfKeyPair(controlKeyPair)
+      authorityKeys <- checkpointSigner.operatorKeyRegistry
+        .get(authorityId)
+        .flatMap(IO.fromOption(_)(new IllegalStateException("missing loader-validated authority identity")))
+      controlKeys <- checkpointSigner.operatorKeyRegistry
+        .get(controlId)
+        .flatMap(IO.fromOption(_)(new IllegalStateException("missing loader-validated control identity")))
+      _ <- IO.raiseUnless(
+        java.security.MessageDigest.isEqual(authorityKeys.vrfPublicKey.toBytes, authorityVrf._2) &&
+          java.security.MessageDigest.isEqual(controlKeys.vrfPublicKey.toBytes, controlVrf._2) &&
+          !java.security.MessageDigest.isEqual(authorityKeys.kes.vk.value, controlKeys.kes.vk.value) &&
+          !java.security.MessageDigest.isEqual(authorityKeys.vrfPublicKey.toBytes, controlKeys.vrfPublicKey.toBytes)
+      )(new IllegalStateException("loader-validated A/B controls are not distinct and correctly bound"))
+      replayCount <- Ref.of[IO, Int](0)
+      manager <- concreteAcceptanceManager(
+        checkpointSigner,
+        authorityId,
+        executionQuorum = 2,
+        reExecuteTo = replayedRoot,
+        replayCount = replayCount
+      )
+      verifiedEither <- manager.evaluateForSigning(checkpointUnderTest)
+      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      runtimePair = unrootedRuntimeShapedPair(authorityKeys)
+      runtimeRegistry = OperatorConsensusKeyRegistry.make[IO](Map(authorityId -> runtimePair))
+      candidates = List(
+        LocalIdentityCandidate(
+          "missing-authority",
+          authorityKeyPair,
+          authorityVrf._1,
+          authorityVrf._2,
+          OperatorConsensusKeyRegistry.empty[IO]
+        ),
+        LocalIdentityCandidate(
+          "loader-validated-B-vrf-for-A",
+          authorityKeyPair,
+          controlVrf._1,
+          controlVrf._2,
+          checkpointSigner.operatorKeyRegistry
+        ),
+        LocalIdentityCandidate(
+          "loader-validated-B-long-term-for-A",
+          controlKeyPair,
+          authorityVrf._1,
+          authorityVrf._2,
+          checkpointSigner.operatorKeyRegistry
+        ),
+        LocalIdentityCandidate(
+          "unrooted-dummy-runtime-shaped-record",
+          authorityKeyPair,
+          authorityVrf._1,
+          authorityVrf._2,
+          runtimeRegistry
+        ),
+        LocalIdentityCandidate(
+          "malformed-31-byte-local-vrf-evidence",
+          authorityKeyPair,
+          authorityVrf._1,
+          Array.fill[Byte](31)(0x7f.toByte),
+          checkpointSigner.operatorKeyRegistry
+        )
+      )
+      runCandidate = (candidate: LocalIdentityCandidate) =>
+        for {
+          etaCalls <- Ref.of[IO, Int](0)
+          proofCalls = new AtomicInteger(0)
+          eligibility <- countingEligibilityChecker(proofCalls)
+          kesCalls <- Ref.of[IO, Int](0)
+          verificationCalls <- Ref.of[IO, Int](0)
+          published <- Ref.of[IO, List[ShardCheckpointAttestationWire]](Nil)
+          tracker <- ShardTipTracker.make[IO](shardZero, authorityId)
+          countingKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
+            def sign(
+              operatorKeys: OperatorConsensusKeys,
+              checkpointEpoch: EtaPeriod,
+              message: Array[Byte]
+            ): IO[Option[ShardCheckpointProducer.KesSignature]] =
+              kesCalls.update(_ + 1) >> checkpointSigner.producerKesSigner.sign(operatorKeys, checkpointEpoch, message)
+          }
+          emitter = ShardCheckpointAttestationEmitter.make[IO](
+            selfPeerId = authorityId,
+            selfKeyPair = candidate.keyPair,
+            selfVrfSk = candidate.vrfSecret,
+            selfVrfVk = candidate.vrfPublic,
+            operatorKeyRegistry = candidate.registry,
+            kesSigner = countingKesSigner,
+            eligibilityChecker = eligibility,
+            verifyCommitteeSignature =
+              (cp, signature) => verificationCalls.update(_ + 1) >> manager.verifyCommitteeSignature(cp, signature),
+            sidecarClient = recordingSidecar(published),
+            tipTrackerFor = _ => Some(tracker),
+            shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(checkpointSigner.defaultShardEta))
+          )
+          _ <- emitter.emit(verified)
+          replay <- replayCount.get
+          eta <- etaCalls.get
+          proof <- IO(proofCalls.get())
+          kes <- kesCalls.get
+          verification <- verificationCalls.get
+          records <- tracker.attestationCountFor(verified.signingPreimageHash, excludeSelf = false)
+          wires <- published.get
+        } yield
+          candidate.name -> EmitterEffectCounts(
+            replay,
+            eta,
+            proof,
+            kes,
+            verification,
+            records,
+            wires.size
+          )
+      attackResults <- candidates.traverse(runCandidate)
+      positiveResult <- runCandidate(
+        LocalIdentityCandidate(
+          "loader-validated-A-positive",
+          authorityKeyPair,
+          authorityVrf._1,
+          authorityVrf._2,
+          checkpointSigner.operatorKeyRegistry
+        )
+      )
+    } yield {
+      val expectedAttackNames = Set(
+        "missing-authority",
+        "loader-validated-B-vrf-for-A",
+        "loader-validated-B-long-term-for-A",
+        "unrooted-dummy-runtime-shaped-record",
+        "malformed-31-byte-local-vrf-evidence"
+      )
+      val allEmitterEffectsZeroAfterReplay = attackResults.forall {
+        case (_, counts) =>
+          counts.replay == 1 &&
+          counts.etaLookup == 0 &&
+          counts.possessionProof == 0 &&
+          counts.kesSign == 0 &&
+          counts.localVerification == 0 &&
+          counts.trackerRecord == 0 &&
+          counts.publish == 0
+      }
+      val positive = positiveResult._2
+
+      expect.all(
+        attackResults.size == expectedAttackNames.size,
+        attackResults.map(_._1).toSet == expectedAttackNames,
+        allEmitterEffectsZeroAfterReplay,
+        positive.replay == 1,
+        positive.etaLookup == 1,
+        positive.possessionProof == 1,
+        positive.kesSign == 1,
+        positive.localVerification == 1,
+        positive.trackerRecord == 1,
+        positive.publish == 1
+      )
+    }
+  }
+
+  test(
+    "K7b: missing KES capability stops before Ed verification, tracking, and publish after one concrete-manager re-execution-hook invocation"
+  ) { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+
+    for {
+      (keyPair, selfId) <- registeredSigner(checkpointSigner)
+      checkpointUnderTest <- checkpoint(keyPair, selfId, checkpointSigner)
+      selfVrf = VrfKeyDeriver.deriveVrfKeyPair(keyPair)
+      replayCount <- Ref.of[IO, Int](0)
+      manager <- concreteAcceptanceManager(
+        checkpointSigner,
+        selfId,
+        executionQuorum = 2,
+        reExecuteTo = replayedRoot,
+        replayCount = replayCount
+      )
+      verifiedEither <- manager.evaluateForSigning(checkpointUnderTest)
+      verified <- IO.fromEither(verifiedEither.leftMap(failure => new RuntimeException(failure.toString)))
+      etaCalls <- Ref.of[IO, Int](0)
+      proofCalls = new AtomicInteger(0)
+      eligibility <- countingEligibilityChecker(proofCalls)
+      kesCalls <- Ref.of[IO, Int](0)
+      verificationCalls <- Ref.of[IO, Int](0)
+      published <- Ref.of[IO, List[ShardCheckpointAttestationWire]](Nil)
+      tracker <- ShardTipTracker.make[IO](shardZero, selfId)
+      noKesCapability = new ShardCheckpointProducer.KesSigner[IO] {
+        def sign(
+          operatorKeys: OperatorConsensusKeys,
+          checkpointEpoch: EtaPeriod,
+          message: Array[Byte]
+        ): IO[Option[ShardCheckpointProducer.KesSignature]] = kesCalls.update(_ + 1).as(None)
+      }
+      emitter = ShardCheckpointAttestationEmitter.make[IO](
+        selfPeerId = selfId,
+        selfKeyPair = keyPair,
+        selfVrfSk = selfVrf._1,
+        selfVrfVk = selfVrf._2,
+        operatorKeyRegistry = checkpointSigner.operatorKeyRegistry,
+        kesSigner = noKesCapability,
+        eligibilityChecker = eligibility,
+        verifyCommitteeSignature = (_, _) => verificationCalls.update(_ + 1).as(Right(())),
+        sidecarClient = recordingSidecar(published),
+        tipTrackerFor = _ => Some(tracker),
+        shardEtaFor = (_, _) => etaCalls.update(_ + 1).as(Some(checkpointSigner.defaultShardEta))
+      )
+      _ <- emitter.emit(verified)
+      replay <- replayCount.get
+      eta <- etaCalls.get
+      proof <- IO(proofCalls.get())
+      kes <- kesCalls.get
+      verification <- verificationCalls.get
+      records <- tracker.attestationCountFor(verified.signingPreimageHash, excludeSelf = false)
+      wires <- published.get
+    } yield
+      expect.all(
+        replay == 1,
+        eta == 1,
+        proof == 1,
+        kes == 1,
+        verification == 0,
+        records == 0,
+        wires.isEmpty
+      )
+  }
+
+  test("reject: a mismatched re-execution-hook result cannot mint a capability or reach the emitter") { res =>
     implicit val (h, sp, ec, checkpointSigner) = res
     val shardEta = checkpointSigner.defaultShardEta
     for {

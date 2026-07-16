@@ -496,8 +496,18 @@ criteria are in `NAKAMOTO-PLAN.md`.
     explicitly unrooted/runtime-shaped negative, and maps every
     present semantic row to a concrete adapter-negative anchor plus the checked
     `Draw`/eta/proof/replay/sign/record/store/adopt/publish/slash obligation
-    vocabulary. This proves the frozen atomic-pair boundary and pins current
-    adapter test names; it does not prove each listed effect is instrumented. It is
+    vocabulary. K7b-1 additionally qualifies only the frozen execution-attester:
+    one invocation of the concrete acceptance manager's injected re-execution
+    hook returns the fixture-selected matching root and produces the private
+    capability; separate wrong-VRF and wrong-long-term-key attacks, plus missing,
+    unrooted dummy runtime-shaped, and malformed identities, then have directly
+    observed zero eta/proof/KES/tracker/publish effects. Ed signing is source-order
+    dominated by the zero KES call. Positive and staged KES/local-verification
+    controls prove the bounded emitter probes. This exercises the production
+    capability-before-sign order, but the injected hook does not prove CL1 replay
+    semantics or economic correctness. This proves the frozen atomic-pair boundary
+    and pins current adapter test names; it does not prove
+    draw/store/adopt/slash effects or that each remaining obligation is instrumented. It is
     not a common runtime adapter or a historical branch proof. `KEYREG-006`,
     `KEYREG-010`, and `KEYREG-011` remain open until qualification proves every
     allowlisted consumer's exact-parent historical semantics and positive runtime
