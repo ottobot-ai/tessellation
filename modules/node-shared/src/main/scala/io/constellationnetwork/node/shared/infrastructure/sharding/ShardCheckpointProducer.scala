@@ -250,9 +250,9 @@ object ShardCheckpointProducer {
     *   injectable per-MG derivation that re-runs the metagraph's currency derivation over its full included SC-binary chain at the pinned
     *   finalized base and returns the canonical per-MG MPT root. Current ordinary GL0 adoption independently replays the same included
     *   snapshots and compares its local root with `perMetagraphMptRoots`; that is transitional containment, not the target sharding model.
-    *   Target execution signers and assigned watchtowers replay, while an ordinary noncommittee GL0 adopter verifies the replay certificate,
-    *   applies the namespace-confined canonical diff, and recomputes the root. Universal GL0 execution of direct native GL1/DAG-token
-    *   transitions is a separate invariant and is never removed by this path.
+    *   Target execution signers and assigned watchtowers replay, while an ordinary noncommittee GL0 adopter verifies the replay
+    *   certificate, applies the namespace-confined canonical diff, and recomputes the root. Universal GL0 execution of direct native
+    *   GL1/DAG-token transitions is a separate invariant and is never removed by this path.
     *
     * The implicit `Hasher[F]` is required for the canonical preimage hash; `SecurityProvider[F]` is required for the Ed25519 sign path
     * (`Signing.signData`).

@@ -112,8 +112,7 @@ private[node] object ShardCheckpointOutboxUnavailable {
   final case class InvalidDirectory(path: Path, detail: String, cause0: Throwable = null)
       extends ShardCheckpointOutboxUnavailable(s"Unsafe local shard-checkpoint outbox directory at $path: $detail", cause0)
 
-  final case class StoreClosed(path: Path)
-      extends ShardCheckpointOutboxUnavailable(s"Local shard-checkpoint outbox store is closed: $path")
+  final case class StoreClosed(path: Path) extends ShardCheckpointOutboxUnavailable(s"Local shard-checkpoint outbox store is closed: $path")
 
   final case class ArtifactTooLarge(actualBytes: Long, maximumBytes: Long)
       extends ShardCheckpointOutboxUnavailable(
@@ -318,7 +317,7 @@ private[node] object ShardCheckpointOutboxStore {
           case error: ShardCheckpointOutboxRecoveryRequired => Async[F].raiseError(error)
           case error: ShardCheckpointOutboxRejected         => Async[F].raiseError(error)
           case error: ShardCheckpointOutboxUnavailable      => Async[F].raiseError(error)
-          case error                                         => Async[F].raiseError(DurableWriteFailed(recordPath, error))
+          case error                                        => Async[F].raiseError(DurableWriteFailed(recordPath, error))
         }
     }
 

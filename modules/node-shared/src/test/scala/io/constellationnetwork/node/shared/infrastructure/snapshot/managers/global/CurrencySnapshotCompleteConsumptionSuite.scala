@@ -29,7 +29,7 @@ object CurrencySnapshotCompleteConsumptionSuite extends MutableIOSuite {
   override type Res = Hasher[IO]
 
   override def sharedResource: Resource[IO, Res] =
-    Resource.eval(JsonSerializer.forAsync[IO]).map { implicit json => Hasher.forJson[IO] }
+    Resource.eval(JsonSerializer.forAsync[IO]).map(implicit json => Hasher.forJson[IO])
 
   private def binary(label: String): Signed[StateChannelSnapshotBinary] = {
     val proof = SignatureProof(Id(Hex("11" * 64)), Signature(Hex("22" * 70)))

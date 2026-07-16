@@ -1,6 +1,10 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality.model
 
-import io.constellationnetwork.node.shared.domain.snapshot.finality.model.Phase2ConsumerLeaseReferenceModel.CommitResult.{AlreadyCommitted, Committed, Stale}
+import io.constellationnetwork.node.shared.domain.snapshot.finality.model.Phase2ConsumerLeaseReferenceModel.CommitResult.{
+  AlreadyCommitted,
+  Committed,
+  Stale
+}
 import io.constellationnetwork.node.shared.domain.snapshot.finality.model.Phase2ConsumerLeaseReferenceModel.CoordinatorMode.Running
 import io.constellationnetwork.node.shared.domain.snapshot.finality.model.Phase2ConsumerLeaseReferenceModel.Failure._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.model.Phase2ConsumerLeaseReferenceModel.ReferenceUsePolicy._
@@ -52,9 +56,7 @@ object Phase2ConsumerLeaseReferenceModelSuite extends SimpleIOSuite {
   private def leaseOf(base: State, target: GlobalSnapshotStateRef, policy: ReferenceUsePolicy): Lease =
     Phase2ConsumerLeaseReferenceModel
       .capture(base, target, policy)
-      .flatMap(descriptor =>
-        Phase2ConsumerLeaseReferenceModel.acquireIfCurrent(base, Phase2ConsumerLeaseReferenceModel.verify(descriptor))
-      )
+      .flatMap(descriptor => Phase2ConsumerLeaseReferenceModel.acquireIfCurrent(base, Phase2ConsumerLeaseReferenceModel.verify(descriptor)))
       .fold(error => throw new AssertionError(s"expected lease, got $error"), lease => lease)
 
   pureTest("[FOLLOW-008A] same-ordinal replacement cannot inherit the old hash's Phase-2 release") {

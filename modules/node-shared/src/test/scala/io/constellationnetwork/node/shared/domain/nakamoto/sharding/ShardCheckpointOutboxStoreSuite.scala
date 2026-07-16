@@ -83,20 +83,23 @@ object ShardCheckpointOutboxStoreSuite extends SimpleIOSuite {
       val opaqueId = Array[Byte](4, 5, 6)
       val artifact = Array[Byte](11, 12, 13)
 
-      ShardCheckpointOutboxStore.resource[IO](directory, limits).use { first =>
-        requireEmpty(first).flatMap(empty => first.install(empty.head, opaqueId, artifact))
-      }.flatMap { staleCustody =>
-        ShardCheckpointOutboxStore.resource[IO](directory, limits).use { reopened =>
-          for {
-            snapshot <- reopened.load
-            current <- snapshot match {
-              case occupied: Occupied => reopened.readExact(occupied.custody)
-              case _: Empty           => IO.raiseError[Array[Byte]](new AssertionError("durable record missing after restart"))
-            }
-            stale <- reopened.readExact(staleCustody).attempt
-          } yield expect.all(current.sameElements(artifact), stale.isLeft)
+      ShardCheckpointOutboxStore
+        .resource[IO](directory, limits)
+        .use { first =>
+          requireEmpty(first).flatMap(empty => first.install(empty.head, opaqueId, artifact))
         }
-      }
+        .flatMap { staleCustody =>
+          ShardCheckpointOutboxStore.resource[IO](directory, limits).use { reopened =>
+            for {
+              snapshot <- reopened.load
+              current <- snapshot match {
+                case occupied: Occupied => reopened.readExact(occupied.custody)
+                case _: Empty           => IO.raiseError[Array[Byte]](new AssertionError("durable record missing after restart"))
+              }
+              stale <- reopened.readExact(staleCustody).attempt
+            } yield expect.all(current.sameElements(artifact), stale.isLeft)
+          }
+        }
     }
   }
 
@@ -206,7 +209,8 @@ object ShardCheckpointOutboxStoreSuite extends SimpleIOSuite {
                 reopened.readExact(occupied.custody).flatMap { exact =>
                   reopened.install(occupied.head, Array[Byte](99), artifact).attempt.map(exact -> _)
                 }
-              case _: Empty => IO.raiseError[(Array[Byte], Either[Throwable, DurablyCustodiedShardCheckpoint])](
+              case _: Empty =>
+                IO.raiseError[(Array[Byte], Either[Throwable, DurablyCustodiedShardCheckpoint])](
                   new AssertionError("post-move record reopened as empty")
                 )
             }
@@ -276,8 +280,8 @@ object ShardCheckpointOutboxStoreSuite extends SimpleIOSuite {
 
   private def requireEmpty(store: ShardCheckpointOutboxStore[IO]): IO[Empty] =
     store.load.flatMap {
-      case empty: Empty       => IO.pure(empty)
-      case _: Occupied        => IO.raiseError(new AssertionError("expected an empty outbox slot"))
+      case empty: Empty => IO.pure(empty)
+      case _: Occupied  => IO.raiseError(new AssertionError("expected an empty outbox slot"))
     }
 
   private def flipLastByte(path: Path): IO[Unit] =
