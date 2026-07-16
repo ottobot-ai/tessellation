@@ -248,8 +248,11 @@ object ShardCheckpointProducer {
     *   `nakamoto.sharding.checkpoint.staircase-delta-slots`.
     * @param derivePerMgState
     *   injectable per-MG derivation that re-runs the metagraph's currency derivation over its full included SC-binary chain at the pinned
-    *   finalized base and returns the canonical per-MG MPT root. GL0 independently re-executes the same included snapshots and compares its
-    *   local root with `perMetagraphMptRoots`.
+    *   finalized base and returns the canonical per-MG MPT root. Current ordinary GL0 adoption independently replays the same included
+    *   snapshots and compares its local root with `perMetagraphMptRoots`; that is transitional containment, not the target sharding model.
+    *   Target execution signers and assigned watchtowers replay, while an ordinary noncommittee GL0 adopter verifies the replay certificate,
+    *   applies the namespace-confined canonical diff, and recomputes the root. Universal GL0 execution of direct native GL1/DAG-token
+    *   transitions is a separate invariant and is never removed by this path.
     *
     * The implicit `Hasher[F]` is required for the canonical preimage hash; `SecurityProvider[F]` is required for the Ed25519 sign path
     * (`Signing.signData`).
@@ -646,12 +649,14 @@ object ShardCheckpointProducer {
 
       /** Build the [[ShardDerivedStateDelta]] from the already chain-link-ordered per-MG snapshots.
         *
-        * GL0 authenticates and re-executes `includedSnapshots`, compares the resulting local roots, and derives all economic and
-        * cross-shard effects itself.
+        * Current ordinary GL0 adoption authenticates and replays `includedSnapshots`, compares the resulting local roots, and derives the
+        * economic effects. This is transitional until the signed diff/intents contract lands. In the target, producer plus every execution
+        * signer replay, assigned watchtowers provide positive replay coverage, and ordinary noncommittee GL0 applies the verified scoped
+        * diff, recomputes the root, and runs only the global conflict/nullifier/settlement kernel for CL1-derived global intents.
         *
         * '''Input is pre-ordered (R-2).''' `orderedSnapshots` has already been chain-link-ordered by [[chainLinkOrder]] off the gl0
         * FINALIZED-base per-MG tip (S2), so each MG's `NonEmptyList` is strictly parent→child from base->latest. `derivePerMgState` is
-        * therefore re-executed over a correct chain, and `includedSnapshots` carries the SAME ordered chain gl0 adopts / re-derives.
+        * therefore re-executed over a correct chain, and `includedSnapshots` carries the SAME ordered chain current GL0 adoption replays.
         */
       private def assembleDelta(
         orderedSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],

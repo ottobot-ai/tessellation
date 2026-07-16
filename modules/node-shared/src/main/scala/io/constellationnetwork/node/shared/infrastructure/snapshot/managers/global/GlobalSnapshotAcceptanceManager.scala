@@ -1031,8 +1031,11 @@ object GlobalSnapshotAcceptanceManager {
                 (adopted, roots, slashRequests, pendingAdoptions)
             }
 
-        /** Recreate every adopted CL1 snapshot with the global currency transition function. Checkpoint diffs are deliberately absent from
-          * this interface: no committee-carried state can replace the result of global execution.
+        /** Transitional ordinary-GL0 recreation of every adopted CL1 snapshot with the shared currency transition function. The current
+          * checkpoint schema has no canonical diff, so no committee-carried claim can replace this result. Target noncommittee GL0 adoption
+          * instead verifies replay-backed execution signatures and positive watchtower coverage, applies the namespace-confined canonical
+          * diff, recomputes its root, and runs the global conflict/nullifier/settlement kernel. This CL1 transition does not alter the
+          * separate invariant that every GL0 validator executes direct native GL1/DAG-token transitions.
           */
         private def deriveAdoptedCurrencyState(
           ordinal: SnapshotOrdinal,
