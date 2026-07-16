@@ -177,9 +177,9 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     // WATCHTOWER fraud-proof CONSENSUS ARTIFACT (W3a). The canonical `SortedSet` of UPHELD fraud proofs the gl0 leader embedded in the
     // produced snapshot's `fraudProofs` field, threaded back here on EVERY path (leader-produce, follower-`createContext`,
     // peer-`validateArtifact`) so the slash is folded identically. Each entry is re-validated via the `invalidStateProofValidator`
-    // (deterministic recompute); on UPHELD a `WatchtowerSlashRequest(submitter = Some(challengerAddress))` is surfaced into the SAME
-    // `applyWatchtowerSlashes` fold the self-detected re-exec mismatch feeds (durable slash + bounty to the challenger + `Slashings` MPT
-    // write). The set is `(shardId, disputedCheckpointHash)`-ordered so the same wrong checkpoint appears at most once. Default
+    // (deterministic recompute); on UPHELD a `WatchtowerSlashRequest(submitter = challengerAddress)` is surfaced into the SAME
+    // `applyWatchtowerSlashes` fold (durable slash + bounty to the challenger + `Slashings` MPT write). The set is
+    // `(shardId, disputedCheckpointHash)`-ordered so the same wrong checkpoint appears at most once. Default
     // `SortedSet.empty` (every test/cl0/dl1 call site) ⇒ no slash ⇒ byte-identical; ALWAYS empty at `numShards = 1` ⇒ the regression bar holds.
     fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty,
     // Unified operator-key registrations are ordinary consensus events. They are evaluated against the exact parent branch and inclusion
@@ -261,11 +261,11 @@ object GlobalSnapshotAcceptanceManager {
       }
     }
 
-  private final case class PendingCheckpointAdoption(
+  private final case class StagedCheckpointReplay(
     shardId: ShardId,
     shardOrdinal: io.constellationnetwork.schema.sharding.ShardOrdinal,
-    checkpointHash: Hash,
-    replayedMetagraphs: Set[Address]
+    snapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    roots: SortedMap[Address, Hash]
   )
 
   private[global] def pruneRejectedSpendActions(
@@ -337,11 +337,8 @@ object GlobalSnapshotAcceptanceManager {
 
   private case object InvalidMerkleTree extends NoStackTrace
 
-  /** One upheld invalid-state-proof dispute surfaced from `adoptShardCheckpoints` — the durable-slash request the accept path applies. The
-    * reachable producer is the GL0-deterministic replay mismatch (`ShardCheckpointAcceptResult.RejectedReExecutionMismatch`), which carries
-    * no fraud-proof submitter ⇒ `submitter = None` ⇒ the full slashed amount BURNS (no bounty recipient). The `submitter` slot is `Option`
-    * so the watchtower-quorum dispute path (an `InvalidStateProofEvidence` carrying `fraudProof.submitterId`), when later wired into
-    * accept, credits the bounty by passing `Some(submitterAddress)`.
+  /** One artifact-carried invalid-state-proof dispute revalidated as upheld by this GL0 node. A local replay mismatch is not a request: it
+    * rejects the checkpoint but cannot slash unless the exact portable fraud evidence is carried for every follower to revalidate.
     *
     * @param shardId
     *   the shard whose committee signed the wrong derivation (double-slash key half + registry-entry field).
@@ -350,18 +347,18 @@ object GlobalSnapshotAcceptanceManager {
     * @param slashSigners
     *   the committee signers to slash (every signer attested the wrong derivation; §10.2), deduplicated by the helper.
     * @param submitter
-    *   the bounty recipient if this dispute arrived via a watchtower fraud proof; `None` for the gl0 self-detected re-exec path (burn all).
+    *   the authenticated fraud-proof submitter and bounty recipient.
     */
   final case class WatchtowerSlashRequest(
     shardId: ShardId,
     disputedCheckpointHash: Hash,
     slashSigners: List[PeerId],
-    submitter: Option[Address]
+    submitter: Address
   )
 
   /** The deterministic outcome of folding every [[WatchtowerSlashRequest]] for one ordinal — the post-slash (pre-clean) stake maps that
     * replace the accept path's `updatedCreateDelegatedStakes` / `updatedCreateNodeCollaterals`, the per-operator audit records to durably
-    * write into the `Slashings` MPT partition, the bounty credits to fold into balances (empty when no submitter), and the burned total.
+    * write into the `Slashings` MPT partition, the bounty credits to fold into balances, and the burned total.
     */
   final case class WatchtowerSlashApplication(
     slashedDelegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
@@ -374,10 +371,9 @@ object GlobalSnapshotAcceptanceManager {
   /** Apply every upheld invalid-state-proof dispute for one ordinal as a PURE, deterministic fold (consensus-state — every honest node
     * computes the byte-identical post-state). Requests are processed in `(shardId, disputedCheckpointHash)` sort order; each
     * [[InvalidStateProofSlashManager.applySlash]] is pure and its post-slash maps seed the next request's prior, so the accumulated maps +
-    * registry entries + burn are order-deterministic. Bounty credit: when a request carries a `submitter`, `bountyAmount` is credited to
-    * that address via `creditBalance` over its balance after every earlier economic transition in this ordinal (`postEconomicBalances` +
-    * any earlier credit this fold); otherwise the whole slashed pool burns. `disputedCheckpointHash` doubles as the registry entry's
-    * `evidenceDigest` (it is the canonical identity of the disputed checkpoint).
+    * registry entries + burn are order-deterministic. `bountyAmount` is credited to the authenticated submitter over its balance after
+    * every earlier economic transition in this ordinal (`postEconomicBalances` + any earlier credit this fold). `disputedCheckpointHash`
+    * doubles as the registry entry's `evidenceDigest` (it is the canonical identity of the disputed checkpoint).
     *
     * Returns the prior maps verbatim + empty deltas when `requests` is empty — the no-op fast path that keeps `numShards = 1` (where no
     * request is ever produced) byte-identical.
@@ -394,10 +390,8 @@ object GlobalSnapshotAcceptanceManager {
     if (requests.isEmpty)
       WatchtowerSlashApplication(priorDelegatedStakes, priorNodeCollaterals, Nil, SortedMap.empty[Address, Balance], 0L)
     else {
-      // A checkpoint is slashable once per `(shardId, checkpointHash)`, even when local replay and one or more carried fraud proofs surface
-      // the same dispute in this ordinal. Coalesce before the economic fold so input list order cannot decide which duplicate receives a
-      // bounty. Signers are unioned canonically. A self-detected request keeps the existing burn-all policy; otherwise the lowest ordered
-      // authenticated submitter receives the single bounty.
+      // A checkpoint is slashable once per `(shardId, checkpointHash)`. Coalesce duplicate carried proofs before the economic fold so
+      // input list order cannot decide which authenticated submitter receives the single bounty. Signers are unioned canonically.
       val canonicalRequests = requests
         .groupBy(r => (r.shardId.value.value, r.disputedCheckpointHash.value))
         .toList
@@ -407,9 +401,7 @@ object GlobalSnapshotAcceptanceManager {
             val representative = duplicates.head
             representative.copy(
               slashSigners = duplicates.flatMap(_.slashSigners).distinct.sortBy(_.value.value),
-              submitter =
-                if (duplicates.exists(_.submitter.isEmpty)) None
-                else duplicates.flatMap(_.submitter).sorted.headOption
+              submitter = duplicates.map(_.submitter).sorted.head
             )
         }
 
@@ -430,26 +422,24 @@ object GlobalSnapshotAcceptanceManager {
             bountyFraction = config.bountyFraction,
             cooldownEpochs = config.cooldownEpochs
           )
-          // Bounty credit ONLY when a submitter is present (watchtower-quorum path). The re-exec path passes `None` ⇒ no credit ⇒ the
-          // `bountyAmount` portion also burns (it is never returned to any balance). Read the running balance from the post-economic map
-          // folded with any earlier credit this same fold so two requests crediting the same submitter accumulate.
-          val nextBountyDelta: SortedMap[Address, Balance] = req.submitter match {
-            case Some(addr) if res.bountyAmount > 0L =>
-              val current = acc.bountyBalanceDelta.getOrElse(addr, postEconomicBalances.getOrElse(addr, Balance.empty))
-              acc.bountyBalanceDelta.updated(addr, InvalidStateProofSlashManager.creditBalance(current, res.bountyAmount))
-            case _ => acc.bountyBalanceDelta
-          }
-          // Burn = the slashed pool minus whatever was actually credited as bounty. With no submitter the credit is 0 ⇒ burn = total.
-          val creditedThisStep: Long = req.submitter match {
-            case Some(_) => res.bountyAmount
-            case None    => 0L
-          }
+          // Read the running balance after prior economic effects and earlier bounty credits in this same deterministic fold.
+          val nextBountyDelta: SortedMap[Address, Balance] =
+            if (res.bountyAmount > 0L) {
+              val current = acc.bountyBalanceDelta.getOrElse(
+                req.submitter,
+                postEconomicBalances.getOrElse(req.submitter, Balance.empty)
+              )
+              acc.bountyBalanceDelta.updated(
+                req.submitter,
+                InvalidStateProofSlashManager.creditBalance(current, res.bountyAmount)
+              )
+            } else acc.bountyBalanceDelta
           WatchtowerSlashApplication(
             slashedDelegatedStakes = res.slashedDelegatedStakes,
             slashedNodeCollaterals = res.slashedNodeCollaterals,
             registryEntries = acc.registryEntries ++ res.newRegistryEntries,
             bountyBalanceDelta = nextBountyDelta,
-            totalBurned = acc.totalBurned + (res.totalSlashedAmount - creditedThisStep)
+            totalBurned = acc.totalBurned + (res.totalSlashedAmount - res.bountyAmount)
           )
         }
     }
@@ -567,8 +557,8 @@ object GlobalSnapshotAcceptanceManager {
     // WATCHTOWER fraud-proof DETERMINISTIC dispute verdict (W3a). When `Some`, every fraud-proof artifact carried in `accept(fraudProofs=…)`
     // is re-validated here via the SAME `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed
     // checkpoint's OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger). On UPHELD a `WatchtowerSlashRequest` with
-    // `submitter = Some(challengerAddress)` is surfaced into the SAME `applyWatchtowerSlashes` fold the self-detected re-exec path feeds, so
-    // the leader/follower/peer reach a BYTE-IDENTICAL slash (the validator is pure given its inputs + the exact proposal-parent reader
+    // the authenticated challenger address is surfaced into `applyWatchtowerSlashes`, so the leader/follower/peer reach a BYTE-IDENTICAL
+    // slash (the validator is pure given its inputs + the exact proposal-parent reader
     // supplied inside `accept`). The production wiring (`GlobalSnapshotConsensus.make`) passes the validator built with the PIN-1
     // `watchtowerReDerive` closure; authoritative validation replaces its staging reader with an
     // `InvalidStateProofSlashedReader.fromGlobalStateReader(mpt)` bound to `parentTip`, so an already-slashed checkpoint yields
@@ -823,31 +813,10 @@ object GlobalSnapshotAcceptanceManager {
           // wedges the MG (the seeding flake's root cause). Pure function of (embedded checkpoint, prior GSI) — every
           // node reaches the same adopt/defer decision.
           priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash]
-        )(implicit hasher: Hasher[F]): F[
-          (
-            SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-            // The claimed roots remain comparison values only. GL0 recreates every accepted window and rejects any root mismatch.
-            SortedMap[Address, Hash],
-            // WATCHTOWER durable-slash requests (slashing part 3): one per upheld invalid-state-proof dispute surfaced this ordinal — the
-            // GL0-deterministic replay mismatch (`RejectedReExecutionMismatch`). Consumed by the accept path's pure
-            // `applyWatchtowerSlashes` fold (post-slash stake maps + `Slashings` MPT records + burn). Empty on the common all-accept path
-            // and ALWAYS empty at `numShards = 1` (this method never runs there) ⇒ the regression bar is preserved.
-            List[WatchtowerSlashRequest],
-            // Local pipeline/fork-choice acknowledgements. They are applied only after the selected MG suffixes have passed the
-            // independent GSAM replay and root comparison later in this accept pass.
-            List[PendingCheckpointAdoption]
-          )
-        ] =
+        )(implicit hasher: Hasher[F]): F[List[StagedCheckpointReplay]] =
           shardCheckpoints.toList
-            .foldM(
-              (
-                SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-                SortedMap.empty[Address, Hash],
-                List.empty[WatchtowerSlashRequest],
-                List.empty[PendingCheckpointAdoption]
-              )
-            ) {
-              case ((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions), (shardId, cp)) =>
+            .foldM(List.empty[StagedCheckpointReplay]) {
+              case (stagedReplays, (shardId, cp)) =>
                 // DETERMINISTIC adopt-verifier — NOT intake `evaluate`. `verifyEmbedded` decides from the checkpoint bytes, the committee
                 // membership for `(shardId, epoch)`, the configured execution quorum, and deterministic replay, so the leader (produce),
                 // the follower (`createContext`), and every gl0 peer (`validateArtifact`) reach a byte-identical adopt decision + committed
@@ -858,7 +827,7 @@ object GlobalSnapshotAcceptanceManager {
                       s"[ACCEPTANCE/SHARDING] ordinal=$ordinal mapShard=$shardId checkpointShard=${cp.shardId} " +
                         s"shardOrd=${cp.shardOrdinal.value} REJECTED outer shard key mismatch"
                     )
-                    .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
+                    .as(stagedReplays)
                 else
                   checkpointManager.verifyEmbedded(cp).flatMap {
                     case ShardCheckpointAcceptResult.Accepted =>
@@ -922,11 +891,6 @@ object GlobalSnapshotAcceptanceManager {
                         val adopted = trimResults.collect { case Right(Right(r)) => r }
                         val chainContinuous: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]] =
                           SortedMap.from(adopted.map { case (mg, suffix, _) => mg -> suffix })(Address.OrderingInstance)
-                        // A carried root is only a claim to compare with GL0's recreated result. State diffs are ignored.
-                        val newRoots: SortedMap[Address, Hash] =
-                          SortedMap.from(chainContinuous.keys.toList.flatMap { mg =>
-                            cp.derivedStateDelta.perMetagraphMptRoots.get(mg).map(mg -> _)
-                          })(Address.OrderingInstance)
                         alreadyAdopted.traverse_ { mg =>
                           loggerBundle.app.info(
                             s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
@@ -957,21 +921,32 @@ object GlobalSnapshotAcceptanceManager {
                               s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                                 s"SELECTED-FOR-REPLAY mgs=${chainContinuous.size} binaries=${chainContinuous.values.map(_.size).sum} " +
                                 s"deferredMgs=${deferred.size} alreadyAdoptedMgs=${alreadyAdopted.size}"
-                            ) >>
-                          Hasher[F]
-                            .hash(cp.signingPreimage)
-                            .map { cpHash =>
-                              val nextPending =
-                                if (deferred.isEmpty)
-                                  pendingAdoptions :+ PendingCheckpointAdoption(
-                                    shardId,
-                                    cp.shardOrdinal,
-                                    cpHash,
-                                    chainContinuous.keySet
-                                  )
-                                else pendingAdoptions
-                              (adoptedAcc ++ chainContinuous, rootsAcc ++ newRoots, slashAcc, nextPending)
+                            ) >> {
+                            // Checkpoint atomicity: one deferred MG suppresses every sibling transition from this checkpoint. An exact
+                            // AlreadyAdopted-only checkpoint is an idempotent no-op. At least one Continue and zero Defer are required before
+                            // any checkpoint-derived snapshot or root is staged for replay.
+                            if (deferred.nonEmpty || chainContinuous.isEmpty)
+                              stagedReplays.pure[F]
+                            else {
+                              val stagedKeys = chainContinuous.keySet ++ alreadyAdopted.toSet
+                              val stagedRoots = cp.derivedStateDelta.perMetagraphMptRoots.filter {
+                                case (mg, _) => stagedKeys.contains(mg)
+                              }
+
+                              // A Continue+Already checkpoint is one atomic state claim. Retain every claimed root so the fold can prove
+                              // that an already-consumed outer binary still names the exact current currency state before applying any
+                              // continuing sibling. Missing or extra roots make the complete checkpoint unavailable.
+                              if (stagedRoots.keySet =!= stagedKeys)
+                                stagedReplays.pure[F]
+                              else
+                                (stagedReplays :+ StagedCheckpointReplay(
+                                  shardId,
+                                  cp.shardOrdinal,
+                                  chainContinuous,
+                                  stagedRoots
+                                )).pure[F]
                             }
+                          }
                       } // close trimResults flatMap
 
                     case ShardCheckpointAcceptResult.PendingMoreAttestations =>
@@ -980,7 +955,7 @@ object GlobalSnapshotAcceptanceManager {
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                             s"PENDING — will retry next gl0 ord"
                         )
-                        .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
+                        .as(stagedReplays)
 
                     case ShardCheckpointAcceptResult.Rejected(reason) =>
                       // Logged at info (not warn) because a Rejected checkpoint can be a legitimate operator-level transient, such as an
@@ -991,44 +966,20 @@ object GlobalSnapshotAcceptanceManager {
                           s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
                             s"REJECTED reason=$reason"
                         )
-                        .as((adoptedAcc, rootsAcc, slashAcc, pendingAdoptions))
+                        .as(stagedReplays)
 
-                    case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
-                      // Wrong-derivation result from unconditional GL0 replay. The committee signers deviated from determinism and are the
-                      // 100% `InvalidStateProof` slash targets (§10.2). The deterministic LEDGER EFFECT is
-                      // `InvalidStateProofSlashManager.applySlash` (stake reduction ×(1−slashFraction) + cooldown registry entry +
-                      // bounty/burn), the SAME sink the WATCHTOWER quorum-path dispute feeds via an on-chain `InvalidStateProofEvidence`.
-                      //
-                      // DURABLE WIRING (slashing part 3): surface a `WatchtowerSlashRequest` here — the canonical disputed-checkpoint hash
-                      // (`Hasher(cp.signingPreimage)`) + the slash-target signers. The accept path's pure `applyWatchtowerSlashes` fold then
-                      // (a) reduces/removes the targets' `activeDelegatedStakes` / `activeNodeCollaterals` BEFORE `cleanStateMaps` (so the
-                      // existing removal-key derivation + GSI + accumulator stay consistent), and (c) writes each `SlashedRegistryEntry` into
-                      // the `Slashings` MPT partition (fieldId 34) — both the writer-algebra view AND the #107 verify-replay set — after
-                      // `applyStateChanges`. This path carries NO fraud-proof submitter (gl0 self-detected via re-exec), so the bounty has no
-                      // recipient ⇒ the whole slashed pool burns (`submitter = None`). The decision is reached identically by leader/follower/
-                      // peer (deterministic re-exec inside `accept()`), so the durable write is consensus-safe.
-                      val slashTargets = slashSigners.distinct
-                      Hasher[F].hash(cp.signingPreimage).flatMap { cpHash =>
-                        loggerBundle.app
-                          .warn(
-                            s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
-                              s"REJECTED-REEXEC-MISMATCH reason=$reason slashSigners=${slashTargets.size} " +
-                              s"checkpoint=${cpHash.value.take(12)} (InvalidStateProof 100% tier — durable slash + Slashings MPT write queued)"
-                          )
-                          .as(
-                            (
-                              adoptedAcc,
-                              rootsAcc,
-                              slashAcc :+ WatchtowerSlashRequest(shardId, cpHash, slashTargets, submitter = None),
-                              pendingAdoptions
-                            )
-                          )
-                      }
+                    case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, _) =>
+                      // A local replay mismatch rejects the complete checkpoint but is not portable slash evidence. The checkpoint may be
+                      // absent from the final artifact after the post-accept applied-set filter, so applying a local slash here would make
+                      // leader and followers diverge. Only an artifact-carried fraud proof revalidated by every GL0 node may reach the
+                      // consensus slash sink.
+                      loggerBundle.app
+                        .info(
+                          s"[ACCEPTANCE/SHARDING] ordinal=$ordinal shardId=$shardId shardOrd=${cp.shardOrdinal.value} " +
+                            s"REJECTED replay-mismatch reason=$reason (no slash without portable fraud evidence)"
+                        )
+                        .as(stagedReplays)
                   }
-            }
-            .map {
-              case (adopted, roots, slashRequests, pendingAdoptions) =>
-                (adopted, roots, slashRequests, pendingAdoptions)
             }
 
         /** Transitional ordinary-GL0 recreation of every adopted CL1 snapshot with the shared currency transition function. The current
@@ -1043,49 +994,151 @@ object GlobalSnapshotAcceptanceManager {
           priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
             CurrencySnapshot
           ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+          priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
           adoptedScSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
           attestedRoots: SortedMap[Address, Hash],
           getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
-        )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] =
-          stateChannelEventsProcessor
-            .processCurrencySnapshotsWithCompleteConsumption(
-              ordinal,
-              currentBalances,
-              priorLastCurrencySnapshots,
-              // The checkpoint carries canonical OLDEST-FIRST windows. The structured boundary performs the legacy order conversion and
-              // separately proves that recreation returned every exact Signed input in that same order. Root equality over an accepted
-              // prefix is insufficient: the checkpoint signature covers the whole window.
-              adoptedScSnapshots,
-              getGlobalSnapshotByOrdinal
-            )
-            .flatMap { replay =>
-              // Incomplete, reordered, substituted, and unexpected output is structurally unavailable to checkpoint adoption.
-              val completelyAccepted = replay.completeResults
-              // The accepted map is the output of full CurrencySnapshotValidator recreation. Checkpoints carry execution inputs and root
-              // claims only; they cannot replace balances, references, active sets, or any other economic state.
-              val unverifiedResult =
-                stateChannelEventsProcessor
-                  .assembleAcceptanceResult(completelyAccepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+        )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] = {
+          val basePairsConsistent = adoptedScSnapshots.keysIterator.forall { mg =>
+            priorLastCurrencySnapshots.contains(mg) === priorLastStateChannelSnapshotHashes.contains(mg)
+          }
+          val expectedParentHashes = SortedMap.from(adoptedScSnapshots.keysIterator.flatMap { mg =>
+            priorLastStateChannelSnapshotHashes
+              .get(mg)
+              .orElse(Option.when(!priorLastCurrencySnapshots.contains(mg))(Hash.empty))
+              .map(mg -> _)
+          })
 
-              adoptedScSnapshots.keys.toList.traverse { mg =>
-                (unverifiedResult.calculatedCurrencyState.get(mg), attestedRoots.get(mg)) match {
-                  case (Some(state), Some(attestedRoot)) if completelyAccepted.contains(mg) =>
-                    GlobalStateConverter
-                      .currencySnapshotMgRoot[F](SortedMap(mg -> state))
-                      .map(recreatedRoot => Option.when(recreatedRoot === attestedRoot)(mg))
-                  case _ => none[Address].pure[F]
+          if (!basePairsConsistent)
+            stateChannelEventsProcessor
+              .assembleAcceptanceResult(SortedMap.empty, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+              .pure[F]
+          else
+            stateChannelEventsProcessor
+              .processCurrencySnapshotsWithCompleteConsumption(
+                ordinal,
+                currentBalances,
+                priorLastCurrencySnapshots,
+                expectedParentHashes,
+                // The checkpoint carries canonical OLDEST-FIRST windows. The structured boundary performs the legacy order conversion and
+                // separately proves that recreation returned every exact Signed input in that same order. Root equality over an accepted
+                // prefix is insufficient: the checkpoint signature covers the whole window.
+                adoptedScSnapshots,
+                getGlobalSnapshotByOrdinal
+              )
+              .flatMap { replay =>
+                val completelyAccepted = replay.completeResults
+                val everyWindowConsumed =
+                  replay.allInputsCompletelyConsumed && completelyAccepted.keySet === adoptedScSnapshots.keySet
+
+                if (!everyWindowConsumed)
+                  stateChannelEventsProcessor
+                    .assembleAcceptanceResult(SortedMap.empty, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+                    .pure[F]
+                else {
+                  val unverifiedResult =
+                    stateChannelEventsProcessor
+                      .assembleAcceptanceResult(completelyAccepted, priorLastCurrencySnapshots, Set.empty[StateChannelOutput])
+
+                  adoptedScSnapshots.keys.toList.traverse { mg =>
+                    (unverifiedResult.calculatedCurrencyState.get(mg), attestedRoots.get(mg)) match {
+                      case (Some(state), Some(attestedRoot)) =>
+                        GlobalStateConverter
+                          .currencySnapshotMgRoot[F](SortedMap(mg -> state))
+                          .map(_ === attestedRoot)
+                      case _ => false.pure[F]
+                    }
+                  }.map { verified =>
+                    val allRootsMatch = verified.forall(identity)
+                    stateChannelEventsProcessor.assembleAcceptanceResult(
+                      Option.when(allRootsMatch)(completelyAccepted).getOrElse(SortedMap.empty),
+                      priorLastCurrencySnapshots,
+                      Set.empty[StateChannelOutput]
+                    )
+                  }
                 }
-              }.map { verified =>
-                val verifiedMgs = verified.flatten.toSet
-                stateChannelEventsProcessor.assembleAcceptanceResult(
-                  // Filter positively rather than subtracting rejected checkpoint keys: an unexpected processor output is never an
-                  // independently authorized checkpoint input and therefore cannot enter the accepted result.
-                  completelyAccepted.filter { case (mg, _) => verifiedMgs.contains(mg) },
-                  priorLastCurrencySnapshots,
-                  Set.empty[StateChannelOutput]
-                )
               }
+        }
+
+        /** Apply checkpoint groups in deterministic shard order. Base/raw state-channel events have already run. Each group sees only the
+          * balances, currency state, and outer tips committed by earlier successful stages; a failed group is discarded in full, including
+          * every fee balance write, before the next group executes.
+          */
+        private def applyAdoptedCheckpointGroups(
+          ordinal: SnapshotOrdinal,
+          startingBalances: SortedMap[Address, Balance],
+          priorTips: SortedMap[Address, Hash],
+          baseAcceptance: StateChannelAcceptanceResult,
+          groups: List[StagedCheckpointReplay],
+          getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+        )(implicit hasher: Hasher[F]): F[StateChannelAcceptanceResult] = {
+          def acceptedTips(
+            accepted: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+          ): F[SortedMap[Address, Hash]] =
+            accepted.toList.traverse { case (mg, binaries) => Hasher[F].hash(binaries.last.value).map(mg -> _) }
+              .map(SortedMap.from(_))
+
+          def merge(
+            prior: StateChannelAcceptanceResult,
+            next: StateChannelAcceptanceResult
+          ): StateChannelAcceptanceResult =
+            StateChannelAcceptanceResult(
+              accepted = prior.accepted ++ next.accepted,
+              calculatedCurrencyState = next.calculatedCurrencyState,
+              returned = prior.returned ++ next.returned,
+              balanceUpdate = prior.balanceUpdate ++ next.balanceUpdate,
+              incomingCurrencySnapshotsWithState = prior.incomingCurrencySnapshotsWithState ++ next.incomingCurrencySnapshotsWithState
+            )
+
+          val allGroupKeys = groups.flatMap(_.roots.keys)
+          val groupsAreDisjoint = allGroupKeys.distinct.size === allGroupKeys.size
+
+          if (!groupsAreDisjoint) baseAcceptance.pure[F]
+          else
+            acceptedTips(baseAcceptance.accepted).flatMap { baseTipUpdates =>
+              val initial = (baseAcceptance, priorTips ++ baseTipUpdates)
+
+              groups
+                .sortBy(group => (group.shardId.value.value, group.shardOrdinal.value))
+                .foldM(initial) {
+                  case ((acceptedSoFar, tipsSoFar), group) =>
+                    val continuingRoots = group.roots.filter { case (mg, _) => group.snapshots.contains(mg) }
+                    val alreadyAdopted = group.roots.keySet -- group.snapshots.keySet
+
+                    alreadyAdopted.toList.traverse { mg =>
+                      acceptedSoFar.calculatedCurrencyState.get(mg) match {
+                        case Some(state) =>
+                          GlobalStateConverter
+                            .currencySnapshotMgRoot[F](SortedMap(mg -> state))
+                            .map(_ === group.roots(mg))
+                        case None => false.pure[F]
+                      }
+                    }.flatMap { alreadyRootsMatch =>
+                      if (!alreadyRootsMatch.forall(identity))
+                        (acceptedSoFar, tipsSoFar).pure[F]
+                      else
+                        deriveAdoptedCurrencyState(
+                          ordinal,
+                          startingBalances ++ acceptedSoFar.balanceUpdate,
+                          acceptedSoFar.calculatedCurrencyState,
+                          tipsSoFar,
+                          group.snapshots,
+                          continuingRoots,
+                          getGlobalSnapshotByOrdinal
+                        ).flatMap { staged =>
+                          val groupAcceptedAtomically = staged.accepted.keySet === group.snapshots.keySet && group.snapshots.nonEmpty
+                          if (!groupAcceptedAtomically)
+                            (acceptedSoFar, tipsSoFar).pure[F]
+                          else
+                            acceptedTips(staged.accepted).map { tipUpdates =>
+                              (merge(acceptedSoFar, staged), tipsSoFar ++ tipUpdates)
+                            }
+                        }
+                    }
+                }
+                .map(_._1)
             }
+        }
 
         private def calculateRewards(
           ordinal: SnapshotOrdinal,
@@ -1979,22 +2032,14 @@ object GlobalSnapshotAcceptanceManager {
                         priorLastStateChannelSnapshotHashes
                       )
                     case _ =>
-                      Async[F].pure(
-                        (
-                          SortedMap.empty[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
-                          SortedMap.empty[Address, Hash],
-                          List.empty[WatchtowerSlashRequest],
-                          List.empty[PendingCheckpointAdoption]
-                        )
-                      )
+                      Async[F].pure(List.empty[StagedCheckpointReplay])
                   }
-                adoptedScSnapshots = adoptedResult._1
-                adoptedRoots = adoptedResult._2
+                adoptedCheckpointGroups = adoptedResult
 
                 // WATCHTOWER fraud-proof CONSENSUS ARTIFACT → durable slash (W3a). Re-validate EVERY carried fraud proof here via the SAME
                 // deterministic `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed checkpoint's
                 // OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger's claimed roots), and for each UPHELD dispute
-                // surface a `WatchtowerSlashRequest(submitter = Some(challengerAddress))`. Because the validator is a pure function of the
+                // surface a `WatchtowerSlashRequest(submitter = challengerAddress)`. Because the validator is a pure function of the
                 // evidence + the exact proposal-parent slash ledger, the leader/follower/peer reach a BYTE-IDENTICAL
                 // verdict and thus the byte-identical slash. The honest-committee floor is enforced INSIDE the validator (`DisputeNotUpheld` on
                 // a frivolous/forged proof ⇒ skipped here). The double-slash guard is the validator's step-7 exact-parent `slashedReader`
@@ -2021,7 +2066,7 @@ object GlobalSnapshotAcceptanceManager {
                                   upheld.shardId,
                                   checkpointHash,
                                   upheld.slashTargets,
-                                  submitter = Some(submitterAddr)
+                                  submitter = submitterAddr
                                 )
                               )
                             }
@@ -2039,13 +2084,11 @@ object GlobalSnapshotAcceptanceManager {
                     case _ => Async[F].pure(List.empty[WatchtowerSlashRequest])
                   }
 
-                // WATCHTOWER durable-slash requests = the GL0 self-detected replay mismatches (`submitter = None` ⇒ burn) UNION the
-                // upheld watchtower fraud-proof disputes (`submitter = Some` ⇒ bounty). Both are applied to the stake maps below, before
-                // cleaning, via the SAME pure `applyWatchtowerSlashes` fold. ALWAYS empty at numShards=1 (neither source produces a request
-                // there). The `watchtowerEnabled` config gate makes the durable slash inert when off (drop the requests ⇒ `applyWatchtowerSlashes`
-                // is a no-op ⇒ stake maps + `Slashings` partition + mptRoot unchanged) — a single deterministic kill-switch read at one site.
+                // Only portable, artifact-carried fraud evidence can reach the consensus slash sink. A local checkpoint replay mismatch
+                // rejects all checkpoint effects but cannot slash because the post-accept artifact filter may omit those checkpoint bytes.
+                // The `watchtowerEnabled` config gate makes the durable slash inert when off.
                 adoptedSlashRequests =
-                  if (invaliditySlashingConfig.watchtowerEnabled) adoptedResult._3 ++ fraudProofSlashRequests else Nil
+                  if (invaliditySlashingConfig.watchtowerEnabled) fraudProofSlashRequests else Nil
 
                 // CHANGE 3 — partition the raw `scEvents` by the deterministic static shard assignment. When sharding is
                 // active (`numShards > 1` AND `shardAssignment` wired), a metagraph address that maps to a shard flows ONLY
@@ -2083,51 +2126,28 @@ object GlobalSnapshotAcceptanceManager {
                   getGlobalSnapshotByOrdinal
                 )
 
-                // Merge committee-selected SC snapshot bytes after currency derivation is rerun via
-                // `deriveAdoptedCurrencyState`) with the standard chain-link result. The two MG sets are disjoint in normal
-                // operation (a sharded MG flows only via its committee; a non-sharded/bootstrap MG only via raw scEvents), but
-                // on the rare mixed-bootstrap overlap the globally recreated adopted entry wins (`++` right-biased). When
-                // `adoptedScSnapshots` is empty (numShards=1 OR no checkpoints
-                // this ord) the result IS `baseAcceptance` verbatim — no `deriveAdoptedCurrencyState` call, no merge.
-                acceptanceAndVerifiedMetagraphs <-
-                  if (adoptedScSnapshots.isEmpty)
-                    Async[F].pure((baseAcceptance, Set.empty[Address]))
+                // Protocol order is explicit: raw/base events first, then checkpoint groups in ascending shard/ordinal order. Each group
+                // threads the exact committed balances/state/tips from the previous stage. Independent absolute balance maps are never
+                // right-biased together; a failed group contributes zero state, tip, fee, root, or adoption capability.
+                combinedStateChannelAcceptance <-
+                  if (adoptedCheckpointGroups.isEmpty)
+                    Async[F].pure(baseAcceptance)
                   else
-                    deriveAdoptedCurrencyState(
+                    applyAdoptedCheckpointGroups(
                       ordinal,
                       updatedGlobalBalances,
-                      priorLastCurrencySnapshots,
-                      adoptedScSnapshots,
-                      adoptedRoots,
+                      priorLastStateChannelSnapshotHashes,
+                      baseAcceptance,
+                      adoptedCheckpointGroups,
                       getGlobalSnapshotByOrdinal
-                    ).map { adoptedAcceptance =>
-                      (
-                        StateChannelAcceptanceResult(
-                          accepted = baseAcceptance.accepted ++ adoptedAcceptance.accepted,
-                          // Both base + adopt return `priorLastCurrencySnapshots.concat(<states>)`. Merging them right-biased
-                          // yields `prior ++ baseStates ++ adoptedStates` — the prior keys are overwritten with identical
-                          // values, so this is exactly what a single combined `calculateLastCurrencySnapshots` would produce.
-                          calculatedCurrencyState = baseAcceptance.calculatedCurrencyState ++ adoptedAcceptance.calculatedCurrencyState,
-                          // Adopted snapshots are never "returned" (committee-accepted, not gl0-rejected); only the raw-event
-                          // chain-link path can return events to a metagraph.
-                          returned = baseAcceptance.returned ++ adoptedAcceptance.returned,
-                          balanceUpdate = baseAcceptance.balanceUpdate ++ adoptedAcceptance.balanceUpdate,
-                          incomingCurrencySnapshotsWithState =
-                            baseAcceptance.incomingCurrencySnapshotsWithState ++ adoptedAcceptance.incomingCurrencySnapshotsWithState
-                        ),
-                        adoptedAcceptance.accepted.keySet
-                      )
-                    }
-                (
-                  StateChannelAcceptanceResult(
-                    scSnapshots,
-                    currencySnapshots,
-                    returnedSCEvents,
-                    currencyAcceptanceBalanceUpdate,
-                    incomingCurrencySnapshots
-                  ),
-                  _
-                ) = acceptanceAndVerifiedMetagraphs
+                    )
+                StateChannelAcceptanceResult(
+                  scSnapshots,
+                  currencySnapshots,
+                  returnedSCEvents,
+                  currencyAcceptanceBalanceUpdate,
+                  incomingCurrencySnapshots
+                ) = combinedStateChannelAcceptance
 
                 transactionsRefsDeltas <- transactionReferenceManager.acceptTransactionRefs(
                   initialData.blockResult.contextUpdate.lastTxRefs,
@@ -2636,8 +2656,8 @@ object GlobalSnapshotAcceptanceManager {
                 // BEFORE `cleanStateMaps`, so the existing cleaning + removed-key derivation + GSI + accumulator all consume the post-slash
                 // maps with no second code path. `applyWatchtowerSlashes` reduces/removes the slash targets' delegated-stake + collateral
                 // records (100% tier ⇒ full removal), yields one `SlashedRegistryEntry` per `(operator, shard, checkpoint)` for the
-                // `Slashings` MPT write, and (re-exec path: `submitter = None`) burns the entire pool (no bounty credit). Empty `requests`
-                // (the common path; ALWAYS empty at numShards=1) ⇒ the prior maps verbatim + empty deltas ⇒ byte-identical to pre-slash.
+                // `Slashings` MPT write, credits the authenticated fraud-proof submitter's bounty, and burns the remainder. Empty
+                // `requests` (the common path; ALWAYS empty at numShards=1) yields the prior maps verbatim and empty deltas.
                 // Every ordinary balance effect for this ordinal has completed at this point. Materialize the complete view once so a
                 // right-biased bounty update starts from the submitter's post-transfer/fee/lock/spend balance and cannot restore its
                 // prior-ordinal balance. Addresses untouched this ordinal retain their MPT-materialized prior value.
@@ -2713,7 +2733,7 @@ object GlobalSnapshotAcceptanceManager {
                   updatedLastStateChannelSnapshotHashes,
                   (priorLastTxRefs ++ transactionsRefsDeltas).toSortedMap,
                   // `slashBountyBalanceDelta` already carries the submitter's final credited post-economic balance, so the right-biased
-                  // merge cannot erase an earlier same-ordinal debit. Empty on the reachable re-exec path (no submitter) ⇒ byte-identical.
+                  // merge cannot erase an earlier same-ordinal debit. Empty when no carried fraud proof is upheld.
                   postEconomicBalances ++ slashBountyBalanceDelta,
                   updatedLastCurrencySnapshots,
                   updatedLastCurrencySnapshotProofs,
@@ -2743,8 +2763,8 @@ object GlobalSnapshotAcceptanceManager {
                     updatedBalancesByAllowSpendsDeltas ++
                     updatedBalancesByTokenLocksDeltas ++
                     updatedBalancesBySpendTransactionsDeltas ++
-                    // WATCHTOWER slash bounty credit (final balance per submitter). Empty on the reachable re-exec path (no submitter) ⇒ the
-                    // accumulator `balances` delta — and thus the MPT Balances partition + mptRoot — is byte-identical to pre-slash.
+                    // WATCHTOWER slash bounty credit (final balance per authenticated fraud-proof submitter). Empty when no carried proof
+                    // is upheld, leaving the accumulator balances partition unchanged by slashing.
                     slashBountyBalanceDelta
 
                 currencySnapshotsDeltas = incomingCurrencySnapshots.collect {

@@ -110,7 +110,7 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
     val valid =
       duplicateIds.isEmpty && duplicateSources.isEmpty && danglingSourceIds.isEmpty && invalidMissingAuthority.isEmpty &&
         unexplainedMissingCurrentAuthority.isEmpty && unsafeWithoutRed.isEmpty && featureIdentityCollapsed.isEmpty &&
-        frozenCounts == ((39, 12, 182))
+        frozenCounts == ((40, 12, 185))
     if (valid) success
     else
       failure(
@@ -119,6 +119,39 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
           s"unsafeWithoutRed=$unsafeWithoutRed " +
           s"featureIdentityCollapsed=$featureIdentityCollapsed frozenCounts=$frozenCounts"
       )
+  }
+
+  pureTest("every state-channel checkpoint lifecycle source covers the complete binary grammar") {
+    val binaryIds = V4EconomicGrammarManifest.wireCarriers
+      .find(_.anchor.symbol == "StateChannelSnapshotBinary")
+      .map(_.operationIds)
+      .getOrElse(Set.empty)
+    val requiredPaths = Set(
+      GrammarPaths.stateChannelBinary,
+      GrammarPaths.stateChannelOutput,
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelEventsProcessor.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelAcceptanceManager.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/ShardCheckpointGl0AcceptanceManager.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/ShardWindowContinuation.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointWiring.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducer.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/WatchtowerFraudProofEmitter.scala",
+      "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala",
+      "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala",
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedServices.scala"
+    )
+    val rowsByPath = V4EconomicGrammarManifest.reviewedSources.map(row => row.path -> row).toMap
+    val missingRows = requiredPaths -- rowsByPath.keySet
+    val underclassified = requiredPaths.toList.sorted.flatMap { path =>
+      rowsByPath.get(path).flatMap { row =>
+        val missingIds = binaryIds -- row.operationIds
+        Option.when(missingIds.nonEmpty)(path -> missingIds.toList.sorted)
+      }
+    }
+
+    if (binaryIds.nonEmpty && missingRows.isEmpty && underclassified.isEmpty) success
+    else failure(s"binaryIds=$binaryIds missingRows=$missingRows underclassified=$underclassified")
   }
 
   test("every operation constructor and economic wire-carrier anchor resolves exactly and removed v4 adjustment authority stays absent") {
@@ -246,6 +279,7 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
       stateChannelBinary.exists(_.operationIds("ECO-DELEGATED-STAKE-RELEASE")),
       stateChannelBinary.exists(_.operationIds("ECO-OPAQUE-CARRIAGE")),
       stateChannelBinary.exists(_.operationIds("ECO-OPAQUE-CARRIAGE-FEE-ERA")),
+      stateChannelBinary.exists(_.operationIds("ECO-OPAQUE-CARRIAGE-SHARDED")),
       !stateChannelBinary.exists(_.operationIds("ECO-NODE-COLLATERAL-RELEASE")),
       !V4EconomicGrammarManifest.wireCarriers.exists(_.operationIds.exists(genesisBackingIds)),
       allowSpendConsume.intendedAuthority == RootedReferencedAllowSpend,
@@ -841,6 +875,28 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
         processor.contains("if(isFeeRequired)none.asRight[Agg]"),
         processor.contains("caseNoneif!isFeeRequired"),
         !processor.contains("opaqueFeePayer")
+      )
+    }
+  }
+
+  test("RED ECON-OPAQUE-SHARD-001: total shard assignment removes the generic raw opaque carriage path") {
+    productionSources.map { sources =>
+      val globalAcceptance = compact(
+        stripComments(
+          sources(
+            "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala"
+          ).contents
+        )
+      )
+
+      expect.all(
+        globalAcceptance.contains("case(Some(cfg),Some(assignment))ifcfg.numShards>1=>"),
+        globalAcceptance.contains("assignment.shardIdFor(out.address).map(_=>out->true)"),
+        globalAcceptance.contains("annotated.collect{case(out,isSharded)if!isSharded=>out}"),
+        globalAcceptance.contains("case_=>Async[F].pure(scEvents)"),
+        globalAcceptance.contains(
+          "processStateChannelEvents(ordinal,updatedGlobalBalances,priorLastStateChannelSnapshotHashes,priorLastCurrencySnapshots,baseScEvents,validationType,getGlobalSnapshotByOrdinal)"
+        )
       )
     }
   }

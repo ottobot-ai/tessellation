@@ -45,8 +45,8 @@ E2.9 now has a production-dark structured manifest at
 `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/economics/V4EconomicGrammarManifest.scala`
 and a CI guard at
 `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/economics/V4EconomicGrammarCompletenessGuardSuite.scala`.
-At the frozen baseline they classify 39 operation identities, 12 economic wire
-carriers, and 182 reviewed current-fork sources. V4 feature identity is kept
+At the frozen baseline they classify 40 operation identities, 12 economic wire
+carriers, and 185 reviewed current-fork sources. V4 feature identity is kept
 separate from current activation, so retaining a v4 capability does not approve
 its current authority path. Every row records intended and current authority as
 separate mandatory fields; an unsafe or missing implementation cannot inherit
@@ -139,6 +139,15 @@ The suite pins these current unsafe behaviors as RED evidence:
   activation or while fees are waived. Once fees are required the processor has
   no authenticated opaque fee-payer lane and drops/stops the opaque chain, so a
   distinct fee-era row is `MissingFailClosed`;
+- sharding currently has no standalone opaque/data-only route. With
+  `numShards > 1`, the total metagraph assignment removes every raw
+  state-channel event from the standard carriage path, while checkpoint
+  production requires currency replay and defers the whole checkpoint when any
+  included nondecodable opaque metagraph has no reproducible currency root. That
+  standalone case fails closed, but decoder-selected lane confusion remains open:
+  custom bytes that decode as framework currency are not objectively typed as
+  opaque. The retained O-09 lane remains unavailable until S3/E4 bind the signed
+  lane/diff/DA contract and E7 supplies authenticated custody/admission;
 - framework-with-data `DataApplicationBlock` carriage and standalone opaque
   state-channel carriage are distinct rows and carrier sets. The full
   `CurrencySnapshot` carrier is limited to fields it actually contains rather
@@ -490,6 +499,7 @@ reference interpreter and production kernel.
 | `ECON-SUPPLY-001 derived-supply-and-slash` | Every accepted transition preserves the explicit equation over balances, active token locks, and delegated-stake rewards. A slash cannot reduce only a backing record, retain the backing lock, log a fictitious burn, and mint a bounty balance. |
 | `ECON-REWARD-CURRENCY-001 deterministic-registration` | A non-empty currency reward set rejects while no deterministic active-era reward implementation is registered. Once registered, every execution signer recreates the exact reward set and GL0 adoption verifies the same diff/root. |
 | `ECON-OPAQUE-FEE-001 fee-era-carriage` | Fee activation cannot silently drop a previously supported opaque chain. Either a separately authenticated fee-payer mechanism accepts it as carriage-only or the fee-era lane remains explicitly unavailable. |
+| `ECON-OPAQUE-SHARD-001 sharded-carriage` | `numShards > 1` cannot route every state-channel binary into framework-currency replay. The explicit signed opaque/data-only lane must retain authenticated ordering/custody/availability without a currency root and without acquiring framework authority. Until that lane exists, sharded opaque carriage remains explicitly unavailable. |
 | `ECON-GENESIS-BACKING-001` | Every genesis stake/collateral amount is backed by an exact genesis token lock or an explicit genesis issuance/conservation rule. An arbitrary fixture event plus one-unit signer stipend cannot create unbacked eligibility weight. |
 | `ECON-CORRECTION-001 trust-direction` | ML0/CL1/DL1 attempts to construct a correction reject. The active-era GL0 protocol rule applies the same root-covered correction on every GL0 node and downstream nodes rebase from the exact containing Phase-2 hash. |
 | `V4-GRAMMAR-PARITY-*` | Golden v4 fixtures for every retained operation reproduce intended valid functionality. Fixtures that encode upstream authorization, inflation, replay, or ordering defects must reject under a named new rule rather than silently disappear. |
@@ -532,11 +542,13 @@ the final root.
    active-era allowlist and activation policy remain open.
 7. O-09's pure opaque/data-only lane remains an engineering/schema gate. Current
    source carries it only before fee activation/while fee-waived; the fee-era
-   row is `MissingFailClosed`. This is distinct from the locked
-   `FrameworkCurrency` and `FrameworkCurrencyWithData` lanes.
+   row is `MissingFailClosed`. The current total `numShards > 1` routing also
+   removes the raw carriage path and has no non-currency checkpoint lane, so the
+   sharded-carriage row is independently `MissingFailClosed`. These are distinct
+   from the locked `FrameworkCurrency` and `FrameworkCurrencyWithData` lanes.
 8. No runtime economic oracle, differential production/reference-kernel,
    cross-JVM, or full adversarial corpus was run for this source inventory. The
-   20-test tripwire suite is structural and RED evidence only.
+   22-test tripwire suite is structural and RED evidence only.
 
 Until these items and the required oracle vectors are closed, this document is
 evidence for planning E2.1/E2.2/E2.9 only. It is not evidence that the current

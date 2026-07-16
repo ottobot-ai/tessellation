@@ -778,9 +778,16 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   transitions is permanent and is not part of this replacement.
 - Current landing: shard checkpoint signatures require a sealed
   `VerifiedShardCheckpoint` minted by intake replay, including for under-quorum
-  ancestor closure across committee rotation. This capability currently proves
-  the root-only recreation result; E4 must extend it to the exact diff/intents/
-  complete-root result before E5 can close.
+  ancestor closure across committee rotation. Producer and receiver replay now
+  consume the complete multi-MG checkpoint in one canonical fold over one
+  retained base, including rooted global balances; any partial/unexpected result
+  withholds every root. The producer also re-reads and byte-compares a
+  domain/version-tagged canonical Scodec identity of that exact captured ordinal
+  immediately before signing. A newer finalized descendant does not invalidate
+  the retained base or restart production. This capability still proves only the
+  root-recreation result: the checkpoint does not yet bind E4's exact diff/
+  decisions/intents/lane/DA result or E1/P4.4's exact Phase-2 hash/root, so E5 and
+  `SHARD-E-002` remain partial.
 - Gates: `SIG-*`, `SHARD-E-001` through `SHARD-E-005`, economic differential
   tests from S2.
 
@@ -1051,9 +1058,44 @@ delivery, rollback, and recovery.
   result decides mismatch, rollback/quarantine, signer-specific debit, and
   reward. This adjudication path never replaces or narrows universal native
   `GL1 -> GL0` execution. Missing data defers and cannot slash.
+- Current partial landing authenticates the disputed execution certificate, then
+  replays the complete ordered multi-MG checkpoint batch once. The evidence MG is
+  only the root selector; it never narrows execution. A reproduced-root mismatch
+  upholds the dispute. For a structurally certificate-valid checkpoint, the only
+  non-root execution outcome that may uphold is an explicit typed
+  `ProvenInvalidTransition`; unavailable history, replay failure, and generic
+  incomplete legacy output are `Unavailable` and never slash
+  (`InvalidStateProofValidator.scala:168-215`;
+  `ShardCheckpointWiring.scala:239-314`). Production replay currently returns
+  only `Reproduced` or `Unavailable`; no production transition branch emits
+  `ProvenInvalidTransition`.
+- **HIGH OPEN:** checkpoint-wide shared-fee oversubscription now fails closed and
+  withholds every root, but the legacy currency processor exposes the rejected
+  suffix only as generic incomplete output. A colluding execution quorum that
+  signs that unexecutable batch is therefore blocked from adoption but cannot be
+  convicted by `InvalidStateProof`. Add a typed, deterministic transition-reject
+  disposition that distinguishes protocol invalidity from missing/local replay
+  dependencies before claiming slashing completeness
+  (`GlobalSnapshotStateChannelEventsProcessor.scala:145-220`;
+  `ExecutionBasePinReExecutionSuite.scala:731-855`).
+- **HIGH OPEN:** `verifyExecutionCertificate` currently delegates to `preCheck`,
+  which rejects an `includedSnapshots`/`perMetagraphMptRoots` keyset mismatch
+  before authenticating the quorum signatures. The emitter therefore publishes
+  nothing, and the portable validator rejects at its certificate gate before its
+  missing-attested-root verdict can convict the signers. Ordinary adoption fails
+  closed, but a quorum that signed the structurally invalid preimage escapes
+  `InvalidStateProof` (`ShardCheckpointGl0AcceptanceManager.scala:336-345,462-528`;
+  `WatchtowerFraudProofEmitter.scala:90-109`;
+  `InvalidStateProofValidator.scala:168-215`). Separate a typed authenticated
+  execution-signature/quorum proof from structural checkpoint validity. Keep the
+  structural check mandatory for ordinary acceptance, while portable adjudication
+  uses the authenticated signer capability to convict deterministic structural
+  invalidity. Do not weaken identity, membership, KES/VRF, distinctness, or quorum
+  checks (`WT-002B`).
 - Evidence is deterministic, permanent/exact-once, branch-aware, and distinguishes
   an honest replay on a later-orphaned Phase-2 base from execution fraud.
-- Gates: `WT-001` through `WT-007`, `CRYPTO-001`, `REC-*`, resource/flood tests.
+- Gates: `WT-001` through `WT-007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`,
+  `REC-*`, resource/flood tests.
 
 ### E12 - Downstream exact-hash rebase and return path (`PARTIAL`)
 

@@ -160,16 +160,18 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
 
   // ---- pure fold ----------------------------------------------------------------------------------------------------------------------
 
-  pureTest("applyWatchtowerSlashes (no submitter): removes offender records, emits one record per signer, burns the whole pool") {
+  pureTest("applyWatchtowerSlashes removes offender records, credits the authenticated submitter, and burns the remainder") {
     val app = applyWatchtowerSlashes(
-      requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = None)),
+      requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = submitter)),
       priorDelegatedStakes = priorStakes,
       priorNodeCollaterals = priorCollaterals,
-      postEconomicBalances = SortedMap.empty[Address, Balance],
+      postEconomicBalances = SortedMap(submitter -> Balance(NonNegLong.unsafeFrom(10L))),
       eventOrdinal = ord,
       currentEpoch = epoch,
       config = config
     )
+    val total = 3300L
+    val bounty = math.floor(total.toDouble * 0.05d).toLong // 165
     val aStakeOps =
       app.slashedDelegatedStakes.getOrElse(delegatorA, SortedSet.empty[DelegatedStakeRecord]).toList.map(_.event.value.nodeId)
     expect.all(
@@ -180,25 +182,6 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       app.registryEntries.head.peerId == offender,
       app.registryEntries.head.shardId == shardZero,
       app.registryEntries.head.disputedCheckpointHash == cpA,
-      app.bountyBalanceDelta.isEmpty,
-      // total = 1000 + 2000 + 300; no submitter ⇒ whole pool burns.
-      app.totalBurned == 3300L
-    )
-  }
-
-  pureTest("applyWatchtowerSlashes (with submitter): credits the bounty and burns the remainder") {
-    val app = applyWatchtowerSlashes(
-      requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(submitter))),
-      priorDelegatedStakes = priorStakes,
-      priorNodeCollaterals = priorCollaterals,
-      postEconomicBalances = SortedMap(submitter -> Balance(NonNegLong.unsafeFrom(10L))),
-      eventOrdinal = ord,
-      currentEpoch = epoch,
-      config = config
-    )
-    val total = 3300L
-    val bounty = math.floor(total.toDouble * 0.05d).toLong // 165
-    expect.all(
       app.bountyBalanceDelta.get(submitter).map(_.value.value) == Some(10L + bounty),
       app.totalBurned == total - bounty
     )
@@ -208,7 +191,7 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
     val priorBalance = 1000L
     val postEconomicBalance = 400L
     val app = applyWatchtowerSlashes(
-      requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(submitter))),
+      requests = List(WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = submitter)),
       priorDelegatedStakes = priorStakes,
       priorNodeCollaterals = priorCollaterals,
       postEconomicBalances = SortedMap(submitter -> Balance(NonNegLong.unsafeFrom(postEconomicBalance))),
@@ -226,8 +209,8 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
   }
 
   pureTest("applyWatchtowerSlashes is order-deterministic over two requests and empty-input is a no-op") {
-    val r1 = WatchtowerSlashRequest(shardOne, cpB, List(offender), submitter = None)
-    val r2 = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = None)
+    val r1 = WatchtowerSlashRequest(shardOne, cpB, List(offender), submitter = submitter)
+    val r2 = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = submitter)
     val ab = applyWatchtowerSlashes(List(r1, r2), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
     val ba = applyWatchtowerSlashes(List(r2, r1), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
     val empty = applyWatchtowerSlashes(Nil, priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
@@ -246,8 +229,8 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
   pureTest("applyWatchtowerSlashes coalesces one checkpoint key independent of duplicate request order") {
     val lowSubmitter = Address.fromBytes("a-submit".getBytes("UTF-8"))
     val highSubmitter = Address.fromBytes("z-submit".getBytes("UTF-8"))
-    val low = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(lowSubmitter))
-    val high = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(highSubmitter))
+    val low = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = lowSubmitter)
+    val high = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = highSubmitter)
     val lowHigh = applyWatchtowerSlashes(List(low, high), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
     val highLow = applyWatchtowerSlashes(List(high, low), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
     val canonicalSubmitter = SortedSet(lowSubmitter, highSubmitter).head
@@ -257,22 +240,6 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       lowHigh.registryEntries.size == 1,
       lowHigh.bountyBalanceDelta.keySet == Set(canonicalSubmitter),
       lowHigh.totalBurned == highLow.totalBurned
-    )
-  }
-
-  pureTest("self-detected duplicate preserves burn-all policy independent of request order") {
-    val submitter = Address.fromBytes("watchtower".getBytes("UTF-8"))
-    val selfDetected = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = None)
-    val carried = WatchtowerSlashRequest(shardZero, cpA, List(offender), submitter = Some(submitter))
-    val selfFirst = applyWatchtowerSlashes(List(selfDetected, carried), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
-    val carriedFirst =
-      applyWatchtowerSlashes(List(carried, selfDetected), priorStakes, priorCollaterals, SortedMap.empty, ord, epoch, config)
-
-    expect.all(
-      selfFirst == carriedFirst,
-      selfFirst.registryEntries.size == 1,
-      selfFirst.bountyBalanceDelta.isEmpty,
-      selfFirst.totalBurned > 0L
     )
   }
 
@@ -292,7 +259,7 @@ object InvalidStateProofSlashLedgerSuite extends MutableIOSuite {
       store <- mkStore
       // Write the records the fold would produce for an upheld dispute on (shardZero, cpA), signed by both operators.
       app = applyWatchtowerSlashes(
-        List(WatchtowerSlashRequest(shardZero, cpA, List(offender, honest), submitter = None)),
+        List(WatchtowerSlashRequest(shardZero, cpA, List(offender, honest), submitter = submitter)),
         priorStakes,
         priorCollaterals,
         SortedMap.empty[Address, Balance],

@@ -9,6 +9,7 @@ import cats.effect.std.Supervisor
 import cats.implicits.none
 import cats.syntax.applicative._
 import cats.syntax.list._
+import cats.syntax.traverse._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 import scala.reflect.runtime.universe.TypeTag
@@ -36,6 +37,8 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
 }
 import io.constellationnetwork.node.shared.domain.fork.ForkInfo
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
+import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
+import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
 import io.constellationnetwork.node.shared.domain.node.{UpdateNodeParametersAcceptanceManager, UpdateNodeParametersValidator}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{UpdateNodeCollateralAcceptanceManager, UpdateNodeCollateralValidator}
 import io.constellationnetwork.node.shared.domain.priceOracle.{PriceStateUpdater, PricingUpdateValidator}
@@ -50,20 +53,21 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.trigger
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger}
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.{RewardsInfoCalculator, RewardsInfoStorage}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
+import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
-  GlobalSnapshotAcceptanceManager,
-  GlobalSnapshotStateChannelEventsProcessor
-}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global._
 import io.constellationnetwork.node.shared.logger.Slf4jLoggerBundle
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.EtaPeriod
+import io.constellationnetwork.schema.nakamoto.slot.Slot
 import io.constellationnetwork.schema.node.RewardFraction
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.round.RoundId
+import io.constellationnetwork.schema.sharding._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction._
 import io.constellationnetwork.schema.{GlobalStateProofSelector, _}
@@ -481,7 +485,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     )(implicit hasher: Hasher[F]): IO[StateChannelAcceptanceResult] = IO(
       StateChannelAcceptanceResult(
         events.groupByNel(_.address).view.mapValues(_.map(_.snapshotBinary)).toSortedMap,
-        SortedMap.empty,
+        priorLastCurrencySnapshots,
         Set.empty,
         SortedMap.empty,
         SortedMap.empty
@@ -501,7 +505,12 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         Address,
         (NonEmptyList[(Signed[StateChannelSnapshotBinary], Option[CurrencySnapshotWithState])], SortedMap[Address, Balance])
       ]
-    ] = ???
+    ] = IO.pure(
+      events.map {
+        case (metagraph, binaries) =>
+          metagraph -> (binaries.map(_ -> priorLastCurrencySnapshots.get(metagraph)), SortedMap.empty[Address, Balance])
+      }
+    )
 
     def assembleAcceptanceResult(
       processed: SortedMap[
@@ -512,7 +521,22 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         CurrencySnapshot
       ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
       returned: Set[StateChannelOutput]
-    ): StateChannelAcceptanceResult = ???
+    ): StateChannelAcceptanceResult = {
+      val recreated = SortedMap.from(processed.toList.flatMap {
+        case (metagraph, (pairs, _)) => pairs.last._2.map(metagraph -> _)
+      })
+      val calculated = recreated.foldLeft(priorLastCurrencySnapshots) {
+        case (acc, (metagraph, state)) => acc.updated(metagraph, state)
+      }
+
+      StateChannelAcceptanceResult(
+        accepted = processed.map { case (metagraph, (pairs, _)) => metagraph -> pairs.map(_._1) },
+        calculatedCurrencyState = calculated,
+        returned = returned,
+        balanceUpdate = SortedMap.empty,
+        incomingCurrencySnapshotsWithState = SortedMap.empty
+      )
+    }
 
   }
 
@@ -629,7 +653,14 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     pendingPostBytes: Ref[IO, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]]
   )
 
-  private def mkRootedParent(balances: SortedMap[Address, Balance])(
+  private def mkRootedParent(
+    balances: SortedMap[Address, Balance],
+    lastStateChannelSnapshotHashes: SortedMap[Address, Hash] = SortedMap.empty,
+    lastCurrencySnapshots: SortedMap[
+      Address,
+      Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+    ] = SortedMap.empty
+  )(
     implicit sp: SecurityProvider[IO],
     h: Hasher[IO],
     j: JsonSerializer[IO]
@@ -640,7 +671,10 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       signedGenesis <- Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair)
       legacyArtifact <- GlobalIncrementalSnapshot.fromGlobalSnapshot[IO](signedGenesis.value)
       parentOrdinal = SnapshotOrdinal.MinValue.next
-      parentContext = signedGenesis.value.info.toGlobalSnapshotInfo
+      parentContext = signedGenesis.value.info.toGlobalSnapshotInfo.copy(
+        lastStateChannelSnapshotHashes = lastStateChannelSnapshotHashes,
+        lastCurrencySnapshots = lastCurrencySnapshots
+      )
       parentProof <- GlobalSnapshotInfo.mptStateProof[IO](parentContext)
       artifact = legacyArtifact.copy(ordinal = parentOrdinal, stateProof = parentProof)
       signedArtifact <- Signed.forAsyncHasher[IO, GlobalIncrementalSnapshot](artifact, keyPair)
@@ -887,6 +921,278 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       retention = ShardCheckpointRetentionConfig(retainedCheckpoints = 8L),
       checkpoint = ShardCheckpointConfig(binaryBufferCap = 4096)
     )
+
+  private final case class CheckpointCarriageRig(
+    deps: ShardCheckpointWiring.AcceptanceDeps[IO],
+    checkpoint: ShardCheckpoint,
+    checkpointHash: Hash,
+    metagraph: Address,
+    verifyCalls: Ref[IO, Int]
+  )
+
+  /** Models a candidate that passes the leader's first deterministic checkpoint filter, but whose second GSAM verification cannot be
+    * reproduced. The second result is deliberately node-local and carries no fraud-proof artifact; it may reject carriage, but it must not
+    * create slash state that a follower cannot reconstruct from the resulting global snapshot.
+    */
+  private final class RecordedCheckpointManager(
+    calls: Ref[IO, Int],
+    decision: Int => ShardCheckpointAcceptResult
+  ) extends ShardCheckpointGl0AcceptanceManager[IO] {
+
+    private def nextDecision: IO[ShardCheckpointAcceptResult] =
+      calls.modify(seen => (seen + 1, decision(seen)))
+
+    override def evaluate(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] = nextDecision
+
+    override def evaluateForSigning(
+      checkpoint: ShardCheckpoint
+    ): IO[Either[VerifiedShardCheckpointFailure, VerifiedShardCheckpoint]] =
+      IO.pure(Left(VerifiedShardCheckpointFailure.Rejected("test stub cannot mint signing capabilities")))
+
+    override def verifyEmbedded(checkpoint: ShardCheckpoint): IO[ShardCheckpointAcceptResult] = nextDecision
+
+    override def verifyExecutionCertificate(checkpoint: ShardCheckpoint): IO[Either[String, Unit]] =
+      IO.pure(Left("test stub has no portable execution certificate"))
+
+    override def verifyCommitteeSignature(
+      checkpoint: ShardCheckpoint,
+      signature: CommitteeMemberSignature
+    ): IO[Either[String, Unit]] = IO.pure(Right(()))
+
+    override def noteAdopted(shardId: ShardId, shardOrdinal: ShardOrdinal, checkpointHash: Hash): IO[Unit] = IO.unit
+
+    override def lastAdoptedOrd(shardId: ShardId): IO[Option[ShardOrdinal]] = IO.pure(None)
+
+    override def lastAdoptedAnchor(shardId: ShardId): IO[Option[Hash]] = IO.pure(None)
+
+    override def lastAdoptedCheckpoint(shardId: ShardId): IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None)
+
+    override def watchtowerReExec(checkpoint: ShardCheckpoint): IO[List[WatchtowerMismatch]] = IO.pure(List.empty)
+  }
+
+  private def mkCheckpointCarriageRig()(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    m: Metrics[IO]
+  ): IO[CheckpointCarriageRig] =
+    for {
+      checkpointKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      checkpointSigner = PeerId.fromPublic(checkpointKeyPair.getPublic)
+      metagraph = Address.fromBytes("artifact-carriage-mg".getBytes("UTF-8"))
+      assignment = ShardAssignment.make[IO](activeNativeShardingConfig.numShards)
+      shardId <- assignment.shardIdFor(metagraph)
+      binary <- Signed.forAsyncHasher[IO, StateChannelSnapshotBinary](
+        StateChannelSnapshotBinary(Hash.empty, "artifact-carriage-binary".getBytes("UTF-8"), SnapshotFee.MinValue),
+        checkpointKeyPair
+      )
+      committeeSignature = CommitteeMemberSignature(
+        peerId = checkpointSigner,
+        vrfProof = Hex(""),
+        ed25519Sig = Hex(""),
+        kesProductSig = Hex(""),
+        kesTreeStep = 0
+      )
+      checkpoint = ShardCheckpoint(
+        shardId = shardId,
+        parentCheckpointHash = Hash.empty,
+        shardOrdinal = ShardOrdinal(1L),
+        gl0AnchorOrdinal = SnapshotOrdinal.MinValue,
+        slot = Slot.unsafeApply(1L),
+        derivedStateDelta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(metagraph -> Hash("31" * 32)),
+          includedSnapshots = SortedMap(metagraph -> NonEmptyList.one(binary))
+        ),
+        committeeSignatures = NonEmptyList.one(committeeSignature),
+        epoch = EtaPeriod(0L),
+        executionBaseOrdinal = SnapshotOrdinal.MinValue
+      )
+      signedCheckpoint <- Signed.forAsyncHasher[IO, ShardCheckpoint](checkpoint, checkpointKeyPair)
+      chainStore <- ShardChainStore.make[IO](shardId)
+      stored <- chainStore.store(
+        signedCheckpoint,
+        checkpoint.parentCheckpointHash,
+        checkpoint.shardOrdinal,
+        checkpoint.slot.value.value,
+        Array.fill[Byte](32)(1.toByte)
+      )
+      _ <- IO.raiseUnless(stored)(new IllegalStateException("checkpoint carriage fixture did not enter the shard chain"))
+      tipTracker <- ShardTipTracker.make[IO](shardId, checkpointSigner)
+      finalityTriggers <- ShardFinalityTriggers.make[IO](shardId, kQuorum = 1, chainStore, tipTracker)
+      binaryBuffer <- ShardBinaryBuffer.make[IO](shardId, activeNativeShardingConfig.checkpoint.binaryBufferCap)
+      verifyCalls <- Ref.of[IO, Int](0)
+      manager = new RecordedCheckpointManager(
+        verifyCalls,
+        seen =>
+          if (seen == 0) ShardCheckpointAcceptResult.Accepted
+          else ShardCheckpointAcceptResult.RejectedReExecutionMismatch("second-pass local replay mismatch", List(checkpointSigner))
+      )
+      checkpointHash <- h.hash(checkpoint.signingPreimage)
+      deps = ShardCheckpointWiring.AcceptanceDeps[IO](
+        activeNativeShardingConfig,
+        manager,
+        assignment,
+        Map(
+          shardId -> ShardCheckpointWiring.ShardRegistryEntry(
+            chainStore,
+            tipTracker,
+            finalityTriggers,
+            binaryBuffer
+          )
+        ),
+        (_, _) => IO.pure(Set(checkpointSigner))
+      )
+    } yield CheckpointCarriageRig(deps, checkpoint, checkpointHash, metagraph, verifyCalls)
+
+  private final case class ContinueAlreadyLifecycleRig(
+    parent: RootedParent,
+    leaderDeps: ShardCheckpointWiring.AcceptanceDeps[IO],
+    followerDeps: ShardCheckpointWiring.AcceptanceDeps[IO],
+    checkpoint: ShardCheckpoint,
+    alreadyMetagraph: Address,
+    continuingMetagraph: Address,
+    continuingSuffix: Signed[StateChannelSnapshotBinary],
+    leaderVerifyCalls: Ref[IO, Int],
+    followerVerifyCalls: Ref[IO, Int]
+  )
+
+  private def acceptedCheckpointDeps(
+    checkpoint: ShardCheckpoint,
+    signedCheckpoint: Signed[ShardCheckpoint],
+    checkpointSigner: PeerId,
+    assignment: ShardAssignment[IO]
+  )(
+    implicit h: Hasher[IO],
+    m: Metrics[IO]
+  ): IO[(ShardCheckpointWiring.AcceptanceDeps[IO], Ref[IO, Int])] =
+    for {
+      chainStore <- ShardChainStore.make[IO](checkpoint.shardId)
+      stored <- chainStore.store(
+        signedCheckpoint,
+        checkpoint.parentCheckpointHash,
+        checkpoint.shardOrdinal,
+        checkpoint.slot.value.value,
+        Array.fill[Byte](32)(2.toByte)
+      )
+      _ <- IO.raiseUnless(stored)(new IllegalStateException("successful checkpoint fixture did not enter the shard chain"))
+      tipTracker <- ShardTipTracker.make[IO](checkpoint.shardId, checkpointSigner)
+      finalityTriggers <- ShardFinalityTriggers.make[IO](checkpoint.shardId, kQuorum = 1, chainStore, tipTracker)
+      binaryBuffer <- ShardBinaryBuffer.make[IO](checkpoint.shardId, activeNativeShardingConfig.checkpoint.binaryBufferCap)
+      verifyCalls <- Ref.of[IO, Int](0)
+      manager = new RecordedCheckpointManager(verifyCalls, _ => ShardCheckpointAcceptResult.Accepted)
+      deps = ShardCheckpointWiring.AcceptanceDeps[IO](
+        activeNativeShardingConfig,
+        manager,
+        assignment,
+        Map(
+          checkpoint.shardId -> ShardCheckpointWiring.ShardRegistryEntry(
+            chainStore,
+            tipTracker,
+            finalityTriggers,
+            binaryBuffer
+          )
+        ),
+        (_, _) => IO.pure(Set(checkpointSigner))
+      )
+    } yield (deps, verifyCalls)
+
+  private def mkContinueAlreadyLifecycleRig()(
+    implicit h: Hasher[IO],
+    sp: SecurityProvider[IO],
+    j: JsonSerializer[IO],
+    m: Metrics[IO]
+  ): IO[ContinueAlreadyLifecycleRig] =
+    for {
+      checkpointKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      checkpointSigner = PeerId.fromPublic(checkpointKeyPair.getPublic)
+      assignment = ShardAssignment.make[IO](activeNativeShardingConfig.numShards)
+      candidates <- (0 until 32).toList.traverse { index =>
+        val address = Address.fromBytes(s"continue-already-$index".getBytes("UTF-8"))
+        assignment.shardIdFor(address).map(shardId => (address, shardId))
+      }
+      sameShardPair <- IO.fromOption(
+        candidates.combinations(2).collectFirst {
+          case List((alreadyMetagraph, shardId), (continuingMetagraph, otherShardId)) if shardId == otherShardId =>
+            (alreadyMetagraph, continuingMetagraph, shardId)
+        }
+      )(new IllegalStateException("could not find two deterministic metagraphs assigned to one shard"))
+      (alreadyMetagraph, continuingMetagraph, shardId) = sameShardPair
+      alreadyBinary <- Signed.forAsyncHasher[IO, StateChannelSnapshotBinary](
+        StateChannelSnapshotBinary(Hash.empty, "already-binary".getBytes("UTF-8"), SnapshotFee.MinValue),
+        checkpointKeyPair
+      )
+      continuingPrefix <- Signed.forAsyncHasher[IO, StateChannelSnapshotBinary](
+        StateChannelSnapshotBinary(Hash.empty, "continuing-prefix".getBytes("UTF-8"), SnapshotFee.MinValue),
+        checkpointKeyPair
+      )
+      continuingPrefixHash <- h.hash(continuingPrefix.value)
+      continuingSuffix <- Signed.forAsyncHasher[IO, StateChannelSnapshotBinary](
+        StateChannelSnapshotBinary(
+          continuingPrefixHash,
+          "continuing-suffix".getBytes("UTF-8"),
+          SnapshotFee.MinValue
+        ),
+        checkpointKeyPair
+      )
+      alreadyTip <- h.hash(alreadyBinary.value)
+      priorCurrency <- Signed.forAsyncHasher[IO, CurrencySnapshot](
+        CurrencySnapshot.mkGenesis(Map.empty, None, None),
+        checkpointKeyPair
+      )
+      recreatedState: CurrencySnapshotWithState = Left(priorCurrency)
+      alreadyRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(alreadyMetagraph -> recreatedState))
+      continuingRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(continuingMetagraph -> recreatedState))
+      committeeSignature = CommitteeMemberSignature(
+        peerId = checkpointSigner,
+        vrfProof = Hex(""),
+        ed25519Sig = Hex(""),
+        kesProductSig = Hex(""),
+        kesTreeStep = 0
+      )
+      checkpoint = ShardCheckpoint(
+        shardId = shardId,
+        parentCheckpointHash = Hash.empty,
+        shardOrdinal = ShardOrdinal(1L),
+        gl0AnchorOrdinal = SnapshotOrdinal.MinValue,
+        slot = Slot.unsafeApply(1L),
+        derivedStateDelta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(alreadyMetagraph -> alreadyRoot, continuingMetagraph -> continuingRoot),
+          includedSnapshots = SortedMap(
+            alreadyMetagraph -> NonEmptyList.one(alreadyBinary),
+            continuingMetagraph -> NonEmptyList.of(continuingPrefix, continuingSuffix)
+          )
+        ),
+        committeeSignatures = NonEmptyList.one(committeeSignature),
+        epoch = EtaPeriod(0L),
+        executionBaseOrdinal = SnapshotOrdinal.MinValue
+      )
+      signedCheckpoint <- Signed.forAsyncHasher[IO, ShardCheckpoint](checkpoint, checkpointKeyPair)
+      parent <- mkRootedParent(
+        balances = SortedMap.empty,
+        lastStateChannelSnapshotHashes = SortedMap(
+          alreadyMetagraph -> alreadyTip,
+          continuingMetagraph -> continuingPrefixHash
+        ),
+        lastCurrencySnapshots = SortedMap(
+          alreadyMetagraph -> (Left(priorCurrency): CurrencySnapshotWithState),
+          continuingMetagraph -> (Left(priorCurrency): CurrencySnapshotWithState)
+        )
+      )
+      leaderPair <- acceptedCheckpointDeps(checkpoint, signedCheckpoint, checkpointSigner, assignment)
+      followerPair <- acceptedCheckpointDeps(checkpoint, signedCheckpoint, checkpointSigner, assignment)
+      (leaderDeps, leaderVerifyCalls) = leaderPair
+      (followerDeps, followerVerifyCalls) = followerPair
+    } yield
+      ContinueAlreadyLifecycleRig(
+        parent,
+        leaderDeps,
+        followerDeps,
+        checkpoint,
+        alreadyMetagraph,
+        continuingMetagraph,
+        continuingSuffix,
+        leaderVerifyCalls,
+        followerVerifyCalls
+      )
 
   private def mkActiveNativeShardDeps(
     selfId: PeerId
@@ -1684,6 +1990,103 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         expect.eql(producerStoredTokenLocks, followerStoredTokenLocks) &&
         expect(replay.artifact.stateProof.mptRoot.contains(producerRecomputedRoot)) &&
         expect.eql(producerRecomputedRoot, followerRecomputedRoot)
+  }
+
+  test("a second-pass checkpoint mismatch without portable evidence is omitted without slash state and recreates on a follower") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      parent <- mkRootedParent(SortedMap.empty)
+      leaderRig <- mkCheckpointCarriageRig()
+      followerRig <- mkCheckpointCarriageRig()
+      leader <- mkGlobalSnapshotConsensusFixture(rootedParent = Some(parent), shardAcceptanceDeps = Some(leaderRig.deps))
+      follower <- mkGlobalSnapshotConsensusFixture(rootedParent = Some(parent), shardAcceptanceDeps = Some(followerRig.deps))
+
+      (artifact, leaderContext, _) <- leader.functions.createProposalArtifact(
+        parent.ordinal,
+        parent.signedArtifact,
+        parent.context,
+        h,
+        EventTrigger,
+        Set.empty,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      leaderVerifyCalls <- leaderRig.verifyCalls.get
+      locallySlashed <- io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader
+        .fromMptStore[IO](leader.mptStore)
+        .wasSlashed(leaderRig.checkpoint.shardId, leaderRig.checkpointHash)
+
+      followerResult <- follower.functions.validateArtifact(
+        parent.signedArtifact,
+        parent.context,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerVerifyCalls <- followerRig.verifyCalls.get
+    } yield
+      expect.all(
+        leaderVerifyCalls == 2,
+        artifact.shardCheckpoints.isEmpty,
+        !artifact.stateChannelSnapshots.contains(leaderRig.metagraph),
+        artifact.fraudProofs.isEmpty,
+        !locallySlashed,
+        followerVerifyCalls == 0,
+        followerResult.exists { case (recreated, followerContext) => recreated == artifact && followerContext == leaderContext }
+      )
+  }
+
+  test("a Continue+Already checkpoint embeds with only its continuing suffix and recreates byte-identically on a follower") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    for {
+      rig <- mkContinueAlreadyLifecycleRig()
+      leader <- mkGlobalSnapshotConsensusFixture(
+        rootedParent = Some(rig.parent),
+        shardAcceptanceDeps = Some(rig.leaderDeps)
+      )
+      follower <- mkGlobalSnapshotConsensusFixture(
+        rootedParent = Some(rig.parent),
+        shardAcceptanceDeps = Some(rig.followerDeps)
+      )
+      (artifact, leaderContext, _) <- leader.functions.createProposalArtifact(
+        rig.parent.ordinal,
+        rig.parent.signedArtifact,
+        rig.parent.context,
+        h,
+        EventTrigger,
+        Set.empty,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      leaderCalls <- rig.leaderVerifyCalls.get
+      continuingTip <- h.hash(rig.continuingSuffix.value)
+
+      followerResult <- follower.functions.validateArtifact(
+        rig.parent.signedArtifact,
+        rig.parent.context,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerCalls <- rig.followerVerifyCalls.get
+      expectedSnapshots = SortedMap(rig.continuingMetagraph -> NonEmptyList.one(rig.continuingSuffix))
+      expectedCheckpoints = SortedMap(rig.checkpoint.shardId -> rig.checkpoint)
+    } yield
+      expect.all(
+        leaderCalls == 2,
+        artifact.shardCheckpoints == expectedCheckpoints,
+        artifact.stateChannelSnapshots == expectedSnapshots,
+        !artifact.stateChannelSnapshots.contains(rig.alreadyMetagraph),
+        leaderContext.lastStateChannelSnapshotHashes.get(rig.continuingMetagraph).contains(continuingTip),
+        leaderContext.lastStateChannelSnapshotHashes.get(rig.alreadyMetagraph) ==
+          rig.parent.context.lastStateChannelSnapshotHashes.get(rig.alreadyMetagraph),
+        followerCalls == 2,
+        followerResult.exists { case (recreated, followerContext) => recreated == artifact && followerContext == leaderContext }
+      )
   }
 
   // With execution sharding active, a metagraph binary can enter GL0 only through a qualifying shard

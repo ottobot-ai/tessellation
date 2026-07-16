@@ -30,6 +30,7 @@ result*
 metals.sbt
 .bloop/
 .metals/
+.scala-build/
 site/
 .bsp/
 scripts/

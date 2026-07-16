@@ -589,36 +589,25 @@ object GlobalSnapshotConsensus {
       finalizedReaderAt = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
         .pinnedPriorReaderAt[F](gl0PinnedReader)
 
-      // ─── WATCHTOWER fraud-proof re-derivation closure (W3a) — hoisted ABOVE the GSAM so the on-chain verdict can use it ───
-      // The PIN-1 per-MG re-derivation — IDENTICAL encoding to the unconditional replay the acceptance manager uses
-      // (`reExecDerivationAtPinnedBase`), so the recomputed root is byte-comparable against the committee-attested
-      // `perMetagraphMptRoots`. Track-1 execution-base-pin: it re-derives at the DISPUTED checkpoint's `executionBaseOrdinal` (the 4th closure arg,
-      // resolved via `finalizedReaderAt` — pinned to the checkpoint's base, NOT this node's live base), so a watchtower whose base runs
-      // ahead of the checkpoint's does NOT recompute a different root and false-slash an honest checkpoint.
-      watchtowerReDerive = {
+      // ─── WATCHTOWER fraud-proof batch replay (W3a) — hoisted ABOVE the GSAM so the on-chain verdict can use it ───
+      // Replay the complete checkpoint SortedMap exactly once at its pinned base. The evidence MG is only a root selector; narrowing replay
+      // to it would erase shared fee-payer/dependency ordering and let a quorum-signed invalid batch evade portable slashing.
+      watchtowerReplayCheckpoint = {
         implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
-        val reExec = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-          .reExecDerivationAtPinnedBase[F](shardScEventsProcessor, finalizedReaderAt, getGlobalSnapshotByOrdinalWithFallback)(
+        io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+          .reExecCheckpointAtPinnedBase[F](shardScEventsProcessor, finalizedReaderAt, getGlobalSnapshotByOrdinalWithFallback)(
             Async[F],
             Parallel[F],
             h,
             implicitly[io.constellationnetwork.json.JsonSerializer[F]],
             globalStateProofSelector
           )
-        (
-          mg: io.constellationnetwork.schema.address.Address,
-          binaries: cats.data.NonEmptyList[
-            io.constellationnetwork.security.signature.Signed[io.constellationnetwork.statechannel.StateChannelSnapshotBinary]
-          ],
-          anchor: io.constellationnetwork.schema.SnapshotOrdinal,
-          executionBaseOrdinal: io.constellationnetwork.schema.SnapshotOrdinal
-        ) => reExec(mg, binaries, anchor, executionBaseOrdinal).map(_.getOrElse(io.constellationnetwork.security.hash.Hash.empty))
       }
 
       // ─── WATCHTOWER on-chain dispute verdict for the GSAM accept path (W3a) ──────────────────────────────
       // The SAME deterministic validator the daemon uses, but reading the DURABLE `Slashings` MPT partition for the double-slash guard (so a
       // checkpoint already slashed in a prior ordinal yields `AlreadySlashed` ⇒ NOT upheld ⇒ no double slash). Built with the PIN-1
-      // `watchtowerReDerive` closure (hoisted above) so the recomputed root matches the committee-attested `perMetagraphMptRoots`
+      // `watchtowerReplayCheckpoint` closure (hoisted above) so the recomputed roots match the committee-attested `perMetagraphMptRoots`
       // byte-for-byte. `None` at `numShards = 1` (`shardAcceptanceDeps = None`) ⇒ carried fraud proofs (always empty there) are ignored ⇒
       // byte-identical regression bar. Passed into BOTH this gl0 GSAM (leader-produce + `validateArtifact`) below; the SharedServices
       // `createContext` GSAM gets its own via the same recipe (so all three mptRoot-computing paths slash identically).
@@ -627,7 +616,7 @@ object GlobalSnapshotConsensus {
           implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
           Some(
             io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
-              reDerivePerMgRoot = watchtowerReDerive,
+              replayCheckpoint = watchtowerReplayCheckpoint,
               slashedReader =
                 io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[F](mptStore),
               verifyExecutionCertificate = deps.acceptanceManager.verifyExecutionCertificate
@@ -1527,6 +1516,16 @@ object GlobalSnapshotConsensus {
               val gl0EtaBytesForPeriod: io.constellationnetwork.schema.nakamoto.EtaPeriod => F[Array[Byte]] =
                 (epoch: io.constellationnetwork.schema.nakamoto.EtaPeriod) =>
                   etaForPeriodCallback(epoch).map(h => io.constellationnetwork.security.hex.Hex(h.value).toBytes)
+              val executionBaseOrdinalF =
+                io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+                  .pinnedExecutionBaseOrdinal[F](signedBytesStore)
+              val executionBaseF =
+                io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+                  .pinnedExecutionBase[F](executionBaseOrdinalF, finalizedReaderAt)
+              val executionBaseAt =
+                (ordinal: SnapshotOrdinal) =>
+                  io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+                    .pinnedExecutionBase[F](ordinal.pure[F], finalizedReaderAt)
               deps.registry.toList.traverse {
                 case (shardId, entry) =>
                   // Per-shard closure: resolve the rotated gl0 eta for the checkpoint's epoch, then domain-separate to
@@ -1539,15 +1538,13 @@ object GlobalSnapshotConsensus {
                     .make[F](
                       shardId = shardId,
                       chainStore = entry.chainStore,
-                      // S2 — BASE-ANCHORED window (VERSION-MODEL §4): the producer's `chainLinkOrder` anchors each MG's binary window on the
-                      // gl0 DEPTH-K-FINALIZED base's per-MG `lastStateChannelSnapshotHashes` — the SAME finalized base `derivePerMgState`
-                      // reads. So window-anchor == execution prior on every verifier, all on
-                      // the finalized base; the window RE-INCLUDES base->adopted binaries and advances on GL0 finalization
-                      // (NOT the bestTip-derived `chainStore.perMgTip`, which ran ahead of base — the run-24..27 §4 window-anchor violation).
-                      finalizedBasePerMgTip = {
-                        import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax.MptStoreReadOps
-                        mptStore.getAllLastStateChannelSnapshotHashes
-                      },
+                      // S2 — PINNED BASE-ANCHORED window (VERSION-MODEL §4): both the stamped execution ordinal and the per-MG
+                      // `lastStateChannelSnapshotHashes` come from one retained immutable reader. The window anchor therefore cannot race
+                      // ahead of the prior that producer/signers/watchtowers replay. Missing or malformed retained state defers before sign.
+                      executionBaseF = executionBaseF,
+                      // Re-check the exact captured ordinal before signing. Resolving latest here would turn ordinary Phase-2 descendant
+                      // advancement during replay into an unbounded checkpoint restart loop.
+                      executionBaseAt = executionBaseAt,
                       // NEWNESS GATE (S2-deadlock fix, runs 19-22 + ord-26 re-freeze): the gate reference is this chain's CHAIN-WIDE
                       // per-MG checkpoint frontier (the latest binary minted per MG across the noteAnchor-followed bestTip ancestry), NOT
                       // the latest-PRODUCED global GSI. `getCombined` LAGS the in-flight per-MG adoptions, so it sits BEHIND gl0's true
@@ -1581,9 +1578,9 @@ object GlobalSnapshotConsensus {
                       // So best-tip S(N) ≠ adopted S(N) even in the happy path and the producer root cannot be reproduced (run-26:
                       // ~890 ADOPT-VERIFY/node, all 8 nodes agree bit-for-bit on the recomputed root; only the producer's attested
                       // root diverged — proving gl0's prior is deterministic-finalized and the producer was the lone outlier).
-                      // The execution prior is resolved AT the per-checkpoint `executionBaseOrdinal` (4th closure arg) via the
-                      // hoisted `finalizedReaderAt` (fast-path live reader when the ordinal is the current base — the common case — else a
-                      // version-retained pinned reader). The producer passes `executionBaseOrdinalF`'s captured savepoint as that ordinal.
+                      // The compatibility scalar resolves the execution prior AT the per-checkpoint `executionBaseOrdinal` (4th closure
+                      // arg) through the version-retained pinned reader. There is no mutable live-reader fast path. Production checkpoint
+                      // construction uses the batch callback below with the already captured complete `executionBaseF` value.
                       derivePerMgState = ShardCheckpointWiring
                         .reExecDerivationAtPinnedBase[F](
                           shardScEventsProcessor,
@@ -1596,14 +1593,24 @@ object GlobalSnapshotConsensus {
                           implicitly[io.constellationnetwork.json.JsonSerializer[F]],
                           globalStateProofSelector
                         ),
+                      derivePerMgStates = Some(
+                        ShardCheckpointWiring.reExecDerivationsAtResolvedBase[F](
+                          shardScEventsProcessor,
+                          getGlobalSnapshotByOrdinalWithFallback
+                        )(
+                          Async[F],
+                          Parallel[F],
+                          shardHasher,
+                          implicitly[io.constellationnetwork.json.JsonSerializer[F]],
+                          globalStateProofSelector
+                        )
+                      ),
                       // Pinned execution-base savepoint: the base ordinal the producer stamps and executes every per-MG window over.
                       // = the signed byte store's NEWEST persisted ordinal (`pinnedExecutionBaseOrdinal`), NOT the live
                       // `mptStore.lastPersistedOrdinal`: the diff prior is resolved EXCLUSIVELY through the version-retained pinned
                       // reader now (no live fast path — the 2026-07-08 mid-fold-skew wedge), and the signed store trails the live
                       // watermark by the finalize lag, so stamping the watermark would OMIT-defer almost every mint while stamping the
                       // store's own latest is resolvable-by-construction on the minting node and finalize-synchronized on every verifier.
-                      executionBaseOrdinalF = io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
-                        .pinnedExecutionBaseOrdinal[F](signedBytesStore),
                       // V1 permits one outstanding checkpoint per shard. Only the exact Phase-2 checkpoint anchor releases its successor.
                       lastPhase2Checkpoint = deps.acceptanceManager.lastAdoptedCheckpoint(shardId),
                       // Tier-1 idempotence cadence (task #45): re-publish a held checkpoint's bytes every N ticks
@@ -1692,8 +1699,8 @@ object GlobalSnapshotConsensus {
           }
 
           // ─── WATCHTOWER fraud-proof wiring (numShards>1 AND watchtower-enabled) ────────────────────────────
-          // `watchtowerReDerive` is hoisted to the OUTER for-comprehension (above the GSAM) so the on-chain GSAM dispute verdict can use the
-          // SAME closure; it is in lexical scope here for the emitter + the daemon's validator.
+          // `watchtowerReplayCheckpoint` is hoisted to the outer for-comprehension so every dispute verdict uses the same complete-batch
+          // closure; it is in lexical scope here for the daemon's validator.
           watchtowerFraudProofEmitter <- (shardAcceptanceDeps, sharedCfg.nakamoto.invaliditySlashing.watchtowerEnabled) match {
             case (Some(deps), true) =>
               implicit val h: io.constellationnetwork.security.Hasher[F] = HasherSelector[F].getCurrent
@@ -1724,7 +1731,7 @@ object GlobalSnapshotConsensus {
                 .pure(
                   Some(
                     io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
-                      reDerivePerMgRoot = watchtowerReDerive,
+                      replayCheckpoint = watchtowerReplayCheckpoint,
                       // Daemon validation only stages evidence; bind its duplicate guard to the stable finalized MPT base available here.
                       // The authoritative GSAM fold revalidates against its own consensus-state reader before applying any slash.
                       slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader

@@ -339,8 +339,8 @@ object ShardMetricsSuite extends MutableIOSuite {
       state <- stateRef.get
     } yield {
       val mismatchHasSigner = result match {
-        case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, slashSigners) => slashSigners == List(signerPeer)
-        case _                                                                        => false
+        case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, committeeSigners) => committeeSigners == List(signerPeer)
+        case _                                                                            => false
       }
       expect(mismatchHasSigner) &&
       expect(state.counters.getOrElse(ShardMetrics.CheckpointRejectedTotal.value, 0) == 1) &&

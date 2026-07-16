@@ -8,6 +8,8 @@ import cats.effect.Async
 import cats.effect.std.Supervisor
 import cats.syntax.all._
 
+import scala.collection.immutable.SortedMap
+
 import io.constellationnetwork.domain.allowance_list.AllowanceListEntry
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.env.AppEnvironment
@@ -317,7 +319,8 @@ object SharedServices {
           // NEVER at this node's live base when the two differ. The re-derived per-MG root is base-DEPENDENT
           // (full recreation starts from cumulative balances/refs/active-sets and messages in the seed prior), so a live read on a node
           // whose finalized tip ≠ the checkpoint's base recomputes a DIFFERENT root for the SAME
-          // honest checkpoint → false `RejectedReExecutionMismatch` (a durable 100% slash of the whole committee) + adopt-decision split.
+          // honest checkpoint → false `RejectedReExecutionMismatch` + adopt-decision split. The local result cannot slash; a divergent
+          // base could still create false portable fraud evidence later, so every replay rail must resolve the same retained view.
           // Same shared recipe the gl0 produce/watchtower rail uses (`GlobalSnapshotConsensus.finalizedReaderAt`): ALWAYS the
           // version-retained, root-verified pinned reader over this node's `mpt_snapshot_info` byte store
           // (`sharedPinnedCurrencyInfoReader`) — NO live fast path (`lastPersistedOrdinal == ord` does not pin the live store's
@@ -352,6 +355,28 @@ object SharedServices {
             // never a deterministic-mismatch false slash.
             reExec(mg, binaries, anchor, executionBaseOrdinal).map(_.getOrElse(io.constellationnetwork.security.hash.Hash.empty))
         },
+        reExecuteDerivations = Some {
+          implicit val h: Hasher[F] = HasherSelector[F].getCurrent
+          val pinnedReaderAt =
+            ShardCheckpointWiring.pinnedPriorReaderAt[F](sharedPinnedCurrencyInfoReader)
+          val reExecBatch =
+            ShardCheckpointWiring.reExecDerivationsAtPinnedBaseBatch[F](
+              shardScEventsProcessor,
+              pinnedReaderAt,
+              storages.lastNGlobalSnapshot.getByOrdinal
+            )(
+              Async[F],
+              Parallel[F],
+              h,
+              implicitly[JsonSerializer[F]],
+              globalStateProofSelector
+            )
+          (
+            windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+            anchor: SnapshotOrdinal,
+            executionBaseOrdinal: SnapshotOrdinal
+          ) => reExecBatch(windows, anchor, executionBaseOrdinal).map(_.map { case (mg, root) => mg -> root.getOrElse(Hash.empty) })
+        },
         // FINDING-002/EPIC-3.1 — slash-cooldown committee exclusion. Reads the `Slashings` (fieldId 34) records off the SAME
         // finalized-base `storages.mptStore` the committee draw's eta resolver (`sharedEtaForPeriod` → HistoricalStakeReader) reads,
         // pinned per epoch at the anchor `(epoch−1)·R − 1` (R = the SAME `etaRotationSnapshots` the GSAM boundary writer uses) — a pure
@@ -377,12 +402,12 @@ object SharedServices {
           // re-derivation reads S(N) at the DISPUTED checkpoint's own `executionBaseOrdinal`, never this follower's live base. A follower
           // whose live tip ran AHEAD of the pinned base would otherwise recompute a different root, false-UPHOLD the fraud proof, and
           // write a slash (fieldId-34 + stake maps) into its consensus root that the pinned leader didn't → StateProofMismatch
-          // mirror-freeze fork. Unresolvable anchor ⇒ fail-closed `Hash.empty` ⇒ `InvalidStateProofValidator` step 7 rejects the dispute
-          // (`CannotRederive`) — an unverifiable dispute never slashes.
+          // mirror-freeze fork. Unresolvable anchor/history ⇒ fail-closed batch `Unavailable` ⇒ `InvalidStateProofValidator` rejects the
+          // dispute (`CannotRederive`) — an unverifiable dispute never slashes.
           val pinnedReaderAt =
             ShardCheckpointWiring.pinnedPriorReaderAt[F](sharedPinnedCurrencyInfoReader)
-          val reExec =
-            ShardCheckpointWiring.reExecDerivationAtPinnedBase[F](
+          val replayCheckpoint =
+            ShardCheckpointWiring.reExecCheckpointAtPinnedBase[F](
               shardScEventsProcessor,
               pinnedReaderAt,
               storages.lastNGlobalSnapshot.getByOrdinal
@@ -393,16 +418,9 @@ object SharedServices {
               implicitly[JsonSerializer[F]],
               globalStateProofSelector
             )
-          val reDerive =
-            (
-              mg: Address,
-              binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-              anchor: SnapshotOrdinal,
-              executionBaseOrdinal: SnapshotOrdinal
-            ) => reExec(mg, binaries, anchor, executionBaseOrdinal).map(_.getOrElse(io.constellationnetwork.security.hash.Hash.empty))
           Some(
             io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[F](
-              reDerivePerMgRoot = reDerive,
+              replayCheckpoint = replayCheckpoint,
               slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader
                 .fromMptStore[F](storages.mptStore),
               verifyExecutionCertificate = deps.acceptanceManager.verifyExecutionCertificate

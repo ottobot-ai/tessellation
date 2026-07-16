@@ -12,7 +12,11 @@ import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
-import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashedReader, InvalidStateProofValidator}
+import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{
+  InvalidStateProofBatchReplay,
+  InvalidStateProofSlashedReader,
+  InvalidStateProofValidator
+}
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
@@ -220,7 +224,8 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
         // REAL validator: re-derives the honest root, verifies the checkpoint's real execution certificate, checks the envelope binding,
         // and verifies the watchtower's Ed25519 challenger signature.
         validator = InvalidStateProofValidator.make[IO](
-          reDerivePerMgRoot = (_, _, _, _) => IO.pure(honestRoot),
+          replayCheckpoint =
+            (windows, _, _) => IO.pure(InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> honestRoot).to(SortedMap))),
           slashedReader = InvalidStateProofSlashedReader.neverSlashed[IO],
           verifyExecutionCertificate = rig.acceptanceManager.verifyExecutionCertificate
         )

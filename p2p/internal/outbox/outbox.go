@@ -1,6 +1,5 @@
-// Package outbox provides a small, in-memory durable-publish ledger used by the
-// sidecar to re-gossip messages until the JVM confirms they reached Phase-3
-// finality (task #196).
+// Package outbox provides a small, in-memory republish ledger used by the
+// sidecar to re-gossip messages until the JVM confirms them (task #196).
 //
 // Why this exists. GossipSub publish is fire-and-forget: a single Publish call
 // hands the message to the local mesh once and never retries on the publisher's
@@ -11,7 +10,7 @@
 // the peer was unhealthy — iter-s3prep-baseline-mg4); MetagraphBinary and
 // MetagraphAttestation gossiped once and accepted the loss. The outbox
 // generalises the retry: the sidecar holds each published message until
-// either (a) the JVM acks Phase-3 finality via ConfirmFinalized, or (b) the
+// either (a) the JVM acknowledges the message via ConfirmFinalized, or (b) the
 // TTL expires. Between Add and Confirm, a periodic ticker re-publishes
 // entries whose last-publish time is older than `republishInterval`.
 //
@@ -27,7 +26,7 @@ import (
 	"time"
 )
 
-// Entry is a single message held by the outbox awaiting Phase-3 finality.
+// Entry is a single message held by the outbox awaiting JVM confirmation.
 // Fields are exported so the republish goroutine in main.go can read them
 // without going through the outbox lock (the snapshot returned by
 // DueForRepublish is a copy).
@@ -67,7 +66,7 @@ type Outbox struct {
 	republishInterval time.Duration
 	// ttl is the maximum age of an entry from its FirstPublishedAt before
 	// Prune drops it without confirmation. Defaults to 1h. Long enough that
-	// in normal Phase-3 finality cadence (k1=255 snapshots × ~7s = ~30min)
+	// in the expected confirmation cadence (k1=255 snapshots × ~7s = ~30min)
 	// the JVM has ample time to ack; short enough that a leak on the JVM
 	// side bounds memory.
 	ttl time.Duration
@@ -127,7 +126,7 @@ func (o *Outbox) Add(topic string, msgID, payload []byte) {
 
 // Confirm drops outbox entries for the listed message ids on `topic`. Returns
 // the number actually dropped (≤ len(msgIDs)). Unknown ids are ignored —
-// confirmation is idempotent so a duplicate Phase-3 ack costs nothing.
+// confirmation is idempotent so a duplicate JVM acknowledgement costs nothing.
 func (o *Outbox) Confirm(topic string, msgIDs [][]byte) int {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -193,8 +192,8 @@ func (o *Outbox) MarkRepublished(topic string, msgID []byte) {
 
 // Prune drops entries whose FirstPublishedAt is older than `now - ttl`.
 // Returns the count dropped — caller logs at WARN when non-zero (a non-zero
-// rate means Phase-3 finality is taking longer than ttl, which is a real
-// problem worth surfacing).
+// rate means confirmation is taking longer than ttl, which is a real problem
+// worth surfacing).
 func (o *Outbox) Prune() int {
 	o.mu.Lock()
 	defer o.mu.Unlock()

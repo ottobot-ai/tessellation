@@ -618,6 +618,18 @@ object V4EconomicGrammarManifest {
       List(SourceAnchor(stateChannelBinary, "StateChannelSnapshotBinary")),
       Set("fee-required-opaque-chain-rejected"),
       Set("ECON-OPAQUE-FEE-001", "ECON-LANE-001")
+    ),
+    Operation(
+      "ECO-OPAQUE-CARRIAGE-SHARDED",
+      "standalone opaque/data-only state-channel payload with execution sharding enabled",
+      RetainedVariant,
+      MissingFailClosed,
+      AuthenticatedInclusionOnly,
+      Missing,
+      Set(DataCarriage),
+      List(SourceAnchor(stateChannelBinary, "StateChannelSnapshotBinary")),
+      Set("sharded-opaque-carriage-route-missing"),
+      Set("ECON-OPAQUE-SHARD-001", "ECON-LANE-001")
     )
   )
 
@@ -646,7 +658,8 @@ object V4EconomicGrammarManifest {
   private val slashingIds = Set("ECO-INVALID-STATE-SLASH", "ECO-OTHER-SLASH-TIERS")
   private val genesisBackingIds = Set("ECO-GENESIS-DELEGATED-STAKE", "ECO-GENESIS-NODE-COLLATERAL")
   private val frameworkDataIds = Set("ECO-FRAMEWORK-DATA-CARRIAGE")
-  private val opaqueDataIds = Set("ECO-OPAQUE-CARRIAGE", "ECO-OPAQUE-CARRIAGE-FEE-ERA")
+  private val opaqueDataIds =
+    Set("ECO-OPAQUE-CARRIAGE", "ECO-OPAQUE-CARRIAGE-FEE-ERA", "ECO-OPAQUE-CARRIAGE-SHARDED")
   private val dataApplicationIds = Set("ECO-DATA-FEE") ++ frameworkDataIds
   private val snapshotFeeIds = Set("ECO-SNAPSHOT-FEE", "ECO-SNAPSHOT-FEE-NO-DEBIT")
   private val stateChannelIds = snapshotFeeIds ++ opaqueDataIds
@@ -673,6 +686,7 @@ object V4EconomicGrammarManifest {
     "ECO-GENESIS-ISSUANCE",
     "ECO-GLOBAL-SYNC"
   ) ++ dataApplicationIds
+  private val allStateChannelBinaryIds = currencyFullSnapshotIds ++ currencyFrameworkIds ++ stateChannelIds
   private val currencyEventIds = currencyTransferIds ++ Set(
     "ECO-ALLOW-CREATE",
     "ECO-TOKEN-LOCK-CREATE",
@@ -711,11 +725,11 @@ object V4EconomicGrammarManifest {
     ),
     WireCarrier(
       SourceAnchor(stateChannelBinary, "StateChannelSnapshotBinary"),
-      currencyFullSnapshotIds ++ currencyFrameworkIds ++ stateChannelIds
+      allStateChannelBinaryIds
     ),
     WireCarrier(
       SourceAnchor(stateChannelOutput, "StateChannelOutput"),
-      currencyFullSnapshotIds ++ currencyFrameworkIds ++ stateChannelIds
+      allStateChannelBinaryIds
     ),
     WireCarrier(SourceAnchor(currencyEvent, "CurrencySnapshotEvent"), currencyEventIds),
     WireCarrier(SourceAnchor(globalEvent, "GlobalSnapshotEvent"), currentRootedEconomicIds -- Set("ECO-GENESIS-ISSUANCE"))
@@ -808,7 +822,7 @@ object V4EconomicGrammarManifest {
     ReviewedSource(
       stateChannelBinary,
       Set(Ingress),
-      stateChannelIds,
+      allStateChannelBinaryIds,
       "1257ed7fdf28d3ac4857742435ed96156d1e1435f2ea84d379b569334d835f60"
     ),
     ReviewedSource(
@@ -927,8 +941,8 @@ object V4EconomicGrammarManifest {
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelEventsProcessor.scala",
       Set(Ingress, Validation, BalanceWriter),
-      stateChannelIds,
-      "ae6b6855a20c3e03f7eee504e88737ffd8b533a18d6ab15ba64f1c39e781b191"
+      allStateChannelBinaryIds,
+      "09542005cd61c22a41941ef6f25c600dfb613af2859e16c3bcc1b4276e79de35"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala",
@@ -946,8 +960,8 @@ object V4EconomicGrammarManifest {
         ParameterWriter,
         SlashRegistryWriter
       ),
-      currentRootedEconomicIds,
-      "fa11759841c8927782b748b8efc45433d88019db0cdd3df4ce1342c2dc8a23db"
+      currentRootedEconomicIds ++ allStateChannelBinaryIds,
+      "4c72575e536974fe8f878016117b5a9d3c8568b8dbfa95d9c742d7e3dc986978"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofSlashManager.scala",
@@ -1006,7 +1020,7 @@ object V4EconomicGrammarManifest {
     ReviewedSource(
       stateChannelOutput,
       Set(Ingress),
-      currencyFrameworkIds ++ stateChannelIds,
+      allStateChannelBinaryIds,
       "e207ddc4189f152a703dce09c836c7be58d7f2bfc1ee204949a58fb591cc6cd5"
     ),
     ReviewedSource(
@@ -1144,7 +1158,7 @@ object V4EconomicGrammarManifest {
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/StateChannelSnapshotBinaryCodec.scala",
       Set(Codec),
-      currencyFrameworkIds ++ stateChannelIds,
+      allStateChannelBinaryIds,
       "7f44bd643fe96afdfaf2cbc98b95919a9af8dfcc95f7078e3e2f2741e6e2a4db"
     ),
     ReviewedSource(
@@ -1331,7 +1345,7 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofValidator.scala",
       Set(Validation),
       Set("ECO-INVALID-STATE-SLASH"),
-      "08face1138322b430ccc51a5a4f45cdc4a220c685dec6fc43b9c2af3260fc1e8"
+      "e22f2617c04607693750df5e9371a2a54d8d017f332a7232c9e37972e8971fe1"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/node/UpdateNodeParametersAcceptanceManager.scala",
@@ -1456,14 +1470,14 @@ object V4EconomicGrammarManifest {
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotStateChannelAcceptanceManager.scala",
       Set(Validation),
-      currencyFrameworkIds ++ stateChannelIds,
+      allStateChannelBinaryIds,
       "836c97b5ac5193430cfa826811e996765f44bdc13201023c8bdb6399ef347984"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/ShardCheckpointGl0AcceptanceManager.scala",
       Set(Validation),
-      currencyFrameworkIds ++ stateChannelIds,
-      "eec13aaf9d1cfe29de0613192a7d490d41d293e929238187f982ea7f753a6eb7"
+      allStateChannelBinaryIds,
+      "fe39ee69a1aac7d55c22cb908c80a549c825409563becb0b93af034ce979d145"
     ),
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala",
@@ -1521,9 +1535,9 @@ object V4EconomicGrammarManifest {
     ),
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensusFunctions.scala",
-      Set(MigrationGate, RewardConstruction),
-      globalRewardIds ++ delegatedStakeIds ++ Set("ECO-NODE-PARAMETERS"),
-      "e466fd5fbb21c908d2d4e4c21732ecd07e048b7d2666b6a876a74a7ae5683c60"
+      Set(Ingress, Validation, MigrationGate, RewardConstruction),
+      currentRootedEconomicIds ++ allStateChannelBinaryIds,
+      "6a8ca0d35529bf0768861e1e77674e963685d194f9f06fdb9241a27c2ecaba08"
     ),
     ReviewedSource(
       applicationConfig,
@@ -1630,14 +1644,14 @@ object V4EconomicGrammarManifest {
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala",
       Set(Ingress, Validation, ConfigurationAuthority),
-      currentRootedEconomicIds,
-      "a5186a5bded463f8f766d00f83bdb112c372eefa73dff6726b4619beb1c5a46d"
+      currentRootedEconomicIds ++ allStateChannelBinaryIds,
+      "90d94370b751632944a2d17ba70aa92f6c3f8a3f6e9faea574def98b0ffdbc45"
     ),
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoSyncDaemon.scala",
       Set(Ingress, Validation),
       currentRootedEconomicIds,
-      "794311e70a45cf722c1c7beeb2542163f5c4033971ad9cbd97b56c607cad4014"
+      "0451d732fdb08aaff580a54e85933bcd2391e10ae6296f04989a3191f54c7381"
     ),
     ReviewedSource(
       "modules/dag-l1/src/main/scala/io/constellationnetwork/dag/l1/domain/consensus/block/BlockConsensusCell.scala",
@@ -1718,10 +1732,28 @@ object V4EconomicGrammarManifest {
       "4eefd4ba26c87ff8fc1ac435b73939465a3108b26d9c147b70c49569cf07cb49"
     ),
     ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/ShardWindowContinuation.scala",
+      Set(Validation),
+      allStateChannelBinaryIds,
+      "cedb40b9b97eb101f274faf9917e8af10d186cd9dab3aa51da97936b501e3084"
+    ),
+    ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointWiring.scala",
       Set(Ingress, Validation),
-      currencyFrameworkIds ++ stateChannelIds ++ slashingIds,
-      "42826f7e2a06c5c3dfd79a1410d450d2179b4becb5f56e8e00a3519ea819341f"
+      allStateChannelBinaryIds ++ slashingIds,
+      "2ab88b1003155b4837d9c633495527bad1cdfc70e60e24a4b28fdeab2faf70b1"
+    ),
+    ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducer.scala",
+      Set(Ingress, Validation),
+      allStateChannelBinaryIds,
+      "63dedf7053c31287a7f0142f8067e562705f636340ccf37a9653278a169533b1"
+    ),
+    ReviewedSource(
+      "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/sharding/WatchtowerFraudProofEmitter.scala",
+      Set(Ingress, Validation),
+      allStateChannelBinaryIds ++ Set("ECO-INVALID-STATE-SLASH"),
+      "70455f823f4bb17a8c806e433dbfbed05cfe7e24cf7eff99e1bde71ade39f44c"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/CurrencySnapshotCreator.scala",
@@ -1785,9 +1817,9 @@ object V4EconomicGrammarManifest {
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/modules/SharedServices.scala",
-      Set(ConfigurationAuthority),
-      currentRootedEconomicIds,
-      "2b0eece2a9a51ebd8f35d25e43ca65bdbc9a8d16103990dc10a7f7c4dc551dd4"
+      Set(Validation, ConfigurationAuthority),
+      currentRootedEconomicIds ++ allStateChannelBinaryIds,
+      "078eff1e6518724b5f87a34606668428f5c7a3d3a414882d082e3809c7720669"
     ),
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/schema/nakamoto/follow/SyncedField.scala",

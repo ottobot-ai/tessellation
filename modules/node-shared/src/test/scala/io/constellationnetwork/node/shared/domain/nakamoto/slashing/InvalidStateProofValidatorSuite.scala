@@ -92,7 +92,9 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
   private final case class AuthenticatedCheckpoint(
     checkpoint: ShardCheckpoint,
     checkpointSigner: RegisteredCheckpointSigner,
-    acceptanceManager: ShardCheckpointGl0AcceptanceManager[IO]
+    acceptanceManager: ShardCheckpointGl0AcceptanceManager[IO],
+    committeeKeyPair: KeyPair,
+    committeeId: PeerId
   )
 
   /** Construct a configured one-of-one execution quorum through the production period-zero registration and certificate-verification path.
@@ -124,7 +126,7 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       _ <- IO.fromEither(
         certificate.leftMap(reason => new IllegalStateException(s"authenticated checkpoint fixture rejected: $reason"))
       )
-    } yield AuthenticatedCheckpoint(checkpoint, checkpointSigner, acceptanceManager)
+    } yield AuthenticatedCheckpoint(checkpoint, checkpointSigner, acceptanceManager, committeeKeyPair, committeeId)
 
   private def unauthenticatedCheckpoint(attestedRoot: Hash, nSigners: Int): ShardCheckpoint = {
     val signers = NonEmptyList.fromListUnsafe((1 to nSigners).toList.map(committeeSig))
@@ -176,28 +178,78 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
   private val attested: Hash = Hash("a" * 64)
   private val honestDifferent: Hash = Hash("b" * 64) // honest re-derivation ≠ attested ⇒ UPHELD
 
+  private type BatchReplay = (
+    SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    SnapshotOrdinal,
+    SnapshotOrdinal
+  ) => IO[InvalidStateProofBatchReplay]
+
+  private def reproduced(root: Hash): BatchReplay =
+    (windows, _, _) => IO.pure(InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> root).to(SortedMap)))
+
   private def makeValidator(
-    reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash],
+    replayCheckpoint: BatchReplay,
     verifyCertificate: ShardCheckpoint => IO[Either[String, Unit]],
     slashedReader: InvalidStateProofSlashedReader[IO] = InvalidStateProofSlashedReader.neverSlashed[IO]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): InvalidStateProofValidator[IO] =
-    InvalidStateProofValidator.make[IO](reDerive, slashedReader, verifyCertificate)
+    InvalidStateProofValidator.make[IO](replayCheckpoint, slashedReader, verifyCertificate)
 
   test("UPHELD: a single honest re-derivation that differs from the quorum-attested root upholds the dispute") {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
-      // reDerive returns a DIFFERENT root than attested ⇒ committee deviated ⇒ upheld.
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(honestDifferent)
+      val replayCheckpoint = reproduced(honestDifferent)
       for {
         rig <- authenticatedCheckpoint(attested)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         cp = rig.checkpoint
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
         res <- validator.validate(ev)
       } yield expect(res.isRight)
+  }
+
+  test("UPHELD: typed proven invalidity replays the complete multi-MG batch once; evidence MG is only a selector") {
+    case (h0, sp0) =>
+      implicit val h: Hasher[IO] = h0
+      implicit val sp: SecurityProvider[IO] = sp0
+      val mgB = Address.fromBytes("mgB-shared-dependency".getBytes("UTF-8"))
+      val attestedB = Hash("c" * 64)
+
+      for {
+        rig <- authenticatedCheckpoint(attested)
+        cp = rig.checkpoint
+        window = cp.derivedStateDelta.includedSnapshots(mgA)
+        expandedDelta = cp.derivedStateDelta.copy(
+          includedSnapshots = cp.derivedStateDelta.includedSnapshots.updated(mgB, window),
+          perMetagraphMptRoots = cp.derivedStateDelta.perMetagraphMptRoots.updated(mgB, attestedB)
+        )
+        placeholder = CommitteeMemberSignature(rig.committeeId, Hex(""), Hex(""), Hex(""), 0)
+        unsigned = cp.copy(derivedStateDelta = expandedDelta, committeeSignatures = NonEmptyList.one(placeholder))
+        signature <- rig.checkpointSigner.sign(
+          unsigned,
+          rig.committeeKeyPair,
+          rig.committeeId,
+          rig.checkpointSigner.defaultShardEta
+        )
+        expanded = unsigned.copy(committeeSignatures = NonEmptyList.one(signature))
+        certificate <- rig.acceptanceManager.verifyExecutionCertificate(expanded)
+        _ <- IO.fromEither(certificate.leftMap(new IllegalStateException(_)))
+        replayCalls <- cats.effect.Ref.of[IO, Int](0)
+        replayedKeys <- cats.effect.Ref.of[IO, Set[Address]](Set.empty)
+        replayCheckpoint: BatchReplay = (windows, replayAnchor, replayBase) =>
+          replayCalls.update(_ + 1) >>
+            replayedKeys.set(windows.keySet) >>
+            IO.raiseWhen(replayAnchor =!= expanded.gl0AnchorOrdinal)(new IllegalStateException("wrong anchor")) >>
+            IO.raiseWhen(replayBase =!= expanded.executionBaseOrdinal)(new IllegalStateException("wrong execution base")) >>
+            IO.pure(InvalidStateProofBatchReplay.ProvenInvalidTransition)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
+        (kp, pid) <- challengerSetup(rig.checkpointSigner)
+        evidence <- mkEvidence(expanded, kp, pid, claimed = attested, challengerRoot = honestDifferent)
+        result <- validator.validate(evidence)
+        calls <- replayCalls.get
+        keys <- replayedKeys.get
+      } yield expect.all(result.isRight, calls == 1, keys == Set(mgA, mgB))
   }
 
   test(
@@ -208,11 +260,10 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       implicit val sp: SecurityProvider[IO] = sp0
       // Honest re-derivation REPRODUCES the attested root ⇒ committee did NOT deviate. The challenger still CLAIMS a different
       // root (honestDifferent) in the envelope — the verdict must ignore that claim and recompute ⇒ NOT upheld.
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(attested)
+      val replayCheckpoint = reproduced(attested)
       for {
         rig <- authenticatedCheckpoint(attested)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         cp = rig.checkpoint
         ev <- mkEvidence(cp, kp, pid, claimed = honestDifferent, challengerRoot = honestDifferent)
@@ -224,11 +275,10 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(honestDifferent)
+      val replayCheckpoint = reproduced(honestDifferent)
       for {
         rig <- authenticatedCheckpoint(attested)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         cp = rig.checkpoint
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
@@ -241,11 +291,10 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(honestDifferent)
+      val replayCheckpoint = reproduced(honestDifferent)
       for {
         rig <- authenticatedCheckpoint(attested)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         cp = rig.checkpoint
         ev0 <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
@@ -259,11 +308,10 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(honestDifferent)
+      val replayCheckpoint = reproduced(honestDifferent)
       for {
         rig <- authenticatedCheckpoint(attested)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         cp = rig.checkpoint
         ev0 <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
@@ -277,19 +325,14 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       } yield expect(res match { case Left(_: InvalidStateProofRejection.CheckpointHashMismatch) => true; case _ => false })
   }
 
-  test("FAIL-CLOSED: reDerive returning the Hash.empty cannot-re-derive sentinel ⇒ dispute NOT upheld (never a slash)") {
+  test("FAIL-CLOSED: unavailable complete-batch replay does not uphold a dispute") {
     case (h0, sp0) =>
       implicit val h: Hasher[IO] = h0
       implicit val sp: SecurityProvider[IO] = sp0
-      // `Hash.empty` is the production wiring's fail-closed "cannot re-derive" sentinel (`reExecDerivationAtPinnedBase` returned
-      // None — the pinned execution-base is unresolvable below this node's retention / not reached, or the derivation OMITted).
-      // "This node can't check" is NOT evidence the committee deviated: upholding here would 100%-slash an honest committee
-      // on a local retention miss. The verdict must fail closed — reject the dispute, never uphold.
-      val reDerive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-        (_, _, _, _) => IO.pure(Hash.empty)
+      val replayCheckpoint: BatchReplay = (_, _, _) => IO.pure(InvalidStateProofBatchReplay.Unavailable)
       for {
         rig <- authenticatedCheckpoint(attested)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         cp = rig.checkpoint
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
@@ -311,9 +354,13 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
           derivedStateDelta = rig.checkpoint.derivedStateDelta.copy(perMetagraphMptRoots = SortedMap.empty)
         )
         replayCalls <- cats.effect.Ref.of[IO, Int](0)
-        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
-          replayCalls.updateAndGet(_ + 1).as(Hash.empty)
-        validator = makeValidator(reDerive, rig.acceptanceManager.verifyExecutionCertificate)
+        replayCheckpoint: BatchReplay = (windows, _, _) =>
+          replayCalls
+            .updateAndGet(_ + 1)
+            .as(
+              InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> attested).to(SortedMap))
+            )
+        validator = makeValidator(replayCheckpoint, rig.acceptanceManager.verifyExecutionCertificate)
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         ev <- mkEvidence(cpNoRoot, kp, pid, claimed = attested, challengerRoot = honestDifferent)
         res <- validator.validate(ev)
@@ -341,10 +388,14 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
         cpHash = ev.fraudProof.disputedCheckpointHash
         reader = InvalidStateProofSlashedReader.fromSet[IO](Set((shardZero, cpHash)))
         replayCalls <- cats.effect.Ref.of[IO, Int](0)
-        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
-          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
+        replayCheckpoint: BatchReplay = (windows, _, _) =>
+          replayCalls
+            .updateAndGet(_ + 1)
+            .as(
+              InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> honestDifferent).to(SortedMap))
+            )
         validator = makeValidator(
-          reDerive,
+          replayCheckpoint,
           verifyCertificate = rig.acceptanceManager.verifyExecutionCertificate,
           slashedReader = reader
         )
@@ -364,12 +415,16 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
         cpHash = ev.fraudProof.disputedCheckpointHash
         replayCalls <- cats.effect.Ref.of[IO, Int](0)
-        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
-          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
+        replayCheckpoint: BatchReplay = (windows, _, _) =>
+          replayCalls
+            .updateAndGet(_ + 1)
+            .as(
+              InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> honestDifferent).to(SortedMap))
+            )
         // The construction-time reader models daemon staging over finalized state. The authoritative GSAM caller has a newer immutable
         // proposal-parent view in which this checkpoint is already slashed; that exact view must win.
         validator = makeValidator(
-          reDerive,
+          replayCheckpoint,
           verifyCertificate = rig.acceptanceManager.verifyExecutionCertificate,
           slashedReader = InvalidStateProofSlashedReader.neverSlashed[IO]
         )
@@ -392,10 +447,14 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
         (kp, pid) <- challengerSetup(rig.checkpointSigner)
         ev <- mkEvidence(rig.checkpoint, kp, pid, claimed = attested, challengerRoot = honestDifferent)
         replayCalls <- cats.effect.Ref.of[IO, Int](0)
-        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
-          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
+        replayCheckpoint: BatchReplay = (windows, _, _) =>
+          replayCalls
+            .updateAndGet(_ + 1)
+            .as(
+              InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> honestDifferent).to(SortedMap))
+            )
         validator = makeValidator(
-          reDerive,
+          replayCheckpoint,
           verifyCertificate = rig.acceptanceManager.verifyExecutionCertificate,
           slashedReader = reader
         )
@@ -413,9 +472,13 @@ object InvalidStateProofValidatorSuite extends MutableIOSuite {
       for {
         checkpointSigner <- RegisteredCheckpointSigner.make
         replayCalls <- cats.effect.Ref.of[IO, Int](0)
-        reDerive = (_: Address, _: NonEmptyList[Signed[StateChannelSnapshotBinary]], _: SnapshotOrdinal, _: SnapshotOrdinal) =>
-          replayCalls.updateAndGet(_ + 1).as(honestDifferent)
-        validator = makeValidator(reDerive, verifyCertificate = _ => IO.pure(Left("unregistered VRF/KES signer")))
+        replayCheckpoint: BatchReplay = (windows, _, _) =>
+          replayCalls
+            .updateAndGet(_ + 1)
+            .as(
+              InvalidStateProofBatchReplay.Reproduced(windows.keysIterator.map(_ -> honestDifferent).to(SortedMap))
+            )
+        validator = makeValidator(replayCheckpoint, verifyCertificate = _ => IO.pure(Left("unregistered VRF/KES signer")))
         (kp, pid) <- challengerSetup(checkpointSigner)
         ev <- mkEvidence(cp, kp, pid, claimed = attested, challengerRoot = honestDifferent)
         result <- validator.validate(ev)

@@ -20,7 +20,11 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.pro
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.{GossipStream, SidecarClient}
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{ShardCheckpointAcceptResult, VerifiedShardCheckpoint}
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
+  ShardCheckpointAcceptResult,
+  VerifiedShardCheckpoint,
+  VerifiedShardCheckpointFailure
+}
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.Slot
@@ -412,6 +416,16 @@ object NakamotoSyncDaemon {
       case ShardCheckpointAcceptResult.PendingMoreAttestations           => true
       case ShardCheckpointAcceptResult.Rejected(_)                       => false
       case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(_, _) => false
+    }
+
+  /** Only an affirmative local reproduction mismatch is eligible to trigger construction of portable fraud evidence. A plain rejection
+    * includes unavailable replay state and every structural/authentication failure, none of which says that an authenticated execution
+    * quorum signed an incorrect root. The emitter independently requires the complete certificate before it publishes.
+    */
+  private[nakamoto] def shardCheckpointFraudEvidenceEligible(failure: VerifiedShardCheckpointFailure): Boolean =
+    failure match {
+      case _: VerifiedShardCheckpointFailure.ReExecutionMismatch => true
+      case _: VerifiedShardCheckpointFailure.Rejected            => false
     }
 
   /** Run checkpoint recovery work only after the claimed producer has passed the cheap, parent-independent committee signature gate.
@@ -2444,8 +2458,9 @@ object NakamotoSyncDaemon {
     *      Re-wrap the bare `ShardCheckpoint` into a `Signed[ShardCheckpoint]` from the committee signatures present (the codec scaladoc
     *      describes the re-wrap — the producer's own committee `ed25519Sig` IS `signData(preimageHash)`, byte-identical to the outer
     *      `Signed` proof it built).
-    *   1. Run `deps.acceptanceManager.evaluateForSigning(checkpoint)`, including framework replay, and receive a
-    *      [[VerifiedShardCheckpoint]] only for `Accepted` or `PendingMoreAttestations`.
+    *   1. Run `deps.acceptanceManager.evaluateForSigning(checkpoint)`, including framework replay. Receive a [[VerifiedShardCheckpoint]]
+    *      only for `Accepted` or `PendingMoreAttestations`; an affirmative mismatch may trigger certificate-gated portable fraud evidence
+    *      but never storage or attestation.
     *   1. For a verified checkpoint only, store it in `entry.chainStore` and record its carried committee signatures.
     *   1. Before each missing execution signature, reuse that exact receipt capability or replay the corresponding stored ancestor once.
     *
@@ -2464,9 +2479,10 @@ object NakamotoSyncDaemon {
     shardCheckpointAttestationEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointAttestationEmitter[F]
     ],
-    // WATCHTOWER (fraud-proof part 1): re-execute each adopted checkpoint EVEN on the quorum path and gossip a
-    // FraudProofEnvelope on a per-MG root mismatch. `None` at numShards=1 or when watchtower-enabled=false ⇒ no
-    // approval-check. Fired on the became-best-tip adopt seam (same gate as the attestation emitter).
+    // WATCHTOWER (fraud-proof part 1): re-execute a certificate-authenticated checkpoint and gossip a FraudProofEnvelope
+    // on a per-MG root mismatch. `None` at numShards=1 or when watchtower-enabled=false ⇒ no approval-check. Fired
+    // directly for the typed affirmative-mismatch rejection (before storage/attestation), and defensively on the
+    // replay-valid became-best-tip seam.
     watchtowerFraudProofEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]
     ],
@@ -2624,12 +2640,17 @@ object NakamotoSyncDaemon {
                             } >>
                               deps.acceptanceManager.evaluateForSigning(checkpoint).flatMap {
                                 case Left(failure) =>
+                                  val emitPortableEvidence = shardCheckpointFraudEvidenceEligible(failure)
                                   logger.info(
                                     s"🧩 ShardCheckpoint rx shard=${checkpoint.shardId.value.value} " +
                                       s"shardOrd=${checkpoint.shardOrdinal.value} gl0Anchor=${checkpoint.gl0AnchorOrdinal.value.value} " +
                                       s"signers=${checkpoint.committeeSignatures.size} evaluate=${failure.acceptanceResult} " +
-                                      s"— NOT adopted/attested (re-exec/pre-check reject)"
-                                  )
+                                      (if (emitPortableEvidence)
+                                         s"— NOT adopted/attested; emitting only certificate-authenticated portable mismatch evidence"
+                                       else s"— NOT adopted/attested (re-exec unavailable or pre-check/structural reject; no evidence)")
+                                  ) >> Async[F].whenA(emitPortableEvidence) {
+                                    watchtowerFraudProofEmitter.fold(Async[F].unit)(_.emit(checkpoint))
+                                  }
                                 case Right(verifiedCheckpoint) =>
                                   // The capability above was minted by this exact intake replay. Store/count/sign are unreachable for a
                                   // rejected or mismatching checkpoint, and the received checkpoint is not replayed a second time merely to
@@ -2651,8 +2672,9 @@ object NakamotoSyncDaemon {
                                           entry.chainStore.bestTip.flatMap { bestTipOpt =>
                                             val becameBestTip = recovered.inserted && bestTipOpt.exists(_.hash === checkpointHash)
                                             // WATCHTOWER approval-check (fraud-proof part 1): on adopting this checkpoint as canonical best tip,
-                                            // re-execute its per-MG derivations EVEN THOUGH it was quorum-admitted (the whole point — catch a
-                                            // quorum-signed wrong root) and gossip a FraudProofEnvelope on any mismatch. It remains inside the
+                                            // defensively re-execute its complete batch after the emitter re-verifies the execution certificate,
+                                            // and gossip a FraudProofEnvelope on any mismatch. Affirmative intake mismatches take the earlier
+                                            // rejection branch and emit without adoption. This successful-path replay remains inside the
                                             // bounded generation-owned shard worker, so reconnect/cancellation cannot leave stale replay or
                                             // publication mutating state. `None` (numShards=1 / watchtower disabled) ⇒ skipped. Only on
                                             // becameBestTip: a non-canonical sibling is not adopted, so its effects are never applied — no need

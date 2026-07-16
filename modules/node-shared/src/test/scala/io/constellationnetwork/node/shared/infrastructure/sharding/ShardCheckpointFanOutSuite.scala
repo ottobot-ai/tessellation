@@ -148,10 +148,13 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
     shardEta: Array[Byte]
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val executionBase =
+        chainStore.perMgTip.map(tips => ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, tips).some)
       ShardCheckpointProducer.make[IO](
         shardId = shardId,
         chainStore = chainStore,
-        finalizedBasePerMgTip = chainStore.perMgTip, // fan-out tests assert perMgTip-anchored chain-linking (pre-S2 parity)
+        executionBaseF = executionBase,
+        executionBaseAt = _ => executionBase,
         adoptedPerMgTip = chainStore.perMgTip, // == window anchor ⇒ newness gate is a no-op here (S2-deadlock fix, 2026-06-15)
         slotLeader = ssl,
         publisher = ShardCheckpointPublisher.noop[IO],
@@ -166,7 +169,6 @@ object ShardCheckpointFanOutSuite extends MutableIOSuite {
         shardEtaFor = _ => IO.pure(shardEta),
         staircaseDeltaSlots = 5,
         derivePerMgState = deterministicDerive,
-        executionBaseOrdinalF = cats.effect.IO.pure(SnapshotOrdinal.MinValue),
         lastPhase2Checkpoint = cats.effect.IO.pure(None),
         republishEveryTicks = 1
       )

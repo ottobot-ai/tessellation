@@ -2,7 +2,10 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 
 import cats.effect.{IO, Ref}
 
-import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointAcceptResult
+import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
+  ShardCheckpointAcceptResult,
+  VerifiedShardCheckpointFailure
+}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -20,6 +23,23 @@ object ShardCheckpointAdmissibilitySuite extends SimpleIOSuite {
         !NakamotoSyncDaemon.shardCheckpointAdmissible(ShardCheckpointAcceptResult.Rejected("bad pre-check")),
         !NakamotoSyncDaemon.shardCheckpointAdmissible(
           ShardCheckpointAcceptResult.RejectedReExecutionMismatch("mismatch", signers)
+        )
+      )
+    )
+  }
+
+  test("only an affirmative replay mismatch may trigger portable fraud-evidence construction") {
+    val signers = List(PeerId(Hex("aa" * 64)))
+    IO.pure(
+      expect.all(
+        NakamotoSyncDaemon.shardCheckpointFraudEvidenceEligible(
+          VerifiedShardCheckpointFailure.ReExecutionMismatch("wrong root", signers)
+        ),
+        !NakamotoSyncDaemon.shardCheckpointFraudEvidenceEligible(
+          VerifiedShardCheckpointFailure.Rejected("pinned replay base unavailable")
+        ),
+        !NakamotoSyncDaemon.shardCheckpointFraudEvidenceEligible(
+          VerifiedShardCheckpointFailure.Rejected("execution certificate malformed")
         )
       )
     )

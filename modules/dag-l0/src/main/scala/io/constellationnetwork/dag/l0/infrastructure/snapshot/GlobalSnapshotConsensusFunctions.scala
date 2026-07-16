@@ -966,6 +966,22 @@ object GlobalSnapshotConsensusFunctions {
           "rewards" -> acceptedRewardTxs.size.toString
         )
 
+        // `verifyEmbedded` proves the checkpoint claim itself, while GSAM's second pass proves that the complete group was actually
+        // represented in the final accepted state-channel map after base/root/lineage/atomicity checks. Only that exact intersection may
+        // enter the global artifact. Keeping the earlier verifier is deliberate: a locally rejected candidate must never trigger a slash
+        // and then disappear before followers receive the same evidence. Both passes use the bounded checkpoint-level batch replay path.
+        appliedShardCheckpoints <- adoptableShardCheckpoints.toList.traverseFilter {
+          case (shardId, checkpoint) =>
+            ShardWindowContinuation
+              .wasFullyAppliedF(
+                shardId,
+                checkpoint,
+                snapshotContext.lastStateChannelSnapshotHashes,
+                scSnapshots
+              )
+              .map(Option.when(_)(shardId -> checkpoint))
+        }.map(entries => SortedMap.from(entries))
+
         (deprecated, remainedActive, accepted) = getUpdatedTips(
           lastActiveTips,
           lastDeprecatedTips,
@@ -989,11 +1005,10 @@ object GlobalSnapshotConsensusFunctions {
           lastArtifactHash,
           accepted,
           scSnapshots,
-          // shardCheckpoints (§3.4) — embed the SAME `verifyEmbedded`-accepted subset GSAM adopted into `scSnapshots`
-          // above, so the artifact's `shardCheckpoints` field and its `stateChannelSnapshots` (adopt-won) are mutually
-          // consistent and a follower/validator threading `artifact.shardCheckpoints` back through accept() recreates
-          // both byte-identically. Empty at numShards=1 (regression bar) — `adoptableShardCheckpoints` is empty there.
-          adoptableShardCheckpoints,
+          // Embed only checkpoints proven to be atomically represented by the final `scSnapshots`, not merely the candidates accepted by
+          // the pre-replay verifier. A follower re-runs the same two checks and therefore recreates both fields byte-identically.
+          // Empty at numShards=1 (regression bar) because `adoptableShardCheckpoints` is empty there.
+          appliedShardCheckpoints,
           acceptedRewardTxs,
           delegatorRewardsMap.some,
           currentEpochProgress,

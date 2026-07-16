@@ -13,7 +13,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.delegatedStake.{UpdateDelegatedStakeAcceptanceManager, UpdateDelegatedStakeValidator}
-import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
+import io.constellationnetwork.node.shared.domain.nakamoto.{ShardAssignment, ShardWindowContinuation}
 import io.constellationnetwork.node.shared.domain.node.{UpdateNodeParametersAcceptanceManager, UpdateNodeParametersAcceptanceResult}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
   UpdateNodeCollateralAcceptanceManager,
@@ -36,7 +36,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.artifact.{PricingUpdate, SpendAction}
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
@@ -49,6 +49,9 @@ import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{addressSetImmutableCodec, signedCurrencySnapshotImmutableCodec}
+import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutableCodec}
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.statechannel.{StateChannelOutput, StateChannelSnapshotBinary, StateChannelValidationType}
 
 import eu.timepit.refined.auto._
@@ -213,7 +216,7 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
         implicit hasher: Hasher[IO]
       ): IO[SortedMap[Address, MetagraphAcceptanceResult]] =
         // GSAM only calls this from the adopt path (`deriveAdoptedCurrencyState`); capture the adopted snapshot map.
-        capturedAdoptedRef.set(events).as(SortedMap.empty[Address, MetagraphAcceptanceResult])
+        capturedAdoptedRef.update(_ ++ events).as(SortedMap.empty[Address, MetagraphAcceptanceResult])
 
       override def assembleAcceptanceResult(
         processed: SortedMap[Address, MetagraphAcceptanceResult],
@@ -294,6 +297,84 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
           calculatedCurrencyState = priorLastCurrencySnapshots ++ recreated,
           returned = returned,
           balanceUpdate = SortedMap.empty,
+          incomingCurrencySnapshotsWithState = SortedMap.empty
+        )
+      }
+    }
+
+  /** Replay fixture that debits one shared payer per successfully assembled checkpoint group and records the balance each group observed.
+    * Returning the debit inside each MG's `MetagraphAcceptanceResult` keeps failed-root behavior faithful to production assembly:
+    * assembling an empty processed map must also discard that group's fee update.
+    */
+  private def mkSharedFeeReplayProcessor(
+    recreatedState: CurrencySnapshotWithState,
+    payer: Address,
+    debit: Long,
+    observedBalances: Ref[IO, List[(Address, Balance)]]
+  ): GlobalSnapshotStateChannelEventsProcessor[IO] =
+    new GlobalSnapshotStateChannelEventsProcessor[IO] {
+      override def process(
+        snapshotOrdinal: SnapshotOrdinal,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastStateChannelSnapshotHashes: SortedMap[Address, Hash],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        events: List[StateChannelOutput],
+        validationType: StateChannelValidationType,
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[StateChannelAcceptanceResult] =
+        IO.pure(
+          StateChannelAcceptanceResult(
+            SortedMap.empty,
+            priorLastCurrencySnapshots,
+            Set.empty,
+            SortedMap.empty,
+            SortedMap.empty
+          )
+        )
+
+      override def processCurrencySnapshots(
+        snapshotOrdinal: SnapshotOrdinal,
+        currentBalances: SortedMap[Address, Balance],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        events: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[SortedMap[Address, MetagraphAcceptanceResult]] = {
+        val before = currentBalances.getOrElse(payer, Balance.empty)
+        val after = Balance(NonNegLong.unsafeFrom(before.value.value - debit))
+
+        events.toList.traverse {
+          case (mg, newestFirst) =>
+            observedBalances
+              .update(_ :+ (mg -> before))
+              .as(
+                mg -> (
+                  newestFirst.reverse.map(_ -> recreatedState.some),
+                  SortedMap(payer -> after)
+                )
+              )
+        }
+          .map(SortedMap.from(_))
+      }
+
+      override def assembleAcceptanceResult(
+        processed: SortedMap[Address, MetagraphAcceptanceResult],
+        priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
+          CurrencySnapshot
+        ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+        returned: Set[StateChannelOutput]
+      ): StateChannelAcceptanceResult = {
+        val recreated = SortedMap.from(processed.toList.flatMap { case (mg, (pairs, _)) => pairs.last._2.map(mg -> _) })
+        val balanceUpdate = SortedMap.from(processed.valuesIterator.flatMap(_._2).toList)
+
+        StateChannelAcceptanceResult(
+          accepted = processed.map { case (mg, (pairs, _)) => mg -> pairs.map(_._1) },
+          calculatedCurrencyState = priorLastCurrencySnapshots ++ recreated,
+          returned = returned,
+          balanceUpdate = balanceUpdate,
           incomingCurrencySnapshotsWithState = SortedMap.empty
         )
       }
@@ -752,6 +833,40 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       SortedMap.empty
     )
 
+  private def seedPriorFullCurrencyState(
+    store: MptStore[IO, GlobalStateKey],
+    mg: Address,
+    snapshot: Signed[CurrencySnapshot],
+    stateChannelTip: Hash
+  )(implicit hasher: Hasher[IO]): IO[Unit] =
+    for {
+      currencyIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      tipIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+      _ <- store.insert[Signed[CurrencySnapshot]](
+        GlobalStateKey.metagraph(mg, GlobalStateFieldId.LastCurrencySnapshots),
+        snapshot
+      )
+      _ <- store.insert[Hash](
+        GlobalStateKey.metagraph(mg, GlobalStateFieldId.LastStateChannelSnapshotHashes),
+        stateChannelTip
+      )
+      _ <- store.insert[SortedSet[Address]](currencyIndex, SortedSet(mg))
+      _ <- store.insert[SortedSet[Address]](tipIndex, SortedSet(mg))
+      _ <- store.commit(SnapshotOrdinal.MinValue)
+    } yield ()
+
+  private def seedPriorBalance(
+    store: MptStore[IO, GlobalStateKey],
+    address: Address,
+    balance: Balance
+  )(implicit hasher: Hasher[IO]): IO[Unit] =
+    for {
+      balanceIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.Balances)
+      _ <- store.insert[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, address), balance)
+      _ <- store.insert[SortedSet[Address]](balanceIndex, SortedSet(address))
+      _ <- store.commit(SnapshotOrdinal.MinValue)
+    } yield ()
+
   // ============================================================================
   // Test 1: numShards=1 byte-equivalence — adopt gate inactive, raw scEvents flow through chain-link unchanged
   // ============================================================================
@@ -939,9 +1054,18 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
           Some(stub),
           mkSuccessfulReplayProcessor(recreatedState)
         )
-        _ <- invokeAccept(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+        accepted <- invokeAcceptCapturing(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
         recorded <- adoptions.get
-      } yield expect(recorded.isEmpty)
+      } yield
+        expect.all(
+          recorded.isEmpty,
+          !accepted._1.contains(goodMg),
+          !accepted._1.contains(badMg),
+          !accepted._3.lastCurrencySnapshots.contains(goodMg),
+          !accepted._3.lastCurrencySnapshots.contains(badMg),
+          !accepted._3.lastStateChannelSnapshotHashes.contains(goodMg),
+          !accepted._3.lastStateChannelSnapshotHashes.contains(badMg)
+        )
     }
   }
 
@@ -955,7 +1079,11 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
       for {
         mg <- IO.pure(mkAddress("accepted-prefix-must-not-adopt"))
         validN = mkSignedBinary("valid-currency-N".getBytes("UTF-8"))
-        nondecodableN1 = mkSignedBinary(Array[Byte](0x01, 0x02, 0x03))
+        validNHash <- Hasher[IO].hash(validN.value)
+        nondecodableN1Base = mkSignedBinary(Array[Byte](0x01, 0x02, 0x03))
+        nondecodableN1 = nondecodableN1Base.copy(
+          value = nondecodableN1Base.value.copy(lastSnapshotHash = validNHash)
+        )
         prefixRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(mg -> prefixState))
         delta = ShardDerivedStateDelta(
           // Adversarial claim: this root is exactly correct for N, but says nothing about the unprocessed N+1 input also covered by the
@@ -985,6 +1113,226 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
           !accepted._3.lastCurrencySnapshots.contains(mg),
           !accepted._3.lastStateChannelSnapshotHashes.contains(mg),
           recordedAdoptions.isEmpty
+        )
+    }
+  }
+
+  test("second-pass replay mismatch rejects every checkpoint effect and cannot slash without portable fraud evidence") { res =>
+    implicit val (h, sp) = res
+    val mg = mkAddress("second-pass-mismatch")
+    val signer = io.constellationnetwork.schema.peer.PeerId(Hex("cd" * 64))
+    val binary = mkSignedBinary("second-pass-mismatch-content".getBytes("UTF-8"))
+    val cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, mkDelta(mg, binary))
+
+    for {
+      calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+      raw <- Ref.of[IO, List[StateChannelOutput]](Nil)
+      replayed <- Ref.of[IO, SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]](SortedMap.empty)
+      stub = StubAcceptanceManager(
+        calls,
+        _ => ShardCheckpointAcceptResult.RejectedReExecutionMismatch("synthetic second-pass mismatch", List(signer))
+      )
+      pair <- mkSuiteManagerWithProcessorAndStore(
+        Some(mkShardingConfig(numShards = 4)),
+        Some(stub),
+        mkCaptorProcessor(raw, replayed)
+      )
+      (mgr, store) = pair
+      accepted <- invokeAcceptCapturing(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+      cpHash <- Hasher[IO].hash(cp.signingPreimage)
+      slashed <- wasSlashed(store, cp.shardId, cpHash)
+      carryEligible <- ShardWindowContinuation.wasFullyAppliedF(
+        cp.shardId,
+        cp,
+        SortedMap.empty,
+        accepted._1
+      )
+      replayInputs <- replayed.get
+    } yield
+      expect.all(
+        !carryEligible,
+        !slashed,
+        replayInputs.isEmpty,
+        !accepted._1.contains(mg),
+        !accepted._3.lastCurrencySnapshots.contains(mg),
+        !accepted._3.lastStateChannelSnapshotHashes.contains(mg),
+        accepted._3.balances.get(mg).isEmpty
+      )
+  }
+
+  test("Continue+Defer within one checkpoint suppresses replay and every continuing sibling effect") { res =>
+    implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("81" * 64)), Signature(Hex("82" * 70)))
+      val recreatedState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(stateProof)))
+
+      for {
+        continueMg <- IO.pure(mkAddress("atomic-continue-before-defer"))
+        deferMg <- IO.pure(mkAddress("atomic-deferred-sibling"))
+        continueBinary = mkSignedBinary("atomic-continue-before-defer".getBytes("UTF-8"))
+        deferBinaryBase = mkSignedBinary("atomic-deferred-sibling".getBytes("UTF-8"))
+        deferBinary = deferBinaryBase.copy(
+          value = deferBinaryBase.value.copy(lastSnapshotHash = Hash("99" * 32))
+        )
+        continueRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(continueMg -> recreatedState))
+        deferRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(deferMg -> recreatedState))
+        delta = ShardDerivedStateDelta(
+          perMetagraphMptRoots = SortedMap(continueMg -> continueRoot, deferMg -> deferRoot),
+          includedSnapshots = SortedMap(
+            continueMg -> NonEmptyList.one(continueBinary),
+            deferMg -> NonEmptyList.one(deferBinary)
+          )
+        )
+        cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, delta)
+        calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+        replayCalls <- Ref.of[IO, Int](0)
+        stub = StubAcceptanceManager(calls, _ => ShardCheckpointAcceptResult.Accepted)
+        mgr <- mkSuiteManagerWithProcessor(
+          Some(mkShardingConfig(numShards = 4)),
+          Some(stub),
+          mkSuccessfulReplayProcessor(recreatedState, onReplay = replayCalls.update(_ + 1))
+        )
+        accepted <- invokeAcceptCapturing(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+        replayCount <- replayCalls.get
+      } yield
+        expect.all(
+          replayCount == 0,
+          !accepted._1.contains(continueMg),
+          !accepted._1.contains(deferMg),
+          !accepted._3.lastCurrencySnapshots.contains(continueMg),
+          !accepted._3.lastCurrencySnapshots.contains(deferMg),
+          !accepted._3.lastStateChannelSnapshotHashes.contains(continueMg),
+          !accepted._3.lastStateChannelSnapshotHashes.contains(deferMg)
+        )
+    }
+  }
+
+  test("failed checkpoint group cannot leak a fee debit into a later valid group sharing the payer") { res =>
+    implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("91" * 64)), Signature(Hex("92" * 70)))
+      val recreatedState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(stateProof)))
+      val failedMg = mkAddress("atomic-failed-fee-group")
+      val validMg = mkAddress("atomic-valid-fee-group")
+      val payer = mkAddress("atomic-shared-fee-payer")
+      val startingBalance = Balance(NonNegLong.unsafeFrom(100L))
+      val oneDebitBalance = Balance(NonNegLong.unsafeFrom(90L))
+      val failedBinary = mkSignedBinary("atomic-failed-fee-group".getBytes("UTF-8"))
+      val validBinary = mkSignedBinary("atomic-valid-fee-group".getBytes("UTF-8"))
+
+      for {
+        failedCorrectRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(failedMg -> recreatedState))
+        validRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(validMg -> recreatedState))
+        wrongFailedRoot = if (failedCorrectRoot === Hash("a9" * 32)) Hash("b9" * 32) else Hash("a9" * 32)
+        failedCheckpoint = mkCheckpoint(
+          ShardId.unsafeApply(0),
+          1L,
+          2L,
+          ShardDerivedStateDelta(
+            perMetagraphMptRoots = SortedMap(failedMg -> wrongFailedRoot),
+            includedSnapshots = SortedMap(failedMg -> NonEmptyList.one(failedBinary))
+          )
+        )
+        validCheckpoint = mkCheckpoint(
+          ShardId.unsafeApply(1),
+          1L,
+          2L,
+          ShardDerivedStateDelta(
+            perMetagraphMptRoots = SortedMap(validMg -> validRoot),
+            includedSnapshots = SortedMap(validMg -> NonEmptyList.one(validBinary))
+          )
+        )
+        calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+        observed <- Ref.of[IO, List[(Address, Balance)]](Nil)
+        stub = StubAcceptanceManager(calls, _ => ShardCheckpointAcceptResult.Accepted)
+        pair <- mkSuiteManagerWithProcessorAndStore(
+          Some(mkShardingConfig(numShards = 4)),
+          Some(stub),
+          mkSharedFeeReplayProcessor(recreatedState, payer, debit = 10L, observedBalances = observed)
+        )
+        (mgr, store) = pair
+        _ <- seedPriorBalance(store, payer, startingBalance)
+        accepted <- invokeAcceptCapturing(
+          mgr,
+          Nil,
+          SortedMap(failedCheckpoint.shardId -> failedCheckpoint, validCheckpoint.shardId -> validCheckpoint),
+          emptyGsi.copy(balances = SortedMap(payer -> startingBalance))
+        )
+        seen <- observed.get
+      } yield
+        expect.all(
+          seen == List(failedMg -> startingBalance, validMg -> startingBalance),
+          !accepted._1.contains(failedMg),
+          accepted._1.keySet == Set(validMg),
+          !accepted._3.lastCurrencySnapshots.contains(failedMg),
+          accepted._3.lastCurrencySnapshots.contains(validMg),
+          !accepted._3.lastStateChannelSnapshotHashes.contains(failedMg),
+          accepted._3.lastStateChannelSnapshotHashes.contains(validMg),
+          accepted._3.balances.get(payer).contains(oneDebitBalance)
+        )
+    }
+  }
+
+  test("Continue+Already checkpoint applies only when the already-consumed sibling root still matches current currency state") { res =>
+    implicit val (h, sp) = res
+    JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val stateProof = SignatureProof(io.constellationnetwork.schema.ID.Id(Hex("71" * 64)), Signature(Hex("72" * 70)))
+      val recreatedState: CurrencySnapshotWithState =
+        Left(Signed(CurrencySnapshot.mkGenesis(Map.empty, None, None), NonEmptySet.of(stateProof)))
+      val priorSnapshot = recreatedState.swap.toOption.get
+      val alreadyMg = mkAddress("atomic-already-mg")
+      val continueMg = mkAddress("atomic-continue-mg")
+      val alreadyBinary = mkSignedBinary("atomic-already".getBytes("UTF-8"))
+      val continueBinary = mkSignedBinary("atomic-continue".getBytes("UTF-8"))
+
+      def run(validAlreadyRoot: Boolean): IO[(SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], GlobalSnapshotInfo)] =
+        for {
+          alreadyTip <- Hasher[IO].hash(alreadyBinary.value)
+          currentRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(alreadyMg -> recreatedState))
+          continueRoot <- GlobalStateConverter.currencySnapshotMgRoot[IO](SortedMap(continueMg -> recreatedState))
+          wrongRoot = if (currentRoot === Hash("f1" * 32)) Hash("f2" * 32) else Hash("f1" * 32)
+          delta = ShardDerivedStateDelta(
+            perMetagraphMptRoots = SortedMap(
+              alreadyMg -> Option.when(validAlreadyRoot)(currentRoot).getOrElse(wrongRoot),
+              continueMg -> continueRoot
+            ),
+            includedSnapshots = SortedMap(
+              alreadyMg -> NonEmptyList.one(alreadyBinary),
+              continueMg -> NonEmptyList.one(continueBinary)
+            )
+          )
+          cp = mkCheckpoint(ShardId.unsafeApply(0), 1L, 2L, delta)
+          calls <- Ref.of[IO, List[ShardCheckpoint]](Nil)
+          stub = StubAcceptanceManager(calls, _ => ShardCheckpointAcceptResult.Accepted)
+          pair <- mkSuiteManagerWithProcessorAndStore(
+            Some(mkShardingConfig(numShards = 4)),
+            Some(stub),
+            mkSuccessfulReplayProcessor(recreatedState)
+          )
+          (mgr, store) = pair
+          _ <- seedPriorFullCurrencyState(store, alreadyMg, priorSnapshot, alreadyTip)
+          accepted <- invokeAcceptCapturing(mgr, Nil, SortedMap(cp.shardId -> cp), emptyGsi)
+        } yield (accepted._1, accepted._3)
+
+      for {
+        valid <- run(validAlreadyRoot = true)
+        invalid <- run(validAlreadyRoot = false)
+        continueTip <- Hasher[IO].hash(continueBinary.value)
+        alreadyTip <- Hasher[IO].hash(alreadyBinary.value)
+      } yield
+        expect.all(
+          valid._1.keySet == Set(continueMg),
+          valid._2.lastCurrencySnapshots.keySet.contains(alreadyMg),
+          valid._2.lastCurrencySnapshots.keySet.contains(continueMg),
+          valid._2.lastStateChannelSnapshotHashes.get(alreadyMg).contains(alreadyTip),
+          valid._2.lastStateChannelSnapshotHashes.get(continueMg).contains(continueTip),
+          !invalid._1.contains(continueMg),
+          invalid._2.lastCurrencySnapshots.keySet.contains(alreadyMg),
+          !invalid._2.lastCurrencySnapshots.keySet.contains(continueMg),
+          invalid._2.lastStateChannelSnapshotHashes.get(alreadyMg).contains(alreadyTip),
+          !invalid._2.lastStateChannelSnapshotHashes.keySet.contains(continueMg)
         )
     }
   }
@@ -1378,7 +1726,12 @@ object GlobalSnapshotAcceptanceManagerShardingSuite extends MutableIOSuite {
     sp: SecurityProvider[IO]
   ): io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[IO] =
     io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator.make[IO](
-      reDerivePerMgRoot = (_, _, _, _) => IO.pure(honestRoot),
+      replayCheckpoint = (windows, _, _) =>
+        IO.pure(
+          io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofBatchReplay.Reproduced(
+            windows.keysIterator.map(_ -> honestRoot).to(SortedMap)
+          )
+        ),
       slashedReader = io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofSlashedReader.fromMptStore[IO](store),
       verifyExecutionCertificate = verifyExecutionCertificate
     )

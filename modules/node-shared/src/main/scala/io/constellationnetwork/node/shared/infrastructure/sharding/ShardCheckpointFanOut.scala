@@ -38,10 +38,10 @@ import org.typelevel.log4cats.Logger
   * '''EXECUTION-SHARDING R-1 — the inversion (input source).''' The fan-out NO LONGER partitions gl0's post-chain-link
   * `stateChannelSnapshots` map (which the `CHANGE-3` Axis-1a filter empties at `numShards > 1`, and which inherits gl0's #259 freeze).
   * Instead each producer is fed `shardBinaryBuffers(sid).snapshotPending` — the complete signed binaries that passed metagraph admission
-  * and were buffered for this shard off the global binaries gossip topic. The producer then chain-link-orders them off the SHARD's own
-  * prior-checkpoint tip (`ShardChainStore.perMgTip`). This is the centerpiece of the inversion: production is driven by what the shard has
-  * buffered, fully decoupled from gl0's chain-link admission. The buffer is already shard-scoped (the daemon buffers by
-  * `ShardAssignment.shardIdFor`), so no partition step is needed here.
+  * and were buffered for this shard off the global binaries gossip topic. The producer chain-link-orders them from the exact pinned GL0
+  * execution-base tips it will replay. Production is driven by what the shard has buffered and is decoupled from GL0's post-chain-link
+  * event selection, but the economic lineage remains anchored to retained global state. The buffer is already shard-scoped (the daemon
+  * buffers by `ShardAssignment.shardIdFor`), so no partition step is needed here.
   */
 object ShardCheckpointFanOut {
 

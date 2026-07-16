@@ -722,8 +722,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
   - **Current landing:** the shard attestation emitter accepts only a sealed
     replay-minted `VerifiedShardCheckpoint`; rejected/mismatching intake cannot
     store/count/sign, replay-valid under-quorum intake can collect signatures, and
-    ancestor duties are checked against each ancestor's own epoch. This proves the
-    current root-replay signing boundary, not future diff/intents parity.
+    ancestor duties are checked against each ancestor's own epoch. Producer and
+    receiver replay now use one complete multi-MG fold over one retained base,
+    including rooted global balances; partial/unexpected output withholds every
+    root, and the producer byte-compares a fresh canonical Scodec identity of the
+    exact captured ordinal immediately before signing. A newer finalized
+    descendant does not invalidate that retained base. This proves the current
+    root-replay signing boundary only, not future diff/decisions/intents/lane/DA
+    parity or an exact hash/root-bound Phase-2 base.
   - **Gate:** `SIG-*`, `SHARD-E-001..005`, `ECON-*` differential suite.
 
 - [ ] **E6 IN PROGRESS - single-outstanding multi-MG batching**
@@ -957,9 +963,34 @@ criteria are in `NAKAMOTO-PLAN.md`.
     not the assertion, decides mismatch, rollback/quarantine, signer debit, and
     reward. This is not the ordinary sharded-CL1 adoption path; native GL1
     transitions and the global kernel remain universal execution paths.
+  - **Current partial landing:** the validator authenticates the execution
+    certificate and replays the complete ordered multi-MG batch once; the evidence
+    MG selects only the attested root to compare. A reproduced-root mismatch or an
+    explicit typed `ProvenInvalidTransition` may uphold. Missing history, replay
+    failure, and generic incomplete legacy output are `Unavailable` and cannot
+    slash. Production replay currently has no `ProvenInvalidTransition` producer
+    (`InvalidStateProofValidator.scala:168-215`;
+    `ShardCheckpointWiring.scala:239-314`).
+  - **HIGH OPEN:** shared-fee oversubscription fails closed and withholds the full
+    batch, but the legacy processor reports only generic incomplete output. A
+    colluding quorum that signs the unexecutable batch is rejected yet escapes
+    `InvalidStateProof` until the processor exposes a typed deterministic reject
+    (`GlobalSnapshotStateChannelEventsProcessor.scala:145-220`;
+    `ExecutionBasePinReExecutionSuite.scala:731-855`; `WT-002A`).
+  - **HIGH OPEN:** execution-certificate verification currently includes the
+    structural included/root keyset check. A quorum-signed missing-root checkpoint
+    is rejected before its signatures are exposed as authenticated slash targets,
+    so the emitter publishes nothing and the validator's missing-root conviction
+    branch is unreachable. Split authenticated signature/quorum proof from
+    structural validity; ordinary acceptance must still reject the structure,
+    while portable adjudication may convict only after the signer proof succeeds
+    (`ShardCheckpointGl0AcceptanceManager.scala:336-345,462-528`;
+    `WatchtowerFraudProofEmitter.scala:90-109`;
+    `InvalidStateProofValidator.scala:168-215`; `WT-002B`).
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.
-  - **Gate:** `WT-001..007`, `CRYPTO-001`, `REC-*`, flood/resource tests.
+  - **Gate:** `WT-001..007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`, `REC-*`,
+    flood/resource tests.
 
 ### Wave 5 - Rebase, correction, and activation
 
@@ -1066,7 +1097,21 @@ be the independent closer.
   `ShardCurrencyStateDiff`; every signer replays before signing and ordinary GL0
   nodes apply/root-check. Keep `authoritative*`, `AdoptFromSignedFields`, and
   direct cross-shard receipt schemas deleted.
-- ⚠ **Watchtower InvalidStateProof slash — durable ledger** (Slashings fieldId 34) (`ed8928b81`); durably slash a full-quorum colluding committee on one honest fraud proof (`68246cffe`, W3a). **Wired-vs-shelfware being verified in handoff.**
+- ⚠ **Watchtower InvalidStateProof slash — portable path and durable ledger are
+  wired, adjudication remains incomplete.** Emission verifies the execution
+  certificate before replay/publication, and only consensus-artifact-carried
+  evidence revalidated by every GL0 node reaches the Slashings field-34 sink. The
+  adjudicator replays the complete ordered checkpoint batch once; evidence MG is
+  only a selector, and unavailable/generic incomplete replay cannot slash. Root
+  mismatch is live. The execution-result `ProvenInvalidTransition` branch has no
+  production producer, leaving shared-fee oversubscription fail-closed but
+  nonslashable (`WatchtowerFraudProofEmitter.scala:90-109`;
+  `InvalidStateProofValidator.scala:168-215`; `ShardCheckpointWiring.scala:239-314`).
+  Separately, `verifyExecutionCertificate` rejects a signed included/root keyset
+  mismatch as structural invalidity before returning an authenticated quorum, so
+  the missing-root slash branch is unreachable (`WT-002B`, HIGH OPEN). The target
+  separates signer/quorum authentication from structural validity without making
+  the malformed checkpoint ordinarily acceptable.
 - ⚠ **Slash-cooldown committee exclusion** — the cooldown reader is wired, but the loop is not closed: the worktree wire-epoch check still
   depends on an unrooted local R and ordinal-only anchor (SHARD-03/SHARD-09), while ECO-06 leaves bonded principal undebited.
 - ⚠ **Cross-shard framework reads = Option A (finality-first), exact-hash gate
@@ -1292,8 +1337,15 @@ consensus-economic roadmap for dependencies and release gates.
 - ⚠ **Slashing = detection-only accumulator** — landed but SHELF-WARE; planned refactor to epoch-anchored participating-set + demotion-as-exclusion (design-only).
 - ⚠ **Watchtower fraud-proof / InvalidStateProof slash** — intended noncommittee
   collusion backstop for execution-certified diff adoption. Selection, challenge
-  timing versus full economic release, independently computed adjudication, bonded
-  debit, DoS bounds, and false-slash resistance remain release blockers.
+  timing versus full economic release, bonded debit, DoS bounds, and false-slash
+  resistance remain release blockers. Portable adjudication now authenticates the
+  certificate and replays the full ordered checkpoint batch once, but the legacy
+  transition processor has no typed deterministic-invalid result: shared-fee
+  oversubscription is rejected without roots yet cannot convict a colluding
+  execution quorum (`WT-002A`, HIGH OPEN). The same fail-closed-but-no-conviction
+  gap exists for a quorum-signed included/root keyset mismatch because certificate
+  authentication currently includes the structural rejection (`WT-002B`, HIGH
+  OPEN).
 - ⏳ **BLS / aggregate-sig** — feasibility PROVEN (BC 1.85 KAT byte-match); unified rotatable ValidatorKeyRegistry + PoP, target = snapshot certs. Not started in prod.
 
 ---

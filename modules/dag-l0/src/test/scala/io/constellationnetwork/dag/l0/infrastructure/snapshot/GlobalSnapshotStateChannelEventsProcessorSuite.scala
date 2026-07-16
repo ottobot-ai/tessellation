@@ -374,6 +374,7 @@ object GlobalSnapshotStateChannelEventsProcessorSuite extends MutableIOSuite {
         SnapshotOrdinal(1L),
         SortedMap.empty,
         SortedMap.empty,
+        SortedMap(address -> Hash.empty),
         SortedMap(address -> orderedWindow),
         _ => none.pure[IO]
       )

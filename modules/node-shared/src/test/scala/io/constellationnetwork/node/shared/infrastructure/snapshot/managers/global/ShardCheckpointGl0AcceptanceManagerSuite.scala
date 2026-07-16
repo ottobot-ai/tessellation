@@ -43,7 +43,7 @@ import weaver.MutableIOSuite
   *   1. '''Pre-check fail: bad Ed25519 sig''' — signature doesn't verify → `Rejected`
   *   1. '''Execution quorum accept''' — at least `kQuorum` distinct valid signers and matching re-execution → `Accepted`
   *   1. '''Missing execution quorum''' — fewer than `kQuorum` distinct valid signers → `Rejected` without re-execution
-  *   1. '''Replay mismatch''' — intake re-execution returns a different root → `RejectedReExecutionMismatch` with every signer
+  *   1. '''Replay mismatch''' — intake re-execution returns a different root → `RejectedReExecutionMismatch` with every committee signer
   *
   * '''Test fixture pattern''':
   *   - Build checkpoint envelopes with real Ed25519, KES, and VRF signatures, and inject registries containing the corresponding public
@@ -198,7 +198,14 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
     shardEtaFor: (ShardId, EtaPeriod) => IO[Option[Array[Byte]]] = (_, _) => IO.pure(realShardEta.some),
     producerDutyValidator: ShardCheckpointProducerDutyValidator[IO] = TestCheckpointDutyValidator.allow[IO],
     reExecuteDerivation: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Hash] =
-      (_, _, _, _) => IO.pure(Hash("11" * 32))
+      (_, _, _, _) => IO.pure(Hash("11" * 32)),
+    reExecuteDerivations: Option[
+      (
+        SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        SnapshotOrdinal,
+        SnapshotOrdinal
+      ) => IO[SortedMap[Address, Hash]]
+    ] = None
   )(
     implicit h: Hasher[IO],
     sp: SecurityProvider[IO],
@@ -212,7 +219,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       shardAssignment = ShardAssignment.make[IO](numShards = 1),
       shardEtaFor = shardEtaFor,
       producerDutyValidator = producerDutyValidator,
-      reExecuteDerivation = reExecuteDerivation
+      reExecuteDerivation = reExecuteDerivation,
+      reExecuteDerivations = reExecuteDerivations
     )
 
   private def registryWithPair(
@@ -756,10 +764,10 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 5: under-quorum replay mismatch — reject and slash signers
+  // Test 5: under-quorum replay mismatch — reject and retain committee signer identity for evidence construction
   // ============================================================================
 
-  test("under-quorum re-exec mismatch → RejectedReExecutionMismatch with slash list = signers") { res =>
+  test("under-quorum re-exec mismatch → RejectedReExecutionMismatch with committee signer list") { res =>
     implicit val (h, sp, _, checkpointSigner) = res
     for {
       (signerKp1, signerPeer1) <- mkSigner
@@ -771,7 +779,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       delta = mkDelta(mg, mptRoot, binary)
       shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer1)
 
-      // TWO real signers — both go in the slash list when the re-exec mismatches.
+      // TWO real signers — both remain attached to the diagnostic result for separately portable evidence construction.
       sig1 <- mkValidSig(shell, signerKp1, signerPeer1)
       sig2 <- mkValidSig(shell, signerKp2, signerPeer2)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2))
@@ -800,9 +808,9 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       result <- mgr.evaluate(checkpoint)
     } yield
       result match {
-        case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
+        case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, committeeSigners) =>
           expect(reason.contains("re-exec mismatch")) &&
-          expect.same(List(signerPeer1, signerPeer2), slashSigners)
+          expect.same(List(signerPeer1, signerPeer2), committeeSigners)
         case other => failure(s"Expected RejectedReExecutionMismatch, got $other")
       }
   }
@@ -829,9 +837,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       // pinned execution-base is unresolvable below this node's retention / not yet reached, or the derivation deferred). That is
       // "THIS NODE can't check", NOT "the committee deviated" (the same reading `watchtowerReExec` applies when it filters
       // `Hash.empty` mismatches). The checkpoint must be REJECTED (fail-closed: never admitted unverified) but the signers must
-      // NOT be slash targets — `RejectedReExecutionMismatch` feeds the DURABLE 100% `InvalidStateProof` slash
-      // (`GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` → `WatchtowerSlashRequest`), which demands an AFFIRMATIVE
-      // pinned-base re-derivation mismatch as evidence.
+      // NOT be affirmative mismatch evidence. A local `RejectedReExecutionMismatch` never directly reaches the slash sink; only a separately
+      // carried fraud proof revalidated by every GL0 node can slash.
       reExecCb = (
         (
           _: Address,
@@ -864,8 +871,55 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       }
   }
 
+  test("batch replay with a missing or extra MG result fails closed without scalar fallback or slash classification") { res =>
+    implicit val (h, sp, _, checkpointSigner) = res
+    for {
+      (signerKp, signerPeer) <- mkSigner
+      scalarCalls <- cats.effect.Ref.of[IO, Int](0)
+      batchCalls <- cats.effect.Ref.of[IO, Int](0)
+      mgA = Address.fromBytes("mg-batch-a".getBytes("UTF-8"))
+      mgB = Address.fromBytes("mg-batch-b".getBytes("UTF-8"))
+      extraMg = Address.fromBytes("mg-batch-extra".getBytes("UTF-8"))
+      claimedRoot = Hash("11" * 32)
+      binary = mkSignedBinary("batch-binary-content".getBytes("UTF-8"))
+      delta = ShardDerivedStateDelta(
+        perMetagraphMptRoots = SortedMap(mgA -> claimedRoot, mgB -> claimedRoot),
+        includedSnapshots = SortedMap(mgA -> NonEmptyList.one(binary), mgB -> NonEmptyList.one(binary))
+      )
+      shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer)
+      validSig <- mkValidSig(shell, signerKp, signerPeer)
+      checkpoint = shell.copy(committeeSignatures = NonEmptyList.one(validSig))
+
+      runBatch = (result: SortedMap[Address, Hash]) =>
+        mkManager(
+          executionQuorum = 1,
+          committeeMembership = Set(signerPeer),
+          reExecuteDerivation =
+            (_, _, _, _) => scalarCalls.update(_ + 1) *> IO.raiseError(new AssertionError("scalar replay fallback reached")),
+          reExecuteDerivations = Some((_, _, _) => batchCalls.update(_ + 1).as(result))
+        ).flatMap(_.verifyEmbedded(checkpoint))
+
+      missing <- runBatch(SortedMap(mgA -> claimedRoot))
+      extra <- runBatch(SortedMap(mgA -> claimedRoot, mgB -> claimedRoot, extraMg -> claimedRoot))
+      scalarCount <- scalarCalls.get
+      batchCount <- batchCalls.get
+    } yield {
+      def isCannotDerive(result: ShardCheckpointAcceptResult): Boolean = result match {
+        case ShardCheckpointAcceptResult.Rejected(reason) => reason.contains("cannot re-derive")
+        case _                                            => false
+      }
+
+      expect.all(
+        isCannotDerive(missing),
+        isCannotDerive(extra),
+        scalarCount == 0,
+        batchCount == 2
+      )
+    }
+  }
+
   // ============================================================================
-  // Test 5c (execution-base-pin fail-closed): affirmative mismatch on ANOTHER MG still slashes
+  // Test 5c (execution-base-pin fail-closed): affirmative mismatch on another MG remains a typed diagnostic rejection
   // ============================================================================
 
   test("mixed window: one MG affirmatively mismatches, another can't-derive → RejectedReExecutionMismatch (affirmative evidence wins)") {
@@ -888,8 +942,8 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(validSig))
 
         // mgBad re-derives to a REAL root ≠ claimed (affirmative deviation evidence); mgUncheckable yields the can't-check sentinel.
-        // The affirmative mismatch is cryptographic evidence the committee deviated — it must still slash, regardless of the
-        // uncheckable sibling.
+        // The affirmative mismatch wins the diagnostic classification regardless of the uncheckable sibling. It still cannot slash without
+        // separately portable evidence.
         reExecCb = (
           (
             a: Address,
@@ -912,9 +966,9 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
         result <- mgr.evaluate(checkpoint)
       } yield
         result match {
-          case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, slashSigners) =>
+          case ShardCheckpointAcceptResult.RejectedReExecutionMismatch(reason, committeeSigners) =>
             expect(reason.contains("re-exec mismatch")) &&
-            expect.same(List(signerPeer), slashSigners)
+            expect.same(List(signerPeer), committeeSigners)
           case other => failure(s"Expected RejectedReExecutionMismatch (affirmative mismatch on mgBad), got $other")
         }
   }

@@ -87,19 +87,32 @@ trait GlobalSnapshotStateChannelEventsProcessor[F[_]] {
     priorLastCurrencySnapshots: SortedMap[Address, Either[Signed[
       CurrencySnapshot
     ], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]],
+    expectedParentHashes: SortedMap[Address, Hash],
     orderedEvents: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
     implicit hasher: Hasher[F],
     F: Monad[F]
   ): F[GlobalSnapshotStateChannelEventsProcessor.CurrencySnapshotProcessingResult] =
-    processCurrencySnapshots(
-      snapshotOrdinal,
-      currentBalances,
-      priorLastCurrencySnapshots,
-      orderedEvents.map { case (address, binaries) => address -> binaries.reverse },
-      getGlobalSnapshotByOrdinal
-    ).flatMap(GlobalSnapshotStateChannelEventsProcessor.classifyCheckpointConsumption(orderedEvents, _))
+    GlobalSnapshotStateChannelEventsProcessor
+      .classifyCheckpointLineage(expectedParentHashes, orderedEvents)
+      .flatMap { invalidLineage =>
+        val replayableEvents = orderedEvents.filterNot { case (address, _) => invalidLineage.contains(address) }
+        val processedF =
+          if (replayableEvents.isEmpty) SortedMap.empty[Address, MetagraphAcceptanceResult].pure[F]
+          else
+            processCurrencySnapshots(
+              snapshotOrdinal,
+              currentBalances,
+              priorLastCurrencySnapshots,
+              replayableEvents.map { case (address, binaries) => address -> binaries.reverse },
+              getGlobalSnapshotByOrdinal
+            )
+
+        processedF
+          .flatMap(GlobalSnapshotStateChannelEventsProcessor.classifyCheckpointConsumption(replayableEvents, _))
+          .map(_.withConsumptionOverrides(invalidLineage))
+      }
 
   /** Assemble a [[StateChannelAcceptanceResult]] from the per-MG output of [[processCurrencySnapshots]].
     *
@@ -139,6 +152,8 @@ object GlobalSnapshotStateChannelEventsProcessor {
   object CurrencyWindowConsumption {
     case object Complete extends CurrencyWindowConsumption
     final case class Incomplete(expectedInputs: Int, processedInputs: Int) extends CurrencyWindowConsumption
+    case object MissingExpectedParent extends CurrencyWindowConsumption
+    final case class InvalidOuterParentLink(inputIndex: Int, expectedParent: Hash, actualParent: Hash) extends CurrencyWindowConsumption
     case object UnexpectedOutput extends CurrencyWindowConsumption
   }
 
@@ -161,6 +176,11 @@ object GlobalSnapshotStateChannelEventsProcessor {
     /** All and only exact, completely consumed checkpoint windows. Unexpected or incomplete processor output is excluded. */
     def completeResults: SortedMap[Address, MetagraphAcceptanceResult] =
       processed.filter { case (address, _) => completelyConsumed(address) }
+
+    private[global] def withConsumptionOverrides(
+      overrides: SortedMap[Address, CurrencyWindowConsumption]
+    ): CurrencySnapshotProcessingResult =
+      new CurrencySnapshotProcessingResult(processed -- overrides.keySet, windowConsumption ++ overrides)
   }
 
   private[global] object CurrencySnapshotProcessingResult {
@@ -199,6 +219,45 @@ object GlobalSnapshotStateChannelEventsProcessor {
 
       CurrencySnapshotProcessingResult(processed, SortedMap.from(expectedDispositions ++ unexpectedDispositions))
     }
+  }
+
+  /** Validate the outer state-channel lineage before invoking currency recreation. The parent of the first binary is the exact tip from the
+    * checkpoint's pinned execution-base reader; every later parent is the canonical VALUE hash of the preceding binary. The enclosing
+    * `Signed` hash remains the complete-consumption identity and is deliberately not used as the state-channel parent hash.
+    */
+  private[global] def classifyCheckpointLineage[F[_]: Monad: Hasher](
+    expectedParentHashes: SortedMap[Address, Hash],
+    orderedEvents: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+  ): F[SortedMap[Address, CurrencyWindowConsumption]] = {
+    import CurrencyWindowConsumption._
+
+    def firstMismatch(
+      binaries: List[Signed[StateChannelSnapshotBinary]],
+      expectedParent: Hash,
+      inputIndex: Int
+    ): F[Option[InvalidOuterParentLink]] =
+      binaries match {
+        case Nil => none[InvalidOuterParentLink].pure[F]
+        case binary :: tail =>
+          val actualParent = binary.value.lastSnapshotHash
+          if (actualParent =!= expectedParent)
+            InvalidOuterParentLink(inputIndex, expectedParent, actualParent).some.pure[F]
+          else
+            Hasher[F]
+              .hash(binary.value)
+              .flatMap(nextExpected => firstMismatch(tail, nextExpected, inputIndex + 1))
+      }
+
+    orderedEvents.toList.traverse {
+      case (address, binaries) =>
+        expectedParentHashes.get(address) match {
+          case None => (address -> (MissingExpectedParent: CurrencyWindowConsumption)).some.pure[F]
+          case Some(expectedParent) =>
+            firstMismatch(binaries.toList, expectedParent, 0)
+              .map(_.map(mismatch => address -> (mismatch: CurrencyWindowConsumption)))
+        }
+    }
+      .map(dispositions => SortedMap.from(dispositions.flatten))
   }
 
   def make[F[_]: Async: JsonSerializer: Parallel](
@@ -598,8 +657,8 @@ object GlobalSnapshotStateChannelEventsProcessor {
                                           }): Either[Agg, Result]
                                         }
                                       }
-                                  }.handleErrorWith { e => // we don't accept neither binary nor incremental
-                                    logger.warn(e)(
+                                  }.handleErrorWith { error => // we don't accept neither binary nor incremental
+                                    logger.warn(error)(
                                       s"Currency snapshot of ordinal ${snapshot.value.ordinal.show} for address ${address.show} couldn't be applied"
                                     ) >> Async[F].pure(current.asRight)
                                   }

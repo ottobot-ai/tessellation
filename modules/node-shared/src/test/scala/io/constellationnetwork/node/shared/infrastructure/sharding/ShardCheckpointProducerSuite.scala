@@ -8,7 +8,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 
-import io.constellationnetwork.currency.schema.currency.SnapshotFee
+import io.constellationnetwork.currency.schema.currency.{CurrencySnapshot, DataApplicationPartV1, SnapshotFee}
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto._
@@ -34,6 +34,7 @@ import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof, verifySignatureProof}
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedCurrencySnapshotImmutableCodec
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -360,6 +361,13 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     shardEta: Array[Byte],
     derive: (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => IO[Option[Hash]] =
       deterministicDerive,
+    deriveBatch: Option[
+      (
+        SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        SnapshotOrdinal,
+        ShardCheckpointProducer.PinnedExecutionBase
+      ) => IO[SortedMap[Address, Option[Hash]]]
+    ] = None,
     republishEveryTicks: Int = 1,
     lastPhase2Checkpoint: IO[Option[(ShardOrdinal, Hash)]] = IO.pure(None),
     // S2: the finalized-base per-MG window anchor. `None` ⇒ the shard's `perMgTip` (so the pre-S2 cases keep their perMgTip-anchored
@@ -373,14 +381,23 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     kesSigner: Option[ShardCheckpointProducer.KesSigner[IO]] = None,
     publisher: Option[ShardCheckpointPublisher[IO]] = None,
     shardEtaFor: Option[EtaPeriod => IO[Array[Byte]]] = None,
-    executionBaseOrdinalF: IO[SnapshotOrdinal] = IO.pure(SnapshotOrdinal.MinValue)
+    executionBaseOrdinalF: IO[SnapshotOrdinal] = IO.pure(SnapshotOrdinal.MinValue),
+    executionBaseOverride: Option[IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None,
+    executionBaseAtOverride: Option[SnapshotOrdinal => IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ShardCheckpointProducer[IO]] =
     JsonSerializer.forAsync[IO].flatMap { implicit json =>
+      val executionBase = executionBaseOverride.getOrElse(
+        (executionBaseOrdinalF, finalizedBaseTip.getOrElse(rig.chainStore.perMgTip))
+          .mapN((ordinal, tips) => ShardCheckpointProducer.PinnedExecutionBase(ordinal, tips).some)
+      )
+      val finalizedBasePerMgTip = finalizedBaseTip.getOrElse(rig.chainStore.perMgTip)
       ShardCheckpointProducer.make[IO](
         shardId = shardZero,
         chainStore = rig.chainStore,
-        finalizedBasePerMgTip = finalizedBaseTip.getOrElse(rig.chainStore.perMgTip),
-        adoptedPerMgTip = adoptedTip.getOrElse(finalizedBaseTip.getOrElse(rig.chainStore.perMgTip)),
+        executionBaseF = executionBase,
+        executionBaseAt = executionBaseAtOverride
+          .getOrElse(ordinal => finalizedBasePerMgTip.map(tips => ShardCheckpointProducer.PinnedExecutionBase(ordinal, tips).some)),
+        adoptedPerMgTip = adoptedTip.getOrElse(finalizedBasePerMgTip),
         slotLeader = ssl,
         publisher = publisher.getOrElse(rig.publisher),
         selfPeerId = rig.selfPeerId,
@@ -395,7 +412,7 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         shardEtaFor = shardEtaFor.getOrElse(_ => IO.pure(shardEta)),
         staircaseDeltaSlots = 5,
         derivePerMgState = derive,
-        executionBaseOrdinalF = executionBaseOrdinalF,
+        derivePerMgStates = deriveBatch,
         lastPhase2Checkpoint = lastPhase2Checkpoint,
         republishEveryTicks = republishEveryTicks
       )
@@ -415,7 +432,9 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
     kesSigner: Option[ShardCheckpointProducer.KesSigner[IO]] = None,
     operatorKeyRegistry: Option[OperatorConsensusKeyRegistry[IO]] = None,
     selfVrfVk: Option[Array[Byte]] = None,
-    republishEveryTicks: Int = 1
+    republishEveryTicks: Int = 1,
+    executionBaseOverride: Option[IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None,
+    executionBaseAtOverride: Option[SnapshotOrdinal => IO[Option[ShardCheckpointProducer.PinnedExecutionBase]]] = None
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[ProducerProbe] =
     for {
       etaCalls <- Ref.of[IO, Int](0)
@@ -461,7 +480,12 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         kesSigner = Some(countingKesSigner),
         publisher = Some(countingPublisher),
         shardEtaFor = Some(_ => etaCalls.update(_ + 1).as(shardEta)),
-        executionBaseOrdinalF = baseCalls.update(_ + 1) >> baseOrdinalF
+        executionBaseOrdinalF = baseCalls.update(_ + 1) >> baseOrdinalF,
+        executionBaseOverride = executionBaseOverride.map(source => baseCalls.update(_ + 1) >> source),
+        executionBaseAtOverride = Some { ordinal =>
+          baseCalls.update(_ + 1) >> executionBaseAtOverride
+            .fold(rig.chainStore.perMgTip.map(tips => ShardCheckpointProducer.PinnedExecutionBase(ordinal, tips).some))(_(ordinal))
+        }
       )
       counts = (etaCalls.get, dutyCalls.get, proofCalls.get, derivationCalls.get, baseCalls.get, kesCalls.get, publishCalls.get).mapN(
         ProducerEffectCounts.apply
@@ -742,14 +766,14 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
       )
       deriveNoneCounts <- deriveNoneProbe.counts
 
-      movingBaseRead <- Ref.of[IO, Int](0)
-      movingBase = movingBaseRead.modify { reads =>
+      latestBaseRead <- Ref.of[IO, Int](0)
+      advancingLatestBase = latestBaseRead.modify { reads =>
         val ordinal = if (reads == 0) SnapshotOrdinal.MinValue else SnapshotOrdinal.unsafeApply(1L)
         (reads + 1, ordinal)
       }
       movingBaseRig <- producerRig(population, authorityIdentity)
-      movingBaseProbe <- probedProducer(ssl, movingBaseRig, shardEta, baseOrdinalF = movingBase)
-      movedBase <- movingBaseProbe.producer.produce(
+      movingBaseProbe <- probedProducer(ssl, movingBaseRig, shardEta, baseOrdinalF = advancingLatestBase)
+      descendantAdvanced <- movingBaseProbe.producer.produce(
         mkPendingSnapshots(1),
         mkOrd(22L),
         EtaPeriod.Zero,
@@ -757,6 +781,47 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         Set(population.authorityId)
       )
       movingBaseCounts <- movingBaseProbe.counts
+      latestBaseReads <- latestBaseRead.get
+
+      unavailableBaseRig <- producerRig(population, authorityIdentity)
+      unavailableBaseProbe <- probedProducer(
+        ssl,
+        unavailableBaseRig,
+        shardEta,
+        executionBaseOverride = Some(IO.pure(None))
+      )
+      unavailableBase <- unavailableBaseProbe.producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(22L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(22L),
+        Set(population.authorityId)
+      )
+      unavailableBaseCounts <- unavailableBaseProbe.counts
+
+      movingTipsRead <- Ref.of[IO, Int](0)
+      movingTips = movingTipsRead.modify { reads =>
+        val tips =
+          if (reads == 0) SortedMap.empty[Address, Hash]
+          else SortedMap(Address.fromBytes("changed-base-tip".getBytes("UTF-8")) -> Hash("77" * 32))
+        (reads + 1, ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, tips).some)
+      }
+      movingTipsRig <- producerRig(population, authorityIdentity)
+      movingTipsProbe <- probedProducer(
+        ssl,
+        movingTipsRig,
+        shardEta,
+        executionBaseOverride = Some(movingTips),
+        executionBaseAtOverride = Some(_ => movingTips)
+      )
+      movedTips <- movingTipsProbe.producer.produce(
+        mkPendingSnapshots(1),
+        mkOrd(22L),
+        EtaPeriod.Zero,
+        Slot.unsafeApply(22L),
+        Set(population.authorityId)
+      )
+      movingTipsCounts <- movingTipsProbe.counts
 
       noKesRig <- producerRig(population, authorityIdentity)
       noKesSigner = new ShardCheckpointProducer.KesSigner[IO] {
@@ -781,10 +846,91 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         offDutyCounts == ProducerEffectCounts(1, 1, 0, 0, 1, 0, 0),
         deriveNone.isEmpty,
         deriveNoneCounts == ProducerEffectCounts(1, 1, 1, 1, 1, 0, 0),
-        movedBase.isEmpty,
-        movingBaseCounts == ProducerEffectCounts(1, 1, 1, 1, 2, 0, 0),
+        descendantAdvanced.nonEmpty,
+        latestBaseReads == 1,
+        movingBaseCounts == ProducerEffectCounts(1, 1, 1, 1, 2, 1, 1),
+        unavailableBase.isEmpty,
+        unavailableBaseCounts == ProducerEffectCounts(0, 0, 0, 0, 1, 0, 0),
+        movedTips.isEmpty,
+        movingTipsCounts == ProducerEffectCounts(1, 1, 1, 1, 2, 0, 0),
         noKes.isEmpty,
         noKesCounts == ProducerEffectCounts(1, 1, 1, 1, 2, 1, 0)
+      )
+  }
+
+  test("canonical base identity accepts independent FrameworkCurrencyWithData decode and rejects one-byte mutation") { res =>
+    implicit val (h, sp, ssl) = res
+    val proof = SignatureProof(Id(Hex("31" * 64)), Signature(Hex("32" * 70)))
+    val dataPart = DataApplicationPartV1(
+      onChainState = Array[Byte](1, 2, 3, 4),
+      blocks = List(Array[Byte](5, 6), Array[Byte](7, 8, 9)),
+      calculatedStateProof = Hash("33" * 32)
+    )
+    val original = Signed(
+      CurrencySnapshot.mkGenesis(Map.empty, dataApplicationPart = dataPart.some, latestGlobalSnapshot = None),
+      NonEmptySet.of(proof)
+    )
+    val independentlyDecoded = signedCurrencySnapshotImmutableCodec
+      .fromImmutableBytes(signedCurrencySnapshotImmutableCodec.immutableBytes(original))
+      .toOption
+      .get
+    val decodedPart = independentlyDecoded.value.dataApplication.get
+    val mutatedState = decodedPart.onChainState.clone()
+    mutatedState(0) = (mutatedState(0) ^ 0x01).toByte
+    val oneByteMutation = independentlyDecoded.copy(
+      value = independentlyDecoded.value.copy(
+        dataApplication = decodedPart.copy(onChainState = mutatedState).some
+      )
+    )
+
+    def run(after: Signed[CurrencySnapshot]): IO[(Option[Signed[ShardCheckpoint]], List[Signed[ShardCheckpoint]])] =
+      for {
+        rig <- freshRig
+        shardEta <- ssl.computeShardEta(shardZero, randomGl0Eta())
+        pending = mkPendingSnapshots(1)
+        mg = pending.firstKey
+        beforeBase = ShardCheckpointProducer.PinnedExecutionBase(
+          SnapshotOrdinal.MinValue,
+          SortedMap(mg -> Hash.empty),
+          SortedMap(mg -> Left(original))
+        )
+        afterBase = beforeBase.copy(priorCurrencySnapshots = SortedMap(mg -> Left(after)))
+        reads <- Ref.of[IO, Int](0)
+        baseF = reads.modify { count =>
+          val selected = if (count == 0) beforeBase else afterBase
+          (count + 1, selected.some)
+        }
+        producer <- makeProducer(
+          ssl,
+          rig,
+          Ratio.One,
+          shardEta,
+          executionBaseOverride = Some(baseF),
+          executionBaseAtOverride = Some(_ => baseF)
+        )
+        produced <- producer.produce(
+          pending,
+          SnapshotOrdinal.unsafeApply(24L),
+          EtaPeriod.Zero,
+          Slot.unsafeApply(24L),
+          Set(rig.selfPeerId)
+        )
+        published <- rig.recorded
+      } yield (produced, published)
+
+    for {
+      identical <- run(independentlyDecoded)
+      mutated <- run(oneByteMutation)
+    } yield
+      expect.all(
+        identical._1.nonEmpty,
+        identical._2.size == 1,
+        mutated._1.isEmpty,
+        mutated._2.isEmpty,
+        MessageDigest.isEqual(
+          original.value.dataApplication.get.onChainState,
+          independentlyDecoded.value.dataApplication.get.onChainState
+        ) && (original.value.dataApplication.get.onChainState ne independentlyDecoded.value.dataApplication.get.onChainState)
       )
   }
 
@@ -1143,6 +1289,76 @@ object ShardCheckpointProducerSuite extends MutableIOSuite {
         d.perMetagraphMptRoots.size == 4
       )
     }
+  }
+
+  test("batch replay output must have the exact checkpoint MG keyset: missing or extra results suppress signing and publication") { res =>
+    implicit val (h, sp, ssl) = res
+    for {
+      gl0Eta <- IO(randomGl0Eta())
+      shardEta <- ssl.computeShardEta(shardZero, gl0Eta)
+      pending = mkPendingSnapshots(numMgs = 2)
+      extraMg = mkAddress("batch-extra-mg")
+      missingCalls <- Ref.of[IO, Int](0)
+      extraCalls <- Ref.of[IO, Int](0)
+      missingRig <- freshRig
+      missingProducer <- makeProducer(
+        ssl,
+        missingRig,
+        Ratio.One,
+        shardEta,
+        deriveBatch = Some((windows, _, _) =>
+          missingCalls
+            .update(_ + 1)
+            .as(
+              SortedMap.from(windows.keys.toList.tail.map(_ -> Some(Hash("a1" * 32))))
+            )
+        )
+      )
+      missing <- tryProduceUntilSome(
+        missingProducer,
+        startOrd = 4150L,
+        EtaPeriod.Zero,
+        pending = pending,
+        maxAttempts = 5,
+        committee = Set(missingRig.selfPeerId)
+      )
+      extraRig <- freshRig
+      extraProducer <- makeProducer(
+        ssl,
+        extraRig,
+        Ratio.One,
+        shardEta,
+        deriveBatch = Some((windows, _, _) =>
+          extraCalls
+            .update(_ + 1)
+            .as(
+              SortedMap.from(
+                windows.keysIterator.map(_ -> Some(Hash("b2" * 32))).toList :+ (extraMg -> Some(Hash("c3" * 32)))
+              )
+            )
+        )
+      )
+      extra <- tryProduceUntilSome(
+        extraProducer,
+        startOrd = 4150L,
+        EtaPeriod.Zero,
+        pending = pending,
+        maxAttempts = 5,
+        committee = Set(extraRig.selfPeerId)
+      )
+      missingCount <- missingCalls.get
+      extraCount <- extraCalls.get
+      missingPublished <- missingRig.recorded
+      extraPublished <- extraRig.recorded
+    } yield
+      expect.all(
+        missing.isEmpty,
+        extra.isEmpty,
+        missingCount > 0,
+        extraCount > 0,
+        missingPublished.isEmpty,
+        extraPublished.isEmpty
+      )
   }
 
   // ===========================================================================

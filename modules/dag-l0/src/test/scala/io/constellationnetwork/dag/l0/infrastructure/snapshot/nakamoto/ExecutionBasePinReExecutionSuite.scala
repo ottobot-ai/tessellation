@@ -3,7 +3,7 @@ package io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto
 import java.security.KeyPair
 
 import cats.data.{NonEmptyList, NonEmptySet}
-import cats.effect.{IO, Resource}
+import cats.effect.{IO, Ref, Resource}
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
@@ -16,7 +16,12 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, PinnedCurrencyInfoReader}
-import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofSlashedReader, InvalidStateProofValidator}
+import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{
+  InvalidStateProofBatchReplay,
+  InvalidStateProofSlashedReader,
+  InvalidStateProofValidator
+}
+import io.constellationnetwork.node.shared.domain.statechannel.FeeCalculatorConfig
 import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
 import io.constellationnetwork.node.shared.infrastructure.sharding.{
@@ -24,14 +29,16 @@ import io.constellationnetwork.node.shared.infrastructure.sharding.{
   ShardCheckpointWiring,
   TestCheckpointDutyValidator
 }
+import io.constellationnetwork.node.shared.infrastructure.snapshot.CurrencySnapshotContextFunctions
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.ShardCheckpointGl0AcceptanceManager
 import io.constellationnetwork.node.shared.snapshot.currency.CurrencySnapshotEvent
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
+import io.constellationnetwork.schema.currencyMessage.{CurrencyMessage, MessageOrdinal, MessageType}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.height.{Height, SubHeight}
-import io.constellationnetwork.schema.mpt.{GlobalStateConverter, GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.nakamoto.slot.{Slot => SlotT}
 import io.constellationnetwork.schema.peer.PeerId
@@ -47,6 +54,10 @@ import io.constellationnetwork.security.mpt.storages.MptStateStorage
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.signature.{Signed, Signing}
+import io.constellationnetwork.serde.ImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.addressSetImmutableCodec
+import io.constellationnetwork.serde.codecs.instances.HashCodec.{immutableCodec => hashImmutableCodec}
+import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.shared.sharedKryoRegistrar
 import io.constellationnetwork.statechannel.StateChannelSnapshotBinary
 
@@ -86,6 +97,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
   private val anchorOrd: SnapshotOrdinal = ord(1000L)
   private val shardZero: ShardId = ShardId.unsafeApply(0)
   private val epochZero: EtaPeriod = EtaPeriod(0L)
+  private val baseStateChannelTip: Hash = Hash("a1" * 32)
 
   private def unsignedIncremental(snapOrdinal: Long): CurrencyIncrementalSnapshot =
     CurrencyIncrementalSnapshot(
@@ -152,6 +164,15 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       bytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](state)
       producer <- InMemoryMerklePatriciaProducer.make[IO](bytes)
       store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+      mg = state.firstKey
+      _ <- store.insert[Hash](
+        GlobalStateKey.metagraph(mg, GlobalStateFieldId.LastStateChannelSnapshotHashes),
+        baseStateChannelTip
+      )
+      indexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+      _ <- store.insert[SortedSet[Address]](indexKey, SortedSet(mg))
+      currencyIndexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      _ <- store.insert[SortedSet[Address]](currencyIndexKey, SortedSet(mg))
       _ <- store.commit(atOrdinal)
     } yield store
 
@@ -207,19 +228,57 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       .toHashed[IO]
   }
 
-  private def mkPinnedHistory(
+  private def mkPinnedHistoryForState(
     dir: fs2.io.file.Path,
-    mg: Address,
-    baseIncremental: Signed[CurrencyIncrementalSnapshot]
+    state: MgState,
+    stateChannelTips: SortedMap[Address, Hash],
+    stateChannelTipIndex: SortedSet[Address],
+    currencyIndex: SortedSet[Address],
+    globalBalances: SortedMap[Address, Balance]
   )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
     for {
-      baseBytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](mgState(mg, baseIncremental, baseInfo))
-      baseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](baseBytes)
+      baseBytes <- GlobalStateConverter.currencySnapshotMgEntries[IO](state)
+      producer <- InMemoryMerklePatriciaProducer.make[IO](baseBytes)
+      store <- MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+      _ <- stateChannelTips.toList.traverse_ {
+        case (address, tip) =>
+          store.insert[Hash](GlobalStateKey.metagraph(address, GlobalStateFieldId.LastStateChannelSnapshotHashes), tip)
+      }
+      stateChannelIndexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+      _ <- store.insert[SortedSet[Address]](stateChannelIndexKey, stateChannelTipIndex)
+      currencyIndexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+      _ <- store.insert[SortedSet[Address]](currencyIndexKey, currencyIndex)
+      balanceIndexKey <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.Balances)
+      _ <- globalBalances.toList.traverse_ {
+        case (address, balance) =>
+          store.insert[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, address), balance)
+      }
+      _ <- store.insert[SortedSet[Address]](balanceIndexKey, globalBalances.keySet.to(SortedSet))
+      pinnedBytes <- store.allEntriesAsBytes
+      baseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](pinnedBytes)
       byteStore <- MptStateStorage.make[IO](dir)
-      _ <- byteStore.writeState(executionBase, baseBytes)
+      _ <- byteStore.writeState(executionBase, pinnedBytes)
       pinnedSnap <- mkHashed(executionBase, Some(baseRoot))
       resolver = (o: SnapshotOrdinal) => (if (o === executionBase) pinnedSnap.some else none).pure[IO]
     } yield PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+
+  private def mkPinnedHistory(
+    dir: fs2.io.file.Path,
+    mg: Address,
+    baseIncremental: Signed[CurrencyIncrementalSnapshot],
+    includeStateChannelTipTarget: Boolean = true,
+    includeStateChannelTipIndexMember: Boolean = true,
+    includeCurrencyIndexMember: Boolean = true,
+    globalBalances: SortedMap[Address, Balance] = SortedMap.empty
+  )(implicit h: Hasher[IO], js: JsonSerializer[IO]): IO[PinnedCurrencyInfoReader[IO]] =
+    mkPinnedHistoryForState(
+      dir,
+      mgState(mg, baseIncremental, baseInfo),
+      Option.when(includeStateChannelTipTarget)(mg -> baseStateChannelTip).toList.to(SortedMap),
+      if (includeStateChannelTipIndexMember) SortedSet(mg) else SortedSet.empty,
+      if (includeCurrencyIndexMember) SortedSet(mg) else SortedSet.empty,
+      globalBalances
+    )
 
   private def liveReaderAt(live: MptStore[IO, GlobalStateKey]): SnapshotOrdinal => IO[Option[GlobalStateReader[IO]]] =
     _ => GlobalStateReader.fromMptStore[IO](live).some.pure[IO]
@@ -275,10 +334,42 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
       signedNext <- forAsyncHasher[IO, CurrencyIncrementalSnapshot](creation.artifact, metagraphKey)
       contentBytes <- JsonSerializer[IO].serialize(signedNext)
       binary <- forAsyncHasher[IO, StateChannelSnapshotBinary](
-        StateChannelSnapshotBinary(Hash.empty, contentBytes, SnapshotFee.MinValue),
+        StateChannelSnapshotBinary(baseStateChannelTip, contentBytes, SnapshotFee.MinValue),
         metagraphKey
       )
     } yield NonEmptyList.one(binary)
+
+  private def mkPositiveFeeWindow(
+    metagraphKey: KeyPair,
+    ownerMessage: Signed[CurrencyMessage],
+    fee: SnapshotFee
+  )(
+    implicit h: Hasher[IO],
+    js: JsonSerializer[IO],
+    sp: SecurityProvider[IO]
+  ): IO[(Signed[CurrencyIncrementalSnapshot], NonEmptyList[Signed[StateChannelSnapshotBinary]])] =
+    for {
+      firstValue <- CurrencyIncrementalSnapshot.fromCurrencySnapshot[IO](CurrencySnapshot.mkGenesis(Map.empty, None, None))(
+        implicitly[cats.Parallel[IO]],
+        implicitly[cats.effect.Async[IO]],
+        h,
+        js,
+        CurrencyStateProofSelector.instance
+      )
+      first <- forAsyncHasher[IO, CurrencyIncrementalSnapshot](firstValue, metagraphKey)
+      firstHash <- first.toHashed[IO].map(_.hash)
+      secondValue = firstValue.copy(
+        ordinal = SnapshotOrdinal.unsafeApply(1L),
+        lastSnapshotHash = firstHash,
+        messages = Some(SortedSet(ownerMessage))
+      )
+      second <- forAsyncHasher[IO, CurrencyIncrementalSnapshot](secondValue, metagraphKey)
+      content <- js.serialize(second)
+      binary <- forAsyncHasher[IO, StateChannelSnapshotBinary](
+        StateChannelSnapshotBinary(baseStateChannelTip, content, fee),
+        metagraphKey
+      )
+    } yield first -> NonEmptyList.one(binary)
 
   private final case class RegisteredCheckpoint(
     checkpoint: ShardCheckpoint,
@@ -401,7 +492,7 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         baseIncremental <- signedIncremental(5L, metagraphKey)
         harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
         validWindow <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
-        validBinaryHash <- validWindow.last.toHashed[IO].map(_.hash)
+        validBinaryHash <- Hasher[IO].hash(validWindow.last.value)
         invalidChild <- forAsyncHasher[IO, StateChannelSnapshotBinary](
           StateChannelSnapshotBinary(validBinaryHash, Array[Byte](0x01, 0x02, 0x03), SnapshotFee.MinValue),
           metagraphKey
@@ -459,9 +550,13 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
         attestedRoot = attestedRootOpt.getOrElse(Hash.empty)
         checkpointRig <- mkCheckpoint(mg, window, attestedRoot)
         checkpoint = checkpointRig.checkpoint
-        followerReplay = mkReplay(harness, productionReaderAt(pinned))
+        followerReplay = ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
+          harness.processor,
+          productionReaderAt(pinned),
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
         validator = InvalidStateProofValidator.make[IO](
-          (a, bins, anchor, base) => followerReplay(a, bins, anchor, base).map(_.getOrElse(Hash.empty)),
+          followerReplay,
           InvalidStateProofSlashedReader.neverSlashed[IO],
           checkpointRig.acceptanceManager.verifyExecutionCertificate
         )
@@ -476,6 +571,288 @@ object ExecutionBasePinReExecutionSuite extends MutableIOSuite {
           liveAheadOrdinal.contains(liveAhead),
           attestedRoot =!= Hash.empty,
           verdict == Left(InvalidStateProofRejection.DisputeNotUpheld(attestedRoot, attestedRoot))
+        )
+    }
+  }
+
+  test("indexed parent-tip gap defers replay and cannot become watchtower fraud or slash evidence") { res =>
+    implicit val (ks, h, js, sp) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        mg = PublicKeyOps(metagraphKey.getPublic).toAddress
+        baseIncremental <- signedIncremental(5L, metagraphKey)
+        harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
+        window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
+        corruptPinned <- mkPinnedHistory(dir, mg, baseIncremental, includeStateChannelTipTarget = false)
+        replay = mkReplay(harness, productionReaderAt(corruptPinned))
+        replayed <- replay(mg, window, anchorOrd, executionBase)
+        attestedRoot = Hash("c3" * 32)
+        checkpointRig <- mkCheckpoint(mg, window, attestedRoot)
+        checkpoint = checkpointRig.checkpoint
+        validator = InvalidStateProofValidator.make[IO](
+          ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
+            harness.processor,
+            productionReaderAt(corruptPinned),
+            globalSnapshotLookup(harness.initialGlobalSnapshot)
+          ),
+          InvalidStateProofSlashedReader.neverSlashed[IO],
+          checkpointRig.acceptanceManager.verifyExecutionCertificate
+        )
+        challengerKp <- KeyPairGenerator.makeKeyPair[IO]
+        challengerId = PeerId.fromPublic(challengerKp.getPublic)
+        _ <- checkpointRig.checkpointSigner.preregisterGenesis(challengerKp, challengerId)
+        evidence <- mkEvidence(checkpoint, mg, challengerKp, challengerId, attestedRoot, Hash("d4" * 32))
+        verdict <- validator.validate(evidence)
+      } yield
+        expect.all(
+          replayed.isEmpty,
+          verdict == Left(InvalidStateProofRejection.CannotRederive(mg))
+        )
+    }
+  }
+
+  test("checkpoint fraud replay maps swallowed currency-recreation failures to Unavailable, never proven invalidity") { res =>
+    implicit val (ks, h, js, sp) = res
+    Files[IO].tempDirectory.use { dir =>
+      val retainedInputFailure = new IllegalStateException("retained GL0 dependency unavailable")
+      val failingContextFns = new CurrencySnapshotContextFunctions[IO] {
+        def createContext(
+          context: CurrencySnapshotContext,
+          lastArtifact: Signed[CurrencyIncrementalSnapshot],
+          signedArtifact: Signed[CurrencyIncrementalSnapshot],
+          getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+        )(implicit hasher: Hasher[IO]): IO[CurrencySnapshotContext] = IO.raiseError(retainedInputFailure)
+      }
+
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        mg = PublicKeyOps(metagraphKey.getPublic).toAddress
+        baseIncremental <- signedIncremental(5L, metagraphKey)
+        creatorHarness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
+        window <- mkRealWindow(creatorHarness, mg, metagraphKey, baseIncremental)
+        failingHarness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(
+          Map.empty,
+          contextFnsOverride = failingContextFns.some
+        )
+        pinned <- mkPinnedHistory(dir, mg, baseIncremental)
+        replay = ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
+          failingHarness.processor,
+          productionReaderAt(pinned),
+          globalSnapshotLookup(failingHarness.initialGlobalSnapshot)
+        )
+        result <- replay(SortedMap(mg -> window), anchorOrd, executionBase)
+      } yield expect(result == InvalidStateProofBatchReplay.Unavailable)
+    }
+  }
+
+  test("one-sided pinned currency/tip presence cannot enter shard currency replay") { res =>
+    implicit val (ks, h, js, sp) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        mg = PublicKeyOps(metagraphKey.getPublic).toAddress
+        baseIncremental <- signedIncremental(5L, metagraphKey)
+        harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
+        window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
+        currencyOnly <- mkPinnedHistory(
+          dir / "currency-only",
+          mg,
+          baseIncremental,
+          includeStateChannelTipTarget = false,
+          includeStateChannelTipIndexMember = false
+        )
+        tipOnly <- mkPinnedHistory(
+          dir / "tip-only",
+          mg,
+          baseIncremental,
+          includeCurrencyIndexMember = false
+        )
+        currencyOnlyReplay = mkReplay(harness, productionReaderAt(currencyOnly))
+        tipOnlyReplay = mkReplay(harness, productionReaderAt(tipOnly))
+        currencyOnlyRoot <- currencyOnlyReplay(mg, window, anchorOrd, executionBase)
+        tipOnlyRoot <- tipOnlyReplay(mg, window, anchorOrd, executionBase)
+      } yield expect.all(currencyOnlyRoot.isEmpty, tipOnlyRoot.isEmpty)
+    }
+  }
+
+  test("receiver batch replay strictly materializes one pinned base for the complete multi-MG checkpoint") { res =>
+    implicit val (ks, h, js, sp) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+        mg = PublicKeyOps(metagraphKey.getPublic).toAddress
+        otherMg = addr("batch-second-mg")
+        baseIncremental <- signedIncremental(5L, metagraphKey)
+        harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(Map.empty)
+        window <- mkRealWindow(harness, mg, metagraphKey, baseIncremental)
+        pinned <- mkPinnedHistory(dir, mg, baseIncremental)
+        delegateOpt <- productionReaderAt(pinned)(executionBase)
+        delegate <- IO.fromOption(delegateOpt)(new IllegalStateException("missing retained test reader"))
+        currencyIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastCurrencySnapshots)
+        tipIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.LastStateChannelSnapshotHashes)
+        balanceIndex <- GlobalStateKey.activeAddressIndexKey[IO](GlobalStateFieldId.Balances)
+        currencyIndexReads <- Ref.of[IO, Int](0)
+        tipIndexReads <- Ref.of[IO, Int](0)
+        balanceIndexReads <- Ref.of[IO, Int](0)
+        counting = new GlobalStateReader[IO] {
+          def get[V: ImmutableCodec](key: GlobalStateKey): IO[Option[V]] = delegate.get[V](key)
+          def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
+            currencyIndexReads.update(_ + 1).whenA(key === currencyIndex) >>
+              tipIndexReads.update(_ + 1).whenA(key === tipIndex) >>
+              balanceIndexReads.update(_ + 1).whenA(key === balanceIndex) >>
+              delegate.getStrict[V](key)
+          def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] = delegate.getMany[V](keys)
+          def getAllForPrefix[V: ImmutableCodec](prefix: Hex): IO[Map[Hex, V]] = delegate.getAllForPrefix[V](prefix)
+          def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): IO[List[StrictMptEntry[V]]] =
+            delegate.getAllForPrefixStrict[V](prefix)
+        }
+        replay = ShardCheckpointWiring.reExecDerivationsAtPinnedBaseBatch[IO](
+          harness.processor,
+          _ => counting.some.pure[IO],
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
+        roots <- replay(SortedMap(mg -> window, otherMg -> window), anchorOrd, executionBase)
+        currencyReads <- currencyIndexReads.get
+        tipReads <- tipIndexReads.get
+        balanceReads <- balanceIndexReads.get
+      } yield
+        expect.all(
+          roots.keySet == Set(mg, otherMg),
+          roots.get(mg).flatten.isEmpty,
+          roots.get(otherMg).flatten.isEmpty,
+          currencyReads == 1,
+          tipReads == 1,
+          balanceReads == 1
+        )
+    }
+  }
+
+  test("checkpoint batch serializes a shared positive-fee payer and withholds every root on overspend") { res =>
+    implicit val (ks, h, js, sp) = res
+
+    val fee = SnapshotFee(10L)
+    val feeConfigs = SortedMap(
+      SnapshotOrdinal.MinValue -> FeeCalculatorConfig(
+        baseFee = 1L,
+        stakingWeight = BigDecimal(0),
+        computationalCost = 1L,
+        proWeight = BigDecimal(0)
+      )
+    )
+    val emptyInfo = CurrencySnapshotInfo(
+      lastTxRefs = SortedMap.empty,
+      balances = SortedMap.empty,
+      lastMessages = None,
+      lastFeeTxRefs = None,
+      lastAllowSpendRefs = None,
+      activeAllowSpends = None,
+      globalSnapshotSyncView = None,
+      lastTokenLockRefs = None,
+      activeTokenLocks = None
+    )
+    val contextFns = new CurrencySnapshotContextFunctions[IO] {
+      def createContext(
+        context: CurrencySnapshotContext,
+        lastArtifact: Signed[CurrencyIncrementalSnapshot],
+        signedArtifact: Signed[CurrencyIncrementalSnapshot],
+        getGlobalSnapshotByOrdinal: SnapshotOrdinal => IO[Option[Hashed[GlobalIncrementalSnapshot]]]
+      )(implicit hasher: Hasher[IO]): IO[CurrencySnapshotContext] = {
+        val ownerMessage = signedArtifact.value.messages.flatMap(_.find(_.value.messageType === MessageType.Owner))
+        val lastMessages = ownerMessage.map(message => SortedMap[MessageType, Signed[CurrencyMessage]](MessageType.Owner -> message))
+        context.copy(snapshotInfo = context.snapshotInfo.copy(lastMessages = lastMessages)).pure[IO]
+      }
+    }
+
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        payerKey <- KeyPairGenerator.makeKeyPair[IO]
+        metagraphKeyA <- KeyPairGenerator.makeKeyPair[IO]
+        metagraphKeyB <- KeyPairGenerator.makeKeyPair[IO]
+        payer = payerKey.getPublic.toAddress
+        mgA = metagraphKeyA.getPublic.toAddress
+        mgB = metagraphKeyB.getPublic.toAddress
+        ownerMessageA <- forAsyncHasher[IO, CurrencyMessage](
+          CurrencyMessage(MessageType.Owner, payer, mgA, MessageOrdinal.MinValue),
+          payerKey
+        )
+        ownerMessageB <- forAsyncHasher[IO, CurrencyMessage](
+          CurrencyMessage(MessageType.Owner, payer, mgB, MessageOrdinal.MinValue),
+          payerKey
+        )
+        chainA <- mkPositiveFeeWindow(metagraphKeyA, ownerMessageA, fee)
+        chainB <- mkPositiveFeeWindow(metagraphKeyB, ownerMessageB, fee)
+        windows = SortedMap(mgA -> chainA._2, mgB -> chainB._2)
+        prior: MgState = SortedMap(
+          mgA -> Right((chainA._1, emptyInfo)),
+          mgB -> Right((chainB._1, emptyInfo))
+        )
+        tips = windows.keysIterator.map(_ -> baseStateChannelTip).to(SortedMap)
+        fundedPinned <- mkPinnedHistoryForState(
+          dir / "funded",
+          prior,
+          tips,
+          windows.keySet.to(SortedSet),
+          windows.keySet.to(SortedSet),
+          SortedMap(payer -> Balance(20L))
+        )
+        overspentPinned <- mkPinnedHistoryForState(
+          dir / "overspent",
+          prior,
+          tips,
+          windows.keySet.to(SortedSet),
+          windows.keySet.to(SortedSet),
+          SortedMap(payer -> Balance(10L))
+        )
+        harness <- GlobalSnapshotStateChannelEventsProcessorSuite.mkProcessorHarness(
+          Map.empty,
+          feeConfigs = feeConfigs,
+          contextFnsOverride = contextFns.some
+        )
+        fundedReplay = ShardCheckpointWiring.reExecDerivationsAtPinnedBaseBatch[IO](
+          harness.processor,
+          productionReaderAt(fundedPinned),
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
+        overspentReplay = ShardCheckpointWiring.reExecDerivationsAtPinnedBaseBatch[IO](
+          harness.processor,
+          productionReaderAt(overspentPinned),
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
+        fundedFraudReplay = ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
+          harness.processor,
+          productionReaderAt(fundedPinned),
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
+        overspentFraudReplay = ShardCheckpointWiring.reExecCheckpointAtPinnedBase[IO](
+          harness.processor,
+          productionReaderAt(overspentPinned),
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
+        fundedRoots <- fundedReplay(windows, anchorOrd, executionBase)
+        fundedFraudDisposition <- fundedFraudReplay(windows, anchorOrd, executionBase)
+        rawOverspent <- harness.processor.processCurrencySnapshots(
+          anchorOrd,
+          SortedMap(payer -> Balance(10L)),
+          prior,
+          windows.map { case (mg, binaries) => mg -> binaries.reverse },
+          globalSnapshotLookup(harness.initialGlobalSnapshot)
+        )
+        overspentRoots <- overspentReplay(windows, anchorOrd, executionBase)
+        overspentFraudDisposition <- overspentFraudReplay(windows, anchorOrd, executionBase)
+        canonicalFirst = windows.firstKey
+      } yield
+        expect.all(
+          fundedRoots.keySet == windows.keySet,
+          fundedRoots.values.forall(_.exists(_ =!= Hash.empty)),
+          rawOverspent.keySet == Set(canonicalFirst),
+          fundedFraudDisposition match {
+            case InvalidStateProofBatchReplay.Reproduced(roots) => roots.keySet == windows.keySet
+            case _                                              => false
+          },
+          overspentRoots.keySet == windows.keySet,
+          overspentRoots.values.forall(_.isEmpty),
+          overspentFraudDisposition == InvalidStateProofBatchReplay.Unavailable
         )
     }
   }

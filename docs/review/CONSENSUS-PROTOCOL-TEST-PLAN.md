@@ -393,6 +393,51 @@ unit test is not runtime eligibility.
 | SHARD-S-002 | For every supported N including N below kDraw/kQuorum/K, all nodes choose the same explicit mode. Impossible execution quorum does not auto-lower. Small-network Avalanche behavior is an explicit O-01 parameter/outcome; until frozen, an economic production profile that reaches that case cannot boot. |
 | SHARD-S-003 | Stake splitting, multiple registered keys, activation after eta disclosure, admission/execution/watchtower draw correlation, and adaptive key grinding cannot multiply one economic operator's eligibility beyond the ratified bound. |
 
+Current narrow `SHARD-E-002` landing: checkpoint replay consumes the complete
+multi-metagraph window in one canonical `SortedMap` fold over one retained base,
+including rooted global balances. Missing/extra output, one-sided currency/tip
+state, malformed lineage, or partial consumption withholds every root. The
+producer captures a domain/version-tagged canonical Scodec identity of that base
+before replay and byte-compares a fresh read of the exact captured ordinal
+immediately before signing, so changed/unavailable bytes defer before KES/Ed25519
+signing or publication while a newer finalized descendant does not restart replay.
+`CurrencySnapshotCompleteConsumptionSuite`, `ExecutionBasePinReExecutionSuite`,
+`ShardCheckpointProducerSuite`, and `ShardCheckpointGl0AcceptanceManagerSuite`
+force these boundaries, including outer-lineage rejection, a shared positive-fee
+payer, and all-or-nothing overspend. This is not closure of
+`SHARD-E-002`: the wire still lacks the E4 diff/decisions/intents/lane/DA contract,
+and exact hash/root-bound Phase-2 authority remains `SHARD-E-003A`/P4.4.
+
+Current portable-fraud-adjudication landing uses the same complete ordered
+checkpoint-batch replay once per verdict. The evidence metagraph selects only the
+attested root to compare; it does not reduce the replay window. A reproduced-root
+mismatch upholds. For a structurally certificate-valid checkpoint, the only
+non-root execution success is an explicit typed `ProvenInvalidTransition`;
+unavailable history, thrown replay, and generic incomplete legacy output map to
+`Unavailable` and cannot slash
+(`InvalidStateProofValidator.scala:168-215`;
+`ShardCheckpointWiring.scala:239-314`). The node-local fraud emitter independently
+verifies the complete execution certificate before replay or publication
+(`WatchtowerFraudProofEmitter.scala:90-109`). `WT-002A` remains HIGH/RED because
+shared-fee oversubscription is fail-closed but currently surfaces only as generic
+incomplete output, so a colluding quorum cannot be convicted for signing that
+unexecutable batch.
+
+`WT-002B` is a separate HIGH/RED certificate-boundary gap.
+`verifyExecutionCertificate` calls the ordinary structural `preCheck`; an exact
+quorum can sign a checkpoint whose `includedSnapshots` and
+`perMetagraphMptRoots` keysets differ, but the keyset rejection occurs before the
+signature fold returns an authenticated signer set
+(`ShardCheckpointGl0AcceptanceManager.scala:336-345,462-528`). Both the emitter
+and portable validator stop at that combined gate, making the validator's
+missing-attested-root conviction branch unreachable
+(`WatchtowerFraudProofEmitter.scala:90-109`;
+`InvalidStateProofValidator.scala:168-215`). The repair must produce a typed
+authenticated execution-signature/quorum capability independently of structural
+validity. Ordinary acceptance still applies and requires the structural checks;
+only portable adjudication may consume the authenticated signer capability to
+convict a deterministic structural violation.
+
 `SHARD-C-009` remains RED while embedded validation reads a receiver-local shard
 store. Its oracle runs the same child artifact on fresh validators with and without
 prior shard gossip and requires the same verdict from portable proposal-parent-
@@ -413,8 +458,10 @@ as roster and eta, and a local mismatch halts before validation.
 
 | Test ID | Required scenario and assertion |
 |---|---|
-| WT-001 | A colluding execution threshold signs a wrong diff/root; assigned noncommittee watchtower replay detects it, and the ratified adjudicator independently computes the mismatch from exact retained inputs/base before rollback or slash. |
-| WT-002 | Unavailable base/input, peer timeout, local crash, different but valid custom-data availability view, or stale checkpoint cannot slash an honest signer. |
+| WT-001 | A colluding execution threshold signs a wrong diff/root; assigned noncommittee watchtower replay detects it, and the ratified adjudicator authenticates the execution certificate and replays the complete ordered multi-MG checkpoint batch exactly once from retained inputs/base. Evidence MG is only the compared-root selector; selecting one MG cannot erase shared dependencies before rollback or slash. |
+| WT-002 | Unavailable base/input, peer timeout, local crash, thrown recreation, generic incomplete legacy output, different but valid custom-data availability view, or stale checkpoint yields `Unavailable`/no-slash. For a structurally valid checkpoint, only reproduced-root mismatch or an explicit typed deterministic-invalid transition may uphold. |
+| WT-002A | Two MGs share a fee payer whose balance covers only the first canonical debit. Ordinary replay withholds the complete checkpoint, while portable adjudication distinguishes an explicit deterministic oversubscription reject from unavailable/swallowed dependency failure. The former convicts the execution signers; the latter cannot slash. This remains RED until the legacy processor returns the typed reject. |
+| WT-002B | A distinct valid execution quorum signs the exact checkpoint preimage with one MG in `includedSnapshots` and no corresponding `perMetagraphMptRoots` entry. Ordinary intake/adoption rejects the structural mismatch. A separate authenticated signature/quorum proof still identifies only the actual signers, and portable adjudication convicts them for deterministic missing-root invalidity. Under-quorum, duplicate, nonmember, bad Ed25519/KES/VRF, or historically unresolved signers never produce that capability or slash. This remains RED while `verifyExecutionCertificate` couples signer authentication to structural validity. |
 | WT-003 | Evidence identifies only actual signers, is byte-deterministic, applies once, debits real bonded principal, caps reward, and changes the next eligible roster at the ratified anchor. |
 | WT-004 | Partition/eclipsed watchtowers delay only the affected checkpoint. Before required positive coverage, it is not GL0-inclusion-eligible and cannot create any local/cross-MG economic derivative; unrelated GL0/shard work progresses. |
 | WT-005 | Watchtower selection is deterministic from canonical state, excludes execution members as specified, provides the required coverage, and cannot be producer-chosen/grinded. |

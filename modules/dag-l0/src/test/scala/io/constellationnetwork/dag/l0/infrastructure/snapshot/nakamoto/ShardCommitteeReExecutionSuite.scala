@@ -131,7 +131,9 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
     ShardCheckpointProducer.make[IO](
       shardId = shardZero,
       chainStore = chainStore,
-      finalizedBasePerMgTip = SortedMap.empty[Address, Hash].pure[IO],
+      executionBaseF = ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, SortedMap.empty[Address, Hash]).some.pure[IO],
+      executionBaseAt =
+        _ => ShardCheckpointProducer.PinnedExecutionBase(SnapshotOrdinal.MinValue, SortedMap.empty[Address, Hash]).some.pure[IO],
       adoptedPerMgTip = SortedMap.empty[Address, Hash].pure[IO],
       slotLeader = slotLeader,
       publisher = ShardCheckpointPublisher.noop[IO],
@@ -144,7 +146,6 @@ object ShardCommitteeReExecutionSuite extends MutableIOSuite {
       shardEtaFor = _ => fixedShardEta.pure[IO],
       staircaseDeltaSlots = 5,
       derivePerMgState = replay,
-      executionBaseOrdinalF = SnapshotOrdinal.MinValue.pure[IO],
       lastPhase2Checkpoint = none.pure[IO],
       republishEveryTicks = 1
     )

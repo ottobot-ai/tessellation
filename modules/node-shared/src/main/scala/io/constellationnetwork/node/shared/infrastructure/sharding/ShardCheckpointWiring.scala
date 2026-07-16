@@ -7,21 +7,20 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{Map, SortedMap}
 
-import io.constellationnetwork.currency.schema.currency.{CurrencyIncrementalSnapshot, CurrencySnapshot, CurrencySnapshotInfo}
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.config.types.ShardingConfig
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
-import io.constellationnetwork.node.shared.domain.nakamoto.slashing.SlashCooldownReader
+import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{InvalidStateProofBatchReplay, SlashCooldownReader}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   GlobalSnapshotStateChannelEventsProcessor,
-  ShardCheckpointGl0AcceptanceManager
+  ShardCheckpointGl0AcceptanceManager,
+  SpendTransactionBalanceManager
 }
 import io.constellationnetwork.numerics.Ratio
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.mpt.GlobalStateConverter
 import io.constellationnetwork.schema.nakamoto.EtaPeriod
 import io.constellationnetwork.schema.peer.PeerId
@@ -87,12 +86,11 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   * Algorand player-replaceability (a per-`(shard, epoch)` membership VRF whose output is unknowable from the VK alone, verified with
   * `CommitteeSortition.verifyMembership`) is a v2 hardening.
   *
-  * '''reExecuteDerivation — transitional caller-supplied replay.''' Current receive and GL0-adoption paths re-run each MG derivation and
-  * compare the recomputed `mptRoot` byte-for-byte against the committee-signed value. The closure is supplied as a parameter so each call
-  * site passes the SAME [[reExecDerivationAtPinnedBase]] closure built from its own [[GlobalSnapshotStateChannelEventsProcessor]] and a
-  * reader for the signed Phase-2 execution base. That is what makes the current producer's roots and every verifier's recomputed roots
-  * byte-identical. The `None`/[[noReExecDerivation]] fallback (fail-closed `Hash.empty`) remains for callers that have not wired a
-  * processor.
+  * '''reExecuteDerivation — transitional caller-supplied replay.''' Current receive and GL0-adoption paths replay the complete checkpoint
+  * batch in one canonical metagraph order and compare every recomputed `mptRoot` byte-for-byte against the committee-signed value. Each
+  * production call site wires [[reExecDerivationsAtPinnedBaseBatch]] from its [[GlobalSnapshotStateChannelEventsProcessor]] and a reader
+  * for the retained execution base. The scalar [[reExecDerivationAtPinnedBase]] delegates to that batch implementation for focused one-MG
+  * callers. The `None`/[[noReExecDerivation]] fallback (fail-closed `Hash.empty`) remains for callers without a processor.
   *
   * '''HOCON rule''' (per `[[feedback-prefer-hocon-over-sysenv]]`): every tunable is read off the typed [[ShardingConfig]] passed in by the
   * caller from `cfg.nakamoto.sharding`. No `sys.env.get` anywhere in this helper.
@@ -144,11 +142,11 @@ object ShardCheckpointWiring {
     *   - Empty checkpoints are rejected before this fallback can authorize anything.
     *   - For a content-bearing checkpoint the `Hash.empty` sentinel is the manager's CANNOT-RE-DERIVE marker: `reExecPath` buckets it as
     *     "this node can't check" and returns a plain `Rejected` — the checkpoint is DROPPED (fail-closed; the binaries do NOT enter the gl0
-    *     snapshot) but the signers are NOT slash targets. This matters because `RejectedReExecutionMismatch` now feeds the DURABLE 100%
-    *     `InvalidStateProof` slash (`GlobalSnapshotAcceptanceManager.adoptShardCheckpoints` → `WatchtowerSlashRequest`), which demands an
-    *     AFFIRMATIVE pinned-base re-derivation mismatch as evidence — a sentinel from an unwired closure (or an unresolvable pinned
-    *     execution-base) is not evidence of committee deviation. The checkpoint is never admitted while replay is unavailable, and honest
-    *     signers are not slashed for a local inability to replay.
+    *     snapshot) and the signers are NOT slash targets. `RejectedReExecutionMismatch` is only a typed local rejection/diagnostic result;
+    *     it cannot reach the consensus slash sink. Only artifact-carried fraud evidence independently revalidated by every GL0 node may
+    *     create a `WatchtowerSlashRequest`. A sentinel from an unwired closure (or an unresolvable pinned execution-base) is not evidence
+    *     of committee deviation. The checkpoint is never admitted while replay is unavailable, and honest signers are not slashed for a
+    *     local inability to replay.
     */
   def noReExecDerivation[F[_]: Async]
     : (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash] =
@@ -161,8 +159,9 @@ object ShardCheckpointWiring {
     * pinned prior, and `currencySnapshotMgRoot` commits the recreated result. So every rail that recomputes the root for comparison against
     * `perMetagraphMptRoots(mg)` — the gl0 produce/watchtower rail (`GlobalSnapshotConsensus.finalizedReaderAt`), the SharedServices
     * unconditional `reExecuteDerivation`, and the SharedServices `createContext` fraud-proof validator — MUST read the SAME pinned base the
-    * producer executed over, or an honest committee's root is not reproduced and the mismatch feeds the 100% `InvalidStateProof` slash (the
-    * false-slash + split this pin kills). One shared definition keeps all three rails byte-identical, mirroring
+    * producer executed over, or an honest committee's root is not reproduced. A local mismatch now rejects without slashing; independently
+    * replayed, artifact-carried fraud evidence can still reach the 100% `InvalidStateProof` slash, so exact base agreement remains
+    * necessary to prevent false evidence and adopt-decision splits. One shared definition keeps all three rails byte-identical, mirroring
     * [[reExecDerivationAtPinnedBase]] itself.
     *
     * '''Resolution — ALWAYS the version-retained [[PinnedCurrencyInfoReader.pinnedReaderAt]]''' (which verifies the retained bytes
@@ -206,186 +205,202 @@ object ShardCheckpointWiring {
   def pinnedExecutionBaseOrdinal[F[_]: Async](signedBytesStore: MptStateStorage[F]): F[SnapshotOrdinal] =
     signedBytesStore.findLatestOrdinal.map(_.getOrElse(SnapshotOrdinal.MinValue))
 
-  /** The pinned per-MG derivation shared by producer and verifier. It returns only the recreated per-MG MPT root. Every GL0 verifier
-    * independently recreates the state.
-    *
-    * '''Diff base = `S(N)` from the adopted, chain-linked best-tip (PIN-4 — NOT empty-prior, NOT the undo journal).''' The committee +
-    * every verifier are gl0 nodes that ALREADY adopted checkpoint N (the chain-link guard enforces in-order adoption), so `S(N)` — the
-    * prior checkpoint's cumulative per-MG currency state — is already in their overlay best-tip. `priorStateReader` is exactly that
-    * best-tip `GlobalStateReader`; `S(N)` is reconstructed from it via [[GlobalStateConverter.reconstructCurrencyInfoFrom]] (all eight
-    * serialized `Mg*` fields, including the transitional root-excluded sync view, plus fieldId-7 allow-spends) and the fieldId-5
-    * incremental. Snapshots execute IN ORDER (chain-link), so cumulative state, allow-spends, and token-locks accumulate. The
-    * per-currency-snapshot `gl0AnchorOrdinal` is the metagraph's fee-cutover/exec CONTEXT only.
-    *
-    * '''Derivation.''' Runs the SAME full recreation as the global adopter, with finalized global-snapshot lookup, and seeds
-    * `priorLastCurrencySnapshots` with `S(N)` (`Right((priorInc, S(N)))`, or `Left(genesis)` at the metagraph's genesis window, or absent
-    * for a never-seen MG) INSTEAD of `SortedMap.empty`. The LAST resulting per-MG `CurrencySnapshotWithState` is `next` (mirrors
-    * `calculateLastCurrencySnapshots`).
-    *
-    * '''Root (PIN-1).''' `root = GlobalStateConverter.currencySnapshotMgRoot(SortedMap(mg -> next))` — the COMPONENT-ADDRESSABLE per-MG MPT
-    * root (the `rootHash` of the standalone trie over the MG's fieldId-5 incremental + `infoSubFields` `Mg*` entries, one leaf per
-    * account), NOT the old flat `Hasher.hash((incrementalRoot, infoRoot))` (which could not back a single-leaf inclusion proof) and NOT the
-    * an empty-prior or Some/None-sensitive hash. This `Hash` is what `perMetagraphMptRoots(mg)` carries (that field is `SortedMap[Address,
-    * Hash]`); the gl0 verifier recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state, and `ShardSubtreeProofService`
-    * witnesses a single `(field, account)` leaf against it. '''All three PIN-1 sites + TaskB must route through
-    * `currencySnapshotMgRoot`.'''
+  /** Capture the execution ordinal, complete currency state, every rooted state-channel tip, and all rooted global balances from the same
+    * retained reader view. A missing reader yields `None`; strict index/entry decoding failures remain effect failures, so neither replay
+    * nor a validity signature can follow malformed state.
+    */
+  def pinnedExecutionBase[F[_]: Async: Hasher](
+    executionBaseOrdinalF: F[SnapshotOrdinal],
+    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]]
+  ): F[Option[ShardCheckpointProducer.PinnedExecutionBase]] = {
+    import GlobalStateReaderOps._
+
+    executionBaseOrdinalF.flatMap { ordinal =>
+      priorReaderAt(ordinal).flatMap(
+        _.traverse(reader =>
+          (
+            reader.materializeLastCurrencySnapshots,
+            reader.materializeLastStateChannelSnapshotHashes,
+            SpendTransactionBalanceManager.make(reader).materializeAllBalancesFromMpt
+          ).tupled.map {
+            case (priorCurrencySnapshots, perMgTips, balances) =>
+              ShardCheckpointProducer.PinnedExecutionBase(ordinal, perMgTips, priorCurrencySnapshots, balances)
+          }
+        )
+      )
+    }
+  }
+
+  private def unavailableBatch(
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]]
+  ): SortedMap[Address, Option[Hash]] =
+    windows.keysIterator.map(_ -> Option.empty[Hash]).to(SortedMap)
+
+  /** Replay one complete checkpoint batch against one immutable execution base. The processor's SortedMap fold is the consensus order for
+    * shared fee payers, so every later metagraph observes the absolute balance updates accepted for earlier metagraphs. A generic
+    * incomplete result is conservatively unavailable: legacy replay uses the same prefix shape for deterministic rejection and swallowed
+    * local dependency failures. It cannot become slash evidence until the processor supplies a typed deterministic rejection.
+    */
+  private def replayCheckpointAtResolvedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    processor: GlobalSnapshotStateChannelEventsProcessor[F],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    gl0AnchorOrdinal: SnapshotOrdinal,
+    executionBase: ShardCheckpointProducer.PinnedExecutionBase
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[InvalidStateProofBatchReplay] = {
+    val logger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring.reExecResolved")
+    val basePairsConsistent = windows.keysIterator.forall { mg =>
+      executionBase.priorCurrencySnapshots.contains(mg) === executionBase.perMgTips.contains(mg)
+    }
+    val expectedParentHashes = SortedMap.from(windows.keysIterator.map { mg =>
+      mg -> executionBase.perMgTips.getOrElse(mg, Hash.empty)
+    })
+
+    if (!basePairsConsistent)
+      logger
+        .warn("[execution-base-pin] checkpoint has a one-sided currency/tip prior — OMIT complete batch")
+        .as[InvalidStateProofBatchReplay](InvalidStateProofBatchReplay.Unavailable)
+    else
+      Ref
+        .of[F, Boolean](false)
+        .flatMap { missingHistoricalSnapshot =>
+          val trackedGlobalSnapshotLookup = (ordinal: SnapshotOrdinal) =>
+            getGlobalSnapshotByOrdinal(ordinal).flatTap(snapshot => missingHistoricalSnapshot.set(true).whenA(snapshot.isEmpty))
+
+          processor
+            .processCurrencySnapshotsWithCompleteConsumption(
+              gl0AnchorOrdinal,
+              executionBase.balances,
+              executionBase.priorCurrencySnapshots,
+              expectedParentHashes,
+              windows,
+              trackedGlobalSnapshotLookup
+            )
+            .flatMap(replay => missingHistoricalSnapshot.get.tupleLeft(replay))
+            .flatMap {
+              case (_, true) =>
+                logger
+                  .warn("[execution-base-pin] checkpoint replay could not resolve referenced GL0 history — OMIT complete batch")
+                  .as[InvalidStateProofBatchReplay](InvalidStateProofBatchReplay.Unavailable)
+              case (replay, false) =>
+                val complete = replay.allInputsCompletelyConsumed && replay.completeResults.keySet === windows.keySet
+
+                if (!complete)
+                  logger
+                    .warn("[execution-base-pin] checkpoint batch incomplete without typed deterministic cause — OMIT complete batch")
+                    .as[InvalidStateProofBatchReplay](InvalidStateProofBatchReplay.Unavailable)
+                else
+                  windows.toList.traverse {
+                    case (mg, _) =>
+                      replay.completeResult(mg).flatMap { case (pairs, _) => pairs.toList.flatMap(_._2).lastOption } match {
+                        case None => (mg -> Option.empty[Hash]).pure[F]
+                        case Some(state) =>
+                          GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> state)).map(root => mg -> root.some)
+                      }
+                  }.map[InvalidStateProofBatchReplay] { derived =>
+                    NonEmptyList.fromList(derived).flatMap(_.traverse { case (mg, root) => root.map(mg -> _) }) match {
+                      case Some(roots) => InvalidStateProofBatchReplay.Reproduced(SortedMap.from(roots.toList))
+                      case None        => InvalidStateProofBatchReplay.Unavailable
+                    }
+                  }
+            }
+        }
+        .handleErrorWith(error =>
+          logger
+            .warn(error)("[execution-base-pin] resolved-base batch replay failed — OMIT complete batch")
+            .as[InvalidStateProofBatchReplay](InvalidStateProofBatchReplay.Unavailable)
+        )
+  }
+
+  private def reExecAllAtResolvedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    processor: GlobalSnapshotStateChannelEventsProcessor[F],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]],
+    windows: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    gl0AnchorOrdinal: SnapshotOrdinal,
+    executionBase: ShardCheckpointProducer.PinnedExecutionBase
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): F[SortedMap[Address, Option[Hash]]] =
+    replayCheckpointAtResolvedBase(processor, getGlobalSnapshotByOrdinal, windows, gl0AnchorOrdinal, executionBase).map {
+      case InvalidStateProofBatchReplay.Reproduced(roots) => roots.view.mapValues(_.some).to(SortedMap)
+      case _                                              => unavailableBatch(windows)
+    }
+
+  /** Producer batch replay over the exact immutable base object that anchored the checkpoint windows. No reader is re-resolved here. */
+  def reExecDerivationsAtResolvedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    processor: GlobalSnapshotStateChannelEventsProcessor[F],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): (
+    SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    SnapshotOrdinal,
+    ShardCheckpointProducer.PinnedExecutionBase
+  ) => F[SortedMap[Address, Option[Hash]]] =
+    (windows, gl0AnchorOrdinal, executionBase) =>
+      reExecAllAtResolvedBase(processor, getGlobalSnapshotByOrdinal, windows, gl0AnchorOrdinal, executionBase)
+
+  /** Receiver batch replay resolves and strictly materializes one retained base for the complete checkpoint, then reuses it across MGs. */
+  def reExecDerivationsAtPinnedBaseBatch[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    processor: GlobalSnapshotStateChannelEventsProcessor[F],
+    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): (
+    SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    SnapshotOrdinal,
+    SnapshotOrdinal
+  ) => F[SortedMap[Address, Option[Hash]]] = {
+    val replayResolved = reExecDerivationsAtResolvedBase(processor, getGlobalSnapshotByOrdinal)
+
+    (windows, gl0AnchorOrdinal, executionBaseOrdinal) =>
+      pinnedExecutionBase(executionBaseOrdinal.pure[F], priorReaderAt).flatMap {
+        case Some(executionBase) => replayResolved(windows, gl0AnchorOrdinal, executionBase)
+        case None                => windows.keysIterator.map(_ -> Option.empty[Hash]).to(SortedMap).pure[F]
+      }
+        .handleError(_ => windows.keysIterator.map(_ -> Option.empty[Hash]).to(SortedMap))
+  }
+
+  /** Portable invalid-state-proof replay. It resolves one pinned base and executes the complete checkpoint batch exactly once. The disputed
+    * metagraph remains an evidence selector only; it never narrows execution or resets shared balances/dependencies.
+    */
+  def reExecCheckpointAtPinnedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    processor: GlobalSnapshotStateChannelEventsProcessor[F],
+    priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
+    getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
+  )(
+    implicit stateProofSelector: StateProofSelector
+  ): (
+    SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+    SnapshotOrdinal,
+    SnapshotOrdinal
+  ) => F[InvalidStateProofBatchReplay] =
+    (windows, gl0AnchorOrdinal, executionBaseOrdinal) =>
+      pinnedExecutionBase(executionBaseOrdinal.pure[F], priorReaderAt).flatMap {
+        case Some(executionBase) =>
+          replayCheckpointAtResolvedBase(processor, getGlobalSnapshotByOrdinal, windows, gl0AnchorOrdinal, executionBase)
+        case None => Async[F].pure[InvalidStateProofBatchReplay](InvalidStateProofBatchReplay.Unavailable)
+      }
+        .handleError(_ => InvalidStateProofBatchReplay.Unavailable)
+
+  /** Compatibility scalar for focused replay/fraud callers. Production checkpoint paths use [[reExecDerivationsAtPinnedBaseBatch]] so
+    * shared fee-payer balances are serialized once across the complete checkpoint. The scalar delegates to that exact batch implementation
+    * with one metagraph; it has no separate transition semantics.
     */
   def reExecDerivationAtPinnedBase[F[_]: Async: Parallel: Hasher: JsonSerializer](
     processor: GlobalSnapshotStateChannelEventsProcessor[F],
-    // Track-1 execution-base-pin: the prior reader is resolved PER CALL at the checkpoint's `executionBaseOrdinal` (the 4th closure arg), NOT fixed
-    // at construction to the node-local live base. This is what makes the producer's diff-prior + derivation-prior and every re-executor's
-    // (committee/watchtower) read the SAME pinned base `S(N)`. `None` ⇒ this node cannot resolve the pinned base (evicted below retention,
-    // or not reached) ⇒ OMIT (defer) rather than derive over a WRONG base. Callers wire only the version-retained pinned reader.
     priorReaderAt: SnapshotOrdinal => F[Option[GlobalStateReader[F]]],
-    // Currency recreation resolves the snapshot's signed `globalSyncView` through this finalized, hash-checked lookup. Supplying a
-    // node-local head or `None` would either fork the transition inputs or make the verifier fall back to trusting claimed fields.
     getGlobalSnapshotByOrdinal: SnapshotOrdinal => F[Option[Hashed[GlobalIncrementalSnapshot]]]
   )(
     implicit stateProofSelector: StateProofSelector
   ): (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Option[Hash]] = {
-    import GlobalStateReaderOps._
-    type CurrencyState = Either[Signed[CurrencySnapshot], (Signed[CurrencyIncrementalSnapshot], CurrencySnapshotInfo)]
+    val replayBatch = reExecDerivationsAtPinnedBaseBatch(processor, priorReaderAt, getGlobalSnapshotByOrdinal)
 
-    val emptyInfo: CurrencySnapshotInfo =
-      CurrencySnapshotInfo(SortedMap.empty, SortedMap.empty, None, None, None, None, None, None, None)
-
-    // [REEXEC-DIAG] (2026-06-13, REMOVE after e2e): pin why the producer emits the empty-state fallback (96271a6c) for every MG —
-    // priorState/getCurrencySnapshotInfo values, the lastStateOpt=None branch, and the SWALLOWED handleErrorWith exception.
-    val reExecDiagLogger = Slf4jLogger.getLoggerFromName[F]("ShardCheckpointWiring.reExecDiag")
-    def descPrior(p: Option[CurrencyState]): String = p match {
-      case None                     => "None"
-      case Some(Left(g))            => s"Left(genesis@${g.value.ordinal.value.value})"
-      case Some(Right((inc, info))) => s"Right(inc@${inc.value.ordinal.value.value},bal=${info.balances.size})"
-    }
-
-    /** S(N) for this MG from the adopted best-tip: `Right((priorInc, info))` (has an incremental), `Left(genesis)` (post-genesis
-      * pre-first-incremental window), or `None` (never seen by gl0 ⇒ empty prior; the genesis binary in the window seeds it).
-      */
-    def priorState(priorStateReader: GlobalStateReader[F], mg: Address): F[Option[CurrencyState]] =
-      priorStateReader.getLastIncrementalCurrencySnapshot(mg).flatMap {
-        case Some(inc) =>
-          priorStateReader
-            .getCurrencySnapshotInfo(mg)
-            .map {
-              case Some(info) => Right((inc, info)): CurrencyState
-              case None       => Right((inc, emptyInfo)): CurrencyState // defensive: incremental present but info empty
-            }
-            .map(_.some)
-        case None =>
-          priorStateReader.getLastCurrencySnapshot(mg).map(_.map(g => Left(g): CurrencyState))
-      }
-
-    (
-      mg: Address,
-      binaries: NonEmptyList[Signed[StateChannelSnapshotBinary]],
-      gl0AnchorOrdinal: SnapshotOrdinal,
-      executionBaseOrdinal: SnapshotOrdinal
-    ) =>
-      // Track-1 execution-base-pin: resolve the prior reader AT `executionBaseOrdinal` (the producer's stamped base, cluster-uniform). A `None`
-      // means this node cannot serve the pinned base (below retention, or not yet reached) — OMIT (defer) rather than seed the derivation
-      // from a WRONG base and attest a root no honest verifier reproduces.
-      priorReaderAt(executionBaseOrdinal).flatMap {
-        case None =>
-          reExecDiagLogger
-            .warn(
-              s"[execution-base-pin] mg=${mg.value.value.take(10)} cannot resolve pinned execution-base ord=${executionBaseOrdinal.value.value} " +
-                s"(evicted/not-reached) — OMIT (defer)"
-            )
-            .as(None: Option[Hash])
-        case Some(priorStateReader) =>
-          // The derivation prior is the full pinned S(N) CurrencyState; the genesis `Left` is needed to seed the state fold.
-          priorState(priorStateReader, mg).flatMap { priorOpt =>
-            val priorMap: SortedMap[Address, CurrencyState] =
-              priorOpt.fold(SortedMap.empty[Address, CurrencyState])(p => SortedMap(mg -> p))
-
-            reExecDiagLogger.info(
-              s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} anchor=${gl0AnchorOrdinal.value.value} windowSize=${binaries.size} " +
-                s"priorOpt=${descPrior(priorOpt)}"
-            ) >>
-              // Full currency recreation against the checkpoint's pinned prior and the snapshot's pinned finalized GL0 view. The structured
-              // checkpoint boundary takes the canonical OLDEST-FIRST input and refuses to derive a root unless the processor returned that
-              // exact complete Signed-binary sequence. A valid prefix followed by an invalid binary is not execution of the signed window.
-              processor
-                .processCurrencySnapshotsWithCompleteConsumption(
-                  gl0AnchorOrdinal,
-                  SortedMap.empty[Address, Balance],
-                  priorMap,
-                  SortedMap(mg -> binaries),
-                  getGlobalSnapshotByOrdinal
-                )
-                .flatMap { replay =>
-                  replay.completeResult(mg) match {
-                    case None =>
-                      reExecDiagLogger
-                        .warn(
-                          s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} checkpoint window was only partially or ambiguously processed " +
-                            s"(windowSize=${binaries.size}, disposition=${replay.consumption(mg)}) — OMIT (defer)"
-                        )
-                        .as(None: Option[Hash])
-                    case Some((pairs, _)) =>
-                      // Mirror calculateLastCurrencySnapshots: the LAST resulting state across the completely re-executed chain is `next`.
-                      val lastStateOpt: Option[CurrencyState] = pairs.toList.flatMap(_._2).lastOption
-                      lastStateOpt match {
-                        case Some(next) =>
-                          // The root and optional transport diff are cut over the full recreation output. No metagraph or committee field
-                          // replaces `infoOf(next)`.
-                          // CONTIGUITY (I3 / run-27b) — RELAXED to advisory. The window anchors at `finalizedBasePerMgTip` (S2 §4) and the diff prior
-                          // is read at `executionBaseOrdinal` — the SAME finalized base by construction — so a window chaining from the base advances
-                          // `base.ordinal` by EXACTLY `windowSize`; the old OMIT is now an invariant. Keep the check as a diagnostic only (a violation
-                          // means a base read-skew, caught fail-closed downstream by the adopter's now-unconditional GAP-1 balances/refs compare — a
-                          // drop, never silent corruption) and PROCEED to derive rather than defer (removing a false-defer liveness hazard).
-                          val contiguousWithBase: Boolean = (priorOpt, next) match {
-                            case (Some(Right((priorInc, _))), Right((nextInc, _))) =>
-                              nextInc.value.ordinal.value.value === priorInc.value.ordinal.value.value + binaries.size.toLong
-                            case _ => true
-                          }
-                          for {
-                            _ <-
-                              if (contiguousWithBase) Async[F].unit
-                              else
-                                reExecDiagLogger.warn(
-                                  s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} window NOT contiguous with pinned execution-base " +
-                                    s"(${descPrior(priorOpt)} windowSize=${binaries.size} nextOrd=${next.toOption
-                                        .map(_._1.value.ordinal.value.value)
-                                        .getOrElse(-1L)}) — base read-skew; proceeding (the adopter's full re-exec root check is fail-closed)"
-                                )
-                            // PIN-1: COMPONENT-ADDRESSABLE per-MG root — the rootHash of the MG sub-trie over the fieldId-5 incremental + the
-                            // `infoSubFields` `Mg*` entries (one leaf per account), via the shared `currencySnapshotMgRoot`. The gl0 follower
-                            // recomputes the IDENTICAL `currencySnapshotMgRoot` over its post-apply state — all three PIN-1 sites route through that
-                            // one helper, so the bytes are identical by construction.
-                            root <- GlobalStateConverter.currencySnapshotMgRoot[F](SortedMap(mg -> next))
-                            // DIAG: committee's attested per-sub-field root breakdown — match `root=` here to gl0's
-                            // `[ACCEPTANCE/ADOPT-VERIFY] attested=` line to pin the diverging half (inc vs info) + `Mg*` sub-field.
-                            cmtDiag <- GlobalStateConverter.currencySnapshotFieldRootsDiag[F](SortedMap(mg -> next))
-                            _ <- reExecDiagLogger.info(
-                              s"[REEXEC-FIELDS] mg=${mg.value.value.take(10)} root=${root.value.take(16)} $cmtDiag"
-                            )
-                          } yield Some(root): Option[Hash]
-                        case None =>
-                          // OMIT-ON-CAN'T-DERIVE (2026-06-13). The derivation produced NO state — the genesis-bootstrap race: this MG's
-                          // genesis was already consumed by an earlier shard checkpoint (perMgTip advanced past it) BUT this producer node's
-                          // best-tip prior reader has not yet seen gl0 ADOPT that genesis (the ~6-min embed/quorum warmup), so `priorOpt=None`
-                          // AND the window head is a non-genesis incremental → `processCurrencySnapshots`'s genesis-window
-                          // guard drops the window. We must NOT commit an empty-state root + empty diff: once committee-quorumed that
-                          // "couldn't-derive" sentinel is a PERMANENT lie — every gl0 later recomputes the real non-empty root from its
-                          // now-adopted S(N), mismatches the attested empty sentinel forever, and drops the MG's currency advance (the run-26
-                          // freeze). Instead OMIT this MG: its binaries stay pending, `perMgTip` does not advance, and it re-derives correctly
-                          // on a later checkpoint once the prior is adopted (the pipeline self-heals).
-                          reExecDiagLogger
-                            .warn(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} lastStateOpt=None — OMIT (defer until prior adopted)")
-                            .as(None: Option[Hash])
-                      }
-                  }
-                }
-                .handleErrorWith { e =>
-                  // A derivation crash is likewise NOT a committable state — OMIT this MG (defer) rather than attest an empty-state root
-                  // every verifier would mismatch. The MG re-derives cleanly on a later checkpoint over the same chain.
-                  reExecDiagLogger
-                    .warn(e)(s"[REEXEC-DIAG] mg=${mg.value.value.take(10)} DERIVATION CRASH → OMIT (defer)")
-                    .as(None: Option[Hash])
-                }
-          }
-      } // close priorReaderAt(executionBaseOrdinal).flatMap
+    (mg, binaries, gl0AnchorOrdinal, executionBaseOrdinal) =>
+      replayBatch(SortedMap(mg -> binaries), gl0AnchorOrdinal, executionBaseOrdinal).map(_.getOrElse(mg, None))
   }
 
   /** Build the acceptance-side sharding dependencies, gated on `cfg.numShards > 1`.
@@ -424,11 +439,12 @@ object ShardCheckpointWiring {
     *   producer can still select an older favorable epoch and its matching committee. A canonical genesis/rooted parameter commitment and
     *   exact proposal-parent hash-bound Phase-2 anchor/freshness proof remain RED consensus gates.
     * @param reExecuteDerivation
-    *   the pinned-base re-exec derivation closure. `Some(...)` recomputes the canonical per-MG root and rejects (+ flags slash signers) on
-    *   a byte-mismatch. `None` (the default) ⇒ [[noReExecDerivation]] (fail-closed: non-empty checkpoints are rejected on the `Hash.empty`
-    *   sentinel, never falsely admitted). Modelled as `Option` rather than a defaulted closure because Scala can't resolve `Async[F]` for
-    *   `noReExecDerivation[F]` at the default-arg site (the context bound is on the method, not on the default expression) — the same
-    *   constraint the GSAM `localEventsPublisher` param hits.
+    *   the pinned-base re-exec derivation closure. `Some(...)` recomputes the canonical per-MG root and returns a typed local rejection on
+    *   a byte-mismatch; that result cannot slash without separately carried and revalidated fraud evidence. `None` (the default) ⇒
+    *   [[noReExecDerivation]] (fail-closed: non-empty checkpoints are rejected on the `Hash.empty` sentinel, never falsely admitted).
+    *   Modelled as `Option` rather than a defaulted closure because Scala can't resolve `Async[F]` for `noReExecDerivation[F]` at the
+    *   default-arg site (the context bound is on the method, not on the default expression) — the same constraint the GSAM
+    *   `localEventsPublisher` param hits.
     * @param slashCooldownReader
     *   FINDING-002/EPIC-3.1 — the per-operator cooldown gate over the `Slashings` (fieldId 34) partition [[committeeFor]] excludes on.
     *   Production (`SharedServices`) passes `Some(SlashCooldownReader.fromMptStore(storages.mptStore, R))` — the SAME store + eta-period
@@ -448,6 +464,13 @@ object ShardCheckpointWiring {
     etaForEpoch: EtaPeriod => F[Array[Byte]],
     reExecuteDerivation: Option[
       (Address, NonEmptyList[Signed[StateChannelSnapshotBinary]], SnapshotOrdinal, SnapshotOrdinal) => F[Hash]
+    ] = None,
+    reExecuteDerivations: Option[
+      (
+        SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
+        SnapshotOrdinal,
+        SnapshotOrdinal
+      ) => F[SortedMap[Address, Hash]]
     ] = None,
     slashCooldownReader: Option[SlashCooldownReader[F]] = None
   ): F[Option[AcceptanceDeps[F]]] = {
@@ -529,7 +552,8 @@ object ShardCheckpointWiring {
           shardAssignment = shardAssignment,
           shardEtaFor = shardEtaFor,
           producerDutyValidator = producerDutyValidator,
-          reExecuteDerivation = reExec
+          reExecuteDerivation = reExec,
+          reExecuteDerivations = reExecuteDerivations
         )
         _ <- logger.info(
           s"sharding ACTIVE: numShards=${cfg.numShards} kDraw=$kDraw kQuorum=$kQuorum " +
