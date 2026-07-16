@@ -6,7 +6,11 @@ import io.constellationnetwork.node.shared.domain.economics.ReferenceBalanceScop
 import io.constellationnetwork.node.shared.domain.economics.ReferenceDecision.{Accepted, Rejected}
 import io.constellationnetwork.node.shared.domain.economics.ReferenceInput.{AllowSpendCreate, Transfer}
 import io.constellationnetwork.node.shared.domain.economics.ReferenceRejection._
-import io.constellationnetwork.node.shared.domain.economics.ReferenceWrite.{AllowSpendReference => AllowSpendReferenceWrite, Balance => BalanceWrite, _}
+import io.constellationnetwork.node.shared.domain.economics.ReferenceWrite.{
+  AllowSpendReference => AllowSpendReferenceWrite,
+  Balance => BalanceWrite,
+  _
+}
 import io.constellationnetwork.node.shared.domain.economics.TransferLane.{CurrencyCl1, NativeGl1}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.security.hash.Hash
@@ -120,7 +124,11 @@ object V4EconomicReferenceAllowSpendSuite extends FunSuite {
       .and(expect(result.finalState.balanceOf(account(scopeB, alice)) == 100))
       .and(expect(result.finalState.balanceOf(account(Dag, alice)) == 100))
       .and(expect(result.finalState.allowSpendReservationOf(identity).exists(_.scope == scopeA)))
-      .and(expect(result.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(laneB, alice)) == StructuralAllowSpendReference.genesis))
+      .and(
+        expect(
+          result.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(laneB, alice)) == StructuralAllowSpendReference.genesis
+        )
+      )
       .and(expect(result.conservedTotals(scopeA) == 100))
       .and(expect(result.conservedTotals(scopeB) == 100))
       .and(expect(result.conservedTotals(Dag) == 100))
@@ -179,9 +187,17 @@ object V4EconomicReferenceAllowSpendSuite extends FunSuite {
 
     expect(replay.rejected.head.reason == DuplicateSemanticIdentity(firstIdentity))
       .and(expect(replay.finalState == acceptedState))
-      .and(expect(siblingResult.rejected.head.reason == AllowSpendParentReferenceMismatch(expectedParent, StructuralAllowSpendReference.genesis)))
+      .and(
+        expect(
+          siblingResult.rejected.head.reason == AllowSpendParentReferenceMismatch(expectedParent, StructuralAllowSpendReference.genesis)
+        )
+      )
       .and(expect(siblingResult.finalState == acceptedState))
-      .and(expect(phantomResult.rejected.head.reason == AllowSpendParentReferenceMismatch(StructuralAllowSpendReference.genesis, phantomParent)))
+      .and(
+        expect(
+          phantomResult.rejected.head.reason == AllowSpendParentReferenceMismatch(StructuralAllowSpendReference.genesis, phantomParent)
+        )
+      )
       .and(expect(phantomResult.finalState == base))
   }
 
