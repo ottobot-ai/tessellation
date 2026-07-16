@@ -21,6 +21,7 @@ sealed trait Phase2UseScope extends Product with Serializable
 object Phase2UseScope {
   final case class BinaryAdmission(metagraphId: Address, parent: Hash, binary: Hash) extends Phase2UseScope
   final case class BinaryConfirmationRequeue(metagraphId: Address, binary: Hash) extends Phase2UseScope
+  final case class CurrencySnapshotReplay(metagraphId: Address, candidate: Hash) extends Phase2UseScope
   final case class ShardExecutionBase(shardId: ShardId, checkpoint: Hash) extends Phase2UseScope
   final case class CheckpointInclusion(shardId: ShardId, checkpoint: Hash) extends Phase2UseScope
   final case class CheckpointAnchorAdvancement(shardId: ShardId, checkpoint: Hash) extends Phase2UseScope
@@ -55,6 +56,7 @@ object Phase2ReferencePolicy {
     scope match {
       case _: Phase2UseScope.BinaryAdmission                  => ExactCanonicalAncestor
       case _: Phase2UseScope.BinaryConfirmationRequeue        => ExactCanonicalAncestor
+      case _: Phase2UseScope.CurrencySnapshotReplay           => ExactCanonicalAncestor
       case _: Phase2UseScope.ShardExecutionBase               => ExactCanonicalAncestor
       case _: Phase2UseScope.CheckpointInclusion              => ExactCanonicalAncestor
       case _: Phase2UseScope.CheckpointAnchorAdvancement      => ExactCanonicalAncestor

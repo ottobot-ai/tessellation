@@ -198,7 +198,11 @@ object NakamotoChainStoreExactReplayHistorySourceSuite extends SimpleIOSuite {
       result <- ExactReplayHistorySession.open[IO](claimed, ExactReplayHistoryBounds(1, 1), source)
     } yield
       expect(result.left.toOption.exists(_.isInstanceOf[ExactReplayHistoryFailure.MissingCommittedRoot])) &&
-        expect(result.left.toOption.exists(_.isInstanceOf[io.constellationnetwork.node.shared.domain.nakamoto.overlay.ExactReplayHistoryUnavailable]))
+        expect(
+          result.left.toOption.exists(
+            _.isInstanceOf[io.constellationnetwork.node.shared.domain.nakamoto.overlay.ExactReplayHistoryUnavailable]
+          )
+        )
   }
 
   test("same-ordinal fallback sibling remains typed unavailable and never reaches the artifact read") {
@@ -313,20 +317,28 @@ object NakamotoChainStoreExactReplayHistorySourceSuite extends SimpleIOSuite {
     val position = ExactReplayHistoryPosition(Hash("66" * 32), SnapshotOrdinal.unsafeApply(9L))
     val eraStore = new ScriptedChainStore(
       walk = (_, _, _) =>
-        IO.pure(Left(NakamotoChainStore.ExactWalkError.HashEraUnavailable(
-          NakamotoChainStore.ExactWalkPosition(position.hash, position.ordinal),
-          JsonHash,
-          KryoHash
-        ))),
+        IO.pure(
+          Left(
+            NakamotoChainStore.ExactWalkError.HashEraUnavailable(
+              NakamotoChainStore.ExactWalkPosition(position.hash, position.ordinal),
+              JsonHash,
+              KryoHash
+            )
+          )
+        ),
       read = (_, _) => IO.raiseError(new AssertionError("hash-era failure must stop before read"))
     )
     val storageStore = new ScriptedChainStore(
       walk = (_, _, _) =>
-        IO.pure(Left(NakamotoChainStore.ExactWalkError.StorageReadFailed(
-          NakamotoChainStore.ExactWalkPosition(position.hash, position.ordinal),
-          "hash",
-          "disk unavailable"
-        ))),
+        IO.pure(
+          Left(
+            NakamotoChainStore.ExactWalkError.StorageReadFailed(
+              NakamotoChainStore.ExactWalkPosition(position.hash, position.ordinal),
+              "hash",
+              "disk unavailable"
+            )
+          )
+        ),
       read = (_, _) => IO.raiseError(new AssertionError("storage failure must stop before second read"))
     )
 
@@ -343,10 +355,14 @@ object NakamotoChainStoreExactReplayHistorySourceSuite extends SimpleIOSuite {
     val position = ExactReplayHistoryPosition(Hash("77" * 32), SnapshotOrdinal.unsafeApply(10L))
     val chainStore = new ScriptedChainStore(
       walk = (_, _, _) =>
-        IO.pure(Left(NakamotoChainStore.ExactWalkError.ContentHashFailed(
-          NakamotoChainStore.ExactWalkPosition(position.hash, position.ordinal),
-          "codec unavailable"
-        ))),
+        IO.pure(
+          Left(
+            NakamotoChainStore.ExactWalkError.ContentHashFailed(
+              NakamotoChainStore.ExactWalkPosition(position.hash, position.ordinal),
+              "codec unavailable"
+            )
+          )
+        ),
       read = (_, _) => IO.raiseError(new AssertionError("verification failure must stop before read"))
     )
 
@@ -400,8 +416,11 @@ object NakamotoChainStoreExactReplayHistorySourceSuite extends SimpleIOSuite {
 
   /** All unlisted calls fail so a best tip, ordinal scan, or canonical-head fallback is observable. */
   private final class ScriptedChainStore(
-    walk: (NakamotoChainStore.ExactWalkPosition, SnapshotOrdinal, Int) =>
-      IO[Either[NakamotoChainStore.ExactWalkError, NakamotoChainStore.ExactWalkResult]],
+    walk: (
+      NakamotoChainStore.ExactWalkPosition,
+      SnapshotOrdinal,
+      Int
+    ) => IO[Either[NakamotoChainStore.ExactWalkError, NakamotoChainStore.ExactWalkResult]],
     read: (Hash, Long) => IO[Option[NakamotoChainStore.StoredSnapshot]]
   ) extends NakamotoChainStore.NakamotoChainStoreAlgebra[IO] {
 

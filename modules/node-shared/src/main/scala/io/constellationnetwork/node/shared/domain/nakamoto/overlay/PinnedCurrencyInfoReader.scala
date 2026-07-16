@@ -297,11 +297,12 @@ object PinnedCurrencyInfoReader {
       }
     }
 
-    /** Pin to the EXACT canonical snapshot at `ordinal`, verify the retained state bytes reproduce its committed `mptRoot`, and hand them
-      * to `reconstruct` — the collapsed `Option` view of [[withVerifiedAnchorBytesR]]. Returns `None` (NEVER a HEAD fallback) on any miss
-      * along the way — anchor failures AND a clean-verify-but-absent reconstruction alike. Shared by [[readAt]] /
-      * [[readMetagraphSyncDataAt]] (I-PIN, hash carried) and [[pinnedReaderAt]] (full execution-base reference carried) so all honor one
-      * pin+verify+hard-reject contract; they differ only in which partition they reconstruct from the verified bytes.
+    /** Pin an ordinal+hash request to the exact resolved snapshot, verify that retained bytes reproduce its committed `mptRoot`, and hand
+      * them to `reconstruct` — the collapsed `Option` view of [[withVerifiedAnchorBytesR]]. Returns `None` (NEVER a HEAD fallback) on any
+      * miss, including both anchor failures and a clean-verify-but-absent reconstruction. [[readAt]] and [[readMetagraphSyncDataAt]] use
+      * this legacy two-field entry point. Until the live Phase-2 lease and post-replay `commitIfCurrent` exist, the four-field
+      * execution-base entry points deliberately re-enter here after their initial exact-reference validation so a changed or unavailable
+      * canonical resolver fails closed before retained bytes are accepted.
       */
     private def withVerifiedAnchorBytes[A](
       ordinal: SnapshotOrdinal,
@@ -332,69 +333,84 @@ object PinnedCurrencyInfoReader {
               logger.debug(
                 s"[2a] pinned snapshot ord=${ordinal.show} carries no committed mptRoot (BFT/pre-MPT) — hard-reject $what for $ctx"
               ) >> unreadable
-            case Some(expectedMptRoot) =>
-              byteStore.readState(ordinal).flatMap {
-                case None =>
-                  // Retained state bytes evicted/absent at the anchor (store retention doesn't reach this depth, or a creation-side
-                  // staging race left a HOLE at a locally-finalized ordinal). Before hard-rejecting, try the read-time peer BACKFILL —
-                  // the pinned snapshot at `ordinal` DID resolve (we hold `expectedMptRoot`, the local verification anchor), so a
-                  // peer-served byte map is acceptable iff it reproduces that committed root. See [[PinnedByteBackfill]] for the
-                  // determinism contract. No backfill wired / fetch miss / wrong root ⇒ the exact pre-existing fail-closed reject.
-                  backfill match {
-                    case None =>
-                      logger.debug(
-                        s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject $what for $ctx"
-                      ) >> unreadable
-                    case Some(bf) =>
-                      bf.fetch(ordinal).flatMap {
-                        case None =>
-                          logger.debug(
-                            s"[2a] no retained state bytes at pinned ord=${ordinal.show} and peer backfill unavailable — " +
-                              s"hard-reject $what for $ctx (fail-closed defer)"
-                          ) >> unreadable
-                        case Some(fetched) =>
-                          // STRIP to the consensus entry set FIRST: the root is computed exactly over `consensusRootEntries`, so the
-                          // verify below covers every byte we would persist — no root-excluded peer byte can survive.
-                          val stripped = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(fetched)
-                          GlobalSnapshotInfo.consensusMptRoot[F](stripped).flatMap { fetchedRoot =>
-                            if (fetchedRoot =!= expectedMptRoot)
-                              // Peer bytes do NOT reproduce the locally-pinned committed root (fork / corrupt / stale peer) —
-                              // hard-reject and leave the store UNTOUCHED (never stage unverified bytes).
-                              logger.warn(
-                                s"[2a][backfill] peer bytes at pinned ord=${ordinal.show} recompute mptRoot=${fetchedRoot.show} ≠ " +
-                                  s"pinned stateProof.mptRoot=${expectedMptRoot.show} — REJECTED (store untouched), hard-reject $what for $ctx"
-                              ) >> unreadable
-                            else
-                              // VERIFIED against the local anchor — persist the stripped (root-determined, cluster-uniform) map so
-                              // every subsequent read at this ordinal is a plain store hit, then serve THIS read from it.
-                              byteStore.writeState(ordinal, stripped) >>
-                                logger.info(
-                                  s"[2a][backfill] HEALED hole at pinned ord=${ordinal.show}: peer bytes verified === committed " +
-                                    s"mptRoot=${expectedMptRoot.show.take(12)} (${stripped.size} consensus entries staged) — serving $what for $ctx"
-                                ) >>
-                                reconstruct(stripped).map(PinnedAnchorRead.AnchorVerified(_): PinnedAnchorRead[A])
-                          }
-                      }
-                  }
-                case Some(bytes) =>
-                  GlobalSnapshotInfo.consensusMptRoot[F](bytes).flatMap { computedRoot =>
-                    if (computedRoot =!= expectedMptRoot)
-                      // Retained bytes do NOT reproduce the pinned snapshot's committed root (wrong branch / corrupt) — hard-reject.
-                      logger.debug(
-                        s"[2a] retained bytes at pinned ord=${ordinal.show} recompute mptRoot=${computedRoot.show} ≠ pinned " +
-                          s"stateProof.mptRoot=${expectedMptRoot.show} — hard-reject $what for $ctx"
-                      ) >> unreadable
-                    else
-                      // ANCHOR VERIFIED — the reconstruction's own Option is now a pinned fact (Some = the committed value, None = the
-                      // requested partition has nothing committed under this verified root), NOT a failure.
-                      reconstruct(bytes).map(PinnedAnchorRead.AnchorVerified(_): PinnedAnchorRead[A])
-                  }
-              }
+            case Some(expectedMptRoot) => withVerifiedRetainedBytesR(ordinal, expectedMptRoot, ctx, what)(reconstruct)
           }
         case _ =>
           logger.debug(
             s"[2a] no canonical snapshot at pinned ord=${ordinal.show} matching hash=${expectedGlobalSnapshotHash.show} — hard-reject $what for $ctx"
           ) >> unreadable
+      }
+    }
+
+    /** Verify retained bytes against the root from the immediately preceding hash-matching resolver observation. The execution-base path
+      * currently reaches this only after its initial four-field check and a second hash-currentness check. Do not collapse those
+      * observations until replay has a mandatory post-work `commitIfCurrent`; otherwise a density replacement can turn an orphaned base
+      * into a signature.
+      */
+    private def withVerifiedRetainedBytesR[A](
+      ordinal: SnapshotOrdinal,
+      expectedMptRoot: Hash,
+      ctx: String,
+      what: String
+    )(reconstruct: Map[Hex, Array[Byte]] => F[Option[A]]): F[PinnedAnchorRead[A]] = {
+      val unreadable: F[PinnedAnchorRead[A]] = (PinnedAnchorRead.AnchorUnreadable: PinnedAnchorRead[A]).pure[F]
+
+      byteStore.readState(ordinal).flatMap {
+        case None =>
+          // Retained state bytes evicted/absent at the anchor (store retention doesn't reach this depth, or a creation-side
+          // staging race left a HOLE at a locally-finalized ordinal). Before hard-rejecting, try the read-time peer BACKFILL —
+          // the pinned snapshot at `ordinal` DID resolve (we hold `expectedMptRoot`, the local verification anchor), so a
+          // peer-served byte map is acceptable iff it reproduces that committed root. See [[PinnedByteBackfill]] for the
+          // determinism contract. No backfill wired / fetch miss / wrong root ⇒ the exact pre-existing fail-closed reject.
+          backfill match {
+            case None =>
+              logger.debug(
+                s"[2a] no retained state bytes at pinned ord=${ordinal.show} (evicted/absent) — hard-reject $what for $ctx"
+              ) >> unreadable
+            case Some(bf) =>
+              bf.fetch(ordinal).flatMap {
+                case None =>
+                  logger.debug(
+                    s"[2a] no retained state bytes at pinned ord=${ordinal.show} and peer backfill unavailable — " +
+                      s"hard-reject $what for $ctx (fail-closed defer)"
+                  ) >> unreadable
+                case Some(fetched) =>
+                  // STRIP to the consensus entry set FIRST: the root is computed exactly over `consensusRootEntries`, so the
+                  // verify below covers every byte we would persist — no root-excluded peer byte can survive.
+                  val stripped = io.constellationnetwork.schema.mpt.GlobalStateKey.consensusRootEntries(fetched)
+                  GlobalSnapshotInfo.consensusMptRoot[F](stripped).flatMap { fetchedRoot =>
+                    if (fetchedRoot =!= expectedMptRoot)
+                      // Peer bytes do NOT reproduce the locally-pinned committed root (fork / corrupt / stale peer) —
+                      // hard-reject and leave the store UNTOUCHED (never stage unverified bytes).
+                      logger.warn(
+                        s"[2a][backfill] peer bytes at pinned ord=${ordinal.show} recompute mptRoot=${fetchedRoot.show} ≠ " +
+                          s"pinned stateProof.mptRoot=${expectedMptRoot.show} — REJECTED (store untouched), hard-reject $what for $ctx"
+                      ) >> unreadable
+                    else
+                      // VERIFIED against the local anchor — persist the stripped (root-determined, cluster-uniform) map so
+                      // every subsequent read at this ordinal is a plain store hit, then serve THIS read from it.
+                      byteStore.writeState(ordinal, stripped) >>
+                        logger.info(
+                          s"[2a][backfill] HEALED hole at pinned ord=${ordinal.show}: peer bytes verified === committed " +
+                            s"mptRoot=${expectedMptRoot.show.take(12)} (${stripped.size} consensus entries staged) — serving $what for $ctx"
+                        ) >>
+                        reconstruct(stripped).map(PinnedAnchorRead.AnchorVerified(_): PinnedAnchorRead[A])
+                  }
+              }
+          }
+        case Some(bytes) =>
+          GlobalSnapshotInfo.consensusMptRoot[F](bytes).flatMap { computedRoot =>
+            if (computedRoot =!= expectedMptRoot)
+              // Retained bytes do NOT reproduce the pinned snapshot's committed root (wrong branch / corrupt) — hard-reject.
+              logger.debug(
+                s"[2a] retained bytes at pinned ord=${ordinal.show} recompute mptRoot=${computedRoot.show} ≠ pinned " +
+                  s"stateProof.mptRoot=${expectedMptRoot.show} — hard-reject $what for $ctx"
+              ) >> unreadable
+            else
+              // ANCHOR VERIFIED — the reconstruction's own Option is now a pinned fact (Some = the committed value, None = the
+              // requested partition has nothing committed under this verified root), NOT a failure.
+              reconstruct(bytes).map(PinnedAnchorRead.AnchorVerified(_): PinnedAnchorRead[A])
+          }
       }
     }
 

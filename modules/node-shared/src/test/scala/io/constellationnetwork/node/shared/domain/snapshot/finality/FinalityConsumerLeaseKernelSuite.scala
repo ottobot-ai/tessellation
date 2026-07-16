@@ -139,6 +139,7 @@ object FinalityConsumerLeaseKernelSuite extends SimpleIOSuite {
     val scopes: List[Phase2UseScope] = List(
       BinaryAdmission(mg, hash(1), hash(2)),
       BinaryConfirmationRequeue(mg, hash(3)),
+      CurrencySnapshotReplay(mg, hash(19)),
       ShardExecutionBase(shard, hash(4)),
       CheckpointInclusion(shard, hash(5)),
       CheckpointAnchorAdvancement(shard, hash(6)),
@@ -157,7 +158,7 @@ object FinalityConsumerLeaseKernelSuite extends SimpleIOSuite {
       DownstreamEventDelivery(hash(18))
     )
 
-    expect(scopes.size == 18) && expect(scopes.forall(Phase2ReferencePolicy.forScope(_) == ExactCanonicalAncestor))
+    expect(scopes.size == 19) && expect(scopes.forall(Phase2ReferencePolicy.forScope(_) == ExactCanonicalAncestor))
   }
 
   pureTest("acquisition, verified-readback, and lease capabilities are not Java-serializable") {

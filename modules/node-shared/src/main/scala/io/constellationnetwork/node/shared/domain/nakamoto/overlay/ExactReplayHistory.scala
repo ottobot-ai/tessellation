@@ -312,8 +312,8 @@ object ExactReplayHistorySession {
         case Right(byOrdinal) =>
           Concurrent[F].map(resolve(SortedSet.from(byOrdinal.keys)))(
             _.flatMap { state =>
-              byOrdinal.toVector
-                .traverse { case (ordinal, expected) =>
+              byOrdinal.toVector.traverse {
+                case (ordinal, expected) =>
                   artifactAt(state, ordinal).flatMap { observed =>
                     Either.cond(
                       observed.reference == expected,
@@ -321,7 +321,7 @@ object ExactReplayHistorySession {
                       RequestedReferenceNotAncestor(expected, observed.reference): ExactReplayHistoryFailure
                     )
                   }
-                }
+              }
                 .map(artifacts => new IssuedBatch(anchor, artifacts))
             }
           )
@@ -478,7 +478,7 @@ object ExactReplayHistorySession {
       Left(InvalidArtifactParent(expected, value.lastSnapshotHash))
     else
       value.stateProof.mptRoot match {
-        case None => Left(MissingCommittedRoot(expected))
+        case None                                     => Left(MissingCommittedRoot(expected))
         case Some(root) if !isCanonicalNonEmpty(root) => Left(InvalidCommittedRoot(expected, root))
         case Some(root) =>
           val reference = GlobalSnapshotStateRef(value.ordinal, hashed.hash, value.lastSnapshotHash, MptRoot(root))

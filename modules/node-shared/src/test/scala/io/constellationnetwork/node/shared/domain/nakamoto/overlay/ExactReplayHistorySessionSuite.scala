@@ -253,7 +253,9 @@ object ExactReplayHistorySessionSuite extends SimpleIOSuite {
     for {
       counts <- Ref.of[IO, Map[ExactReplayHistoryPosition, Int]](Map.empty)
       session <- open(a3, countingSource(counts)(requested => IO.cede.as(artifacts.get(requested).toRight(ArtifactUnavailable(requested)))))
-      results <- NonEmptyList.of(a1.ordinal, a2.ordinal).pure[IO]
+      results <- NonEmptyList
+        .of(a1.ordinal, a2.ordinal)
+        .pure[IO]
         .flatMap(targets => List.fill(16)(session.resolveOrdinals(targets)).parSequence)
       observed <- counts.get
     } yield
@@ -444,7 +446,7 @@ object ExactReplayHistorySessionSuite extends SimpleIOSuite {
     } yield
       expect(hashResult.left.exists {
         case InvalidReference(`badHash`, "snapshot hash", _) => true
-        case _                                                => false
+        case _                                               => false
       }) &&
         expect(rootResult.left.toOption.contains(InvalidReference(badRoot, "MPT root", Hash.empty))) &&
         expect(parentResult.left.toOption.contains(InvalidReference(emptyParent, "parent hash", Hash.empty))) &&

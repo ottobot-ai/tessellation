@@ -301,6 +301,25 @@ object PinnedCurrencyInfoReaderSuite extends MutableIOSuite {
     }
   }
 
+  test("execution-base-pin fails closed when the canonical resolver changes after exact-reference validation") { res =>
+    implicit val (h, _, js) = res
+    Files[IO].tempDirectory.use { dir =>
+      for {
+        boe <- buildBytesAndOracle
+        (bytes, root, oracle) = boe
+        byteStore <- MptStateStorage.make[IO](dir)
+        _ <- byteStore.writeState(ord(10L), bytes)
+        pinned <- mkHashed(10L, Some(root))
+        base = executionBase(pinned, root)
+        calls <- IO.ref(0)
+        resolver = (_: SnapshotOrdinal) => calls.modify(current => (current + 1, Option.when(current == 0)(pinned)))
+        reader = PinnedCurrencyInfoReader.make[IO](byteStore, resolver)
+        got <- reader.readAtExecutionBaseVerified(base, mg)
+        observed <- calls.get
+      } yield expect.same(2, observed) && expect.same(PinnedAnchorRead.AnchorUnreadable, got) && expect(oracle.nonEmpty)
+    }
+  }
+
   test("execution-base-pin readAtExecutionBase NO-SNAPSHOT: exact base unavailable ⇒ None (never a head fallback)") { res =>
     implicit val (h, _, js) = res
     Files[IO].tempDirectory.use { dir =>

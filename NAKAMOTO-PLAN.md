@@ -1002,12 +1002,36 @@ delivery, rollback, and recovery.
   253-392,395-505`; `ExactReplayHistorySessionSuite.scala:144-337,339-510`). It
   has no codec or live caller and conveys structural history only, not Phase-2,
   state-image validity, or economic replay authority.
+- The exact execution-base reader retains its fail-closed canonical recheck after
+  validating the signed four-field reference and before accepting retained bytes
+  (`PinnedCurrencyInfoReader.scala:268-298,321-413`). A focused regression changes
+  the resolver between those observations and requires `AnchorUnreadable`
+  (`PinnedCurrencyInfoReaderSuite.scala:304-321`). Do not collapse this into one
+  pre-work observation until a live exact Phase-2 lease is followed by mandatory
+  post-replay `commitIfCurrent`; otherwise density replacement can authorize a
+  signature over an orphaned base. This recheck is containment, not FIN-14 closure.
+- A package-private dark identity-composition model now requires the real
+  `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
+  the exact-history session, and matching exact-image, semantic, field-32, and
+  target-value descriptors (`CandidateCurrencyReplayView.scala:28-92,151-253`).
+  It exposes a narrow exact-target currency replay projection (not a generic
+  global reader) and derives historical
+  `SpendAction`s from the exact signed history. It explicitly distinguishes
+  field-32 absent, present-empty, and present-nonempty states and has no generic
+  state reader, codec, signing, commit, or finality operation. This model is not
+  an issuer or verifier: its package-owned descriptors are not derived from bytes,
+  and identifier equality proves neither ROOT-008 semantics nor ROOT-010 witness
+  preimages/population. It has no live caller and must remain dark.
 - Activation still requires the P6 exact Phase-2 lease/evidence and density-reorg
   invalidation, a signed complete `GlobalSyncView`, P10's exact root-verified
   historical `GlobalStateReader`/MPT image, pinning message validation and every
   economic read to the same candidate session, live migration, and hash-era
   crossing. Missing history defers or enters authenticated recovery. This dark
-  slice closes neither FIN-14 nor E10.
+  slice closes neither FIN-14 nor E10. A live replay-view issuer additionally
+  requires the active-era strict physical parser and complete target codecs,
+  verified whole-image value derivation, the signed complete `GlobalSyncView`,
+  ROOT-010 field-32 witness parity/removal, and a short `commitIfCurrent` around
+  every resulting effect.
 - The first dark L-23 durability slice originally landed without changing the
   then-live finality rails. The later containment described above disabled the
   unsafe optimistic sink independently of this still-dark store. ScodecV1

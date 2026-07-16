@@ -910,13 +910,31 @@ criteria are in `NAKAMOTO-PLAN.md`.
     253-392,395-505`; `ExactReplayHistorySessionSuite.scala:144-337,339-510`). It
     has no codec or live caller and is not a Phase-2 lease, state-validity proof,
     root-verified MPT image, or economic replay capability.
+  - [ ] Keep the new candidate replay-view composition model dark. It requires the
+    actual `CanonicalPhase2Lease` with the dedicated `CurrencySnapshotReplay`
+    purpose, exact structural history, and one shared exact image/semantic/F32/
+    target-value identity. Historical `SpendAction`s come only from the signed
+    exact history, and field-32 absence remains distinct from present-empty. The
+    package-owned descriptors are test scaffolding, not verifier-minted receipts;
+    equality checks do not prove decoded values, ROOT-008 semantics, or ROOT-010
+    witness preimages/operator population. Do not add a live caller, signer,
+    mutator, codec, or generic state-reader escape hatch.
+  - [ ] Preserve the live exact-base reader's fail-closed canonical recheck until
+    Phase-2 replay has a mandatory post-work `commitIfCurrent`. The regression in
+    which the resolver changes after initial `(ordinal,hash,parentHash,mptRoot)`
+    validation must return `AnchorUnreadable`. A future immutable lease may replace
+    repeated reads only together with its final CAS; a single pre-work observation
+    can otherwise sign an orphan after density replacement.
   - [ ] Keep the activation boundary open until P6 supplies exact Phase-2
     lease/evidence and density-reorg invalidation; the signed complete
     `GlobalSyncView` exists; P10 supplies an exact root-verified historical
     `GlobalStateReader`/MPT image; message validation and every economic read are
     pinned to the same candidate session; and live migration plus hash-era
     crossing are complete. Until then unavailable history defers/enters
-    authenticated recovery and neither FIN-14 nor E10 is closed.
+    authenticated recovery and neither FIN-14 nor E10 is closed. Before minting a
+    replay view, ROOT-008 must supply the strict active-era parser and complete
+    codecs/value derivation, ROOT-010 must supply verified field-32 witness parity
+    and removal, and each effect must close through `commitIfCurrent`.
   - [ ] Harden live chain-store admission so ordinal, parent hash, slot, and VRF
     metadata are derived from and checked against the authenticated signed snapshot;
     the dark ancestry walk is detection/recovery infrastructure, not that boundary.

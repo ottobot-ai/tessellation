@@ -122,34 +122,31 @@ object NakamotoChainStoreExactReplayHistorySource {
   ): F[Either[ExactReplayHistoryFailure, Hashed[io.constellationnetwork.schema.GlobalIncrementalSnapshot]]] = {
     import ExactReplayHistoryFailure._
 
-    Async[F]
-      .delay {
-        val selector = HasherSelector[F]
-        val current = selector.getCurrent
-        val currentLogic = current.getLogic(position.ordinal)
-        val ordinalLogic = selector.getForOrdinal(position.ordinal).getLogic(position.ordinal)
-        (current, currentLogic, ordinalLogic)
-      }
-      .attempt
-      .flatMap {
-        case Left(error) =>
-          Async[F].pure(Left(SourceVerificationUnavailable(position, s"hash-era-selection-failed: ${renderThrowable(error)}")))
-        case Right((_, currentLogic, ordinalLogic)) if currentLogic != ordinalLogic =>
-          Async[F].pure(
-            Left(SourceHashEraUnavailable(position, s"current=$currentLogic ordinal=$ordinalLogic"))
-          )
-        case Right((current, _, _)) =>
-          implicit val hasher: Hasher[F] = current
-          stored.signedSnapshot.toHashed[F].attempt.map {
-            case Left(error) =>
-              Left(SourceVerificationUnavailable(position, s"content-rehash-failed: ${renderThrowable(error)}"))
-            case Right(hashed) if !isCanonicalNonEmptyHash(hashed.hash) =>
-              Left(SourceVerificationUnavailable(position, "content rehash produced a reserved or non-canonical hash"))
-            case Right(hashed) if hashed.hash =!= position.hash =>
-              Left(SourceCorrupt(position, s"content rehash ${hashed.hash.value} differs from requested ${position.hash.value}"))
-            case Right(hashed) => Right(hashed)
-          }
-      }
+    Async[F].delay {
+      val selector = HasherSelector[F]
+      val current = selector.getCurrent
+      val currentLogic = current.getLogic(position.ordinal)
+      val ordinalLogic = selector.getForOrdinal(position.ordinal).getLogic(position.ordinal)
+      (current, currentLogic, ordinalLogic)
+    }.attempt.flatMap {
+      case Left(error) =>
+        Async[F].pure(Left(SourceVerificationUnavailable(position, s"hash-era-selection-failed: ${renderThrowable(error)}")))
+      case Right((_, currentLogic, ordinalLogic)) if currentLogic != ordinalLogic =>
+        Async[F].pure(
+          Left(SourceHashEraUnavailable(position, s"current=$currentLogic ordinal=$ordinalLogic"))
+        )
+      case Right((current, _, _)) =>
+        implicit val hasher: Hasher[F] = current
+        stored.signedSnapshot.toHashed[F].attempt.map {
+          case Left(error) =>
+            Left(SourceVerificationUnavailable(position, s"content-rehash-failed: ${renderThrowable(error)}"))
+          case Right(hashed) if !isCanonicalNonEmptyHash(hashed.hash) =>
+            Left(SourceVerificationUnavailable(position, "content rehash produced a reserved or non-canonical hash"))
+          case Right(hashed) if hashed.hash =!= position.hash =>
+            Left(SourceCorrupt(position, s"content rehash ${hashed.hash.value} differs from requested ${position.hash.value}"))
+          case Right(hashed) => Right(hashed)
+        }
+    }
   }
 
   private def isCanonicalNonEmptyHash(hash: Hash): Boolean = {
@@ -169,14 +166,14 @@ object NakamotoChainStoreExactReplayHistorySource {
     import ExactWalkHashRole._
 
     error match {
-      case InvalidMaxSteps(_) | TargetAboveStart(_, _) | RequiredStepsExceedLimit(_, _) | StepLimitExceeded(_, _) |
-          ReservedSnapshotHash(_) | ExactWalkError.PrematureChainRoot(_, _) | CycleDetected(_, _) =>
+      case InvalidMaxSteps(_) | TargetAboveStart(_, _) | RequiredStepsExceedLimit(_, _) | StepLimitExceeded(_, _) | ReservedSnapshotHash(
+            _
+          ) | ExactWalkError.PrematureChainRoot(_, _) | CycleDetected(_, _) =>
         SourceVerificationUnavailable(position, s"unexpected one-link exact-walk result: ${renderWalkError(error)}")
       case NonCanonicalSnapshotHash(_, Requested | Rehashed, _) =>
         SourceVerificationUnavailable(position, renderWalkError(error))
-      case NonCanonicalSnapshotHash(_, Stored | StoredParent | SignedParent, _) | StoredHashMismatch(_, _) |
-          StoredOrdinalMismatch(_, _) | SignedOrdinalMismatch(_, _) | StoredParentMismatch(_, _, _) |
-          ExactHashContentMismatch(_, _) =>
+      case NonCanonicalSnapshotHash(_, Stored | StoredParent | SignedParent, _) | StoredHashMismatch(_, _) | StoredOrdinalMismatch(_, _) |
+          SignedOrdinalMismatch(_, _) | StoredParentMismatch(_, _, _) | ExactHashContentMismatch(_, _) =>
         SourceCorrupt(position, renderWalkError(error))
       case HashEraUnavailable(_, current, ordinal) =>
         SourceHashEraUnavailable(position, s"current=$current ordinal=$ordinal")
