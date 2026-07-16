@@ -3,7 +3,7 @@ package io.constellationnetwork.dag.l0.domain.snapshot.programs
 import cats.effect.Async
 import cats.effect.std.Random
 import cats.syntax.all._
-import cats.{Applicative, Parallel}
+import cats.{Applicative, MonadThrow, Parallel}
 
 import scala.concurrent.duration._
 import scala.util.control.NoStackTrace
@@ -29,7 +29,7 @@ import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.node.NodeState
-import io.constellationnetwork.schema.peer.Peer
+import io.constellationnetwork.schema.peer.{L0Peer, Peer}
 import io.constellationnetwork.schema.snapshot.SnapshotMetadata
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
@@ -43,6 +43,37 @@ import retry.RetryPolicies._
 import retry._
 
 object Download {
+
+  /** Bind the destructive download decision to the exact checkpoint observed during multi-peer selection.
+    *
+    * This prevents the selected peer from equivocating between selection and metadata retrieval. It does not make the sampled cohort
+    * Byzantine-safe and does not solve staged or malicious-majority responses.
+    */
+  private[programs] def selectBoundMetadata[F[_]: MonadThrow](
+    peerSelect: PeerSelect[F],
+    fetch: L0Peer => F[SnapshotMetadata]
+  ): F[SnapshotMetadata] =
+    peerSelect.select.flatMap { selection =>
+      fetch(selection.peer).flatMap { metadata =>
+        if (metadata.ordinal === selection.ordinal && metadata.hash === selection.hash) metadata.pure[F]
+        else
+          SnapshotMetadataSelectionMismatch(selection.ordinal, selection.hash, metadata.ordinal, metadata.hash)
+            .raiseError[F, SnapshotMetadata]
+      }
+    }
+
+  private[programs] def validateGenesis[F[_]: Async: Hasher: SecurityProvider](
+    snapshot: Signed[GlobalSnapshot],
+    expectedOrdinal: SnapshotOrdinal,
+    expectedHash: Hash
+  ): F[Hashed[GlobalSnapshot]] =
+    snapshot.toHashedWithSignatureCheck[F].flatMap(_.liftTo[F]).flatMap { hashed =>
+      if (hashed.ordinal === expectedOrdinal && hashed.hash === expectedHash) hashed.pure[F]
+      else
+        GenesisSnapshotIdentityMismatch(expectedOrdinal, expectedHash, hashed.ordinal, hashed.hash)
+          .raiseError[F, Hashed[GlobalSnapshot]]
+    }
+
   def make[F[_]: Async: Parallel: Random: JsonSerializer: SecurityProvider](
     snapshotStorage: SnapshotDownloadStorage[F],
     p2pClient: P2PClient[F],
@@ -163,7 +194,7 @@ object Download {
           onError = (err: Throwable, details: RetryDetails) =>
             logger.error(err)(s"[RecoveryDownload] Error fetching metadata (attempt=${details.retriesSoFar})")
         ) {
-          peerSelect.select.flatMap(p2pClient.globalSnapshot.getLatestMetadata.run(_))
+          selectBoundMetadata(peerSelect, peer => p2pClient.globalSnapshot.getLatestMetadata.run(peer))
         }
       }
 
@@ -260,7 +291,7 @@ object Download {
           onError = (err: Throwable, retryDetails: RetryDetails) =>
             logger.error(err)(s"Error when trying to fetch latest metadata (attempt=${retryDetails.retriesSoFar}), selecting new peer")
         ) {
-          peerSelect.select.flatMap(p2pClient.globalSnapshot.getLatestMetadata.run(_))
+          selectBoundMetadata(peerSelect, peer => p2pClient.globalSnapshot.getLatestMetadata.run(peer))
         }
       }
 
@@ -544,30 +575,29 @@ object Download {
 
     def getGenesisSnapshot(
       tmpMap: Map[SnapshotOrdinal, Hash]
-    )(implicit hasherSelector: HasherSelector[F]): F[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)] =
-      snapshotStorage
-        .readGenesis(lastFullGlobalSnapshotOrdinal)
-        .flatMap {
-          _.map(_.pure[F]).getOrElse {
-            hasherSelector.withCurrent { implicit hasher =>
-              fetchGenesis(lastFullGlobalSnapshotOrdinal)
-                .flatTap(snapshotStorage.writeGenesis)
-            }
-          }
-        }
-        .flatMap { genesis =>
-          val incrementalGenesisOrdinal = genesis.ordinal.next
+    )(implicit hasherSelector: HasherSelector[F]): F[(Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)] = {
+      val incrementalGenesisOrdinal = lastFullGlobalSnapshotOrdinal.next
+      val readIncremental = tmpMap
+        .get(incrementalGenesisOrdinal)
+        .as(snapshotStorage.readTmp(incrementalGenesisOrdinal))
+        .getOrElse(snapshotStorage.readPersisted(incrementalGenesisOrdinal))
 
-          tmpMap
-            .get(incrementalGenesisOrdinal)
-            .as(snapshotStorage.readTmp(incrementalGenesisOrdinal))
-            .getOrElse(snapshotStorage.readPersisted(incrementalGenesisOrdinal))
-            .flatMap {
-              case Some(snapshot) => (genesis.value, snapshot).pure[F]
-              case None           => FirstIncrementalNotFound.raiseError[F, (GlobalSnapshot, Signed[GlobalIncrementalSnapshot])]
+      readIncremental.flatMap {
+        case None => FirstIncrementalNotFound.raiseError[F, (Signed[GlobalIncrementalSnapshot], GlobalSnapshotInfo)]
+        case Some(incremental) =>
+          val expectedGenesisHash = incremental.value.lastSnapshotHash
+
+          hasherSelector.withCurrent { implicit hasher =>
+            snapshotStorage.readGenesis(lastFullGlobalSnapshotOrdinal).flatMap {
+              case Some(genesis) =>
+                validateGenesis(genesis, lastFullGlobalSnapshotOrdinal, expectedGenesisHash).map(_.signed)
+              case None =>
+                fetchGenesis(lastFullGlobalSnapshotOrdinal, expectedGenesisHash)
+                  .flatTap(snapshotStorage.writeGenesis)
             }
-            .map { case (full, incremental) => (incremental, full.info.toGlobalSnapshotInfo) }
-        }
+          }.map(genesis => (incremental, genesis.value.info.toGlobalSnapshotInfo))
+      }
+    }
 
     def fetchSnapshot(hash: Option[Hash], ordinal: SnapshotOrdinal)(implicit hasher: Hasher[F]): F[Signed[GlobalIncrementalSnapshot]] =
       clusterStorage.getResponsivePeers
@@ -610,7 +640,7 @@ object Download {
           case _              => CannotFetchSnapshot.raiseError[F, Signed[GlobalIncrementalSnapshot]]
         }
 
-    def fetchGenesis(ordinal: SnapshotOrdinal)(implicit hasher: Hasher[F]): F[Signed[GlobalSnapshot]] =
+    def fetchGenesis(ordinal: SnapshotOrdinal, expectedHash: Hash)(implicit hasher: Hasher[F]): F[Signed[GlobalSnapshot]] =
       clusterStorage.getResponsivePeers
         .map(NodeState.ready)
         .map(_.toList)
@@ -629,7 +659,7 @@ object Download {
               p2pClient.globalSnapshot
                 .getFull(ordinal)
                 .run(peer)
-                .flatMap(_.toHashed[F])
+                .flatMap(validateGenesis(_, ordinal, expectedHash))
                 .map(_.some)
                 .handleError(_ => none[Hashed[GlobalSnapshot]])
                 .map {
@@ -649,6 +679,20 @@ object Download {
   case object CannotFetchSnapshot extends NoStackTrace
 
   case object CannotFetchGenesisSnapshot extends NoStackTrace
+
+  case class SnapshotMetadataSelectionMismatch(
+    expectedOrdinal: SnapshotOrdinal,
+    expectedHash: Hash,
+    actualOrdinal: SnapshotOrdinal,
+    actualHash: Hash
+  ) extends NoStackTrace
+
+  case class GenesisSnapshotIdentityMismatch(
+    expectedOrdinal: SnapshotOrdinal,
+    expectedHash: Hash,
+    actualOrdinal: SnapshotOrdinal,
+    actualHash: Hash
+  ) extends NoStackTrace
 
   case object FirstIncrementalNotFound extends NoStackTrace
 

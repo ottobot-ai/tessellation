@@ -14,7 +14,7 @@ import cats.syntax.list._
 import scala.util.control.NoStackTrace
 
 import io.constellationnetwork.node.shared.domain.cluster.storage.ClusterStorage
-import io.constellationnetwork.node.shared.domain.snapshot.PeerSelect
+import io.constellationnetwork.node.shared.domain.snapshot.{PeerSelect, PeerSelection}
 import io.constellationnetwork.node.shared.http.p2p.clients.SnapshotClient
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.node.NodeState.Ready
@@ -31,13 +31,13 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Peer selection for snapshot download.
   *
-  * Selects a single L0 peer whose snapshot ordinal is in the majority cohort and whose snapshot hash for that ordinal is in the majority
-  * cohort.
+  * Selects a single L0 peer from a unique largest ordinal cohort and then a unique largest hash cohort at that ordinal. These are local
+  * plurality observations, not authenticated consensus or Phase-2 evidence. Callers must authenticate downloaded state before mutation.
   *
   * Selection process:
   *   1. Filter ready peers and uniformly sample up to `maxSampleSize` candidates. 2. Query each candidate's latest snapshot ordinal; the
-  *      most popular ordinal becomes `majorityOrdinal`. 3. Query each candidate's snapshot hash at `majorityOrdinal`; the largest
-  *      hash-equivalence class wins. 4. Pick one peer uniformly at random from the winning class.
+  *      unique largest ordinal cohort wins. 3. Query only that cohort's members for the snapshot hash at the selected ordinal; the unique
+  *      largest hash-equivalence class wins. 4. Pick one peer uniformly at random from the winning hash cohort.
   */
 object PeerSelect {
   val peerSelectLoggerName = "PeerSelectLogger"
@@ -47,8 +47,9 @@ object PeerSelect {
     initialPeers: NonEmptyList[Peer],
     latestOrdinals: NonEmptyList[SnapshotOrdinal],
     ordinalDistribution: List[(SnapshotOrdinal, NonEmptyList[Peer])],
-    majorityOrdinal: SnapshotOrdinal,
+    selectedOrdinal: SnapshotOrdinal,
     hashDistribution: List[(Hash, NonEmptyList[Peer])],
+    selectedHash: Hash,
     peerCandidates: NonEmptyList[Peer],
     selectedPeer: L0Peer
   )
@@ -66,9 +67,9 @@ object PeerSelect {
 
     val logger = Slf4jLogger.getLoggerFromName[F](peerSelectLoggerName)
 
-    def select: F[L0Peer] = getFilteredPeerDetails
+    def select: F[PeerSelection] = getFilteredPeerDetails
       .flatTap(details => logger.debug(details.asJson.noSpaces))
-      .map(_.selectedPeer)
+      .map(details => PeerSelection(details.selectedPeer, details.selectedOrdinal, details.selectedHash))
 
     def getFilteredPeerDetails: F[FilteredPeerDetails] = for {
       peers <- storage.getResponsivePeers
@@ -82,25 +83,28 @@ object PeerSelect {
       }
       latestOrdinals = peerOrdinals.map { case (_, ordinal) => ordinal }
       ordinalDistribution = peerOrdinals.groupMap { case (_, ordinal) => ordinal } { case (peer, _) => peer }
-      (majorityOrdinal, _) = latestOrdinals.groupBy(identity).maxBy { case (_, ordinals) => ordinals.size }
-      peerDistribution <- peers
-        .parTraverseN(maxConcurrentPeerInquiries)(getSnapshotHashByPeer(_, majorityOrdinal))
+      ordinalSelection <- MonadThrow[F].fromEither(uniqueLargestCohort(peerOrdinals))
+      (selectedOrdinal, ordinalCohort) = ordinalSelection
+      peerSnapshotHashes <- ordinalCohort
+        .parTraverseN(maxConcurrentPeerInquiries)(getSnapshotHashByPeer(_, selectedOrdinal))
         .flatMap { maybePeerSnapshotHashes =>
           MonadThrow[F].fromOption(
             maybePeerSnapshotHashes.toList.flatten.toNel,
             NoHashes
           )
         }
-        .map(_.groupMap { case (_, hash) => hash } { case (peer, _) => peer })
-      peerCandidates = peerDistribution.values.maxBy(_.length)
+      peerDistribution = peerSnapshotHashes.groupMap { case (_, hash) => hash } { case (peer, _) => peer }
+      hashSelection <- MonadThrow[F].fromEither(uniqueLargestCohort(peerSnapshotHashes))
+      (selectedHash, peerCandidates) = hashSelection
       selectedPeer <- Random[F].elementOf(peerCandidates.toList).map(L0Peer.fromPeer)
     } yield
       FilteredPeerDetails(
         peers,
         latestOrdinals,
         ordinalDistribution.toList,
-        majorityOrdinal,
+        selectedOrdinal,
         peerDistribution.toList,
+        selectedHash,
         peerCandidates,
         selectedPeer
       )
@@ -115,4 +119,20 @@ object PeerSelect {
     def getSnapshotHashByPeer(peer: Peer, ordinal: SnapshotOrdinal): F[Option[(Peer, Hash)]] =
       snapshotClient.getHash(ordinal).run(peer).map(_.map((peer, _)))
   }
+
+  /** Return the only largest value cohort, rejecting ties instead of making map iteration order authoritative. */
+  private[snapshot] def uniqueLargestCohort[A, B](
+    observations: NonEmptyList[(A, B)]
+  ): Either[AmbiguousPeerCohort.type, (B, NonEmptyList[A])] = {
+    val cohorts = observations.toList.groupMap { case (_, value) => value } { case (item, _) => item }.toList.map {
+      case (value, items) => value -> NonEmptyList.fromListUnsafe(items)
+    }
+    val largestSize = cohorts.iterator.map(_._2.length).max
+    cohorts.filter(_._2.length === largestSize) match {
+      case winner :: Nil => Right(winner)
+      case _             => Left(AmbiguousPeerCohort)
+    }
+  }
+
+  case object AmbiguousPeerCohort extends NoStackTrace
 }

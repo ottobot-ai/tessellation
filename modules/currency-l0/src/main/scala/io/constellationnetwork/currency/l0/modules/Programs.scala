@@ -21,6 +21,7 @@ import io.constellationnetwork.node.shared.domain.snapshot.programs.Download
 import io.constellationnetwork.node.shared.infrastructure.genesis.{GenesisFS => GenesisLoader}
 import io.constellationnetwork.node.shared.infrastructure.snapshot.{CurrencySnapshotContextFunctions, PeerSelect}
 import io.constellationnetwork.node.shared.modules.{SharedPrograms, SharedStorages}
+import io.constellationnetwork.schema.CurrencyStateProofSelector
 import io.constellationnetwork.schema.peer.{L0Peer, PeerId}
 import io.constellationnetwork.security.{HasherSelector, SecurityProvider}
 
@@ -37,7 +38,7 @@ object Programs {
     p2pClient: P2PClient[F],
     currencySnapshotContextFns: CurrencySnapshotContextFunctions[F],
     dataApplication: Option[(BaseDataApplicationL0Service[F], CalculatedStateLocalFileSystemStorage[F])]
-  )(implicit context: L0NodeContext[F]): Programs[F] = {
+  )(implicit context: L0NodeContext[F], currencyStateProofSelector: CurrencyStateProofSelector): Programs[F] = {
     val peerSelect: PeerSelect[F] =
       PeerSelect.make(
         storages.cluster,
