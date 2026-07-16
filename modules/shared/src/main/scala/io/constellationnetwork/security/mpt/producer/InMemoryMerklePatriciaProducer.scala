@@ -16,13 +16,14 @@ import io.constellationnetwork.security.mpt.{MerklePatriciaTrie, MptRoot}
 import io.circe.syntax._
 import io.circe.{Encoder, Json}
 
-class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializer](
+final class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializer] private (
   stateRef: Ref[F, Map[Hex, Array[Byte]]],
   trieRef: Ref[F, Option[MerklePatriciaTrie]],
   pendingInsertsRef: Ref[F, Map[Hex, Array[Byte]]],
   pendingRemovesRef: Ref[F, List[Hex]],
   rootHashCacheRef: Ref[F, Map[SnapshotOrdinal, MptRoot]],
-  lastBuiltOrdinalRef: Ref[F, Option[SnapshotOrdinal]]
+  lastBuiltOrdinalRef: Ref[F, Option[SnapshotOrdinal]],
+  override val physicalKeyPolicy: PhysicalTrieKeyPolicy
 ) extends StatefulMerklePatriciaProducer[F] {
 
   private val parallelProducer: ParallelMerklePatriciaProducer[F] = ParallelMerklePatriciaProducer[F]
@@ -38,10 +39,9 @@ class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializ
     Async[F].uncancelable { _ =>
       stateRef
         .modify[Either[MerklePatriciaError, Unit]] { current =>
-          val retainedKeys = current.keySet -- removals
           (for {
-            _ <- PhysicalTrieKeyValidator.validateEachKey(removals)
-            _ <- PhysicalTrieKeyValidator.validateInsertion(retainedKeys, byteEntries.keys)
+            _ <- physicalKeyPolicy.validateEach(removals)
+            _ <- physicalKeyPolicy.validateInsertion(current.keySet -- removals, byteEntries.keys)
           } yield ()) match {
             case Left(error) => current -> Left(error)
             case Right(_) =>
@@ -274,7 +274,9 @@ class InMemoryMerklePatriciaProducer[F[_]: Async: Hasher: Parallel: JsonSerializ
           }
           .map(_.flatten)
 
-    encodedPairs.flatMap(PhysicalTrieKeyValidator.materializeEntries(_).liftTo[F])
+    encodedPairs.flatMap { entries =>
+      physicalKeyPolicy.validateComplete(entries.map(_._1)).liftTo[F].as(entries.toMap)
+    }
   }
 
   override def savepoint: F[ProducerSavepoint[F]] =
@@ -308,8 +310,20 @@ object InMemoryMerklePatriciaProducer {
   def make[F[_]: Async: Hasher: Parallel: JsonSerializer](
     initial: Map[Hex, Array[Byte]] = Map.empty
   ): F[InMemoryMerklePatriciaProducer[F]] =
+    makeWithPolicy(initial, PhysicalTrieKeyPolicy.Generic)
+
+  def makeWithFixedWidthKeys[F[_]: Async: Hasher: Parallel: JsonSerializer](
+    widthBytes: Int,
+    initial: Map[Hex, Array[Byte]] = Map.empty
+  ): F[InMemoryMerklePatriciaProducer[F]] =
+    PhysicalTrieKeyPolicy.fixedWidth(widthBytes).liftTo[F].flatMap(makeWithPolicy(initial, _))
+
+  private def makeWithPolicy[F[_]: Async: Hasher: Parallel: JsonSerializer](
+    initial: Map[Hex, Array[Byte]],
+    physicalKeyPolicy: PhysicalTrieKeyPolicy
+  ): F[InMemoryMerklePatriciaProducer[F]] =
     for {
-      _ <- PhysicalTrieKeyValidator.validateKeys(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+      _ <- physicalKeyPolicy.validateComplete(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
       stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
@@ -323,6 +337,7 @@ object InMemoryMerklePatriciaProducer {
         pendingInsertsRef,
         pendingRemovesRef,
         rootHashCacheRef,
-        lastBuiltOrdinalRef
+        lastBuiltOrdinalRef,
+        physicalKeyPolicy
       )
 }

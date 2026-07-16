@@ -20,6 +20,7 @@ import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.instances.HashCodec._
 
 import eu.timepit.refined.types.numeric.NonNegLong
+import fs2.io.file.Files
 import io.circe.{Encoder, Json}
 import weaver.MutableIOSuite
 
@@ -66,8 +67,14 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
 
   private final case class Fixture(
     store: HistoricalCommitmentSmtStore[IO],
-    producer: InMemoryMerklePatriciaProducer[IO]
+    producer: InMemoryMerklePatriciaProducer[IO],
+    durable: MptStore[IO, CommitmentKey]
   )
+
+  private final class TestAppendHook(afterInsert: IO[Unit], beforeCommit: IO[Unit]) extends HistoricalCommitmentAppendHook[IO] {
+    def afterDurableInsert: IO[Unit] = afterInsert
+    def beforeDurableCommit: IO[Unit] = beforeCommit
+  }
 
   private final class BeforeHasher(delegate: Hasher[IO], before: IO[Unit]) extends Hasher[IO] {
     def hash[A: Encoder](data: A): IO[Hash] = before >> delegate.hash(data)
@@ -82,6 +89,8 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     snapshotTaken: Deferred[IO, Unit],
     releaseSnapshot: Deferred[IO, Unit]
   ) extends StatefulMerklePatriciaProducer[IO] {
+
+    override def physicalKeyPolicy: PhysicalTrieKeyPolicy = delegate.physicalKeyPolicy
 
     def entries: IO[Map[Hex, Array[Byte]]] =
       delegate.entries.flatMap(image => snapshotTaken.complete(()).void >> releaseSnapshot.get.as(image))
@@ -115,6 +124,46 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     def savepoint: IO[ProducerSavepoint[IO]] = delegate.savepoint
   }
 
+  private final class BeforeBuildProducer(
+    delegate: StatefulMerklePatriciaProducer[IO],
+    beforeBuildForOrdinal: IO[Unit],
+    restoreFailure: IO[Option[Throwable]] = IO.pure(None)
+  ) extends StatefulMerklePatriciaProducer[IO] {
+
+    override def physicalKeyPolicy: PhysicalTrieKeyPolicy = delegate.physicalKeyPolicy
+
+    def entries: IO[Map[Hex, Array[Byte]]] = delegate.entries
+    def physicalKeys: IO[Set[Hex]] = delegate.physicalKeys
+    def entriesForKeys(keys: Set[Hex]): IO[Map[Hex, Array[Byte]]] = delegate.entriesForKeys(keys)
+    def entry(key: Hex): IO[Option[Array[Byte]]] = delegate.entry(key)
+    def entryCount: IO[Int] = delegate.entryCount
+    def entriesWithPrefix(prefix: Hex): IO[Map[Hex, Array[Byte]]] = delegate.entriesWithPrefix(prefix)
+    def build: IO[Either[MerklePatriciaError, MerklePatriciaTrie]] = delegate.build
+    def buildForOrdinal(ordinal: SnapshotOrdinal): IO[Either[MerklePatriciaError, MerklePatriciaTrie]] =
+      beforeBuildForOrdinal >> delegate.buildForOrdinal(ordinal)
+    def getRootHashForOrdinal(ordinal: SnapshotOrdinal): IO[Option[MptRoot]] = delegate.getRootHashForOrdinal(ordinal)
+    def getCurrentRootHash: IO[Option[MptRoot]] = delegate.getCurrentRootHash
+    def getLastBuiltOrdinal: IO[Option[SnapshotOrdinal]] = delegate.getLastBuiltOrdinal
+    def insert[A: Encoder](data: Map[Hex, A]): IO[Either[MerklePatriciaError, Unit]] = delegate.insert(data)
+    def insertBytes(data: Map[Hex, Array[Byte]]): IO[Either[MerklePatriciaError, Unit]] = delegate.insertBytes(data)
+    def replaceBytes(
+      upserts: Map[Hex, Array[Byte]],
+      removals: List[Hex]
+    ): IO[Either[MerklePatriciaError, Unit]] = delegate.replaceBytes(upserts, removals)
+    def update[A: Encoder](key: Hex, value: A): IO[Either[MerklePatriciaError, Unit]] = delegate.update(key, value)
+    def remove(keys: List[Hex]): IO[Either[MerklePatriciaError, Unit]] = delegate.remove(keys)
+    def clear: IO[Unit] = delegate.clear
+    def getProver: IO[MerklePatriciaSingleInclusionProver[IO]] = delegate.getProver
+    def buildHexMap(data: Map[GlobalStateKey, Json]): IO[Map[Hex, Array[Byte]]] = delegate.buildHexMap(data)
+    def savepoint: IO[ProducerSavepoint[IO]] =
+      delegate.savepoint.map { savepoint =>
+        new ProducerSavepoint[IO] {
+          def restore: IO[Unit] =
+            restoreFailure.flatMap(_.fold(savepoint.restore)(IO.raiseError))
+        }
+      }
+  }
+
   private def hashBytes(hash: Hash): Array[Byte] =
     ImmutableCodec[Hash].immutableBytes(hash).toArray
 
@@ -122,30 +171,35 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     res: Res,
     entries: List[(Hex, Hash)],
     retention: Int = HistoricalCommitmentSmtStore.UnboundedVersionRetention,
-    hasherOverride: Option[Hasher[IO]] = None
+    hasherOverride: Option[Hasher[IO]] = None,
+    appendHook: Option[HistoricalCommitmentAppendHook[IO]] = None
   ): IO[Fixture] =
     rawFixture(
       res,
       entries.map { case (key, hash) => key -> hashBytes(hash) }.toMap,
       retention,
-      hasherOverride
+      hasherOverride,
+      appendHook
     )
 
   private def rawFixture(
     res: Res,
     entries: Map[Hex, Array[Byte]],
     retention: Int = HistoricalCommitmentSmtStore.UnboundedVersionRetention,
-    hasherOverride: Option[Hasher[IO]] = None
+    hasherOverride: Option[Hasher[IO]] = None,
+    appendHook: Option[HistoricalCommitmentAppendHook[IO]] = None
   ): IO[Fixture] = {
     implicit val hh: Hasher[IO] = hasherOverride.getOrElse(res._1)
     implicit val sp: SecurityProvider[IO] = res._2
     implicit val js: JsonSerializer[IO] = res._3
     val _ = (sp, js)
     for {
-      producer <- InMemoryMerklePatriciaProducer.make[IO](entries)
+      producer <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes, entries)
       durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
-      store <- HistoricalCommitmentSmtStore.make[IO](durable, retention)
-    } yield Fixture(store, producer)
+      store <- appendHook.fold(HistoricalCommitmentSmtStore.make[IO](durable, retention))(
+        HistoricalCommitmentSmtStore.makeWithAppendHook[IO](durable, retention, _)
+      )
+    } yield Fixture(store, producer, durable)
   }
 
   private def controlledBeforeNthHash(
@@ -290,6 +344,247 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     } yield expect(before === again)
   }
 
+  test("append failure after durable insert restores the old complete generation and retry plus reopen matches clean replay") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    val failure = new RuntimeException("injected failure after durable insert")
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      hook = new TestAppendHook(armed.get.ifM(IO.raiseError(failure), IO.unit), IO.unit)
+      f <- rawFixture(res, Map.empty, appendHook = hook.some)
+      _ <- driveChain(f.store, upTo = 12L)
+      beforeRoot <- f.store.rootForSnapshot(ord(12L))
+      beforeHash <- f.store.commitmentHashAt(ord(8L))
+      _ <- armed.set(true)
+      failed <- f.store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L)).attempt
+      afterFailureRoot <- f.store.rootForSnapshot(ord(12L))
+      unpublishedRoot <- f.store.rootForSnapshot(ord(13L))
+      afterFailureHash <- f.store.commitmentHashAt(ord(8L))
+      _ <- armed.set(false)
+      retried <- f.store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L))
+      reopened <- HistoricalCommitmentSmtStore.make[IO](f.durable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+      appendBeforeReplay <- reopened.appendAtFinality(ord(14L), ord(9L), commitmentFor(9L)).attempt
+      _ <- reopened.replayFrom(K, ord(8L))
+      reopenedRoot <- reopened.rootForSnapshot(ord(13L))
+      clean <- fresh(res)
+      _ <- driveChain(clean, upTo = 13L)
+      cleanRoot <- clean.rootForSnapshot(ord(13L))
+    } yield
+      expect(failed.left.exists(_ eq failure)) &&
+        expect(beforeRoot.isDefined) &&
+        expect(afterFailureRoot === beforeRoot) &&
+        expect(unpublishedRoot.isEmpty) &&
+        expect(beforeHash.isEmpty) &&
+        expect(afterFailureHash.isEmpty) &&
+        expect(appendBeforeReplay.left.exists(_.isInstanceOf[HistoricalCommitmentReplayRequired])) &&
+        expect(reopenedRoot.contains(retried)) &&
+        expect(cleanRoot.contains(retried))
+  }
+
+  test("a completed filesystem image reopens only through strict replay and reproduces the published root") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
+    Files[IO].tempDirectory.use { directory =>
+      for {
+        source <- rawFixture(res, Map.empty)
+        _ <- driveChain(source.store, upTo = 13L)
+        expected <- source.store.rootForSnapshot(ord(13L))
+        retainedImage <- source.durable.allEntriesAsBytes
+        producer <- FileSystemMerklePatriciaProducer.makeWithFixedWidthKeys[IO](
+          directory,
+          CommitmentKey.EncodedBytes,
+          retainedImage
+        )
+        // Await one explicit completed legacy persistence call. This exercises reopen/replay, not subprocess power-loss safety.
+        _ <- producer.persist(ord(8L))
+        restartedProducer <- FileSystemMerklePatriciaProducer.makeWithFixedWidthKeys[IO](
+          directory,
+          CommitmentKey.EncodedBytes
+        )
+        restartedDurable <- MptStore.make[IO, CommitmentKey](restartedProducer, CommitmentKey.toHexF[IO])
+        loaded <- restartedDurable.loadPersisted(ord(8L))
+        restarted <- HistoricalCommitmentSmtStore.make[IO](
+          restartedDurable,
+          HistoricalCommitmentSmtStore.UnboundedVersionRetention
+        )
+        appendBeforeReplay <- restarted.appendAtFinality(ord(14L), ord(9L), commitmentFor(9L)).attempt
+        _ <- restarted.replayFrom(K, ord(8L))
+        reproduced <- restarted.rootForSnapshot(ord(13L))
+      } yield
+        expect(loaded) &&
+          expect(appendBeforeReplay.left.exists(_.isInstanceOf[HistoricalCommitmentReplayRequired])) &&
+          expect(reproduced === expected)
+    }
+  }
+
+  test("append cancellation before durable commit restores the old complete generation") { res =>
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      entered <- Deferred[IO, Unit]
+      hook = new TestAppendHook(IO.unit, armed.get.ifM(entered.complete(()).void >> IO.never, IO.unit))
+      f <- rawFixture(res, Map.empty, appendHook = hook.some)
+      _ <- driveChain(f.store, upTo = 12L)
+      before <- f.store.rootForSnapshot(ord(12L))
+      _ <- armed.set(true)
+      append <- f.store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L)).start
+      _ <- entered.get.timeout(5.seconds)
+      _ <- append.cancel
+      outcome <- append.join
+      after <- f.store.rootForSnapshot(ord(12L))
+      unpublished <- f.store.rootForSnapshot(ord(13L))
+      retained <- f.store.commitmentHashAt(ord(8L))
+    } yield
+      expect(outcome match { case Outcome.Canceled() => true; case _ => false }) &&
+        expect(after === before) &&
+        expect(unpublished.isEmpty) &&
+        expect(retained.isEmpty)
+  }
+
+  test("append preparation hashing failure leaves both publications at the old generation") { res =>
+    val failure = new RuntimeException("injected append preparation hashing failure")
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      calls <- Ref.of[IO, Int](0)
+      controlled = controlledBeforeNthHash(res._1, armed, calls, n = 1, action = IO.raiseError(failure))
+      f <- rawFixture(res, Map.empty, hasherOverride = controlled.some)
+      _ <- driveChain(f.store, upTo = 12L)
+      before <- f.store.rootForSnapshot(ord(12L))
+      _ <- armed.set(true)
+      failed <- f.store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L)).attempt
+      after <- f.store.rootForSnapshot(ord(12L))
+      unpublished <- f.store.rootForSnapshot(ord(13L))
+      retained <- f.store.commitmentHashAt(ord(8L))
+    } yield
+      expect(failed.left.exists(_ eq failure)) &&
+        expect(after === before) &&
+        expect(unpublished.isEmpty) &&
+        expect(retained.isEmpty)
+  }
+
+  test("cancellation after durable commit begins cannot split durable and live publication") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
+    for {
+      entered <- Deferred[IO, Unit]
+      release <- Deferred[IO, Unit]
+      delegate <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes)
+      producer = new BeforeBuildProducer(delegate, entered.complete(()).void >> release.get)
+      durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
+      store <- HistoricalCommitmentSmtStore.make[IO](durable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+      append <- store.appendAtFinality(ord(K), ord(0L), commitmentFor(0L)).start
+      _ <- entered.get.timeout(5.seconds)
+      cancel <- append.cancel.start
+      _ <- release.complete(())
+      _ <- cancel.joinWithNever
+      outcome <- append.join
+      liveRoot <- store.rootForSnapshot(ord(K))
+      durableHash <- store.commitmentHashAt(ord(0L))
+      reopened <- HistoricalCommitmentSmtStore.make[IO](durable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+      _ <- reopened.replayFrom(K, ord(0L))
+      reopenedRoot <- reopened.rootForSnapshot(ord(K))
+    } yield
+      expect(outcome match { case Outcome.Succeeded(_) | Outcome.Canceled() => true; case _ => false }) &&
+        expect(liveRoot.isDefined) &&
+        expect(durableHash.isDefined) &&
+        expect(reopenedRoot === liveRoot)
+  }
+
+  test("durable commit failure rolls back the inserted leaf and preserves the old live generation") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
+    val failure = new RuntimeException("injected durable commit failure")
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      delegate <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes)
+      producer = new BeforeBuildProducer(delegate, armed.get.ifM(IO.raiseError(failure), IO.unit))
+      durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
+      store <- HistoricalCommitmentSmtStore.make[IO](durable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+      _ <- driveChain(store, upTo = 12L)
+      before <- store.rootForSnapshot(ord(12L))
+      _ <- armed.set(true)
+      failed <- store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L)).attempt
+      after <- store.rootForSnapshot(ord(12L))
+      unpublished <- store.rootForSnapshot(ord(13L))
+      retained <- store.commitmentHashAt(ord(8L))
+    } yield
+      expect(failed.left.exists(_ eq failure)) &&
+        expect(after === before) &&
+        expect(unpublished.isEmpty) &&
+        expect(retained.isEmpty)
+  }
+
+  test("rollback failure poisons the live store and every later operation returns the same latched failure") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
+    val operationFailure = new RuntimeException("injected pre-commit failure")
+    val rollbackFailure = new RuntimeException("injected rollback failure")
+    for {
+      hookArmed <- Ref.of[IO, Boolean](false)
+      rollbackArmed <- Ref.of[IO, Boolean](false)
+      delegate <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes)
+      producer = new BeforeBuildProducer(
+        delegate,
+        IO.unit,
+        rollbackArmed.get.map(Option.when(_)(rollbackFailure))
+      )
+      durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
+      hook = new TestAppendHook(hookArmed.get.ifM(IO.raiseError(operationFailure), IO.unit), IO.unit)
+      store <- HistoricalCommitmentSmtStore.makeWithAppendHook[IO](
+        durable,
+        HistoricalCommitmentSmtStore.UnboundedVersionRetention,
+        hook
+      )
+      _ <- driveChain(store, upTo = 12L)
+      _ <- hookArmed.set(true) >> rollbackArmed.set(true)
+      failed <- store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L)).attempt
+      rootRead <- store.rootForSnapshot(ord(12L)).attempt
+      durableRead <- store.commitmentHashAt(ord(7L)).attempt
+      retry <- store.appendAtFinality(ord(13L), ord(8L), commitmentFor(8L)).attempt
+      poison = failed.left.toOption
+    } yield
+      expect(poison.exists(_.isInstanceOf[HistoricalCommitmentAppendRollbackFailed])) &&
+        expect(poison.exists(p => rootRead.left.exists(_ eq p))) &&
+        expect(poison.exists(p => durableRead.left.exists(_ eq p))) &&
+        expect(poison.exists(p => retry.left.exists(_ eq p)))
+  }
+
+  test("one append hashes one structural-sharing update rather than retained history") { res =>
+    for {
+      armed <- Ref.of[IO, Boolean](false)
+      calls <- Ref.of[IO, Int](0)
+      counting = new BeforeHasher(res._1, armed.get.ifM(calls.update(_ + 1), IO.unit))
+      f <- rawFixture(res, Map.empty, hasherOverride = counting.some)
+      _ <- driveChain(f.store, upTo = 105L)
+      _ <- calls.set(0) >> armed.set(true)
+      _ <- f.store.appendAtFinality(ord(106L), ord(101L), commitmentFor(101L))
+      appendHashCalls <- calls.get
+    } yield
+      // A full-history rebuild at 102 leaves performs tens of thousands of hashes. One forked leaf update is bounded by SMT depth plus
+      // the dedicated MPT's one pending insertion and remains comfortably below this deterministic operation-count ceiling.
+      expect(appendHashCalls > 0) && expect(appendHashCalls < 1024)
+  }
+
+  test("conflicting duplicate evidence and a skipped ordinal fail before either publication changes") { res =>
+    for {
+      store <- fresh(res)
+      _ <- driveChain(store, upTo = 12L)
+      before <- store.rootForSnapshot(ord(12L))
+      retained <- store.commitmentHashAt(ord(7L))
+      conflict <- store.appendAtFinality(ord(12L), ord(7L), commitmentFor(700L)).attempt
+      wrongVersion <- store.appendAtFinality(ord(13L), ord(7L), commitmentFor(7L)).attempt
+      skipped <- store.appendAtFinality(ord(14L), ord(9L), commitmentFor(9L)).attempt
+      after <- store.rootForSnapshot(ord(12L))
+      missingEight <- store.commitmentHashAt(ord(8L))
+      missingNine <- store.commitmentHashAt(ord(9L))
+    } yield
+      expect(conflict.left.exists(_.isInstanceOf[ConflictingHistoricalCommitment])) &&
+        expect(wrongVersion.left.exists(_.isInstanceOf[HistoricalCommitmentReplayLagMismatch])) &&
+        expect(skipped.left.exists(_.isInstanceOf[NonContiguousHistoricalCommitment])) &&
+        expect(after === before) &&
+        expect(retained.isDefined) &&
+        expect(missingEight.isEmpty) &&
+        expect(missingNine.isEmpty)
+  }
+
   test("chain-replay recovery is byte-identical and a second replayFrom is idempotent") { res =>
     for {
       live <- fresh(res)
@@ -372,31 +667,61 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     IO.pure(expect(CommitmentKey.decodeAll(List(canonical, alias)).left.exists(_.isInstanceOf[DuplicateDurableNipopowIdentity])))
   }
 
-  test("historical replay rejects the complete malformed image before committing any version") { res =>
+  test("historical store rejects generic and wrong-width recovery producers before exposing an API") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
+
+    for {
+      genericProducer <- InMemoryMerklePatriciaProducer.make[IO]()
+      genericDurable <- MptStore.make[IO, CommitmentKey](genericProducer, CommitmentKey.toHexF[IO])
+      genericResult <- HistoricalCommitmentSmtStore
+        .make[IO](genericDurable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+        .attempt
+      wrongWidthProducer <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes - 1)
+      wrongWidthDurable <- MptStore.make[IO, CommitmentKey](wrongWidthProducer, CommitmentKey.toHexF[IO])
+      wrongWidthResult <- HistoricalCommitmentSmtStore
+        .make[IO](wrongWidthDurable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+        .attempt
+      exactProducer <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes)
+      exactDurable <- MptStore.make[IO, CommitmentKey](exactProducer, CommitmentKey.toHexF[IO])
+      exactResult <- HistoricalCommitmentSmtStore
+        .make[IO](exactDurable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)
+        .attempt
+    } yield
+      expect.all(
+        genericResult == Left(InvalidHistoricalCommitmentKeyPolicy(None)),
+        wrongWidthResult == Left(InvalidHistoricalCommitmentKeyPolicy(Some(CommitmentKey.EncodedBytes - 1))),
+        exactResult.isRight
+      )
+  }
+
+  test("historical recovery producer rejects a malformed physical image before store construction") { res =>
+    implicit val hh: Hasher[IO] = res._1
+    implicit val js: JsonSerializer[IO] = res._3
     val valid = CommitmentKey.toHex(ord(1))
     val oversized = Hex("0000000000000002aa")
+
     for {
-      f <- fixture(res, List(valid -> h("valid"), oversized -> h("bad")))
-      beforeKeys <- f.producer.physicalKeys
-      result <- f.store.replayFrom(K, ord(1L)).attempt
-      replayPrefix <- f.store.rootForSnapshot(ord(K + 1L))
-      afterKeys <- f.producer.physicalKeys
-    } yield
-      expect(result.left.exists(_.isInstanceOf[MalformedDurableNipopowKey]))
-        .and(expect(replayPrefix.isEmpty))
-        .and(expect(afterKeys == beforeKeys))
+      result <- InMemoryMerklePatriciaProducer
+        .makeWithFixedWidthKeys[IO](
+          CommitmentKey.EncodedBytes,
+          Map(valid -> hashBytes(h("valid")), oversized -> hashBytes(h("bad")))
+        )
+        .attempt
+    } yield expect(result == Left(UnexpectedPhysicalTrieKeyWidth(oversized, CommitmentKey.EncodedBytes, CommitmentKey.EncodedBytes + 1)))
   }
 
   test("historical replay rejects a malformed recovery-KV value before publishing any derived version") { res =>
     val validKey = CommitmentKey.toHex(ord(1L))
     for {
-      f <- rawFixture(res, Map(validKey -> Array[Byte](0x01, 0x02)))
-      _ <- f.store.appendAtFinality(ord(50L), ord(50L), commitmentFor(50L))
-      before <- f.store.rootForSnapshot(ord(50L))
+      f <- rawFixture(res, Map.empty)
+      _ <- f.store.appendAtFinality(ord(K), ord(0L), commitmentFor(0L))
+      _ <- f.producer.insertBytes(Map(validKey -> Array[Byte](0x01, 0x02))).rethrow
+      before <- f.store.rootForSnapshot(ord(K))
       beforeKeys <- f.producer.physicalKeys
       result <- f.store.replayFrom(K, ord(1L)).attempt
       replayPrefix <- f.store.rootForSnapshot(ord(K + 1L))
-      after <- f.store.rootForSnapshot(ord(50L))
+      after <- f.store.rootForSnapshot(ord(K))
       afterKeys <- f.producer.physicalKeys
     } yield
       expect(result.left.exists(_.isInstanceOf[MalformedDurableNipopowValue])) &&
@@ -467,7 +792,7 @@ object HistoricalCommitmentSmtStoreSuite extends MutableIOSuite {
     for {
       snapshotTaken <- Deferred[IO, Unit]
       releaseSnapshot <- Deferred[IO, Unit]
-      delegate <- InMemoryMerklePatriciaProducer.make[IO](Map(zero))
+      delegate <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](CommitmentKey.EncodedBytes, Map(zero))
       producer = new PausedSnapshotProducer(delegate, snapshotTaken, releaseSnapshot)
       durable <- MptStore.make[IO, CommitmentKey](producer, CommitmentKey.toHexF[IO])
       store <- HistoricalCommitmentSmtStore.make[IO](durable, HistoricalCommitmentSmtStore.UnboundedVersionRetention)

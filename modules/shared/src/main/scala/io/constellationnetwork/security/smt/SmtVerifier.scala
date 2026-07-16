@@ -38,7 +38,8 @@ object SmtVerifier {
       else
         proof match {
           case SmtProof.Inclusion(key, value, valueDigest, siblings) =>
-            Hasher[F].hashBytes(value).flatMap { computed =>
+            val owned = value.clone()
+            Hasher[F].hashBytes(owned).flatMap { computed =>
               if (computed =!= valueDigest)
                 (SmtProofError.ValueBindingFailed(key): SmtProofError).asLeft[Verified[SmtEntry]].pure[F]
               else
@@ -46,7 +47,7 @@ object SmtVerifier {
                   SmtHashing
                     .leafDigest[F](pos, valueDigest)
                     .flatMap(leaf => foldUp(pos, leaf, siblings))
-                    .map(recomputed => bindRoot(root, recomputed, SmtEntry.Present(key, value)))
+                    .map(recomputed => bindRoot(root, recomputed, SmtEntry.Present(key, owned)))
                 }
             }
 

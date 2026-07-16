@@ -171,4 +171,66 @@ object VersionedSmtSuite extends MutableIOSuite {
       rootB <- b.commit(ord(1), Map(k3 -> bytes("3"), k1 -> bytes("1"), k2 -> bytes("2")), Set.empty)
     } yield expect(rootA === rootB)
   }
+
+  test("fork shares the complete starting generation but publishes later commits only to the fork") { res =>
+    implicit val (_, h, _) = res
+    val first = key(10)
+    val second = key(11)
+
+    for {
+      original <- VersionedSmt.make[IO](retention = 4)
+      root1 <- original.commit(ord(1), Map(first -> bytes("first")), Set.empty)
+      candidate <- original.fork
+      candidateRoot1 <- candidate.rootAt(ord(1))
+      root2 <- candidate.commit(ord(2), Map(second -> bytes("second")), Set.empty)
+      originalRoot1 <- original.rootAt(ord(1))
+      originalRoot2 <- original.rootAt(ord(2))
+      candidateRoot2 <- candidate.rootAt(ord(2))
+    } yield
+      expect(candidateRoot1.contains(root1)) &&
+        expect(originalRoot1.contains(root1)) &&
+        expect(originalRoot2.isEmpty) &&
+        expect(candidateRoot2.contains(root2))
+  }
+
+  test("caller and proof byte mutation cannot alter retained roots or either side of a structural fork") { res =>
+    implicit val (_, h, _) = res
+    val k = key(12)
+    val candidateKey = key(13)
+    val originalInput = bytes("original")
+    val candidateInput = bytes("candidate")
+    val expectedOriginal = originalInput.clone()
+    val expectedCandidate = candidateInput.clone()
+
+    for {
+      original <- VersionedSmt.make[IO](retention = 4)
+      originalRoot <- original.commit(ord(1), Map(k -> originalInput), Set.empty)
+      candidate <- original.fork
+      candidateRoot <- candidate.commit(ord(2), Map(candidateKey -> candidateInput), Set.empty)
+      _ <- IO {
+        originalInput(0) = 0
+        candidateInput(0) = 0
+      }
+      originalProof <- original.proveAt(ord(1), k).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      candidateProof <- candidate.proveAt(ord(1), k).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      candidateOwnProof <- candidate.proveAt(ord(2), candidateKey).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      _ <- IO(originalProof.value(0) = 1)
+      originalFresh <- original.proveAt(ord(1), k).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      candidateFresh <- candidate.proveAt(ord(1), k).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      originalRootAfter <- original.rootAt(ord(1))
+      originalCandidateVersion <- original.rootAt(ord(2))
+      candidateOriginalRootAfter <- candidate.rootAt(ord(1))
+      candidateRootAfter <- candidate.rootAt(ord(2))
+    } yield
+      expect.all(
+        candidateProof.value.sameElements(expectedOriginal),
+        candidateOwnProof.value.sameElements(expectedCandidate),
+        originalFresh.value.sameElements(expectedOriginal),
+        candidateFresh.value.sameElements(expectedOriginal),
+        originalRootAfter.contains(originalRoot),
+        originalCandidateVersion.isEmpty,
+        candidateOriginalRootAfter.contains(originalRoot),
+        candidateRootAfter.contains(candidateRoot)
+      )
+  }
 }

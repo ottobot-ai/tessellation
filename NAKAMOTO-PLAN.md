@@ -276,17 +276,24 @@ already has a hard-coded kill switch.
    gapped, failed, or cancelled replay preserves the prior tree (`STOR-02`;
    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/DurableNipopowKey.scala:32-42,44-115`;
    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStore.scala:101-108,159-262`;
-   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStore.scala:179-264`;
+   `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStore.scala:289-327,485-529`;
    `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStoreSuite.scala:258-456`;
-   `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStoreSuite.scala:293-337,349-559`). The
-   steady-state append path is not covered by that atomic-swap claim: it publishes
-   `durable.insert/commit` before `versioned.commit`, without an all-or-none
-   failure/cancellation boundary. A failure after durable publication can leave a
-   retained leaf absent from the live tree, and a later append can extend that
-   stale tree until restart replay derives another root
-   (`HistoricalCommitmentSmtStore.scala:150-168`). Add the `REC-004` RED injection
-   between those effects and require the next append plus restart replay to match
-   clean replay before activation. The
+   `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStoreSuite.scala:588-883`).
+   Steady-state append now prepares an isolated structural-sharing SMT fork,
+   savepoints the recovery KV, rolls back on pre-commit failure/cancellation, and
+   masks the terminal `durable.commit` plus one `Published(versioned,cursor)` swap
+   under the store lock (`HistoricalCommitmentSmtStore.scala:237-276,330-450`).
+   Fixed eight-byte physical keys avoid the generic retained-key enumeration on
+   ordinary append, while private producer construction makes that policy a
+   validated capability. SMT input/read/proof/verifier/fork boundaries own their
+   mutable value bytes. Focused failure/cancellation, retry/reopen, policy,
+   operation-count, and alias tests cover old-or-new publication within one live
+   process (`HistoricalCommitmentSmtStoreSuite.scala:347-563,670-731`;
+   `PhysicalTrieKeyPolicySuite.scala:21-67`; `SparseMerkleTreeSuite.scala:401-454`;
+   `VersionedSmtSuite.scala:175-235`). `MptStore.commit` still has no synchronous
+   durable receipt, so power-loss atomicity remains `STOR-01`; exact-hash density-
+   reorg replacement and authenticated production boot/branch wiring remain open
+   under `REC-004`. The
    detached skip-ahead tower driver and startup provider publication are removed.
    Its staged serialized exact-hash coordinator/finalizer is deliberately
    unwired and in-memory. It still has three correctness/resource defects: public
@@ -536,10 +543,15 @@ only. Registration proves key ownership and never grants operator eligibility.
   committed-genesis fixture. Direct pair construction remains only in registry
   algebra and explicit negative/runtime-unavailable cases. A static source-
   inventory guard now fails on new split-registry factories, unreviewed raw VRF
-  consumers, or changed direct-constructor locations/counts. It does not discover
-  every higher-level sortition, eligibility, duty, proof, or verifier call. This textual
-  allowlist does not prove an allowlisted consumer uses the correct historical
-  branch, so K7 still needs cross-consumer qualification.
+  consumers, or changed direct-constructor locations/counts. A second checked
+  semantic manifest now inventories reviewed lexical spellings for the current
+  higher-level sortition, eligibility, duty, signing, proof, tower, and evidence
+  calls at file/count granularity, and binds each row to an uncommented/unquoted
+  negative-vector test-shaped declaration; see
+  `docs/review/OPERATOR-CONSENSUS-KEY-SEMANTIC-MANIFEST.md`. Neither source
+  inventory tracks same-file line motion or same-kind substitution, or proves an
+  allowlisted consumer uses the correct historical branch, so K7 still needs
+  cross-consumer qualification.
 - Tower verification now resolves the current atomic period-zero pair for every
   header occurrence, cryptographically binds each proof to the header's exact
   carried `eta || slot`
@@ -624,8 +636,11 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    a rooted runtime-unavailable negative case. Arbitrary keys remain legal only in
    isolated crypto-primitive tests. The repository guard inventories split
    registry factories, raw production VRF consumers, and direct pair construction,
-   and fails on an unreviewed change. Extend it to a complete semantic manifest of
-   higher-level sortition/eligibility/duty/proof/verifier entry points.
+   and fails on an unreviewed change. The checked semantic manifest now covers the
+   reviewed lexical spellings and file/counts for current higher-level
+   sortition/eligibility/duty/signing/proof/tower/evidence entry points and
+   explicitly records absent watchtower-assignment and optimistic-sampler roles
+   without activating them. It is not an AST/call-graph inventory.
    `CommitteeSortitionSuite`, `CommitteeShardSortitionSuite`, and
    `EligibilityCheckerSuite` now use loader-validated period-zero paired identities;
    wrong-key cases use another registered identity and statistical coverage varies

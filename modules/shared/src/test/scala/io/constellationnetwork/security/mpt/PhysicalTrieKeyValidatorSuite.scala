@@ -517,4 +517,107 @@ object PhysicalTrieKeyValidatorSuite extends MutableIOSuite {
         )
     }
   }
+
+  test("public producer factories bind Generic or a validated immutable fixed-width policy") { implicit res =>
+    implicit val (json, hasher) = res
+
+    Files[IO].tempDirectory.use { directory =>
+      for {
+        memoryGeneric <- InMemoryMerklePatriciaProducer.make[IO]()
+        memoryFixed <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](2)
+        invalidMemoryWidth <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](0).attempt
+        filesystemGeneric <- FileSystemMerklePatriciaProducer.make[IO](directory / "generic")
+        filesystemFixed <- FileSystemMerklePatriciaProducer.makeWithFixedWidthKeys[IO](directory / "fixed", 2)
+        invalidFilesystemWidth <- FileSystemMerklePatriciaProducer
+          .makeWithFixedWidthKeys[IO](directory / "invalid", 0)
+          .attempt
+      } yield
+        expect.all(
+          memoryGeneric.physicalKeyPolicy == PhysicalTrieKeyPolicy.Generic,
+          memoryFixed.physicalKeyPolicy.exactWidthBytes.contains(2),
+          invalidMemoryWidth == Left(PhysicalTrieKeyPolicy.InvalidFixedWidth(0)),
+          filesystemGeneric.physicalKeyPolicy == PhysicalTrieKeyPolicy.Generic,
+          filesystemFixed.physicalKeyPolicy.exactWidthBytes.contains(2),
+          invalidFilesystemWidth == Left(PhysicalTrieKeyPolicy.InvalidFixedWidth(0))
+        )
+    }
+  }
+
+  test("in-memory fixed-width producer enforces its immutable policy across initial, mutation, clear, and savepoint restore") {
+    implicit res =>
+      implicit val (json, hasher) = res
+      val initial = Map(Hex("aabb") -> Array[Byte](1))
+      val short = Hex("aa")
+
+      for {
+        invalidInitial <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](2, Map(short -> Array[Byte](0))).attempt
+        producer <- InMemoryMerklePatriciaProducer.makeWithFixedWidthKeys[IO](2, initial)
+        savepoint <- producer.savepoint
+        validInsert <- producer.insertBytes(Map(Hex("ccdd") -> Array[Byte](2)))
+        invalidInsert <- producer.insertBytes(Map(short -> Array[Byte](3)))
+        invalidRemove <- producer.remove(List(Hex("ff")))
+        beforeClear <- producer.entries
+        _ <- producer.clear
+        empty <- producer.entries
+        widthAfterClear = producer.physicalKeyPolicy.exactWidthBytes
+        _ <- savepoint.restore
+        afterRestore <- producer.entries
+        widthAfterRestore = producer.physicalKeyPolicy.exactWidthBytes
+      } yield
+        expect.all(
+          invalidInitial == Left(UnexpectedPhysicalTrieKeyWidth(short, 2, 1)),
+          validInsert == Right(()),
+          invalidInsert == Left(UnexpectedPhysicalTrieKeyWidth(short, 2, 1)),
+          invalidRemove == Left(UnexpectedPhysicalTrieKeyWidth(Hex("ff"), 2, 1)),
+          beforeClear.keySet == Set(Hex("aabb"), Hex("ccdd")),
+          empty.isEmpty,
+          widthAfterClear.contains(2),
+          sameEntries(afterRestore, initial),
+          widthAfterRestore.contains(2)
+        )
+  }
+
+  test("filesystem fixed-width producer rejects a wrong-width disk generation without changing the loaded generation or policy") {
+    implicit res =>
+      implicit val (json, hasher) = res
+      val validOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(20L))
+      val invalidOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(21L))
+      val valid = Map(Hex("aabb") -> Array[Byte](1), Hex("ccdd") -> Array[Byte](2))
+      val short = Hex("aa")
+
+      Files[IO].tempDirectory.use { directory =>
+        for {
+          invalidInitial <- FileSystemMerklePatriciaProducer
+            .makeWithFixedWidthKeys[IO](directory / "invalid", 2, Map(short -> Array[Byte](0)))
+            .attempt
+          producer <- FileSystemMerklePatriciaProducer.makeWithFixedWidthKeys[IO](directory, 2, valid)
+          _ <- producer.persist(validOrdinal)
+          storage <- MptStateStorage.make[IO](directory)
+          persisted <- awaitPersistedState(storage, validOrdinal)
+          _ <- storage.writeState(invalidOrdinal, Map(short -> Array[Byte](9)))
+          restarted <- FileSystemMerklePatriciaProducer.makeWithFixedWidthKeys[IO](directory, 2)
+          loaded <- restarted.load(validOrdinal)
+          before <- restarted.entries
+          rejected <- restarted.load(invalidOrdinal).attempt
+          after <- restarted.entries
+          savepoint <- restarted.savepoint
+          _ <- restarted.clear
+          widthAfterClear = restarted.physicalKeyPolicy.exactWidthBytes
+          _ <- savepoint.restore
+          restored <- restarted.entries
+          widthAfterRestore = restarted.physicalKeyPolicy.exactWidthBytes
+        } yield
+          expect.all(
+            invalidInitial == Left(UnexpectedPhysicalTrieKeyWidth(short, 2, 1)),
+            persisted.exists(image => sameEntries(image, valid)),
+            loaded,
+            rejected == Left(UnexpectedPhysicalTrieKeyWidth(short, 2, 1)),
+            sameEntries(before, valid),
+            sameEntries(after, valid),
+            widthAfterClear.contains(2),
+            sameEntries(restored, valid),
+            widthAfterRestore.contains(2)
+          )
+      }
+  }
 }

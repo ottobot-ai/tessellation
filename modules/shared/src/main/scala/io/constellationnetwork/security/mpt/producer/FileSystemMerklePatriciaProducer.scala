@@ -30,14 +30,15 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
   *   - Pending changes are tracked for incremental updates
   *   - Full rebuild only when no cached trie exists
   */
-class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerializer](
+final class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerializer] private (
   stateRef: Ref[F, Map[Hex, Array[Byte]]],
   trieRef: Ref[F, Option[MerklePatriciaTrie]],
   pendingInsertsRef: Ref[F, Map[Hex, Array[Byte]]],
   pendingRemovesRef: Ref[F, List[Hex]],
   storage: MptStateStorage[F],
   rootHashCacheRef: Ref[F, Map[SnapshotOrdinal, MptRoot]],
-  lastBuiltOrdinalRef: Ref[F, Option[SnapshotOrdinal]]
+  lastBuiltOrdinalRef: Ref[F, Option[SnapshotOrdinal]],
+  override val physicalKeyPolicy: PhysicalTrieKeyPolicy
 ) extends StatefulWithPersistenceMerklePatriciaProducer[F] {
 
   private val logger = Slf4jLogger.getLoggerFromName[F](this.getClass.getName)
@@ -55,10 +56,9 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
     Async[F].uncancelable { _ =>
       stateRef
         .modify[Either[MerklePatriciaError, Unit]] { current =>
-          val retainedKeys = current.keySet -- removals
           (for {
-            _ <- PhysicalTrieKeyValidator.validateEachKey(removals)
-            _ <- PhysicalTrieKeyValidator.validateInsertion(retainedKeys, byteEntries.keys)
+            _ <- physicalKeyPolicy.validateEach(removals)
+            _ <- physicalKeyPolicy.validateInsertion(current.keySet -- removals, byteEntries.keys)
           } yield ()) match {
             case Left(error) => current -> Left(error)
             case Right(_) =>
@@ -330,7 +330,9 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
              } yield hex -> bytes
          }
        }.map(_.flatten)
-     }).flatMap(PhysicalTrieKeyValidator.materializeEntries(_).liftTo[F])
+     }).flatMap { entries =>
+      physicalKeyPolicy.validateComplete(entries.map(_._1)).liftTo[F].as(entries.toMap)
+    }
 
   override def persist(ordinal: SnapshotOrdinal): F[Unit] =
     for {
@@ -347,7 +349,7 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
 
       loaded <- storage.readState(ordinal).flatMap {
         case Some(state) =>
-          PhysicalTrieKeyValidator.validateKeys(state.keys) match {
+          physicalKeyPolicy.validateComplete(state.keys) match {
             case Left(error) => error.raiseError[F, Boolean]
             case Right(_) =>
               for {
@@ -375,7 +377,7 @@ class FileSystemMerklePatriciaProducer[F[_]: Async: Parallel: Hasher: JsonSerial
         for {
           _ <- logger.info("[MPT] Building from provided data")
           data <- buildData
-          _ <- PhysicalTrieKeyValidator.validateKeys(data.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+          _ <- physicalKeyPolicy.validateComplete(data.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
           _ <- stateRef.set(copyEntries(data))
           _ <- trieRef.set(None)
           _ <- pendingInsertsRef.set(Map.empty)
@@ -421,42 +423,83 @@ object FileSystemMerklePatriciaProducer {
   private[producer] def copyEntries(entries: Map[Hex, Array[Byte]]): Map[Hex, Array[Byte]] =
     entries.iterator.map { case (key, bytes) => key -> copyBytes(bytes) }.toMap
 
+  /** Test-only storage injection for persistence-failure coverage. This cannot mint a fixed-width capability: it always owns fresh refs,
+    * validates and copies the complete initial image under the Generic policy, and exposes no caller-supplied refs or policy.
+    */
+  private[mpt] def makeWithStorageForTest[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    storage: MptStateStorage[F],
+    initial: Map[Hex, Array[Byte]] = Map.empty
+  ): F[FileSystemMerklePatriciaProducer[F]] =
+    validateInitial(initial, PhysicalTrieKeyPolicy.Generic) >>
+      makeWithValidatedStorage(initial, storage, PhysicalTrieKeyPolicy.Generic)
+
   def make[F[_]: Async: Parallel: Hasher: JsonSerializer](
     path: Path,
     initial: Map[Hex, Array[Byte]] = Map.empty
   ): F[FileSystemMerklePatriciaProducer[F]] =
+    makeWithPolicy(path, initial, PhysicalTrieKeyPolicy.Generic)
+
+  def makeWithFixedWidthKeys[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    path: Path,
+    widthBytes: Int,
+    initial: Map[Hex, Array[Byte]] = Map.empty
+  ): F[FileSystemMerklePatriciaProducer[F]] =
+    PhysicalTrieKeyPolicy.fixedWidth(widthBytes).liftTo[F].flatMap(makeWithPolicy(path, initial, _))
+
+  private def makeWithPolicy[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    path: Path,
+    initial: Map[Hex, Array[Byte]],
+    physicalKeyPolicy: PhysicalTrieKeyPolicy
+  ): F[FileSystemMerklePatriciaProducer[F]] =
     for {
-      _ <- PhysicalTrieKeyValidator.validateKeys(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
-      stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
-      trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
-      pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
-      pendingRemovesRef <- Ref.of[F, List[Hex]](List.empty)
+      _ <- validateInitial(initial, physicalKeyPolicy)
       storage <- MptStateStorage.make[F](path)
-      rootHashCacheRef <- Ref.of[F, Map[SnapshotOrdinal, MptRoot]](Map.empty)
-      lastBuiltOrdinalRef <- Ref.of[F, Option[SnapshotOrdinal]](None)
-    } yield
-      new FileSystemMerklePatriciaProducer[F](
-        stateRef,
-        trieRef,
-        pendingInsertsRef,
-        pendingRemovesRef,
-        storage,
-        rootHashCacheRef,
-        lastBuiltOrdinalRef
-      )
+      producer <- makeWithValidatedStorage(initial, storage, physicalKeyPolicy)
+    } yield producer
 
   def make[F[_]: Async: Parallel: Hasher: JsonSerializer](
     path: Path,
     cutoffLogic: OrdinalCutoff,
     initial: Map[Hex, Array[Byte]]
   ): F[FileSystemMerklePatriciaProducer[F]] =
+    makeWithPolicy(path, cutoffLogic, initial, PhysicalTrieKeyPolicy.Generic)
+
+  def makeWithFixedWidthKeys[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    path: Path,
+    cutoffLogic: OrdinalCutoff,
+    widthBytes: Int,
+    initial: Map[Hex, Array[Byte]]
+  ): F[FileSystemMerklePatriciaProducer[F]] =
+    PhysicalTrieKeyPolicy.fixedWidth(widthBytes).liftTo[F].flatMap(makeWithPolicy(path, cutoffLogic, initial, _))
+
+  private def makeWithPolicy[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    path: Path,
+    cutoffLogic: OrdinalCutoff,
+    initial: Map[Hex, Array[Byte]],
+    physicalKeyPolicy: PhysicalTrieKeyPolicy
+  ): F[FileSystemMerklePatriciaProducer[F]] =
     for {
-      _ <- PhysicalTrieKeyValidator.validateKeys(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+      _ <- validateInitial(initial, physicalKeyPolicy)
+      storage <- MptStateStorage.make[F](path, cutoffLogic)
+      producer <- makeWithValidatedStorage(initial, storage, physicalKeyPolicy)
+    } yield producer
+
+  private def validateInitial[F[_]: Async](
+    initial: Map[Hex, Array[Byte]],
+    physicalKeyPolicy: PhysicalTrieKeyPolicy
+  ): F[Unit] =
+    physicalKeyPolicy.validateComplete(initial.keys).fold(_.raiseError[F, Unit], _ => Async[F].unit)
+
+  private def makeWithValidatedStorage[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    initial: Map[Hex, Array[Byte]],
+    storage: MptStateStorage[F],
+    physicalKeyPolicy: PhysicalTrieKeyPolicy
+  ): F[FileSystemMerklePatriciaProducer[F]] =
+    for {
       stateRef <- Ref.of[F, Map[Hex, Array[Byte]]](copyEntries(initial))
       trieRef <- Ref.of[F, Option[MerklePatriciaTrie]](None)
       pendingInsertsRef <- Ref.of[F, Map[Hex, Array[Byte]]](Map.empty)
       pendingRemovesRef <- Ref.of[F, List[Hex]](List.empty)
-      storage <- MptStateStorage.make[F](path, cutoffLogic)
       rootHashCacheRef <- Ref.of[F, Map[SnapshotOrdinal, MptRoot]](Map.empty)
       lastBuiltOrdinalRef <- Ref.of[F, Option[SnapshotOrdinal]](None)
     } yield
@@ -467,6 +510,7 @@ object FileSystemMerklePatriciaProducer {
         pendingRemovesRef,
         storage,
         rootHashCacheRef,
-        lastBuiltOrdinalRef
+        lastBuiltOrdinalRef,
+        physicalKeyPolicy
       )
 }

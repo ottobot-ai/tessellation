@@ -40,6 +40,12 @@ trait VersionedSmt[F[_]] {
 
   /** The set of versions currently under retention (ascending). */
   def retainedVersions: F[List[SnapshotOrdinal]]
+
+  /** Create an unpublished structural-sharing fork of the current complete state. Mutating the fork cannot affect this instance. Immutable
+    * SMT nodes and retained-version maps are shared until the fork commits, so preparing one candidate update is logarithmic in tree size
+    * rather than a full-history rebuild.
+    */
+  def fork: F[VersionedSmt[F]]
 }
 
 object VersionedSmt {
@@ -52,7 +58,11 @@ object VersionedSmt {
   /** Create a versioned SMT retaining the most recent `retention` committed versions (must be >= 1). */
   def make[F[_]: Async: Hasher](retention: Int): F[VersionedSmt[F]] = {
     val bound = math.max(1, retention)
-    Ref.of[F, State](State(SortedMap.empty[SnapshotOrdinal, SmtNode], SmtNode.Empty)).map { stateRef =>
+    fromState(bound, State(SortedMap.empty[SnapshotOrdinal, SmtNode], SmtNode.Empty))
+  }
+
+  private def fromState[F[_]: Async: Hasher](bound: Int, initial: State): F[VersionedSmt[F]] =
+    Ref.of[F, State](initial).map { stateRef =>
       new VersionedSmt[F] {
 
         def commit(version: SnapshotOrdinal, upserts: Map[Hex, Array[Byte]], removes: Set[Hex]): F[SmtRoot] =
@@ -65,8 +75,9 @@ object VersionedSmt {
               case (acc, (key, value)) =>
                 for {
                   pos <- SmtHashing.position[F](key)
-                  vd <- Hasher[F].hashBytes(value)
-                  next <- SmtNodeOps.insert[F](acc, key, pos, vd, value, 0)
+                  owned = value.clone()
+                  vd <- Hasher[F].hashBytes(owned)
+                  next <- SmtNodeOps.insert[F](acc, key, pos, vd, owned, 0)
                 } yield next
             }
             newVersions = prune(state.versions.updated(version, afterUpserts))
@@ -88,11 +99,13 @@ object VersionedSmt {
         def retainedVersions: F[List[SnapshotOrdinal]] =
           stateRef.get.map(_.versions.keys.toList)
 
+        def fork: F[VersionedSmt[F]] =
+          stateRef.get.flatMap(fromState[F](bound, _))
+
         /** Keep only the most-recent `bound` versions by ordinal. */
         private def prune(versions: SortedMap[SnapshotOrdinal, SmtNode]): SortedMap[SnapshotOrdinal, SmtNode] =
           if (versions.size <= bound) versions
           else SortedMap.from(versions.toList.takeRight(bound))
       }
     }
-  }
 }

@@ -40,6 +40,11 @@ trait ProducerSavepoint[F[_]] {
 
 trait StatefulMerklePatriciaProducer[F[_]] {
 
+  /** Immutable physical-key policy enforced by every constructor/load/mutation path of this producer. Generic collision-safe validation is
+    * the default; dedicated stores may opt into a stricter fixed-width policy at producer construction.
+    */
+  def physicalKeyPolicy: PhysicalTrieKeyPolicy = PhysicalTrieKeyPolicy.Generic
+
   /** Defensively copied full state image. Callers cannot mutate producer state through returned byte arrays. */
   def entries: F[Map[Hex, Array[Byte]]]
 
@@ -163,6 +168,11 @@ final case class InvalidDigitPhysicalTrieKey(key: Hex, index: Int, digit: Char) 
 final case class NonCanonicalPhysicalTrieKey(key: Hex, canonical: Hex) extends PhysicalTrieKeyError {
   override def getMessage: String =
     s"Physical trie key is not canonical lowercase hex: ${key.value}; canonical=${canonical.value}"
+}
+
+final case class UnexpectedPhysicalTrieKeyWidth(key: Hex, expectedBytes: Int, observedBytes: Int) extends PhysicalTrieKeyError {
+  override def getMessage: String =
+    s"Physical trie key must be exactly $expectedBytes bytes, got $observedBytes bytes: ${key.value}"
 }
 
 final case class DuplicatePhysicalTriePath(path: Hex, first: Hex, second: Hex) extends PhysicalTrieKeyError {

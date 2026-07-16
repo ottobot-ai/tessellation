@@ -218,15 +218,24 @@ criteria are in `NAKAMOTO-PLAN.md`.
     gapped, failed, or cancelled replay preserves the prior tree (`STOR-02`;
     `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/DurableNipopowKey.scala:32-42,44-115`;
     `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStore.scala:101-108,159-262`;
-    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStore.scala:179-264`;
+    `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStore.scala:289-327,485-529`;
     `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/MptTowerStoreSuite.scala:258-456`;
-    `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStoreSuite.scala:293-337,349-559`). The
-    append path is still split-publication: durable KV commit precedes the live
-    versioned-SMT commit without one all-or-none boundary
-    (`HistoricalCommitmentSmtStore.scala:150-168`). Add `REC-004` failure and
-    cancellation injection between those effects; the old or new complete
-    generation must remain visible, later append cannot extend stale live state,
-    and restart replay plus the next append must equal clean replay. The old
+    `modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/domain/nakamoto/nipopow/HistoricalCommitmentSmtStoreSuite.scala:588-883`).
+    Steady-state append now prepares an isolated structural-sharing SMT fork,
+    savepoints the recovery KV, rolls back on pre-commit failure/cancellation,
+    and masks the terminal `durable.commit` plus one `Published(versioned,cursor)`
+    swap under the store lock
+    (`HistoricalCommitmentSmtStore.scala:237-276,330-450`). Fixed eight-byte
+    physical keys avoid enumerating retained keys during ordinary append, and
+    SMT constructors, reads, proofs, verifier outputs, and forks own their mutable
+    value bytes. Focused failure/cancellation, retry/reopen, policy, operation-count,
+    and alias tests cover the old-or-new invariant within one live process
+    (`HistoricalCommitmentSmtStoreSuite.scala:347-563,670-731`;
+    `PhysicalTrieKeyPolicySuite.scala:21-67`; `SparseMerkleTreeSuite.scala:401-454`;
+    `VersionedSmtSuite.scala:175-235`). This is not power-loss atomicity:
+    `MptStore.commit` has no synchronous durable receipt. Exact-hash density-reorg
+    replacement and authenticated production boot/branch wiring also remain open
+    under `REC-004`/`STOR-01`. The old
     detached skip-ahead driver and startup provider publication are removed.
     Its serialized exact-hash coordinator/finalizer is deliberately unwired,
     in-memory, and not activation-safe. The public finalizer lacks a single-writer
@@ -474,12 +483,19 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `OperatorConsensusKeys` construction is confined to registry algebra or
     explicit negative/runtime-unavailable cases. A static repository guard now
     rejects new split-registry factories, unreviewed raw VRF production
-    consumers, and new/direct fixture constructors. This guard does not inventory
-    every higher-level sortition/eligibility/duty/verifier call, so extend it with
-    a complete semantic consumer manifest. `KEYREG-011` remains open
+    consumers, and new/direct fixture constructors. A separate checked semantic
+    manifest now inventories reviewed lexical spellings for current higher-level
+    sortition, eligibility, duty, signing, proof, tower, and evidence calls at
+    file/count granularity, and requires each row's uncommented/unquoted
+    negative-vector test-shaped declaration to remain. Same-file line motion or
+    same-kind substitution is not detected; the lexer does not resolve Weaver
+    symbols.
+    It also records assigned-watchtower selection and optimistic VRF sampling as
+    blocked/absent rather than silently treating current scaffolds as those roles.
+    `KEYREG-011` remains open
     until qualification proves every allowlisted consumer's historical semantics
     and every generated-unregistered-key no-side-effect vector; the textual
-    allowlist is a review tripwire, not that proof.
+    and semantic inventories are review tripwires, not that proof.
   - **Portable evidence remains open:** for every suffix and upper-level tower
     occurrence, the verifier now resolves the current atomic period-zero pair,
     verifies the VRF proof over the header's exact carried `eta || slot` bytes,

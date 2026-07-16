@@ -30,8 +30,9 @@ final class InMemorySparseMerkleTree[F[_]: Async: Hasher] private (rootRef: Ref[
     for {
       node <- rootRef.get
       pos <- SmtHashing.position[F](key)
-      vd <- Hasher[F].hashBytes(value)
-      updated <- SmtNodeOps.insert[F](node, key, pos, vd, value, 0)
+      owned = value.clone()
+      vd <- Hasher[F].hashBytes(owned)
+      updated <- SmtNodeOps.insert[F](node, key, pos, vd, owned, 0)
       tree <- InMemorySparseMerkleTree.fromNode[F](updated)
     } yield tree
 
@@ -55,8 +56,9 @@ final class InMemorySparseMerkleTree[F[_]: Async: Hasher] private (rootRef: Ref[
         case (acc, (key, value)) =>
           for {
             pos <- SmtHashing.position[F](key)
-            vd <- Hasher[F].hashBytes(value)
-            next <- SmtNodeOps.insert[F](acc, key, pos, vd, value, 0)
+            owned = value.clone()
+            vd <- Hasher[F].hashBytes(owned)
+            next <- SmtNodeOps.insert[F](acc, key, pos, vd, owned, 0)
           } yield next
       }
       tree <- InMemorySparseMerkleTree.fromNode[F](afterUpserts)
@@ -85,8 +87,9 @@ object InMemorySparseMerkleTree {
         case (acc, (key, value)) =>
           for {
             pos <- SmtHashing.position[F](key)
-            vd <- Hasher[F].hashBytes(value)
-            next <- SmtNodeOps.insert[F](acc, key, pos, vd, value, 0)
+            owned = value.clone()
+            vd <- Hasher[F].hashBytes(owned)
+            next <- SmtNodeOps.insert[F](acc, key, pos, vd, owned, 0)
           } yield next
       }
       .flatMap(fromNode[F])

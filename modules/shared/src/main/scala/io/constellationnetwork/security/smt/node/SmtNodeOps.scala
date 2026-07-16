@@ -67,7 +67,7 @@ object SmtNodeOps {
     node match {
       case SmtNode.Empty => None
       case leaf: SmtNode.Leaf =>
-        if (leaf.position === position) Some(leaf.value) else None
+        if (leaf.position === position) Some(leaf.valueCopy) else None
       case internal: SmtNode.Internal =>
         if (SmtHashing.bit(position, depth)) get(internal.right, position, depth + 1)
         else get(internal.left, position, depth + 1)
@@ -91,7 +91,7 @@ object SmtNodeOps {
 
         case leaf: SmtNode.Leaf =>
           if (leaf.position === position)
-            (SmtProof.Inclusion(key, leaf.value, leaf.valueDigest, acc.reverse): SmtProof).asRight[SmtProofError]
+            (SmtProof.Inclusion(key, leaf.valueCopy, leaf.valueDigest, acc.reverse): SmtProof).asRight[SmtProofError]
           else
             (SmtProof.Absence(
               key,

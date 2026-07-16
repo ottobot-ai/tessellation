@@ -44,23 +44,7 @@ object MptPersistenceFailureSuite extends MutableIOSuite {
   }
 
   private def producer(storage: MptStateStorage[IO])(implicit hasher: Hasher[IO], jsonSerializer: JsonSerializer[IO]) =
-    for {
-      state <- Ref.of[IO, Map[Hex, Array[Byte]]](initial)
-      trie <- Ref.of[IO, Option[MerklePatriciaTrie]](None)
-      pendingInserts <- Ref.of[IO, Map[Hex, Array[Byte]]](Map.empty)
-      pendingRemoves <- Ref.of[IO, List[Hex]](List.empty)
-      roots <- Ref.of[IO, Map[SnapshotOrdinal, MptRoot]](Map.empty)
-      lastBuilt <- Ref.of[IO, Option[SnapshotOrdinal]](None)
-    } yield
-      new FileSystemMerklePatriciaProducer[IO](
-        state,
-        trie,
-        pendingInserts,
-        pendingRemoves,
-        storage,
-        roots,
-        lastBuilt
-      )
+    FileSystemMerklePatriciaProducer.makeWithStorageForTest[IO](storage, initial)
 
   test("failed state write propagates and never applies retention cutoff") { res =>
     implicit val (jsonSerializer, hasher) = res

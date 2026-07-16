@@ -20,7 +20,7 @@ import io.constellationnetwork.security.smt.SmtHashing
   * Because the shape is a pure function of `S` (and positions are key-hashes, hence uniform), the [[root]] digest is independent of the
   * order keys were inserted/removed.
   */
-sealed trait SmtNode extends Product with Serializable {
+sealed trait SmtNode extends Serializable {
   def digest: Hash
 }
 
@@ -35,7 +35,15 @@ object SmtNode {
     * the ABSENCE of a DIFFERENT key can hand the verifier the genuine occupying key (which the verifier re-hashes to the committed
     * position). `value` is retained so the in-memory tree can answer `get` and the prover can emit the value bytes.
     */
-  final case class Leaf private (key: Hex, position: Hash, valueDigest: Hash, value: Array[Byte], digest: Hash) extends SmtNode
+  final class Leaf private (
+    val key: Hex,
+    val position: Hash,
+    val valueDigest: Hash,
+    private val ownedValue: Array[Byte],
+    val digest: Hash
+  ) extends SmtNode {
+    private[node] def valueCopy: Array[Byte] = ownedValue.clone()
+  }
 
   /** An internal node split by one bit; `left`/`right` may be [[Empty]] (stem). */
   final case class Internal private (left: SmtNode, right: SmtNode, digest: Hash) extends SmtNode
@@ -43,7 +51,7 @@ object SmtNode {
   object Leaf {
 
     def make[F[_]: Sync: Hasher](key: Hex, position: Hash, valueDigest: Hash, value: Array[Byte]): F[Leaf] =
-      SmtHashing.leafDigest[F](position, valueDigest).map(d => new Leaf(key, position, valueDigest, value, d))
+      SmtHashing.leafDigest[F](position, valueDigest).map(d => new Leaf(key, position, valueDigest, value.clone(), d))
   }
 
   object Internal {

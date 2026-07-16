@@ -398,6 +398,60 @@ object SparseMerkleTreeSuite extends MutableIOSuite with Checkers {
     }
   }
 
+  test("tree, proof, and verifier outputs own their value bytes across every mutable boundary") { res =>
+    implicit val (_, h, _) = res
+    val verifier = SmtVerifier.make[IO]
+    val constructorKey = Hex.fromBytes(Array.fill[Byte](32)(21))
+    val insertKey = Hex.fromBytes(Array.fill[Byte](32)(22))
+    val changesKey = Hex.fromBytes(Array.fill[Byte](32)(23))
+    val constructorInput = "constructor".getBytes("UTF-8")
+    val insertInput = "insert".getBytes("UTF-8")
+    val changesInput = "changes".getBytes("UTF-8")
+    val expectedConstructor = constructorInput.clone()
+    val expectedInsert = insertInput.clone()
+    val expectedChanges = changesInput.clone()
+
+    for {
+      constructed <- InMemorySparseMerkleTree.make[IO](Map(constructorKey -> constructorInput))
+      inserted <- constructed.insert(insertKey, insertInput)
+      changed <- inserted.withChanges(Map(changesKey -> changesInput), Set.empty)
+      rootBefore <- changed.root
+      _ <- IO {
+        constructorInput(0) = 0
+        insertInput(0) = 0
+        changesInput(0) = 0
+      }
+      constructorValue <- changed.get(constructorKey).map(_.get)
+      insertValue <- changed.get(insertKey).map(_.get)
+      changesValue <- changed.get(changesKey).map(_.get)
+      _ <- IO {
+        constructorValue(0) = 1
+        insertValue(0) = 1
+        changesValue(0) = 1
+      }
+      constructorAgain <- changed.get(constructorKey).map(_.get)
+      insertAgain <- changed.get(insertKey).map(_.get)
+      changesAgain <- changed.get(changesKey).map(_.get)
+      prover <- changed.asInstanceOf[InMemorySparseMerkleTree[IO]].prover
+      inclusion <- prover.prove(insertKey).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      verified <- verifier.verify(rootBefore, inclusion).map(_.toOption.get)
+      verifiedValue = verified.value.asInstanceOf[SmtEntry.Present].value
+      _ <- IO(inclusion.value(0) = 2)
+      verifiedUnaffected = verifiedValue.sameElements(expectedInsert)
+      _ <- IO(verifiedValue(0) = 3)
+      freshProof <- prover.prove(insertKey).map(_.toOption.get.asInstanceOf[SmtProof.Inclusion])
+      rootAfter <- changed.root
+    } yield
+      expect.all(
+        constructorAgain.sameElements(expectedConstructor),
+        insertAgain.sameElements(expectedInsert),
+        changesAgain.sameElements(expectedChanges),
+        verifiedUnaffected,
+        freshProof.value.sameElements(expectedInsert),
+        rootAfter == rootBefore
+      )
+  }
+
   // ---- collapse invariant sanity (white-box): node count is bounded, not 2^256 ---------------------------------------------------------
 
   test("structural: a 2-leaf tree materializes a bounded stem (no 2^256 blow-up)") { res =>
