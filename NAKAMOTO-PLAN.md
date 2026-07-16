@@ -1108,10 +1108,19 @@ These are consensus dependencies, not optional cleanup:
 
 | Track | Work | Earliest parallel start | Blocks |
 |---|---|---|---|
-| S1 canonical identity/serde/era | Replace the currently unwired Scodec era scaffold and live JSON/Kryo hashing/proofs with one hash-bound ScodecV1 ordinal-0 service; freeze composite vectors and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
+| S1 canonical identity/serde/era | Replace live JSON/Kryo hashing/proofs with one hash-bound ScodecV1 ordinal-0 service; freeze composite vectors and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. The unused configurable multi-era registry and invalid bridge scaffold are deleted. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
 | S2 deterministic framework oracle/kernel | Authorization, checked arithmetic, conservation, semantic replay protection, ordered execution, resource bounds, independent prefix oracle. | After E0 economic grammar | E4/E5/E8-E11/E13 |
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
+
+Current S1 evidence is cleanup and identity only. The stale configurable
+Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
+deleted. `ProtocolEraId.ScodecV1` is frozen to strict tag `0x01`; empty,
+trailing, and every other one-byte tag reject, and a source tripwire keeps the
+identity dark outside its schema and codec. The 26 root-focused tests pass.
+Live hashing/signing, state-proof selection, MPT bytes, disk reads, and lane
+decoding remain JSON/Kryo/legacy and are guarded against piecemeal activation.
+This does not close S1, SER-005, or ERA-001.
 
 Current S2 evidence is intentionally narrow. A nonactivating test reference
 interpreter supports exactly the typed IDs for zero-fee native transfer,

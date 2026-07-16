@@ -552,10 +552,20 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 - [ ] **S1 PARTIAL - canonical ScodecV1, identity, era, and parameters**
   - Freeze one bounded representation/signature domain for every active artifact.
-  - Replace the unwired era registry and JSON/Kryo `HasherSelector` plus legacy
-    state-proof switches with one canonical hash-bound protocol-era service.
+  - Replace JSON/Kryo `HasherSelector` plus legacy state-proof switches with one
+    canonical hash-bound protocol-era service.
     Ordinal zero is ScodecV1 for bytes, hashes, signatures, state proofs, MPT
     nodes/values, and recovery records in every environment.
+  - **Landed nonactivating E1a cleanup (2026-07-16):** deleted the unused
+    configurable Kryo/JSON/Scodec range registry and invalid plain-JSON/Kryo
+    bridge scaffold. Added only `ProtocolEraId.ScodecV1`, frozen as strict tag
+    `0x01`; empty, trailing, and all 255 other one-byte tags reject. A source
+    tripwire permits this identity only in its schema and codec files. Root
+    verification passes 26 focused tests.
+  - E1a does not change live hashing, signing, state-proof selection, MPT bytes,
+    disk reads, or lane decoding. The atomic Scodec runtime cutover, composite
+    vectors, bounded signed lanes, exact parameters, and verified upstream-v4
+    offline importer remain open.
   - Replace JSON state-channel content and decoder-success classification with an
     explicit signed framework-currency / framework-currency-with-data lane.
   - Delete undeployed fork-only compatibility paths; isolate historical disk/

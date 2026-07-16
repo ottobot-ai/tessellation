@@ -217,10 +217,17 @@ with its RED test and owned write set while unrelated decision gates remain open
 | E1.7 | Canonical `ConsensusParameters` includes finality, eta, committee/shard, duty, resource, retention, DA, challenge, fee, and upgrade values. Derivations use exact integer/rational arithmetic (`R`, for example, uses a ratified `31/10` rule rather than `Double`). Local mismatch halts before signing/mutation. |
 | E1.8 | Encode the owner-ratified V1 binary/social `ProtocolEra` hard-fork authority and exact activation delay for parameter/era/registration changes. A local admin/`ProductionGate` may make one node abstain but cannot change validity, phase, state, or another node. A live signed correction or network-halt mechanism is deferred engineering and has no V1 authority; any future form must be an explicit bounded canonical transition that cannot rewrite or waive validation and has deterministic expiry/resume. |
 | E1.9 | Inventory every retained signed commitment. `smtRoot` and its tower-eligibility inputs are retained and must be independently reproduced and verified on produce/follow/restart/bootstrap. A decorative, producer-chosen, or follower-ignored root is forbidden. |
-| E1.10 | Replace the unwired `EraCodecRegistry` scaffold plus `HasherSelector`/state-proof ordinal switches with one typed protocol-era service. New-chain ordinal 0 selects only ScodecV1 for object bytes, hashes, signatures, state proofs, MPT nodes, and recovery records; no local boundary can change consensus. |
+| E1.10 | The unwired configurable `EraCodecRegistry` and invalid legacy bridges are deleted, and a strict one-value `ProtocolEraId.ScodecV1` identity is landed. Replace `HasherSelector`/state-proof ordinal switches with one typed branch-bound protocol-era service. New-chain ordinal 0 selects only ScodecV1 for object bytes, hashes, signatures, state proofs, MPT nodes, and recovery records; no local boundary can change consensus. |
 | E1.11 | Give every state-channel payload an explicit signed lane/type. Currency and currency-with-data carry exact framework Scodec bytes for replay plus a separately committed custom payload; decoder success never chooses authority. |
 | E1.12 | Move upstream-v4 Kryo/Brotli-JSON types and probing into a read-only offline importer with frozen fixtures. The importer verifies the source snapshot/state and emits one ScodecV1 genesis manifest; active runtime stores cannot invoke legacy decoders. |
 | E1.13 | Freeze full byte/hash/signature/root vectors for every composite consensus object and MPT node/value, not only round trips or primitive codecs. An independent implementation and negative corpus must reproduce them. |
+
+The E1a cleanup is deliberately nonactivating. It deletes the unused
+Kryo/JSON/Scodec range registry and unused plain-JSON/Kryo bridge typeclasses,
+then freezes `ProtocolEraId.ScodecV1` as tag `0x01` with strict unknown-tag and
+trailing-byte rejection. Live JSON/Kryo hashing, signing, state-proof selection,
+disk probing, MPT hashing, and lane decoding are unchanged and remain guarded
+against piecemeal Scodec activation. E1/SER-005/ERA-001 therefore remain open.
 
 ### E2 - Deterministic conservative framework kernel
 

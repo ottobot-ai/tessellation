@@ -25,6 +25,14 @@
 > HEAD `21933559c`. Where a fact came only from a memory note, it was re-checked against source;
 > memory notes are treated as STALE until confirmed.
 
+> **2026-07-16 correction:** this document's 2026-07-07 evidence appendix is
+> retained as point-in-time history. The unused `EraCodecRegistry`, `SerdeEra`,
+> ordinal-range scaffold, and plain-JSON/Kryo legacy bridges have since been
+> deleted. A strict, single-case `ProtocolEraId.ScodecV1` identity is landed but
+> unwired. Live `HashSelect`, state-proof selectors, schema gates, and disk
+> probing remain; the atomic Scodec cutover and offline upstream-v4 importer are
+> still open.
+
 ---
 
 ## 0. TL;DR — what "the hardfork" actually is in THIS project
@@ -32,7 +40,7 @@
 There is **no single artifact named "the hardfork."** The word maps to **two distinct things**,
 and conflating them is the first way to lose the thread:
 
-1. **Inherited-mainnet era machinery** (`Era`, `EraCodecRegistry`, `HashSelect`,
+1. **Inherited-mainnet era machinery** (`Era`, `HashSelect`,
    `StateProofSelector`, `last-kryo-hash-ordinal`, `last-legacy-state-proof-ordinal`,
    `fields-added-ordinals`). This is a **classic activation-ordinal** apparatus for *reading old
    chain state* (Kryo→JSON→scodec, tess3 schema migrations, legacy vs MPT state-proof format). It
@@ -117,15 +125,15 @@ explicitly *dropped* is the multi-version wire-negotiation / mixed-mode-cluster 
 | `FieldsAddedOrdinals` (per-env schema gates) | **BUILT + WIRED** | `config/types.scala:27-38`; HOCON `application.conf:165-224`. Values are **mainnet ordinals** (e.g. tess3 mainnet 2 572 384), `dev = 0`. |
 | `HashSelect` / `HashLogic` (crypto-hash era: Kryo vs JSON) | **BUILT, ad-hoc inline** (not the registry) | per `ERA-REGISTRY-DESIGN.md:46-54` at `security/Hasher.scala:15-21` + inline wiring `TessellationIOApp.scala:135-138`. HOCON `last-kryo-hash-ordinal` `application.conf:57-62` (mainnet 2 572 384, `dev 0`). *(Cited from design doc + HOCON; `Hasher.scala` line range UNVERIFIED against current source — check `Hasher.scala:15-21`.)* |
 | `StateProofSelector` / `SnapshotFormat` (legacy-16-field vs MPT root) | **BUILT, ad-hoc inline** | per `ERA-REGISTRY-DESIGN.md:74-80` at `schema/StateProofSelector.scala:8-39`; HOCON `last-legacy-state-proof-ordinal` `application.conf:64-69` (mainnet 5 960 000, `dev 0`). *(Line ranges cited from design doc; UNVERIFIED against current source.)* |
-| `EraCodecRegistry` (serde: the ONE validated, sealed-ADT registry) | **BUILT but UNWIRED** — scaffold/seed | `serde/era/EraCodecRegistry.scala:17-91` (VERIFIED, read in full). `fromRanges` validation `:45-83`; `defaultScodec` `:88-90`. Consumers are **only** the serde package + legacy bridges (`serde/legacy/{KryoBridge,JsonBridge,LegacyBridgeSerde}.scala`, `serde/package.scala`) — **no production dispatch site**. Confirms `ERA-REGISTRY-DESIGN.md:40` ("built and tested … not yet wired into production dispatch"). |
+| `ProtocolEraId` | **DARK IDENTITY ONLY** | The stale multi-era `EraCodecRegistry` and unused legacy bridges are deleted. `schema/era/ProtocolEraId.scala` exposes only `ScodecV1`; its strict codec freezes tag `0x01`. Nothing consults it for runtime dispatch. |
 | **Unified `EraRegistry`** (the `ERA-REGISTRY-DESIGN.md` proposal: bundle serde+crypto+schema on one range list) | **ABSENT / DESIGN-ONLY** | `grep "class EraRegistry\|object EraRegistry\|io.constellationnetwork.era" modules/ = 0 hits`. The doc's own status: *"research / design … no implementation in this doc"* (`:3`). No S1–S6 slice from Part C is built. |
 | `protocolVersion` field anywhere | **ABSENT** | `grep -rn "protocolVersion\|protocol_version" modules/ = 0 hits`. |
 | Genesis `activationOrdinal` | **BUILT — but NOT a protocol fork** | `L0GenesisData.activationOrdinal = 0L` / `Cl1GenesisData.activationOrdinal = 0L` (`tools/genesis/GenesisGenerator.scala:301,315`; also test fixtures `…:79,98`, KES/VRF loaders). This is the *genesis activation ordinal* (from which genesis state is live), not a hardfork/era boundary — do not mistake it for one. |
 
-**Net:** the era apparatus is a genuine, partly-live **read-path** for historical mainnet formats.
-On the greenfield Nakamoto chain every boundary is `dev = 0`, so it is dormant-except-as-template.
-The *unified* registry the design doc proposes (and its S4 "Brotli-JSON → scodec MPT node hash"
-consensus flip, `ERA-REGISTRY-DESIGN.md:204-213`) is **entirely design-only**.
+**Net:** inherited schema/hash/proof selectors remain partly live, while the
+abandoned multi-serde registry is deleted. The single ScodecV1 identity does not
+select bytes. The atomic Scodec runtime cutover and any future branch-bound era
+schedule remain design/implementation work.
 
 ### 2.2 The sharding economic-trust cutover ("A4" / roots-only)
 
@@ -169,10 +177,11 @@ What actually breaks compat, and what the greenfield rule says must stay readabl
 **What MUST stay readable (per the greenfield rule):**
 - **Prior on-disk state** — a node must not fail to start because its disk state was written by an
   older binary (`feedback_greenfield_no_wire_compat`, "What we DO need to preserve").
-- **Already-finalized chain-store snapshot bytes** — must be parseable by any version shipped
-  (ibid.). This is precisely what `EraCodecRegistry` + `LegacyBridgeSerde`'s *read-only-historical*
-  contract exist to guarantee (`serde/package.scala:18`, `ERA-REGISTRY-DESIGN.md:32`), and why a
-  Shape-B ordinal boundary keeps pre-`B` ordinals re-derivable the old way rather than re-genesising.
+- **Already-finalized chain-store snapshot bytes** — must be parseable according
+  to an explicit historical-read contract. The deleted bridge scaffold never
+  provided this guarantee. Upstream-v4 input belongs to a frozen, read-only
+  offline importer; future in-protocol eras require exact retained decoders and
+  a branch-bound transition contract.
 
 **What is explicitly NOT preserved:** network wire-format compat across versions; protocol-version
 negotiation; mixed-mode BFT/Nakamoto clusters during migration (`SYNC-PROTOCOL.md:345-346`); dual
@@ -258,8 +267,8 @@ load-bearing.
 ### 5.2 Mechanical / lower-leverage (fallback tasks for Opus/Sonnet)
 
 - **M1** — Scrub stale line-number citations in this doc's §2.1 "UNVERIFIED" rows: confirm
-  `Hasher.scala:15-21` (HashSelect/HashLogic), `StateProofSelector.scala:8-39`, `SerdeEra.scala`
-  line ranges against current source (the design doc's citations predate this branch).
+  `Hasher.scala:15-21` (HashSelect/HashLogic) and `StateProofSelector.scala:8-39`
+  against current source (the design doc's citations predate this branch).
 - **M2** — Confirm/deny the A2 shard-eligibility gate exists under any name (SC-binary admission
   VRF-shard-gating); reconcile `project_sharding_direction_clarified` A2 with source.
 - **M3** — Enumerate every reader of gl0's per-MG `CurrencySnapshotInfo` /
@@ -269,9 +278,9 @@ load-bearing.
 - **M4** — Grep-audit that no `numShards > 1`-gated code path leaks into the `numShards = 1`
   byte-identity path (the regression bar); list every site keyed on `numShards`/`shardAcceptanceDeps
   = None` and confirm each collapses to the pre-sharding bytes.
-- **M5** — If the unified `EraRegistry` is greenlit, S1 (promote+widen `EraCodecRegistry`, add
-  `HashKind`/`SchemaShape`, no behavior change) is a mechanical, additive refactor
-  (`ERA-REGISTRY-DESIGN.md:206`) — Sonnet-appropriate once the design decision (F1/F2) is made.
+- **M5** — Superseded. Do not resurrect the deleted configurable registry. E1
+  requires an atomic, branch-bound Scodec cutover behind the strict
+  `ProtocolEraId`, not a local ordinal-range dispatch refactor.
 
 ---
 

@@ -1,13 +1,24 @@
-# Unified `EraRegistry` — ordinal-routed protocol evolution (serde · crypto · schema)
+# Unified `EraRegistry` — superseded historical proposal
 
-**Status:** research / design, 2026-05-29. Owner: orchestrator. Read-only survey + proposal; **no implementation in this doc**.
-**Relation to committed work:** builds directly on the already-landed serde-era scaffold (`serde/era/`, `serde/legacy/`, the `ImmutableCodec`/`Transmittable`/`Persistable` byte-kinds) and the `.workspace/serde-design-notes.md` rationale. Aligns vocabulary with [SMT-HISTORICAL-PROOFS-DESIGN.md](./SMT-HISTORICAL-PROOFS-DESIGN.md) (Part B.1 crypto-layer read) and mirrors the slicing discipline of [GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md](./GL1-INCLUSION-PROOF-FOLLOW-DESIGN.md).
+**Status:** **SUPERSEDED 2026-07-16. DO NOT IMPLEMENT.** This document is
+retained only as a historical survey of the rejected configurable
+ordinal-range design. The unused `serde/era` registry and `serde/legacy`
+bridges described below were deleted. Greenfield code exposes only the strict
+dark identity `ProtocolEraId.ScodecV1`; it is not runtime dispatch. Any future
+upgrade needs a new owner-reviewed, exact branch/hash-bound `ProtocolEra`
+design. The live Scodec cutover must be atomic and the upstream-v4 reader must
+be an isolated verified offline importer.
+
+All present-tense implementation claims below describe the 2026-05-29 source
+survey and are not current architecture.
 
 ---
 
 ## TL;DR
 
-Today there are **four** independent "do X differently before/after ordinal N" mechanisms, three of which the owner named (serde, crypto-hash, schema) plus one more this survey found (state-proof format). They share the same shape — a per-ordinal dispatch — but only one of them (`serde/era/EraCodecRegistry`) has the disciplined, validated, sealed-ADT form; the other three are ad-hoc inline `if (ordinal <= boundary)` checks scattered across wiring code.
+At the time of this survey there were **four** independent "do X differently
+before/after ordinal N" mechanisms. The `EraCodecRegistry` discussed here was
+never a production authority and has since been deleted.
 
 **Proposal:** a single `EraRegistry` keyed by `OrdinalRange → Era`, where `Era` bundles the active **serde codec kind**, **crypto hash transform**, and **schema/fields shape** for that ordinal range. It is the `EraCodecRegistry` generalized: keep its range-validation and sealed-era discipline, widen the value from `SerdeEra` to a record of policies, and make every per-ordinal call site (snapshot decode, **MPT/SMT node hashing**, field-presence checks, **disk reads**) consult it.
 

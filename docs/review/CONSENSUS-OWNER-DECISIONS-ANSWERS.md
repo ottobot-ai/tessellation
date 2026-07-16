@@ -230,8 +230,11 @@ metagraphs never force an economic view onto the hypergraph, `AGENTS.md:61-63`) 
 **Sharpening:** "governance via binary" fixes *who authorizes*; a correction still needs a
 deterministic **on-chain mechanism** so every node applies a byte-identical change — an exact
 `(metagraph, preRoot→postRoot)` target, an **activation ordinal**, replay protection — i.e. the
-ordinal/hash-bound `ProtocolEra` boundary (`ERA-REGISTRY-DESIGN.md`; `EraCodecRegistry` exists,
-greenfield `dev=0`, unwired).
+ordinal/hash-bound `ProtocolEra` boundary. The abandoned configurable
+`EraCodecRegistry` and legacy bridges are deleted; the landed
+`ProtocolEraId.ScodecV1` is only a strict dark identity. The actual branch-bound
+activation schedule and transition remain open engineering, not local HOCON or
+an ordinal-range selector.
 
 **Deferred engineering:** a signed-correction schema (target/diff/post-root/reason/activation-
 ordinal/audit-trail) and live Shape-B correction implementation are not V1 prerequisites. A

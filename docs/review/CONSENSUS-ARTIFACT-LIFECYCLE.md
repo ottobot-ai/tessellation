@@ -782,8 +782,10 @@ floor, or lets manual recovery select a branch.
 ## 11. Canonical serialization and protocol eras
 
 The serde migration is not complete today. MPT values use scodec-backed codecs,
-but ordinary signing/hashing still routes through Circe/JSON/Kryo selectors, and
-`EraCodecRegistry` is not the production authority.
+but ordinary signing/hashing still routes through Circe/JSON/Kryo selectors.
+The unused configurable `EraCodecRegistry` and its invalid plain-JSON/Kryo bridge
+surface are deleted. `ProtocolEraId.ScodecV1` is a dark artifact identity only;
+it is not production dispatch or upgrade authority.
 
 Target rules:
 
