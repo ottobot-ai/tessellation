@@ -996,6 +996,19 @@ be the independent closer.
   store/preference/signing API. Still open: the full authenticated-executed
   capability, `storeValidated`, exact-tip preference capability, durable revisions
   and publication/effect journals, and the real sampled exact-hash Snowball rail.
+  **Restart authority remains OPEN:** startup still selects the restored disk head
+  through raw `chainStore.store` (`SnapshotLeaderLoop.scala:695-713`). An inert
+  seed plus validated-parent-only intake would circularly deadlock because there
+  is no first validated parent; normal gossip only replays an incoming child
+  against the raw parent returned by `chainStore.get`
+  (`NakamotoSyncDaemon.scala:1795-1815`) and cannot upgrade that parent. Before
+  changing this boundary, land a committed genesis/root base capability, ordered
+  authenticated ancestry replay, exact signed-body and historical
+  KES/eta/operator-registry/parameter retention, and crash-safe replay progress.
+  Commit `ccafab7b3` safely prevents a `SelectedTip` issued by one chain-store
+  instance from finalizing another (`NakamotoChainStore.scala:914-925`; regression
+  `NakamotoChainStoreSuite.scala:741-771`, focused suite 56/56), but is containment
+  only and does not close this restart gate.
 
 ---
 

@@ -1159,6 +1159,21 @@ partitioning and a distinct GL0-wide certified-checkpoint adoption lane also
 remain open; the current sidecar truthfully acknowledges its transitional
 all-shards profile when sharding is active.
 
+**Cold-restart NO-GO (`OPEN`, 2026-07-15):** the live leader path raw-selects
+`snapshotStorage.head` (`SnapshotLeaderLoop.scala:695-713`). Merely moving that
+head into an inert seed while requiring validated parents circularly removes the
+first parent needed for replay. Normal gossip is not a bootstrap authority: it
+loads the raw parent and replays only the child
+(`NakamotoSyncDaemon.scala:1795-1815`). The prerequisite tranche is a committed
+genesis/root base capability, ordered authenticated ancestry replay to the
+restored head, exact signed-body plus historical KES/eta/operator-registry/
+parameter retention, and crash-safe replay progress/recovery. Do not claim an
+inert seed, permanent restart halt, or gossip-driven upgrade closes E1/E4.8.
+Commit `ccafab7b3` separately binds `finalizeSelectedAt` to the issuing
+chain-store instance (`NakamotoChainStore.scala:914-925`; regression
+`NakamotoChainStoreSuite.scala:741-771`, focused suite 56/56); that containment
+does not supply cold-restart authority.
+
 **What landed:**
 - Sidecar `/tessellation/rumors/1.0.0` GossipSub topic + `PublishRumor` gRPC RPC
 - `SidecarRumorBridge`: outbound `publishFn` (wired into `Gossip.setSidecarPublishFn`) and inbound `receive` daemon (parses `Signed[RumorRaw]` JSON, recomputes hash, offers to `rumorQueue`)

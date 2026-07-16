@@ -138,6 +138,23 @@ from `snapshotStorage.head` without full replay
 (`SnapshotLeaderLoop.scala:693-719`). A restored head must therefore be treated
 as unattestable until exact readback validation and replay complete.
 
+**Restart-authority NO-GO (`OPEN`, 2026-07-15):** do not implement only an inert
+recovery seed plus a validated-parent-only receive/store boundary. In the current
+startup path the restored head is the first selected parent
+(`SnapshotLeaderLoop.scala:695-713`). If that seed is correctly excluded from
+validated-parent lookup, no child can establish the first validated parent and
+restart deadlocks. Conversely, ordinary gossip is not an upgrade mechanism: the
+receiver obtains the parent through raw `chainStore.get` and replays only the
+incoming child against that parent (`NakamotoSyncDaemon.scala:1795-1815`); it does
+not authenticate and replay the restored parent. Safe cold-start authority first
+requires a committed genesis/root base capability, ordered authenticated ancestry
+replay from that base to the restored head, retention of the exact signed bodies
+and historical KES/eta/operator-registry/parameter context for every step, and
+crash-safe replay progress/recovery semantics. Until that complete bootstrap is
+specified and implemented, raw restored-head selection remains open and grants no
+attestation, projection, preference, or finality authority. A permanent restart
+halt or a normal-gossip-upgrade claim is not Phase B/C completion.
+
 The shard signing boundary is the pattern to preserve, not authority for GL0:
 `VerifiedShardCheckpoint` has a sealed capability whose implementation is private
 to its replaying manager
@@ -685,6 +702,13 @@ in-memory monotone branch/lineage revisions, and exact selected-tip finalization
 CAS are live. Reset advances revisions in-process instead of resetting them.
 These revisions restart at zero and persistence is not crash-atomic, so they
 cannot authorize signing or satisfy Phase C.
+
+Commit `ccafab7b3` independently binds `finalizeSelectedAt`'s `SelectedTip` to
+its issuing chain-store instance before comparing visible selection fields
+(`NakamotoChainStore.scala:914-925`). Its cross-store regression is
+`NakamotoChainStoreSuite.scala:741-771`; the focused suite passed 56/56. This is a
+safe stale/foreign-capability containment fix only. It does not authenticate a
+restored head, create a replay base, or close the restart-authority NO-GO above.
 
 - `NakamotoChainStore.scala`: add the persisted monotone branch and lineage
   revisions, validated storage,
