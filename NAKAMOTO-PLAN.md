@@ -1113,14 +1113,18 @@ These are consensus dependencies, not optional cleanup:
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
 
-Current S1 evidence is cleanup and identity only. The stale configurable
-Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
+Current S1 evidence is cleanup, identity, and one dark byte contract only. The
+stale configurable Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
 deleted. `ProtocolEraId.ScodecV1` is frozen to strict tag `0x01`; empty,
 trailing, and every other one-byte tag reject, and a source tripwire keeps the
-identity dark outside its schema and codec. The 26 root-focused tests pass.
-Live hashing/signing, state-proof selection, MPT bytes, disk reads, and lane
-decoding remain JSON/Kryo/legacy and are guarded against piecemeal activation.
-This does not close S1, SER-005, or ERA-001.
+identity dark outside its schema and codec. A separate explicit, non-implicit
+MPT commitment codec freezes strict leaf/branch/extension bytes and passes 15
+focused tests; nine atomic-cutover guards freeze all 23 current JSON MPT hash
+sites and ordinary production references to the dark codec. The guard is a
+syntactic fuse, not semantic non-reachability proof. Live hashing/signing,
+state-proof selection, MPT roots/proofs, disk reads, and lane decoding remain
+JSON/Kryo/legacy and are guarded against piecemeal activation. This does not
+close S1, SER-005, SER-006, or ERA-001.
 
 Current S2 evidence is intentionally narrow. A nonactivating test reference
 interpreter supports exactly the typed IDs for zero-fee native transfer,

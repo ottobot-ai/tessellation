@@ -229,6 +229,16 @@ trailing-byte rejection. Live JSON/Kryo hashing, signing, state-proof selection,
 disk probing, MPT hashing, and lane decoding are unchanged and remain guarded
 against piecemeal Scodec activation. E1/SER-005/ERA-001 therefore remain open.
 
+The E1b slice is also deliberately nonactivating. It freezes one explicit,
+non-implicit ScodecV1 byte contract for the complete MPT commitment ADT: tags
+`0/1/2`, bounded packed nibble paths with zero odd padding, 32-byte digests, and
+sorted unique branches of at most 16 children. Exact leaf/branch/extension
+goldens and strict negative tests pass 15/15. An inverse source guard passes 9/9,
+freezes all 23 current JSON commitment-hash sites, and rejects ordinary production
+references to the dark codec. That regex inventory is a syntactic fuse, not a
+semantic non-reachability proof. Live MPT hashing, proof bytes, roots, aggregate
+bounds, and runtime selection remain unchanged; E1/SER-005/SER-006 stay open.
+
 ### E2 - Deterministic conservative framework kernel
 
 **Depends on:** E0 grammar; final codecs integrate after E1.

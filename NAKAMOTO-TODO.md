@@ -566,6 +566,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     disk reads, or lane decoding. The atomic Scodec runtime cutover, composite
     vectors, bounded signed lanes, exact parameters, and verified upstream-v4
     offline importer remain open.
+  - **Landed nonactivating E1b byte contract (2026-07-16):** added an explicit,
+    non-implicit ScodecV1 codec for the complete MPT commitment ADT with frozen
+    leaf/branch/extension vectors and strict tag, path, nibble, hash, branch,
+    truncation, and trailing-byte rejection. Fifteen codec tests and nine
+    atomic-cutover guards passed. The guard freezes all 23 current JSON MPT
+    commitment-hash sites and rejects ordinary production references to the dark
+    codec. This is a syntactic fuse, not semantic non-reachability proof.
+  - E1b does not select hash preimages, compute a target MPT root, encode proof
+    aggregates, or activate Scodec in hashing/signing/storage. Aggregate proof and
+    message bounds plus the atomic domain-bound runtime cutover remain open.
   - Replace JSON state-channel content and decoder-success classification with an
     explicit signed framework-currency / framework-currency-with-data lane.
   - Delete undeployed fork-only compatibility paths; isolate historical disk/
