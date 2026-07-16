@@ -432,24 +432,37 @@ focused tests.
 
 A bounded test-only production adapter exercises the real lower native
 acceptance managers and currency ML0 wrappers for zero-fee transfer and
-allow-spend creation. It checks production signature/source ownership,
-canonical lane genesis, exact parents, accepted-block payload binding, exact
-exposed balance/reference state, single-operation active allow-spends, and real
-one-call mixed-outcome batches against the reference model. Raw reference inputs
-are not exposed. The 13 focused characterization tests pass.
+allow-spend creation plus single-operation zero-fee nonreplacement token-lock
+creation. The production differential suite passes 17 tests. The token-lock row
+checks production signature/source ownership, exact native/currency scope,
+canonical lane-specific genesis, exact parent and complete signed payload, and
+an aggregate result with exactly that one accepted block. It compares exact
+exposed balances, successor reference, empty claimed-replacement state,
+lane-specific in-round context, and the complete address-keyed active-lock map.
+Wrong-owner, wrong-lane, wrong-parent, forged-genesis, nonzero-fee, and
+replacement cases retain the exact production rejection or explicit
+helper-boundary error. Raw reference inputs are encapsulated by private adapter
+implementations and reach reference execution only through internal projection
+methods. Existing transfer/allow-spend one-call mixed-outcome batches remain
+characterized; this token-lock slice is single-operation and makes no batch
+parity claim.
 
 This is not production-kernel implementation, the complete GL0 acceptance path,
-E2.8 completion, canonical Scodec/hash/signature binding, MPT/root integration,
-or runtime activation. Production batch insufficiency awaits while the reference
+token-lock batch differential, E2.8 completion or cross-platform property
+coverage, canonical Scodec/hash/signature binding, MPT/root integration, or
+runtime activation. Production batch insufficiency awaits while the reference
 row rejects; live GL0's allow-spend epoch rule differs from the target window;
 legacy signatures omit domain/lane; production exposes no independent replay-ID
 or write-order evidence and no batch allow-spend active-record delta; and
-single-result observers accept caller-supplied production results. Nonzero fees
-remain fail-closed because their disposition is not frozen. Live snapshot
-acceptance does not yet enforce the reference row's contextual token-lock
-minimum-duration rule. Token-lock replacement, expiry/refund, and manual unlock
-remain open. Allow-spend consume, expiry, and refund remain blocked on O-13
-terminal ordering. Every other grammar row remains open.
+single-result observers accept caller-supplied production results. Token-lock
+nonzero fees and replacement remain helper-fail-closed because their disposition
+and transition semantics are not frozen. The differential explicitly preserves
+the live snapshot acceptance versus stricter reference contextual
+minimum-duration divergence. Token-lock expiry/refund and manual unlock remain
+open and require owner review in
+[`TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md`](TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md).
+Allow-spend consume, expiry, and refund remain blocked on O-13 terminal ordering.
+Every other grammar row remains open.
 
 ## 6. Required RED and oracle tests
 

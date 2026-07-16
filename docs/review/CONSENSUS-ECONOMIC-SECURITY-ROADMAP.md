@@ -293,26 +293,37 @@ fails closed every other manifest row. The four focused suites pass 41 tests.
 
 A bounded test-only production adapter now exercises the real lower native
 acceptance managers and currency ML0 wrappers for zero-fee transfer and
-allow-spend creation. It verifies production signatures/source ownership,
-canonical lane genesis, exact parents, accepted-block payload binding, exact
-exposed balances and successor references, single-operation active
-allow-spends, and real one-call batch accepted/rejected/dependent/awaiting
-outcomes. Raw reference inputs remain private to the adapter. Its 13 tests pass.
+allow-spend creation plus single-operation zero-fee nonreplacement token-lock
+creation. The production differential suite passes 17 tests. For token locks it
+binds production signature/source ownership, exact native/currency scope,
+canonical lane-specific genesis, parent, complete signed payload, and an
+aggregate result containing exactly that one accepted block. It compares exact
+exposed balances, successor reference, claimed-replacement and lane-specific
+in-round context fields, and the complete address-keyed active-lock map. The
+wrong-owner, lane, parent, genesis, fee, and replacement negatives preserve the
+exact production rejection or explicit helper-boundary error. Raw reference
+inputs are encapsulated by private adapter implementations and reach reference
+execution only through internal projection methods. Existing transfer/
+allow-spend mixed-outcome batches remain characterized; token locks have no
+batch-parity claim.
 
 This evidence does not implement or validate the production kernel, complete
-GL0 acceptance path, E2.8 cross-platform property corpus, canonical
+GL0 acceptance path, token-lock batch differential, E2.8 cross-platform property corpus, canonical
 Scodec/hash/signature bytes, MPT writes, complete-root calculation, or runtime
 activation. Production batch insufficiency is `Awaiting` while the reference
 row rejects, and live GL0 accepts an allow-spend outside the target reference
 epoch window. Legacy payload signatures do not bind domain/lane; production
 exposes no independent replay-ID or write-order evidence; batch allow-spend APIs
 do not expose active-record deltas; single-result observers consume
-caller-supplied results and prove no invocation provenance; and nonzero fees
-remain out of scope. Live snapshot acceptance does not yet enforce the reference
-row's contextual token-lock minimum-duration rule; token-lock replacement,
-expiry/refund, and manual unlock remain open. Allow-spend consume/expiry/refund
-remain blocked on O-13 terminal ordering, and every other E2 operation row
-remains open.
+caller-supplied results and prove no invocation provenance. Token-lock nonzero
+fees and replacement remain helper-fail-closed because their target semantics
+are not frozen. The differential explicitly records that live snapshot
+acceptance accepts a lock rejected by the stricter reference contextual
+minimum-duration rule. Token-lock expiry/refund and manual unlock remain open
+and require owner review in
+[`TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md`](TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md).
+Allow-spend consume/expiry/refund remain blocked on O-13 terminal ordering, and
+every other E2 operation row remains open.
 
 ### E3 - Pure finality and fork-choice model
 
