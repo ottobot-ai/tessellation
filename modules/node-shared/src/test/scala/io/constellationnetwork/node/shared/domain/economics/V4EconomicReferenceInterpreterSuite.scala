@@ -292,7 +292,7 @@ object V4EconomicReferenceInterpreterSuite extends FunSuite {
 
   test("custom-origin framework claim has no executable constructor and fails closed") {
     val base = state(account(Dag, alice) -> BigInt(100))
-    val input = UnsupportedManifestOperation("ECO-TOKEN-LOCK-MANUAL", CustomData)
+    val input = UnsupportedManifestOperation.fromValue("ECO-TOKEN-LOCK-MANUAL", CustomData).toOption.get
     val result = execute(context(NativeGl1), base, input)
 
     expect(result.rejected.head.reason == UnsupportedOperation("ECO-TOKEN-LOCK-MANUAL", CustomData))
