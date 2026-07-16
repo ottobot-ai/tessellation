@@ -808,6 +808,12 @@ object CurrencySnapshotProcessor {
   private def describe(err: FollowVerificationError): String = err match {
     case FollowVerificationError.CommittedRootMismatch(expected, got) =>
       s"CommittedRootMismatch(expected=${expected.show.take(12)}, got=${got.show.take(12)})"
+    case FollowVerificationError.MissingFieldProof(field)    => s"MissingFieldProof($field)"
+    case FollowVerificationError.MissingFieldValues(field)   => s"MissingFieldValues($field)"
+    case FollowVerificationError.MissingFieldValue(field, _) => s"MissingFieldValue($field)"
+    case FollowVerificationError.RangeBoundsMismatch(field, _, _, _, _) =>
+      s"RangeBoundsMismatch($field)"
+    case FollowVerificationError.UnprovenEmptyField(field)    => s"UnprovenEmptyField($field)"
     case FollowVerificationError.RangeProofInvalid(field, _)  => s"RangeProofInvalid($field)"
     case FollowVerificationError.ValueBindingFailed(field, _) => s"ValueBindingFailed($field)"
     case FollowVerificationError.FieldRootMismatch(field, expected, got) =>
