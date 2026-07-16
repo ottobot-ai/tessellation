@@ -357,9 +357,17 @@ eligibility, duty, signing, proof, tower, and evidence calls at file/count
 granularity, and requires uncommented/unquoted negative-vector test-shaped
 declarations. Same-file line motion or same-kind substitution is not detected,
 and the lexer does not resolve Weaver symbols. It also records the
-intentionally absent watchtower and optimistic-sampler consumers. Neither
-inventory is an AST/call-graph proof or proves branch-historical qualification,
-so K7 remains open.
+intentionally absent watchtower and optimistic-sampler consumers. K7a now adds
+a generated two-operator frozen-view matrix: A is authority, while separately
+signed and loader-validated B is absent from A's view. The real genesis-only
+resolver rejects B, B's complete pair substituted for A, an unrooted runtime-
+shaped record with a dummy proof, and a malformed carried VRF key. That runtime-
+shaped negative is not loader- or cryptographically validated. Every present
+semantic row also names a concrete adapter-negative test and required zero-
+authority-effect obligations. Anchor existence does not prove that test
+instruments every listed effect. Neither inventory nor
+that lexical anchor mapping is an AST/call-graph proof, and the generated matrix
+does not prove branch-historical qualification, so K7 remains open.
 
 The tower verifier resolves every suffix and upper-level occurrence through the
 current atomic period-zero pair, verifies its VRF proof over the header's exact
@@ -403,9 +411,12 @@ This is not runtime completion. The following remain merge gates:
    tripwire and checked higher-level consumer manifest. `CommitteeSortitionSuite`, `CommitteeShardSortitionSuite`,
    and `EligibilityCheckerSuite` use loader-validated period-zero paired identities;
    wrong-key cases use another registered identity and repeated statistical trials
-   vary canonical draw inputs instead of minting disposable keys. The manifest
-   fails on new matched spellings in unmanifested files, file/count changes, and
-   stale negative-vector test-shaped declarations; it is not proof of historical
-   semantics. `KEYREG-011` remains open until every
-   allowlisted path passes the generated historical-branch and unregistered-key
-   no-side-effect matrix.
+   vary canonical draw inputs instead of minting disposable keys. The K7a matrix
+   qualifies the frozen resolver and the manifest pins concrete adapter-negative
+   anchors plus the complete zero-effect obligation vocabulary. Per-adapter
+   instrumentation of those obligations remains incomplete. The manifest fails on new
+   matched spellings in unmanifested files, file/count changes, and stale negative
+   or qualification test-shaped declarations; it is not proof of historical
+   semantics. `KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open until every
+   allowlisted path passes the generated historical-branch and exact-parent
+   no-side-effect matrix, including positive historical runtime consumers.

@@ -10,6 +10,15 @@ classified, and attached to an uncommented/unquoted `test`/`pureTest` call shape
 Weaver symbol or prove the named vector exercises the row. It also does not prove the call site has the exact branch-historical registry,
 roster, stake, eta, or Phase-2 witness required by `KEYREG-006..010`.
 
+The `qualification_source`, `qualification_anchor`, and `required_zero_effects` columns add a bounded K7a obligation inventory. Every
+non-`BLOCKED` row names an existing adapter-specific negative test and the authority effects that a completed qualification must keep zero
+after that adapter rejects an unqualified identity. The checked obligation vocabulary is `Draw`, `EtaLookup`, `PossessionProof`, `Replay`,
+`KesSign`, `EdSign`,
+`AggregatorRecord`, `TrackerRecord`, `Store`, `Adopt`, `Publish`, and `Slash`. The semantic suite proves that the source and exact
+test-shaped anchor exist and that every effect name is known; it does not infer control flow or prove that an assertion instruments every
+listed effect. For example, the GL0 identity anchor proves resolver rejection but does not itself instrument replay, storage, adoption, or
+publication. Those entries remain explicit unproved obligations.
+
 ## Status meanings
 
 - `FROZEN_GENESIS`: the live path accepts only a committed period-zero atomic pair or otherwise fails closed. It is not runtime-rotation
@@ -28,6 +37,14 @@ The checked inventory covers higher-level calls for:
   equivocation evidence;
 - NiPoPoW tower pair lookup and proof verification.
 
+`OperatorConsensusKeyQualificationMatrix` adds executable frozen-view identity vectors generated through
+`CanonicalOperatorConsensusFixture.makePopulation(2)`. Operator A supplies the authority view. Operator B is a separately signed,
+loader-validated period-zero control that exists in the combined fixture population but is absent from A's authority view. The real
+genesis-only resolver accepts A's exact atomic pair and rejects B as an absent operator, B's complete registered KES+VRF pair substituted
+for A, an unrooted runtime-shaped record with a dummy proof presented to the frozen resolver, and a malformed carried VRF key. The runtime-
+shaped negative is not loader- or cryptographically validated. This is fixture and frozen-resolver qualification only. It is not a common
+adapter layered over the distinct production consumers.
+
 Two target roles are deliberately recorded as absent:
 
 - deterministic assigned-watchtower selection and its positive replay-coverage identity;
@@ -45,7 +62,10 @@ The semantic suite fails when:
 2. a reviewed call moves between files, is renamed, or changes occurrence count without a manifest review;
 3. an explicitly blocked selector matching a reviewed spelling silently appears;
 4. an uncommented/unquoted `test`/`pureTest` call shape is removed or its exact test name changes without updating the row;
-5. a row omits the explicit `not qualified` limitation.
+5. a non-blocked row lacks a real adapter-negative source/anchor, uses an unknown or duplicated zero-effect obligation, or the manifest no
+   longer covers the complete obligation vocabulary;
+6. a blocked row claims an adapter anchor or obligation that cannot exist while the consumer remains absent;
+7. a row omits the explicit `not qualified` limitation.
 
 The inventory is keyed by `(kind, source file, occurrence count)`: moving a call between lines in the same file, or replacing one same-kind
 call with another in that file while preserving the count, is not detected. It is not a Scala AST, symbol-resolution, or call-graph proof;
@@ -55,9 +75,17 @@ separate fail-closed tripwire rejects reviewed call spellings anywhere inside a 
 The existing raw-primitive guard remains independent. Both guards must pass: the raw guard catches reviewed direct primitive spellings,
 while this manifest catches reviewed higher-level API spellings.
 
+The generated matrix and adapter mappings are intentionally separate. The generated matrix executes the shared frozen atomic-pair
+boundary. Snapshot intake, admission, producer, attester, checkpoint adoption, tower, and slashing retain their own concrete negative
+anchors because those adapters have different inputs and side effects. The `required_zero_effects` column is the remaining instrumentation
+contract, not evidence that the named anchor observes every effect. Treating the mappings as one executable runtime abstraction would hide
+those differences and would be a false proof.
+
 ## Remaining activation blockers
 
-`KEYREG-011` remains open. Closing it still requires the generated branch/era/operator cross-consumer matrix, exact N-2 pair plus
+`KEYREG-006`, `KEYREG-010`, and `KEYREG-011` remain open. K7a qualifies only frozen-genesis resolver rejection and inventories the current
+adapter anchors and unproved zero-effect obligations. Closing those gates still requires executable adapter instrumentation, the generated
+historical branch/era/operator cross-consumer matrix, exact N-2 pair plus
 roster/stake resolution, exact N-1 eta, exact Phase-2 shard references, runtime local secret-bundle selection, assigned watchtower coverage,
-the optimistic sampler, portable tower membership evidence, and exact offence-parent slashing resolution. No row in this manifest activates
-those paths or supplies a selection policy.
+the optimistic sampler, portable nonempty-tower membership evidence, and positive exact-offence-parent slashing/runtime consumers. No row
+in this manifest activates those paths or supplies a selection policy.

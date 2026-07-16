@@ -547,11 +547,18 @@ only. Registration proves key ownership and never grants operator eligibility.
   semantic manifest now inventories reviewed lexical spellings for the current
   higher-level sortition, eligibility, duty, signing, proof, tower, and evidence
   calls at file/count granularity, and binds each row to an uncommented/unquoted
-  negative-vector test-shaped declaration; see
+  negative-vector test-shaped declaration. K7a now also maps every present
+  consumer to a concrete adapter-negative test and a checked vocabulary of
+  zero-authority-effect obligations. The mapping does not prove those effects
+  are instrumented by the named test. A generated two-operator frozen-view
+  matrix proves that a
+  loader-registered control outside the authority view, its complete pair
+  substituted for the authority operator, an unrooted runtime-shaped record, and
+  malformed wire key all fail the real genesis-only resolver; see
   `docs/review/OPERATOR-CONSENSUS-KEY-SEMANTIC-MANIFEST.md`. Neither source
-  inventory tracks same-file line motion or same-kind substitution, or proves an
-  allowlisted consumer uses the correct historical branch, so K7 still needs
-  cross-consumer qualification.
+  inventory tracks same-file line motion or same-kind substitution. The adapter
+  anchor mapping is not control-flow proof and the generated matrix is not
+  historical authority, so K7 still needs cross-consumer branch qualification.
 - Tower verification now resolves the current atomic period-zero pair for every
   header occurrence, cryptographically binds each proof to the header's exact
   carried `eta || slot`
@@ -644,10 +651,14 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    `CommitteeSortitionSuite`, `CommitteeShardSortitionSuite`, and
    `EligibilityCheckerSuite` now use loader-validated period-zero paired identities;
    wrong-key cases use another registered identity and statistical coverage varies
-   canonical draw inputs instead of minting disposable keys. Complete the semantic
-   generated-branch/consumer matrix and generated-unregistered-key no-side-effect
-   vectors; an allowlisted path is not automatically correct. Gate: `KEYREG-006`,
-   `KEYREG-011`, and a zero-unapproved-call-site inventory artifact.
+   canonical draw inputs instead of minting disposable keys. K7a's generated
+   frozen-view matrix and adapter-specific zero-effect obligation inventory are
+   landed, but per-adapter effect instrumentation is incomplete. They deliberately
+   do not activate or simulate a common runtime adapter.
+   Complete the historical generated-branch/consumer matrix, positive historical
+   runtime consumers, and exact-parent no-side-effect vectors; an allowlisted path
+   is not automatically correct. Gates: `KEYREG-006`, `KEYREG-010`, `KEYREG-011`,
+   and a zero-unapproved-call-site inventory artifact.
 
 ### E3 - Portable NiPoPoW tower (`SCAFFOLD ONLY`)
 

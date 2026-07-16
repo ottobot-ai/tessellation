@@ -16,7 +16,9 @@ import weaver.SimpleIOSuite
   *
   * This is a source-inventory tripwire, not a proof that an allowlisted consumer has correct historical semantics. In particular, a
   * `FROZEN_GENESIS` row records the current containment boundary, while a `BLOCKED` row records an intentionally absent target consumer.
-  * Runtime branch-historical qualification remains covered by KEYREG-006..010 and is not inferred from this suite passing.
+  * Runtime branch-historical qualification remains covered by KEYREG-006..010 and is not inferred from this suite passing. Likewise, a
+  * required-zero-effect entry is an instrumentation obligation; checking that its adapter-negative test name exists does not prove that the
+  * test observes each named effect.
   */
 object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
 
@@ -31,13 +33,16 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
     expectedCount: Int,
     negativeSource: String,
     negativeAnchor: String,
+    qualificationSource: String,
+    qualificationAnchor: String,
+    requiredZeroEffects: String,
     limitation: String
   )
 
   private val allowedStatuses = Set("FROZEN_GENESIS", "FAIL_CLOSED_SCAFFOLD", "BLOCKED")
 
-  /** These are semantic API calls, not primitive names. A consumer remains visible even when it delegates VRF/KES work through a helper
-    * and never mentions `EcVrf25519` or `OperationalKeyMaker` directly.
+  /** These are semantic API calls, not primitive names. A consumer remains visible even when it delegates VRF/KES work through a helper and
+    * never mentions `EcVrf25519` or `OperationalKeyMaker` directly.
     */
   private val callKinds: Map[String, Regex] = Map(
     "active-pair-resolve" -> raw"\bActiveOperatorConsensusKeys\s*\.\s*resolve\s*\(".r,
@@ -94,21 +99,23 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
         case key if actual(key) != expected(key) => s"${key._1}@${key._2} expected=${expected(key)} actual=${actual(key)}"
       }
 
-      expect.all(
-        duplicateKeys.isEmpty,
-        unknownKinds.isEmpty,
-        unmanifested.isEmpty,
-        stale.isEmpty,
-        changed.isEmpty
-      ).and(
-        if (duplicateKeys.isEmpty && unknownKinds.isEmpty && unmanifested.isEmpty && stale.isEmpty && changed.isEmpty) success
-        else
-          failure(
-            s"duplicate=${duplicateKeys.mkString(",")} unknownKinds=${unknownKinds.toList.sorted.mkString(",")} " +
-              s"unmanifested=${unmanifested.toList.sorted.mkString(",")} stale=${stale.toList.sorted.mkString(",")} " +
-              s"changed=${changed.mkString(",")}"
-          )
-      )
+      expect
+        .all(
+          duplicateKeys.isEmpty,
+          unknownKinds.isEmpty,
+          unmanifested.isEmpty,
+          stale.isEmpty,
+          changed.isEmpty
+        )
+        .and(
+          if (duplicateKeys.isEmpty && unknownKinds.isEmpty && unmanifested.isEmpty && stale.isEmpty && changed.isEmpty) success
+          else
+            failure(
+              s"duplicate=${duplicateKeys.mkString(",")} unknownKinds=${unknownKinds.toList.sorted.mkString(",")} " +
+                s"unmanifested=${unmanifested.toList.sorted.mkString(",")} stale=${stale.toList.sorted.mkString(",")} " +
+                s"changed=${changed.mkString(",")}"
+            )
+        )
     }
   }
 
@@ -165,18 +172,20 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
           sources.flatMap(source => Option.when(pattern.findFirstIn(scalaCodeOnly(source.contents)).nonEmpty)(kind -> source.path))
       }
 
-      expect.all(
-        manifestKinds == expectedKinds,
-        invalidShape.isEmpty,
-        occurrences.isEmpty
-      ).and(
-        if (manifestKinds == expectedKinds && invalidShape.isEmpty && occurrences.isEmpty) success
-        else
-          failure(
-            s"manifestKinds=${manifestKinds.toList.sorted.mkString(",")} expected=${expectedKinds.toList.sorted.mkString(",")} " +
-              s"invalidShape=${invalidShape.map(_.id).sorted.mkString(",")} occurrences=${occurrences.sorted.mkString(",")}"
-          )
-      )
+      expect
+        .all(
+          manifestKinds == expectedKinds,
+          invalidShape.isEmpty,
+          occurrences.isEmpty
+        )
+        .and(
+          if (manifestKinds == expectedKinds && invalidShape.isEmpty && occurrences.isEmpty) success
+          else
+            failure(
+              s"manifestKinds=${manifestKinds.toList.sorted.mkString(",")} expected=${expectedKinds.toList.sorted.mkString(",")} " +
+                s"invalidShape=${invalidShape.map(_.id).sorted.mkString(",")} occurrences=${occurrences.sorted.mkString(",")}"
+            )
+        )
     }
   }
 
@@ -205,6 +214,50 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
     }
   }
 
+  test("every non-blocked row records zero-effect obligations beside an executable adapter negative anchor") {
+    manifestRows.flatMap { rows =>
+      rows
+        .filterNot(_.status == "BLOCKED")
+        .traverse { row =>
+          IO.blocking {
+            val root = repositoryRoot(Paths.get(sys.props("user.dir")).toAbsolutePath.normalize())
+            val path = root.resolve(row.qualificationSource).normalize()
+            val insideRoot = path.startsWith(root)
+            val normalized = path.toString.replace('\\', '/')
+            val isTestSource = normalized.contains("/src/test/scala/") && normalized.endsWith(".scala")
+            val contents = Option.when(insideRoot && isTestSource && Files.isRegularFile(path))(
+              new String(Files.readAllBytes(path), StandardCharsets.UTF_8)
+            )
+            val anchorFound = contents.exists(source => executableTestAnchors(source).contains(row.qualificationAnchor))
+            val effectNames = row.requiredZeroEffects.split("\\|", -1).toList
+            val distinctEffects = effectNames.distinct.sizeCompare(effectNames.size) == 0
+            val unknownEffects = effectNames.toSet -- OperatorConsensusKeyQualificationMatrix.EffectObligation.byManifestName.keySet
+            (row.id, insideRoot, isTestSource, Files.isRegularFile(path), anchorFound, distinctEffects, unknownEffects)
+          }
+        }
+        .map { results =>
+          val failures = results.collect {
+            case (id, inside, testSource, regular, anchor, distinct, unknown)
+                if !inside || !testSource || !regular || !anchor || !distinct || unknown.nonEmpty =>
+              s"$id(inside=$inside testSource=$testSource regular=$regular anchor=$anchor distinct=$distinct " +
+                s"unknown=${unknown.toList.sorted.mkString("|")})"
+          }
+          val coveredEffects = rows
+            .filterNot(_.status == "BLOCKED")
+            .flatMap(_.requiredZeroEffects.split("\\|", -1))
+            .toSet
+          val expectedEffects = OperatorConsensusKeyQualificationMatrix.EffectObligation.byManifestName.keySet
+
+          if (failures.isEmpty && coveredEffects == expectedEffects) success
+          else
+            failure(
+              s"invalid adapter obligation mappings=${failures.mkString(",")} " +
+                s"covered=${coveredEffects.toList.sorted.mkString("|")} expected=${expectedEffects.toList.sorted.mkString("|")}"
+            )
+        }
+    }
+  }
+
   pureTest("negative-vector lexer accepts test-shaped declarations and rejects comment or literal spoofs") {
     val source = List(
       "test(\"live IO vector\") { IO.unit }",
@@ -225,15 +278,46 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
       val badStatuses = rows.iterator.map(_.status).toSet -- allowedStatuses
       val emptyFields = rows.collect {
         case row
-            if List(row.id, row.status, row.subsystem, row.kind, row.source, row.negativeSource, row.negativeAnchor, row.limitation)
+            if List(
+              row.id,
+              row.status,
+              row.subsystem,
+              row.kind,
+              row.source,
+              row.negativeSource,
+              row.negativeAnchor,
+              row.qualificationSource,
+              row.qualificationAnchor,
+              row.requiredZeroEffects,
+              row.limitation
+            )
               .exists(_.trim.isEmpty) =>
           row.id
       }
       val misleadingLimitations = rows.collect {
         case row if !row.limitation.toLowerCase.contains("not qualified") => row.id
       }
+      val badBlockedQualificationShape = rows.collect {
+        case row
+            if row.status == "BLOCKED" &&
+              (row.qualificationSource != "-" || row.qualificationAnchor != "-" || row.requiredZeroEffects != "-") =>
+          row.id
+      }
+      val badActiveQualificationShape = rows.collect {
+        case row
+            if row.status != "BLOCKED" &&
+              (row.qualificationSource == "-" || row.qualificationAnchor == "-" || row.requiredZeroEffects == "-") =>
+          row.id
+      }
 
-      expect.all(duplicateIds.isEmpty, badStatuses.isEmpty, emptyFields.isEmpty, misleadingLimitations.isEmpty)
+      expect.all(
+        duplicateIds.isEmpty,
+        badStatuses.isEmpty,
+        emptyFields.isEmpty,
+        misleadingLimitations.isEmpty,
+        badBlockedQualificationShape.isEmpty,
+        badActiveQualificationShape.isEmpty
+      )
     }
   }
 
@@ -243,14 +327,28 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
       val path = root.resolve("docs/review/OPERATOR-CONSENSUS-KEY-SEMANTIC-MANIFEST.tsv")
       val lines = Files.readAllLines(path, StandardCharsets.UTF_8).asScala.toList
       val expectedHeader =
-        "id\tstatus\tsubsystem\tkind\tsource\texpected_count\tnegative_source\tnegative_anchor\tlimitation"
+        "id\tstatus\tsubsystem\tkind\tsource\texpected_count\tnegative_source\tnegative_anchor\tqualification_source\tqualification_anchor\trequired_zero_effects\tlimitation"
       require(lines.headOption.contains(expectedHeader), s"Unexpected semantic manifest header in $path")
       lines.drop(1).filter(_.trim.nonEmpty).map { line =>
         val fields = line.split("\t", -1).toList
-        require(fields.size == 9, s"Expected 9 tab-separated fields, got ${fields.size}: $line")
-        val id :: status :: subsystem :: kind :: source :: expected :: negativeSource :: negativeAnchor :: limitation :: Nil = fields
+        require(fields.size == 12, s"Expected 12 tab-separated fields, got ${fields.size}: $line")
+        val id :: status :: subsystem :: kind :: source :: expected :: negativeSource :: negativeAnchor :: qualificationSource :: qualificationAnchor :: requiredZeroEffects :: limitation :: Nil =
+          fields
         val expectedCount = Try(expected.toInt).getOrElse(throw new IllegalArgumentException(s"Invalid expected_count for $id: $expected"))
-        ManifestRow(id, status, subsystem, kind, source, expectedCount, negativeSource, negativeAnchor, limitation)
+        ManifestRow(
+          id,
+          status,
+          subsystem,
+          kind,
+          source,
+          expectedCount,
+          negativeSource,
+          negativeAnchor,
+          qualificationSource,
+          qualificationAnchor,
+          requiredZeroEffects,
+          limitation
+        )
       }
     }
 
@@ -313,7 +411,7 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
       var escaped = false
       var closedAt = -1
 
-      while (cursor < input.length && closedAt < 0) {
+      while (cursor < input.length && closedAt < 0)
         if (triple && input.startsWith("\"\"\"", cursor)) closedAt = cursor
         else {
           val char = input.charAt(cursor)
@@ -324,7 +422,6 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
             cursor += 1
           }
         }
-      }
 
       if (closedAt < 0) input.substring(start) -> input.length
       else input.substring(start, closedAt) -> (closedAt + (if (triple) 3 else 1))

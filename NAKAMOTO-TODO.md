@@ -492,10 +492,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     symbols.
     It also records assigned-watchtower selection and optimistic VRF sampling as
     blocked/absent rather than silently treating current scaffolds as those roles.
-    `KEYREG-011` remains open
-    until qualification proves every allowlisted consumer's historical semantics
-    and every generated-unregistered-key no-side-effect vector; the textual
-    and semantic inventories are review tripwires, not that proof.
+    K7a adds a generated two-operator frozen-view resolver matrix, including an
+    explicitly unrooted/runtime-shaped negative, and maps every
+    present semantic row to a concrete adapter-negative anchor plus the checked
+    `Draw`/eta/proof/replay/sign/record/store/adopt/publish/slash obligation
+    vocabulary. This proves the frozen atomic-pair boundary and pins current
+    adapter test names; it does not prove each listed effect is instrumented. It is
+    not a common runtime adapter or a historical branch proof. `KEYREG-006`,
+    `KEYREG-010`, and `KEYREG-011` remain open until qualification proves every
+    allowlisted consumer's exact-parent historical semantics and positive runtime
+    path. The textual and semantic inventories remain review tripwires.
   - **Portable evidence remains open:** for every suffix and upper-level tower
     occurrence, the verifier now resolves the current atomic period-zero pair,
     verifies the VRF proof over the header's exact carried `eta || slot` bytes,
