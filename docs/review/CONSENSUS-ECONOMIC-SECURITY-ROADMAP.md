@@ -545,6 +545,15 @@ fork choice, GL0 consensus, MPT publication, followers, or serving, and cannot
 advance `CoreApplied` or `Released` through public authority. It also does not
 implement exact per-hash P0/P1 state or the optimistic K/alpha/beta cascade.
 
+A separate dark `ShardCheckpointOutboxStore` now exercises one local opaque-byte
+custody slot: bounded caller-supplied ID/bytes, store-bound expected-head CAS,
+exact idempotence, write/file-force/atomic-move/directory-force/readback ordering,
+restart, and fail-closed corruption. It imports no checkpoint/wire codec and has
+no consensus-ID derivation, validation, release, publication, or republish
+operation. This is storage-mechanism evidence only. E4 canonical signed bytes,
+exact Phase-2 currentness/revalidation, multi-checkpoint anchor/orphan lifecycle,
+and `SHARD-C-008` still block the production pre-publication outbox.
+
 The accompanying pure reference model now represents generic exact-hash
 canonical replacement, true-MRCA orphan/adopt ranges, Phase-2 replacement, and
 the `maxvalid-tk`/`maxvalid-bg` boundary. It explicitly accepts a preselected

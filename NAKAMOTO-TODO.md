@@ -529,8 +529,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
     prefixes fail closed, and unexpected MG output is excluded. This does not
     prove CL1 replay correctness or decisions/diff/intents parity. An exact hash/
     root-bound execution base, a durable pre-publication checkpoint outbox, and
-    historical committee/membership/runtime activation remain open. The textual
-    and semantic inventories remain review tripwires.
+    historical committee/membership/runtime activation remain open. A new dark,
+    unwired single-slot store proves only bounded opaque exact-byte custody,
+    store-bound CAS/idempotence, forced atomic replacement, verified readback,
+    and corruption/restart failure behavior. It has no checkpoint codec,
+    consensus ID, publish/release operation, or republish authority; E4 bytes,
+    exact Phase-2 revalidation, anchor/orphan lifecycle, and `SHARD-C-008` remain
+    open. The textual and semantic inventories remain review tripwires.
   - **Portable evidence remains open:** for every suffix and upper-level tower
     occurrence, the verifier now resolves the current atomic period-zero pair,
     verifies the VRF proof over the header's exact carried `eta || slot` bytes,

@@ -586,7 +586,12 @@ only. Registration proves key ownership and never grants operator eligibility.
   decisions/diff/intents parity, and the target E4 replay contract remain open.
   An exact hash/root-bound execution base, a durable pre-publication held-
   checkpoint outbox, and historical committee/membership/runtime-key activation
-  also remain open.
+  also remain open. `ShardCheckpointOutboxStore` is now an unwired single-slot
+  storage primitive for caller-supplied opaque IDs and exact bytes. It proves
+  local CAS/idempotence, forced atomic replacement, bounded readback, restart,
+  and corruption handling only. It deliberately cannot derive/validate a
+  checkpoint, publish/release bytes, or authorize restart republish, so it does
+  not close the held-checkpoint outbox or `SHARD-C-008`.
 - Tower verification now resolves the current atomic period-zero pair for every
   header occurrence, cryptographically binds each proof to the header's exact
   carried `eta || slot`
