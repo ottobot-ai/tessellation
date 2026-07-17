@@ -229,7 +229,9 @@ object CanonicalPhase2LeaseAcquirerSuite extends SimpleIOSuite {
       boundary <- TestBoundary.create(base)
       entered <- Deferred[IO, Unit]
       never <- Deferred[IO, Unit]
-      blocked = readbackSource(_ => entered.complete(()).void >> never.get.as(Right(exactReadbacks(released, base.currentSelectionByTarget(target)))))
+      blocked = readbackSource(_ =>
+        entered.complete(()).void >> never.get.as(Right(exactReadbacks(released, base.currentSelectionByTarget(target))))
+      )
       fiber <- new CanonicalPhase2LeaseAcquirer[IO](boundary, blocked).acquire(scope, target).start
       _ <- entered.get.timeout(1.second)
       _ <- fiber.cancel.timeout(1.second)
