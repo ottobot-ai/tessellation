@@ -220,6 +220,13 @@ bounty credit does not repair that conservation gap.
 Existing W3a component tests use identical stub replay and policy across nodes.
 They remain useful dark/future-era tests, but do not prove activation safety.
 
+The focused pre-activation oracle
+`O22FraudProofPreActivationContainmentRedSuite` compiles and fails all four
+intended gates with zero errors: active producer/GSAM authority, acceptance of a
+retired JSON member, acceptance of the pinned retired Scodec shape, and current
+field-34 cooldown influence on committee selection. Its SHA-256 is
+`e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
+
 ## 9. Owner response format
 
 Please answer all three:

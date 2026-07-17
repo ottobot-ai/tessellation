@@ -1365,7 +1365,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     candidate reject/defer semantics, and per-new-signer debit-funded bounty
     ownership. Until answered and implemented, `WT-000` blocks every nonempty
     active-era proof; `WT-001..010` remain activation tests, not evidence that the
-    current live path is safe.
+    current live path is safe. The focused
+    `O22FraudProofPreActivationContainmentRedSuite` compiles and fails all four
+    intended gates with zero errors: producer/GSAM authority, retired JSON,
+    retired Scodec bytes, and current field-34 cooldown influence. SHA-256
+    `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.
   - **Gate:** `WT-001..007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`, `REC-*`,

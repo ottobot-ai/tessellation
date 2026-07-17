@@ -1278,7 +1278,10 @@ delivery, rollback, and recovery.
   rooted effects while mapping failed adjudication to no slash. Before any further
   live use, O-22 must select mandatory-empty versus field removal, whole-candidate
   verdict semantics, and incremental-signer bounty ownership. `WT-000` is the
-  current-era containment gate; `WT-001..010` remain future activation gates.
+  current-era containment gate; its focused RED oracle currently fails all four
+  intended authority/retired-shape/cooldown checks with zero errors (SHA-256
+  `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`).
+  `WT-001..010` remain future activation gates.
 - A package-private dark identity-composition model now requires the real
   `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
   the exact-history session, and matching exact-image, semantic, field-32, and
