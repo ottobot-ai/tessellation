@@ -244,6 +244,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
       placement, reproduces the direct-hash key, and rejects duplicate logical
       hashes deterministically. Keep XMG-013 open for restart, compaction,
       exact-parent recovery, density reorg, and accepted-state ingress vectors.
+    - **MPT-04 FOCUSED FIELD-8 PARSER GREEN (`1e942fb28`):** one strict reader
+      now owns every audited live native-token-lock MPT read and rejects
+      malformed/noncanonical bytes, empty or mixed sets, currency-scoped locks,
+      wrong physical keys/contracts, and duplicate source/current unsigned
+      identities before use. Keep MPT-04/ROOT-008 open for signature/reference
+      history, the frozen cross-hash-era identity function, field 30, resource
+      bounds, and accepted-state/restart/catch-up/bootstrap/reorg integration.
   - [ ] **4. Raw recovery and tower:** exact-snapshot/root-verify network, disk,
     and deep-reorg maps; strip non-consensus derived bytes and rebuild them only
     from rooted state (`ROOT-009`). `ECO-IDX-02`'s root-invisible System-index

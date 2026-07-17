@@ -514,6 +514,16 @@ impossible absent/noncanonical retained bytes, and duplicate input order fail
 before map construction. Restart, compaction, exact-parent recovery,
 accepted-state ingress, and density-reorg integration remain RED/open.
 
+The focused native field-8 portion of `MPT-04` is GREEN at `1e942fb28` in
+`ActiveTokenLockMptReaderSuite`: canonical multi-lock/source entries succeed;
+wrong key/suffix/contract, empty/mixed/currency-scoped sets, null/malformed/
+empty/trailing/noncanonical bytes, impossible prefix absence, duplicate logical
+sources, duplicate unsigned values with different proof sets, and malformed or
+wrong-source point reads fail before economic use. This does not close
+signature/reference-history validation, the final hash-era identity vectors,
+field 30, resource bounds, or accepted-state/restart/catch-up/bootstrap/reorg
+integration; `MPT-04` and `ROOT-008` remain partial/open.
+
 ### 4.8 Payload lanes and data availability
 
 | Test ID | Required scenario and assertion |

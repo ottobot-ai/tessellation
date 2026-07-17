@@ -295,7 +295,15 @@ already has a hard-coded kill switch.
    key/raw bytes, requires canonical re-encoding and exact direct-hash key
    reproduction, and rejects duplicate logical hashes. Keep MPT-02/XMG-013
    partial until restart, compaction, exact-parent recovery, density reorg, and
-   accepted-state ingress vectors pass; the other five parser families remain open.
+   accepted-state ingress vectors pass.
+   The focused MPT-04 native field-8 parser landed at `1e942fb28`: all audited
+   live node-shared readers share strict physical-key/raw-byte validation,
+   native-only scope, homogeneous-source and current unsigned-reference
+   uniqueness, exact key reproduction, and deterministic duplicate rejection.
+   Keep MPT-04/ROOT-008 partial for signatures/reference history, the frozen
+   cross-hash-era identity function, field 30, resource bounds, and complete
+   ingress/restart/catch-up/bootstrap/reorg proof. MPT-01, MPT-03, MPT-05, and
+   MPT-06 remain open.
 4. **Harden raw recovery and tower state.** Network sync, persisted restore, and
    deep-reorg loads accept only an exact snapshot-bound complete root. Any
    non-consensus derived bytes are stripped and deterministically rebuilt from
