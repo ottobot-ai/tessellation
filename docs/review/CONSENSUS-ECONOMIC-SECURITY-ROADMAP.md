@@ -409,7 +409,15 @@ the fold, allowing zero principal debit followed by full maturity refund
 (`DelegatedRewardsDistributor.scala:168-180,219-255`;
 `NodeCollateralStateManager.scala:218-251`;
 `GlobalSnapshotAcceptanceManager.scala:2673-2713`;
-`TokenLockStateManager.scala:694-711,870-918`). ECO-30's historical HIGH
+`TokenLockStateManager.scala:694-711,870-918`). Passing current pending maps is
+not sufficient: it can seize delegation created after the offense and cannot
+follow a modified offense-time bond through successor/replacement state. O-23
+now freezes stable `BondId`/tranche liability, full-only V1, pending/release
+horizon, slash-before-release ordering, reward treatment, and density-reorg
+revalidation. The focused `InvalidStateProofSlashPrincipalRedSuite` compiles and
+fails 5/5 intended cases (SHA-256
+`96f568291a4eee8e636debd814b8d8e4a3d5eebc6c3c2e06a5a752f4b3c04ca7`).
+ECO-30's historical HIGH
 event-isolation halt is fixed in the current worktree: opposite-family pending
 use rejects in each validator, and accepted-only collateral arbitration rejects
 both a direct predecessor withdrawal and withdrawal of a non-latest parent-state

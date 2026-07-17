@@ -384,7 +384,14 @@ already has a hard-coded kill switch.
    (`DelegatedRewardsDistributor.scala:168-180,219-255`;
    `NodeCollateralStateManager.scala:218-251`;
    `GlobalSnapshotAcceptanceManager.scala:2673-2713`;
-   `TokenLockStateManager.scala:694-711,870-918`).
+   `TokenLockStateManager.scala:694-711,870-918`). A current active+pending scan
+   would still charge delegation created after the offense and lose modified
+   offense-time lineages. O-23 therefore blocks production work until stable
+   `BondId`/tranche liability, full-only InvalidStateProof V1, pending/release
+   horizon, slash-before-release ordering, reward treatment, and density-reorg
+   revalidation are ratified. `InvalidStateProofSlashPrincipalRedSuite` compiles
+   and fails all five intended cases (SHA-256
+   `96f568291a4eee8e636debd814b8d8e4a3d5eebc6c3c2e06a5a752f4b3c04ca7`).
    ECO-30's historical HIGH event-isolation halt is FIXED IN WORKTREE:
    delegated/collateral validation now rejects opposite-family pending-lock use,
    and accepted-only collateral arbitration rejects both a direct predecessor
@@ -1371,6 +1378,12 @@ delivery, rollback, and recovery.
 - An assigned, bonded, rate-limited challenge names exact retained inputs/base,
   checkpoint, signers, and reproduced mismatch. An assertion alone never rolls
   back or slashes.
+- **PRE-ACTIVATION CONTAINMENT:** O-22 recommends removing `fraudProofs` from the
+  current greenfield `GlobalIncrementalSnapshot` schema, disconnecting the local
+  pool/validator/slash fold/field-34 writer from producer and follower consensus,
+  and retaining any transport/replay components as explicitly dark tests only.
+  No current-era nonempty proof may change canonical bytes or state while
+  O-20/O-22/O-23 and the engineering gates remain open.
 - First version has all GL0 validators perform bounded exceptional replay of the
   challenged sharded-CL1 checkpoint's exact retained framework inputs/base; its
   result decides mismatch, rollback/quarantine, signer-specific debit, and
@@ -1412,6 +1425,12 @@ delivery, rollback, and recovery.
   checks (`WT-002B`).
 - Evidence is deterministic, permanent/exact-once, branch-aware, and distinguishes
   an honest replay on a later-orphaned Phase-2 base from execution fraud.
+- The economic sink uses offense-time stable bond tranches, not a slash-time
+  `PeerId` scan. InvalidStateProof V1 is full-only unless a later protocol era
+  specifies residual-lock semantics. Slash consumes exact active or pending
+  backing before maturity/replacement, funds bounty only from actual debit, and
+  deduplicates `(peerId, shardId, checkpointHash)` independently. O-23 owns these
+  pending decisions.
 - Gates: `WT-001` through `WT-007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`,
   `REC-*`, resource/flood tests.
 

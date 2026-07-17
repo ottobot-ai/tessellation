@@ -836,7 +836,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
     field-20/hash-era rules, and the complete oracle. **ECO-06 remains
     CRITICAL/OPEN:** slashing sees only active maps. A same/prior-round withdrawal
     moves guilty principal to pending before adjudication, so the slash can write
-    cooldown with zero debit and maturity later refunds the full lock
+    cooldown with zero debit and maturity later refunds the full lock. Scanning
+    current pending maps is still insufficient: it can charge delegation created
+    after the offense because current schemas do not preserve an offense-time
+    bond lineage. O-23 now freezes the required `BondId`/tranche, full-only V1,
+    pending horizon, ordering, reward, and density-reorg choices before production
+    implementation
     (`DelegatedRewardsDistributor.scala:168-180,219-255`;
     `NodeCollateralStateManager.scala:218-251`;
     `GlobalSnapshotAcceptanceManager.scala:2673-2713`;
@@ -846,6 +851,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     withdrawal, and non-latest reused-lock-owner withdrawal now reject as
     attributable events before materialization; preserve all four focused
     regressions and the final whole-state defense.
+  - **ECO-06 RED evidence:** `InvalidStateProofSlashPrincipalRedSuite` compiles
+    and fails all five intended cases (zero backing debit with synthetic bounty,
+    delegated pending escape, collateral pending escape, durable dedup before
+    debit, and full maturity refund after the slash record). SHA-256:
+    `96f568291a4eee8e636debd814b8d8e4a3d5eebc6c3c2e06a5a752f4b3c04ca7`.
   - **ECO-29 current tree fixed / history compromised:** public genesis now
     carries signed event/backing-lock bundles and generated economic secrets are
     stored separately with owner-only permissions. Historical fixture private

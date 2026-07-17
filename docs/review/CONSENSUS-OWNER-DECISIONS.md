@@ -13,8 +13,10 @@ reason. `O-21` was surfaced by the optimistic-finality evidence audit and awaits
 no implementation may infer that gossip counts or an opaque digest prove a completed sampled cascade.
 `O-22` was surfaced by the fraud-proof activation audit and awaits an owner response; no implementation
 may give a current-era nonempty proof consensus authority or infer a filter-and-continue adjudication rule.
-**Owner-question completeness:** `17/22` dispositioned. `O-01` through `O-17` are ratified;
-`O-18`, `O-19`, `O-20`, `O-21`, and `O-22` are pending.
+`O-23` was surfaced by the ECO-06 principal-conservation audit and awaits an owner response; no
+implementation may infer slash-time operator-wide liability, partial-lock semantics, or a release horizon.
+**Owner-question completeness:** `17/23` dispositioned. `O-01` through `O-17` are ratified;
+`O-18`, `O-19`, `O-20`, `O-21`, `O-22`, and `O-23` are pending.
 **Updated:** 2026-07-16
 
 This register uses project phases only where the owner has ratified them:
@@ -770,6 +772,32 @@ deduplication, structural-invalid signer accountability, rooted policy, principa
 conservation, field-34 Scodec/key grammar, historical atomic KES+VRF context,
 watchtower coverage, resource bounds, and density-reorg behavior remain mandatory
 engineering gates.
+
+### O-23 Slash liability and bond tranches
+
+Owner-review packet:
+[O-23 Slash Liability and Bond Tranche Owner Review](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
+
+**OWNER RESPONSE REQUIRED; ECO-06 IS NOT A PENDING-MAP PATCH.** The current
+manager selects whatever active records point at a signer when the proof is
+included. It therefore misses offense-time principal moved to pending and can
+charge delegation created after the bad signature. Existing historical stake
+state commits only an aggregate per operator and cannot identify the liable
+locks across successor/replacement lineages.
+
+The owner must disposition `O23-01` through `O23-06`: infraction-time stable
+`BondId`/tranche liability versus slash-time operator-wide liability; full-only
+InvalidStateProof V1 versus a new residual-lock design; the pending/release
+horizon; slash-before-release same-candidate ordering; actual-debit bounty and
+reward treatment; and density-reorg culpability. The packet recommends
+infraction-time tranches, full-only V1, pending slashability through the complete
+liability horizon, slash-before-release, bounty funded only by exact principal
+debit with rewards separately burned, and revalidated culpability after a later
+density reorg.
+
+No O-23 answer activates the live path. O-20/O-22, exact historical Phase-2
+context, per-signer adjudication, resource bounds, atomic accumulator integration,
+serde, restart, and reorg gates remain mandatory.
 
 ## Change rule
 

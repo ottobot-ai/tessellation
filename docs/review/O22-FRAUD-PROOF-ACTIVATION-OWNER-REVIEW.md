@@ -9,7 +9,7 @@ pooling, and RED tests may remain dark, but no current-era fraud proof may enter
 GL0 proposal or change canonical state.
 
 **Primary gates:** O-03, O-11, O-16, O-17, O-18, O-20, WT-001..010,
-SLASH-03..06, ECO-06, and MPT-05
+O-23, SLASH-03..06, ECO-06, and MPT-05
 
 **Updated:** 2026-07-16
 
@@ -70,6 +70,14 @@ freezing an evidence collection whose per-signer identity, ordering, resource
 bounds, and field-34 relationship are not yet ratified. It causes broader codec
 and constructor churn now, but follows the project's rule against retaining
 undeployed compatibility or abandoned authority shapes.
+
+The containment is end-to-end, not a case-class-only deletion. Current producer,
+follower, and GSAM acceptance lose the proof input, slash fold, bounty/burn path,
+and field-34 writer. Current committee selection must not consume pre-activation
+field-34 records as cooldown authority. Local transport/pool/replay components may
+remain only behind an explicitly dark boundary. O-20 owns the future typed field
+and the disposition of fork-only test data; no existing JSON leaf or interpolated
+key is grandfathered into that era.
 
 Accepting nonempty proofs as inert is not a valid third option: it signs bytes
 whose future interpretation is ambiguous. Retaining the current conditional
@@ -151,7 +159,8 @@ Activation remains blocked until all of these are implemented and tested:
 2. Accountability for authentic signers on structurally invalid checkpoints
    (`SLASH-06`) and signer-specific deduplication (`SLASH-05`).
 3. Actual bonded-principal debit conservation and a bounty no greater than the
-   principal debited (`ECO-06`).
+   principal debited (`ECO-06`). O-23 separately freezes the offense-time bond
+   identity, full-slash V1, pending/release horizon, and same-candidate order.
 4. Frozen Scodec field-34 value/key grammar, accumulation, and physical
    key/value binding (`O-20`, `MPT-05`, `WT-010`).
 5. Positive assigned-watchtower coverage, bonded/rate-limited challenges, and

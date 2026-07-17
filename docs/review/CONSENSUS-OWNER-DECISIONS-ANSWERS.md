@@ -11,8 +11,8 @@ recommendations and directions recorded here. Ratification does **not** assert t
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
 document records which direction is settled and which executable freeze gates remain. `O-18`,
-`O-19`, `O-20`, `O-21`, and `O-22` were added after that ratification pass and are not answered by this document.
-**Owner-question completeness:** `17/22` dispositioned. `O-01` through `O-17` are ratified;
+`O-19`, `O-20`, `O-21`, `O-22`, and `O-23` were added after that ratification pass and are not answered by this document.
+**Owner-question completeness:** `17/23` dispositioned. `O-01` through `O-17` are ratified;
 `O-18` awaits an owner response in
 [`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md),
 and `O-19` awaits an owner response in
@@ -23,6 +23,8 @@ and `O-19` awaits an owner response in
 [`O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`](O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md).
 `O-22` awaits an owner response in
 [`O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
+`O-23` awaits an owner response in
+[`O23-SLASH-LIABILITY-OWNER-REVIEW.md`](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
 
 ---
 
@@ -686,6 +688,24 @@ history cannot slash, local HOCON cannot select rooted economics, per-signer
 accountability is once-only, and exceptional replay results rather than a
 watchtower assertion decide guilt.
 
+## O-23 - Slash liability and bond tranches 🔴
+
+**Status:** **OWNER RESPONSE REQUIRED.** The focused packet is
+[`O23-SLASH-LIABILITY-OWNER-REVIEW.md`](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
+
+The pending `O23-01` through `O23-06` choices define which principal is liable,
+whether InvalidStateProof V1 is full-only, how long pending principal remains
+slashable, whether slash precedes every same-candidate release, how exact debit
+funds bounty and treats accrued rewards, and how objectively invalid signatures
+are revalidated after a later density reorg.
+
+The packet recommends infraction-time stable `BondId`/tranche liability from the
+exact delayed eligibility population; full-only V1; pending slashability through
+the complete liability horizon; slash-before-release ordering; bounty funded only
+by exact principal debit with rewards separately burned; and branch rollback plus
+full historical revalidation after density replacement. This answers document
+does not infer those choices.
+
 ---
 
 ## Cross-cutting caveats
@@ -724,7 +744,7 @@ watchtower assertion decide guilt.
    quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
    A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
    activation proofs. These are not unanswered owner choices and may not be filled by local
-   configuration or an implementation shortcut. O-18, O-19, O-20, O-21, and O-22 are different: their focused
+   configuration or an implementation shortcut. O-18, O-19, O-20, O-21, O-22, and O-23 are different: their focused
    choices are newly surfaced and still await an owner response.
 
 ## Provenance
