@@ -37,6 +37,7 @@ import io.constellationnetwork.node.shared.infrastructure.block.processing.Block
 import io.constellationnetwork.node.shared.infrastructure.mempool.EventMempool
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointWiring
+import io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsDistributor
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.{
   GlobalSnapshotAcceptanceManager,
   GlobalSnapshotStateChannelAcceptanceManager,
@@ -151,6 +152,11 @@ object GlobalSnapshotConsensus {
     feeConfigs: SortedMap[SnapshotOrdinal, FeeCalculatorConfig],
     client: Client[F],
     rewardsService: RewardsService[F],
+    delegatedRewardsForReader: io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[
+      F
+    ] => DelegatedRewardsDistributor[
+      F
+    ],
     txHasher: Hasher[F],
     lastNGlobalSnapshotStorage: LastNGlobalSnapshotStorage[F],
     lastGlobalSnapshotStorage: LastSnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
@@ -183,6 +189,9 @@ object GlobalSnapshotConsensus {
     // MultiBranch this picks up the chain's pending writes; the legacy `mptStore` path saw
     // base-only and could miscalculate fees during finality stalls (#117 root cause).
     pendingReader: io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[F],
+    // Exact selected branch backing `pendingReader`. Consensus caches must key on this identity,
+    // not on ordinal, because density selection may replace a tip at the same height.
+    bestTipBranchF: F[Option[io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId]],
     eventMempool: EventMempool[F, GlobalSnapshotEvent, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
     rumorQueue: Queue[F, Hashed[RumorRaw]],
@@ -743,6 +752,7 @@ object GlobalSnapshotConsensus {
           snapshotAcceptanceManager,
           collateral,
           rewardsService,
+          delegatedRewardsForReader,
           GlobalSnapshotEventCutter.make(
             appConfig.snapshot.eventCutter.maxBinarySizeBytes,
             SnapshotBinaryFeeCalculator.make(appConfig.shared.feeConfigs, pendingReader)
@@ -831,10 +841,9 @@ object GlobalSnapshotConsensus {
           // GSI-to-MPT migration; reading from it directly drops a redundant in-memory mirror and
           // closes a class of byte-determinism gaps between independent node MPT builds.
           //
-          // Hot-path caching: `NodeStakeAggregator.cached` memoizes the result keyed on
-          // `SnapshotOrdinal` and invalidates whenever the parent ordinal advances. Without this
-          // the per-slot VRF eligibility (~200 calls/sec at 8gl0+4mg+4shards) would re-run two MPT
-          // prefix-scans per call. See `NodeStakeAggregator.cached` for the trade-off discussion.
+          // Hot-path caching: `NodeStakeAggregator.cached` memoizes the result by exact selected
+          // overlay branch, not ordinal. A same-height density replacement must invalidate the
+          // aggregate, and each miss captures both stake partitions under one overlay mutex hold.
           //
           // Reader: `pendingReader` is the `GlobalStateReader.pending` resolved to chain bestTip
           // under MultiBranch — matches "view of stake at the parent the consensus is voting on".
@@ -850,8 +859,8 @@ object GlobalSnapshotConsensus {
           // aggregate.
           stakeAggregator <- io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator
             .cached[F](
-              io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator.make[F](pendingReader),
-              lastGlobalSnapshotStorage.getOrdinal
+              branch => io.constellationnetwork.node.shared.domain.nakamoto.NodeStakeAggregator.atBranch[F](mptOverlay, branch),
+              bestTipBranchF
             )
             .toResource
           // §G3 — historical-stake-snapshot reader migrated from GSI iteration to MPT point read.

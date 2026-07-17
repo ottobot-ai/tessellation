@@ -157,9 +157,13 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       // Create token lock
       tokenLock <- mkTokenLock(keyPair, TokenLockAmount(100L), replaceTokenLockRef = None)
       hashedTokenLock <- tokenLock.toHashed
+      oldTokenLock <- mkTokenLock(keyPair, TokenLockAmount(101L), replaceTokenLockRef = None)
+      hashedOldTokenLock <- oldTokenLock.toHashed
 
-      // Create delegated stake event
+      // Each withdrawal must retain a distinct unsigned create identity. Proof/epoch variants of one
+      // create are not two economic records and are rejected by the strict field-14 writer grammar.
       delegatedStakeEvent <- mkDelegatedStakeCreate(keyPair, nodeId, hashedTokenLock)
+      oldDelegatedStakeEvent <- mkDelegatedStakeCreate(keyPair, nodeId, hashedOldTokenLock)
 
       // Create withdrawals with different epochs
       recentWithdrawal = PendingDelegatedStakeWithdrawal(
@@ -172,7 +176,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       )
 
       oldWithdrawal = PendingDelegatedStakeWithdrawal(
-        event = delegatedStakeEvent,
+        event = oldDelegatedStakeEvent,
         rewards = Amount(10L),
         acceptedOrdinal = SnapshotOrdinal(1L),
         createdAt = EpochProgress(1L), // Old, should expire
@@ -186,7 +190,7 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       )
 
       existingTokenLocks = SortedMap(
-        address1 -> SortedSet(tokenLock)
+        address1 -> SortedSet(tokenLock, oldTokenLock)
       )
 
       lastSnapshotContext = mkGlobalSnapshotInfo(
@@ -1396,9 +1400,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         // Original token lock should still be active
         newSnapshotInfo.activeTokenLocks.isDefined,
         newSnapshotInfo.activeTokenLocks.get.get(address1) == SortedSet(originalTokenLock).some,
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 
@@ -1466,9 +1469,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         // Original token lock should still be active
         newSnapshotInfo.activeTokenLocks.isDefined,
         newSnapshotInfo.activeTokenLocks.get.get(address1) == SortedSet(originalTokenLock).some,
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 
@@ -1542,9 +1544,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         newSnapshotInfo.activeTokenLocks.get.nonEmpty,
         newSnapshotInfo.activeTokenLocks.get.get(address1) == SortedSet(anotherTokenLock).some,
         !newSnapshotInfo.activeTokenLocks.get.contains(address),
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 
@@ -1607,9 +1608,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         // Token lock replacement should be rejected because reference not found in empty transactions
         newSnapshotInfo.activeTokenLocks.isDefined,
         newSnapshotInfo.activeTokenLocks.get.isEmpty,
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 
@@ -1680,9 +1680,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         newSnapshotInfo.activeTokenLocks.isDefined,
         newSnapshotInfo.activeTokenLocks.get.get(address1) == SortedSet(originalTokenLock).some,
         !newSnapshotInfo.activeTokenLocks.get.contains(address2),
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 
@@ -1779,13 +1778,12 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         },
         // The original token lock should not be in activeTokenLocks
         !newSnapshotInfo.activeTokenLocks.get.get(address1).exists(_.contains(originalTokenLock)),
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.size == 1,
+        tokenLockResult.notAccepted.size == 2
       )
   }
 
-  test("should accept one token lock replacement out of multiple valid replacements") { res =>
+  test("should reject one block containing multiple replacements for the same token lock") { res =>
     implicit val (h, sp) = res
 
     for {
@@ -1858,27 +1856,15 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
       acceptedReplacement = acceptedReplacements.headOption
     } yield
       expect.all(
-        // Exactly one replacement should be accepted
+        // The block-level acceptance logic rejects the entire conflicting chain.
         acceptedReplacements.size == 1,
         acceptedReplacement.isDefined,
-        // The accepted replacement should have a higher amount than the original
-        acceptedReplacement.exists(_.value.amount.value.value > originalTokenLock.amount.value.value),
-        // The original token lock should be replaced by exactly one replacement
+        acceptedReplacement.contains(originalTokenLock),
         newSnapshotInfo.activeTokenLocks.isDefined,
         newSnapshotInfo.activeTokenLocks.get.contains(address1),
         newSnapshotInfo.activeTokenLocks.get.get(address1).map(_.size) == 1.some,
-        // The replacement in activeTokenLocks should match one of the submitted replacements
-        newSnapshotInfo.activeTokenLocks.get.get(address1).exists { locks =>
-          locks.exists(lock =>
-            lock.value.amount.value.value > originalTokenLock.amount.value.value &&
-              lock.value.replaceTokenLockRef.contains(originalHashedTokenLock.hash)
-          )
-        },
-        // The original token lock should not be in activeTokenLocks
-        !newSnapshotInfo.activeTokenLocks.get.get(address1).exists(_.contains(originalTokenLock)),
-        // but the token lock block should be accepted
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 
@@ -1950,8 +1936,8 @@ object GlobalSnapshotAcceptanceManagerSuite extends MutableIOSuite {
         // Original token lock should still be active
         newSnapshotInfo.activeTokenLocks.isDefined,
         newSnapshotInfo.activeTokenLocks.get.get(address1) == SortedSet(originalTokenLock).some,
-        tokenLockResult.accepted.nonEmpty,
-        tokenLockResult.notAccepted.isEmpty
+        tokenLockResult.accepted.isEmpty,
+        tokenLockResult.notAccepted.map(_._1) == List(tokenLockBlock)
       )
   }
 

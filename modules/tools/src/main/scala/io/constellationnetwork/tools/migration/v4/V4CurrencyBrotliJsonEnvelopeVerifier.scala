@@ -16,16 +16,14 @@ import io.constellationnetwork.tools.migration.v4.V4SourceEncoding.V4BrotliJson
 sealed trait V4CurrencyJsonEnvelopeVerificationError extends Product with Serializable
 
 object V4CurrencyJsonEnvelopeVerificationError {
-  final case class WrongSourceEra(context: V4SourceContext, required: V4SourceEncoding)
-      extends V4CurrencyJsonEnvelopeVerificationError
+  final case class WrongSourceEra(context: V4SourceContext, required: V4SourceEncoding) extends V4CurrencyJsonEnvelopeVerificationError
   case object MissingSourceContext extends V4CurrencyJsonEnvelopeVerificationError
   case object MissingCompressedSource extends V4CurrencyJsonEnvelopeVerificationError
   case object MissingExpectedValueHash extends V4CurrencyJsonEnvelopeVerificationError
   final case class InvalidDecodeLimits(limits: Option[BrotliDecodeLimits]) extends V4CurrencyJsonEnvelopeVerificationError
   final case class DecodeFailure(cause: Throwable) extends V4CurrencyJsonEnvelopeVerificationError
   case object NonCanonicalEnvelopeBytes extends V4CurrencyJsonEnvelopeVerificationError
-  final case class OrdinalMismatch(expected: SnapshotOrdinal, actual: SnapshotOrdinal)
-      extends V4CurrencyJsonEnvelopeVerificationError
+  final case class OrdinalMismatch(expected: SnapshotOrdinal, actual: SnapshotOrdinal) extends V4CurrencyJsonEnvelopeVerificationError
   final case class HashMismatch(expected: Hash, actual: Hash) extends V4CurrencyJsonEnvelopeVerificationError
   final case class InvalidSignatures(proofs: NonEmptySet[SignatureProof]) extends V4CurrencyJsonEnvelopeVerificationError
 }

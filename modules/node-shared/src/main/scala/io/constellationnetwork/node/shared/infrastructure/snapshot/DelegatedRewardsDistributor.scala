@@ -1,36 +1,28 @@
 package io.constellationnetwork.node.shared.infrastructure.snapshot
 
-import cats.Applicative
-import cats.data.NonEmptySet
-import cats.effect.{Async, Sync}
+import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet, TreeSet}
+import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.util.control.NoStackTrace
 
-import io.constellationnetwork.currency.dataApplication.DataCalculatedState
-import io.constellationnetwork.env.AppEnvironment
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
-import io.constellationnetwork.schema.ID.Id
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, StakeCollateralMptReader}
+import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.ConsensusTrigger
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
-import io.constellationnetwork.schema.node.{DelegatedStakeRewardParameters, RewardFraction, UpdateNodeParameters}
 import io.constellationnetwork.schema.peer.PeerId
-import io.constellationnetwork.schema.transaction.{RewardTransaction, Transaction, TransactionAmount}
-import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, GlobalSnapshotInfo, SnapshotOrdinal}
+import io.constellationnetwork.schema.transaction.RewardTransaction
+import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.delegatedStakeRecordSetCodec
 import io.constellationnetwork.syntax.sortedCollection.{sortedMapSyntax, sortedSetSyntax}
 
-import eu.timepit.refined.auto._
-import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
+import eu.timepit.refined.types.numeric.NonNegLong
 
 case class DelegatedRewardsResult(
   delegatorRewardsMap: SortedMap[PeerId, Map[Address, Amount]],
@@ -66,6 +58,42 @@ trait DelegatedRewardsDistributor[F[_]] {
 
 object DelegatedRewardsDistributor {
 
+  final case class ConflictingAcceptedStakeTransitions(source: Address, stakeRef: Hash, tokenLockRef: Hash)
+      extends RuntimeException(
+        s"Accepted delegated-stake successor and withdrawal share one backing lock: source=${source.show} " +
+          s"stakeRef=${stakeRef.value} tokenLockRef=${tokenLockRef.value}"
+      )
+      with NoStackTrace
+
+  private def validateAcceptedStakeTransitionExclusivity[F[_]: Async: Hasher](
+    delegatedStakeDiffs: UpdateDelegatedStakeAcceptanceResult,
+    partitionedRecords: PartitionedStakeUpdates
+  ): F[Unit] = {
+    val acceptedCreateTokenLocks = delegatedStakeDiffs.acceptedCreates.iterator.flatMap {
+      case (source, creates) => creates.iterator.map { case (create, _) => source -> create.tokenLockRef }
+    }.toSet
+
+    for {
+      existingByReference <- partitionedRecords.unexpiredCreateDelegatedStakes.toList.flatTraverse {
+        case (source, records) =>
+          records.toList.traverse(record => DelegatedStakeReference.of[F](record.event).map(ref => (source -> ref.hash) -> record))
+      }
+        .map(_.toMap)
+      conflicts = delegatedStakeDiffs.acceptedWithdrawals.iterator.flatMap {
+        case (source, withdrawals) =>
+          withdrawals.iterator.flatMap {
+            case (withdrawal, _) =>
+              existingByReference
+                .get(source -> withdrawal.stakeRef)
+                .filter(record => acceptedCreateTokenLocks(source -> record.tokenLockRef))
+                .map(record => ConflictingAcceptedStakeTransitions(source, withdrawal.stakeRef, record.tokenLockRef))
+          }
+      }.toList
+        .sortBy(conflict => (conflict.source.show, conflict.stakeRef.value, conflict.tokenLockRef.value))
+      _ <- conflicts.headOption.traverse_(Async[F].raiseError[Unit])
+    } yield ()
+  }
+
   /** Identifies which stakes are being modified (have matching tokenLockRef in both existing records and acceptedCreates). Returns a Set of
     * (Address, TokenLockRef) tuples representing the modified stakes.
     */
@@ -79,7 +107,7 @@ object DelegatedRewardsDistributor {
           case (ev, _) =>
             existingRecords
               .get(addr)
-              .filter(_.exists(_.event.tokenLockRef === ev.tokenLockRef))
+              .filter(_.exists(_.tokenLockRef === ev.tokenLockRef))
               .map(_ => addr -> ev.tokenLockRef)
         }
     }.toSet
@@ -95,7 +123,7 @@ object DelegatedRewardsDistributor {
       case (address, records) =>
         val filtered = records.filterNot { record =>
           modifiedStakes.contains(
-            (address, record.event.tokenLockRef)
+            (address, record.tokenLockRef)
           )
         }
 
@@ -112,6 +140,7 @@ object DelegatedRewardsDistributor {
     val modifiedStakes = identifyModifiedStakes(existingRecords, delegatedStakeDiffs.acceptedCreates)
 
     for {
+      _ <- validateAcceptedStakeTransitionExclusivity(delegatedStakeDiffs, partitionedRecords)
       newRecordsWithRewards <- delegatedStakeDiffs.acceptedCreates.toList.traverse {
         case (addr, stakeList) =>
           val existingRecordsForAddr = existingRecords.getOrElse(addr, List.empty)
@@ -119,7 +148,7 @@ object DelegatedRewardsDistributor {
           stakeList.traverse {
             case (ev, ord) =>
               val matchingExistingRecord = existingRecordsForAddr.find { record =>
-                record.event.tokenLockRef === ev.tokenLockRef
+                record.tokenLockRef === ev.tokenLockRef
               }
 
               DelegatedStakeRecord(
@@ -157,7 +186,7 @@ object DelegatedRewardsDistributor {
       }.map(_.map {
         case (addr, recs) =>
           addr -> recs.map { record =>
-            val isModified = modifiedStakes.contains((addr, record.event.tokenLockRef))
+            val isModified = modifiedStakes.contains((addr, record.tokenLockRef))
 
             val nodeSpecificReward =
               if (isModified) Amount.empty
@@ -192,30 +221,38 @@ object DelegatedRewardsDistributor {
     delegatedStakeDiffs: UpdateDelegatedStakeAcceptanceResult,
     partitionedRecords: PartitionedStakeUpdates
   ): F[SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]]] =
-    delegatedStakeDiffs.acceptedWithdrawals.toList.traverse {
-      case (addr, acceptedWithdrawls) =>
-        acceptedWithdrawls.traverse {
-          case (ev, ep) =>
-            reader
-              .get[SortedSet[DelegatedStakeRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveDelegatedStakes, addr))
-              .flatMap { maybeStakes =>
-                maybeStakes.flatTraverse {
-                  _.findM { s =>
-                    DelegatedStakeReference.of(s.event).map(_.hash === ev.stakeRef)
-                  }.map(
-                    _.map(rec =>
-                      PendingDelegatedStakeWithdrawal(rec.event, rec.rewards, rec.createdAt, ep, rec.currentTokenLockRef, rec.currentAmount)
+    validateAcceptedStakeTransitionExclusivity(delegatedStakeDiffs, partitionedRecords) >>
+      delegatedStakeDiffs.acceptedWithdrawals.toList.traverse {
+        case (addr, acceptedWithdrawls) =>
+          acceptedWithdrawls.traverse {
+            case (ev, ep) =>
+              StakeCollateralMptReader
+                .readActiveDelegatedStakes(reader, addr)
+                .flatMap { maybeStakes =>
+                  maybeStakes.flatTraverse {
+                    _.findM { s =>
+                      DelegatedStakeReference.of(s.event).map(_.hash === ev.stakeRef)
+                    }.map(
+                      _.map(rec =>
+                        PendingDelegatedStakeWithdrawal(
+                          rec.event,
+                          rec.rewards,
+                          rec.createdAt,
+                          ep,
+                          rec.currentTokenLockRef,
+                          rec.currentAmount
+                        )
+                      )
                     )
-                  )
+                  }
                 }
-              }
-              .flatMap(Async[F].fromOption(_, new RuntimeException("Unexpected None when processing user delegations")))
-        }.map { records =>
-          addr -> records.toSortedSet
-        }
-    }.map(records => SortedMap.from(records))
-      .map(partitionedRecords.unexpiredWithdrawalsDelegatedStaking |+| _)
-      .map(_.filterNot(_._2.isEmpty))
+                .flatMap(Async[F].fromOption(_, new RuntimeException("Unexpected None when processing user delegations")))
+          }.map { records =>
+            addr -> records.toSortedSet
+          }
+      }.map(records => SortedMap.from(records))
+        .map(partitionedRecords.unexpiredWithdrawalsDelegatedStaking |+| _)
+        .map(_.filterNot(_._2.isEmpty))
 
   def sumMintedAmount[F[_]: Async](
     reservedAddressRewards: SortedSet[RewardTransaction],

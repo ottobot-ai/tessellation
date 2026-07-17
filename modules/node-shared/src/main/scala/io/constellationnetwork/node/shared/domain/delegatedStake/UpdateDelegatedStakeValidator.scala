@@ -4,61 +4,49 @@ import cats.data.{NonEmptySet, ValidatedNec}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
+import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.syntax.validated._
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeValidator.UpdateDelegatedStakeValidationErrorOr
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
-import io.constellationnetwork.schema.ID.Id
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, UpdateNodeParametersMptReader}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
-import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.node.UpdateNodeParameters
-import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, UpdateNodeCollateral}
+import io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
-import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.SignedValidator.SignedValidationError
 import io.constellationnetwork.security.signature.signature.SignatureProof
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
-import io.constellationnetwork.security.{Hasher, SecurityProvider}
 
 import derevo.cats.{eqv, show}
 import derevo.derive
-import eu.timepit.refined.internal.Adjacent.integralAdjacent
 
 trait UpdateDelegatedStakeValidator[F[_]] {
   def validateCreateDelegatedStake(
     signed: Signed[UpdateDelegatedStake.Create],
-    lastContext: GlobalSnapshotInfo
+    parentStateReader: GlobalStateReader[F]
   ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]]
 
   def validateWithdrawDelegatedStake(
     signed: Signed[UpdateDelegatedStake.Withdraw],
-    lastContext: GlobalSnapshotInfo
+    parentStateReader: GlobalStateReader[F]
   ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]]
 }
 
 object UpdateDelegatedStakeValidator {
-  def make[F[_]: Async: SecurityProvider](
+  def make[F[_]: Async](
     signedValidator: SignedValidator[F],
     seedlist: Option[Set[SeedlistEntry]]
-  )(implicit hasher: Hasher[F]): UpdateDelegatedStakeValidator[F] =
-    makeFallback(signedValidator, seedlist)
-
-  def make[F[_]: Async: SecurityProvider](
-    signedValidator: SignedValidator[F],
-    seedlist: Option[Set[SeedlistEntry]],
-    reader: GlobalStateReader[F]
   )(implicit hasher: Hasher[F]): UpdateDelegatedStakeValidator[F] =
     new UpdateDelegatedStakeValidator[F] {
 
       def validateCreateDelegatedStake(
         signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
+        parentStateReader: GlobalStateReader[F]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
         for {
           numberOfSignaturesV <- validateNumberOfSignatures(signed)
@@ -69,10 +57,10 @@ object UpdateDelegatedStakeValidator {
             .isSignedExclusivelyBy(signed, signed.source)
             .map(_.errorMap[UpdateDelegatedStakeValidationError](InvalidSigned))
           authorizedNodeIdV = validateAuthorizedNodeId(signed)
-          nodeIdV <- validateNodeId(signed, lastContext)
-          parentV <- validateParent(signed)
-          tokenLockV <- validateTokenLock(signed)
-          pendingWithdrawalV <- validatePendingWithdrawal(signed)
+          nodeIdV <- validateNodeId(signed, parentStateReader)
+          parentV <- validateParent(signed, parentStateReader)
+          tokenLockV <- validateTokenLock(signed, parentStateReader)
+          pendingWithdrawalV <- validatePendingWithdrawal(signed, parentStateReader)
         } yield
           numberOfSignaturesV
             .productR(signaturesV)
@@ -85,7 +73,7 @@ object UpdateDelegatedStakeValidator {
 
       def validateWithdrawDelegatedStake(
         signed: Signed[UpdateDelegatedStake.Withdraw],
-        lastContext: GlobalSnapshotInfo
+        parentStateReader: GlobalStateReader[F]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] =
         for {
           numberOfSignaturesV <- validateNumberOfSignatures(signed)
@@ -95,7 +83,7 @@ object UpdateDelegatedStakeValidator {
           isSignedExclusivelyBySource <- signedValidator
             .isSignedExclusivelyBy(signed, signed.source)
             .map(_.errorMap[UpdateDelegatedStakeValidationError](InvalidSigned))
-          withdrawV <- validateWithdrawal(signed)
+          withdrawV <- validateWithdrawal(signed, parentStateReader)
         } yield
           numberOfSignaturesV
             .productR(signaturesV)
@@ -114,7 +102,8 @@ object UpdateDelegatedStakeValidator {
       }
 
       private def validateParent(
-        signed: Signed[UpdateDelegatedStake.Create]
+        signed: Signed[UpdateDelegatedStake.Create],
+        reader: GlobalStateReader[F]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
         for {
           maybeDelegatedStakes <- reader.getDelegatedStakes(signed.source)
@@ -143,19 +132,14 @@ object UpdateDelegatedStakeValidator {
           UnauthorizedNode(signed.nodeId).invalidNec
         }
 
-      // Mixed data sources: `updateNodeParameters` is keyed by `Id` (not `Address`), so it cannot
-      // be stored in MptStore which is keyed by `GlobalStateKey` (address-based). We must read it
-      // from `lastContext` (GlobalSnapshotInfo) directly. The per-address `activeDelegatedStakes`
-      // lookup is migrated to MptStore below.
       private def validateNodeId(
         signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] = {
-        val nodeIdParams = lastContext.updateNodeParameters
-          .getOrElse(SortedMap.empty[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)])
-          .get(signed.nodeId.toId)
-
-        reader.getDelegatedStakes(signed.source).map { maybeDelegatedStakes =>
+        reader: GlobalStateReader[F]
+      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
+        for {
+          nodeIdParams <- UpdateNodeParametersMptReader.read(reader, signed.nodeId.toId)
+          maybeDelegatedStakes <- reader.getDelegatedStakes(signed.source)
+        } yield {
           val activeDelegatedStakes = maybeDelegatedStakes
             .getOrElse(SortedSet.empty[DelegatedStakeRecord])
             .toList
@@ -168,10 +152,10 @@ object UpdateDelegatedStakeValidator {
             signed.validNec
           }
         }
-      }
 
       private def validatePendingWithdrawal(
-        signed: Signed[UpdateDelegatedStake.Create]
+        signed: Signed[UpdateDelegatedStake.Create],
+        reader: GlobalStateReader[F]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
         reader.getDelegatedStakeWithdrawals(signed.source).map { maybeWithdrawals =>
           val withdrawalRef = maybeWithdrawals
@@ -185,7 +169,8 @@ object UpdateDelegatedStakeValidator {
         }
 
       private def validateWithdrawal(
-        signed: Signed[UpdateDelegatedStake.Withdraw]
+        signed: Signed[UpdateDelegatedStake.Withdraw],
+        reader: GlobalStateReader[F]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] = {
 
         def validateUniqueness(address: Address): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] =
@@ -224,7 +209,8 @@ object UpdateDelegatedStakeValidator {
       }
 
       private def validateTokenLock(
-        signed: Signed[UpdateDelegatedStake.Create]
+        signed: Signed[UpdateDelegatedStake.Create],
+        reader: GlobalStateReader[F]
       ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] = {
 
         def tokenLockAvailable(address: Address): F[Boolean] =
@@ -276,231 +262,6 @@ object UpdateDelegatedStakeValidator {
         } yield maybeParent.map(_.event)
     }
 
-  // Fallback implementation uses GlobalSnapshotInfo directly instead of MptStore.
-  // Used by currency-l0/l1 modules which operate on CurrencySnapshotInfo (small, per-metagraph
-  // state) and do not have access to the global MptStore. Can be removed once all modules
-  // are migrated to MptStore.
-  private def makeFallback[F[_]: Async: SecurityProvider](
-    signedValidator: SignedValidator[F],
-    seedlist: Option[Set[SeedlistEntry]]
-  )(implicit hasher: Hasher[F]): UpdateDelegatedStakeValidator[F] =
-    new UpdateDelegatedStakeValidator[F] {
-
-      def validateCreateDelegatedStake(
-        signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
-        for {
-          numberOfSignaturesV <- validateNumberOfSignatures(signed)
-          signaturesV <- signedValidator
-            .validateSignatures(signed)
-            .map(_.errorMap[UpdateDelegatedStakeValidationError](InvalidSigned))
-          isSignedExclusivelyBySource <- signedValidator
-            .isSignedExclusivelyBy(signed, signed.source)
-            .map(_.errorMap[UpdateDelegatedStakeValidationError](InvalidSigned))
-          authorizedNodeIdV = validateAuthorizedNodeId(signed)
-          nodeIdV = validateNodeId(signed, lastContext)
-          parentV <- validateParent(signed, lastContext)
-          tokenLockV <- validateTokenLock(signed, lastContext)
-          pendingWithdrawalV = validatePendingWithdrawal(signed, lastContext)
-        } yield
-          numberOfSignaturesV
-            .productR(signaturesV)
-            .productR(isSignedExclusivelyBySource)
-            .productR(authorizedNodeIdV)
-            .productR(nodeIdV)
-            .productR(parentV)
-            .productR(tokenLockV)
-            .productR(pendingWithdrawalV)
-
-      def validateWithdrawDelegatedStake(
-        signed: Signed[UpdateDelegatedStake.Withdraw],
-        lastContext: GlobalSnapshotInfo
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] =
-        for {
-          numberOfSignaturesV <- validateNumberOfSignatures(signed)
-          signaturesV <- signedValidator
-            .validateSignatures(signed)
-            .map(_.errorMap[UpdateDelegatedStakeValidationError](InvalidSigned))
-          isSignedExclusivelyBySource <- signedValidator
-            .isSignedExclusivelyBy(signed, signed.source)
-            .map(_.errorMap[UpdateDelegatedStakeValidationError](InvalidSigned))
-          withdrawV <- validateWithdrawal(signed, lastContext)
-        } yield
-          numberOfSignaturesV
-            .productR(signaturesV)
-            .productR(isSignedExclusivelyBySource)
-            .productR(withdrawV)
-
-      private def validateNumberOfSignatures[A <: UpdateDelegatedStake](
-        signed: Signed[A]
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[A]]] = {
-        val result = if (signed.proofs.size == 1) {
-          signed.validNec[UpdateDelegatedStakeValidationError]
-        } else {
-          TooManySignatures(signed.proofs).invalidNec
-        }
-        result.pure[F]
-      }
-
-      private def validateParent(
-        signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] =
-        for {
-          // Sort by event.ordinal (account-local sequence) to find the latest reference,
-          // consistent with DelegatedStakesRoutes.getLastReference and NodeCollateralValidator.
-          lastRef <- lastContext.activeDelegatedStakes
-            .getOrElse(SortedMap.empty[Address, List[DelegatedStakeRecord]])
-            .get(signed.source)
-            .flatMap(stakes => Option.when(stakes.nonEmpty)(stakes.maxBy(_.event.ordinal)))
-            .traverse(stake => DelegatedStakeReference.of(stake.event))
-            .map(_.getOrElse(DelegatedStakeReference.empty))
-        } yield
-          if (lastRef == signed.parent) {
-            signed.validNec
-          } else {
-            InvalidParent(signed.parent).invalidNec
-          }
-
-      private def validateAuthorizedNodeId(
-        signed: Signed[UpdateDelegatedStake.Create]
-      ): UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]] =
-        if (seedlist.forall(_.exists(_.peerId === signed.nodeId))) {
-          signed.validNec
-        } else {
-          UnauthorizedNode(signed.nodeId).invalidNec
-        }
-
-      private def validateNodeId(
-        signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
-      ): UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]] = {
-        val activeDelegatedStakes = lastContext.activeDelegatedStakes
-          .getOrElse(SortedMap.empty[Address, List[DelegatedStakeRecord]])
-          .getOrElse(signed.source, List.empty)
-        val nodeIdParams = lastContext.updateNodeParameters
-          .getOrElse(SortedMap.empty[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)])
-          .get(signed.nodeId.toId)
-
-        if (activeDelegatedStakes.exists(s => s.event.nodeId == signed.nodeId)) {
-          StakeExistsForNode(signed.nodeId).invalidNec
-        } else if (nodeIdParams.isEmpty) {
-          NodeIdParamsNotFilled(signed.nodeId).invalidNec
-        } else {
-          signed.validNec
-        }
-      }
-
-      private def validatePendingWithdrawal(
-        signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
-      ): UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]] = {
-        val withdrawalRef = lastContext.delegatedStakesWithdrawals
-          .getOrElse(SortedMap.empty[Address, List[PendingDelegatedStakeWithdrawal]])
-          .getOrElse(signed.source, List.empty)
-          .find { case w: PendingDelegatedStakeWithdrawal => signed.tokenLockRef == w.tokenLockRef }
-        if (withdrawalRef.isEmpty) {
-          signed.validNec
-        } else {
-          AlreadyWithdrawn(signed.parent.hash).invalidNec
-        }
-      }
-
-      private def validateWithdrawal(
-        signed: Signed[UpdateDelegatedStake.Withdraw],
-        lastContext: GlobalSnapshotInfo
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] = {
-
-        def validateUniqueness(address: Address): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] = {
-          val withdrawals = lastContext.delegatedStakesWithdrawals
-            .getOrElse(SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]])
-            .getOrElse(address, SortedSet.empty[PendingDelegatedStakeWithdrawal])
-          for {
-            stakeRefs <- withdrawals.toList.traverse(w => DelegatedStakeReference.of(w.event))
-          } yield
-            if (stakeRefs.exists(ref => ref.hash === signed.stakeRef)) {
-              AlreadyWithdrawn(signed.stakeRef).invalidNec
-            } else {
-              signed.validNec
-            }
-        }
-
-        def validateCreate(address: Address): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]]] =
-          getParent(
-            address,
-            lastContext.activeDelegatedStakes.getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]]),
-            signed
-          ).map {
-            case Some(delegatedStaking) =>
-              if (delegatedStaking.source =!= signed.source)
-                InvalidSourceAddress(signed.stakeRef).invalidNec
-              else
-                signed.validNec
-            case _ =>
-              InvalidStake(signed.stakeRef).invalidNec
-          }
-
-        for {
-          parentV <- validateCreate(signed.source)
-          uniqueV <- validateUniqueness(signed.source)
-        } yield uniqueV.productR(parentV)
-      }
-
-      private def validateTokenLock(
-        signed: Signed[UpdateDelegatedStake.Create],
-        lastContext: GlobalSnapshotInfo
-      ): F[UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Create]]] = {
-
-        def tokenLockAvailable(address: Address): Boolean = {
-          val maybeExistingStake = lastContext.activeDelegatedStakes
-            .getOrElse(SortedMap.empty[Address, List[DelegatedStakeRecord]])
-            .getOrElse(address, List.empty)
-            .find(_.tokenLockRef === signed.tokenLockRef)
-
-          val maybeExistingCollateral = lastContext.activeNodeCollaterals
-            .getOrElse(SortedMap.empty[Address, List[NodeCollateralRecord]])
-            .getOrElse(address, List.empty[NodeCollateralRecord])
-            .find(_.event.tokenLockRef === signed.tokenLockRef)
-
-          maybeExistingCollateral.isEmpty && maybeExistingStake.forall(_.event.nodeId != signed.nodeId)
-        }
-
-        def tokenLockValid(address: Address): F[Boolean] = {
-          val tokenLocks = lastContext.activeTokenLocks
-            .getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
-            .getOrElse(address, SortedSet.empty[Signed[TokenLock]])
-          for {
-            tokenLocksWithReferences <- tokenLocks.toList.traverse(t => TokenLockReference.of(t).map(r => (t, r)))
-          } yield
-            tokenLocksWithReferences.find { case (_, r) => r.hash === signed.tokenLockRef } match {
-              case Some((tokenLock, _)) =>
-                signed.amount.value.value === tokenLock.amount.value.value &&
-                tokenLock.unlockEpoch.isEmpty &&
-                address === tokenLock.source
-              case None => false
-            }
-        }
-
-        val available = tokenLockAvailable(signed.source)
-
-        for {
-          valid <- if (available) tokenLockValid(signed.source) else available.pure[F]
-        } yield if (valid) signed.validNec else InvalidTokenLock(signed.tokenLockRef).invalidNec
-      }
-
-      private def getParent(
-        address: Address,
-        delegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]],
-        signed: Signed[UpdateDelegatedStake.Withdraw]
-      ): F[Option[Signed[UpdateDelegatedStake.Create]]] =
-        for {
-          maybeParent <- delegatedStakes.getOrElse(address, SortedSet.empty[DelegatedStakeRecord]).findM { s =>
-            DelegatedStakeReference.of(s.event).map(_.hash === signed.stakeRef)
-          }
-        } yield maybeParent.map(_.event)
-    }
-
   @derive(eqv, show)
   sealed trait UpdateDelegatedStakeValidationError
 
@@ -528,6 +289,8 @@ object UpdateDelegatedStakeValidator {
   case class InvalidParent(parent: DelegatedStakeReference) extends UpdateDelegatedStakeValidationError
 
   case class DuplicatedParent(parent: DelegatedStakeReference) extends UpdateDelegatedStakeValidationError
+
+  case class ConflictingStakeTransition(stakeRef: Hash) extends UpdateDelegatedStakeValidationError
 
   case class NodeIdParamsNotFilled(nodeId: PeerId) extends UpdateDelegatedStakeValidationError
 

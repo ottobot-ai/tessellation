@@ -14,21 +14,27 @@ import io.constellationnetwork.domain.seedlist.SeedlistEntry
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
+import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator._
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.signature.Signed.forAsyncHasher
 import io.constellationnetwork.security.signature.SignedValidator.{InvalidSignatures, NotSignedExclusivelyByAddressOwner}
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
@@ -106,7 +112,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(validCreate, keyPair)
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateNodeCollateral(signed, lastContext)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -126,7 +132,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       )
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateNodeCollateral(signed, lastContext)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext))
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -155,7 +161,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       signed = signed1.addProof(signed2.proofs.head)
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateNodeCollateral(signed, lastContext1)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext1))
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -176,7 +182,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, lastContext)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -189,7 +195,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(invalidCreate, keyPair)
       seedlist <- mkSeedlist()
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateNodeCollateral(signed, lastContext)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(UnauthorizedNode(invalidCreate.nodeId).invalidNec, result)
   }
 
@@ -208,7 +214,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference, lastRef)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, context)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(StakeExistsForNode(validCreate.nodeId).invalidNec, result)
   }
 
@@ -229,7 +235,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference, lastRef)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, context)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -255,7 +261,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference, lastRef)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, context)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(AlreadyWithdrawn(validCreate.parent.hash).invalidNec, result)
   }
 
@@ -275,7 +281,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, context)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidParent(validCreate.parent).invalidNec, result)
   }
 
@@ -302,7 +308,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, context)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -318,7 +324,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, lastContext)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -333,7 +339,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validCreate = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateNodeCollateral(signed, lastContext)
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -351,7 +357,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(validWithdraw, keyPair)
       seedlist <- mkSeedlist(validParent.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateWithdrawNodeCollateral(signed, context)
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -376,7 +382,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       )
       seedlist <- mkSeedlist(validParent.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateWithdrawNodeCollateral(signed, context)
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield
       expect.all(result match {
         case invalid @ Invalid(_) =>
@@ -403,7 +409,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       signed2 <- forAsyncHasher(validWithdraw, keyPair1)
       signed = signed1.addProof(signed2.proofs.head)
       validator = mkValidator()
-      result <- validator.validateWithdrawNodeCollateral(signed, context)
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield
       expect.all(result match {
         case invalid @ Invalid(_) =>
@@ -422,7 +428,8 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
     for {
       signed <- forAsyncHasher(validWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawNodeCollateral(signed, mkGlobalContext())
+      context = mkGlobalContext()
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidCollateral(signed.collateralRef).invalidNec, result)
   }
 
@@ -435,7 +442,8 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
     for {
       signed <- forAsyncHasher(invalidWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawNodeCollateral(signed, mkGlobalContext())
+      context = mkGlobalContext()
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidCollateral(lastRef.hash).invalidNec, result)
   }
 
@@ -452,8 +460,53 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       validWithdraw = testWithdrawNodeCollateral(keyPair, sourceAddress).copy(collateralRef = lastRef.hash)
       signed <- forAsyncHasher(validWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawNodeCollateral(signed, context)
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(Valid(signed), result)
+  }
+
+  test("same-ordinal sibling validation is bound to the supplied proposal-parent reader") { res =>
+    implicit val (json, h, sp, keyPair, sourceAddress) = res
+
+    val parent = testCreateNodeCollateral(keyPair, sourceAddress)
+
+    for {
+      signedParent <- forAsyncHasher(parent, keyPair)
+      collateralRef <- NodeCollateralReference.of(signedParent)
+      record = NodeCollateralRecord(signedParent, SnapshotOrdinal.MinValue)
+      contradictoryContext = mkGlobalContext(SortedMap(sourceAddress -> SortedSet(record)))
+      siblingWithCollateral = pointReaderFromContextForTest(contradictoryContext)
+      siblingWithoutCollateral = GlobalStateReader.empty[IO]
+      withdrawal <- forAsyncHasher(
+        testWithdrawNodeCollateral(keyPair, sourceAddress).copy(collateralRef = collateralRef.hash),
+        keyPair
+      )
+      validator = mkValidator()
+      manager = UpdateNodeCollateralAcceptanceManager.make[IO](validator)
+      delegatedResult = UpdateDelegatedStakeAcceptanceResult(SortedMap.empty, List.empty, SortedMap.empty, List.empty)
+      accepted <- manager.accept(
+        creates = List.empty,
+        withdrawals = List(withdrawal),
+        parentStateReader = siblingWithCollateral,
+        lastGlobalEpochProgress = EpochProgress.MinValue,
+        lastSnapshotOrdinal = SnapshotOrdinal.MinValue,
+        updateDelegatedStakeAcceptanceResult = delegatedResult
+      )
+      rejected <- manager.accept(
+        creates = List.empty,
+        withdrawals = List(withdrawal),
+        parentStateReader = siblingWithoutCollateral,
+        lastGlobalEpochProgress = EpochProgress.MinValue,
+        lastSnapshotOrdinal = SnapshotOrdinal.MinValue,
+        updateDelegatedStakeAcceptanceResult = delegatedResult
+      )
+    } yield
+      expect.all(
+        accepted.acceptedWithdrawals.values.flatten.map(_._1).toList == List(withdrawal),
+        accepted.notAcceptedWithdrawals.isEmpty,
+        rejected.acceptedWithdrawals.isEmpty,
+        rejected.notAcceptedWithdrawals.map(_._1) == List(withdrawal),
+        rejected.notAcceptedWithdrawals.headOption.exists(_._2.head == InvalidCollateral(collateralRef.hash))
+      )
   }
 
   test("should fail when lastRef of the withdraw node collateral is not empty and the global context does not contain the parent") { res =>
@@ -469,7 +522,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       invalidWithdraw = testWithdrawNodeCollateral(keyPair, sourceAddress).copy(collateralRef = lastRef)
       signed <- forAsyncHasher(invalidWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawNodeCollateral(signed, context)
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidCollateral(lastRef).invalidNec, result)
   }
 
@@ -488,7 +541,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
         invalidWithdraw = testWithdrawNodeCollateral(keyPair, sourceAddress).copy(collateralRef = lastRef.hash)
         signed <- forAsyncHasher(invalidWithdraw, keyPair)
         validator = mkValidator()
-        result <- validator.validateWithdrawNodeCollateral(signed, context)
+        result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
       } yield expect.same(InvalidCollateral(lastRef.hash).invalidNec, result)
   }
 
@@ -510,7 +563,7 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       )
       seedlist <- mkSeedlist(validParent.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateWithdrawNodeCollateral(signed, context)
+      result <- validator.validateWithdrawNodeCollateral(signed, pointReaderFromContextForTest(context))
     } yield expect.same(AlreadyWithdrawn(lastRef.hash).invalidNec, result)
   }
 
@@ -519,6 +572,43 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       seedlistEntry = SeedlistEntry(PeerId.fromPublic(keyPair.getPublic), None, None, None, None)
     } yield Some(peerIds.map(SeedlistEntry(_, None, None, None, None)).toSet + seedlistEntry)
+
+  /** Point-read adapter for validator unit fixtures only. Production consensus supplies the proposal-parent MPT reader explicitly. */
+  def pointReaderFromContextForTest(context: GlobalSnapshotInfo): GlobalStateReader[IO] =
+    new GlobalStateReader[IO] {
+      private def valueAt[V](key: GlobalStateKey): Option[V] =
+        key.userNamespace match {
+          case AddressNamespace(address) =>
+            (key.fieldId match {
+              case GlobalStateFieldId.ActiveDelegatedStakes =>
+                context.activeDelegatedStakes.flatMap(_.get(address)).filter(_.nonEmpty)
+              case GlobalStateFieldId.ActiveNodeCollaterals =>
+                context.activeNodeCollaterals.flatMap(_.get(address)).filter(_.nonEmpty)
+              case GlobalStateFieldId.NodeCollateralWithdrawals =>
+                context.nodeCollateralWithdrawals.flatMap(_.get(address)).filter(_.nonEmpty)
+              case GlobalStateFieldId.ActiveTokenLocks =>
+                context.activeTokenLocks.flatMap(_.get(address)).filter(_.nonEmpty)
+              case _ => None
+            }).map(_.asInstanceOf[V])
+          case _ => None
+        }
+
+      def get[V: ImmutableCodec](key: GlobalStateKey): IO[Option[V]] = IO.pure(valueAt[V](key))
+
+      def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
+        IO.pure(
+          valueAt[V](key)
+            .map[StrictMptRead[V]](value => StrictMptRead.Present(value, implicitly[ImmutableCodec[V]].immutableBytes(value)))
+            .getOrElse(StrictMptRead.Absent)
+        )
+
+      def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] =
+        IO.pure(keys.flatMap(key => valueAt[V](key).map(key -> _)).toMap)
+
+      def getAllForPrefix[V: ImmutableCodec](prefix: Hex): IO[Map[Hex, V]] = IO.pure(Map.empty)
+
+      def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): IO[List[StrictMptEntry[V]]] = IO.pure(List.empty)
+    }
 
   private def mkValidator(seedlist: Option[Set[SeedlistEntry]] = None)(
     implicit S: SecurityProvider[IO],

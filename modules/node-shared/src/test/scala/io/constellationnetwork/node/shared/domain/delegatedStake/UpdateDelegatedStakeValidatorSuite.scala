@@ -15,11 +15,14 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeValidator._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
+import io.constellationnetwork.schema.mpt.PartitionNamespace.AddressNamespace
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.node._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
@@ -33,6 +36,7 @@ import io.constellationnetwork.security.signature.SignedValidator.{InvalidSignat
 import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
 import io.constellationnetwork.security.signature.{Signed, SignedValidator}
 import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
+import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.shared.sharedKryoRegistrar
 
 import eu.timepit.refined.types.all.PosLong
@@ -135,8 +139,27 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(validCreate, keyPair)
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(Valid(signed), result)
+  }
+
+  test("same-ordinal sibling create validation reads node parameters only from the supplied field-12 parent") { res =>
+    implicit val (json, h, sp, keyPair, sourceAddress) = res
+
+    for {
+      (tokenLockReference, parentWithNodeParameters) <- mkValidGlobalContext(keyPair, keyPair)
+      parentWithoutNodeParameters = parentWithNodeParameters.copy(updateNodeParameters = None)
+      create = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
+      signed <- forAsyncHasher(create, keyPair)
+      seedlist <- mkSeedlist(create.nodeId)
+      validator = mkValidator(seedlist)
+      accepted <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(parentWithNodeParameters))
+      rejected <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(parentWithoutNodeParameters))
+    } yield
+      expect.all(
+        accepted == Valid(signed),
+        rejected == NodeIdParamsNotFilled(create.nodeId).invalidNec
+      )
   }
 
   test("should fail when the create delegated stake is not signed correctly") { res =>
@@ -155,7 +178,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       )
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -184,7 +207,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       signed = signed1.addProof(signed2.proofs.head)
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateDelegatedStake(signed, lastContext1)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext1))
     } yield
       expect.all(result match {
         case Invalid(errors) =>
@@ -205,7 +228,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -218,7 +241,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(invalidCreate, keyPair)
       seedlist <- mkSeedlist()
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(UnauthorizedNode(invalidCreate.nodeId).invalidNec, result)
   }
 
@@ -241,7 +264,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference, lastRef)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, context)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(StakeExistsForNode(validCreate.nodeId).invalidNec, result)
   }
 
@@ -266,7 +289,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference, lastRef)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, context)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -298,7 +321,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference, lastRef)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, context)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(AlreadyWithdrawn(validCreate.parent.hash).invalidNec, result)
   }
 
@@ -322,7 +345,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, context)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidParent(validCreate.parent).invalidNec, result)
   }
 
@@ -345,7 +368,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, context)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -361,7 +384,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -375,7 +398,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validCreate = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
       signed <- forAsyncHasher(validCreate, keyPair)
       validator = mkValidator()
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -396,7 +419,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validWithdraw = testWithdrawDelegatedStake(keyPair, sourceAddress).copy(stakeRef = lastRef.hash)
       signed <- forAsyncHasher(validWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, context)
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -424,7 +447,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
         )
       )
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, context)
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield
       expect.all(result match {
         case invalid @ Invalid(_) =>
@@ -455,7 +478,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       signed2 <- forAsyncHasher(validWithdraw, keyPair1)
       signed = signed1.addProof(signed2.proofs.head)
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, context)
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield
       expect.all(result match {
         case invalid @ Invalid(_) =>
@@ -474,7 +497,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
     for {
       signed <- forAsyncHasher(validWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, mkGlobalContext())
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(mkGlobalContext()))
     } yield expect.same(InvalidStake(signed.stakeRef).invalidNec, result)
   }
 
@@ -487,7 +510,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
     for {
       signed <- forAsyncHasher(invalidWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, mkGlobalContext())
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(mkGlobalContext()))
     } yield expect.same(InvalidStake(lastRef.hash).invalidNec, result)
   }
 
@@ -508,7 +531,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       validWithdraw = testWithdrawDelegatedStake(keyPair, sourceAddress).copy(stakeRef = lastRef.hash)
       signed <- forAsyncHasher(validWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, context)
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(Valid(signed), result)
   }
 
@@ -525,7 +548,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       invalidWithdraw = testWithdrawDelegatedStake(keyPair, sourceAddress).copy(stakeRef = lastRef)
       signed <- forAsyncHasher(invalidWithdraw, keyPair)
       validator = mkValidator()
-      result <- validator.validateWithdrawDelegatedStake(signed, context)
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(InvalidStake(lastRef).invalidNec, result)
   }
 
@@ -548,7 +571,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
         invalidWithdraw = testWithdrawDelegatedStake(keyPair, sourceAddress).copy(stakeRef = lastRef.hash)
         signed <- forAsyncHasher(invalidWithdraw, keyPair)
         validator = mkValidator()
-        result <- validator.validateWithdrawDelegatedStake(signed, context)
+        result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
       } yield expect.same(InvalidStake(lastRef.hash).invalidNec, result)
   }
 
@@ -575,7 +598,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       )
       seedlist <- mkSeedlist(validParent.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateWithdrawDelegatedStake(signed, context)
+      result <- validator.validateWithdrawDelegatedStake(signed, pointReaderFromContextForTest(context))
     } yield expect.same(AlreadyWithdrawn(lastRef.hash).invalidNec, result)
   }
 
@@ -589,7 +612,7 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       signed <- forAsyncHasher(validCreate, keyPair)
       seedlist <- mkSeedlist(validCreate.nodeId)
       validator = mkValidator(seedlist)
-      result <- validator.validateCreateDelegatedStake(signed, lastContext)
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(lastContext))
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
@@ -598,6 +621,61 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       seedlistEntry = SeedlistEntry(PeerId.fromPublic(keyPair.getPublic), None, None, None, None)
     } yield Some(peerIds.map(SeedlistEntry(_, None, None, None, None)).toSet + seedlistEntry)
+
+  /** Point-read adapter for validator unit fixtures only. Production consensus always supplies the proposal-parent MPT reader explicitly.
+    */
+  def pointReaderFromContextForTest(context: GlobalSnapshotInfo)(implicit hasher: Hasher[IO]): GlobalStateReader[IO] =
+    new GlobalStateReader[IO] {
+      private def updateNodeParametersValue[V](key: GlobalStateKey): IO[Option[V]] = {
+        def loop(entries: List[(Id, (Signed[UpdateNodeParameters], SnapshotOrdinal))]): IO[Option[V]] =
+          entries match {
+            case Nil => IO.pure(None)
+            case (id, record) :: tail =>
+              GlobalStateKey.updateNodeParametersKey[IO](id).flatMap { expectedKey =>
+                if (expectedKey == key) IO.pure(Some(record.asInstanceOf[V]))
+                else loop(tail)
+              }
+          }
+
+        loop(context.updateNodeParameters.toList.flatMap(_.toList))
+      }
+
+      private def valueAt[V](key: GlobalStateKey): IO[Option[V]] =
+        if (key.fieldId == GlobalStateFieldId.UpdateNodeParameters) updateNodeParametersValue[V](key)
+        else
+          IO.pure(
+            key.userNamespace match {
+              case AddressNamespace(address) =>
+                (key.fieldId match {
+                  case GlobalStateFieldId.ActiveDelegatedStakes =>
+                    context.activeDelegatedStakes.flatMap(_.get(address)).filter(_.nonEmpty)
+                  case GlobalStateFieldId.DelegatedStakesWithdrawals =>
+                    context.delegatedStakesWithdrawals.flatMap(_.get(address)).filter(_.nonEmpty)
+                  case GlobalStateFieldId.ActiveNodeCollaterals =>
+                    context.activeNodeCollaterals.flatMap(_.get(address)).filter(_.nonEmpty)
+                  case GlobalStateFieldId.ActiveTokenLocks =>
+                    context.activeTokenLocks.flatMap(_.get(address)).filter(_.nonEmpty)
+                  case _ => None
+                }).map(_.asInstanceOf[V])
+              case _ => None
+            }
+          )
+
+      def get[V: ImmutableCodec](key: GlobalStateKey): IO[Option[V]] = valueAt[V](key)
+
+      def getStrict[V: ImmutableCodec](key: GlobalStateKey): IO[StrictMptRead[V]] =
+        valueAt[V](key).map { maybeValue =>
+          maybeValue
+            .map[StrictMptRead[V]](value => StrictMptRead.Present(value, implicitly[ImmutableCodec[V]].immutableBytes(value)))
+            .getOrElse(StrictMptRead.Absent)
+        }
+
+      def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): IO[Map[GlobalStateKey, V]] = IO.pure(Map.empty)
+
+      def getAllForPrefix[V: ImmutableCodec](prefix: Hex): IO[Map[Hex, V]] = IO.pure(Map.empty)
+
+      def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): IO[List[StrictMptEntry[V]]] = IO.pure(List.empty)
+    }
 
   private def mkValidator(seedlist: Option[Set[SeedlistEntry]] = None)(
     implicit S: SecurityProvider[IO],

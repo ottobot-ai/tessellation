@@ -101,6 +101,8 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
         "test signer derives, registers, resolves, and compares a complete genesis pair before emitting any VRF proof",
       "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/RegisteredCheckpointSignerSuite.scala" ->
         "compares derived bytes with the signer fixture's loader-validated atomic registration",
+      "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducerSuite.scala" ->
+        "preregisters producer identities, resolves the canonical pair, and byte-compares it before high-level producer tests",
       "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointAttestationEmitterSuite.scala" ->
         "passes local secrets only with the matching preregistered atomic checkpoint-signer identity",
       "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/ShardCheckpointGl0AcceptanceManagerSuite.scala" ->
@@ -131,7 +133,8 @@ object OperatorConsensusKeyUsageGuardSuite extends SimpleIOSuite {
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/genesis/VrfRegistryLoaderSuite.scala" -> 3,
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/RegisteredCheckpointSigner.scala" -> 5,
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/RegisteredCheckpointSignerSuite.scala" -> 2,
-    "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointAttestationEmitterSuite.scala" -> 6,
+    "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointProducerSuite.scala" -> 3,
+    "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/sharding/ShardCheckpointAttestationEmitterSuite.scala" -> 12,
     "modules/node-shared/src/test/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/ShardCheckpointGl0AcceptanceManagerSuite.scala" -> 4,
     "modules/shared/src/test/scala/io/constellationnetwork/security/vrf/EcVrf25519Suite.scala" -> 1,
     "modules/shared/src/test/scala/io/constellationnetwork/security/vrf/EcVrf25519UniformitySuite.scala" -> 1,

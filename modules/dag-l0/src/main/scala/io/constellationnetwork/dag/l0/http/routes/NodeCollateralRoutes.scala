@@ -24,7 +24,6 @@ import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
 
 import eu.timepit.refined.auto._
-import eu.timepit.refined.types.all.NonNegLong
 import io.circe.shapes._
 import org.http4s.HttpRoutes
 import org.http4s.circe.CirceEntityCodec.circeEntityEncoder
@@ -102,10 +101,10 @@ final case class NodeCollateralRoutes[F[_]: Async: Hasher](
     case req @ POST -> Root =>
       snapshotStorage.head.flatMap {
         case None => ServiceUnavailable()
-        case Some((_, info)) =>
+        case Some(_) =>
           for {
             signed <- req.as[Signed[UpdateNodeCollateral.Create]]
-            result <- validator.validateCreateNodeCollateral(signed, info)
+            result <- validator.validateCreateNodeCollateral(signed, reader)
             response <- result match {
               case Valid(validSigned) =>
                 logger.info(s"Accepted create node collateral from ${validSigned.proofs.map(_.id).map(PeerId.fromId)}") >>
@@ -126,10 +125,10 @@ final case class NodeCollateralRoutes[F[_]: Async: Hasher](
     case req @ PUT -> Root =>
       snapshotStorage.head.flatMap {
         case None => ServiceUnavailable()
-        case Some((_, info)) =>
+        case Some(_) =>
           for {
             signed <- req.as[Signed[UpdateNodeCollateral.Withdraw]]
-            result <- validator.validateWithdrawNodeCollateral(signed, info)
+            result <- validator.validateWithdrawNodeCollateral(signed, reader)
             response <- result match {
               case Valid(validSigned) =>
                 logger.info(s"Accepted withdraw node collateral from ${validSigned.proofs.map(_.id).map(PeerId.fromId)}") >>

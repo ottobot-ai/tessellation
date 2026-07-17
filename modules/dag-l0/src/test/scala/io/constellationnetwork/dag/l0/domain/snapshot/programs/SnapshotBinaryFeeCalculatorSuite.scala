@@ -43,7 +43,7 @@ object SnapshotBinaryFeeCalculatorSuite extends MutableIOSuite with Checkers {
 
   val eventAddress = Address(refineV[DAGAddressRefined].unsafeFrom("DAGSTARDUSTCOLLECTIVEHZOIPHXZUBFGNXWJETZVSPAPAHMLXS"))
   val stakingAddress = Address(refineV[DAGAddressRefined].unsafeFrom("DAG7coCMRPJah33MMcfAEZVeB1vYn3vDRe6WqeGU"))
-  val metagraphId = Address(refineV[DAGAddressRefined].unsafeFrom("DAG7coCMRPJah33MMcfAEZVeB1vYn3vDRe6WqeGU"))
+  val metagraphId = eventAddress
 
   type Res = (Hasher[IO], JsonSerializer[IO])
 

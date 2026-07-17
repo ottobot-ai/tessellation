@@ -168,10 +168,11 @@ object MgAddressFieldStrictReconstructionSuite extends MutableIOSuite {
       keyHolder <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       valueHolder <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       fixtures = addressFieldValues(metagraph, valueHolder)
-      attempts <- fixtures.traverse { case (field, bytes) =>
-        canonicalHex(metagraph, field, keyHolder).flatMap { physicalKey =>
-          reconstruct(metagraph, List(physicalKey -> bytes)).attempt
-        }
+      attempts <- fixtures.traverse {
+        case (field, bytes) =>
+          canonicalHex(metagraph, field, keyHolder).flatMap { physicalKey =>
+            reconstruct(metagraph, List(physicalKey -> bytes)).attempt
+          }
       }
     } yield
       expect(
@@ -191,20 +192,21 @@ object MgAddressFieldStrictReconstructionSuite extends MutableIOSuite {
       holder <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       wrongContract <- KeyPairGenerator.makeKeyPair[IO].map(_.getPublic.toAddress)
       fixtures = addressFieldValues(metagraph, holder)
-      attempts <- fixtures.traverse { case (field, bytes) =>
-        for {
-          canonical <- canonicalHex(metagraph, field, holder)
-          wrongContractKey <- GlobalStateKey.toHex[IO](
-            GlobalStateKey(
-              MetagraphNamespace(metagraph),
-              field,
-              AddressNamespace(wrongContract),
-              AddressNamespace(holder)
+      attempts <- fixtures.traverse {
+        case (field, bytes) =>
+          for {
+            canonical <- canonicalHex(metagraph, field, holder)
+            wrongContractKey <- GlobalStateKey.toHex[IO](
+              GlobalStateKey(
+                MetagraphNamespace(metagraph),
+                field,
+                AddressNamespace(wrongContract),
+                AddressNamespace(holder)
+              )
             )
-          )
-          wrongContractResult <- reconstruct(metagraph, List(wrongContractKey -> bytes)).attempt
-          suffixResult <- reconstruct(metagraph, List(Hex(canonical.value + "00") -> bytes)).attempt
-        } yield List(wrongContractResult, suffixResult)
+            wrongContractResult <- reconstruct(metagraph, List(wrongContractKey -> bytes)).attempt
+            suffixResult <- reconstruct(metagraph, List(Hex(canonical.value + "00") -> bytes)).attempt
+          } yield List(wrongContractResult, suffixResult)
       }
     } yield
       expect(

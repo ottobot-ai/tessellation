@@ -90,10 +90,10 @@ object nodeCollateral {
   case class NodeCollateralRecord(event: Signed[UpdateNodeCollateral.Create], createdAt: SnapshotOrdinal)
 
   object NodeCollateralRecord {
-    implicit val order: Order[NodeCollateralRecord] = Order[SnapshotOrdinal].contramap(_.createdAt)
+    implicit val order: Order[NodeCollateralRecord] =
+      Order.by(r => (r.createdAt, r.event))
 
-    implicit val ordering: Ordering[NodeCollateralRecord] =
-      Ordering.by(r => (r.createdAt, r.event))
+    implicit val ordering: Ordering[NodeCollateralRecord] = order.toOrdering
   }
   @derive(decoder, encoder, eqv, show)
   case class PendingNodeCollateralWithdrawal(
@@ -102,10 +102,10 @@ object nodeCollateral {
     createdAt: EpochProgress
   )
   object PendingNodeCollateralWithdrawal {
-    implicit val order: Order[PendingNodeCollateralWithdrawal] = Order[EpochProgress].contramap(_.createdAt)
+    implicit val order: Order[PendingNodeCollateralWithdrawal] =
+      Order.by(r => (r.createdAt, r.event, r.acceptedOrdinal))
 
-    implicit val ordering: Ordering[PendingNodeCollateralWithdrawal] =
-      Ordering.by(r => (r.createdAt, r.event))
+    implicit val ordering: Ordering[PendingNodeCollateralWithdrawal] = order.toOrdering
   }
 
   @derive(eqv, show, encoder)

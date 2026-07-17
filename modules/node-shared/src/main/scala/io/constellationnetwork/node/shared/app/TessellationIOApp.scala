@@ -239,25 +239,6 @@ abstract class TessellationIOApp[A <: CliMethod](
                                           }
                                         }
 
-                                        // #198: Class-2 validator path migrated to GlobalStateReader (#118 follow-up). On gl0, seed
-                                        // the validators with the overlay-aware `pending` reader so BOTH HTTP intake and the
-                                        // acceptance manager (constructed below from `validators.updateDelegatedStakeValidator`)
-                                        // see the chain's pending writes under MultiBranch. On followers (gl1/cl1/dl1/ml0), seed
-                                        // with the finalized adapter — followers must read only finalized gl0 state. Sealed-trait
-                                        // match (no string compare). The `bestTipFn` default returns the lastGlobalSnapshot hash
-                                        // (set in `SharedStorages.make`), so `pending` resolves sanely from boot; gl0 later
-                                        // overrides `setBestTipFn` from the chain store so reads track the true canonical tip
-                                        // across reorgs. Gl0's `Main` re-runs `withOverlayReader` after `Services.make` builds the
-                                        // canonical `pendingReader` — that rebind is a no-op semantics-wise but ties the validator
-                                        // identity to the same reader handle the HTTP read sites use.
-                                        sharedReader = layer match {
-                                          case DagL0 =>
-                                            io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-                                              .pending[IO](storages.mptOverlay, storages.bestTipFn)
-                                          case _ =>
-                                            io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
-                                              .finalized[IO](storages.mptStore)
-                                        }
                                         validators = _hasherSelector.withCurrent { implicit hasher =>
                                           SharedValidators.make[IO](
                                             cfg.environment,
@@ -269,8 +250,7 @@ abstract class TessellationIOApp[A <: CliMethod](
                                             cfg.snapshotSize.maxStateChannelSnapshotBinarySizeInBytes,
                                             Hasher.forKryo[IO],
                                             cfg.delegatedStaking,
-                                            cfg.priceOracle,
-                                            Some(sharedReader)
+                                            cfg.priceOracle
                                           )
                                         }
                                         // Split-safety (#261): load the layer-specific atomic KES+VRF registry so the createContext /

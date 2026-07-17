@@ -72,9 +72,8 @@ object GlobalDelegatedRewardsDistributor {
   /** §G5 — MPT-primary reward distribution. The state-manager parameters provide branch-aware MPT reads for `activeDelegatedStakes`
     * (per-record) and `updateNodeParameters` (per-Id), replacing the legacy GSI map closures (`info.activeDelegatedStakes` /
     * `info.updateNodeParameters`). `reader` is used by `DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes` for per-address
-    * point reads when resolving withdrawal stake references. The caching strategy is per-snapshot-ordinal: callers should thread a
-    * `pendingReader` whose branch view is bound to the chain best-tip, so a single accept() cycle sees a consistent prior-state view across
-    * all reads (matches G1 pattern).
+    * point reads when resolving withdrawal stake references. Consensus callers must bind all three dependencies to the exact proposal
+    * parent branch. An ambient best-tip `pendingReader` is suitable only for non-consensus read paths.
     */
   def make[F[_]: Async: Hasher](
     environment: AppEnvironment,

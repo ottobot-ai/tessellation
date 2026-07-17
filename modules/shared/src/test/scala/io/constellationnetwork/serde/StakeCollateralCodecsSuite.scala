@@ -2,6 +2,8 @@ package io.constellationnetwork.serde
 
 import cats.data.NonEmptySet
 
+import scala.collection.immutable.SortedSet
+
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.balance.Amount
@@ -19,6 +21,7 @@ import io.constellationnetwork.serde.codecs.instances.DelegatedStakeCodecs.{
   pendingDelegatedStakeWithdrawalImmutableCodec,
   updateDelegatedStakeImmutableCodec
 }
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.serde.codecs.instances.NodeCollateralCodecs.{
   nodeCollateralRecordImmutableCodec,
   pendingNodeCollateralWithdrawalImmutableCodec,
@@ -41,6 +44,38 @@ object StakeCollateralCodecsSuite extends FunSuite {
 
   private def proof: SignatureProof =
     SignatureProof(Id(Hex("cafe")), Signature(Hex("beef")))
+
+  private def alternateProof: SignatureProof =
+    SignatureProof(Id(Hex("face")), Signature(Hex("feed")))
+
+  private def verifySetContract[A: Ordering](
+    codec: ImmutableCodec[SortedSet[A]],
+    first: A,
+    second: A,
+    firstProofVariant: A,
+    secondProofVariant: A
+  ) = {
+    val forward = SortedSet(first, second)
+    val reverse = SortedSet(second, first)
+    val proofVariants = SortedSet(firstProofVariant, secondProofVariant)
+    val forwardBytes = codec.immutableBytes(forward)
+    val reverseBytes = codec.immutableBytes(reverse)
+    val proofVariantBytes = codec.immutableBytes(proofVariants)
+
+    expect.all(
+      forward.size == 2,
+      reverse.size == 2,
+      forwardBytes == reverseBytes,
+      codec.fromImmutableBytes(forwardBytes) == Right(forward),
+      proofVariants.size == 2,
+      codec.fromImmutableBytes(proofVariantBytes) == Right(proofVariants)
+    )
+  }
+
+  private def survivesSetRoundTrip[A: Ordering](codec: ImmutableCodec[SortedSet[A]], first: A, second: A): Boolean = {
+    val records = SortedSet(first, second)
+    records.size == 2 && codec.fromImmutableBytes(codec.immutableBytes(records)) == Right(records)
+  }
 
   // ---- DelegatedStake ------------------------------------------------------
 
@@ -98,6 +133,84 @@ object StakeCollateralCodecsSuite extends FunSuite {
     expect(bytes.fromImmutableBytes[PendingDelegatedStakeWithdrawal](pendingDelegatedStakeWithdrawalImmutableCodec) == Right(pending))
   }
 
+  test("DelegatedStakeRecord sets preserve same-ordinal batching and alternate-proof identities") {
+    val createdAt = SnapshotOrdinal(NonNegLong.unsafeFrom(51L))
+    val firstCreate = UpdateDelegatedStake.Create(
+      src,
+      nodeId,
+      DelegatedStakeAmount(NonNegLong.unsafeFrom(101L)),
+      DelegatedStakeFee(NonNegLong.unsafeFrom(1L)),
+      Hash("1" * 64),
+      DelegatedStakeReference.empty
+    )
+    val secondCreate = firstCreate.copy(
+      amount = DelegatedStakeAmount(NonNegLong.unsafeFrom(102L)),
+      tokenLockRef = Hash("2" * 64)
+    )
+    val first = DelegatedStakeRecord(Signed(firstCreate, NonEmptySet.one(proof)), createdAt, Amount.empty)
+    val second = DelegatedStakeRecord(Signed(secondCreate, NonEmptySet.one(proof)), createdAt, Amount.empty)
+    val firstProofVariant = DelegatedStakeRecord(Signed(firstCreate, NonEmptySet.one(proof)), createdAt, Amount.empty)
+    val secondProofVariant = DelegatedStakeRecord(Signed(firstCreate, NonEmptySet.one(alternateProof)), createdAt, Amount.empty)
+
+    verifySetContract(delegatedStakeRecordSetCodec, first, second, firstProofVariant, secondProofVariant).and(
+      expect.all(
+        survivesSetRoundTrip(
+          delegatedStakeRecordSetCodec,
+          firstProofVariant,
+          firstProofVariant.copy(currentTokenLockRef = Some(Hash("9" * 64)))
+        ),
+        survivesSetRoundTrip(
+          delegatedStakeRecordSetCodec,
+          firstProofVariant,
+          firstProofVariant.copy(currentAmount = Some(DelegatedStakeAmount(NonNegLong.unsafeFrom(105L))))
+        )
+      )
+    )
+  }
+
+  test("PendingDelegatedStakeWithdrawal sets preserve same-epoch batching and alternate-proof identities") {
+    val createdAt = EpochProgress(NonNegLong.unsafeFrom(101L))
+    val acceptedAt = SnapshotOrdinal(NonNegLong.unsafeFrom(52L))
+    val firstCreate = UpdateDelegatedStake.Create(
+      src,
+      nodeId,
+      DelegatedStakeAmount(NonNegLong.unsafeFrom(103L)),
+      DelegatedStakeFee(NonNegLong.unsafeFrom(1L)),
+      Hash("3" * 64),
+      DelegatedStakeReference.empty
+    )
+    val secondCreate = firstCreate.copy(
+      amount = DelegatedStakeAmount(NonNegLong.unsafeFrom(104L)),
+      tokenLockRef = Hash("4" * 64)
+    )
+    val first = PendingDelegatedStakeWithdrawal(Signed(firstCreate, NonEmptySet.one(proof)), Amount.empty, acceptedAt, createdAt)
+    val second = PendingDelegatedStakeWithdrawal(Signed(secondCreate, NonEmptySet.one(proof)), Amount.empty, acceptedAt, createdAt)
+    val firstProofVariant =
+      PendingDelegatedStakeWithdrawal(Signed(firstCreate, NonEmptySet.one(proof)), Amount.empty, acceptedAt, createdAt)
+    val secondProofVariant =
+      PendingDelegatedStakeWithdrawal(Signed(firstCreate, NonEmptySet.one(alternateProof)), Amount.empty, acceptedAt, createdAt)
+
+    verifySetContract(pendingDelegatedStakeWithdrawalSetCodec, first, second, firstProofVariant, secondProofVariant).and(
+      expect.all(
+        survivesSetRoundTrip(
+          pendingDelegatedStakeWithdrawalSetCodec,
+          firstProofVariant,
+          firstProofVariant.copy(acceptedOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(53L)))
+        ),
+        survivesSetRoundTrip(
+          pendingDelegatedStakeWithdrawalSetCodec,
+          firstProofVariant,
+          firstProofVariant.copy(currentTokenLockRef = Some(Hash("a" * 64)))
+        ),
+        survivesSetRoundTrip(
+          pendingDelegatedStakeWithdrawalSetCodec,
+          firstProofVariant,
+          firstProofVariant.copy(currentAmount = Some(DelegatedStakeAmount(NonNegLong.unsafeFrom(106L))))
+        )
+      )
+    )
+  }
+
   // ---- NodeCollateral ------------------------------------------------------
 
   test("UpdateNodeCollateral.Create round-trips through the sealed-ADT codec") {
@@ -146,5 +259,64 @@ object StakeCollateralCodecsSuite extends FunSuite {
     )
     val bytes = pendingNodeCollateralWithdrawalImmutableCodec.immutableBytes(pending)
     expect(bytes.fromImmutableBytes[PendingNodeCollateralWithdrawal](pendingNodeCollateralWithdrawalImmutableCodec) == Right(pending))
+  }
+
+  test("NodeCollateralRecord sets preserve same-ordinal batching and alternate-proof identities") {
+    val createdAt = SnapshotOrdinal(NonNegLong.unsafeFrom(78L))
+    val firstCreate = UpdateNodeCollateral.Create(
+      src,
+      nodeId,
+      NodeCollateralAmount(NonNegLong.unsafeFrom(501L)),
+      NodeCollateralFee(NonNegLong.unsafeFrom(1L)),
+      Hash("5" * 64),
+      NodeCollateralReference.empty
+    )
+    val secondCreate = firstCreate.copy(
+      amount = NodeCollateralAmount(NonNegLong.unsafeFrom(502L)),
+      tokenLockRef = Hash("6" * 64)
+    )
+    val first = NodeCollateralRecord(Signed(firstCreate, NonEmptySet.one(proof)), createdAt)
+    val second = NodeCollateralRecord(Signed(secondCreate, NonEmptySet.one(proof)), createdAt)
+    val firstProofVariant = NodeCollateralRecord(Signed(firstCreate, NonEmptySet.one(proof)), createdAt)
+    val secondProofVariant = NodeCollateralRecord(Signed(firstCreate, NonEmptySet.one(alternateProof)), createdAt)
+
+    verifySetContract(
+      nodeCollateralRecordSetCodec,
+      first,
+      second,
+      firstProofVariant,
+      secondProofVariant
+    )
+  }
+
+  test("PendingNodeCollateralWithdrawal sets preserve same-epoch batching and alternate-proof identities") {
+    val createdAt = EpochProgress(NonNegLong.unsafeFrom(201L))
+    val acceptedAt = SnapshotOrdinal(NonNegLong.unsafeFrom(79L))
+    val firstCreate = UpdateNodeCollateral.Create(
+      src,
+      nodeId,
+      NodeCollateralAmount(NonNegLong.unsafeFrom(503L)),
+      NodeCollateralFee(NonNegLong.unsafeFrom(1L)),
+      Hash("7" * 64),
+      NodeCollateralReference.empty
+    )
+    val secondCreate = firstCreate.copy(
+      amount = NodeCollateralAmount(NonNegLong.unsafeFrom(504L)),
+      tokenLockRef = Hash("8" * 64)
+    )
+    val first = PendingNodeCollateralWithdrawal(Signed(firstCreate, NonEmptySet.one(proof)), acceptedAt, createdAt)
+    val second = PendingNodeCollateralWithdrawal(Signed(secondCreate, NonEmptySet.one(proof)), acceptedAt, createdAt)
+    val firstProofVariant = PendingNodeCollateralWithdrawal(Signed(firstCreate, NonEmptySet.one(proof)), acceptedAt, createdAt)
+    val secondProofVariant = PendingNodeCollateralWithdrawal(Signed(firstCreate, NonEmptySet.one(alternateProof)), acceptedAt, createdAt)
+
+    verifySetContract(pendingNodeCollateralWithdrawalSetCodec, first, second, firstProofVariant, secondProofVariant).and(
+      expect(
+        survivesSetRoundTrip(
+          pendingNodeCollateralWithdrawalSetCodec,
+          firstProofVariant,
+          firstProofVariant.copy(acceptedOrdinal = SnapshotOrdinal(NonNegLong.unsafeFrom(80L)))
+        )
+      )
+    )
   }
 }

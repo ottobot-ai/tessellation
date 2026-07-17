@@ -15,7 +15,6 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.node.shared.domain.node.NodeStorage
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.node.shared.infrastructure.delegatedStake.RewardsInfoStorage
-import io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsDistributor
 import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -142,10 +141,10 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
     case req @ POST -> Root =>
       snapshotStorage.head.flatMap {
         case None => ServiceUnavailable()
-        case Some((_, info)) =>
+        case Some(_) =>
           for {
             signed <- req.as[Signed[UpdateDelegatedStake.Create]]
-            result <- validator.validateCreateDelegatedStake(signed, info)
+            result <- validator.validateCreateDelegatedStake(signed, reader)
             response <- result match {
               case Valid(validSigned) =>
                 logger.info(s"Accepted create delegated stake from ${validSigned.proofs.map(_.id).map(PeerId.fromId)}") >>
@@ -164,10 +163,10 @@ final case class DelegatedStakesRoutes[F[_]: Async: Hasher](
     case req @ PUT -> Root =>
       snapshotStorage.head.flatMap {
         case None => ServiceUnavailable()
-        case Some((_, info)) =>
+        case Some(_) =>
           for {
             signed <- req.as[Signed[UpdateDelegatedStake.Withdraw]]
-            result <- validator.validateWithdrawDelegatedStake(signed, info)
+            result <- validator.validateWithdrawDelegatedStake(signed, reader)
             response <- result match {
               case Valid(validSigned) =>
                 logger.info(s"Accepted withdraw delegated stake from ${validSigned.proofs.map(_.id).map(PeerId.fromId)}") >>

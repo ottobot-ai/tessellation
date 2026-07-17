@@ -1,18 +1,18 @@
 package io.constellationnetwork.node.shared.domain.delegatedStake
 
+import cats.Order
 import cats.data.NonEmptyChain
 import cats.data.Validated.{Invalid, Valid}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.immutable.{SortedMap, SortedSet}
-
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeValidator._
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, StakeCollateralMptReader}
+import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, DelegatedStakeReference, UpdateDelegatedStake}
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.tokenLock.TokenLock
-import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hasher, SecurityProvider}
@@ -22,16 +22,18 @@ import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Accepts or rejects delegated stake create/withdraw events for inclusion in a global snapshot.
   *
-  * '''Determinism''': Uses `foldLeftM` with first-wins duplicate tracking (`parentRefsSeen`, `tokenLockRefsSeen`, `stakeRefsSeen`). The
-  * input lists MUST be in canonical order — if two creates share the same parent, only the first in iteration order is accepted. Callers
-  * must sort events before passing them to `accept()`.
+  * '''Determinism''': Uses `foldLeftM` with first-wins duplicate tracking (`parentRefsSeen`, `tokenLockRefsSeen`, `stakeRefsSeen`). Creates
+  * are processed before withdrawals, and each type is internally sorted by the protocol `Signed` ordering. If two creates from the same
+  * source share a parent, only the first valid event is accepted. An accepted successor create reserves its source/backing-token-lock
+  * against a same-batch withdrawal of the existing stake backed by that lock. Rejected events never reserve a parent, token-lock, or stake
+  * reference against a later valid event.
   */
 trait UpdateDelegatedStakeAcceptanceManager[F[_]] {
 
   def accept(
     creates: List[Signed[UpdateDelegatedStake.Create]],
     withdrawals: List[Signed[UpdateDelegatedStake.Withdraw]],
-    lastSnapshotContext: GlobalSnapshotInfo,
+    parentStateReader: GlobalStateReader[F],
     currentGlobalEpochProgress: EpochProgress,
     currentSnapshotOrdinal: SnapshotOrdinal,
     acceptedTokenLocks: List[Signed[TokenLock]]
@@ -44,7 +46,7 @@ object UpdateDelegatedStakeAcceptanceManager {
   private case class CreateDelegatedStakeAcceptanceResult(
     accepted: List[Signed[UpdateDelegatedStake.Create]],
     rejected: List[(Signed[UpdateDelegatedStake.Create], NonEmptyChain[UpdateDelegatedStakeValidationError])],
-    parentRefsSeen: Set[DelegatedStakeReference],
+    parentRefsSeen: Set[(Address, DelegatedStakeReference)],
     tokenLockRefsSeen: Set[Hash]
   )
   private object CreateDelegatedStakeAcceptanceResult {
@@ -73,33 +75,34 @@ object UpdateDelegatedStakeAcceptanceManager {
         def reject(error: UpdateDelegatedStakeValidationError) =
           (acc.accepted, (signed, NonEmptyChain.of(error)) :: acc.rejected)
 
-        val (newAccepted, newRejected) = validated match {
-          case Valid(_) if acc.parentRefsSeen(signed.parent) =>
-            reject(DuplicatedParent(signed.parent))
+        validated match {
+          case Valid(_) if acc.parentRefsSeen((signed.source, signed.parent)) =>
+            val (accepted, rejected) = reject(DuplicatedParent(signed.parent))
+            acc.copy(accepted = accepted, rejected = rejected)
           case Valid(_) if acc.tokenLockRefsSeen(signed.tokenLockRef) =>
-            reject(DuplicatedTokenLock(signed.tokenLockRef))
+            val (accepted, rejected) = reject(DuplicatedTokenLock(signed.tokenLockRef))
+            acc.copy(accepted = accepted, rejected = rejected)
           case Valid(_) if acceptedTokenLocks.exists(_.value.replaceTokenLockRef == signed.tokenLockRef.some) =>
-            reject(OutdatedTokenLock(signed.tokenLockRef))
+            val (accepted, rejected) = reject(OutdatedTokenLock(signed.tokenLockRef))
+            acc.copy(accepted = accepted, rejected = rejected)
           case Valid(a) =>
-            (a :: acc.accepted, acc.rejected)
-          case Invalid(e) =>
-            (acc.accepted, (signed, e) :: acc.rejected)
+            acc.copy(
+              accepted = a :: acc.accepted,
+              parentRefsSeen = acc.parentRefsSeen + ((signed.source, signed.parent)),
+              tokenLockRefsSeen = acc.tokenLockRefsSeen + signed.tokenLockRef
+            )
+          case Invalid(errors) =>
+            acc.copy(rejected = (signed, errors) :: acc.rejected)
         }
-
-        CreateDelegatedStakeAcceptanceResult(
-          newAccepted,
-          newRejected,
-          acc.parentRefsSeen + signed.parent,
-          acc.tokenLockRefsSeen + signed.tokenLockRef
-        )
       }
 
       private def processWithdrawValidation(
         acc: WithdrawDelegatedStakeAcceptanceResult,
         signed: Signed[UpdateDelegatedStake.Withdraw],
         validated: UpdateDelegatedStakeValidationErrorOr[Signed[UpdateDelegatedStake.Withdraw]],
-        hashedExistingDelegatedStakes: Map[Hash, DelegatedStakeRecord],
-        acceptedTokenLocks: List[Signed[TokenLock]]
+        hashedExistingDelegatedStakes: Map[(Address, Hash), DelegatedStakeRecord],
+        acceptedTokenLocks: List[Signed[TokenLock]],
+        acceptedCreateTokenLocks: Set[(Address, Hash)]
       ): WithdrawDelegatedStakeAcceptanceResult = {
         def reject(error: UpdateDelegatedStakeValidationError) =
           (acc.accepted, (signed, NonEmptyChain.of(error)) :: acc.rejected)
@@ -110,54 +113,66 @@ object UpdateDelegatedStakeAcceptanceManager {
             lock.value.replaceTokenLockRef == maybeRecord.map(_.tokenLockRef)
           }
 
-        val maybeExistingDelegatedStake = hashedExistingDelegatedStakes.get(signed.stakeRef)
+        val maybeExistingDelegatedStake = hashedExistingDelegatedStakes.get(signed.source -> signed.stakeRef)
 
-        val (newAccepted, newRejected) = validated match {
+        validated match {
+          case Valid(_) if maybeExistingDelegatedStake.exists(record => acceptedCreateTokenLocks((signed.source, record.tokenLockRef))) =>
+            val (accepted, rejected) = reject(ConflictingStakeTransition(signed.stakeRef))
+            acc.copy(accepted = accepted, rejected = rejected)
           case Valid(_) if acc.stakeRefsSeen(signed.stakeRef) =>
-            reject(DuplicatedStake(signed.stakeRef))
+            val (accepted, rejected) = reject(DuplicatedStake(signed.stakeRef))
+            acc.copy(accepted = accepted, rejected = rejected)
           case Valid(_) if hasOutdatedTokenLock(maybeExistingDelegatedStake) =>
-            reject(OutdatedTokenLock(maybeExistingDelegatedStake.map(_.tokenLockRef).getOrElse(Hash.empty)))
+            val (accepted, rejected) = reject(OutdatedTokenLock(maybeExistingDelegatedStake.map(_.tokenLockRef).getOrElse(Hash.empty)))
+            acc.copy(accepted = accepted, rejected = rejected)
           case Valid(a) =>
-            (a :: acc.accepted, acc.rejected)
-          case Invalid(e) =>
-            (acc.accepted, (signed, e) :: acc.rejected)
+            acc.copy(accepted = a :: acc.accepted, stakeRefsSeen = acc.stakeRefsSeen + signed.stakeRef)
+          case Invalid(errors) =>
+            acc.copy(rejected = (signed, errors) :: acc.rejected)
         }
-
-        WithdrawDelegatedStakeAcceptanceResult(newAccepted, newRejected, acc.stakeRefsSeen + signed.stakeRef)
       }
 
       def accept(
         creates: List[Signed[UpdateDelegatedStake.Create]],
         withdrawals: List[Signed[UpdateDelegatedStake.Withdraw]],
-        lastSnapshotContext: GlobalSnapshotInfo,
+        parentStateReader: GlobalStateReader[F],
         currentGlobalEpochProgress: EpochProgress,
         currentSnapshotOrdinal: SnapshotOrdinal,
         acceptedTokenLocks: List[Signed[TokenLock]]
       )(implicit hasher: Hasher[F]): F[UpdateDelegatedStakeAcceptanceResult] =
         for {
-          hashedExistingDelegatedStakes <- lastSnapshotContext.activeDelegatedStakes
-            .getOrElse(SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]])
-            .values
-            .flatten
-            .toList
-            .traverse(record => record.event.toHashed.map(_.hash -> record))
+          existingDelegatedStakes <- StakeCollateralMptReader.materializeActiveDelegatedStakes(parentStateReader)
+          hashedExistingDelegatedStakes <- existingDelegatedStakes.toList.flatTraverse {
+            case (source, records) =>
+              records.toList.traverse(record => record.event.toHashed.map(hashed => (source -> hashed.hash) -> record))
+          }
             .map(_.toMap)
 
           // Defensive sort: ensure deterministic first-wins duplicate resolution.
           // foldLeftM with parentRefsSeen/tokenLockRefsSeen is order-dependent.
-          sortedCreates = creates.sortBy(_.show)
-          sortedWithdrawals = withdrawals.sortBy(_.show)
+          sortedCreates = creates.sorted(Signed.ordering(Order[UpdateDelegatedStake.Create].toOrdering))
+          sortedWithdrawals = withdrawals.sorted(Signed.ordering(Order[UpdateDelegatedStake.Withdraw].toOrdering))
 
           createResult <- sortedCreates.foldLeftM(CreateDelegatedStakeAcceptanceResult.empty) { (acc, signed) =>
             validator
-              .validateCreateDelegatedStake(signed, lastSnapshotContext)
+              .validateCreateDelegatedStake(signed, parentStateReader)
               .map(processCreateValidation(acc, signed, _, acceptedTokenLocks))
           }
+          acceptedCreateTokenLocks = createResult.accepted.iterator.map(create => create.source -> create.tokenLockRef).toSet
 
           withdrawResult <- sortedWithdrawals.foldLeftM(WithdrawDelegatedStakeAcceptanceResult.empty) { (acc, signed) =>
             validator
-              .validateWithdrawDelegatedStake(signed, lastSnapshotContext)
-              .map(processWithdrawValidation(acc, signed, _, hashedExistingDelegatedStakes, acceptedTokenLocks))
+              .validateWithdrawDelegatedStake(signed, parentStateReader)
+              .map { validated =>
+                processWithdrawValidation(
+                  acc,
+                  signed,
+                  validated,
+                  hashedExistingDelegatedStakes,
+                  acceptedTokenLocks,
+                  acceptedCreateTokenLocks
+                )
+              }
           }
 
           acceptedCreatesMap <- createResult.accepted

@@ -22,6 +22,7 @@ import io.constellationnetwork.node.shared.domain.consensus.ConsensusFunctions.I
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
 import io.constellationnetwork.node.shared.domain.event.EventCutter
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardWindowContinuation
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, GlobalStateReader}
 import io.constellationnetwork.node.shared.domain.rewards.Rewards
 import io.constellationnetwork.node.shared.domain.snapshot.services.GlobalL0Service
 import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusLog
@@ -249,6 +250,7 @@ object GlobalSnapshotConsensusFunctions {
     globalSnapshotAcceptanceManager: GlobalSnapshotAcceptanceManager[F],
     collateral: Amount,
     rewardsService: RewardsService[F],
+    delegatedRewardsForReader: GlobalStateReader[F] => DelegatedRewardsDistributor[F],
     eventCutter: EventCutter[F, StateChannelEvent, DAGEvent],
     updateNodeParametersCutter: UpdateNodeParametersCutter[F],
     environment: AppEnvironment,
@@ -586,8 +588,9 @@ object GlobalSnapshotConsensusFunctions {
           }
       }
 
-      val rewardsWithFacilitators: List[(Address, PeerId)] => RewardsInput => F[DelegatedRewardsResult] = {
-        faciltators: List[(Address, PeerId)] =>
+      val rewardsWithFacilitators
+        : DelegatedRewardsDistributor[F] => List[(Address, PeerId)] => RewardsInput => F[DelegatedRewardsResult] = {
+        delegatedRewards: DelegatedRewardsDistributor[F] => faciltators: List[(Address, PeerId)] =>
           {
             case ClassicRewardsInput(txs) =>
               classicRewardsFn(lastArtifact, snapshotContext.balances, txs, trigger, events, None)
@@ -595,22 +598,21 @@ object GlobalSnapshotConsensusFunctions {
             case DelegateRewardsInput(udsar, psu, ep) =>
               val ordinal = lastArtifact.ordinal.next
               if (shouldUseDelegatedRewards(ordinal, ep)) {
-                rewardsService.delegatedRewards.distribute(snapshotContext, trigger, ep, faciltators, udsar, psu).map {
-                  delegatedRewardsResult =>
-                    if (ordinal > incrementalDelegatedStakingStartingOrdinal) {
-                      val updatedCreateDelegatedStakes = delegatedRewardsResult.updatedCreateDelegatedStakes.view.mapValues { records =>
-                        records.map { r =>
-                          r.copy(
-                            currentTokenLockRef = r.currentTokenLockRef.orElse(r.tokenLockRef.some),
-                            currentAmount = r.currentAmount.orElse(r.amount.some)
-                          )
-                        }
-                      }.to(SortedMap)
+                delegatedRewards.distribute(snapshotContext, trigger, ep, faciltators, udsar, psu).map { delegatedRewardsResult =>
+                  if (ordinal > incrementalDelegatedStakingStartingOrdinal) {
+                    val updatedCreateDelegatedStakes = delegatedRewardsResult.updatedCreateDelegatedStakes.view.mapValues { records =>
+                      records.map { r =>
+                        r.copy(
+                          currentTokenLockRef = r.currentTokenLockRef.orElse(r.tokenLockRef.some),
+                          currentAmount = r.currentAmount.orElse(r.amount.some)
+                        )
+                      }
+                    }.to(SortedMap)
 
-                      delegatedRewardsResult.copy(updatedCreateDelegatedStakes = updatedCreateDelegatedStakes)
-                    } else {
-                      delegatedRewardsResult
-                    }
+                    delegatedRewardsResult.copy(updatedCreateDelegatedStakes = updatedCreateDelegatedStakes)
+                  } else {
+                    delegatedRewardsResult
+                  }
                 }
               } else {
                 classicRewardsFn(lastArtifact, snapshotContext.balances, SortedSet.empty, trigger, events, None)
@@ -625,6 +627,10 @@ object GlobalSnapshotConsensusFunctions {
 
       for {
         lastArtifactHash <- getLastArtifactHash
+        // Reward reproduction is consensus-root-bearing. Bind every delegated-stake, node-parameter, and
+        // withdrawal read to the exact supplied proposal parent, never the node's ambient selected best tip.
+        proposalParentReader = GlobalStateReader.fromOverlay[F](overlay, BranchId(lastArtifactHash))
+        proposalParentDelegatedRewards = delegatedRewardsForReader(proposalParentReader)
         currentOrdinal = lastArtifact.ordinal.next
         currentEpochProgress = trigger match {
           case EventTrigger => lastArtifact.epochProgress
@@ -915,7 +921,7 @@ object GlobalSnapshotConsensusFunctions {
               snapshotContext,
               lastActiveTips,
               lastDeprecatedTips,
-              rewardsWithFacilitators(lastFacilitators),
+              rewardsWithFacilitators(proposalParentDelegatedRewards)(lastFacilitators),
               StateChannelValidationType.Full,
               getGlobalSnapshotByOrdinal,
               // The parent's snapshot hash identifies the branch we're extending. Inside accept(),

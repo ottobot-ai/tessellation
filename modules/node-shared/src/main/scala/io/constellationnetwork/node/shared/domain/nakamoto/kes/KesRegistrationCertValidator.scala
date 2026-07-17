@@ -87,9 +87,7 @@ object KesRegistrationCertValidator {
 
   case class RegistrationEvaluationContext(candidateParentHash: Hash, inclusionPeriod: EtaPeriod)
 
-  /** Validator that always rejects. Used in modules that don't carry the long-term seedlist needed to verify the operator binding (mirrors
-    * the `UpdateNodeCollateralValidator.rejectAll` fallback).
-    */
+  /** Validator that always rejects. Used in modules that don't carry the long-term seedlist needed to verify the operator binding. */
   def rejectAll[F[_]: Async]: KesRegistrationCertValidator[F] = new KesRegistrationCertValidator[F] {
     def validate(
       signed: Signed[KesRegistrationCert],

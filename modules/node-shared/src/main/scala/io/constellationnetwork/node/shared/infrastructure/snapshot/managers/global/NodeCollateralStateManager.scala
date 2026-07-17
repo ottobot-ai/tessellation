@@ -5,7 +5,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, StakeCollateralMptReader}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralAcceptanceResult
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -13,11 +13,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.security.Hasher
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{
-  nodeCollateralRecordSetCodec,
-  nodeCollateralWithdrawalExpiryKeySetImmutableCodec,
-  pendingNodeCollateralWithdrawalSetCodec
-}
+import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.nodeCollateralWithdrawalExpiryKeySetImmutableCodec
 import io.constellationnetwork.syntax.sortedCollection.sortedSetSyntax
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -41,7 +37,7 @@ trait NodeCollateralStateManager[F[_]] {
     * Sweeps the NC-withdrawal expiry index for buckets `[previousEpochProgress + 1 .. epochProgress]` — the range covering withdrawals
     * whose expiry epoch (`createdAt + withdrawalTimeLimit`) fell into the past since the previous accept. Each bucket epoch is checked
     * against that target-derived expiry before the withdrawal can expire; the rooted index is not independently authoritative. Resolves
-    * each expiring key's hash via `mptStore.getNodeCollateralWithdrawals(addr)` instead of iterating an in-memory full map.
+    * each expiring key's hash through the strict point reader instead of iterating an in-memory full map.
     *
     * Note the sweep bounds differ from AllowSpend/TokenLock: NC's legacy predicate is `<=` (expiry_epoch <= currentEpoch), so the delta
     * window is `(prevEpoch, curEpoch]` — inclusive upper bound, exclusive lower. The other two are `<` so the window is `[prevEpoch,
@@ -102,13 +98,12 @@ object NodeCollateralStateManager {
         SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
         SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]
       )
-    ] = {
-      val existingNodeCollaterals =
-        lastSnapshotContext.activeNodeCollaterals.getOrElse(SortedMap.empty[Address, SortedSet[NodeCollateralRecord]])
-      val existingWithdrawals =
-        lastSnapshotContext.nodeCollateralWithdrawals.getOrElse(SortedMap.empty[Address, SortedSet[PendingNodeCollateralWithdrawal]])
-
-      findExpiredWithdrawalsViaIndexFromMpt(previousEpochProgress, epochProgress, withdrawalTimeLimit).map { expiredWithdrawals =>
+    ] =
+      for {
+        existingNodeCollaterals <- StakeCollateralMptReader.materializeActiveNodeCollaterals(reader)
+        existingWithdrawals <- StakeCollateralMptReader.materializeNodeCollateralWithdrawals(reader)
+        expiredWithdrawals <- findExpiredWithdrawalsViaIndexFromMpt(previousEpochProgress, epochProgress, withdrawalTimeLimit)
+      } yield {
         // NB: `SortedMap.flatMap { case (a, ws) => ws.map(w => (a, w)) }` would build a `Map` keyed by `a`,
         // dropping all but one `(a, w)` per address. Use `.iterator.flatMap` so the result preserves every pair.
         val expiredPairs: Set[(Address, PendingNodeCollateralWithdrawal)] =
@@ -119,7 +114,6 @@ object NodeCollateralStateManager {
         }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
         (existingNodeCollaterals, unexpiredWithdrawals, expiredWithdrawals)
       }
-    }
 
     def findExpiredWithdrawalsViaIndexFromMpt(
       previousEpochProgress: EpochProgress,
@@ -156,11 +150,17 @@ object NodeCollateralStateManager {
               val expectedHashes = expectedEpochsByHash.keySet
               for {
                 targetHex <- GlobalStateKey.toHex[F](targetKey)
-                addrSet <- StrictMptRead.requirePresentF(
-                  reader.getStrict[SortedSet[PendingNodeCollateralWithdrawal]](targetKey),
-                  s"expiry target NodeCollateralWithdrawals(address=$addr)",
-                  targetHex
-                )
+                addrSet <- StakeCollateralMptReader
+                  .readNodeCollateralWithdrawals(reader, addr)
+                  .flatMap(
+                    Async[F].fromOption(
+                      _,
+                      StrictMptRead.MissingConsensusMptValue(
+                        s"expiry target NodeCollateralWithdrawals(address=$addr)",
+                        targetHex
+                      )
+                    )
+                  )
                 hashed <- addrSet.toList.traverse(w => w.event.toHashed.map(h => (h.hash, w)))
                 actualHashes = hashed.iterator.map(_._1).toSet
                 missingHashes = expectedHashes -- actualHashes
@@ -236,8 +236,8 @@ object NodeCollateralStateManager {
         case (addr, acceptedWithdrawls) =>
           acceptedWithdrawls.traverse {
             case (ev, ep) =>
-              reader
-                .get[SortedSet[NodeCollateralRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveNodeCollaterals, addr))
+              StakeCollateralMptReader
+                .readActiveNodeCollaterals(reader, addr)
                 .flatMap { maybeCollaterals =>
                   maybeCollaterals.flatTraverse {
                     _.findM { s =>
@@ -252,38 +252,19 @@ object NodeCollateralStateManager {
         .map(_.filterNot(_._2.isEmpty))
 
     def materializeActiveNodeCollateralAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
-      for {
-        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
-        entries <- reader.getAllForPrefix[SortedSet[NodeCollateralRecord]](prefix)
-      } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
+      StakeCollateralMptReader.materializeActiveNodeCollaterals(reader).map(_.keySet)
 
     def materializeNodeCollateralWithdrawalAddressesFromMpt(implicit hasher: Hasher[F]): F[Set[Address]] =
-      for {
-        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
-        entries <- reader.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
-      } yield entries.values.toList.mapFilter(s => s.headOption.map(_.event.value.source)).toSet
+      StakeCollateralMptReader.materializeNodeCollateralWithdrawals(reader).map(_.keySet)
 
     def materializeNodeCollateralWithdrawalsFromMpt(
       implicit hasher: Hasher[F]
     ): F[SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]]] =
-      for {
-        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.NodeCollateralWithdrawals)
-        entries <- reader.getAllForPrefix[SortedSet[PendingNodeCollateralWithdrawal]](prefix)
-      } yield
-        SortedMap.from(
-          entries.values.toList
-            .mapFilter(set => set.headOption.map(h => h.event.value.source -> set))
-        )
+      StakeCollateralMptReader.materializeNodeCollateralWithdrawals(reader)
 
     def materializeActiveNodeCollateralsFromMpt(
       implicit hasher: Hasher[F]
     ): F[SortedMap[Address, SortedSet[NodeCollateralRecord]]] =
-      for {
-        prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
-        entries <- reader.getAllForPrefix[SortedSet[NodeCollateralRecord]](prefix)
-      } yield
-        SortedMap.from(
-          entries.values.toList.mapFilter(set => set.headOption.map(_.event.value.source -> set)).filter(_._2.nonEmpty)
-        )
+      StakeCollateralMptReader.materializeActiveNodeCollaterals(reader)
   }
 }

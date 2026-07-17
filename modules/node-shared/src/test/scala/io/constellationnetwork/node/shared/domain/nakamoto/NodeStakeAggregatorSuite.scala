@@ -8,7 +8,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId
 import io.constellationnetwork.node.shared.infrastructure.metrics.{CountingMetrics, Metrics}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
@@ -16,7 +16,7 @@ import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
-import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalTimeLimit}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.EpochStakeSnapshotter
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
@@ -39,8 +39,8 @@ import weaver.MutableIOSuite
   *      Byte-equivalent across independent MPT builds with the same input (core determinism — the §G1 motivation: closing #218-style
   *      cross-node drift on stake reads).
   *
-  * The per-snapshot-ordinal cached variant ([[NodeStakeAggregator.cached]]) is exercised in separate tests below: hit on same ordinal, miss
-  * on ordinal advance, None ordinal defeats cache.
+  * The exact-branch cached variant ([[NodeStakeAggregator.cached]]) is exercised in separate tests below: hit on the same branch, miss on
+  * same-height branch replacement, and `None` defeats cache.
   */
 object NodeStakeAggregatorSuite extends MutableIOSuite {
 
@@ -51,8 +51,8 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
   type Res = (Hasher[IO], SecurityProvider[IO], JsonSerializer[IO])
 
   // Test-scope Metrics — no-op for non-counter calls, so the latency-distribution recording in
-  // `NodeStakeAggregator.make` becomes a no-op. The test assertions check aggregate output, not
-  // the metric side-effect. Made `implicit` here so all `NodeStakeAggregator.make[IO](...)`
+  // `NodeStakeAggregator.fromMptStore` becomes a no-op. The test assertions check aggregate output, not
+  // the metric side-effect. Made `implicit` here so all `NodeStakeAggregator.fromMptStore[IO](...)`
   // invocations below pick it up without each test having to rewire it.
   implicit val testMetrics: Metrics[IO] =
     CountingMetrics.instance(Ref.unsafe[IO, Map[String, Int]](Map.empty))
@@ -72,6 +72,8 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
 
   private def pid(label: String): PeerId =
     PeerId(Hex(label.getBytes("UTF-8").map(b => f"$b%02x").mkString))
+
+  private def branch(hexDigit: String): BranchId = BranchId(Hash(hexDigit * 64))
 
   private def addr(tag: String): Address =
     Address.fromBytes(tag.getBytes("UTF-8"))
@@ -123,14 +125,26 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
       _ <- store.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal(NonNegLong(1L)))
     } yield store
 
+  private def captureStakePrefixes(
+    store: MptStore[IO, GlobalStateKey]
+  )(implicit h: Hasher[IO]): IO[Map[Hex, List[StrictMptRawEntry]]] =
+    for {
+      delegatedPrefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[IO](GlobalStateFieldId.ActiveDelegatedStakes)
+      collateralPrefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[IO](GlobalStateFieldId.ActiveNodeCollaterals)
+      captured <- store.withExclusiveLock {
+        List(delegatedPrefix, collateralPrefix)
+          .traverse(prefix => store.rawEntriesForPrefixStrict(prefix).map(prefix -> _))
+          .map(_.toMap)
+      }
+    } yield captured
+
   // ---- core spec assertions ------------------------------------------------
 
   test("empty MPT → empty Map") { res =>
     implicit val (h, _, js) = res
     for {
       store <- mkStore(SortedMap.empty, SortedMap.empty)
-      reader = GlobalStateReader.fromMptStore[IO](store)
-      aggregator = NodeStakeAggregator.make[IO](reader)
+      aggregator = NodeStakeAggregator.fromMptStore[IO](store)
       out <- aggregator.aggregateFromMpt
     } yield expect(out.isEmpty)
   }
@@ -146,8 +160,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     )
     for {
       store <- mkStore(delegated, SortedMap.empty)
-      reader = GlobalStateReader.fromMptStore[IO](store)
-      aggregator = NodeStakeAggregator.make[IO](reader)
+      aggregator = NodeStakeAggregator.fromMptStore[IO](store)
       out <- aggregator.aggregateFromMpt
     } yield expect.same(Map(n -> BigInt(1000)), out)
   }
@@ -164,8 +177,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     )
     for {
       store <- mkStore(delegated, collateral)
-      reader = GlobalStateReader.fromMptStore[IO](store)
-      aggregator = NodeStakeAggregator.make[IO](reader)
+      aggregator = NodeStakeAggregator.fromMptStore[IO](store)
       out <- aggregator.aggregateFromMpt
     } yield expect.same(Map(n -> BigInt(1000)), out)
   }
@@ -197,8 +209,8 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     for {
       store1 <- mkStore(delegated, collateral)
       store2 <- mkStore(delegated, collateral)
-      agg1 <- NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store1)).aggregateFromMpt
-      agg2 <- NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store2)).aggregateFromMpt
+      agg1 <- NodeStakeAggregator.fromMptStore[IO](store1).aggregateFromMpt
+      agg2 <- NodeStakeAggregator.fromMptStore[IO](store2).aggregateFromMpt
     } yield
       // Expected: A = 100 + 50 = 150, B = 200 + 150 = 350, C = 300.
       expect.same(agg1, agg2) &&
@@ -218,13 +230,39 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     )
     for {
       store <- mkStore(delegated, SortedMap.empty)
-      out <- NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store)).aggregateFromMpt
+      out <- NodeStakeAggregator.fromMptStore[IO](store).aggregateFromMpt
     } yield expect.same(Map(seed -> BigInt(100), ghost -> BigInt(900)), out)
+  }
+
+  test("one aggregate captures delegated stake and collateral in a single multi-prefix request") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src = addr("source-1")
+    val delegated = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 400L, src, ord = 1L))
+    )
+    val collateral = SortedMap[Address, SortedSet[NodeCollateralRecord]](
+      src -> SortedSet(mkCollateral(n, 600L, src, ord = 2L))
+    )
+
+    for {
+      store <- mkStore(delegated, collateral)
+      snapshot <- captureStakePrefixes(store)
+      requestsR <- Ref.of[IO, List[List[Hex]]](List.empty)
+      aggregator = NodeStakeAggregator.fromRawPrefixSnapshot[IO] { prefixes =>
+        requestsR.update(_ :+ prefixes) >> IO.pure(snapshot)
+      }
+      out <- aggregator.aggregateFromMpt
+      requests <- requestsR.get
+    } yield
+      expect.same(Map(n -> BigInt(1000)), out) &&
+        expect.same(1, requests.size) &&
+        expect.same(snapshot.keySet, requests.headOption.fold(Set.empty[Hex])(_.toSet))
   }
 
   // ---- cached wrapper -------------------------------------------------------
 
-  test("cached: same ordinal serves from cache (underlying called once)") { res =>
+  test("cached: same exact branch serves from cache (underlying called once)") { res =>
     implicit val (h, _, js) = res
     val n = pid("node-A")
     val src = addr("s")
@@ -233,16 +271,14 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     )
     for {
       store <- mkStore(delegated, SortedMap.empty)
-      reader = GlobalStateReader.fromMptStore[IO](store)
       callsR <- Ref.of[IO, Int](0)
       // Counting wrapper around the real aggregator — every aggregateFromMpt call bumps `callsR`.
       countingAggregator = new NodeStakeAggregator[IO] {
-        private val underlying = NodeStakeAggregator.make[IO](reader)
+        private val underlying = NodeStakeAggregator.fromMptStore[IO](store)
         def aggregateFromMpt(implicit hasher: Hasher[IO]): IO[Map[PeerId, BigInt]] =
           callsR.update(_ + 1) >> underlying.aggregateFromMpt(hasher)
       }
-      ord = SnapshotOrdinal(NonNegLong(7L))
-      cached <- NodeStakeAggregator.cached[IO](countingAggregator, IO.pure(Some(ord)))
+      cached <- NodeStakeAggregator.cached[IO](_ => countingAggregator, IO.pure(Some(branch("1"))))
       _ <- cached.aggregateFromMpt
       _ <- cached.aggregateFromMpt
       _ <- cached.aggregateFromMpt
@@ -250,7 +286,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     } yield expect.same(1, calls)
   }
 
-  test("cached: ordinal advance invalidates cache (underlying re-fetched)") { res =>
+  test("cached: same-height branch replacement invalidates cache and ABA cannot reuse the sibling result") { res =>
     implicit val (h, _, js) = res
     val n = pid("node-A")
     val src = addr("s")
@@ -259,27 +295,28 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     )
     for {
       store <- mkStore(delegated, SortedMap.empty)
-      reader = GlobalStateReader.fromMptStore[IO](store)
       callsR <- Ref.of[IO, Int](0)
       countingAggregator = new NodeStakeAggregator[IO] {
-        private val underlying = NodeStakeAggregator.make[IO](reader)
+        private val underlying = NodeStakeAggregator.fromMptStore[IO](store)
         def aggregateFromMpt(implicit hasher: Hasher[IO]): IO[Map[PeerId, BigInt]] =
           callsR.update(_ + 1) >> underlying.aggregateFromMpt(hasher)
       }
-      currentOrdR <- Ref.of[IO, SnapshotOrdinal](SnapshotOrdinal(NonNegLong(1L)))
-      cached <- NodeStakeAggregator.cached[IO](countingAggregator, currentOrdR.get.map(_.some))
+      branchA = branch("1")
+      branchB = branch("2")
+      currentBranchR <- Ref.of[IO, BranchId](branchA)
+      cached <- NodeStakeAggregator.cached[IO](_ => countingAggregator, currentBranchR.get.map(_.some))
       _ <- cached.aggregateFromMpt
       _ <- cached.aggregateFromMpt
-      _ <- currentOrdR.set(SnapshotOrdinal(NonNegLong(2L))) // advance
+      _ <- currentBranchR.set(branchB)
       _ <- cached.aggregateFromMpt
       _ <- cached.aggregateFromMpt
-      _ <- currentOrdR.set(SnapshotOrdinal(NonNegLong(3L))) // advance again
+      _ <- currentBranchR.set(branchA)
       _ <- cached.aggregateFromMpt
       calls <- callsR.get
     } yield expect.same(3, calls)
   }
 
-  test("cached: None ordinal defeats cache (every call re-reads)") { res =>
+  test("cached: no selected branch defeats cache (every call re-reads base)") { res =>
     implicit val (h, _, js) = res
     val n = pid("node-A")
     val src = addr("s")
@@ -288,19 +325,53 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     )
     for {
       store <- mkStore(delegated, SortedMap.empty)
-      reader = GlobalStateReader.fromMptStore[IO](store)
       callsR <- Ref.of[IO, Int](0)
       countingAggregator = new NodeStakeAggregator[IO] {
-        private val underlying = NodeStakeAggregator.make[IO](reader)
+        private val underlying = NodeStakeAggregator.fromMptStore[IO](store)
         def aggregateFromMpt(implicit hasher: Hasher[IO]): IO[Map[PeerId, BigInt]] =
           callsR.update(_ + 1) >> underlying.aggregateFromMpt(hasher)
       }
-      cached <- NodeStakeAggregator.cached[IO](countingAggregator, IO.pure(Option.empty[SnapshotOrdinal]))
+      cached <- NodeStakeAggregator.cached[IO](_ => countingAggregator, IO.pure(Option.empty[BranchId]))
       _ <- cached.aggregateFromMpt
       _ <- cached.aggregateFromMpt
       _ <- cached.aggregateFromMpt
       calls <- callsR.get
     } yield expect.same(3, calls)
+  }
+
+  test("cached: a selected-tip change during a miss retries and never returns or caches the stale branch") { res =>
+    implicit val (h, _, js) = res
+    val n = pid("node-A")
+    val src = addr("source-1")
+    val branchA = branch("1")
+    val branchB = branch("2")
+    val delegatedA = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 100L, src, ord = 1L))
+    )
+    val delegatedB = SortedMap[Address, SortedSet[DelegatedStakeRecord]](
+      src -> SortedSet(mkDelegated(n, 900L, src, ord = 2L))
+    )
+
+    for {
+      storeA <- mkStore(delegatedA, SortedMap.empty)
+      storeB <- mkStore(delegatedB, SortedMap.empty)
+      snapshotA <- captureStakePrefixes(storeA)
+      snapshotB <- captureStakePrefixes(storeB)
+      currentBranchR <- Ref.of[IO, BranchId](branchA)
+      callsR <- Ref.of[IO, Int](0)
+      underlyingAt = (requested: BranchId) =>
+        NodeStakeAggregator.fromRawPrefixSnapshot[IO] { _ =>
+          callsR.update(_ + 1) >>
+            (if (requested == branchA) currentBranchR.set(branchB).as(snapshotA) else IO.pure(snapshotB))
+        }
+      cached <- NodeStakeAggregator.cached[IO](underlyingAt, currentBranchR.get.map(_.some))
+      first <- cached.aggregateFromMpt
+      second <- cached.aggregateFromMpt
+      calls <- callsR.get
+    } yield
+      expect.same(Map(n -> BigInt(900)), first) &&
+        expect.same(first, second) &&
+        expect.same(2, calls)
   }
 
   // ---- §G2 byte-equivalence parity ------------------------------------------
@@ -308,9 +379,9 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
   // The G2 migration replaces `EpochStakeSnapshotter.snapshot(info)` (walks the in-memory
   // `activeDelegatedStakes + activeNodeCollaterals` GSI maps) with
   // `NodeStakeAggregator.snapshotFromMpt(aggregator)` (prefix-scans the same data out of the MPT).
-  // The two MUST produce byte-identical `StakeDistribution` when MPT and GSI are in sync — which is
-  // the invariant inside `GlobalSnapshotAcceptanceManager.accept()` since both views are built from
-  // the same accepted records (GSI directly, MPT via `syncFromGlobalSnapshotInfo`).
+  // The two MUST produce byte-identical `StakeDistribution` when MPT and GSI describe the same
+  // committed state. The closing-ordinal history writer separately uses its exact post-transition
+  // GSI because the current accumulator has not yet landed in the parent MPT.
   //
   // The MPT path returns a flat `Map[PeerId, BigInt]` aggregate (sum-as-we-fold), the GSI path
   // computes separate delegated + collateral maps then merges. Both funnel through
@@ -335,7 +406,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
 
     for {
       store <- mkStore(delegated, SortedMap.empty)
-      aggregator = NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store))
+      aggregator = NodeStakeAggregator.fromMptStore[IO](store)
       mptPrimary <- NodeStakeAggregator.snapshotFromMpt[IO](aggregator)
       gsiBytes = StakeDistributionCodec.codec.encode(gsiPrimary).require.toByteArray
       mptBytes = StakeDistributionCodec.codec.encode(mptPrimary).require.toByteArray
@@ -372,7 +443,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
 
     for {
       store <- mkStore(delegated, collateral)
-      aggregator = NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store))
+      aggregator = NodeStakeAggregator.fromMptStore[IO](store)
       mptPrimary <- NodeStakeAggregator.snapshotFromMpt[IO](aggregator)
       gsiBytes = StakeDistributionCodec.codec.encode(gsiPrimary).require.toByteArray
       mptBytes = StakeDistributionCodec.codec.encode(mptPrimary).require.toByteArray
@@ -394,7 +465,7 @@ object NodeStakeAggregatorSuite extends MutableIOSuite {
     val gsiPrimary = EpochStakeSnapshotter.snapshot(info)
     for {
       store <- mkStore(SortedMap.empty, SortedMap.empty)
-      aggregator = NodeStakeAggregator.make[IO](GlobalStateReader.fromMptStore(store))
+      aggregator = NodeStakeAggregator.fromMptStore[IO](store)
       mptPrimary <- NodeStakeAggregator.snapshotFromMpt[IO](aggregator)
       gsiBytes = StakeDistributionCodec.codec.encode(gsiPrimary).require.toByteArray
       mptBytes = StakeDistributionCodec.codec.encode(mptPrimary).require.toByteArray

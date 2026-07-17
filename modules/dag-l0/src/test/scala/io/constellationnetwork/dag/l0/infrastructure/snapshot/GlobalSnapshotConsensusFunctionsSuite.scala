@@ -27,8 +27,8 @@ import io.constellationnetwork.env.AppEnvironment.Dev
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.json.JsonSerializer
-import io.constellationnetwork.node.shared.config.DelegatedRewardsConfigProvider
 import io.constellationnetwork.node.shared.config.types._
+import io.constellationnetwork.node.shared.config.{DefaultDelegatedRewardsConfigProvider, DelegatedRewardsConfigProvider}
 import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceManager,
@@ -38,6 +38,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
 import io.constellationnetwork.node.shared.domain.fork.ForkInfo
 import io.constellationnetwork.node.shared.domain.gossip.Gossip
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, GlobalStateReader, MptOverlay}
 import io.constellationnetwork.node.shared.domain.nakamoto.sharding._
 import io.constellationnetwork.node.shared.domain.node.{UpdateNodeParametersAcceptanceManager, UpdateNodeParametersValidator}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{UpdateNodeCollateralAcceptanceManager, UpdateNodeCollateralValidator}
@@ -651,8 +652,55 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
   private final case class GlobalConsensusFixture(
     functions: GlobalSnapshotConsensusFunctions[IO],
     mptStore: MptStore[IO, GlobalStateKey],
+    overlay: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay[IO, GlobalStateKey],
     pendingPostBytes: Ref[IO, Map[Hash, (SnapshotOrdinal, Map[Hex, Array[Byte]])]]
   )
+
+  private type DelegatedRewardsWiring =
+    MptOverlay[IO, GlobalStateKey] => (
+      DelegatedRewardsDistributor[IO],
+      GlobalStateReader[IO] => DelegatedRewardsDistributor[IO]
+    )
+
+  private def markerDelegatedRewards(
+    reader: GlobalStateReader[IO],
+    markerKey: GlobalStateKey,
+    rewardPeer: PeerId,
+    rewardAddress: Address,
+    configProvider: DelegatedRewardsConfigProvider
+  ): DelegatedRewardsDistributor[IO] =
+    new DelegatedRewardsDistributor[IO] {
+      override def getEmissionConfig(epochProgress: EpochProgress): IO[EmissionConfigEntry] =
+        configProvider.getConfig().emissionConfig(AppEnvironment.Dev)(epochProgress).pure[IO]
+
+      override def calculateVariableInflation(
+        epochProgress: EpochProgress,
+        lastSnapshotContext: GlobalSnapshotInfo
+      ): IO[Amount] = Amount.empty.pure[IO]
+
+      override def distribute(
+        lastSnapshotContext: GlobalSnapshotInfo,
+        trigger: ConsensusTrigger,
+        epochProgress: EpochProgress,
+        facilitators: List[(Address, PeerId)],
+        delegatedStakeDiffs: UpdateDelegatedStakeAcceptanceResult,
+        partitionedRecords: PartitionedStakeUpdates
+      ): IO[DelegatedRewardsResult] =
+        reader.get[Balance](markerKey).flatMap {
+          case Some(marker) =>
+            DelegatedRewardsResult(
+              delegatorRewardsMap = SortedMap(rewardPeer -> Map(rewardAddress -> Amount(marker.value))),
+              updatedCreateDelegatedStakes = partitionedRecords.unexpiredCreateDelegatedStakes,
+              updatedWithdrawDelegatedStakes = partitionedRecords.unexpiredWithdrawalsDelegatedStaking,
+              nodeOperatorRewards = SortedSet.empty,
+              reservedAddressRewards = SortedSet.empty,
+              withdrawalRewardTxs = SortedSet.empty,
+              totalEmittedRewardsAmount = Amount.empty
+            ).pure[IO]
+          case None =>
+            IO.raiseError(new IllegalStateException("Reward marker missing from selected proposal-parent branch"))
+        }
+    }
 
   private def mkRootedParent(
     balances: SortedMap[Address, Balance],
@@ -689,7 +737,11 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     ] = None,
     blockAcceptanceManager: BlockAcceptanceManager[IO] = bam,
     allowSpendBlockAcceptanceManager: AllowSpendBlockAcceptanceManager[IO] = asbam,
-    tokenLockBlockAcceptanceManager: TokenLockBlockAcceptanceManager[IO] = tlbam
+    tokenLockBlockAcceptanceManager: TokenLockBlockAcceptanceManager[IO] = tlbam,
+    overlayMode: io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay.OverlayMode =
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay.OverlayMode.Passthrough,
+    delegatedRewardsWiring: Option[DelegatedRewardsWiring] = None,
+    rewardConfigProvider: DelegatedRewardsConfigProvider = delegatedRewardsConfigProvider
   )(
     implicit j: JsonSerializer[IO],
     sp: SecurityProvider[IO],
@@ -703,7 +755,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
     val pricingUpdateValidator = PricingUpdateValidator.make[IO](None, NonNegLong(0))
     val priceStateUpdater = PriceStateUpdater.make[IO](
       Dev,
-      delegatedRewardsConfigProvider,
+      rewardConfigProvider,
       io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader.empty[IO]
     )
 
@@ -735,8 +787,22 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         } yield ()
       }
       pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
-      mptOverlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
-        .passthrough[IO, GlobalStateKey](mptStore, pcTree)
+      mptOverlay <- io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay.make[IO, GlobalStateKey](
+        mode = overlayMode,
+        underlying = mptStore,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty)
+      )
+      rewardWiring = delegatedRewardsWiring
+        .map(_(mptOverlay))
+        .getOrElse(
+          (
+            delegatorRewards,
+            (_: io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader[IO]) => delegatorRewards
+          )
+        )
+      (readPathDelegatedRewards, exactParentDelegatedRewardsForReader) = rewardWiring
       dbLogger <- Slf4jLoggerBundle.makeUnsafe[IO]
       snapshotAcceptanceManager <- {
         implicit val globalStateProofSelector: GlobalStateProofSelector = stateProofSelector
@@ -791,8 +857,8 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
         .make[IO](g5Reader)
       g5BalanceManager = io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.SpendTransactionBalanceManager
         .make[IO](g5Reader)
-      rewardsInfoCalculator = RewardsInfoCalculator.make(delegatorRewards, g5StakeManager, g5UnpReader, g5BalanceManager)
-      rewardsService = RewardsService[IO](classicRewards, delegatorRewards, rewardsInfoCalculator, rewardsInfoStorage)
+      rewardsInfoCalculator = RewardsInfoCalculator.make(readPathDelegatedRewards, g5StakeManager, g5UnpReader, g5BalanceManager)
+      rewardsService = RewardsService[IO](classicRewards, readPathDelegatedRewards, rewardsInfoCalculator, rewardsInfoStorage)
       // Task #12 slice 2b — the producer's hash-keyed changeset-staging Ref (empty for this unit suite; the
       // promotion/finality path is exercised in the dag-l0 integration loop, not here).
       pendingAccumulatorsRef <- Ref.of[IO, Map[
@@ -810,10 +876,11 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           snapshotAcceptanceManager,
           collateral,
           rewardsService,
+          exactParentDelegatedRewardsForReader,
           GlobalSnapshotEventCutter.make[IO](20_000_000, feeCalculator),
           UpdateNodeParametersCutter.make(100),
           AppEnvironment.Dev,
-          delegatedRewardsConfigProvider,
+          rewardConfigProvider,
           SnapshotOrdinal.MinValue,
           SnapshotOrdinal.MinValue,
           SnapshotOrdinal.MinValue,
@@ -825,7 +892,7 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
           // W3a — no-op fraud-proof pool (this suite does not exercise the watchtower path).
           fraudProofPool = io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool.noop[IO]
         )
-    } yield GlobalConsensusFixture(globalSnapshotConsensusFunction, mptStore, pendingPostBytesRef)
+    } yield GlobalConsensusFixture(globalSnapshotConsensusFunction, mptStore, mptOverlay, pendingPostBytesRef)
   }
 
   def mkGlobalSnapshotConsensusFunctions(
@@ -1277,6 +1344,82 @@ object GlobalSnapshotConsensusFunctionsSuite extends MutableIOSuite with Checker
       actual = result.map(_._1.stateChannelSnapshots(scEvent.value.address))
       expectation = expect.same(true, result.isRight) && expect.same(expected, actual)
     } yield expectation
+  }
+
+  test("delegated rewards are recreated from the exact proposal-parent branch, not ambient best tip") { res =>
+    implicit val (_, j, h, sp, m) = res
+
+    val activeRewardsConfig = DefaultDelegatedRewardsConfigProvider
+    val siblingBranch = BranchId(Hash("b" * 64))
+
+    for {
+      rewardKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      rewardPeer = PeerId.fromPublic(rewardKeyPair.getPublic)
+      rewardAddress = PublicKeyOps(rewardKeyPair.getPublic).toAddress
+      markerKey = GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, rewardAddress)
+      parent <- mkRootedParent(SortedMap.empty)
+      parentHash <- h.hash(parent.signedArtifact.value)
+      parentBranch = BranchId(parentHash)
+      seedFixture = (fixture: GlobalConsensusFixture) =>
+        for {
+          parentHandle <- fixture.overlay.checkout(BranchId.base)
+          _ <- parentHandle.insert[Balance](markerKey, Balance(11L))
+          _ <- fixture.overlay.commit(parentHandle, parentBranch, parent.ordinal)
+          siblingHandle <- fixture.overlay.checkout(BranchId.base)
+          _ <- siblingHandle.insert[Balance](markerKey, Balance(99L))
+          _ <- fixture.overlay.commit(siblingHandle, siblingBranch, parent.ordinal)
+        } yield ()
+      rewardWiring: DelegatedRewardsWiring = overlay => {
+        val exactParentFactory: GlobalStateReader[IO] => DelegatedRewardsDistributor[IO] =
+          reader => markerDelegatedRewards(reader, markerKey, rewardPeer, rewardAddress, activeRewardsConfig)
+        val ambientReader = GlobalStateReader.pending[IO](overlay, IO.pure(Some(siblingBranch)))
+        exactParentFactory(ambientReader) -> exactParentFactory
+      }
+      producer <- mkGlobalSnapshotConsensusFixture(
+        rootedParent = Some(parent),
+        overlayMode = MptOverlay.OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        delegatedRewardsWiring = Some(rewardWiring),
+        rewardConfigProvider = activeRewardsConfig
+      )
+      follower <- mkGlobalSnapshotConsensusFixture(
+        rootedParent = Some(parent),
+        overlayMode = MptOverlay.OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        delegatedRewardsWiring = Some(rewardWiring),
+        rewardConfigProvider = activeRewardsConfig
+      )
+      _ <- seedFixture(producer)
+      _ <- seedFixture(follower)
+      producerAmbient <- GlobalStateReader.pending[IO](producer.overlay, IO.pure(Some(siblingBranch))).get[Balance](markerKey)
+      producerExact <- GlobalStateReader.fromOverlay[IO](producer.overlay, parentBranch).get[Balance](markerKey)
+      followerAmbient <- GlobalStateReader.pending[IO](follower.overlay, IO.pure(Some(siblingBranch))).get[Balance](markerKey)
+      followerExact <- GlobalStateReader.fromOverlay[IO](follower.overlay, parentBranch).get[Balance](markerKey)
+      (artifact, _, _) <- producer.functions.createProposalArtifact(
+        parent.ordinal,
+        parent.signedArtifact,
+        parent.context,
+        h,
+        EventTrigger,
+        Set.empty,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      followerResult <- follower.functions.validateArtifact(
+        parent.signedArtifact,
+        parent.context,
+        EventTrigger,
+        artifact,
+        Set.empty,
+        _ => None.pure[IO]
+      )
+      expectedRewards = SortedMap(rewardPeer -> Map(rewardAddress -> Amount(11L)))
+    } yield
+      expect.eql(Some(Balance(99L)), producerAmbient) &&
+        expect.eql(Some(Balance(11L)), producerExact) &&
+        expect.eql(Some(Balance(99L)), followerAmbient) &&
+        expect.eql(Some(Balance(11L)), followerExact) &&
+        expect.eql(Some(expectedRewards), artifact.delegateRewards) &&
+        expect(followerResult.isRight) &&
+        expect.eql(Some(Some(expectedRewards)), followerResult.toOption.map(_._1.delegateRewards))
   }
 
   test("validateArtifact - returns invalid artifact error for incorrect data") { res =>

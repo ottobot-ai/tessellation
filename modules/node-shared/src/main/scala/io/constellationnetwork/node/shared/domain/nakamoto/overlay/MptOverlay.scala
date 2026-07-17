@@ -283,6 +283,12 @@ trait MptOverlay[F[_], K] {
     */
   def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]]
 
+  /** Capture multiple raw prefix views from one branch image. MultiBranch serializes the complete capture against branch
+    * commit/finalization so callers cannot combine partitions observed before and after a base replacement. Passthrough has no overlay
+    * mutation owner; callers must externally serialize direct handle writes if they use this as consensus authority.
+    */
+  def rawEntriesForPrefixesStrict(branch: BranchId, prefixes: List[Hex]): F[Map[Hex, List[StrictMptRawEntry]]]
+
   /** Capture one defensively owned branch byte image and derive its trie without mutating the base producer, its pending-change refs, or
     * its ordinal/root caches. Root and proof/value consumers must use this single image rather than reading the overlay twice.
     *
@@ -544,6 +550,11 @@ object MptOverlay {
 
       def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]] =
         underlying.getAllForPrefixStrict[V](prefix)
+
+      def rawEntriesForPrefixesStrict(branch: BranchId, prefixes: List[Hex]): F[Map[Hex, List[StrictMptRawEntry]]] =
+        underlying.withExclusiveLock {
+          prefixes.distinct.traverse(prefix => underlying.rawEntriesForPrefixStrict(prefix).map(prefix -> _)).map(_.toMap)
+        }
 
       def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
         underlying.allEntriesAsBytes
@@ -931,23 +942,39 @@ object MptOverlay {
         } yield (baseEntries -- filteredRemovals) ++ decoded.toMap
 
       def getAllForPrefixStrict[V: ImmutableCodec](branch: BranchId, prefix: Hex): F[List[StrictMptEntry[V]]] =
+        rawEntriesForPrefixesStrict(branch, List(prefix)).map { byPrefix =>
+          byPrefix.getOrElse(prefix, List.empty).map {
+            case StrictMptRawEntry(key, bytes) =>
+              StrictMptEntry(key, StrictMptRead.fromStoredBytes[V](bytes.fold[Array[Byte]](null)(_.toArray)))
+          }
+        }
+
+      def rawEntriesForPrefixesStrict(branch: BranchId, prefixes: List[Hex]): F[Map[Hex, List[StrictMptRawEntry]]] =
         mutex.permit.use { _ =>
+          val distinctPrefixes = prefixes.distinct
+
           for {
-            baseEntries <- underlying.rawEntriesForPrefixStrict(prefix)
+            baseEntries <- distinctPrefixes.traverse { prefix =>
+              underlying.rawEntriesForPrefixStrict(prefix).map(prefix -> _)
+            }
             pending <- pendingRef.get
             merged = mergedChain(branch, pending)
-            baseMap = baseEntries.iterator.map {
-              case StrictMptRawEntry(key, bytes) => key -> bytes.fold[Array[Byte]](null)(_.toArray)
-            }.toMap
-            filteredUpserts = merged.upserts.filter {
-              case (key, _) =>
-                StatefulMerklePatriciaProducer.hasNibblePrefix(key, prefix)
+            branchEntries = baseEntries.map {
+              case (prefix, rawBaseEntries) =>
+                val baseMap = rawBaseEntries.iterator.map {
+                  case StrictMptRawEntry(key, bytes) => key -> bytes.fold[Array[Byte]](null)(_.toArray)
+                }.toMap
+                val filteredUpserts = merged.upserts.filter {
+                  case (key, _) =>
+                    StatefulMerklePatriciaProducer.hasNibblePrefix(key, prefix)
+                }
+                val filteredRemovals = merged.removals.filter(StatefulMerklePatriciaProducer.hasNibblePrefix(_, prefix))
+                val entries = filteredUpserts.foldLeft(baseMap -- filteredRemovals) {
+                  case (current, (key, value)) => current.updated(key, value)
+                }
+                prefix -> StrictMptRead.captureRawEntries(entries)
             }
-            filteredRemovals = merged.removals.filter(StatefulMerklePatriciaProducer.hasNibblePrefix(_, prefix))
-            branchEntries = filteredUpserts.foldLeft(baseMap -- filteredRemovals) {
-              case (entries, (key, value)) => entries.updated(key, value)
-            }
-          } yield StrictMptRead.decodeEntries[V](branchEntries)
+          } yield branchEntries.toMap
         }
 
       def captureBranchImage(branch: BranchId): F[Either[MerklePatriciaError, MptBranchImage]] =

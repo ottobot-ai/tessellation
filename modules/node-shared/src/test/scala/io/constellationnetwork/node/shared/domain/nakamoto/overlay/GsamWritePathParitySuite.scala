@@ -196,7 +196,7 @@ object GsamWritePathParitySuite extends MutableIOSuite with Checkers {
       _ <- overlay.commit(handle, childBranch, ordinal)
       rootRes <- overlay.buildRoot(childBranch, ordinal)
       bytes <- store.allEntriesAsBytes
-    } yield (rootRes.toOption.map(_.rootHash), bytes)
+    } yield (Option.when(bytes.nonEmpty)(rootRes.toOption.map(_.rootHash)).flatten, bytes)
 
   /** PATH G — writer-algebra over `MptOverlay.MultiBranch`. Writes accumulate in the per-branch `ChangeSet` until `finalizeBranch` folds
     * them into the underlying store. Compared to path A post-finalize, the base bytes must be identical — divergence here points to a bug

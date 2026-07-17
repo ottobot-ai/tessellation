@@ -40,21 +40,21 @@ object GlobalStateReaderOps {
     def getMetagraphSyncData(metagraphAddress: Address): F[Option[MetagraphSyncDataInfo]] =
       reader.get[MetagraphSyncDataInfo](GlobalStateKey.hypergraph(GlobalStateFieldId.MetagraphSyncData, metagraphAddress))
 
-    def getDelegatedStakes(address: Address): F[Option[SortedSet[DelegatedStakeRecord]]] =
-      reader.get[SortedSet[DelegatedStakeRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveDelegatedStakes, address))
+    def getDelegatedStakes(address: Address)(implicit hasher: Hasher[F]): F[Option[SortedSet[DelegatedStakeRecord]]] =
+      StakeCollateralMptReader.readActiveDelegatedStakes(reader, address)
 
-    def getDelegatedStakeWithdrawals(address: Address): F[Option[SortedSet[PendingDelegatedStakeWithdrawal]]] =
-      reader.get[SortedSet[PendingDelegatedStakeWithdrawal]](
-        GlobalStateKey.hypergraph(GlobalStateFieldId.DelegatedStakesWithdrawals, address)
-      )
+    def getDelegatedStakeWithdrawals(
+      address: Address
+    )(implicit hasher: Hasher[F]): F[Option[SortedSet[PendingDelegatedStakeWithdrawal]]] =
+      StakeCollateralMptReader.readDelegatedStakeWithdrawals(reader, address)
 
-    def getNodeCollaterals(address: Address): F[Option[SortedSet[NodeCollateralRecord]]] =
-      reader.get[SortedSet[NodeCollateralRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveNodeCollaterals, address))
+    def getNodeCollaterals(address: Address)(implicit hasher: Hasher[F]): F[Option[SortedSet[NodeCollateralRecord]]] =
+      StakeCollateralMptReader.readActiveNodeCollaterals(reader, address)
 
-    def getNodeCollateralWithdrawals(address: Address): F[Option[SortedSet[PendingNodeCollateralWithdrawal]]] =
-      reader.get[SortedSet[PendingNodeCollateralWithdrawal]](
-        GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, address)
-      )
+    def getNodeCollateralWithdrawals(
+      address: Address
+    )(implicit hasher: Hasher[F]): F[Option[SortedSet[PendingNodeCollateralWithdrawal]]] =
+      StakeCollateralMptReader.readNodeCollateralWithdrawals(reader, address)
 
     def getActiveTokenLocks(address: Address)(implicit hasher: Hasher[F]): F[Option[SortedSet[Signed[TokenLock]]]] =
       ActiveTokenLockMptReader.readNative(reader, address)

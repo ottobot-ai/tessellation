@@ -521,7 +521,7 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
         override def accept(
           createEvents: List[Signed[UpdateNodeCollateral.Create]],
           withdrawEvents: List[Signed[UpdateNodeCollateral.Withdraw]],
-          lastSnapshotContext: GlobalSnapshotInfo,
+          parentStateReader: GlobalStateReader[IO],
           epochProgress: EpochProgress,
           ordinal: SnapshotOrdinal,
           delegatedStakeAcceptanceResult: io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult

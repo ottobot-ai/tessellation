@@ -346,8 +346,8 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       ),
     "modules/shared/src/main/scala/io/constellationnetwork/schema/mpt/GlobalStateConverter.scala" ->
       Reviewed(
-        7,
-        "encodes typed MPT leaf values on the already-live MPT state path; it does not select artifact/signature/hash preimages"
+        10,
+        "encodes and canonically round-trips typed MPT leaf values on the already-live MPT state path; it does not select artifact/signature/hash preimages"
       )
   )
 

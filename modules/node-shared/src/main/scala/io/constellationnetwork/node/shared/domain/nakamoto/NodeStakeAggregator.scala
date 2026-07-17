@@ -3,19 +3,13 @@ package io.constellationnetwork.node.shared.domain.nakamoto
 import cats.effect.kernel.{Async, Ref}
 import cats.syntax.all._
 
-import scala.collection.immutable.SortedSet
-import scala.concurrent.duration.{FiniteDuration, MILLISECONDS}
-
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, MptOverlay, StakeCollateralMptReader}
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
-import io.constellationnetwork.schema.SnapshotOrdinal
-import io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
+import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nakamoto.{EpochStakeSnapshotter, StakeDistribution}
-import io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security.Hasher
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.{delegatedStakeRecordSetCodec, nodeCollateralRecordSetCodec}
+import io.constellationnetwork.security.hex.Hex
 
 import eu.timepit.refined.auto._
 
@@ -38,9 +32,8 @@ import eu.timepit.refined.auto._
   * `StakeRegistry.stakeWeightedMpt` impl handles this).
   *
   * '''Caching.''' This trait exposes the raw, uncached read. For the consensus hot path — `EligibilityChecker.relativeStake` fires per-slot
-  * — wrap in [[NodeStakeAggregator.cached]] which memoizes the result keyed on `SnapshotOrdinal` and invalidates whenever the parent
-  * ordinal advances. The pattern mirrors `materializeActiveTokenLocksFromMpt` ("read once per accept") but with finer-grained per-ordinal
-  * invalidation since `relativeStake` is read-side, not write-side.
+  * — wrap in [[NodeStakeAggregator.cached]], keyed by the exact overlay `BranchId`. Ordinal-only caching is unsafe because a density reorg
+  * can replace the selected branch at the same height.
   */
 trait NodeStakeAggregator[F[_]] {
 
@@ -57,35 +50,41 @@ object NodeStakeAggregator {
     *
     * Reads the per-node aggregate via `aggregator.aggregateFromMpt` and wraps it in a `StakeDistribution` through
     * `EpochStakeSnapshotter.fromCombined`. The wrapping uses the same `SortedMap` materialization as the GSI-primary path — so when MPT and
-    * GSI are in sync (which is the case during `accept()` — the GSI is built from the same accepted records that the MPT writer then
-    * syncs), the resulting `StakeDistribution` bytes are identical to those produced by `EpochStakeSnapshotter.snapshot(info)`. This
-    * byte-equivalence is the §G2 migration contract; see `NodeStakeAggregatorSuite` "snapshotFromMpt parity" test.
+    * GSI describe the same committed state, the resulting `StakeDistribution` bytes are identical to those produced by
+    * `EpochStakeSnapshotter.snapshot(info)`. This byte-equivalence is the §G2 migration contract; see `NodeStakeAggregatorSuite`
+    * "snapshotFromMpt parity" test. A closing-period boundary cannot use the parent MPT for this projection because its current-ordinal
+    * state changes have not been applied yet; that path projects the exact post-transition `GlobalSnapshotInfo` instead.
     *
-    * Effectful because the underlying MPT prefix-scan is `F[]`. Callers in `GlobalSnapshotAcceptanceManager.accept()` already run under an
-    * `implicit hasher: Hasher[F]` (set at the top of `accept()` from `HasherSelector.getForOrdinal(ordinal)`), so the additional `flatMap`
-    * lifts cleanly into the existing for-comprehension.
+    * Effectful because the underlying MPT prefix-scan is `F[]`.
     */
   def snapshotFromMpt[F[_]: Async](aggregator: NodeStakeAggregator[F])(implicit hasher: Hasher[F]): F[StakeDistribution] =
     aggregator.aggregateFromMpt.map(EpochStakeSnapshotter.fromCombined)
 
-  /** Uncached pass-through implementation. Every call re-runs two MPT prefix scans + an in-memory fold. Suitable for low-frequency callers
-    * (boot, diagnostics, tests). Production hot-path uses [[cached]] which wraps this and serves repeated calls within the same snapshot
-    * ordinal from memory.
+  /** Uncached implementation over one raw multi-prefix capture. Every call captures delegated stake and collateral from the same MPT image,
+    * then validates and folds both partitions. Reading the prefixes independently is unsafe: finalization can replace the base between
+    * scans and create a delegated(A) + collateral(B) hybrid stake distribution.
     *
     * '''Latency observability.''' Each call records its wall-clock to the `dag_nakamoto_stake_aggregator_mpt_scan_ms` distribution — gives
     * the operator a single Grafana series for "how expensive is the MPT prefix-scan in this run." Compared to a counter, the distribution
     * exposes p50/p99 which is what matters when the per-slot hot path fires this thousands of times. Recorded on every call (including the
     * cache-miss path inside `cached`, by virtue of the wrapper calling `underlying.aggregateFromMpt`).
     */
-  def make[F[_]: Async: Metrics](reader: GlobalStateReader[F]): NodeStakeAggregator[F] = new NodeStakeAggregator[F] {
+  private[nakamoto] def fromRawPrefixSnapshot[F[_]: Async: Metrics](
+    capture: List[Hex] => F[Map[Hex, List[StrictMptRawEntry]]]
+  ): NodeStakeAggregator[F] = new NodeStakeAggregator[F] {
 
     def aggregateFromMpt(implicit hasher: Hasher[F]): F[Map[PeerId, BigInt]] =
       for {
         startNanos <- Async[F].monotonic.map(_.toNanos)
         delegatedPrefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveDelegatedStakes)
-        delegatedEntries <- reader.getAllForPrefix[SortedSet[DelegatedStakeRecord]](delegatedPrefix)
         collateralPrefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveNodeCollaterals)
-        collateralEntries <- reader.getAllForPrefix[SortedSet[NodeCollateralRecord]](collateralPrefix)
+        rawEntries <- capture(List(delegatedPrefix, collateralPrefix))
+        delegatedEntries <- StakeCollateralMptReader.materializeActiveDelegatedStakesFromRaw(
+          rawEntries.getOrElse(delegatedPrefix, List.empty)
+        )
+        collateralEntries <- StakeCollateralMptReader.materializeActiveNodeCollateralsFromRaw(
+          rawEntries.getOrElse(collateralPrefix, List.empty)
+        )
         endNanos <- Async[F].monotonic.map(_.toNanos)
         elapsedMs = (endNanos - startNanos) / 1000000L
         _ <- Metrics[F].recordDistribution("dag_nakamoto_stake_aggregator_mpt_scan_ms", elapsedMs)
@@ -114,45 +113,76 @@ object NodeStakeAggregator {
       }
   }
 
-  /** Per-snapshot-ordinal cached wrapper.
+  /** Finalized-base/bootstrap factory. The store lock makes the two scans one captured image for callers whose mutations also respect
+    * `MptStore.withExclusiveLock`. Production GL0 consensus uses [[atBranch]], not this adapter.
+    */
+  def fromMptStore[F[_]: Async: Metrics](store: MptStore[F, GlobalStateKey]): NodeStakeAggregator[F] =
+    fromRawPrefixSnapshot { prefixes =>
+      store.withExclusiveLock {
+        prefixes.distinct.traverse(prefix => store.rawEntriesForPrefixStrict(prefix).map(prefix -> _)).map(_.toMap)
+      }
+    }
+
+  /** Requested overlay branch capture. MultiBranch holds its branch/finalization mutex for the complete two-prefix snapshot. The overlay's
+    * legacy absent-branch-to-base behavior still applies; exact candidate-parent authentication remains a separate consensus requirement.
+    */
+  def atBranch[F[_]: Async: Metrics](
+    overlay: MptOverlay[F, GlobalStateKey],
+    branch: BranchId
+  ): NodeStakeAggregator[F] =
+    fromRawPrefixSnapshot(prefixes => overlay.rawEntriesForPrefixesStrict(branch, prefixes))
+
+  /** Branch-identity cached wrapper.
     *
     * Caching question — three options:
     *   - (a) Pure pass-through: every call re-reads MPT. Simple and correct but expensive when `relativeStake` fires per slot at 1 Hz × N
     *     validators × per-leader-election × per- attestation-verify. Two prefix scans per call.
-    *   - (b) '''Per-snapshot cache (this implementation).''' Hold a `Ref[F, Option[(SnapshotOrdinal, Map[PeerId, BigInt])]]` and refresh
-    *     when the snapshot ordinal advances. Matches `materializeActiveTokenLocksFromMpt` semantics (read once per accept) but with finer-
-    *     grained per-ordinal invalidation. Trade-off: a stale read within the same snapshot ordinal is by construction correct because the
-    *     MPT view at that ordinal is immutable; stake mutations only land at snapshot acceptance.
+    *   - (b) '''Per-branch cache (this implementation).''' Hold a `Ref[F, Option[(BranchId, Map[PeerId, BigInt])]]` and refresh when the
+    *     selected branch changes. The miss path receives the requested branch identity and captures both partitions together, so one
+    *     aggregate cannot mix delegated stake from one tip with collateral from another. Authentication that an absent requested branch
+    *     really names the current base is a separate candidate-parent binding requirement.
     *   - (c) Caller passes the aggregate as a pure `Map[PeerId, BigInt]`, computed once. Requires plumbing changes at every call site and
     *     loses the lazy boot path.
     *
     * Choice rationale: (b) hits the hot path without a plumbing rewrite. (a) is too expensive at 8gl0+4mg+4shards (sims show ~200
     * calls/sec). (c) is correct but invasive.
     *
-    * The `currentOrdinalF` callback resolves the "view ordinal" — typically `lastGlobalSnapshotStorage.getOrdinal`. `None` (pre-genesis)
-    * defeats caching (always reads).
+    * The `currentBranchF` callback must be the same selected-tip source used by the live overlay reader. `None` (pre-bootstrap) defeats
+    * caching and reads the finalized base through `BranchId.base`.
     */
   def cached[F[_]: Async](
-    underlying: NodeStakeAggregator[F],
-    currentOrdinalF: F[Option[SnapshotOrdinal]]
+    underlyingAt: BranchId => NodeStakeAggregator[F],
+    currentBranchF: F[Option[BranchId]]
   ): F[NodeStakeAggregator[F]] =
-    Ref.of[F, Option[(SnapshotOrdinal, Map[PeerId, BigInt])]](None).map { cacheR =>
+    Ref.of[F, Option[(BranchId, Map[PeerId, BigInt])]](None).map { cacheR =>
       new NodeStakeAggregator[F] {
         def aggregateFromMpt(implicit hasher: Hasher[F]): F[Map[PeerId, BigInt]] =
-          currentOrdinalF.flatMap {
+          currentBranchF.flatMap {
             case None =>
-              // No ordinal yet → always read uncached; pre-genesis path with no MPT entries returns
-              // empty map immediately.
-              underlying.aggregateFromMpt
-            case Some(ord) =>
+              underlyingAt(BranchId.base).aggregateFromMpt.flatMap { fresh =>
+                currentBranchF.flatMap {
+                  case None    => fresh.pure[F]
+                  case Some(_) => Async[F].defer(aggregateFromMpt)
+                }
+              }
+            case Some(branch) =>
               cacheR.get.flatMap {
-                case Some((cachedOrd, cachedMap)) if cachedOrd === ord =>
-                  Async[F].pure(cachedMap)
+                case Some((cachedBranch, cachedMap)) if cachedBranch == branch =>
+                  currentBranchF.flatMap {
+                    case Some(stillSelected) if stillSelected == branch => cachedMap.pure[F]
+                    case _                                              => Async[F].defer(aggregateFromMpt)
+                  }
                 case _ =>
                   for {
-                    fresh <- underlying.aggregateFromMpt
-                    _ <- cacheR.set(Some((ord, fresh)))
-                  } yield fresh
+                    fresh <- underlyingAt(branch).aggregateFromMpt
+                    selectedAfter <- currentBranchF
+                    result <- selectedAfter match {
+                      case Some(stillSelected) if stillSelected == branch =>
+                        cacheR.set(Some((branch, fresh))).as(fresh)
+                      case _ =>
+                        Async[F].defer(aggregateFromMpt)
+                    }
+                  } yield result
               }
           }
       }

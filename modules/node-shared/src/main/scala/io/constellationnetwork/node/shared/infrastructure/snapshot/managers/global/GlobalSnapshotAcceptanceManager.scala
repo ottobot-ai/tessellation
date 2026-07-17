@@ -52,7 +52,6 @@ import io.constellationnetwork.node.shared.infrastructure.local_events.proto.loc
   TokenLockStateChange => PbTokenLockStateChange,
   TransactionAccepted => PbTransactionAccepted
 }
-import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.snapshot._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.kes.KesRegistrationStateManager
 import io.constellationnetwork.node.shared.logger.LoggerBundle
@@ -68,7 +67,7 @@ import io.constellationnetwork.schema.kes.KesRegistrationCert.{KesRegistrationRe
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.StateChangesAccumulator
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
+import io.constellationnetwork.schema.nakamoto.{EpochStakeSnapshotter, EtaPeriod, HistoricalStakeSnapshot}
 import io.constellationnetwork.schema.node.UpdateNodeParameters
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
@@ -443,7 +442,7 @@ object GlobalSnapshotAcceptanceManager {
         }
     }
 
-  def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer: Metrics](
+  def make[F[_]: Async: Parallel: HasherSelector: SecurityProvider: JsonSerializer](
     fieldsAddedOrdinals: FieldsAddedOrdinals,
     metagraphsSyncConfig: MetagraphsSyncConfig,
     environment: AppEnvironment,
@@ -462,11 +461,11 @@ object GlobalSnapshotAcceptanceManager {
     overlay: MptOverlay[F, GlobalStateKey],
     loggerBundle: LoggerBundle[F],
     // §3 NIPoPoW S0.4: number of snapshots per eta-rotation period. At every boundary ordinal (`ord % R == R - 1`)
-    // accept() captures `NodeStakeAggregator.snapshotFromMpt` (the §G2 MPT-primary path; byte-equivalent to the previous
-    // `EpochStakeSnapshotter.snapshot(builtInfo)` GSI walk) into `historicalStakeSnapshots[currentPeriod]` and prunes
-    // entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a reorg-grace). REQUIRED (no source-level
-    // default): must match the producer's R = round(3.1·k₁) (`nakamoto.confirmation-depth-k` derived) for cross-node determinism —
-    // a stale literal would silently diverge. Prod + the gl0 path thread the derived R; test callers pass an explicit R fixture.
+    // accept() captures the exact post-transition field-13/15 state from the just-built `GlobalSnapshotInfo` into
+    // `historicalStakeSnapshots[currentPeriod]` and prunes entries older than `currentPeriod - 3` (algorithm reads N-2; the extra slot is a
+    // reorg-grace). REQUIRED (no source-level default): must match the producer's R = round(3.1·k₁)
+    // (`nakamoto.confirmation-depth-k` derived) for cross-node determinism — a stale literal would silently diverge. Prod + the gl0 path
+    // thread the derived R; test callers pass an explicit R fixture.
     etaRotationSnapshots: Long,
     // Path 1 (heap-leak workstream): callback that returns eta_period for the just-closed eta-period at
     // the boundary write. Eta_period is determined at the 2/3-mark of period (period-1) and used by slot
@@ -628,12 +627,6 @@ object GlobalSnapshotAcceptanceManager {
       val delegatedStakeStateManager = DelegatedStakeStateManager.make[F](branchAwareReader)
       val nodeCollateralStateManager = NodeCollateralStateManager.make[F](branchAwareReader)
       val transactionReferenceManager = TransactionReferenceManager.make[F](branchAwareReader)
-      // §G2 — MPT-primary stake aggregator. Mirrors the per-state-manager pattern (each routed via the branch-aware reader so
-      // boundary-write reads under MultiBranch see pending parent-branch writes). Used by `computeHistoricalStakeBoundaryDelta`
-      // to materialize the §3 NIPoPoW S0.4 boundary `StakeDistribution` from MPT prefix-scans rather than walking the in-memory
-      // `baseInfo.activeDelegatedStakes / activeNodeCollaterals` maps; the two paths are byte-equivalent when MPT and GSI are in
-      // sync (which they are inside accept() since the GSI is built from the same accepted records the MPT writer then syncs).
-      val stakeAggregator: NodeStakeAggregator[F] = NodeStakeAggregator.make[F](branchAwareReader)
       val blockAcceptanceCoordinatorManager = BlockAcceptanceCoordinatorManager.make[F](
         blockAcceptanceManager,
         allowSpendBlockAcceptanceManager,
@@ -734,7 +727,7 @@ object GlobalSnapshotAcceptanceManager {
             delegatedResult <- updateDelegatedStakeAcceptanceManager.accept(
               cdsEvents,
               wdsEvents,
-              lastSnapshotContext,
+              branchAwareReader,
               epochProgress,
               ordinal,
               acceptedGlobalTokenLocks
@@ -760,13 +753,12 @@ object GlobalSnapshotAcceptanceManager {
           epochProgress: EpochProgress,
           cncEvents: List[Signed[UpdateNodeCollateral.Create]],
           wncEvents: List[Signed[UpdateNodeCollateral.Withdraw]],
-          lastSnapshotContext: GlobalSnapshotInfo,
           delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
         ): F[UpdateNodeCollateralAcceptanceResult] =
           updateNodeCollateralAcceptanceManager.accept(
             cncEvents,
             wncEvents,
-            lastSnapshotContext,
+            branchAwareReader,
             epochProgress,
             ordinal,
             delegatedStakeAcceptanceResult
@@ -1419,16 +1411,15 @@ object GlobalSnapshotAcceptanceManager {
           baseInfo: GlobalSnapshotInfo,
           parentTip: BranchId,
           pinnedBoundaryEta: Option[Hash]
-        )(
-          implicit hasher: Hasher[F]
         ): F[(SortedMap[EtaPeriod, HistoricalStakeSnapshot], Set[EtaPeriod], SortedMap[EtaPeriod, HistoricalStakeSnapshot])] = {
           val ordValue = ordinal.value.value
           if (etaRotationSnapshots > 0L && ordValue % etaRotationSnapshots == etaRotationSnapshots - 1L) {
             val currentPeriod = EtaPeriod(ordValue / etaRotationSnapshots)
-            // §G2 — read the boundary `StakeDistribution` from the MPT via `NodeStakeAggregator` rather than from
-            // `baseInfo.{activeDelegatedStakes, activeNodeCollaterals}`. The two are byte-equivalent here (MPT was just synced
-            // from the same accepted records that built the GSI), and routing via MPT removes the redundant in-memory mirror —
-            // closing a class of #218-style cross-node drift bugs where two nodes' GSI iteration order produced divergent bytes.
+            // The boundary distribution MUST include every transition accepted at this closing ordinal. `baseInfo` is the exact typed
+            // post-transition state; the parent MPT is intentionally not consulted here because the current accumulator is applied only
+            // after this boundary entry has been constructed. Reading the parent would delay creates, withdrawals, expiry and slash effects
+            // by one eta period. `EpochStakeSnapshotter` materializes the combined result into a `SortedMap`, and fields 13/15 have already
+            // passed strict physical-key/value validation plus total record ordering before reaching this point.
             //
             // Path 1 (heap-leak workstream): the gl0-producer resolves eta_currentPeriod via `etaForPeriod` and packs it into
             // the `HistoricalStakeSnapshot` boundary entry. Eta is deterministic from the canonical chain at this point
@@ -1436,7 +1427,8 @@ object GlobalSnapshotAcceptanceManager {
             //
             val etaF: F[Hash] =
               pinnedBoundaryEta.fold(etaForPeriod.map(_(currentPeriod, parentTip)).getOrElse(Async[F].pure(Hash.empty)))(Async[F].pure)
-            (NodeStakeAggregator.snapshotFromMpt[F](stakeAggregator), etaF).mapN { (newStakeSnapshot, eta) =>
+            val newStakeSnapshot = EpochStakeSnapshotter.snapshot(baseInfo)
+            etaF.map { eta =>
               val newSnapshot = HistoricalStakeSnapshot(newStakeSnapshot, eta)
               val retentionMinPeriod = currentPeriod.value - 3L
               val priorKeys = baseInfo.historicalStakeSnapshots.keySet
@@ -1547,8 +1539,8 @@ object GlobalSnapshotAcceptanceManager {
           // GSI field set and the `StateChangesAccumulator.historicalStakeSnapshots` / `removedHistoricalStakeSnapshotKeys`
           // delta — keeping them in lockstep is the MPT parity contract.
           //
-          // §G2 — `computeHistoricalStakeBoundaryDelta` is now `F[]` (reads the boundary `StakeDistribution` from MPT via
-          // `NodeStakeAggregator.snapshotFromMpt`). `buildGlobalSnapshotInfo` lifts into `F[]` here.
+          // Eta derivation is effectful; the stake distribution itself is the pure deterministic projection of this exact post-transition
+          // `baseInfo`.
           computeHistoricalStakeBoundaryDelta(ordinal, baseInfo, parentTip, pinnedBoundaryEta).map {
             case (adds, removes, nextHistorical) =>
               BuildGlobalSnapshotInfoResult(
@@ -1955,7 +1947,6 @@ object GlobalSnapshotAcceptanceManager {
                   epochProgress,
                   cncEvents,
                   wncEvents,
-                  lastSnapshotContext,
                   initialData.delegatedResult
                 )
 

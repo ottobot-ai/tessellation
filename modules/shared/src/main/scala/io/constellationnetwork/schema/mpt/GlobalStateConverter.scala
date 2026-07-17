@@ -63,6 +63,78 @@ object GlobalStateConverter {
     entries.toList.parTraverse { case (key, value) => GlobalStateKey.toHex[F](key).map(_ -> value) }
       .flatMap(materializePhysicalEntries[F, V])
 
+  private def validateStakeCollateralPartition[F[_]: Async: Hasher, A](
+    fieldId: GlobalStateFieldId,
+    entries: Iterable[(Address, SortedSet[A])],
+    sourceOf: A => Address,
+    identityOf: A => Any
+  )(implicit codec: ImmutableCodec[SortedSet[A]]): F[Unit] = {
+    val context = s"emit field-${fieldId.toInt} stake/collateral state"
+
+    entries.toList.traverse_ {
+      case (owner, records) =>
+        GlobalStateKey.toHex[F](GlobalStateKey.hypergraph(fieldId, owner)).flatMap { physicalKey =>
+          def inconsistent(reason: String): F[Unit] =
+            Async[F].raiseError(StrictMptRead.InconsistentConsensusMptIndex(context, physicalKey, reason))
+
+          if (records.isEmpty)
+            inconsistent("empty record set")
+          else {
+            val sources = records.iterator.map(sourceOf).toSet
+
+            if (sources.size =!= 1)
+              inconsistent("mixed embedded create sources")
+            else if (sources.head =!= owner)
+              inconsistent(s"source/key mismatch expected=$owner actual=${sources.head}")
+            else {
+              val identities = records.iterator.map(identityOf).toList
+              if (identities.distinct.size =!= identities.size) inconsistent("duplicate unsigned create identity")
+              else
+                Async[F].delay(codec.immutableBytes(records)).flatMap { encoded =>
+                  codec.fromImmutableBytes(encoded) match {
+                    case Left(error) => inconsistent(s"set codec cannot decode its own canonical bytes: $error")
+                    case Right(roundTripped) if roundTripped != records =>
+                      inconsistent("set codec round-trip changed record membership")
+                    case Right(_) => Async[F].unit
+                  }
+                }
+            }
+          }
+        }
+    }
+  }
+
+  private def validateStakeCollateralStructure[F[_]: Async: Hasher](
+    activeDelegatedStakes: Iterable[(Address, SortedSet[DelegatedStakeRecord])],
+    delegatedStakeWithdrawals: Iterable[(Address, SortedSet[PendingDelegatedStakeWithdrawal])],
+    activeNodeCollaterals: Iterable[(Address, SortedSet[NodeCollateralRecord])],
+    nodeCollateralWithdrawals: Iterable[(Address, SortedSet[PendingNodeCollateralWithdrawal])]
+  ): F[Unit] =
+    validateStakeCollateralPartition[F, DelegatedStakeRecord](
+      GlobalStateFieldId.ActiveDelegatedStakes,
+      activeDelegatedStakes,
+      _.event.value.source,
+      _.event.value
+    ) >>
+      validateStakeCollateralPartition[F, PendingDelegatedStakeWithdrawal](
+        GlobalStateFieldId.DelegatedStakesWithdrawals,
+        delegatedStakeWithdrawals,
+        _.event.value.source,
+        _.event.value
+      ) >>
+      validateStakeCollateralPartition[F, NodeCollateralRecord](
+        GlobalStateFieldId.ActiveNodeCollaterals,
+        activeNodeCollaterals,
+        _.event.value.source,
+        _.event.value
+      ) >>
+      validateStakeCollateralPartition[F, PendingNodeCollateralWithdrawal](
+        GlobalStateFieldId.NodeCollateralWithdrawals,
+        nodeCollateralWithdrawals,
+        _.event.value.source,
+        _.event.value
+      )
+
   private def strictValueOrElse[F[_]: Async, V](
     read: F[StrictMptRead[V]],
     ifAbsent: => V,
@@ -647,7 +719,12 @@ object GlobalStateConverter {
   )(
     implicit stateProofSelector: StateProofSelector
   ): F[Map[GlobalStateKey, Json]] =
-    (
+    validateStakeCollateralStructure[F](
+      acc.activeDelegatedStakes,
+      acc.delegatedStakesWithdrawals,
+      acc.activeNodeCollaterals,
+      acc.nodeCollateralWithdrawals
+    ) >> (
       convertRequiredMetagraph(acc.lastStateChannelSnapshotHashes, GlobalStateFieldId.LastStateChannelSnapshotHashes),
       convertRequiredHypergraph(acc.lastTxRefs, GlobalStateFieldId.LastTxRefs),
       convertRequiredHypergraph(acc.balances, GlobalStateFieldId.Balances),
@@ -698,7 +775,12 @@ object GlobalStateConverter {
   )(
     implicit stateProofSelector: StateProofSelector
   ): F[Map[GlobalStateKey, Json]] =
-    (
+    validateStakeCollateralStructure[F](
+      info.activeDelegatedStakes.toList.flatMap(_.toList),
+      info.delegatedStakesWithdrawals.toList.flatMap(_.toList),
+      info.activeNodeCollaterals.toList.flatMap(_.toList),
+      info.nodeCollateralWithdrawals.toList.flatMap(_.toList)
+    ) >> (
       convertRequiredMetagraph(info.lastStateChannelSnapshotHashes, GlobalStateFieldId.LastStateChannelSnapshotHashes),
       convertRequiredHypergraph(info.lastTxRefs, GlobalStateFieldId.LastTxRefs),
       convertRequiredHypergraph(info.balances, GlobalStateFieldId.Balances),
@@ -899,154 +981,161 @@ object GlobalStateConverter {
     ): Iterable[(GlobalStateKey, Array[Byte])] =
       data.map { case (addr, v) => GlobalStateKey.metagraph(addr, fieldId) -> enc(v) }
 
-    val stateChanHashes = metagraph1(info.lastStateChannelSnapshotHashes, LastStateChannelSnapshotHashes)
-    val txRefs = hypergraph1(info.lastTxRefs, LastTxRefs)
-    val balances = hypergraph1(info.balances, Balances)
-    val currencyProofs = metagraph1(info.lastCurrencySnapshotsProofs, LastCurrencySnapshotsProofs)
-    val activeAllowSpends = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
-      case (optAddr, inner) =>
-        inner.toList.map {
-          case (addr, s) =>
-            GlobalStateKey.hypergraph(ActiveAllowSpends, optAddr, addr) ->
-              enc[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](s)
+    validateStakeCollateralStructure[F](
+      info.activeDelegatedStakes.toList.flatMap(_.toList),
+      info.delegatedStakesWithdrawals.toList.flatMap(_.toList),
+      info.activeNodeCollaterals.toList.flatMap(_.toList),
+      info.nodeCollateralWithdrawals.toList.flatMap(_.toList)
+    ) >> Async[F].defer {
+      val stateChanHashes = metagraph1(info.lastStateChannelSnapshotHashes, LastStateChannelSnapshotHashes)
+      val txRefs = hypergraph1(info.lastTxRefs, LastTxRefs)
+      val balances = hypergraph1(info.balances, Balances)
+      val currencyProofs = metagraph1(info.lastCurrencySnapshotsProofs, LastCurrencySnapshotsProofs)
+      val activeAllowSpends = info.activeAllowSpends.toList.flatMap(_.toList).flatMap {
+        case (optAddr, inner) =>
+          inner.toList.map {
+            case (addr, s) =>
+              GlobalStateKey.hypergraph(ActiveAllowSpends, optAddr, addr) ->
+                enc[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](s)
+          }
+      }
+      val activeTokenLocks = info.activeTokenLocks.toList.flatMap(_.toList).map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(ActiveTokenLocks, addr) -> enc[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](s)
+      }
+      val tokenLockBalances = info.tokenLockBalances.toList.flatMap(_.toList).flatMap {
+        case (tokenAddr, inner) =>
+          inner.toList.map { case (holder, bal) => GlobalStateKey.hypergraph(TokenLockBalances, tokenAddr, holder) -> enc(bal) }
+      }
+      val lastAllowSpendRefs = info.lastAllowSpendRefs.toList.flatMap(_.toList).map {
+        case (addr, r) => GlobalStateKey.hypergraph(LastAllowSpendRefs, addr) -> enc(r)
+      }
+      val lastTokenLockRefs = info.lastTokenLockRefs.toList.flatMap(_.toList).map {
+        case (addr, r) => GlobalStateKey.hypergraph(LastTokenLockRefs, addr) -> enc(r)
+      }
+      val activeDelegatedStakes = info.activeDelegatedStakes.toList.flatMap(_.toList).map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr) -> enc[SortedSet[DelegatedStakeRecord]](s)
+      }
+      val delegatedStakesWithdrawals = info.delegatedStakesWithdrawals.toList.flatMap(_.toList).map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr) -> enc[SortedSet[PendingDelegatedStakeWithdrawal]](s)
+      }
+      val activeNodeCollaterals = info.activeNodeCollaterals.toList.flatMap(_.toList).map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr) -> enc[SortedSet[NodeCollateralRecord]](s)
+      }
+      val nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr) -> enc[SortedSet[PendingNodeCollateralWithdrawal]](s)
+      }
+      val metagraphSyncData = info.metagraphSyncData.toList.flatMap(_.toList).map {
+        case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
+      }
+
+      val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
+        info.updateNodeParameters.toList.flatMap(_.toList).parTraverse {
+          case (id, rec) =>
+            GlobalStateKey.updateNodeParametersKey[F](id).map(k => k -> enc[(Signed[UpdateNodeParameters], SnapshotOrdinal)](rec))
         }
-    }
-    val activeTokenLocks = info.activeTokenLocks.toList.flatMap(_.toList).map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(ActiveTokenLocks, addr) -> enc[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](s)
-    }
-    val tokenLockBalances = info.tokenLockBalances.toList.flatMap(_.toList).flatMap {
-      case (tokenAddr, inner) =>
-        inner.toList.map { case (holder, bal) => GlobalStateKey.hypergraph(TokenLockBalances, tokenAddr, holder) -> enc(bal) }
-    }
-    val lastAllowSpendRefs = info.lastAllowSpendRefs.toList.flatMap(_.toList).map {
-      case (addr, r) => GlobalStateKey.hypergraph(LastAllowSpendRefs, addr) -> enc(r)
-    }
-    val lastTokenLockRefs = info.lastTokenLockRefs.toList.flatMap(_.toList).map {
-      case (addr, r) => GlobalStateKey.hypergraph(LastTokenLockRefs, addr) -> enc(r)
-    }
-    val activeDelegatedStakes = info.activeDelegatedStakes.toList.flatMap(_.toList).map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr) -> enc[SortedSet[DelegatedStakeRecord]](s)
-    }
-    val delegatedStakesWithdrawals = info.delegatedStakesWithdrawals.toList.flatMap(_.toList).map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr) -> enc[SortedSet[PendingDelegatedStakeWithdrawal]](s)
-    }
-    val activeNodeCollaterals = info.activeNodeCollaterals.toList.flatMap(_.toList).map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr) -> enc[SortedSet[NodeCollateralRecord]](s)
-    }
-    val nodeCollateralWithdrawals = info.nodeCollateralWithdrawals.toList.flatMap(_.toList).map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr) -> enc[SortedSet[PendingNodeCollateralWithdrawal]](s)
-    }
-    val metagraphSyncData = info.metagraphSyncData.toList.flatMap(_.toList).map {
-      case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
-    }
 
-    val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
-      info.updateNodeParameters.toList.flatMap(_.toList).parTraverse {
-        case (id, rec) =>
-          GlobalStateKey.updateNodeParametersKey[F](id).map(k => k -> enc[(Signed[UpdateNodeParameters], SnapshotOrdinal)](rec))
+      val priceStateF: F[List[(GlobalStateKey, Array[Byte])]] =
+        info.priceState.toList.flatMap(_.toList).parTraverse {
+          case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
+        }
+
+      // §3 NIPoPoW S0 historical stake snapshots: one entry per stored eta-period (retention cap = 4).
+      // Each entry's value is the scodec-encoded `HistoricalStakeSnapshot` — the combined stake +
+      // eta record (Path 1, heap-leak workstream). Covered by `mptRoot` and gets its own per-field
+      // subtree root via `FId.HistoricalStakeSnapshots` for efficient NIPoPoW Merkle proofs.
+      val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
+        import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+          historicalImmutableCodec => historicalStakeSnapshotImmutable
+        }
+        info.historicalStakeSnapshots.toList.parTraverse {
+          case (period, entry) =>
+            GlobalStateKey
+              .historicalStakeSnapshotsKey[F](period)
+              .map(k => k -> enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable))
+        }
       }
 
-    val priceStateF: F[List[(GlobalStateKey, Array[Byte])]] =
-      info.priceState.toList.flatMap(_.toList).parTraverse {
-        case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
-      }
+      val kesRegistrationCertsF: F[List[(GlobalStateKey, Array[Byte])]] =
+        info.kesRegistrationCerts.toList.parTraverse {
+          case (peerId, records) =>
+            GlobalStateKey
+              .kesRegistrationCertsKey[F](peerId)
+              .map(_ -> enc[SortedSet[KesRegistrationRecord]](records))
+        }
 
-    // §3 NIPoPoW S0 historical stake snapshots: one entry per stored eta-period (retention cap = 4).
-    // Each entry's value is the scodec-encoded `HistoricalStakeSnapshot` — the combined stake +
-    // eta record (Path 1, heap-leak workstream). Covered by `mptRoot` and gets its own per-field
-    // subtree root via `FId.HistoricalStakeSnapshots` for efficient NIPoPoW Merkle proofs.
-    val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
-      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
-        historicalImmutableCodec => historicalStakeSnapshotImmutable
-      }
-      info.historicalStakeSnapshots.toList.parTraverse {
-        case (period, entry) =>
-          GlobalStateKey
-            .historicalStakeSnapshotsKey[F](period)
-            .map(k => k -> enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable))
-      }
-    }
+      val lastKesRegistrationRefsF: F[List[(GlobalStateKey, Array[Byte])]] =
+        info.lastKesRegistrationRefs.toList.parTraverse {
+          case (peerId, ref) =>
+            GlobalStateKey
+              .lastKesRegistrationRefsKey[F](peerId)
+              .map(_ -> enc[KesRegistrationReference](ref))
+        }
 
-    val kesRegistrationCertsF: F[List[(GlobalStateKey, Array[Byte])]] =
-      info.kesRegistrationCerts.toList.parTraverse {
-        case (peerId, records) =>
-          GlobalStateKey
-            .kesRegistrationCertsKey[F](peerId)
-            .map(_ -> enc[SortedSet[KesRegistrationRecord]](records))
-      }
+      val genesisOperatorKeysF: F[List[(GlobalStateKey, Array[Byte])]] =
+        info.genesisOperatorKeys.toList.parTraverse {
+          case (peerId, record) =>
+            GlobalStateKey
+              .genesisOperatorKey[F](peerId)
+              .map(_ -> enc[GenesisOperatorConsensusKey](record)(genesisOperatorKeyImmutable))
+        }
 
-    val lastKesRegistrationRefsF: F[List[(GlobalStateKey, Array[Byte])]] =
-      info.lastKesRegistrationRefs.toList.parTraverse {
-        case (peerId, ref) =>
-          GlobalStateKey
-            .lastKesRegistrationRefsKey[F](peerId)
-            .map(_ -> enc[KesRegistrationReference](ref))
-      }
+      // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo) per
+      // metagraph address. Delegated to the shared `currencySnapshotEntryBytes` so the producer and the gl1-style follow
+      // verifier (`FollowVerifyCore` / `GlobalStateConverter.currencySnapshotFieldRoots`) encode these bytes through ONE code
+      // path — byte-identity by construction, not by two implementations kept in lockstep.
+      val currencyEntriesF = currencySnapshotEntryBytes[F](info.lastCurrencySnapshots)
+      val systemIndexEntriesF = globalSnapshotSystemIndexEntries[F](info, withdrawalTimeLimit)
 
-    val genesisOperatorKeysF: F[List[(GlobalStateKey, Array[Byte])]] =
-      info.genesisOperatorKeys.toList.parTraverse {
-        case (peerId, record) =>
-          GlobalStateKey
-            .genesisOperatorKey[F](peerId)
-            .map(_ -> enc[GenesisOperatorConsensusKey](record)(genesisOperatorKeyImmutable))
-      }
-
-    // Currency snapshots encode as two separate keys (Signed[CurrencyIncrementalSnapshot] + CurrencySnapshotInfo) per
-    // metagraph address. Delegated to the shared `currencySnapshotEntryBytes` so the producer and the gl1-style follow
-    // verifier (`FollowVerifyCore` / `GlobalStateConverter.currencySnapshotFieldRoots`) encode these bytes through ONE code
-    // path — byte-identity by construction, not by two implementations kept in lockstep.
-    val currencyEntriesF = currencySnapshotEntryBytes[F](info.lastCurrencySnapshots)
-    val systemIndexEntriesF = globalSnapshotSystemIndexEntries[F](info, withdrawalTimeLimit)
-
-    (
-      currencyEntriesF,
-      updateNodeParametersF,
-      priceStateF,
-      systemIndexEntriesF,
-      historicalStakeSnapshotsF,
-      kesRegistrationCertsF,
-      lastKesRegistrationRefsF,
-      genesisOperatorKeysF
-    ).mapN {
       (
-        currencyEntries,
-        unpEntries,
-        priceEntries,
-        systemIndexes,
-        histStakeEntries,
-        kesCertEntries,
-        kesRefEntries,
-        genesisKeyEntries
-      ) =>
-        val systemEntries: Iterable[(GlobalStateKey, Array[Byte])] =
-          systemIndexes.activeAddressIndexes.iterator.map { case (key, addresses) => key -> enc[SortedSet[Address]](addresses) }.toList ++
-            systemIndexes.tokenLockBalanceAddressPairs.iterator.map {
-              case (key, pairs) => key -> enc[SortedSet[(Address, Address)]](pairs)
-            }.toList ++
-            systemIndexes.allowSpendExpiryBuckets.iterator.map {
-              case (key, bucket) => key -> enc[SortedSet[AllowSpendExpiryKey]](bucket)
-            }.toList ++
-            systemIndexes.tokenLockExpiryBuckets.iterator.map {
-              case (key, bucket) => key -> enc[SortedSet[TokenLockExpiryKey]](bucket)
-            }.toList ++
-            systemIndexes.nodeCollateralWithdrawalExpiryBuckets.iterator.map {
-              case (key, bucket) => key -> enc[SortedSet[NodeCollateralWithdrawalExpiryKey]](bucket)
-            }.toList
-        val all: Iterable[(GlobalStateKey, Array[Byte])] =
-          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-            lastAllowSpendRefs ++ lastTokenLockRefs ++
-            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-            metagraphSyncData ++ currencyEntries ++ unpEntries ++ priceEntries ++
-            systemEntries ++
-            histStakeEntries ++ kesCertEntries ++ kesRefEntries ++ genesisKeyEntries
-        all.toMap
+        currencyEntriesF,
+        updateNodeParametersF,
+        priceStateF,
+        systemIndexEntriesF,
+        historicalStakeSnapshotsF,
+        kesRegistrationCertsF,
+        lastKesRegistrationRefsF,
+        genesisOperatorKeysF
+      ).mapN {
+        (
+          currencyEntries,
+          unpEntries,
+          priceEntries,
+          systemIndexes,
+          histStakeEntries,
+          kesCertEntries,
+          kesRefEntries,
+          genesisKeyEntries
+        ) =>
+          val systemEntries: Iterable[(GlobalStateKey, Array[Byte])] =
+            systemIndexes.activeAddressIndexes.iterator.map { case (key, addresses) => key -> enc[SortedSet[Address]](addresses) }.toList ++
+              systemIndexes.tokenLockBalanceAddressPairs.iterator.map {
+                case (key, pairs) => key -> enc[SortedSet[(Address, Address)]](pairs)
+              }.toList ++
+              systemIndexes.allowSpendExpiryBuckets.iterator.map {
+                case (key, bucket) => key -> enc[SortedSet[AllowSpendExpiryKey]](bucket)
+              }.toList ++
+              systemIndexes.tokenLockExpiryBuckets.iterator.map {
+                case (key, bucket) => key -> enc[SortedSet[TokenLockExpiryKey]](bucket)
+              }.toList ++
+              systemIndexes.nodeCollateralWithdrawalExpiryBuckets.iterator.map {
+                case (key, bucket) => key -> enc[SortedSet[NodeCollateralWithdrawalExpiryKey]](bucket)
+              }.toList
+          val all: Iterable[(GlobalStateKey, Array[Byte])] =
+            stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+              activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+              lastAllowSpendRefs ++ lastTokenLockRefs ++
+              activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+              activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+              metagraphSyncData ++ currencyEntries ++ unpEntries ++ priceEntries ++
+              systemEntries ++
+              histStakeEntries ++ kesCertEntries ++ kesRefEntries ++ genesisKeyEntries
+          all.toMap
+      }
     }
   }
 
@@ -1075,128 +1164,135 @@ object GlobalStateConverter {
 
     def enc[V](v: V)(implicit c: ImmutableCodec[V]): Array[Byte] = c.immutableBytes(v).toArray
 
-    val stateChanHashes = acc.lastStateChannelSnapshotHashes.iterator.map {
-      case (addr, h) => GlobalStateKey.metagraph(addr, LastStateChannelSnapshotHashes) -> enc(h)
-    }.toList
-    val txRefs = acc.lastTxRefs.iterator.map { case (addr, r) => GlobalStateKey.hypergraph(LastTxRefs, addr) -> enc(r) }.toList
-    val balances = acc.balances.iterator.map { case (addr, b) => GlobalStateKey.hypergraph(Balances, addr) -> enc(b) }.toList
-    val currencyProofs = acc.lastCurrencySnapshotsProofs.iterator.map {
-      case (addr, p) => GlobalStateKey.metagraph(addr, LastCurrencySnapshotsProofs) -> enc(p)
-    }.toList
-    val activeAllowSpends = acc.activeAllowSpends.toList.flatMap {
-      case (optAddr, inner) =>
-        inner.toList.map {
-          case (addr, s) =>
-            GlobalStateKey.hypergraph(ActiveAllowSpends, optAddr, addr) ->
-              enc[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](s)
+    validateStakeCollateralStructure[F](
+      acc.activeDelegatedStakes,
+      acc.delegatedStakesWithdrawals,
+      acc.activeNodeCollaterals,
+      acc.nodeCollateralWithdrawals
+    ) >> Async[F].defer {
+      val stateChanHashes = acc.lastStateChannelSnapshotHashes.iterator.map {
+        case (addr, h) => GlobalStateKey.metagraph(addr, LastStateChannelSnapshotHashes) -> enc(h)
+      }.toList
+      val txRefs = acc.lastTxRefs.iterator.map { case (addr, r) => GlobalStateKey.hypergraph(LastTxRefs, addr) -> enc(r) }.toList
+      val balances = acc.balances.iterator.map { case (addr, b) => GlobalStateKey.hypergraph(Balances, addr) -> enc(b) }.toList
+      val currencyProofs = acc.lastCurrencySnapshotsProofs.iterator.map {
+        case (addr, p) => GlobalStateKey.metagraph(addr, LastCurrencySnapshotsProofs) -> enc(p)
+      }.toList
+      val activeAllowSpends = acc.activeAllowSpends.toList.flatMap {
+        case (optAddr, inner) =>
+          inner.toList.map {
+            case (addr, s) =>
+              GlobalStateKey.hypergraph(ActiveAllowSpends, optAddr, addr) ->
+                enc[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](s)
+          }
+      }
+      val activeTokenLocks = acc.activeTokenLocks.iterator.map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(ActiveTokenLocks, addr) -> enc[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](s)
+      }.toList
+      val tokenLockBalances = acc.tokenLockBalances.toList.flatMap {
+        case (tokenAddr, inner) =>
+          inner.toList.map { case (holder, bal) => GlobalStateKey.hypergraph(TokenLockBalances, tokenAddr, holder) -> enc(bal) }
+      }
+      val lastAllowSpendRefs = acc.lastAllowSpendRefs.iterator.map {
+        case (addr, r) => GlobalStateKey.hypergraph(LastAllowSpendRefs, addr) -> enc(r)
+      }.toList
+      val lastTokenLockRefs = acc.lastTokenLockRefs.iterator.map {
+        case (addr, r) => GlobalStateKey.hypergraph(LastTokenLockRefs, addr) -> enc(r)
+      }.toList
+      val activeDelegatedStakes = acc.activeDelegatedStakes.iterator.map {
+        case (addr, s) => GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr) -> enc[SortedSet[DelegatedStakeRecord]](s)
+      }.toList
+      val delegatedStakesWithdrawals = acc.delegatedStakesWithdrawals.iterator.map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr) -> enc[SortedSet[PendingDelegatedStakeWithdrawal]](s)
+      }.toList
+      val activeNodeCollaterals = acc.activeNodeCollaterals.iterator.map {
+        case (addr, s) => GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr) -> enc[SortedSet[NodeCollateralRecord]](s)
+      }.toList
+      val nodeCollateralWithdrawals = acc.nodeCollateralWithdrawals.iterator.map {
+        case (addr, s) =>
+          GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr) -> enc[SortedSet[PendingNodeCollateralWithdrawal]](s)
+      }.toList
+      val metagraphSyncData = acc.metagraphSyncData.iterator.map {
+        case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
+      }.toList
+
+      val currencyEntriesF = acc.lastCurrencySnapshots.toList.parTraverse {
+        case (metagraphAddr, Left(fullSnapshot)) =>
+          for {
+            inc <- CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value)
+            infoEntries <- infoEntryBytes[F](metagraphAddr, fullSnapshot.info.toCurrencySnapshotInfo)
+          } yield
+            (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
+              enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs))) :: infoEntries
+        case (metagraphAddr, Right((inc, snInfo))) =>
+          infoEntryBytes[F](metagraphAddr, snInfo).map { infoEntries =>
+            (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
+              enc[Signed[CurrencyIncrementalSnapshot]](inc)) :: infoEntries
+          }
+      }
+
+      val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
+        acc.updateNodeParameters.toList.parTraverse {
+          case (id, rec) =>
+            GlobalStateKey.updateNodeParametersKey[F](id).map(k => k -> enc[(Signed[UpdateNodeParameters], SnapshotOrdinal)](rec))
         }
-    }
-    val activeTokenLocks = acc.activeTokenLocks.iterator.map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(ActiveTokenLocks, addr) -> enc[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](s)
-    }.toList
-    val tokenLockBalances = acc.tokenLockBalances.toList.flatMap {
-      case (tokenAddr, inner) =>
-        inner.toList.map { case (holder, bal) => GlobalStateKey.hypergraph(TokenLockBalances, tokenAddr, holder) -> enc(bal) }
-    }
-    val lastAllowSpendRefs = acc.lastAllowSpendRefs.iterator.map {
-      case (addr, r) => GlobalStateKey.hypergraph(LastAllowSpendRefs, addr) -> enc(r)
-    }.toList
-    val lastTokenLockRefs = acc.lastTokenLockRefs.iterator.map {
-      case (addr, r) => GlobalStateKey.hypergraph(LastTokenLockRefs, addr) -> enc(r)
-    }.toList
-    val activeDelegatedStakes = acc.activeDelegatedStakes.iterator.map {
-      case (addr, s) => GlobalStateKey.hypergraph(ActiveDelegatedStakes, addr) -> enc[SortedSet[DelegatedStakeRecord]](s)
-    }.toList
-    val delegatedStakesWithdrawals = acc.delegatedStakesWithdrawals.iterator.map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(DelegatedStakesWithdrawals, addr) -> enc[SortedSet[PendingDelegatedStakeWithdrawal]](s)
-    }.toList
-    val activeNodeCollaterals = acc.activeNodeCollaterals.iterator.map {
-      case (addr, s) => GlobalStateKey.hypergraph(ActiveNodeCollaterals, addr) -> enc[SortedSet[NodeCollateralRecord]](s)
-    }.toList
-    val nodeCollateralWithdrawals = acc.nodeCollateralWithdrawals.iterator.map {
-      case (addr, s) =>
-        GlobalStateKey.hypergraph(NodeCollateralWithdrawals, addr) -> enc[SortedSet[PendingNodeCollateralWithdrawal]](s)
-    }.toList
-    val metagraphSyncData = acc.metagraphSyncData.iterator.map {
-      case (addr, d) => GlobalStateKey.hypergraph(MetagraphSyncData, addr) -> enc(d)
-    }.toList
 
-    val currencyEntriesF = acc.lastCurrencySnapshots.toList.parTraverse {
-      case (metagraphAddr, Left(fullSnapshot)) =>
-        for {
-          inc <- CurrencyIncrementalSnapshot.fromCurrencySnapshot(fullSnapshot.value)
-          infoEntries <- infoEntryBytes[F](metagraphAddr, fullSnapshot.info.toCurrencySnapshotInfo)
-        } yield
-          (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
-            enc[Signed[CurrencyIncrementalSnapshot]](Signed(inc, fullSnapshot.proofs))) :: infoEntries
-      case (metagraphAddr, Right((inc, snInfo))) =>
-        infoEntryBytes[F](metagraphAddr, snInfo).map { infoEntries =>
-          (GlobalStateKey.metagraph(metagraphAddr, LastIncrementalCurrencySnapshots) ->
-            enc[Signed[CurrencyIncrementalSnapshot]](inc)) :: infoEntries
+      val priceStateF: F[List[(GlobalStateKey, Array[Byte])]] =
+        acc.priceState.toList.parTraverse {
+          case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
         }
-    }
 
-    val updateNodeParametersF: F[List[(GlobalStateKey, Array[Byte])]] =
-      acc.updateNodeParameters.toList.parTraverse {
-        case (id, rec) =>
-          GlobalStateKey.updateNodeParametersKey[F](id).map(k => k -> enc[(Signed[UpdateNodeParameters], SnapshotOrdinal)](rec))
+      // §3 NIPoPoW S0 historical-stake-snapshots delta: empty on non-boundary ordinals, otherwise the new
+      // entry(ies) appended at this boundary. Mirrors the projection in `toAllStateKeyValueBytes`'s
+      // `historicalStakeSnapshotsF` so the writer-bytes match the rebuild-bytes byte-for-byte.
+      val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
+        import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
+          historicalImmutableCodec => historicalStakeSnapshotImmutable
+        }
+        acc.historicalStakeSnapshots.toList.parTraverse {
+          case (period, entry) =>
+            GlobalStateKey
+              .historicalStakeSnapshotsKey[F](period)
+              .map(k => k -> enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable))
+        }
       }
 
-    val priceStateF: F[List[(GlobalStateKey, Array[Byte])]] =
-      acc.priceState.toList.parTraverse {
-        case (tp, rec) => GlobalStateKey.priceStateKey[F](tp).map(k => k -> enc[PriceRecord](rec))
-      }
+      val kesRegistrationCertsF: F[List[(GlobalStateKey, Array[Byte])]] =
+        acc.kesRegistrationCerts.toList.parTraverse {
+          case (peerId, records) =>
+            GlobalStateKey
+              .kesRegistrationCertsKey[F](peerId)
+              .map(_ -> enc[SortedSet[KesRegistrationRecord]](records))
+        }
 
-    // §3 NIPoPoW S0 historical-stake-snapshots delta: empty on non-boundary ordinals, otherwise the new
-    // entry(ies) appended at this boundary. Mirrors the projection in `toAllStateKeyValueBytes`'s
-    // `historicalStakeSnapshotsF` so the writer-bytes match the rebuild-bytes byte-for-byte.
-    val historicalStakeSnapshotsF: F[List[(GlobalStateKey, Array[Byte])]] = {
-      import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{
-        historicalImmutableCodec => historicalStakeSnapshotImmutable
-      }
-      acc.historicalStakeSnapshots.toList.parTraverse {
-        case (period, entry) =>
-          GlobalStateKey
-            .historicalStakeSnapshotsKey[F](period)
-            .map(k => k -> enc[HistoricalStakeSnapshot](entry)(historicalStakeSnapshotImmutable))
-      }
-    }
+      val lastKesRegistrationRefsF: F[List[(GlobalStateKey, Array[Byte])]] =
+        acc.lastKesRegistrationRefs.toList.parTraverse {
+          case (peerId, ref) =>
+            GlobalStateKey
+              .lastKesRegistrationRefsKey[F](peerId)
+              .map(_ -> enc[KesRegistrationReference](ref))
+        }
 
-    val kesRegistrationCertsF: F[List[(GlobalStateKey, Array[Byte])]] =
-      acc.kesRegistrationCerts.toList.parTraverse {
-        case (peerId, records) =>
-          GlobalStateKey
-            .kesRegistrationCertsKey[F](peerId)
-            .map(_ -> enc[SortedSet[KesRegistrationRecord]](records))
+      (
+        currencyEntriesF,
+        updateNodeParametersF,
+        priceStateF,
+        historicalStakeSnapshotsF,
+        kesRegistrationCertsF,
+        lastKesRegistrationRefsF
+      ).mapN { (currencyEntries, unpEntries, priceEntries, histStakeEntries, kesCertEntries, kesRefEntries) =>
+        val all: Iterable[(GlobalStateKey, Array[Byte])] =
+          stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
+            activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
+            lastAllowSpendRefs ++ lastTokenLockRefs ++
+            activeDelegatedStakes ++ delegatedStakesWithdrawals ++
+            activeNodeCollaterals ++ nodeCollateralWithdrawals ++
+            metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
+            histStakeEntries ++ kesCertEntries ++ kesRefEntries
+        all.toMap
       }
-
-    val lastKesRegistrationRefsF: F[List[(GlobalStateKey, Array[Byte])]] =
-      acc.lastKesRegistrationRefs.toList.parTraverse {
-        case (peerId, ref) =>
-          GlobalStateKey
-            .lastKesRegistrationRefsKey[F](peerId)
-            .map(_ -> enc[KesRegistrationReference](ref))
-      }
-
-    (
-      currencyEntriesF,
-      updateNodeParametersF,
-      priceStateF,
-      historicalStakeSnapshotsF,
-      kesRegistrationCertsF,
-      lastKesRegistrationRefsF
-    ).mapN { (currencyEntries, unpEntries, priceEntries, histStakeEntries, kesCertEntries, kesRefEntries) =>
-      val all: Iterable[(GlobalStateKey, Array[Byte])] =
-        stateChanHashes ++ txRefs ++ balances ++ currencyProofs ++
-          activeAllowSpends ++ activeTokenLocks ++ tokenLockBalances ++
-          lastAllowSpendRefs ++ lastTokenLockRefs ++
-          activeDelegatedStakes ++ delegatedStakesWithdrawals ++
-          activeNodeCollaterals ++ nodeCollateralWithdrawals ++
-          metagraphSyncData ++ currencyEntries.flatten ++ unpEntries ++ priceEntries ++
-          histStakeEntries ++ kesCertEntries ++ kesRefEntries
-      all.toMap
     }
   }
 
@@ -2258,24 +2354,6 @@ object GlobalStateConverter {
       def getTokenLockBalance(tokenAddress: Address, holderAddress: Address): F[Option[Balance]] =
         store
           .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, tokenAddress, holderAddress))
-
-      def getDelegatedStakes(address: Address): F[Option[SortedSet[DelegatedStakeRecord]]] =
-        store
-          .get[SortedSet[DelegatedStakeRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveDelegatedStakes, address))
-
-      def getDelegatedStakeWithdrawals(address: Address): F[Option[SortedSet[PendingDelegatedStakeWithdrawal]]] =
-        store
-          .get[SortedSet[PendingDelegatedStakeWithdrawal]](
-            GlobalStateKey.hypergraph(GlobalStateFieldId.DelegatedStakesWithdrawals, address)
-          )
-
-      def getNodeCollaterals(address: Address): F[Option[SortedSet[NodeCollateralRecord]]] =
-        store
-          .get[SortedSet[NodeCollateralRecord]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveNodeCollaterals, address))
-
-      def getNodeCollateralWithdrawals(address: Address): F[Option[SortedSet[PendingNodeCollateralWithdrawal]]] =
-        store
-          .get[SortedSet[PendingNodeCollateralWithdrawal]](GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, address))
 
       def getCurrencySnapshot(metagraphAddress: Address): F[Option[Signed[CurrencySnapshot]]] =
         store

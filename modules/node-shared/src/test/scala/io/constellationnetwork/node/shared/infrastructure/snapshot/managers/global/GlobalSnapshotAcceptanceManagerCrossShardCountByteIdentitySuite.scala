@@ -16,6 +16,7 @@ import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.domain.block.processing._
 import io.constellationnetwork.node.shared.domain.delegatedStake.{UpdateDelegatedStakeAcceptanceManager, UpdateDelegatedStakeValidator}
 import io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.node.{UpdateNodeParametersAcceptanceManager, UpdateNodeParametersAcceptanceResult}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
   UpdateNodeCollateralAcceptanceManager,
@@ -211,7 +212,7 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
       override def accept(
         createEvents: List[Signed[UpdateNodeCollateral.Create]],
         withdrawEvents: List[Signed[UpdateNodeCollateral.Withdraw]],
-        lastSnapshotContext: GlobalSnapshotInfo,
+        parentStateReader: GlobalStateReader[IO],
         epochProgress: EpochProgress,
         ordinal: SnapshotOrdinal,
         delegatedStakeAcceptanceResult: io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult

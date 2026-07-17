@@ -781,13 +781,13 @@ object V4EconomicGrammarManifest {
       delegatedStake,
       Set(Ingress),
       delegatedStakeIds ++ delegatedStakeReleaseIds ++ Set("ECO-GENESIS-DELEGATED-STAKE"),
-      "f43499e3fb57a81dd55ea09828fbe476467216f7ac42c480815be60cf85239a5"
+      "a78ea08f5c800a27266245b23f150120f116ba89730b42cf4757ddcce0911f84"
     ),
     ReviewedSource(
       nodeCollateral,
       Set(Ingress),
       Set("ECO-NODE-COLLATERAL-CREATE", "ECO-NODE-COLLATERAL-WITHDRAW", "ECO-GENESIS-NODE-COLLATERAL"),
-      "da6f7d65286e64872e90b1d98adb00aeee4807f51dff8e53aad74c5767fd6b48"
+      "b929cc0c9537c6782aa0e765b4618a2f2a0dad7537e5ba47d81c35d58523a734"
     ),
     ReviewedSource(
       currencyMessage,
@@ -929,13 +929,13 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/DelegatedStakeStateManager.scala",
       Set(BalanceWriter, StakeWriter, ReferenceWriter),
       delegatedStakeIds ++ delegatedStakeReleaseIds,
-      "4f6ccfea2aceadd6707b8556982d52298353955651ebbc46b224387650699b35"
+      "3ccab25986bc3c548814d2be242fe5f0e2b58d45ae6d43f162d819fcf53d98c4"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/NodeCollateralStateManager.scala",
       Set(BalanceWriter, CollateralWriter, ReferenceWriter),
       Set("ECO-NODE-COLLATERAL-CREATE", "ECO-NODE-COLLATERAL-WITHDRAW"),
-      "935a0fa6bd1caab9ee7e2df6bf40891c6bb27c81d6b39297f7c168518f07f4d4"
+      "d64dfe7e1f92d318ccdcfa1a9dfac7fa0d515a541ea2e6ed38a5ef6f4ac472b0"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/MetagraphSyncManager.scala",
@@ -966,7 +966,7 @@ object V4EconomicGrammarManifest {
         SlashRegistryWriter
       ),
       currentRootedEconomicIds ++ allStateChannelBinaryIds,
-      "4c72575e536974fe8f878016117b5a9d3c8568b8dbfa95d9c742d7e3dc986978"
+      "d1d1a990435bfce049965cd29364ad643429e34b6ad0c0e4a4d880a7c89d7a54"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofSlashManager.scala",
@@ -996,7 +996,7 @@ object V4EconomicGrammarManifest {
       "modules/shared/src/main/scala/io/constellationnetwork/schema/mpt/GlobalStateConverter.scala",
       Set(BalanceWriter, ReservationWriter, ReferenceWriter, NullifierWriter, StakeWriter, CollateralWriter, PriceWriter),
       currentRootedEconomicIds,
-      "18617676e7bb768b0d2267e4b60524f6cbc1c2c9bbc5342ffe966a90df7fb407"
+      "860ba31a974b754c3481e3243ba7606aac9255bc6c049c172bbf1cca910fc406"
     ),
     ReviewedSource(
       block,
@@ -1290,13 +1290,13 @@ object V4EconomicGrammarManifest {
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/DelegatedStakesRoutes.scala",
       Set(DecoderIngress),
       delegatedStakeIds,
-      "73bf9d2281937eff68073a45eaab30fc4ce205aacc8632890e82e1fb51342cf8"
+      "fb2785d1389dd0ab63690cb96abad8b5f5ce8173e466094e5bf82d8a112d682a"
     ),
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/NodeCollateralRoutes.scala",
       Set(DecoderIngress),
       nodeCollateralIds,
-      "99db83e0d60a01225019b1c8bb0851e28638051e3b4e1f04ad546f13bd621d37"
+      "7db438d36dd7bd777f13c6ab3a7037969763f215fbfcf571ec6d6f7981d2f28d"
     ),
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/http/routes/NodeParametersRoutes.scala",
@@ -1362,7 +1362,7 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/delegatedStake/UpdateDelegatedStakeAcceptanceManager.scala",
       Set(Validation),
       delegatedStakeIds,
-      "cd4e8e76cc8c2751e1b12d1042cf5e6074a448889836191ceb2f9e957abe84c7"
+      "cc2fa59cd76bb270f6f68f9f67d1cb72d8247eddfecb040b1df257ca3a8c6c9f"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofValidator.scala",
@@ -1392,7 +1392,7 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nodeCollateral/UpdateNodeCollateralAcceptanceManager.scala",
       Set(Validation),
       nodeCollateralIds,
-      "e2111b669584d3108d59a9c4dfb2df3a18660fd620398edf453fe1d8ff972306"
+      "5e4bbb085d225887427f92b9d58c99a995b09ae9b8b5f0dc43ba4083c6b2652a"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/statechannel/StateChannelValidator.scala",
@@ -1674,7 +1674,7 @@ object V4EconomicGrammarManifest {
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala",
       Set(Ingress, Validation, ConfigurationAuthority),
       currentRootedEconomicIds ++ allStateChannelBinaryIds,
-      "68d1a1071863a5155fda42966b9bc9cae7c726c811d08b7a776c7d0a31ae8b45"
+      "6f48592c4fcfe22e77bc0700c0ca08115c0f17a5329ffd89f5ef33400c1a08d2"
     ),
     ReviewedSource(
       "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoSyncDaemon.scala",
@@ -1812,7 +1812,7 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/DelegatedRewardsDistributor.scala",
       Set(RewardConstruction, RewardWriter, StakeWriter),
       globalRewardIds ++ delegatedStakeIds ++ Set("ECO-NODE-PARAMETERS"),
-      "3b80fa5bd78ada4fa3057c611ad78b9d0a71ae4d494ff276b1428f3dd28653aa"
+      "73fcc08a082e9daba5b6b8eb0a603c91fe4bf575ac18ec7f4d2f6b4a4b22af42"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala",
@@ -1949,13 +1949,13 @@ object V4EconomicGrammarManifest {
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/delegatedStake/UpdateDelegatedStakeValidator.scala",
       Set(Validation),
       delegatedStakeIds,
-      "d51769688d1e3b332bcc96e2636deefd2c78c59230d15711c24e1e6ed31b89e0"
+      "78163b80201da2d3e0ef1cd34d53c7d3ff5a33d99f11a02dda42b9ac317dc157"
     ),
     ReviewedSource(
       "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nodeCollateral/UpdateNodeCollateralValidator.scala",
       Set(Validation),
       nodeCollateralIds,
-      "0f116a691594aca8c7ebfcdd6eb33533efc22236269d4547d57f616342edb92a"
+      "24900358a111c8374cae1f17795cc97db6358c155556efb020d655a9510682be"
     ),
     ReviewedSource(
       "modules/shared/src/main/scala/io/constellationnetwork/currency/validations/DataTransactionsValidator.scala",

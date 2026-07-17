@@ -372,10 +372,9 @@ object StakeRegistry {
     * tip whose ancestor's MPT hasn't been hydrated yet), relative stake falls back to `Ratio(1, validators.size)`. This matches
     * [[stakeWeighted]]'s `snapshotInfoR = None` boot path so the leader-loop wiring elects pre-genesis just like before the migration.
     *
-    * '''§3 NIPoPoW N-2 lookback.''' `relativeStakeAt` is unchanged from [[stakeWeighted]] — the historical-distribution path doesn't read
-    * from the live MPT; it consults `historicalDistributionFor(period)` (which today still reads from
-    * `GlobalSnapshotInfo.historicalStakeSnapshots`). The warmup fall-through reads the current MPT-derived aggregate via the same fallback
-    * chain — empty aggregate → 1/N.
+    * '''§3 NIPoPoW N-2 lookback.''' `relativeStakeAt` consults `historicalDistributionFor(period)` for the exact retained historical
+    * distribution. Production supplies an MPT-backed `HistoricalStakeReader`; the warmup fall-through reads the current MPT-derived
+    * aggregate via the same fallback chain — empty aggregate → 1/N.
     */
   def stakeWeightedMpt[F[_]: Async](
     aggregator: NodeStakeAggregator[F],

@@ -162,7 +162,7 @@ object OperatorConsensusKeySemanticManifestSuite extends SimpleIOSuite {
     * secondary tripwire; any future use of the semantic APIs above is caught by `callKinds` regardless of naming.
     */
   private val blockedKinds: Map[String, Regex] = Map(
-    "blocked-watchtower-assignment" -> raw"\b(?:WatchtowerAssignment|AssignedWatchtower|selectWatchtowers|assignWatchtowers)\b".r,
+    "blocked-watchtower-assignment" -> raw"\b(?:select|assign|draw|sample)Watchtowers?\s*\(".r,
     "blocked-optimistic-vrf-sampling" -> raw"\b(?:OptimisticVrfSampler|FinalityVrfSampler|sampleOptimisticCommittee)\b".r
   )
 

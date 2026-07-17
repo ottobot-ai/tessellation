@@ -70,10 +70,7 @@ object V4CurrencyBrotliJsonEnvelopeVerifierSuite extends MutableIOSuite {
     "version" -> Json.fromString("0.0.1")
   )
 
-  private def fixture(value: Json = sourceValue)(implicit
-    json: JsonSerializer[IO],
-    securityProvider: SecurityProvider[IO]
-  ): IO[Fixture] = {
+  private def fixture(value: Json = sourceValue)(implicit json: JsonSerializer[IO], securityProvider: SecurityProvider[IO]): IO[Fixture] = {
     implicit val sourceHasher: Hasher[IO] = Hasher.forJson[IO]
 
     for {
@@ -125,10 +122,10 @@ object V4CurrencyBrotliJsonEnvelopeVerifierSuite extends MutableIOSuite {
         case Right(verified) =>
           Hash.fromBytesForSync[IO](verified.valueHashPreimageBytes).map { canonicalHash =>
             expect.same(source.signed.proofs, verified.legacyProofs) &&
-              expect.same(source.hash, verified.valueHash) &&
-              expect.same(source.hash, canonicalHash) &&
-              expect.same(sourceContext, verified.context) &&
-              expect(verified.originalCompressedBytes.sameElements(source.bytes))
+            expect.same(source.hash, verified.valueHash) &&
+            expect.same(source.hash, canonicalHash) &&
+            expect.same(sourceContext, verified.context) &&
+            expect(verified.originalCompressedBytes.sameElements(source.bytes))
           }
         case Left(error) => IO.pure(failure(s"expected cryptographically valid raw envelope, got $error"))
       }
@@ -180,7 +177,7 @@ object V4CurrencyBrotliJsonEnvelopeVerifierSuite extends MutableIOSuite {
         expect(
           invalid.zip(invalidLimits).forall {
             case (Right(Left(InvalidDecodeLimits(Some(actual)))), expected) => actual == expected
-            case _                                                         => false
+            case _                                                          => false
           }
         )
   }
@@ -238,10 +235,11 @@ object V4CurrencyBrotliJsonEnvelopeVerifierSuite extends MutableIOSuite {
         changedHash,
         generousLimits(changedBytes)
       )
-    } yield result match {
-      case Left(InvalidSignatures(proofs)) => expect.same(changed.proofs, proofs)
-      case other                           => failure(s"expected invalid-signature rejection, got $other")
-    }
+    } yield
+      result match {
+        case Left(InvalidSignatures(proofs)) => expect.same(changed.proofs, proofs)
+        case other                           => failure(s"expected invalid-signature rejection, got $other")
+      }
   }
 
   test("compressed and decompressed limits reject before semantic verification") { res =>
@@ -355,22 +353,23 @@ object V4CurrencyBrotliJsonEnvelopeVerifierSuite extends MutableIOSuite {
         source.hash,
         generousLimits(source.bytes)
       )
-    } yield result match {
-      case Right(verified) =>
-        val pristineCanonical = verified.valueHashPreimageBytes
-        source.bytes(0) = (source.bytes(0) ^ 0xff).toByte
-        val firstSourceRead = verified.originalCompressedBytes
-        val firstCanonicalRead = verified.valueHashPreimageBytes
-        firstSourceRead(0) = (firstSourceRead(0) ^ 0xff).toByte
-        firstCanonicalRead(0) = (firstCanonicalRead(0) ^ 0xff).toByte
+    } yield
+      result match {
+        case Right(verified) =>
+          val pristineCanonical = verified.valueHashPreimageBytes
+          source.bytes(0) = (source.bytes(0) ^ 0xff).toByte
+          val firstSourceRead = verified.originalCompressedBytes
+          val firstCanonicalRead = verified.valueHashPreimageBytes
+          firstSourceRead(0) = (firstSourceRead(0) ^ 0xff).toByte
+          firstCanonicalRead(0) = (firstCanonicalRead(0) ^ 0xff).toByte
 
-        expect(verified.originalCompressedBytes.sameElements(pristineSource)) &&
+          expect(verified.originalCompressedBytes.sameElements(pristineSource)) &&
           expect(verified.valueHashPreimageBytes.sameElements(pristineCanonical)) &&
           expect(!verified.originalCompressedBytes.sameElements(source.bytes)) &&
           expect(!verified.originalCompressedBytes.sameElements(firstSourceRead)) &&
           expect(!verified.valueHashPreimageBytes.sameElements(firstCanonicalRead))
-      case Left(error) => failure(s"expected cryptographically valid raw envelope, got $error")
-    }
+        case Left(error) => failure(s"expected cryptographically valid raw envelope, got $error")
+      }
   }
 
   test("raw stage-1 evidence exposes no parsed object, active snapshot, hasher, or public constructor") { _ =>

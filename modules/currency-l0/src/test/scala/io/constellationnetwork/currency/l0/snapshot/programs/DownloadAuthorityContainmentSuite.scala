@@ -52,8 +52,8 @@ object DownloadAuthorityContainmentSuite extends MutableIOSuite {
     activeTokenLocks = None
   )
 
-  private def signedSnapshot(info: CurrencySnapshotInfo, keyPair: java.security.KeyPair)(implicit
-    jsonSerializer: JsonSerializer[IO],
+  private def signedSnapshot(info: CurrencySnapshotInfo, keyPair: java.security.KeyPair)(
+    implicit jsonSerializer: JsonSerializer[IO],
     hasher: Hasher[IO],
     securityProvider: SecurityProvider[IO]
   ): IO[Signed[CurrencyIncrementalSnapshot]] =

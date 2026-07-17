@@ -132,10 +132,10 @@ object delegatedStake {
   }
 
   object DelegatedStakeRecord {
-    implicit val order: Order[DelegatedStakeRecord] = Order[SnapshotOrdinal].contramap(_.createdAt)
+    implicit val order: Order[DelegatedStakeRecord] =
+      Order.by(r => (r.createdAt, r.rewards, r.event, r.currentTokenLockRef, r.currentAmount))
 
-    implicit val ordering: Ordering[DelegatedStakeRecord] =
-      Ordering.by(r => (r.createdAt, r.rewards, r.event))
+    implicit val ordering: Ordering[DelegatedStakeRecord] = order.toOrdering
   }
 
   @derive(decoder, encoder, eqv, show)
@@ -152,10 +152,10 @@ object delegatedStake {
   }
 
   object PendingDelegatedStakeWithdrawal {
-    implicit val order: Order[PendingDelegatedStakeWithdrawal] = Order[EpochProgress].contramap(_.createdAt)
+    implicit val order: Order[PendingDelegatedStakeWithdrawal] =
+      Order.by(r => (r.createdAt, r.rewards, r.event, r.acceptedOrdinal, r.currentTokenLockRef, r.currentAmount))
 
-    implicit val ordering: Ordering[PendingDelegatedStakeWithdrawal] =
-      Ordering.by(r => (r.createdAt, r.rewards, r.event))
+    implicit val ordering: Ordering[PendingDelegatedStakeWithdrawal] = order.toOrdering
   }
 
   @derive(eqv, show)

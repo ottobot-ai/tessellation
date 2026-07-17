@@ -129,11 +129,10 @@ object Services {
         .pure[F]
         .toResource
 
-      // §G5: build the MPT-backed state readers used by the reward distributor + RewardsInfoCalculator. Wired ahead
-      // of `delegatorRewards` so its `make` can take them as constructor parameters. Uses the same branch-aware
-      // `pendingReader` (constructed below) so reward calc sees the chain's best-tip view — matches G1's
-      // `NodeStakeAggregator.cached` convention. Note: GSAM constructs its own siblings (with `branchAwareReader`
-      // bound to its in-flight accept's parent branch); these are read-path-only.
+      // §G5: build the MPT-backed state readers used by the read-path reward distributor + RewardsInfoCalculator.
+      // `pendingReader` follows the selected best tip and is therefore appropriate only for HTTP/read-path services.
+      // Consensus proposal construction and follower recreation use `delegatedRewardsForReader` below with a reader
+      // bound to the exact supplied proposal parent; an ambient best-tip reader must never feed a candidate root.
       pendingReader: GlobalStateReader[F] = GlobalStateReader.pending[F](
         sharedStorages.mptOverlay,
         sharedStorages.bestTipFn
@@ -145,17 +144,20 @@ object Services {
       spendTransactionBalanceManagerForRewards =
         io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.SpendTransactionBalanceManager.make[F](pendingReader)
 
-      delegatorRewards <- HasherSelector[F].withCurrent { implicit hasher =>
-        GlobalDelegatedRewardsDistributor
-          .make[F](
-            cfg.environment,
-            DefaultDelegatedRewardsConfigProvider.getConfig(),
-            delegatedStakeStateManagerForRewards,
-            updateNodeParametersStateReader,
-            pendingReader
-          )
-          .pure[F]
+      delegatedRewardsForReader <- HasherSelector[F].withCurrent { implicit hasher =>
+        val factory: GlobalStateReader[F] => io.constellationnetwork.node.shared.infrastructure.snapshot.DelegatedRewardsDistributor[F] =
+          reader =>
+            GlobalDelegatedRewardsDistributor.make[F](
+              cfg.environment,
+              DefaultDelegatedRewardsConfigProvider.getConfig(),
+              io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.DelegatedStakeStateManager.make[F](reader),
+              io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.UpdateNodeParametersStateReader.make[F](reader),
+              reader
+            )
+        factory.pure[F]
       }.toResource
+
+      delegatorRewards = delegatedRewardsForReader(pendingReader)
 
       rewardsInfoCalculator = RewardsInfoCalculator.make(
         delegatorRewards,
@@ -281,6 +283,7 @@ object Services {
             feeConfigs = cfg.shared.feeConfigs,
             client,
             rewardsService,
+            delegatedRewardsForReader,
             txHasher,
             sharedStorages.lastNGlobalSnapshot,
             sharedStorages.lastGlobalSnapshot,
@@ -291,6 +294,7 @@ object Services {
             sharedStorages.setBestTipFn,
             sharedStorages.setDeepStateReader,
             pendingReader,
+            sharedStorages.bestTipFn,
             eventMempoolService,
             loggerBundle,
             queues.rumor,

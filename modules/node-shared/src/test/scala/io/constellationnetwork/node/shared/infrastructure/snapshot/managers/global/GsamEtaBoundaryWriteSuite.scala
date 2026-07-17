@@ -14,10 +14,14 @@ import io.constellationnetwork.node.shared.infrastructure.snapshot.{DelegatedRew
 import io.constellationnetwork.node.shared.modules.SharedServices
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.balance.Amount
+import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot}
+import io.constellationnetwork.schema.nakamoto.{EpochStakeSnapshotter, EtaPeriod, HistoricalStakeSnapshot}
+import io.constellationnetwork.schema.tokenLock.TokenLockAmount
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.key.ops.PublicKeyOps
+import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.statechannel.StateChannelValidationType
 
 import eu.timepit.refined.auto._
@@ -97,16 +101,16 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
       totalEmittedRewardsAmount = Amount.empty
     ).pure[IO]
 
-  // Run accept() at the given boundary ordinal and return the post-accept GSI's per-period entry.
-  private def runBoundary(
+  private def runBoundaryInfo(
     mgr: GlobalSnapshotAcceptanceManager[IO],
     boundaryOrd: Long,
-    expectedPeriod: Long,
     parentTip: io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId =
       io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
-    pinnedBoundaryEta: Option[Hash] = None
-  ): IO[Option[HistoricalStakeSnapshot]] = {
-    val priorInfo = mkGlobalSnapshotInfo()
+    pinnedBoundaryEta: Option[Hash] = None,
+    priorInfo: GlobalSnapshotInfo = mkGlobalSnapshotInfo(),
+    delegatedStakeCreates: List[Signed[UpdateDelegatedStake.Create]] = List.empty,
+    rewardsFn: RewardsInput => IO[DelegatedRewardsResult] = emptyRewardsFn
+  ): IO[GlobalSnapshotInfo] =
     for {
       result <- mgr.accept(
         ordinal = SnapshotOrdinal(NonNegLong.unsafeFrom(boundaryOrd)),
@@ -117,22 +121,33 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         tokenLockBlocksForAcceptance = List.empty,
         scEvents = List.empty,
         unpEvents = List.empty,
-        cdsEvents = List.empty,
+        cdsEvents = delegatedStakeCreates,
         wdsEvents = List.empty,
         cncEvents = List.empty,
         wncEvents = List.empty,
         lastSnapshotContext = priorInfo,
         lastActiveTips = SortedSet.empty,
         lastDeprecatedTips = SortedSet.empty,
-        calculateRewardsFn = emptyRewardsFn,
+        calculateRewardsFn = rewardsFn,
         validationType = StateChannelValidationType.Full,
         getGlobalSnapshotByOrdinal = _ => IO.pure(None),
         parentTip = parentTip,
         pinnedBoundaryEta = pinnedBoundaryEta
       )
       (_, _, _, _, _, _, _, _, snapshotInfo, _, _, _, _, _, _, _, _) = result
-    } yield snapshotInfo.historicalStakeSnapshots.get(EtaPeriod(expectedPeriod))
-  }
+    } yield snapshotInfo
+
+  // Run accept() at the given boundary ordinal and return the post-accept GSI's per-period entry.
+  private def runBoundary(
+    mgr: GlobalSnapshotAcceptanceManager[IO],
+    boundaryOrd: Long,
+    expectedPeriod: Long,
+    parentTip: io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId =
+      io.constellationnetwork.node.shared.domain.nakamoto.overlay.BranchId.passthrough,
+    pinnedBoundaryEta: Option[Hash] = None
+  ): IO[Option[HistoricalStakeSnapshot]] =
+    runBoundaryInfo(mgr, boundaryOrd, parentTip, pinnedBoundaryEta)
+      .map(_.historicalStakeSnapshots.get(EtaPeriod(expectedPeriod)))
 
   test("regression: with etaForPeriod=None the boundary write lands Hash.empty (pre-fix behavior)") { res =>
     implicit val (h, sp) = res
@@ -146,6 +161,46 @@ object GsamEtaBoundaryWriteSuite extends MutableIOSuite {
         entry.isDefined,
         // ...but the eta is `Hash.empty` — the bug surface area Path 1 fixes.
         entry.map(_.eta).contains(Hash.empty)
+      )
+  }
+
+  test("boundary stake snapshot includes delegated stake accepted at the closing ordinal") { res =>
+    implicit val (h, sp) = res
+
+    for {
+      nodeKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      nodeId = nodeKeyPair.getPublic.toId.toPeerId
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKeyPair.getPublic.toAddress
+      tokenLock <- mkTokenLock(sourceKeyPair, TokenLockAmount(900L), replaceTokenLockRef = none)
+      hashedTokenLock <- tokenLock.toHashed
+      create <- mkDelegatedStakeCreate(sourceKeyPair, nodeId, hashedTokenLock)
+      nodeParameters <- mkUpdateNodeParameters(nodeKeyPair, nodeId, rewardFraction = 7_000_000)
+      priorInfo = mkGlobalSnapshotInfo(
+        activeTokenLocks = SortedMap(source -> SortedSet(tokenLock)).some,
+        updateNodeParameters = SortedMap(
+          nodeParameters.proofs.head.id -> (nodeParameters, SnapshotOrdinal(NonNegLong(1L)))
+        ).some
+      )
+      mgr <- mkManager(initialSnapshotInfo = priorInfo.some, etaRotationSnapshots = R, etaForPeriod = None)
+      postInfo <- runBoundaryInfo(
+        mgr,
+        boundaryOrd = 9L,
+        priorInfo = priorInfo,
+        delegatedStakeCreates = List(create),
+        rewardsFn = delegatedRewardsFunction(priorInfo)
+      )
+      boundaryEntry = postInfo.historicalStakeSnapshots.get(EtaPeriod(0L))
+      expected = EpochStakeSnapshotter.snapshot(postInfo)
+      activeAmount = postInfo.activeDelegatedStakes
+        .flatMap(_.get(source))
+        .flatMap(_.headOption)
+        .map(_.amount.value.value)
+    } yield
+      expect.all(
+        activeAmount.contains(900L),
+        expected.stakeOf(nodeId) == BigInt(900L),
+        boundaryEntry.exists(_.stakes == expected)
       )
   }
 

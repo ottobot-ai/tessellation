@@ -25,6 +25,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceResult,
   UpdateDelegatedStakeValidator
 }
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.node.{UpdateNodeParametersAcceptanceManager, UpdateNodeParametersAcceptanceResult}
 import io.constellationnetwork.node.shared.domain.nodeCollateral.{
   UpdateNodeCollateralAcceptanceManager,
@@ -148,18 +149,50 @@ object Mocks {
         AllowSpendBlockAcceptanceContextUpdate.empty.asRight.pure[IO]
     }
 
-    val mockTokenLockBlockAcceptanceManager = new TokenLockBlockAcceptanceManager[IO] {
+    val tokenLockAcceptanceLogic = TokenLockBlockAcceptanceLogic.make[IO]
+    val tokenLockBlockAcceptanceManager = new TokenLockBlockAcceptanceManager[IO] {
+      private def transactionChains(block: Signed[TokenLockBlock]) =
+        block.value.tokenLocks.toList
+          .groupBy(_.source)
+          .view
+          .mapValues(transactions => NonEmptyList.fromListUnsafe(transactions.sorted))
+          .toMap
+
       override def acceptBlocksIteratively(
         blocks: List[Signed[TokenLockBlock]],
         context: TokenLockBlockAcceptanceContext[IO],
         snapshotOrdinal: SnapshotOrdinal,
         shouldPerformMetagraphSpecificValidations: Boolean,
         lastGlobalSnapshotEpochProgress: Option[EpochProgress]
-      )(implicit hasher: Hasher[IO]): IO[TokenLockBlockAcceptanceResult] = TokenLockBlockAcceptanceResult(
-        contextUpdate = TokenLockBlockAcceptanceContextUpdate.empty,
-        accepted = blocks, // Accept all blocks for testing
-        notAccepted = List.empty[(Signed[TokenLockBlock], TokenLockBlockNotAcceptedReason)]
-      ).pure[IO]
+      )(implicit hasher: Hasher[IO]): IO[TokenLockBlockAcceptanceResult] = {
+        def go(
+          initState: TokenLockBlockAcceptanceState,
+          toProcess: List[(Signed[TokenLockBlock], Map[Address, NonEmptyList[Signed[TokenLock]]])]
+        ): IO[TokenLockBlockAcceptanceState] =
+          toProcess
+            .foldLeftM(initState.copy(awaiting = List.empty)) {
+              case (state, blockAndChains @ (block, chains)) =>
+                tokenLockAcceptanceLogic
+                  .acceptBlock(block, chains, context, state.contextUpdate, shouldPerformMetagraphSpecificValidations)(hasher)
+                  .value
+                  .map {
+                    case Right(update) => state.copy(contextUpdate = update, accepted = state.accepted :+ block)
+                    case Left(reason: TokenLockBlockRejectionReason) =>
+                      state.copy(rejected = state.rejected :+ (block -> reason))
+                    case Left(reason: TokenLockBlockAwaitReason) =>
+                      state.copy(awaiting = state.awaiting :+ (blockAndChains -> reason))
+                  }
+            }
+            .flatMap { next =>
+              if (next == initState) next.pure[IO]
+              else go(next, next.awaiting.map(_._1))
+            }
+
+        go(
+          TokenLockBlockAcceptanceState.withRejectedBlocks(List.empty),
+          blocks.sorted.map(block => block -> transactionChains(block))
+        ).map(_.toBlockAcceptanceResult)
+      }
 
       override def acceptBlock(
         block: Signed[TokenLockBlock],
@@ -168,7 +201,15 @@ object Mocks {
         shouldPerformMetagraphSpecificValidations: Boolean,
         lastGlobalSnapshotEpochProgress: Option[EpochProgress]
       )(implicit hasher: Hasher[IO]): IO[Either[TokenLockBlockNotAcceptedReason, TokenLockBlockAcceptanceContextUpdate]] =
-        TokenLockBlockAcceptanceContextUpdate.empty.asRight.pure[IO]
+        tokenLockAcceptanceLogic
+          .acceptBlock(
+            block,
+            transactionChains(block),
+            context,
+            TokenLockBlockAcceptanceContextUpdate.empty,
+            shouldPerformMetagraphSpecificValidations
+          )(hasher)
+          .value
     }
 
     val mockStateChannelEventsProcessor = new GlobalSnapshotStateChannelEventsProcessor[IO] {
@@ -242,7 +283,7 @@ object Mocks {
       def accept(
         createEvents: List[Signed[UpdateNodeCollateral.Create]],
         withdrawEvents: List[Signed[UpdateNodeCollateral.Withdraw]],
-        lastSnapshotContext: GlobalSnapshotInfo,
+        parentStateReader: GlobalStateReader[IO],
         epochProgress: EpochProgress,
         ordinal: SnapshotOrdinal,
         delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
@@ -350,7 +391,7 @@ object Mocks {
                       AppEnvironment.Dev,
                       blockAcceptanceManager = mockBlockAcceptanceManager,
                       allowSpendBlockAcceptanceManager = mockAllowSpendBlockAcceptanceManager,
-                      tokenLockBlockAcceptanceManager = mockTokenLockBlockAcceptanceManager,
+                      tokenLockBlockAcceptanceManager = tokenLockBlockAcceptanceManager,
                       stateChannelEventsProcessor = mockStateChannelEventsProcessor,
                       updateNodeParametersAcceptanceManager = mockUpdateNodeParametersAcceptanceManager,
                       updateDelegatedStakeAcceptanceManager = updateDelegatedStakeAcceptanceManager,

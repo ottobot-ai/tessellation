@@ -3,6 +3,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import cats.effect._
 import cats.syntax.all._
 
+import scala.concurrent.duration._
+
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
@@ -15,6 +17,7 @@ import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.mpt.producer.{InMemoryMerklePatriciaProducer, TerminalPhysicalTrieKeyCollision}
+import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.StringCodec._
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 
@@ -46,11 +49,67 @@ object MptOverlaySuite extends MutableIOSuite {
       store <- MptStore.make[IO, GlobalStateKey](mptProducer, GlobalStateKey.toHex[IO])
     } yield store
 
+  private def pauseFirstRawPrefixRead(
+    delegate: MptStore[IO, GlobalStateKey],
+    readCount: Ref[IO, Int],
+    firstReadStarted: Deferred[IO, Unit],
+    releaseFirstRead: Deferred[IO, Unit]
+  ): MptStore[IO, GlobalStateKey] = new MptStore[IO, GlobalStateKey] {
+    override def get[V: ImmutableCodec](key: GlobalStateKey) = delegate.get[V](key)
+    override def getStrict[V: ImmutableCodec](key: GlobalStateKey) = delegate.getStrict[V](key)
+    override def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]) = delegate.getMany[V](keys)
+    override def getAllForPrefix[V: ImmutableCodec](prefix: Hex) = delegate.getAllForPrefix[V](prefix)
+    override def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex) = delegate.getAllForPrefixStrict[V](prefix)
+    override def rawEntriesForPrefixStrict(prefix: Hex) =
+      readCount.getAndUpdate(_ + 1).flatMap {
+        case 0 => firstReadStarted.complete(()) >> releaseFirstRead.get >> delegate.rawEntriesForPrefixStrict(prefix)
+        case _ => delegate.rawEntriesForPrefixStrict(prefix)
+      }
+    override def insert[V: ImmutableCodec](key: GlobalStateKey, value: V) = delegate.insert(key, value)
+    override def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]) = delegate.insert(entries)
+    override def remove(key: GlobalStateKey) = delegate.remove(key)
+    override def remove(keys: List[GlobalStateKey]) = delegate.remove(keys)
+    override def contains(key: GlobalStateKey) = delegate.contains(key)
+    override def isEmpty = delegate.isEmpty
+    override def clear = delegate.clear
+    override def build(ordinal: SnapshotOrdinal) = delegate.build(ordinal)
+    override def sync[V: ImmutableCodec](newState: Map[GlobalStateKey, V], ordinal: SnapshotOrdinal) =
+      delegate.sync(newState, ordinal)
+    override def commit(ordinal: SnapshotOrdinal) = delegate.commit(ordinal)
+    override def lastPersistedOrdinal = delegate.lastPersistedOrdinal
+    override def syncFull[V: ImmutableCodec](newState: Map[GlobalStateKey, V], ordinal: SnapshotOrdinal) =
+      delegate.syncFull(newState, ordinal)
+    override def syncFullIfNeeded[V: ImmutableCodec](newState: => IO[Map[GlobalStateKey, V]], ordinal: SnapshotOrdinal) =
+      delegate.syncFullIfNeeded(newState, ordinal)
+    override def update[V: ImmutableCodec](toUpsert: Map[GlobalStateKey, V], toRemove: Set[GlobalStateKey]) =
+      delegate.update(toUpsert, toRemove)
+    override def underlying = delegate.underlying
+    override def allEntriesAsBytes = delegate.allEntriesAsBytes
+    override def allEntriesStrict = delegate.allEntriesStrict
+    override def loadBytes(entries: Map[Hex, Array[Byte]], ordinal: SnapshotOrdinal) = delegate.loadBytes(entries, ordinal)
+    override def loadPersisted(ordinal: SnapshotOrdinal) = delegate.loadPersisted(ordinal)
+    override def deleteAbove(ordinal: SnapshotOrdinal) = delegate.deleteAbove(ordinal)
+    override def savepoint = delegate.savepoint
+    override def withTransaction[A](body: IO[(A, MptTxAction)]) = delegate.withTransaction(body)
+    override def withExclusiveLock[A](fa: IO[A]) = delegate.withExclusiveLock(fa)
+  }
+
   private def addr(seed: Int): Address =
     Address.fromBytes(s"mpt-overlay-suite-seed-$seed".getBytes("UTF-8"))
 
   private def gskBalance(seed: Int): GlobalStateKey =
     GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, addr(seed))
+
+  private def capturedBalance(
+    captured: Map[Hex, List[StrictMptRawEntry]],
+    prefix: Hex
+  ): Option[Balance] =
+    captured.get(prefix).flatMap(_.headOption).flatMap(_.rawBytes).flatMap { bytes =>
+      StrictMptRead.fromStoredBytes[Balance](bytes.toArray) match {
+        case StrictMptRead.Present(value, _) => Some(value)
+        case _                               => None
+      }
+    }
 
   private val ordinal: SnapshotOrdinal = SnapshotOrdinal(NonNegLong(1L))
 
@@ -351,6 +410,74 @@ object MptOverlaySuite extends MutableIOSuite {
         aSeesKeyB.isEmpty, // ← isolation: B's write not visible from A
         bSeesKeyA.isEmpty, // ← isolation: A's write not visible from B
         bSeesKeyB.contains(Balance(NonNegLong(22L)))
+      )
+  }
+
+  test("multi-branch multi-prefix capture blocks finalization and cannot return a hybrid branch image") { res =>
+    implicit val (h, _, js) = res
+    val key1 = gskBalance(110)
+    val key2 = gskBalance(111)
+
+    for {
+      underlying <- mkStore
+      _ <- underlying.insert[Balance](
+        Map(
+          key1 -> Balance(NonNegLong(1L)),
+          key2 -> Balance(NonNegLong(10L))
+        )
+      )
+      readCount <- Ref.of[IO, Int](0)
+      firstReadStarted <- Deferred[IO, Unit]
+      releaseFirstRead <- Deferred[IO, Unit]
+      store = pauseFirstRawPrefixRead(underlying, readCount, firstReadStarted, releaseFirstRead)
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = MptOverlay.OverlayMode.productionDefault,
+        store,
+        pcTree,
+        GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      handleA <- overlay.checkout(parentP)
+      _ <- handleA.insert[Balance](
+        Map(
+          key1 -> Balance(NonNegLong(2L)),
+          key2 -> Balance(NonNegLong(20L))
+        )
+      )
+      _ <- overlay.commit(handleA, branchA, ordinal)
+      handleB <- overlay.checkout(parentP)
+      _ <- handleB.insert[Balance](
+        Map(
+          key1 -> Balance(NonNegLong(3L)),
+          key2 -> Balance(NonNegLong(30L))
+        )
+      )
+      _ <- overlay.commit(handleB, branchB, ordinal)
+      prefix1 <- GlobalStateKey.toHex[IO](key1)
+      prefix2 <- GlobalStateKey.toHex[IO](key2)
+      captureFiber <- overlay.rawEntriesForPrefixesStrict(branchA, List(prefix1, prefix2)).start
+      _ <- firstReadStarted.get
+      finalizeStarted <- Deferred[IO, Unit]
+      finalizeDone <- Deferred[IO, FinalizationOutcome]
+      finalizeFiber <- (finalizeStarted.complete(()) >>
+        overlay.finalizeBranch(branchB, ordinal).flatTap(finalizeDone.complete)).start
+      _ <- finalizeStarted.get
+      _ <- IO.sleep(100.millis)
+      prematureFinalize <- finalizeDone.tryGet
+      _ <- releaseFirstRead.complete(())
+      captured <- captureFiber.joinWithNever
+      finalized <- finalizeFiber.joinWithNever
+      base1 <- underlying.get[Balance](key1)
+      base2 <- underlying.get[Balance](key2)
+    } yield
+      expect.all(
+        prematureFinalize.isEmpty,
+        capturedBalance(captured, prefix1).contains(Balance(NonNegLong(2L))),
+        capturedBalance(captured, prefix2).contains(Balance(NonNegLong(20L))),
+        finalized.isInstanceOf[FinalizationOutcome.Folded],
+        base1.contains(Balance(NonNegLong(3L))),
+        base2.contains(Balance(NonNegLong(30L)))
       )
   }
 

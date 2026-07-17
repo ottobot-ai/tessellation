@@ -1,21 +1,16 @@
 package io.constellationnetwork.node.shared.domain.nodeCollateral
 
+import cats.Order
 import cats.data.NonEmptyChain
 import cats.data.Validated.{Invalid, Valid}
 import cats.effect.Async
 import cats.syntax.all._
 
-import scala.collection.MapView
-
 import io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
-import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator.{
-  DuplicatedCreate,
-  UpdateNodeCollateralValidationError,
-  UpdateNodeCollateralValidationErrorOr
-}
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralReference, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
@@ -24,20 +19,19 @@ import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.syntax.sortedCollection.sortedMapSyntax
 
-import eu.timepit.refined.types.numeric.NonNegLong
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 /** Accepts or rejects node collateral create/withdraw events for inclusion in a global snapshot.
   *
-  * '''Determinism''': Creates are sorted and processed with a first-wins acceptance context. Withdrawals use `traverse` for validation and
-  * `foldLeft` for partitioning accepted/rejected results.
+  * '''Determinism''': Creates and withdrawals are sorted by the protocol `Signed` ordering and processed with first-wins acceptance
+  * contexts. Only accepted events reserve duplicate keys.
   */
 trait UpdateNodeCollateralAcceptanceManager[F[_]] {
 
   def accept(
     creates: List[Signed[UpdateNodeCollateral.Create]],
     withdrawals: List[Signed[UpdateNodeCollateral.Withdraw]],
-    lastSnapshotContext: GlobalSnapshotInfo,
+    parentStateReader: GlobalStateReader[F],
     lastGlobalEpochProgress: EpochProgress,
     lastSnapshotOrdinal: SnapshotOrdinal,
     updateDelegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
@@ -60,6 +54,16 @@ object UpdateNodeCollateralAcceptanceManager {
     val empty: CreateAcceptanceResult = CreateAcceptanceResult(List.empty, List.empty, Set.empty, Set.empty, Set.empty, Set.empty)
   }
 
+  private case class WithdrawalAcceptanceResult(
+    accepted: List[Signed[UpdateNodeCollateral.Withdraw]],
+    rejected: List[(Signed[UpdateNodeCollateral.Withdraw], NonEmptyChain[UpdateNodeCollateralValidationError])],
+    acceptedReferences: Set[(Address, Hash)]
+  )
+
+  private object WithdrawalAcceptanceResult {
+    val empty: WithdrawalAcceptanceResult = WithdrawalAcceptanceResult(List.empty, List.empty, Set.empty)
+  }
+
   def make[F[_]: Async: SecurityProvider](validator: UpdateNodeCollateralValidator[F]) =
     new UpdateNodeCollateralAcceptanceManager[F] {
       private val logger = Slf4jLogger.getLoggerFromClass[F](getClass)
@@ -67,7 +71,8 @@ object UpdateNodeCollateralAcceptanceManager {
       private def processCreateValidation(
         acc: CreateAcceptanceResult,
         signed: Signed[UpdateNodeCollateral.Create],
-        validated: UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Create]]
+        validated: UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Create]],
+        delegatedStakeTokenLockReferences: Set[Hash]
       ): CreateAcceptanceResult = {
         val duplicatesAcceptedContext =
           acc.acceptedSources(signed.source) ||
@@ -76,17 +81,16 @@ object UpdateNodeCollateralAcceptanceManager {
             acc.acceptedNodes((signed.source, signed.nodeId))
 
         validated match {
+          case Valid(_) if delegatedStakeTokenLockReferences(signed.tokenLockRef) =>
+            acc.copy(
+              rejected = (signed, NonEmptyChain.of(DelegatedStakeTokenLockConflict(signed.tokenLockRef))) :: acc.rejected
+            )
           case Valid(_) if duplicatesAcceptedContext =>
-            CreateAcceptanceResult(
-              acc.accepted,
-              (
+            acc.copy(
+              rejected = (
                 signed,
                 NonEmptyChain.of(DuplicatedCreate(signed.source, signed.nodeId, signed.tokenLockRef, signed.parent))
-              ) :: acc.rejected,
-              acc.acceptedSources,
-              acc.acceptedTokenLockRefs,
-              acc.acceptedParents,
-              acc.acceptedNodes
+              ) :: acc.rejected
             )
           case Valid(accepted) =>
             CreateAcceptanceResult(
@@ -109,76 +113,82 @@ object UpdateNodeCollateralAcceptanceManager {
         }
       }
 
+      private def processWithdrawalValidation(
+        acc: WithdrawalAcceptanceResult,
+        signed: Signed[UpdateNodeCollateral.Withdraw],
+        validated: UpdateNodeCollateralValidationErrorOr[Signed[UpdateNodeCollateral.Withdraw]]
+      ): WithdrawalAcceptanceResult = {
+        val reference = signed.source -> signed.collateralRef
+
+        validated match {
+          case Valid(_) if acc.acceptedReferences(reference) =>
+            acc.copy(
+              rejected = (signed, NonEmptyChain.of(DuplicatedWithdrawal(signed.source, signed.collateralRef))) :: acc.rejected
+            )
+          case Valid(accepted) =>
+            acc.copy(
+              accepted = accepted :: acc.accepted,
+              acceptedReferences = acc.acceptedReferences + reference
+            )
+          case Invalid(errors) =>
+            acc.copy(rejected = (signed, errors) :: acc.rejected)
+        }
+      }
+
       def accept(
         creates: List[Signed[UpdateNodeCollateral.Create]],
         withdrawals: List[Signed[UpdateNodeCollateral.Withdraw]],
-        lastSnapshotContext: GlobalSnapshotInfo,
+        parentStateReader: GlobalStateReader[F],
         lastGlobalEpochProgress: EpochProgress,
         lastSnapshotOrdinal: SnapshotOrdinal,
         updateDelegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
       ): F[UpdateNodeCollateralAcceptanceResult] = {
-
-        def partitionAccepted[A](validated: List[UpdateNodeCollateralValidationErrorOr[A]], signed: List[A]) =
-          validated
-            .zip(signed)
-            .foldLeft(
-              (
-                List.empty[A],
-                List.empty[(A, NonEmptyChain[UpdateNodeCollateralValidationError])]
-              )
-            ) {
-              case ((accepted, notAccepted), (validated, signed)) =>
-                validated match {
-                  case Valid(a)   => (a :: accepted, notAccepted)
-                  case Invalid(e) => (accepted, (signed, e) :: notAccepted)
-                }
-            }
-
         // Defensive sort for deterministic partition ordering across all peers.
-        val sortedCreates = creates.sortBy(_.show)
-        val sortedWithdrawals = withdrawals.sortBy(_.show)
+        val sortedCreates = creates.sorted(Signed.ordering(Order[UpdateNodeCollateral.Create].toOrdering))
+        val sortedWithdrawals = withdrawals.sorted(Signed.ordering(Order[UpdateNodeCollateral.Withdraw].toOrdering))
+        val delegatedStakeTokenLockReferences = updateDelegatedStakeAcceptanceResult.acceptedCreates.values
+          .flatMap(_.map(_._1.tokenLockRef))
+          .toSet
+
         for {
           createResult <- sortedCreates.foldLeftM(CreateAcceptanceResult.empty) { (acc, signed) =>
-            validator.validateCreateNodeCollateral(signed, lastSnapshotContext).map(processCreateValidation(acc, signed, _))
+            validator
+              .validateCreateNodeCollateral(signed, parentStateReader)
+              .map(processCreateValidation(acc, signed, _, delegatedStakeTokenLockReferences))
           }
-          validatedWithdrawals <- sortedWithdrawals.traverse(signed =>
-            validator.validateWithdrawNodeCollateral(signed, lastSnapshotContext)
-          )
+          withdrawalResult <- sortedWithdrawals.foldLeftM(WithdrawalAcceptanceResult.empty) { (acc, signed) =>
+            validator
+              .validateWithdrawNodeCollateral(signed, parentStateReader)
+              .map(processWithdrawalValidation(acc, signed, _))
+          }
           acceptedCreates = createResult.accepted
           notAcceptedCreates = createResult.rejected
-          (acceptedWithdrawals, notAcceptedWithdrawals) = partitionAccepted(validatedWithdrawals, sortedWithdrawals)
-
-          delegatedStakeTokenLockReferences = updateDelegatedStakeAcceptanceResult.acceptedCreates.values
-            .flatMap(_.map(_._1.tokenLockRef))
-            .toSet
 
           acceptedCreatesMap <- acceptedCreates
-            .filterNot(c => delegatedStakeTokenLockReferences(c.tokenLockRef))
             .map(c => (c, lastSnapshotOrdinal))
             .traverse { case (signed, ord) => signed.proofs.head.id.toAddress.map((_, (signed, ord))) }
             .map(_.groupBy(_._1).view.mapValues(_.map(_._2)).toSortedMap)
 
-          acceptedWithdrawalsMap <- acceptedWithdrawals
+          acceptedWithdrawalsMap <- withdrawalResult.accepted
             .map(w => (w, lastGlobalEpochProgress))
             .traverse { case (signed, epoch) => signed.proofs.head.id.toAddress.map((_, (signed, epoch))) }
             .map(_.groupBy(_._1).view.mapValues(_.map(_._2)).toSortedMap)
 
-          filteredByDelegStake = acceptedCreates.size - acceptedCreatesMap.values.map(_.size).sum
           _ <- logger.info(
             s"[NODE_COLLATERAL] ordinal=${lastSnapshotOrdinal.show} " +
               s"input: creates=${creates.size} withdrawals=${withdrawals.size} " +
               s"delegStakeTokenLockRefs=${delegatedStakeTokenLockReferences.size} | " +
               s"result: acceptedCreates=${acceptedCreatesMap.values.map(_.size).sum} " +
-              s"rejectedCreates=${notAcceptedCreates.size} filteredByDelegStake=$filteredByDelegStake " +
+              s"rejectedCreates=${notAcceptedCreates.size} " +
               s"acceptedWithdrawals=${acceptedWithdrawalsMap.values.map(_.size).sum} " +
-              s"rejectedWithdrawals=${notAcceptedWithdrawals.size}"
+              s"rejectedWithdrawals=${withdrawalResult.rejected.size}"
           )
         } yield
           UpdateNodeCollateralAcceptanceResult(
             acceptedCreatesMap,
             notAcceptedCreates,
             acceptedWithdrawalsMap,
-            notAcceptedWithdrawals
+            withdrawalResult.rejected
           )
       }
     }
