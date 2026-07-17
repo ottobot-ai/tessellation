@@ -2081,10 +2081,6 @@ object GlobalStateConverter {
         store
           .get[TokenLockReference](GlobalStateKey.hypergraph(GlobalStateFieldId.LastTokenLockRefs, address))
 
-      def getActiveTokenLocks(address: Address): F[Option[SortedSet[Signed[TokenLock]]]] =
-        store
-          .get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, address))
-
       def getTokenLockBalance(tokenAddress: Address, holderAddress: Address): F[Option[Balance]] =
         store
           .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.TokenLockBalances, tokenAddress, holderAddress))

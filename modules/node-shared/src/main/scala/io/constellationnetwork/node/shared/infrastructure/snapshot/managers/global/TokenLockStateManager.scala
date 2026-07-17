@@ -5,7 +5,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ActiveTokenLockMptReader, GlobalStateReader}
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelAcceptanceResult.CurrencySnapshotWithState
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.address.Address
@@ -124,7 +124,7 @@ trait TokenLockStateManager[F[_]] {
     expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
-  /** MPT-backed `acceptTokenLocks`. Reads current active sets per-address via `mptStore.getActiveTokenLocks` instead of iterating an
+  /** MPT-backed `acceptTokenLocks`. Reads current active sets per-address through the strict native field-8 reader instead of iterating an
     * in-memory map. Returns deltas + removedKeys + expiry-index delta; caller reconstructs full state if needed.
     */
   def acceptTokenLocksFromMpt(
@@ -151,8 +151,7 @@ trait TokenLockStateManager[F[_]] {
     expiredGlobalTokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]]
   )(implicit hasher: Hasher[F]): F[Either[BalanceArithmeticError, (SortedMap[Address, Balance], SortedMap[Address, Balance])]]
 
-  /** MPT-backed `findExpiredGlobalTokenLocksViaIndex`. Resolves each expiring hash via
-    * `reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr))` instead of an
+  /** MPT-backed `findExpiredGlobalTokenLocksViaIndex`. Resolves each expiring hash through the strict native field-8 reader instead of an
     * in-memory map lookup.
     */
   def findExpiredGlobalTokenLocksViaIndexFromMpt(
@@ -324,8 +323,8 @@ object TokenLockStateManager {
                   st.pure[F]
                 } else {
                   for {
-                    activeTokenLocks <- reader
-                      .get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, tx.source))
+                    activeTokenLocks <- ActiveTokenLockMptReader
+                      .readNative(reader, tx.source)
                       .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]))
                     balance <- reader
                       .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, tx.source))
@@ -414,11 +413,16 @@ object TokenLockStateManager {
                 val expectedHashes = expectedEpochsByHash.keySet
                 for {
                   targetHex <- GlobalStateKey.toHex[F](targetKey)
-                  addrSet <- StrictMptRead.requirePresentF(
-                    reader.getStrict[SortedSet[Signed[TokenLock]]](targetKey),
-                    s"expiry target ActiveTokenLocks(address=$addr)",
-                    targetHex
-                  )
+                  addrSet <- ActiveTokenLockMptReader
+                    .readNative(reader, addr)
+                    .flatMap(
+                      _.liftTo[F](
+                        StrictMptRead.MissingConsensusMptValue(
+                          s"expiry target ActiveTokenLocks(address=$addr)",
+                          targetHex
+                        )
+                      )
+                    )
                   hashed <- addrSet.toList.traverse(s => s.toHashed.map(h => (h.hash, s)))
                   actualHashes = hashed.iterator.map(_._1).toSet
                   missingHashes = expectedHashes -- actualHashes
@@ -484,9 +488,7 @@ object TokenLockStateManager {
             ) {
               case ((deltasAcc, removedAcc), address) =>
                 for {
-                  currentActiveOpt <- reader.get[SortedSet[Signed[TokenLock]]](
-                    GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, address)
-                  )
+                  currentActiveOpt <- ActiveTokenLockMptReader.readNative(reader, address)
                   currentActive = currentActiveOpt.getOrElse(SortedSet.empty[Signed[TokenLock]])
                   incomingLocks = acceptedGlobalTokenLocks.getOrElse(address, SortedSet.empty[Signed[TokenLock]])
                   unexpired = (currentActive ++ incomingLocks).filter(_.unlockEpoch.forall(_ >= epochProgress))
@@ -519,8 +521,8 @@ object TokenLockStateManager {
                 touchedAddresses.toList
                   .foldLeftM[F, (Entries, Entries)]((List.empty, List.empty)) {
                     case ((accAdds, accRemoves), addr) =>
-                      reader
-                        .get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr))
+                      ActiveTokenLockMptReader
+                        .readNative(reader, addr)
                         .flatMap { oldSetOpt =>
                           val oldSet = oldSetOpt.getOrElse(SortedSet.empty[Signed[TokenLock]])
                           val newSet = newSetByAddress.getOrElse(addr, oldSet) // untouched-but-present means no diff → same old set
@@ -855,21 +857,15 @@ object TokenLockStateManager {
         addresses: Set[Address]
       )(implicit hasher: Hasher[F]): F[Map[Hash, Signed[TokenLock]]] =
         addresses.toList.flatTraverse { addr =>
-          reader
-            .get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, addr))
+          ActiveTokenLockMptReader
+            .readNative(reader, addr)
             .map(_.fold(List.empty[Signed[TokenLock]])(_.toList))
         }.flatMap { locks =>
           locks.traverse(lock => lock.toHashed.map(h => h.hash -> lock)).map(_.toMap)
         }
 
       def materializeActiveTokenLocksFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, SortedSet[Signed[TokenLock]]]] =
-        for {
-          prefix <- GlobalStateKey.hypergraphFieldPrefix[F](GlobalStateFieldId.ActiveTokenLocks)
-          entries <- reader.getAllForPrefix[SortedSet[Signed[TokenLock]]](prefix)
-        } yield
-          SortedMap.from(
-            entries.values.toList.mapFilter(set => set.headOption.map(_.value.source -> set)).filter(_._2.nonEmpty)
-          )
+        ActiveTokenLockMptReader.materializeNative(reader)
 
       def materializeLastTokenLockRefsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Address, TokenLockReference]] =
         for {

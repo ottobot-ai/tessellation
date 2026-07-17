@@ -11,8 +11,8 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.node.shared.domain.snapshot.storage.SnapshotStorage
 import io.constellationnetwork.routes.internal._
 import io.constellationnetwork.schema._
-import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.tokenLock.TokenLock
+import io.constellationnetwork.security.HasherSelector
 import io.constellationnetwork.security.signature.Signed
 
 import eu.timepit.refined.auto._
@@ -20,7 +20,7 @@ import org.http4s.HttpRoutes
 import org.http4s.circe.CirceEntityCodec.circeEntityEncoder
 import org.http4s.dsl.Http4sDsl
 
-final case class GL0TokenLockRoutes[F[_]: Async](
+final case class GL0TokenLockRoutes[F[_]: Async: HasherSelector](
   snapshotStorage: SnapshotStorage[F, GlobalIncrementalSnapshot, GlobalSnapshotInfo],
   reader: GlobalStateReader[F]
 ) extends Http4sDsl[F]
@@ -36,10 +36,12 @@ final case class GL0TokenLockRoutes[F[_]: Async](
       // required as the head sentinel so we don't serve stale state before genesis converges.
       snapshotStorage.head.flatMap {
         case Some(_) =>
-          reader
-            .getActiveTokenLocks(address)
-            .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]).toList.map(_.value))
-            .flatMap(Ok(_))
+          HasherSelector[F].withCurrent { implicit hasher =>
+            reader
+              .getActiveTokenLocks(address)
+              .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]).toList.map(_.value))
+              .flatMap(Ok(_))
+          }
         case None => ServiceUnavailable()
       }
 

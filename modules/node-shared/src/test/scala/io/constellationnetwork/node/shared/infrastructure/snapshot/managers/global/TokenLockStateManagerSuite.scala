@@ -453,7 +453,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
     } yield expect(result.isEmpty)
   }
 
-  test("acceptReplacementTokenLocks - should handle multiple token locks with mixed currency ID states") { res =>
+  test("acceptReplacementTokenLocks - should reject field-8 state with mixed currency ID states") { res =>
     implicit val (jsonHasher, sp, _, js) = res
 
     for {
@@ -499,7 +499,7 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
         hashedExistingTokenLockEmptyCurrency.hash.some
       )
 
-      // Create replacement token lock for non-empty currency ID token lock (should be accepted because replacement has empty currency ID)
+      // A native replacement cannot make a currency-scoped record valid inside the native field-8 partition.
       replacementTokenLockWithCurrency = TokenLock(
         testAddress,
         TokenLockAmount(300L), // Higher amount
@@ -522,15 +522,13 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
 
       localMptStore <- mkMptStore(snapshotInfo)
       acceptanceManager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
-      result <- acceptanceManager.acceptReplacementTokenLocks(
-        List(signedReplacementTokenLockEmptyCurrency, signedReplacementTokenLockWithCurrency),
-        snapshotInfo
-      )
-    } yield
-      expect.eql(
-        result,
-        List(signedReplacementTokenLockEmptyCurrency)
-      ) // Only the first should be accepted because the second tries to replace a token lock with non-empty currency ID
+      result <- acceptanceManager
+        .acceptReplacementTokenLocks(
+          List(signedReplacementTokenLockEmptyCurrency, signedReplacementTokenLockWithCurrency),
+          snapshotInfo
+        )
+        .attempt
+    } yield expect(result.left.exists(_.getMessage.contains("currencyId=None")))
   }
 
   test("acceptReplacementTokenLocks - should reject replacement token locks with lower or equal amount") { res =>

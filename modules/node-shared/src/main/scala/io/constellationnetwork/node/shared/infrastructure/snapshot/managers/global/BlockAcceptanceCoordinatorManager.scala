@@ -8,19 +8,17 @@ import cats.syntax.all._
 import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.node.shared.domain.block.processing._
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ActiveTokenLockMptReader, GlobalStateReader}
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
-import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs.signedTokenLockSetCodec
 
 trait BlockAcceptanceCoordinatorManager[F[_]] {
   def acceptBlocks(
@@ -122,11 +120,10 @@ object BlockAcceptanceCoordinatorManager {
         toBeReplacedHashedTokenLocks <-
           if (replacementRefHashes.isEmpty) List.empty[Hashed[TokenLock]].pure[F]
           else
-            for {
-              prefix <- GlobalStateKey.hypergraphFieldPrefix[F](GlobalStateFieldId.ActiveTokenLocks)
-              activeByAddress <- reader.getAllForPrefix[SortedSet[Signed[TokenLock]]](prefix)
-              hashed <- activeByAddress.values.toList.flatMap(_.toList).traverse(_.toHashed)
-            } yield hashed.filter(lock => replacementRefHashes.contains(lock.hash)).sortBy(_.hash)
+            ActiveTokenLockMptReader
+              .materializeNative(reader)
+              .flatMap(_.values.toList.flatMap(_.toList).traverse(_.toHashed))
+              .map(_.filter(lock => replacementRefHashes.contains(lock.hash)).sortBy(_.hash))
 
         // §G4: balances + lastTokenLockRefs sourced from the branch-aware MPT reader.
         // `toBeReplacedHashedTokenLocks` already resolves via the same `reader` above.

@@ -56,8 +56,8 @@ object GlobalStateReaderOps {
         GlobalStateKey.hypergraph(GlobalStateFieldId.NodeCollateralWithdrawals, address)
       )
 
-    def getActiveTokenLocks(address: Address): F[Option[SortedSet[Signed[TokenLock]]]] =
-      reader.get[SortedSet[Signed[TokenLock]]](GlobalStateKey.hypergraph(GlobalStateFieldId.ActiveTokenLocks, address))
+    def getActiveTokenLocks(address: Address)(implicit hasher: Hasher[F]): F[Option[SortedSet[Signed[TokenLock]]]] =
+      ActiveTokenLockMptReader.readNative(reader, address)
 
     /** Reconstruct a metagraph's `CurrencySnapshotInfo` from the UNROLLED per-entry `Mg*` partitions (+ fieldId-7 allow-spends), gated on
       * the presence of the fieldId-5 incremental so a metagraph still at its genesis (`LastCurrencySnapshots` Left partition, no
