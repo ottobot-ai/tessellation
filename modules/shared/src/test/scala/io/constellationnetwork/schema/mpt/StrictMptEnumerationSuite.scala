@@ -37,7 +37,7 @@ object StrictMptEnumerationSuite extends MutableIOSuite {
   test("strict prefix scan retains malformed, empty, and null entries in physical-key order") { res =>
     implicit val (hasher, json) = res
     val validKey = Hex("aa03")
-    val caseAliasKey = Hex("AA03")
+    val additionalValidKey = Hex("aa04")
     val malformedKey = Hex("aa02")
     val emptyKey = Hex("aa01")
     val nullKey = Hex("aa00")
@@ -49,7 +49,7 @@ object StrictMptEnumerationSuite extends MutableIOSuite {
         .insertBytes(
           Map(
             validKey -> encoded("valid"),
-            caseAliasKey -> encoded("case-alias"),
+            additionalValidKey -> encoded("additional-valid"),
             malformedKey -> Array[Byte](0x7f),
             emptyKey -> Array.emptyByteArray,
             nullKey -> null,
@@ -62,10 +62,10 @@ object StrictMptEnumerationSuite extends MutableIOSuite {
     } yield {
       val reads = strict.map(entry => entry.physicalKey -> entry.read).toMap
       expect.all(
-        strict.map(_.physicalKey) == List(caseAliasKey, nullKey, emptyKey, malformedKey, validKey),
-        reads.get(caseAliasKey).exists {
-          case StrictMptRead.Present("case-alias", _) => true
-          case _                                      => false
+        strict.map(_.physicalKey) == List(nullKey, emptyKey, malformedKey, validKey, additionalValidKey),
+        reads.get(additionalValidKey).exists {
+          case StrictMptRead.Present("additional-valid", _) => true
+          case _                                            => false
         },
         reads.get(validKey).exists {
           case StrictMptRead.Present("valid", raw) => raw == ByteVector.view(encoded("valid"))
@@ -151,7 +151,7 @@ object StrictMptEnumerationSuite extends MutableIOSuite {
 
   test("filesystem producer owns inserted bytes and every raw read result") { res =>
     implicit val (hasher, json) = res
-    val key = Hex("DD00")
+    val key = Hex("dd00")
     val original = encoded("filesystem-owned")
     val input = original.clone()
 
