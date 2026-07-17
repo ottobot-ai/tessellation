@@ -444,6 +444,15 @@ object GlobalStateKey {
       contractPart <- serializeNamespace[F](EmptyNamespace)
     } yield Hex(networkPart + fieldPart + contractPart)
 
+  /** Hex prefix matching every contract placement for one unrolled metagraph sub-field. Structural reconstruction uses this broader prefix
+    * and then requires every value to reproduce its exact canonical empty-contract key, so a misplaced leaf is rejected rather than hidden.
+    */
+  def metagraphFieldPrefixAcrossContracts[F[_]: Sync: Hasher](mgAddr: Address, subField: GlobalStateFieldId): F[Hex] =
+    for {
+      networkPart <- serializeNamespace[F](MetagraphNamespace(mgAddr))
+      fieldPart = f"${subField.toInt}%08x"
+    } yield Hex(networkPart + fieldPart)
+
   def hypergraph(fieldId: GlobalStateFieldId, user: Address): GlobalStateKey =
     GlobalStateKey(HypergraphNamespace, fieldId, EmptyNamespace, AddressNamespace(user))
 

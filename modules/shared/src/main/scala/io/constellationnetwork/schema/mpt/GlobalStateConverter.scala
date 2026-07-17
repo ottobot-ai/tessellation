@@ -25,7 +25,7 @@ import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, Pend
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.priceOracle.{PriceRecord, TokenPair}
 import io.constellationnetwork.schema.snapshot.MetagraphSyncDataInfo
-import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference}
+import io.constellationnetwork.schema.swap.{AllowSpend, AllowSpendReference, CurrencyId}
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.schema.transaction.TransactionReference
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal, StateProofSelector}
@@ -1200,6 +1200,26 @@ object GlobalStateConverter {
     }
   }
 
+  /** Materialize every typed accumulator upsert and every physical trie key before a compound writer mutates its target. This is a
+    * validation boundary, not authority: it proves only that the supplied delta has canonical encodings/keys and satisfies the field-local
+    * writer grammar enforced by [[infoEntryBytes]].
+    */
+  def preflightStateChangesEntries[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    acc: StateChangesAccumulator
+  )(implicit stateProofSelector: StateProofSelector): F[Unit] =
+    toAccumulatorBytesDelta[F](acc).flatMap(toPhysicalEntries[F, Array[Byte]]).void
+
+  /** Full-image counterpart to [[preflightStateChangesEntries]]. The complete GSI is encoded and projected to canonical physical keys
+    * before a clear/rebuild path can touch the live store.
+    */
+  def preflightGlobalSnapshotInfoEntries[F[_]: Async: Parallel: Hasher: JsonSerializer](
+    info: GlobalSnapshotInfo
+  )(
+    implicit stateProofSelector: StateProofSelector,
+    withdrawalTimeLimitCtx: WithdrawalTimeLimit
+  ): F[Unit] =
+    toAllStateKeyValueBytes[F](info).flatMap(toPhysicalEntries[F, Array[Byte]]).void
+
   /** Hex-keyed delta derived from a `StateChangesAccumulator` — pairs well with `MptStore.allEntriesAsBytes` (which is `Map[Hex,
     * Array[Byte]]`) for independent state-replay verification: `expected = (prevBytes -- removes) ++ upserts`.
     *
@@ -1486,6 +1506,79 @@ object GlobalStateConverter {
     if (fieldEntries.isEmpty) Hash.empty.pure[F]
     else MerklePatriciaTrie.makeParallelFromBytes[F](fieldEntries).map(_.rootHash.value)
 
+  private def validateMgActiveTokenLocks[F[_]: Sync: Hasher](
+    metagraphAddress: Address,
+    context: String,
+    physicalKey: Hex,
+    holder: Address,
+    locks: SortedSet[Signed[TokenLock]]
+  ): F[Unit] = {
+    def inconsistent(reason: String): F[Unit] =
+      Sync[F].raiseError(StrictMptRead.InconsistentConsensusMptIndex(context, physicalKey, reason))
+
+    val expectedCurrency = CurrencyId(metagraphAddress).some
+
+    if (locks.isEmpty)
+      inconsistent("empty token-lock set")
+    else if (locks.exists(_.value.source =!= holder))
+      inconsistent("token-lock source/holder mismatch")
+    else if (locks.exists(_.value.currencyId =!= expectedCurrency))
+      inconsistent(s"token-lock currency scope mismatch expected=$expectedCurrency")
+    else
+      locks.toList.traverse(lock => Hasher[F].hash(lock.value)).flatMap { identities =>
+        if (identities.distinct.size =!= identities.size) inconsistent("duplicate unsigned token-lock identity")
+        else Sync[F].unit
+      }
+  }
+
+  private def validateMgLastMessage[F[_]: Sync](
+    metagraphAddress: Address,
+    context: String,
+    physicalKey: Hex,
+    messageType: MessageType,
+    message: Signed[CurrencyMessage]
+  ): F[Unit] = {
+    def inconsistent(reason: String): F[Unit] =
+      Sync[F].raiseError(StrictMptRead.InconsistentConsensusMptIndex(context, physicalKey, reason))
+
+    if (message.value.messageType =!= messageType) inconsistent("message type mismatch")
+    else if (message.value.metagraphId =!= metagraphAddress) inconsistent("message metagraph mismatch")
+    else Sync[F].unit
+  }
+
+  /** Reject structurally impossible per-metagraph framework state before any encoder or typed MPT writer can commit it. Cryptographic
+    * authorization and reference-history validation remain transition-layer responsibilities; this gate owns only the rooted field grammar
+    * that reconstruction can reproduce from the stored value and physical key.
+    */
+  private def validateCurrencyInfoStructure[F[_]: Sync: Hasher](
+    metagraphAddress: Address,
+    info: CurrencySnapshotInfo
+  ): F[Unit] = {
+    val context = s"emit CurrencySnapshotInfo(metagraph=$metagraphAddress)"
+
+    for {
+      _ <- info.activeTokenLocks
+        .getOrElse(SortedMap.empty[Address, SortedSet[Signed[TokenLock]]])
+        .toList
+        .traverse_ {
+          case (holder, locks) =>
+            GlobalStateKey
+              .toHex[F](GlobalStateKey.metagraphEntry(metagraphAddress, GlobalStateFieldId.MgActiveTokenLocks, holder))
+              .flatMap(validateMgActiveTokenLocks[F](metagraphAddress, context, _, holder, locks))
+        }
+      _ <- info.lastMessages
+        .getOrElse(SortedMap.empty[MessageType, Signed[CurrencyMessage]])
+        .toList
+        .traverse_ {
+          case (messageType, message) =>
+            GlobalStateKey
+              .metagraphEntryHashed[F](metagraphAddress, GlobalStateFieldId.MgLastMessages, messageType.value)
+              .flatMap(GlobalStateKey.toHex[F])
+              .flatMap(validateMgLastMessage[F](metagraphAddress, context, _, messageType, message))
+        }
+    } yield ()
+  }
+
   /** Emit the UNROLLED per-entry MPT key→bytes for ONE metagraph's `CurrencySnapshotInfo` — the eight serialized `Mg*` sub-field partitions
     * that REPLACE the monolithic fieldId-6 blob (`docs/nakamoto/UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN.md`). One entry per account / holder /
     * messageType / peer, keyed `metagraphEntry(mgAddr, MgXxx, key)`; each value carries its own typed entry key `(key, value)` because
@@ -1531,7 +1624,8 @@ object GlobalStateConverter {
         case (p, s) => GlobalStateKey.metagraphEntryHashed[F](mgAddr, MgGlobalSnapshotSyncView, p.value.value).map(_ -> enc((p, s)))
       }
 
-    (messagesF, syncViewF).mapN((m, s) => addressKeyed ++ m ++ s)
+    validateCurrencyInfoStructure[F](mgAddr, info) >>
+      (messagesF, syncViewF).mapN((m, s) => addressKeyed ++ m ++ s)
   }
 
   /** JSON twin of [[infoEntryBytes]] for the legacy `Map[GlobalStateKey, Json]` full-state path ([[convertCurrencySnapshots]] →
@@ -1569,7 +1663,8 @@ object GlobalStateConverter {
         case (p, s) => GlobalStateKey.metagraphEntryHashed[F](mgAddr, MgGlobalSnapshotSyncView, p.value.value).map(_ -> (p, s).asJson)
       }
 
-    (messagesF, syncViewF).mapN((m, s) => addressKeyed ++ m ++ s)
+    validateCurrencyInfoStructure[F](mgAddr, info) >>
+      (messagesF, syncViewF).mapN((m, s) => addressKeyed ++ m ++ s)
   }
 
   /** Canonical typed MPT entries for the `lastCurrencySnapshots` GSI field — the EXACT producer encoding gl0 writes in
@@ -1833,20 +1928,98 @@ object GlobalStateConverter {
     reader: CurrencyInfoReader[F]
   ): F[CurrencySnapshotInfo] = {
     import GlobalStateFieldId._
-    def scan[K, V](sub: GlobalStateFieldId)(implicit c: ImmutableCodec[(K, V)], o: Ordering[K]): F[SortedMap[K, V]] =
-      GlobalStateKey
-        .metagraphFieldPrefix[F](metagraphAddress, sub)
-        .flatMap(reader.getAllForPrefix[(K, V)])
-        .map(e => SortedMap.from(e.values))
+
+    def scan[K, V](sub: GlobalStateFieldId)(
+      expectedKey: K => F[GlobalStateKey]
+    )(
+      validate: (Hex, K, V) => F[Unit]
+    )(
+      implicit codec: ImmutableCodec[(K, V)],
+      ordering: Ordering[K]
+    ): F[SortedMap[K, V]] = {
+      val context = s"reconstruct CurrencySnapshotInfo(metagraph=$metagraphAddress,field=${sub.toInt})"
+
+      GlobalStateKey.metagraphFieldPrefixAcrossContracts[F](metagraphAddress, sub).flatMap { prefix =>
+        reader.getAllForPrefixStrict[(K, V)](prefix).flatMap { entries =>
+          entries
+            .sortBy(_.physicalKey.value)
+            .foldLeftM((SortedSet.empty[K], List.empty[(K, V)])) {
+              case (_, StrictMptEntry(physicalKey, StrictMptRead.Absent)) =>
+                Sync[F].raiseError[(SortedSet[K], List[(K, V)])](
+                  StrictMptRead.MissingConsensusMptValue(context, physicalKey)
+                )
+
+              case (_, StrictMptEntry(physicalKey, StrictMptRead.Malformed(reason, _))) =>
+                Sync[F].raiseError[(SortedSet[K], List[(K, V)])](
+                  StrictMptRead.MalformedConsensusMptValue(context, physicalKey, reason)
+                )
+
+              case ((seen, acc), StrictMptEntry(physicalKey, StrictMptRead.Present(entry @ (key, value), rawBytes))) =>
+                val canonicalBytes = codec.immutableBytes(entry)
+
+                if (rawBytes != canonicalBytes)
+                  Sync[F].raiseError[(SortedSet[K], List[(K, V)])](
+                    StrictMptRead.MalformedConsensusMptValue(context, physicalKey, "non-canonical value encoding")
+                  )
+                else if (seen.contains(key))
+                  Sync[F].raiseError[(SortedSet[K], List[(K, V)])](
+                    StrictMptRead.InconsistentConsensusMptIndex(context, physicalKey, s"duplicate logical key=$key")
+                  )
+                else
+                  for {
+                    canonicalKey <- expectedKey(key)
+                    expectedHex <- GlobalStateKey.toHex[F](canonicalKey)
+                    _ <- Sync[F].raiseWhen(physicalKey =!= expectedHex)(
+                      StrictMptRead.InconsistentConsensusMptIndex(
+                        context,
+                        physicalKey,
+                        s"key/value mismatch expected=${expectedHex.value} actual=${physicalKey.value}"
+                      )
+                    )
+                    _ <- validate(physicalKey, key, value)
+                  } yield (seen + key, (key -> value) :: acc)
+            }
+            .map { case (_, validated) => SortedMap.from(validated.reverse) }
+        }
+      }
+    }
+
+    def addressKey(sub: GlobalStateFieldId)(address: Address): F[GlobalStateKey] =
+      GlobalStateKey.metagraphEntry(metagraphAddress, sub, address).pure[F]
+
+    def noAdditionalValidation[K, V]: (Hex, K, V) => F[Unit] = (_, _, _) => Sync[F].unit
+
+    def validateActiveTokenLocks(
+      physicalKey: Hex,
+      holder: Address,
+      locks: SortedSet[Signed[TokenLock]]
+    ): F[Unit] =
+      validateMgActiveTokenLocks[F](metagraphAddress, "reconstruct MgActiveTokenLocks", physicalKey, holder, locks)
+
+    def validateLastMessage(
+      physicalKey: Hex,
+      messageType: MessageType,
+      message: Signed[CurrencyMessage]
+    ): F[Unit] =
+      validateMgLastMessage[F](metagraphAddress, "reconstruct MgLastMessages", physicalKey, messageType, message)
+
     for {
-      balances <- scan[Address, Balance](MgBalances)
-      lastTxRefs <- scan[Address, TransactionReference](MgLastTxRefs)
-      lastFeeTxRefs <- scan[Address, TransactionReference](MgLastFeeTxRefs)
-      lastAllowSpendRefs <- scan[Address, AllowSpendReference](MgLastAllowSpendRefs)
-      lastTokenLockRefs <- scan[Address, TokenLockReference](MgLastTokenLockRefs)
-      activeTokenLocks <- scan[Address, SortedSet[Signed[TokenLock]]](MgActiveTokenLocks)
-      lastMessages <- scan[MessageType, Signed[CurrencyMessage]](MgLastMessages)
-      globalSyncView <- scan[PeerId, Signed[GlobalSnapshotSync]](MgGlobalSnapshotSyncView)
+      balances <- scan[Address, Balance](MgBalances)(addressKey(MgBalances))(noAdditionalValidation)
+      lastTxRefs <- scan[Address, TransactionReference](MgLastTxRefs)(addressKey(MgLastTxRefs))(noAdditionalValidation)
+      lastFeeTxRefs <- scan[Address, TransactionReference](MgLastFeeTxRefs)(addressKey(MgLastFeeTxRefs))(noAdditionalValidation)
+      lastAllowSpendRefs <- scan[Address, AllowSpendReference](MgLastAllowSpendRefs)(addressKey(MgLastAllowSpendRefs))(
+        noAdditionalValidation
+      )
+      lastTokenLockRefs <- scan[Address, TokenLockReference](MgLastTokenLockRefs)(addressKey(MgLastTokenLockRefs))(noAdditionalValidation)
+      activeTokenLocks <- scan[Address, SortedSet[Signed[TokenLock]]](MgActiveTokenLocks)(addressKey(MgActiveTokenLocks))(
+        validateActiveTokenLocks
+      )
+      lastMessages <- scan[MessageType, Signed[CurrencyMessage]](MgLastMessages)(messageType =>
+        GlobalStateKey.metagraphEntryHashed[F](metagraphAddress, MgLastMessages, messageType.value)
+      )(validateLastMessage)
+      globalSyncView <- scan[PeerId, Signed[GlobalSnapshotSync]](MgGlobalSnapshotSyncView)(peerId =>
+        GlobalStateKey.metagraphEntryHashed[F](metagraphAddress, MgGlobalSnapshotSyncView, peerId.value.value)
+      )(noAdditionalValidation)
       activeAllowSpendEntries <- GlobalStateKey
         .hypergraphFieldPrefix[F](ActiveAllowSpends, metagraphAddress.some)
         .flatMap(reader.getAllForPrefix[SortedSet[Signed[AllowSpend]]])
@@ -1916,6 +2089,7 @@ object GlobalStateConverter {
     def optMap[V](sub: GlobalStateFieldId, m: Option[SortedMap[Address, V]]): Map[GlobalStateKey, (Address, V)] =
       addrMap(sub, m.getOrElse(SortedMap.empty[Address, V]))
     for {
+      _ <- validateCurrencyInfoStructure[F](metagraphAddress, newInfo)
       msgEntries <- newInfo.lastMessages
         .getOrElse(SortedMap.empty[MessageType, Signed[CurrencyMessage]])
         .toList
@@ -2632,71 +2806,76 @@ object GlobalStateConverter {
         // insert each typed batch, then build once at the end.
         // Caller-serialized — see MptStore.withTransaction. Local bootstrap/restart reconstruction is single-fiber; accept() callers run
         // under `mptStore.withTransaction`'s savepoint scope, also `snapshotSemaphore`-serialized.
-        for {
-          // FINDING-S01: capture the MPT-NATIVE consensus partitions (ConsumedAllowSpends 33 / Slashings 34 — in the signed
-          // consensus root but with NO GlobalSnapshotInfo field) BEFORE the clear, and re-insert them verbatim below. Without
-          // this the rebuild silently wipes the cross-shard spent-set (double-spend re-open) and commits a root that diverges
-          // from the signed stateProof.mptRoot. Empty at numShards = 1 ⇒ byte-identical no-op.
-          preservedMptNative <-
-            if (preserveMptNative)
-              store.underlying.entries.map(_.filter {
-                case (hex, _) => GlobalStateKey.fieldIdFromHex(hex).exists(GlobalStateFieldId.mptNativeConsensusFields.contains)
-              })
-            else Map.empty[Hex, Array[Byte]].pure[F]
-          _ <- store.clear
-          currency <- buildCurrencySnapshotEntries
-          updateNodeParametersEntries <- updateNodeParametersEntriesF
-          priceStateEntries <- priceStateEntriesF
-          systemIndexes <- globalSnapshotSystemIndexEntries[F](info, withdrawalTimeLimit)
-          historicalStakeEntries <- historicalStakeEntriesF
-          kesRegistrationCertEntries <- kesRegistrationCertEntriesF
-          lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
-          genesisOperatorKeyEntries <- genesisOperatorKeyEntriesF
-          _ <- store.insert[Hash](stateChanHashes)
-          _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
-          _ <- store.insert[Balance](balances)
-          _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
-          // Unrolled per-metagraph info — all eight serialized `Mg*` partitions replace the monolithic fieldId-6 blob; only the seven
-          // deterministic `infoSubFields` participate in `infoRoot`. `store.clear` above leaves an
-          // empty store, so the reconstructed prior is empty ⇒ no removals; the upserts are the full info per MG.
-          _ <- currency._2.traverse_ {
-            case (metagraphAddr, newInfo) =>
-              reconstructCurrencyInfoFrom[F](metagraphAddr, CurrencyInfoMpt.fromMptStore(store)).flatMap { priorInfo =>
-                writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, CurrencyInfoMpt.fromMptStore(store))
+        preflightGlobalSnapshotInfoEntries[F](info) >>
+          store.withTransaction {
+            for {
+              // FINDING-S01: capture the MPT-NATIVE consensus partitions (ConsumedAllowSpends 33 / Slashings 34 — in the signed
+              // consensus root but with NO GlobalSnapshotInfo field) BEFORE the clear, and re-insert them verbatim below. Without
+              // this the rebuild silently wipes the cross-shard spent-set (double-spend re-open) and commits a root that diverges
+              // from the signed stateProof.mptRoot. Empty at numShards = 1 ⇒ byte-identical no-op.
+              preservedMptNative <-
+                if (preserveMptNative)
+                  store.underlying.entries.map(_.filter {
+                    case (hex, _) => GlobalStateKey.fieldIdFromHex(hex).exists(GlobalStateFieldId.mptNativeConsensusFields.contains)
+                  })
+                else Map.empty[Hex, Array[Byte]].pure[F]
+              _ <- store.clear
+              currency <- buildCurrencySnapshotEntries
+              updateNodeParametersEntries <- updateNodeParametersEntriesF
+              priceStateEntries <- priceStateEntriesF
+              systemIndexes <- globalSnapshotSystemIndexEntries[F](info, withdrawalTimeLimit)
+              historicalStakeEntries <- historicalStakeEntriesF
+              kesRegistrationCertEntries <- kesRegistrationCertEntriesF
+              lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
+              genesisOperatorKeyEntries <- genesisOperatorKeyEntriesF
+              _ <- store.insert[Hash](stateChanHashes)
+              _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
+              _ <- store.insert[Balance](balances)
+              _ <- store.insert[Signed[io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot]](currency._1)
+              // Unrolled per-metagraph info — all eight serialized `Mg*` partitions replace the monolithic fieldId-6 blob; only the seven
+              // deterministic `infoSubFields` participate in `infoRoot`. `store.clear` above leaves an
+              // empty store, so the reconstructed prior is empty ⇒ no removals; the upserts are the full info per MG.
+              _ <- currency._2.traverse_ {
+                case (metagraphAddr, newInfo) =>
+                  reconstructCurrencyInfoFrom[F](metagraphAddr, CurrencyInfoMpt.fromMptStore(store)).flatMap { priorInfo =>
+                    writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, CurrencyInfoMpt.fromMptStore(store))
+                  }
               }
+              _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
+              _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
+              _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocks)
+              _ <- store.insert[Balance](tokenLockBalances)
+              _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefs)
+              _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefs)
+              _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakes)
+              _ <- store
+                .insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](
+                  delegatedStakesWithdrawals
+                )
+              _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollaterals)
+              _ <- store
+                .insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](nodeCollateralWithdrawals)
+              _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
+              _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
+              _ <- store.insert[PriceRecord](priceStateEntries)
+              _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
+              _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
+              _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
+              _ <- store.insert[GenesisOperatorConsensusKey](genesisOperatorKeyEntries)
+              _ <- store.insert[SortedSet[Address]](systemIndexes.activeAddressIndexes)
+              _ <- store.insert[SortedSet[(Address, Address)]](systemIndexes.tokenLockBalanceAddressPairs)
+              _ <- store.insert[SortedSet[AllowSpendExpiryKey]](systemIndexes.allowSpendExpiryBuckets)
+              _ <- store.insert[SortedSet[TokenLockExpiryKey]](systemIndexes.tokenLockExpiryBuckets)
+              _ <- store
+                .insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](systemIndexes.nodeCollateralWithdrawalExpiryBuckets)
+              // FINDING-S01: restore the MPT-native consensus partitions captured above — raw bytes, verbatim (no codec round-trip),
+              // exactly as the byte-faithful `loadBytes` path would carry them. Keys cannot collide with any GSI-derived insert
+              // (disjoint fieldIds).
+              _ <- store.underlying.insertBytes(preservedMptNative).flatMap(_.liftTo[F]).whenA(preservedMptNative.nonEmpty)
+              empty <- store.isEmpty
+              _ <- store.build(snapshotOrdinal).rethrow.unlessA(empty)
+            } yield ((), MptTxAction.Commit: MptTxAction)
           }
-          _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
-          _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
-          _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocks)
-          _ <- store.insert[Balance](tokenLockBalances)
-          _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefs)
-          _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefs)
-          _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakes)
-          _ <- store
-            .insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](delegatedStakesWithdrawals)
-          _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollaterals)
-          _ <- store
-            .insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](nodeCollateralWithdrawals)
-          _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncData)
-          _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
-          _ <- store.insert[PriceRecord](priceStateEntries)
-          _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
-          _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
-          _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
-          _ <- store.insert[GenesisOperatorConsensusKey](genesisOperatorKeyEntries)
-          _ <- store.insert[SortedSet[Address]](systemIndexes.activeAddressIndexes)
-          _ <- store.insert[SortedSet[(Address, Address)]](systemIndexes.tokenLockBalanceAddressPairs)
-          _ <- store.insert[SortedSet[AllowSpendExpiryKey]](systemIndexes.allowSpendExpiryBuckets)
-          _ <- store.insert[SortedSet[TokenLockExpiryKey]](systemIndexes.tokenLockExpiryBuckets)
-          _ <- store
-            .insert[SortedSet[NodeCollateralWithdrawalExpiryKey]](systemIndexes.nodeCollateralWithdrawalExpiryBuckets)
-          // FINDING-S01: restore the MPT-native consensus partitions captured above — raw bytes, verbatim (no codec round-trip),
-          // exactly as the byte-faithful `loadBytes` path would carry them. Keys cannot collide with any GSI-derived insert
-          // (disjoint fieldIds).
-          _ <- store.underlying.insertBytes(preservedMptNative).flatMap(_.liftTo[F]).whenA(preservedMptNative.nonEmpty)
-          empty <- store.isEmpty
-          _ <- store.build(snapshotOrdinal).rethrow.unlessA(empty)
-        } yield ()
       }
 
       def syncFromStateChanges(acc: StateChangesAccumulator, snapshotOrdinal: SnapshotOrdinal)(
@@ -2868,148 +3047,159 @@ object GlobalStateConverter {
             acc.updateNodeParameters.size + acc.priceState.size +
             acc.historicalStakeSnapshots.size + acc.kesRegistrationCerts.size + acc.lastKesRegistrationRefs.size
 
+        val currencyInfoMpt = CurrencyInfoMpt.fromMptStore(store)
+
         for {
-          t0 <- Async[F].monotonic.map(_.toMillis)
-          // Validate every touched rooted System index before mutating any partition. A malformed index is authenticated corrupt state,
-          // not absence; fail before the first remove/insert even when this legacy writer is called without an outer transaction.
+          _ <- preflightStateChangesEntries[F](acc)
+          currency <- buildCurrencySnapshotEntries
+          // Decode every touched MG's exact parent view before the first mutation. A malformed later MG therefore cannot make the writer
+          // depend on transaction rollback after earlier partitions have already changed.
+          currencyWithPriors <- currency._2.traverse {
+            case (metagraphAddr, newInfo) =>
+              reconstructCurrencyInfoFrom[F](metagraphAddr, currencyInfoMpt).map(priorInfo => (metagraphAddr, newInfo, priorInfo))
+          }
           _ <- preflightSystemIndexReads(store, acc)
           keysToRemove <- toRemovalGlobalStateKeys
+          _ <- store.withTransaction {
+            for {
+              t0 <- Async[F].monotonic.map(_.toMillis)
 
-          _ <- syncLogger.debug(
-            s"[MPT.Sync] ordinal=$snapshotOrdinal delta: " +
-              s"scHashes=${acc.lastStateChannelSnapshotHashes.size} " +
-              s"txRefs=${acc.lastTxRefs.size} " +
-              s"balances=${acc.balances.size} " +
-              s"currencySnapshots=${acc.lastCurrencySnapshots.size} " +
-              s"currencyProofs=${acc.lastCurrencySnapshotsProofs.size} " +
-              s"allowSpends=${acc.activeAllowSpends.values.map(_.values.map(_.size).sum).sum} " +
-              s"tokenLocks=${acc.activeTokenLocks.values.map(_.size).sum} " +
-              s"tokenLockBal=${acc.tokenLockBalances.size} " +
-              s"delegStakes=${acc.activeDelegatedStakes.size} " +
-              s"delegWithdrawals=${acc.delegatedStakesWithdrawals.size} " +
-              s"nodeCollaterals=${acc.activeNodeCollaterals.size} " +
-              s"collateralWithdrawals=${acc.nodeCollateralWithdrawals.size} " +
-              s"metagraphSync=${acc.metagraphSyncData.size} " +
-              s"historicalStake=${acc.historicalStakeSnapshots.size} " +
-              s"operatorKeyRegistrations=${acc.kesRegistrationCerts.size} " +
-              s"totalEntries=$totalEntries removals=${keysToRemove.size}"
-          )
+              _ <- syncLogger.debug(
+                s"[MPT.Sync] ordinal=$snapshotOrdinal delta: " +
+                  s"scHashes=${acc.lastStateChannelSnapshotHashes.size} " +
+                  s"txRefs=${acc.lastTxRefs.size} " +
+                  s"balances=${acc.balances.size} " +
+                  s"currencySnapshots=${acc.lastCurrencySnapshots.size} " +
+                  s"currencyProofs=${acc.lastCurrencySnapshotsProofs.size} " +
+                  s"allowSpends=${acc.activeAllowSpends.values.map(_.values.map(_.size).sum).sum} " +
+                  s"tokenLocks=${acc.activeTokenLocks.values.map(_.size).sum} " +
+                  s"tokenLockBal=${acc.tokenLockBalances.size} " +
+                  s"delegStakes=${acc.activeDelegatedStakes.size} " +
+                  s"delegWithdrawals=${acc.delegatedStakesWithdrawals.size} " +
+                  s"nodeCollaterals=${acc.activeNodeCollaterals.size} " +
+                  s"collateralWithdrawals=${acc.nodeCollateralWithdrawals.size} " +
+                  s"metagraphSync=${acc.metagraphSyncData.size} " +
+                  s"historicalStake=${acc.historicalStakeSnapshots.size} " +
+                  s"operatorKeyRegistrations=${acc.kesRegistrationCerts.size} " +
+                  s"totalEntries=$totalEntries removals=${keysToRemove.size}"
+              )
 
-          // Remove stale keys first (entries that are now empty: AllowSpends, TokenLocks,
-          // TokenLockBalances, DelegatedStakes, DelegatedStakeWithdrawals, NodeCollaterals, NodeCollateralWithdrawals)
-          _ <- store.remove(keysToRemove.toList).whenA(keysToRemove.nonEmpty)
+              // Remove stale keys first (entries that are now empty: AllowSpends, TokenLocks,
+              // TokenLockBalances, DelegatedStakes, DelegatedStakeWithdrawals, NodeCollaterals, NodeCollateralWithdrawals)
+              _ <- store.remove(keysToRemove.toList).whenA(keysToRemove.nonEmpty)
 
-          currency <- buildCurrencySnapshotEntries
-          _ <- store.insert[Hash](stateChanHashes)
-          _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
-          _ <- store.insert[Balance](balances)
-          _ <- store.insert[Signed[CurrencyIncrementalSnapshot]](currency._1)
-          // Unrolled per-metagraph info: reconstruct the prior `Mg*` state, then upsert the new info + remove dropped entries
-          // (`writeCurrencyInfo` → `infoRemovalKeys`). Replaces the monolithic fieldId-6 blob insert. fieldId-7 `activeAllowSpends`
-          // is untouched here (its removals are the accumulator's `removedAllowSpendKeys`, applied in `keysToRemove` above).
-          _ <- currency._2.traverse_ {
-            case (metagraphAddr, newInfo) =>
-              reconstructCurrencyInfoFrom[F](metagraphAddr, CurrencyInfoMpt.fromMptStore(store)).flatMap { priorInfo =>
-                writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, CurrencyInfoMpt.fromMptStore(store))
+              _ <- store.insert[Hash](stateChanHashes)
+              _ <- store.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
+              _ <- store.insert[Balance](balances)
+              _ <- store.insert[Signed[CurrencyIncrementalSnapshot]](currency._1)
+              // Unrolled per-metagraph info: reconstruct the prior `Mg*` state, then upsert the new info + remove dropped entries
+              // (`writeCurrencyInfo` → `infoRemovalKeys`). Replaces the monolithic fieldId-6 blob insert. fieldId-7 `activeAllowSpends`
+              // is untouched here (its removals are the accumulator's `removedAllowSpendKeys`, applied in `keysToRemove` above).
+              _ <- currencyWithPriors.traverse_ {
+                case (metagraphAddr, newInfo, priorInfo) =>
+                  writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, currencyInfoMpt)
               }
+              _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
+              _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
+              _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocksEntries)
+              _ <- store.insert[Balance](tokenLockBalancesEntries)
+              _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefsEntries)
+              _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefsEntries)
+              _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakesEntries)
+              _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](
+                delegatedStakesWithdrawalsEntries
+              )
+              _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollateralsEntries)
+              _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](
+                nodeCollateralWithdrawalsEntries
+              )
+              _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncDataEntries)
+              updateNodeParametersEntries <- updateNodeParametersEntriesF
+              priceStateEntries <- priceStateEntriesF
+              historicalStakeEntries <- historicalStakeEntriesF
+              kesRegistrationCertEntries <- kesRegistrationCertEntriesF
+              lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
+              _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
+              _ <- store.insert[PriceRecord](priceStateEntries)
+              _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
+              _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
+              _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
+              _ <- applySystemIndexDelta[F, AllowSpendExpiryKey](
+                store,
+                SystemNamespaceLabel.ExpiryIndexAllowSpends,
+                acc.allowSpendExpiryIndex
+              )
+              _ <- applySystemIndexDelta[F, TokenLockExpiryKey](
+                store,
+                SystemNamespaceLabel.ExpiryIndexTokenLocks,
+                acc.tokenLockExpiryIndex
+              )
+              _ <- applySystemIndexDelta[F, NodeCollateralWithdrawalExpiryKey](
+                store,
+                SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+                acc.nodeCollateralWithdrawalExpiryIndex
+              )
+
+              // ActiveAddressIndex maintenance for address-keyed values that cannot recover their owner from value bytes. These accumulator
+              // fields are additive/overwrite-only (no removal channels), so `removed = empty`. The verify replay path mirrors every call in
+              // `replayActiveAddressIndexDelta` so `expectedBytes == storeBytes`.
+              _ <- applyActiveAddressIndexDelta[F](store, LastAllowSpendRefs, acc.lastAllowSpendRefs.keySet.toSet, Set.empty)
+              _ <- applyActiveAddressIndexDelta[F](store, LastTokenLockRefs, acc.lastTokenLockRefs.keySet.toSet, Set.empty)
+              _ <- applyActiveAddressIndexDelta[F](store, LastTxRefs, acc.lastTxRefs.keySet.toSet, Set.empty)
+              _ <- applyActiveAddressIndexDelta[F](store, Balances, acc.balances.keySet.toSet, Set.empty)
+              _ <- applyActiveAddressIndexDelta[F](
+                store,
+                LastStateChannelSnapshotHashes,
+                acc.lastStateChannelSnapshotHashes.keySet.toSet,
+                Set.empty
+              )
+              _ <- applyActiveAddressIndexDelta[F](
+                store,
+                LastCurrencySnapshots,
+                acc.lastCurrencySnapshots.keySet.toSet,
+                Set.empty
+              )
+              _ <- applyActiveAddressIndexDelta[F](
+                store,
+                LastCurrencySnapshotsProofs,
+                acc.lastCurrencySnapshotsProofs.keySet.toSet,
+                Set.empty
+              )
+              _ <- applyActiveAddressIndexDelta[F](
+                store,
+                MetagraphSyncData,
+                acc.metagraphSyncData.keySet.toSet,
+                Set.empty
+              )
+              // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Adds come from this
+              // ordinal's deltas; removes come from the manager's pair-shaped `removedTokenLockBalanceKeys`, so the
+              // rooted consensus index prunes in lock-step with the actual MPT entry deletes (otherwise materialize keeps re-reading
+              // the stale pair and the diff loop re-emits the same removal every ordinal).
+              _ <- applyAddressPairIndexDelta[F](
+                store,
+                TokenLockBalances,
+                acc.tokenLockBalances.iterator.flatMap {
+                  case (mid, inner) => inner.keysIterator.map(holder => (mid, holder))
+                }.toSet,
+                acc.removedTokenLockBalanceKeys
+              )
+
+              _ <- store.commit(snapshotOrdinal)
+              // Diagnostics run after persistence has started and therefore cannot be allowed to reverse the transaction verdict. A
+              // diagnostic I/O/logger failure is non-consensus and is contained here; `store.commit` remains the final fallible state step.
+              _ <- (for {
+                t2 <- Async[F].monotonic.map(_.toMillis)
+                totalMptEntries <- store.underlying.entries.map(_.size)
+                rootHash <- store.underlying.getRootHashForOrdinal(snapshotOrdinal)
+                _ <- syncLogger.info(
+                  s"[MPT.Sync] ordinal=$snapshotOrdinal AFTER: totalMptEntries=$totalMptEntries " +
+                    s"rootHash=${rootHash.map(_.show.take(12)).getOrElse("none")} " +
+                    s"totalMs=${t2 - t0}"
+                )
+              } yield ()).attempt.void
+
+            } yield ((), MptTxAction.Commit: MptTxAction)
           }
-          _ <- store.insert[io.constellationnetwork.merkletree.Proof](currencyProofs)
-          _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.swap.AllowSpend]]](activeAllowSpends)
-          _ <- store.insert[SortedSet[Signed[io.constellationnetwork.schema.tokenLock.TokenLock]]](activeTokenLocksEntries)
-          _ <- store.insert[Balance](tokenLockBalancesEntries)
-          _ <- store.insert[io.constellationnetwork.schema.swap.AllowSpendReference](lastAllowSpendRefsEntries)
-          _ <- store.insert[io.constellationnetwork.schema.tokenLock.TokenLockReference](lastTokenLockRefsEntries)
-          _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord]](activeDelegatedStakesEntries)
-          _ <- store.insert[SortedSet[io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal]](
-            delegatedStakesWithdrawalsEntries
-          )
-          _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord]](activeNodeCollateralsEntries)
-          _ <- store.insert[SortedSet[io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal]](
-            nodeCollateralWithdrawalsEntries
-          )
-          _ <- store.insert[MetagraphSyncDataInfo](metagraphSyncDataEntries)
-          updateNodeParametersEntries <- updateNodeParametersEntriesF
-          priceStateEntries <- priceStateEntriesF
-          historicalStakeEntries <- historicalStakeEntriesF
-          kesRegistrationCertEntries <- kesRegistrationCertEntriesF
-          lastKesRegistrationRefEntries <- lastKesRegistrationRefEntriesF
-          _ <- store.insert[(Signed[UpdateNodeParameters], SnapshotOrdinal)](updateNodeParametersEntries)
-          _ <- store.insert[PriceRecord](priceStateEntries)
-          _ <- store.insert[HistoricalStakeSnapshot](historicalStakeEntries)
-          _ <- store.insert[SortedSet[KesRegistrationRecord]](kesRegistrationCertEntries)
-          _ <- store.insert[KesRegistrationReference](lastKesRegistrationRefEntries)
-          _ <- applySystemIndexDelta[F, AllowSpendExpiryKey](
-            store,
-            SystemNamespaceLabel.ExpiryIndexAllowSpends,
-            acc.allowSpendExpiryIndex
-          )
-          _ <- applySystemIndexDelta[F, TokenLockExpiryKey](
-            store,
-            SystemNamespaceLabel.ExpiryIndexTokenLocks,
-            acc.tokenLockExpiryIndex
-          )
-          _ <- applySystemIndexDelta[F, NodeCollateralWithdrawalExpiryKey](
-            store,
-            SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
-            acc.nodeCollateralWithdrawalExpiryIndex
-          )
-
-          // ActiveAddressIndex maintenance for address-keyed values that cannot recover their owner from value bytes. These accumulator
-          // fields are additive/overwrite-only (no removal channels), so `removed = empty`. The verify replay path mirrors every call in
-          // `replayActiveAddressIndexDelta` so `expectedBytes == storeBytes`.
-          _ <- applyActiveAddressIndexDelta[F](store, LastAllowSpendRefs, acc.lastAllowSpendRefs.keySet.toSet, Set.empty)
-          _ <- applyActiveAddressIndexDelta[F](store, LastTokenLockRefs, acc.lastTokenLockRefs.keySet.toSet, Set.empty)
-          _ <- applyActiveAddressIndexDelta[F](store, LastTxRefs, acc.lastTxRefs.keySet.toSet, Set.empty)
-          _ <- applyActiveAddressIndexDelta[F](store, Balances, acc.balances.keySet.toSet, Set.empty)
-          _ <- applyActiveAddressIndexDelta[F](
-            store,
-            LastStateChannelSnapshotHashes,
-            acc.lastStateChannelSnapshotHashes.keySet.toSet,
-            Set.empty
-          )
-          _ <- applyActiveAddressIndexDelta[F](
-            store,
-            LastCurrencySnapshots,
-            acc.lastCurrencySnapshots.keySet.toSet,
-            Set.empty
-          )
-          _ <- applyActiveAddressIndexDelta[F](
-            store,
-            LastCurrencySnapshotsProofs,
-            acc.lastCurrencySnapshotsProofs.keySet.toSet,
-            Set.empty
-          )
-          _ <- applyActiveAddressIndexDelta[F](
-            store,
-            MetagraphSyncData,
-            acc.metagraphSyncData.keySet.toSet,
-            Set.empty
-          )
-          // Address-pair index for `tokenLockBalances` — `(metagraphAddr, holderAddr)` pairs. Adds come from this
-          // ordinal's deltas; removes come from the manager's pair-shaped `removedTokenLockBalanceKeys`, so the
-          // rooted consensus index prunes in lock-step with the actual MPT entry deletes (otherwise materialize keeps re-reading
-          // the stale pair and the diff loop re-emits the same removal every ordinal).
-          _ <- applyAddressPairIndexDelta[F](
-            store,
-            TokenLockBalances,
-            acc.tokenLockBalances.iterator.flatMap {
-              case (mid, inner) => inner.keysIterator.map(holder => (mid, holder))
-            }.toSet,
-            acc.removedTokenLockBalanceKeys
-          )
-
-          _ <- store.commit(snapshotOrdinal)
-          t2 <- Async[F].monotonic.map(_.toMillis)
-
-          // Log total MPT entry count after sync for cross-node comparison
-          totalMptEntries <- store.underlying.entries.map(_.size)
-          rootHash <- store.underlying.getRootHashForOrdinal(snapshotOrdinal)
-          _ <- syncLogger.info(
-            s"[MPT.Sync] ordinal=$snapshotOrdinal AFTER: totalMptEntries=$totalMptEntries " +
-              s"rootHash=${rootHash.map(_.show.take(12)).getOrElse("none")} " +
-              s"totalMs=${t2 - t0}"
-          )
-
         } yield ()
       }
     }

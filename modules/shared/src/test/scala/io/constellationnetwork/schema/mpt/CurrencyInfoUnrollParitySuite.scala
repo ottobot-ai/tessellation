@@ -65,14 +65,14 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
   private def testHash(label: String): Hash =
     Hash(label.getBytes("UTF-8").map("%02x".format(_)).mkString.padTo(64, '0').take(64))
 
-  private def mkTokenLock(source: Address, label: String): Signed[TokenLock] =
+  private def mkTokenLock(source: Address, label: String, metagraphAddress: Address): Signed[TokenLock] =
     Signed(
       TokenLock(
         source,
         TokenLockAmount(PosLong(200L)),
         TokenLockFee(NonNegLong(0L)),
         TokenLockReference(TokenLockOrdinal(NonNegLong(0L)), testHash(s"tl-parent-$label")),
-        None,
+        CurrencyId(metagraphAddress).some,
         EpochProgress(NonNegLong(700L)).some,
         None
       ),
@@ -83,7 +83,7 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
     * fields, `lastMessages` and root-excluded `globalSnapshotSyncView`, need signing fixtures and are covered by the step-3 round-trip.
     * `activeAllowSpends` is left `None` — it stays in fieldId-7, NOT an `infoSubField`, so it does not contribute to `infoRoot`.
     */
-  private def richInfo(holder: Address): CurrencySnapshotInfo =
+  private def richInfo(metagraphAddress: Address, holder: Address): CurrencySnapshotInfo =
     CurrencySnapshotInfo(
       lastTxRefs = SortedMap(holder -> TransactionReference(TransactionOrdinal(NonNegLong(1L)), testHash("csi-tx"))),
       balances = SortedMap(holder -> Balance(NonNegLong(555L))),
@@ -93,7 +93,7 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       activeAllowSpends = None,
       globalSnapshotSyncView = None,
       lastTokenLockRefs = SortedMap(holder -> TokenLockReference(TokenLockOrdinal(NonNegLong(4L)), testHash("csi-tlr"))).some,
-      activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x"))).some
+      activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x", metagraphAddress))).some
     )
 
   private def signedIncremental(
@@ -129,7 +129,7 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       inc <- signedIncremental(7L)
     } yield
       GlobalSnapshotInfo.empty.copy(
-        lastCurrencySnapshots = SortedMap(mgAddr -> (inc, richInfo(holder)).asRight[Signed[CurrencySnapshot]])
+        lastCurrencySnapshots = SortedMap(mgAddr -> (inc, richInfo(mgAddr, holder)).asRight[Signed[CurrencySnapshot]])
       )
 
   test("infoRoot: producer mptStateProof (union-from-entries) === follower currencySnapshotFieldRoots (shared encoder)") { res =>
@@ -206,7 +206,7 @@ object CurrencyInfoUnrollParitySuite extends MutableIOSuite {
       activeAllowSpends = SortedMap(holder -> SortedSet(mkAllowSpend(holder, "x", CurrencyId(mgAddr).some))).some,
       globalSnapshotSyncView = Some(SortedMap.empty),
       lastTokenLockRefs = SortedMap(holder -> TokenLockReference(TokenLockOrdinal(NonNegLong(4L)), testHash("csi-tlr"))).some,
-      activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x"))).some
+      activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, "x", mgAddr))).some
     )
 
   /** Write the unrolled storage for one MG: all eight serialized `Mg*` partitions (seven `infoRoot` fields plus the root-excluded sync

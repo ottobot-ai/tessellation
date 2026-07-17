@@ -203,7 +203,21 @@ object AcceptanceMptStateChanges {
         case (peerId, ref) => GlobalStateKey.lastKesRegistrationRefsKey[F](peerId).map(_ -> ref)
       }.map(_.toMap)
 
+    val currencyInfoMpt = CurrencyInfoMptAdapters.mptFor[F](mpt)
+
     for {
+      // Materialize every typed upsert and physical key before touching the branch. This includes every currency-info structure, so a
+      // malformed later metagraph cannot leave earlier Passthrough writes in the base store.
+      _ <- GlobalStateConverter.preflightStateChangesEntries[F](acc)
+      currency <- buildCurrencySnapshotEntries
+      // Reconstruction is also decode-strict and may fail. Read every prior from the same parent view before the first mutation, then
+      // reuse the complete batch in the write phase instead of interleaving a later metagraph read with earlier metagraph writes.
+      currencyWithPriors <- currency._2.traverse {
+        case (metagraphAddr, newInfo) =>
+          GlobalStateConverter
+            .reconstructCurrencyInfoFrom[F](metagraphAddr, currencyInfoMpt)
+            .map(priorInfo => (metagraphAddr, newInfo, priorInfo))
+      }
       // Fail before staging any branch mutation when a rooted System index is present but undecodable. The RMW helpers repeat the strict
       // read at their write site; this preflight gives applyStateChanges an all-or-nothing malformed-input boundary even for callers that
       // inspect or accidentally reuse a failed handle.
@@ -212,22 +226,18 @@ object AcceptanceMptStateChanges {
       // Remove stale keys first — same as the legacy syncFromStateChanges (line 1597).
       _ <- if (keysToRemove.nonEmpty) mpt.remove(keysToRemove.toList) else Async[F].unit
 
-      currency <- buildCurrencySnapshotEntries
       _ <- mpt.insert[Hash](stateChanHashes)
       _ <- mpt.insert[io.constellationnetwork.schema.transaction.TransactionReference](txRefs)
       _ <- mpt.insert[Balance](balances)
       _ <- mpt.insert[Signed[CurrencyIncrementalSnapshot]](currency._1)
       // fieldId-6 monolithic blob REPLACED by the unrolled per-entry `Mg*` partitions (UNROLL-CURRENCY-SNAPSHOT-INFO-DESIGN §6):
-      // for each MG, reconstruct the prior info from the branch-aware overlay view (the same `getAllForPrefix` the writer accumulates
-      // into), then upsert all eight serialized `Mg*` partitions (seven rooted fields plus the transitional root-excluded sync view) and
-      // remove dropped entries via the shared `writeCurrencyInfo` (byte-identical to `infoEntryBytes`).
+      // for each MG, use the prior reconstructed from the branch-aware parent view before any mutation, then upsert all eight serialized
+      // `Mg*` partitions (seven rooted fields plus the transitional root-excluded sync view) and remove dropped entries via the shared
+      // `writeCurrencyInfo` (byte-identical to `infoEntryBytes`).
       // Does NOT touch fieldId-5 (above) nor activeAllowSpends/fieldId-7 (the `removedAllowSpendKeys` path).
-      _ <- currency._2.traverse_ {
-        case (metagraphAddr, newInfo) =>
-          val infoMpt = CurrencyInfoMptAdapters.mptFor[F](mpt)
-          GlobalStateConverter
-            .reconstructCurrencyInfoFrom[F](metagraphAddr, infoMpt)
-            .flatMap(priorInfo => GlobalStateConverter.writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, infoMpt))
+      _ <- currencyWithPriors.traverse_ {
+        case (metagraphAddr, newInfo, priorInfo) =>
+          GlobalStateConverter.writeCurrencyInfo[F](metagraphAddr, newInfo, priorInfo, currencyInfoMpt)
       }
       _ <- mpt.insert[Proof](currencyProofs)
       _ <- mpt.insert[SortedSet[Signed[AllowSpend]]](activeAllowSpends)

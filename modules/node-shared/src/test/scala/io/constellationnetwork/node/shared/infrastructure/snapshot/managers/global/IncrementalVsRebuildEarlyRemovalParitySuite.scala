@@ -83,14 +83,19 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
       testProofs
     )
 
-  private def mkTokenLock(source: Address, unlockAt: Option[EpochProgress], label: String): Signed[TokenLock] =
+  private def mkTokenLock(
+    source: Address,
+    unlockAt: Option[EpochProgress],
+    label: String,
+    currencyId: Option[CurrencyId] = None
+  ): Signed[TokenLock] =
     Signed(
       TokenLock(
         source = source,
         amount = TokenLockAmount(PosLong(200L)),
         fee = TokenLockFee(NonNegLong(0L)),
         parent = TokenLockReference(TokenLockOrdinal(NonNegLong(0L)), testHash(s"tl-parent-$label")),
-        currencyId = None,
+        currencyId = currencyId,
         unlockEpoch = unlockAt,
         replaceTokenLockRef = None
       ),
@@ -485,7 +490,7 @@ object IncrementalVsRebuildEarlyRemovalParitySuite extends MutableIOSuite {
         activeAllowSpends = None,
         globalSnapshotSyncView = None,
         lastTokenLockRefs = None,
-        activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, None, "lock1"))).some
+        activeTokenLocks = SortedMap(holder -> SortedSet(mkTokenLock(holder, None, "lock1", CurrencyId(mgAddr).some))).some
       )
       // Next ordinal: the holder's lock has expired -> dropped from activeTokenLocks (an MgActiveTokenLocks removal).
       nextInfo = priorInfo.copy(activeTokenLocks = SortedMap.empty[Address, SortedSet[Signed[TokenLock]]].some)
