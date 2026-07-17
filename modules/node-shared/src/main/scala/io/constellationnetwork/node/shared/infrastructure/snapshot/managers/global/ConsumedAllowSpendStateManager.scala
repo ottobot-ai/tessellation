@@ -81,8 +81,8 @@ final case class CrossShardSettlementResult(
 trait ConsumedAllowSpendStateManager[F[_]] {
 
   /** Materialize the full `hash(AS) → ConsumedAllowSpend` spent-set by prefix-scanning the MPT under `(HypergraphNamespace,
-    * fieldId=ConsumedAllowSpends)`. The map key is recovered from the value's `allowSpendHash` (the value-carries-key pattern —
-    * `consumedAllowSpendKey` hashes the hash into the user slot, lossy like every hashed key).
+    * fieldId=ConsumedAllowSpends)`. Every value must reproduce its exact physical key from `allowSpendHash`, retain the canonical codec
+    * bytes, and claim a unique semantic hash before it can enter the returned map.
     */
   def materializeConsumedAllowSpendsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Hash, ConsumedAllowSpend]]
 
@@ -154,11 +154,63 @@ object ConsumedAllowSpendStateManager {
     def materializeConsumedAllowSpendsFromMpt(implicit hasher: Hasher[F]): F[SortedMap[Hash, ConsumedAllowSpend]] =
       for {
         prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ConsumedAllowSpends)
-        entries <- reader.getAllForPrefix[ConsumedAllowSpend](prefix)
-      } yield
-        entries.values.toList.foldLeft(SortedMap.empty[Hash, ConsumedAllowSpend]) {
-          case (acc, value) => acc.updated(value.allowSpendHash, value)
-        }
+        entries <- reader.getAllForPrefixStrict[ConsumedAllowSpend](prefix)
+        validated <- entries
+          .sortBy(_.physicalKey.value)
+          .foldLeftM(
+            (SortedSet.empty[Hash], List.empty[(Hash, ConsumedAllowSpend)])
+          ) {
+            case (_, StrictMptEntry(physicalKey, StrictMptRead.Absent)) =>
+              Async[F].raiseError[(SortedSet[Hash], List[(Hash, ConsumedAllowSpend)])](
+                StrictMptRead.MissingConsensusMptValue(
+                  "materialize ConsumedAllowSpends prefix entry",
+                  physicalKey
+                )
+              )
+
+            case (_, StrictMptEntry(physicalKey, StrictMptRead.Malformed(reason, _))) =>
+              Async[F].raiseError[(SortedSet[Hash], List[(Hash, ConsumedAllowSpend)])](
+                StrictMptRead.MalformedConsensusMptValue(
+                  "materialize ConsumedAllowSpends prefix entry",
+                  physicalKey,
+                  reason
+                )
+              )
+
+            case ((seen, acc), StrictMptEntry(physicalKey, StrictMptRead.Present(value, rawBytes))) =>
+              val canonicalBytes = consumedAllowSpendImmutableCodec.immutableBytes(value)
+
+              if (rawBytes != canonicalBytes)
+                Async[F].raiseError[(SortedSet[Hash], List[(Hash, ConsumedAllowSpend)])](
+                  StrictMptRead.MalformedConsensusMptValue(
+                    "materialize ConsumedAllowSpends prefix entry",
+                    physicalKey,
+                    "non-canonical value encoding"
+                  )
+                )
+              else if (seen.contains(value.allowSpendHash))
+                Async[F].raiseError[(SortedSet[Hash], List[(Hash, ConsumedAllowSpend)])](
+                  StrictMptRead.InconsistentConsensusMptIndex(
+                    "materialize ConsumedAllowSpends prefix entry",
+                    physicalKey,
+                    s"duplicate semantic allow-spend hash=${value.allowSpendHash.value}"
+                  )
+                )
+              else
+                GlobalStateKey.toHex[F](GlobalStateKey.consumedAllowSpendKey(value.allowSpendHash)).flatMap { expectedKey =>
+                  if (physicalKey === expectedKey)
+                    (seen + value.allowSpendHash, (value.allowSpendHash -> value) :: acc).pure[F]
+                  else
+                    Async[F].raiseError[(SortedSet[Hash], List[(Hash, ConsumedAllowSpend)])](
+                      StrictMptRead.InconsistentConsensusMptIndex(
+                        "materialize ConsumedAllowSpends prefix entry",
+                        physicalKey,
+                        s"key/value mismatch expected=${expectedKey.value} actual=${physicalKey.value}"
+                      )
+                    )
+                }
+          }
+      } yield SortedMap.from(validated._2.reverse)
 
     def materializeActiveAllowSpendsFromMpt(
       implicit hasher: Hasher[F]

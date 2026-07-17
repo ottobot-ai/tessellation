@@ -79,7 +79,6 @@ key. Representative confirmed sites are:
 - delegated stake and collateral: `DelegatedStakeStateManager.scala:163-195`
   and `NodeCollateralStateManager.scala:254-287`.
 - active token locks: `TokenLockStateManager.scala:865-872`.
-- consumed allow-spends: `ConsumedAllowSpendStateManager.scala:154-161`.
 - slash/dedup state: `InvalidStateProofSlashedReader.scala:70-93`.
 
 The existing field-7 reader and the KES/genesis readers demonstrate pieces of
@@ -89,6 +88,15 @@ values and reject misplaced or duplicate claims
 `KesRegistrationStateManager.scala:164-208`;
 `L0GenesisLoader.scala:454-483`). They are field-local precedents, not a
 whole-image proof.
+
+Field 33 is now another field-local precedent: its materializer retains strict
+physical entries and raw bytes, requires canonical re-encoding, reproduces
+`consumedAllowSpendKey(value.allowSpendHash)` exactly, and rejects duplicate
+semantic hashes before map construction
+(`ConsumedAllowSpendStateManager.scala:154-213`;
+`ConsumedAllowSpendStateManagerMaterializationSuite.scala:102-225`). This closes
+the live MPT-02 parser only. It does not prove the complete ROOT-008 image or the
+restart/compaction/reorg portions of XMG-013.
 
 ## 2. Canonical physical syntax
 
@@ -236,7 +244,7 @@ reader is safe:
 | 22, 23 | GSI/accumulator typed writer | `KesRegistrationStateManager` (`KesRegistrationStateManager.scala:125-231`) | Field 22 checks homogeneous operator/key; field 23 identity is recovered indirectly and missing/invalid pointers can be omitted. |
 | 24 | Genesis typed writer | `L0GenesisLoader.materializeRootedGenesisOperatorKeys` (`L0GenesisLoader.scala:454-483`) | Key/duplicate checks exist; whole-image and writer-epoch rules still belong in the manifest. |
 | 25-32 | `infoEntryBytes`/currency typed writer (`GlobalStateConverter.scala:1479-1524`) | `reconstructCurrencyInfoFrom` (`GlobalStateConverter.scala:1824-1858`) | Reconstruction uses `entries.values`; field 32 is additionally root-excluded. |
-| 33 | `AllowSpendConsumeHandler` and `CrossShardMessageEngine.write` (`AllowSpendConsumeHandler.scala:28-56`; `GlobalSnapshotAcceptanceManager.scala:2977-2982`) | `ConsumedAllowSpendStateManager` (`ConsumedAllowSpendStateManager.scala:154-161`) | Scodec exists, but current materializer does not compare key to `allowSpendHash`. |
+| 33 | `AllowSpendConsumeHandler` and `CrossShardMessageEngine.write` (`AllowSpendConsumeHandler.scala:28-56`; `GlobalSnapshotAcceptanceManager.scala:2986-2991`) | strict `ConsumedAllowSpendStateManager` materializer (`ConsumedAllowSpendStateManager.scala:154-213`) | Focused parser now enforces canonical raw bytes, exact direct-hash key, malformed/absent failure, and unique semantic identity. Whole-image/recovery XMG-013 remains open. |
 | 34 | direct GSAM upheld-dispute insert (`GlobalSnapshotAcceptanceManager.scala:2950-2975`) | `InvalidStateProofSlashedReader` and `SlashCooldownReader` | Readers discard physical keys; value codec is canonical JSON, not target scodec. |
 
 ### 4.2 Target writer and reader roles
