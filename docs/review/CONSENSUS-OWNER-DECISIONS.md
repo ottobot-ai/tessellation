@@ -787,7 +787,7 @@ locks across successor/replacement lineages.
 
 The owner must disposition `O23-01` through `O23-06`: infraction-time stable
 `BondId`/tranche liability versus slash-time operator-wide liability; full-only
-InvalidStateProof V1 versus a new residual-lock design; the pending/release
+InvalidStateProof V1 with exact-amount tranches versus a new residual-lock design; the pending/release
 horizon; slash-before-release same-candidate ordering; actual-debit bounty and
 reward treatment; and density-reorg culpability. The packet recommends
 infraction-time tranches, full-only V1, pending slashability through the complete

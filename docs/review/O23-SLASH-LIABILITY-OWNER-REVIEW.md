@@ -83,6 +83,14 @@ simpler, but it can seize later innocent delegation and is not recommended.
 **Recommendation:** freeze InvalidStateProof V1 at exactly `1/1`. Any active
 policy carrying another fraction is invalid.
 
+Each slashable V1 tranche owns one unique exact-amount backing lock. An
+amount-preserving replacement may carry the same `BondId`; an amount increase
+creates a new exact tranche, and an amount decrease stages the old tranche for
+release only after its liability deadline. An attached slashable tranche cannot
+silently mutate into a larger or smaller single lock. A full slash therefore
+consumes the complete exact lock for each selected liable tranche without
+creating a residual lock or overcharging a later increase.
+
 `TokenLock` amount and reference are immutable signed data, delegated records
 can change only metadata amount, and collateral has no partial-amount slot. The
 current fractional path therefore cannot debit the exact principal it reports.
@@ -184,8 +192,9 @@ that only newly culpable signers produce debit or reward.
 2. Same-round and prior-round withdrawal cannot hide principal; maturity cannot
    refund a consumed lock.
 3. A post-offense delegation to the same operator is not charged.
-4. Successor, replacement, redelegation, and pending state preserve one stable
-   `BondId` and cannot reduce open liability.
+4. Successor, exact-amount replacement, redelegation, and pending state preserve
+   one stable `BondId`; amount increase creates a distinct tranche and amount
+   decrease cannot reduce open liability.
 5. Overlapping signer sets `A/B/C` then `A/D/E` debit each signer once and reward
    only the first canonical claimant for each new debit.
 6. Partial-fraction policy, surplus/missing/duplicate backing, malformed lineage,
@@ -244,7 +253,7 @@ Please answer all six:
 
 ```text
 O23-01: accept infraction-time BondId/tranche liability
-O23-02: accept full InvalidStateProof V1 only
+O23-02: accept full InvalidStateProof V1 with one exact-amount lock per tranche
 O23-03: accept pending slashability through the complete liability horizon
 O23-04: accept slash-before-release same-candidate ordering
 O23-05: accept actual-debit funding and reward forfeiture as separate burn

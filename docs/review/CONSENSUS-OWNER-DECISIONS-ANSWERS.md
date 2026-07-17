@@ -694,7 +694,7 @@ watchtower assertion decide guilt.
 [`O23-SLASH-LIABILITY-OWNER-REVIEW.md`](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
 
 The pending `O23-01` through `O23-06` choices define which principal is liable,
-whether InvalidStateProof V1 is full-only, how long pending principal remains
+whether InvalidStateProof V1 is full-only over exact-amount tranches, how long pending principal remains
 slashable, whether slash precedes every same-candidate release, how exact debit
 funds bounty and treats accrued rewards, and how objectively invalid signatures
 are revalidated after a later density reorg.
