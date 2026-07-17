@@ -233,12 +233,27 @@ criteria are in `NAKAMOTO-PLAN.md`.
         pinned/network/disk/reorg integration plus production-scale tests; ROOT-005
         mutation ownership; and ROOT-009/BR-05 authenticated staged installation.
   - [ ] **3. Parallel consumer migrations:** after step 2, independently close
-    `MPT-01` Mg* value-only reconstruction; `MPT-02` consumed-allow-spend
+    `MPT-01` historical Mg* value-only reconstruction (focused fields 25-32
+    parser/writer/preflight partial); `MPT-02` consumed-allow-spend
     physical nullifier keys; `MPT-03` stake/collateral scope and keys; `MPT-04`
     token-lock value/head selection; `MPT-05` slash/cooldown keys; and `MPT-06`
     price/parameter keys. The parser defects are confirmed; malicious ingress is
     PLAUSIBLE pending end-to-end RED reproduction. Gates: `XMG-013`, `PERM-005`,
     `WT-010`, `ECON-G-002`.
+    - **MPT-01 FOCUSED MG PARSER/WRITER/PREFLIGHT GREEN; FINDING PARTIAL:**
+      fields 25-32 now retain physical keys and raw bytes, require canonical
+      re-encoding and exact address/hashed-key reproduction across contract
+      placements, and reject malformed/absent entries and duplicate logical
+      identities before map construction. Field 30 enforces a nonempty homogeneous
+      holder set, owning-MG currency scope, and unsigned token-lock identity;
+      field 31 enforces tuple/payload message type and owning MG. Byte, JSON, and
+      typed writers share those structural gates. Full rebuild, direct incremental,
+      and AcceptanceMpt paths preflight malformed later-MG currency info before the
+      tested mutations. Keep MPT-01/ROOT-008 open for complete field-5/25-31
+      population/root relations, field-5 consistency, exact candidate-era hashing,
+      field-32 witness/deletion and optionality, cryptographic/reference history,
+      consensus resource bounds, arbitrary raw ingress, and complete restart/
+      catch-up/bootstrap/reorg coverage. This is not `VerifiedGlobalStateImage`.
     - **MPT-02 FOCUSED PARSER GREEN:** field 33 now retains exact physical
       key/raw bytes, rejects malformed/trailing/noncanonical values and wrong
       placement, reproduces the direct-hash key, and rejects duplicate logical
@@ -249,8 +264,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
       malformed/noncanonical bytes, empty or mixed sets, currency-scoped locks,
       wrong physical keys/contracts, and duplicate source/current unsigned
       identities before use. Keep MPT-04/ROOT-008 open for signature/reference
-      history, the frozen cross-hash-era identity function, field 30, resource
-      bounds, and accepted-state/restart/catch-up/bootstrap/reorg integration.
+      history, the frozen candidate-era identity function, resource bounds, and
+      accepted-state/restart/catch-up/bootstrap/reorg integration. Focused field-30
+      structure is covered by MPT-01; its cryptographic/history/lifecycle proof is not.
   - [ ] **4. Raw recovery and tower:** exact-snapshot/root-verify network, disk,
     and deep-reorg maps; strip non-consensus derived bytes and rebuild them only
     from rooted state (`ROOT-009`). `ECO-IDX-02`'s root-invisible System-index

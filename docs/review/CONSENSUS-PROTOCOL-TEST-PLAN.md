@@ -514,15 +514,39 @@ impossible absent/noncanonical retained bytes, and duplicate input order fail
 before map construction. Restart, compaction, exact-parent recovery,
 accepted-state ingress, and density-reorg integration remain RED/open.
 
+The focused parser/writer/preflight portion of `MPT-01` is GREEN, but the finding
+remains PARTIAL. `MgAddressFieldStrictReconstructionSuite` covers fields 25-30
+canonical reconstruction, A-key/B-value, wrong-contract/suffix placement,
+strict absent/malformed/noncanonical values, deterministic duplicate identities,
+and field-30 nonempty/source/owning-MG/unsigned-identity rules.
+`CurrencyInfoHashedEntryStrictReconstructionSuite` covers the corresponding
+field-31/32 hashed-key vectors plus field-31 tuple/payload type and MG identity.
+`CurrencyInfoWriterStructureGateSuite` proves that the byte, JSON, and typed
+writers share the field-30/31 structural gate before typed mutation.
+`CurrencyInfoDirectWriterAtomicitySuite` proves unchanged bytes for malformed
+later-MG field-30/31 state and tested later key-materialization failures in full
+and direct-incremental compound writers.
+`AcceptanceMptCurrencyInfoPreflightAtomicitySuite` proves unchanged Passthrough
+base bytes/root when a later MG carries malformed field-30 state, while
+`CurrencyInfoUnrollParitySuite` retains canonical writer/reconstruction round-trip
+and field-root parity coverage. These focused tests do not construct a sealed
+`VerifiedGlobalStateImage`, prove field-5/25-31
+population/root relations or field-5 consistency, bind the identity hash to an
+exact candidate era, solve field-32 witness/deletion or `None` versus
+`Some(empty)`, validate signatures/reference history, freeze resource bounds,
+prove arbitrary raw ingress, or cover restart/catch-up/bootstrap/reorg. They also
+do not claim AcceptanceMpt is atomic against every unrelated later storage failure.
+
 The focused native field-8 portion of `MPT-04` is GREEN at `1e942fb28` in
 `ActiveTokenLockMptReaderSuite`: canonical multi-lock/source entries succeed;
 wrong key/suffix/contract, empty/mixed/currency-scoped sets, null/malformed/
 empty/trailing/noncanonical bytes, impossible prefix absence, duplicate logical
 sources, duplicate unsigned values with different proof sets, and malformed or
 wrong-source point reads fail before economic use. This does not close
-signature/reference-history validation, the final hash-era identity vectors,
-field 30, resource bounds, or accepted-state/restart/catch-up/bootstrap/reorg
-integration; `MPT-04` and `ROOT-008` remain partial/open.
+signature/reference-history validation, the candidate-era hash/identity vectors,
+resource bounds, or accepted-state/restart/catch-up/bootstrap/reorg integration.
+Focused field-30 structure is now covered by MPT-01, but its cryptographic,
+history, and lifecycle gates remain; `MPT-04` and `ROOT-008` stay partial/open.
 
 ### 4.8 Payload lanes and data availability
 

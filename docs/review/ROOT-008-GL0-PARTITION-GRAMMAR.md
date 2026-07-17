@@ -1,15 +1,17 @@
 # ROOT-008 GL0 Partition Grammar
 
-Status: **DESIGN PACKET - NOT IMPLEMENTED, NOT AN ACTIVATION CLAIM**
+Status: **FOCUSED MPT-01 PARSER/WRITER/PREFLIGHT PARTIAL; ROOT-008 NOT IMPLEMENTED, NOT AN ACTIVATION CLAIM**
 
 Date: 2026-07-14
 
 This packet defines the target structural grammar for every physical leaf that may
 appear in the GL0 consensus MPT. It is the design input for `ROOT-008`; it is not
 evidence that current readers, recovery, diff adoption, or snapshot acceptance
-enforce the contract. The current implementation still contains value-only
-reconstruction and root-excluded writable field 32. Those paths remain release
-blockers.
+enforce the complete contract. Fields 25-32 now have a focused strict
+physical-key/raw-value reconstruction path and field-30/31 writer structure
+gates, but other value-only readers remain and field 32 is still writable,
+root-excluded, and replay-consumed. Whole-image relations and lifecycle coverage
+remain release blockers.
 
 The contract has two independent layers:
 
@@ -69,16 +71,14 @@ Complete decode must be followed by `encode(decoded) == raw`; otherwise a codec
 which accepts more than one byte representation can still admit a consensus
 alias.
 
-Current prefix readers reconstruct several maps from `entries.values`,
+Remaining prefix readers reconstruct several maps from `entries.values`,
 `headOption`, or an embedded identity without first checking the actual physical
 key. Representative confirmed sites are:
 
-- Mg fields: `GlobalStateConverter.scala:1824-1858`.
 - update parameters: `UpdateNodeParametersStateReader.scala:17-50`.
 - price state: `PriceStateUpdater.scala:38-83`.
 - delegated stake and collateral: `DelegatedStakeStateManager.scala:163-195`
   and `NodeCollateralStateManager.scala:254-287`.
-- active token locks: `TokenLockStateManager.scala:865-872`.
 - slash/dedup state: `InvalidStateProofSlashedReader.scala:70-93`.
 
 The existing field-7 reader and the KES/genesis readers demonstrate pieces of
@@ -88,6 +88,32 @@ values and reject misplaced or duplicate claims
 `KesRegistrationStateManager.scala:164-208`;
 `L0GenesisLoader.scala:454-483`). They are field-local precedents, not a
 whole-image proof.
+
+Fields 25-32 are now a field-local precedent rather than a current values-only
+parser defect. `reconstructCurrencyInfoFrom` scans each MG/field across contract
+placements while retaining sorted physical keys and raw bytes, rejects strict
+absence/malformed/noncanonical encoding, recomputes the exact address or hashed
+key, and rejects duplicate semantic identities before `SortedMap` construction.
+Field 30 additionally requires a nonempty homogeneous holder set, owning-MG
+currency scope, and unique unsigned token-lock identity; field 31 binds tuple
+message type and payload metagraph. The byte, JSON, and typed writers share the
+field-30/31 structure gate (`GlobalStateKey.scala:447-454`;
+`GlobalStateConverter.scala:1509-1579,1596-1667,1923-2038,2080-2116`).
+The focused oracle is split across `MgAddressFieldStrictReconstructionSuite`,
+`CurrencyInfoHashedEntryStrictReconstructionSuite`,
+`CurrencyInfoWriterStructureGateSuite`, `CurrencyInfoDirectWriterAtomicitySuite`,
+`AcceptanceMptCurrencyInfoPreflightAtomicitySuite`, and the canonical round-trip/
+field-root vectors in `CurrencyInfoUnrollParitySuite`.
+
+Compound full rebuild and direct incremental writers preflight every supplied
+currency entry and physical key before their transaction/mutation phase; the
+AcceptanceMpt path preflights the same input and reconstructs every touched prior
+MG before its first mutation (`GlobalStateConverter.scala:1203-1221,2805-2843,3050-3064`;
+`AcceptanceMptStateChanges.scala:206-240`). Focused later-MG malformed-structure
+and key-materialization vectors leave the exercised bytes/root unchanged. This
+is not general transaction atomicity for every later storage failure and does
+not prove arbitrary raw ingress, whole-image population/root relations, or any
+restart/catch-up/bootstrap/reorg path.
 
 Field 33 is now another field-local precedent: its materializer retains strict
 physical entries and raw bytes, requires canonical re-encoding, reproduces
@@ -201,9 +227,9 @@ inside one exact-parent transaction.
 | 27 | `MgLastFeeTxRefs` | `(Address, TransactionReference)`; same writer/reader family | `MGEntryAddress`; account from tuple, exact key, duplicate rejection, valid fee-reference semantics. | `G + C-info` |
 | 28 | `MgLastAllowSpendRefs` | `(Address, AllowSpendReference)`; same writer/reader family | `MGEntryAddress`; account from tuple, exact key, duplicate rejection, valid reference. | `G + C-info` |
 | 29 | `MgLastTokenLockRefs` | `(Address, TokenLockReference)`; same writer/reader family | `MGEntryAddress`; account from tuple, exact key, duplicate rejection, valid reference. | `G + C-info` |
-| 30 | `MgActiveTokenLocks` | `(Address, SortedSet[Signed[TokenLock]])`; same writer/reader family | `MGEntryAddress`; tuple account must equal every lock source; set is nonempty; exact key; duplicate lock identities rejected. The relationship between each lock's `currencyId` and network MG is frozen by the economic grammar. | `G + C-info` |
-| 31 | `MgLastMessages` | `(MessageType, Signed[CurrencyMessage])`; same writer/reader family | `MGEntryHash`; tuple type must equal `message.messageType`; signed message `metagraphId` must equal network MG; derive `HASH32(messageType.value)`, reproduce key, require valid signature/domain, and reject duplicate `(mg,type)`. | `G + C-info` |
-| 32 | `MgGlobalSnapshotSyncView` | `(PeerId, Signed[GlobalSnapshotSync])`; current `infoEntryBytes` writer and Mg reconstruction | **Target GL0: `DENY`.** Current shape is `MGEntryHash`, and a transitional audit must at least require tuple peer equals the sole valid signer and exact hashed key. It cannot become authoritative because these bytes are excluded from `mptRoot`. Remove only after the exact optional replay witness and explicit ML0 population pass `ROOT-010`; retain the field in ML0 `CurrencySnapshotInfo`. | current `X`; target `DENY` |
+| 30 | `MgActiveTokenLocks` | `(Address, SortedSet[Signed[TokenLock]])`; same writer/reader family | `MGEntryAddress`; focused reader/writer paths now require tuple account to equal every lock source, a nonempty set, exact key, `currencyId == Some(CurrencyId(owningMg))`, and unique current unsigned lock identity. Signature/reference history, frozen candidate-era identity, bounds, and lifecycle proof remain open. | `G + C-info` |
+| 31 | `MgLastMessages` | `(MessageType, Signed[CurrencyMessage])`; same writer/reader family | `MGEntryHash`; focused reader/writer paths now require tuple type to equal `message.messageType`, payload `metagraphId` to equal network MG, exact `HASH32(messageType.value)` key, canonical bytes, and unique `(mg,type)`. Valid signature/domain/history and candidate-era hash binding remain open. | `G + C-info` |
+| 32 | `MgGlobalSnapshotSyncView` | `(PeerId, Signed[GlobalSnapshotSync])`; current `infoEntryBytes` writer and Mg reconstruction | **Target GL0: `DENY`.** The focused transitional reader now requires canonical tuple bytes, exact hashed peer key, and duplicate rejection, but it does not prove tuple peer equals the sole valid signer or the complete ML0 population. It cannot become authoritative because these bytes are excluded from `mptRoot`. Remove only after the exact optional replay witness and explicit ML0 population pass `ROOT-010`; retain the field in ML0 `CurrencySnapshotInfo`. | current `X`; target `DENY` |
 | 33 | `ConsumedAllowSpends` | `ConsumedAllowSpend`; direct cross-shard settlement writer and consumed-state manager | `GlobalHashed`; value's `allowSpendHash` is the user digest directly, not rehashed. Reproduce exact key and reject duplicate hash identities. Decoded owner/source/destination/currency/amount/expiry/reference claims are not authorization; O-13/XMG must join retained authorization and delivery evidence before the global kernel creates the permanent nullifier. It is never removed by acknowledgement or retention. | `G` only |
 | 34 | `Slashings` | `SlashedRegistryEntry`; upheld-dispute GSAM writer and slash/cooldown readers | `GlobalHashed`; derive the exact composite `HASH32(canonicalTuple(peerId, shardId, checkpointHash))`, whose byte codec must be frozen with the manifest. Reproduce key and reject duplicate triples before map/set construction. Evidence, reason, event ordinal, cooldown, and the corresponding economic effects are adjudication invariants, not trusted record claims. Replace current canonical-JSON value codec with one frozen scodec codec before schema activation. | `G` only |
 
@@ -232,7 +258,7 @@ reader is safe:
 | 3 | No canonical typed target writer; full currency snapshots are converted to field 5 plus info | Legacy point read and field-3/5 union materializer (`GlobalStateConverter.scala:2102-2109,2174-2256`) | Retired live shape remains accepted/readable. |
 | 6 | No canonical writer; fields 25-31 replaced it | No target reader; `CurrencySnapshotInfo` codec still exists | Retired field ID remains accepted. |
 | 7, 10 | GSI/accumulator typed writer | `GlobalStateConverter` field-7 validator plus `AllowSpendStateManager` (`GlobalStateConverter.scala:1750-1819`; `AllowSpendStateManager.scala:504-528`) | Field 7 has local key checks; field 10 still depends on its index. Neither substitutes for whole-image relations. |
-| 8, 9, 11 | GSI/accumulator typed writer | `TokenLockStateManager` (`TokenLockStateManager.scala:865-927`) | Field 8 still uses `headOption`; index-backed 9/11 need manifest-level bijection. |
+| 8, 9, 11 | GSI/accumulator typed writer | strict field-8 `ActiveTokenLockMptReader` plus `TokenLockStateManager` | Focused field 8 now retains physical/raw entries and enforces canonical native scope, homogeneous nonempty sources, exact keys, and duplicate current unsigned identity rejection. Signatures/history/era/bounds/lifecycle and index-backed 9/11 manifest bijection remain open. |
 | 12 | GSI/accumulator typed writer | `UpdateNodeParametersStateReader` and duplicate `GlobalStateConverter` reader (`UpdateNodeParametersStateReader.scala:40-50`; `GlobalStateConverter.scala:2273-2279`) | Both full scans currently discard physical keys. |
 | 13, 14 | GSI/accumulator typed writer | `DelegatedStakeStateManager` and `NodeStakeAggregator` (`DelegatedStakeStateManager.scala:163-195`; `NodeStakeAggregator.scala:82-113`) | Values/head selection can drop empty or misplaced records. |
 | 15, 16 | GSI/accumulator typed writer | `NodeCollateralStateManager` and `NodeStakeAggregator` (`NodeCollateralStateManager.scala:254-287`; `NodeStakeAggregator.scala:82-113`) | Same value-only defect; field-16 expiry also consumes local `WithdrawalTimeLimit`. |
@@ -243,7 +269,7 @@ reader is safe:
 | 21 | Dedicated `MptTowerStore`, not GL0 | dedicated tower store/verifier | Active GL0 enum acceptance is wider than intended ownership. |
 | 22, 23 | GSI/accumulator typed writer | `KesRegistrationStateManager` (`KesRegistrationStateManager.scala:125-231`) | Field 22 checks homogeneous operator/key; field 23 identity is recovered indirectly and missing/invalid pointers can be omitted. |
 | 24 | Genesis typed writer | `L0GenesisLoader.materializeRootedGenesisOperatorKeys` (`L0GenesisLoader.scala:454-483`) | Key/duplicate checks exist; whole-image and writer-epoch rules still belong in the manifest. |
-| 25-32 | `infoEntryBytes`/currency typed writer (`GlobalStateConverter.scala:1479-1524`) | `reconstructCurrencyInfoFrom` (`GlobalStateConverter.scala:1824-1858`) | Reconstruction uses `entries.values`; field 32 is additionally root-excluded. |
+| 25-32 | `infoEntryBytes`/`infoEntryJson`/currency typed writer (`GlobalStateConverter.scala:1596-1667,2080-2116`) | strict `reconstructCurrencyInfoFrom` (`GlobalStateConverter.scala:1923-2038`) | **FOCUSED MPT-01 PARTIAL:** canonical raw bytes, exact physical address/hashed keys across contract placements, malformed/absent failure, and deterministic duplicate rejection are enforced. Field-30/31 structure is enforced before focused writes, and compound paths preflight malformed later-MG input before the tested mutations. This is not whole-image/population/root, field-32 witness/deletion, crypto/history, era-hash, bounds, raw-ingress, or lifecycle closure. |
 | 33 | `AllowSpendConsumeHandler` and `CrossShardMessageEngine.write` (`AllowSpendConsumeHandler.scala:28-56`; `GlobalSnapshotAcceptanceManager.scala:2986-2991`) | strict `ConsumedAllowSpendStateManager` materializer (`ConsumedAllowSpendStateManager.scala:154-213`) | Focused parser now enforces canonical raw bytes, exact direct-hash key, malformed/absent failure, and unique semantic identity. Whole-image/recovery XMG-013 remains open. |
 | 34 | direct GSAM upheld-dispute insert (`GlobalSnapshotAcceptanceManager.scala:2950-2975`) | `InvalidStateProofSlashedReader` and `SlashCooldownReader` | Readers discard physical keys; value codec is canonical JSON, not target scodec. |
 

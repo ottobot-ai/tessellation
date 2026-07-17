@@ -284,13 +284,27 @@ already has a hard-coded kill switch.
    composes with, but does not replace, O-07/ECON-G economic authorization,
    conservation, backing, replay protection, and transition validity.
 3. **Migrate key-blind consumers in parallel after step 2.** Close the six
-   source-confirmed parser families: `MPT-01` Mg* value-only reconstruction,
+   source-confirmed parser families: `MPT-01` historical Mg* value-only
+   reconstruction (focused fields 25-32 parser/writer/preflight partial),
    `MPT-02` consumed-allow-spend physical nullifier keys, `MPT-03` stake and
    collateral scope/keys, `MPT-04` token-lock value/head selection, `MPT-05`
    slash/cooldown keys, and `MPT-06` price/parameter keys. Their parser defects
    are confirmed; end-to-end malicious ingress remains PLAUSIBLE until the RED
    integration vectors reproduce it. Gates: `XMG-013`, `PERM-005`, `WT-010`,
    `ECON-G-002`.
+   The focused MPT-01 fields 25-32 parser/writer/preflight work is green, but the
+   finding remains partial. Reconstruction retains physical keys/raw bytes,
+   requires canonical re-encoding and exact address/hashed-key reproduction
+   across contract placements, and rejects malformed/absent entries and duplicate
+   logical identities. Field 30 enforces nonempty homogeneous holder/owning-MG
+   currency scope/unsigned identity; field 31 enforces tuple/payload type and MG.
+   Byte, JSON, and typed writers share those gates, and full rebuild, direct
+   incremental, and AcceptanceMpt paths preflight malformed later-MG currency
+   info before the tested mutations. This is not `VerifiedGlobalStateImage` or
+   ROOT-008 closure: field-5/25-31 population/root relations and field-5
+   consistency, candidate-era hashing, field-32 witness/deletion/optionality,
+   crypto/history, resource bounds, arbitrary raw ingress, and the complete
+   restart/catch-up/bootstrap/reorg matrix remain open.
    The focused live MPT-02 field-33 parser is now strict: it retains physical
    key/raw bytes, requires canonical re-encoding and exact direct-hash key
    reproduction, and rejects duplicate logical hashes. Keep MPT-02/XMG-013
@@ -301,9 +315,10 @@ already has a hard-coded kill switch.
    native-only scope, homogeneous-source and current unsigned-reference
    uniqueness, exact key reproduction, and deterministic duplicate rejection.
    Keep MPT-04/ROOT-008 partial for signatures/reference history, the frozen
-   cross-hash-era identity function, field 30, resource bounds, and complete
-   ingress/restart/catch-up/bootstrap/reorg proof. MPT-01, MPT-03, MPT-05, and
-   MPT-06 remain open.
+   candidate-era identity function, resource bounds, and complete ingress/restart/
+   catch-up/bootstrap/reorg proof. Focused field-30 structure is covered by MPT-01;
+   its cryptographic/history/lifecycle proof is not. MPT-01 is partial; MPT-03,
+   MPT-05, and MPT-06 remain open.
 4. **Harden raw recovery and tower state.** Network sync, persisted restore, and
    deep-reorg loads accept only an exact snapshot-bound complete root. Any
    non-consensus derived bytes are stripped and deterministically rebuilt from
