@@ -24,14 +24,15 @@ object InvalidStateProofBatchReplay {
   case object Unavailable extends InvalidStateProofBatchReplay
 }
 
-/** WATCHTOWER invalid-state-proof DETERMINISTIC verdict — the accept-time validator for an [[InvalidStateProofEvidence]] (the
-  * `InvalidStateProof` 100% slashing tier). Companion to [[SlashableEvidenceValidator]] / [[ShardCheckpointEquivocationValidator]].
+/** WATCHTOWER invalid-state-proof verdict function — the accept-time validator for an [[InvalidStateProofEvidence]] (the
+  * `InvalidStateProof` slashing tier). Companion to [[SlashableEvidenceValidator]] / [[ShardCheckpointEquivocationValidator]].
   *
   * '''The single non-negotiable: the verdict must be a byte-identical function of portable evidence and a uniquely identified canonical
-  * base on every honest node.''' Current exceptional adjudication makes every GL0 node independently replay the disputed signed inputs at
-  * the carried exact base and decides UPHELD iff the checkpoint result differs. Never trust the challenger's claimed roots. Ordinary target
-  * adoption does not universally replay: execution signers replay before signing, positive watchtower coverage is required pre-inclusion,
-  * and other GL0 nodes verify the certificate/coverage/base/namespace/diff/root.
+  * base on every honest node.''' The target exceptional path makes every GL0 replay the disputed signed inputs at the carried exact base
+  * and uphold only when the checkpoint result differs. Current production does not yet satisfy that premise: replay-history availability
+  * can differ, and unavailable maps to `CannotRederive`/no-slash. Never trust the challenger's claimed roots. Ordinary target adoption does
+  * not universally replay: execution signers replay before signing, positive watchtower coverage is required pre-inclusion, and other GL0
+  * nodes verify the certificate/coverage/base/namespace/diff/root.
   *
   * '''The re-derivation primitive (`replayCheckpoint`).''' Injected as the same `(includedChains, gl0AnchorOrdinal, executionBase) \=>
   * F[InvalidStateProofBatchReplay]` closure the

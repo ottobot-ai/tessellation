@@ -1160,6 +1160,23 @@ criteria are in `NAKAMOTO-PLAN.md`.
     (`ShardCheckpointGl0AcceptanceManager.scala:336-345,462-528`;
     `WatchtowerFraudProofEmitter.scala:90-109`;
     `InvalidStateProofValidator.scala:168-215`; `WT-002B`).
+  - **Current local reorg containment:** watchtower emission requires one present
+    process-local GL0 lineage generation across replay, immediately before
+    challenger Ed25519, and before every publish/retry. Inbound checkpoint lookup
+    plus adjudicator replay is bracketed by the same kind of generation; upheld
+    results are tagged only inside the local pool, whose offer rechecks and whose
+    proposal peek prunes mismatched/absent generations. No lineage value enters a
+    schema, preimage, snapshot, root, or slash verdict. Missing/moving generations,
+    stale offers, replacement plus forced ABA, and descendant-stable behavior have
+    focused tests. This does not close the final effect-read race, revoke gossiped
+    bytes, remove already-orphaned shard-store entries, provide exact proposal-
+    parent history, or make adjudication branch-aware. A real mismatch can still
+    become `CannotRederive`/no-slash after density replacement, so guilty signers
+    escape; per-node history/config asymmetry can also split rooted results. The
+    slice preserves the current Ed25519-only fraud envelope; any KES/domain change
+    needs a separate crypto/evidence design. `O-20` remains independently open for
+    the rooted field-34 slash-record schema. `FIN-14`, `SHARD-C-012`, `WT-006`,
+    `O-16`, and `O-20` remain open.
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.
   - **Gate:** `WT-001..007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`, `REC-*`,

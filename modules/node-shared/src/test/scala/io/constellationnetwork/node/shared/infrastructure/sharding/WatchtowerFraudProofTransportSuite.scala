@@ -17,6 +17,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.slashing.{
   InvalidStateProofSlashedReader,
   InvalidStateProofValidator
 }
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.node.shared.infrastructure.metrics.{Metrics, NoOpMetrics}
@@ -78,6 +79,7 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
 
   private val mgA: Address = Address.fromBytes("mgA".getBytes("UTF-8"))
   private val attestedRoot: Hash = Hash("a" * 64)
+  private val stableLineage = CanonicalLineageRevision(NonNegLong.unsafeFrom(1L))
   private val honestRoot: Hash = Hash("b" * 64)
 
   private def mkCheckpoint(
@@ -194,6 +196,7 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
       selfKeyPair = kp,
       acceptanceManager = manager,
       sidecarClient = client,
+      localGlobalLineageRevision = IO.pure(stableLineage.some),
       publishAttempts = attempts,
       publishRetryDelay = 10.millis
     )
@@ -231,8 +234,8 @@ object WatchtowerFraudProofTransportSuite extends MutableIOSuite {
           verifyExecutionCertificate = rig.acceptanceManager.verifyExecutionCertificate
         )
         verdict <- validator.validate(evidence)
-        pool <- WatchtowerFraudProofPool.make[IO]()
-        _ <- verdict.traverse(pool.offer)
+        pool <- WatchtowerFraudProofPool.make[IO](IO.pure(stableLineage.some))
+        _ <- verdict.traverse(pool.offer(_, stableLineage))
         staged <- pool.peekAll
       } yield
         expect(fp.disputedCheckpointHash === cpHash)

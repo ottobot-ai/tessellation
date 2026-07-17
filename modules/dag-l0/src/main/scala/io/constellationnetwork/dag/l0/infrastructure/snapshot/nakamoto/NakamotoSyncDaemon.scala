@@ -914,9 +914,9 @@ object NakamotoSyncDaemon {
     watchtowerFraudProofEmitter: Option[
       io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofEmitter[F]
     ] = None,
-    // WATCHTOWER (fraud-proof part 2): DETERMINISTIC dispute verdict. On receiving a `FraudProofEnvelope`, every
-    // gl0 INDEPENDENTLY re-runs this over the disputed checkpoint's OWN bytes (never trusting the challenger) and
-    // decides UPHELD iff attested ≠ honest-re-derived. `None` at numShards=1.
+    // WATCHTOWER (fraud-proof part 2): local dispute replay. On receiving a `FraudProofEnvelope`, this node re-runs
+    // the validator over the disputed checkpoint's own bytes rather than trusting the challenger. Universal identical
+    // adjudication is still blocked on exact proposal-parent history and rooted slash parameters. `None` at numShards=1.
     invalidStateProofValidator: Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
     ] = None,
@@ -933,11 +933,11 @@ object NakamotoSyncDaemon {
       io.constellationnetwork.node.shared.infrastructure.sharding.ShardCheckpointProducer[F]
     ] = Map.empty,
     shardAssignment: Option[io.constellationnetwork.node.shared.domain.nakamoto.ShardAssignment[F]] = None,
-    // WATCHTOWER fraud-proof POOL (W3a): `handleFraudProof` OFFERS a locally-UPHELD inbound dispute here so the gl0 leader producer embeds it
-    // in the next snapshot's `fraudProofs` consensus field (where EVERY node re-validates + slashes it deterministically). The sole
-    // production wiring passes the shared instance; at `numShards = 1` it passes `WatchtowerFraudProofPool.noop[F]` ⇒ offers discard ⇒ no
-    // fraud proofs ever embedded ⇒ byte-identical regression bar. Required (no default — `noop` needs `Sync[F]`, not summonable at a
-    // default-arg site).
+    // WATCHTOWER fraud-proof POOL (W3a): `handleFraudProof` offers a locally-upheld, lineage-tagged dispute so the GL0 leader may propose it
+    // in `fraudProofs`. Carried proofs are replayed again during acceptance, but identical slash results are not established until history
+    // and configuration blockers close. The sole production wiring passes the shared instance; at `numShards = 1` it passes
+    // `WatchtowerFraudProofPool.noop[F]`, so no fraud proofs are embedded. Required because `noop` needs `Sync[F]`, unavailable at a
+    // default-argument site.
     fraudProofPool: io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool[F]
   )(
     implicit globalStateProofSelector: io.constellationnetwork.schema.GlobalStateProofSelector,
@@ -1226,7 +1226,14 @@ object NakamotoSyncDaemon {
                         VariableLaneByteCapacity,
                         VariableMessageMaxBytes
                       )(_.serializedSize.toLong)(fp =>
-                        handleFraudProof(fp, shardAcceptanceDeps, invalidStateProofValidator, fraudProofPool, logger)
+                        handleFraudProof(
+                          fp,
+                          shardAcceptanceDeps,
+                          invalidStateProofValidator,
+                          chainStore.selectedTip.map(_.map(_.lineageRevision)),
+                          fraudProofPool,
+                          logger
+                        )
                       )
                     } yield
                       (
@@ -2941,21 +2948,21 @@ object NakamotoSyncDaemon {
 
   /** WATCHTOWER dispute consumer (fraud-proof part 2) — handle an incoming `FraudProofEnvelopeWire`.
     *
-    * '''Deterministic verdict, recomputed not trusted.''' Decode the envelope, resolve the disputed `ShardCheckpoint` from the local
+    * '''Local replay result, recomputed not trusted.''' Decode the envelope, resolve the disputed `ShardCheckpoint` from the local
     * per-shard chain store BY HASH (the checkpoint the committee signed — its bytes are the verdict's inputs), build the
     * [[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence]], and run
     * [[io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator]] — which re-derives the honest per-MG root
-    * from the checkpoint's OWN `includedSnapshots` (pure / finalized-base) and upholds iff it differs from the committee-attested root. The
-    * verdict is identical on every gl0 because it recomputes; the challenger's claimed roots in the envelope are never read for the
-    * verdict.
+    * from the checkpoint's OWN `includedSnapshots` and upholds iff it differs from the committee-attested root. The challenger's claimed
+    * roots in the envelope are never verdict authority. This local result is only a staging hint: exact proposal-parent history,
+    * branch-aware adjudication, and rooted protocol parameters are still required before every GL0 can derive one identical slash result.
     *
-    * '''On UPHELD''': log loudly (this slice surfaces the verdict + the slash-target committee). The AUTHORITATIVE 100% slash is applied by
-    * the GSAM accept path when an `InvalidStateProofEvidence` (carrying the full checkpoint) lands in a global snapshot — submitting that
-    * evidence to the L0 mempool is the remaining wiring (see the GSAM `InvalidStateProofSlashManager` sink + its TODO). On NOT-upheld (the
-    * honest-committee floor) / any rejection, log + drop — a frivolous or forged fraud proof has no effect.
+    * '''On locally UPHELD''': attempt to stage the lineage-tagged evidence for a leader proposal. The target GSAM path revalidates carried
+    * evidence before a rooted slash, but it is not activation-safe until exact proposal-parent history and rooted parameters make every GL0
+    * derive one result. On NOT-upheld or any rejection, log + drop; a frivolous or forged fraud proof has no local effect.
     *
     * '''Checkpoint not in local store''': we cannot re-derive (the checkpoint may have been pruned, or we never tracked this shard). Drop
-    * with a debug log — the on-chain evidence path carries the full checkpoint and does NOT depend on local availability.
+    * with a debug log. Carried on-chain evidence includes the full checkpoint, but adjudication still depends on retained exact execution-
+    * base/history bytes; missing history must defer and is an open portability/availability requirement.
     *
     * `None` deps / validator (numShards=1) ⇒ drop with a debug log.
     */
@@ -2967,6 +2974,7 @@ object NakamotoSyncDaemon {
     invalidStateProofValidator: Option[
       io.constellationnetwork.node.shared.domain.nakamoto.slashing.InvalidStateProofValidator[F]
     ],
+    localGlobalLineageRevision: F[Option[CanonicalLineageRevision]],
     fraudProofPool: io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool[F],
     logger: org.typelevel.log4cats.Logger[F]
   ): F[Unit] =
@@ -2979,42 +2987,86 @@ object NakamotoSyncDaemon {
               case None =>
                 logger.debug(s"🛡️ FraudProof for untracked shard=${fp.shardId.value.value}; dropping")
               case Some(entry) =>
-                entry.chainStore.getByHash(fp.disputedCheckpointHash).flatMap {
+                val readLineage = localGlobalLineageRevision.handleError(_ => None)
+                readLineage.flatMap {
                   case None =>
-                    logger.debug(
-                      s"🛡️ FraudProof: disputed checkpoint ${fp.disputedCheckpointHash.value.take(12)} not in local store " +
-                        s"(shard=${fp.shardId.value.value}); cannot re-derive verdict locally — dropping (on-chain evidence carries it)"
+                    logger.warn(
+                      s"FraudProof validation deferred: shard=${fp.shardId.value.value} " +
+                        s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} reason=global-lineage-unavailable stage=before-lookup-replay"
                     )
-                  case Some(hashedCp) =>
-                    val cp = hashedCp.signed.value
-                    val attested = cp.derivedStateDelta.perMetagraphMptRoots
-                      .get(fp.metagraphAddress)
-                      .getOrElse(io.constellationnetwork.security.hash.Hash.empty)
-                    val evidence = io.constellationnetwork.schema.slashing.InvalidStateProofEvidence(
-                      shardId = fp.shardId,
-                      disputedCheckpoint = cp,
-                      metagraphAddress = fp.metagraphAddress,
-                      attestedRoot = attested,
-                      fraudProof = fp
-                    )
-                    validator.validate(evidence).flatMap {
-                      case Right(upheld) =>
-                        // UPHELD locally — OFFER the validated evidence into the node-local pool so the gl0 leader embeds it as the
-                        // `fraudProofs` consensus artifact (W3a). The on-chain GSAM accept path re-validates it DETERMINISTICALLY on every
-                        // node and applies the 100% slash + bounty to the challenger; this offer is a pure liveness aid (the authoritative
-                        // verdict + slash are the consensus fold, never this pool). The set keys on the dispute's `(shardId, checkpointHash)`.
-                        fraudProofPool.offer(upheld) >>
-                          logger.warn(
-                            s"🛡️ WATCHTOWER dispute UPHELD: shard=${fp.shardId.value.value} " +
-                              s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} mg=${fp.metagraphAddress.value.value.take(10)} " +
-                              s"slashTargets=${evidence.slashTargets.size} — committee signed a wrong derivation (queued for on-chain 100% " +
-                              s"InvalidStateProof slash via the fraudProofs consensus artifact)"
+                  case Some(validationLineage) =>
+                    val lookupAndValidate =
+                      entry.chainStore.getByHash(fp.disputedCheckpointHash).flatMap {
+                        case None =>
+                          Async[F].pure(
+                            Option.empty[
+                              (
+                                io.constellationnetwork.schema.slashing.InvalidStateProofEvidence,
+                                Either[
+                                  io.constellationnetwork.schema.slashing.InvalidStateProofRejection,
+                                  io.constellationnetwork.schema.slashing.InvalidStateProofEvidence
+                                ]
+                              )
+                            ]
                           )
-                      case Left(rejection) =>
-                        logger.info(
-                          s"🛡️ WATCHTOWER dispute NOT upheld (no slash): shard=${fp.shardId.value.value} " +
-                            s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} reason=$rejection"
-                        )
+                        case Some(hashedCp) =>
+                          val cp = hashedCp.signed.value
+                          val attested = cp.derivedStateDelta.perMetagraphMptRoots
+                            .get(fp.metagraphAddress)
+                            .getOrElse(io.constellationnetwork.security.hash.Hash.empty)
+                          val evidence = io.constellationnetwork.schema.slashing.InvalidStateProofEvidence(
+                            shardId = fp.shardId,
+                            disputedCheckpoint = cp,
+                            metagraphAddress = fp.metagraphAddress,
+                            attestedRoot = attested,
+                            fraudProof = fp
+                          )
+                          validator.validate(evidence).map(result => Option(evidence -> result))
+                      }
+
+                    Async[F].attempt(lookupAndValidate).flatMap { validated =>
+                      readLineage.flatMap {
+                        case Some(afterReplay) if afterReplay == validationLineage =>
+                          validated match {
+                            case Left(error) => Async[F].raiseError[Unit](error)
+                            case Right(None) =>
+                              logger.debug(
+                                s"🛡️ FraudProof: disputed checkpoint ${fp.disputedCheckpointHash.value.take(12)} not in local store " +
+                                  s"(shard=${fp.shardId.value.value}); cannot re-derive verdict locally — dropping (on-chain evidence carries it)"
+                              )
+                            case Right(Some((evidence, Right(upheld)))) =>
+                              // The pool tag is local invalidation state only. `offer` checks it again and proposal peek prunes anything
+                              // not matching the live generation; no lineage value enters the proof, signature, snapshot, or slash verdict.
+                              fraudProofPool.offer(upheld, validationLineage).flatMap {
+                                case true =>
+                                  logger.warn(
+                                    s"🛡️ WATCHTOWER dispute UPHELD: shard=${fp.shardId.value.value} " +
+                                      s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} " +
+                                      s"mg=${fp.metagraphAddress.value.value.take(10)} " +
+                                      s"slashTargets=${evidence.slashTargets.size} — locally staged as a fraudProofs proposal candidate; " +
+                                      s"proposal-parent consensus adjudication is still required"
+                                  )
+                                case false =>
+                                  logger.warn(
+                                    s"FraudProof staging suppressed: shard=${fp.shardId.value.value} " +
+                                      s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} " +
+                                      s"reason=global-lineage-moved-or-unavailable stage=pool-offer"
+                                  )
+                              }
+                            case Right(Some((_, Left(rejection)))) =>
+                              logger.info(
+                                s"🛡️ WATCHTOWER dispute NOT upheld (no slash): shard=${fp.shardId.value.value} " +
+                                  s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} reason=$rejection"
+                              )
+                          }
+                        case _ =>
+                          logger.warn(
+                            s"FraudProof validation discarded: shard=${fp.shardId.value.value} " +
+                              s"checkpoint=${fp.disputedCheckpointHash.value.take(12)} " +
+                              s"reason=global-lineage-moved-or-unavailable stage=after-lookup-replay " +
+                              s"replayLineage=${validationLineage.value.value}"
+                          )
+                      }
                     }
                 }
             }

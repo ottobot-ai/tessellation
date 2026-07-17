@@ -1077,6 +1077,32 @@ delivery, rollback, and recovery.
   emitter check-to-act races remain. It does not issue a
   `CanonicalPhase2Lease`, revoke already-gossiped bytes, or close FIN-14,
   `FOLLOW-008N`, `SHARD-C-008`, or `SHARD-C-012`.
+- Watchtower proof creation and local proposal staging now have matching
+  process-local lineage containment. The emitter requires a present
+  `CanonicalLineageRevision`, brackets certificate-authenticated checkpoint replay
+  with the same generation, rechecks immediately before the challenger Ed25519
+  signature, and rechecks before every publish/retry attempt. This slice preserves
+  the current Ed25519-only fraud envelope; any KES/domain change requires a separate
+  crypto/evidence design. `O-20` remains independently open for the rooted field-34
+  slash-record schema, not the fraud-evidence signature scheme.
+  Inbound proof handling brackets disputed-checkpoint lookup, evidence construction,
+  and validator replay with one generation. Only a stable upheld result may be
+  offered to the pool; the pool rechecks that generation, stores it only as a
+  process-local tag, and atomically prunes mismatched or absent generations before
+  proposal peek. Tests prove missing/moving generations suppress replay-derived
+  publication, stale offers fail, descendant-stable entries remain eligible, and
+  replacement pruning prevents forced ABA revival
+  (`WatchtowerFraudProofCertificateGateSuite.scala`;
+  `WatchtowerFraudProofTransportSuite.scala`). This is local fail-stop containment,
+  not adjudication closure. A final read-to-sign/publish/Ref-update race remains;
+  already-gossiped bytes are not revoked; an orphan checkpoint already in the
+  untagged shard store can be selected after acquisition; candidate-parent exact
+  history and purpose-scoped `commitIfCurrent` are absent; and a guilty committee
+  can still escape when a density reorg makes its old replay base unavailable.
+  Universal GSAM adjudication is also activation-blocked because retained-history
+  asymmetry maps `CannotRederive` to no-slash while another node may uphold, and
+  local env-overridable watchtower/slash parameters feed rooted state. Branch-aware
+  evidence/adjudication, `FIN-14`, `SHARD-C-012`, `O-16`, and `O-20` remain open.
 - A package-private dark identity-composition model now requires the real
   `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
   the exact-history session, and matching exact-image, semantic, field-32, and

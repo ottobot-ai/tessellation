@@ -398,7 +398,8 @@ object GlobalSnapshotConsensusFunctions {
         // holds. The leader already filtered these to the `verifyEmbedded`-accepted subset, so the
         // follower's `verifyEmbedded` re-accepts all of them (deterministic) and the embedded set round-trips.
         incomingShardCheckpoints = artifact.shardCheckpoints,
-        // Split-safety (W3a): thread the leader's embedded fraud proofs so the follower folds the SAME slash and re-embeds the SAME map.
+        // Split-safety target (W3a): thread the leader's embedded fraud proofs so the follower re-embeds the SAME map. Identical slash folding
+        // remains activation-blocked until proposal-parent history and slash parameters are consensus-bound; local staging is not authority.
         incomingFraudProofs = artifact.fraudProofs
       )
 
@@ -868,8 +869,9 @@ object GlobalSnapshotConsensusFunctions {
         // WATCHTOWER fraud proofs (W3a). PRODUCE path (`sourceShardCheckpoints = true`): peek the node-local `fraudProofPool` — the disputes
         // the gossip consumer staged locally — and embed them. FOLLOWER/validator path: thread the leader's embedded `incomingFraudProofs`
         // unchanged (split-safety — never re-source the local pool, so the recreated artifact's `fraudProofs` field round-trips byte-exactly).
-        // GSAM's accept() re-validates each carried evidence DETERMINISTICALLY and slashes on UPHELD, so the leader/follower/peer fold the
-        // SAME slash regardless of whose pool sourced it. Empty at `numShards = 1` / `noop` pool ⇒ byte-identical to the pre-watchtower path.
+        // GSAM's accept() currently re-validates each carried proof, but universal identical adjudication is not yet established: retained-
+        // history and local slash-config asymmetry remain activation blockers. Empty at `numShards = 1` / `noop` pool is byte-identical to
+        // the pre-watchtower path.
         effectiveFraudProofs <-
           if (sourceShardCheckpoints) fraudProofPool.peekAll
           else incomingFraudProofs.pure[F]

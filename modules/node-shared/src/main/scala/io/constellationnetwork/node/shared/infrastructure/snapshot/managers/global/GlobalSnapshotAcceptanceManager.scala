@@ -174,11 +174,10 @@ trait GlobalSnapshotAcceptanceManager[F[_]] {
     // signed artifact's consensus-pinned eta so the follower recreates the producer's HistoricalStakeSnapshot bytes. GL0 production leaves
     // this None and derives eta locally. This is finalized GL0 metadata flowing downstream, not a CL1 economic-state override.
     pinnedBoundaryEta: Option[Hash] = None,
-    // WATCHTOWER fraud-proof CONSENSUS ARTIFACT (W3a). The canonical `SortedSet` of UPHELD fraud proofs the gl0 leader embedded in the
-    // produced snapshot's `fraudProofs` field, threaded back here on EVERY path (leader-produce, follower-`createContext`,
-    // peer-`validateArtifact`) so the slash is folded identically. Each entry is re-validated via the `invalidStateProofValidator`
-    // (deterministic recompute); on UPHELD a `WatchtowerSlashRequest(submitter = challengerAddress)` is surfaced into the SAME
-    // `applyWatchtowerSlashes` fold (durable slash + bounty to the challenger + `Slashings` MPT write). The set is
+    // WATCHTOWER fraud-proof CONSENSUS ARTIFACT (W3a). The canonical set of locally staged proof candidates the GL0 leader embedded is
+    // threaded back on leader/follower/validator paths. Each entry is replayed via `invalidStateProofValidator`; a local upheld result
+    // surfaces a `WatchtowerSlashRequest` into the pure slash fold. Identical consensus results are an activation requirement, not a current
+    // guarantee: exact proposal-parent replay history and rooted slash policy remain open. The set is
     // `(shardId, disputedCheckpointHash)`-ordered so the same wrong checkpoint appears at most once. Default
     // `SortedSet.empty` (every test/cl0/dl1 call site) ⇒ no slash ⇒ byte-identical; ALWAYS empty at `numShards = 1` ⇒ the regression bar holds.
     fraudProofs: SortedSet[io.constellationnetwork.schema.slashing.InvalidStateProofEvidence] = SortedSet.empty,
@@ -544,22 +543,17 @@ object GlobalSnapshotAcceptanceManager {
       (io.constellationnetwork.node.shared.domain.nakamoto.nipopow.HistoricalCommitmentSmtStore[F], Long)
     ] = None,
     // WATCHTOWER invalid-state-proof slashing config (slashing part 3): slashFraction / bountyFraction / cooldownEpochs / watchtowerEnabled
-    // — typed HOCON, NOT a `sys.env` read (project rule). Threaded into the `applyWatchtowerSlashes` fold at the upheld-dispute sink. Default
-    // mirrors `application.conf`'s `nakamoto.invalidity-slashing` (100% tier, 5% bounty, 100-epoch cooldown, watchtower ON) so the durable
-    // slash applies at `numShards > 1`. REQUIRED (no source-level default): slashFraction/bountyFraction feed the post-slash stake
-    // maps committed into the global mptRoot, so they must be the operator-configured, cluster-uniform values — never a silent
-    // literal. Prod threads `SharedConfig.nakamoto.invaliditySlashing` (100% tier, 5% bounty, 100-epoch cooldown, watchtower ON)
-    // at BOTH GSAM construction sites; test callers pass an explicit fixture.
+    // feeds the upheld-dispute fold and rooted state. It is currently local HOCON with environment overrides, so merely threading the same
+    // `SharedConfig` object to both local GSAM instances does not make it consensus-bound across nodes. Activation requires these values in
+    // authenticated proposal-parent policy; until then differing local config can split roots. Test callers pass explicit fixtures.
     // NOTE: `watchtowerEnabled = false` makes the sink inert (no slash + no `Slashings` write), keeping the mptRoot pre-slash. The slash is
     // ONLY reachable at `numShards > 1` regardless (the adopt path that surfaces the request never runs at `numShards = 1`), so the
     // `numShards = 1` byte-identical regression bar is independent of this config.
     invaliditySlashingConfig: InvalidStateProofSlashingConfig,
-    // WATCHTOWER fraud-proof DETERMINISTIC dispute verdict (W3a). When `Some`, every fraud-proof artifact carried in `accept(fraudProofs=…)`
-    // is re-validated here via the SAME `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed
-    // checkpoint's OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger). On UPHELD a `WatchtowerSlashRequest` with
-    // the authenticated challenger address is surfaced into `applyWatchtowerSlashes`, so the leader/follower/peer reach a BYTE-IDENTICAL
-    // slash (the validator is pure given its inputs + the exact proposal-parent reader
-    // supplied inside `accept`). The production wiring (`GlobalSnapshotConsensus.make`) passes the validator built with the PIN-1
+    // WATCHTOWER fraud-proof replay (W3a). When present, each carried proof is revalidated here with the same validator shape the daemon uses;
+    // the challenger roots are never authority. Given identical evidence, exact history, parent ledger, and rooted policy, validation plus
+    // `applyWatchtowerSlashes` is deterministic. Production does not yet guarantee those inputs across nodes: missing retained replay history
+    // can yield no-slash and slashing policy is local config. The production wiring (`GlobalSnapshotConsensus.make`) passes a PIN-1
     // `watchtowerReDerive` closure; authoritative validation replaces its staging reader with an
     // `InvalidStateProofSlashedReader.fromGlobalStateReader(mpt)` bound to `parentTip`, so an already-slashed checkpoint yields
     // `AlreadySlashed` ⇒ NOT upheld ⇒ no double slash. `None` (cl0/dl1/tests passing no validator) ⇒ carried fraud proofs are ignored ⇒ no slash. The slash is
@@ -2036,13 +2030,11 @@ object GlobalSnapshotAcceptanceManager {
                   }
                 adoptedCheckpointGroups = adoptedResult
 
-                // WATCHTOWER fraud-proof CONSENSUS ARTIFACT → durable slash (W3a). Re-validate EVERY carried fraud proof here via the SAME
-                // deterministic `InvalidStateProofValidator` the daemon uses (recomputes the honest per-MG root from the disputed checkpoint's
-                // OWN signed bytes; UPHELD iff attested ≠ honest — never trusts the challenger's claimed roots), and for each UPHELD dispute
-                // surface a `WatchtowerSlashRequest(submitter = challengerAddress)`. Because the validator is a pure function of the
-                // evidence + the exact proposal-parent slash ledger, the leader/follower/peer reach a BYTE-IDENTICAL
-                // verdict and thus the byte-identical slash. The honest-committee floor is enforced INSIDE the validator (`DisputeNotUpheld` on
-                // a frivolous/forged proof ⇒ skipped here). The double-slash guard is the validator's step-7 exact-parent `slashedReader`
+                // WATCHTOWER fraud-proof consensus artifact → slash candidate (W3a). Revalidate every carried proof and surface a request only
+                // for a locally upheld result; challenger-carried roots are never authority. The fold is byte-deterministic only when all nodes
+                // have the same exact replay history, proposal-parent slash ledger, and rooted policy. Those availability/policy premises are
+                // current activation blockers, so this code must not be described as universal adjudication today. The double-slash guard is
+                // the validator's step-7 exact-parent `slashedReader`
                 // PLUS `applyWatchtowerSlashes`'s per-`(shardId, checkpointHash)` coalescing within the fold.
                 // `submitterId.toAddress` is the deterministic recover-public-key→address of the challenger (the bounty recipient).
                 // BYTE-IDENTITY GATE: explicitly require `numShards > 1` (the SAME gate `adoptShardCheckpoints` uses) so that even a forged

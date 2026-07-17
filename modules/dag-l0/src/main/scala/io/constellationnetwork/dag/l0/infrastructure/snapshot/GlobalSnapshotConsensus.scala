@@ -721,9 +721,17 @@ object GlobalSnapshotConsensus {
       // WATCHTOWER fraud-proof POOL (W3a) — the single shared node-local staging area. The daemon's `handleFraudProof` OFFERS
       // locally-UPHELD disputes into it; the gl0 leader producer PEEKS it to embed the `fraudProofs` consensus field. `noop` at
       // numShards=1 (no shard deps) ⇒ always-empty ⇒ no fraud proofs embedded ⇒ byte-identical regression bar.
+      // The pool is built before the concrete chain store because consensusFunctions closes over it. Resolve through the deferred Ref that
+      // is populated with that exact store below; absence/error fail closed. The generation is process-local invalidation state only.
+      fraudProofPoolLineageRevision = chainStoreForLookupRef.get.flatMap {
+        case Some(store) => store.selectedTip.map(_.map(_.lineageRevision))
+        case None => Async[F].pure(Option.empty[io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision])
+      }
       fraudProofPool <- shardAcceptanceDeps match {
         case Some(_) =>
-          io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool.make[F]().toResource
+          io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool
+            .make[F](fraudProofPoolLineageRevision)
+            .toResource
         case None =>
           Async[F]
             .pure(io.constellationnetwork.node.shared.infrastructure.sharding.WatchtowerFraudProofPool.noop[F])
@@ -1771,6 +1779,9 @@ object GlobalSnapshotConsensus {
                       selfKeyPair = keyPair,
                       acceptanceManager = deps.acceptanceManager,
                       sidecarClient = sidecarClient,
+                      // Local discard-only containment. The fraud proof carries no lineage field: replacement suppresses stale local replay
+                      // evidence before Ed25519 and every publish attempt, but is not portable adjudication/finality authority.
+                      localGlobalLineageRevision = chainStore.selectedTip.map(_.map(_.lineageRevision)),
                       publishAttempts = sharedCfg.nakamoto.invaliditySlashing.fraudProofPublishAttempts,
                       publishRetryDelay = sharedCfg.nakamoto.invaliditySlashing.fraudProofPublishRetryDelay
                     )
@@ -2219,9 +2230,9 @@ object GlobalSnapshotConsensus {
                     // Execution-certificate closure: after local replay of the exact checkpoint, sign and gossip our
                     // execution signature so peers can reach configured `kQuorum`. `None` at numShards=1 means no emit.
                     shardCheckpointAttestationEmitter = shardCheckpointAttestationEmitter,
-                    // WATCHTOWER (fraud-proof part 1 + 2): re-execute each adopted checkpoint on the quorum path +
-                    // gossip a FraudProofEnvelope on a per-MG root mismatch; the validator re-runs the deterministic
-                    // verdict on inbound fraud proofs. `None` at numShards=1 / watchtower-disabled.
+                    // WATCHTOWER (fraud-proof part 1 + 2): locally re-execute each adopted checkpoint on the quorum path and gossip a
+                    // FraudProofEnvelope on mismatch. Inbound validation recomputes instead of trusting the challenger, but universal
+                    // identical adjudication remains blocked on exact proposal-parent history and rooted policy. `None` when inactive.
                     watchtowerFraudProofEmitter = watchtowerFraudProofEmitter,
                     invalidStateProofValidator = invalidStateProofValidator,
                     // Per-ord producer fan-out (decoupled from gl0-leader win): EVERY node fans out shard

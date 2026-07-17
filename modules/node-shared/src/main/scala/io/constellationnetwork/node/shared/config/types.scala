@@ -247,9 +247,10 @@ object types {
     * `docs/nakamoto/WATCHTOWER-FRAUD-PROOF-DESIGN.md`). This is the evidence-based total-loss tier for a committee that signed a checkpoint
     * with a wrong per-MG derivation.
     *
-    *   - `watchtowerEnabled`: master switch for the watchtower approval-check (the per-checkpoint re-execution + fraud-proof gossip).
-    *     Default `true` at `numShards > 1`; INERT at `numShards = 1` (no committee checkpoints exist). Turning it off disables fraud-proof
-    *     emission (the dispute consumer + slash still run if an envelope arrives, but no node produces one).
+    *   - `watchtowerEnabled`: current local master switch for both watchtower emission and the GSAM fraud-proof slash sink. Default `true`
+    *     at `numShards > 1`; inert at `numShards = 1`. Because the sink changes rooted stake, balances, cooldown, and field-34 bytes, this
+    *     local switch is not activation-safe: the target protocol-era policy must be proposal-parent authenticated and identical on every
+    *     GL0.
     *   - `slashFraction`: exact `Ratio` — fraction of the offender's combined (delegated + collateral) stake destroyed. Production `"1/1"`
     *     (total loss — the `InvalidStateProof` tier is the maximum severity; a single proven wrong derivation = total loss). A value `< 1`
     *     reduces delegated stake proportionally and still fully removes collateral (collateral has no partial-amount slot).
@@ -260,8 +261,8 @@ object types {
     *     Default `100`, matching the equivocation cooldown in `SLASHING-DESIGN.md` §6.
     *   - `fraudProofPublishAttempts` / `fraudProofPublishRetryDelay`: bounded retry for the watchtower emitter's fraud-proof publish over
     *     the LOCAL sidecar gRPC hop (EPIC-9-NET M4 "retry-or-outbox"). A fraud proof is slashing evidence — a single warn-and-drop on a
-    *     transient sidecar restart silently disarmed the tooth. Once the RPC lands, the sidecar's durable outbox owns network delivery.
-    *     Node-local QoS knobs (NOT consensus-critical — divergent values cannot split the cluster).
+    *     transient sidecar restart silently disarmed the tooth. Once the RPC lands, the sidecar's TTL-bounded in-memory outbox retries but
+    *     is lost on sidecar restart. These retry values are node-local QoS knobs and do not select the consensus slash result.
     *
     * '''Current challenge-window gap.''' Live GSAM limits disputes by `confirmationDepthK`, but target k1 only makes an exact hash Phase-2
     * operational; it does not make checkpoint economics irreversible or prevent a later density reorg. Positive deterministic watchtower

@@ -769,7 +769,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
   }
 
   // ============================================================================
-  // Test 5: under-quorum replay mismatch — reject and retain committee signer identity for evidence construction
+  // Test 5: under-quorum replay mismatch — reject and retain signer identity for local diagnostics only
   // ============================================================================
 
   test("under-quorum re-exec mismatch → RejectedReExecutionMismatch with committee signer list") { res =>
@@ -784,7 +784,7 @@ object ShardCheckpointGl0AcceptanceManagerSuite extends MutableIOSuite {
       delta = mkDelta(mg, mptRoot, binary)
       shell = mkCheckpointShell(shardOrd = 2L, gl0Anchor = 100L, delta = delta, placeholderPeerId = signerPeer1)
 
-      // TWO real signers — both remain attached to the diagnostic result for separately portable evidence construction.
+      // TWO real signers remain attached to the diagnostic result, but cannot satisfy the portable kQuorum adjudication capability.
       sig1 <- mkValidSig(shell, signerKp1, signerPeer1)
       sig2 <- mkValidSig(shell, signerKp2, signerPeer2)
       checkpoint = shell.copy(committeeSignatures = NonEmptyList.of(sig1, sig2))

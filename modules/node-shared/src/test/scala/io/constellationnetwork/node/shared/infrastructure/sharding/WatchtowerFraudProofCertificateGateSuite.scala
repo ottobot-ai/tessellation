@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.infrastructure.sharding
 import cats.data.{NonEmptyList, NonEmptySet}
 import cats.effect.kernel.Ref
 import cats.effect.{IO, Resource}
+import cats.syntax.all._
 
 import scala.collection.immutable.SortedMap
 import scala.concurrent.duration.Duration
@@ -10,6 +11,7 @@ import scala.concurrent.duration.Duration
 import io.constellationnetwork.currency.schema.currency.SnapshotFee
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.SidecarClient
 import io.constellationnetwork.node.shared.infrastructure.consensus.nakamoto.proto.sidecar._
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global._
@@ -42,6 +44,8 @@ object WatchtowerFraudProofCertificateGateSuite extends MutableIOSuite {
   private val metagraph = Address.fromBytes("certificate-gate-mg".getBytes("UTF-8"))
   private val claimedRoot = Hash("11" * 32)
   private val reproducedRoot = Hash("22" * 32)
+  private val lineageA = CanonicalLineageRevision(NonNegLong.unsafeFrom(1L))
+  private val lineageB = CanonicalLineageRevision(NonNegLong.unsafeFrom(2L))
 
   private def checkpoint: ShardCheckpoint = {
     val peerId = PeerId(Hex("33" * 64))
@@ -64,6 +68,27 @@ object WatchtowerFraudProofCertificateGateSuite extends MutableIOSuite {
       committeeSignatures = NonEmptyList.one(CommitteeMemberSignature(peerId, Hex(""), Hex(""), Hex(""), 0)),
       epoch = io.constellationnetwork.schema.nakamoto.EtaPeriod.Zero,
       executionBase = io.constellationnetwork.node.shared.ShardCheckpointTestFixtures.defaultExecutionBase
+    )
+  }
+
+  private val stagedEvidence: io.constellationnetwork.schema.slashing.InvalidStateProofEvidence = {
+    val fp = FraudProofEnvelope(
+      shardId = checkpoint.shardId,
+      disputedCheckpointHash = Hash("66" * 32),
+      metagraphAddress = metagraph,
+      gl0AnchorOrdinal = checkpoint.gl0AnchorOrdinal,
+      claimedDerivation = claimedRoot,
+      challengerDerivation = reproducedRoot,
+      reexecutionWitness = Hex(reproducedRoot.value),
+      challengerSignature = Hex("77" * 64),
+      submitterId = checkpoint.committeeSignatures.head.peerId
+    )
+    io.constellationnetwork.schema.slashing.InvalidStateProofEvidence(
+      checkpoint.shardId,
+      checkpoint,
+      metagraph,
+      claimedRoot,
+      fp
     )
   }
 
@@ -126,7 +151,8 @@ object WatchtowerFraudProofCertificateGateSuite extends MutableIOSuite {
     certificate: Either[String, Unit],
     mismatches: List[WatchtowerMismatch],
     replayCalls: Ref[IO, Int],
-    publishCalls: Ref[IO, Int]
+    publishCalls: Ref[IO, Int],
+    localGlobalLineageRevision: IO[Option[CanonicalLineageRevision]] = IO.pure(lineageA.some)
   )(implicit hasher: Hasher[IO], securityProvider: SecurityProvider[IO]): IO[WatchtowerFraudProofEmitter[IO]] =
     KeyPairGenerator.makeKeyPair[IO].map { keyPair =>
       WatchtowerFraudProofEmitter.make[IO](
@@ -134,6 +160,7 @@ object WatchtowerFraudProofCertificateGateSuite extends MutableIOSuite {
         selfKeyPair = keyPair,
         acceptanceManager = manager(certificate, mismatches, replayCalls),
         sidecarClient = client(publishCalls),
+        localGlobalLineageRevision = localGlobalLineageRevision,
         publishAttempts = 1,
         publishRetryDelay = Duration.Zero
       )
@@ -183,5 +210,141 @@ object WatchtowerFraudProofCertificateGateSuite extends MutableIOSuite {
       replays <- replayCalls.get
       publishes <- publishCalls.get
     } yield expect.all(replays == 1, publishes == 0)
+  }
+
+  test("missing lineage before replay emits no evidence and does not invoke replay") { res =>
+    implicit val (hasher, securityProvider) = res
+    for {
+      replayCalls <- Ref.of[IO, Int](0)
+      publishCalls <- Ref.of[IO, Int](0)
+      watchtower <- emitter(
+        Right(()),
+        List(WatchtowerMismatch(metagraph, claimedRoot, reproducedRoot)),
+        replayCalls,
+        publishCalls,
+        IO.pure(None)
+      )
+      _ <- watchtower.emit(checkpoint)
+      replays <- replayCalls.get
+      publishes <- publishCalls.get
+    } yield expect.all(replays == 0, publishes == 0)
+  }
+
+  test("lineage replacement during replay discards the mismatch before signature or publication") { res =>
+    implicit val (hasher, securityProvider) = res
+    for {
+      replayCalls <- Ref.of[IO, Int](0)
+      publishCalls <- Ref.of[IO, Int](0)
+      reads <- Ref.of[IO, List[Option[CanonicalLineageRevision]]](List(lineageA.some, lineageB.some))
+      lineageRead = reads.modify {
+        case head :: tail => tail -> head
+        case Nil          => Nil -> Option.empty[CanonicalLineageRevision]
+      }
+      watchtower <- emitter(
+        Right(()),
+        List(WatchtowerMismatch(metagraph, claimedRoot, reproducedRoot)),
+        replayCalls,
+        publishCalls,
+        lineageRead
+      )
+      _ <- watchtower.emit(checkpoint)
+      replays <- replayCalls.get
+      publishes <- publishCalls.get
+    } yield expect.all(replays == 1, publishes == 0)
+  }
+
+  test("lineage replacement after replay but before signing emits no portable evidence") { res =>
+    implicit val (hasher, securityProvider) = res
+    for {
+      replayCalls <- Ref.of[IO, Int](0)
+      publishCalls <- Ref.of[IO, Int](0)
+      reads <- Ref.of[IO, List[Option[CanonicalLineageRevision]]](List(lineageA.some, lineageA.some, lineageB.some))
+      lineageRead = reads.modify {
+        case head :: tail => tail -> head
+        case Nil          => Nil -> Option.empty[CanonicalLineageRevision]
+      }
+      watchtower <- emitter(
+        Right(()),
+        List(WatchtowerMismatch(metagraph, claimedRoot, reproducedRoot)),
+        replayCalls,
+        publishCalls,
+        lineageRead
+      )
+      _ <- watchtower.emit(checkpoint)
+      replays <- replayCalls.get
+      publishes <- publishCalls.get
+    } yield expect.all(replays == 1, publishes == 0)
+  }
+
+  test("lineage replacement after signing but before publish suppresses the publish attempt") { res =>
+    implicit val (hasher, securityProvider) = res
+    for {
+      replayCalls <- Ref.of[IO, Int](0)
+      publishCalls <- Ref.of[IO, Int](0)
+      reads <- Ref.of[IO, List[Option[CanonicalLineageRevision]]](
+        List(lineageA.some, lineageA.some, lineageA.some, lineageA.some, lineageB.some)
+      )
+      lineageRead = reads.modify {
+        case head :: tail => tail -> head
+        case Nil          => Nil -> Option.empty[CanonicalLineageRevision]
+      }
+      watchtower <- emitter(
+        Right(()),
+        List(WatchtowerMismatch(metagraph, claimedRoot, reproducedRoot)),
+        replayCalls,
+        publishCalls,
+        lineageRead
+      )
+      _ <- watchtower.emit(checkpoint)
+      replays <- replayCalls.get
+      publishes <- publishCalls.get
+    } yield expect.all(replays == 1, publishes == 0)
+  }
+
+  test("a stable lineage generation across descendant extension permits replay and publication") { res =>
+    implicit val (hasher, securityProvider) = res
+    for {
+      replayCalls <- Ref.of[IO, Int](0)
+      publishCalls <- Ref.of[IO, Int](0)
+      watchtower <- emitter(
+        Right(()),
+        List(WatchtowerMismatch(metagraph, claimedRoot, reproducedRoot)),
+        replayCalls,
+        publishCalls,
+        IO.pure(lineageA.some)
+      )
+      _ <- watchtower.emit(checkpoint)
+      replays <- replayCalls.get
+      publishes <- publishCalls.get
+    } yield expect.all(replays == 1, publishes == 1)
+  }
+
+  test("pool rejects stale offers and replacement pruning prevents ABA revival") { _ =>
+    for {
+      current <- Ref.of[IO, Option[CanonicalLineageRevision]](lineageA.some)
+      pool <- WatchtowerFraudProofPool.make[IO](current.get)
+      offeredA <- pool.offer(stagedEvidence, lineageA)
+      stagedA <- pool.peekAll
+      _ <- current.set(lineageB.some)
+      offeredB <- pool.offer(stagedEvidence, lineageB)
+      staleOffer <- pool.offer(stagedEvidence, lineageA)
+      stagedB <- pool.peekAll
+      _ <- current.set(lineageA.some)
+      stagedAfterAba <- pool.peekAll
+    } yield expect.all(offeredA, stagedA.size == 1, offeredB, !staleOffer, stagedB.size == 1, stagedAfterAba.isEmpty)
+  }
+
+  test("pool keeps entries across descendant extension and prunes them on lineage absence") { _ =>
+    for {
+      current <- Ref.of[IO, Option[CanonicalLineageRevision]](lineageA.some)
+      pool <- WatchtowerFraudProofPool.make[IO](current.get)
+      offered <- pool.offer(stagedEvidence, lineageA)
+      _ <- current.set(lineageA.some)
+      descendantPeek <- pool.peekAll
+      _ <- current.set(None)
+      absentPeek <- pool.peekAll
+      _ <- current.set(lineageA.some)
+      afterAbsence <- pool.peekAll
+    } yield expect.all(offered, descendantPeek.size == 1, absentPeek.isEmpty, afterAbsence.isEmpty)
   }
 }

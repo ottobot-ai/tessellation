@@ -74,9 +74,10 @@ object SidecarClient {
       */
     def publishShardCheckpointAttestation(msg: ShardCheckpointAttestationWire): F[PublishResponse]
 
-    /** WATCHTOWER: publish a fraud proof on the gl0-wide `fraud-proof` topic. The wire payload is a proto-encoded `FraudProofEnvelopeWire`
-      * produced via `FraudProofWireCodecs.toWire`; the sidecar gossips it to every gl0 so each independently re-runs the deterministic
-      * dispute verdict. Failures are swallowed by the caller (the watchtower must not block the accept path on a publish failure).
+    /** WATCHTOWER: publish a fraud proof on the GL0-wide `fraud-proof` topic. The wire payload is a proto-encoded `FraudProofEnvelopeWire`
+      * produced via `FraudProofWireCodecs.toWire`; the sidecar gossips it to every GL0 for independent replay. Identical consensus
+      * adjudication still requires exact proposal-parent history and rooted policy. Failures are swallowed by the caller so the watchtower
+      * does not block the accept path.
       */
     def publishFraudProof(msg: FraudProofEnvelopeWire): F[PublishResponse]
 
@@ -120,8 +121,9 @@ object SidecarClient {
       */
     val ShardCheckpointAttestation = "shard-checkpoint-attestation"
 
-    /** WATCHTOWER: gl0-wide fraud-proof topic. Unlike the per-shard checkpoint topics, fraud proofs gossip to EVERY gl0 (every node must
-      * independently re-run the dispute verdict + apply the slash), so this is a single cluster-wide topic with no shard-id suffix.
+    /** WATCHTOWER: GL0-wide fraud-proof topic. Unlike the per-shard checkpoint topics, fraud proofs gossip to every GL0 so each can replay
+      * the dispute; gossip reachability itself neither establishes a verdict nor authorizes a slash. This is one topic without a shard
+      * suffix.
       */
     val FraudProof = "fraud-proof"
   }
