@@ -5,6 +5,8 @@ import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.delegatedStake.UpdateDelegatedStake
 import io.constellationnetwork.schema.nakamoto.GenesisOperatorConsensusKey
 import io.constellationnetwork.schema.nodeCollateral.UpdateNodeCollateral
+import io.constellationnetwork.schema.tokenLock.TokenLock
+import io.constellationnetwork.security.signature.Signed
 
 import derevo.cats.{eqv, show}
 import derevo.derive
@@ -124,18 +126,12 @@ object types {
       )
   }
 
-  /** Genesis-seeded delegated-stake record. Tier-1 design: the fixture file is BYTE-DETERMINISTIC across regenerations with the same seed,
-    * but ECDSA signatures are NOT deterministic in this codebase (`Signing.signData` uses a non-seeded `SecureRandom`). Resolution: the
-    * fixture embeds the RAW unsigned event plus the synthetic delegator's private-key hex. The loader signs at LOAD time. Each load
-    * produces a valid `Signed[UpdateDelegatedStake.Create]` whose signature differs by RNG but verifies against the same public key.
-    *
-    * Trade-off: the runtime in-memory `Signed[...]` is not byte-equal across cluster restarts. For Tier-1 (genesis-seeded validator stake
-    * distribution) this is acceptable — the `activeDelegatedStakes` map is keyed by `(address, ordinal)` not by signature bytes, and the
-    * VRF stake-weighting reads `amount` (not the signature). Tier-2 cross-client byte-portability is explicitly out of scope.
+  /** Fully signed genesis delegated-stake bundle. Genesis JSON is public consensus input and therefore never contains an owner private key.
+    * The loader verifies both signatures and derives the only accepted `tokenLockRef` from `signedBackingTokenLock`.
     */
   case class L0GenesisDelegatedStake(
-    event: UpdateDelegatedStake.Create,
-    delegatorPrivateKeyHex: String,
+    signedEvent: Signed[UpdateDelegatedStake.Create],
+    signedBackingTokenLock: Signed[TokenLock],
     createdAt: Long,
     rewards: Long
   )
@@ -145,12 +141,10 @@ object types {
     implicit val decoder: Decoder[L0GenesisDelegatedStake] = deriveDecoder[L0GenesisDelegatedStake]
   }
 
-  /** Genesis-seeded node-collateral record. Same shape as `L0GenesisDelegatedStake` minus rewards (collateral records do not accumulate
-    * rewards by themselves).
-    */
+  /** Fully signed genesis node-collateral bundle. Same security contract as `L0GenesisDelegatedStake`; no owner secret is persisted. */
   case class L0GenesisNodeCollateral(
-    event: UpdateNodeCollateral.Create,
-    ownerPrivateKeyHex: String,
+    signedEvent: Signed[UpdateNodeCollateral.Create],
+    signedBackingTokenLock: Signed[TokenLock],
     createdAt: Long
   )
 
@@ -186,40 +180,43 @@ object types {
     initialBalances: List[L0GenesisBalance]
   ) {
 
-    /** Build a deterministic balance map for `GlobalSnapshot.mkGenesis`. Combines `initialBalances` with the delegator/owner addresses from
-      * stake records so the signer addresses actually have non-zero balances (avoids "signer address has no balance" surprises downstream).
+    /** Explicit spendable balances only. Active backing-lock principal is a separate genesis allocation and is never synthesized as a
+      * spendable stipend. Invalid or duplicate balance entries fail closed instead of being silently dropped/overwritten.
       */
-    def initialBalanceMap: Map[Address, Balance] = {
-      def parseAddr(s: String): Option[Address] =
-        refineV[DAGAddressRefined](s).toOption.map(Address(_))
-      def parseBalance(v: Long): Option[Balance] =
-        refineV[NonNegative](v).toOption.map(Balance(_))
+    def initialBalanceMap: Map[Address, Balance] =
+      validatedGenesisAllocation.fold(message => throw new IllegalArgumentException(message), _._1)
 
-      val explicit = initialBalances.flatMap { b =>
-        for {
-          addr <- parseAddr(b.address)
-          bal <- parseBalance(b.balance)
-        } yield addr -> bal
-      }.toMap
-
-      // Stake-signer addresses get a 1-DAG stipend if not already in `initialBalances` so the
-      // address is present in the genesis balance map. Stake records carry the actual amount via
-      // the signed event; this stipend is just "address must exist".
-      val stipend = Balance(refineV[NonNegative](1L).toOption.get)
-      val signerAddrs =
-        delegatedStakes.map(_.event.source.value.value) ++ nodeCollaterals.map(_.event.source.value.value)
-      val signerBalances = signerAddrs
-        .flatMap(parseAddr)
-        .map { addr =>
-          explicit.get(addr) match {
-            case Some(b) => addr -> b
-            case None    => addr -> stipend
-          }
+    def validatedGenesisAllocation: Either[String, (Map[Address, Balance], BigInt)] =
+      for {
+        balances <- initialBalances.zipWithIndex.foldLeft[Either[String, Map[Address, Balance]]](Right(Map.empty)) {
+          case (accE, (entry, index)) =>
+            for {
+              acc <- accE
+              refinedAddress <- refineV[DAGAddressRefined](entry.address).left
+                .map(error => s"Invalid genesis balance address at index $index: $error")
+              address = Address(refinedAddress)
+              refinedBalance <- refineV[NonNegative](entry.balance).left
+                .map(error => s"Invalid genesis balance at index $index: $error")
+              _ <- Either.cond(
+                !acc.contains(address),
+                (),
+                s"Duplicate genesis balance address at index $index: ${address.value.value}"
+              )
+            } yield acc.updated(address, Balance(refinedBalance))
         }
-        .toMap
-
-      explicit ++ signerBalances
-    }
+        spendable = balances.valuesIterator.foldLeft(BigInt(0))((sum, balance) => sum + balance.value.value)
+        backing =
+          delegatedStakes.iterator
+            .map(_.signedBackingTokenLock.amount.value.value)
+            .++(nodeCollaterals.iterator.map(_.signedBackingTokenLock.amount.value.value))
+            .foldLeft(BigInt(0))(_ + _)
+        allocation = spendable + backing
+        _ <- Either.cond(
+          allocation <= BigInt(Long.MaxValue),
+          (),
+          s"Genesis allocation exceeds the protocol Long domain: $allocation"
+        )
+      } yield balances -> allocation
   }
 
   object L0GenesisData {

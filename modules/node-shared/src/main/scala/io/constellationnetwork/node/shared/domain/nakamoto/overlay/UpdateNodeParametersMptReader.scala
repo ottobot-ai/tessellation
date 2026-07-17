@@ -33,7 +33,7 @@ object UpdateNodeParametersMptReader {
       physicalKey <- GlobalStateKey.toHex[F](key)
       read <- reader.getStrict[Record](key)
       result <- read match {
-        case StrictMptRead.Absent => none[Record].pure[F]
+        case StrictMptRead.Absent               => none[Record].pure[F]
         case StrictMptRead.Malformed(reason, _) => malformed[F, Option[Record]](physicalKey, reason)
         case StrictMptRead.Present(record @ (signed, _), rawBytes) =>
           if (rawBytes != unpRecordImmutableCodec.immutableBytes(record))

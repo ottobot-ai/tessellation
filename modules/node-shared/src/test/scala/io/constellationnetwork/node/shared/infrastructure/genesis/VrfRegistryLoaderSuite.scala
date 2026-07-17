@@ -191,7 +191,7 @@ object VrfRegistryLoaderSuite extends MutableIOSuite {
         .buildOperatorKeyRegistry[IO](baseData(List(record._2), startingEpochProgress = 1L))
         .attempt
     } yield
-      expect(changedActivation.swap.exists(_.getMessage.contains("longTermSignature does not bind"))) &&
+      expect(changedActivation.swap.exists(_.getMessage.contains("activationOrdinal must equal the greenfield genesis ordinal"))) &&
         expect(changedEpochProgress.swap.exists(_.getMessage.contains("longTermSignature does not bind")))
   }
 

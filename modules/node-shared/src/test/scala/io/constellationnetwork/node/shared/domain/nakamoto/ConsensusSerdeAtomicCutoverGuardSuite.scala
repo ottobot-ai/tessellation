@@ -207,6 +207,8 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     * Scodec while another still selects by ordinal is not a migration.
     */
   private val reviewedOrdinalHasherSelections: Map[String, Reviewed] = Map(
+    "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/Main.scala" ->
+      Reviewed(2, "fresh genesis and its first incremental use their exact ordinal-selected legacy hash authorities"),
     "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStore.scala" ->
       Reviewed(1, "exact branch walking checks the stored snapshot against ordinal-selected legacy hash authority"),
     "modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/NakamotoChainStoreExactReplayHistorySource.scala" ->
@@ -215,10 +217,16 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       Reviewed(1, "tower catch-up rehashes a historical snapshot with ordinal-selected legacy bytes"),
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/HistoricalOperatorConsensusKeyRegistry.scala" ->
       Reviewed(1, "historical KES registration references use the accepting ordinal's legacy hash authority"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/HistoricalStakeReader.scala" ->
+      Reviewed(4, "dark exact-parent stake reconstruction authenticates each historical boundary with that ordinal's legacy bytes"),
+    "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/genesis/L0GenesisLoader.scala" ->
+      Reviewed(1, "genesis loading builds the first live state under its exact ordinal-selected legacy authority"),
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/GlobalSnapshotContextFunctions.scala" ->
       Reviewed(2, "snapshot context reconstruction selects legacy bytes for parent tips and parent identity"),
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala" ->
-      Reviewed(1, "global acceptance selects the candidate ordinal's legacy hashing authority")
+      Reviewed(1, "global acceptance selects the candidate ordinal's legacy hashing authority"),
+    "modules/tools/src/main/scala/io/constellationnetwork/tools/genesis/GenesisGenerator.scala" ->
+      Reviewed(1, "generated first-live state is committed under its exact ordinal-selected legacy authority")
   )
 
   private val currentHasherPromotion =

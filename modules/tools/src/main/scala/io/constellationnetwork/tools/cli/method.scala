@@ -76,9 +76,8 @@ object method {
     */
   case class ShardScanCmd(count: Int, numShards: Int) extends CliMethod
 
-  /** Tier-1 test-vector generator. See `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` for
-    * the design rationale. Emits a byte-deterministic `l0-genesis.json` (operator set + delegated-stake records + node-collateral records +
-    * protocol params + initial balances) into `outputDir`. Optionally synthesizes a `cl1-genesis.json` (single-metagraph for Tier-1).
+  /** Offline greenfield genesis ceremony. Emits one canonical, randomly signed public `l0-genesis.json`; the public seed is not sufficient
+    * to reproduce it. Optionally synthesizes a `cl1-genesis.json` (single-metagraph for Tier-1).
     */
   case class GenerateGenesisCmd(
     outputDir: Path,
@@ -89,6 +88,9 @@ object method {
     initialBalancesCsv: Option[Path],
     seed: Long,
     keysFromDir: Option[Path],
+    operatorKeyAlias: String,
+    operatorKeyPasswordEnv: Option[String],
+    testOnlyDeterministicOperatorKeys: Boolean,
     networkMagic: String,
     startingEpochProgress: Long
   ) extends CliMethod
@@ -162,18 +164,28 @@ object method {
   }
 
   object GenerateGenesisCmd {
-    private def parseWeights(s: String): List[BigDecimal] =
-      if (s.trim.isEmpty) List.empty
+    private[tools] def parseStakeWeights(value: String): Either[String, List[BigDecimal]] =
+      if (value.trim.isEmpty) Right(List.empty)
       else
-        s.split(",")
+        value
+          .split(",", -1)
           .toList
           .map(_.trim)
-          .filter(_.nonEmpty)
-          .flatMap(p => scala.util.Try(BigDecimal(p)).toOption)
+          .zipWithIndex
+          .traverse {
+            case (token, index) =>
+              Either
+                .cond(token.nonEmpty, token, s"Stake weight ${index + 1} is empty")
+                .flatMap(value =>
+                  Either
+                    .catchNonFatal(BigDecimal(value))
+                    .leftMap(_ => s"Stake weight ${index + 1} is not a decimal: $value")
+                )
+          }
 
     val opts: Opts[GenerateGenesisCmd] = Opts.subcommand(
       "generate-genesis",
-      "Generate a Tier-1 l0-genesis.json test-vector fixture"
+      "Run the offline ceremony that creates a greenfield l0-genesis.json"
     ) {
       (
         Opts.option[Path]("output-dir", "Directory to write l0-genesis.json (and optional cl1-genesis.json) into."),
@@ -184,7 +196,7 @@ object method {
             "Comma-separated relative weights summing to ≈1.0. Defaults to uniform if omitted."
           )
           .withDefault("")
-          .map(parseWeights),
+          .mapValidated(parseStakeWeights(_).toValidatedNel),
         Opts
           .option[Long]("stake-budget-datum", "Total stake budget in datum (1 DAG = 1e8 datum).")
           .withDefault(1000000000000L),
@@ -200,10 +212,24 @@ object method {
             "Optional CSV (address,balance) to seed cl1 balances; if omitted, synthesizes per-operator stipends."
           )
           .orNone,
-        Opts.option[Long]("seed", "Required: PRNG seed for byte-determinism."),
+        Opts.option[Long]("seed", "Allocation/test-fixture seed; it does not reproduce securely generated keys or signatures."),
         Opts
-          .option[Path]("keys-from", "Optional directory containing nodes/N/key.p12 to reuse existing operator keys.")
+          .option[Path]("keys-from", "Offline ceremony directory containing nodes/N/key.p12 operator credentials.")
           .orNone,
+        Opts.option[String]("operator-key-alias", "Alias used by each operator keystore.").withDefault("alias"),
+        Opts
+          .option[String](
+            "operator-key-password-env",
+            "Name of the environment variable containing the operator keystore password; the password is never accepted on argv."
+          )
+          .orNone,
+        Opts
+          .flag(
+            "test-only-deterministic-operator-keys",
+            "TEST ONLY: derive operator credentials from the public seed. Never use for a deployed genesis."
+          )
+          .map(_ => true)
+          .withDefault(false),
         Opts.option[String]("network-magic", "Test-cluster network magic string.").withDefault("test-cluster"),
         Opts.option[Long]("starting-epoch-progress", "Initial epoch progress for the genesis.").withDefault(0L)
       ).mapN(GenerateGenesisCmd.apply)

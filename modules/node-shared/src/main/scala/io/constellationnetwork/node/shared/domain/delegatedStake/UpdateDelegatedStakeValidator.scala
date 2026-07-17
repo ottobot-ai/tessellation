@@ -13,7 +13,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{GlobalStateReader, UpdateNodeParametersMptReader}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
-import io.constellationnetwork.schema.nodeCollateral.NodeCollateralRecord
+import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, PendingNodeCollateralWithdrawal}
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.security.Hasher
@@ -217,6 +217,7 @@ object UpdateDelegatedStakeValidator {
           for {
             maybeDelegatedStakes <- reader.getDelegatedStakes(address)
             maybeNodeCollaterals <- reader.getNodeCollaterals(address)
+            maybeNodeCollateralWithdrawals <- reader.getNodeCollateralWithdrawals(address)
           } yield {
             val maybeExistingStake = maybeDelegatedStakes
               .getOrElse(SortedSet.empty[DelegatedStakeRecord])
@@ -226,7 +227,13 @@ object UpdateDelegatedStakeValidator {
               .getOrElse(SortedSet.empty[NodeCollateralRecord])
               .find(_.event.tokenLockRef === signed.tokenLockRef)
 
-            maybeExistingCollateral.isEmpty && maybeExistingStake.forall(_.event.nodeId != signed.nodeId)
+            val maybePendingCollateral = maybeNodeCollateralWithdrawals
+              .getOrElse(SortedSet.empty[PendingNodeCollateralWithdrawal])
+              .find(_.event.tokenLockRef === signed.tokenLockRef)
+
+            maybePendingCollateral.isEmpty &&
+            maybeExistingCollateral.isEmpty &&
+            maybeExistingStake.forall(_.event.nodeId != signed.nodeId)
           }
 
         def tokenLockValid(address: Address): F[Boolean] =

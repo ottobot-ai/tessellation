@@ -10,6 +10,7 @@ import scala.util.control.NoStackTrace
 import io.constellationnetwork.currency.schema.currency.CurrencyIncrementalSnapshot
 import io.constellationnetwork.dag.l1.domain.address.storage.AddressStorage
 import io.constellationnetwork.node.shared.domain.collateral.LatestBalances
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator.BackingReplacementRequirement
 import io.constellationnetwork.node.shared.domain.snapshot.storage.LastSnapshotStorage
 import io.constellationnetwork.node.shared.domain.tokenlock.TokenLockStorage
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
@@ -19,7 +20,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.snapshot.{Snapshot, SnapshotInfo, StateProof}
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockBlock, TokenLockReference}
 import io.constellationnetwork.schema.{GlobalIncrementalSnapshot, SnapshotOrdinal}
-import io.constellationnetwork.security.hash.ProofsHash
+import io.constellationnetwork.security.hash.{Hash, ProofsHash}
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.security.{Hashed, Hasher}
 
@@ -114,6 +115,8 @@ object TokenLockBlockService {
           def getCurrentEpochProgress: EpochProgress = currentEpochProgress
 
           def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]] = replacementCandidates
+
+          def getBackingReplacementRequirement(ref: Hash): F[Option[BackingReplacementRequirement]] = none.pure[F]
         }
 
       private def processAcceptanceSuccess(

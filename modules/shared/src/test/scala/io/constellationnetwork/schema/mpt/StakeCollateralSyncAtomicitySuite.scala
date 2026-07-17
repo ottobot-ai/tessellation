@@ -175,9 +175,13 @@ object StakeCollateralSyncAtomicitySuite extends MutableIOSuite {
     implicit val (hasher, jsonSerializer) = res
 
     malformedCases
-      .traverse(runCase(_, (store, accumulator) =>
-        store.syncFromGlobalSnapshotInfo(applyAccumulatorToGSI(GlobalSnapshotInfo.empty, accumulator), rejectedOrdinal)
-      ))
+      .traverse(
+        runCase(
+          _,
+          (store, accumulator) =>
+            store.syncFromGlobalSnapshotInfo(applyAccumulatorToGSI(GlobalSnapshotInfo.empty, accumulator), rejectedOrdinal)
+        )
+      )
       .map(_.reduce(_.and(_)))
   }
 }

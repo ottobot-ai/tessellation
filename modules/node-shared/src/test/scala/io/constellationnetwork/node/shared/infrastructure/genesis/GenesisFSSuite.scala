@@ -9,6 +9,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.genesis.types._
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
+import io.constellationnetwork.schema.GlobalSnapshotInfo
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.generators.{addressGen, balanceGen}
@@ -17,9 +18,9 @@ import io.constellationnetwork.security.signature.Signed
 
 import fs2.io.file.Files
 import fs2.text
-import io.circe.Printer
-import io.circe.parser.decode
+import io.circe.parser.{decode, parse}
 import io.circe.syntax._
+import io.circe.{Json, Printer}
 import org.scalacheck.Gen
 import weaver._
 import weaver.scalacheck._
@@ -141,36 +142,79 @@ object GenesisFSSuite extends MutableIOSuite with Checkers {
 
     // Try relative-to-cwd first; fall back to walking up to find the project root (sbt usually
     // runs tests from the module dir, while `just test` runs from the project root).
-    def resolveFixture(rel: String): IO[Option[fs2.io.file.Path]] = {
+    def resolveFixture(rel: String): IO[fs2.io.file.Path] = {
       val cwd = fs2.io.file.Path(System.getProperty("user.dir"))
       val candidates = List(
         cwd / rel,
         cwd / s"../../$rel",
         cwd / s"../$rel"
       )
-      candidates.collectFirstSomeM(p => Files[IO].exists(p).map(if (_) Some(p) else None))
+      candidates
+        .collectFirstSomeM(p => Files[IO].exists(p).map(if (_) Some(p) else None))
+        .flatMap(
+          _.liftTo[IO](
+            new IllegalStateException(
+              s"Required tracked genesis fixture is missing from every repository-relative candidate: $rel"
+            )
+          )
+        )
     }
 
     fixtures.traverse {
       case (rel, expOps, expStakes, expColls) =>
-        resolveFixture(rel).flatMap {
-          case None =>
-            // The repo root differs depending on where sbt was invoked; if the file doesn't
-            // exist at the relative path we skip rather than fail (the fixture-emit pipeline is
-            // independently verified by the determinism diff in commit history).
-            IO.pure(success)
-          case Some(path) =>
-            genesisFS.loadL0Genesis(path).flatMap { data =>
-              L0GenesisLoader.buildOperatorKeyRegistry[IO](data).attempt.map { registryResult =>
-                expect
-                  .eql(data.operators.size, expOps)
-                  .and(expect.eql(data.delegatedStakes.size, expStakes))
-                  .and(expect.eql(data.nodeCollaterals.size, expColls))
-                  .and(expect(data.operators.forall(op => op.kesMasterVk.length == 64 && op.vrfVk.length == 64)))
-                  .and(expect(registryResult.isRight))
-              }
+        resolveFixture(rel).flatMap { path =>
+          implicit val hasher: Hasher[IO] = res._3
+          implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(hasher)
+
+          genesisFS.loadL0Genesis(path).flatMap { data =>
+            L0GenesisLoader.augmentSnapshotInfo[IO](GlobalSnapshotInfo.empty, data).attempt.map { augmentationResult =>
+              expect
+                .eql(data.operators.size, expOps)
+                .and(expect.eql(data.delegatedStakes.size, expStakes))
+                .and(expect.eql(data.nodeCollaterals.size, expColls))
+                .and(expect(data.operators.forall(op => op.kesMasterVk.length == 64 && op.vrfVk.length == 64)))
+                .and(expect(augmentationResult.isRight))
             }
+          }
         }
+    }.map(_.combineAll)
+  }
+
+  test("tracked L0 genesis fixtures contain no private fields or PKCS8 private-key material") { _ =>
+    val fixtures = List(
+      "test-vectors/genesis/8-node-uniform-stake.json",
+      "test-vectors/genesis/8-node-skewed-stake.json",
+      "test-vectors/genesis/8-node-with-collateral.json",
+      "test-vectors/genesis/3-node-minimal.json"
+    )
+
+    def fieldNames(json: Json): Set[String] =
+      json.arrayOrObject(
+        Set.empty,
+        _.iterator.flatMap(fieldNames).toSet,
+        obj => obj.keys.toSet ++ obj.values.iterator.flatMap(fieldNames)
+      )
+
+    val cwd = fs2.io.file.Path(System.getProperty("user.dir"))
+    def resolve(rel: String): IO[fs2.io.file.Path] = {
+      val candidates = List(cwd / rel, cwd / s"../../$rel", cwd / s"../$rel")
+      candidates
+        .collectFirstSomeM(path => Files[IO].exists(path).map(if (_) Some(path) else None))
+        .flatMap(_.liftTo[IO](new IllegalStateException(s"Required tracked genesis fixture is missing: $rel")))
+    }
+
+    fixtures.traverse { rel =>
+      for {
+        path <- resolve(rel)
+        raw <- Files[IO].readAll(path).through(text.utf8.decode).compile.string
+        json <- parse(raw).leftMap(error => new IllegalArgumentException(s"$rel is not valid JSON: $error")).liftTo[IO]
+        normalizedFields = fieldNames(json).map(_.toLowerCase)
+        forbiddenFields = normalizedFields.filter(name => name.contains("private") || name.contains("secret"))
+        containsEcPkcs8 =
+          raw.toLowerCase.contains("30818d020100301006072a8648ce3d020106052b8104000a")
+      } yield
+        expect(forbiddenFields.isEmpty) &&
+          expect(!containsEcPkcs8)
     }.map(_.combineAll)
   }
 

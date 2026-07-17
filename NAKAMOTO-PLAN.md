@@ -10,6 +10,13 @@
 > after conflicting text is reconciled through E0. The older May roadmap is
 > retained below as historical context and is not an implementation order.
 >
+> **Epic-ID namespace warning.** This plan and `NAKAMOTO-TODO.md` use E11-E13
+> for exceptional challenge/slashing, downstream rebase, and protocol-level GL0
+> correction. `docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md` retains E11-E13
+> for MPT/GSI recovery, transport/bootstrap, and existing-network genesis.
+> Until E0 publishes one reconciled ownership ledger, cite the document and full
+> epic name; a bare E11, E12, or E13 is ambiguous.
+>
 > **Committee correction.** Both committees are GL0-operator committees, not ML0 committees. Per-binary admission uses a real secret-key VRF keyed by `(eta, metagraph, parentHash)` but currently weights operators uniformly (`1/N`). Execution-shard membership is a separate public deterministic VK-hash draw keyed by `(eta, shard, epoch)`, also uniform `1/N`, followed by hash-shuffled staircase duty. The abandoned design was secret, stake-weighted shard membership with per-slot LDD leadership. Historical roadmap text below is not the live shard design.
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
@@ -355,24 +362,38 @@ already has a hard-coded kill switch.
    (`GlobalSnapshotAcceptanceManager.scala:1409-1458,1502-1551,2638-2687,2711-2739,2770-2808`), and
    `GsamEtaBoundaryWriteSuite.scala:167-204` proves a closing-ordinal delegated
    create is present in both post-state and the period boundary entry.
-   Two concrete ECO-02 backing subdefects are also fixed by `d34d23655`, without
-   closing ECO-02. An accepted delegated-stake successor now reserves its
-   `(source,effectiveTokenLockRef)` before withdrawals are processed, so a
-   same-snapshot withdrawal of the predecessor rejects with
-   `ConflictingStakeTransition`; an invalid create reserves nothing
-   (`UpdateDelegatedStakeAcceptanceManager.scala:99-176`). Both stake
-   materializers independently fail closed if contradictory accepted
-   successor/withdrawal results bypass arbitration, and replacement lookup,
-   filtering, and reward carry-forward compare effective `record.tokenLockRef`
-   rather than stale `event.tokenLockRef`
-   (`DelegatedRewardsDistributor.scala:61-95,100-250`;
-   `DelegatedStakeStateManager.scala:92-115`;
-   `UpdateDelegatedStakeAcceptanceManagerSuite.scala:194-334`). This prevents
-   refunding the predecessor's lock while retaining that same-batch successor.
-   It does not reject indefinite-to-finite token-lock replacement or prove that
-   every counted stake/collateral record joins one live, indefinite, uniquely
-   bound lock. Overall ECO-02 remains CRITICAL/PARTIAL, and conservation is not
-   closed.
+   **ECO-02 focused backing lifecycle is green; overall remains
+   CRITICAL/PARTIAL.** The current worktree requires every active or pending
+   stake/collateral record to bind one unique live native same-source indefinite
+   lock covering its effective amount, obtains all five parent partitions in one
+   capture, validates terminal replacement chains, and checks the complete
+   changed post-state before acceptance returns
+   (`StakeBackingValidator.scala:26-30,296-396,442-472,510-568`;
+   `GlobalSnapshotAcceptanceManager.scala:2727-2762`). This subsumes the prior
+   same-batch, stale-effective-reference, and finite replacement exploits.
+   Collateral maturity removes both the pending record and its lock, credits the
+   exact amount once, removes the expiry bucket, and cannot credit a following
+   snapshot (`TokenLockStateManager.scala:842-930`;
+   `NodeCollateralWithdrawalExpiryRootParitySuite.scala:60-257`). It does not
+   validate every unchanged raw-installed image or close restart/reorg, resource
+   bounds/reverse binding, hash-era migration, or the complete economic oracle.
+   ECO-06 remains CRITICAL/OPEN because slash metadata removal still does not
+   debit principal. A same/prior-round withdrawal moves the guilty active record
+   into pending before the slash fold; the fold sees zero principal, can still
+   publish cooldown/evidence, and maturity later refunds the full lock
+   (`DelegatedRewardsDistributor.scala:168-180,219-255`;
+   `NodeCollateralStateManager.scala:218-251`;
+   `GlobalSnapshotAcceptanceManager.scala:2673-2713`;
+   `TokenLockStateManager.scala:694-711,870-918`).
+   ECO-30's historical HIGH event-isolation halt is FIXED IN WORKTREE:
+   delegated/collateral validation now rejects opposite-family pending-lock use,
+   and accepted-only collateral arbitration rejects both a direct predecessor
+   withdrawal and withdrawal of a non-latest parent-state record whose lock is
+   reused by an accepted create
+   (`UpdateDelegatedStakeValidator.scala:216-237`;
+   `UpdateNodeCollateralValidator.scala:205-227`;
+   `UpdateNodeCollateralAcceptanceManager.scala:74-149,168-200`). Retain the
+   final whole-state gate as defense.
    A separate exact-parent reward recreation defect is fixed by `d34d23655`
    (CONS-10, CRITICAL historical). The former singleton distributor read
    delegated stakes, node parameters, and withdrawal records through the
@@ -386,18 +407,25 @@ already has a hard-coded kill switch.
    requires both producer and follower to reproduce 11
    (`GlobalSnapshotConsensusFunctionsSuite.scala:1349-1423`). This fixes
    CONS-10 only for retained parent branches.
-   Candidate validation is still not exact-parent-bound: an absent/orphan
-   `BranchId` can resolve to the finalized base, and historical stake plus its
-   live fallback still resolve through the receiver's ambient best tip. Thus a
-   retained child of branch B can be judged with sibling A's N-2 distribution
-   (CONS-08, CRITICAL/OPEN). The same absent/evicted-branch-to-base behavior is
+   A staged exact-parent historical-stake reader now captures one proved
+   lineage, reproduces the supplied base and parent roots, and derives field
+   20's read key under its historical boundary write ordinal
+   (`HistoricalStakeReader.scala:18-40,60-120,152-161`;
+   `MptOverlay.scala:1052-1072`). It is deliberately dark and no producer or
+   follower eligibility path consumes it. Candidate validation is therefore
+   still not exact-parent-bound: an absent/orphan `BranchId` can resolve to the
+   finalized base, and the live historical-stake fallback follows the receiver's
+   ambient best tip (CONS-08, CRITICAL/OPEN, ACTIVATION NO-GO). The same
+   absent/evicted-branch-to-base behavior is
    the explicit CONS-10 residual and remains owned by CONS-08/SMT-02; the reward
-   fix does not authenticate branch existence. CONS-04's missing mature
-   historical distribution also remains open. Keep MPT-03 and PERM-005 partial for
+   fix does not authenticate branch existence. Field 20 still lacks its period
+   in the stored value, so removal/rekey across a hash era is unresolved.
+   CONS-04's missing mature historical distribution also remains open. Keep
+   MPT-03 and PERM-005 partial for
    whole-image wrong-network/partition and arbitrary raw ingress,
    restart/catch-up/bootstrap/reorg, frozen protocol reference/hash era,
    signatures/reference and withdrawal history, resource bounds, rooted expiry
-   parameters, counted-record-to-live-lock backing, and slash conservation.
+   parameters, complete oracle coverage, and slash conservation.
    The focused MPT-04 native field-8 parser landed at `1e942fb28`: all audited
    live node-shared readers share strict physical-key/raw-byte validation,
    native-only scope, homogeneous-source and current unsigned-reference
@@ -782,6 +810,13 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    stake capability closes CONS-08; its typed mature-history failure semantics
    also close CONS-04. Gates: `CONS-04`, `CONS-08`, `KEYREG-002..005`,
    `KEYREG-007`, `KEYREG-008`, and `CRYPTO-001`.
+   **Current status: dark prerequisite only, ACTIVATION NO-GO.**
+   `ExactParentHistoricalStakeReader` reproduces exact captured base/parent roots
+   and uses the historical boundary write ordinal for field-20 reads, but no
+   producer/follower eligibility consumer is wired
+   (`HistoricalStakeReader.scala:18-40,60-120,152-161`). The field-20 value also
+   lacks `EtaPeriod`, so removal/rekey across a hash-era boundary remains
+   undefined until O-17/R008-02 lands. This does not close CONS-04 or CONS-08.
 4. **K3 - Provision secrets, implement O-12's ratified baseline, and activate runtime rotation.** Before
    submitting a record, atomically provision the future VRF secret and fresh KES
    tree, durably bind them to the registration ID, and verify both public keys.
@@ -1107,6 +1142,15 @@ delivery, rollback, and recovery.
   a finalized prefix retains canonical descendants. Restart restores the anchor
   before production, and global finality stages overlay, chain, tracker, outbox,
   watermarks, and projections through one recoverable transition.
+- **Current implementation is PARTIAL/NO-GO:** known canonical folds now retain
+  strict descendants (`MptOverlay.scala:1231-1256,1268-1286,1763-1787`), but an
+  unknown first finalization still records a hash without applying its state and
+  an absent same-ordinal replacement still undoes old state, records the new
+  hash, and delegates application to a later resync
+  (`MptOverlay.scala:1171-1230,1259-1267`). The undo journal and base/marker/
+  descendant/finality publication are not one durable transaction
+  (`MptOverlay.scala:1580-1617`). Descendant retention is an improvement, not
+  E9-BRANCH activation evidence.
 - The owner-ratified session strategy is immutable parent-state capture plus a
   generation compare-and-set at commit; a stale session retries or defers instead
   of holding a lock across replay. Locally viable branch generations are retained
@@ -1503,15 +1547,26 @@ four IDs to positive constructors; the unsupported sentinel refuses them and
 dynamically fails closed every other manifest row. Its 41 focused tests are
 green.
 
-Commit `d34d23655` also closes two narrow delegated-stake backing bugs before the full
-S2 backing kernel: a same-snapshot accepted successor cannot coexist with
-withdrawal of the predecessor sharing its effective lock, and replacement
-materialization no longer compares the stale original event lock after
-`currentTokenLockRef` advances. The acceptance and materialization defenses are
-documented under ECO-02/MPT-03 above. They are not a conservation proof.
-Indefinite-to-finite replacement and the mandatory join from every counted
-stake/collateral record to one live, indefinite, uniquely bound lock remain the
-ECO-02 activation blockers owned by S2.
+The current worktree extends `d34d23655` with the focused S2 backing fold
+documented under ECO-02/MPT-03 above. Changed ordinary transitions now enforce
+the active/pending-record-to-live-native-indefinite-unique-lock join, reject the
+reproduced finite replacement, and release matured collateral principal exactly
+once. This is not a conservation or activation proof: raw accepted-state
+installation, restart/reorg, bounds/reverse index, hash-era rules, complete
+oracle coverage, and ECO-06 slash debit remain blockers.
+ECO-30's focused event-isolation regressions now prove cross-family pending-lock
+reuse, direct collateral successor/predecessor withdrawal, and non-latest
+reused-lock-owner withdrawal reject as attributable events before materialization.
+Preserve them and the terminal defense.
+
+The same packet replaces private-key-bearing public genesis records with fully
+signed event/backing-lock bundles and persists newly generated economic secrets
+separately. The current public artifacts and scanner are greenfield only. Private
+keys previously committed at
+`cdec63f1c:test-vectors/genesis/3-node-minimal.json:19,35,51` are permanently
+compromised and their owner addresses are unusable (ECO-29); deleting them from
+HEAD or rewriting history cannot revoke copies. The future upstream-v4
+snapshot-to-new-genesis importer remains roadmap E13 / P12 / `MIG-*` open work.
 
 A bounded test-only adapter supplies initial context and runs the real lower
 native acceptance managers and currency ML0 wrappers for the transfer and

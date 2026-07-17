@@ -1,6 +1,6 @@
 # Consensus and Economic Security Roadmap
 
-**Status:** Active implementation plan; `17/21` owner questions are dispositioned. O-01 through O-17 are ratified; O-18 transport/DA, O-19 migration policy, O-20 field-34 slash-record schema, and O-21 optimistic decision evidence await owner responses. Remaining engineering/research/parameter/proof gates block their named dependent tasks.
+**Status:** Active implementation plan; `17/22` owner questions are dispositioned. O-01 through O-17 are ratified; O-18 transport/DA, O-19 migration policy, O-20 field-34 slash-record schema, O-21 optimistic decision evidence, and O-22 fraud-proof activation/adjudication await owner responses. Remaining engineering/research/parameter/proof gates block their named dependent tasks.
 **Source baseline:** `c610a0740c34833e563f8a94c2ab820186a75897`
 **Audit baseline:** `CORRECTNESS-SECURITY-AUDIT-2026-07-11.md`
 **Normative architecture:** `CONSENSUS-ARTIFACT-LIFECYCLE.md`
@@ -12,6 +12,12 @@ detailed security work breakdown and retains its pre-existing `E*.*` task IDs fo
 finding/test traceability; a bare epic number is therefore not a cross-document
 identifier. Refer to an epic by document plus full name until E0 emits the
 machine-readable ownership ledger.
+
+Concretely, plan/TODO E11-E13 mean exceptional challenge/slashing, downstream
+rebase, and protocol-level GL0 correction. Roadmap E11-E13 below mean MPT/GSI
+recovery, transport/bootstrap, and existing-network genesis. This is an open
+PLAN/DOC namespace defect, not authorization to renumber either document
+silently.
 
 This roadmap replaces the incorrect global-BFT plus ordinary-noncommittee
 universal-CL1-replay plan. It does not discard the audit findings or universal
@@ -384,6 +390,35 @@ and require owner review in
 Allow-spend consume/expiry/refund remain blocked on O-13 terminal ordering, and
 every other E2 operation row remains open.
 
+The current backing packet is a focused E2 hardening slice, not kernel closure.
+`StakeBackingValidator` now joins every changed active/pending stake or collateral
+record to one unique live native same-source indefinite covering lock, validates
+the five parent partitions in one capture, checks terminal replacements, and
+revalidates the complete changed post-state
+(`StakeBackingValidator.scala:26-30,296-396,442-472,510-568`;
+`GlobalSnapshotAcceptanceManager.scala:2727-2762`). Collateral maturity removes
+its pending record and backing lock, credits exact principal once, and does not
+credit again (`TokenLockStateManager.scala:842-930`;
+`NodeCollateralWithdrawalExpiryRootParitySuite.scala:60-257`). ECO-02 remains
+CRITICAL/PARTIAL until raw accepted-state installation, lifecycle/recovery,
+resource bounds/reverse binding, hash-era identity, and the complete oracle
+close. ECO-06 remains CRITICAL/OPEN because slashing still changes metadata and
+credits bounty without debiting the backing principal. It also inspects active
+maps only: a same/prior-round withdrawal moves the guilty record to pending before
+the fold, allowing zero principal debit followed by full maturity refund
+(`DelegatedRewardsDistributor.scala:168-180,219-255`;
+`NodeCollateralStateManager.scala:218-251`;
+`GlobalSnapshotAcceptanceManager.scala:2673-2713`;
+`TokenLockStateManager.scala:694-711,870-918`). ECO-30's historical HIGH
+event-isolation halt is fixed in the current worktree: opposite-family pending
+use rejects in each validator, and accepted-only collateral arbitration rejects
+both a direct predecessor withdrawal and withdrawal of a non-latest parent-state
+record whose lock is reused by an accepted create
+(`UpdateDelegatedStakeValidator.scala:216-237`;
+`UpdateNodeCollateralValidator.scala:205-227`;
+`UpdateNodeCollateralAcceptanceManager.scala:74-149,168-200`). Preserve those
+regressions; the final whole-state validator remains defense.
+
 ### E3 - Pure finality and fork-choice model
 
 **Depends on:** E0 phase decisions. Pure model can run in parallel with E1/E2.
@@ -454,6 +489,16 @@ runtime eligibility; economic debit integrates with E2.
 | E6.8 | Define supported validator-set sizes and fail-closed/degraded modes. Never silently clamp/renormalize `kQuorum`, K, alpha, or weight denominators to locally observed N. Small dev networks use explicit canonical non-economic parameters or depth-only behavior; an impossible threshold halts visibly. |
 | E6.9 | Prevent uniform-committee Sybil/key grinding with canonical operator identity, minimum live bonded principal, delayed registration/activation before eta is known, key-count rules, and quantitative stake-splitting/correlated admission-execution-watchtower analysis. |
 | E6.10 | Reuse v4 signed node-profile and token-lock-backed delegated-stake/collateral event and withdrawal state only as deterministic identity/backing facts. Remove seedlist/local-peer membership authority after O-11's ratified replacement roster is implemented and rooted. Delivery order is owner rule -> canonical codec/root -> immutable genesis population -> pure boundary fold/undo -> exact N-2/N-1 resolver -> exact Phase-2 artifact refs -> all-consumer migration -> adversarial/restart qualification. A passing model with an injected roster does not close the production gate. |
+
+The first exact-parent N-2 stake reader is deliberately dark. It captures one
+proved parent lineage under the overlay mutex, reproduces both supplied roots,
+and selects the field-20 key under the boundary write ordinal
+(`HistoricalStakeReader.scala:18-40,60-120,152-161`;
+`MptOverlay.scala:1052-1072`). No producer/follower eligibility path consumes
+that capability, so CONS-04/CONS-08 remain open and activation is NO-GO.
+Furthermore, field 20 still stores no `EtaPeriod`; exact reads improved, but
+removal/rekey across a hash-era transition cannot reproduce the old physical key
+until O-17/R008-02 lands.
 
 ### E7 - Canonical checkpoint diff and execution result
 
@@ -618,13 +663,18 @@ root, or a locally current branch cannot substitute for those gates
 `GlobalFollowProofService.scala:39-47`).
 
 E9-BRANCH is one activation unit, not a sequence of independently enabled guards.
-Today a successful fold deletes pending descendants, restart restores no
-authenticated base identity, and the global finality sinks update the tip tracker,
-chain store, and outbox before the overlay. Enabling unknown-branch rejection alone
-therefore converts existing silent corruption into a normal-path halt after partial
-external mutation. The verified anchor, descendant retention, exact session,
-explicit `RecoveryRequired` state, and preflighted finality transaction must be
-available before the fail-closed guard becomes active.
+Known canonical folds now retain strict descendants
+(`MptOverlay.scala:1231-1256,1268-1286,1763-1787`), so the prior blanket claim
+that a successful fold deletes descendants is stale. Activation remains NO-GO:
+an unknown first finalization still records a hash without applying its state,
+and an absent same-ordinal replacement still undoes old state, records the new
+hash, and requires a later caller resync
+(`MptOverlay.scala:1171-1230,1259-1267`). Restart has no authenticated base
+identity; undo/base/markers/descendants and the global finality sinks are not one
+durable transition (`MptOverlay.scala:1580-1617`). The verified anchor,
+unknown-canonical preflight, exact session, durable recovery intent, explicit
+`RecoveryRequired`, and coordinated finality transaction must all be available
+before the fail-closed guard or exact-parent consumers activate.
 
 The first dark implementation slice is an immutable local MPT image store: copied
 and sorted bytes, independent root rebuild, versioned deterministic encoding,
@@ -848,6 +898,18 @@ descriptors from the retained image, and no live consumer closes effects through
 | E13.3 | Canonical ScodecV1 manifest commits source evidence, transform version, new network/genesis/parameters/operator keys, output root, and replay-domain separation. |
 | E13.4 | Two independent implementations/reproduction paths produce byte-identical new ordinal-0 genesis and supply report. |
 | E13.5 | Cutover rehearsal covers source freeze, export publication, operator/user verification, new-chain launch, rollback/cancel procedure, and old-message replay rejection. |
+
+Current fresh genesis is a greenfield ceremony, not E13. Its public schema carries
+fully signed stake/collateral events and exact signed backing locks, while
+economic private keys are written separately with owner-only permissions
+(`domain/genesis/types.scala:129-154`;
+`L0GenesisLoader.scala:81-179,185-280`;
+`GenesisGenerator.scala:338-423,450-644`). Historical fixtures nevertheless
+published complete PKCS8 delegator keys at
+`cdec63f1c:test-vectors/genesis/3-node-minimal.json:19,35,51`. Those owners are
+permanently compromised and unusable even after current-tree removal or a
+history rewrite (ECO-29). The upstream-v4 exporter/transform, conservation
+report, and ordinal-zero ScodecV1 import manifest remain open.
 
 ### E14 - Independent qualification and release
 

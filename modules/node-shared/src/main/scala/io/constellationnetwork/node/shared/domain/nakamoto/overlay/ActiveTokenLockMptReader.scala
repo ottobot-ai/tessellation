@@ -98,31 +98,46 @@ object ActiveTokenLockMptReader {
     } yield result
   }
 
+  private def materializeEntries[F[_]: Async: Hasher](
+    entries: List[StrictMptEntry[SortedSet[Signed[TokenLock]]]]
+  ): F[ActiveTokenLocks] =
+    entries
+      .sortBy(_.physicalKey.value)
+      .foldLeftM((SortedSet.empty[Address], List.empty[(Address, SortedSet[Signed[TokenLock]])])) {
+        case (_, StrictMptEntry(physicalKey, StrictMptRead.Absent)) =>
+          Async[F].raiseError[(SortedSet[Address], List[(Address, SortedSet[Signed[TokenLock]])])](
+            StrictMptRead.MissingConsensusMptValue(context, physicalKey)
+          )
+
+        case (_, StrictMptEntry(physicalKey, StrictMptRead.Malformed(reason, _))) =>
+          malformed[F, (SortedSet[Address], List[(Address, SortedSet[Signed[TokenLock]])])](physicalKey, reason)
+
+        case ((seen, acc), StrictMptEntry(physicalKey, StrictMptRead.Present(locks, rawBytes))) =>
+          validateValue[F](physicalKey, locks, rawBytes).flatMap {
+            case (source, _) if seen.contains(source) =>
+              inconsistent[F, (SortedSet[Address], List[(Address, SortedSet[Signed[TokenLock]])])](
+                physicalKey,
+                s"duplicate logical token-lock source=$source"
+              )
+            case (source, validatedLocks) =>
+              requireCanonicalKey[F](physicalKey, source).as((seen + source, (source -> validatedLocks) :: acc))
+          }
+      }
+      .map(validated => SortedMap.from(validated._2.reverse))
+
   def materializeNative[F[_]: Async: Hasher](reader: GlobalStateReader[F]): F[ActiveTokenLocks] =
     for {
       prefix <- GlobalStateKey.hypergraphFieldPrefixAcrossContracts[F](GlobalStateFieldId.ActiveTokenLocks)
       entries <- reader.getAllForPrefixStrict[SortedSet[Signed[TokenLock]]](prefix)
-      validated <- entries
-        .sortBy(_.physicalKey.value)
-        .foldLeftM((SortedSet.empty[Address], List.empty[(Address, SortedSet[Signed[TokenLock]])])) {
-          case (_, StrictMptEntry(physicalKey, StrictMptRead.Absent)) =>
-            Async[F].raiseError[(SortedSet[Address], List[(Address, SortedSet[Signed[TokenLock]])])](
-              StrictMptRead.MissingConsensusMptValue(context, physicalKey)
-            )
+      validated <- materializeEntries(entries)
+    } yield validated
 
-          case (_, StrictMptEntry(physicalKey, StrictMptRead.Malformed(reason, _))) =>
-            malformed[F, (SortedSet[Address], List[(Address, SortedSet[Signed[TokenLock]])])](physicalKey, reason)
-
-          case ((seen, acc), StrictMptEntry(physicalKey, StrictMptRead.Present(locks, rawBytes))) =>
-            validateValue[F](physicalKey, locks, rawBytes).flatMap {
-              case (source, _) if seen.contains(source) =>
-                inconsistent[F, (SortedSet[Address], List[(Address, SortedSet[Signed[TokenLock]])])](
-                  physicalKey,
-                  s"duplicate logical token-lock source=$source"
-                )
-              case (source, validatedLocks) =>
-                requireCanonicalKey[F](physicalKey, source).as((seen + source, (source -> validatedLocks) :: acc))
-            }
-        }
-    } yield SortedMap.from(validated._2.reverse)
+  def materializeNativeFromRaw[F[_]: Async: Hasher](entries: List[StrictMptRawEntry]): F[ActiveTokenLocks] =
+    materializeEntries(
+      entries.map {
+        case StrictMptRawEntry(physicalKey, rawBytes) =>
+          val storedBytes = rawBytes.fold[Array[Byte]](null)(_.toArray)
+          StrictMptEntry(physicalKey, StrictMptRead.fromStoredBytes[SortedSet[Signed[TokenLock]]](storedBytes))
+      }
+    )
 }

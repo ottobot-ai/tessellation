@@ -4,143 +4,359 @@
       "8 operators with stake distribution: 0.125,0.125,0.125,0.125,0.125,0.125,0.125,0.125",
       "Total stake budget: 800000000000 datum",
       "Collateral per operator: 100000000000 datum",
-      "Stake records signed at load time with synthetic delegator keys",
-      "ECDSA signatures non-deterministic by RNG (verifiable but not byte-equal across loads)"
+      "Stake and collateral records carry exact signed native backing locks",
+      "Economic owner private keys are absent from genesis JSON"
     ],
     "generatedAt" : "1970-01-01T00:00:00Z",
-    "generatorVersion" : "tools-4.1.0-alpha.0+914.184f7863.local",
-    "invocation" : "generate-genesis --num-operators 8 --seed 1003 --stake-distribution 0.125,0.125,0.125,0.125,0.125,0.125,0.125,0.125 --stake-budget-datum 800000000000 --collateral-per-operator 100000000000 --network-magic test-cluster",
+    "generatorVersion" : "tools-4.1.0-alpha.0+1058.64ad146b.local",
+    "invocation" : "generate-genesis --num-operators 8 --seed 1003 --stake-distribution 0.125,0.125,0.125,0.125,0.125,0.125,0.125,0.125 --stake-budget-datum 800000000000 --collateral-per-operator 100000000000 --network-magic test-cluster --test-only-deterministic-operator-keys",
     "seed" : 1003
   },
   "activationOrdinal" : 0,
   "delegatedStakes" : [
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042080960d3e9008fb56400e5de995d5e2512964aa49dfa500531eb3c1353df37a0ea00706052b8104000aa144034200044f1dea4433ec36d708d3afe2c15c6dec0669852640a50c85f656b3eb7fa5378a0cf86716f4c295b7fe97fbed01817acc8585dab15f3e8438f66cbf494a935968",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG6B8dGffdS7GKmNokwxbvjYnXLHhFADycrnxUS",
-        "tokenLockRef" : "95017131dc8ce746664d80892e1ee6d6f0ce942f4679b6eafec25d044471dc38"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "57c32d6c4e6c28409c6365e27e981c7f0d22efb2bd40970aa4fd7ca527af5268aa7f9ffeb42244fb96fac778661bfd9369c21126ba9f44d317f2acb6f7613653",
+            "signature" : "30450220504aecbc816ff183fcc82c1827bdb96302925e80c0df6a4bbf01e3d555c45d8302210085d50bca9c7f89f524016358c72a86519492b85263077b0e3ef4c8d0e81f3ed1"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG52Sj27nZsKcs34jfC43htqPSaD7mYLAxnF9nN",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "57c32d6c4e6c28409c6365e27e981c7f0d22efb2bd40970aa4fd7ca527af5268aa7f9ffeb42244fb96fac778661bfd9369c21126ba9f44d317f2acb6f7613653",
+            "signature" : "304602210088c25e219ec16dcc51709edc748c8712ce0c8b3311cf9d2ba6c4c436b8b0272c022100c9e1657b629d1af5a8914a7ca2171513fe16865a7c5cf91b70255b7fb74acda7"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG52Sj27nZsKcs34jfC43htqPSaD7mYLAxnF9nN",
+          "tokenLockRef" : "73a6a2c3fc5b1082d6dacd52b07752c38b59f4f05116b2dfa3d14b88eeaf6dd1"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042031aa02aa3155d4d0a25f5dfea668617d49e6926704bc64a8597b0e15760a17f4a00706052b8104000aa14403420004ad218a38e7540c2e124c00550ca204cbfa32b6722676549aff7e6fe36676831ca46b49aefa26ab664ac65f95f758db448f558c52000f8a3acb50156ce898d6ac",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG2opPNYgWpNXF6nhZqMbuVCMZNu5zmSZ9eDCPe",
-        "tokenLockRef" : "8f691fd136fd0661f182febcaf4575de8cbed35f1783d575b81a728b6692d538"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "ce19d585cef0f5c6aa53ef96cb91ddf2d1f0abf33a60e0cbc4ea3f8fd0f93143748bf287de166d067f8995466df26a47038b2b7b3d6612c11f459d0e9d53d270",
+            "signature" : "304402205d5e08a9487eab6f17a1aac54d6b687a05ec3ce350ffc16eb6b658e899b3577802200bdaf41c62338a4077b70770006d280b650c0ab4c2ad0f593eac3488158c5efd"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG57QUNfVRSEjbLLrqfmcEdN8CeyfJuAPNR2d6G",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "ce19d585cef0f5c6aa53ef96cb91ddf2d1f0abf33a60e0cbc4ea3f8fd0f93143748bf287de166d067f8995466df26a47038b2b7b3d6612c11f459d0e9d53d270",
+            "signature" : "3045022025ed979e1b59a52beccb95b7514448b511935589a82e55c5138163ede229e5c40221008eff919439e87e51d12413e8b490882b4098586e07cbf036623b3e999236c83b"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG57QUNfVRSEjbLLrqfmcEdN8CeyfJuAPNR2d6G",
+          "tokenLockRef" : "5adab930ddde8744ab0ef149733d73cc24d770d148768edf64be21efcb0dade0"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a047630740201010420895330fc33970d7fc01ec343a317fabcd257f70bcbaad629bae8b608d8ecc5e7a00706052b8104000aa1440342000407efd9706a83409500e2a56d849950477793c8bacd8d4ef01d8ae1897d8ae6ce8ebfd0f214c79323e948745cf4172a3f86dc95a8b35e6110936cd4d2044f949e",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG1erhKSZbMg74WZQNoMp6cgAwmH92qYBEMquif",
-        "tokenLockRef" : "a1b579f559ee60e0b2487ce127dea1aaed6c8d47fb588044077a83e17fbdacae"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "51f1f684c53b0a365c9b4a3008c3209df8d07b2621e2240a9a504f954493d4b1311b135a72f9bc34d4958dc753fb742a864b99882d4aaa96a256944a38ab7cc8",
+            "signature" : "3046022100a4dd1748a53969bb2ac890ff4e5614aad30242c4b99e6fb7fa2bfea5282d005d0221009571c5dba6d5f9ab8e7d4ac839bc25230d8c6bccb55343830935379dd8efdb57"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG5rUWkZbDVcFnCeouKXPqsJdsS5kcmmyZDPooh",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "51f1f684c53b0a365c9b4a3008c3209df8d07b2621e2240a9a504f954493d4b1311b135a72f9bc34d4958dc753fb742a864b99882d4aaa96a256944a38ab7cc8",
+            "signature" : "3045022100f59f07493895ef8f37ed1fc40e429ef71fabced1b884f19c58671d9ebf265eb0022013325bbf6b9d1179aa5ce9419b195254567b47481a9bb1fb6d6a09e894d7713d"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG5rUWkZbDVcFnCeouKXPqsJdsS5kcmmyZDPooh",
+          "tokenLockRef" : "5a89635a80063d1effd6108ac5dbddb9e79cd00039fdd0df8e7ebedbe6a965d6"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a047630740201010420293ba876f93fd59fdf82a48fb05c50bc5c251651ef20f027b49ffd7ca939b736a00706052b8104000aa14403420004a4b05856275ea34c11921bd4916e08efcb85d19fd617e9736815727de3d44dd24c56908f34ec9f29429d2df920f477d1439a9802f1ee7678570fec89f7106164",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG1Majgg9z76rdioa4kGzNbJnS3FJzqD2ST6ADB",
-        "tokenLockRef" : "a56f5675d41da510a0c8de712ba5c091f2beb193b42d53732ab949d01d4778a2"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "e74461f7cc3881fac5e6fc29d1575cf4a47509cd263159cf57a5bd086e33eac6710f24367f1a29bafb740dcb16a784673f8cb1a179d9119f4e4a3e4078036348",
+            "signature" : "30440220660371567554213383ec83008bbf518f96e6087c9465baf07aa2ae9f9c37b8c902200ae76b735cf5964cb381c899b6456880a76d33c09764b8c524336af5e225120e"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG6uLkSQS3YE8Woe2c5u7c1jSu1hfG6rxKJKffA",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "e74461f7cc3881fac5e6fc29d1575cf4a47509cd263159cf57a5bd086e33eac6710f24367f1a29bafb740dcb16a784673f8cb1a179d9119f4e4a3e4078036348",
+            "signature" : "304502206970f7c959a940cbd544168074e2026828125ea15bb0ae3ccf911295339648b7022100bbc680fce96aa8a7be7fd97d6e8b66fd6151a504b355b0fda0a5406558775e4b"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG6uLkSQS3YE8Woe2c5u7c1jSu1hfG6rxKJKffA",
+          "tokenLockRef" : "2b3a03cd37ac5d1cc081fd943c107e1af54dff3eca0093b5f0ecfc4003256b8e"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104202c17bb42c48970ad600a53de07a01e5268078ba9fa48096ab83aad2f07667cd3a00706052b8104000aa14403420004c375e6e468bbec0058c31fac6a241d40b7297350ca5fbb1227553c4c9c18f9bdabc0c3d7897dd944f176f4c1c72e37658efbf23779d198f5db6f459e6c8e5006",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG1i6KMCEJjtXPVhq3vrdnHQgvXafdtDNEqDG1e",
-        "tokenLockRef" : "7fcc312debd862cc472e392aeb46b5d07ca84574c7bf52ee8af6986b0e4c4edf"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "2ad80d015dd5c4af0b26a3f7d92a83b62740b6a351f6a8a9e19ce6cdfbbe28883efc314b17319612a49f121a913c614e16500b5b975a902602a2828c40d9531e",
+            "signature" : "304502201c51301a8b7348c319f1dc1ae0f1024a4eace6b0c917f3dbbcbd4284d662a358022100d04c3b3285ee2dbe31f63297a8602c08615bf59614c6395ecdda69df5cd75892"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG7etQ2yQAKxukNWxp4qMyUg7Rzd3iiaTBozQHv",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "2ad80d015dd5c4af0b26a3f7d92a83b62740b6a351f6a8a9e19ce6cdfbbe28883efc314b17319612a49f121a913c614e16500b5b975a902602a2828c40d9531e",
+            "signature" : "30440220036b7a4bc6d7057f990b896ff7bddf4d7917b6e30b3246698cf207e9bc9150ce02201244139fe594638e17c0150c2c817ec4620c7138dc0346a236400b38b7ae73b5"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG7etQ2yQAKxukNWxp4qMyUg7Rzd3iiaTBozQHv",
+          "tokenLockRef" : "5ac65042d3771a6c6d3c4d47ad29c1be64ff122b48402f8c80afc3f59ac683af"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042059b0dc87b8864b945ef2905110a7c0ee6c6849541283849c7c5a5ee1836c88f8a00706052b8104000aa144034200046ab1c6b6bb84b85737989220a87ba9e8cf709fa2ba185c41fcda37c4cebdbed6e79f506d72316f134fc05177e30b29c38cb35589ec8de4d632cafe3a908fb01e",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG5M1QMtXo5MD2vfEmLi9YNaZmr87tHa1r7f37D",
-        "tokenLockRef" : "1f3fd3bd4fdcf02d810cbe822ebdbb446962025b07a645fffbb0ab542b06cd27"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "2acc8a8791a918e7a9b32b768c4592f31255e5aa04fd762da529b1f868bb163a8e8e72c0495e59dd68081c2a01ac7c32480a20be72e4bc703638c59c49bd000b",
+            "signature" : "30450220028be8798e3e8116581dbaddc4844d051c800cd024209a1e83f5d8ca33ce8f5802210087f66880bbf7f839adffe298ac9781ddab38c4b6213845be1388d586bff92228"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG1puQNTiHbTw3yXs2orwYB2FDnDfVssd3SzXcv",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "2acc8a8791a918e7a9b32b768c4592f31255e5aa04fd762da529b1f868bb163a8e8e72c0495e59dd68081c2a01ac7c32480a20be72e4bc703638c59c49bd000b",
+            "signature" : "30450220356b7f1dc4c3b6de7fb9fb5f0bd992f750d50842a9af2f36d0802e08692e42c3022100f80f4996125be79590fd2655c97778faffe9044cef295ac2505340c12169f5f1"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG1puQNTiHbTw3yXs2orwYB2FDnDfVssd3SzXcv",
+          "tokenLockRef" : "26e2776c79b9f1d23be8b88d711a076e67bd36e91eb4fd089bc95d205177e9f7"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104205f555e702d92c62c6ef18b3e7ec44e440d679ca5e5058b298d40a8d77fa7d28ca00706052b8104000aa14403420004aa2e6672055684103008438fadbb5ce259c1cc20621c3cabe2281e19279a07cc42081eca1b5b806a89025a8a6d7a77aa8e30265c61bead61bf58d5b0946aa09f",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG1oWSXoYDyFXYU3BAxoRNxb4QW3aYinbSUiDnA",
-        "tokenLockRef" : "504c20426e8b5aef5c76e0da7f5858e71ca84728afc6e8747926f63c358c71b0"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "32b0fb067b277d656ed8b5c10e06f457326ee5f7d7d200be0ced5d48f883c6617edd7d33d732b6c77fe3498c4754120aacbc450fee5dadb291beb4e0c4e3f82f",
+            "signature" : "30450220181cb43fce54ad34722cbd5b7ec07b3234f6a3917a6d9fbb58f10fe0ed5e970a022100b9aad8ad19c4d62f2b99d3fb10a102ccc2bc896761f317861939ddc1c19cc31f"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG2LpGsjtDDHh3YCDbXAnN9sR7vvNRKwuY1yKaf",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "32b0fb067b277d656ed8b5c10e06f457326ee5f7d7d200be0ced5d48f883c6617edd7d33d732b6c77fe3498c4754120aacbc450fee5dadb291beb4e0c4e3f82f",
+            "signature" : "3045022100e3d0ef0cda5261ec6f2cb5b8aa47ce7dc5d9134d9cc938d8641de7c9ea17419c02205b8c72d00ad71d70d2ecf41506b7f2434edfc15c204679bde987b2a9eed4a632"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG2LpGsjtDDHh3YCDbXAnN9sR7vvNRKwuY1yKaf",
+          "tokenLockRef" : "29ecf19e8fff7d3a24372535a23496f4786f14a682f42d462aba3cc4d2a75d6e"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "delegatorPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104204a69996308d67251fbe1e23f35f2249f602e444df98b8fabf588d2e61c0185b7a00706052b8104000aa144034200040d6400bc5aa282ec3923e3f9c5bb2339fd58cf53e2d7f9790b6101e83d9263cc0230edf885d6bf17d70e49587f1f4bee98e527405466088707b0de9860af7e23",
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG0Rs8Ue1sFAhfZJPej6NGFcdqgHSAPhU39afaL",
-        "tokenLockRef" : "5c84c3776e75004ac22b9365d2b85d7ef3b05552f94f45ab628d319ee40dd555"
+      "rewards" : 0,
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "0bf56cefd2314e4d8133abdabc1178393a8dabb63cfaf06bf06b83fe2f796d65e189082de0cc06eb422172611792597fc6f394d8af9f3c59fd942d9fe09d6186",
+            "signature" : "3046022100b87c4b1dee1519d79ace3f681d73df88617b29841ca1a74fb878ca3c891959bd022100f447f044384ffe8915a0694a3bcac5fd9e605b81265bd7297e2232442fb78681"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG4G22Xes7qFsqcv7GjhgbQH6xhEcDDALjyQa7J",
+          "unlockEpoch" : null
+        }
       },
-      "rewards" : 0
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "0bf56cefd2314e4d8133abdabc1178393a8dabb63cfaf06bf06b83fe2f796d65e189082de0cc06eb422172611792597fc6f394d8af9f3c59fd942d9fe09d6186",
+            "signature" : "304402200fe3e12e11d9cf1fa778d18c3f201eb099ae69aefd08063eac899b14fece7697022029ba560f56393308034be392280c917c68b059ef1e461e0b0291960a8d8e788c"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG4G22Xes7qFsqcv7GjhgbQH6xhEcDDALjyQa7J",
+          "tokenLockRef" : "d80b78e384d90d250e24cc24dc3b2e936246f154d4c54c703984dfc730951c44"
+        }
+      }
     }
   ],
   "initialBalances" : [
@@ -181,195 +397,411 @@
   "nodeCollaterals" : [
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG2esFECRBZ1cYyBQoA2eFrQMkjUdt1o7NKbQVS",
-        "tokenLockRef" : "8a51039ca899378eb135ec948a31f1297ee164da219b108dec7f6d4717ee3272"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "93bdfc7578440d826249df0296a30ad2ddc2433f515fac4ee4744f595e08c778a9520eaccb136961ea72fcdfa6ce90ac7582bf2b9a0d67128b38af563b7749cb",
+            "signature" : "3045022100fa2abbcfcf79cef2206054d9068799d91b98f781df1747778f9554144e501d120220417581f895fa94bbeb28e1c2974a0295df79d505a61a41baa0e459f141a830de"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG64ddMnejamQa3Qcz8WeohGDKuhjrWDTfCtQTu",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042051959b2892c70bc948b01ab5091ba345b4e5af38722cfa41ba3685ff8f2399eda00706052b8104000aa1440342000406c5f204abca5c373cc3171e4bae7164861c041d2cf8b9caff7ff03b2ed2b780378158c10719f8f553e7748680b0fd954db7fcb8ef94ba274d24845393973b18"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "93bdfc7578440d826249df0296a30ad2ddc2433f515fac4ee4744f595e08c778a9520eaccb136961ea72fcdfa6ce90ac7582bf2b9a0d67128b38af563b7749cb",
+            "signature" : "3046022100cd448f9fa2ec29a04863f489b709100f93b07bcfb6dcdea0297b87e154350c550221008794dabf5bbe1c11b7e3fd5a5950b1e078e9dc5e04ca77d962103f97511e4fb0"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG64ddMnejamQa3Qcz8WeohGDKuhjrWDTfCtQTu",
+          "tokenLockRef" : "a0bdba23cf2d80a329e42458c1454866898cd98efca9c645b8456895e92cd096"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG3ZEfCU1hFKkDYtyvVWnpEUU4vYmDiXxYA7XUr",
-        "tokenLockRef" : "1ae7b5dbddd85e91714704cb72b716f661bdb3a6a644d5443b2e9bdc45d2a538"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "d190f4982942302209994b93caf38bfcb13c82d601d28bd8511c799428d26782ab516cfbde995ba8b2e7cb57013da159f968392aab46964184a2547c4df7e0b5",
+            "signature" : "3045022100d7f7c8b3ad16435948e1bb6b496e5c9109e8a6d0328596f9fb1a9e6ea5f3bc3602201042835308e7ee631685e5f732cf12502a5b4badccfe42f88275f1198b0b82f1"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG7ZhAQwp9ofCVrFVvr3HTX3mvfWa1VHxaAbYma",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104202db2091a7cfbc857823ab3725eb6aea444624e06e1104efdfba051ff4adf8b0da00706052b8104000aa144034200045b2db4b5bfb188c2d23ceb12c15046e459af07b70f8777a24b48586780690d88acb083f244b68ed9b065faffbb34e2557e587af914728a5b79b69bffc33a8e2c"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "d190f4982942302209994b93caf38bfcb13c82d601d28bd8511c799428d26782ab516cfbde995ba8b2e7cb57013da159f968392aab46964184a2547c4df7e0b5",
+            "signature" : "3045022068ee0dfb8dd27ad1b9c8fc859c73952b800afab2fca2d64ca6867fea65beb9fb022100fdee755a65108b8618e881c05a8991b3e1355f554eb5c919d8cd554c9940763f"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG7ZhAQwp9ofCVrFVvr3HTX3mvfWa1VHxaAbYma",
+          "tokenLockRef" : "0c6592374d33899099c6284333831ae2595bc626442e962d5f555ad43edfc266"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG8UERfKgBcaxvbqKgfAUg3rXuzVZL26JuobE6w",
-        "tokenLockRef" : "5954ed1f33afd43e974485b5076c6c8136750aee81be13730687acabbd0c4247"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "34164614c5b0e6920f5b2788d2b6834f8cea86ed32650ced8154a679cb16692eb5c9b3994b3c663553aa0d01790a0a4e933274d1651c1debd22f3de4fff51949",
+            "signature" : "3046022100c27b1ca8cde0fdeb90475a83c3a8b9e1d5dd46713ee67bce8d1f49a15c881517022100ed9283b7b75799b3b981f718e17556ad3a07d1c17ade9da4d2c72e85264cfaeb"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG4N4xA2wxHmshFKHkUeY9CZRDzohgaXRSCXQ43",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104205f405293e4f566e0f459225d144a62604ccb1567571dbbc77da679b63a8eb377a00706052b8104000aa1440342000442746d071bac95e1b0ad5a6bd454ddec6500e592f123e8cadde4548b6f000f1f53ba12af41deec21ba8dface2ec4f0aefee05ca7878aaeb3981dbbadb1292647"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "34164614c5b0e6920f5b2788d2b6834f8cea86ed32650ced8154a679cb16692eb5c9b3994b3c663553aa0d01790a0a4e933274d1651c1debd22f3de4fff51949",
+            "signature" : "30450220540f4cf25ce830cb81027d76301b71ab7b80727e0ae0e15ca851e674062d8e4a022100a48e3052bd963d57c00692b692fc8a29b600030cac89c2973a9b2e3890c25268"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG4N4xA2wxHmshFKHkUeY9CZRDzohgaXRSCXQ43",
+          "tokenLockRef" : "d019ef146ac73ac110c873d68b5bc213f0b03b00c457b582b144e7e82d7769df"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG7BcUH7JhRifdGrfGUAxsrip9vVtapHcDSpfMT",
-        "tokenLockRef" : "02148bea99a50a5cdd72ce980d8a486261fc06153199df5e2dc3eb08762997ea"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "248839ad22ec83404b48ecd9e65b6b648e992478bc667e9a7271b7f11b9d1e39f839850fe9652cdc32bb8ad3c55b4682ca009ba0a44b8eb68719968288d4b2fc",
+            "signature" : "3045022100badfb4aa084379069be223c5bc15ec6b68756e93f624055de3d2a42a3a887de1022050f058efcaa94170dd24aeb54a6ae6b2396eb6337eea91b72d6c2cf894af7785"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG5dwsMuVhvCnCAQ5qBBoceScWHfUqYLrjHvvrs",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a047630740201010420992707dfd66c01531da2f26c219a74e9e30e8d48144c7afd009d24f24608682ea00706052b8104000aa14403420004e03088cdc8be5a39f67e02e46d6551d462b64dd36ea9ec5b9401c2a3a2dd14593ccc64c49bb16ffe53373e03baa9c3545fff669e04ea14a0e07a530fa6d07b6a"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "248839ad22ec83404b48ecd9e65b6b648e992478bc667e9a7271b7f11b9d1e39f839850fe9652cdc32bb8ad3c55b4682ca009ba0a44b8eb68719968288d4b2fc",
+            "signature" : "3045022017c853fd14cb2a619c3ebbfa493f5d8dc22a017d794efe647b70ad67f5a8bab802210081fbe9d08ef6c3fc8b145d99adae80b48ed5227df0fe0985625c4f16848bb9c1"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG5dwsMuVhvCnCAQ5qBBoceScWHfUqYLrjHvvrs",
+          "tokenLockRef" : "82051b389cd9a26dc52518f3cfea988822e70a1b92a15afcee42a68fd9eb5785"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG6HrPyGDbRNboBLf8DXx78W5NVQkic7c7MtuhK",
-        "tokenLockRef" : "017341897bb40cda837125b95838693289de62e3a86dec69804e3b8d0b87c141"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "db48f51efa6b354520fc039e19680fe7e7dacfc7bbc64eb1ce4a48563364f1511a4481f6a8dbed5508f9a7fa04fcdf19e1757094aa84efc106a847be3151eb42",
+            "signature" : "304402207856389f3ed0366b64c2cf207943a7107dbd0e27cf22f21e4100f160334afe2602207c114babb33738347d86bc8511fd5d3431ba5d88a3cdfc55e47e102e8c3232bd"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG4rqMpCNNZVtAYuDnGyVXGXV6d7rwgUdiYPTnp",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104205f378834a1e28fd85a1690a1d1144371557d3e72b862190196d8692e18f2b196a00706052b8104000aa14403420004fda5f1b520360f50a4ba13ca4b402ac55834648f3501711cdad93f82eb2b644225bb623ff3a179e454750b14286e25339aecb5f20d3964c8547d91fed0a129da"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "db48f51efa6b354520fc039e19680fe7e7dacfc7bbc64eb1ce4a48563364f1511a4481f6a8dbed5508f9a7fa04fcdf19e1757094aa84efc106a847be3151eb42",
+            "signature" : "304402206b6f20a2881ddb6c157d6659d0c1e309b8dc6b0faafd3286886847866f41e832022009ab802a6e0ee99f582c0fbc9c2cab05afcfd97478a5fa07e6de8f87b4277ec5"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG4rqMpCNNZVtAYuDnGyVXGXV6d7rwgUdiYPTnp",
+          "tokenLockRef" : "dc94c28ada7f136dadcf10a37f0eb8ed07d6e89e5f89ebaedd41222a0f8f76ae"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG5yUndCB1eTSc3Seo4c2rQNVY24AyJ2gnoYK5F",
-        "tokenLockRef" : "9f8502970d9ab993326debcdd78c57e7ea7910560f489f92b073aa8f93279845"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "6861bca21a0f3dd5787a927050cf242a7a86fb4dcf62c69e872ab171d4ff0b4602c73ff996de70345c98276a5932255daa63de1a425862e29b1eaa47eb49d44a",
+            "signature" : "304502202c6fb332ce2b98969f976b2eb9799310b5d25e861300bdaadd5cb37ecbf0744d022100f19643458e91884324c7c29f7ff430dae0c69a09d6120488ba83a5b635d63ba5"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG6Ufr5hYZZn7SuLWz8NCyBXTA2gbPpLP2NfQTY",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042028074fd19e6ed7259862e260641b69a81052638457160af272ae16431478177aa00706052b8104000aa144034200049c109c08cb08b007ad1e35fcfd921f9f32494d0317a692b3d8d2eda7f0a2d2b968b16eb0e775cd71f0361d5bf43a457724ddbd4dc7d67fa1016883ce23de0bcd"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "6861bca21a0f3dd5787a927050cf242a7a86fb4dcf62c69e872ab171d4ff0b4602c73ff996de70345c98276a5932255daa63de1a425862e29b1eaa47eb49d44a",
+            "signature" : "304502205f86b4e82795f60dc26e00cc8c308ee638b340e57101507c6f623a8b586e190c022100a2bab1359f65ad249846949ee057cdb067ff3723ea0c31479495dfd213a56f6d"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG6Ufr5hYZZn7SuLWz8NCyBXTA2gbPpLP2NfQTY",
+          "tokenLockRef" : "9f9cddd640c9434c9eecacb131c1ed103b7e1de3ff8476538d13695bd452a83f"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG03WqJf26zT5hwH4yCN61kazVYQ9onKgFrCKwF",
-        "tokenLockRef" : "9f9358421887cf779ab95a3e1f8e418ce7e857b2f6873e89e3ecee2740dc6048"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "42e1d69537571ec09e0a3e04606caa14d1eb15cbd653b1a9a673d3182fd804740cc75243f0d5b966cdfee9518dbf3d68cfcc8dfc24714826e8b27799b324541a",
+            "signature" : "304402201bfe50ae2ee5beb17468ff415dda4b9eeebf173090752911b4b0958c529ef1e602207603c97ecbc5f8b7675e6d0bbcdcc60aeea07af2ad5afe4239a2cd67b74321cf"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG7RN3dTUPMyd8miSnWYgXnnsBXr5E54CaZJNAo",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a04763074020101042072892267c3cce2e542ccb09c8c72a1960e69dd01a1323ba671fb229a617a844fa00706052b8104000aa144034200041ff60abac7e171edb61d0bea845ce103ec7d01922e59d18e2e7ab1550948b3946df1af0b21d1253d150b7103bd9280d12437faaf6b64c8652742db786e282808"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "42e1d69537571ec09e0a3e04606caa14d1eb15cbd653b1a9a673d3182fd804740cc75243f0d5b966cdfee9518dbf3d68cfcc8dfc24714826e8b27799b324541a",
+            "signature" : "3045022100b1397dcf79aa4ba6f3966b4e5b0389f738632a854ad8a55326d012fa5263b5fc02201aa4f041633cbe0a80649d04bace9d175bacda7460f844a8f6f48efc11e8be86"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG7RN3dTUPMyd8miSnWYgXnnsBXr5E54CaZJNAo",
+          "tokenLockRef" : "340dd2f00f22c58386e22a01768630f0c490d804413224f5f7fb3cdfa343199e"
+        }
+      }
     },
     {
       "createdAt" : 0,
-      "event" : {
-        "amount" : 100000000000,
-        "fee" : 0,
-        "nodeId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
-        "parent" : {
-          "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
-          "ordinal" : 0
-        },
-        "source" : "DAG5ANEcy8WU4k1YzHt8CJRYkJHQp6mK8vix6Pzm",
-        "tokenLockRef" : "2a1040ff306a0935aa6a70dae82de65afcebf33ec4851744f35241a1e9729bda"
+      "signedBackingTokenLock" : {
+        "proofs" : [
+          {
+            "id" : "00ada64438e238a469c03fc195871af598ca966c8e2b3eb8c0654f5d93db3128ba558793275890830ba98af523c6ea00283f17f48d5d2fee3723bd4e772a9599",
+            "signature" : "30450221008285043b8591f3e008a739bd73825f9e1e2a7abf2582de8cb093b0bd418cbba6022026ed0cd5283acab51068dc323675372846dcd778716ac8c535d638953875d3f8"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "currencyId" : null,
+          "fee" : 0,
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "replaceTokenLockRef" : null,
+          "source" : "DAG3aSn8pWiFFdi1SCos27mw3uAgHaAqaDgaYxaX",
+          "unlockEpoch" : null
+        }
       },
-      "ownerPrivateKeyHex" : "30818d020100301006072a8648ce3d020106052b8104000a0476307402010104200b3d0a5694bad275fac0700ade95239384003b8bbce8c0ea0524360c8657799fa00706052b8104000aa14403420004dc0f471300852259667e145c68eddc501dc3e3c3aaf84ff5a67c793c85595a37ee43e235a0e6578612d4b927ec7e3797d9bea2feef335516fee37a6bb9cd3659"
+      "signedEvent" : {
+        "proofs" : [
+          {
+            "id" : "00ada64438e238a469c03fc195871af598ca966c8e2b3eb8c0654f5d93db3128ba558793275890830ba98af523c6ea00283f17f48d5d2fee3723bd4e772a9599",
+            "signature" : "304502203010454a9c60d005bd5b12aea0683b8eed1cce04e9da167b98686d7dd3b6764a022100bc8056c98acd8cffd24a67cd80cdf240086d10a75110ba876eadcb721bfb52c3"
+          }
+        ],
+        "value" : {
+          "amount" : 100000000000,
+          "fee" : 0,
+          "nodeId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
+          "parent" : {
+            "hash" : "0000000000000000000000000000000000000000000000000000000000000000",
+            "ordinal" : 0
+          },
+          "source" : "DAG3aSn8pWiFFdi1SCos27mw3uAgHaAqaDgaYxaX",
+          "tokenLockRef" : "fc59043cb60f87485d4c70a8275b2122c0268b32c472a74308bfb853c42358fa"
+        }
+      }
     }
   ],
   "operators" : [
     {
       "address" : "DAG6DptbddQVYoaga8UsEyKNaxe3gthC4qdviRoi",
-      "kesMasterVk" : "c39f867e3b56fcd7bee39ffe0afcd5720ae3f041c2d80cd60012e41757fd0c48",
+      "kesMasterVk" : "25efd7d21b6ff03063e4959baa99cee44ecde7d45c24a2f17856c51fa5c38cae",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "3045022100de82f6ceb3afca3ccda4fbd8c221c32ac537e00fc9878a4f7a4045d2c2da31100220452246a69091f7aee6e1a2ed1162f5133fc96098cc93ec71b7ca2478447524e0",
+      "longTermSignature" : "304402201a5df2934f3247fb13458736b6d133eb030b00be793dda7d5ebffa395bb12df3022062b7c0caf840c34afbad301bbb7a310b663ef9709845304f20e87272464e483a",
       "peerId" : "4fd22ff2ee843e97f78d86c0992dfe7fde0fa8a88f01af47a41de523a1475db2d020edf5f233a022e0fa7a714ec8a2824715f732abe2d617b6e080503ecccd4a",
       "vrfVk" : "538db9b0e104ce865d82e527e45b28c47416a277b82c8e5180c5cdf60bbe4551"
     },
     {
       "address" : "DAG7GbAT6aCBcr9uER9vr1v7asRMrmg3ab8p9Eye",
-      "kesMasterVk" : "26fac1ae4356fcd97776a4256b0ccbd78749a778383c5c7370139fa3b4373baa",
+      "kesMasterVk" : "384dc440bf2b20913987e41a4a986f475c353a6e1c224e1806099167fd6ab652",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "304602210081eaa9a5c4f193b48fd0e777c3fb4d1b0b0bbf5c0e2c49760ee9e1290aad7af0022100b50276a5e77ff7fb2f78a28e65da8a71c6a55644860f8abd3aab051b83212aae",
+      "longTermSignature" : "304502210094bdf24abb78311e865fe89b8b5b4ae92e944818b1c31efc53657e45d85be2f702204c336bfc722da9db9290894252e1d94fa14fea3402ed836ee2adba0352d5a2bf",
       "peerId" : "24358a733cb21978531b35acd371a7780d266b86cf062b6a24f6a288ea1e746e8628e31414443dd99a2383c697696b9c00ad517d4d1304738e21f15189cddd49",
       "vrfVk" : "f17d264d04123410dfed60eab64bdac5891a6142f0e602333e4ee10078a13394"
     },
     {
       "address" : "DAG7o3cgczkXPwsYkwNmZYUaXsVfNLgkfHqZ4otW",
-      "kesMasterVk" : "74f96b591c95a54fd22f21f024704c6bd8f47094e997c41be6c0fcbc493529b1",
+      "kesMasterVk" : "14c3df9ac41a91395ac58bc7a06b8b81ede59fe1c1369110a6de3835ab742a22",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "30440220464e81dfa7f952358547fc35bcdee5d3428b592b72c8b84db473edc12ee0e53302200bdf6cd17acd0aa8876d95c3b86c1e49916b4284af9068dca30d5f98add82bb4",
+      "longTermSignature" : "304402201a70f16eecf6966e3aefe1724fc2d5ee94267479621d2ad64c46635a1df5b7f3022016a1ad854e227946f3fea57905f8be2900ef73fb32f6e1a47851b60e8f9d26ad",
       "peerId" : "046d8ec51935678080e7f511ab86de25c9881577fe308d5b03310f761f6c03c53d263ccf320334ad8515a48e4ad0c5ae37768b40ecf5ff7411f18207522b9a05",
       "vrfVk" : "21e0bab7b62c20440485603f81dbc820fa6dfa01db89c4fb5e770068fc3e6c3f"
     },
     {
       "address" : "DAG5Yjhq8fepasaZdCKGQryoCH33RyY9kEHpNzBQ",
-      "kesMasterVk" : "937b7b2d845246621754b84c237f2ea067120550e6a49f9d890fba0d24007408",
+      "kesMasterVk" : "032518905c7902befa2d85443b3b44b019ef5b839e72e6402a002ffd883e1f65",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "3045022100deea51011d20717b7b5a41376cfd033414a490786ca880463c5d35c3cbac9b38022027091a7de455a4537dac75ba5c842c1f10f50be5dca32afe3d0aa7a72a50a770",
+      "longTermSignature" : "3046022100c0ab14760c77e3a9a9bfaf7191bdb96178870091a11818fba4089aaaa701611e02210091876abce4c708a6435c3b7e866ad929ffada1d50a3422febc7b773946b2a5cd",
       "peerId" : "52c14d18c1da5dd0b9441ae1bfb6c4762cd52bebeb8d6ceaaf77858795da1b752f6a61de0f1a1f529bc9cd039644f7d71db9551ee9b1cf67f18f160229e058c6",
       "vrfVk" : "c390c2c8480143aa0a147361a0225ae76e273c86c66d5d45272a8dd1aa5c9550"
     },
     {
       "address" : "DAG2ss5taKrVZWV4szdcLf4QNLqJZt4XGvxG3LfZ",
-      "kesMasterVk" : "e3dfd1417d1b27256f4dc7d6fa3ce81af7f162e63703ce7860e2e418f89d70da",
+      "kesMasterVk" : "bb189a5a7c3034bbef40dd2cc4c28871b5b29e1dc66db8d92d2de2a192b51ecd",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "3045022100b9869ca2944a2ade20ae093d953eabf053916f96deb6cef831d46410ccd0ba8e02200a3e29d584180609c1a1941b7a08a5f01fa5601df41433b1aa738dbb758aef95",
+      "longTermSignature" : "304402205d6bc010c20fd60aa250f629ab76f60256a78cbf23ec08e634e285e642b17d0802206e9a67c6e2320e85eb674514af7c24195405896a009e1768e6f4904acd19e35e",
       "peerId" : "ead195ada76de3ab2c458d5f6da06a697261387127bf1aad4ccc044580a209a1c0eb5082d65f8af2846f25db7f3cfe27a03d8e715e33a7d9b9f00cf30972436b",
       "vrfVk" : "de7edc94f8d350cad836b2efa078af93a6d47b9273bee7863367f7cbdfbb4b7b"
     },
     {
       "address" : "DAG1xJ47Jmi32XfMB5ZsBHq7YjtvtKiXMJtxXVKc",
-      "kesMasterVk" : "648547487c516c7d55a400d09537cda9254693087672ed8fa94d5375d513e6c7",
+      "kesMasterVk" : "00536cafc5dff4d24cb2ff05ec77670c5adcb40cb3d5e0a01c942712cd8f54bb",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "304402204c27a9dff65c8545eac1bbde965138199982dee11a2175faef2d5d3fc4e2555f022051a54acee055ff89f4c1a2e8914706611209b1fc7339f1abf2a0dac745783bf1",
+      "longTermSignature" : "30450221009c13556e90bd4a595bd84f7e30105a2bf1a50d0a1fb4487f61b2477cd74af55b0220488de05db99e9a29fa3d0209da4e43aadf2566f8297ae354f470782245832678",
       "peerId" : "c9bd94da1132ac69d485a97daa48e118f460b6f73f39a38483521585de1f597077cb4ff6851f60b56c64d814cea5c21e558ebdda6b632cd2f1cbe7969bab2f83",
       "vrfVk" : "1e93e5d39cae726982e96997c0591cfc9193c6072768bd0c1820adf5fb14d6d2"
     },
     {
       "address" : "DAG5ZuF59FLvSBzwZ6b6HWikzKDChyEDS6QSwRQh",
-      "kesMasterVk" : "3725ebc7a39c7fcad68708f6c318a6d17c7aeef851f6f7a1a456e20ef96fe46c",
+      "kesMasterVk" : "578b5a57b576a039fd0fc413100f310992be42b84ec4ef6b930c69ea47520fd4",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "3045022014a752243fcb265c51074f14437678eafd5cba9a9ec74d1a1c2fa1224706ee98022100b8239cb5e1a36e7f146a5ee3d21eb19d79ad08d85f89abffcf60b1683de9b025",
+      "longTermSignature" : "3044022029c110cab6aa71401a2c173460f0bf2f575d9f0f488c5bd268289c6240a28b5202207664c8e7fb19cd99cdf58466e20aee551dcb58bc9298816ebeb5764a670e7f4c",
       "peerId" : "f466be88e2794258b1d3c0a5cdf64e8eab3c62e54b779df960e2ee434b4e3d98e27ff774f467e047b4f7e438ae09c72cb36603aa6cf3ce5008a8c99ab2f4c6b9",
       "vrfVk" : "1e1474ca07e6b11ac3b955ff91ae8c956ee262e517fbb480809175a7e0d8dba4"
     },
     {
       "address" : "DAG6zgcDgKF3REs6d4TCXsT353dpSGVAHqZTcFgq",
-      "kesMasterVk" : "c94a2a31bf9b7e54c3be788cd54249b79600ef564a9bf19a9aa8bc2f58ec85e6",
+      "kesMasterVk" : "98dab1d13b2946fe192a511e3b8a3af609a2bff42bcd9d08d3cc3a859e93ecda",
       "kesMasterVkStep" : 0,
       "kesPeriodOffset" : 0,
-      "longTermSignature" : "30450221009a37e1a8267cba2ef76da3208a58262eead5788aa02bee42b9be01c8a7212ed602207c5036c3559978f27bf699a2c93ba44321ffe575ff393a8037c146c9dbd4de3e",
+      "longTermSignature" : "3045022067d9037e379a96efdd8c060e66315c1297ea974dfb957017f9cee0474204ff25022100bbe5a14faccfc25b01d7848bf92c864da00289e4fe66978b3cc2c6b25b085575",
       "peerId" : "1c87ae17b7f9bf3362571304aa385ab92ca82511e4f8fc9e10dae4ef6bf200db0307cb823d2d0625d6bf7b65c9bb077e148ad91b95f11f4eec21fa7b98451ba6",
       "vrfVk" : "aab6ae8625e143811884b4bc52488b2c37860574e38ae84b28ffcc6cf7b34d21"
     }

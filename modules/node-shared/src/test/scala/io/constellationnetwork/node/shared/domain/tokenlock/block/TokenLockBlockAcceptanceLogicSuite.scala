@@ -11,6 +11,7 @@ import scala.collection.immutable.{SortedMap, SortedSet}
 
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator._
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.node.shared.domain.tokenlock.TokenLockChainValidator.TokenLockNel
 import io.constellationnetwork.node.shared.infrastructure.snapshot.managers.global.TokenLockStateManager
@@ -106,7 +107,8 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
     source: Address,
     sourceBalance: Long,
     replacementCandidates: List[Hashed[TokenLock]],
-    currentEpochProgress: EpochProgress = epoch(1L)
+    currentEpochProgress: EpochProgress = epoch(1L),
+    backingRequirements: Map[Hash, BackingReplacementRequirement] = Map.empty
   ): TokenLockBlockAcceptanceContext[IO] =
     TokenLockBlockAcceptanceContext.fromStaticData[IO](
       balances = Map(source -> balance(sourceBalance)),
@@ -114,7 +116,8 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
       collateral = io.constellationnetwork.schema.balance.Amount.empty,
       initialTxRef = TokenLockReference.empty,
       toBeReplacedHashedTokenLocks = replacementCandidates,
-      currentEpochProgress = currentEpochProgress
+      currentEpochProgress = currentEpochProgress,
+      backingReplacementRequirements = backingRequirements
     )
 
   private def readerWithBalance(source: Address, sourceBalance: Balance): GlobalStateReader[IO] =
@@ -136,6 +139,11 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
       def getAllForPrefixStrict[V: ImmutableCodec](
         prefix: Hex
       ): IO[List[io.constellationnetwork.schema.mpt.StrictMptEntry[V]]] = List.empty.pure[IO]
+
+      override def captureRawPrefixesStrict(
+        prefixes: List[Hex]
+      ): Option[IO[Map[Hex, List[io.constellationnetwork.schema.mpt.StrictMptRawEntry]]]] =
+        Some(prefixes.distinct.map(_ -> List.empty[io.constellationnetwork.schema.mpt.StrictMptRawEntry]).toMap.pure[IO])
     }
 
   test("only a replacement referenced by the current block releases capacity and final application matches admission") { res =>
@@ -184,6 +192,156 @@ object TokenLockBlockAcceptanceLogicSuite extends MutableIOSuite {
         replacementUpdate.balances.get(source).contains(Balance.empty),
         replacementUpdate.claimedReplacementRefs == Set(existingHashed.hash),
         applied._1.get(source).contains(Balance.empty)
+      )
+  }
+
+  test("same-ordinal maturity and replacement cannot release pending delegated principal twice") { res =>
+    implicit val (hasher, securityProvider) = res
+
+    for {
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKeyPair.getPublic.toAddress
+      pendingBacking <- makeTokenLock(sourceKeyPair, amountValue = 50L, feeValue = 0L)
+      pendingBackingHashed <- pendingBacking.toHashed[IO]
+      replacement <- makeTokenLock(
+        sourceKeyPair,
+        amountValue = 60L,
+        feeValue = 0L,
+        replacementRef = pendingBackingHashed.hash.some
+      )
+      block <- makeBlock(List(replacement), 101L)
+      result <- accept(
+        TokenLockBlockAcceptanceLogic.make[IO],
+        block,
+        context(
+          source,
+          sourceBalance = 1_000L,
+          List(pendingBackingHashed),
+          backingRequirements = Map(
+            pendingBackingHashed.hash -> PendingDelegatedBackingRequirement(source, 50L, 50L)
+          )
+        ),
+        TokenLockBlockAcceptanceContextUpdate.empty
+      )
+    } yield
+      expect(
+        result.left.exists {
+          case RejectedReplacementTokenLock(_, ref, PendingBackingReplacementRejected) =>
+            ref === pendingBackingHashed.hash
+          case _ => false
+        }
+      )
+  }
+
+  test("pending collateral backing rejects token lock replacement before maturity") { res =>
+    implicit val (hasher, securityProvider) = res
+
+    for {
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKeyPair.getPublic.toAddress
+      pendingBacking <- makeTokenLock(sourceKeyPair, amountValue = 50L, feeValue = 0L)
+      pendingBackingHashed <- pendingBacking.toHashed[IO]
+      replacement <- makeTokenLock(
+        sourceKeyPair,
+        amountValue = 60L,
+        feeValue = 0L,
+        replacementRef = pendingBackingHashed.hash.some
+      )
+      block <- makeBlock(List(replacement), 102L)
+      result <- accept(
+        TokenLockBlockAcceptanceLogic.make[IO],
+        block,
+        context(
+          source,
+          sourceBalance = 1_000L,
+          List(pendingBackingHashed),
+          backingRequirements = Map(
+            pendingBackingHashed.hash -> PendingCollateralBackingRequirement(source, 50L, 50L)
+          )
+        ),
+        TokenLockBlockAcceptanceContextUpdate.empty
+      )
+    } yield
+      expect(
+        result.left.exists {
+          case RejectedReplacementTokenLock(_, ref, PendingBackingReplacementRejected) =>
+            ref === pendingBackingHashed.hash
+          case _ => false
+        }
+      )
+  }
+
+  test("backing lookup runs only after cheap replacement and balance gates") { res =>
+    implicit val (hasher, securityProvider) = res
+
+    for {
+      sourceKeyPair <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKeyPair.getPublic.toAddress
+      existing <- makeTokenLock(sourceKeyPair, amountValue = 50L, feeValue = 0L)
+      existingHashed <- existing.toHashed[IO]
+      invalid <- makeTokenLock(
+        sourceKeyPair,
+        amountValue = 50L,
+        feeValue = 0L,
+        replacementRef = existingHashed.hash.some
+      )
+      valid <- Signed.forAsyncHasher(
+        TokenLock(
+          source = source,
+          amount = amount(60L),
+          fee = fee(0L),
+          parent = TokenLockReference.empty,
+          currencyId = none,
+          unlockEpoch = none,
+          replaceTokenLockRef = existingHashed.hash.some
+        ),
+        sourceKeyPair
+      )
+      invalidBlock <- makeBlock(List(invalid), 103L)
+      validBlock <- makeBlock(List(valid), 104L)
+      invalidLookups <- Ref.of[IO, Int](0)
+      validLookups <- Ref.of[IO, Int](0)
+      reader = readerWithBalance(source, balance(10L))
+      invalidContext = TokenLockBlockAcceptanceContext.fromMptWithBackingLookup[IO](
+        reader,
+        io.constellationnetwork.schema.balance.Amount.empty,
+        TokenLockReference.empty,
+        List(existingHashed),
+        epoch(1L),
+        _ => invalidLookups.update(_ + 1).as(DelegatedBackingRequirement(source, 50L, 50L).some)
+      )
+      validContext = TokenLockBlockAcceptanceContext.fromMptWithBackingLookup[IO](
+        reader,
+        io.constellationnetwork.schema.balance.Amount.empty,
+        TokenLockReference.empty,
+        List(existingHashed),
+        epoch(1L),
+        _ => validLookups.update(_ + 1).as(DelegatedBackingRequirement(source, 50L, 50L).some)
+      )
+      invalidResult <- accept(
+        TokenLockBlockAcceptanceLogic.make[IO],
+        invalidBlock,
+        invalidContext,
+        TokenLockBlockAcceptanceContextUpdate.empty
+      )
+      validResult <- accept(
+        TokenLockBlockAcceptanceLogic.make[IO],
+        validBlock,
+        validContext,
+        TokenLockBlockAcceptanceContextUpdate.empty
+      )
+      invalidCount <- invalidLookups.get
+      validCount <- validLookups.get
+    } yield
+      expect.all(
+        invalidResult.left.exists {
+          case RejectedReplacementTokenLock(_, ref, ReplacementAmountNotIncreased(_, _)) =>
+            ref === existingHashed.hash
+          case _ => false
+        },
+        invalidCount == 0,
+        validResult.isRight,
+        validCount == 1
       )
   }
 

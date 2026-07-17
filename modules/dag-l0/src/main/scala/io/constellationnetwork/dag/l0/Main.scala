@@ -13,6 +13,7 @@ import io.constellationnetwork.dag.l0.infrastructure.snapshot.event.GlobalSnapsh
 import io.constellationnetwork.dag.l0.infrastructure.snapshot.nakamoto.{ConsensusInputGate, MptBaseConsistency}
 import io.constellationnetwork.dag.l0.modules._
 import io.constellationnetwork.ext.cats.effect._
+import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
 import io.constellationnetwork.ext.kryo._
 import io.constellationnetwork.node.shared.app.{DagL0, NodeShared, TessellationIOApp}
 import io.constellationnetwork.node.shared.domain.nakamoto.EtaStateManager.EtaSourceRange
@@ -34,9 +35,9 @@ import io.constellationnetwork.schema.mpt.GlobalStateKey
 import io.constellationnetwork.schema.node.NodeState
 import io.constellationnetwork.schema.peer.{Peer, Responsive}
 import io.constellationnetwork.schema.semver.TessellationVersion
-import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.signature.Signed
+import io.constellationnetwork.security.{Hasher, HasherSelector}
 
 import com.monovore.decline.Opts
 import eu.timepit.refined.auto._
@@ -45,6 +46,20 @@ import org.typelevel.log4cats.SelfAwareStructuredLogger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 import pureconfig.generic.auto._
 import pureconfig.module.enumeratum._
+
+private[l0] object FreshGenesisHasherBoundary {
+  def atGenesis[F[_], A](
+    selector: HasherSelector[F],
+    genesisOrdinal: SnapshotOrdinal
+  )(use: Hasher[F] => F[A]): F[A] =
+    selector.forOrdinal(genesisOrdinal)(use)
+
+  def atFirstLive[F[_], A](
+    selector: HasherSelector[F],
+    genesisOrdinal: SnapshotOrdinal
+  )(use: Hasher[F] => F[A]): F[A] =
+    selector.forOrdinal(genesisOrdinal.next)(use)
+}
 
 private[l0] object GenesisOperatorKeyAnchor {
   def requireJson(path: Option[fs2.io.file.Path]): Either[IllegalArgumentException, fs2.io.file.Path] =
@@ -534,10 +549,7 @@ object Main
                             ) >> IO.pure(
                               (
                                 balanceMap,
-                                (base: GlobalSnapshotInfo) =>
-                                  hasherSelector.withCurrent { implicit hasher =>
-                                    L0GenesisLoader.augmentSnapshotInfo[IO](base, data)
-                                  }
+                                (base: GlobalSnapshotInfo) => L0GenesisLoader.augmentSnapshotInfo[IO](base, data)
                               )
                             )
                         }
@@ -561,21 +573,27 @@ object Main
                     loadStep.flatMap {
                       case (balanceMap, augmenter) =>
                         val genesis = GlobalSnapshot.mkGenesis(balanceMap, method.startingEpochProgress)
-                        hasherSelector.withCurrent { implicit hasher =>
-                          Signed.forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair).flatMap(_.toHashed[IO])
-                        }.flatMap { hashedGenesis =>
-                          GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
-                            fullGlobalSnapshotLocalFileSystemStorage =>
-                              hasherSelector.withCurrent { implicit hasher =>
-                                fullGlobalSnapshotLocalFileSystemStorage.write(hashedGenesis.signed) >> {
-                                  // Order matters: apply the Tier-1 augmenter BEFORE building the
-                                  // ord=1 incremental snapshot. The augmenter overlays
-                                  // `activeDelegatedStakes`, `activeNodeCollaterals`, and the immutable
-                                  // long-term-signed genesis KES+VRF identities (JSON path);
-                                  // CSV path is identity. We pass the post-augmentation GSI to
-                                  // `mkFirstIncrementalSnapshot` so the stateProof in the snapshot
-                                  // matches the GSI + MPT we are about to persist. The CSV path
-                                  // is unaffected (augmenter == identity → same bytes as before).
+                        GlobalSnapshotLocalFileSystemStorage.make[IO](cfg.snapshot.snapshotPath).flatMap {
+                          fullGlobalSnapshotLocalFileSystemStorage =>
+                            FreshGenesisHasherBoundary
+                              .atGenesis(hasherSelector, genesis.ordinal) { selectedGenesisHasher =>
+                                implicit val genesisHasher: Hasher[IO] = selectedGenesisHasher
+                                Signed
+                                  .forAsyncHasher[IO, GlobalSnapshot](genesis, keyPair)
+                                  .flatMap(_.toHashed[IO])
+                                  .flatTap(hashed => fullGlobalSnapshotLocalFileSystemStorage.write(hashed.signed))
+                              }
+                              .flatMap { hashedGenesis =>
+                                FreshGenesisHasherBoundary.atFirstLive(
+                                  hasherSelector,
+                                  hashedGenesis.ordinal
+                                ) { selectedFirstLiveHasher =>
+                                  implicit val firstLiveHasher: Hasher[IO] = selectedFirstLiveHasher
+
+                                  // The exact first-live hasher covers augmentation hashes, the ord=1
+                                  // state proof, signature, artifact hash, storage initialization, and
+                                  // verified MPT reconstruction. Genesis itself was signed, hashed, and
+                                  // persisted under its own ordinal's selected hasher above.
                                   val baseGsi = hashedGenesis.info.toGlobalSnapshotInfo
                                   augmenter(baseGsi).flatMap { globalSnapshotInfo =>
                                     L0GenesisLoader
@@ -628,7 +646,6 @@ object Main
                                   }
                                 }
                               }
-                          }
                         }
                     }
 

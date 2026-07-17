@@ -23,6 +23,7 @@ import io.constellationnetwork.node.shared.domain.delegatedStake.{
   UpdateDelegatedStakeAcceptanceManager,
   UpdateDelegatedStakeAcceptanceResult
 }
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator
 import io.constellationnetwork.node.shared.domain.nakamoto._
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.KesRegistrationCertValidator.RegistrationEvaluationContext
 import io.constellationnetwork.node.shared.domain.nakamoto.kes._
@@ -753,7 +754,8 @@ object GlobalSnapshotAcceptanceManager {
           epochProgress: EpochProgress,
           cncEvents: List[Signed[UpdateNodeCollateral.Create]],
           wncEvents: List[Signed[UpdateNodeCollateral.Withdraw]],
-          delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
+          delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult,
+          acceptedTokenLocks: List[Signed[TokenLock]]
         ): F[UpdateNodeCollateralAcceptanceResult] =
           updateNodeCollateralAcceptanceManager.accept(
             cncEvents,
@@ -761,7 +763,8 @@ object GlobalSnapshotAcceptanceManager {
             branchAwareReader,
             epochProgress,
             ordinal,
-            delegatedStakeAcceptanceResult
+            delegatedStakeAcceptanceResult,
+            acceptedTokenLocks
           )
 
         private def processStateChannelEvents(
@@ -1241,8 +1244,9 @@ object GlobalSnapshotAcceptanceManager {
           epochProgress: EpochProgress,
           allowSpendBlocksForAcceptance: List[Signed[AllowSpendBlock]],
           tokenLockBlocksForAcceptance: List[Signed[TokenLockBlock]],
-          lastSnapshotContext: GlobalSnapshotInfo
-        )(implicit hasher: Hasher[F]): F[(AllowSpendBlockAcceptanceResult, TokenLockBlockAcceptanceResult)] =
+          lastSnapshotContext: GlobalSnapshotInfo,
+          parentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
+        )(implicit hasher: Hasher[F]): F[(AllowSpendBlockAcceptanceResult, BackingAwareTokenLockAcceptanceResult)] =
           for {
             allowSpend <- blockAcceptanceCoordinatorManager.acceptAllowSpendBlocks(
               allowSpendBlocksForAcceptance,
@@ -1250,11 +1254,12 @@ object GlobalSnapshotAcceptanceManager {
               ordinal,
               epochProgress
             )
-            tokenLock <- blockAcceptanceCoordinatorManager.acceptTokenLockBlocks(
+            tokenLock <- blockAcceptanceCoordinatorManager.acceptTokenLockBlocksWithBackingState(
               tokenLockBlocksForAcceptance,
               lastSnapshotContext,
               ordinal,
-              epochProgress
+              epochProgress,
+              parentBackingState
             )
           } yield (allowSpend, tokenLock)
 
@@ -1880,14 +1885,17 @@ object GlobalSnapshotAcceptanceManager {
                     acceptedKesRegistrationPeers.contains(peerId)
                 }
 
-                (allowSpendBlockAcceptanceResult, tokenLockBlockAcceptanceResult) <-
+                (allowSpendBlockAcceptanceResult, backingAwareTokenLockAcceptanceResult) <-
                   acceptAllowSpendAndTokenLockBlocks(
                     ordinal,
                     epochProgress,
                     allowSpendBlocksForAcceptance,
                     tokenLockBlocksForAcceptance,
-                    lastSnapshotContext
+                    lastSnapshotContext,
+                    none
                   )
+                tokenLockBlockAcceptanceResult = backingAwareTokenLockAcceptanceResult.result
+                earlyParentBackingState = backingAwareTokenLockAcceptanceResult.parentBackingState
 
                 acceptedGlobalAllowSpends = allowSpendBlockAcceptanceResult.accepted.flatMap(_.value.transactions.toList)
                 _dagLayerTokenLocks = tokenLockBlockAcceptanceResult.accepted
@@ -1903,13 +1911,19 @@ object GlobalSnapshotAcceptanceManager {
                 }
                 acceptedGlobalTokenLocks <- tokenLockStateManager.acceptReplacementTokenLocks(
                   _dagLayerTokenLocks,
-                  lastSnapshotContext
+                  lastSnapshotContext,
+                  earlyParentBackingState
                 )
                 _ <- Async[F].raiseUnless(acceptedGlobalTokenLocks === _dagLayerTokenLocks)(
                   new IllegalStateException(
                     s"Token-lock admission/state parity violation: admitted=${_dagLayerTokenLocks.size} stateAccepted=${acceptedGlobalTokenLocks.size}"
                   )
                 )
+                globalTokenLocks = acceptedGlobalTokenLocks
+                  .groupBy(_.value.source)
+                  .view
+                  .mapValues(SortedSet.from(_))
+                  .to(SortedMap)
 
                 // ─── Q2 hoist: compute expired sets ONCE per accept() ──────────────────────────
                 // Both the TokenLockStateManager and the AllowSpendStateManager internally call
@@ -1947,9 +1961,89 @@ object GlobalSnapshotAcceptanceManager {
                   epochProgress,
                   cncEvents,
                   wncEvents,
-                  initialData.delegatedResult
+                  initialData.delegatedResult,
+                  acceptedGlobalTokenLocks
                 )
 
+                // Project the post-transition stake shape before reward calculation. The reward function may update
+                // rewards only; its output is compared against this projection below.
+                unexpiredNodeCollateralsRaw <- nodeCollateralStateManager.acceptNodeCollaterals(
+                  lastSnapshotContext,
+                  epochProgress,
+                  previousEpochProgress,
+                  withdrawalTimeLimit
+                )
+                (unexpiredCreate, unexpiredWithdraw, expiredNodeCollateralWithdrawals) = unexpiredNodeCollateralsRaw
+
+                updatedCreateNodeCollaterals <- nodeCollateralStateManager.getUpdatedCreateNodeCollaterals(
+                  nodeCollateralAcceptanceResult,
+                  unexpiredCreate
+                )
+
+                updatedWithdrawNodeCollaterals <- nodeCollateralStateManager.getUpdatedWithdrawNodeCollaterals(
+                  nodeCollateralAcceptanceResult,
+                  unexpiredWithdraw,
+                  lastSnapshotContext
+                )
+
+                globalActiveTokenLocks <- tokenLockStateManager.materializeActiveTokenLocksFromMpt
+                tokenLockLookupAddresses = acceptedGlobalTokenLocks.map(_.value.source).toSet ++
+                  initialData.existingStakes.expired.keySet ++
+                  expiredNodeCollateralWithdrawals.keySet
+                globalActiveTokenLocksByRefFromState <- tokenLockStateManager.buildActiveTokenLocksByRefFromMpt(
+                  tokenLockLookupAddresses
+                )
+                inRoundAcceptedTokenLocksByRef <- acceptedGlobalTokenLocks
+                  .traverse(lock => lock.toHashed.map(hashed => hashed.hash -> lock))
+                  .map(_.toMap)
+                globalActiveTokenLocksByRef = globalActiveTokenLocksByRefFromState ++ inRoundAcceptedTokenLocksByRef
+
+                generatedTokenUnlocks <- tokenLockStateManager
+                  .generateTokenUnlocks(
+                    initialData.existingStakes.expired,
+                    expiredNodeCollateralWithdrawals,
+                    acceptedGlobalTokenLocks,
+                    globalActiveTokenLocksByRef
+                  )
+                  .leftMap(error => new RuntimeException(s"Error generating token unlocks: $error"))
+                  .liftTo[F]
+
+                tokenLockAcceptanceResult <- tokenLockStateManager.acceptTokenLocksWithExpired(
+                  epochProgress,
+                  globalTokenLocks,
+                  globalActiveTokenLocks,
+                  generatedTokenUnlocks,
+                  expiredTokenLocksHoisted
+                )
+                updatedGlobalTokenLocks = tokenLockAcceptanceResult.fullState
+                tokenLocksDeltas = tokenLockAcceptanceResult.deltas
+                removedTokenLockKeys = tokenLockAcceptanceResult.removedKeys
+                tokenLockExpiryIndexDelta = tokenLockAcceptanceResult.expiryIndexDelta
+
+                projectedCreateDelegatedStakes <-
+                  if (era.atOrAfterTess3(ordinal))
+                    DelegatedRewardsDistributor.getUpdatedCreateDelegatedStakes(
+                      SortedMap.empty[PeerId, Map[Address, Amount]],
+                      initialData.delegatedResult,
+                      PartitionedStakeUpdates(
+                        initialData.existingStakes.existing,
+                        initialData.existingStakes.unexpired,
+                        initialData.existingStakes.expired
+                      )
+                    )
+                  else SortedMap.empty[Address, SortedSet[DelegatedStakeRecord]].pure[F]
+                projectedWithdrawDelegatedStakes <-
+                  if (era.atOrAfterTess3(ordinal))
+                    DelegatedRewardsDistributor.getUpdatedWithdrawalDelegatedStakes(
+                      mpt,
+                      initialData.delegatedResult,
+                      PartitionedStakeUpdates(
+                        initialData.existingStakes.existing,
+                        initialData.existingStakes.unexpired,
+                        initialData.existingStakes.expired
+                      )
+                    )
+                  else SortedMap.empty[Address, SortedSet[PendingDelegatedStakeWithdrawal]].pure[F]
                 // Source prior-ordinal `updateNodeParameters` from the MPT instead of `lastSnapshotContext.updateNodeParameters`.
                 // The MPT key is a hash of the `Id`, but the signed value carries the signer's `Id` in `proofs.head.id`,
                 // which by GSAM convention matches the map's keying `Id`. No reverse index is needed; prefix-scan + value-decode.
@@ -2188,6 +2282,17 @@ object GlobalSnapshotAcceptanceManager {
                     s"updatedDelegStakes=${updatedCreateDelegatedStakes.size} updatedDelegWithdrawals=${updatedWithdrawDelegatedStakes.size}"
                 )
 
+                // The supplied reward function may alter rewards only. Comparing the non-reward record
+                // multiset avoids another full token-lock hash/index pass.
+                _ <- StakeBackingValidator.requireRewardOnlyChange(
+                  projectedCreateDelegatedStakes,
+                  updatedCreateDelegatedStakes
+                )
+                _ <- StakeBackingValidator.requirePendingStateUnchanged(
+                  projectedWithdrawDelegatedStakes,
+                  updatedWithdrawDelegatedStakes
+                )
+
                 (updatedBalancesByRewards, acceptedRewardTxs, rewardBalancesDelta) <- rewardAcceptanceManager.acceptRewardTxs(
                   initialData.blockResult.contextUpdate.balances.toSortedMap ++ currencyAcceptanceBalanceUpdate,
                   withdrawalRewardTxs ++ nodeOperatorRewards ++ reservedAddressRewards
@@ -2356,12 +2461,6 @@ object GlobalSnapshotAcceptanceManager {
                   .mapValues(SortedSet.from(_))
                   .to(SortedMap)
 
-                globalTokenLocks = acceptedGlobalTokenLocks
-                  .groupBy(_.value.source)
-                  .view
-                  .mapValues(SortedSet.from(_))
-                  .to(SortedMap)
-
                 // `unappliedGlobalChangeOrdinals` is a lossless consensus acknowledgement queue. Never evict an unacknowledged ordinal to
                 // satisfy its configured bound: doing so makes absence indistinguishable from owner application and can retire an economic
                 // overlay early. Instead, deterministically backpressure only new currency-targeted transactions for an owner whose queue is
@@ -2415,30 +2514,6 @@ object GlobalSnapshotAcceptanceManager {
                 // Same materialized view as `lastActiveAllowSpends` above — `lastSnapshotContext` is immutable,
                 // so a single MPT read covers both consumers (validateArtifacts and acceptAllowSpends).
                 globalActiveAllowSpends = lastActiveAllowSpends
-                globalActiveTokenLocks <- tokenLockStateManager.materializeActiveTokenLocksFromMpt
-
-                // Build the hash-keyed lookup from the MPT — same source as `acceptReplacementTokenLocks` so the
-                // two reads can't disagree. Scoped to the addresses actually involved in this acceptance round
-                // (replacement TX sources + expired-withdrawal stakers); avoids a full address-set scan.
-                // Fixes the chain-sync replay stall observed on gl0-7 where MPT and GSI views of activeTokenLocks
-                // diverged and `generateTokenUnlocks` failed lookups that `acceptReplacementTokenLocks` had passed.
-                tokenLockLookupAddresses = acceptedGlobalTokenLocks.map(_.value.source).toSet ++
-                  initialData.existingStakes.expired.keySet
-                globalActiveTokenLocksByRefFromState <- tokenLockStateManager.buildActiveTokenLocksByRefFromMpt(
-                  tokenLockLookupAddresses
-                )
-                // #186 in-round chain fix: a replacement accepted this round may target a lock ALSO accepted
-                // this round (A→B inside one ordinal — `acceptReplacementTokenLocks` now admits that chain).
-                // `generateTokenUnlocks` must resolve that in-round ref or the whole acceptance raises
-                // ("Token lock not found for replacement ref" → RuntimeException below). Union the parent-state
-                // map with this round's accepted locks. For rounds without an in-round chain none of the added
-                // refs is ever looked up, so outputs stay byte-identical to the prior behavior. Deterministic:
-                // `acceptedGlobalTokenLocks` is itself deterministic (derived from sorted block acceptance) and
-                // the keys are content-addressed hashes.
-                inRoundAcceptedTokenLocksByRef <- acceptedGlobalTokenLocks
-                  .traverse(lock => lock.toHashed.map(hashed => hashed.hash -> lock))
-                  .map(_.toMap)
-                globalActiveTokenLocksByRef = globalActiveTokenLocksByRefFromState ++ inRoundAcceptedTokenLocksByRef
 
                 globalLastAllowSpendRefs <- allowSpendStateManager.materializeLastAllowSpendRefsFromMpt
                 globalLastTokenLockRefs <- tokenLockStateManager.materializeLastTokenLockRefsFromMpt
@@ -2472,46 +2547,6 @@ object GlobalSnapshotAcceptanceManager {
                   allowSpendBalancesResult
                     .leftMap(ex => new RuntimeException(s"Balance arithmetic error updating balances by allow spends: $ex"))
                 )
-
-                unexpiredNodeCollateralsRaw <- nodeCollateralStateManager.acceptNodeCollaterals(
-                  lastSnapshotContext,
-                  epochProgress,
-                  previousEpochProgress,
-                  withdrawalTimeLimit
-                )
-                (unexpiredCreate, unexpiredWithdraw, _) = unexpiredNodeCollateralsRaw
-
-                updatedCreateNodeCollaterals <- nodeCollateralStateManager.getUpdatedCreateNodeCollaterals(
-                  nodeCollateralAcceptanceResult,
-                  unexpiredCreate
-                )
-
-                updatedWithdrawNodeCollaterals <- nodeCollateralStateManager.getUpdatedWithdrawNodeCollaterals(
-                  nodeCollateralAcceptanceResult,
-                  unexpiredWithdraw,
-                  lastSnapshotContext
-                )
-
-                generatedTokenUnlocks <- tokenLockStateManager
-                  .generateTokenUnlocks(
-                    initialData.existingStakes.expired,
-                    acceptedGlobalTokenLocks,
-                    globalActiveTokenLocksByRef
-                  )
-                  .leftMap(error => new RuntimeException(s"Error generating token unlocks: $error"))
-                  .liftTo[F]
-
-                tokenLockAcceptanceResult <- tokenLockStateManager.acceptTokenLocksWithExpired(
-                  epochProgress,
-                  globalTokenLocks,
-                  globalActiveTokenLocks,
-                  generatedTokenUnlocks,
-                  expiredTokenLocksHoisted
-                )
-                updatedGlobalTokenLocks = tokenLockAcceptanceResult.fullState
-                tokenLocksDeltas = tokenLockAcceptanceResult.deltas
-                removedTokenLockKeys = tokenLockAcceptanceResult.removedKeys
-                tokenLockExpiryIndexDelta = tokenLockAcceptanceResult.expiryIndexDelta
 
                 updatedTokenLockRefs = tokenLockStateManager.acceptTokenLockRefs(
                   globalLastTokenLockRefs,
@@ -2689,6 +2724,42 @@ object GlobalSnapshotAcceptanceManager {
                 removedDelegatedStakeWithdrawalKeys = cleanedMapsResult.removedDelegatedStakeWithdrawalKeys
                 removedNodeCollateralKeys = cleanedMapsResult.removedNodeCollateralKeys
                 removedNodeCollateralWithdrawalKeys = cleanedMapsResult.removedNodeCollateralWithdrawalKeys
+                acceptedBoundBackingReplacement = earlyParentBackingState.exists { parent =>
+                  acceptedGlobalTokenLocks.exists(
+                    _.replaceTokenLockRef.exists(parent.replacementRequirements.contains)
+                  )
+                }
+                delegatedBackingChanged =
+                  initialData.delegatedResult.acceptedCreates.valuesIterator.exists(_.nonEmpty) ||
+                    initialData.delegatedResult.acceptedWithdrawals.valuesIterator.exists(_.nonEmpty) ||
+                    initialData.existingStakes.expired.valuesIterator.exists(_.nonEmpty)
+                collateralBackingChanged =
+                  nodeCollateralAcceptanceResult.acceptedCreates.valuesIterator.exists(_.nonEmpty) ||
+                    nodeCollateralAcceptanceResult.acceptedWithdrawals.valuesIterator.exists(_.nonEmpty) ||
+                    expiredNodeCollateralWithdrawals.valuesIterator.exists(_.nonEmpty)
+                backingStateChanged =
+                  acceptedBoundBackingReplacement ||
+                    delegatedBackingChanged ||
+                    collateralBackingChanged ||
+                    slashRegistryEntries.nonEmpty
+                finalParentBackingState <-
+                  if (!backingStateChanged) none[StakeBackingValidator.ValidatedBackingState].pure[F]
+                  else
+                    earlyParentBackingState.fold(StakeBackingValidator.validateParent(mpt).map(_.some))(_.some.pure[F])
+                // The sole whole-state transition gate for this ordinal. Unchanged parent locks reuse
+                // their already-proved references; only new/changed lock values are hashed.
+                _ <- finalParentBackingState.traverse_(parent =>
+                  StakeBackingValidator
+                    .validateTransition(
+                      parent,
+                      updatedGlobalTokenLocksCleaned,
+                      updatedCreateDelegatedStakesCleaned,
+                      updatedWithdrawDelegatedStakesCleaned,
+                      updatedCreateNodeCollateralsCleaned,
+                      updatedWithdrawNodeCollateralsCleaned
+                    )
+                    .void
+                )
 
                 priorPriceState <- priceStateUpdater.materializePriceStateFromMpt
                 priceStateDeltas <- priceStateUpdater.updatePriceState(

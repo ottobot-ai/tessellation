@@ -2,12 +2,13 @@ package io.constellationnetwork.node.shared.infrastructure.snapshot.managers.glo
 
 import cats.Parallel
 import cats.data.NonEmptySetImpl.catsDataInstancesForNonEmptySet
-import cats.effect.Async
+import cats.effect.{Async, Ref}
 import cats.syntax.all._
 
 import scala.collection.immutable.SortedSet
 
 import io.constellationnetwork.node.shared.domain.block.processing._
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ActiveTokenLockMptReader, GlobalStateReader}
 import io.constellationnetwork.node.shared.domain.swap.block._
 import io.constellationnetwork.node.shared.domain.tokenlock.block._
@@ -17,8 +18,13 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.swap._
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.schema.transaction.TransactionReference
+import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.signature.Signed
-import io.constellationnetwork.security.{Hashed, Hasher}
+
+final case class BackingAwareTokenLockAcceptanceResult(
+  result: TokenLockBlockAcceptanceResult,
+  parentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
+)
 
 trait BlockAcceptanceCoordinatorManager[F[_]] {
   def acceptBlocks(
@@ -42,6 +48,14 @@ trait BlockAcceptanceCoordinatorManager[F[_]] {
     snapshotOrdinal: SnapshotOrdinal,
     epochProgress: EpochProgress
   )(implicit hasher: Hasher[F]): F[TokenLockBlockAcceptanceResult]
+
+  def acceptTokenLockBlocksWithBackingState(
+    blocksForAcceptance: List[Signed[TokenLockBlock]],
+    lastSnapshotContext: GlobalSnapshotInfo,
+    snapshotOrdinal: SnapshotOrdinal,
+    epochProgress: EpochProgress,
+    parentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
+  )(implicit hasher: Hasher[F]): F[BackingAwareTokenLockAcceptanceResult]
 }
 
 object BlockAcceptanceCoordinatorManager {
@@ -106,33 +120,41 @@ object BlockAcceptanceCoordinatorManager {
         }
     }
 
-    def acceptTokenLockBlocks(
+    private def acceptTokenLockBlocksWithParent(
       blocksForAcceptance: List[Signed[TokenLockBlock]],
       lastSnapshotContext: GlobalSnapshotInfo,
       snapshotOrdinal: SnapshotOrdinal,
-      epochProgress: EpochProgress
-    )(implicit hasher: Hasher[F]): F[TokenLockBlockAcceptanceResult] = {
+      epochProgress: EpochProgress,
+      suppliedParentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
+    )(implicit hasher: Hasher[F]): F[BackingAwareTokenLockAcceptanceResult] = {
       val (nativeBlocks, invalidLaneBlocks) = blocksForAcceptance.sorted.partition(_.tokenLocks.forall(_.currencyId.isEmpty))
       val replacementTxs = nativeBlocks.flatMap(_.value.tokenLocks.toList).filter(_.replaceTokenLockRef.nonEmpty)
       val replacementRefHashes = replacementTxs.flatMap(_.replaceTokenLockRef).toSet
+      val replacementSources = replacementTxs.map(_.source).distinct.sorted
 
       for {
-        toBeReplacedHashedTokenLocks <-
-          if (replacementRefHashes.isEmpty) List.empty[Hashed[TokenLock]].pure[F]
-          else
-            ActiveTokenLockMptReader
-              .materializeNative(reader)
-              .flatMap(_.values.toList.flatMap(_.toList).traverse(_.toHashed))
-              .map(_.filter(lock => replacementRefHashes.contains(lock.hash)).sortBy(_.hash))
+        backingStateCache <- Ref.of[F, Option[StakeBackingValidator.ValidatedBackingState]](suppliedParentBackingState)
+        toBeReplacedHashedTokenLocks <- replacementSources.flatTraverse { source =>
+          ActiveTokenLockMptReader
+            .readNative(reader, source)
+            .map(_.fold(List.empty[Signed[TokenLock]])(_.toList))
+            .flatMap(_.traverse(_.toHashed))
+        }.map(_.filter(lock => replacementRefHashes.contains(lock.hash)).sortBy(_.hash))
 
         // §G4: balances + lastTokenLockRefs sourced from the branch-aware MPT reader.
         // `toBeReplacedHashedTokenLocks` already resolves via the same `reader` above.
-        context = TokenLockBlockAcceptanceContext.fromMpt[F](
+        loadParentBackingState = backingStateCache.get.flatMap {
+          case Some(state) => state.pure[F]
+          case None =>
+            StakeBackingValidator.validateParent(reader).flatTap(state => backingStateCache.set(state.some))
+        }
+        context = TokenLockBlockAcceptanceContext.fromMptWithBackingLookup[F](
           reader,
           collateral,
           TokenLockReference.empty,
           toBeReplacedHashedTokenLocks,
-          epochProgress
+          epochProgress,
+          ref => loadParentBackingState.map(_.replacementRequirements.get(ref))
         )
         res <- tokenLockBlockAcceptanceManager.acceptBlocksIteratively(
           nativeBlocks,
@@ -141,10 +163,43 @@ object BlockAcceptanceCoordinatorManager {
           shouldPerformMetagraphSpecificValidations = true,
           epochProgress.some
         )
+        capturedBackingState <- backingStateCache.get
       } yield
-        res.copy(
-          notAccepted = res.notAccepted ++ invalidLaneBlocks.map(_ -> InvalidGlobalTokenLockLane)
+        BackingAwareTokenLockAcceptanceResult(
+          res.copy(
+            notAccepted = res.notAccepted ++ invalidLaneBlocks.map(_ -> InvalidGlobalTokenLockLane)
+          ),
+          capturedBackingState
         )
     }
+
+    def acceptTokenLockBlocks(
+      blocksForAcceptance: List[Signed[TokenLockBlock]],
+      lastSnapshotContext: GlobalSnapshotInfo,
+      snapshotOrdinal: SnapshotOrdinal,
+      epochProgress: EpochProgress
+    )(implicit hasher: Hasher[F]): F[TokenLockBlockAcceptanceResult] =
+      acceptTokenLockBlocksWithParent(
+        blocksForAcceptance,
+        lastSnapshotContext,
+        snapshotOrdinal,
+        epochProgress,
+        None
+      ).map(_.result)
+
+    override def acceptTokenLockBlocksWithBackingState(
+      blocksForAcceptance: List[Signed[TokenLockBlock]],
+      lastSnapshotContext: GlobalSnapshotInfo,
+      snapshotOrdinal: SnapshotOrdinal,
+      epochProgress: EpochProgress,
+      parentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
+    )(implicit hasher: Hasher[F]): F[BackingAwareTokenLockAcceptanceResult] =
+      acceptTokenLockBlocksWithParent(
+        blocksForAcceptance,
+        lastSnapshotContext,
+        snapshotOrdinal,
+        epochProgress,
+        parentBackingState
+      )
   }
 }

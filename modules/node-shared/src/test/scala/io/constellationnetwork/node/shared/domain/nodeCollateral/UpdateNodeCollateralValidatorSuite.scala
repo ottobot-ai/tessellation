@@ -312,6 +312,41 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
+  test("should fail when the tokenLock backs a pending delegated stake withdrawal") { res =>
+    implicit val (json, h, sp, keyPair, sourceAddress) = res
+
+    for {
+      (tokenLockReference, lastContext) <- mkValidGlobalContext(keyPair)
+      delegated = UpdateDelegatedStake.Create(
+        source = sourceAddress,
+        nodeId = PeerId.fromPublic(keyPair.getPublic),
+        amount = DelegatedStakeAmount(NonNegLong(100L)),
+        tokenLockRef = tokenLockReference
+      )
+      signedDelegated <- forAsyncHasher(delegated, keyPair)
+      context = lastContext.copy(delegatedStakesWithdrawals =
+        Some(
+          SortedMap(
+            sourceAddress -> SortedSet(
+              PendingDelegatedStakeWithdrawal(
+                signedDelegated,
+                Amount.empty,
+                SnapshotOrdinal.MinValue,
+                EpochProgress.MinValue,
+                None,
+                None
+              )
+            )
+          )
+        )
+      )
+      create = testCreateNodeCollateral(keyPair, sourceAddress, tokenLockReference)
+      signed <- forAsyncHasher(create, keyPair)
+      validator = mkValidator()
+      result <- validator.validateCreateNodeCollateral(signed, pointReaderFromContextForTest(context))
+    } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
+  }
+
   test("should fail when the tokenLock amount is too low") { res =>
     implicit val (json, h, sp, keyPair, sourceAddress) = res
 
@@ -489,7 +524,8 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
         parentStateReader = siblingWithCollateral,
         lastGlobalEpochProgress = EpochProgress.MinValue,
         lastSnapshotOrdinal = SnapshotOrdinal.MinValue,
-        updateDelegatedStakeAcceptanceResult = delegatedResult
+        updateDelegatedStakeAcceptanceResult = delegatedResult,
+        acceptedTokenLocks = List.empty
       )
       rejected <- manager.accept(
         creates = List.empty,
@@ -497,7 +533,8 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
         parentStateReader = siblingWithoutCollateral,
         lastGlobalEpochProgress = EpochProgress.MinValue,
         lastSnapshotOrdinal = SnapshotOrdinal.MinValue,
-        updateDelegatedStakeAcceptanceResult = delegatedResult
+        updateDelegatedStakeAcceptanceResult = delegatedResult,
+        acceptedTokenLocks = List.empty
       )
     } yield
       expect.all(
@@ -582,6 +619,8 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
             (key.fieldId match {
               case GlobalStateFieldId.ActiveDelegatedStakes =>
                 context.activeDelegatedStakes.flatMap(_.get(address)).filter(_.nonEmpty)
+              case GlobalStateFieldId.DelegatedStakesWithdrawals =>
+                context.delegatedStakesWithdrawals.flatMap(_.get(address)).filter(_.nonEmpty)
               case GlobalStateFieldId.ActiveNodeCollaterals =>
                 context.activeNodeCollaterals.flatMap(_.get(address)).filter(_.nonEmpty)
               case GlobalStateFieldId.NodeCollateralWithdrawals =>
@@ -625,11 +664,15 @@ object UpdateNodeCollateralValidatorSuite extends MutableIOSuite {
   def mkGlobalContext(
     nodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]] = SortedMap.empty,
     withdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]] = SortedMap.empty,
-    tokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] = SortedMap.empty
+    tokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] = SortedMap.empty,
+    delegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]] = SortedMap.empty,
+    delegatedWithdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]] = SortedMap.empty
   ) =
     GlobalSnapshotInfo.empty.copy(
       activeNodeCollaterals = Option.when(nodeCollaterals.nonEmpty)(nodeCollaterals),
       nodeCollateralWithdrawals = Option.when(withdrawals.nonEmpty)(withdrawals),
+      activeDelegatedStakes = Option.when(delegatedStakes.nonEmpty)(delegatedStakes),
+      delegatedStakesWithdrawals = Option.when(delegatedWithdrawals.nonEmpty)(delegatedWithdrawals),
       activeTokenLocks = Option.when(tokenLocks.nonEmpty)(tokenLocks)
     )
 

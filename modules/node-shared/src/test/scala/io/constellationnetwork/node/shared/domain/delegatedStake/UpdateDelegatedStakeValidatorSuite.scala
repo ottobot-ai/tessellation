@@ -372,6 +372,34 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
     } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
   }
 
+  test("should fail when the tokenLock backs a pending node collateral withdrawal") { res =>
+    implicit val (json, h, sp, keyPair, sourceAddress) = res
+
+    for {
+      (tokenLockReference, lastContext) <- mkValidGlobalContext(keyPair, keyPair)
+      collateral = UpdateNodeCollateral.Create(
+        source = sourceAddress,
+        nodeId = PeerId.fromPublic(keyPair.getPublic),
+        amount = NodeCollateralAmount(NonNegLong(100L)),
+        tokenLockRef = tokenLockReference
+      )
+      signedCollateral <- forAsyncHasher(collateral, keyPair)
+      context = lastContext.copy(nodeCollateralWithdrawals =
+        Some(
+          SortedMap(
+            sourceAddress -> SortedSet(
+              PendingNodeCollateralWithdrawal(signedCollateral, SnapshotOrdinal.MinValue, EpochProgress.MinValue)
+            )
+          )
+        )
+      )
+      create = testCreateDelegatedStake(keyPair, sourceAddress, tokenLockReference)
+      signed <- forAsyncHasher(create, keyPair)
+      validator = mkValidator()
+      result <- validator.validateCreateDelegatedStake(signed, pointReaderFromContextForTest(context))
+    } yield expect.same(InvalidTokenLock(tokenLockReference).invalidNec, result)
+  }
+
   test("should fail when the tokenLock amount is too low") { res =>
     implicit val (json, h, sp, keyPair, sourceAddress) = res
 
@@ -653,6 +681,8 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
                     context.delegatedStakesWithdrawals.flatMap(_.get(address)).filter(_.nonEmpty)
                   case GlobalStateFieldId.ActiveNodeCollaterals =>
                     context.activeNodeCollaterals.flatMap(_.get(address)).filter(_.nonEmpty)
+                  case GlobalStateFieldId.NodeCollateralWithdrawals =>
+                    context.nodeCollateralWithdrawals.flatMap(_.get(address)).filter(_.nonEmpty)
                   case GlobalStateFieldId.ActiveTokenLocks =>
                     context.activeTokenLocks.flatMap(_.get(address)).filter(_.nonEmpty)
                   case _ => None
@@ -693,12 +723,16 @@ object UpdateDelegatedStakeValidatorSuite extends MutableIOSuite {
     delegatedStakes: SortedMap[Address, SortedSet[DelegatedStakeRecord]] = SortedMap.empty,
     withdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]] = SortedMap.empty,
     tokenLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]] = SortedMap.empty,
-    nodeParams: SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)] = SortedMap.empty
+    nodeParams: SortedMap[Id, (Signed[UpdateNodeParameters], SnapshotOrdinal)] = SortedMap.empty,
+    nodeCollaterals: SortedMap[Address, SortedSet[NodeCollateralRecord]] = SortedMap.empty,
+    nodeCollateralWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]] = SortedMap.empty
   ) =
     GlobalSnapshotInfo.empty.copy(
       updateNodeParameters = Option.when(nodeParams.nonEmpty)(nodeParams),
       activeDelegatedStakes = Option.when(delegatedStakes.nonEmpty)(delegatedStakes),
       delegatedStakesWithdrawals = Option.when(withdrawals.nonEmpty)(withdrawals),
+      activeNodeCollaterals = Option.when(nodeCollaterals.nonEmpty)(nodeCollaterals),
+      nodeCollateralWithdrawals = Option.when(nodeCollateralWithdrawals.nonEmpty)(nodeCollateralWithdrawals),
       activeTokenLocks = Option.when(tokenLocks.nonEmpty)(tokenLocks)
     )
 

@@ -18,6 +18,7 @@ import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
+import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.swap.CurrencyId
 import io.constellationnetwork.schema.tokenLock._
@@ -933,6 +934,77 @@ object TokenLockStateManagerSuite extends MutableIOSuite with Checkers {
       result <- acceptanceManager.generateTokenUnlocks(expiredWithdrawals, List.empty, globalActiveTokenLocksByRef).pure[IO]
     } yield
       expect.eql(Right(Map(testAddress -> List(TokenUnlock(testHash("tokenLockRef"), TokenLockAmount(100L), none, testAddress)))), result)
+  }
+
+  test("collateral maturity removes its backing lock and credits principal exactly once") { res =>
+    implicit val (jsonHasher, sp, _, js) = res
+
+    for {
+      kp <- KeyPairGenerator.makeKeyPair[IO]
+      testAddress <- kp.getPublic.toId.toAddress
+      backingLock = TokenLock(
+        testAddress,
+        TokenLockAmount(100L),
+        TokenLockFee(0L),
+        TokenLockReference.empty,
+        none,
+        none,
+        none
+      )
+      signedBackingLock <- Signed.forAsyncHasher(backingLock, kp)
+      backingRef <- TokenLockReference.of[IO](signedBackingLock).map(_.hash)
+      collateralCreate = UpdateNodeCollateral.Create(
+        testAddress,
+        PeerId.fromPublic(kp.getPublic),
+        NodeCollateralAmount(100L),
+        NodeCollateralFee(0L),
+        backingRef,
+        NodeCollateralReference.empty
+      )
+      signedCollateralCreate <- Signed.forAsyncHasher(collateralCreate, kp)
+      expiredCollateral = PendingNodeCollateralWithdrawal(
+        signedCollateralCreate,
+        SnapshotOrdinal(1L),
+        EpochProgress(1L)
+      )
+      snapshotInfo = GlobalSnapshotInfo.empty.copy(
+        balances = SortedMap(testAddress -> Balance.empty),
+        activeTokenLocks = SortedMap(testAddress -> SortedSet(signedBackingLock)).some
+      )
+      localMptStore <- mkMptStore(snapshotInfo)
+      manager = TokenLockStateManager.make[IO](GlobalStateReader.fromMptStore(localMptStore))
+      generated <- IO.fromEither(
+        manager
+          .generateTokenUnlocks(
+            SortedMap.empty,
+            SortedMap(testAddress -> SortedSet(expiredCollateral)),
+            List.empty,
+            Map(backingRef -> signedBackingLock)
+          )
+          .leftMap(new AssertionError(_))
+      )
+      lockState <- manager.acceptTokenLocksWithExpired(
+        EpochProgress(2L),
+        SortedMap.empty,
+        SortedMap(testAddress -> SortedSet(signedBackingLock)),
+        generated,
+        SortedMap.empty
+      )
+      balanceResult <- manager.updateGlobalBalancesByTokenLocksWithExpired(
+        EpochProgress(2L),
+        SortedMap(testAddress -> Balance.empty),
+        SortedMap.empty,
+        generated,
+        SortedMap.empty
+      )
+      balances <- IO.fromEither(balanceResult.leftMap(new AssertionError(_)))
+    } yield
+      expect.all(
+        generated == Map(testAddress -> List(TokenUnlock(backingRef, TokenLockAmount(100L), none, testAddress))),
+        lockState.fullState.isEmpty,
+        lockState.removedKeys == Set(testAddress),
+        balances._1.get(testAddress).contains(Balance(100L))
+      )
   }
 
   test("generateTokenUnlocks - should generate unlocks for token locks with replacement references") { res =>

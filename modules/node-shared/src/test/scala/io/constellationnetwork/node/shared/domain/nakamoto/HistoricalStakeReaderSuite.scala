@@ -9,18 +9,20 @@ import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay.OverlayMode
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{BranchId, GlobalStateReader, MptOverlay}
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore}
-import io.constellationnetwork.schema.nakamoto.{EtaPeriod, HistoricalStakeSnapshot, StakeDistribution}
+import io.constellationnetwork.schema.nakamoto._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.serde.codecs.instances.StakeDistributionCodec.{historicalImmutableCodec => historicalStakeSnapshotImmutable}
 
 import eu.timepit.refined.types.numeric.NonNegLong
+import io.circe.Encoder
 import weaver.MutableIOSuite
 
 /** Spec assertions for the §G3 MPT-primary historical-stake-snapshots reader.
@@ -65,6 +67,20 @@ object HistoricalStakeReaderSuite extends MutableIOSuite {
     */
   private def entry(stakes: StakeDistribution, eta: Hash = Hash.empty): HistoricalStakeSnapshot =
     HistoricalStakeSnapshot(stakes, eta)
+
+  private def taggedHasher(delegate: Hasher[IO], tag: Byte): Hasher[IO] =
+    new Hasher[IO] {
+      def hash[A: Encoder](data: A): IO[Hash] =
+        delegate.prefixedHash(data, Array(tag))
+      def hashBytes(bytes: Array[Byte]): IO[Hash] =
+        delegate.hashBytes(Array(tag) ++ bytes)
+      def compare[A: Encoder](data: A, expectedHash: Hash): IO[Boolean] =
+        hash(data).map(_ == expectedHash)
+      def getLogic(ordinal: SnapshotOrdinal): HashLogic =
+        delegate.getLogic(ordinal)
+      def prefixedHash[A: Encoder](data: A, prefix: Array[Byte]): IO[Hash] =
+        delegate.prefixedHash(data, Array(tag) ++ prefix)
+    }
 
   /** Build an MPT store seeded with `historical` entries by writing each `(period, snapshot)` directly via the same key derivation the GSAM
     * boundary writer uses (`AcceptanceMptStateChanges.applyStateChanges` → `historicalStakeSnapshotsKey[F](period)` →
@@ -240,6 +256,216 @@ object HistoricalStakeReaderSuite extends MutableIOSuite {
       expect.same(Some(expected), out) &&
         expect.same(Some(eta), out.map(_.eta)) &&
         expect.same(Some(eta.value), out.map(_.eta.value))
+  }
+
+  test("staged exact reader rejects a mismatched finalized-base root") { res =>
+    implicit val (h, _, js) = res
+    implicit val selector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent[IO](h)
+    val period = EtaPeriod(20L)
+    val expected = entry(dist(pid("node-A") -> BigInt(100)))
+
+    for {
+      store <- mkStore(SortedMap(period -> expected))
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        underlying = store,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      bytes <- store.allEntriesAsBytes
+      root <- GlobalSnapshotInfo.consensusMptRoot[IO](bytes)
+      base = GlobalSnapshotStateRef(
+        SnapshotOrdinal.MinValue,
+        Hash("a" * 64),
+        Hash.empty,
+        MptRoot(root)
+      )
+      mismatched = base.copy(mptRoot = MptRoot(Hash("f" * 64)))
+      result <- HistoricalStakeReader.exact[IO](overlay, etaRotationSnapshots = 1L).lookupExact(mismatched, mismatched, period)
+    } yield expect(result.swap.exists(_.isInstanceOf[ParentStateError.ParentStateRootMismatch]))
+  }
+
+  test("staged exact reader selects each state-reference ordinal and rejects a mismatched parent root") { res =>
+    implicit val (h, _, js) = res
+    val selectedOrdinals = new java.util.concurrent.ConcurrentLinkedQueue[Long]()
+    implicit val selector: HasherSelector[IO] = new HasherSelector[IO] {
+      def getCurrent: Hasher[IO] = h
+      def getForOrdinal(ordinal: SnapshotOrdinal): Hasher[IO] = {
+        selectedOrdinals.add(ordinal.value.value)
+        h
+      }
+    }
+    val period = EtaPeriod.Zero
+    val expected = entry(dist(pid("node-A") -> BigInt(200)))
+    val baseHash = Hash("b" * 64)
+    val childHash = Hash("c" * 64)
+    val ord1 = SnapshotOrdinal(NonNegLong(1L))
+    val ord2 = SnapshotOrdinal(NonNegLong(2L))
+
+    for {
+      store <- mkStore(SortedMap.empty)
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        underlying = store,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      handle <- overlay.checkout(BranchId(baseHash))
+      key <- GlobalStateKey.historicalStakeSnapshotsKey[IO](period)
+      _ <- {
+        val _ = historicalStakeSnapshotImmutable
+        handle.insert[HistoricalStakeSnapshot](key, expected)
+      }
+      _ <- overlay.commit(handle, BranchId(childHash), ord2)
+      baseBytes <- store.allEntriesAsBytes
+      parentBytes <- overlay.allEntriesAsBytes(BranchId(childHash))
+      baseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](baseBytes)
+      parentRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](parentBytes)
+      base = GlobalSnapshotStateRef(ord1, baseHash, Hash("d" * 64), MptRoot(baseRoot))
+      parent = GlobalSnapshotStateRef(ord2, childHash, baseHash, MptRoot(parentRoot))
+      reader = HistoricalStakeReader.exact[IO](overlay, etaRotationSnapshots = 2L)
+      valid <- reader.lookupExact(base, parent, period)
+      mismatched <- reader.lookupExact(base, parent.copy(mptRoot = MptRoot(Hash("e" * 64))), period)
+      selected = {
+        import scala.jdk.CollectionConverters._
+        selectedOrdinals.iterator().asScala.toSet
+      }
+    } yield
+      expect.all(
+        valid.contains(HistoricalStakeReader.ParentStakeView.Historical(expected)),
+        mismatched.swap.exists(_.isInstanceOf[ParentStateError.ParentStateRootMismatch]),
+        selected.contains(ord1.value.value),
+        selected.contains(ord2.value.value)
+      )
+  }
+
+  test("staged exact reader derives a historical key with the boundary-write hasher, not the later parent hasher") { res =>
+    val (currentHasher, _, jsonSerializer) = res
+    val writerHasher = taggedHasher(currentHasher, 0x11.toByte)
+    val parentHasher = taggedHasher(currentHasher, 0x22.toByte)
+    implicit val js: JsonSerializer[IO] = jsonSerializer
+    val selectedOrdinals = new java.util.concurrent.ConcurrentLinkedQueue[Long]()
+    val period = EtaPeriod(1L)
+    val etaRotationSnapshots = 10L
+    val writeOrdinal = SnapshotOrdinal(NonNegLong(19L))
+    val parentOrdinal = SnapshotOrdinal(NonNegLong(25L))
+    val expected = entry(dist(pid("node-migration") -> BigInt(300)))
+    implicit val selector: HasherSelector[IO] = new HasherSelector[IO] {
+      def getCurrent: Hasher[IO] = parentHasher
+      def getForOrdinal(ordinal: SnapshotOrdinal): Hasher[IO] = {
+        selectedOrdinals.add(ordinal.value.value)
+        if (ordinal == writeOrdinal) writerHasher else parentHasher
+      }
+    }
+
+    for {
+      producer <- {
+        implicit val producerHasher: Hasher[IO] = writerHasher
+        InMemoryMerklePatriciaProducer.make[IO]()
+      }
+      store <- {
+        implicit val writeHasher: Hasher[IO] = writerHasher
+        MptStore.make[IO, GlobalStateKey](producer, GlobalStateKey.toHex[IO])
+      }
+      key <- {
+        implicit val writeHasher: Hasher[IO] = writerHasher
+        GlobalStateKey.historicalStakeSnapshotsKey[IO](period)
+      }
+      _ <- {
+        val _ = historicalStakeSnapshotImmutable
+        store.insert[HistoricalStakeSnapshot](key, expected)
+      }
+      bytes <- store.allEntriesAsBytes
+      root <- {
+        implicit val rootHasher: Hasher[IO] = parentHasher
+        GlobalSnapshotInfo.consensusMptRoot[IO](bytes)
+      }
+      state = GlobalSnapshotStateRef(parentOrdinal, Hash("a" * 64), Hash("b" * 64), MptRoot(root))
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- {
+        implicit val overlayHasher: Hasher[IO] = parentHasher
+        MptOverlay.make[IO, GlobalStateKey](
+          mode = OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+          underlying = store,
+          pcTree = pcTree,
+          toHex = GlobalStateKey.toHex[IO],
+          bestTipsFn = IO.pure(Set.empty[BranchId])
+        )
+      }
+      result <- HistoricalStakeReader
+        .exact[IO](overlay, etaRotationSnapshots)
+        .lookupExact(state, state, period)
+      selected = {
+        import scala.jdk.CollectionConverters._
+        selectedOrdinals.iterator().asScala.toList
+      }
+    } yield
+      expect.all(
+        result.contains(HistoricalStakeReader.ParentStakeView.Historical(expected)),
+        selected.contains(writeOrdinal.value.value),
+        selected.contains(parentOrdinal.value.value)
+      )
+  }
+
+  test("staged exact reader allows warmup only for negative lookbacks and fails closed on absent mature history") { res =>
+    implicit val (h, _, js) = res
+    implicit val selector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent[IO](h)
+    val parentOrdinal = SnapshotOrdinal(NonNegLong(5L))
+
+    for {
+      store <- mkStore(SortedMap.empty)
+      bytes <- store.allEntriesAsBytes
+      root <- GlobalSnapshotInfo.consensusMptRoot[IO](bytes)
+      state = GlobalSnapshotStateRef(parentOrdinal, Hash("c" * 64), Hash("d" * 64), MptRoot(root))
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        underlying = store,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      reader = HistoricalStakeReader.exact[IO](overlay, etaRotationSnapshots = 2L)
+      warmup <- reader.lookupExact(state, state, EtaPeriod(-1L))
+      mature <- reader.lookupExact(state, state, EtaPeriod.Zero)
+    } yield
+      expect.all(
+        warmup.contains(HistoricalStakeReader.ParentStakeView.GenesisWarmup(Map.empty)),
+        mature.left.toOption.contains(ParentStateError.HistoricalStakeUnavailable(state, EtaPeriod.Zero))
+      )
+  }
+
+  test("staged exact reader rejects invalid rotation length and write-ordinal overflow") { res =>
+    implicit val (h, _, js) = res
+    implicit val selector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent[IO](h)
+    val parentOrdinal = SnapshotOrdinal(NonNegLong(Long.MaxValue))
+
+    for {
+      store <- mkStore(SortedMap.empty)
+      bytes <- store.allEntriesAsBytes
+      root <- GlobalSnapshotInfo.consensusMptRoot[IO](bytes)
+      state = GlobalSnapshotStateRef(parentOrdinal, Hash("e" * 64), Hash("f" * 64), MptRoot(root))
+      pcTree <- ParentChildTree.make[IO]
+      overlay <- MptOverlay.make[IO, GlobalStateKey](
+        mode = OverlayMode.MultiBranch(MptOverlay.DefaultMaxPendingBranches),
+        underlying = store,
+        pcTree = pcTree,
+        toHex = GlobalStateKey.toHex[IO],
+        bestTipsFn = IO.pure(Set.empty[BranchId])
+      )
+      invalid <- HistoricalStakeReader.exact[IO](overlay, etaRotationSnapshots = 0L).lookupExact(state, state, EtaPeriod.Zero)
+      overflow <- HistoricalStakeReader
+        .exact[IO](overlay, etaRotationSnapshots = 2L)
+        .lookupExact(state, state, EtaPeriod(Long.MaxValue))
+    } yield
+      expect.all(
+        invalid.left.toOption.contains(ParentStateError.InvalidEtaRotationSnapshots(0L)),
+        overflow.left.toOption.contains(ParentStateError.HistoricalStakeWriteOrdinalOverflow(EtaPeriod(Long.MaxValue), 2L))
+      )
   }
 
   test(

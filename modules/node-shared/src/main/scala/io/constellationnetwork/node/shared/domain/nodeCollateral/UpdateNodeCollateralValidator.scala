@@ -12,7 +12,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateRe
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReaderOps._
 import io.constellationnetwork.node.shared.domain.nodeCollateral.UpdateNodeCollateralValidator.UpdateNodeCollateralValidationErrorOr
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.delegatedStake.DelegatedStakeRecord
+import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
@@ -205,19 +205,25 @@ object UpdateNodeCollateralValidator {
         def tokenLockAvailable(address: Address): F[Boolean] =
           for {
             maybeDelegatedStakes <- reader.getDelegatedStakes(signed.source)
+            maybeDelegatedWithdrawals <- reader.getDelegatedStakeWithdrawals(signed.source)
             maybeNodeCollaterals <- reader.getNodeCollaterals(address)
           } yield {
             val maybeExistingStake = maybeDelegatedStakes
               .getOrElse(SortedSet.empty[DelegatedStakeRecord])
-              .find(_.event.tokenLockRef === signed.tokenLockRef)
+              .find(_.tokenLockRef === signed.tokenLockRef)
               .map(_.event)
+            val maybePendingStake = maybeDelegatedWithdrawals
+              .getOrElse(SortedSet.empty[PendingDelegatedStakeWithdrawal])
+              .find(_.tokenLockRef === signed.tokenLockRef)
             val maybeExistingCollateral = maybeNodeCollaterals
               .getOrElse(SortedSet.empty[NodeCollateralRecord])
               .find(_.event.tokenLockRef === signed.tokenLockRef)
               .map(_.event)
             // A collateral create may replace the prior record backed by the same lock, but it
             // cannot duplicate collateral for the same node or reuse a delegated-stake lock.
-            maybeExistingStake.isEmpty && maybeExistingCollateral.forall(_.nodeId =!= signed.nodeId)
+            maybePendingStake.isEmpty &&
+            maybeExistingStake.isEmpty &&
+            maybeExistingCollateral.forall(_.nodeId =!= signed.nodeId)
           }
 
         // Verify the token lock belongs to the signing address (address === tokenLock.source),
@@ -284,7 +290,11 @@ object UpdateNodeCollateralValidator {
 
   case class DuplicatedWithdrawal(source: Address, collateralRef: Hash) extends UpdateNodeCollateralValidationError
 
+  case class ConflictingCollateralTransition(collateralRef: Hash) extends UpdateNodeCollateralValidationError
+
   case class DelegatedStakeTokenLockConflict(tokenLockReference: Hash) extends UpdateNodeCollateralValidationError
+
+  case class OutdatedTokenLock(tokenLockReference: Hash) extends UpdateNodeCollateralValidationError
 
   type UpdateNodeCollateralValidationErrorOr[A] = ValidatedNec[UpdateNodeCollateralValidationError, A]
 }

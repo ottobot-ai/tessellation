@@ -3,6 +3,7 @@ package io.constellationnetwork.node.shared.domain.tokenlock.block
 import cats.Applicative
 import cats.syntax.applicative._
 
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator.BackingReplacementRequirement
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.GlobalStateReader
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.{Amount, Balance}
@@ -10,6 +11,7 @@ import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey}
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.security.Hashed
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.serde.codecs.instances.NewtypeLongShapes._
 import io.constellationnetwork.serde.codecs.instances.TokenLockReferenceCodec.{immutableCodec => tokenLockReferenceImmutableCodec}
 
@@ -26,6 +28,8 @@ trait TokenLockBlockAcceptanceContext[F[_]] {
   def getCurrentEpochProgress: EpochProgress
 
   def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]]
+
+  def getBackingReplacementRequirement(ref: Hash): F[Option[BackingReplacementRequirement]]
 }
 
 object TokenLockBlockAcceptanceContext {
@@ -39,7 +43,8 @@ object TokenLockBlockAcceptanceContext {
     collateral: Amount,
     initialTxRef: TokenLockReference,
     toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]],
-    currentEpochProgress: EpochProgress
+    currentEpochProgress: EpochProgress,
+    backingReplacementRequirements: Map[Hash, BackingReplacementRequirement] = Map.empty
   ): TokenLockBlockAcceptanceContext[F] =
     new TokenLockBlockAcceptanceContext[F] {
 
@@ -57,6 +62,9 @@ object TokenLockBlockAcceptanceContext {
       def getCurrentEpochProgress: EpochProgress = currentEpochProgress
 
       def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]] = toBeReplacedHashedTokenLocks
+
+      def getBackingReplacementRequirement(ref: Hash): F[Option[BackingReplacementRequirement]] =
+        backingReplacementRequirements.get(ref).pure[F]
     }
 
   /** §G4: MPT-backed token-lock acceptance context. Mirrors [[BlockAcceptanceContext.fromMpt]] — `getBalance` and `getLastTxRef` are
@@ -69,7 +77,25 @@ object TokenLockBlockAcceptanceContext {
     collateral: Amount,
     initialTxRef: TokenLockReference,
     toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]],
-    currentEpochProgress: EpochProgress
+    currentEpochProgress: EpochProgress,
+    backingReplacementRequirements: Map[Hash, BackingReplacementRequirement] = Map.empty
+  )(implicit F: Applicative[F]): TokenLockBlockAcceptanceContext[F] =
+    fromMptWithBackingLookup(
+      reader,
+      collateral,
+      initialTxRef,
+      toBeReplacedHashedTokenLocks,
+      currentEpochProgress,
+      ref => backingReplacementRequirements.get(ref).pure[F]
+    )
+
+  def fromMptWithBackingLookup[F[_]](
+    reader: GlobalStateReader[F],
+    collateral: Amount,
+    initialTxRef: TokenLockReference,
+    toBeReplacedHashedTokenLocks: List[Hashed[TokenLock]],
+    currentEpochProgress: EpochProgress,
+    backingRequirementLookup: Hash => F[Option[BackingReplacementRequirement]]
   ): TokenLockBlockAcceptanceContext[F] =
     new TokenLockBlockAcceptanceContext[F] {
 
@@ -87,6 +113,9 @@ object TokenLockBlockAcceptanceContext {
       def getCurrentEpochProgress: EpochProgress = currentEpochProgress
 
       def getToBeReplacedHashedTokenLocks: List[Hashed[TokenLock]] = toBeReplacedHashedTokenLocks
+
+      def getBackingReplacementRequirement(ref: Hash): F[Option[BackingReplacementRequirement]] =
+        backingRequirementLookup(ref)
     }
 
 }

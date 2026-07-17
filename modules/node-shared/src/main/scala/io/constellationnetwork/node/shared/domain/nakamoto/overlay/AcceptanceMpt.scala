@@ -17,6 +17,13 @@ trait GlobalStateReader[F[_]] {
   def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]]
   def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]]
   def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]]
+
+  /** Atomically capture several raw consensus partitions from one immutable reader image.
+    *
+    * `None` means the reader cannot prove a coherent multi-partition capture. Consensus validators that join fields must fail closed rather
+    * than combine independent scans from such a reader.
+    */
+  def captureRawPrefixesStrict(prefixes: List[Hex]): Option[F[Map[Hex, List[StrictMptRawEntry]]]] = None
 }
 
 object GlobalStateReader {
@@ -25,13 +32,19 @@ object GlobalStateReader {
     * (catch-up / bootstrap, finalized-base reads). Branch-aware reads belong on the overlay path; this adapter is for migration scaffolding
     * where a manager has been converted to `GlobalStateReader[F]` but its consumer still wires it from an `MptStore`.
     */
-  def fromMptStore[F[_]](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] = new GlobalStateReader[F] {
+  def fromMptStore[F[_]: cats.Monad](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] = new GlobalStateReader[F] {
     def get[V: ImmutableCodec](key: GlobalStateKey): F[Option[V]] = store.get[V](key)
     def getStrict[V: ImmutableCodec](key: GlobalStateKey): F[StrictMptRead[V]] = store.getStrict[V](key)
     def getMany[V: ImmutableCodec](keys: List[GlobalStateKey]): F[Map[GlobalStateKey, V]] = store.getMany[V](keys)
     def getAllForPrefix[V: ImmutableCodec](prefix: Hex): F[Map[Hex, V]] = store.getAllForPrefix[V](prefix)
     def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
       store.getAllForPrefixStrict[V](prefix)
+    override def captureRawPrefixesStrict(prefixes: List[Hex]): Option[F[Map[Hex, List[StrictMptRawEntry]]]] =
+      Some(
+        store.withExclusiveLock(
+          prefixes.distinct.traverse(prefix => store.rawEntriesForPrefixStrict(prefix).map(prefix -> _)).map(_.toMap)
+        )
+      )
   }
 
   /** Branch-aware reader bound to a specific `parent`. Routes every read to `overlay.get(parent, ...)`, so under MultiBranch the
@@ -69,6 +82,8 @@ object GlobalStateReader {
       currentParent.flatMap(p => overlay.getAllForPrefix[V](p, prefix))
     def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
       currentParent.flatMap(p => overlay.getAllForPrefixStrict[V](p, prefix))
+    override def captureRawPrefixesStrict(prefixes: List[Hex]): Option[F[Map[Hex, List[StrictMptRawEntry]]]] =
+      Some(currentParent.flatMap(parent => overlay.rawEntriesForPrefixesStrict(parent, prefixes)))
   }
 
   /** GL0 HTTP / read-path constructor (#117/#118 Phase 2). Reads at the chain's current best tip so callers see the canonical
@@ -92,7 +107,7 @@ object GlobalStateReader {
     * Provided as a named factory so call sites in follower modules (gl1/cl1/dl1/ml0) make the "finalized-only" choice explicit at
     * construction time and don't accidentally pick up overlay-pending state. Has the same type as `pending` but no `MptOverlay` dependency.
     */
-  def finalized[F[_]](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] =
+  def finalized[F[_]: cats.Monad](store: MptStore[F, GlobalStateKey]): GlobalStateReader[F] =
     fromMptStore[F](store)
 
   /** Empty reader that always returns no values. Used by tests / wirings where no MPT is available — equivalent to "no prior state". */
@@ -106,6 +121,8 @@ object GlobalStateReader {
       cats.Applicative[F].pure(Map.empty)
     def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
       cats.Applicative[F].pure(List.empty)
+    override def captureRawPrefixesStrict(prefixes: List[Hex]): Option[F[Map[Hex, List[StrictMptRawEntry]]]] =
+      Some(cats.Applicative[F].pure(prefixes.distinct.map(_ -> List.empty[StrictMptRawEntry]).toMap))
   }
 }
 
@@ -167,6 +184,9 @@ object AcceptanceMpt {
 
     def getAllForPrefixStrict[V: ImmutableCodec](prefix: Hex): F[List[StrictMptEntry[V]]] =
       overlay.getAllForPrefixStrict[V](parent, prefix)
+
+    override def captureRawPrefixesStrict(prefixes: List[Hex]): Option[F[Map[Hex, List[StrictMptRawEntry]]]] =
+      Some(overlay.rawEntriesForPrefixesStrict(parent, prefixes))
 
     def insert[V: ImmutableCodec](key: GlobalStateKey, value: V): F[Unit] = handle.insert(key, value)
     def insert[V: ImmutableCodec](entries: Map[GlobalStateKey, V]): F[Unit] = handle.insert(entries)

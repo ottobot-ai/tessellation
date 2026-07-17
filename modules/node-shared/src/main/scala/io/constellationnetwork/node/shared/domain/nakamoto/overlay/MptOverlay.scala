@@ -12,6 +12,7 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
@@ -41,6 +42,24 @@ object BranchId {
     * overlay's pending map resolves to the base, so this is purely a documentation alias.
     */
   val base: BranchId = BranchId(Hash.empty)
+}
+
+/** Immutable byte images for one exact retained parent and the finalized base to which its overlay lineage resolves.
+  *
+  * Branch presence and continuity are checked under the overlay mutation boundary. This is not authenticated until the consumer
+  * independently reproduces both signed `mptRoot` values from the captured bytes.
+  */
+final class ExactParentStateCapture private[overlay] (
+  val base: GlobalSnapshotStateRef,
+  val parent: GlobalSnapshotStateRef,
+  private val baseEntries: SortedMap[Hex, ByteVector],
+  private val parentEntries: SortedMap[Hex, ByteVector]
+) {
+  def baseByteMap: Map[Hex, Array[Byte]] =
+    baseEntries.iterator.map { case (key, value) => key -> value.toArray }.toMap
+
+  def parentByteMap: Map[Hex, Array[Byte]] =
+    parentEntries.iterator.map { case (key, value) => key -> value.toArray }.toMap
 }
 
 /** Defensively owned, read-only materialization of one overlay branch view and the trie derived from those exact bytes.
@@ -154,6 +173,23 @@ final case class FinalizationUndoGapError(
       s"MptOverlay.finalizeBranch: cannot replace canonical=${previousCanonical.value.value} with " +
         s"canonical=${replacementCanonical.value.value} at ordinal=${ordinal.value.value}: prior undo record is unavailable. " +
         s"Failing closed until authenticated parent-state recovery completes."
+    )
+
+/** Fail-closed error raised when same-ordinal canonical replacement is attempted while the persisted base is not exactly at that ordinal.
+  * Replaying `undoJournal[ordinal]` on top of a later base would corrupt every descendant transition; replaying it against an earlier or
+  * unknown base is equally unauthenticated. The caller must first rewind/reconstruct the exact common-parent state through the ordinary
+  * recovery path.
+  */
+final case class FinalizationReplacementRequiresRewindError(
+  ordinal: SnapshotOrdinal,
+  previousCanonical: BranchId,
+  replacementCanonical: BranchId,
+  persistedBaseOrdinal: Option[SnapshotOrdinal]
+) extends RuntimeException(
+      s"MptOverlay.finalizeBranch: cannot replace canonical=${previousCanonical.value.value} with " +
+        s"canonical=${replacementCanonical.value.value} at ordinal=${ordinal.value.value}: persisted base ordinal is " +
+        s"${persistedBaseOrdinal.fold("unavailable")(_.value.value.toString)}, not exactly ${ordinal.value.value}. " +
+        s"RecoveryRequired: rewind or reconstruct the exact replacement base before applying its undo."
     )
 
 /** Fail-closed error raised when a caller tries to finalize below either the explicit retained-history floor or the MPT base's persisted
@@ -289,6 +325,17 @@ trait MptOverlay[F[_], K] {
     */
   def rawEntriesForPrefixesStrict(branch: BranchId, prefixes: List[Hex]): F[Map[Hex, List[StrictMptRawEntry]]]
 
+  /** Capture one exact retained parent and the exact finalized-base image supplied by the caller.
+    *
+    * Unlike legacy branch reads, a missing requested branch or intermediate ancestor is a typed failure and never falls through to base.
+    * The complete immutable images are copied while the overlay mutation boundary is held; callers must then reproduce both signed roots
+    * before interpreting any value.
+    */
+  def captureExactParentState(
+    base: GlobalSnapshotStateRef,
+    parent: GlobalSnapshotStateRef
+  ): F[Either[ParentStateError, ExactParentStateCapture]]
+
   /** Capture one defensively owned branch byte image and derive its trie without mutating the base producer, its pending-change refs, or
     * its ordinal/root caches. Root and proof/value consumers must use this single image rather than reading the overlay twice.
     *
@@ -335,8 +382,8 @@ trait MptOverlay[F[_], K] {
     * so the path is benign for gl0.
     *
     * Multi-branch: walks `canonical → ... → base` through the pending-branches map, merges all chain `ChangeSet`s, applies the merged delta
-    * to the underlying producer, and clears the entire pending-branches map. (More nuanced eviction — keeping non-conflicting siblings —
-    * lands in #56.9.) Passthrough: always returns `NoOp` because there is no overlay state to fold.
+    * to the underlying producer, removes the folded lineage and unrelated tines, and retains only strict descendants of `canonical`.
+    * Passthrough: always returns `NoOp` because there is no overlay state to fold.
     */
   def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome]
 
@@ -399,6 +446,16 @@ trait MptOverlay[F[_], K] {
 }
 
 object MptOverlay {
+
+  private[overlay] def captureImmutableEntries(
+    state: GlobalSnapshotStateRef,
+    entries: Map[Hex, Array[Byte]]
+  ): Either[ParentStateError, SortedMap[Hex, ByteVector]] =
+    entries.collectFirst { case (key, bytes) if bytes eq null => key } match {
+      case Some(key) => Left(ParentStateError.MalformedCapturedStateValue(state, key))
+      case None =>
+        Right(SortedMap.from(entries.iterator.map { case (key, bytes) => key -> ByteVector.view(bytes.clone()) }))
+    }
 
   /** Read-only snapshot of the overlay's in-memory history-accumulator sizes (Track-3 S2 memory-budget telemetry). Returned by
     * `MptOverlay.journalSizes`.
@@ -554,6 +611,21 @@ object MptOverlay {
       def rawEntriesForPrefixesStrict(branch: BranchId, prefixes: List[Hex]): F[Map[Hex, List[StrictMptRawEntry]]] =
         underlying.withExclusiveLock {
           prefixes.distinct.traverse(prefix => underlying.rawEntriesForPrefixStrict(prefix).map(prefix -> _)).map(_.toMap)
+        }
+
+      def captureExactParentState(
+        base: GlobalSnapshotStateRef,
+        parent: GlobalSnapshotStateRef
+      ): F[Either[ParentStateError, ExactParentStateCapture]] =
+        underlying.withExclusiveLock {
+          ExactParentResolver.resolve(base, Map.empty, parent, maxSteps = 1) match {
+            case Left(error) => Async[F].pure(Left(error))
+            case Right(_) =>
+              underlying.allEntriesAsBytes.map { entries =>
+                captureImmutableEntries(parent, entries)
+                  .map(captured => new ExactParentStateCapture(base, parent, captured, captured))
+              }
+          }
         }
 
       def allEntriesAsBytes(branch: BranchId): F[Map[Hex, Array[Byte]]] =
@@ -977,6 +1049,28 @@ object MptOverlay {
           } yield branchEntries.toMap
         }
 
+      def captureExactParentState(
+        base: GlobalSnapshotStateRef,
+        parent: GlobalSnapshotStateRef
+      ): F[Either[ParentStateError, ExactParentStateCapture]] =
+        mutex.permit.use { _ =>
+          for {
+            pending <- pendingRef.get
+            result <- validateExactParentLineage(base, parent, pending) match {
+              case Left(error) => Async[F].pure(Left(error))
+              case Right(_) =>
+                underlying.allEntriesAsBytes.map { rawBase =>
+                  val parentChanges = mergedChain(BranchId(parent.hash), pending)
+                  val rawParent = (rawBase -- parentChanges.removals) ++ parentChanges.upserts
+                  (
+                    captureImmutableEntries(base, rawBase),
+                    captureImmutableEntries(parent, rawParent)
+                  ).mapN((baseEntries, parentEntries) => new ExactParentStateCapture(base, parent, baseEntries, parentEntries))
+                }
+            }
+          } yield result
+        }
+
       def captureBranchImage(branch: BranchId): F[Either[MerklePatriciaError, MptBranchImage]] =
         mutex.permit
           .use(_ => allEntriesAsBytesUnlocked(branch))
@@ -1030,152 +1124,171 @@ object MptOverlay {
 
       def finalizeBranch(canonical: BranchId, ordinal: SnapshotOrdinal): F[FinalizationOutcome] =
         mutex.permit.use { _ =>
-          (prunedHistoryFloorRef.get, underlying.lastPersistedOrdinal).mapN {
-            case (Some(prunedFloor), Some(baseAnchor)) => Some(prunedFloor.max(baseAnchor.value.value))
-            case (Some(prunedFloor), None)             => Some(prunedFloor)
-            case (None, Some(baseAnchor))              => Some(baseAnchor.value.value)
-            case (None, None)                          => none[Long]
-          }.flatMap {
-            case Some(floor) if ordinal.value.value < floor =>
-              FinalizationHistoryPrunedError(ordinal, SnapshotOrdinal.unsafeApply(floor)).raiseError[F, FinalizationOutcome]
-            case _ =>
-              finalizedRef.get.flatMap { finalized =>
+          val requireExactReplacementBase =
+            (finalizedRef.get, underlying.lastPersistedOrdinal).tupled.flatMap {
+              case (finalized, persistedBaseOrdinal) =>
                 finalized.get(ordinal) match {
-                  case Some(prev) if prev.value === canonical.value =>
-                    // Already finalized at exactly this (ordinal, hash); nothing to do.
-                    FinalizationOutcome.NoOp.pure[F].widen[FinalizationOutcome]
-                  case Some(prev) =>
-                    // Reorg-style re-finalization: the same ordinal is being finalized with a different canonical
-                    // hash than before. Followers (gl1/cl1/dl1/ml0) hit this path when `setForRecovery` resets
-                    // their LastSnapshotStorage to ord N < currentOrdinal and the GlobalSnapshotPullingProcess
-                    // re-pulls + re-validates each snapshot through `createContext`. The previous behavior raised
-                    // and aborted the recovery loop entirely (#113); instead, accept the new canonical as the
-                    // post-reorg truth, fold its pending chain (idempotent under MultiBranch when the prior
-                    // finalization already cleared pending), and update the finalizedRef. The fold may overwrite
-                    // base entries the prior canonical wrote — that is correct: the new canonical is the new state
-                    // at this ordinal, and base must reflect it. GL0 Phase-2 state remains density-reorgable, so
-                    // the global path can legitimately reach this replacement path and must retain/recover the
-                    // exact old undo plus replacement inputs before changing base.
-                    pendingRef.get.flatMap { pending =>
-                      pending.get(canonical) match {
-                        case None =>
-                          // Reorg-replace where the NEW canonical was never overlay-registered locally. Two cases:
-                          //   1. Idempotent — pending genuinely empty (a prior canonical's fold already cleared it).
-                          //   2. Bug surface (#116, iter14 evidence): pending still holds fork branches from the
-                          //      locally-rejected chain. Eviction (`evictIfOverCap`) and `walkAncestorsInPending`
-                          //      would treat them as protected via `lastCommittedBranchRef`, blocking real eviction
-                          //      and skewing chain walks. Worse: if the orphan branches' deltas were earlier folded
-                          //      into base on a prior fork-side finalize, base now holds rejected writes. Reads at
-                          //      `parentTip=canonical` walk pending→empty→base, returning the contaminated bytes
-                          //      (manifests as StateProofMismatch on followers, divergent local-built proofs on
-                          //      gl0 — see iter14 forensics: gl0-2 ord 81 PRE 64545a6f vs canonical cad91eed).
-                          // The overlay alone cannot reconstruct missing canonical deltas (caller never pushed
-                          // them via `commit`). What it CAN do: drop orphan pending so eviction/walks no longer
-                          // protect rejected ancestors, and reset `lastCommittedBranchRef` so the next commit
-                          // does not protect a now-stale tip. Caller is responsible for resyncing base via
-                          // `syncFromGlobalSnapshotInfo` when it can detect the case (gl0 NakamotoSyncDaemon
-                          // catch-up does this on reorg adoption; gl1/dl1 do it via `recoverFromOrphan` +
-                          // `setForRecovery` on StateProofMismatch). The WARN log surfaces the case so operators
-                          // can see when canonical was never overlay-registered locally.
-                          val droppedCount = pending.size
-                          val cleanup =
-                            if (droppedCount > 0)
-                              pendingRef.set(Map.empty) >> lastCommittedBranchRef.set(none)
-                            else Async[F].unit
-                          val undoGap = FinalizationUndoGapError(ordinal, prev, canonical)
-                          Async[F].uncancelable { poll =>
-                            for {
-                              undoAvailable <- undoJournalRef.get.map(_.contains(ordinal.value.value))
-                              _ <- if (undoAvailable) Async[F].unit else undoGap.raiseError[F, Unit]
-                              // Cache invalidation is safe to perform before the base mutation: a failed/canceled undo merely forces
-                              // re-derivation. Once the undo commits, cancellation stays masked through every overlay marker update.
-                              _ <- onBaseRevert
-                              // #121: Replay the previous canonical's undo entry to revert base to its pre-`ordinal` state.
-                              // This plugs the "Base may still hold rejected writes" leak: prior versions of this code path
-                              // dropped pending but left the prior fold's writes in base, contaminating subsequent reads at
-                              // `parentTip=canonical` (overlay walks pending→empty→base, sees the rejected bytes).
-                              undoApplied <- poll(applyUndoAt(ordinal.value.value, ordinal))
-                              _ <- if (undoApplied) Async[F].unit else undoGap.raiseError[F, Unit]
-                              _ <- cleanup
-                              _ <- finalizedRef.update(_.updated(ordinal, canonical))
-                              _ <-
-                                if (droppedCount > 0)
-                                  logger.warn(
-                                    s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                                      s"new=${canonical.value} — canonical NOT in pending; dropped $droppedCount " +
-                                      s"orphan fork branch(es) from pendingRef + reset lastCommittedBranchRef. " +
-                                      s"Undo applied=$undoApplied (base reverted to pre-ord state). " +
-                                      s"Caller still needs to resync base via syncFromGlobalSnapshotInfo to apply " +
-                                      s"the new canonical's deltas."
-                                  )
-                                else
-                                  logger.info(
-                                    s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                                      s"new=${canonical.value} (pending already empty, no fold needed). " +
-                                      s"Undo applied=$undoApplied."
-                                  )
-                            } yield
-                              if (droppedCount > 0) FinalizationOutcome.Folded(0, droppedCount): FinalizationOutcome
-                              else FinalizationOutcome.NoOp: FinalizationOutcome
-                          }
-                        case Some(_) =>
-                          val merged = mergedChain(canonical, pending)
-                          val droppedCount = pending.size - countAncestors(canonical, pending)
-                          Async[F].uncancelable { poll =>
-                            for {
-                              // Track-3 S4: prior canonical's writes just reverted from base — drop the stale eta walk cache
-                              // before the coordinated replacement so a hook failure cannot split old/new base state. A later transaction
-                              // failure only causes harmless cache re-derivation.
-                              _ <- onBaseRevert
-                              // Undo the old canonical and apply the new canonical under ONE producer savepoint/commit. The new undo record is
-                              // published before this cancelable boundary returns, so an error cannot expose a pre-ordinal half-state.
-                              undoApplied <- poll(replaceFinalizedBase(merged, ordinal, prev, canonical))
-                              _ <- pendingRef.set(Map.empty)
-                              _ <- lastCommittedBranchRef.set(none)
-                              _ <- finalizedRef.update(_.updated(ordinal, canonical))
-                              _ <- logger.info(
-                                s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
-                                  s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount " +
-                                  s"undoApplied=$undoApplied"
-                              )
-                            } yield FinalizationOutcome.Folded(merged.size, droppedCount)
-                          }
-                      }
-                    }
-                  case None =>
-                    pendingRef.get.flatMap { pending =>
-                      pending.get(canonical) match {
-                        case None =>
-                          // Branch never registered with the overlay. Record the finalization (so future calls at
-                          // this ordinal are conflict-checked) but there is nothing to apply.
-                          finalizedRef
-                            .update(_.updated(ordinal, canonical))
-                            .as(FinalizationOutcome.NoOp: FinalizationOutcome)
-                        case Some(_) =>
-                          val merged = mergedChain(canonical, pending)
-                          val droppedCount = pending.size - countAncestors(canonical, pending)
-                          Async[F].uncancelable { poll =>
-                            for {
-                              _ <- poll(foldIntoBase(merged, ordinal))
-                              _ <- pendingRef.set(Map.empty)
-                              // pendingRef cleared → any prior `lastCommittedBranchRef` now points at a branch
-                              // that's no longer in pending (its ancestor walk yields zero protection per the
-                              // "branch not in pending" leaf in walkAncestorsInPending). Reset to None so a
-                              // future commit can re-establish the protection cleanly. Same rationale as the
-                              // reorg-replace `case Some` arm above (#116).
-                              _ <- lastCommittedBranchRef.set(none)
-                              _ <- finalizedRef.update(_.updated(ordinal, canonical))
-                              _ <- logger.info(
-                                s"[MptOverlay] Finalized branch=${canonical.value} at ordinal=$ordinal: " +
-                                  s"keysApplied=${merged.size} branchesDropped=$droppedCount"
-                              )
-                            } yield FinalizationOutcome.Folded(merged.size, droppedCount)
-                          }
-                      }
-                    }
+                  case Some(previous) if previous.value =!= canonical.value && persistedBaseOrdinal =!= ordinal.some =>
+                    FinalizationReplacementRequiresRewindError(
+                      ordinal,
+                      previous,
+                      canonical,
+                      persistedBaseOrdinal
+                    ).raiseError[F, Unit]
+                  case _ => Async[F].unit
                 }
-              }
-          }
+            }
+
+          requireExactReplacementBase >>
+            (prunedHistoryFloorRef.get, underlying.lastPersistedOrdinal).mapN {
+              case (Some(prunedFloor), Some(baseAnchor)) => Some(prunedFloor.max(baseAnchor.value.value))
+              case (Some(prunedFloor), None)             => Some(prunedFloor)
+              case (None, Some(baseAnchor))              => Some(baseAnchor.value.value)
+              case (None, None)                          => none[Long]
+            }.flatMap {
+              case Some(floor) if ordinal.value.value < floor =>
+                FinalizationHistoryPrunedError(ordinal, SnapshotOrdinal.unsafeApply(floor)).raiseError[F, FinalizationOutcome]
+              case _ =>
+                finalizedRef.get.flatMap { finalized =>
+                  finalized.get(ordinal) match {
+                    case Some(prev) if prev.value === canonical.value =>
+                      // Already finalized at exactly this (ordinal, hash); nothing to do.
+                      FinalizationOutcome.NoOp.pure[F].widen[FinalizationOutcome]
+                    case Some(prev) =>
+                      // Reorg-style re-finalization: the same ordinal is being finalized with a different canonical
+                      // hash than before. Followers (gl1/cl1/dl1/ml0) hit this path when `setForRecovery` resets
+                      // their LastSnapshotStorage to ord N < currentOrdinal and the GlobalSnapshotPullingProcess
+                      // re-pulls + re-validates each snapshot through `createContext`. The previous behavior raised
+                      // and aborted the recovery loop entirely (#113); instead, accept the new canonical as the
+                      // post-reorg truth, fold its pending chain (idempotent under MultiBranch when the prior
+                      // finalization already cleared pending), and update the finalizedRef. The fold may overwrite
+                      // base entries the prior canonical wrote — that is correct: the new canonical is the new state
+                      // at this ordinal, and base must reflect it. GL0 Phase-2 state remains density-reorgable, so
+                      // the global path can legitimately reach this replacement path and must retain/recover the
+                      // exact old undo plus replacement inputs before changing base.
+                      pendingRef.get.flatMap { pending =>
+                        pending.get(canonical) match {
+                          case None =>
+                            // Reorg-replace where the NEW canonical was never overlay-registered locally. Two cases:
+                            //   1. Idempotent — pending genuinely empty (a prior canonical's fold already cleared it).
+                            //   2. Bug surface (#116, iter14 evidence): pending still holds fork branches from the
+                            //      locally-rejected chain. Eviction (`evictIfOverCap`) and `walkAncestorsInPending`
+                            //      would treat them as protected via `lastCommittedBranchRef`, blocking real eviction
+                            //      and skewing chain walks. Worse: if the orphan branches' deltas were earlier folded
+                            //      into base on a prior fork-side finalize, base now holds rejected writes. Reads at
+                            //      `parentTip=canonical` walk pending→empty→base, returning the contaminated bytes
+                            //      (manifests as StateProofMismatch on followers, divergent local-built proofs on
+                            //      gl0 — see iter14 forensics: gl0-2 ord 81 PRE 64545a6f vs canonical cad91eed).
+                            // The overlay alone cannot reconstruct missing canonical deltas (caller never pushed
+                            // them via `commit`). What it CAN do: drop orphan pending so eviction/walks no longer
+                            // protect rejected ancestors, and reset `lastCommittedBranchRef` so the next commit
+                            // does not protect a now-stale tip. Caller is responsible for resyncing base via
+                            // `syncFromGlobalSnapshotInfo` when it can detect the case (gl0 NakamotoSyncDaemon
+                            // catch-up does this on reorg adoption; gl1/dl1 do it via `recoverFromOrphan` +
+                            // `setForRecovery` on StateProofMismatch). The WARN log surfaces the case so operators
+                            // can see when canonical was never overlay-registered locally.
+                            val droppedCount = pending.size
+                            val cleanup =
+                              if (droppedCount > 0)
+                                pendingRef.set(Map.empty) >> lastCommittedBranchRef.set(none)
+                              else Async[F].unit
+                            val undoGap = FinalizationUndoGapError(ordinal, prev, canonical)
+                            Async[F].uncancelable { poll =>
+                              for {
+                                undoAvailable <- undoJournalRef.get.map(_.contains(ordinal.value.value))
+                                _ <- if (undoAvailable) Async[F].unit else undoGap.raiseError[F, Unit]
+                                // Cache invalidation is safe to perform before the base mutation: a failed/canceled undo merely forces
+                                // re-derivation. Once the undo commits, cancellation stays masked through every overlay marker update.
+                                _ <- onBaseRevert
+                                // #121: Replay the previous canonical's undo entry to revert base to its pre-`ordinal` state.
+                                // This plugs the "Base may still hold rejected writes" leak: prior versions of this code path
+                                // dropped pending but left the prior fold's writes in base, contaminating subsequent reads at
+                                // `parentTip=canonical` (overlay walks pending→empty→base, sees the rejected bytes).
+                                undoApplied <- poll(applyUndoAt(ordinal.value.value, ordinal))
+                                _ <- if (undoApplied) Async[F].unit else undoGap.raiseError[F, Unit]
+                                _ <- cleanup
+                                _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                                _ <-
+                                  if (droppedCount > 0)
+                                    logger.warn(
+                                      s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                        s"new=${canonical.value} — canonical NOT in pending; dropped $droppedCount " +
+                                        s"orphan fork branch(es) from pendingRef + reset lastCommittedBranchRef. " +
+                                        s"Undo applied=$undoApplied (base reverted to pre-ord state). " +
+                                        s"Caller still needs to resync base via syncFromGlobalSnapshotInfo to apply " +
+                                        s"the new canonical's deltas."
+                                    )
+                                  else
+                                    logger.info(
+                                      s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                        s"new=${canonical.value} (pending already empty, no fold needed). " +
+                                        s"Undo applied=$undoApplied."
+                                    )
+                              } yield
+                                if (droppedCount > 0) FinalizationOutcome.Folded(0, droppedCount): FinalizationOutcome
+                                else FinalizationOutcome.NoOp: FinalizationOutcome
+                            }
+                          case Some(_) =>
+                            val merged = mergedChain(canonical, pending)
+                            val retainedDescendants = strictDescendantsOf(canonical, pending)
+                            val canonicalAncestors = walkAncestorsInPending(canonical, pending).intersect(pending.keySet)
+                            val droppedCount =
+                              (pending.keySet -- canonicalAncestors -- retainedDescendants.keySet).size
+                            Async[F].uncancelable { poll =>
+                              for {
+                                // Track-3 S4: prior canonical's writes just reverted from base — drop the stale eta walk cache
+                                // before the coordinated replacement so a hook failure cannot split old/new base state. A later transaction
+                                // failure only causes harmless cache re-derivation.
+                                _ <- onBaseRevert
+                                // Undo the old canonical and apply the new canonical under ONE producer savepoint/commit. The new undo record is
+                                // published before this cancelable boundary returns, so an error cannot expose a pre-ordinal half-state.
+                                undoApplied <- poll(replaceFinalizedBase(merged, ordinal, prev, canonical))
+                                _ <- pendingRef.set(retainedDescendants)
+                                _ <- lastCommittedBranchRef.update(_.filter(retainedDescendants.contains))
+                                _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                                _ <- logger.info(
+                                  s"[MptOverlay] Reorg-replace finality at ordinal=$ordinal: prev=${prev.value} " +
+                                    s"new=${canonical.value} keysApplied=${merged.size} branchesDropped=$droppedCount " +
+                                    s"descendantsRetained=${retainedDescendants.size} " +
+                                    s"undoApplied=$undoApplied"
+                                )
+                              } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                            }
+                        }
+                      }
+                    case None =>
+                      pendingRef.get.flatMap { pending =>
+                        pending.get(canonical) match {
+                          case None =>
+                            // Branch never registered with the overlay. Record the finalization (so future calls at
+                            // this ordinal are conflict-checked) but there is nothing to apply.
+                            finalizedRef
+                              .update(_.updated(ordinal, canonical))
+                              .as(FinalizationOutcome.NoOp: FinalizationOutcome)
+                          case Some(_) =>
+                            val merged = mergedChain(canonical, pending)
+                            val retainedDescendants = strictDescendantsOf(canonical, pending)
+                            val canonicalAncestors = walkAncestorsInPending(canonical, pending).intersect(pending.keySet)
+                            val droppedCount =
+                              (pending.keySet -- canonicalAncestors -- retainedDescendants.keySet).size
+                            Async[F].uncancelable { poll =>
+                              for {
+                                _ <- poll(foldIntoBase(merged, ordinal))
+                                _ <- pendingRef.set(retainedDescendants)
+                                _ <- lastCommittedBranchRef.update(_.filter(retainedDescendants.contains))
+                                _ <- finalizedRef.update(_.updated(ordinal, canonical))
+                                _ <- logger.info(
+                                  s"[MptOverlay] Finalized branch=${canonical.value} at ordinal=$ordinal: " +
+                                    s"keysApplied=${merged.size} branchesDropped=$droppedCount " +
+                                    s"descendantsRetained=${retainedDescendants.size}"
+                                )
+                              } yield FinalizationOutcome.Folded(merged.size, droppedCount)
+                            }
+                        }
+                      }
+                  }
+                }
+            }
         }
 
       def pruneBelow(ord: SnapshotOrdinal): F[Unit] =
@@ -1551,6 +1664,88 @@ object MptOverlay {
             }
       }
 
+    private def validateExactParentLineage(
+      base: GlobalSnapshotStateRef,
+      requested: GlobalSnapshotStateRef,
+      pending: Map[BranchId, BranchEntry]
+    ): Either[ParentStateError, Unit] = {
+      import ParentStateError._
+      import ParentStateUnavailableReason._
+
+      def validateIdentity(state: GlobalSnapshotStateRef): Either[ParentStateError, Unit] =
+        if (
+          state.hash == Hash.empty ||
+          state.mptRoot.value == Hash.empty ||
+          (state.ordinal != SnapshotOrdinal.MinValue && state.parentHash == Hash.empty) ||
+          !SnapshotStateIdentityValidation.isCanonical(state.hash) ||
+          !SnapshotStateIdentityValidation.isCanonical(state.parentHash) ||
+          !SnapshotStateIdentityValidation.isCanonical(state.mptRoot.value)
+        )
+          Left(ReservedBaseSentinel(state))
+        else Right(())
+
+      @tailrec
+      def walk(
+        current: BranchId,
+        expectedOrdinal: SnapshotOrdinal,
+        visited: Set[BranchId],
+        path: Vector[BranchId]
+      ): Either[ParentStateError, Unit] =
+        if (visited.contains(current))
+          Left(AncestryCycle(requested, current, path :+ current))
+        else
+          pending.get(current) match {
+            case None =>
+              Left(ParentStateUnavailable(requested, current, MissingAncestorOf(requested)))
+            case Some(entry) if entry.ordinal =!= expectedOrdinal =>
+              Left(BranchOrdinalMismatch(requested, current, expectedOrdinal, entry.ordinal))
+            case Some(entry) =>
+              val observedParent = entry.parent
+              if (current == BranchId(requested.hash) && observedParent != BranchId(requested.parentHash))
+                Left(BranchParentMismatch(requested, current, BranchId(requested.parentHash), observedParent))
+              else if (observedParent == BranchId(base.hash)) {
+                val expectedChildOrdinal = BigInt(base.ordinal.value.value) + 1
+                if (BigInt(entry.ordinal.value.value) == expectedChildOrdinal) Right(())
+                else
+                  Left(
+                    BranchOrdinalMismatch(
+                      requested,
+                      current,
+                      SnapshotOrdinal.unsafeApply(expectedChildOrdinal.toLong),
+                      entry.ordinal
+                    )
+                  )
+              } else {
+                val expectedParentOrdinal = BigInt(entry.ordinal.value.value) - 1
+                if (expectedParentOrdinal < 0)
+                  Left(ParentStateUnavailable(requested, observedParent, MissingAncestorOf(requested)))
+                else
+                  walk(
+                    observedParent,
+                    SnapshotOrdinal.unsafeApply(expectedParentOrdinal.toLong),
+                    visited + current,
+                    path :+ current
+                  )
+              }
+          }
+
+      validateIdentity(base).flatMap { _ =>
+        Either.cond(!pending.contains(BranchId(base.hash)), (), PendingBaseBranchCollision(base)).flatMap { _ =>
+          validateIdentity(requested).flatMap { _ =>
+            if (requested.hash == base.hash)
+              Either.cond(requested == base, (), ParentStateMismatch(requested, base))
+            else
+              walk(
+                BranchId(requested.hash),
+                requested.ordinal,
+                Set.empty,
+                Vector.empty
+              )
+          }
+        }
+      }
+    }
+
     /** Walk the chain leaf→root merging `ChangeSet`s in chronological order. At each level, `entry.changes.merge(acc)` ensures the parent's
       * changes are applied first (older), then the accumulated child-side delta on top (newer). Pure recursion.
       */
@@ -1565,15 +1760,31 @@ object MptOverlay {
         case Some(entry) => mergedChain(entry.parent, pending, entry.changes.merge(acc))
       }
 
-    /** Number of branches in `pending` that are on the chain from `branch` to base (inclusive). Used by `finalizeBranch` to compute
-      * `branchesDropped = pending.size - ancestors`.
+    /** Retain only strict descendants whose complete pending ancestry reaches `canonical`.
+      *
+      * Once `canonical` is folded into the persisted base, its own entry and every ancestor are redundant. A direct child intentionally
+      * keeps `parent = canonical`: the now-absent parent entry is the exact base boundary. Sibling tines and branches whose ancestry is
+      * missing or cyclic are not state-reconstructible from the new base and are dropped.
       */
-    @tailrec
-    private def countAncestors(branch: BranchId, pending: Map[BranchId, BranchEntry], acc: Int = 0): Int =
-      pending.get(branch) match {
-        case None        => acc
-        case Some(entry) => countAncestors(entry.parent, pending, acc + 1)
+    private def strictDescendantsOf(
+      canonical: BranchId,
+      pending: Map[BranchId, BranchEntry]
+    ): Map[BranchId, BranchEntry] = {
+      @tailrec
+      def reachesCanonical(current: BranchId, visited: Set[BranchId]): Boolean =
+        if (current == canonical) true
+        else if (visited.contains(current)) false
+        else
+          pending.get(current) match {
+            case None        => false
+            case Some(entry) => reachesCanonical(entry.parent, visited + current)
+          }
+
+      pending.filter {
+        case (branch, entry) =>
+          branch != canonical && reachesCanonical(entry.parent, Set(branch))
       }
+    }
 
     /** Set of `BranchId`s on the chain from `branch` to base (inclusive of `branch` itself). Used by eviction (#56.9) to identify branches
       * that must NOT be dropped because they are ancestors of the canonical tip — finality walk-back depends on them being present.

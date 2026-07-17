@@ -109,9 +109,13 @@ The suite pins these current unsafe behaviors as RED evidence:
 - delegated-stake and node-collateral create requests bind an already-funded
   `tokenLockRef`; their acceptance managers do not debit the balance or consume
   their request `fee` field again. Withdrawal requests update backing records,
-  not spendable balances. Delegated-stake expiry later generates a canonical
-  `TokenUnlock`; node-collateral expiry currently has no analogous release path,
-  so `ECO-NODE-COLLATERAL-RELEASE` is explicitly `MissingFailClosed`;
+  not spendable balances. Delegated-stake expiry generates a canonical
+  `TokenUnlock`; the current worktree now does the same for matured node
+  collateral. It removes the pending collateral and backing lock, credits the
+  exact principal once, removes the expiry bucket, and produces no following
+  credit (`TokenLockStateManager.scala:842-930`;
+  `NodeCollateralWithdrawalExpiryRootParitySuite.scala:60-257`). This focused
+  closure does not repair slash conservation;
 - an absent pricing allowlist authorizes every metagraph;
 - total supply is not a rooted field or writable accumulator. The API derives it
   from balances, active token locks, and delegated-stake rewards. Manifest rows
@@ -123,18 +127,26 @@ The suite pins these current unsafe behaviors as RED evidence:
   stake slash also removes the record's accumulated rewards, which the derived
   supply calculation counts, so the current effect union contains both the
   bounty `Mint` and that reward `Burn`. Neither effect makes the claimed
-  principal burn real;
+  principal burn real. The fold also sees only active records. A same/prior-round
+  withdrawal moves the guilty record to pending before adjudication, so the
+  slash can publish cooldown/evidence with zero principal debit and maturity
+  later refunds the full lock (`DelegatedRewardsDistributor.scala:168-180,219-255`;
+  `NodeCollateralStateManager.scala:218-251`;
+  `GlobalSnapshotAcceptanceManager.scala:2673-2713`;
+  `TokenLockStateManager.scala:694-711,870-918`);
 - current GL0 wiring supplies no deterministic currency-reward implementation.
   Re-execution substitutes an empty reward set, so exact artifact comparison
   rejects a non-empty metagraph reward claim. `ECO-REWARD-CURRENCY` is
   `MissingFailClosed`, not active;
-- the L0 genesis loader signs arbitrary delegated-stake and node-collateral
-  fixture events and installs them as active records while token-lock state is
-  empty; a one-unit address stipend is not backing for the event amount. The
-  delegated-stake fixture also installs arbitrary accumulated rewards counted by
-  derived supply, so its genesis-only row records a `Mint`. The two genesis-only
-  backing operations are separate unsafe rows and are excluded from ordinary
-  incremental/event carrier sets;
+- current greenfield genesis public input carries a signed stake/collateral event
+  plus exact signed native indefinite backing lock, requires the same owner
+  signer, zero fee/reward, exact amount/ref/ordinal, and installs the active lock
+  with the record (`domain/genesis/types.scala:129-154`;
+  `L0GenesisLoader.scala:81-179,185-280`). Generated owner secrets are
+  separate owner-only files. Historical git objects nevertheless expose complete
+  fixture PKCS8 keys at
+  `cdec63f1c:test-vectors/genesis/3-node-minimal.json:19,35,51`; every such owner
+  is permanently compromised and unusable (ECO-29);
 - standalone opaque state-channel binaries are retained only before fee
   activation or while fees are waived. Once fees are required the processor has
   no authenticated opaque fee-payer lane and drops/stops the opaque chain, so a
@@ -402,8 +414,8 @@ replay, source/sink, or state transition differs.
 | Protocol balance correction | V4 `BalanceAdjustment` at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:58-72`; v4 application at `v4.0.0@22953a1e:modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/currency/CurrencySnapshotAcceptanceManager.scala:490-515` | Preserve the capability, not the upward ML0 authority. The target is a separately typed, root-covered GL0 protocol correction under locked decision L-18 and O-06's deferred engineering schema gate; no owner answer remains pending. |
 | Node parameter update | `v4.0.0@22953a1e:modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotEvent.scala:33-34`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/node.scala:162-181` | Changes reward fraction and requires source, reference, replay, and activation rules. |
 | Delegated stake create/withdraw/release | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/delegatedStake.scala:80-100` | Create and withdrawal requests mutate records backed by a pre-funded token lock; they do not debit or refund principal. Deterministic withdrawal expiry separately generates the `TokenUnlock` that releases the lock. |
-| Node collateral create/withdraw/missing release | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:67-87` | Create and withdrawal requests mutate collateral records backed by a pre-funded token lock. The current expiry path drops pending withdrawals but does not generate the analogous token unlock, so release is a named missing operation rather than a false request-side balance credit. |
-| Genesis stake and collateral backing | Current loader at `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/genesis/L0GenesisLoader.scala:167-235`; fixture balances at `modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/genesis/types.scala:189-221` | Genesis installs active stake/collateral records independently of empty token-lock state. These genesis-only operations cannot be conflated with runtime creates that validate a pre-funded lock. |
+| Node collateral create/withdraw/release | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/nodeCollateral.scala:67-87`; current maturity fold `TokenLockStateManager.scala:842-930`; `GlobalSnapshotAcceptanceManager.scala:1968-2017` | Create and withdrawal requests mutate records backed by a pre-funded token lock. Maturity is a separate deterministic transition that now removes the pending record and lock and credits the exact principal once. Slash-vs-pending ordering remains a separate critical row under ECO-06. |
+| Genesis stake and collateral backing | current public bundles `domain/genesis/types.scala:129-154`; validation/installation `L0GenesisLoader.scala:81-179,185-280`; allocation `domain/genesis/types.scala:183-219` | Greenfield genesis installs only owner-signed events with exact signed native indefinite backing locks and zero rewards. The public file contains no owner secret. Historical private-key-bearing fixtures remain permanently compromised under ECO-29 and cannot be imported or reused. This is not the future upstream-v4 snapshot importer. |
 | Reward subtypes | Base value at `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/transaction.scala:144-152` | Operator, delegator, reserved-address, withdrawal, and configured one-time rewards need named mint source, cap, and order. Current GL0 wiring rejects non-empty currency rewards because no deterministic implementation is registered, so retained wire syntax is not current activation. |
 | Currency owner/staking messages | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/currencyMessage.scala:23-32,60-73,87-97` | They select fee and staking addresses, so signature, sequence, and activation are economically relevant. |
 | Global sync and delivery acknowledgement | `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/currency/schema/globalSnapshotSync.scala:27-42,52-74`; `v4.0.0@22953a1e:modules/shared/src/main/scala/io/constellationnetwork/schema/artifact.scala:74-98` | Exact hash-bound cursor, application acknowledgement, and permanent replay state must not be collapsed to bounded history. |
@@ -494,13 +506,14 @@ reference interpreter and production kernel.
 | `ECON-F-004 exact-snapshot-fee-and-sink` | A subsequent incremental accepts only the exact deterministic fee under the target rule. The current minimum-only overcharge and debit-without-recipient behavior stays RED until the fee sink and supply equation are ratified. |
 | `ECON-F-004A first-incremental-no-debit` | Full/genesis and first-incremental fee claims take their explicitly classified no-debit path. They cannot be mistaken for a paid fee or satisfy a conservation assertion that assumes the subsequent-incremental debit. |
 | `ECON-F-005 fee-source-sink` | For every fee-bearing operation, the oracle names the debited source, credited recipient, and supply delta. Current debit-only transaction, allow-spend, and token-lock fees are burn/unaccounted sinks; a `FeeTransfer` classification requires a matching destination credit. |
-| `ECON-F-006 pre-funded-backing-no-double-debit` | Delegated-stake and node-collateral create/withdraw requests bind the canonical pre-funded token lock and perform no second principal/fee debit or immediate refund. Delegated expiry releases exactly that lock once. |
-| `ECON-COLLATERAL-RELEASE-001` | An expired node-collateral withdrawal must generate and apply the canonical token-lock release exactly once. Until that path exists, the release operation remains `MissingFailClosed` and the request path cannot claim a balance credit. |
-| `ECON-SUPPLY-001 derived-supply-and-slash` | Every accepted transition preserves the explicit equation over balances, active token locks, and delegated-stake rewards. A slash cannot reduce only a backing record, retain the backing lock, log a fictitious burn, and mint a bounty balance. |
+| `ECON-F-006 pre-funded-backing-no-double-debit` | Delegated-stake and node-collateral create/withdraw requests bind the canonical pre-funded token lock and perform no second principal/fee debit or immediate refund. Active and pending records retain one unique live native indefinite covering lock until the terminal transition. |
+| `ECON-COLLATERAL-RELEASE-001` | **Focused worktree GREEN:** an expired node-collateral withdrawal generates and applies the canonical token-lock release exactly once, removes pending/lock/expiry state, and the next ordinal cannot credit again (`NodeCollateralWithdrawalExpiryRootParitySuite.scala:60-257`). Preserve restart/reorg and slash interaction coverage before broad closure. |
+| `ECON-SUPPLY-001 derived-supply-and-slash` | Every accepted transition preserves the explicit equation over balances, active token locks, and delegated-stake rewards. A slash cannot reduce only an active backing record, retain the backing lock, log a fictitious burn, and mint a bounty balance. It must also slash/debit pending encumbrances so withdrawal before adjudication cannot produce zero debit followed by full maturity refund. |
 | `ECON-REWARD-CURRENCY-001 deterministic-registration` | A non-empty currency reward set rejects while no deterministic active-era reward implementation is registered. Once registered, every execution signer recreates the exact reward set and GL0 adoption verifies the same diff/root. |
 | `ECON-OPAQUE-FEE-001 fee-era-carriage` | Fee activation cannot silently drop a previously supported opaque chain. Either a separately authenticated fee-payer mechanism accepts it as carriage-only or the fee-era lane remains explicitly unavailable. |
 | `ECON-OPAQUE-SHARD-001 sharded-carriage` | `numShards > 1` cannot route every state-channel binary into framework-currency replay. The explicit signed opaque/data-only lane must retain authenticated ordering/custody/availability without a currency root and without acquiring framework authority. Until that lane exists, sharded opaque carriage remains explicitly unavailable. |
-| `ECON-GENESIS-BACKING-001` | Every genesis stake/collateral amount is backed by an exact genesis token lock or an explicit genesis issuance/conservation rule. An arbitrary fixture event plus one-unit signer stipend cannot create unbacked eligibility weight. |
+| `ECON-GENESIS-BACKING-001` | **Focused greenfield worktree GREEN:** every public genesis stake/collateral record contains an owner-signed event and exact same-owner signed native indefinite backing lock; loader and first-live root install both atomically. Public JSON contains no owner secret. This does not implement upstream-v4 migration. |
+| `GENESIS-SECRET-001` | Every tracked public fixture and generated public JSON contains no private/secret field or EC PKCS8 material. Every owner key ever exposed in repository history is permanently denied from deployment/import; deleting or rewriting history is not revocation. |
 | `ECON-CORRECTION-001 trust-direction` | ML0/CL1/DL1 attempts to construct a correction reject. The active-era GL0 protocol rule applies the same root-covered correction on every GL0 node and downstream nodes rebase from the exact containing Phase-2 hash. |
 | `V4-GRAMMAR-PARITY-*` | Golden v4 fixtures for every retained operation reproduce intended valid functionality. Fixtures that encode upstream authorization, inflation, replay, or ordering defects must reject under a named new rule rather than silently disappear. |
 | `V4-GRAMMAR-UNSUPPORTED-001` | Every v4/fork economic constructor absent from the frozen grammar fails closed before diff construction or signing. |
@@ -532,11 +545,16 @@ the final root.
 5. The live DL1 shared-artifact injection, unsigned manual unlock, no-reference
    metagraph spend, bounded global-processing acknowledgement, replayable data
    fee, debit-only fee sinks, overchargeable/unaccounted state-channel fee sink,
-   first-incremental no-debit fee branch, missing node-collateral release,
-   optional-empty pricing allowlist, disabled currency rewards, fee-era opaque
-   rejection, unbacked genesis stake/collateral, derived-supply accounting, and
-   inflationary slash-conservation gates remain open defects. The tripwire
-   prevents silent drift; it does not repair them.
+   first-incremental no-debit fee branch, optional-empty pricing allowlist,
+   disabled currency rewards, fee-era opaque rejection, derived-supply
+   accounting, and inflationary slash-conservation gates remain open defects.
+   Slash conservation includes the active-only fold: withdrawal can move guilty
+   principal to pending before adjudication and later obtain full maturity
+   refund. Node-collateral exact-once maturity and greenfield signed genesis
+   backing are focused current-worktree closures, not evidence that the broader
+   grammar/oracle is complete. Historical genesis owner secrets remain
+   permanently compromised under ECO-29. The tripwire prevents silent drift; it
+   does not repair the remaining operations.
 6. `PricingUpdate` exists and mutates v4 consensus state. Current source treats
    an absent allowlist as permission for every metagraph; the intended rooted
    active-era allowlist and activation policy remain open.

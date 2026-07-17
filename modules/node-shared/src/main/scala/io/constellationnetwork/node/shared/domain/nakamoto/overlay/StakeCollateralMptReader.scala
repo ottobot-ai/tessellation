@@ -223,6 +223,17 @@ object StakeCollateralMptReader {
       _.event.value
     )
 
+  def materializeDelegatedStakeWithdrawalsFromRaw[F[_]: Async: Hasher](
+    entries: List[StrictMptRawEntry]
+  ): F[DelegatedStakeWithdrawals] =
+    materializeRawEntries(
+      entries,
+      GlobalStateFieldId.DelegatedStakesWithdrawals,
+      "materialize DelegatedStakesWithdrawals",
+      _.event.value.source,
+      _.event.value
+    )
+
   def readActiveNodeCollaterals[F[_]: Async: Hasher](
     reader: GlobalStateReader[F],
     address: Address
@@ -272,6 +283,17 @@ object StakeCollateralMptReader {
   def materializeNodeCollateralWithdrawals[F[_]: Async: Hasher](reader: GlobalStateReader[F]): F[NodeCollateralWithdrawals] =
     materialize(
       reader,
+      GlobalStateFieldId.NodeCollateralWithdrawals,
+      "materialize NodeCollateralWithdrawals",
+      _.event.value.source,
+      _.event.value
+    )
+
+  def materializeNodeCollateralWithdrawalsFromRaw[F[_]: Async: Hasher](
+    entries: List[StrictMptRawEntry]
+  ): F[NodeCollateralWithdrawals] =
+    materializeRawEntries(
+      entries,
       GlobalStateFieldId.NodeCollateralWithdrawals,
       "materialize NodeCollateralWithdrawals",
       _.event.value.source,

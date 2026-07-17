@@ -92,6 +92,25 @@ case class ReplacementTargetExpired(unlockEpoch: EpochProgress, currentEpochProg
     extends ReplacementTokenLockRejectionReason
 
 @derive(eqv, show)
+case object CollateralBackingReplacementRejected extends ReplacementTokenLockRejectionReason
+
+@derive(eqv, show)
+case object PendingBackingReplacementRejected extends ReplacementTokenLockRejectionReason
+
+@derive(eqv, show)
+case class SlashedDelegatedBackingReplacementUnsupported(effectiveAmount: Long, backingAmount: Long)
+    extends ReplacementTokenLockRejectionReason
+
+@derive(eqv, show)
+case object BackingReplacementMustBeIndefinite extends ReplacementTokenLockRejectionReason
+
+@derive(eqv, show)
+case class BackingReplacementSourceMismatch(expectedSource: Address, actualSource: Address) extends ReplacementTokenLockRejectionReason
+
+@derive(eqv, show)
+case class BackingReplacementAmountShortfall(required: Long, actual: Long) extends ReplacementTokenLockRejectionReason
+
+@derive(eqv, show)
 sealed trait TokenLockAwaitReason
 
 @derive(eqv, show)

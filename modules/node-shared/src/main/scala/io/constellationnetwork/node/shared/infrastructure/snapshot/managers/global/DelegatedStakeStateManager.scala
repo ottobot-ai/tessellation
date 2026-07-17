@@ -5,6 +5,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ActiveTokenLockMptReader, GlobalStateReader, StakeCollateralMptReader}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake._
@@ -74,21 +75,15 @@ object DelegatedStakeStateManager {
         existingDelegatedStakes <- materializeActiveDelegatedStakesFromMpt
         existingWithdrawals <- materializeDelegatedStakeWithdrawalsFromMpt
 
-        hashedReplacementTokenLocks <- acceptedTokenLocks.filter(_.replaceTokenLockRef.isDefined).traverse(_.toHashed)
-        replacementTokenLocks = hashedReplacementTokenLocks.mapFilter(tl => tl.replaceTokenLockRef.tupleRight(tl)).toMap
+        replacementStartingRefs =
+          existingDelegatedStakes.valuesIterator.flatten.map(_.tokenLockRef).toList
+        replacementTokenLocks <- StakeBackingValidator.terminalReplacements(
+          acceptedTokenLocks,
+          replacementStartingRefs
+        )
 
-        // Build a map of active token locks by reference for checking if token locks are still active.
-        // Scoped to the addresses that own withdrawals — the only consumers of `activeTokenLocksByRef`
-        // (lines below) iterate `existingWithdrawals` / `expiredWithdrawals` whose keys ARE the
-        // staker addresses, and a token lock's source equals the staker. Reading from MPT here
-        // (instead of `lastSnapshotContext.activeTokenLocks`) is part of #11 — drop GSI materialization.
-        activeTokenLocksByRef <- existingWithdrawals.keySet.toList.flatTraverse { addr =>
-          ActiveTokenLockMptReader.readNative(reader, addr).flatMap {
-            case Some(locks) => locks.toList.traverse(_.toHashed)
-            case None        => List.empty[Hashed[TokenLock]].pure[F]
-          }
-        }.map(_.map(hashed => hashed.hash -> hashed).toMap)
-
+        // Resolve to the terminal same-ordinal replacement. Stopping at an intermediate A in L -> A -> B
+        // leaves counted stake bound to a lock that the token-lock transition removes in the same snapshot.
         updatedExistingDelegatedStakes = existingDelegatedStakes.view
           .mapValues(_.map { record =>
             replacementTokenLocks.get(record.tokenLockRef).fold(record) { hashedTokenLock =>
@@ -100,21 +95,7 @@ object DelegatedStakeStateManager {
           })
           .toSortedMap
 
-        updatedExistingWithdrawals = existingWithdrawals.view
-          .mapValues(_.map { record =>
-            replacementTokenLocks
-              .get(record.tokenLockRef)
-              .filter(_ => activeTokenLocksByRef.contains(record.tokenLockRef))
-              .fold(record) { hashedTokenLock =>
-                record.copy(
-                  currentTokenLockRef = hashedTokenLock.hash.some,
-                  currentAmount = DelegatedStakeAmount.fromTokenLockAmount(hashedTokenLock.amount).some
-                )
-              }
-          })
-          .toSortedMap
-
-        unexpiredWithdrawals = updatedExistingWithdrawals.map {
+        unexpiredWithdrawals = existingWithdrawals.map {
           case (address, withdrawals) =>
             address -> withdrawals.filterNot {
               case PendingDelegatedStakeWithdrawal(_, _, _, withdrawalEpoch, _, _) =>
@@ -122,13 +103,23 @@ object DelegatedStakeStateManager {
             }
         }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
 
-        expiredWithdrawals = updatedExistingWithdrawals.map {
+        expiredWithdrawals = existingWithdrawals.map {
           case (address, withdrawals) =>
             address -> withdrawals.filter {
               case PendingDelegatedStakeWithdrawal(_, _, _, withdrawalEpoch, _, _) =>
                 isWithdrawalExpired(withdrawalEpoch)
             }
         }.filter { case (_, withdrawalList) => withdrawalList.nonEmpty }
+
+        // Maturity may release principal only while the exact encumbering lock is still active.
+        // Point-read only addresses with matured withdrawals; a missing lock holds the withdrawal
+        // pending instead of dropping the record without recovering principal.
+        activeTokenLocksByRef <- expiredWithdrawals.keySet.toList.flatTraverse { addr =>
+          ActiveTokenLockMptReader.readNative(reader, addr).flatMap {
+            case Some(locks) => locks.toList.traverse(_.toHashed)
+            case None        => List.empty[Hashed[TokenLock]].pure[F]
+          }
+        }.map(_.map(hashed => hashed.hash -> hashed).toMap)
 
         // Keep expired withdrawals in pending state if their token lock is no longer active
         finalUnexpiredWithdrawals = unexpiredWithdrawals |+| expiredWithdrawals.map {

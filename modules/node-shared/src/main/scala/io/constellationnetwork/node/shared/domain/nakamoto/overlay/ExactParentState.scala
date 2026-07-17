@@ -3,7 +3,8 @@ package io.constellationnetwork.node.shared.domain.nakamoto.overlay
 import scala.annotation.tailrec
 import scala.util.control.NoStackTrace
 
-import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
+import io.constellationnetwork.schema.SnapshotOrdinal
+import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GlobalSnapshotStateRef}
 import io.constellationnetwork.security.hash.Hash
 
 private[overlay] object SnapshotStateIdentityValidation {
@@ -57,6 +58,9 @@ object ParentStateError {
   final case class PendingBaseCollision(base: GlobalSnapshotStateRef, stored: GlobalSnapshotStateRef)
       extends ParentStateError(s"Pending branch map shadows supplied base ${base.hash.value}: $stored")
 
+  final case class PendingBaseBranchCollision(base: GlobalSnapshotStateRef)
+      extends ParentStateError(s"Pending branch map shadows supplied base ${base.hash.value}")
+
   final case class ParentStateUnavailable(
     requestedParent: GlobalSnapshotStateRef,
     missingAncestor: BranchId,
@@ -68,6 +72,55 @@ object ParentStateError {
   final case class ParentStateMismatch(requested: GlobalSnapshotStateRef, stored: GlobalSnapshotStateRef)
       extends ParentStateError(
         s"Exact parent identity mismatch for ${requested.hash.value}: requested=$requested stored=$stored"
+      )
+
+  final case class BranchOrdinalMismatch(
+    requestedParent: GlobalSnapshotStateRef,
+    branch: BranchId,
+    expected: SnapshotOrdinal,
+    observed: SnapshotOrdinal
+  ) extends ParentStateError(
+        s"Exact parent branch ${branch.value.value} has ordinal ${observed.value.value}, expected ${expected.value.value} " +
+          s"while resolving ${requestedParent.hash.value}"
+      )
+
+  final case class BranchParentMismatch(
+    requestedParent: GlobalSnapshotStateRef,
+    branch: BranchId,
+    expected: BranchId,
+    observed: BranchId
+  ) extends ParentStateError(
+        s"Exact parent branch ${branch.value.value} links to ${observed.value.value}, expected ${expected.value.value} " +
+          s"while resolving ${requestedParent.hash.value}"
+      )
+
+  final case class ParentStateRootMismatch(state: GlobalSnapshotStateRef, observed: Hash)
+      extends ParentStateError(
+        s"Exact parent state root mismatch for ${state.hash.value}: " +
+          s"expected=${state.mptRoot.value.value} observed=${observed.value}"
+      )
+
+  final case class MalformedCapturedStateValue(state: GlobalSnapshotStateRef, key: io.constellationnetwork.security.hex.Hex)
+      extends ParentStateError(
+        s"Exact parent state ${state.hash.value} contains a null value at physical key ${key.value}"
+      )
+
+  final case class HistoricalStakeUnavailable(parent: GlobalSnapshotStateRef, period: EtaPeriod)
+      extends ParentStateError(
+        s"Historical stake period ${period.value} is unavailable in exact parent ${parent.hash.value}"
+      )
+
+  final case class InvalidEtaRotationSnapshots(value: Long)
+      extends ParentStateError(s"Exact-parent historical stake lookup requires a positive eta rotation length, got $value")
+
+  final case class HistoricalStakeWriteOrdinalOverflow(period: EtaPeriod, etaRotationSnapshots: Long)
+      extends ParentStateError(
+        s"Historical stake write ordinal overflows for period=${period.value}, etaRotationSnapshots=$etaRotationSnapshots"
+      )
+
+  final case class FinalizedBaseUnavailable(parent: GlobalSnapshotStateRef)
+      extends ParentStateError(
+        s"Exact finalized MPT base is unavailable while resolving parent ${parent.hash.value}"
       )
 
   final case class OrdinalDiscontinuity(parent: GlobalSnapshotStateRef, child: GlobalSnapshotStateRef)
@@ -128,7 +181,13 @@ object ExactParentResolver {
     }
 
   private def validateStateIdentity(state: GlobalSnapshotStateRef): Either[ParentStateError, Unit] =
-    if (!SnapshotStateIdentityValidation.isCanonical(state.hash))
+    if (state.hash == Hash.empty)
+      Left(ReservedBaseSentinel(state))
+    else if (state.mptRoot.value == Hash.empty)
+      Left(ReservedBaseSentinel(state))
+    else if (state.ordinal != SnapshotOrdinal.MinValue && state.parentHash == Hash.empty)
+      Left(ReservedBaseSentinel(state))
+    else if (!SnapshotStateIdentityValidation.isCanonical(state.hash))
       Left(NonCanonicalStateIdentity(state, "snapshot hash", state.hash))
     else if (!SnapshotStateIdentityValidation.isCanonical(state.parentHash))
       Left(NonCanonicalStateIdentity(state, "parent hash", state.parentHash))

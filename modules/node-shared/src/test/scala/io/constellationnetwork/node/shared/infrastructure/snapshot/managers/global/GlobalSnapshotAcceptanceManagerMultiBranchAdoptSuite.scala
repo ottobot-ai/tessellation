@@ -524,7 +524,8 @@ object GlobalSnapshotAcceptanceManagerMultiBranchAdoptSuite extends MutableIOSui
           parentStateReader: GlobalStateReader[IO],
           epochProgress: EpochProgress,
           ordinal: SnapshotOrdinal,
-          delegatedStakeAcceptanceResult: io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
+          delegatedStakeAcceptanceResult: io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult,
+          acceptedTokenLocks: List[Signed[TokenLock]]
         ): IO[UpdateNodeCollateralAcceptanceResult] =
           UpdateNodeCollateralAcceptanceResult(SortedMap.empty, List.empty, SortedMap.empty, List.empty).pure[IO]
       }

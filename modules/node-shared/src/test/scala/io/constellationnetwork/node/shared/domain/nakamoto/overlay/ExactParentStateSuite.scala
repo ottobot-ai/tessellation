@@ -108,10 +108,26 @@ object ExactParentStateSuite extends SimpleIOSuite {
 
   pureTest("Hash.empty and non-canonical identities reject at the structural boundary") {
     val reserved = base.copy(hash = Hash.empty)
+    val emptyRoot = base.copy(mptRoot = MptRoot(Hash.empty))
+    val emptyNonGenesisParent = state(11L, 11, 10).copy(parentHash = Hash.empty)
     val badBase = base.copy(hash = Hash("not-a-hash"))
     val badRequested = state(11L, 11, 10).copy(parentHash = Hash("ABC"))
 
     expect(ExactParentResolver.resolve(reserved, Map.empty, reserved, limit).left.toOption.contains(ReservedBaseSentinel(reserved)))
+      .and(
+        expect(
+          ExactParentResolver.resolve(emptyRoot, Map.empty, emptyRoot, limit).left.toOption.contains(ReservedBaseSentinel(emptyRoot))
+        )
+      )
+      .and(
+        expect(
+          ExactParentResolver
+            .resolve(base, Map.empty, emptyNonGenesisParent, limit)
+            .left
+            .toOption
+            .contains(ReservedBaseSentinel(emptyNonGenesisParent))
+        )
+      )
       .and(
         expect(
           ExactParentResolver
@@ -128,6 +144,12 @@ object ExactParentStateSuite extends SimpleIOSuite {
             .exists(_.isInstanceOf[NonCanonicalStateIdentity])
         )
       )
+  }
+
+  pureTest("only a structurally complete genesis state may carry Hash.empty as parent") {
+    val genesis = state(0L, 1, 0)
+
+    expect(ExactParentResolver.resolve(genesis, Map.empty, genesis, limit).exists(_.parent == genesis))
   }
 
   pureTest("Hash.empty cannot be smuggled into an intermediate pending lineage") {

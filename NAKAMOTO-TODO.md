@@ -15,6 +15,13 @@
 >   deleted. The canonical execution-committee byte diff is target protocol, not
 >   stale compatibility state.
 >
+> **Epic-ID namespace warning.** This TODO and `NAKAMOTO-PLAN.md` use E11-E13
+> for exceptional challenge/slashing, downstream rebase, and protocol-level GL0
+> correction. `docs/review/CONSENSUS-ECONOMIC-SECURITY-ROADMAP.md` retains E11-E13
+> for MPT/GSI recovery, transport/bootstrap, and existing-network genesis.
+> Until E0 publishes one reconciled ownership ledger, cite the document and full
+> epic name; a bare E11, E12, or E13 is ambiguous.
+>
 > **Biggest change since 2026-04-05:** the project moved into execution sharding.
 > The producer and every execution-committee signer independently recreate CL1
 > and sign only an exact matching canonical byte diff/root. Ordinary noncommittee
@@ -298,22 +305,31 @@ criteria are in `NAKAMOTO-PLAN.md`.
       the distribution from exact post-transition `baseInfo`, and
       `GsamEtaBoundaryWriteSuite.scala:167-204` proves a closing-ordinal
       delegated create is present in the captured boundary entry.
-      Two concrete ECO-02 subdefects are fixed by `d34d23655` without closing
-      ECO-02. Accepted
-      delegated-stake successors reserve their `(source,effectiveTokenLockRef)`
-      before withdrawals, so a same-snapshot predecessor withdrawal rejects
-      with `ConflictingStakeTransition`; rejected creates reserve nothing
-      (`UpdateDelegatedStakeAcceptanceManager.scala:99-176`). Both downstream
-      materializers fail closed if contradictory accepted successor/withdrawal
-      results bypass that arbitration, and replacement matching uses effective
-      `record.tokenLockRef`, not stale `event.tokenLockRef`
-      (`DelegatedRewardsDistributor.scala:61-95,100-250`;
-      `DelegatedStakeStateManager.scala:92-115`;
-      `UpdateDelegatedStakeAcceptanceManagerSuite.scala:194-334`). The
-      indefinite-to-finite replacement exploit and the missing invariant joining
-      every counted stake/collateral record to one live, indefinite, uniquely
-      bound lock remain open. ECO-02 is CRITICAL/PARTIAL; do not claim backing
-      or conservation closure.
+      **ECO-02 FOCUSED BACKING LIFECYCLE GREEN; OVERALL CRITICAL/PARTIAL.**
+      `StakeBackingValidator` now requires every active or pending delegated-
+      stake/collateral record to bind one unique live native same-source
+      indefinite lock covering its effective amount, captures all five parent
+      partitions atomically, rejects unsafe terminal replacement chains, and
+      revalidates the complete changed post-state
+      (`StakeBackingValidator.scala:26-30,296-396,442-472,510-568`;
+      `GlobalSnapshotAcceptanceManager.scala:2727-2762`). This subsumes the prior
+      same-batch, stale-effective-reference, and indefinite-to-finite reproduced
+      paths. Collateral maturity now removes its pending record and backing lock,
+      credits exact principal once, removes the expiry bucket, and cannot credit
+      again (`TokenLockStateManager.scala:842-930`;
+      `NodeCollateralWithdrawalExpiryRootParitySuite.scala:60-257`).
+      Do not close ECO-02: unchanged malicious/raw-installed images, complete
+      restart/catch-up/bootstrap/reorg coverage, resource bounds/reverse binding
+      index, frozen reference/hash-era behavior, and the full economic oracle are
+      open. ECO-06 slash principal conservation remains independently
+      CRITICAL/OPEN. ECO-30's historical event-isolation halt is fixed in the
+      current worktree: both validators reject opposite-family pending-lock reuse,
+      and accepted-only collateral arbitration rejects both a direct predecessor
+      withdrawal and withdrawal of a non-latest parent-state record whose lock is
+      reused by an accepted create
+      (`UpdateDelegatedStakeValidator.scala:216-237`;
+      `UpdateNodeCollateralValidator.scala:205-227`;
+      `UpdateNodeCollateralAcceptanceManager.scala:74-149,168-200`).
       CONS-10's historical exact-parent reward recreation defect is fixed by
       `d34d23655` for retained parent branches. The former singleton reward
       distributor followed the receiver's ambient best tip; candidates extending
@@ -325,19 +341,25 @@ criteria are in `NAKAMOTO-PLAN.md`.
       MultiBranch producer/follower regression gives ambient sibling B marker 99
       and parent A marker 11 and requires both to reproduce 11
       (`GlobalSnapshotConsensusFunctionsSuite.scala:1349-1423`).
-      Candidate validation remains unsafe: an absent/orphan branch can fall back
-      to the finalized base, and historical stake plus its live fallback still
-      resolve through the receiver's ambient best tip instead of the candidate's
-      exact parent (CONS-08, CRITICAL/OPEN). Unknown/evicted-branch fallback is
+      Candidate validation remains unsafe. A dark exact-parent historical-stake
+      reader now captures one proved lineage, reproduces base/parent roots, and
+      reads field 20 under the historical boundary write ordinal
+      (`HistoricalStakeReader.scala:18-40,60-120,152-161`;
+      `MptOverlay.scala:1052-1072`), but producer and follower eligibility do not
+      use it. The live ambient reader therefore remains authoritative; an
+      absent/orphan branch can still fall back to the finalized base (CONS-08,
+      CRITICAL/OPEN, ACTIVATION NO-GO). Unknown/evicted-branch fallback is
       also the explicit residual for CONS-10 and remains owned by CONS-08/SMT-02;
       the reward fix does not authenticate branch existence.
-      CONS-04's mature-period missing-history fallback also remains open. Keep
+      Field 20 still lacks its period in the value, so removal/rekey across a hash
+      era cannot reproduce the old physical key even though exact reads now use
+      the write ordinal. CONS-04's mature-period missing-history fallback also
+      remains open. Keep
       PERM-005/MPT-03 open for whole-image wrong-network/partition and arbitrary
       raw ingress,
       restart/catch-up/bootstrap/reorg, frozen protocol reference/hash era,
       signatures/reference and withdrawal history, resource bounds, rooted
-      expiry parameters, counted-record-to-live-lock backing, and slash
-      conservation.
+      expiry parameters, full oracle coverage, and slash conservation.
     - **MPT-04 FOCUSED FIELD-8 PARSER GREEN (`1e942fb28`):** one strict reader
       now owns every audited live native-token-lock MPT read and rejects
       malformed/noncanonical bytes, empty or mixed sets, currency-scoped locks,
@@ -806,13 +828,29 @@ criteria are in `NAKAMOTO-PLAN.md`.
 - [ ] **S2 PARTIAL - deterministic framework oracle and kernel**
   - Close authorization, conservation/checked arithmetic, replay, ordering,
     backing, and resource-limit findings for every enabled economic operation.
-  - **ECO-02 remains CRITICAL/PARTIAL:** same-snapshot delegated successor plus
-    predecessor withdrawal and stale `event.tokenLockRef` replacement matching
-    are fixed by `d34d23655`, with acceptance and materializer
-    fail-closed regressions. Still reject or atomically preserve every
-    indefinite-to-finite replacement and prove that every counted delegated
-    stake/collateral record joins one live, indefinite, uniquely bound lock.
-    The focused fixes are not backing or conservation closure.
+  - **ECO-02 remains CRITICAL/PARTIAL:** the focused worktree now enforces the
+    counted/pending-record-to-live-native-indefinite-unique-lock join on every
+    changed ordinary transition and blocks the reproduced finite replacement.
+    Collateral maturity releases principal exactly once. Activation still needs
+    whole-image/raw-install and recovery coverage, bounded reverse lookup,
+    field-20/hash-era rules, and the complete oracle. **ECO-06 remains
+    CRITICAL/OPEN:** slashing sees only active maps. A same/prior-round withdrawal
+    moves guilty principal to pending before adjudication, so the slash can write
+    cooldown with zero debit and maturity later refunds the full lock
+    (`DelegatedRewardsDistributor.scala:168-180,219-255`;
+    `NodeCollateralStateManager.scala:218-251`;
+    `GlobalSnapshotAcceptanceManager.scala:2673-2713`;
+    `TokenLockStateManager.scala:694-711,870-918`). Fail-closed replacement is not
+    conservation. **ECO-30 historical/pre-fix HIGH/FIXED IN WORKTREE:**
+    cross-family pending-lock reuse, direct collateral successor/predecessor
+    withdrawal, and non-latest reused-lock-owner withdrawal now reject as
+    attributable events before materialization; preserve all four focused
+    regressions and the final whole-state defense.
+  - **ECO-29 current tree fixed / history compromised:** public genesis now
+    carries signed event/backing-lock bundles and generated economic secrets are
+    stored separately with owner-only permissions. Historical fixture private
+    keys at `cdec63f1c:test-vectors/genesis/3-node-minimal.json:19,35,51` are
+    permanently compromised and must never be funded, imported, or reused.
   - Differential-check decisions and exact writes after every input prefix.
   - **Landed nonactivating E2.1 slice (2026-07-16):** the test-only reference
     interpreter supports exactly four typed operation IDs: zero-fee native
@@ -1101,6 +1139,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
     Unknown/evicted hashes and incomplete ancestry enter typed recovery; they
     never fall through to base. Finalizing an unknown branch cannot mutate base
     or markers, and finalizing an ancestor retains canonical descendants.
+  - **Current branch worktree is PARTIAL/NO-GO:** known canonical folds retain
+    strict descendants (`MptOverlay.scala:1231-1256,1268-1286,1763-1787`).
+    Unknown first finalization still records an unapplied hash, and an absent
+    same-ordinal replacement still undoes old state, records the replacement,
+    and requires caller resync (`MptOverlay.scala:1171-1230,1259-1267`).
+    Undo/base/markers/descendants/finality sinks have no one durable recovery
+    transaction (`MptOverlay.scala:1580-1617`). Do not activate exact-parent
+    consumers or treat descendant retention as E9-BRANCH closure.
   - **Owner decision locked (L-23):** an exact-parent session captures one
     immutable generation and commits through generation CAS/retry; viable branch
     generations have bounded local retention with authenticated reconstruction or

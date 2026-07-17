@@ -16,15 +16,15 @@ import io.constellationnetwork.schema.mpt.GlobalStateConverter.syntax._
 import io.constellationnetwork.schema.mpt._
 import io.constellationnetwork.schema.nodeCollateral._
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security._
-import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signed
 import io.constellationnetwork.serde.codecs.instances.GlobalStateMptCodecs._
 import io.constellationnetwork.statechannel.StateChannelValidationType
 
-import eu.timepit.refined.types.numeric.NonNegLong
+import eu.timepit.refined.types.numeric.{NonNegLong, PosLong}
 import weaver.MutableIOSuite
 
 /** Regression for the former construction-site flag split: every GSAM must emit the node-collateral-withdrawal expiry-index delta, and the
@@ -68,11 +68,24 @@ object NodeCollateralWithdrawalExpiryRootParitySuite extends MutableIOSuite {
       keyPair <- KeyPairGenerator.makeKeyPair[IO]
       source = keyPair.getPublic.toAddress
       nodeId = PeerId.fromPublic(keyPair.getPublic)
+      backingLock <- Signed.forAsyncHasher[IO, TokenLock](
+        TokenLock(
+          source = source,
+          amount = TokenLockAmount(PosLong.unsafeFrom(1_000_000L)),
+          fee = TokenLockFee(NonNegLong.unsafeFrom(0L)),
+          parent = TokenLockReference.empty,
+          currencyId = none,
+          unlockEpoch = none,
+          replaceTokenLockRef = none
+        ),
+        keyPair
+      )
+      backingRef <- TokenLockReference.of(backingLock)
       create = UpdateNodeCollateral.Create(
         source = source,
         nodeId = nodeId,
         amount = NodeCollateralAmount(NonNegLong(1_000_000L)),
-        tokenLockRef = Hash("ab" * 32)
+        tokenLockRef = backingRef.hash
       )
       signedCreate <- Signed.forAsyncHasher[IO, UpdateNodeCollateral.Create](create, keyPair)
       collateralRef <- NodeCollateralReference.of(signedCreate)
@@ -82,6 +95,7 @@ object NodeCollateralWithdrawalExpiryRootParitySuite extends MutableIOSuite {
       )
       priorInfo = GlobalSnapshotInfo.empty.copy(
         balances = SortedMap(source -> Balance(NonNegLong(1_000_000L))),
+        activeTokenLocks = SortedMap(source -> SortedSet(backingLock)).some,
         activeNodeCollaterals = SortedMap(source -> SortedSet(NodeCollateralRecord(signedCreate, priorOrdinal))).some
       )
       forcedAcceptance = UpdateNodeCollateralAcceptanceResult(
@@ -121,6 +135,64 @@ object NodeCollateralWithdrawalExpiryRootParitySuite extends MutableIOSuite {
       signedStateProof = result._10
       accumulator = result._16
 
+      maturityManager <- Mocks.mkManager(
+        initialSnapshotInfo = producedInfo.some,
+        lastLegacyStateProofOrdinal = SnapshotOrdinal.MinValue
+      )
+      maturityResult <- maturityManager.accept(
+        ordinal = SnapshotOrdinal(NonNegLong(3L)),
+        epochProgress = expiryEpoch,
+        previousEpochProgress = acceptedEpoch,
+        blocksForAcceptance = List.empty,
+        allowSpendBlocksForAcceptance = List.empty,
+        tokenLockBlocksForAcceptance = List.empty,
+        scEvents = List.empty,
+        unpEvents = List.empty,
+        cdsEvents = List.empty,
+        wdsEvents = List.empty,
+        cncEvents = List.empty,
+        wncEvents = List.empty,
+        lastSnapshotContext = producedInfo,
+        lastActiveTips = SortedSet.empty,
+        lastDeprecatedTips = SortedSet.empty,
+        calculateRewardsFn = Mocks.delegatedRewardsFunction(producedInfo),
+        validationType = StateChannelValidationType.Full,
+        getGlobalSnapshotByOrdinal = _ => none[Hashed[GlobalIncrementalSnapshot]].pure[IO],
+        parentTip = BranchId.passthrough
+      )
+      maturedInfo = maturityResult._9
+      maturityAccumulator = maturityResult._16
+
+      followUpResult <- maturityManager.accept(
+        ordinal = SnapshotOrdinal(NonNegLong(4L)),
+        epochProgress = EpochProgress(NonNegLong.unsafeFrom(expiryEpoch.value.value + 1L)),
+        previousEpochProgress = expiryEpoch,
+        blocksForAcceptance = List.empty,
+        allowSpendBlocksForAcceptance = List.empty,
+        tokenLockBlocksForAcceptance = List.empty,
+        scEvents = List.empty,
+        unpEvents = List.empty,
+        cdsEvents = List.empty,
+        wdsEvents = List.empty,
+        cncEvents = List.empty,
+        wncEvents = List.empty,
+        lastSnapshotContext = maturedInfo,
+        lastActiveTips = SortedSet.empty,
+        lastDeprecatedTips = SortedSet.empty,
+        calculateRewardsFn = Mocks.delegatedRewardsFunction(maturedInfo),
+        validationType = StateChannelValidationType.Full,
+        getGlobalSnapshotByOrdinal = _ => none[Hashed[GlobalIncrementalSnapshot]].pure[IO],
+        parentTip = BranchId.passthrough
+      )
+      followUpInfo = followUpResult._9
+      followUpAccumulator = followUpResult._16
+      maturityExpiryDelta = maturityAccumulator.nodeCollateralWithdrawalExpiryIndex match {
+        case delta: SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey] => delta
+      }
+      followUpExpiryDelta = followUpAccumulator.nodeCollateralWithdrawalExpiryIndex match {
+        case delta: SystemIndexDelta.EpochBucket[NodeCollateralWithdrawalExpiryKey] => delta
+      }
+
       hashedCreate <- signedCreate.toHashed
       expiryKey = NodeCollateralWithdrawalExpiryKey(source, hashedCreate.hash)
       expectedIndexDelta =
@@ -152,6 +224,13 @@ object NodeCollateralWithdrawalExpiryRootParitySuite extends MutableIOSuite {
         SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
         expiryEpoch
       )
+
+      maturedRebuildStore <- freshStore
+      _ <- maturedRebuildStore.syncFromGlobalSnapshotInfo(maturedInfo, SnapshotOrdinal(NonNegLong(3L)))
+      maturedRebuildBucket <- maturedRebuildStore.getExpiryBucket[NodeCollateralWithdrawalExpiryKey](
+        SystemNamespaceLabel.ExpiryIndexNodeCollateralWithdrawals,
+        expiryEpoch
+      )
     } yield
       expect.all(
         clue(accumulator.nodeCollateralWithdrawalExpiryIndex) == clue(expectedIndexDelta),
@@ -161,7 +240,20 @@ object NodeCollateralWithdrawalExpiryRootParitySuite extends MutableIOSuite {
         clue(replayRoot) == clue(producerRoot),
         clue(rebuildRoot) == clue(producerRoot),
         clue(consensusBytes(replayBytes)) == clue(consensusBytes(producerBytes)),
-        clue(consensusBytes(rebuildBytes)) == clue(consensusBytes(producerBytes))
+        clue(consensusBytes(rebuildBytes)) == clue(consensusBytes(producerBytes)),
+        producedInfo.nodeCollateralWithdrawals.flatMap(_.get(source)).exists(_.nonEmpty),
+        producedInfo.activeTokenLocks.flatMap(_.get(source)).contains(SortedSet(backingLock)),
+        maturedInfo.nodeCollateralWithdrawals.flatMap(_.get(source)).forall(_.isEmpty),
+        maturedInfo.activeTokenLocks.flatMap(_.get(source)).forall(_.isEmpty),
+        maturedInfo.balances(source).value.value - producedInfo.balances(source).value.value == 1_000_000L,
+        maturityExpiryDelta.removes
+          .get(expiryEpoch)
+          .exists(_.contains(expiryKey)),
+        maturedRebuildBucket.isEmpty,
+        followUpInfo.nodeCollateralWithdrawals.flatMap(_.get(source)).forall(_.isEmpty),
+        followUpInfo.activeTokenLocks.flatMap(_.get(source)).forall(_.isEmpty),
+        followUpInfo.balances(source) == maturedInfo.balances(source),
+        followUpExpiryDelta.isEmpty
       )
   }
 }

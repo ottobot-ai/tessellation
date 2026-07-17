@@ -236,9 +236,9 @@ object SharedServices {
       updateDelegatedStakeAcceptanceManager = UpdateDelegatedStakeAcceptanceManager.make(
         validators.updateDelegatedStakeValidator
       )
-      updateNodeCollateralAcceptanceManager = UpdateNodeCollateralAcceptanceManager.make(
-        validators.updateNodeCollateralValidator
-      )
+      updateNodeCollateralAcceptanceManager = HasherSelector[F].withCurrent { implicit hasher =>
+        UpdateNodeCollateralAcceptanceManager.make(validators.updateNodeCollateralValidator)
+      }
       priceStateUpdater = PriceStateUpdater.make[F](
         cfg.environment,
         DefaultDelegatedRewardsConfigProvider,

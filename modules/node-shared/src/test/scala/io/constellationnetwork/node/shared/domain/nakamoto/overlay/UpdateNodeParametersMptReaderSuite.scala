@@ -71,7 +71,10 @@ object UpdateNodeParametersMptReaderSuite extends MutableIOSuite {
 
     for {
       key <- GlobalStateKey.updateNodeParametersKey[IO](idA)
-      present <- UpdateNodeParametersMptReader.read(readerAt(key, StrictMptRead.Present(canonical, unpRecordImmutableCodec.immutableBytes(canonical))), idA)
+      present <- UpdateNodeParametersMptReader.read(
+        readerAt(key, StrictMptRead.Present(canonical, unpRecordImmutableCodec.immutableBytes(canonical))),
+        idA
+      )
       absent <- UpdateNodeParametersMptReader.read(GlobalStateReader.empty[IO], idA)
     } yield expect.all(present.contains(canonical), absent.isEmpty)
   }

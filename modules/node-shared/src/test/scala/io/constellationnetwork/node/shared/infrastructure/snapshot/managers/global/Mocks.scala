@@ -92,6 +92,8 @@ object Mocks {
     forcedNodeCollateralAcceptanceResult: Option[UpdateNodeCollateralAcceptanceResult] = None,
     lastLegacyStateProofOrdinal: SnapshotOrdinal = SnapshotOrdinal(Long.MaxValue)
   )(implicit h: Hasher[IO], sp: SecurityProvider[IO]): IO[GlobalSnapshotAcceptanceManager[IO]] = {
+    val configuredWithdrawalTimeLimit = EpochProgress(4L)
+
     // Create mock dependencies for testing
     val mockBlockAcceptanceManager = new BlockAcceptanceManager[IO] {
       override def acceptBlocksIteratively(
@@ -286,7 +288,8 @@ object Mocks {
         parentStateReader: GlobalStateReader[IO],
         epochProgress: EpochProgress,
         ordinal: SnapshotOrdinal,
-        delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult
+        delegatedStakeAcceptanceResult: UpdateDelegatedStakeAcceptanceResult,
+        acceptedTokenLocks: List[Signed[TokenLock]]
       ): IO[UpdateNodeCollateralAcceptanceResult] =
         forcedNodeCollateralAcceptanceResult
           .getOrElse(
@@ -371,7 +374,14 @@ object Mocks {
               )
               .flatMap { mptStore =>
                 for {
-                  _ <- initialSnapshotInfo.traverse_(info => mptStore.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal.MinValue))
+                  _ <- initialSnapshotInfo.traverse_ { info =>
+                    val configuredWithdrawalTimeLimitContext: io.constellationnetwork.schema.mpt.WithdrawalTimeLimit =
+                      io.constellationnetwork.schema.mpt.WithdrawalTimeLimit.some(configuredWithdrawalTimeLimit)
+                    mptStore.syncFromGlobalSnapshotInfo(info, SnapshotOrdinal.MinValue)(
+                      globalStateProofSelector,
+                      configuredWithdrawalTimeLimitContext
+                    )
+                  }
                   pcTree <- io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree.make[IO]
                   overlay = io.constellationnetwork.node.shared.domain.nakamoto.overlay.MptOverlay
                     .passthrough[IO, GlobalStateKey](mptStore, pcTree)
@@ -400,7 +410,7 @@ object Mocks {
                       pricingUpdateValidator = mockPricingUpdateValidator,
                       priceStateUpdater = mockPriceStateUpdater,
                       collateral = Amount.empty,
-                      withdrawalTimeLimit = EpochProgress(4L),
+                      withdrawalTimeLimit = configuredWithdrawalTimeLimit,
                       loggerBundle = loggerBundle,
                       overlay = overlay,
                       etaRotationSnapshots = etaRotationSnapshots,

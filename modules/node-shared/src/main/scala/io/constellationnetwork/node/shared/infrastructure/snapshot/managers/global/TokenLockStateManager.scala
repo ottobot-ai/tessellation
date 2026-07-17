@@ -5,6 +5,7 @@ import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator
 import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ActiveTokenLockMptReader, GlobalStateReader}
 import io.constellationnetwork.node.shared.domain.statechannel.StateChannelAcceptanceResult.CurrencySnapshotWithState
 import io.constellationnetwork.schema._
@@ -14,6 +15,7 @@ import io.constellationnetwork.schema.balance._
 import io.constellationnetwork.schema.delegatedStake.PendingDelegatedStakeWithdrawal
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nodeCollateral.PendingNodeCollateralWithdrawal
 import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security.Hasher
 import io.constellationnetwork.security.hash.Hash
@@ -90,6 +92,12 @@ trait TokenLockStateManager[F[_]] {
   def acceptReplacementTokenLocks(
     acceptedTokenLocks: List[Signed[TokenLock]],
     lastSnapshotContext: GlobalSnapshotInfo
+  )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]]
+
+  def acceptReplacementTokenLocks(
+    acceptedTokenLocks: List[Signed[TokenLock]],
+    lastSnapshotContext: GlobalSnapshotInfo,
+    parentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
   )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]]
 
   def acceptTokenLockRefs(
@@ -179,6 +187,19 @@ trait TokenLockStateManager[F[_]] {
     expiredWithdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
     acceptedTokenLocks: List[Signed[TokenLock]],
     globalActiveTokenLocksByRef: Map[Hash, Signed[TokenLock]]
+  ): Either[String, Map[Address, List[TokenUnlock]]] =
+    generateTokenUnlocks(
+      expiredWithdrawals,
+      SortedMap.empty,
+      acceptedTokenLocks,
+      globalActiveTokenLocksByRef
+    )
+
+  def generateTokenUnlocks(
+    expiredDelegatedWithdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
+    expiredCollateralWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
+    acceptedTokenLocks: List[Signed[TokenLock]],
+    globalActiveTokenLocksByRef: Map[Hash, Signed[TokenLock]]
   ): Either[String, Map[Address, List[TokenUnlock]]]
 
   /** Build a hash-keyed lookup of active token locks for a given set of addresses, sourced from the MPT. Used by the acceptance pipeline so
@@ -262,9 +283,10 @@ object TokenLockStateManager {
           )
         }
 
-      def acceptReplacementTokenLocks(
+      private def acceptReplacementTokenLocksWithParent(
         acceptedTokenLocks: List[Signed[TokenLock]],
-        lastSnapshotContext: GlobalSnapshotInfo
+        lastSnapshotContext: GlobalSnapshotInfo,
+        suppliedParentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
       )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]] = {
         // #186 in-round chain fix (2026-07-09): a replacement B whose `replaceTokenLockRef` targets a lock A
         // accepted EARLIER IN THIS SAME LIST used to be dropped silently — the candidate set was read only from
@@ -312,60 +334,81 @@ object TokenLockStateManager {
           else
             st.copy(result = st.result :+ tx, seen = st.seen ++ seenAdd).pure[F]
 
-        acceptedTokenLocks
-          .foldLeftM(FoldSt(List.empty, Set.empty, Map.empty, Map.empty)) { (st, tx) =>
-            tx.replaceTokenLockRef match {
-              case Some(replaceTokenLockRef) =>
-                if (tx.currencyId.nonEmpty) {
-                  // we can only replace DAG token locks
-                  st.pure[F]
-                } else if (st.seen(replaceTokenLockRef)) {
-                  st.pure[F]
-                } else {
-                  for {
-                    activeTokenLocks <- ActiveTokenLockMptReader
-                      .readNative(reader, tx.source)
-                      .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]))
-                    balance <- reader
-                      .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, tx.source))
-                      .map(_.getOrElse(Balance.empty))
-                    existingWithRefs <- activeTokenLocks.toList
-                      .filter(_.currencyId.isEmpty) // we can only replace DAG token locks
-                      .traverse(existing => TokenLockReference.of(existing).map(ref => (ref, existing)))
-                    // Parent-state candidates ∪ locks accepted earlier in this same round.
-                    candidates = existingWithRefs ++ st.inRoundBySource.getOrElse(tx.source, List.empty)
-                    delta = st.deltaBySource.getOrElse(tx.source, BigInt(0))
-                    matched = candidates.find {
-                      case (ref, existing) =>
-                        ref.hash === replaceTokenLockRef &&
-                        existing.source == tx.source &&
-                        existing.amount < tx.amount &&
-                        BigInt(balance.value.value) + delta + BigInt(existing.amount.value.value) >=
-                          BigInt(tx.amount.value.value) + BigInt(tx.fee.value.value)
-                    }
-                    newSt <- matched match {
-                      case Some((_, replaced)) =>
-                        recordAccepted(
-                          st,
-                          tx,
-                          netDelta = BigInt(replaced.amount.value.value) - BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value),
-                          seenAdd = Some(replaceTokenLockRef)
-                        )
-                      case None => st.pure[F]
-                    }
-                  } yield newSt
-                }
-              case None =>
-                recordAccepted(
-                  st,
-                  tx,
-                  netDelta = -BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value),
-                  seenAdd = None
-                )
+        val needsBackingState = acceptedTokenLocks.exists(_.replaceTokenLockRef.nonEmpty)
+        val parentBackingStateF =
+          if (!needsBackingState) suppliedParentBackingState.pure[F]
+          else suppliedParentBackingState.fold(StakeBackingValidator.validateParent(reader).map(_.some))(_.some.pure[F])
+
+        parentBackingStateF.flatMap { parentBackingState =>
+          acceptedTokenLocks
+            .foldLeftM(FoldSt(List.empty, Set.empty, Map.empty, Map.empty)) { (st, tx) =>
+              tx.replaceTokenLockRef match {
+                case Some(replaceTokenLockRef) =>
+                  if (tx.currencyId.nonEmpty) {
+                    // we can only replace DAG token locks
+                    st.pure[F]
+                  } else if (st.seen(replaceTokenLockRef)) {
+                    st.pure[F]
+                  } else {
+                    for {
+                      activeTokenLocks <- ActiveTokenLockMptReader
+                        .readNative(reader, tx.source)
+                        .map(_.getOrElse(SortedSet.empty[Signed[TokenLock]]))
+                      balance <- reader
+                        .get[Balance](GlobalStateKey.hypergraph(GlobalStateFieldId.Balances, tx.source))
+                        .map(_.getOrElse(Balance.empty))
+                      existingWithRefs <- activeTokenLocks.toList
+                        .filter(_.currencyId.isEmpty) // we can only replace DAG token locks
+                        .traverse(existing => TokenLockReference.of(existing).map(ref => (ref, existing)))
+                      // Parent-state candidates ∪ locks accepted earlier in this same round.
+                      candidates = existingWithRefs ++ st.inRoundBySource.getOrElse(tx.source, List.empty)
+                      delta = st.deltaBySource.getOrElse(tx.source, BigInt(0))
+                      matched = candidates.find {
+                        case (ref, existing) =>
+                          ref.hash === replaceTokenLockRef &&
+                          existing.source == tx.source &&
+                          existing.amount < tx.amount &&
+                          BigInt(balance.value.value) + delta + BigInt(existing.amount.value.value) >=
+                            BigInt(tx.amount.value.value) + BigInt(tx.fee.value.value)
+                      }
+                      newSt <- matched match {
+                        case Some((_, replaced)) =>
+                          recordAccepted(
+                            st,
+                            tx,
+                            netDelta = BigInt(replaced.amount.value.value) - BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value),
+                            seenAdd = Some(replaceTokenLockRef)
+                          )
+                        case None => st.pure[F]
+                      }
+                    } yield newSt
+                  }
+                case None =>
+                  recordAccepted(
+                    st,
+                    tx,
+                    netDelta = -BigInt(tx.amount.value.value) - BigInt(tx.fee.value.value),
+                    seenAdd = None
+                  )
+              }
             }
-          }
-          .map(_.result)
+            .map(_.result)
+            .flatTap(result => parentBackingState.traverse_(StakeBackingValidator.validateAcceptedReplacements(_, result)))
+        }
       }
+
+      def acceptReplacementTokenLocks(
+        acceptedTokenLocks: List[Signed[TokenLock]],
+        lastSnapshotContext: GlobalSnapshotInfo
+      )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]] =
+        acceptReplacementTokenLocksWithParent(acceptedTokenLocks, lastSnapshotContext, None)
+
+      override def acceptReplacementTokenLocks(
+        acceptedTokenLocks: List[Signed[TokenLock]],
+        lastSnapshotContext: GlobalSnapshotInfo,
+        parentBackingState: Option[StakeBackingValidator.ValidatedBackingState]
+      )(implicit hasher: Hasher[F]): F[List[Signed[TokenLock]]] =
+        acceptReplacementTokenLocksWithParent(acceptedTokenLocks, lastSnapshotContext, parentBackingState)
 
       def acceptTokenLockRefs(
         lastTokenLockRefs: SortedMap[Address, TokenLockReference],
@@ -797,7 +840,8 @@ object TokenLockStateManager {
         }
 
       def generateTokenUnlocks(
-        expiredWithdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
+        expiredDelegatedWithdrawals: SortedMap[Address, SortedSet[PendingDelegatedStakeWithdrawal]],
+        expiredCollateralWithdrawals: SortedMap[Address, SortedSet[PendingNodeCollateralWithdrawal]],
         acceptedTokenLocks: List[Signed[TokenLock]],
         globalActiveTokenLocksByRef: Map[Hash, Signed[TokenLock]]
       ): Either[String, Map[Address, List[TokenUnlock]]] = {
@@ -823,22 +867,55 @@ object TokenLockStateManager {
           }
           .map(_.groupBy { case (address, _) => address }.view.mapValues(_.map { case (_, tokenUnlock) => tokenUnlock }).toMap)
 
-        val expiredWithdrawalUnlocks = expiredWithdrawals.toList.traverse {
-          case (address, withdrawals) =>
-            withdrawals.toList.traverse { pw: PendingDelegatedStakeWithdrawal =>
-              for {
-                activeTokenLock <- globalActiveTokenLocksByRef
-                  .get(pw.tokenLockRef)
-                  .toRight(s"Token lock not found for ref: ${pw.tokenLockRef}")
-              } yield
-                TokenUnlock(
-                  pw.tokenLockRef,
-                  activeTokenLock.amount,
-                  activeTokenLock.currencyId,
-                  activeTokenLock.source
+        val expiredEncumbrances: List[(Address, Hash)] =
+          expiredDelegatedWithdrawals.toList.flatMap {
+            case (address, withdrawals) => withdrawals.toList.map(withdrawal => address -> withdrawal.tokenLockRef)
+          } ++
+            expiredCollateralWithdrawals.toList.flatMap {
+              case (address, withdrawals) => withdrawals.toList.map(withdrawal => address -> withdrawal.event.tokenLockRef)
+            }
+
+        val duplicateExpiredRefs =
+          expiredEncumbrances.groupMapReduce(_._2)(_ => 1)(_ + _).collect { case (ref, count) if count > 1 => ref }.toList.sorted
+
+        val expiredWithdrawalUnlocks =
+          Either
+            .cond(
+              duplicateExpiredRefs.isEmpty,
+              (),
+              s"Backing token lock appears in multiple expired withdrawals: ${duplicateExpiredRefs.mkString(",")}"
+            )
+            .flatMap { _ =>
+              expiredEncumbrances.sortBy { case (address, ref) => (address, ref) }.traverse {
+                case (address, ref) =>
+                  for {
+                    activeTokenLock <- globalActiveTokenLocksByRef
+                      .get(ref)
+                      .toRight(s"Token lock not found for ref: $ref")
+                    _ <- Either.cond(
+                      activeTokenLock.source === address,
+                      (),
+                      s"Backing token lock source mismatch for ref=$ref expected=$address actual=${activeTokenLock.source}"
+                    )
+                    _ <- Either.cond(
+                      activeTokenLock.currencyId.isEmpty,
+                      (),
+                      s"Backing token lock is not native for ref=$ref"
+                    )
+                  } yield
+                    address -> TokenUnlock(
+                      ref,
+                      activeTokenLock.amount,
+                      activeTokenLock.currencyId,
+                      activeTokenLock.source
+                    )
+              }
+                .map(
+                  _.groupMap(_._1)(_._2).view
+                    .mapValues(_.sortBy(_.tokenLockRef))
+                    .toMap
                 )
-            }.map(tokenUnlocks => address -> tokenUnlocks)
-        }.map(_.toMap)
+            }
 
         for {
           withdrawalUnlocks <- expiredWithdrawalUnlocks

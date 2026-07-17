@@ -1,5 +1,6 @@
 package io.constellationnetwork.node.shared.domain.tokenlock.block
 
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator.BackingReplacementRequirement
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
@@ -14,7 +15,8 @@ case class TokenLockBlockAcceptanceContextUpdate(
   balances: Map[Address, Balance],
   lastTokenLocksRefs: Map[Address, TokenLockReference],
   claimedReplacementRefs: Set[Hash],
-  inRoundTokenLocksByHash: Map[Hash, Hashed[TokenLock]]
+  inRoundTokenLocksByHash: Map[Hash, Hashed[TokenLock]],
+  inRoundBackingRequirements: Map[Hash, BackingReplacementRequirement] = Map.empty
 )
 
 object TokenLockBlockAcceptanceContextUpdate {
@@ -23,6 +25,7 @@ object TokenLockBlockAcceptanceContextUpdate {
     Map.empty,
     Map.empty,
     Set.empty,
+    Map.empty,
     Map.empty
   )
 }

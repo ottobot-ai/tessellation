@@ -14,12 +14,12 @@ import io.constellationnetwork.schema.mpt.{GlobalStateKey, MptStore, WithdrawalT
 import io.constellationnetwork.schema.nakamoto.GenesisOperatorConsensusKey
 import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, GlobalStateProofSelector, SnapshotOrdinal}
+import io.constellationnetwork.security._
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops.PublicKeyOps
 import io.constellationnetwork.security.mpt.producer.InMemoryMerklePatriciaProducer
 import io.constellationnetwork.security.signature.Signing
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
-import io.constellationnetwork.security.{Hasher, KeyPairGenerator, SecurityProvider}
 import io.constellationnetwork.serde.codecs.instances.GenesisOperatorConsensusKeyCodec.immutableCodec
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -79,6 +79,7 @@ object GenesisOperatorKeyCommitmentSuite extends MutableIOSuite {
   test("changing the valid signed genesis operator set changes the canonical MPT root") { res =>
     implicit val json: JsonSerializer[IO] = res._1
     implicit val hasher: Hasher[IO] = res._2
+    implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(hasher)
     implicit val sp: SecurityProvider[IO] = res._3
 
     for {
@@ -99,6 +100,7 @@ object GenesisOperatorKeyCommitmentSuite extends MutableIOSuite {
   test("rooted records round-trip through MPT and local startup material must match") { res =>
     implicit val json: JsonSerializer[IO] = res._1
     implicit val hasher: Hasher[IO] = res._2
+    implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(hasher)
     implicit val sp: SecurityProvider[IO] = res._3
 
     for {
@@ -160,6 +162,7 @@ object GenesisOperatorKeyCommitmentSuite extends MutableIOSuite {
 
   test("ordinary state deltas preserve the immutable genesis identity") { res =>
     implicit val hasher: Hasher[IO] = res._2
+    implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(hasher)
     implicit val sp: SecurityProvider[IO] = res._3
 
     for {

@@ -7,6 +7,7 @@ import cats.Applicative
 import cats.data.NonEmptyList
 import cats.effect._
 import cats.effect.std.{Console, Random}
+import cats.effect.syntax.all._
 import cats.syntax.all._
 
 import scala.concurrent.duration._
@@ -78,6 +79,7 @@ object Main
             case _ =>
               JsonSerializer.forAsync[IO].asResource.use { implicit jsonSerializer =>
                 implicit val hasher = Hasher.forJson[IO]
+                implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(hasher)
                 EmberClientBuilder.default[IO].build.use { client =>
                   Random.scalaUtilRandom[IO].flatMap { implicit random =>
                     (method match {
@@ -253,13 +255,10 @@ object Main
       .drain
   }
 
-  /** Tier-1 test-vector emit. Parallel to `createGenesis` (which emits the legacy CSV format) but targets the `L0GenesisData` schema. See
-    * `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` §1.1 and `project_test_vector_pattern` memory.
-    *
-    * Determinism: the emitted `l0-genesis.json` is byte-deterministic for a given (seed, flag-set). Verified by running the generator twice
-    * and `diff -r`-ing the outputs (see commit message).
+  /** Offline greenfield genesis ceremony. Securely generated KES/economic keys and signatures make each output a one-time canonical
+    * artifact; `--seed` does not make the complete public JSON reproducible.
     */
-  def generateGenesis[F[_]: Async: SecurityProvider: Console](cmd: cli.method.GenerateGenesisCmd): F[Unit] = {
+  def generateGenesis[F[_]: Async: HasherSelector: SecurityProvider: Console](cmd: cli.method.GenerateGenesisCmd): F[Unit] = {
     import io.constellationnetwork.tools.genesis.GenesisGenerator
     import io.circe.Printer
 
@@ -274,6 +273,9 @@ object Main
       initialBalancesCsv = cmd.initialBalancesCsv.map(_.toString),
       seed = cmd.seed,
       keysFromDir = cmd.keysFromDir.map(_.toString),
+      operatorKeyAlias = cmd.operatorKeyAlias,
+      operatorKeyPasswordEnv = cmd.operatorKeyPasswordEnv,
+      testOnlyDeterministicOperatorKeys = cmd.testOnlyDeterministicOperatorKeys,
       networkMagic = cmd.networkMagic,
       startingEpochProgress = cmd.startingEpochProgress
     )
@@ -282,39 +284,37 @@ object Main
       (if (cmd.stakeDistribution.nonEmpty) s" --stake-distribution ${cmd.stakeDistribution.mkString(",")}" else "") +
       s" --stake-budget-datum ${cmd.stakeBudgetDatum}" +
       s" --collateral-per-operator ${cmd.collateralPerOperator}" +
-      s" --network-magic ${cmd.networkMagic}"
+      s" --network-magic ${cmd.networkMagic}" +
+      (if (cmd.testOnlyDeterministicOperatorKeys) " --test-only-deterministic-operator-keys" else "")
 
-    // Canonical printer: sort keys and use a 2-space indent for human-reviewable diffs.
-    // `Printer.spaces2` defaults sortKeys=false, so override it: key ordering is what makes
-    // output byte-deterministic across JVMs (Circe map iteration order is not stable).
+    // Stable public encoding makes a reviewed artifact portable after it has been generated.
     val printer = Printer.spaces2.copy(sortKeys = true, dropNullValues = false)
 
     for {
       outputs <- GenesisGenerator.generate[F](opts, invocation)
-      _ <- Async[F].blocking {
-        java.nio.file.Files.createDirectories(cmd.outputDir)
-      }
-      l0Json = printer.print(io.circe.syntax.EncoderOps(outputs.l0Genesis).asJson)
-      _ <- Async[F].blocking {
-        java.nio.file.Files.writeString(cmd.outputDir.resolve("l0-genesis.json"), l0Json)
-      }
-      _ <- outputs.cl1Genesis.traverse_ { cl1 =>
-        Async[F].blocking {
-          val cl1Json = printer.print(io.circe.syntax.EncoderOps(cl1).asJson)
-          java.nio.file.Files.writeString(cmd.outputDir.resolve("cl1-genesis.json"), cl1Json)
-        }
-      }
-      // §1.2 Slice 3b: persist per-operator KES SK blobs to <outputDir>/keys/operator-<N>/kes-sk.bin
-      // for the gl0 container to mount + load at startup (Slice 3d / Slice 4). The public KES
-      // registration certs live in the L0 genesis JSON itself.
-      skPaths <- GenesisGenerator.writeKesSecretKeys[F](cmd.outputDir.toString, outputs.kesSecretKeys)
-      _ <- console.green[F](s"Wrote l0-genesis.json (${l0Json.length} bytes) to ${cmd.outputDir}")
-      _ <- console.green[F](s"  operators: ${outputs.l0Genesis.operators.size}")
-      _ <- console.green[F](s"  delegatedStakes: ${outputs.l0Genesis.delegatedStakes.size}")
-      _ <- console.green[F](s"  nodeCollaterals: ${outputs.l0Genesis.nodeCollaterals.size}")
-      _ <- console.green[F](s"  initialBalances: ${outputs.l0Genesis.initialBalances.size}")
-      _ <- console.green[F](s"  atomic operator key records: ${outputs.l0Genesis.operators.size}")
-      _ <- console.green[F](s"  kesSecretKeys written: ${skPaths.size} (under ${cmd.outputDir}/keys/operator-*)")
+      _ <- Async[F].defer {
+        val l0Json = printer.print(io.circe.syntax.EncoderOps(outputs.l0Genesis).asJson)
+        val cl1Json = outputs.cl1Genesis.map(cl1 => printer.print(io.circe.syntax.EncoderOps(cl1).asJson))
+
+        for {
+          _ <- Async[F].blocking {
+            java.nio.file.Files.createDirectories(cmd.outputDir)
+          }
+          persisted <- GenesisGenerator.persistGeneratedOutputs[F](cmd.outputDir.toString, outputs, l0Json, cl1Json)
+          _ <- console.green[F](s"Wrote l0-genesis.json (${l0Json.length} bytes) to ${cmd.outputDir}")
+          _ <- console.green[F](s"  operators: ${outputs.l0Genesis.operators.size}")
+          _ <- console.green[F](s"  delegatedStakes: ${outputs.l0Genesis.delegatedStakes.size}")
+          _ <- console.green[F](s"  nodeCollaterals: ${outputs.l0Genesis.nodeCollaterals.size}")
+          _ <- console.green[F](s"  initialBalances: ${outputs.l0Genesis.initialBalances.size}")
+          _ <- console.green[F](s"  atomic operator key records: ${outputs.l0Genesis.operators.size}")
+          _ <- console.green[F](
+            s"  kesSecretKeys written: ${persisted.kesSecretKeys.size} (under ${cmd.outputDir}/keys/operator-*)"
+          )
+          _ <- console.green[F](
+            s"  economic owner keys written: ${persisted.economicSecretKeys.size} (under ${cmd.outputDir}/keys/economic/operator-*)"
+          )
+        } yield ()
+      }.guarantee(GenesisGenerator.zeroGeneratedSecrets(outputs))
     } yield ()
   }
 

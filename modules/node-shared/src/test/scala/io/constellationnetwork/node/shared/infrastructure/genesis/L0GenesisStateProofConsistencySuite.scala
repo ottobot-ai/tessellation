@@ -9,14 +9,14 @@ import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.kryo.KryoSerializer
 import io.constellationnetwork.node.shared.domain.genesis.types._
 import io.constellationnetwork.node.shared.nodeSharedKryoRegistrar
+import io.constellationnetwork.schema._
 import io.constellationnetwork.schema.delegatedStake._
 import io.constellationnetwork.schema.epoch.EpochProgress
-import io.constellationnetwork.schema.{GlobalSnapshot, GlobalStateProofSelector, SnapshotOrdinal}
+import io.constellationnetwork.schema.tokenLock._
 import io.constellationnetwork.security._
-import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.key.ops._
-import io.constellationnetwork.security.signature.Signing
+import io.constellationnetwork.security.signature.{Signed, Signing}
 import io.constellationnetwork.security.vrf.VrfKeyDeriver
 
 import eu.timepit.refined.types.numeric.NonNegLong
@@ -29,9 +29,8 @@ import weaver.MutableIOSuite
   *   1. (Within-node) The ord=1 `GlobalIncrementalSnapshot.stateProof` is computed from the same (post-augmentation) GSI that the storage
   *      layer + MPT will hold at boot. Achieved by passing `augmentedInfo` to `GlobalSnapshot.mkFirstIncrementalSnapshot`.
   *
-  * 2. (Cross-node) The `Signed[UpdateDelegatedStake.Create]` bytes produced by `L0GenesisLoader.signedDeterministic` are byte-identical
-  * across loads of the same fixture. Without this the `activeDelegatedStakes` MPT leaves diverge cross-node, and so do the
-  * `stateProof.mptRoot`s.
+  * 2. (Cross-node) The exact signed economic bundle persisted in genesis is installed byte-for-byte on every node. The loader never
+  * reconstructs signatures from private material.
   */
 object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
   type Res = (KryoSerializer[IO], JsonSerializer[IO], Hasher[IO], SecurityProvider[IO])
@@ -85,15 +84,26 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
         Hex.fromBytes(vrfVk).value,
         Hex.fromBytes(operatorSignature).value
       )
-      privHex = Hex.fromBytes(delegatorKp.getPrivate.getEncoded).value
+      backingLock = TokenLock(
+        source = delegatorAddr,
+        amount = TokenLockAmount(eu.timepit.refined.types.numeric.PosLong.unsafeFrom(100L)),
+        fee = TokenLockFee(NonNegLong(0L)),
+        parent = TokenLockReference.empty,
+        currencyId = None,
+        unlockEpoch = None,
+        replaceTokenLockRef = None
+      )
+      signedBackingLock <- Signed.forAsyncHasher[F, TokenLock](backingLock, delegatorKp)
+      backingRef <- TokenLockReference.of[F](signedBackingLock)
       event = UpdateDelegatedStake.Create(
         source = delegatorAddr,
         nodeId = operatorPeerId,
         amount = DelegatedStakeAmount(NonNegLong.unsafeFrom(100L)),
         fee = DelegatedStakeFee(NonNegLong(0L)),
-        tokenLockRef = Hash.fromBytes("test-stateproof-consistency".getBytes("UTF-8")),
+        tokenLockRef = backingRef.hash,
         parent = DelegatedStakeReference.empty
       )
+      signedEvent <- Signed.forAsyncHasher[F, UpdateDelegatedStake.Create](event, delegatorKp)
     } yield
       L0GenesisData(
         _meta = L0GenesisMeta(
@@ -110,8 +120,8 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
         operators = List(genesisOperator),
         delegatedStakes = List(
           L0GenesisDelegatedStake(
-            event = event,
-            delegatorPrivateKeyHex = privHex,
+            signedEvent = signedEvent,
+            signedBackingTokenLock = signedBackingLock,
             createdAt = 0L,
             rewards = 0L
           )
@@ -125,6 +135,7 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
 
     for {
       data <- buildFixture[IO]
+      implicit0(hasherSelector: HasherSelector[IO]) = HasherSelector.forSyncAlwaysCurrent(h)
       // 1) build genesis snapshot from the (initial-balance only) balance map.
       balanceMap = data.initialBalanceMap
       genesisSnapshot = GlobalSnapshot.mkGenesis(balanceMap, EpochProgress(NonNegLong(0L)))
@@ -162,22 +173,20 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
         expect(firstIncr.stateProof != legacyIncr.stateProof)
   }
 
-  test("Issue B: signedDeterministic produces byte-identical Signed[Event] across loads") { res =>
+  test("Issue B: genesis persists exact signed event and backing-lock bytes") { res =>
     implicit val (_, js, h, sp) = res
 
     for {
       data <- buildFixture[IO]
-      kp <- L0GenesisLoader.keyPairFromHex[IO](data.delegatedStakes.head.delegatorPrivateKeyHex)
-      ev = data.delegatedStakes.head.event
-      // Two independent invocations of the deterministic signer over the SAME (key, event) must
-      // produce byte-identical Signed[Event]. The old non-deterministic path (Signed.forAsyncHasher)
-      // does not satisfy this — RNG-driven k → different (r, s) → different signature bytes.
-      a <- L0GenesisLoader.signedDeterministic[IO, UpdateDelegatedStake.Create](ev, kp)
-      b <- L0GenesisLoader.signedDeterministic[IO, UpdateDelegatedStake.Create](ev, kp)
-      // The single-proof signature hex must match (newtype unwraps via `coerce` to Hex).
-      sigA = a.proofs.head.signature.coerce.value
-      sigB = b.proofs.head.signature.coerce.value
-    } yield expect.same(sigA, sigB) && expect.same(a, b)
+      bundle = data.delegatedStakes.head
+      computedRef <- TokenLockReference.of[IO](bundle.signedBackingTokenLock)
+      eventSignature = bundle.signedEvent.proofs.head.signature.coerce.value
+      lockSignature = bundle.signedBackingTokenLock.proofs.head.signature.coerce.value
+    } yield
+      expect(eventSignature.nonEmpty) &&
+        expect(lockSignature.nonEmpty) &&
+        expect.same(bundle.signedEvent.tokenLockRef, computedRef.hash) &&
+        expect.same(bundle.signedEvent.proofs.head.id, bundle.signedBackingTokenLock.proofs.head.id)
   }
 
   test("Issue B: cross-node consistency — two GSIs built via augmentSnapshotInfo are byte-equal") { res =>
@@ -189,6 +198,7 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
     // deterministic path both nodes produce byte-equal GSIs.
     for {
       data <- buildFixture[IO]
+      implicit0(hasherSelector: HasherSelector[IO]) = HasherSelector.forSyncAlwaysCurrent(h)
       balanceMap = data.initialBalanceMap
       genesisSnapshot = GlobalSnapshot.mkGenesis(balanceMap, EpochProgress(NonNegLong(0L)))
       kp <- KeyPairGenerator.makeKeyPair[IO]
@@ -202,5 +212,44 @@ object L0GenesisStateProofConsistencySuite extends MutableIOSuite {
       proof1 <- gsiNode1.stateProof[IO](hashedGenesis.ordinal)
       proof2 <- gsiNode2.stateProof[IO](hashedGenesis.ordinal)
     } yield expect.same(gsiNode1, gsiNode2) && expect.same(proof1, proof2)
+  }
+
+  test("loader selects the actual first-live hasher and rejects the current-only bundle under a legacy schedule") { res =>
+    implicit val (ks, js, currentHasher, sp) = res
+    val legacyHasher = Hasher.forKryo[IO]
+    val selectedOrdinals = scala.collection.mutable.ListBuffer.empty[SnapshotOrdinal]
+    implicit val boundarySelector: HasherSelector[IO] = new HasherSelector[IO] {
+      def getCurrent: Hasher[IO] = currentHasher
+      def getForOrdinal(ordinal: SnapshotOrdinal): Hasher[IO] = {
+        selectedOrdinals += ordinal
+        if (ordinal == SnapshotOrdinal.MinValue.next) legacyHasher else currentHasher
+      }
+    }
+
+    for {
+      data <- buildFixture[IO]
+      result <- L0GenesisLoader.augmentSnapshotInfo[IO](GlobalSnapshotInfo.empty, data).attempt
+    } yield
+      expect.same(List(SnapshotOrdinal.MinValue.next), selectedOrdinals.toList) &&
+        expect(
+          result.swap.exists(
+            _.getMessage.contains("public signed-bundle schema is greenfield-current-hash-only")
+          )
+        )
+  }
+
+  test("loader rejects a future activation ordinal in the ordinal-zero greenfield genesis schema") { res =>
+    implicit val (_, js, h, sp) = res
+    implicit val hasherSelector: HasherSelector[IO] = HasherSelector.forSyncAlwaysCurrent(h)
+
+    for {
+      data <- buildFixture[IO]
+      result <- L0GenesisLoader.augmentSnapshotInfo[IO](GlobalSnapshotInfo.empty, data.copy(activationOrdinal = 100L)).attempt
+    } yield
+      expect(
+        result.swap.exists(
+          _.getMessage.contains("activationOrdinal must equal the greenfield genesis ordinal")
+        )
+      )
   }
 }

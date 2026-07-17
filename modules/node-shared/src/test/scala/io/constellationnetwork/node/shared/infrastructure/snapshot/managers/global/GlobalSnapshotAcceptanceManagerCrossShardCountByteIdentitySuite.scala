@@ -215,7 +215,8 @@ object GlobalSnapshotAcceptanceManagerCrossShardCountByteIdentitySuite extends M
         parentStateReader: GlobalStateReader[IO],
         epochProgress: EpochProgress,
         ordinal: SnapshotOrdinal,
-        delegatedStakeAcceptanceResult: io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult
+        delegatedStakeAcceptanceResult: io.constellationnetwork.node.shared.domain.delegatedStake.UpdateDelegatedStakeAcceptanceResult,
+        acceptedTokenLocks: List[Signed[TokenLock]]
       ): IO[UpdateNodeCollateralAcceptanceResult] =
         UpdateNodeCollateralAcceptanceResult(
           acceptedCreates = SortedMap.empty,

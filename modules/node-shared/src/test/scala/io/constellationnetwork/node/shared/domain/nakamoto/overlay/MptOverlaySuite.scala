@@ -8,14 +8,16 @@ import scala.concurrent.duration._
 import io.constellationnetwork.ext.cats.effect.ResourceIO
 import io.constellationnetwork.json.JsonSerializer
 import io.constellationnetwork.node.shared.domain.nakamoto.ParentChildTree
-import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.balance.Balance
 import io.constellationnetwork.schema.epoch.EpochProgress
 import io.constellationnetwork.schema.mpt._
+import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
+import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
 import io.constellationnetwork.security._
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
+import io.constellationnetwork.security.mpt.MptRoot
 import io.constellationnetwork.security.mpt.producer.{InMemoryMerklePatriciaProducer, TerminalPhysicalTrieKeyCollision}
 import io.constellationnetwork.serde.ImmutableCodec
 import io.constellationnetwork.serde.codecs.StringCodec._
@@ -375,6 +377,103 @@ object MptOverlaySuite extends MutableIOSuite {
         bestTipsFn = IO.pure(Set.empty[BranchId])
       )
     } yield (store, overlay)
+
+  test("exact-parent byte capture owns its values and rejects null state bytes") { _ =>
+    val state = GlobalSnapshotStateRef(
+      SnapshotOrdinal.MinValue,
+      Hash("1" * 64),
+      Hash.empty,
+      MptRoot(Hash("2" * 64))
+    )
+    val key = Hex("ab")
+    val source = Array[Byte](1, 2, 3)
+    val captured = MptOverlay.captureImmutableEntries(state, Map(key -> source))
+
+    source(0) = 9
+    val firstRead = captured.toOption.flatMap(_.get(key)).map(_.toArray)
+    val firstReadWasOwned = firstRead.exists(java.util.Arrays.equals(_, Array[Byte](1, 2, 3)))
+    firstRead.foreach(_(1) = 8)
+    val secondRead = captured.toOption.flatMap(_.get(key)).map(_.toArray)
+    val malformed = MptOverlay.captureImmutableEntries(state, Map(key -> (null: Array[Byte])))
+
+    IO.pure(
+      expect.all(
+        firstReadWasOwned,
+        secondRead.exists(java.util.Arrays.equals(_, Array[Byte](1, 2, 3))),
+        malformed.left.toOption.contains(ParentStateError.MalformedCapturedStateValue(state, key))
+      )
+    )
+  }
+
+  test("exact-parent overlay capture fails closed on missing and inconsistent lineage") { res =>
+    implicit val (h, _, js) = res
+    val boundary = BranchId(Hash("8" * 64))
+    val missing = BranchId(Hash("7" * 64))
+    val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
+    val placeholderRoot = MptRoot(Hash("6" * 64))
+    val baseRef = GlobalSnapshotStateRef(SnapshotOrdinal.MinValue, boundary.value, Hash.empty, placeholderRoot)
+    val parentRef = GlobalSnapshotStateRef(ordinal, branchA.value, boundary.value, placeholderRoot)
+    val missingRef = GlobalSnapshotStateRef(ordinal, missing.value, boundary.value, placeholderRoot)
+    val grandchildRef = GlobalSnapshotStateRef(ordinal2, branchC.value, missing.value, placeholderRoot)
+
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+      direct <- overlay.checkout(boundary)
+      _ <- overlay.commit(direct, branchA, ordinal)
+      dangling <- overlay.checkout(missing)
+      _ <- overlay.commit(dangling, branchC, ordinal2)
+      missingRequested <- overlay.captureExactParentState(baseRef, missingRef)
+      missingIntermediate <- overlay.captureExactParentState(baseRef, grandchildRef)
+      wrongParent <- overlay.captureExactParentState(baseRef, parentRef.copy(parentHash = branchB.value))
+      wrongOrdinal <- overlay.captureExactParentState(baseRef, parentRef.copy(ordinal = ordinal2))
+      collision <- overlay.checkout(boundary)
+      _ <- overlay.commit(collision, boundary, SnapshotOrdinal.MinValue)
+      baseCollision <- overlay.captureExactParentState(baseRef, baseRef)
+    } yield
+      expect.all(
+        missingRequested.left.exists {
+          case ParentStateError.ParentStateUnavailable(_, branch, ParentStateUnavailableReason.MissingAncestorOf(_)) =>
+            branch == missing
+          case _ => false
+        },
+        missingIntermediate.left.exists {
+          case ParentStateError.ParentStateUnavailable(_, branch, ParentStateUnavailableReason.MissingAncestorOf(_)) =>
+            branch == missing
+          case _ => false
+        },
+        wrongParent.left.exists {
+          case ParentStateError.BranchParentMismatch(_, branch, expected, observed) =>
+            branch == branchA && expected == branchB && observed == boundary
+          case _ => false
+        },
+        wrongOrdinal.left.exists {
+          case ParentStateError.BranchOrdinalMismatch(_, branch, expected, observed) =>
+            branch == branchA && expected == ordinal2 && observed == ordinal
+          case _ => false
+        },
+        baseCollision.left.toOption.contains(ParentStateError.PendingBaseBranchCollision(baseRef))
+      )
+  }
+
+  test("exact-parent overlay capture rejects a cyclic pending lineage before materialization") { res =>
+    implicit val (h, _, js) = res
+    val boundary = BranchId(Hash("8" * 64))
+    val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
+    val placeholderRoot = MptRoot(Hash("6" * 64))
+    val baseRef = GlobalSnapshotStateRef(SnapshotOrdinal.MinValue, boundary.value, Hash.empty, placeholderRoot)
+    val parentRef = GlobalSnapshotStateRef(ordinal2, branchA.value, branchB.value, placeholderRoot)
+
+    for {
+      pair <- mkMultiBranch
+      (_, overlay) = pair
+      a <- overlay.checkout(branchB)
+      _ <- overlay.commit(a, branchA, ordinal2)
+      b <- overlay.checkout(branchA)
+      _ <- overlay.commit(b, branchB, ordinal)
+      result <- overlay.captureExactParentState(baseRef, parentRef)
+    } yield expect(result.left.exists(_.isInstanceOf[ParentStateError.AncestryCycle]))
+  }
 
   // ----- ACCEPTANCE GATE for #56.4 -----
 
@@ -1093,6 +1192,189 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
+  test("multi-branch: finalizing an ancestor retains only its strict descendants for exact-parent capture") { res =>
+    implicit val (h, _, js) = res
+    val childA = branchC
+    val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
+    val keyAtA = gskBalance(1010)
+    val keyAtA2 = gskBalance(1011)
+    val keyAtB = gskBalance(1012)
+    val finalizedParent = BranchId(Hash("9" * 64))
+
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      initialBytes <- store.allEntriesAsBytes
+
+      hA <- overlay.checkout(finalizedParent)
+      _ <- hA.insert[Balance](keyAtA, Balance(NonNegLong(11L)))
+      _ <- overlay.commit(hA, branchA, ordinal)
+
+      hA2 <- overlay.checkout(branchA)
+      _ <- hA2.insert[Balance](keyAtA2, Balance(NonNegLong(12L)))
+      _ <- overlay.commit(hA2, childA, ordinal2)
+
+      hB <- overlay.checkout(finalizedParent)
+      _ <- hB.insert[Balance](keyAtB, Balance(NonNegLong(99L)))
+      _ <- overlay.commit(hB, branchB, ordinal)
+
+      ancestorOutcome <- overlay.finalizeBranch(branchA, ordinal)
+      baseBytes <- store.allEntriesAsBytes
+      parentBytes <- overlay.allEntriesAsBytes(childA)
+      baseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](baseBytes)
+      parentRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](parentBytes)
+      baseRef = GlobalSnapshotStateRef(ordinal, branchA.value, finalizedParent.value, MptRoot(baseRoot))
+      childRef = GlobalSnapshotStateRef(ordinal2, childA.value, branchA.value, MptRoot(parentRoot))
+      siblingRef = GlobalSnapshotStateRef(ordinal, branchB.value, finalizedParent.value, MptRoot(parentRoot))
+      capture <- overlay.captureExactParentState(baseRef, childRef)
+      siblingCapture <- overlay.captureExactParentState(baseRef, siblingRef)
+      childSeesA <- overlay.get[Balance](childA, keyAtA)
+      childSeesA2 <- overlay.get[Balance](childA, keyAtA2)
+      siblingWriteGone <- overlay.get[Balance](branchB, keyAtB)
+      sizesAfterAncestor <- overlay.journalSizes
+      childOutcome <- overlay.finalizeBranch(childA, ordinal2)
+      baseAfterChild <- store.allEntriesAsBytes
+      rootAfterChild <- GlobalSnapshotInfo.consensusMptRoot[IO](baseAfterChild)
+      sizesAfterChild <- overlay.journalSizes
+      revertOutcome <- overlay.revertToOrdinal(SnapshotOrdinal.MinValue)
+      baseAfterRevert <- store.allEntriesAsBytes
+    } yield
+      expect.all(
+        ancestorOutcome == FinalizationOutcome.Folded(keysApplied = 1, branchesDropped = 1),
+        childSeesA.contains(Balance(NonNegLong(11L))),
+        childSeesA2.contains(Balance(NonNegLong(12L))),
+        siblingWriteGone.isEmpty,
+        sizesAfterAncestor.pendingBranches == 1,
+        capture.exists { exact =>
+          sameBytes(exact.baseByteMap, baseBytes) &&
+          sameBytes(exact.parentByteMap, parentBytes)
+        },
+        siblingCapture.swap.exists(_.isInstanceOf[ParentStateError.ParentStateUnavailable]),
+        childOutcome == FinalizationOutcome.Folded(keysApplied = 1, branchesDropped = 0),
+        sameBytes(baseAfterChild, parentBytes),
+        rootAfterChild == parentRoot,
+        sizesAfterChild.pendingBranches == 0,
+        revertOutcome == RevertOutcome.Shallow(undoStepsApplied = 2),
+        sameBytes(baseAfterRevert, initialBytes)
+      )
+  }
+
+  test("same-ordinal replacement drops old descendants and retains only replacement descendants") { res =>
+    implicit val (h, _, js) = res
+    val oldChild = branchC
+    val replacementChild = BranchId(Hash("d" * 64))
+    val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
+    val finalizedParent = BranchId(Hash("9" * 64))
+    val oldCanonicalKey = gskBalance(1020)
+    val oldChildKey = gskBalance(1021)
+    val replacementKey = gskBalance(1022)
+    val replacementChildKey = gskBalance(1023)
+
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      old <- overlay.checkout(finalizedParent)
+      _ <- old.insert[Balance](oldCanonicalKey, Balance(NonNegLong(10L)))
+      _ <- overlay.commit(old, branchA, ordinal)
+      oldDescendant <- overlay.checkout(branchA)
+      _ <- oldDescendant.insert[Balance](oldChildKey, Balance(NonNegLong(11L)))
+      _ <- overlay.commit(oldDescendant, oldChild, ordinal2)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+
+      replacement <- overlay.checkout(finalizedParent)
+      _ <- replacement.insert[Balance](replacementKey, Balance(NonNegLong(20L)))
+      _ <- overlay.commit(replacement, branchB, ordinal)
+      replacementDescendant <- overlay.checkout(branchB)
+      _ <- replacementDescendant.insert[Balance](replacementChildKey, Balance(NonNegLong(21L)))
+      _ <- overlay.commit(replacementDescendant, replacementChild, ordinal2)
+      replacementOutcome <- overlay.finalizeBranch(branchB, ordinal)
+
+      replacementBaseBytes <- store.allEntriesAsBytes
+      replacementChildBytes <- overlay.allEntriesAsBytes(replacementChild)
+      replacementBaseRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](replacementBaseBytes)
+      replacementChildRoot <- GlobalSnapshotInfo.consensusMptRoot[IO](replacementChildBytes)
+      replacementBaseRef =
+        GlobalSnapshotStateRef(ordinal, branchB.value, finalizedParent.value, MptRoot(replacementBaseRoot))
+      replacementChildRef =
+        GlobalSnapshotStateRef(ordinal2, replacementChild.value, branchB.value, MptRoot(replacementChildRoot))
+      oldChildRef = GlobalSnapshotStateRef(ordinal2, oldChild.value, branchA.value, MptRoot(replacementChildRoot))
+      replacementCapture <- overlay.captureExactParentState(replacementBaseRef, replacementChildRef)
+      oldCapture <- overlay.captureExactParentState(replacementBaseRef, oldChildRef)
+      oldCanonicalGone <- overlay.get[Balance](replacementChild, oldCanonicalKey)
+      oldChildGone <- overlay.get[Balance](oldChild, oldChildKey)
+      replacementVisible <- overlay.get[Balance](replacementChild, replacementKey)
+      replacementChildVisible <- overlay.get[Balance](replacementChild, replacementChildKey)
+      sizes <- overlay.journalSizes
+    } yield
+      expect.all(
+        replacementOutcome == FinalizationOutcome.Folded(keysApplied = 1, branchesDropped = 1),
+        oldCanonicalGone.isEmpty,
+        oldChildGone.isEmpty,
+        replacementVisible.contains(Balance(NonNegLong(20L))),
+        replacementChildVisible.contains(Balance(NonNegLong(21L))),
+        sizes.pendingBranches == 1,
+        replacementCapture.exists(exact => sameBytes(exact.parentByteMap, replacementChildBytes)),
+        oldCapture.left.exists(_.isInstanceOf[ParentStateError.ParentStateUnavailable])
+      )
+  }
+
+  test("same-ordinal replacement requires exact base rewind and leaves advanced state untouched") { res =>
+    implicit val (h, _, js) = res
+    val child = branchC
+    val ordinal2 = SnapshotOrdinal(NonNegLong(2L))
+    val finalizedParent = BranchId(Hash("9" * 64))
+    val oldKey = gskBalance(1030)
+    val childKey = gskBalance(1031)
+    val replacementKey = gskBalance(1032)
+
+    for {
+      pair <- mkMultiBranch
+      (store, overlay) = pair
+      old <- overlay.checkout(finalizedParent)
+      _ <- old.insert[Balance](oldKey, Balance(NonNegLong(10L)))
+      _ <- overlay.commit(old, branchA, ordinal)
+      _ <- overlay.finalizeBranch(branchA, ordinal)
+      oldChild <- overlay.checkout(branchA)
+      _ <- oldChild.insert[Balance](childKey, Balance(NonNegLong(11L)))
+      _ <- overlay.commit(oldChild, child, ordinal2)
+      _ <- overlay.finalizeBranch(child, ordinal2)
+
+      replacement <- overlay.checkout(finalizedParent)
+      _ <- replacement.insert[Balance](replacementKey, Balance(NonNegLong(20L)))
+      _ <- overlay.commit(replacement, branchB, ordinal)
+      bytesBeforeRejected <- store.allEntriesAsBytes
+      sizesBeforeRejected <- overlay.journalSizes
+      rejected <- overlay.finalizeBranch(branchB, ordinal).attempt
+      bytesAfterRejected <- store.allEntriesAsBytes
+      sizesAfterRejected <- overlay.journalSizes
+      tipAfterRejected <- store.lastPersistedOrdinal
+
+      rewind <- overlay.revertToOrdinal(SnapshotOrdinal.MinValue)
+      replayReplacement <- overlay.checkout(finalizedParent)
+      _ <- replayReplacement.insert[Balance](replacementKey, Balance(NonNegLong(20L)))
+      _ <- overlay.commit(replayReplacement, branchB, ordinal)
+      recovered <- overlay.finalizeBranch(branchB, ordinal)
+      oldAfterRecovery <- store.get[Balance](oldKey)
+      childAfterRecovery <- store.get[Balance](childKey)
+      replacementAfterRecovery <- store.get[Balance](replacementKey)
+    } yield
+      expect.all(
+        rejected.left.exists {
+          case FinalizationReplacementRequiresRewindError(rejectedOrdinal, previous, replacement, Some(baseTip)) =>
+            rejectedOrdinal == ordinal && previous == branchA && replacement == branchB && baseTip == ordinal2
+          case _ => false
+        },
+        sameBytes(bytesAfterRejected, bytesBeforeRejected),
+        sizesAfterRejected == sizesBeforeRejected,
+        tipAfterRejected.contains(ordinal2),
+        rewind == RevertOutcome.Shallow(undoStepsApplied = 2),
+        recovered == FinalizationOutcome.Folded(keysApplied = 1, branchesDropped = 0),
+        oldAfterRecovery.isEmpty,
+        childAfterRecovery.isEmpty,
+        replacementAfterRecovery.contains(Balance(NonNegLong(20L)))
+      )
+  }
+
   test("multi-branch: finalizeBranch is idempotent at same (ordinal, hash)") { res =>
     implicit val (h, _, js) = res
     for {
@@ -1353,7 +1635,7 @@ object MptOverlaySuite extends MutableIOSuite {
       )
   }
 
-  test("multi-branch: unknown first finalization is idempotent but a different hash fails without an undo") { res =>
+  test("multi-branch: unknown first finalization is idempotent but replacement fails without an exact persisted base") { res =>
     implicit val (h, _, js) = res
     for {
       pair <- mkMultiBranch
@@ -1363,15 +1645,15 @@ object MptOverlaySuite extends MutableIOSuite {
       r1 <- overlay.finalizeBranch(branchA, ordinal)
       // Re-finalizing same (ordinal, branchA) — still NoOp.
       r2 <- overlay.finalizeBranch(branchA, ordinal)
-      // No fold occurred, so there is no authenticated undo record proving the pre-ordinal base for a different hash.
+      // No fold occurred, so neither an exact persisted base nor an authenticated undo proves replacement safety.
       reorg <- overlay.finalizeBranch(branchB, ordinal).attempt
     } yield
       expect.all(
         r1 == FinalizationOutcome.NoOp,
         r2 == FinalizationOutcome.NoOp,
         reorg match {
-          case Left(_: FinalizationUndoGapError) => true
-          case _                                 => false
+          case Left(_: FinalizationReplacementRequiresRewindError) => true
+          case _                                                   => false
         }
       )
   }

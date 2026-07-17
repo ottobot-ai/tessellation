@@ -110,7 +110,7 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
     val valid =
       duplicateIds.isEmpty && duplicateSources.isEmpty && danglingSourceIds.isEmpty && invalidMissingAuthority.isEmpty &&
         unexplainedMissingCurrentAuthority.isEmpty && unsafeWithoutRed.isEmpty && featureIdentityCollapsed.isEmpty &&
-        frozenCounts == ((40, 13, 192))
+        frozenCounts == ((40, 13, 193))
     if (valid) success
     else
       failure(
@@ -268,6 +268,7 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
           "ECO-TOKEN-LOCK-EXPIRY",
           "ECO-TOKEN-LOCK-MANUAL",
           "ECO-DELEGATED-STAKE-RELEASE",
+          "ECO-NODE-COLLATERAL-RELEASE",
           "ECO-PRICE",
           "ECO-CROSS-MG-NULLIFIER"
         )
@@ -660,7 +661,8 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
         operation("ECO-DELEGATED-STAKE-RELEASE").effects == Set(StakeBacking, Release, BalanceCredit),
         operation("ECO-NODE-COLLATERAL-CREATE").effects == Set(CollateralBacking, ReferenceAdvance),
         operation("ECO-NODE-COLLATERAL-WITHDRAW").effects == Set(CollateralBacking, ReferenceAdvance),
-        operation("ECO-NODE-COLLATERAL-RELEASE").activation == MissingFailClosed,
+        operation("ECO-NODE-COLLATERAL-RELEASE").activation == ActiveNeedsOracle,
+        operation("ECO-NODE-COLLATERAL-RELEASE").effects == Set(CollateralBacking, Release, BalanceCredit),
         blockAcceptance.contains("minusFeeOps=sortedTxs.groupMap(_.source)(tx=>minusFn(tx.fee))"),
         blockAcceptance.contains("plusAmountOps=sortedTxs.groupMap(_.destination)(tx=>plusFn(tx.amount))"),
         !blockAcceptance.contains("plusFeeOps"),
@@ -678,8 +680,12 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
         !collateralAcceptance.contains(".minus("),
         !collateralAcceptance.contains(".plus("),
         !collateralAcceptance.contains(".fee"),
-        globalAcceptance.contains("(unexpiredCreate,unexpiredWithdraw,_)=unexpiredNodeCollateralsRaw"),
-        globalAcceptance.contains("generateTokenUnlocks(initialData.existingStakes.expired,"),
+        globalAcceptance.contains(
+          "(unexpiredCreate,unexpiredWithdraw,expiredNodeCollateralWithdrawals)=unexpiredNodeCollateralsRaw"
+        ),
+        globalAcceptance.contains(
+          "generateTokenUnlocks(initialData.existingStakes.expired,expiredNodeCollateralWithdrawals,"
+        ),
         !globalAcceptance.contains("generateTokenUnlocks(unexpiredNodeCollateralsRaw")
       )
     }
@@ -901,7 +907,7 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
     }
   }
 
-  test("RED ECON-GENESIS-BACKING-001: genesis installs arbitrary active stake and collateral while token locks stay empty") {
+  test("ECON-GENESIS-BACKING-001 closed: genesis installs only signed stake and collateral with exact live backing locks") {
     productionSources.map { sources =>
       val loader = compact(
         stripComments(
@@ -915,26 +921,33 @@ object V4EconomicGrammarCompletenessGuardSuite extends SimpleIOSuite {
           sources("modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/genesis/types.scala").contents
         )
       )
-      val snapshotInfo = compact(
-        stripComments(sources("modules/shared/src/main/scala/io/constellationnetwork/schema/GlobalSnapshotInfo.scala").contents)
-      )
       val stake = operation("ECO-GENESIS-DELEGATED-STAKE")
       val collateral = operation("ECO-GENESIS-NODE-COLLATERAL")
 
       expect.all(
-        stake.activation == ActiveSourceProvenUnsafe,
+        stake.activation == ActiveWithOpenConservationGate,
         stake.effects == Set(StakeBacking, RewardWeight, Mint),
-        collateral.activation == ActiveSourceProvenUnsafe,
+        !stake.redObligations("ECON-GENESIS-BACKING-001"),
+        collateral.activation == ActiveWithOpenConservationGate,
         collateral.effects == Set(CollateralBacking),
-        genesisTypes.contains("caseclassL0GenesisDelegatedStake(event:UpdateDelegatedStake.Create"),
+        !collateral.redObligations("ECON-GENESIS-BACKING-001"),
+        genesisTypes.contains(
+          "caseclassL0GenesisDelegatedStake(signedEvent:Signed[UpdateDelegatedStake.Create],signedBackingTokenLock:Signed[TokenLock]"
+        ),
         genesisTypes.contains("rewards:Long"),
-        genesisTypes.contains("caseclassL0GenesisNodeCollateral(event:UpdateNodeCollateral.Create"),
-        genesisTypes.contains("caseNone=>addr->stipend"),
+        genesisTypes.contains(
+          "caseclassL0GenesisNodeCollateral(signedEvent:Signed[UpdateNodeCollateral.Create],signedBackingTokenLock:Signed[TokenLock]"
+        ),
+        genesisTypes.contains("defvalidatedGenesisAllocation:Either[String,(Map[Address,Balance],BigInt)]"),
+        !genesisTypes.contains("privateKey"),
+        loader.contains("validateSignedBySource[F,UpdateDelegatedStake.Create]"),
+        loader.contains("event.tokenLockRef,stake.signedBackingTokenLock"),
+        loader.contains("eventProofId===lockProofId"),
+        loader.contains("StakeBackingValidator.validateActiveState[F](activeLocks,stakeMap,collMap)"),
         loader.contains("activeDelegatedStakes=Some(stakeMap)"),
-        loader.contains("valrewardsAmount=Amount(NonNegLong.unsafeFrom(s.rewards))"),
         loader.contains("activeNodeCollaterals=Some(collMap)"),
-        !sectionAfter(loader, "base.copy(", 500).contains("activeTokenLocks"),
-        snapshotInfo.contains("Some(SortedMap.empty[Address,SortedSet[Signed[TokenLock]]])")
+        loader.contains("activeTokenLocks=Some(activeLocks)"),
+        loader.contains("lastTokenLockRefs=Some(lastTokenLockRefs)")
       )
     }
   }

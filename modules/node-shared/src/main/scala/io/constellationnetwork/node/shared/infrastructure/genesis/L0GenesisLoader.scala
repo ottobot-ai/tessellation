@@ -1,34 +1,33 @@
 package io.constellationnetwork.node.shared.infrastructure.genesis
 
-import java.security._
-import java.security.spec.PKCS8EncodedKeySpec
-
-import cats.data.NonEmptySet
 import cats.effect.Async
 import cats.syntax.all._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
-import io.constellationnetwork.ext.crypto._
+import io.constellationnetwork.ext.cats.syntax.next.catsSyntaxNext
+import io.constellationnetwork.node.shared.domain.economics.StakeBackingValidator
 import io.constellationnetwork.node.shared.domain.genesis.types._
 import io.constellationnetwork.node.shared.domain.nakamoto.kes.OperatorConsensusKeys
 import io.constellationnetwork.node.shared.domain.nakamoto.{KesRegistryEntry, OperatorConsensusKeyRegistry}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema.address.Address
-import io.constellationnetwork.schema.balance.{Amount, Balance}
+import io.constellationnetwork.schema.balance.Amount
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, UpdateDelegatedStake}
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, MptStore}
 import io.constellationnetwork.schema.nakamoto.slot.VrfPublicKey
 import io.constellationnetwork.schema.nakamoto.{EtaPeriod, GenesisOperatorConsensusKey}
 import io.constellationnetwork.schema.nodeCollateral.{NodeCollateralRecord, UpdateNodeCollateral}
 import io.constellationnetwork.schema.peer.PeerId
+import io.constellationnetwork.schema.tokenLock.{TokenLock, TokenLockReference}
 import io.constellationnetwork.schema.{GlobalSnapshotInfo, SnapshotOrdinal}
+import io.constellationnetwork.security._
+import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.hex.Hex
 import io.constellationnetwork.security.kes.VerificationKeyKesProduct
 import io.constellationnetwork.security.key.ops.PublicKeyOps
-import io.constellationnetwork.security.signature.signature.{Signature, SignatureProof}
+import io.constellationnetwork.security.signature.signature.Signature
 import io.constellationnetwork.security.signature.{Signed, Signing}
-import io.constellationnetwork.security.{Hasher, SecurityProvider}
 import io.constellationnetwork.serde.codecs.instances.GenesisOperatorConsensusKeyCodec.immutableCodec
 
 import eu.timepit.refined.numeric.NonNegative
@@ -36,204 +35,249 @@ import eu.timepit.refined.refineV
 import eu.timepit.refined.types.numeric.NonNegLong
 import io.circe.Encoder
 
-/** Helper that turns a Tier-1 `L0GenesisData` into a `GlobalSnapshotInfo` overlay. Called from the dag-l0 `Main.scala` JSON-genesis
-  * bootstrap branch AFTER `hashedGenesis.info.toGlobalSnapshotInfo` is computed — we widen the in-memory GSI with delegated-stake +
-  * collateral entries before any downstream consumer (storages, services) reads it. The on-disk `Signed[GlobalSnapshot]` stays V1 (Option
-  * (ii) in the §1.1 plan — lowest blast radius).
-  *
-  * Signing: the rest of the codebase uses non-deterministic ECDSA via `Signing.signData` (unseeded `SecureRandom`). For genesis-fixture
-  * records we sign DETERMINISTICALLY via RFC 6979 (`org.bouncycastle.crypto.signers.ECDSASigner` + `HMacDSAKCalculator(SHA512Digest)`) so
-  * every node that loads the same fixture produces byte-identical `Signed[...]` records. This matters because the `Signed[event]` bytes
-  * become MPT leaves in the `activeDelegatedStakes` / `activeNodeCollaterals` partitions — if signatures differed across nodes, the field
-  * root (and therefore the stateProof.mptRoot) would diverge cross-node from genesis onward. The deterministic signature is DER-encoded
-  * `(r, s)` identical in format to JCE's `SHA512withECDSA` output, so existing verifiers (`Signing.verifySignature` →
-  * `Signature.getInstance("SHA512withECDSA")`) accept it without modification.
+/** Validates and installs public, fully signed genesis economic bundles. Genesis loading never receives or reconstructs an economic owner
+  * private key. Every node installs the exact signed bytes committed in the canonical genesis file.
   */
 object L0GenesisLoader {
 
-  private val ECDSA = "ECDSA"
   private val PeerIdLength = 64
   private val KesMasterVerificationKeyLength = 32
 
-  private def parsePrivateKey[F[_]: Async: SecurityProvider](pkcs8Hex: String): F[PrivateKey] =
-    Async[F].delay {
-      val bytes = Hex(pkcs8Hex).toBytes
-      val spec = new PKCS8EncodedKeySpec(bytes)
-      val kf = KeyFactory.getInstance(ECDSA, SecurityProvider[F].provider)
-      kf.generatePrivate(spec)
-    }
+  private def invalidEconomicGenesis(message: String): IllegalArgumentException =
+    new IllegalArgumentException(s"Invalid canonical L0 genesis economic bundle: $message")
 
-  /** Recover the public key from the private key. For EC keys produced by `KeyPairGenerator`, BouncyCastle stores the public point inside
-    * the PKCS8 attributes; we reconstruct it via `BCECPrivateKey.getParameters`. Falls back to ECPublicKeySpec arithmetic if that's
-    * unavailable.
-    */
-  private def derivePublicKey[F[_]: Async: SecurityProvider](priv: PrivateKey): F[PublicKey] =
-    Async[F].delay {
-      import org.bouncycastle.jce.interfaces.ECPrivateKey
-      import org.bouncycastle.jce.spec.ECPublicKeySpec
-      val bcPriv = priv.asInstanceOf[ECPrivateKey]
-      val params = bcPriv.getParameters
-      val q = params.getG.multiply(bcPriv.getD)
-      val pubSpec = new ECPublicKeySpec(q, params)
-      val kf = KeyFactory.getInstance(ECDSA, SecurityProvider[F].provider)
-      kf.generatePublic(pubSpec)
-    }
+  private def requireEconomic[F[_]: Async](condition: Boolean, message: => String): F[Unit] =
+    Async[F].raiseError[Unit](invalidEconomicGenesis(message)).unlessA(condition)
 
-  /** Reconstruct a `KeyPair` from a PKCS8-encoded private-key hex string. */
-  def keyPairFromHex[F[_]: Async: SecurityProvider](pkcs8Hex: String): F[KeyPair] =
+  private def nonNegative[F[_]: Async](label: String, value: Long): F[NonNegLong] =
+    refineV[NonNegative](value)
+      .leftMap(error => invalidEconomicGenesis(s"$label must be non-negative: $error"))
+      .liftTo[F]
+      .map(refined => NonNegLong.unsafeFrom(refined.value))
+
+  private def validateSignedBySource[F[_]: Async: Hasher: SecurityProvider, A: Encoder](
+    label: String,
+    signed: Signed[A],
+    source: Address
+  ): F[Id] =
     for {
-      priv <- parsePrivateKey[F](pkcs8Hex)
-      pub <- derivePublicKey[F](priv)
-    } yield new KeyPair(pub, priv)
-
-  /** Deterministic ECDSA signature over the SHA-512 digest of `messageBytes`, producing the same DER-encoded `(r, s)` ASN.1 sequence that
-    * JCE's `SHA512withECDSA` would emit — but with the per-signature nonce `k` derived deterministically via RFC 6979 (HMAC-DRBG with
-    * SHA-512). The output verifies under the unmodified verifier path (`Signing.verifySignature` →
-    * `Signature.getInstance("SHA512withECDSA")`), so callers outside genesis don't need to change. Used for genesis fixture records where
-    * cross-node byte-equality of `Signed[UpdateDelegatedStake.Create]` / `Signed[UpdateNodeCollateral.Create]` is required to keep the
-    * `activeDelegatedStakes` / `activeNodeCollaterals` MPT leaves identical across all nodes loading the same fixture.
-    *
-    * Implementation notes:
-    *   - SHA-512 of the message produces the `e` integer (high-order bits used per FIPS 186-4 §6.4 if the digest exceeds the curve order
-    *     bit-length; BouncyCastle's `ECDSASigner.generateSignature` handles that internally).
-    *   - `HMacDSAKCalculator(SHA512Digest)` implements RFC 6979 §3.2 with HMAC-SHA-512.
-    *   - DER encoding uses `ASN1OutputStream` over a `DERSequence(r, s)` of `ASN1Integer` — byte-identical to JCE's output.
-    *   - We do NOT canonicalise `s` (no low-S enforcement). JCE doesn't canonicalise either, so the verifier accepts both branches.
-    */
-  private[genesis] def deterministicSign[F[_]: Async](
-    privateKey: PrivateKey,
-    messageBytes: Array[Byte]
-  ): F[Array[Byte]] =
-    Async[F].delay {
-      import java.io.ByteArrayOutputStream
-      import org.bouncycastle.asn1.{ASN1Integer, ASN1OutputStream, DERSequence}
-      import org.bouncycastle.crypto.digests.SHA512Digest
-      import org.bouncycastle.crypto.params.ECPrivateKeyParameters
-      import org.bouncycastle.crypto.signers.{ECDSASigner, HMacDSAKCalculator}
-      import org.bouncycastle.jce.interfaces.{ECPrivateKey => BcECPrivateKey}
-
-      val bcPriv = privateKey.asInstanceOf[BcECPrivateKey]
-      val ecParams = bcPriv.getParameters
-      val domain = new org.bouncycastle.crypto.params.ECDomainParameters(
-        ecParams.getCurve,
-        ecParams.getG,
-        ecParams.getN,
-        ecParams.getH
+      _ <- requireEconomic[F](signed.proofs.size === 1, s"$label must have exactly one owner signature")
+      proofId = signed.proofs.head.id
+      signer <- proofId.toAddress.adaptError {
+        case _ =>
+          invalidEconomicGenesis(s"$label carries a malformed signer identity")
+      }
+      _ <- requireEconomic[F](
+        signer === source,
+        s"$label signer ${signer.value.value} does not match source ${source.value.value}"
       )
-      val keyParams = new ECPrivateKeyParameters(bcPriv.getD, domain)
+      valid <- signed.hasValidSignature[F].adaptError {
+        case _ =>
+          invalidEconomicGenesis(s"$label signature is malformed")
+      }
+      _ <- requireEconomic[F](valid, s"$label signature is invalid")
+    } yield proofId
 
-      // SHA-512 hash of the message: JCE's "SHA512withECDSA" hashes the message INSIDE the
-      // Signature engine before passing the digest to the underlying ECDSA primitive. We do
-      // the same hashing here so the resulting (r, s) verify under the JCE path.
-      val sha = new SHA512Digest()
-      val digest = new Array[Byte](sha.getDigestSize)
-      sha.update(messageBytes, 0, messageBytes.length)
-      sha.doFinal(digest, 0)
+  private def validateBackingLock[F[_]: Async: Hasher: SecurityProvider](
+    label: String,
+    source: Address,
+    exactAmount: Long,
+    expectedRef: Hash,
+    signedLock: Signed[TokenLock]
+  ): F[Id] = {
+    val lock = signedLock.value
 
-      val signer = new ECDSASigner(new HMacDSAKCalculator(new SHA512Digest()))
-      signer.init(true, keyParams)
-      val rs = signer.generateSignature(digest)
-      val r = rs(0)
-      val s = rs(1)
-
-      val baos = new ByteArrayOutputStream()
-      val asn1 = ASN1OutputStream.create(baos)
-      asn1.writeObject(new DERSequence(Array[org.bouncycastle.asn1.ASN1Encodable](new ASN1Integer(r), new ASN1Integer(s))))
-      asn1.close()
-      baos.toByteArray
-    }
-
-  /** Build a `Signed[A]` whose proof signature is byte-deterministic for a given `(privateKey, data)` pair. Mirrors `Signed.forAsyncHasher`
-    * but routes through `deterministicSign`. The signer identity (`Id`) is recovered from the public key the same way as the rest of the
-    * codebase (`PeerId.fromPublic(...).toId`).
-    */
-  private[genesis] def signedDeterministic[F[_]: Async: Hasher: SecurityProvider, A: Encoder](
-    data: A,
-    keyPair: KeyPair
-  ): F[Signed[A]] =
     for {
-      hash <- data.hash
-      sigBytes <- deterministicSign[F](keyPair.getPrivate, hash.getBytes)
-      proof = SignatureProof(PeerId.fromPublic(keyPair.getPublic).toId, Signature(Hex.fromBytes(sigBytes)))
-    } yield Signed[A](data, NonEmptySet.fromSetUnsafe(SortedSet(proof)))
+      proofId <- validateSignedBySource[F, TokenLock](s"$label backing token lock", signedLock, source)
+      _ <- requireEconomic[F](lock.source === source, s"$label backing token-lock source mismatch")
+      _ <- requireEconomic[F](
+        lock.amount.value.value === exactAmount,
+        s"$label backing token-lock amount ${lock.amount.value.value} does not exactly equal event amount $exactAmount"
+      )
+      _ <- requireEconomic[F](lock.fee.value.value === 0L, s"$label backing token-lock fee must be zero")
+      _ <- requireEconomic[F](lock.parent === TokenLockReference.empty, s"$label backing token-lock parent must be native empty")
+      _ <- requireEconomic[F](lock.currencyId.isEmpty, s"$label backing token lock must be native")
+      _ <- requireEconomic[F](lock.unlockEpoch.isEmpty, s"$label backing token lock must be indefinite")
+      _ <- requireEconomic[F](lock.replaceTokenLockRef.isEmpty, s"$label backing token lock cannot replace another lock")
+      computedRef <- TokenLockReference.of[F](signedLock)
+      _ <- requireEconomic[F](
+        computedRef.hash === expectedRef,
+        s"$label event tokenLockRef does not equal the canonical backing token-lock hash"
+      )
+    } yield proofId
+  }
 
-  /** Sign a synthetic delegated-stake event using its embedded delegator private key, then wrap the result in a runtime
-    * `DelegatedStakeRecord`. Defensive: if signing fails (corrupt hex, wrong curve, etc), the entry is skipped and logged — Tier-1 fixtures
-    * are reviewed before landing so silent-skip on malformed records is the conservative choice.
-    *
-    * Uses [[signedDeterministic]] (RFC 6979) so the resulting `Signed[UpdateDelegatedStake.Create]` bytes are byte-identical across nodes
-    * loading the same fixture. Without this, `activeDelegatedStakes` MPT leaf bytes would diverge cross-node.
-    */
-  private def signStake[F[_]: Async: Hasher: SecurityProvider](
-    s: L0GenesisDelegatedStake
-  ): F[Option[(Address, DelegatedStakeRecord)]] =
-    keyPairFromHex[F](s.delegatorPrivateKeyHex).flatMap { kp =>
-      signedDeterministic[F, UpdateDelegatedStake.Create](s.event, kp).map { signed =>
-        val createdAt = SnapshotOrdinal(NonNegLong.unsafeFrom(s.createdAt))
-        val rewardsAmount = Amount(NonNegLong.unsafeFrom(s.rewards))
-        val record = DelegatedStakeRecord(signed, createdAt, rewardsAmount)
-        Option(s.event.source -> record)
-      }
-    }.handleError(_ => Option.empty[(Address, DelegatedStakeRecord)])
+  private def validateStake[F[_]: Async: Hasher: SecurityProvider](
+    index: Int,
+    stake: L0GenesisDelegatedStake,
+    operators: Set[PeerId],
+    activationOrdinal: Long
+  ): F[(Address, DelegatedStakeRecord, Signed[TokenLock])] = {
+    val label = s"delegatedStakes[$index]"
+    val event = stake.signedEvent.value
 
-  private def signCollateral[F[_]: Async: Hasher: SecurityProvider](
-    c: L0GenesisNodeCollateral
-  ): F[Option[(Address, NodeCollateralRecord)]] =
-    keyPairFromHex[F](c.ownerPrivateKeyHex).flatMap { kp =>
-      signedDeterministic[F, UpdateNodeCollateral.Create](c.event, kp).map { signed =>
-        val createdAt = SnapshotOrdinal(NonNegLong.unsafeFrom(c.createdAt))
-        val record = NodeCollateralRecord(signed, createdAt)
-        Option(c.event.source -> record)
-      }
-    }.handleError(_ => Option.empty[(Address, NodeCollateralRecord)])
+    for {
+      eventProofId <- validateSignedBySource[F, UpdateDelegatedStake.Create](s"$label event", stake.signedEvent, event.source)
+      _ <- requireEconomic[F](event.amount.value.value > 0L, s"$label amount must be positive")
+      _ <- requireEconomic[F](event.fee.value.value === 0L, s"$label event fee must be zero")
+      _ <- requireEconomic[F](
+        event.parent === io.constellationnetwork.schema.delegatedStake.DelegatedStakeReference.empty,
+        s"$label event parent must be empty"
+      )
+      _ <- requireEconomic[F](operators(event.nodeId), s"$label targets an operator outside the canonical genesis registry")
+      lockProofId <- validateBackingLock[F](
+        label,
+        event.source,
+        event.amount.value.value,
+        event.tokenLockRef,
+        stake.signedBackingTokenLock
+      )
+      _ <- requireEconomic[F](eventProofId === lockProofId, s"$label event and backing lock must have the exact same signer")
+      createdAt <- nonNegative[F](s"$label.createdAt", stake.createdAt)
+      _ <- requireEconomic[F](
+        stake.createdAt === activationOrdinal,
+        s"$label.createdAt must equal activationOrdinal $activationOrdinal"
+      )
+      _ <- requireEconomic[F](stake.rewards === 0L, s"$label.rewards must be zero at genesis")
+      rewards <- nonNegative[F](s"$label.rewards", stake.rewards)
+      record = DelegatedStakeRecord(stake.signedEvent, SnapshotOrdinal(createdAt), Amount(rewards))
+    } yield (event.source, record, stake.signedBackingTokenLock)
+  }
+
+  private def validateCollateral[F[_]: Async: Hasher: SecurityProvider](
+    index: Int,
+    collateral: L0GenesisNodeCollateral,
+    operators: Set[PeerId],
+    activationOrdinal: Long
+  ): F[(Address, NodeCollateralRecord, Signed[TokenLock])] = {
+    val label = s"nodeCollaterals[$index]"
+    val event = collateral.signedEvent.value
+
+    for {
+      eventProofId <- validateSignedBySource[F, UpdateNodeCollateral.Create](s"$label event", collateral.signedEvent, event.source)
+      _ <- requireEconomic[F](event.amount.value.value > 0L, s"$label amount must be positive")
+      _ <- requireEconomic[F](event.fee.value.value === 0L, s"$label event fee must be zero")
+      _ <- requireEconomic[F](
+        event.parent === io.constellationnetwork.schema.nodeCollateral.NodeCollateralReference.empty,
+        s"$label event parent must be empty"
+      )
+      _ <- requireEconomic[F](operators(event.nodeId), s"$label targets an operator outside the canonical genesis registry")
+      lockProofId <- validateBackingLock[F](
+        label,
+        event.source,
+        event.amount.value.value,
+        event.tokenLockRef,
+        collateral.signedBackingTokenLock
+      )
+      _ <- requireEconomic[F](eventProofId === lockProofId, s"$label event and backing lock must have the exact same signer")
+      createdAt <- nonNegative[F](s"$label.createdAt", collateral.createdAt)
+      _ <- requireEconomic[F](
+        collateral.createdAt === activationOrdinal,
+        s"$label.createdAt must equal activationOrdinal $activationOrdinal"
+      )
+      record = NodeCollateralRecord(collateral.signedEvent, SnapshotOrdinal(createdAt))
+    } yield (event.source, record, collateral.signedBackingTokenLock)
+  }
 
   /** Augment a base `GlobalSnapshotInfo` (from `GlobalSnapshotInfoV1.toGlobalSnapshotInfo`) with the delegated-stake records,
-    * node-collateral records, and balances declared in an L0 genesis fixture. Returns a new GSI with `activeDelegatedStakes`,
-    * `activeNodeCollaterals`, and `balances` populated. Other fields (allow-spends, token-locks, etc.) are left at the empty
-    * `Some(SortedMap.empty)` produced by `toGlobalSnapshotInfo`.
+    * node-collateral records, exact backing locks, and balances declared in an L0 genesis fixture.
     */
-  def augmentSnapshotInfo[F[_]: Async: Hasher: SecurityProvider](
+  def augmentSnapshotInfo[F[_]: Async: HasherSelector: SecurityProvider](
+    base: GlobalSnapshotInfo,
+    data: L0GenesisData
+  ): F[GlobalSnapshotInfo] =
+    requireEconomic[F](
+      data.activationOrdinal === SnapshotOrdinal.MinValue.value.value,
+      s"activationOrdinal must equal the greenfield genesis ordinal ${SnapshotOrdinal.MinValue.value.value}"
+    ) >> nonNegative[F]("activationOrdinal", data.activationOrdinal).flatMap { activationOrdinal =>
+      HasherSelector[F].forOrdinal(SnapshotOrdinal(activationOrdinal).next) { selectedHasher =>
+        Async[F]
+          .raiseError[Unit](
+            invalidEconomicGenesis(
+              s"the public signed-bundle schema is greenfield-current-hash-only, but first live ordinal " +
+                s"${SnapshotOrdinal(activationOrdinal).next.value.value} selects ${selectedHasher.getLogic(SnapshotOrdinal(activationOrdinal).next)}"
+            )
+          )
+          .unlessA(selectedHasher.getLogic(SnapshotOrdinal(activationOrdinal).next) == JsonHash) >> {
+          implicit val hasher: Hasher[F] = selectedHasher
+          augmentSnapshotInfoAtActivationHasher(base, data)
+        }
+      }
+    }
+
+  private def augmentSnapshotInfoAtActivationHasher[F[_]: Async: Hasher: SecurityProvider](
     base: GlobalSnapshotInfo,
     data: L0GenesisData
   ): F[GlobalSnapshotInfo] =
     for {
-      stakePairs <- data.delegatedStakes.flatTraverse(s => signStake[F](s).map(_.toList))
-      collPairs <- data.nodeCollaterals.flatTraverse(c => signCollateral[F](c).map(_.toList))
       genesisOperatorKeys <- buildGenesisOperatorKeys[F](data)
-    } yield {
-      val stakeMap: SortedMap[Address, SortedSet[DelegatedStakeRecord]] =
-        SortedMap.from(
-          stakePairs
-            .groupBy(_._1)
-            .view
-            .mapValues(_.map(_._2).to(SortedSet))
-        )
-      val collMap: SortedMap[Address, SortedSet[NodeCollateralRecord]] =
-        SortedMap.from(
-          collPairs
-            .groupBy(_._1)
-            .view
-            .mapValues(_.map(_._2).to(SortedSet))
-        )
-      // Merge initial-balances declared in the fixture into the base balance map. The base map is
-      // already pre-populated by `GlobalSnapshot.mkGenesis(initialBalanceMap, ...)`, so this is a
-      // belt-and-braces merge — explicit balances in the fixture take precedence over the stipend
-      // entries injected by `initialBalanceMap`.
-      val mergedBalances: SortedMap[Address, Balance] =
-        data.initialBalances.flatMap { b =>
-          for {
-            addr <- refineV[io.constellationnetwork.schema.address.DAGAddressRefined](b.address).toOption.map(Address(_))
-            bal <- refineV[NonNegative](b.balance).toOption.map(Balance(_))
-          } yield addr -> bal
-        }.foldLeft(base.balances) { case (acc, (a, b)) => acc.updated(a, b) }
-
+      allocation <- data.validatedGenesisAllocation
+        .leftMap(invalidEconomicGenesis)
+        .liftTo[F]
+      (initialBalances, _) = allocation
+      stakeTriples <- data.delegatedStakes.zipWithIndex.traverse {
+        case (stake, index) =>
+          validateStake[F](index, stake, genesisOperatorKeys.keySet, data.activationOrdinal)
+      }
+      collateralTriples <- data.nodeCollaterals.zipWithIndex.traverse {
+        case (collateral, index) =>
+          validateCollateral[F](index, collateral, genesisOperatorKeys.keySet, data.activationOrdinal)
+      }
+      duplicateStakeSources =
+        stakeTriples.groupBy(_._1).collect { case (source, records) if records.sizeCompare(1) > 0 => source }.toList
+      _ <- requireEconomic[F](
+        duplicateStakeSources.isEmpty,
+        s"multiple empty-parent delegated-stake records for source(s): ${duplicateStakeSources.map(_.value.value).sorted.mkString(",")}"
+      )
+      duplicateCollateralSources =
+        collateralTriples.groupBy(_._1).collect { case (source, records) if records.sizeCompare(1) > 0 => source }.toList
+      _ <- requireEconomic[F](
+        duplicateCollateralSources.isEmpty,
+        s"multiple empty-parent node-collateral records for source(s): ${duplicateCollateralSources.map(_.value.value).sorted.mkString(",")}"
+      )
+      allTriples = stakeTriples ++ collateralTriples
+      duplicateBackingSources =
+        allTriples.groupBy(_._1).collect { case (source, records) if records.sizeCompare(1) > 0 => source }.toList
+      _ <- requireEconomic[F](
+        duplicateBackingSources.isEmpty,
+        s"multiple parallel empty-parent backing locks for source(s): ${duplicateBackingSources.map(_.value.value).sorted.mkString(",")}"
+      )
+      stakeMap = SortedMap.from(
+        stakeTriples
+          .groupBy(_._1)
+          .view
+          .mapValues(_.map(_._2).to(SortedSet))
+      )
+      collMap = SortedMap.from(
+        collateralTriples
+          .groupBy(_._1)
+          .view
+          .mapValues(_.map(_._2).to(SortedSet))
+      )
+      activeLocks = SortedMap.from(
+        allTriples
+          .groupBy(_._1)
+          .view
+          .mapValues(_.map(_._3).to(SortedSet))
+      )
+      lastTokenLockRefs <- allTriples.traverse {
+        case (source, _, lock) =>
+          TokenLockReference.of[F](lock).map(source -> _)
+      }.map(pairs => SortedMap.from[Address, TokenLockReference](pairs))
+      _ <- StakeBackingValidator.validateActiveState[F](activeLocks, stakeMap, collMap)
+      mergedBalances = initialBalances.foldLeft(base.balances) {
+        case (acc, (address, balance)) =>
+          acc.updated(address, balance)
+      }
+    } yield
       base.copy(
         balances = mergedBalances,
+        activeTokenLocks = Some(activeLocks),
+        lastTokenLockRefs = Some(lastTokenLockRefs),
         activeDelegatedStakes = Some(stakeMap),
         activeNodeCollaterals = Some(collMap),
         genesisOperatorKeys = genesisOperatorKeys
       )
-    }
 
   private final case class ParsedOperator(
     peerId: PeerId,
@@ -334,7 +378,13 @@ object L0GenesisLoader {
 
     for {
       _ <- Async[F].raiseError[Unit](invalidGenesis("networkMagic must be non-empty")).whenA(data.networkMagic.isEmpty)
-      _ <- Async[F].raiseError[Unit](invalidGenesis("activationOrdinal must be non-negative")).whenA(data.activationOrdinal < 0L)
+      _ <- Async[F]
+        .raiseError[Unit](
+          invalidGenesis(
+            s"activationOrdinal must equal the greenfield genesis ordinal ${SnapshotOrdinal.MinValue.value.value}"
+          )
+        )
+        .unlessA(data.activationOrdinal === SnapshotOrdinal.MinValue.value.value)
       _ <- Async[F]
         .raiseError[Unit](invalidGenesis("startingEpochProgress must be non-negative"))
         .whenA(data.startingEpochProgress < 0L)
