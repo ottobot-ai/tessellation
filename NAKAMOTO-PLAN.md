@@ -310,6 +310,94 @@ already has a hard-coded kill switch.
    reproduction, and rejects duplicate logical hashes. Keep MPT-02/XMG-013
    partial until restart, compaction, exact-parent recovery, density reorg, and
    accepted-state ingress vectors pass.
+   The focused MPT-03 fields 13-16 parser/writer/preflight and audited-consumer
+   migration is green. One strict reader retains physical keys/raw bytes and
+   requires canonical encoding, native empty-contract placement, exact key
+   reproduction, nonempty homogeneous embedded sources, and unique unsigned
+   Create identities. Record ordering covers every serialized field and all four
+   converter roots share the structure gate, so the exercised compound writers
+   reject malformed deltas without mutation. Delegated-stake/node-collateral
+   consensus validation reads the exact proposal-parent branch; the delegated
+   node-parameter prerequisite additionally uses a strict field-12 point read
+   that requires canonical bytes, exactly one proof, and requested-id/key
+   equality. This does not fix MPT-06's three full node-parameter scans or
+   field-17 price scan. Batch arbitration now uses protocol `Signed` ordering,
+   source-scoped delegated parent identity, accepted-only duplicate reservation,
+   one accepted collateral withdrawal per `(source, collateralRef)`, and an
+   explicit delegated-stake/token-lock conflict before collateral reservation
+   (ECO-26/ECO-27). The exact-parent collateral path also preserves the v4
+   same-lock replacement rule only when moving collateral to a different node;
+   same-node reuse, delegated-lock reuse, pending withdrawal, and invalid parent
+   still reject (ECO-28). The selected-tip live stake cache now keys by exact
+   `BranchId`, builds one reader pinned to that selected branch on every miss,
+   and bypasses caching when no branch is selected; same-branch, same-height
+   A-B-A, and branchless regressions close only FIN-10's cache-identity
+   subdefect. A second historical race is also fixed by `d34d23655` (FIN-15,
+   HIGH/CONFIRMED): delegated-stake field 13 and collateral field 15 were
+   scanned under two separately acquired overlay locks, so finalization between
+   them could produce delegated(A) plus collateral(B), a stake distribution
+   belonging to no branch. The aggregator now obtains both raw prefixes in one
+   overlay-mutex capture, validates/folds that image, and rechecks the selected
+   `BranchId` after a miss before publishing or returning the cached result. A
+   latch-controlled production-mode `MptOverlay` regression pauses the first
+   prefix read, starts a competing branch finalization, proves finalization is
+   blocked through the complete capture, and observes only complete pre- or
+   post-finalization images (`MptOverlaySuite.scala:52-95,416-481`).
+   A separate historical boundary defect is fixed by `d34d23655` (CONS-09,
+   HIGH/CONFIRMED). Commit `5dfe9bf3ec` changed the closing-period stake capture
+   from the exact post-transition `baseInfo` projection to a parent-tip MPT read
+   before the current `StateChangesAccumulator` was applied. A delegated-stake
+   create, withdrawal, expiry, collateral change, or slash accepted at the
+   closing ordinal was therefore omitted from period N's distribution and
+   delayed one eta period; in particular, a just-slashed operator retained stale
+   N-2 eligibility weight for the affected future period. The boundary writer
+   again snapshots the exact typed post-transition `baseInfo`
+   (`GlobalSnapshotAcceptanceManager.scala:1409-1458,1502-1551,2638-2687,2711-2739,2770-2808`), and
+   `GsamEtaBoundaryWriteSuite.scala:167-204` proves a closing-ordinal delegated
+   create is present in both post-state and the period boundary entry.
+   Two concrete ECO-02 backing subdefects are also fixed by `d34d23655`, without
+   closing ECO-02. An accepted delegated-stake successor now reserves its
+   `(source,effectiveTokenLockRef)` before withdrawals are processed, so a
+   same-snapshot withdrawal of the predecessor rejects with
+   `ConflictingStakeTransition`; an invalid create reserves nothing
+   (`UpdateDelegatedStakeAcceptanceManager.scala:99-176`). Both stake
+   materializers independently fail closed if contradictory accepted
+   successor/withdrawal results bypass arbitration, and replacement lookup,
+   filtering, and reward carry-forward compare effective `record.tokenLockRef`
+   rather than stale `event.tokenLockRef`
+   (`DelegatedRewardsDistributor.scala:61-95,100-250`;
+   `DelegatedStakeStateManager.scala:92-115`;
+   `UpdateDelegatedStakeAcceptanceManagerSuite.scala:194-334`). This prevents
+   refunding the predecessor's lock while retaining that same-batch successor.
+   It does not reject indefinite-to-finite token-lock replacement or prove that
+   every counted stake/collateral record joins one live, indefinite, uniquely
+   bound lock. Overall ECO-02 remains CRITICAL/PARTIAL, and conservation is not
+   closed.
+   A separate exact-parent reward recreation defect is fixed by `d34d23655`
+   (CONS-10, CRITICAL historical). The former singleton distributor read
+   delegated stakes, node parameters, and withdrawal records through the
+   receiver's ambient selected best tip. A candidate extending retained parent A
+   could therefore derive sibling B's rewards and root. Services now provide a
+   `GlobalStateReader => DelegatedRewardsDistributor` factory, and proposal plus
+   follower replay instantiate it from `BranchId(hash(parent))`
+   (`Services.scala:132-160`;
+   `GlobalSnapshotConsensusFunctions.scala:249-260,628-633,910-933`). The
+   MultiBranch regression assigns ambient B marker 99 and parent A marker 11 and
+   requires both producer and follower to reproduce 11
+   (`GlobalSnapshotConsensusFunctionsSuite.scala:1349-1423`). This fixes
+   CONS-10 only for retained parent branches.
+   Candidate validation is still not exact-parent-bound: an absent/orphan
+   `BranchId` can resolve to the finalized base, and historical stake plus its
+   live fallback still resolve through the receiver's ambient best tip. Thus a
+   retained child of branch B can be judged with sibling A's N-2 distribution
+   (CONS-08, CRITICAL/OPEN). The same absent/evicted-branch-to-base behavior is
+   the explicit CONS-10 residual and remains owned by CONS-08/SMT-02; the reward
+   fix does not authenticate branch existence. CONS-04's missing mature
+   historical distribution also remains open. Keep MPT-03 and PERM-005 partial for
+   whole-image wrong-network/partition and arbitrary raw ingress,
+   restart/catch-up/bootstrap/reorg, frozen protocol reference/hash era,
+   signatures/reference and withdrawal history, resource bounds, rooted expiry
+   parameters, counted-record-to-live-lock backing, and slash conservation.
    The focused MPT-04 native field-8 parser landed at `1e942fb28`: all audited
    live node-shared readers share strict physical-key/raw-byte validation,
    native-only scope, homogeneous-source and current unsigned-reference
@@ -317,8 +405,8 @@ already has a hard-coded kill switch.
    Keep MPT-04/ROOT-008 partial for signatures/reference history, the frozen
    candidate-era identity function, resource bounds, and complete ingress/restart/
    catch-up/bootstrap/reorg proof. Focused field-30 structure is covered by MPT-01;
-   its cryptographic/history/lifecycle proof is not. MPT-01 is partial; MPT-03,
-   MPT-05, and MPT-06 remain open.
+   its cryptographic/history/lifecycle proof is not. MPT-01 and MPT-03 are
+   partial; MPT-05 and MPT-06 remain open.
 4. **Harden raw recovery and tower state.** Network sync, persisted restore, and
    deep-reorg loads accept only an exact snapshot-bound complete root. Any
    non-consensus derived bytes are stripped and deterministically rebuilt from
@@ -690,9 +778,10 @@ Deliver E2K in the following order; a later cut cannot bypass an earlier gate:
    every list-returning eta fallback with a typed complete/incomplete exact-parent
    interval; a nonempty partial prefix is never eta authority, and a proved-
    complete empty interval follows one explicitly encoded, branch-authenticated
-   canonical rule rather than an unavailable-history fallback. Gates:
-   `KEYREG-002..005`, `KEYREG-007`, `KEYREG-008`, and
-   `CRYPTO-001`.
+   canonical rule rather than an unavailable-history fallback. This exact-parent
+   stake capability closes CONS-08; its typed mature-history failure semantics
+   also close CONS-04. Gates: `CONS-04`, `CONS-08`, `KEYREG-002..005`,
+   `KEYREG-007`, `KEYREG-008`, and `CRYPTO-001`.
 4. **K3 - Provision secrets, implement O-12's ratified baseline, and activate runtime rotation.** Before
    submitting a record, atomically provision the future VRF secret and fresh KES
    tree, durably bind them to the registration ID, and verify both public keys.
@@ -1413,6 +1502,16 @@ over the same ordered balance ledger. The closed supported-ID partition maps all
 four IDs to positive constructors; the unsupported sentinel refuses them and
 dynamically fails closed every other manifest row. Its 41 focused tests are
 green.
+
+Commit `d34d23655` also closes two narrow delegated-stake backing bugs before the full
+S2 backing kernel: a same-snapshot accepted successor cannot coexist with
+withdrawal of the predecessor sharing its effective lock, and replacement
+materialization no longer compares the stale original event lock after
+`currentTokenLockRef` advances. The acceptance and materialization defenses are
+documented under ECO-02/MPT-03 above. They are not a conservation proof.
+Indefinite-to-finite replacement and the mandatory join from every counted
+stake/collateral record to one live, indefinite, uniquely bound lock remain the
+ECO-02 activation blockers owned by S2.
 
 A bounded test-only adapter supplies initial context and runs the real lower
 native acceptance managers and currency ML0 wrappers for the transfer and

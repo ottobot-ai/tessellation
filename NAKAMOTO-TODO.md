@@ -259,6 +259,85 @@ criteria are in `NAKAMOTO-PLAN.md`.
       placement, reproduces the direct-hash key, and rejects duplicate logical
       hashes deterministically. Keep XMG-013 open for restart, compaction,
       exact-parent recovery, density reorg, and accepted-state ingress vectors.
+    - **MPT-03 FOCUSED FIELDS 13-16 PARSER/WRITER/PREFLIGHT/CONSUMERS GREEN;
+      FINDING PARTIAL:** strict reads retain physical keys/raw bytes and enforce
+      canonical encoding, native empty-contract placement, exact keys, nonempty
+      homogeneous embedded sources, and unique unsigned Create identities.
+      Record ordering covers every serialized field; all four converter roots
+      share the structure gate; focused compound-writer rejection is atomic; and
+      delegated-stake/node-collateral consensus validation uses the exact proposal
+      parent. Delegated node-parameter eligibility now uses a strict canonical
+      field-12 point read with exactly one proof and exact requested-id/key
+      reproduction; MPT-06's three full field-12 scans and field-17 price scan
+      remain open. ECO-26/ECO-27 fix batch arbitration with protocol `Signed`
+      ordering,
+      source-scoped delegated parents, accepted-only reservations, duplicate
+      collateral-withdrawal rejection, and explicit delegated-stake/token-lock
+      conflict rejection before collateral reservation. ECO-28 restores only
+      v4's same-lock collateral replacement onto a different node; same-node
+      reuse, delegated-lock reuse, pending withdrawal, and invalid parent remain
+      rejected. FIN-10's historical ordinal-only cache-identity subdefect is
+      closed: the production cache keys the selected tip by exact `BranchId`,
+      constructs a reader pinned to that selected branch on each miss, and
+      defeats caching when no branch is selected, with same-branch, same-height
+      A-B-A, and branchless regressions. FIN-15's historical cross-prefix race is
+      fixed by `d34d23655`: fields 13 and 15 are captured under one overlay
+      mutex instead of two independently locked scans, so finalization cannot
+      splice delegated(A) with collateral(B); a selected-tip change during a
+      cache miss forces a retry before the result is returned or cached. The
+      production-mode overlay regression now pauses the first raw-prefix read
+      with a latch, starts a competing `finalizeBranch`, proves finalization is
+      blocked until the complete capture returns, and observes no hybrid image
+      (`MptOverlaySuite.scala:52-95,416-481`).
+      CONS-09's historical eta-boundary defect is also fixed by `d34d23655`:
+      commit `5dfe9bf3ec` replaced the exact post-transition boundary projection
+      with a parent-tip MPT read before the current accumulator landed, delaying
+      every closing-ordinal create/withdrawal/expiry/collateral/slash effect by
+      one eta period. That could retain a just-slashed operator's stale
+      eligibility weight in period N's distribution. The writer again derives
+      the distribution from exact post-transition `baseInfo`, and
+      `GsamEtaBoundaryWriteSuite.scala:167-204` proves a closing-ordinal
+      delegated create is present in the captured boundary entry.
+      Two concrete ECO-02 subdefects are fixed by `d34d23655` without closing
+      ECO-02. Accepted
+      delegated-stake successors reserve their `(source,effectiveTokenLockRef)`
+      before withdrawals, so a same-snapshot predecessor withdrawal rejects
+      with `ConflictingStakeTransition`; rejected creates reserve nothing
+      (`UpdateDelegatedStakeAcceptanceManager.scala:99-176`). Both downstream
+      materializers fail closed if contradictory accepted successor/withdrawal
+      results bypass that arbitration, and replacement matching uses effective
+      `record.tokenLockRef`, not stale `event.tokenLockRef`
+      (`DelegatedRewardsDistributor.scala:61-95,100-250`;
+      `DelegatedStakeStateManager.scala:92-115`;
+      `UpdateDelegatedStakeAcceptanceManagerSuite.scala:194-334`). The
+      indefinite-to-finite replacement exploit and the missing invariant joining
+      every counted stake/collateral record to one live, indefinite, uniquely
+      bound lock remain open. ECO-02 is CRITICAL/PARTIAL; do not claim backing
+      or conservation closure.
+      CONS-10's historical exact-parent reward recreation defect is fixed by
+      `d34d23655` for retained parent branches. The former singleton reward
+      distributor followed the receiver's ambient best tip; candidates extending
+      another retained parent could therefore derive different delegated rewards,
+      stake/withdrawal state, balances, and roots. Services now expose a
+      reader-bound distributor factory, and proposal plus follower replay bind it
+      to `BranchId(hash(parent))` (`Services.scala:132-160`;
+      `GlobalSnapshotConsensusFunctions.scala:249-260,628-633,910-933`). The
+      MultiBranch producer/follower regression gives ambient sibling B marker 99
+      and parent A marker 11 and requires both to reproduce 11
+      (`GlobalSnapshotConsensusFunctionsSuite.scala:1349-1423`).
+      Candidate validation remains unsafe: an absent/orphan branch can fall back
+      to the finalized base, and historical stake plus its live fallback still
+      resolve through the receiver's ambient best tip instead of the candidate's
+      exact parent (CONS-08, CRITICAL/OPEN). Unknown/evicted-branch fallback is
+      also the explicit residual for CONS-10 and remains owned by CONS-08/SMT-02;
+      the reward fix does not authenticate branch existence.
+      CONS-04's mature-period missing-history fallback also remains open. Keep
+      PERM-005/MPT-03 open for whole-image wrong-network/partition and arbitrary
+      raw ingress,
+      restart/catch-up/bootstrap/reorg, frozen protocol reference/hash era,
+      signatures/reference and withdrawal history, resource bounds, rooted
+      expiry parameters, counted-record-to-live-lock backing, and slash
+      conservation.
     - **MPT-04 FOCUSED FIELD-8 PARSER GREEN (`1e942fb28`):** one strict reader
       now owns every audited live native-token-lock MPT read and rejects
       malformed/noncanonical bytes, empty or mixed sets, currency-scoped locks,
@@ -453,7 +532,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
     exact historical evidence across restart/reorg/rotation.
   - Prove slash/cooldown activation, key splitting, and mixed-roster quorum do
     not change eligibility nondeterministically.
-  - **Gate:** `CRYPTO-001`, `PARAM-001`, `PERM-*`, `SHARD-C-007`, `SHARD-S-*`.
+  - **Gate:** `CONS-04`, `CONS-08`, `CRYPTO-001`, `PARAM-001`, `PERM-*`,
+    `SHARD-C-007`, `SHARD-S-*`.
 
 - [ ] **E2K PARTIAL - canonical preregistered operator keys for every VRF use**
   - One canonical active-era record binds `PeerId`, KES master VK, VRF VK,
@@ -726,6 +806,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
 - [ ] **S2 PARTIAL - deterministic framework oracle and kernel**
   - Close authorization, conservation/checked arithmetic, replay, ordering,
     backing, and resource-limit findings for every enabled economic operation.
+  - **ECO-02 remains CRITICAL/PARTIAL:** same-snapshot delegated successor plus
+    predecessor withdrawal and stale `event.tokenLockRef` replacement matching
+    are fixed by `d34d23655`, with acceptance and materializer
+    fail-closed regressions. Still reject or atomically preserve every
+    indefinite-to-finite replacement and prove that every counted delegated
+    stake/collateral record joins one live, indefinite, uniquely bound lock.
+    The focused fixes are not backing or conservation closure.
   - Differential-check decisions and exact writes after every input prefix.
   - **Landed nonactivating E2.1 slice (2026-07-16):** the test-only reference
     interpreter supports exactly four typed operation IDs: zero-fee native

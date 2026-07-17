@@ -1,17 +1,27 @@
 # ROOT-008 GL0 Partition Grammar
 
-Status: **FOCUSED MPT-01 PARSER/WRITER/PREFLIGHT PARTIAL; ROOT-008 NOT IMPLEMENTED, NOT AN ACTIVATION CLAIM**
+Status: **FOCUSED MPT-01/MPT-03 PARSER/WRITER/PREFLIGHT PARTIAL; ROOT-008 NOT IMPLEMENTED, NOT AN ACTIVATION CLAIM**
 
 Date: 2026-07-14
 
 This packet defines the target structural grammar for every physical leaf that may
 appear in the GL0 consensus MPT. It is the design input for `ROOT-008`; it is not
 evidence that current readers, recovery, diff adoption, or snapshot acceptance
-enforce the complete contract. Fields 25-32 now have a focused strict
-physical-key/raw-value reconstruction path and field-30/31 writer structure
-gates, but other value-only readers remain and field 32 is still writable,
-root-excluded, and replay-consumed. Whole-image relations and lifecycle coverage
-remain release blockers.
+enforce the complete contract. Fields 25-32 and 13-16 now have focused strict
+physical-key/raw-value reconstruction paths and writer structure gates, but other
+value-only readers remain and field 32 is still writable, root-excluded, and
+replay-consumed. Whole-image relations and lifecycle coverage remain release
+blockers.
+
+Within fields 13/14, commit `d34d23655` additionally rejects the concrete
+same-snapshot delegated successor/predecessor-withdrawal conflict and fails
+closed if contradictory accepted results reach materialization. Replacement
+matching now uses each record's effective token-lock reference. Consensus reward
+recreation also consumes fields 12-14 through a reader bound to the retained
+proposal parent. These are ECO-02/CONS-10 subdefect closures, not ROOT-008 or
+stake-backing closure: unknown/evicted branches still alias to base, and no
+whole-image relation yet proves that every counted stake/collateral record joins
+one live, indefinite, uniquely bound lock.
 
 The contract has two independent layers:
 
@@ -259,13 +269,13 @@ reader is safe:
 | 6 | No canonical writer; fields 25-31 replaced it | No target reader; `CurrencySnapshotInfo` codec still exists | Retired field ID remains accepted. |
 | 7, 10 | GSI/accumulator typed writer | `GlobalStateConverter` field-7 validator plus `AllowSpendStateManager` (`GlobalStateConverter.scala:1750-1819`; `AllowSpendStateManager.scala:504-528`) | Field 7 has local key checks; field 10 still depends on its index. Neither substitutes for whole-image relations. |
 | 8, 9, 11 | GSI/accumulator typed writer | strict field-8 `ActiveTokenLockMptReader` plus `TokenLockStateManager` | Focused field 8 now retains physical/raw entries and enforces canonical native scope, homogeneous nonempty sources, exact keys, and duplicate current unsigned identity rejection. Signatures/history/era/bounds/lifecycle and index-backed 9/11 manifest bijection remain open. |
-| 12 | GSI/accumulator typed writer | `UpdateNodeParametersStateReader` and duplicate `GlobalStateConverter` reader (`UpdateNodeParametersStateReader.scala:40-50`; `GlobalStateConverter.scala:2273-2279`) | Both full scans currently discard physical keys. |
-| 13, 14 | GSI/accumulator typed writer | `DelegatedStakeStateManager` and `NodeStakeAggregator` (`DelegatedStakeStateManager.scala:163-195`; `NodeStakeAggregator.scala:82-113`) | Values/head selection can drop empty or misplaced records. |
-| 15, 16 | GSI/accumulator typed writer | `NodeCollateralStateManager` and `NodeStakeAggregator` (`NodeCollateralStateManager.scala:254-287`; `NodeStakeAggregator.scala:82-113`) | Same value-only defect; field-16 expiry also consumes local `WithdrawalTimeLimit`. |
+| 12 | GSI/accumulator typed writer | strict delegated-stake point reader `UpdateNodeParametersMptReader.scala:15-62`; remaining full scans `UpdateNodeParametersStateReader.scala:42-50`, `GlobalStateConverter.scala:2519-2529`, and `GlobalSnapshotAcceptanceManager.scala:1960-1971` | **NARROW POINT FIX ONLY:** delegated-stake create validation now requires canonical raw bytes, exactly one proof, requested proof-id equality, and exact physical-key reproduction (`UpdateDelegatedStakeValidator.scala:135-154`; `UpdateNodeParametersMptReaderSuite.scala:68-117`). All three full scans still discard physical keys, so MPT-06 remains open. |
+| 13, 14 | GSI/accumulator typed writer plus shared stake/collateral structure gate | strict reader `StakeCollateralMptReader.scala:19-280`; writer gate `GlobalStateConverter.scala:66-136,717-810,984-989,1150-1172`; total/effective record identity `delegatedStake.scala:122-159`; exact-parent validator/fold `UpdateDelegatedStakeValidator.scala:47-251`; `UpdateDelegatedStakeAcceptanceManager.scala:23-209`; fail-closed materialization `DelegatedRewardsDistributor.scala:61-95,100-250`; exact-parent reward factory/use `Services.scala:132-160`; `GlobalSnapshotConsensusFunctions.scala:249-260,628-633,910-933`; atomic selected-tip aggregate/cache `NodeStakeAggregator.scala:63-189`; one-mutex multi-prefix capture `MptOverlay.scala:286-290,554-557,952-978`; callback regressions `NodeStakeAggregatorSuite.scala:237-260,342-375`; reward sibling regression `GlobalSnapshotConsensusFunctionsSuite.scala:1349-1423`; real capture/finalize schedule `MptOverlaySuite.scala:52-95,416-481` | **FOCUSED MPT-03 PARTIAL:** canonical raw bytes, native empty-contract placement, exact physical key, nonempty homogeneous source, unique unsigned Create identity, total serialized-field ordering, and exact proposal-parent stake/collateral validation are enforced in audited paths. Protocol `Signed` ordering, source-scoped parent identity, and accepted-only duplicate reservation close ECO-26. ECO-02's same-batch successor/withdrawal subdefect rejects after accepted-create effective-lock reservation; both materializers fail closed on contradictory accepted results, and replacement logic compares effective `record.tokenLockRef` rather than stale `event.tokenLockRef`. CONS-10 binds consensus reward stake/node-parameter/withdrawal reads to the retained proposal parent. Exact-`BranchId` selected-tip caching with branch-pinned miss reads closes FIN-10's cache-identity subdefect. One atomic fields-13/15 byte capture plus post-miss selected-tip recheck fixes FIN-15's historical delegated(A)/collateral(B) hybrid race. None of these repairs authenticates branch existence: an absent/orphan branch can still resolve to base, and candidate N-2 stake lookup remains receiver-best-tip-bound rather than candidate-parent-bound (CONS-08/SMT-02); missing mature history remains CONS-04. Whole-image/raw-ingress/lifecycle, protocol reference/hash-era, crypto/history, bounds, counted-record-to-live-indefinite-lock backing, and conservation remain open. |
+| 15, 16 | GSI/accumulator typed writer plus shared stake/collateral structure gate | strict reader/writer as fields 13/14; total orders `nodeCollateral.scala:89-108`; exact-parent validator/fold `UpdateNodeCollateralValidator.scala:49-254`; `UpdateNodeCollateralAcceptanceManager.scala:24-193` | Same focused field-local grammar and exact-parent enforcement as fields 13/14. Protocol `Signed` ordering, accepted-only duplicate reservations, one accepted withdrawal per `(source, collateralRef)`, and pre-reservation delegated-stake/token-lock conflict rejection close ECO-27. Same-lock replacement onto a different node is preserved while same-node/delegated-lock/pending-withdrawal/invalid-parent cases reject (ECO-28). Field-16 expiry still consumes local `WithdrawalTimeLimit` (ECO-IDX-03); whole-image/lifecycle and economic backing/slash conservation remain open. |
 | 17 | GSI/accumulator typed writer | `PriceStateUpdater.materializePriceStateFromMpt` (`PriceStateUpdater.scala:77-83`) | Value supplies a pair, but current reader does not check all pair copies or physical key. |
 | 18 | GSI/accumulator typed writer | `GlobalStateConverter` point/index readers (`GlobalStateConverter.scala:2147-2149`; index projection `742-759`) | Requires exact index/leaf bijection. |
 | 19 | `globalSnapshotSystemIndexEntries` and typed rebuild (`GlobalStateConverter.scala:724-856,2682-2687`) | exact index/bucket readers plus allow-spend/token-lock/collateral managers | Known point checks do not yet prove the complete inverse relation or rooted parameter input. |
-| 20 | GSAM period-boundary accumulator plus typed writer (`GlobalSnapshotAcceptanceManager.scala:1360-1422`) | `HistoricalStakeReader.lookup` (`HistoricalStakeReader.scala:32-59`) | Point lookup trusts caller period; raw-image key cannot be derived from current value. |
+| 20 | GSAM period-boundary accumulator plus typed writer (`GlobalSnapshotAcceptanceManager.scala:1409-1458,1502-1551,2638-2687,2711-2739,2770-2808`) | `HistoricalStakeReader.lookup` (`HistoricalStakeReader.scala:32-59`) | **CONS-09 FIXED (`d34d23655`):** commit `5dfe9bf3ec` read the parent-tip MPT before the closing ordinal's accumulator applied, delaying every closing-ordinal stake/collateral/slash effect one eta period. The writer again snapshots exact typed post-transition `baseInfo`; `GsamEtaBoundaryWriteSuite.scala:167-204` proves a closing-ordinal create is present. Point lookup still trusts caller period, and the raw-image key cannot be derived from the current value. |
 | 21 | Dedicated `MptTowerStore`, not GL0 | dedicated tower store/verifier | Active GL0 enum acceptance is wider than intended ownership. |
 | 22, 23 | GSI/accumulator typed writer | `KesRegistrationStateManager` (`KesRegistrationStateManager.scala:125-231`) | Field 22 checks homogeneous operator/key; field 23 identity is recovered indirectly and missing/invalid pointers can be omitted. |
 | 24 | Genesis typed writer | `L0GenesisLoader.materializeRootedGenesisOperatorKeys` (`L0GenesisLoader.scala:454-483`) | Key/duplicate checks exist; whole-image and writer-epoch rules still belong in the manifest. |
