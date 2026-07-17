@@ -21,7 +21,7 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `17/22` dispositioned. `O-01` through `O-17` are
+**Owner-decision status:** `17/23` dispositioned. `O-01` through `O-17` are
 ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
 bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34 slash-record schema
 await owner responses in
@@ -31,10 +31,12 @@ await owner responses in
 evidence awaits a response in
 `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. `O-22` fraud-proof
 activation and adjudication awaits a response in
-`docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. Dependencies under
+`docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. `O-23` slash liability
+and bond tranches awaits a response in
+`docs/review/O23-SLASH-LIABILITY-OWNER-REVIEW.md`. Dependencies under
 O-01 through O-17 mean implementation of their ratified direction and closure of
 their listed engineering, research, schema, parameter, or proof gates. O-18,
-O-19, O-20, O-21, and O-22 are the only pending owner responses.
+O-19, O-20, O-21, O-22, and O-23 are the only pending owner responses.
 
 ## Active objective
 
@@ -387,9 +389,12 @@ already has a hard-coded kill switch.
    `TokenLockStateManager.scala:694-711,870-918`). A current active+pending scan
    would still charge delegation created after the offense and lose modified
    offense-time lineages. O-23 therefore blocks production work until stable
-   `BondId`/tranche liability, full-only InvalidStateProof V1, pending/release
-   horizon, slash-before-release ordering, reward treatment, and density-reorg
-   revalidation are ratified. `InvalidStateProofSlashPrincipalRedSuite` compiles
+   fixed-hash `BondId` plus complete `E-2` tranche liability, full-only V1 with
+   amount-changing bonded replacements and operator/family retargets rejected,
+   bounded hold/release horizons,
+   slash-before-release ordering, consumed-bond tombstones, reward conservation,
+   and portable density-reorg Phase-2 revalidation are ratified.
+   `InvalidStateProofSlashPrincipalRedSuite` compiles
    and fails all five intended cases (SHA-256
    `96f568291a4eee8e636debd814b8d8e4a3d5eebc6c3c2e06a5a752f4b3c04ca7`).
    ECO-30's historical HIGH event-isolation halt is FIXED IN WORKTREE:
@@ -1386,7 +1391,10 @@ delivery, rollback, and recovery.
   pool/validator/slash fold/field-34 writer from producer and follower consensus,
   and retaining any transport/replay components as explicitly dark tests only.
   No current-era nonempty proof may change canonical bytes or state while
-  O-20/O-22/O-23 and the engineering gates remain open.
+  O-20/O-22/O-23 and the engineering gates remain open. This also contains
+  `SLASH-07`: the current field-34 writer expresses cooldown in `EpochProgress`
+  while committee selection compares it to a snapshot-ordinal-derived anchor,
+  allowing event-triggered schedules to produce an empty exclusion interval.
 - First version has all GL0 validators perform bounded exceptional replay of the
   challenged sharded-CL1 checkpoint's exact retained framework inputs/base; its
   result decides mismatch, rollback/quarantine, signer-specific debit, and

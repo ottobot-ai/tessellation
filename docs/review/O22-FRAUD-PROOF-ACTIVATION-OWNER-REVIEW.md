@@ -44,6 +44,7 @@ attestation, or substitute for normal execution.
 | Rooted effects | Locally upheld results can change stake/collateral, bounty/cooldown state, and field 34 (`GlobalSnapshotAcceptanceManager.scala:2647-2673,2959-2984`). | Fraud-proof handling already affects the MPT root and economics. |
 | Active-era guard | `GlobalSnapshotActiveEraValidator` rejects only a populated historical `smtRoot` (`modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala:10-30`). | Any nonempty `fraudProofs` shape passes the era gate today. |
 | Policy | Watchtower enablement, slash/bounty fractions, and cooldown inputs are local configuration (`modules/node-shared/src/main/resources/application.conf:556-588`; `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:702-707`). | Honest nodes with different local policy can derive different rooted results from one proposal. |
+| Retired JSON member | The manual snapshot decoder consumes known fields but does not reject unknown keys (`GlobalIncrementalSnapshot.scala:153-228`), and `Signed` delegates its nested value to that decoder (`security/signature/Signed.scala:56`). | After field removal, an attacker can add a retired `fraudProofs` member to a correctly signed new-shape JSON artifact. Circe can discard the key, then signature verification hashes the clean decoded value and succeeds unless key presence is rejected explicitly. |
 
 The current path is therefore not dark. It must not remain active while this
 decision is pending.
@@ -78,6 +79,15 @@ field-34 records as cooldown authority. Local transport/pool/replay components m
 remain only behind an explicitly dark boundary. O-20 owns the future typed field
 and the disposition of fork-only test data; no existing JSON leaf or interpolated
 key is grandfathered into that era.
+
+The current JSON decoder must explicitly reject the retired key at every nesting
+level; merely deleting the case-class field is permissive because Circe ignores
+unconsumed members. The guard covers direct snapshots, `Signed.value`, combined
+checkpoint files, ML0 global-state wrappers, HTTP responses, and GossipSub/
+ChainSync payloads. Scodec decoding remains complete and rejects the retired
+trailing field. The existing Kryo fallback reads only upstream
+`GlobalIncrementalSnapshotV1`; it is retained for prior upstream-v4 disk access
+and is not a compatibility decoder for this fork's retired 27-field shape.
 
 Accepting nonempty proofs as inert is not a valid third option: it signs bytes
 whose future interpretation is ambiguous. Retaining the current conditional
@@ -120,8 +130,11 @@ deduplication identity is `(peerId, shardId, checkpointHash)`, not merely
 - Competing claims in one candidate use one frozen canonical evidence order. The
   first valid claimant causing a signer's actual debit receives the bounty from
   that debit.
-- A guilty signer with no debit-capable bonded principal may still receive the
-  protocol-defined record/cooldown, but creates no synthetic bounty.
+- A zero-debit record/cooldown is permitted only under O23-05/O23-06 when a
+  rooted consumed-bond tombstone proves prior debit or portable old-branch
+  evidence proves the liable bond is genuinely absent after density replacement.
+  Unexplained missing or divergent backing rejects/defer atomically and never
+  creates a synthetic bounty.
 
 Per-signer once-only accountability and debit conservation are mandatory. The
 owner choice is the claimant-reward rule when evidence discovers signer subsets
@@ -191,16 +204,44 @@ bounty credit does not repair that conservation gap.
 8. O-19 independently governs any future upstream-v4 import. Source-chain
    statements are evidence, not target-chain slash authority.
 
-## 8. Required tests
+## 8. Atomic containment sequence
 
-1. Empty current-era proofs pass; any nonempty value rejects before
-   GSAM/MPT/overlay/finality mutation. A producer with a populated local pool
-   still emits the pre-activation shape.
-   Under the recommended field-removal option, strict JSON/other object decoders
-   reject an explicitly supplied retired `fraudProofs` member rather than
-   ignoring it, and Scodec rejects every old-shape or trailing-field byte vector.
-2. Validation, follower context, download, storage, traversal, serving, restart,
-   and catch-up enforce the same era boundary.
+Under recommended Option B, the active removal is one atomic consensus commit:
+
+1. remove `fraudProofs` from the current snapshot case class, strict JSON
+   decoder, and complete Scodec shape;
+2. disconnect local pool input and carried-proof threading from producer,
+   follower recreation, and context reconstruction;
+3. remove proof/config/validator inputs and the slash/bounty/field-34 sink from
+   GSAM while preserving the ordinary no-proof economic result exactly;
+4. remove production field-34 cooldown consumption and hard-bind current-era
+   committee construction to no exclusion;
+5. retain bounded transport, replay, and pool components only as an explicitly
+   dark diagnostic path; and
+6. update every direct, wrapped, disk, HTTP, GossipSub, ChainSync, restart, and
+   catch-up decoder/test in the same change.
+
+These cannot be split across runtime commits. A schema/codec-only change leaves
+hidden state authority or mixed bytes, while a sink-only change signs a retired
+field with undefined future meaning. Mixed old/new fork nodes are intentionally
+incompatible; this greenfield branch restarts from the new current schema rather
+than adding a dual decoder. The isolated upstream-v4 Kryo reader remains an
+import/disk-read path, not current consensus compatibility.
+
+## 9. Required tests
+
+1. Under Option A, the current-era field is present-empty, every nonempty value
+   rejects before GSAM/MPT/overlay/finality mutation, and a populated local pool
+   cannot change the emitted empty value. Under recommended Option B, the field
+   is absent, the producer never consults/copies the pool, and strict JSON/other
+   object decoders reject an explicitly supplied retired `fraudProofs` member
+   when empty, populated, `null`, or malformed, including inside `Signed.value`;
+   Scodec rejects every old-shape or trailing-field byte vector.
+2. Brotli snapshot storage, combined-checkpoint storage, ML0 global-state
+   wrappers, direct/streaming HTTP download, GossipSub, ChainSync, traversal,
+   serving, restart, and catch-up enforce the same era boundary. Legitimate
+   upstream `GlobalIncrementalSnapshotV1` Kryo disk promotion remains readable,
+   while no fork 27-field fallback exists.
 3. Different local watchtower/slash/bounty/cooldown HOCON values produce
    identical current-era artifacts and roots at shard counts 1, 2, and K.
 4. Upheld, invalid, not-upheld, unavailable, and stale results exercise the exact
@@ -227,7 +268,7 @@ retired JSON member, acceptance of the pinned retired Scodec shape, and current
 field-34 cooldown influence on committee selection. Its SHA-256 is
 `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
 
-## 9. Owner response format
+## 10. Owner response format
 
 Please answer all three:
 

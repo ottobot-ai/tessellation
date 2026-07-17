@@ -121,9 +121,10 @@ test, never a freeze.
 | O-17 | ROOT-008 partition grammar | 🔴 | Numeric gaps/offline import, self-authenticating fields, token-lock scope, and field-32 direction are ratified; identity functions, resource parameters, codecs, and proofs remain stop-the-line engineering. |
 | O-18 | Transport and DA byte contract | 🔴 | **OWNER RESPONSE REQUIRED:** active-era maxima, migration scope, canonical bytes/compression, descriptor/chunk delivery, and the `512000`/`20 MiB` rule semantics are not ratified. Bounded helpers are unwired. |
 | O-19 | Upstream-v4 snapshot migration policy | 🔴 | **OWNER RESPONSE REQUIRED:** all 17 source fields require explicit dispositions; source-unrooted fields, metagraph continuity, epoch/eta, registries, malformed source state, and per-asset conservation are not ratified. The raw tools-only envelope verifier is not an authorized importer or transform. |
-| O-20 | Field-34 slash record schema | 🔴 | **OWNER RESPONSE REQUIRED:** V1 invalid-state-proof-only versus a generalized multi-reason record is not ratified. The recommendation is a narrow invalid-state-proof V1 plus future variant-specific ADT payloads/keys; it has no authority until answered. |
+| O-20 | Field-34 slash record schema | 🔴 | **OWNER RESPONSE REQUIRED:** invalid-state-proof-only V1, half-open `EtaPeriod` exclusion, audit/exclusion-only field 34 with separate atomic economics, and fixed Scodec/SHA-256 preimages are recommended but unratified. The current mixed `EpochProgress`/ordinal cooldown is reproduced unsafe by `SLASH-07`. |
 | O-21 | Optimistic decision evidence | 🔴 | **OWNER RESPONSE REQUIRED:** D-01 already ratifies portable exact signed decided-attestation statements and `T_weight`; only whether those statements are sufficient alone or require additional authoritative transcript material remains unratified. The recommendation is statements alone, with query transcripts audit-only and unable to create qualification authority. |
 | O-22 | Fraud-proof activation and adjudication | 🔴 | **OWNER RESPONSE REQUIRED:** current nonempty proofs have live rooted authority before universal exact-context adjudication exists. The recommendation is current-era field removal, whole-candidate reject/defer, and per-new-signer debit-funded bounties. |
+| O-23 | Slash liability and bond tranches | 🔴 | **OWNER RESPONSE REQUIRED:** current slashing does not debit backing principal or identify offense-time liability. The revised recommendation is fixed-hash complete `E-2` tranches, full-only exact locks with amount-change/retarget rejection, bounded holds, slash-before-release, actual-debit/tombstone/reward conservation, and portable density-reorg revalidation. |
 
 ---
 
@@ -640,17 +641,20 @@ the presence of four `SlashReason` case objects or from the existing invalid-sta
 The focused packet is
 [`O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
 
-The pending `O20-01` choice is between an invalid-state-proof-only V1 field-34 record followed by
-future variant-specific ADT records/keys, and one generalized multi-reason V1 record whose complete
-required-field, key, duplicate, evidence, effect, and invalid-combination semantics must be frozen
-now. The packet recommends the first option because the only production constructor hard-codes
-`InvalidStateProof`, while the current payload and key require invalid-checkpoint-specific context.
-That recommendation is not an answer.
+The pending `O20-01` choice is between an invalid-state-proof-only V1 field-34
+record followed by future variant-specific ADT records/keys, and one generalized
+multi-reason V1. `O20-02` selects a half-open `EtaPeriod` exclusion interval
+instead of the current `EpochProgress`/snapshot-ordinal unit mismatch. `O20-03`
+keeps field 34 limited to culpability/dedup/evidence/exclusion while O-23 economic
+state remains separate but atomically applied. `O20-04` fixes ScodecV1 plus
+SHA-256 identity/evidence preimages instead of ambient hashing. The packet
+recommends all four; that recommendation is not an answer.
 
-Until the owner dispositions `O20-01`, field-34 JSON removal, canonical Scodec value/key activation,
-and the field-34 accumulator/change-set repair remain blocked at the schema freeze. RED tests and
-dark codec experiments may proceed. No future reason tag may reach a consensus writer merely
-because it already exists in the source enum. O-18 and O-19 remain independently pending.
+Until the owner dispositions `O20-01` through `O20-04`, field-34 JSON removal,
+canonical Scodec value/key activation, and the field-34 accumulator/change-set
+repair remain blocked at the schema freeze. RED tests and dark codec experiments
+may proceed. No future reason tag may reach a consensus writer merely because it
+already exists in the source enum. O-18 and O-19 remain independently pending.
 
 ## O-21 - Optimistic decision evidence 🔴
 
@@ -693,18 +697,20 @@ watchtower assertion decide guilt.
 **Status:** **OWNER RESPONSE REQUIRED.** The focused packet is
 [`O23-SLASH-LIABILITY-OWNER-REVIEW.md`](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
 
-The pending `O23-01` through `O23-06` choices define which principal is liable,
-whether InvalidStateProof V1 is full-only over exact-amount tranches, how long pending principal remains
-slashable, whether slash precedes every same-candidate release, how exact debit
-funds bounty and treats accrued rewards, and how objectively invalid signatures
-are revalidated after a later density reorg.
+The pending `O23-01` through `O23-06` choices define a fixed-algorithm `BondId`
+and the complete liable `E-2` tranche set; full-only V1 with amount-changing
+bonded replacements and operator/family retargets rejected; bounded hold/release
+horizons; slash-before-release
+ordering; actual-debit funding with consumed-bond tombstones and reward burn; and
+portable historical Phase-2 revalidation with exact present/tombstone/absent/
+divergent backing outcomes and no deadline reset after a density reorg.
 
-The packet recommends infraction-time stable `BondId`/tranche liability from the
-exact delayed eligibility population; full-only V1; pending slashability through
-the complete liability horizon; slash-before-release ordering; bounty funded only
-by exact principal debit with rewards separately burned; and branch rollback plus
-full historical revalidation after density replacement. This answers document
-does not infer those choices.
+The packet was adversarially revised because the earlier shorthand was not
+schema-freezeable: one replacement lock cannot represent old and new exact
+tranches, ordinal-selected hashes are not stable bond identities, a prior debit
+must be distinguished from unexplained missing backing, and local old-branch
+state cannot prove historical Phase 2. This answers document does not infer the
+revised choices.
 
 ---
 
@@ -765,3 +771,5 @@ O-21 was appended from the optimistic-finality evidence audit against the curren
 2026-07-16; it adds no settled answer.
 O-22 was appended from the fraud-proof activation/adjudication audit against the current source on
 2026-07-16; it adds no settled answer.
+O-23 was appended and adversarially revised from the slash-principal/liability
+audit against the current source on 2026-07-16; it adds no settled answer.

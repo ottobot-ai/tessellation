@@ -55,7 +55,7 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `17/22` dispositioned. `O-01` through `O-17` are
+> **Owner-decision status:** `17/23` dispositioned. `O-01` through `O-17` are
 > ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18`
 > transport/DA bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34
 > slash-record schema await owner responses
@@ -65,7 +65,9 @@
 > decision evidence awaits a response in
 > `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. `O-22`
 > fraud-proof activation and adjudication awaits a response in
-> `docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. Open work under
+> `docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. `O-23` slash
+> liability and bond tranches awaits a response in
+> `docs/review/O23-SLASH-LIABILITY-OWNER-REVIEW.md`. Open work under
 > O-01 through O-17 is an engineering, research, schema, parameter, or proof gate
 > under a ratified direction, not a request for another owner answer.
 
@@ -759,9 +761,17 @@ criteria are in `NAKAMOTO-PLAN.md`.
     it does not define field-34 bytes or close either omission.
   - [ ] **O-20 OWNER RESPONSE REQUIRED / FIELD-34 SCHEMA FREEZE:** review
     `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. The recommendation is an
-    invalid-state-proof-only V1 record plus future variant-specific ADT payloads and
-    keys. Do not infer acceptance, activate latent slash reasons, retain JSON bytes,
-    or encode sentinel/optional future contexts before `O20-01` is answered.
+    invalid-state-proof-only V1 record plus future variant-specific ADT payloads
+    and keys, a half-open rooted `EtaPeriod` exclusion interval, audit/exclusion-
+    only field 34 with separate atomic economics, and fixed Scodec/SHA-256
+    preimages. `SLASH-07` is confirmed: the current writer stores an
+    `EpochProgress` deadline while the reader compares it to a snapshot-ordinal
+    anchor, so event-triggered schedules can make the exclusion interval empty.
+    `SlashCooldownAxisMismatchRedSuite` reproduces the failure 1/1 (SHA-256
+    `7fd927373ece8ccc221344eed83c0b085c59003f7cbe2ea68ceaba4b0948a766`).
+    Do not infer acceptance, activate latent slash reasons, retain JSON bytes, or
+    encode sentinel/optional future contexts before `O20-01` through `O20-04`
+    are answered.
   - [ ] **O-21 OWNER RESPONSE REQUIRED / OPTIMISTIC EVIDENCE FREEZE:** review
     `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. The
     recommendation is sorted unique exact signed local cascade-decision
@@ -839,9 +849,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
     cooldown with zero debit and maturity later refunds the full lock. Scanning
     current pending maps is still insufficient: it can charge delegation created
     after the offense because current schemas do not preserve an offense-time
-    bond lineage. O-23 now freezes the required `BondId`/tranche, full-only V1,
-    pending horizon, ordering, reward, and density-reorg choices before production
-    implementation
+    bond lineage. O-23 now requires owner disposition of a fixed-hash `BondId`,
+    complete `E-2` tranche liability, full-only V1 with amount-changing bonded
+    replacements and operator/family retargets rejected, bounded hold/release
+    horizons, slash-before-release,
+    consumed-bond tombstones, reward conservation, and portable historical
+    Phase-2 revalidation before production implementation
     (`DelegatedRewardsDistributor.scala:168-180,219-255`;
     `NodeCollateralStateManager.scala:218-251`;
     `GlobalSnapshotAcceptanceManager.scala:2673-2713`;

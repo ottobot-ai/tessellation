@@ -713,12 +713,13 @@ three future reason tags while requiring invalid-checkpoint-specific `shardId` a
 `disputedCheckpointHash` fields. Its physical key is the same checkpoint-specific
 triple, and its value still uses a hand-written JSON `ImmutableCodec`.
 
-The owner must disposition `O20-01`: either freeze an invalid-state-proof-only V1
-record and require future slash kinds to add variant-specific ADT payloads/keys, or
-freeze one generalized multi-reason record now together with complete required-field,
-identity, deduplication, evidence, effect, and invalid-combination rules for every
-reason. The packet recommends the narrow V1 plus future variant-specific ADT, but
-that recommendation has no authority until answered.
+The owner must disposition `O20-01` through `O20-04`: invalid-state-proof-only V1
+versus a generalized multi-reason record; a half-open `EtaPeriod` committee-
+exclusion interval versus the current mixed-unit field; audit/exclusion-only
+field 34 with separate atomic O-23 economics; and fixed ScodecV1 plus SHA-256
+identity/evidence preimages versus ambient hashing. The packet recommends the
+narrow V1 and all three cross-cutting corrections, but those recommendations
+have no authority until answered.
 
 Until then, RED tests and dark codec experiments may proceed, but no implementation
 may activate field-34 Scodec bytes, use sentinels/optional combinations to fill
@@ -785,15 +786,16 @@ charge delegation created after the bad signature. Existing historical stake
 state commits only an aggregate per operator and cannot identify the liable
 locks across successor/replacement lineages.
 
-The owner must disposition `O23-01` through `O23-06`: infraction-time stable
-`BondId`/tranche liability versus slash-time operator-wide liability; full-only
-InvalidStateProof V1 with exact-amount tranches versus a new residual-lock design; the pending/release
-horizon; slash-before-release same-candidate ordering; actual-debit bounty and
-reward treatment; and density-reorg culpability. The packet recommends
-infraction-time tranches, full-only V1, pending slashability through the complete
-liability horizon, slash-before-release, bounty funded only by exact principal
-debit with rewards separately burned, and revalidated culpability after a later
-density reorg.
+The owner must disposition `O23-01` through `O23-06`: fixed SHA-256 `BondId`
+preimage and complete `E-2` operator-tranche liability; full-only V1 with every
+amount-changing bonded replacement and operator/family retarget rejected; rooted bounded hold/release
+horizons; slash-before-release same-candidate ordering; actual-debit bounty,
+consumed-bond tombstones, and reward burn; and portable historical Phase-2
+revalidation with exact backing outcomes and no deadline reset after a density
+reorg. These corrections are required because the
+earlier shorthand could overcharge an increased lock, lose old liability, derive
+different identities across hash eras, or confuse prior consumption with missing
+backing.
 
 No O-23 answer activates the live path. O-20/O-22, exact historical Phase-2
 context, per-signer adjudication, resource bounds, atomic accumulator integration,

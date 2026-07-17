@@ -13,6 +13,13 @@ WT-005, SLASH-03..06, ROOT-008-F34, and PARAM-001
 
 **Updated:** 2026-07-16
 
+**Adversarial correction:** the earlier shorthand was not schema-freezeable. A
+single amount-changing replacement lock cannot preserve two exact liability
+tranches; ambient create/reference hashes are not stable identities across hash
+eras; unexplained missing backing is not equivalent to a previously consumed
+bond; and a reorg-surviving verdict needs portable historical Phase-2 evidence.
+The recommendations below incorporate those corrections.
+
 ## 1. Why another owner decision is required
 
 The confirmed ECO-06 exploit has two parts.
@@ -51,25 +58,37 @@ be activated.
 
 ### O23-01 - infraction-time bond liability
 
-**Recommendation:** liability attaches to the exact bonded tranches in the
-delayed canonical population that made the signer eligible for the disputed
+**Recommendation:** liability attaches to every exact security-bond tranche
+assigned to the signer in the delayed canonical population used for the disputed
 checkpoint. For checkpoint period `E`, the normal source is the exact rooted
 `E-2` eligibility population selected under O-11.
 
 Each tranche has a domain-separated stable `BondId` preserved across active,
-successor, replacement, and pending-withdrawal state. The rooted eligibility
-boundary commits the exact `(BondId, operator, source, family, amount)` liability
-set or an equivalent authenticated index. A proof cannot choose that set.
-This does not restore the abandoned stake-weighted shard draw: execution members
-remain a uniform public draw over the eligible operator population, while the
-liability index records the exact slashable backing that made each operator
-eligible.
+same-operator/same-family successor, exact-amount replacement, and pending-
+withdrawal state. V1 freezes the
+identity preimage and algorithm independently of the ordinal-selected ambient
+`Hasher`: fixed protocol domain, rooted chain/genesis domain, bond-family tag,
+and canonical ScodecV1 unsigned-create bytes, hashed with fixed SHA-256. The ID is
+stored at initial acceptance and never rederived from JSON/Kryo-era references or
+successor bytes.
+
+Because the shard draw is uniform over eligible operators, no individual stake
+tranche probabilistically "made" the operator win. The liable set is therefore
+**all** active security-bond tranches assigned to that operator in the exact
+rooted `E-2` eligibility view. The boundary commits the complete ordered
+`(BondId, operator, source, family, amount)` set or an equivalent authenticated
+index; neither the proof nor the verifier chooses a qualifying subset. This does
+not restore the abandoned stake-weighted shard draw: amounts and `BondId`s record
+liability only and never feed committee probability.
 
 Consequences:
 
 - delegation created after the offense is not charged for the earlier offense;
-- withdrawal, replacement, or redelegation cannot erase an already-open
-  liability interval;
+- withdrawal or exact-amount replacement cannot erase an already-open liability
+  interval;
+- operator or bond-family retargeting never preserves a `BondId`; V1 requires
+  the old tranche to finish every liability interval before a separate create
+  may establish a new operator/family tranche;
 - the same bond cannot be charged twice for the same signer/checkpoint identity;
 - current aggregate `HistoricalStakeSnapshot` is insufficient by itself and must
   be extended or paired with a rooted liability index.
@@ -84,12 +103,16 @@ simpler, but it can seize later innocent delegation and is not recommended.
 policy carrying another fraction is invalid.
 
 Each slashable V1 tranche owns one unique exact-amount backing lock. An
-amount-preserving replacement may carry the same `BondId`; an amount increase
-creates a new exact tranche, and an amount decrease stages the old tranche for
-release only after its liability deadline. An attached slashable tranche cannot
-silently mutate into a larger or smaller single lock. A full slash therefore
-consumes the complete exact lock for each selected liable tranche without
-creating a residual lock or overcharging a later increase.
+amount-preserving replacement may carry the same `BondId`. The current one-lock
+replacement transaction cannot represent `old principal + new principal` as two
+exact tranches, so V1 rejects every amount-changing replacement of an attached
+bonded lock. An increase is a separate new exact lock and new `BondId`; a decrease
+stages the complete old tranche unchanged until its liability deadline and may
+create a smaller position only through a separate exact lock. An attached
+slashable tranche cannot silently mutate into a larger or smaller single lock. A
+full slash therefore consumes the complete exact lock for each selected liable
+tranche without creating a residual lock, losing old liability, or overcharging
+later principal.
 
 `TokenLock` amount and reference are immutable signed data, delegated records
 can change only metadata amount, and collateral has no partial-amount slot. The
@@ -106,42 +129,75 @@ complete rooted evidence publication, retrieval, adjudication, inclusion, and
 Phase-2 replacement horizon. The unbond/release delay must be strictly no shorter
 than that liability horizon.
 
-Pending withdrawal is a staged exit, not a release of liability. Maturity,
-amount-reducing replacement, and any other principal release are blocked until
-the tranche's rooted liability deadline has passed. Missing exact history defers
-adjudication and cannot shorten the deadline or authorize release.
+Pending withdrawal is a staged exit, not a release of liability. Maturity and any
+other principal release are blocked until the tranche's rooted liability
+deadline has passed. The protocol must root a maximum artifact signing/anchor
+age, evidence-publication deadline, adjudication bound, Phase-2 replacement
+horizon, and release grace before this schema freezes. Artifacts and evidence
+outside those bounds are invalid.
 
-The exact network constants remain a PARAM-001 derivation, but their ordering is
-protocol law and cannot come from local HOCON.
+V1 forbids operator/family retargeting while any prior liability interval is
+open. The same exact principal cannot concurrently secure operator A and operator
+B under one `BondId`. After the old tranche is fully released, a new signed create
+with a new `BondId` may establish the new operator/family position.
+
+An allegation cannot freeze an honest exit indefinitely. Only a timely,
+authenticated, resource-valid evidence notice carrying the exact bounded data
+and passing the cheap signer/structure gates can open a rooted hold. Missing
+remote history or an unauthenticated/incomplete claim cannot create or extend a
+hold. Once a valid hold exists, unavailable adjudication data defers slash and
+release through the bounded recovery rule; it never becomes no-slash acceptance.
+
+The exact network constants remain a PARAM-001 derivation, but the above bounds
+and ordering are protocol law and cannot come from local HOCON.
 
 ### O23-04 - same-candidate order
 
 **Recommendation:** all ordinary events and proof envelopes validate against the
-same exact proposal parent. Withdrawals may be staged, but no maturity or
-replacement release is paid before adjudication. The deterministic order is:
+same exact proposal parent. Withdrawals may be staged, but no maturity,
+exact-amount successor, or staged release is applied before adjudication. The
+deterministic order is:
 
-1. validate ordinary economic inputs and stage their proposed state;
+1. reject every amount-changing bonded replacement or operator/family retarget,
+   then validate and stage the remaining ordinary economic inputs;
 2. authenticate and adjudicate every carried proof atomically;
 3. apply each newly culpable signer's offense-time slash to active or pending
    tranches and consume the exact backing locks;
-4. remove affected expiry-index entries and write per-signer field-34 records;
-5. process maturity/replacement only for surviving, released tranches; and
-6. compute checked bounty, burn, balances, accumulator delta, and final root.
+4. remove affected release-index entries and write per-signer field-34 records;
+5. process exact-amount successors and liability-expired staged release only for
+   surviving tranches; and
+6. compute checked bounty, principal/reward burns, balances, accumulator delta,
+   and final root.
 
-Slash wins every collision with withdrawal maturity or backing replacement.
+Slash wins every collision with withdrawal maturity, exact-amount successor, or
+staged release.
 There is no filter-failed-proof-and-continue branch.
 
 ### O23-05 - actual-debit funding and rewards
 
 **Recommendation:** `actualDebit` is the sum of exact backing principal removed
 without a balance credit after the complete backing join succeeds. Bounty is
-`floor(actualDebit * rootedBountyFraction)` using checked arithmetic; burn is the
-remainder. Saturation is forbidden. A culpable signer with no debit-capable
-principal may receive the protocol record/cooldown but creates no bounty.
+`floor(actualDebit * rootedBountyFraction)` using checked arithmetic; principal
+burn is the remainder. Saturation is forbidden. A culpable signer with no
+debit-capable principal may receive the protocol record/cooldown but creates no
+bounty only when a rooted consumed-bond tombstone proves that the same `BondId`
+was already canonically debited, or O23-06 portable old-branch evidence proves
+that the offense-time bond is genuinely absent on the replacement branch.
+Unexplained missing or mismatched backing is an atomic failure/defer, not a
+zero-debit slash.
 
-Accrued delegated rewards on a slashed tranche are forfeited as a separately
-accounted burn and never increase the bounty pool. This keeps the bounty tied to
-security principal rather than reward-accounting timing.
+The tombstone binds `BondId`, consumed amount, consuming slash identity, and
+consuming snapshot. This permits two distinct invalid checkpoints signed by one
+bond to record both offenses while debiting the principal once. Same-identity
+duplicates create neither another record nor another economic effect.
+
+Accrued delegated rewards on a slashed tranche are removed from the active or
+pending claim and forfeited as a separately accounted burn; they never increase
+the bounty pool. The conservation equations are
+`principalDebit = bounty + principalBurn` and
+`rewardClaimDebit = rewardBurn`, with supply delta equal to
+`-(principalBurn + rewardBurn)`. Every term uses checked arithmetic and one
+accumulator-owned transition.
 
 ### O23-06 - density reorg behavior
 
@@ -149,10 +205,28 @@ security principal rather than reward-accounting timing.
 remains culpable when its exact base was authenticated Phase 2 at signing time,
 even if a later density reorg orphans that base. The slash effect itself is
 ordinary branch state: it rolls back when its containing snapshot is orphaned
-and may land on the replacement branch only after the exact historical base,
-signer context, liability set, evidence, and newly-culpable status are
-revalidated there. No local upheld cache or orphaned field-34 record carries
+and may land on the replacement branch only after portable evidence revalidates
+the exact historical base, signer context, liability set, evidence, and
+newly-culpable status there. The historical bundle includes the exact signed
+snapshot/root, one permitted Phase-2 qualification for that exact hash
+(`decided-attestation T_weight` or authenticated canonical `k1` depth), and the
+historical roster/KES/VRF/eta/liability proofs needed for the signing period. A
+local old-branch cache, upheld result, or orphaned field-34 record carries no
 authority across the reorg.
+
+Replacement-branch economic outcomes are exact:
+
+- byte-identical live `BondId`/liability/backing applies the original debit;
+- a canonical consumed-bond tombstone records the additional distinct offense
+  with zero debit and no bounty;
+- a portable old-branch liability proof with no replacement-branch `BondId`
+  permits culpability/cooldown only, with zero debit, no bounty, and no hold; and
+- a present but divergent same-`BondId` lineage enters `RecoveryRequired` and
+  cannot be coerced into either debit or no-debit acceptance.
+
+The orphaned branch's hold rolls back with that branch. Re-inclusion may recreate
+only the unexpired remainder of the original rooted liability/evidence deadline;
+density replacement never restarts or extends the clock.
 
 A signature issued against a base that was never valid Phase 2 is outside this
 InvalidStateProof rule and requires its own typed offense; it cannot be smuggled
@@ -172,11 +246,12 @@ applySlash(
 ```
 
 `ValidatedSlashBackingState` contains the active token locks, active and pending
-delegated stake, active and pending collateral, and affected expiry indices from
-one immutable parent capture. `SlashDelta` contains consumed lock refs, all four
-post-state lifecycle maps, expiry removals, per-signer actual debits, checked
-bounty credits, burns, cooldowns, and typed field-34 records. The same delta must
-flow through `StateChangesAccumulator`; direct field-34 writes outside the
+delegated stake, active and pending collateral, affected release indices, and
+consumed-bond tombstones from one immutable parent capture. `SlashDelta` contains
+consumed lock refs, tombstone upserts, all four post-state lifecycle maps, release
+removals, per-signer actual debits, checked bounty credits, principal/reward
+burns, cooldowns, and typed field-34 records. The same delta must flow through
+`StateChangesAccumulator`; direct field-34 or tombstone writes outside the
 accumulator are forbidden.
 
 Per-signer adjudication identity is
@@ -192,17 +267,29 @@ that only newly culpable signers produce debit or reward.
 2. Same-round and prior-round withdrawal cannot hide principal; maturity cannot
    refund a consumed lock.
 3. A post-offense delegation to the same operator is not charged.
-4. Successor, exact-amount replacement, redelegation, and pending state preserve
-   one stable `BondId`; amount increase creates a distinct tranche and amount
-   decrease cannot reduce open liability.
+4. Same-operator/same-family successor, exact-amount replacement, and pending
+   state preserve one stable `BondId`; every amount-changing replacement and
+   operator/family retarget rejects. A separate exact lock/create establishes a
+   distinct increased, reduced, or retargeted tranche only after the old
+   liability interval permits release.
 5. Overlapping signer sets `A/B/C` then `A/D/E` debit each signer once and reward
    only the first canonical claimant for each new debit.
-6. Partial-fraction policy, surplus/missing/duplicate backing, malformed lineage,
+6. One bond signing two distinct invalid checkpoints debits once, records both
+   offenses, and relies on a rooted consumed-bond tombstone for the later
+   zero-debit result. Unexplained missing backing rejects/defer atomically.
+7. Fixed-algorithm `BondId` golden vectors remain identical across ambient hash
+   eras and reject cross-family, cross-chain, malformed, and trailing bytes.
+8. Partial-fraction policy, surplus/duplicate backing, malformed lineage,
    overflow, saturation, and key/value mismatch reject atomically.
-7. Expiry indices, balances, supply, field 34, accumulator replay, restart, and
-   density reorg reproduce the identical root.
-8. Unavailable historical base, roster, key, eta, liability, or lock bytes defer
-   and cannot slash or release the challenged tranche.
+9. Release indices, balances, supply, field 34, tombstones, accumulator replay,
+   restart, and density reorg reproduce the identical root and conservation
+   equations.
+10. Phase-2 qualification, historical base, roster, key, eta, liability, or lock
+    evidence is portable and exact. Missing data defers only under the bounded
+    authenticated-hold rule and cannot slash or silently release the tranche.
+11. Density replacement covers byte-identical backing, canonical tombstone,
+    genuinely absent bond, and divergent same-ID outcomes. No reorg resets a
+    hold/release deadline or converts unexplained absence into no-debit guilt.
 
 The focused `InvalidStateProofSlashPrincipalRedSuite` currently compiles and
 fails all five intended cases: zero active-lock debit with synthetic bounty,
@@ -216,24 +303,27 @@ and full maturity refund after the slash record. Its SHA-256 is
    current greenfield snapshot schema and disconnect proposal, follower, GSAM,
    field-34 writer, and cooldown authority. Keep transport/replay only as dark,
    bounded test components.
-2. **Freeze schemas under O-20/O-23.** Define `BondId`, bond family, liability
-   interval/index, full-only rooted InvalidStateProof policy, per-signer slash
-   identity, and the invalid-state-proof-only Scodec field-34 record/key. Add
-   independent golden and rejection vectors before runtime wiring.
+2. **Freeze schemas under O-20/O-23.** Define the fixed SHA-256 `BondId` preimage,
+   bond family, complete E-2 liability set, liability interval/index, bounded
+   evidence hold, consumed-bond tombstone, full-only rooted InvalidStateProof
+   policy, per-signer slash identity, and invalid-state-proof-only Scodec field-34
+   record/key. Add independent golden and rejection vectors before runtime wiring.
 3. **Propagate stable liability through the lifecycle.** Creation assigns the
-   stable tranche identity; successor, token-lock replacement, withdrawal, and
-   pending state preserve it. Amount-reducing release cannot cross an open
-   liability deadline. The N-2 boundary commits the exact eligible population
-   and liability index from one post-transition state.
+   stable tranche identity; same-operator/same-family successor, exact-amount
+   token-lock replacement, withdrawal, and pending state preserve it. Amount-
+   changing replacement and operator/family retarget reject, and release cannot
+   cross an open liability deadline. The N-2 boundary commits the exact eligible
+   population and complete liability index from one post-transition state.
 4. **Separate signer authentication from artifact validity.** Authenticate every
    historical execution signature over the exact bytes even when the signed
    checkpoint is structurally invalid. Ordinary adoption still rejects the
    malformed checkpoint. Adjudication emits only newly culpable per-signer
    identities.
 5. **Land the pure atomic economic sink.** Capture locks, four lifecycle maps,
-   and expiry state from one exact parent; consume exact liable locks; remove or
-   update records and indices; calculate checked actual debit, reward forfeiture,
-   bounty, and burn; emit one accumulator-owned delta and root.
+   release state, and tombstones from one exact parent; consume exact liable
+   locks; remove or update records and indices; calculate checked actual debit,
+   reward-claim debit, bounty, and burns; emit one accumulator-owned delta and
+   root.
 6. **Qualify history, recovery, and reorg.** Resolve exact Phase-2 base,
    historical roster/KES/VRF/eta/parameters/liabilities, bounded inputs, and
    signer-specific prior records. Prove restart, catch-up, deep retrieval,
@@ -252,12 +342,12 @@ cannot precede exact historical/recovery qualification.
 Please answer all six:
 
 ```text
-O23-01: accept infraction-time BondId/tranche liability
-O23-02: accept full InvalidStateProof V1 with one exact-amount lock per tranche
-O23-03: accept pending slashability through the complete liability horizon
+O23-01: accept fixed-hash BondId and complete E-2 operator-tranche liability
+O23-02: accept full-only V1 and reject amount-changing/retargeting replacements
+O23-03: accept rooted bounded liability/hold/release horizons
 O23-04: accept slash-before-release same-candidate ordering
-O23-05: accept actual-debit funding and reward forfeiture as separate burn
-O23-06: accept revalidated culpability after a later density reorg
+O23-05: accept actual-debit funding, consumed-bond tombstones, and reward burn
+O23-06: accept portable revalidation, exact backing outcomes, and no deadline reset
 ```
 
 An answer selects design only. It does not activate fraud proofs or close O-20,

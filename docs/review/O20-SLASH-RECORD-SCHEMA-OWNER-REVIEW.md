@@ -2,8 +2,8 @@
 
 **Status:** OWNER RESPONSE REQUIRED. This packet does not select or activate a
 field-34 value schema. The recommendation below has no runtime authority until
-the owner dispositions `O20-01` and engineering freezes the resulting key,
-value, codec, transition, and test contracts.
+the owner dispositions `O20-01` through `O20-04` and engineering freezes the
+resulting key, value, codec, transition, and test contracts.
 
 **Runtime authority:** None. The live field-34 writer and readers continue to
 use `InvalidStateProofSlashManager.SlashedRegistryEntry` and its hand-written JSON
@@ -16,12 +16,18 @@ E6, E8
 
 ## 1. Decision required
 
-O-20 asks one narrow question:
+O-20 asks four bounded questions:
 
 > Does the first ScodecV1 field-34 schema represent only the implemented
 > invalid-state-proof slash, with later slash kinds added as variant-specific
 > records, or does V1 freeze one generalized record for slash kinds whose
 > evidence identity and ledger sinks are not implemented?
+
+It also asks whether committee exclusion is represented as a half-open
+`EtaPeriod` interval rather than the current mixed-unit field, whether field 34
+is limited to culpability/dedup/cooldown rather than duplicating economic debit
+state, and whether every identity/evidence digest uses fixed ScodecV1 plus
+SHA-256 rather than the ordinal-selected ambient `Hasher`.
 
 This is an owner decision because the answer fixes rooted MPT value bytes,
 physical-key identity, duplicate detection, cooldown interpretation, and the
@@ -45,6 +51,7 @@ not evidence that can authorize its own creation.
 | Physical key | The current key hashes the interpolated string `peerId|shardId|disputedCheckpointHash` (`GlobalStateKey.scala:566-580`). | It is invalid-state-proof-specific and is not the frozen ROOT-008 canonical tuple codec. Different future evidence identities cannot safely overload it. |
 | Duplicate reader | The invalid-state-proof reader scans the partition and treats any value matching `(shardId, disputedCheckpointHash)` as already slashed (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofSlashedReader.scala:70-93`). | A generalized record could collide with the invalid-state-proof duplicate domain unless variants have distinct typed identities and readers. |
 | Cooldown reader | Committee exclusion consumes only the common `peerId`, `eventOrdinal`, and `cooldownUntilEpoch` projection (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/SlashCooldownReader.scala:114-125,137-150`). | Future variants may share a cooldown projection without sharing their evidence-specific key/value fields. |
+| Cooldown units | The writer sets `cooldownUntilEpoch: EpochProgress` from `currentEpoch + cooldownEpochs`, while the reader compares its numeric value to an anchor derived from GL0 snapshot ordinal (`InvalidStateProofSlashManager.scala:159-169`; `SlashCooldownReader.scala:100-125`). | The current field name, type, and comparison axis are dimensionally ambiguous and cannot be frozen as protocol bytes. |
 | Value bytes | The field-34 value is UTF-8 Circe JSON behind an `ImmutableCodec` (`InvalidStateProofSlashedReader.scala:52-68`). | This cannot be the target ScodecV1 leaf. A canonical value decision is required before the field-34 accumulator/change-set repair freezes bytes. |
 | Producer write | GSAM derives the composite key and writes these records directly after the ordinary accumulator because field 34 is absent from `StateChangesAccumulator` (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala:2967-2992`). | Adding field 34 to the typed accumulator must reproduce the selected record/key bytes; it cannot choose the schema implicitly. |
 
@@ -76,6 +83,13 @@ Tests constructing the generic case class do not activate the other reason tags.
 7. This is a greenfield fork. The target runtime retains no fork-only JSON or
    generalized-record compatibility path. A future protocol-era upgrade must
    define its historical read and state transition explicitly.
+8. Field 34 records culpability identity, evidence commitment, and committee
+   exclusion only. O-23 principal debit, reward burn, liability lineage, and
+   consumed-bond tombstones are separate rooted state applied atomically in the
+   same accumulator transition; the audit record is not a second balance sheet.
+9. Logical identities, evidence digests, and physical keys use fixed ScodecV1
+   preimages and fixed SHA-256. The ordinal-selected ambient `Hasher`, JSON,
+   delimiters, and interpolated strings never define these bytes.
 
 ## 4. O20-01 options
 
@@ -88,7 +102,8 @@ with exactly one accepted V1 variant, `InvalidStateProof`. Its payload contains:
 - `shardId`;
 - `disputedCheckpointHash`;
 - `eventOrdinal`;
-- `cooldownUntilEpoch`; and
+- `excludedFromPeriod` and `eligibleAgainAtPeriod`, a half-open `EtaPeriod`
+  interval; and
 - `evidenceDigest` with one frozen evidence-digest preimage.
 
 The variant tag replaces the independently writable generic `reason` field. V1
@@ -109,7 +124,8 @@ whose payload and physical-key identity match that kind's proved evidence:
 
 The exact future identities above are intentionally not selected by O-20. Their
 own evidence designs must derive them. The common reader may project
-`(peerId,eventOrdinal,cooldownUntilEpoch)` only after strict variant decoding.
+`(peerId,eventOrdinal,excludedFromPeriod,eligibleAgainAtPeriod)` only after
+strict variant decoding.
 
 **Consequences:**
 
@@ -153,20 +169,64 @@ owner also defines now, for every reason:
   migration instead of allowing each future variant to land with its actual
   evidence contract.
 
-## 5. Recommendation rationale
+## 5. O20-02 committee-exclusion interval
+
+**Recommendation:** encode a half-open artifact-period interval
+`[excludedFromPeriod, eligibleAgainAtPeriod)` using `EtaPeriod`. The slash
+transition derives both endpoints from the exact proposal parent and rooted
+rotation/delay/cooldown parameters. Committee construction for artifact period
+`E` excludes the operator exactly when `excludedFromPeriod <= E <
+eligibleAgainAtPeriod`.
+
+This removes the current `EpochProgress` versus snapshot-ordinal comparison and
+makes the roster effect explicit. It does not weight the draw: the selected
+operator population is still sampled uniformly after deterministic exclusions.
+Invalid/negative ordering, overflow, or a locally configured interval rejects.
+
+## 6. O20-03 field-34 economic scope
+
+**Recommendation:** field 34 is the typed per-signer culpability, deduplication,
+evidence-pointer, and exclusion record only. It does not repeat `BondId`s,
+principal amounts, bounty, burns, or supply deltas. O-23 stores liability and
+consumed-bond state in their own typed rooted partitions/deltas. One
+`StateChangesAccumulator` transition applies both or neither.
+
+This prevents two rooted copies of the economic effect from drifting while
+keeping a compact committee-exclusion reader. A valid field-34 record alone can
+never mint, burn, debit, or prove that a bond was consumed.
+
+## 7. O20-04 fixed identity and evidence hashing
+
+**Recommendation:** the logical key preimage is a frozen length-delimited ASCII
+domain, the `InvalidStateProof` variant tag, and exact ScodecV1 bytes for
+`(peerId, shardId, disputedCheckpointHash)`, hashed with fixed SHA-256. The value's
+`evidenceDigest` is fixed SHA-256 over a separate frozen domain plus the complete
+canonical `InvalidStateProofEvidenceV1` bytes. Neither uses `Hasher.hash[A]`, an
+ordinal-selected hasher, JSON, or a delimiter-separated string.
+
+The exact domain literals and evidence codec must be frozen with independent
+golden vectors before any writer is enabled. Until O-22 freezes the evidence
+type, O-20 can select this construction but cannot freeze the final digest bytes.
+
+The focused `SlashCooldownAxisMismatchRedSuite` reproduces O20-02's current
+mixed-unit defect: ordinal anchor 599, `EpochProgress` 42, and stored expiry 142
+produce no active exclusion. It compiles and fails 1/1 intentionally; SHA-256
+`7fd927373ece8ccc221344eed83c0b085c59003f7cbe2ea68ceaba4b0948a766`.
+
+## 8. Recommendation rationale
 
 Option A minimizes consensus authority. It does not remove future slashing; it
 requires a future slash kind to prove its own evidence identity before obtaining
 a rooted consequence. That matches the current source: one implemented ledger
 producer, one invalid-checkpoint composite identity, and readers whose broader
-cooldown need is only a three-field common projection.
+cooldown need is only a compact common exclusion projection.
 
 Option B is not justified merely because four reason case objects already exist.
 Those tags do not specify canonical key bytes, evidence preimages, duplicate
 domains, or ledger effects. Treating them as a finished schema would convert
 placeholder source into protocol authority.
 
-## 6. Activation evidence after an owner answer
+## 9. Activation evidence after an owner answer
 
 The selected option remains nonactivating until all applicable gates pass:
 
@@ -186,20 +246,27 @@ The selected option remains nonactivating until all applicable gates pass:
 7. Source guards proving the JSON leaf codec, interpolated-string key, generic
    reason writer, and direct-outside-accumulator field-34 path are unreachable in
    the active era.
+8. Period-boundary vectors prove exclusion begins and ends at the exact rooted
+   artifact periods and never changes uniform draw weight.
+9. Field-34-only tampering cannot alter balances, supply, liability, bounty,
+   burns, or consumed-bond state; the combined accumulator transition is atomic.
 
 O-18 independently owns transport/page/resource bounds for changeset delivery.
 It cannot alter the selected field-34 identity or make transport bytes state
 authority.
 
-## 7. Response template
+## 10. Response template
 
-The owner may answer with `accept recommendation` or select/replace Option B:
+Please answer all four:
 
 ```text
-O20-01:
+O20-01: accept invalid-state-proof-only V1
+O20-02: accept half-open EtaPeriod exclusion interval
+O20-03: accept audit/exclusion-only field 34 with separate atomic economics
+O20-04: accept fixed ScodecV1 + SHA-256 identity/evidence preimages
 ```
 
-Until `O20-01` is answered, engineering may add RED tests and dark codec
+Until these are answered, engineering may add RED tests and dark codec
 experiments, but must not freeze or activate field-34 Scodec value/key bytes,
 generalize the live slash writer, or treat the latent reason tags as designed
 slash variants.
