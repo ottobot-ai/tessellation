@@ -11,8 +11,8 @@ recommendations and directions recorded here. Ratification does **not** assert t
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
 document records which direction is settled and which executable freeze gates remain. `O-18`,
-`O-19`, `O-20`, and `O-21` were added after that ratification pass and are not answered by this document.
-**Owner-question completeness:** `17/21` dispositioned. `O-01` through `O-17` are ratified;
+`O-19`, `O-20`, `O-21`, and `O-22` were added after that ratification pass and are not answered by this document.
+**Owner-question completeness:** `17/22` dispositioned. `O-01` through `O-17` are ratified;
 `O-18` awaits an owner response in
 [`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md),
 and `O-19` awaits an owner response in
@@ -21,6 +21,8 @@ and `O-19` awaits an owner response in
 [`O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
 `O-21` awaits an owner response in
 [`O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`](O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md).
+`O-22` awaits an owner response in
+[`O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
 
 ---
 
@@ -119,6 +121,7 @@ test, never a freeze.
 | O-19 | Upstream-v4 snapshot migration policy | 🔴 | **OWNER RESPONSE REQUIRED:** all 17 source fields require explicit dispositions; source-unrooted fields, metagraph continuity, epoch/eta, registries, malformed source state, and per-asset conservation are not ratified. The raw tools-only envelope verifier is not an authorized importer or transform. |
 | O-20 | Field-34 slash record schema | 🔴 | **OWNER RESPONSE REQUIRED:** V1 invalid-state-proof-only versus a generalized multi-reason record is not ratified. The recommendation is a narrow invalid-state-proof V1 plus future variant-specific ADT payloads/keys; it has no authority until answered. |
 | O-21 | Optimistic decision evidence | 🔴 | **OWNER RESPONSE REQUIRED:** D-01 already ratifies portable exact signed decided-attestation statements and `T_weight`; only whether those statements are sufficient alone or require additional authoritative transcript material remains unratified. The recommendation is statements alone, with query transcripts audit-only and unable to create qualification authority. |
+| O-22 | Fraud-proof activation and adjudication | 🔴 | **OWNER RESPONSE REQUIRED:** current nonempty proofs have live rooted authority before universal exact-context adjudication exists. The recommendation is current-era field removal, whole-candidate reject/defer, and per-new-signer debit-funded bounties. |
 
 ---
 
@@ -665,6 +668,24 @@ authority. It can qualify only an exact locally valid snapshot on the objectivel
 reversible Phase 2. Until answered and the engineering gates close, canonical `k1` depth remains the
 sole live state-changing Phase-2 rail.
 
+## O-22 - Fraud-proof activation and adjudication 🔴
+
+**Status:** **OWNER RESPONSE REQUIRED.** The focused packet is
+[`O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
+
+The pending `O22-01` choice is mandatory-empty current-era retention versus
+removing the field until an activating protocol era. `O22-02` asks whether every
+invalid/not-upheld/stale proof rejects the complete candidate and unavailable
+history defers it, with zero filter-and-continue path. `O22-03` asks which
+claimant receives the bounty funded by each newly proven signer's actual debit.
+
+The packet recommends current-era field removal, atomic candidate semantics,
+and per-new-signer debit-funded bounty ownership. This answers document does not
+infer those choices. It also does not weaken already settled invariants: missing
+history cannot slash, local HOCON cannot select rooted economics, per-signer
+accountability is once-only, and exceptional replay results rather than a
+watchtower assertion decide guilt.
+
 ---
 
 ## Cross-cutting caveats
@@ -703,7 +724,7 @@ sole live state-changing Phase-2 rail.
    quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
    A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
    activation proofs. These are not unanswered owner choices and may not be filled by local
-   configuration or an implementation shortcut. O-18, O-19, O-20, and O-21 are different: their focused
+   configuration or an implementation shortcut. O-18, O-19, O-20, O-21, and O-22 are different: their focused
    choices are newly surfaced and still await an owner response.
 
 ## Provenance
@@ -721,4 +742,6 @@ baseline `d9268886a` and upstream `v4.0.0` peeled commit `22953a1ee`; it adds no
 O-20 was appended from the field-34 accumulator/schema audit against the current source on
 2026-07-16; it adds no settled answer.
 O-21 was appended from the optimistic-finality evidence audit against the current source on
+2026-07-16; it adds no settled answer.
+O-22 was appended from the fraud-proof activation/adjudication audit against the current source on
 2026-07-16; it adds no settled answer.

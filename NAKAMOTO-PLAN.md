@@ -14,7 +14,7 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `17/21` dispositioned. `O-01` through `O-17` are
+**Owner-decision status:** `17/22` dispositioned. `O-01` through `O-17` are
 ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
 bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34 slash-record schema
 await owner responses in
@@ -22,10 +22,12 @@ await owner responses in
 `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
 `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `O-21` optimistic decision
 evidence awaits a response in
-`docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. Dependencies under
+`docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. `O-22` fraud-proof
+activation and adjudication awaits a response in
+`docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. Dependencies under
 O-01 through O-17 mean implementation of their ratified direction and closure of
 their listed engineering, research, schema, parameter, or proof gates. O-18,
-O-19, O-20, and O-21 are the only pending owner responses.
+O-19, O-20, O-21, and O-22 are the only pending owner responses.
 
 ## Active objective
 
@@ -289,6 +291,11 @@ already has a hard-coded kill switch.
    are confirmed; end-to-end malicious ingress remains PLAUSIBLE until the RED
    integration vectors reproduce it. Gates: `XMG-013`, `PERM-005`, `WT-010`,
    `ECON-G-002`.
+   The focused live MPT-02 field-33 parser is now strict: it retains physical
+   key/raw bytes, requires canonical re-encoding and exact direct-hash key
+   reproduction, and rejects duplicate logical hashes. Keep MPT-02/XMG-013
+   partial until restart, compaction, exact-parent recovery, density reorg, and
+   accepted-state ingress vectors pass; the other five parser families remain open.
 4. **Harden raw recovery and tower state.** Network sync, persisted restore, and
    deep-reorg loads accept only an exact snapshot-bound complete root. Any
    non-consensus derived bytes are stripped and deterministically rebuilt from
@@ -1103,6 +1110,12 @@ delivery, rollback, and recovery.
   asymmetry maps `CannotRederive` to no-slash while another node may uphold, and
   local env-overridable watchtower/slash parameters feed rooted state. Branch-aware
   evidence/adjudication, `FIN-14`, `SHARD-C-012`, `O-16`, and `O-20` remain open.
+  **O-22 stop-the-line correction:** this path is not dark today: a producer peeks
+  the local pool into `GlobalIncrementalSnapshot.fraudProofs`, and GSAM can apply
+  rooted effects while mapping failed adjudication to no slash. Before any further
+  live use, O-22 must select mandatory-empty versus field removal, whole-candidate
+  verdict semantics, and incremental-signer bounty ownership. `WT-000` is the
+  current-era containment gate; `WT-001..010` remain future activation gates.
 - A package-private dark identity-composition model now requires the real
   `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
   the exact-history session, and matching exact-image, semantic, field-32, and

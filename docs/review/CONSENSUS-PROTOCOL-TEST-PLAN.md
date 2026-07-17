@@ -460,6 +460,7 @@ as roster and eta, and a local mismatch halts before validation.
 
 | Test ID | Required scenario and assertion |
 |---|---|
+| WT-000 | Before the O-22 activating era, honest construction emits no fraud-proof authority and every nonempty/old-shape artifact is rejected before GSAM, MPT, overlay, storage, serving, or finality mutation. Under field removal, JSON/other object decoders reject an explicit retired `fraudProofs` member and Scodec rejects old-shape/trailing bytes; no permissive unknown-field compatibility remains. A populated local pool and different watchtower/slash/bounty/cooldown HOCON values cannot change the artifact or root. Activation is exact-parent and reorg-aware; no dark local result is grandfathered. |
 | WT-001 | A colluding execution threshold signs a wrong diff/root; assigned noncommittee watchtower replay detects it, and the ratified adjudicator authenticates the execution certificate and replays the complete ordered multi-MG checkpoint batch exactly once from retained inputs/base. Evidence MG is only the compared-root selector; selecting one MG cannot erase shared dependencies before rollback or slash. |
 | WT-002 | Unavailable base/input, peer timeout, local crash, thrown recreation, generic incomplete legacy output, different but valid custom-data availability view, or stale checkpoint yields `Unavailable`/no-slash. For a structurally valid checkpoint, only reproduced-root mismatch or an explicit typed deterministic-invalid transition may uphold. |
 | WT-002A | Two MGs share a fee payer whose balance covers only the first canonical debit. Ordinary replay withholds the complete checkpoint, while portable adjudication distinguishes an explicit deterministic oversubscription reject from unavailable/swallowed dependency failure. The former convicts the execution signers; the latter cannot slash. This remains RED until the legacy processor returns the typed reject. |
@@ -505,6 +506,13 @@ ratified construction: either field-7 leaves are included in the signed complete
 per-MG root, or the response proves them against the signed complete global root.
 Missing value, wrong scope/source/key/path/root, stale/self-claimed checkpoint, and
 cross-MG substitution reject before the allow-spend is usable.
+
+The focused live-parser portion of `XMG-013` is GREEN in
+`ConsumedAllowSpendStateManagerMaterializationSuite`: canonical entries succeed,
+while A-key/B-value, suffix/wrong-scope, null/malformed/empty/trailing bytes,
+impossible absent/noncanonical retained bytes, and duplicate input order fail
+before map construction. Restart, compaction, exact-parent recovery,
+accepted-state ingress, and density-reorg integration remain RED/open.
 
 ### 4.8 Payload lanes and data availability
 

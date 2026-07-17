@@ -48,7 +48,7 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `17/21` dispositioned. `O-01` through `O-17` are
+> **Owner-decision status:** `17/22` dispositioned. `O-01` through `O-17` are
 > ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18`
 > transport/DA bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34
 > slash-record schema await owner responses
@@ -56,7 +56,9 @@
 > `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
 > `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `O-21` optimistic
 > decision evidence awaits a response in
-> `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. Open work under
+> `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. `O-22`
+> fraud-proof activation and adjudication awaits a response in
+> `docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. Open work under
 > O-01 through O-17 is an engineering, research, schema, parameter, or proof gate
 > under a ratified direction, not a request for another owner answer.
 
@@ -237,6 +239,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     price/parameter keys. The parser defects are confirmed; malicious ingress is
     PLAUSIBLE pending end-to-end RED reproduction. Gates: `XMG-013`, `PERM-005`,
     `WT-010`, `ECON-G-002`.
+    - **MPT-02 FOCUSED PARSER GREEN:** field 33 now retains exact physical
+      key/raw bytes, rejects malformed/trailing/noncanonical values and wrong
+      placement, reproduces the direct-hash key, and rejects duplicate logical
+      hashes deterministically. Keep XMG-013 open for restart, compaction,
+      exact-parent recovery, density reorg, and accepted-state ingress vectors.
   - [ ] **4. Raw recovery and tower:** exact-snapshot/root-verify network, disk,
     and deep-reorg maps; strip non-consensus derived bytes and rebuild them only
     from rooted state (`ROOT-009`). `ECO-IDX-02`'s root-invisible System-index
@@ -1185,6 +1192,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
     needs a separate crypto/evidence design. `O-20` remains independently open for
     the rooted field-34 slash-record schema. `FIN-14`, `SHARD-C-012`, `WT-006`,
     `O-16`, and `O-20` remain open.
+  - [ ] **O-22 OWNER RESPONSE REQUIRED / NONEMPTY FRAUD-PROOF CONTAINMENT:** the
+    producer currently copies the local pool into the global snapshot and GSAM can
+    apply rooted effects while failed adjudication becomes no slash. Select
+    mandatory-empty current-era retention versus field removal, atomic whole-
+    candidate reject/defer semantics, and per-new-signer debit-funded bounty
+    ownership. Until answered and implemented, `WT-000` blocks every nonempty
+    active-era proof; `WT-001..010` remain activation tests, not evidence that the
+    current live path is safe.
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.
   - **Gate:** `WT-001..007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`, `REC-*`,

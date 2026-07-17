@@ -11,8 +11,10 @@ conservation rule. `O-20` was surfaced by the field-34 slash-record audit and aw
 response; no implementation may infer a generalized slash-record schema or activate a latent slash
 reason. `O-21` was surfaced by the optimistic-finality evidence audit and awaits an owner response;
 no implementation may infer that gossip counts or an opaque digest prove a completed sampled cascade.
-**Owner-question completeness:** `17/21` dispositioned. `O-01` through `O-17` are ratified;
-`O-18`, `O-19`, `O-20`, and `O-21` are pending.
+`O-22` was surfaced by the fraud-proof activation audit and awaits an owner response; no implementation
+may give a current-era nonempty proof consensus authority or infer a filter-and-continue adjudication rule.
+**Owner-question completeness:** `17/22` dispositioned. `O-01` through `O-17` are ratified;
+`O-18`, `O-19`, `O-20`, `O-21`, and `O-22` are pending.
 **Updated:** 2026-07-16
 
 This register uses project phases only where the owner has ratified them:
@@ -742,6 +744,32 @@ wall clock, and current local state have no authority.
 Until `O21-01` is answered and the O-01/O-11/O-12/O-15/O-16/O-18 engineering gates close,
 `TipAttestation`, `SnowballAccumulator`, and `TWeightTrigger` remain telemetry,
 and `DecidedAttestationEvidence` remains opaque and nonactivating.
+
+### O-22 Fraud-proof activation and adjudication
+
+Owner-review packet:
+[O-22 Fraud-Proof Activation and Adjudication Owner Review](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
+
+**OWNER RESPONSE REQUIRED; NONEMPTY ACTIVE-ERA PROOFS MUST BE CONTAINED.** The
+current producer copies a node-local fraud pool into the globally signed artifact,
+and GSAM can turn locally upheld evidence into rooted stake, bounty, cooldown, and
+field-34 effects. The active-era shape validator does not reject this field, while
+failed or unavailable adjudication is currently mapped to no slash and continued
+acceptance. This is live consensus authority, not dark scaffolding.
+
+The owner must disposition `O22-01` through `O22-03`: retain a mandatory-empty
+current-era field versus remove it until an activating era; adopt atomic
+reject/defer semantics instead of filtering failed proof adjudication; and freeze
+the deterministic bounty claimant rule when later evidence proves additional
+signers on an already-disputed checkpoint. The packet recommends removing the
+unratified current-era field, whole-candidate reject/defer, and bounties funded only by each newly
+proven signer's actual debit.
+
+No answer activates slashing. Exact proposal-parent adjudication, per-signer
+deduplication, structural-invalid signer accountability, rooted policy, principal
+conservation, field-34 Scodec/key grammar, historical atomic KES+VRF context,
+watchtower coverage, resource bounds, and density-reorg behavior remain mandatory
+engineering gates.
 
 ## Change rule
 
