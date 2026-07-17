@@ -1153,6 +1153,20 @@ delivery, rollback, and recovery.
   core readback, ROOT semantic/image gates, and consumer effect ordering block any
   live issuer. Wrapping the current watermark/best-tip Boolean in an opaque type
   does not close FIN-14.
+- A package-private dark `CanonicalPhase2LeaseAcquirer` now owns the effectful
+  acquisition order: one short coordinator capture, an unlocked readback through
+  an explicitly authenticated-source contract, pure complete-identity verification,
+  and one short serialized `acquireIfCurrent` CAS
+  (`CanonicalPhase2LeaseAcquirer.scala:8-53`). No production implementation exists
+  for either boundary, and there is no factory, issuer, `FinalityGate`/Boolean/
+  ordinal adapter, or live caller. Effectful tests cover replacement and recovery
+  during readback, descendant-extension staleness/retry, raised errors, and
+  cancellation without retaining the coordinator boundary
+  (`CanonicalPhase2LeaseAcquirerSuite.scala:84-236`). Their identity-equal readback
+  fixture proves orchestration and comparison only, not independent authentication
+  or reproduction. A returned lease can become stale immediately; every mutation
+  still requires the short serialized `commitIfCurrent`. This slice closes neither
+  FIN-14, O-16, nor any live `FOLLOW-008` consumer schedule.
 - A test-only `Phase2ConsumerLeaseReferenceModel` now reuses the canonical
   structural reference and existing release/branch/lineage revision types. It
   covers the exact-ref, same-height replacement, acquisition race, pre-commit

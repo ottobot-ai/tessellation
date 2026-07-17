@@ -10,7 +10,7 @@ import io.constellationnetwork.node.shared.domain.nakamoto.overlay._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.CandidateCurrencyReplayViewFailure.Component._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.CandidateCurrencyReplayViewFailure._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.Field32ReplayWitnessState._
-import io.constellationnetwork.node.shared.domain.snapshot.finality.Phase2ReferencePolicy.ExactCanonicalAncestor
+import io.constellationnetwork.node.shared.domain.snapshot.finality.FinalityConsumerLeaseKernel._
 import io.constellationnetwork.node.shared.domain.snapshot.finality.Phase2UseScope.{BinaryAdmission, CurrencySnapshotReplay}
 import io.constellationnetwork.schema.ID.Id
 import io.constellationnetwork.schema._
@@ -118,17 +118,49 @@ object CandidateCurrencyReplayViewSuite extends SimpleIOSuite {
       .flatMap(_.fold(IO.raiseError, IO.pure))
   }
 
-  private def lease(useScope: Phase2UseScope = scope): CanonicalPhase2Lease =
-    new CanonicalPhase2Lease(
-      useScope,
-      ExactCanonicalAncestor,
-      target,
-      released,
-      FinalityCodecFixtures.selection,
+  private val currentSelection = {
+    val path = Vector(target)
+    CanonicalSelectionToken(
       FinalityCodecFixtures.selection.branchRevision,
-      CanonicalLineageRevision(NonNegLong.MinValue),
-      Phase2ConsumerSinkRevision(NonNegLong.MinValue)
+      target,
+      target,
+      ForkChoiceDecision(FinalityCodecFixtures.selectionEvidenceArtifact),
+      PathCommitment(
+        PathSummary(PathRole.CanonicalLineage, target, target, NonNegLong.unsafeFrom(path.size.toLong)),
+        FinalityCodecFixtures.pathManifestArtifact,
+        FinalityIdentity.pathEntriesRoot(path).fold(throw _, identity)
+      )
     )
+  }
+
+  private val leaseState = FinalityConsumerLeaseState(
+    CoordinatorMode.Running,
+    currentSelection.branchRevision,
+    CanonicalLineageRevision(NonNegLong.MinValue),
+    Vector(FinalityCodecFixtures.priorState, target),
+    Map(target -> currentSelection),
+    Map(target -> released),
+    Phase2ConsumerSink.empty
+  )
+
+  // Unsafe test fixture: identity-equal coordinator values prove composition checks, not independent readback authentication/reproduction.
+  private val leaseReadbacks = Phase2LocalReadbacks(
+    released = Some(released),
+    qualification = Some(released.payload.qualification.scope),
+    qualificationEvidence = Some(released.payload.qualification.evidence.artifact),
+    decisionEvidence = Some(currentSelection.decision.evidence),
+    lineage = Some(currentSelection.lineage),
+    publication = Some(released.payload.receipt.activePublication),
+    semanticReceipt = Some(released.payload.receipt.semanticReceipt),
+    authenticatedAnchorReceipt = Some(released.payload.receipt.authenticatedAnchorReceipt)
+  )
+
+  private def lease(useScope: Phase2UseScope = scope): CanonicalPhase2Lease =
+    (for {
+      acquisition <- capture(leaseState, useScope, target)
+      verified <- verifyReadbacks(acquisition, leaseReadbacks)
+      current <- acquireIfCurrent(leaseState, verified)
+    } yield current).fold(error => throw new AssertionError(s"expected lease, got $error"), identity)
 
   private def exactImage(
     useScope: CurrencySnapshotReplay = scope,

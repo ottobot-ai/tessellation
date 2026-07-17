@@ -683,10 +683,15 @@ descendant selection extension, target-surviving replacement, ABA, purpose/targe
 reuse, missing evidence/readbacks, and sink idempotence/collision. This is not
 `FIN-14` closure: current-head `/latest` policy remains absent, portable O-15/O-01
 evidence and full artifact/semantic authentication remain unimplemented, and no
-bounded runtime owns the two short coordinator operations. Durable sink/effect/
-inverse ordering, coordinator/chain-store coupling, verified replacement advancement,
-all generation-scoped invalidation adapters, and every `FinalityGate`, admission,
-checkpoint, follower, serving, tracker, and publication integration remain open.
+production runtime implements the coordinator or authenticated-readback boundaries.
+A package-private dark acquirer now owns their effect order (capture, unlocked read,
+pure identity verification, reacquire) and propagates typed failure, raised error,
+and cancellation without minting authority. Its identity-equal fixtures prove only
+orchestration; they do not authenticate or reproduce snapshot/MPT/semantic bytes.
+Durable sink/effect/inverse ordering, post-return `commitIfCurrent`, coordinator/
+chain-store coupling, verified replacement advancement, all generation-scoped
+invalidation adapters, and every `FinalityGate`, admission, checkpoint, follower,
+serving, tracker, and publication integration remain open.
 
 A separate dark `ShardCheckpointOutboxStore` now exercises one local opaque-byte
 custody slot: bounded caller-supplied ID/bytes, store-bound expected-head CAS,

@@ -1087,6 +1087,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
     not a lease issuer or evidence/readback verifier; purpose/freshness policy and
     `FOLLOW-008B/E/F/G/H/L/M/N/O` remain open, as do every live consumer and
     invalidation path.
+    A package-private dark acquirer now effectfully sequences short capture,
+    unlocked caller-authenticated readback, pure complete-identity verification,
+    and short `acquireIfCurrent`. Its tests cover replacement, recovery, descendant
+    extension, raised error, and cancellation interleavings. The test readbacks are
+    deliberately identity-equal fixtures, not authentication evidence. There is no
+    production boundary implementation, issuer/factory, live adapter/caller, or
+    durable sink owner, and a returned lease still requires `commitIfCurrent` at
+    every effect. Keep this dark; it closes neither FIN-14 nor O-16.
     The live shard producer has only a conservative local precursor: it requires a
     present GL0 `CanonicalLineageRevision` before replay, rechecks the same
     generation after replay before every first validity signature/publication, and

@@ -489,6 +489,17 @@ Its focused suite covers exact four-field identity and the mechanism portions of
 artifact readbacks, purpose/freshness policy, or durable multi-sink effects; it
 does not model `FOLLOW-008B/E/F/G/H/L/M/N/O` and cannot mint a production lease.
 
+The package-private dark `CanonicalPhase2LeaseAcquirer` now owns the effectful
+two-operation sequence without holding the coordinator boundary across readback:
+capture, caller-authenticated read, pure complete-identity verification, then
+serialized reacquisition. Its tests inject replacement, recovery, descendant
+extension, raised errors, and cancellation while the read is unlocked. The supplied
+identity-equal test source is explicitly not proof of independent authentication or
+reproduction. No production coordinator/readback implementation, issuer, factory,
+adapter, or caller exists, and the returned lease still needs `commitIfCurrent`
+around every effect. This is mechanism evidence for `FOLLOW-008C`, not FIN-14 or
+O-16 closure.
+
 | ID | Schedule | Required assertion |
 |---|---|---|
 | FOLLOW-008A | A at N qualifies by `T_weight`; unqualified B replaces A at N. | B cannot acquire a lease or create any derivative. A's ordinal/generation/evidence never transfers. |
