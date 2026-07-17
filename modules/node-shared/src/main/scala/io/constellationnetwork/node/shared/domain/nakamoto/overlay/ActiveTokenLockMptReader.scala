@@ -80,7 +80,7 @@ object ActiveTokenLockMptReader {
       physicalKey <- GlobalStateKey.toHex[F](key)
       read <- reader.getStrict[SortedSet[Signed[TokenLock]]](key)
       result <- read match {
-        case StrictMptRead.Absent => none[SortedSet[Signed[TokenLock]]].pure[F]
+        case StrictMptRead.Absent               => none[SortedSet[Signed[TokenLock]]].pure[F]
         case StrictMptRead.Malformed(reason, _) => malformed[F, Option[SortedSet[Signed[TokenLock]]]](physicalKey, reason)
         case StrictMptRead.Present(locks, rawBytes) =>
           validateValue[F](physicalKey, locks, rawBytes).flatMap {
