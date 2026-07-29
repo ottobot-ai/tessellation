@@ -30,8 +30,8 @@ object Dependencies {
     val newtype = "0.4.4"
     val pureconfig = "0.17.9"
     val refined = "0.11.3"
-    val scodec = "1.11.11"     // scodec-core (Scala 2.13 compatible — 2.x is Scala 3 only)
-    val scodecBits = "1.2.4"   // scodec-bits
+    val scodec = "1.11.11" // scodec-core (Scala 2.13 compatible — 2.x is Scala 3 only)
+    val scodecBits = "1.2.4" // scodec-bits
     val shapeless = "2.3.13"
     val twitterChill = "0.10.0"
     val betterMonadicFor = "0.3.1"

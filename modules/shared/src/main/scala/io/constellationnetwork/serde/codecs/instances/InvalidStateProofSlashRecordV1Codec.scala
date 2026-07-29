@@ -15,10 +15,9 @@ import shapeless.{::, HNil}
 
 /** Dark ScodecV1 grammar for the O20 invalid-state-proof-only field-34 record.
   *
-  * Peer and checkpoint identities compose the canonical shared `PeerIdCodec` and
-  * `HashCodec`; this codec does not define competing encodings. There is no JSON
-  * projection, unknown/future reason fallback, optional context, O23 economic field, or
-  * runtime writer/reader activation.
+  * Peer and checkpoint identities compose the canonical shared `PeerIdCodec` and `HashCodec`; this codec does not define competing
+  * encodings. There is no JSON projection, unknown/future reason fallback, optional context, O23 economic field, or runtime writer/reader
+  * activation.
   */
 object InvalidStateProofSlashRecordV1Codec {
 
@@ -170,7 +169,7 @@ object InvalidStateProofSlashRecordV1Codec {
       Attempt.successful,
       {
         case record: InvalidStateProofSlashRecordV1 => Attempt.successful(record)
-        case null => Attempt.failure(Err("SlashRecordV1 cannot be null"))
+        case null                                   => Attempt.failure(Err("SlashRecordV1 cannot be null"))
       }
     )
 

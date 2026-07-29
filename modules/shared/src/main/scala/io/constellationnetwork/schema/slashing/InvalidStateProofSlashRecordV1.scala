@@ -12,8 +12,8 @@ import scodec.bits.ByteVector
 
 /** Half-open committee-exclusion interval `[excludedFromPeriod, eligibleAgainAtPeriod)`.
   *
-  * Both endpoints are artifact eta periods. Negative, empty, reversed, and
-  * arithmetic-overflow intervals are unrepresentable through the public factories.
+  * Both endpoints are artifact eta periods. Negative, empty, reversed, and arithmetic-overflow intervals are unrepresentable through the
+  * public factories.
   */
 final class EtaPeriodExclusionV1 private (
   val excludedFromPeriod: EtaPeriod,
@@ -29,7 +29,7 @@ final class EtaPeriodExclusionV1 private (
     other match {
       case that: EtaPeriodExclusionV1 =>
         excludedFromPeriod == that.excludedFromPeriod &&
-          eligibleAgainAtPeriod == that.eligibleAgainAtPeriod
+        eligibleAgainAtPeriod == that.eligibleAgainAtPeriod
       case _ => false
     }
 
@@ -42,14 +42,11 @@ object EtaPeriodExclusionV1 {
 
   sealed abstract class ValidationError(val message: String) extends Product with Serializable
 
-  case object NullExcludedFromPeriod
-      extends ValidationError("excludedFromPeriod cannot be null")
+  case object NullExcludedFromPeriod extends ValidationError("excludedFromPeriod cannot be null")
 
-  case object NullEligibleAgainAtPeriod
-      extends ValidationError("eligibleAgainAtPeriod cannot be null")
+  case object NullEligibleAgainAtPeriod extends ValidationError("eligibleAgainAtPeriod cannot be null")
 
-  final case class NegativeExcludedFromPeriod(value: Long)
-      extends ValidationError(s"excludedFromPeriod must be non-negative, got $value")
+  final case class NegativeExcludedFromPeriod(value: Long) extends ValidationError(s"excludedFromPeriod must be non-negative, got $value")
 
   final case class NegativeEligibleAgainAtPeriod(value: Long)
       extends ValidationError(s"eligibleAgainAtPeriod must be non-negative, got $value")
@@ -59,8 +56,7 @@ object EtaPeriodExclusionV1 {
         s"eligibleAgainAtPeriod must be greater than excludedFromPeriod, got [$excludedFrom,$eligibleAgainAt)"
       )
 
-  final case class NonPositivePeriodCount(value: Long)
-      extends ValidationError(s"excluded period count must be positive, got $value")
+  final case class NonPositivePeriodCount(value: Long) extends ValidationError(s"excluded period count must be positive, got $value")
 
   final case class PeriodOverflow(excludedFrom: Long, periodCount: Long)
       extends ValidationError(
@@ -98,9 +94,8 @@ object EtaPeriodExclusionV1 {
 
 /** Opaque fixed-width SHA-256 output committed by a field-34 record.
   *
-  * O22 has not frozen the complete `InvalidStateProofEvidenceV1` preimage. Consequently
-  * this companion intentionally exposes no operation from evidence to digest and no evidence
-  * hash domain. It can only validate already-computed 32-byte values for codec work.
+  * O22 has not frozen the complete `InvalidStateProofEvidenceV1` preimage. Consequently this companion intentionally exposes no operation
+  * from evidence to digest and no evidence hash domain. It can only validate already-computed 32-byte values for codec work.
   */
 final class InvalidStateProofEvidenceDigestV1 private (private val value: ByteVector) {
   def toByteVector: ByteVector = value
@@ -121,8 +116,7 @@ object InvalidStateProofEvidenceDigestV1 {
 
   sealed abstract class ValidationError(val message: String) extends Product with Serializable
   case object NullDigest extends ValidationError("evidence digest cannot be null")
-  final case class InvalidLength(actual: Long)
-      extends ValidationError(s"evidence digest must contain exactly $Length bytes, got $actual")
+  final case class InvalidLength(actual: Long) extends ValidationError(s"evidence digest must contain exactly $Length bytes, got $actual")
 
   def fromByteVector(value: ByteVector): Either[ValidationError, InvalidStateProofEvidenceDigestV1] =
     if (value eq null) Left(NullDigest)
@@ -135,8 +129,8 @@ object InvalidStateProofEvidenceDigestV1 {
 
 /** Exact candidate logical identity for a field-34 invalid-state-proof record.
   *
-  * Its Scodec bytes are recorded by the candidate grammar. Physical-key hashing remains
-  * `SchemaOpen`; this type has no digest wrapper, hash domain, or production hash schema.
+  * Its Scodec bytes are recorded by the candidate grammar. Physical-key hashing remains `SchemaOpen`; this type has no digest wrapper, hash
+  * domain, or production hash schema.
   */
 final class InvalidStateProofSlashLogicalIdV1 private (
   val peerId: PeerId,
@@ -148,8 +142,8 @@ final class InvalidStateProofSlashLogicalIdV1 private (
     other match {
       case that: InvalidStateProofSlashLogicalIdV1 =>
         peerId == that.peerId &&
-          shardId == that.shardId &&
-          disputedCheckpointHash == that.disputedCheckpointHash
+        shardId == that.shardId &&
+        disputedCheckpointHash == that.disputedCheckpointHash
       case _ => false
     }
 
@@ -169,14 +163,11 @@ object InvalidStateProofSlashLogicalIdV1 {
   final case class InvalidPeerIdHex(value: String)
       extends ValidationError("peerId must contain exactly 128 canonical lowercase hex characters")
   case object NullShardId extends ValidationError("shardId cannot be null")
-  final case class NegativeShardId(value: Int)
-      extends ValidationError(s"shardId must be non-negative, got $value")
-  case object NullDisputedCheckpointHash
-      extends ValidationError("disputedCheckpointHash cannot be null")
+  final case class NegativeShardId(value: Int) extends ValidationError(s"shardId must be non-negative, got $value")
+  case object NullDisputedCheckpointHash extends ValidationError("disputedCheckpointHash cannot be null")
   final case class InvalidDisputedCheckpointHash(value: String)
       extends ValidationError("disputedCheckpointHash must contain exactly 64 canonical lowercase hex characters")
-  case object EmptyDisputedCheckpointHash
-      extends ValidationError("disputedCheckpointHash cannot be Hash.empty")
+  case object EmptyDisputedCheckpointHash extends ValidationError("disputedCheckpointHash cannot be Hash.empty")
 
   def from(
     peerId: PeerId,
@@ -232,9 +223,8 @@ object SlashRecordV1 {
 
 /** The only accepted field-34 V1 variant.
   *
-  * Field 34 records culpability, deduplication, evidence commitment, and committee
-  * exclusion. Bond liability, debit, bounty, burn, balance, and supply effects belong to
-  * separate O23 state and are intentionally absent.
+  * Field 34 records culpability, deduplication, evidence commitment, and committee exclusion. Bond liability, debit, bounty, burn, balance,
+  * and supply effects belong to separate O23 state and are intentionally absent.
   */
 final class InvalidStateProofSlashRecordV1 private (
   val logicalId: InvalidStateProofSlashLogicalIdV1,
@@ -251,9 +241,9 @@ final class InvalidStateProofSlashRecordV1 private (
     other match {
       case that: InvalidStateProofSlashRecordV1 =>
         logicalId == that.logicalId &&
-          eventOrdinal == that.eventOrdinal &&
-          exclusion == that.exclusion &&
-          evidenceDigest == that.evidenceDigest
+        eventOrdinal == that.eventOrdinal &&
+        exclusion == that.exclusion &&
+        evidenceDigest == that.evidenceDigest
       case _ => false
     }
 
@@ -266,12 +256,10 @@ object InvalidStateProofSlashRecordV1 {
 
   sealed abstract class ValidationError(val message: String) extends Product with Serializable
 
-  final case class InvalidLogicalId(error: InvalidStateProofSlashLogicalIdV1.ValidationError)
-      extends ValidationError(error.message)
+  final case class InvalidLogicalId(error: InvalidStateProofSlashLogicalIdV1.ValidationError) extends ValidationError(error.message)
   case object NullLogicalId extends ValidationError("logicalId cannot be null")
   case object NullEventOrdinal extends ValidationError("eventOrdinal cannot be null")
-  final case class NegativeEventOrdinal(value: Long)
-      extends ValidationError(s"eventOrdinal must be non-negative, got $value")
+  final case class NegativeEventOrdinal(value: Long) extends ValidationError(s"eventOrdinal must be non-negative, got $value")
   case object NullExclusion extends ValidationError("exclusion cannot be null")
   case object NullEvidenceDigest extends ValidationError("evidenceDigest cannot be null")
 
