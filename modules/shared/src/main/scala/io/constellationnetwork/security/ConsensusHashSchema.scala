@@ -8,14 +8,11 @@ import scodec.bits.ByteVector
 
 /** Audited ScodecV1 hashing capability for one consensus type.
   *
-  * A schema binds the exact immutable codec, static domain frame, and maximum
-  * encoded value size as one capability. Digest callers cannot independently
-  * select or override those components. Production schema capabilities still
-  * require a source allowlist because an in-repository caller could shadow the
-  * complete implicit capability.
+  * A schema binds the exact immutable codec, static domain frame, and maximum encoded value size as one capability. Digest callers cannot
+  * independently select or override those components. Production schema capabilities still require a source allowlist because an
+  * in-repository caller could shadow the complete implicit capability.
   *
-  * Network, genesis, era, parameter, parent, and other exact runtime context
-  * belongs in the versioned value `A`, not in the static domain.
+  * Network, genesis, era, parameter, parent, and other exact runtime context belongs in the versioned value `A`, not in the static domain.
   */
 final class ConsensusHashSchema[A] private (
   private[security] val codec: ImmutableCodec[A],
@@ -53,9 +50,8 @@ object ConsensusHashSchema {
 
   def apply[A](implicit schema: ConsensusHashSchema[A]): ConsensusHashSchema[A] = schema
 
-  /** Validated schema construction is intentionally restricted to reviewed
-    * schema inventories in the security package. There is no public unsafe
-    * domain or generic derivation API.
+  /** Validated schema construction is intentionally restricted to reviewed schema inventories in the security package. There is no public
+    * unsafe domain or generic derivation API.
     */
   private[security] def make[A](
     codec: ImmutableCodec[A],

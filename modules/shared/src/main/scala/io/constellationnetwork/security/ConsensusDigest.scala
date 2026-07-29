@@ -6,9 +6,8 @@ import scodec.bits.ByteVector
 
 /** Validated, immutable raw digest bytes for ScodecV1 consensus operations.
   *
-  * This is intentionally not the legacy hexadecimal-string `Hash`. Signatures
-  * and verifiers can consume [[toByteVector]] without converting the digest to
-  * UTF-8 hexadecimal text.
+  * This is intentionally not the legacy hexadecimal-string `Hash`. Signatures and verifiers can consume [[toByteVector]] without converting
+  * the digest to UTF-8 hexadecimal text.
   */
 final class ConsensusDigest private (private val value: ByteVector) {
 

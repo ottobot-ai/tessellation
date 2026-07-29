@@ -6,11 +6,7 @@ import cats.syntax.all._
 import scala.collection.immutable.{SortedMap, SortedSet}
 import scala.util.control.NoStackTrace
 
-import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{
-  ActiveTokenLockMptReader,
-  GlobalStateReader,
-  StakeCollateralMptReader
-}
+import io.constellationnetwork.node.shared.domain.nakamoto.overlay.{ActiveTokenLockMptReader, GlobalStateReader, StakeCollateralMptReader}
 import io.constellationnetwork.schema.address.Address
 import io.constellationnetwork.schema.delegatedStake.{DelegatedStakeRecord, PendingDelegatedStakeWithdrawal}
 import io.constellationnetwork.schema.mpt.{GlobalStateFieldId, GlobalStateKey, StrictMptRawEntry}
@@ -272,8 +268,8 @@ object StakeBackingValidator {
     activeLocks: SortedMap[Address, SortedSet[Signed[TokenLock]]],
     knownRefsByValue: Map[TokenLock, Hash] = Map.empty
   ): F[Map[Hash, Signed[TokenLock]]] =
-    activeLocks.toList
-      .flatTraverse { case (mapKey, locks) =>
+    activeLocks.toList.flatTraverse {
+      case (mapKey, locks) =>
         locks.toList.traverse { lock =>
           if (mapKey =!= lock.source)
             Async[F].raiseError[(Hash, Signed[TokenLock])](ActiveTokenLockMapKeyMismatch(mapKey, lock.source))
@@ -283,7 +279,7 @@ object StakeBackingValidator {
               .fold(TokenLockReference.of[F](lock).map(_.hash))(_.pure[F])
               .map(_ -> lock)
         }
-      }
+    }
       .flatMap(
         _.foldLeftM(Map.empty[Hash, Signed[TokenLock]]) {
           case (indexed, (ref, _)) if indexed.contains(ref) =>
@@ -406,8 +402,8 @@ object StakeBackingValidator {
   private def delegatedEconomicMultiset(
     state: SortedMap[Address, SortedSet[DelegatedStakeRecord]]
   ): Map[DelegatedEconomicShape, Int] =
-    state.iterator
-      .flatMap { case (mapKey, records) =>
+    state.iterator.flatMap {
+      case (mapKey, records) =>
         records.iterator.map(record =>
           DelegatedEconomicShape(
             mapKey,
@@ -417,8 +413,7 @@ object StakeBackingValidator {
             record.currentAmount
           )
         )
-      }
-      .toList
+    }.toList
       .groupMapReduce(identity)(_ => 1)(_ + _)
 
   /** Reward code may alter only the rewards accumulator, never stake authority or backing fields. */
@@ -490,7 +485,7 @@ object StakeBackingValidator {
   ): F[Option[Hashed[TokenLock]]] = {
     def loop(current: Hash, visited: Set[Hash]): F[Option[Hashed[TokenLock]]] =
       byTarget.getOrElse(current, List.empty) match {
-        case Nil => none[Hashed[TokenLock]].pure[F]
+        case Nil         => none[Hashed[TokenLock]].pure[F]
         case _ :: _ :: _ => Async[F].raiseError(DuplicateBackingReplacement(current))
         case edge :: Nil =>
           if (visited.contains(edge.replacement.hash))
@@ -552,8 +547,8 @@ object StakeBackingValidator {
 
   /** Resolve every requested reference through the complete accepted same-ordinal replacement chain.
     *
-    * Used by delegated-stake materialization so the effective record never stops at an intermediate lock that is itself replaced in the same
-    * snapshot.
+    * Used by delegated-stake materialization so the effective record never stops at an intermediate lock that is itself replaced in the
+    * same snapshot.
     */
   def terminalReplacements[F[_]: Async: Hasher](
     acceptedTokenLocks: List[Signed[TokenLock]],
