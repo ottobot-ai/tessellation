@@ -731,8 +731,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
     configurable Kryo/JSON/Scodec range registry and invalid plain-JSON/Kryo
     bridge scaffold. Added only `ProtocolEraId.ScodecV1`, frozen as strict tag
     `0x01`; empty, trailing, and all 255 other one-byte tags reject. A source
-    tripwire permits this identity only in its schema and codec files. Root
-    verification passes 26 focused tests.
+    tripwire rejects direct production-source references outside its reviewed
+    standalone and dark context schema/codec files. Focused verification passes.
   - E1a does not change live hashing, signing, state-proof selection, MPT bytes,
     disk reads, or lane decoding. The atomic Scodec runtime cutover, composite
     vectors, bounded signed lanes, exact parameters, and verified upstream-v4
@@ -753,6 +753,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     domain, maximum canonical size, vector, signature, or runtime authority.
     E1.1 still requires those exact row-specific contracts, including the
     subordinate finality-payload inventory, before any schema can be frozen.
+  - **Landed nonactivating common-context candidate (2026-07-29):** distinct
+    nonzero 32-byte network, genesis, and consensus-parameter IDs compose with
+    strict `ProtocolEraId.ScodecV1` into a 33-byte bootstrap context and 97-byte
+    ordinary artifact context. JVM-callable constructors enforce refinements and
+    defensive copies, the five values are not Java-serializable, and exact vectors
+    plus source tripwires reject direct production-source references outside the
+    reviewed files. No production hash schema or runtime caller exists. No
+    manifest row leaves `SchemaOpen`: parameter and genesis identities must
+    derive in noncircular bootstrap order, while MPT internals and migration
+    require row-specific contexts.
   - **Confirmed E1.1a blockers:** `StateChangesAccumulator` omits rooted field 33
     `ConsumedAllowSpends` and field 34 `Slashings`; ROOT-008 physical MPT-key
     grammar enforcement remains open; `SlashedRegistryEntry` still uses JSON
@@ -912,25 +922,46 @@ criteria are in `NAKAMOTO-PLAN.md`.
     to a positive input constructor, refuses those IDs in the unsupported
     sentinel, and dynamically fails closed every remaining manifest row. The 41
     focused tests are green.
-  - **Landed bounded production/reference characterization (2026-07-16):** a
+  - **Landed bounded production/reference characterization (updated
+    2026-07-29):** a
     test-only adapter exercises the real lower native acceptance managers and
     currency ML0 wrappers for zero-fee transfer, allow-spend creation, and
-    single-operation zero-fee nonreplacement token-lock creation. The production
-    differential suite passes 17 tests. The token-lock slice verifies production
+    zero-fee nonreplacement token-lock creation. The production differential
+    suite passes 26 tests. The token-lock slice verifies production
     signatures/source ownership, exact native/currency lane and canonical
-    lane-specific genesis, exact parent and signed block payload, an aggregate
-    result containing exactly that one accepted block, exact balance and
-    successor-reference updates, empty claimed-replacement state, exact native/
-    currency in-round context, and the complete address-keyed active-lock map.
+    lane-specific genesis, exact parent and signed block payloads, exact aggregate
+    accepted/awaiting/rejected decision sets, exact balance and
+    successor-reference updates after every accepted prefix, empty
+    claimed-replacement state, exact native/currency in-round context, and the
+    complete address-keyed active-lock map. Native and currency iterative-batch
+    differentials cover child-before-parent retry, forward/reverse order,
+    insufficient-balance awaiting versus reference rejection, mixed awaiting/
+    permanent rejection, duplicate/overlapping decision rejection, and
+    stale/wrong-parent failure without a minted reference input.
     Wrong-owner, wrong-lane, wrong-parent, forged-genesis, nonzero-fee, and
     replacement cases fail at their exact production or helper boundary with
     typed reasons. Raw reference inputs are encapsulated by private adapter
     implementations and reach reference execution only through internal
-    projection methods. The prior real one-call transfer/allow-spend mixed-outcome
-    characterization remains covered; no token-lock batch-parity claim is made.
+    projection methods. The reference suite now exercises both orders of every
+    transfer/allow-spend-create/token-lock-create pair and all six three-operation
+    permutations with exact state after every prefix.
+  - **ECO-12/ECON-BAL-002 RED characterization:** the real lower native GL0 and
+    currency ML0 managers independently accept both conflicting pairs against
+    prior balance 100: transfer 60 plus token lock 60, and allow-spend creation 60
+    plus token lock 60. Sequential application returns `AmountUnderflow` in all
+    four cases. For the allow-spend pair, native GL0 applies the allow-spend first
+    and fails the token lock; ML0 applies the token lock first and fails the
+    allow-spend. The test-only mixed capability instead orders transfer,
+    allow-spend creation, then token-lock creation and retains exactly one funded
+    prefix without partial state. That rank is evidence scaffolding, not a
+    protocol decision. One canonical heterogeneous rank remains an activation
+    blocker (`GlobalSnapshotAcceptanceManager.scala:713-719,2540-2595`;
+    `CurrencySnapshotAcceptanceManager.scala:259-287,415-432,524-565`;
+    `V4EconomicProductionDifferentialSuite.scala:3154-3620`).
   - This evidence is not the production kernel, full GL0 acceptance path, E2.8
-    completion, token-lock batch differential, cross-platform property corpus, canonical
-    hash/signature/Scodec encoding, MPT/root integration, or runtime activation.
+    completion, full heterogeneous production-batch orchestration, cross-platform
+    property corpus, canonical hash/signature/Scodec encoding, MPT/root
+    integration, or runtime activation.
     Production batch insufficiency is `Awaiting` while the reference row rejects;
     live GL0 accepts an allow-spend outside the target reference epoch window.
     Legacy payload signatures do not bind domain/lane, production exposes no
@@ -1399,12 +1430,16 @@ criteria are in `NAKAMOTO-PLAN.md`.
     compatibility decoder. Atomic whole-candidate reject/defer and per-new-signer
     actual-debit-funded bounty ownership are fixed. During implementation,
     `WT-000` is a source-level fail-closed interlock only; `WT-001..010` qualify
-    the final launch path. The focused
-    `O22FraudProofPreActivationContainmentRedSuite` compiles and fails all four
-    legacy/interlock gates with zero errors: producer/GSAM authority, permissive
-    JSON, provisional Scodec bytes, and current field-34 cooldown influence. It
-    is not the target schema. SHA-256
-    `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
+    the final launch path. The tracked `O22FinalLaunchWireRedSuite` specifies the
+    positive ordinal-zero target rather than a temporary absence-of-authority
+    era: no JSON digest authority, strict rejection of provisional/trailing
+    bytes, one bounded canonical `InvalidStateProofEvidenceV1` collection,
+    five-result candidate-atomic adjudication with field-34 integration, and no
+    local-HOCON consensus effect. It compiles under `RedTest` and currently
+    reports four failures and one pass with zero errors. SHA-256
+    `6b21e9f7829eb55cf33030803132d42768e0c70e1cbe506688ef8c3daefad502`;
+    exact custody and promotion gates are in
+    `docs/review/CONSENSUS-RED-WITNESS-CATALOG.md`.
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.
   - **Gate:** `WT-001..007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`, `REC-*`,

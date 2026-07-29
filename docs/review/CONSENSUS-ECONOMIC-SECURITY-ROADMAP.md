@@ -251,6 +251,16 @@ omission-detecting table gives each of the 48 kinds one `SchemaOpen` row while
 explicitly freezing no source type, codec, domain, maximum, vector, signature, or
 authority. It does not close E1.1 or E1.3.
 
+A dark common-context candidate now distinguishes nonzero 32-byte network,
+genesis, and consensus-parameter identities and composes them with
+`ProtocolEraId.ScodecV1`. The bootstrap context is 33 bytes and omits
+self-dependent genesis/parameter IDs; the ordinary context is 97 bytes.
+Constructor-body validation and cloning protect direct JVM callers, the values
+are not Java-serializable, and source tripwires reject direct production-source
+references outside the reviewed files. This closes no manifest row or hash
+schema. Parameter and genesis preimages must be derived in noncircular order,
+while MPT internals and migration require separate row-specific contexts.
+
 The dark E1.10A primitive now computes a typed raw 32-byte SHA-256 digest from
 one bundled `ConsensusHashSchema[A]`, and its public content-ID/sign/verify
 operations cannot select bytes, codec, or domain independently. Package-restricted
@@ -384,35 +394,53 @@ prevents those IDs from entering the unsupported sentinel path, and dynamically
 fails closed every other manifest row. The four focused suites pass 41 tests.
 
 A bounded test-only production adapter now exercises the real lower native
-acceptance managers and currency ML0 wrappers for zero-fee transfer and
-allow-spend creation plus single-operation zero-fee nonreplacement token-lock
-creation. The production differential suite passes 17 tests. For token locks it
-binds production signature/source ownership, exact native/currency scope,
-canonical lane-specific genesis, parent, complete signed payload, and an
-aggregate result containing exactly that one accepted block. It compares exact
-exposed balances, successor reference, claimed-replacement and lane-specific
-in-round context fields, and the complete address-keyed active-lock map. The
-wrong-owner, lane, parent, genesis, fee, and replacement negatives preserve the
-exact production rejection or explicit helper-boundary error. Raw reference
-inputs are encapsulated by private adapter implementations and reach reference
-execution only through internal projection methods. Existing transfer/
-allow-spend mixed-outcome batches remain characterized; token locks have no
-batch-parity claim.
+acceptance managers and currency ML0 wrappers for zero-fee transfer,
+allow-spend creation, and zero-fee nonreplacement token-lock creation. The
+production differential suite passes 26 tests. For token locks it binds
+production signature/source ownership, exact native/currency scope, canonical
+lane-specific genesis, parent, and complete signed payloads. Native and currency
+iterative-batch cases compare exact accepted/awaiting/rejected decision sets,
+aggregate balances and successor references after accepted prefixes,
+claimed-replacement and lane-specific in-round fields, and the complete
+address-keyed active-lock map. They cover child-before-parent retry,
+forward/reverse order, insufficient-balance awaiting, mixed awaiting/permanent
+rejection, malformed aggregate decisions, and stale/wrong-parent failure. The
+wrong-owner, lane, genesis, fee, and replacement negatives preserve the exact
+production rejection or explicit helper-boundary error. Raw reference inputs
+are encapsulated by private adapter implementations and reach reference
+execution only through internal projection methods.
+
+The reference suite covers both orders of every transfer/
+allow-spend-create/token-lock-create pair and all six three-operation
+permutations with exact state after every prefix. The ECO-12/ECON-BAL-002
+differential reproduces the live lower native GL0 and currency ML0 shape. Both
+layers independently accept transfer 60 plus token lock 60 and allow-spend
+creation 60 plus token lock 60 against prior balance 100; current sequential
+application returns `AmountUnderflow` in all four cases. For the allow-spend
+pair, native GL0 applies the allow-spend first and fails the token lock, while
+ML0 applies the token lock first and fails the allow-spend. A private test-only
+mixed capability over already source-validated bindings uses the candidate rank
+transfer, allow-spend creation, token-lock creation and retains exactly one
+funded prefix without partial state. That rank is not activated or normative,
+so canonical heterogeneous ordering remains an activation blocker
+(`GlobalSnapshotAcceptanceManager.scala:713-719,2540-2595`;
+`CurrencySnapshotAcceptanceManager.scala:259-287,415-432,524-565`;
+`V4EconomicProductionDifferentialSuite.scala:3154-3620`).
 
 This evidence does not implement or validate the production kernel, complete
-GL0 acceptance path, token-lock batch differential, E2.8 cross-platform property corpus, canonical
-Scodec/hash/signature bytes, MPT writes, complete-root calculation, or runtime
-activation. Production batch insufficiency is `Awaiting` while the reference
-row rejects, and live GL0 accepts an allow-spend outside the target reference
-epoch window. Legacy payload signatures do not bind domain/lane; production
-exposes no independent replay-ID or write-order evidence; batch allow-spend APIs
-do not expose active-record deltas; single-result observers consume
-caller-supplied results and prove no invocation provenance. Token-lock nonzero
-fees and replacement remain helper-fail-closed because their target semantics
-are not frozen. The differential explicitly records that live snapshot
-acceptance accepts a lock rejected by the stricter reference contextual
-minimum-duration rule. Token-lock expiry/refund and manual unlock remain open
-and require owner review in
+GL0 acceptance path, full heterogeneous production-batch orchestration, E2.8
+cross-platform property corpus, canonical Scodec/hash/signature bytes, MPT
+writes, complete-root calculation, or runtime activation. Production batch
+insufficiency is `Awaiting` while the reference row rejects, and live GL0 accepts
+an allow-spend outside the target reference epoch window. Legacy payload
+signatures do not bind domain/lane; production exposes no independent replay-ID
+or write-order evidence; batch allow-spend APIs do not expose active-record
+deltas; single-result observers consume caller-supplied results and prove no
+invocation provenance. Token-lock nonzero fees and replacement remain
+helper-fail-closed because their target semantics are not frozen. The
+differential explicitly records that live snapshot acceptance accepts a lock
+rejected by the stricter reference contextual minimum-duration rule. Token-lock
+expiry/refund and manual unlock remain open and require owner review in
 [`TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md`](TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md).
 Allow-spend consume/expiry/refund remain blocked on O-13 terminal ordering, and
 every other E2 operation row remains open.

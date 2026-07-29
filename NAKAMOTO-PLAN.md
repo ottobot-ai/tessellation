@@ -1513,7 +1513,8 @@ Current S1 evidence is cleanup, identity, and dark byte/signature contracts only
 stale configurable Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
 deleted. `ProtocolEraId.ScodecV1` is frozen to strict tag `0x01`; empty,
 trailing, and every other one-byte tag reject, and a source tripwire keeps the
-identity dark outside its schema and codec. The dark E1.1a requirements manifest
+identity dark outside its reviewed standalone and common-context schema/codec
+files. The dark E1.1a requirements manifest
 now lands a declaration inventory over 48 grounded artifact families, nine
 authority meanings, and ten typed transcript contracts. Every transcript requires
 the exact eligibility parent, atomic KES/VRF pair, N-2 roster/stake/key view, N-1
@@ -1521,6 +1522,14 @@ eta evidence, period/slot, purpose, and exact subsystem context. It defines no
 codec, wire tag, preimage bytes, signature, or runtime authority. A separate
 omission-detecting schema table now has exactly one `SchemaOpen` row for every
 artifact kind; it does not freeze a source type, codec, domain, bound, or vector.
+Distinct nonzero 32-byte network, genesis, and consensus-parameter IDs now
+compose with the era tag into dark 33-byte bootstrap and 97-byte ordinary
+context candidates. Constructor-body validation and defensive copies hold for
+direct JVM callers, Java serialization is unavailable, and a source guard
+detects direct production-source references outside the reviewed allowlist.
+These candidates close no artifact row:
+parameters and genesis require noncircular bootstrap preimages, and MPT and
+migration need row-specific contexts.
 The dark `ScodecV1Hasher` binds one reviewed `ConsensusHashSchema[A]` to exact
 byte-aligned immutable bytes, a canonical static domain, a maximum encoded size,
 and fixed SHA-256. Its public content-ID/sign/verify operations sign the raw
@@ -1612,31 +1621,50 @@ HEAD or rewriting history cannot revoke copies. The future upstream-v4
 snapshot-to-new-genesis importer remains roadmap E13 / P12 / `MIG-*` open work.
 
 A bounded test-only adapter supplies initial context and runs the real lower
-native acceptance managers and currency ML0 wrappers for the transfer and
-allow-spend rows and single-operation zero-fee nonreplacement token-lock
-creation. The production differential suite passes 17 tests. The token-lock
-slice binds production source ownership, exact native/currency scope, canonical
-lane genesis, parent, signed payload, and an aggregate result with exactly that
-one accepted block. It compares exact exposed balances, successor reference,
-claimed-replacement and native/currency in-round context fields, and the complete
-address-keyed active-lock map; its wrong-owner, lane, parent, genesis, fee, and
+native acceptance managers and currency ML0 wrappers for the transfer,
+allow-spend, and zero-fee nonreplacement token-lock rows. The production
+differential suite passes 26 tests. The token-lock slice binds production source
+ownership, exact native/currency scope, canonical lane genesis, parent, and
+signed payloads. Its iterative native/currency batch projection compares the
+exact accepted/awaiting/rejected decision set, exposed aggregate balance and
+successor reference after each accepted prefix, claimed-replacement and
+lane-specific in-round fields, and the complete address-keyed active-lock map.
+It covers child-before-parent retry, forward/reverse order, insufficient-balance
+awaiting, mixed awaiting/permanent rejection, duplicate or overlapping result
+decisions, and stale/wrong-parent failure; its owner, lane, genesis, fee, and
 replacement negatives retain exact typed reasons or explicit helper-boundary
 errors. Raw reference inputs are encapsulated by private adapter implementations
-and reach reference execution only through internal projection methods. The
-prior transfer/allow-spend mixed-outcome batch characterization remains, but the
-token-lock slice makes no batch-parity claim. This is conditional
-characterization, not the full GL0 path, production-kernel evidence, or E2.8
-completion: batch insufficiency is production
+and reach reference execution only through internal projection methods.
+
+The reference corpus also covers both orders of every transfer/
+allow-spend-create/token-lock-create pair and all six three-operation
+permutations, comparing exact state after every prefix. The ECO-12/
+ECON-BAL-002 production characterization proves that real lower native GL0 and
+currency ML0 acceptance independently accept both transfer 60 plus token lock 60
+and allow-spend creation 60 plus token lock 60 against prior balance 100.
+Sequential application returns `AmountUnderflow` for all four layer/pair cases.
+For the allow-spend pair, native GL0 applies the allow-spend first and fails the
+token lock, while ML0 applies the token lock first and fails the allow-spend. A
+private test-only mixed capability uses already source-validated bindings and a
+candidate transfer, allow-spend-create, token-lock-create rank; it retains
+exactly one funded prefix without partial state. This is not a target ordering
+decision. The live layer disagreement must close before activation
+(`GlobalSnapshotAcceptanceManager.scala:713-719,2540-2595`;
+`CurrencySnapshotAcceptanceManager.scala:259-287,415-432,524-565`;
+`V4EconomicProductionDifferentialSuite.scala:3154-3620`).
+
+This is conditional characterization, not the full GL0 path,
+production-kernel evidence, or E2.8 completion: batch insufficiency is production
 `Awaiting` versus reference rejection; live GL0's allow-spend epoch rule differs
 from the target window; legacy signatures omit domain/lane; production exposes
 no independent replay-ID/write-order evidence or batch active-record delta; and
 single-result observers consume caller-supplied results. Runtime kernel
 activation, cross-platform properties, canonical Scodec/hash/signature bytes,
-MPT/root integration, and nonzero fees remain open. The differential explicitly
-preserves a live snapshot acceptance versus stricter reference divergence for
-the contextual token-lock minimum-duration rule. Token-lock fees, replacement,
-expiry/refund, and manual unlock remain open; expiry semantics require owner
-review in
+MPT/root integration, full heterogeneous production-batch orchestration, and
+nonzero fees remain open. The differential explicitly preserves a live snapshot
+acceptance versus stricter reference divergence for the contextual token-lock
+minimum-duration rule. Token-lock fees, replacement, expiry/refund, and manual
+unlock remain open; expiry semantics require owner review in
 [`TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md`](docs/review/TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md).
 Allow-spend consume/expiry/refund remain blocked on O-13, and every other S2
 grammar row remains open.
