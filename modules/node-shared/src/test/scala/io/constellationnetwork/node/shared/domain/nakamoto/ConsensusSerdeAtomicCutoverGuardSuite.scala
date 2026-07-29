@@ -383,12 +383,21 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     "modules/shared/src/main/scala/io/constellationnetwork/schema/slashing/InvalidStateProofSlashRecordV1.scala"
   private val invalidStateProofSlashRecordV1CodecPath =
     "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/InvalidStateProofSlashRecordV1Codec.scala"
+  private val consensusArtifactContextV1SchemaPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/consensus/ConsensusArtifactContextV1.scala"
+  private val consensusArtifactContextV1CodecPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/ConsensusArtifactContextV1Codec.scala"
 
   private val reviewedProtocolEraIdentityPaths: Set[String] =
-    Set(protocolEraIdentityPath, protocolEraCodecPath)
+    Set(
+      protocolEraIdentityPath,
+      protocolEraCodecPath,
+      consensusArtifactContextV1SchemaPath,
+      consensusArtifactContextV1CodecPath
+    )
 
   private val protocolEraIdentityReference =
-    """\bProtocolEraId\b|\bio\.constellationnetwork\.schema\.era\b""".r
+    """\bProtocolEraId(?:Codec)?\b|\bio\.constellationnetwork\.schema\.era\b""".r
 
   private val mptCommitmentScodecV1Reference =
     """\bMerklePatriciaCommitmentScodecV1Codec\b|\b(?:ImmutableCodec|Codec)\s*\[\s*MerklePatriciaCommitment\s*\]""".r
@@ -398,6 +407,9 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
   private val invalidStateProofSlashRecordV1Reference =
     """\b(?:EtaPeriodExclusionV1|InvalidStateProofEvidenceDigestV1|InvalidStateProofSlashLogicalIdV1|InvalidStateProofSlashRecordV1|InvalidStateProofSlashRecordV1Codec|SlashRecordV1)\b""".r
+
+  private val consensusArtifactContextV1Reference =
+    """\b(?:NetworkIdV1|GenesisIdV1|ConsensusParametersIdV1|ConsensusBootstrapContextV1|ConsensusArtifactContextV1|ConsensusArtifactContextV1Codec)\b""".r
 
   private val consensusSensitivePaths: Set[String] =
     List(
@@ -563,6 +575,25 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       else
         failure(
           s"O20 field-34 ScodecV1 production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
+            s"missing=${missing.toList.sorted.mkString(",")}"
+        )
+    }
+  }
+
+  test("S1 consensus artifact context candidates have no direct production-source references outside their reviewed sources") {
+    productionSources.map { sources =>
+      val actualPaths = sources.collect {
+        case source if consensusArtifactContextV1Reference.findFirstIn(withoutScalaComments(source.contents)).nonEmpty =>
+          source.path
+      }.toSet
+      val expectedPaths = Set(consensusArtifactContextV1SchemaPath, consensusArtifactContextV1CodecPath)
+      val unexpected = actualPaths -- expectedPaths
+      val missing = expectedPaths -- actualPaths
+
+      if (unexpected.isEmpty && missing.isEmpty) success
+      else
+        failure(
+          s"S1 consensus artifact context direct production-source references changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
             s"missing=${missing.toList.sorted.mkString(",")}"
         )
     }

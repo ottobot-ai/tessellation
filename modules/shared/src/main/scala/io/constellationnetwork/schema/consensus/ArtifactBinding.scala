@@ -80,6 +80,10 @@ object ArtifactBinding {
     val semanticLabel: String = "subscription-session-and-generation"
   }
 
+  /** Semantic requirements, not a claim that every row embeds one universal context. Bootstrap parameter/genesis rows and MPT internals
+    * require noncircular row-specific preimages; `Genesis`, `ParameterHash`, and `EmbeddingArtifact` cannot mean an artifact embeds a
+    * digest that depends on that same artifact.
+    */
   val artifactCommon: Set[ArtifactBinding] = Set(Network, Genesis, ProtocolEra, ParameterHash, ArtifactKind, CanonicalContent)
 
   val transcriptCommon: Set[ArtifactBinding] = Set(Network, Genesis, ProtocolEra, ParameterHash, TranscriptKind, CanonicalContent)

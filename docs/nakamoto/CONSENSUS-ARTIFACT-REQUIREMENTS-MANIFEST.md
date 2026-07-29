@@ -2,9 +2,11 @@
 
 ## Status
 
-This is a dark, declaration-only E1.1a inventory. It does **not** close E1.1 or
-E1.3, define canonical bytes, provide a codec, authorize a signature, or activate
-runtime protocol-era selection.
+This is a dark E1.1a requirements inventory. It does **not** close E1.1 or E1.3,
+define any semantic artifact row's canonical bytes or codec, authorize a
+signature, or activate runtime protocol-era selection. The separately identified
+33/97-byte common-context candidates below remain dark supporting types and do
+not close a manifest row.
 
 The source declarations are:
 
@@ -86,6 +88,43 @@ must first authenticate and locally execute the exact snapshot. Aggregated
 decided-attestation `T_weight` or depth-`k1` evidence then qualifies an exact
 canonical snapshot for Phase 2 without a QC, lock, vote lifecycle, or fork-choice
 authority. Neither qualification path replaces GL0 execution.
+
+## Dark Context Candidates
+
+The nonactivating S1 context candidate uses distinct immutable identities rather
+than interchangeable `Hash` fields:
+
+- `ConsensusBootstrapContextV1(networkId, protocolEraId)` is exactly 33 bytes;
+- `ConsensusArtifactContextV1(networkId, genesisId, protocolEraId,
+  parametersId)` is exactly 97 bytes; and
+- each ID is a private-constructor, nonzero, fixed 32-byte value, while
+  `ProtocolEraId.ScodecV1` is the existing strict one-byte tag.
+
+The codecs and exact candidate vectors are dark and source-guarded. They have no
+production `ConsensusHashSchema`, runtime caller, signature authority, storage
+authority, or manifest-row closure.
+
+The split is required to avoid circular identities. Consensus-parameter bytes
+must be derived under the bootstrap `(network, era)` context before a
+`parametersId` exists. A genesis declaration can then bind that `parametersId`
+without requiring its own `genesisId`; only after those two steps can an ordinary
+artifact use the complete 97-byte context. Therefore the blanket `ParameterHash`
+and `Genesis` requirement labels cannot mean that the parameter object or genesis
+declaration embeds its own resulting digest.
+
+MPT internals and migration also require row-specific noncircular contexts. An MPT
+node cannot embed the containing root or snapshot whose identity depends on that
+node, and a migration manifest must bind distinct source and target contexts.
+Artifact kind remains in the type-specific static hash domain; canonical content
+and exact parent/base remain in a strongly typed row preimage. They are not
+dynamic fields or optional bytes in the common context.
+
+No semantic artifact row can leave `SchemaOpen` yet. The dependency order is:
+freeze the exact consensus-parameter object and bootstrap preimage, then the
+genesis declaration preimage, then the ordinary context consumers. The shortest
+ordinary candidate is `NativeDagTransaction`, but its `ExactLayerParent` meaning
+and bounded source-signature envelope still require review before its row can
+close.
 
 ## Grounded Families
 

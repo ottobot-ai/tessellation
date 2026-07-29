@@ -11,4 +11,11 @@ object ProtocolEraId {
   case object ScodecV1 extends ProtocolEraId
 
   val all: List[ProtocolEraId] = List(ScodecV1)
+
+  /** Accept only the canonical singleton registered by this build.
+    *
+    * Scala case-object constructors are callable from JVM code, so subtype or class equality is insufficient here.
+    */
+  def isRegistered(value: ProtocolEraId): Boolean =
+    all.exists(_ eq value)
 }

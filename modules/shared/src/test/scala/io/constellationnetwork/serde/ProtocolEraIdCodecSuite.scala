@@ -41,4 +41,12 @@ object ProtocolEraIdCodecSuite extends FunSuite {
   test("the greenfield build exposes exactly one protocol era") {
     expect(ProtocolEraId.all == List(ScodecV1))
   }
+
+  test("a JVM-forged ScodecV1 instance cannot normalize through the canonical codec") {
+    val forged = ScodecV1.getClass.getConstructor().newInstance().asInstanceOf[ProtocolEraId]
+
+    expect(forged != ScodecV1) &&
+    expect(!ProtocolEraId.isRegistered(forged)) &&
+    expect(codec.encode(forged).isFailure)
+  }
 }
