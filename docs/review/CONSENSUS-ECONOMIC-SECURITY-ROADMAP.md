@@ -277,6 +277,18 @@ and transactionally restores the prior entries, root, and persisted ordinal. The
 current path therefore fails closed at an availability/resync cost. It neither
 defines field-34 bytes nor fixes either accumulator omission.
 
+A dark O-20 candidate now gives the one accepted invalid-state-proof value
+variant strict ScodecV1 bytes by composing the canonical `PeerIdCodec` and
+`HashCodec`: tag `0x01`, a 103-byte logical identity, and a 159-byte record.
+Private factories and complete decoding reject malformed/null identities,
+forged negatives, `Hash.empty`, invalid or overflowing half-open `EtaPeriod`
+intervals, truncation/trailing bytes, and every unknown tag. A production-source
+tripwire permits these types only in their schema and codec files. This is not
+field-34 activation or a completed O-20 contract: no production hash schema,
+logical physical-key digest, O-22 evidence derivation, historical
+operator/parameter check, accumulator delta, O-23 economic effect, recovery
+path, or JSON-runtime removal was added.
+
 The undeployed finality durability union no longer preserves a deleted draft
 tag. Its 14 active kinds are contiguous at `1..14`; the corresponding storage
 prefixes and frozen composite vectors were replaced in place, with no legacy

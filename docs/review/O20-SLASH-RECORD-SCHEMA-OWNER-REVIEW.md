@@ -5,13 +5,22 @@ accepted `O20-01` through `O20-04`: invalid-state-proof-only V1, a half-open
 `EtaPeriod` exclusion interval, audit/exclusion-only field 34 with separate
 atomic economics, and fixed ScodecV1 plus SHA-256 identity/evidence preimages.
 This decision does not activate the current implementation. Engineering still
-has to freeze and qualify the resulting key, value, codec, transition, and test
-contracts.
+has to freeze the manifest-owned key/evidence hash domains and qualify the
+resulting key, value, transition, recovery, and test contracts.
 
 **Current runtime authority:** Unsafe and unqualified. The live field-34 writer
 and readers continue to use
 `InvalidStateProofSlashManager.SlashedRegistryEntry` and its hand-written JSON
 `ImmutableCodec`. Owner ratification does not bless that path.
+
+**Nonactivating engineering evidence:** the dark value candidate now composes
+the canonical length-prefixed `PeerIdCodec` and fixed-width `HashCodec`, with
+tag `0x01`, a 103-byte logical identity, and a 159-byte record. Private factories
+and strict decoding reject invalid identities, `Hash.empty`, invalid/overflowing
+half-open intervals, trailing/truncated bytes, and all unknown tags. A source
+guard prevents runtime use. There is intentionally no production logical-key
+hash schema or evidence-digest computation until the sole manifest-owned domains
+and O-22 evidence bytes are frozen.
 
 **Primary gates:** `ROOT-008-F34`, `SER-005`, `SER-006`, `WT-002`, E1.1, E1.2,
 E6, E8
@@ -76,8 +85,9 @@ Tests constructing the generic case class do not activate the other reason tags.
    cannot suppress, alias, or satisfy duplicate detection for another variant.
 4. Common fields such as operator, event ordinal, and cooldown may have a common
    projection, but evidence-specific fields are required only by the variant
-   whose validator proved them. There are no sentinel hashes, zero shard IDs,
-   overloaded addresses, or optional-field combinations with undefined meaning.
+   whose validator proved them. There are no sentinel hashes, negative or
+   out-of-range shard IDs, overloaded addresses, or optional-field combinations
+   with undefined meaning. Shard `0` is valid because shard IDs are zero-based.
 5. A record is written only after deterministic adjudication against the exact
    historical evidence/key/committee view. Missing history defers and cannot
    slash. Decoding a structurally valid record cannot authorize a slash.

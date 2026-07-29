@@ -1533,7 +1533,15 @@ MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard
 diff/positive replay-coverage, exact optimistic-tip attestation, and finality/tower
 proof schemas. The pending owner decisions are O-18 transport/DA, O-19
 migration policy, and O-21 optimistic-decision evidence. O-20's narrow field-34
-schema direction is owner-ratified; its exact grammar and bytes are not frozen.
+schema direction is owner-ratified. A dark candidate now records tag `0x01`,
+canonical-composition 103-byte logical-identity bytes, and 159-byte record bytes
+with private validated constructors and exhaustive tag/refinement negatives.
+It deliberately has no production hash schema, physical-key digest, O-22
+evidence computation, accumulator, reader/writer, or O-23 economic reachability;
+a source guard confines it to its schema and codec. O-20 therefore remains open
+until the manifest-owned key/evidence domains, historical semantic validation,
+ROOT-008 key agreement, atomic accumulator/economics, recovery, and live JSON
+removal gates close.
 A separate explicit, non-implicit MPT commitment codec freezes strict
 leaf/branch/extension bytes and passes 15 focused tests. The atomic-cutover guard now inventories ordinal-selected
 hash/state-proof authority, direct hash selection, legacy field-erasing snapshot

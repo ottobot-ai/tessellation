@@ -7,14 +7,13 @@ import scodec.bits.{BitVector, ByteVector}
 
 /** Canonical, round-trippable byte representation of `T` — the "immutable" encoding.
   *
-  * These bytes serve two purposes interchangeably:
-  *   1. They are the bytes fed into a signing primitive. `sign(ImmutableCodec[T].immutableBytes(t), key)` is the single path for producing
-  *      a consensus signature. 2. They are the bytes hashed for content addressing.
-  *      `Hash.fromBytes(ImmutableCodec[T].immutableBytes(t).toArray)` is the single path for producing a consensus hash.
+  * These are the canonical payload bytes consumed by the type's reviewed `ConsensusHashSchema`. `ScodecV1Hasher` frames that schema's
+  * static domain, hashes the framed domain plus these exact bytes with SHA-256, and uses the resulting raw 32-byte digest for both content
+  * identity and signatures.
   *
-  * No separate `Signable` typeclass exists — there is no case in the codebase where we want different bytes for signing vs. hashing, and
-  * merging the concepts keeps the mental model small. If a future type legitimately needs divergent signing bytes, introduce `Signable[T]`
-  * at that point, not prophylactically.
+  * `ImmutableCodec` alone grants no hashing or signing authority. Consensus callers cannot sign these bytes directly, invent an ambient
+  * domain, or bypass the schema-bound hasher. When an artifact needs a projection, its versioned preimage is a distinct typed value with
+  * its own reviewed codec and domain.
   *
   * Laws:
   *   - Encoding is bit-exact and platform-independent.

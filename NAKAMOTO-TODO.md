@@ -782,6 +782,17 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `7fd927373ece8ccc221344eed83c0b085c59003f7cbe2ea68ceaba4b0948a766`).
     Do not activate latent slash reasons, retain JSON bytes, or encode
     sentinel/optional future contexts.
+  - **Landed nonactivating O-20 value candidate (2026-07-29):** a closed
+    invalid-state-proof-only record and strict ScodecV1 codec now compose the
+    canonical length-prefixed `PeerIdCodec` and fixed-width `HashCodec`. Candidate
+    vectors record tag `0x01`, a 103-byte logical identity, and a 159-byte record.
+    Private validated constructors reject malformed/null identities, forged
+    negative values, `Hash.empty`, invalid half-open intervals, overflow,
+    trailing/truncated bytes, and all 255 unknown tags. A source tripwire confines
+    the types and codec to their dark schema files. This does **not** close O-20:
+    the manifest-owned logical-key and O-22 evidence preimages/domains, physical
+    ROOT-008 key, historical operator/parameter validation, field-34 accumulator,
+    O-23 atomic economics, recovery, and live JSON-path removal remain open.
   - [ ] **O-21 OWNER RESPONSE REQUIRED / OPTIMISTIC EVIDENCE FREEZE:** review
     `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. The
     recommendation is sorted unique exact signed local cascade-decision

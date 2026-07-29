@@ -379,6 +379,10 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/MerklePatriciaCommitmentScodecV1Codec.scala"
   private val globalStateKeyScodecCodecPath =
     "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/GlobalStateKeyCodec.scala"
+  private val invalidStateProofSlashRecordV1SchemaPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/schema/slashing/InvalidStateProofSlashRecordV1.scala"
+  private val invalidStateProofSlashRecordV1CodecPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/serde/codecs/instances/InvalidStateProofSlashRecordV1Codec.scala"
 
   private val reviewedProtocolEraIdentityPaths: Set[String] =
     Set(protocolEraIdentityPath, protocolEraCodecPath)
@@ -391,6 +395,9 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
   private val globalStateKeyScodecReference =
     """\bGlobalStateKeyCodec\b|\b(?:ImmutableCodec|Codec)\s*\[\s*(?:GlobalStateKey|PartitionNamespace)\s*\]""".r
+
+  private val invalidStateProofSlashRecordV1Reference =
+    """\b(?:EtaPeriodExclusionV1|InvalidStateProofEvidenceDigestV1|InvalidStateProofSlashLogicalIdV1|InvalidStateProofSlashRecordV1|InvalidStateProofSlashRecordV1Codec|SlashRecordV1)\b""".r
 
   private val consensusSensitivePaths: Set[String] =
     List(
@@ -537,6 +544,25 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
       else
         failure(
           s"typed GlobalStateKey Scodec production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
+            s"missing=${missing.toList.sorted.mkString(",")}"
+        )
+    }
+  }
+
+  test("O20 field-34 ScodecV1 record remains dark outside its schema and codec sources") {
+    productionSources.map { sources =>
+      val actualPaths = sources.collect {
+        case source if invalidStateProofSlashRecordV1Reference.findFirstIn(withoutScalaComments(source.contents)).nonEmpty =>
+          source.path
+      }.toSet
+      val expectedPaths = Set(invalidStateProofSlashRecordV1SchemaPath, invalidStateProofSlashRecordV1CodecPath)
+      val unexpected = actualPaths -- expectedPaths
+      val missing = expectedPaths -- actualPaths
+
+      if (unexpected.isEmpty && missing.isEmpty) success
+      else
+        failure(
+          s"O20 field-34 ScodecV1 production reachability changed: unexpected=${unexpected.toList.sorted.mkString(",")} " +
             s"missing=${missing.toList.sorted.mkString(",")}"
         )
     }
