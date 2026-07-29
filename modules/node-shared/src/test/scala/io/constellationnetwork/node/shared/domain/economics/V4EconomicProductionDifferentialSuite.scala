@@ -3151,6 +3151,475 @@ object V4EconomicProductionDifferentialSuite extends MutableIOSuite {
       )
   }
 
+  test("native GL0 transfer and token-lock admission double-accepts before the live application underflows") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      destination = destinationKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      transferCorrespondence = TransferReferenceCorrespondence.nativeGenesis
+      tokenLockCorrespondence = TokenLockReferenceCorrespondence.nativeGenesis
+      transaction <- signedTransaction(
+        source,
+        sourceKey,
+        destination,
+        transferCorrespondence.production,
+        60L,
+        0L,
+        31L,
+        resources.transactionHasher
+      )
+      transferProduction <- acceptNativeTransfer(
+        transaction,
+        initialBalances,
+        transferCorrespondence.production,
+        managerBundle,
+        resources
+      )
+      transferAccepted <- IO.fromEither(transferProduction.leftMap(error => new AssertionError(error.toString)))
+      (transferUpdate, _) = transferAccepted
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        tokenLockCorrespondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      tokenLockProduction <- acceptNativeTokenLock(
+        tokenLock,
+        initialBalances,
+        tokenLockCorrespondence.production,
+        31L,
+        managerBundle,
+        resources
+      )
+      transferBinding <- bindTransfer(
+        transaction,
+        domain,
+        lane,
+        transferCorrespondence,
+        managerBundle.signedValidator,
+        resources.transactionHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      tokenLockBinding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        tokenLockCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      transferAppliedBalances =
+        transferUpdate.balances.foldLeft(initialBalances) { case (balances, (address, value)) => balances.updated(address, value) }
+      application <- TokenLockStateManager
+        .make[IO](GlobalStateReader.empty[IO])
+        .updateGlobalBalancesByTokenLocksWithExpired(
+          epoch(100L),
+          transferAppliedBalances,
+          groupedTokenLocks(SortedSet(tokenLock)),
+          Map.empty,
+          SortedMap.empty
+        )
+      base <- referenceBase(Dag, initialBalances)
+      reference <- IO.fromEither(
+        executeCandidateMixedReservations(
+          ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+          base,
+          Vector(transferBinding),
+          Vector.empty,
+          Vector(tokenLockBinding)
+        ).leftMap(error => new AssertionError(error.toString))
+      )
+      referenceRejection <- rejectedAt(reference, 1)
+    } yield
+      expect.all(
+        transferProduction.isRight,
+        tokenLockProduction._2.accepted == List(tokenLockProduction._1),
+        tokenLockProduction._2.notAccepted.isEmpty,
+        transferAppliedBalances == SortedMap(source -> balance(40L), destination -> balance(60L)),
+        application == Left(AmountUnderflow),
+        reference.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false),
+        referenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 40),
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, destination)) == 60,
+        reference.finalState.activeTokenLocks.isEmpty,
+        reference.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          StructuralTokenLockReference.genesis,
+        reference.conservedTotals(Dag) == 100
+      )
+  }
+
+  test("currency ML0 transfer and token-lock admission double-accepts before the live application underflows") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+
+    for {
+      metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphId = metagraphKey.getPublic.toAddress
+      lane = CurrencyCl1(metagraphId)
+      source = sourceKey.getPublic.toAddress
+      destination = destinationKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      transferCorrespondence <- TransferReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      tokenLockCorrespondence <- TokenLockReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      transaction <- signedTransaction(
+        source,
+        sourceKey,
+        destination,
+        transferCorrespondence.production,
+        60L,
+        0L,
+        32L,
+        resources.transactionHasher
+      )
+      transferBlock <- signedTransferBlock(transaction, resources.currentHasher)
+      transferProduction <- managerBundle.currencyAcceptanceManager.acceptBlocks(
+        List(transferBlock),
+        currencySnapshotContext(
+          metagraphId,
+          initialBalances,
+          lastTxRefs = SortedMap(source -> transferCorrespondence.production)
+        ),
+        snapshotOrdinal,
+        SortedSet(
+          ActiveTip(parentA, NonNegLong.unsafeFrom(0L), snapshotOrdinal),
+          ActiveTip(parentB, NonNegLong.unsafeFrom(0L), snapshotOrdinal)
+        ),
+        SortedSet.empty,
+        transferCorrespondence.production,
+        shouldPerformMetagraphSpecificValidations = true
+      )
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        CurrencyId(metagraphId).some,
+        tokenLockCorrespondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      tokenLockBlock <- signedTokenLockBlock(tokenLock, 32L, resources.currentHasher)
+      tokenLockProduction <- managerBundle.currencyAcceptanceManager.acceptTokenLockBlocks(
+        List(tokenLockBlock),
+        currencySnapshotContext(
+          metagraphId,
+          initialBalances,
+          lastTokenLockRefs = SortedMap(source -> tokenLockCorrespondence.production)
+        ),
+        snapshotOrdinal,
+        tokenLockCorrespondence.production,
+        shouldPerformMetagraphSpecificValidations = true,
+        lastSyncGlobalSnapshotEpochProgress = epoch(100L)
+      )
+      transferBinding <- bindTransfer(
+        transaction,
+        domain,
+        lane,
+        transferCorrespondence,
+        managerBundle.signedValidator,
+        resources.transactionHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      tokenLockBinding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        tokenLockCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      transferAppliedBalances =
+        transferProduction.contextUpdate.balances.foldLeft(initialBalances) {
+          case (balances, (address, value)) => balances.updated(address, value)
+        }
+      application = TokenLockOpsManager
+        .make[IO]
+        .updateBalancesByTokenLocks(
+          epoch(100L),
+          transferAppliedBalances,
+          groupedTokenLocks(SortedSet(tokenLock)),
+          SortedMap.empty,
+          SortedSet.empty
+        )
+      base <- referenceBase(Metagraph(metagraphId), initialBalances)
+      reference <- IO.fromEither(
+        executeCandidateMixedReservations(
+          ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+          base,
+          Vector(transferBinding),
+          Vector.empty,
+          Vector(tokenLockBinding)
+        ).leftMap(error => new AssertionError(error.toString))
+      )
+      referenceRejection <- rejectedAt(reference, 1)
+    } yield
+      expect.all(
+        transferProduction.accepted.map(_._1) == List(transferBlock),
+        transferProduction.notAccepted.isEmpty,
+        tokenLockProduction.accepted == List(tokenLockBlock),
+        tokenLockProduction.notAccepted.isEmpty,
+        transferAppliedBalances == SortedMap(source -> balance(40L), destination -> balance(60L)),
+        application == Left(AmountUnderflow),
+        reference.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false),
+        referenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Metagraph(metagraphId), source), 60, 40),
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), destination)) == 60,
+        reference.finalState.activeTokenLocks.isEmpty,
+        reference.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          StructuralTokenLockReference.genesis,
+        reference.conservedTotals(Metagraph(metagraphId)) == 100
+      )
+  }
+
+  test("native GL0 allow-spend and token-lock admission double-accepts before token-lock application underflows") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+    val lane = NativeGl1
+
+    for {
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      source = sourceKey.getPublic.toAddress
+      destination = destinationKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      allowSpendCorrespondence = AllowSpendReferenceCorrespondence.nativeGenesis
+      tokenLockCorrespondence = TokenLockReferenceCorrespondence.nativeGenesis
+      allowSpend <- signedAllowSpend(
+        source,
+        sourceKey,
+        destination,
+        none,
+        allowSpendCorrespondence.production,
+        60L,
+        0L,
+        110L,
+        List(destination),
+        resources.currentHasher
+      )
+      allowSpendProduction <- acceptNativeAllowSpend(
+        allowSpend,
+        initialBalances,
+        allowSpendCorrespondence.production,
+        33L,
+        managerBundle,
+        resources
+      )
+      allowSpendUpdate <- IO.fromEither(allowSpendProduction.leftMap(error => new AssertionError(error.toString)))
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        none,
+        tokenLockCorrespondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      tokenLockProduction <- acceptNativeTokenLock(
+        tokenLock,
+        initialBalances,
+        tokenLockCorrespondence.production,
+        33L,
+        managerBundle,
+        resources
+      )
+      allowSpendBinding <- bindAllowSpend(
+        allowSpend,
+        domain,
+        lane,
+        allowSpendCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      tokenLockBinding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        tokenLockCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      allowSpendAppliedBalances <- nativeAllowSpendBalances(initialBalances, SortedSet(allowSpend), resources)
+      application <- TokenLockStateManager
+        .make[IO](GlobalStateReader.empty[IO])
+        .updateGlobalBalancesByTokenLocksWithExpired(
+          epoch(100L),
+          allowSpendAppliedBalances,
+          groupedTokenLocks(SortedSet(tokenLock)),
+          Map.empty,
+          SortedMap.empty
+        )
+      base <- referenceBase(Dag, initialBalances)
+      reference <- IO.fromEither(
+        executeCandidateMixedReservations(
+          ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+          base,
+          Vector.empty,
+          Vector(allowSpendBinding),
+          Vector(tokenLockBinding)
+        ).leftMap(error => new AssertionError(error.toString))
+      )
+      referenceRejection <- rejectedAt(reference, 1)
+    } yield
+      expect.all(
+        allowSpendProduction.isRight,
+        allowSpendUpdate.balances == Map(source -> balance(40L)),
+        tokenLockProduction._2.accepted == List(tokenLockProduction._1),
+        tokenLockProduction._2.notAccepted.isEmpty,
+        allowSpendAppliedBalances == SortedMap(source -> balance(40L)),
+        application == Left(AmountUnderflow),
+        reference.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false),
+        referenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Dag, source), 60, 40),
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Dag, source)) == 40,
+        reference.finalState.allowSpendReservationOf(allowSpendBinding.identity).contains(allowSpendBinding.reservation),
+        reference.finalState.activeTokenLocks.isEmpty,
+        reference.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(lane, source)) ==
+          allowSpendBinding.structuralSuccessor,
+        reference.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          StructuralTokenLockReference.genesis,
+        reference.conservedTotals(Dag) == 100
+      )
+  }
+
+  test("currency ML0 allow-spend and token-lock admission double-accepts before allow-spend application underflows") { resources =>
+    implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
+    implicit val currentHasher: Hasher[IO] = resources.currentHasher
+    val managerBundle = managers(resources)
+
+    for {
+      metagraphKey <- KeyPairGenerator.makeKeyPair[IO]
+      sourceKey <- KeyPairGenerator.makeKeyPair[IO]
+      destinationKey <- KeyPairGenerator.makeKeyPair[IO]
+      metagraphId = metagraphKey.getPublic.toAddress
+      lane = CurrencyCl1(metagraphId)
+      source = sourceKey.getPublic.toAddress
+      destination = destinationKey.getPublic.toAddress
+      initialBalances = SortedMap(source -> balance(100L))
+      allowSpendCorrespondence <- AllowSpendReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      tokenLockCorrespondence <- TokenLockReferenceCorrespondence.currencyGenesis(metagraphId, resources.currentHasher)
+      allowSpend <- signedAllowSpend(
+        source,
+        sourceKey,
+        destination,
+        CurrencyId(metagraphId).some,
+        allowSpendCorrespondence.production,
+        60L,
+        0L,
+        110L,
+        List(destination),
+        resources.currentHasher
+      )
+      allowSpendBlock <- signedAllowSpendBlock(allowSpend, 34L, resources.currentHasher)
+      allowSpendProduction <- managerBundle.currencyAcceptanceManager.acceptAllowSpendBlocks(
+        List(allowSpendBlock),
+        currencySnapshotContext(
+          metagraphId,
+          initialBalances,
+          lastAllowSpendRefs = SortedMap(source -> allowSpendCorrespondence.production)
+        ),
+        snapshotOrdinal,
+        allowSpendCorrespondence.production,
+        shouldPerformMetagraphSpecificValidations = true,
+        lastSyncGlobalSnapshotEpochProgress = epoch(100L)
+      )
+      tokenLock <- signedTokenLock(
+        source,
+        sourceKey,
+        CurrencyId(metagraphId).some,
+        tokenLockCorrespondence.production,
+        60L,
+        0L,
+        110L.some,
+        none,
+        resources.currentHasher
+      )
+      tokenLockBlock <- signedTokenLockBlock(tokenLock, 34L, resources.currentHasher)
+      tokenLockProduction <- managerBundle.currencyAcceptanceManager.acceptTokenLockBlocks(
+        List(tokenLockBlock),
+        currencySnapshotContext(
+          metagraphId,
+          initialBalances,
+          lastTokenLockRefs = SortedMap(source -> tokenLockCorrespondence.production)
+        ),
+        snapshotOrdinal,
+        tokenLockCorrespondence.production,
+        shouldPerformMetagraphSpecificValidations = true,
+        lastSyncGlobalSnapshotEpochProgress = epoch(100L)
+      )
+      allowSpendBinding <- bindAllowSpend(
+        allowSpend,
+        domain,
+        lane,
+        allowSpendCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      tokenLockBinding <- bindTokenLock(
+        tokenLock,
+        domain,
+        lane,
+        tokenLockCorrespondence,
+        managerBundle.signedValidator,
+        resources.currentHasher
+      ).flatMap(value => IO.fromEither(value.leftMap(error => new AssertionError(error.toString))))
+      tokenLockAppliedBalances <- currencyTokenLockBalances(initialBalances, SortedSet(tokenLock))
+      application <- AllowSpendOpsManager
+        .make[IO]
+        .updateCurrencyBalancesByAllowSpends(
+          epoch(100L),
+          tokenLockAppliedBalances,
+          SortedMap(source -> SortedSet(allowSpend)),
+          SortedMap.empty,
+          List.empty
+        )
+      base <- referenceBase(Metagraph(metagraphId), initialBalances)
+      reference <- IO.fromEither(
+        executeCandidateMixedReservations(
+          ReferenceContext(domain, lane, SortedSet.empty, epochWindow.some, tokenLockEpochRule.some),
+          base,
+          Vector.empty,
+          Vector(allowSpendBinding),
+          Vector(tokenLockBinding)
+        ).leftMap(error => new AssertionError(error.toString))
+      )
+      referenceRejection <- rejectedAt(reference, 1)
+    } yield
+      expect.all(
+        allowSpendProduction.accepted == List(allowSpendBlock),
+        allowSpendProduction.notAccepted.isEmpty,
+        tokenLockProduction.accepted == List(tokenLockBlock),
+        tokenLockProduction.notAccepted.isEmpty,
+        tokenLockAppliedBalances == SortedMap(source -> balance(40L)),
+        application == Left(AmountUnderflow),
+        reference.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false),
+        referenceRejection.reason == InsufficientBalance(ReferenceBalanceAccount(Metagraph(metagraphId), source), 60, 40),
+        reference.finalState.balanceOf(ReferenceBalanceAccount(Metagraph(metagraphId), source)) == 40,
+        reference.finalState.allowSpendReservationOf(allowSpendBinding.identity).contains(allowSpendBinding.reservation),
+        reference.finalState.activeTokenLocks.isEmpty,
+        reference.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(lane, source)) ==
+          allowSpendBinding.structuralSuccessor,
+        reference.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(lane, source)) ==
+          StructuralTokenLockReference.genesis,
+        reference.conservedTotals(Metagraph(metagraphId)) == 100
+      )
+  }
+
   test("snapshot token-lock acceptance remains weaker than the target contextual minimum-duration rule") { resources =>
     implicit val securityProvider: SecurityProvider[IO] = resources.securityProvider
     implicit val currentHasher: Hasher[IO] = resources.currentHasher

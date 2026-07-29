@@ -359,6 +359,36 @@ object V4EconomicProductionProjection {
     val structuralSuccessor: StructuralTokenLockReference
   ) extends SourceValidatedTokenLock
 
+  /** Test-only candidate ordering for the mixed reservation differential.
+    *
+    * This capability is private so a caller cannot turn an unvalidated payload into a reference input. The candidate heterogeneous rank is
+    * transfer, allow-spend creation, then token-lock creation; input order is retained within each class. Live GL0 currently applies those
+    * three classes in that order, while ML0 applies token locks before allow-spends. The rank is therefore evidence scaffolding, not a
+    * production protocol decision.
+    */
+  private sealed trait MixedOperationCapability extends Product with Serializable {
+    def heterogeneousRank: Int
+    def withinClassIndex: Int
+    def input: ReferenceInput
+  }
+
+  private object MixedOperationCapability {
+    final case class Transfer(binding: SourceValidatedTransfer, withinClassIndex: Int) extends MixedOperationCapability {
+      val heterogeneousRank: Int = 0
+      val input: ReferenceInput = transferInput(binding)
+    }
+
+    final case class AllowSpendCreate(binding: SourceValidatedAllowSpend, withinClassIndex: Int) extends MixedOperationCapability {
+      val heterogeneousRank: Int = 1
+      val input: ReferenceInput = allowSpendInput(binding)
+    }
+
+    final case class TokenLockCreate(binding: SourceValidatedTokenLock, withinClassIndex: Int) extends MixedOperationCapability {
+      val heterogeneousRank: Int = 2
+      val input: ReferenceInput = tokenLockInput(binding)
+    }
+  }
+
   final case class ObservedBalanceDelta(before: Balance, after: Balance)
   final case class ObservedTransferSemanticDelta(
     balances: SortedMap[Address, ObservedBalanceDelta],
@@ -1139,6 +1169,24 @@ object V4EconomicProductionProjection {
     bindings: Vector[SourceValidatedTokenLock]
   ): Either[ReferenceStateError, ReferenceExecution] =
     V4EconomicReferenceInterpreter.execute(context, base, bindings.map(tokenLockInput))
+
+  def executeCandidateMixedReservations(
+    context: ReferenceContext,
+    base: ReferenceState,
+    transfers: Vector[SourceValidatedTransfer],
+    allowSpendCreates: Vector[SourceValidatedAllowSpend],
+    tokenLockCreates: Vector[SourceValidatedTokenLock]
+  ): Either[ReferenceStateError, ReferenceExecution] = {
+    import MixedOperationCapability._
+
+    val capabilities: Vector[MixedOperationCapability] =
+      transfers.zipWithIndex.map { case (binding, index) => Transfer(binding, index) } ++
+        allowSpendCreates.zipWithIndex.map { case (binding, index) => AllowSpendCreate(binding, index) } ++
+        tokenLockCreates.zipWithIndex.map { case (binding, index) => TokenLockCreate(binding, index) }
+    val orderedInputs = capabilities.sortBy(capability => (capability.heterogeneousRank, capability.withinClassIndex)).map(_.input)
+
+    V4EconomicReferenceInterpreter.execute(context, base, orderedInputs)
+  }
 
   private def observeAcceptedTransferUpdate(
     binding: SourceValidatedTransfer,

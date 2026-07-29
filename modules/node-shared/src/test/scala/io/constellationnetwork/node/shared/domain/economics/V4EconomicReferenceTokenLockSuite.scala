@@ -300,38 +300,101 @@ object V4EconomicReferenceTokenLockSuite extends FunSuite {
       .reduce(_ and _)
   }
 
-  test("transfers, allow-spends, and token locks share one ordered spendable-balance ledger") {
+  test("every transfer, allow-spend, and token-lock ordering shares one exact prefix balance ledger") {
     val base = state(account(Dag, alice) -> BigInt(100))
-    val transferThenLock = execute(
-      context(NativeGl1),
-      base,
-      transfer(NativeGl1, alice, bob, amount = 60, salt = 1L),
-      create(preimage(NativeGl1, amount = 50))
+    val operations = Vector[(String, ReferenceInput)](
+      "transfer" -> transfer(NativeGl1, alice, bob, amount = 60, salt = 1L),
+      "allow-spend-create" -> allowSpend(NativeGl1, amount = 60),
+      "token-lock-create" -> create(preimage(NativeGl1, amount = 60))
     )
-    val lockThenTransfer = execute(
-      context(NativeGl1),
-      base,
-      create(preimage(NativeGl1, amount = 60)),
-      transfer(NativeGl1, alice, bob, amount = 50, salt = 2L)
-    )
-    val allowSpendThenLock = execute(
-      context(NativeGl1),
-      base,
-      allowSpend(NativeGl1, amount = 60),
-      create(preimage(NativeGl1, amount = 50))
-    )
+    val pairOrderings = operations.combinations(2).flatMap(_.permutations).toVector
+    val allOperationPermutations = operations.permutations.toVector
+    val scenarios = pairOrderings ++ allOperationPermutations
 
-    expect(transferThenLock.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false))
-      .and(expect(transferThenLock.rejected.head.reason == InsufficientBalance(account(Dag, alice), 50, 40)))
-      .and(expect(transferThenLock.finalState.balanceOf(account(Dag, alice)) == 40))
-      .and(expect(transferThenLock.finalState.balanceOf(account(Dag, bob)) == 60))
-      .and(expect(lockThenTransfer.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false)))
-      .and(expect(lockThenTransfer.rejected.head.reason == InsufficientBalance(account(Dag, alice), 50, 40)))
-      .and(expect(lockThenTransfer.finalState.activeTokenLocks.map(_.amount) == Vector(BigInt(60))))
-      .and(expect(allowSpendThenLock.decisions.map(_.isInstanceOf[Accepted]) == Vector(true, false)))
-      .and(expect(allowSpendThenLock.rejected.head.reason == InsufficientBalance(account(Dag, alice), 50, 40)))
-      .and(expect(allowSpendThenLock.finalState.activeAllowSpendReservations.map(_.amount) == Vector(BigInt(60))))
-      .and(expect(Vector(transferThenLock, lockThenTransfer, allowSpendThenLock).forall(_.conservedTotals(Dag) == 100)))
+    def exactFirstOperationState(input: ReferenceInput, result: ReferenceExecution) =
+      input match {
+        case Transfer(transferPreimage, _) =>
+          val identity = StructuralSemanticIdentity.derive(transferPreimage)
+          expect.all(
+            result.finalState.balanceOf(account(Dag, alice)) == 40,
+            result.finalState.balanceOf(account(Dag, bob)) == 60,
+            result.finalState.lastTxRefOf(ReferenceChainAccount(NativeGl1, alice)) ==
+              StructuralReference(1, Vector(transferPreimage.atom)),
+            result.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(NativeGl1, alice)) ==
+              StructuralAllowSpendReference.genesis,
+            result.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(NativeGl1, alice)) ==
+              StructuralTokenLockReference.genesis,
+            result.finalState.activeAllowSpendReservations.isEmpty,
+            result.finalState.activeTokenLocks.isEmpty,
+            result.finalState.acceptedHistory == Vector(identity),
+            result.finalState.acceptedAllowSpendHistory.isEmpty,
+            result.finalState.acceptedTokenLockHistory.isEmpty
+          )
+
+        case AllowSpendCreate(allowSpendPreimage, _) =>
+          val identity = AllowSpendSemanticIdentity.derive(allowSpendPreimage)
+          expect.all(
+            result.finalState.balanceOf(account(Dag, alice)) == 40,
+            result.finalState.balanceOf(account(Dag, bob)) == 0,
+            result.finalState.lastTxRefOf(ReferenceChainAccount(NativeGl1, alice)) == StructuralReference.genesis,
+            result.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(NativeGl1, alice)) ==
+              StructuralAllowSpendReference(1, Vector(allowSpendPreimage.atom)),
+            result.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(NativeGl1, alice)) ==
+              StructuralTokenLockReference.genesis,
+            result.finalState.activeAllowSpendReservations.map(_.identity) == Vector(identity),
+            result.finalState.activeAllowSpendReservations.map(_.amount) == Vector(BigInt(60)),
+            result.finalState.activeTokenLocks.isEmpty,
+            result.finalState.acceptedHistory.isEmpty,
+            result.finalState.acceptedAllowSpendHistory == Vector(identity),
+            result.finalState.acceptedTokenLockHistory.isEmpty
+          )
+
+        case TokenLockCreate(tokenLockPreimage, _) =>
+          val identity = TokenLockSemanticIdentity.derive(tokenLockPreimage)
+          expect.all(
+            result.finalState.balanceOf(account(Dag, alice)) == 40,
+            result.finalState.balanceOf(account(Dag, bob)) == 0,
+            result.finalState.lastTxRefOf(ReferenceChainAccount(NativeGl1, alice)) == StructuralReference.genesis,
+            result.finalState.lastAllowSpendRefOf(ReferenceAllowSpendChainAccount(NativeGl1, alice)) ==
+              StructuralAllowSpendReference.genesis,
+            result.finalState.lastTokenLockRefOf(ReferenceTokenLockChainAccount(NativeGl1, alice)) ==
+              StructuralTokenLockReference(1, Vector(tokenLockPreimage.atom)),
+            result.finalState.activeAllowSpendReservations.isEmpty,
+            result.finalState.activeTokenLocks.map(_.identity) == Vector(identity),
+            result.finalState.activeTokenLocks.map(_.amount) == Vector(BigInt(60)),
+            result.finalState.acceptedHistory.isEmpty,
+            result.finalState.acceptedAllowSpendHistory.isEmpty,
+            result.finalState.acceptedTokenLockHistory == Vector(identity)
+          )
+
+        case _: ReferenceInput.UnsupportedManifestOperation =>
+          failure("unsupported operations are not part of the bounded mixed-class packet")
+      }
+
+    scenarios.map { scenario =>
+      val firstOnly = execute(context(NativeGl1), base, scenario.head._2)
+      val expectedIdentity = firstOnly.acceptedIds.head
+
+      scenario.indices.map { prefixIndex =>
+        val prefix = scenario.take(prefixIndex + 1)
+        val result = execute(context(NativeGl1), base, prefix.map(_._2): _*)
+        val expectedRejections =
+          Vector.fill(prefixIndex)(InsufficientBalance(account(Dag, alice), required = 60, available = 40))
+
+        expect
+          .all(
+            result.decisions.map(_.isInstanceOf[Accepted]) == (Vector(true) ++ Vector.fill(prefixIndex)(false)),
+            result.acceptedIds == Vector(expectedIdentity),
+            result.rejected.map(_.reason) == expectedRejections,
+            result.finalState == firstOnly.finalState,
+            result.conservedTotals == SortedMap[ReferenceBalanceScope, BigInt](Dag -> BigInt(100)),
+            result.decisions.collect { case accepted: Accepted => accepted.conservedTotals(Dag) } == Vector(BigInt(100))
+          )
+          .and(exactFirstOperationState(scenario.head._2, result))
+      }
+        .reduce(_ and _)
+    }
+      .reduce(_ and _)
   }
 
   test("active token-lock principal participates in conservation with other economic rows") {
