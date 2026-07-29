@@ -29,8 +29,12 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     "modules/shared/src/main/scala/io/constellationnetwork/security/Hasher.scala"
   private val consensusHashSchemaPath =
     "modules/shared/src/main/scala/io/constellationnetwork/security/ConsensusHashSchema.scala"
+  private val consensusDigestPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/security/ConsensusDigest.scala"
   private val scodecV1HasherPath =
     "modules/shared/src/main/scala/io/constellationnetwork/security/ScodecV1Hasher.scala"
+  private val signaturePrimitivePath =
+    "modules/shared/src/main/scala/io/constellationnetwork/security/signature/signature.scala"
   private val appPath =
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/app/TessellationIOApp.scala"
   private val dagL0MainPath =
@@ -416,8 +420,20 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
   private val reviewedConsensusHashSchemaReferences: Map[String, Reviewed] = Map(
     consensusHashSchemaPath -> Reviewed(6, "closed schema capability definition and restricted factory"),
-    scodecV1HasherPath -> Reviewed(2, "typed digest context bound and capability summon")
+    scodecV1HasherPath -> Reviewed(5, "typed digest/content/sign/verify context bounds and capability summon")
   )
+
+  private val consensusDigestReference =
+    """\bConsensusDigest\b""".r
+
+  private val reviewedConsensusDigestReferences: Map[String, Reviewed] = Map(
+    consensusDigestPath -> Reviewed(9, "fixed-width digest definition, validation, equality, and display"),
+    scodecV1HasherPath -> Reviewed(3, "only public schema-bound content identity, signing, and verification entry point"),
+    signaturePrimitivePath -> Reviewed(3, "package-restricted raw digest signing and verification primitives")
+  )
+
+  private val restrictedDigestHelper =
+    """private\s*\[\s*security\s*\]\s+def\s+(?:fromDigest|verifySignatureProof)""".r
 
   test("runtime Scodec activation remains absent") {
     productionSources.map { sources =>
@@ -449,6 +465,27 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
           s"ConsensusHashSchema production inventory changed: constructions=${constructionPaths.sorted.mkString(",")} " +
             s"references=${referenceMismatches.mkString(",")}"
         )
+    }
+  }
+
+  test("raw consensus digest signing remains confined behind the schema-bound hasher") {
+    productionSources.map { sources =>
+      val referenceMismatches =
+        exactInventoryMismatches(
+          sources,
+          consensusDigestReference,
+          reviewedConsensusDigestReferences,
+          "consensus digest reference"
+        )
+      val signatureSource = sources.find(_.path == signaturePrimitivePath)
+      val restrictedHelpers =
+        signatureSource.fold(0)(source => restrictedDigestHelper.findAllIn(withoutScalaComments(source.contents)).size)
+      val visibilityMismatch =
+        if (restrictedHelpers == 3) Nil
+        else List(s"$signaturePrimitivePath restricted digest helpers expected=3 actual=$restrictedHelpers")
+
+      if (referenceMismatches.isEmpty && visibilityMismatch.isEmpty) success
+      else failure((referenceMismatches ++ visibilityMismatch).mkString(","))
     }
   }
 

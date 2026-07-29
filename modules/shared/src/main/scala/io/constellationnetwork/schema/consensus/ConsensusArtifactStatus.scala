@@ -127,6 +127,15 @@ object ManifestCodecStatus {
   case object Open extends ManifestCodecStatus
 }
 
+sealed trait ManifestSchemaStatus extends Product with Serializable {
+  def semanticLabel: String
+}
+object ManifestSchemaStatus {
+  case object SchemaOpen extends ManifestSchemaStatus {
+    val semanticLabel: String = "schema-open"
+  }
+}
+
 sealed trait ManifestActivationStatus extends Product with Serializable
 object ManifestActivationStatus {
   case object DarkOnly extends ManifestActivationStatus

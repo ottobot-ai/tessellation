@@ -40,6 +40,12 @@ object signature {
     def fromHash[F[_]: Async: SecurityProvider](privateKey: PrivateKey, hash: Hash): F[Signature] =
       signData(hash.getBytes)(privateKey).map(raw => Signature(Hex.fromBytes(raw)))
 
+    private[security] def fromDigest[F[_]: Async: SecurityProvider](
+      privateKey: PrivateKey,
+      digest: ConsensusDigest
+    ): F[Signature] =
+      signData(digest.toByteVector.toArray)(privateKey).map(raw => Signature(Hex.fromBytes(raw)))
+
   }
 
   @derive(arbitrary, decoder, encoder, show, order)
@@ -55,6 +61,15 @@ object signature {
         signature <- Signature.fromHash(keyPair.getPrivate, hash)
       } yield SignatureProof(id, signature)
 
+    private[security] def fromDigest[F[_]: Async: SecurityProvider](
+      keyPair: KeyPair,
+      digest: ConsensusDigest
+    ): F[SignatureProof] =
+      for {
+        id <- PeerId._Id.get(PeerId.fromPublic(keyPair.getPublic)).pure[F]
+        signature <- Signature.fromDigest(keyPair.getPrivate, digest)
+      } yield SignatureProof(id, signature)
+
     def fromData[F[_]: Async: SecurityProvider: Hasher, A: Encoder](
       keyPair: KeyPair
     )(data: A): F[SignatureProof] = data.hash.flatMap(SignatureProof.fromHash(keyPair, _))
@@ -64,11 +79,23 @@ object signature {
   def verifySignatureProof[F[_]: Async: SecurityProvider](
     hash: Hash,
     signatureProof: SignatureProof
+  ): F[Boolean] =
+    verifySignatureProofBytes(hash.getBytes, signatureProof)
+
+  private[security] def verifySignatureProof[F[_]: Async: SecurityProvider](
+    digest: ConsensusDigest,
+    signatureProof: SignatureProof
+  ): F[Boolean] =
+    verifySignatureProofBytes(digest.toByteVector.toArray, signatureProof)
+
+  private def verifySignatureProofBytes[F[_]: Async: SecurityProvider](
+    bytes: Array[Byte],
+    signatureProof: SignatureProof
   ): F[Boolean] = {
     val verifyResult = for {
       signatureBytes <- Async[F].delay(signatureProof.signature.coerce.toBytes)
       publicKey <- signatureProof.id.hex.toPublicKey
-      result <- verifySignature(hash.getBytes, signatureBytes)(publicKey)
+      result <- verifySignature(bytes, signatureBytes)(publicKey)
     } yield result
 
     verifyResult.handleErrorWith { err =>

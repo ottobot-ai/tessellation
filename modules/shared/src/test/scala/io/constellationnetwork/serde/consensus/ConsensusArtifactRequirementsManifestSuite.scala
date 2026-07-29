@@ -37,11 +37,16 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
 
     expect.all(
       validation.isEmpty,
+      artifactSchemaValidation.isEmpty,
       transcriptValidation.isEmpty,
       finalityPayloadValidation.isEmpty,
       carrierValidation.isEmpty,
       entries.size == 48,
       entries.map(_.kind).toSet == ConsensusArtifactKind.all.toSet,
+      artifactSchemaDeclarations.size == 48,
+      artifactSchemaDeclarations.map(_.kind).toSet == ConsensusArtifactKind.all.toSet,
+      artifactSchemaDeclarations.map(_.kind.semanticLabel).distinct.size == artifactSchemaDeclarations.size,
+      artifactSchemaDeclarations.forall(_.schemaStatus == ManifestSchemaStatus.SchemaOpen),
       artifactLabels.distinct.size == artifactLabels.size,
       ConsensusTranscriptKind.all.size == 10,
       transcriptEntries.size == 10,
@@ -69,6 +74,18 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       !containsGlobalBftVocabulary,
       codecStatus == ManifestCodecStatus.Open,
       activationStatus == ManifestActivationStatus.DarkOnly
+    )
+  }
+
+  test("per-artifact schema declarations reject missing and duplicate rows while every schema remains open") {
+    val duplicate = artifactSchemaDeclarations.head :: artifactSchemaDeclarations
+    val missing = artifactSchemaDeclarations.filterNot(_.kind == MigrationManifest)
+
+    expect.all(
+      artifactSchemaDeclarations.forall(_.schemaStatus == ManifestSchemaStatus.SchemaOpen),
+      validateArtifactSchemaDeclarations(duplicate).exists(_.isInstanceOf[DuplicateArtifactSchemaKind]),
+      validateArtifactSchemaDeclarations(duplicate).exists(_.isInstanceOf[DuplicateArtifactSchemaSemanticLabel]),
+      validateArtifactSchemaDeclarations(missing).exists(_.isInstanceOf[MissingArtifactSchemaKind])
     )
   }
 
@@ -713,6 +730,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       "ArtifactDefinitionStatus",
       "ArtifactGap",
       "ManifestCodecStatus",
+      "ManifestSchemaStatus",
       "ManifestActivationStatus",
       "ConsensusArtifactKind",
       "ConsensusCarrierKind",
@@ -722,6 +740,7 @@ object ConsensusArtifactRequirementsManifestSuite extends FunSuite {
       "FinalityPayloadCodecStatus",
       "FinalityPayloadVectorStatus",
       "ConsensusTranscriptKind",
+      "ArtifactSchemaDeclaration",
       "TranscriptContract",
       "CarrierContract",
       "FinalityPayloadContract",

@@ -17,7 +17,8 @@ The source declarations are:
 - `schema/consensus/ConsensusTranscriptKind.scala`: randomness/selection
   transcript subjects;
 - `serde/consensus/ConsensusArtifactRequirementsManifest.scala`: pure contracts
-  and structural validation, including the separate `CarrierContract` table.
+  and structural validation, including the separate `ArtifactSchemaDeclaration`
+  and `CarrierContract` tables.
 
 The labels are review identifiers only. They are not wire tags or encoded domain
 separators. The manifest deliberately imports no runtime hasher, immutable codec,
@@ -105,6 +106,16 @@ decided optimistic-attestation evidence, depth-`k1`, and separate fork-choice
 evidence; tower
 proofs; MPT keys, values, nodes, roots, and accumulator; durability records; and the
 offline migration manifest.
+
+Every one of those 48 kinds also has exactly one declaration in the separate
+per-kind schema table. All declarations remain `ManifestSchemaStatus.SchemaOpen`.
+That table assigns no source type, codec, wire tag, preimage, resource limit,
+signature domain, or runtime authority; it only makes an omitted or duplicate
+schema row mechanically detectable while E1.1 remains open. This is not
+totalization of the exact byte contract. The next E1.1 step remains a row-specific
+type, codec, static domain, maximum canonical size, and frozen-vector review for
+every semantic artifact and subordinate payload before any row can leave
+`SchemaOpen`.
 
 The 10 transcript subjects are GL0 leader VRF, admission VRF, execution-committee
 VK-hash draw, shard-eta derivation, staircase rank, checkpoint VRF possession,
@@ -325,13 +336,16 @@ binding or activate runtime finality.
   and retention remain owner-blocked. The finality durability umbrella has exact
   subordinate inventory coverage for all 14 `FinalityArtifactKind` variants, but
   ten payload schemas and their semantic verifiers remain open.
-- The validator's authority-class fallback is intentionally coarse outside the
-  critical shard, optimistic-tip, and tower rows. E1.1 must make the per-kind
-  binding table total and mutation-test every family.
+- The schema declaration table is total only for omission detection. The
+  validator's authority-class fallback is intentionally coarse outside the
+  critical shard, optimistic-tip, and tower rows. E1.1 must still make the exact
+  per-kind binding/type/codec/domain/max/vector contract total and mutation-test
+  every family.
 
 ## Activation Gate
 
-`ManifestCodecStatus.Open` and `ManifestActivationStatus.DarkOnly` are load-bearing
-status markers. Activation still requires the atomic GL0/GL1/ML0/CL1/DL1 cutover,
-complete bounded codecs and vectors, one branch-bound era service, removal of
-active JSON/Kryo authority, and the protocol test-plan SER gates.
+`ManifestSchemaStatus.SchemaOpen`, `ManifestCodecStatus.Open`, and
+`ManifestActivationStatus.DarkOnly` are load-bearing status markers. Activation
+still requires the atomic GL0/GL1/ML0/CL1/DL1 cutover, complete bounded codecs
+and vectors, one branch-bound era service, removal of active JSON/Kryo authority,
+and the protocol test-plan SER gates.

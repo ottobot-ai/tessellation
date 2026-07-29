@@ -7,12 +7,13 @@ import io.constellationnetwork.schema.consensus.ArtifactGap._
 import io.constellationnetwork.schema.consensus.ConsensusArtifactKind._
 import io.constellationnetwork.schema.consensus.ConsensusCarrierKind._
 import io.constellationnetwork.schema.consensus.ConsensusTranscriptKind._
+import io.constellationnetwork.schema.consensus.ManifestSchemaStatus.SchemaOpen
 import io.constellationnetwork.schema.consensus._
 
 /** Dark, declaration-only inventory for the eventual canonical consensus-byte contract.
   *
   * Nothing here serializes, hashes, signs, validates, stores, or activates an artifact. Semantic labels deliberately have no numeric tags
-  * or byte encoding. `codecStatus` and `activationStatus` remain open/dark until the coordinated all-layer cutover.
+  * or byte encoding. Schema, codec, and activation statuses remain open/dark until the coordinated all-layer cutover.
   */
 object ConsensusArtifactRequirementsManifest {
 
@@ -22,6 +23,11 @@ object ConsensusArtifactRequirementsManifest {
     bindings: Set[ArtifactBinding],
     definitionStatus: ArtifactDefinitionStatus,
     knownGaps: Set[ArtifactGap] = Set.empty
+  )
+
+  final case class ArtifactSchemaDeclaration(
+    kind: ConsensusArtifactKind,
+    schemaStatus: ManifestSchemaStatus
   )
 
   final case class TranscriptContract(
@@ -61,6 +67,15 @@ object ConsensusArtifactRequirementsManifest {
     }
     final case class MissingKind(kind: ConsensusArtifactKind) extends Violation {
       val description: String = s"missing artifact kind: ${kind.semanticLabel}"
+    }
+    final case class DuplicateArtifactSchemaKind(kind: ConsensusArtifactKind) extends Violation {
+      val description: String = s"duplicate artifact schema kind: ${kind.semanticLabel}"
+    }
+    final case class DuplicateArtifactSchemaSemanticLabel(label: String) extends Violation {
+      val description: String = s"duplicate artifact schema semantic label: $label"
+    }
+    final case class MissingArtifactSchemaKind(kind: ConsensusArtifactKind) extends Violation {
+      val description: String = s"missing artifact schema kind: ${kind.semanticLabel}"
     }
     final case class InvalidSemanticLabel(kind: ConsensusArtifactKind) extends Violation {
       val description: String = s"invalid semantic label: ${kind.semanticLabel}"
@@ -659,6 +674,26 @@ object ConsensusArtifactRequirementsManifest {
   val finalityPayloadEntries: List[FinalityPayloadContract] =
     ConsensusFinalityPayloadKind.all.map(finalityPayloadContract)
   val carrierEntries: List[CarrierContract] = ConsensusCarrierKind.all.map(carrierContract)
+  val artifactSchemaDeclarations: List[ArtifactSchemaDeclaration] =
+    ConsensusArtifactKind.all.map(ArtifactSchemaDeclaration(_, SchemaOpen))
+
+  def validateArtifactSchemaDeclarations(declarations: List[ArtifactSchemaDeclaration]): List[Violation] = {
+    import Violation._
+
+    val duplicateKinds = declarations.groupBy(_.kind).collect {
+      case (kind, values) if values.sizeCompare(1) > 0 => DuplicateArtifactSchemaKind(kind)
+    }
+    val duplicateLabels = declarations
+      .groupBy(_.kind.semanticLabel)
+      .collect { case (label, values) if values.sizeCompare(1) > 0 => DuplicateArtifactSchemaSemanticLabel(label) }
+    val missingKinds =
+      (ConsensusArtifactKind.all.toSet -- declarations.map(_.kind).toSet).toList.map(MissingArtifactSchemaKind)
+
+    (duplicateKinds ++ duplicateLabels ++ missingKinds).toList.sortBy(_.description)
+  }
+
+  val artifactSchemaValidation: List[Violation] =
+    validateArtifactSchemaDeclarations(artifactSchemaDeclarations)
 
   def validateEntries(contracts: List[ArtifactContract]): List[Violation] = {
     import Violation._

@@ -746,6 +746,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
     subsystem context. Its labels are not codecs, wire tags, preimage bytes,
     signatures, or runtime authority; codec status remains `Open` and activation
     remains `DarkOnly`.
+  - **Current nonactivating per-kind schema inventory:** every one of the 48
+    semantic artifact kinds has exactly one omission-detecting declaration and
+    every declaration remains `SchemaOpen`. Parity and mutation tests reject
+    missing and duplicate rows. This does not define a source type, codec, static
+    domain, maximum canonical size, vector, signature, or runtime authority.
+    E1.1 still requires those exact row-specific contracts, including the
+    subordinate finality-payload inventory, before any schema can be frozen.
   - **Confirmed E1.1a blockers:** `StateChangesAccumulator` omits rooted field 33
     `ConsumedAllowSpends` and field 34 `Slashings`; ROOT-008 physical MPT-key
     grammar enforcement remains open; `SlashedRegistryEntry` still uses JSON

@@ -1,10 +1,15 @@
 package io.constellationnetwork.security
 
+import java.nio.charset.StandardCharsets
+
 import cats.effect.IO
 import cats.syntax.all._
 
+import io.constellationnetwork.security.hash.Hash
+import io.constellationnetwork.security.signature.signature
 import io.constellationnetwork.serde.ImmutableCodec
 
+import io.circe.{Encoder, Json}
 import scodec.bits.ByteVector
 import scodec.codecs.int32
 import weaver.SimpleIOSuite
@@ -61,6 +66,9 @@ object ScodecV1HasherSuite extends SimpleIOSuite {
 
     implicit val consensusHashSchema: ConsensusHashSchema[Unencodable] =
       schema(immutableCodec, "tessellation/test/unencodable/v1", maxEncodedBytes = 4L)
+
+    implicit val jsonEncoder: Encoder[Unencodable] =
+      Encoder.instance(_ => Json.obj("fallback" -> Json.fromBoolean(true)))
   }
 
   private final case class Oversized(value: Int)
@@ -82,6 +90,29 @@ object ScodecV1HasherSuite extends SimpleIOSuite {
         "9b59433cdaab140924210bb4f95694347f66121dbac62c1063588a5be7c5ee5c"
       ) &&
       expect.eql(digest.toByteVector.length, ConsensusDigest.Length)
+    }
+  }
+
+  test("content identity and signature bind the raw 32-byte digest, not its 64-byte ASCII hex") {
+    SecurityProvider.forAsync[IO].use { implicit securityProvider =>
+      val value = Alpha(0x01020304)
+
+      for {
+        keyPair <- KeyPairGenerator.makeKeyPair[IO]
+        digest <- hasher.contentId(value)
+        proof <- hasher.sign(value, keyPair)
+        typedVerification <- hasher.verify(value, proof)
+        rawDigestVerification <- signature.verifySignatureProof[IO](digest, proof)
+        asciiHexVerification <- signature.verifySignatureProof[IO](Hash(digest.toHexString), proof)
+        wrongValueVerification <- hasher.verify(Alpha(0x01020305), proof)
+      } yield
+        expect.eql(digest.toHexString, "9b59433cdaab140924210bb4f95694347f66121dbac62c1063588a5be7c5ee5c") &&
+          expect.eql(digest.toByteVector.length, 32L) &&
+          expect.eql(digest.toHexString.getBytes(StandardCharsets.US_ASCII).length, 64) &&
+          expect(typedVerification) &&
+          expect(rawDigestVerification) &&
+          expect(!asciiHexVerification) &&
+          expect(!wrongValueVerification)
     }
   }
 
@@ -115,6 +146,17 @@ object ScodecV1HasherSuite extends SimpleIOSuite {
         expect(error.getMessage == "deliberate immutable encoding failure")
       case result =>
         failure(s"Expected immutable encoding failure, got $result")
+    }
+  }
+
+  test("signing fails on immutable encoding failure without using an available JSON projection") {
+    SecurityProvider.forAsync[IO].use { implicit securityProvider =>
+      KeyPairGenerator.makeKeyPair[IO].flatMap(hasher.sign(Unencodable(), _)).attempt.map {
+        case Left(error: IllegalArgumentException) =>
+          expect(error.getMessage == "deliberate immutable encoding failure")
+        case result =>
+          failure(s"Expected immutable encoding failure, got $result")
+      }
     }
   }
 
@@ -158,7 +200,7 @@ object ScodecV1HasherSuite extends SimpleIOSuite {
     expect(maximum.exists(_.lengthDelimitedDomain.length == 1L + ConsensusHashSchema.MaxDomainLength))
   }
 
-  pureTest("raw and projection types have no ambient consensus hash schema") {
+  pureTest("raw and projection types cannot use digest, content identity, or signing because they have no consensus schema") {
     val _ = implicitly[NotGiven[ConsensusHashSchema[String]]]
     val _ = implicitly[NotGiven[ConsensusHashSchema[Array[Byte]]]]
     val _ = implicitly[NotGiven[ConsensusHashSchema[ByteVector]]]
