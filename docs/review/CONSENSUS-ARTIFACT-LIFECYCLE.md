@@ -792,15 +792,27 @@ Target rules:
 1. Greenfield genesis uses only `ScodecV1` from new-chain ordinal 0.
 2. Every signed, hashed, MPT key/value, checkpoint, diff, finality evidence,
    recovery record, and migration manifest has one bounded canonical codec.
-3. Decoders consume all bytes and reject trailing bytes, unknown tags, duplicate
+3. `Hasher.forScodec` returns a typed `ScodecV1Hasher`; its consensus digest
+   requires one audited `ConsensusHashSchema[A]` binding the exact byte-aligned
+   `ImmutableCodec[A]`, type-specific static domain, and frozen bounded size.
+   It hashes the canonically length-delimited static domain plus exact immutable
+   bytes with fixed SHA-256. Network, genesis, era, parameter, and exact-context
+   bindings are fields of the versioned preimage `A`, not ambient caller inputs.
+   Every production schema is globally inventoried and domain-unique; raw
+   projection types have no schema. It is not a case in the legacy
+   JSON/Kryo/ordinal selector and has no serializer fallback.
+4. Immutable signatures sign and verify the raw domain-separated digest bytes.
+   The legacy path that signs UTF-8 text for a JSON/Kryo-derived hexadecimal hash
+   is unreachable from new-chain consensus.
+5. Decoders consume all bytes and reject trailing bytes, unknown tags, duplicate
    or unordered collections, non-minimal encodings, invalid refinements, and
    over-limit sizes.
-4. JSON remains an API/debug representation, never a consensus preimage.
-5. Fork-only undeployed compatibility formats are deleted, not retained.
-6. Future public upgrades use one exact canonical hash-bound `ProtocolEra`
+6. JSON remains an API/debug representation, never a consensus preimage.
+7. Fork-only undeployed compatibility formats are deleted, not retained.
+8. Future public upgrades use one exact canonical hash-bound `ProtocolEra`
    schedule with exact predecessor, activation, state transform, density-reorg,
    stale-node, and live-object rules.
-7. Consensus-object hashing and frozen MPT-key derivation are separately versioned
+9. Consensus-object hashing and frozen MPT-key derivation are separately versioned
    so a serde migration cannot silently move keys.
 
 ## 12. Existing-network snapshot genesis

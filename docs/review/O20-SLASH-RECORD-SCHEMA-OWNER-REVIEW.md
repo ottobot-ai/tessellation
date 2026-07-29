@@ -1,22 +1,26 @@
 # O-20 Field-34 Slash Record Schema Owner Review
 
-**Status:** OWNER RESPONSE REQUIRED. This packet does not select or activate a
-field-34 value schema. The recommendation below has no runtime authority until
-the owner dispositions `O20-01` through `O20-04` and engineering freezes the
-resulting key, value, codec, transition, and test contracts.
+**Status:** OWNER-RATIFIED DIRECTION; ENGINEERING OPEN. On 2026-07-29 the owner
+accepted `O20-01` through `O20-04`: invalid-state-proof-only V1, a half-open
+`EtaPeriod` exclusion interval, audit/exclusion-only field 34 with separate
+atomic economics, and fixed ScodecV1 plus SHA-256 identity/evidence preimages.
+This decision does not activate the current implementation. Engineering still
+has to freeze and qualify the resulting key, value, codec, transition, and test
+contracts.
 
-**Runtime authority:** None. The live field-34 writer and readers continue to
-use `InvalidStateProofSlashManager.SlashedRegistryEntry` and its hand-written JSON
-`ImmutableCodec`. No code change is authorized by this packet.
+**Current runtime authority:** Unsafe and unqualified. The live field-34 writer
+and readers continue to use
+`InvalidStateProofSlashManager.SlashedRegistryEntry` and its hand-written JSON
+`ImmutableCodec`. Owner ratification does not bless that path.
 
 **Primary gates:** `ROOT-008-F34`, `SER-005`, `SER-006`, `WT-002`, E1.1, E1.2,
 E6, E8
 
-**Updated:** 2026-07-16
+**Updated:** 2026-07-29
 
-## 1. Decision required
+## 1. Ratified decision
 
-O-20 asks four bounded questions:
+O-20 ratifies four bounded directions:
 
 > Does the first ScodecV1 field-34 schema represent only the implemented
 > invalid-state-proof slash, with later slash kinds added as variant-specific
@@ -52,7 +56,7 @@ not evidence that can authorize its own creation.
 | Duplicate reader | The invalid-state-proof reader scans the partition and treats any value matching `(shardId, disputedCheckpointHash)` as already slashed (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/InvalidStateProofSlashedReader.scala:70-93`). | A generalized record could collide with the invalid-state-proof duplicate domain unless variants have distinct typed identities and readers. |
 | Cooldown reader | Committee exclusion consumes only the common `peerId`, `eventOrdinal`, and `cooldownUntilEpoch` projection (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/slashing/SlashCooldownReader.scala:114-125,137-150`). | Future variants may share a cooldown projection without sharing their evidence-specific key/value fields. |
 | Cooldown units | The writer sets `cooldownUntilEpoch: EpochProgress` from `currentEpoch + cooldownEpochs`, while the reader compares its numeric value to an anchor derived from GL0 snapshot ordinal (`InvalidStateProofSlashManager.scala:159-169`; `SlashCooldownReader.scala:100-125`). | The current field name, type, and comparison axis are dimensionally ambiguous and cannot be frozen as protocol bytes. |
-| Value bytes | The field-34 value is UTF-8 Circe JSON behind an `ImmutableCodec` (`InvalidStateProofSlashedReader.scala:52-68`). | This cannot be the target ScodecV1 leaf. A canonical value decision is required before the field-34 accumulator/change-set repair freezes bytes. |
+| Value bytes | The field-34 value is UTF-8 Circe JSON behind an `ImmutableCodec` (`InvalidStateProofSlashedReader.scala:52-68`). | This cannot be the target ScodecV1 leaf. The ratified narrow Scodec value must replace it before the field-34 accumulator/change-set repair freezes bytes. |
 | Producer write | GSAM derives the composite key and writes these records directly after the ordinary accumulator because field 34 is absent from `StateChangesAccumulator` (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/infrastructure/snapshot/managers/global/GlobalSnapshotAcceptanceManager.scala:2967-2992`). | Adding field 34 to the typed accumulator must reproduce the selected record/key bytes; it cannot choose the schema implicitly. |
 
 Repository search finds no production construction of a record with
@@ -91,11 +95,11 @@ Tests constructing the generic case class do not activate the other reason tags.
    preimages and fixed SHA-256. The ordinal-selected ambient `Hasher`, JSON,
    delimiters, and interpolated strings never define these bytes.
 
-## 4. O20-01 options
+## 4. O20-01 selected scope
 
-### Option A - invalid-state-proof-only V1, future variant-specific ADT
+### Selected - invalid-state-proof-only V1, future variant-specific ADT
 
-**Recommendation.** Freeze the first field-34 value as a closed slash-record ADT
+Freeze the first field-34 value as a closed slash-record ADT
 with exactly one accepted V1 variant, `InvalidStateProof`. Its payload contains:
 
 - `peerId`;
@@ -139,7 +143,7 @@ strict variant decoding.
   consensus use; future enum cases cannot become live merely by reaching a
   writer branch.
 
-### Option B - freeze one generalized multi-reason record in V1
+### Rejected - freeze one generalized multi-reason record in V1
 
 Freeze the current shared shape, or an optional-field expansion of it, with all
 four reason tags active in one V1 value codec. This option is valid only if the
@@ -171,7 +175,7 @@ owner also defines now, for every reason:
 
 ## 5. O20-02 committee-exclusion interval
 
-**Recommendation:** encode a half-open artifact-period interval
+**Selected:** encode a half-open artifact-period interval
 `[excludedFromPeriod, eligibleAgainAtPeriod)` using `EtaPeriod`. The slash
 transition derives both endpoints from the exact proposal parent and rooted
 rotation/delay/cooldown parameters. Committee construction for artifact period
@@ -185,7 +189,7 @@ Invalid/negative ordering, overflow, or a locally configured interval rejects.
 
 ## 6. O20-03 field-34 economic scope
 
-**Recommendation:** field 34 is the typed per-signer culpability, deduplication,
+**Selected:** field 34 is the typed per-signer culpability, deduplication,
 evidence-pointer, and exclusion record only. It does not repeat `BondId`s,
 principal amounts, bounty, burns, or supply deltas. O-23 stores liability and
 consumed-bond state in their own typed rooted partitions/deltas. One
@@ -197,16 +201,17 @@ never mint, burn, debit, or prove that a bond was consumed.
 
 ## 7. O20-04 fixed identity and evidence hashing
 
-**Recommendation:** the logical key preimage is a frozen length-delimited ASCII
+**Selected:** the logical key preimage is a frozen length-delimited ASCII
 domain, the `InvalidStateProof` variant tag, and exact ScodecV1 bytes for
 `(peerId, shardId, disputedCheckpointHash)`, hashed with fixed SHA-256. The value's
 `evidenceDigest` is fixed SHA-256 over a separate frozen domain plus the complete
 canonical `InvalidStateProofEvidenceV1` bytes. Neither uses `Hasher.hash[A]`, an
 ordinal-selected hasher, JSON, or a delimiter-separated string.
 
-The exact domain literals and evidence codec must be frozen with independent
-golden vectors before any writer is enabled. Until O-22 freezes the evidence
-type, O-20 can select this construction but cannot freeze the final digest bytes.
+The exact domain literals and final O-22 evidence codec must be frozen with
+independent golden vectors before any writer is enabled. O-22 now selects the
+direct final V1 launch path; its exact implementation bytes remain an engineering
+freeze gate.
 
 The focused `SlashCooldownAxisMismatchRedSuite` reproduces O20-02's current
 mixed-unit defect: ordinal anchor 599, `EpochProgress` 42, and stored expiry 142
@@ -255,9 +260,7 @@ O-18 independently owns transport/page/resource bounds for changeset delivery.
 It cannot alter the selected field-34 identity or make transport bytes state
 authority.
 
-## 10. Response template
-
-Please answer all four:
+## 10. Owner disposition
 
 ```text
 O20-01: accept invalid-state-proof-only V1
@@ -266,7 +269,7 @@ O20-03: accept audit/exclusion-only field 34 with separate atomic economics
 O20-04: accept fixed ScodecV1 + SHA-256 identity/evidence preimages
 ```
 
-Until these are answered, engineering may add RED tests and dark codec
-experiments, but must not freeze or activate field-34 Scodec value/key bytes,
-generalize the live slash writer, or treat the latent reason tags as designed
-slash variants.
+All four directions were accepted on 2026-07-29. Engineering may now freeze the
+invalid-state-proof-only V1 grammar under the gates in section 9. The current
+JSON leaf, mixed-unit cooldown, direct writer, and latent reason tags remain
+non-authoritative and must not be preserved as compatibility.

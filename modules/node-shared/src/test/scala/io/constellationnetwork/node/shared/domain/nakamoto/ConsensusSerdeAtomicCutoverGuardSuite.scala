@@ -27,6 +27,10 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
   private val hasherPath =
     "modules/shared/src/main/scala/io/constellationnetwork/security/Hasher.scala"
+  private val consensusHashSchemaPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/security/ConsensusHashSchema.scala"
+  private val scodecV1HasherPath =
+    "modules/shared/src/main/scala/io/constellationnetwork/security/ScodecV1Hasher.scala"
   private val appPath =
     "modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/app/TessellationIOApp.scala"
   private val dagL0MainPath =
@@ -404,6 +408,17 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
     "Hasher.forScodec runtime selection" -> """\bHasher\s*\.\s*forScodec\b""".r
   )
 
+  private val consensusHashSchemaConstruction =
+    """\bConsensusHashSchema\s*\.\s*make\b""".r
+
+  private val consensusHashSchemaReference =
+    """\bConsensusHashSchema\b""".r
+
+  private val reviewedConsensusHashSchemaReferences: Map[String, Reviewed] = Map(
+    consensusHashSchemaPath -> Reviewed(6, "closed schema capability definition and restricted factory"),
+    scodecV1HasherPath -> Reviewed(2, "typed digest context bound and capability summon")
+  )
+
   test("runtime Scodec activation remains absent") {
     productionSources.map { sources =>
       val violations = sources.flatMap { source =>
@@ -412,6 +427,28 @@ object ConsensusSerdeAtomicCutoverGuardSuite extends SimpleIOSuite {
 
       if (violations.isEmpty) success
       else failure(s"partial Scodec activation crossed the atomic-cutover fuse: ${violations.mkString(", ")}")
+    }
+  }
+
+  test("production consensus hash schemas remain a closed inactive inventory") {
+    productionSources.map { sources =>
+      val constructionPaths = sources.collect {
+        case source if consensusHashSchemaConstruction.findFirstIn(withoutScalaComments(source.contents)).nonEmpty => source.path
+      }
+      val referenceMismatches =
+        exactInventoryMismatches(
+          sources,
+          consensusHashSchemaReference,
+          reviewedConsensusHashSchemaReferences,
+          "consensus hash schema reference"
+        )
+
+      if (constructionPaths.isEmpty && referenceMismatches.isEmpty) success
+      else
+        failure(
+          s"ConsensusHashSchema production inventory changed: constructions=${constructionPaths.sorted.mkString(",")} " +
+            s"references=${referenceMismatches.mkString(",")}"
+        )
     }
   }
 

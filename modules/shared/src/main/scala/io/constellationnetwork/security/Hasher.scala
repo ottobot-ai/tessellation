@@ -66,6 +66,11 @@ object Hasher {
 
   def apply[F[_]: Hasher]: Hasher[F] = implicitly
 
+  /** Additive ScodecV1 primitive. It is intentionally separate from the legacy JSON/Kryo [[Hasher]] and [[HasherSelector]] hierarchy.
+    */
+  def forScodec[F[_]: Sync]: ScodecV1Hasher[F] =
+    new ScodecV1Hasher[F]
+
   def forKryo[F[_]: Sync: KryoSerializer]: Hasher[F] = new Hasher[F] {
     def getLogic(ordinal: SnapshotOrdinal): HashLogic = KryoHash
 

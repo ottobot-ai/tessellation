@@ -55,21 +55,13 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `17/23` dispositioned. `O-01` through `O-17` are
-> ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18`
-> transport/DA bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34
-> slash-record schema await owner responses
-> in `docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
-> `docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
-> `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `O-21` optimistic
-> decision evidence awaits a response in
-> `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. `O-22`
-> fraud-proof activation and adjudication awaits a response in
-> `docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. `O-23` slash
-> liability and bond tranches awaits a response in
-> `docs/review/O23-SLASH-LIABILITY-OWNER-REVIEW.md`. Open work under
-> O-01 through O-17 is an engineering, research, schema, parameter, or proof gate
-> under a ratified direction, not a request for another owner answer.
+> **Owner-decision status:** `20/23` dispositioned. `O-01` through `O-17`,
+> `O-20`, `O-22`, and `O-23` are ratified in
+> `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. `O-18` transport/DA bytes,
+> `O-19` upstream-v4 migration policy, and `O-21` optimistic decision evidence
+> await owner responses in their focused review packets. Open work under every
+> ratified direction is an engineering, research, schema, parameter, or proof
+> gate, not a request for another owner answer.
 
 ---
 
@@ -720,6 +712,17 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 - [ ] **S1 PARTIAL - canonical ScodecV1, identity, era, and parameters**
   - Freeze one bounded representation/signature domain for every active artifact.
+  - Add `Hasher.forScodec`, returning a typed `ScodecV1Hasher` whose digest
+    requires one audited `ConsensusHashSchema[A]` binding the exact byte-aligned
+    `ImmutableCodec[A]`, a type-specific static domain, and a frozen bounded
+    size. Digest is fixed SHA-256 over the canonically length-delimited static
+    domain plus exact immutable bytes. Put network/genesis/era/parameter/
+    exact-context fields in the versioned preimage type, not ambient inputs. Add
+    immutable sign/verify/content-hash APIs over the raw digest. Inventory every
+    production schema, require the canonical
+    `tessellation/<lowercase-segments>/vN` grammar, and prove global domain
+    uniqueness. It is not another `HashLogic` selector case and has no
+    JSON/Kryo, raw/projection schema, or serializer fallback.
   - Replace JSON/Kryo `HasherSelector` plus legacy state-proof switches with one
     canonical hash-bound protocol-era service.
     Ordinal zero is ScodecV1 for bytes, hashes, signatures, state proofs, MPT
@@ -749,9 +752,10 @@ criteria are in `NAKAMOTO-PLAN.md`.
     bytes under an `ImmutableCodec` facade; signed state-channel lanes, canonical
     shard diff, positive replay coverage, the exact optimistic-tip attestation
     body, and portable finality/tower proof schemas remain open. O-18 controls
-    transport/DA bytes, O-19 controls migration transform/conservation/target-genesis
-    policy, and O-20 must select the field-34 V1 record shape before the JSON leaf
-    and accumulator omission can be replaced by active Scodec bytes.
+    transport/DA bytes and O-19 controls migration
+    transform/conservation/target-genesis policy. O-20 now selects the
+    invalid-state-proof-only field-34 V1 record, so engineering can replace the
+    JSON leaf and accumulator omission with qualified Scodec bytes.
   - **Landed fail-closed accumulator characterization (2026-07-16):** an
     independent target root containing either a typed field-33 leaf or opaque
     field-34 bytes cannot be reproduced from the current 31-field accumulator.
@@ -759,19 +763,18 @@ criteria are in `NAKAMOTO-PLAN.md`.
     follower's exact entries, root, and persisted ordinal. This proves the current
     omission is a liveness/heavy-resync defect rather than silent partial adoption;
     it does not define field-34 bytes or close either omission.
-  - [ ] **O-20 OWNER RESPONSE REQUIRED / FIELD-34 SCHEMA FREEZE:** review
-    `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. The recommendation is an
-    invalid-state-proof-only V1 record plus future variant-specific ADT payloads
-    and keys, a half-open rooted `EtaPeriod` exclusion interval, audit/exclusion-
-    only field 34 with separate atomic economics, and fixed Scodec/SHA-256
-    preimages. `SLASH-07` is confirmed: the current writer stores an
+  - [ ] **O-20 OWNER-RATIFIED / FIELD-34 SCHEMA IMPLEMENTATION:** implement the
+    accepted invalid-state-proof-only V1 record, half-open rooted `EtaPeriod`
+    exclusion interval, audit/exclusion-only field 34 with separate atomic
+    economics, and fixed ScodecV1/SHA-256 preimages under
+    `docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `SLASH-07` is
+    confirmed: the current writer stores an
     `EpochProgress` deadline while the reader compares it to a snapshot-ordinal
     anchor, so event-triggered schedules can make the exclusion interval empty.
     `SlashCooldownAxisMismatchRedSuite` reproduces the failure 1/1 (SHA-256
     `7fd927373ece8ccc221344eed83c0b085c59003f7cbe2ea68ceaba4b0948a766`).
-    Do not infer acceptance, activate latent slash reasons, retain JSON bytes, or
-    encode sentinel/optional future contexts before `O20-01` through `O20-04`
-    are answered.
+    Do not activate latent slash reasons, retain JSON bytes, or encode
+    sentinel/optional future contexts.
   - [ ] **O-21 OWNER RESPONSE REQUIRED / OPTIMISTIC EVIDENCE FREEZE:** review
     `docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. The
     recommendation is sorted unique exact signed local cascade-decision
@@ -849,8 +852,8 @@ criteria are in `NAKAMOTO-PLAN.md`.
     cooldown with zero debit and maturity later refunds the full lock. Scanning
     current pending maps is still insufficient: it can charge delegation created
     after the offense because current schemas do not preserve an offense-time
-    bond lineage. O-23 now requires owner disposition of a fixed-hash `BondId`,
-    complete `E-2` tranche liability, full-only V1 with amount-changing bonded
+    bond lineage. O-23 now ratifies a fixed-hash `BondId`, complete `E-2` tranche
+    liability, full-only V1 with amount-changing bonded
     replacements and operator/family retargets rejected, bounded hold/release
     horizons, slash-before-release,
     consumed-bond tombstones, reward conservation, and portable historical
@@ -1371,17 +1374,18 @@ criteria are in `NAKAMOTO-PLAN.md`.
     needs a separate crypto/evidence design. `O-20` remains independently open for
     the rooted field-34 slash-record schema. `FIN-14`, `SHARD-C-012`, `WT-006`,
     `O-16`, and `O-20` remain open.
-  - [ ] **O-22 OWNER RESPONSE REQUIRED / NONEMPTY FRAUD-PROOF CONTAINMENT:** the
-    producer currently copies the local pool into the global snapshot and GSAM can
-    apply rooted effects while failed adjudication becomes no slash. Select
-    mandatory-empty current-era retention versus field removal, atomic whole-
-    candidate reject/defer semantics, and per-new-signer debit-funded bounty
-    ownership. Until answered and implemented, `WT-000` blocks every nonempty
-    active-era proof; `WT-001..010` remain activation tests, not evidence that the
-    current live path is safe. The focused
+  - [ ] **O-22 OWNER-RATIFIED / FINAL LAUNCH FRAUD-PROOF REPLACEMENT:** replace
+    the provisional path once with the final bounded InvalidStateProof V1
+    collection in the sole ordinal-zero ScodecV1 launch schema. There is no
+    mandatory-empty or removed target era, activation ordinal, later re-add, or
+    compatibility decoder. Atomic whole-candidate reject/defer and per-new-signer
+    actual-debit-funded bounty ownership are fixed. During implementation,
+    `WT-000` is a source-level fail-closed interlock only; `WT-001..010` qualify
+    the final launch path. The focused
     `O22FraudProofPreActivationContainmentRedSuite` compiles and fails all four
-    intended gates with zero errors: producer/GSAM authority, retired JSON,
-    retired Scodec bytes, and current field-34 cooldown influence. SHA-256
+    legacy/interlock gates with zero errors: producer/GSAM authority, permissive
+    JSON, provisional Scodec bytes, and current field-34 cooldown influence. It
+    is not the target schema. SHA-256
     `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
   - Missing data defers/no-slash; later base orphaning is not execution fraud;
     evidence is branch-aware, deterministic, and exact-once.

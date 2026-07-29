@@ -1,7 +1,7 @@
 # Consensus Owner Decision Register — Answers & Ratified Directions (v2)
 
 **Companion to:** [`CONSENSUS-OWNER-DECISIONS.md`](CONSENSUS-OWNER-DECISIONS.md)
-**Revised:** 2026-07-16 · settled-answer source-audit baseline `ad13026d1`
+**Revised:** 2026-07-29 · settled-answer source-audit baseline `ad13026d1`
 **Supersedes:** the v1 draft that was rejected by adversarial audit at HEAD `e26ad406e`.
 This revision reworks every gate against that audited source baseline, dispositions all
 15 audit findings, and folds in the owner's refinement dialogue.
@@ -10,21 +10,17 @@ This revision reworks every gate against that audited source baseline, dispositi
 recommendations and directions recorded here. Ratification does **not** assert that missing
 protocol constants, schemas, reference models, RED vectors, or activation proofs already exist.
 For O-15/O-16/O-17 the audited source packets remain the engineering and proof authority; this
-document records which direction is settled and which executable freeze gates remain. `O-18`,
-`O-19`, `O-20`, `O-21`, `O-22`, and `O-23` were added after that ratification pass and are not answered by this document.
-**Owner-question completeness:** `17/23` dispositioned. `O-01` through `O-17` are ratified;
+document records which direction is settled and which executable freeze gates remain. `O-18`
+through `O-23` were added after the original ratification pass; the owner has now
+also answered `O-20`, `O-22`, and `O-23`.
+**Owner-question completeness:** `20/23` dispositioned. `O-01` through `O-17`,
+`O-20`, `O-22`, and `O-23` are ratified;
 `O-18` awaits an owner response in
 [`O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md`](O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md),
 and `O-19` awaits an owner response in
 [`O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`](O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md).
-`O-20` awaits an owner response in
-[`O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
 `O-21` awaits an owner response in
 [`O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`](O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md).
-`O-22` awaits an owner response in
-[`O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
-`O-23` awaits an owner response in
-[`O23-SLASH-LIABILITY-OWNER-REVIEW.md`](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
 
 ---
 
@@ -121,10 +117,10 @@ test, never a freeze.
 | O-17 | ROOT-008 partition grammar | 🔴 | Numeric gaps/offline import, self-authenticating fields, token-lock scope, and field-32 direction are ratified; identity functions, resource parameters, codecs, and proofs remain stop-the-line engineering. |
 | O-18 | Transport and DA byte contract | 🔴 | **OWNER RESPONSE REQUIRED:** active-era maxima, migration scope, canonical bytes/compression, descriptor/chunk delivery, and the `512000`/`20 MiB` rule semantics are not ratified. Bounded helpers are unwired. |
 | O-19 | Upstream-v4 snapshot migration policy | 🔴 | **OWNER RESPONSE REQUIRED:** all 17 source fields require explicit dispositions; source-unrooted fields, metagraph continuity, epoch/eta, registries, malformed source state, and per-asset conservation are not ratified. The raw tools-only envelope verifier is not an authorized importer or transform. |
-| O-20 | Field-34 slash record schema | 🔴 | **OWNER RESPONSE REQUIRED:** invalid-state-proof-only V1, half-open `EtaPeriod` exclusion, audit/exclusion-only field 34 with separate atomic economics, and fixed Scodec/SHA-256 preimages are recommended but unratified. The current mixed `EpochProgress`/ordinal cooldown is reproduced unsafe by `SLASH-07`. |
+| O-20 | Field-34 slash record schema | 🔴 | **OWNER-RATIFIED; ENGINEERING OPEN:** invalid-state-proof-only V1, half-open `EtaPeriod` exclusion, audit/exclusion-only field 34 with separate atomic economics, and fixed Scodec/SHA-256 preimages. The current JSON leaf and mixed `EpochProgress`/ordinal cooldown remain unsafe. |
 | O-21 | Optimistic decision evidence | 🔴 | **OWNER RESPONSE REQUIRED:** D-01 already ratifies portable exact signed decided-attestation statements and `T_weight`; only whether those statements are sufficient alone or require additional authoritative transcript material remains unratified. The recommendation is statements alone, with query transcripts audit-only and unable to create qualification authority. |
-| O-22 | Fraud-proof activation and adjudication | 🔴 | **OWNER RESPONSE REQUIRED:** current nonempty proofs have live rooted authority before universal exact-context adjudication exists. The recommendation is current-era field removal, whole-candidate reject/defer, and per-new-signer debit-funded bounties. |
-| O-23 | Slash liability and bond tranches | 🔴 | **OWNER RESPONSE REQUIRED:** current slashing does not debit backing principal or identify offense-time liability. The revised recommendation is fixed-hash complete `E-2` tranches, full-only exact locks with amount-change/retarget rejection, bounded holds, slash-before-release, actual-debit/tombstone/reward conservation, and portable density-reorg revalidation. |
+| O-22 | Fraud-proof activation and adjudication | 🔴 | **OWNER-RATIFIED; ENGINEERING OPEN:** directly replace the provisional path with the final ordinal-zero ScodecV1 InvalidStateProof V1 launch schema; no pre-activation wire era or compatibility. Whole-candidate reject/defer and per-new-signer actual-debit-funded bounties are fixed. |
+| O-23 | Slash liability and bond tranches | 🔴 | **OWNER-RATIFIED; ENGINEERING OPEN:** fixed-hash complete `E-2` tranches, full-only exact locks with amount-change/retarget rejection, bounded holds, slash-before-release, actual-debit/tombstone/reward conservation, and portable density-reorg revalidation. |
 
 ---
 
@@ -380,13 +376,13 @@ and non-load-bearing for V1; V1 safety cannot assume escrow or `k2` secret rollb
 
 ## O-13 — Durable delivery sequence 🟡
 
-**Pending owner packet:**
+**Owner-ratified direction; engineering freeze packet:**
 [`O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md`](O13-ALLOW-SPEND-TERMINAL-ORDER-OWNER-REVIEW.md).
 Its candidate-universe, conflict, expiry, partial-consume, ML0 application, and
-same-proposal recommendations require owner disposition. O13-A3 additionally
-requires a domain-bound framework spend-intent schema, strict authority sequence,
-and equivocation disposition; checkpoint/binary coordinates are provenance and
-must not order economic winners.
+same-proposal rules remain exact schema/oracle freeze gates under the ratified
+direction. O13-A3 additionally requires a domain-bound framework spend-intent
+schema, strict authority sequence, and equivocation disposition;
+checkpoint/binary coordinates are provenance and must not order economic winners.
 
 **Owner-ratified direction** (`CONSENSUS-OWNER-DECISIONS.md:350-386`): hash-linked
 per-destination sequence, rooted outbox head + permanent nullifier, ML0 applied-`(sequence,
@@ -636,25 +632,16 @@ target economic state. O-18 remains independently pending.
 
 ## O-20 - Field-34 slash record schema 🔴
 
-**Status:** **OWNER RESPONSE REQUIRED.** This answers document does not infer a disposition from
-the presence of four `SlashReason` case objects or from the existing invalid-state-proof writer.
+**Status:** **OWNER-RATIFIED DIRECTION; ENGINEERING OPEN.**
 The focused packet is
 [`O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
 
-The pending `O20-01` choice is between an invalid-state-proof-only V1 field-34
-record followed by future variant-specific ADT records/keys, and one generalized
-multi-reason V1. `O20-02` selects a half-open `EtaPeriod` exclusion interval
-instead of the current `EpochProgress`/snapshot-ordinal unit mismatch. `O20-03`
-keeps field 34 limited to culpability/dedup/evidence/exclusion while O-23 economic
-state remains separate but atomically applied. `O20-04` fixes ScodecV1 plus
-SHA-256 identity/evidence preimages instead of ambient hashing. The packet
-recommends all four; that recommendation is not an answer.
-
-Until the owner dispositions `O20-01` through `O20-04`, field-34 JSON removal,
-canonical Scodec value/key activation, and the field-34 accumulator/change-set
-repair remain blocked at the schema freeze. RED tests and dark codec experiments
-may proceed. No future reason tag may reach a consensus writer merely because it
-already exists in the source enum. O-18 and O-19 remain independently pending.
+On 2026-07-29 the owner accepted invalid-state-proof-only V1, a half-open
+`EtaPeriod` exclusion interval, audit/exclusion-only field 34 with separate but
+atomically applied O-23 economics, and fixed ScodecV1/SHA-256
+identity/evidence preimages. Engineering may freeze that exact grammar under the
+packet's gates. The current JSON leaf, mixed-unit interval, direct writer, and
+latent reason tags are not retained. O-18 and O-19 remain independently pending.
 
 ## O-21 - Optimistic decision evidence 🔴
 
@@ -676,28 +663,25 @@ sole live state-changing Phase-2 rail.
 
 ## O-22 - Fraud-proof activation and adjudication 🔴
 
-**Status:** **OWNER RESPONSE REQUIRED.** The focused packet is
+**Status:** **OWNER-RATIFIED DIRECTION; FINAL LAUNCH IMPLEMENTATION OPEN.** The focused packet is
 [`O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
 
-The pending `O22-01` choice is mandatory-empty current-era retention versus
-removing the field until an activating protocol era. `O22-02` asks whether every
-invalid/not-upheld/stale proof rejects the complete candidate and unavailable
-history defers it, with zero filter-and-continue path. `O22-03` asks which
-claimant receives the bounty funded by each newly proven signer's actual debit.
-
-The packet recommends current-era field removal, atomic candidate semantics,
-and per-new-signer debit-funded bounty ownership. This answers document does not
-infer those choices. It also does not weaken already settled invariants: missing
-history cannot slash, local HOCON cannot select rooted economics, per-signer
-accountability is once-only, and exceptional replay results rather than a
-watchtower assertion decide guilt.
+On 2026-07-29 the owner rejected the remove-now/re-add-later framing. O22-01 is
+the direct final bounded InvalidStateProof V1 collection in the sole ordinal-zero
+ScodecV1 launch schema, with no pre-activation wire era, activation ordinal,
+provisional-shape retention, or compatibility decoder. O22-02 fixes atomic
+whole-candidate reject/defer semantics. O22-03 fixes per-new-signer bounty
+ownership funded only by that signer's actual debit. Missing history cannot
+slash, local HOCON cannot select rooted economics, per-signer accountability is
+once-only, and exceptional replay rather than a watchtower assertion decides
+guilt.
 
 ## O-23 - Slash liability and bond tranches 🔴
 
-**Status:** **OWNER RESPONSE REQUIRED.** The focused packet is
+**Status:** **OWNER-RATIFIED DIRECTION; ENGINEERING OPEN.** The focused packet is
 [`O23-SLASH-LIABILITY-OWNER-REVIEW.md`](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
 
-The pending `O23-01` through `O23-06` choices define a fixed-algorithm `BondId`
+The accepted `O23-01` through `O23-06` choices define a fixed-algorithm `BondId`
 and the complete liable `E-2` tranche set; full-only V1 with amount-changing
 bonded replacements and operator/family retargets rejected; bounded hold/release
 horizons; slash-before-release
@@ -709,8 +693,8 @@ The packet was adversarially revised because the earlier shorthand was not
 schema-freezeable: one replacement lock cannot represent old and new exact
 tranches, ordinal-selected hashes are not stable bond identities, a prior debit
 must be distinguished from unexplained missing backing, and local old-branch
-state cannot prove historical Phase 2. This answers document does not infer the
-revised choices.
+state cannot prove historical Phase 2. The owner accepted the revised choices on
+2026-07-29; all implementation and qualification gates remain open.
 
 ---
 
@@ -750,8 +734,9 @@ revised choices.
    quantification/rejoin; O-13 full ordering/bounds; O-14 codec/E9 interaction; **O-15
    A/B/C/D/E/F/G**; O-16 freshness/purpose/schema; and O-17 R008-04/05 parameters/identities and
    activation proofs. These are not unanswered owner choices and may not be filled by local
-   configuration or an implementation shortcut. O-18, O-19, O-20, O-21, O-22, and O-23 are different: their focused
-   choices are newly surfaced and still await an owner response.
+   configuration or an implementation shortcut. O-20, O-22, and O-23 now join
+   that owner-ratified/engineering-open set. O-18, O-19, and O-21 still await
+   focused owner responses.
 
 ## Provenance
 

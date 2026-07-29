@@ -1,31 +1,36 @@
 # O-22 Fraud-Proof Activation and Adjudication Owner Review
 
-**Status:** OWNER RESPONSE REQUIRED. The current implementation gives nonempty
-`fraudProofs` live proposal and rooted economic authority before portable
-adjudication has been established. This packet does not ratify that behavior.
+**Status:** OWNER-RATIFIED DIRECTION; FINAL LAUNCH IMPLEMENTATION OPEN. On
+2026-07-29 the owner rejected the remove-now/re-add-in-a-later-era framing and
+ratified a direct greenfield replacement: the sole ordinal-zero ScodecV1 launch
+schema contains the final bounded InvalidStateProof V1 contract. There is no
+pre-activation fraud-proof wire era and no compatibility decoder. Atomic
+candidate semantics and per-new-signer, actual-debit-funded bounty ownership are
+also ratified.
 
-**Runtime authority after containment:** None. Transport, local replay, bounded
-pooling, and RED tests may remain dark, but no current-era fraud proof may enter a
-GL0 proposal or change canonical state.
+**Current runtime authority:** Unsafe and unqualified. The provisional
+`fraudProofs` path remains source evidence only and must be disconnected while
+the final launch path is built. That development interlock is not an on-chain
+era, launch schema, or future activation mechanism.
 
 **Primary gates:** O-03, O-11, O-16, O-17, O-18, O-20, WT-001..010,
 O-23, SLASH-03..06, ECO-06, and MPT-05
 
-**Updated:** 2026-07-16
+**Updated:** 2026-07-29
 
-## 1. Decision required
+## 1. Ratified decisions
 
-O-22 asks three bounded questions:
+The owner dispositions are:
 
-1. Before activation, should the current snapshot schema retain a
-   mandatory-empty `fraudProofs` field, or remove the field until a later
-   protocol era?
-2. After activation, does any invalid, not-upheld, stale, or unavailable proof
-   reject/defer the complete candidate, rather than being filtered while the
-   candidate continues?
-3. When later evidence proves additional signers on an already-disputed
-   checkpoint, which claimant receives the bounty from each newly debited
-   signer?
+1. `O22-01`: replace the provisional path once with the final bounded
+   `InvalidStateProofEvidenceV1` collection in the sole ordinal-zero ScodecV1
+   launch schema. Do not remove and later re-add it, introduce an activation
+   ordinal, retain the provisional shape, or add compatibility.
+2. `O22-02`: any invalid, not-upheld, stale, or unavailable proof rejects or
+   defers the complete candidate, rather than being filtered while the candidate
+   continues.
+3. `O22-03`: each newly proven signer funds the winning claimant's bounty only
+   from principal actually debited from that signer.
 
 This does not alter the consensus architecture. GL0 remains a
 Nakamoto/Taktikos/LDD chain. A fraud proof is exceptional evidence about one
@@ -44,58 +49,45 @@ attestation, or substitute for normal execution.
 | Rooted effects | Locally upheld results can change stake/collateral, bounty/cooldown state, and field 34 (`GlobalSnapshotAcceptanceManager.scala:2647-2673,2959-2984`). | Fraud-proof handling already affects the MPT root and economics. |
 | Active-era guard | `GlobalSnapshotActiveEraValidator` rejects only a populated historical `smtRoot` (`modules/shared/src/main/scala/io/constellationnetwork/validator/GlobalSnapshotActiveEraValidator.scala:10-30`). | Any nonempty `fraudProofs` shape passes the era gate today. |
 | Policy | Watchtower enablement, slash/bounty fractions, and cooldown inputs are local configuration (`modules/node-shared/src/main/resources/application.conf:556-588`; `modules/dag-l0/src/main/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/GlobalSnapshotConsensus.scala:702-707`). | Honest nodes with different local policy can derive different rooted results from one proposal. |
-| Retired JSON member | The manual snapshot decoder consumes known fields but does not reject unknown keys (`GlobalIncrementalSnapshot.scala:153-228`), and `Signed` delegates its nested value to that decoder (`security/signature/Signed.scala:56`). | After field removal, an attacker can add a retired `fraudProofs` member to a correctly signed new-shape JSON artifact. Circe can discard the key, then signature verification hashes the clean decoded value and succeeds unless key presence is rejected explicitly. |
+| Legacy JSON authority | The manual snapshot decoder consumes known fields but does not reject unknown keys (`GlobalIncrementalSnapshot.scala:153-228`), `Signed` delegates its nested value to that decoder (`security/signature/Signed.scala:62`), and live signing still hashes through `Hasher.forJson` (`security/Hasher.scala:111-126`). | This is a confirmed SER-005 cutover gap. Strict unknown-key rejection is useful only as a temporary development interlock; the launch fix is to remove authoritative JSON ingress and sign/verify complete ScodecV1 bytes. |
 
-The current path is therefore not dark. It must not remain active while this
-decision is pending.
+The current path is therefore not dark. It must not remain active while the
+ratified final replacement is incomplete.
 
-## 3. O22-01 pre-activation representation
+## 3. O22-01 final launch representation
 
-### Option A - mandatory-empty current-era field
+This greenfield network has one launch representation:
 
-Retain the current ScodecV1 field temporarily, but make the
-active-era validator reject every nonempty value. Honest construction always
-emits `SortedSet.empty`, independently of local pool contents or HOCON. This is
-the same containment pattern already used for dark `smtRoot` activation.
+- `GlobalIncrementalSnapshot` uses the sole ordinal-zero ScodecV1 schema.
+- Its fraud-proof field is a bounded canonical collection of the final
+  `InvalidStateProofEvidenceV1`, not the provisional
+  `InvalidStateProofEvidence`.
+- The evidence binds the final checkpoint body, namespace-confined diff/root,
+  canonical distinct execution signatures, challenger and signature domain,
+  exact historical Phase-2 qualification, historical committee/KES/VRF/eta and
+  rooted policy, complete offense-time bond liability, and exact replay inputs
+  or a mandatory-available bounded content-addressed bundle.
+- The logical identity preserves claimant and newly covered signer distinctions.
+  It cannot coalesce a later proof that establishes additional culpable signers.
+- Count, byte, replay-work, historical-proof, and total economic-effect limits
+  are fixed consensus parameters.
 
-Local transport, emitter, replay, and pool code may continue for bounded testing
-and diagnostics. Their outputs cannot enter a GL0 proposal, change an MPT root,
-create a portable upheld capability, or be grandfathered into a future era.
+The provisional shape is not frozen. In particular, redundant untrusted
+`attestedRoot`, `claimedDerivation`, `challengerDerivation`, and free-form
+`reexecutionWitness` values do not become authority. Universal exceptional replay
+derives the complete verdict.
 
-### Option B - remove the field until an activating era
+There is no remove/re-add sequence, activation transaction, optional launch
+feature, or fork-only compatibility decoder. While the replacement is under
+construction, a source-level fail-closed interlock disconnects provisional pool
+sourcing, rejects nonempty provisional evidence, prevents the provisional GSAM
+sink, and prevents provisional field-34 records from affecting committee
+selection. The interlock is deleted when the final launch implementation passes
+qualification; it never appears in consensus bytes.
 
-**Recommendation.** Delete `fraudProofs` from the current snapshot schema and add a versioned field
-only in the protocol era that activates the complete adjudication contract. This
-requires no compatibility preservation for this greenfield fork and avoids
-freezing an evidence collection whose per-signer identity, ordering, resource
-bounds, and field-34 relationship are not yet ratified. It causes broader codec
-and constructor churn now, but follows the project's rule against retaining
-undeployed compatibility or abandoned authority shapes.
+## 4. O22-02 launch verdict algebra
 
-The containment is end-to-end, not a case-class-only deletion. Current producer,
-follower, and GSAM acceptance lose the proof input, slash fold, bounty/burn path,
-and field-34 writer. Current committee selection must not consume pre-activation
-field-34 records as cooldown authority. Local transport/pool/replay components may
-remain only behind an explicitly dark boundary. O-20 owns the future typed field
-and the disposition of fork-only test data; no existing JSON leaf or interpolated
-key is grandfathered into that era.
-
-The current JSON decoder must explicitly reject the retired key at every nesting
-level; merely deleting the case-class field is permissive because Circe ignores
-unconsumed members. The guard covers direct snapshots, `Signed.value`, combined
-checkpoint files, ML0 global-state wrappers, HTTP responses, and GossipSub/
-ChainSync payloads. Scodec decoding remains complete and rejects the retired
-trailing field. The existing Kryo fallback reads only upstream
-`GlobalIncrementalSnapshotV1`; it is retained for prior upstream-v4 disk access
-and is not a compatibility decoder for this fork's retired 27-field shape.
-
-Accepting nonempty proofs as inert is not a valid third option: it signs bytes
-whose future interpretation is ambiguous. Retaining the current conditional
-slash path is also not valid.
-
-## 4. O22-02 activated verdict algebra
-
-**Recommendation:** accept atomic candidate semantics. Every carried proof must
+**Selected:** atomic candidate semantics. Every carried proof must
 produce exactly one of these results:
 
 | Result | Candidate behavior |
@@ -117,7 +109,7 @@ and can never slash an honest signer.
 
 ## 5. O22-03 signer coverage and bounty ownership
 
-**Recommendation:** debit and reward per newly proven signer. The evidence and
+**Selected:** debit and reward per newly proven signer. The evidence and
 deduplication identity is `(peerId, shardId, checkpointHash)`, not merely
 `(shardId, checkpointHash)`.
 
@@ -137,7 +129,7 @@ deduplication identity is `(peerId, shardId, checkpointHash)`, not merely
   creates a synthetic bounty.
 
 Per-signer once-only accountability and debit conservation are mandatory. The
-owner choice is the claimant-reward rule when evidence discovers signer subsets
+selected claimant-reward rule applies when evidence discovers signer subsets
 incrementally.
 
 Current checkpoint-wide behavior is insufficient: each committee signature
@@ -154,7 +146,7 @@ signers (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared
 
 The following are exact proposal-parent protocol state, never local HOCON:
 
-- activation status and protocol-era/schema identity;
+- protocol-era/schema/parameter identity;
 - slash fraction, bounty fraction, cooldown, and roster-effect boundary;
 - challenge and retention horizon;
 - challenger bond and false-claim consequence;
@@ -165,7 +157,8 @@ logging, metrics, caches, dark-era local replay, and storage above a protocol
 minimum. Local resource shortage causes defer/recovery, never no-slash
 acceptance.
 
-Activation remains blocked until all of these are implemented and tested:
+Launch qualification remains blocked until all of these are implemented and
+tested:
 
 1. Exact proposal-parent and historical adjudication, including Phase-2 lineage
    and density-reorg behavior.
@@ -186,64 +179,78 @@ removes metadata, and derives bounty from their nominal total
 It does not prove that a corresponding locked principal was debited. Saturating
 bounty credit does not repair that conservation gap.
 
-## 7. Activation and reorg rule
+## 7. Launch and reorg rule
 
-1. Current-era snapshots require an empty field under Option A, or have no field
-   under Option B.
-2. The activating protocol transition commits the complete policy/schema and
-   cannot itself carry fraud proofs.
-3. The first proof-bearing snapshot is a child whose exact proposal parent
-   already contains the active policy.
-4. A density reorg removing the activation parent restores pre-activation
-   semantics.
-5. Dark pool entries and local upheld results are discarded or fully
-   revalidated against the new exact context. They are never grandfathered.
-6. Pre-activation nonempty artifacts remain invalid forever.
-7. O-20 selects the target Scodec record; no fork-only JSON compatibility leaf
-   is retained.
-8. O-19 independently governs any future upstream-v4 import. Source-chain
+1. New-chain ordinal zero commits the sole ScodecV1 schema and rooted policy.
+   There is no protocol activation transaction or earlier target-chain era.
+2. Every proof-bearing candidate is evaluated against its exact proposal parent.
+   Local pool state, an ambient live head, and a receiver's current configuration
+   are never inputs.
+3. A Phase-2 density reorg rolls back the complete proof verdict, field-34
+   record, exclusion, liability, debit, bounty/burn, balance, and supply delta.
+4. Orphaned evidence must be fully revalidated against the replacement exact
+   context. An old local upheld result is never grandfathered and an unavailable
+   old base cannot slash.
+5. O-20 defines the launch Scodec field-34 record; no fork-only JSON leaf,
+   provisional evidence shape, or compatibility decoder is retained.
+6. O-19 independently governs future upstream-v4 import. Source-chain
    statements are evidence, not target-chain slash authority.
 
-## 8. Atomic containment sequence
+## 8. Atomic implementation sequence
 
-Under recommended Option B, the active removal is one atomic consensus commit:
+The direct final implementation is split into reviewable build slices, followed
+by one consensus integration replacement:
 
-1. remove `fraudProofs` from the current snapshot case class, strict JSON
-   decoder, and complete Scodec shape;
-2. disconnect local pool input and carried-proof threading from producer,
-   follower recreation, and context reconstruction;
-3. remove proof/config/validator inputs and the slash/bounty/field-34 sink from
-   GSAM while preserving the ordinary no-proof economic result exactly;
-4. remove production field-34 cooldown consumption and hard-bind current-era
-   committee construction to no exclusion;
-5. retain bounded transport, replay, and pool components only as an explicitly
-   dark diagnostic path; and
-6. update every direct, wrapped, disk, HTTP, GossipSub, ChainSync, restart, and
-   catch-up decoder/test in the same change.
+1. **Development interlock.** Stop provisional pool sourcing, reject nonempty
+   provisional evidence, reject rather than filter provisional adjudication
+   failures, and disconnect provisional field-34 committee effects. Do not
+   introduce a temporary target wire schema.
+2. **Consensus-byte cutover.** Complete SER-005 with a Scodec hasher API that
+   requires one audited `ConsensusHashSchema[A]` binding the exact byte-aligned
+   codec, unique static domain, and frozen bound; migrate producer/verifier
+   pairs, signatures, hashes, storage, GossipSub/ChainSync/HTTP consensus ingress,
+   checkpoint preimages, and evidence preimages together. JSON is API/debug
+   projection only.
+3. **Final grammar.** Freeze the bounded final checkpoint/evidence, O-20 field-34,
+   `BondId`, liability, hold/release, consumed-bond tombstone, and rooted-policy
+   types and Scodec vectors. Allocate separate rooted O-23 economic partitions.
+4. **Liability propagation.** Carry stable `BondId` through active and pending
+   delegation/collateral state, enforce exact-amount lifecycle rules, and commit
+   complete E-2 tranche liability.
+5. **Portable adjudication.** Authenticate signers independently of ordinary
+   structural checkpoint validity and return exactly `Upheld`,
+   `EvidenceInvalid`, `NotUpheld`, `NoNewlyCulpableSigner`, or
+   `HistoryUnavailable`.
+6. **Atomic sink.** Preflight all evidence against one immutable proposal-parent
+   capture, then apply all or none of locks, lifecycle maps, release indices,
+   tombstones, field 34, exclusion, rewards, checked bounty/burn, balances, and
+   supply.
+7. **Replay and recovery.** Extend `StateChangesAccumulator`, change sets,
+   follower replay, restart, catch-up, and density-reorg rollback with the same
+   complete slash delta.
+8. **Final integration replacement.** Replace the provisional field/path once
+   with `InvalidStateProofEvidenceV1`, remove the development interlock, and pass
+   the complete RED/model/multi-node qualification corpus.
 
-These cannot be split across runtime commits. A schema/codec-only change leaves
-hidden state authority or mixed bytes, while a sink-only change signs a retired
-field with undefined future meaning. Mixed old/new fork nodes are intentionally
-incompatible; this greenfield branch restarts from the new current schema rather
-than adding a dual decoder. The isolated upstream-v4 Kryo reader remains an
-import/disk-read path, not current consensus compatibility.
+No slice creates an on-chain dormant era. Producer and verifier migrations for a
+given consensus object cannot be split, and dual JSON/Scodec signature
+acceptance is forbidden. The isolated upstream-v4 reader belongs only in the
+offline importer and is not current runtime compatibility.
 
 ## 9. Required tests
 
-1. Under Option A, the current-era field is present-empty, every nonempty value
-   rejects before GSAM/MPT/overlay/finality mutation, and a populated local pool
-   cannot change the emitted empty value. Under recommended Option B, the field
-   is absent, the producer never consults/copies the pool, and strict JSON/other
-   object decoders reject an explicitly supplied retired `fraudProofs` member
-   when empty, populated, `null`, or malformed, including inside `Signed.value`;
-   Scodec rejects every old-shape or trailing-field byte vector.
-2. Brotli snapshot storage, combined-checkpoint storage, ML0 global-state
-   wrappers, direct/streaming HTTP download, GossipSub, ChainSync, traversal,
-   serving, restart, and catch-up enforce the same era boundary. Legitimate
-   upstream `GlobalIncrementalSnapshotV1` Kryo disk promotion remains readable,
-   while no fork 27-field fallback exists.
+1. During implementation, the development interlock proves that a populated
+   provisional pool cannot reach proposal, GSAM, MPT, overlay, storage, serving,
+   finality, or committee selection. This test is deleted or converted to a
+   source guard when the final path replaces it.
+2. Final direct, wrapped, disk, HTTP, GossipSub, ChainSync, restart, catch-up,
+   checkpoint, and ML0 envelope paths carry or retain exact bounded ScodecV1
+   bytes. Old provisional shapes, unknown tags, trailing bytes, malformed
+   refinements, duplicate identities, unsorted collections, and over-limit
+   values reject. Upstream-v4 Kryo/Brotli fixtures are readable only by the
+   offline importer.
 3. Different local watchtower/slash/bounty/cooldown HOCON values produce
-   identical current-era artifacts and roots at shard counts 1, 2, and K.
+   identical launch artifacts and roots at shard counts 1, 2, and K.
 4. Upheld, invalid, not-upheld, unavailable, and stale results exercise the exact
    verdict algebra. Asymmetric history/cache/restart yields universal defer,
    never slash versus no-slash.
@@ -254,30 +261,28 @@ import/disk-read path, not current consensus compatibility.
    permutations and near-maximum arithmetic.
 7. Field-34 key/value mismatch, duplicate identity, reorg, restart, and
    change-set replay fail closed.
-8. Activation-parent replacement invalidates proof-bearing descendants and all
+8. Phase-2 base/parent replacement invalidates proof-bearing descendants and all
    old-lineage local capabilities.
 9. Local QoS variation never changes artifact validity or rooted output.
 
 Existing W3a component tests use identical stub replay and policy across nodes.
-They remain useful dark/future-era tests, but do not prove activation safety.
+They remain useful component tests, but do not prove launch safety.
 
-The focused pre-activation oracle
+The focused legacy/interlock oracle
 `O22FraudProofPreActivationContainmentRedSuite` compiles and fails all four
-intended gates with zero errors: active producer/GSAM authority, acceptance of a
-retired JSON member, acceptance of the pinned retired Scodec shape, and current
-field-34 cooldown influence on committee selection. Its SHA-256 is
+legacy/interlock gates with zero errors: active producer/GSAM authority,
+permissive legacy JSON member handling, acceptance of the provisional Scodec
+shape, and provisional field-34 cooldown influence on committee selection. It
+does not specify the final launch schema. Its SHA-256 is
 `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
 
-## 10. Owner response format
+## 10. Owner disposition
 
-Please answer all three:
+- `O22-01`: final ordinal-zero ScodecV1 launch schema; no remove/re-add era,
+  activation ordinal, provisional-shape retention, or compatibility decoder.
+- `O22-02`: accepted atomic candidate semantics.
+- `O22-03`: accepted per-new-signer, actual-debit-funded bounty ownership.
 
-- `O22-01: accept recommendation (Option B)` or `O22-01: Option A`;
-- `O22-02: accept atomic candidate semantics` or provide a different exact
-  invalid/not-upheld/unavailable rule; and
-- `O22-03: accept per-new-signer debit-funded bounty ownership` or provide a
-  different deterministic claimant rule.
-
-An answer selects the design only. It does not close the listed engineering,
-schema, economics, resource, recovery, or adversarial-test gates and does not
-activate fraud proofs.
+These answers select design only. They do not close the listed engineering,
+schema, economics, resource, recovery, or adversarial-test gates. Fraud proofs
+become launch-authoritative only when the final implementation passes them.

@@ -7,17 +7,17 @@ missing parameter, schema, reference model, or proof needed to close an engineer
 may infer its byte, compression, chunking, retention, or migration choices. `O-19` was surfaced by
 the upstream-v4 migration-coverage audit and also awaits an owner response; no implementation may
 infer a field disposition, source-authentication exception, registry, epoch/eta mapping, or
-conservation rule. `O-20` was surfaced by the field-34 slash-record audit and awaits an owner
-response; no implementation may infer a generalized slash-record schema or activate a latent slash
-reason. `O-21` was surfaced by the optimistic-finality evidence audit and awaits an owner response;
-no implementation may infer that gossip counts or an opaque digest prove a completed sampled cascade.
-`O-22` was surfaced by the fraud-proof activation audit and awaits an owner response; no implementation
-may give a current-era nonempty proof consensus authority or infer a filter-and-continue adjudication rule.
-`O-23` was surfaced by the ECO-06 principal-conservation audit and awaits an owner response; no
-implementation may infer slash-time operator-wide liability, partial-lock semantics, or a release horizon.
-**Owner-question completeness:** `17/23` dispositioned. `O-01` through `O-17` are ratified;
-`O-18`, `O-19`, `O-20`, `O-21`, `O-22`, and `O-23` are pending.
-**Updated:** 2026-07-16
+conservation rule. `O-20` is ratified as invalid-state-proof-only field 34 with a half-open
+`EtaPeriod` exclusion interval, separate atomic economics, and fixed ScodecV1/SHA-256 preimages.
+`O-21` was surfaced by the optimistic-finality evidence audit and awaits an owner response; no
+implementation may infer that gossip counts or an opaque digest prove a completed sampled cascade.
+`O-22` is ratified as a direct final ordinal-zero ScodecV1 fraud-proof launch path with atomic
+candidate semantics and per-new-signer actual-debit-funded bounties; there is no pre-activation wire
+era. `O-23` is ratified with fixed complete E-2 bond tranches, full-only V1, bounded holds,
+slash-before-release, actual-debit/tombstone/reward conservation, and portable revalidation.
+**Owner-question completeness:** `20/23` dispositioned. `O-01` through `O-17`, `O-20`, `O-22`,
+and `O-23` are ratified; `O-18`, `O-19`, and `O-21` are pending.
+**Updated:** 2026-07-29
 
 This register uses project phases only where the owner has ratified them:
 Phase 0 `Pending`, Phase 1 `Provisional`, and Phase 2 `Operational`. `k2` is a
@@ -706,24 +706,22 @@ stipend, or install target economic state.
 Owner-review packet:
 [O-20 Field-34 Slash Record Schema Owner Review](O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md).
 
-**OWNER RESPONSE REQUIRED; FIELD-34 SCODEC FREEZE BLOCKED.** The only production
+**OWNER-RATIFIED DIRECTION; FIELD-34 IMPLEMENTATION OPEN.** The only production
 `SlashedRegistryEntry` constructor is the invalid-state-proof ledger sink and it
 hard-codes `SlashReason.InvalidStateProof`. The shared record nevertheless exposes
 three future reason tags while requiring invalid-checkpoint-specific `shardId` and
 `disputedCheckpointHash` fields. Its physical key is the same checkpoint-specific
 triple, and its value still uses a hand-written JSON `ImmutableCodec`.
 
-The owner must disposition `O20-01` through `O20-04`: invalid-state-proof-only V1
-versus a generalized multi-reason record; a half-open `EtaPeriod` committee-
-exclusion interval versus the current mixed-unit field; audit/exclusion-only
-field 34 with separate atomic O-23 economics; and fixed ScodecV1 plus SHA-256
-identity/evidence preimages versus ambient hashing. The packet recommends the
-narrow V1 and all three cross-cutting corrections, but those recommendations
-have no authority until answered.
+The owner accepted `O20-01` through `O20-04` on 2026-07-29:
+invalid-state-proof-only V1, a half-open rooted `EtaPeriod` committee-exclusion
+interval, audit/exclusion-only field 34 with separate atomic O-23 economics, and
+fixed ScodecV1 plus SHA-256 identity/evidence preimages.
 
-Until then, RED tests and dark codec experiments may proceed, but no implementation
-may activate field-34 Scodec bytes, use sentinels/optional combinations to fill
-undefined future contexts, or treat enum presence as a designed slash consequence.
+Engineering may freeze that exact narrow schema under the packet's gates. It may
+not retain the current JSON leaf, activate latent reason tags, use
+sentinel/optional combinations for undefined future contexts, or treat enum
+presence as a designed slash consequence.
 
 ### O-21 Optimistic decision evidence
 
@@ -753,22 +751,22 @@ and `DecidedAttestationEvidence` remains opaque and nonactivating.
 Owner-review packet:
 [O-22 Fraud-Proof Activation and Adjudication Owner Review](O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md).
 
-**OWNER RESPONSE REQUIRED; NONEMPTY ACTIVE-ERA PROOFS MUST BE CONTAINED.** The
+**OWNER-RATIFIED DIRECTION; FINAL LAUNCH IMPLEMENTATION OPEN.** The
 current producer copies a node-local fraud pool into the globally signed artifact,
 and GSAM can turn locally upheld evidence into rooted stake, bounty, cooldown, and
 field-34 effects. The active-era shape validator does not reject this field, while
 failed or unavailable adjudication is currently mapped to no slash and continued
 acceptance. This is live consensus authority, not dark scaffolding.
 
-The owner must disposition `O22-01` through `O22-03`: retain a mandatory-empty
-current-era field versus remove it until an activating era; adopt atomic
-reject/defer semantics instead of filtering failed proof adjudication; and freeze
-the deterministic bounty claimant rule when later evidence proves additional
-signers on an already-disputed checkpoint. The packet recommends removing the
-unratified current-era field, whole-candidate reject/defer, and bounties funded only by each newly
-proven signer's actual debit.
+The owner ratified `O22-01` through `O22-03` on 2026-07-29. Replace the
+provisional path once with the final bounded InvalidStateProof V1 collection in
+the sole ordinal-zero ScodecV1 launch schema. There is no mandatory-empty or
+removed target era, activation ordinal, provisional-shape compatibility, or
+later re-add. Carried evidence uses atomic whole-candidate reject/defer semantics,
+and each newly proven signer funds the deterministic winning claimant only from
+that signer's actual debit.
 
-No answer activates slashing. Exact proposal-parent adjudication, per-signer
+Ratification does not activate slashing. Exact proposal-parent adjudication, per-signer
 deduplication, structural-invalid signer accountability, rooted policy, principal
 conservation, field-34 Scodec/key grammar, historical atomic KES+VRF context,
 watchtower coverage, resource bounds, and density-reorg behavior remain mandatory
@@ -779,25 +777,26 @@ engineering gates.
 Owner-review packet:
 [O-23 Slash Liability and Bond Tranche Owner Review](O23-SLASH-LIABILITY-OWNER-REVIEW.md).
 
-**OWNER RESPONSE REQUIRED; ECO-06 IS NOT A PENDING-MAP PATCH.** The current
+**OWNER-RATIFIED DIRECTION; ECO-06 IS NOT A PENDING-MAP PATCH.** The current
 manager selects whatever active records point at a signer when the proof is
 included. It therefore misses offense-time principal moved to pending and can
 charge delegation created after the bad signature. Existing historical stake
 state commits only an aggregate per operator and cannot identify the liable
 locks across successor/replacement lineages.
 
-The owner must disposition `O23-01` through `O23-06`: fixed SHA-256 `BondId`
-preimage and complete `E-2` operator-tranche liability; full-only V1 with every
-amount-changing bonded replacement and operator/family retarget rejected; rooted bounded hold/release
-horizons; slash-before-release same-candidate ordering; actual-debit bounty,
-consumed-bond tombstones, and reward burn; and portable historical Phase-2
-revalidation with exact backing outcomes and no deadline reset after a density
-reorg. These corrections are required because the
+The owner accepted `O23-01` through `O23-06` on 2026-07-29: fixed SHA-256
+`BondId` preimage and complete `E-2` operator-tranche liability; full-only V1
+with every amount-changing bonded replacement and operator/family retarget
+rejected; rooted bounded hold/release horizons; slash-before-release
+same-candidate ordering; actual-debit bounty, consumed-bond tombstones, reward
+burn; and portable historical Phase-2 revalidation with exact backing outcomes
+and no deadline reset after a density reorg. These corrections are required because the
 earlier shorthand could overcharge an increased lock, lose old liability, derive
 different identities across hash eras, or confuse prior consumption with missing
 backing.
 
-No O-23 answer activates the live path. O-20/O-22, exact historical Phase-2
+O-23 ratification does not activate the live path. O-20/O-22 implementation,
+exact historical Phase-2
 context, per-signer adjudication, resource bounds, atomic accumulator integration,
 serde, restart, and reorg gates remain mandatory.
 

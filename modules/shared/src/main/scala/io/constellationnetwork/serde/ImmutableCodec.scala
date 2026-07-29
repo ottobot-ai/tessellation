@@ -3,7 +3,7 @@ package io.constellationnetwork.serde
 import cats.syntax.either._
 
 import scodec._
-import scodec.bits.ByteVector
+import scodec.bits.{BitVector, ByteVector}
 
 /** Canonical, round-trippable byte representation of `T` — the "immutable" encoding.
   *
@@ -31,12 +31,19 @@ trait ImmutableCodec[T] {
 object ImmutableCodec {
   def apply[T](implicit ev: ImmutableCodec[T]): ImmutableCodec[T] = ev
 
+  private def requireByteAligned(bits: BitVector): ByteVector =
+    if (bits.size % 8L == 0L) bits.toByteVector
+    else
+      throw new IllegalArgumentException(
+        s"ImmutableCodec encode produced a non-byte-aligned payload of ${bits.size} bits"
+      )
+
   /** Build from a scodec `Codec`. The scodec codec is the single source of truth for both encode and decode — same bits in both directions.
     */
   def fromScodecCodec[T](codec: Codec[T]): ImmutableCodec[T] = new ImmutableCodec[T] {
     def immutableBytes(value: T): ByteVector =
       codec.encode(value) match {
-        case Attempt.Successful(bits) => bits.toByteVector
+        case Attempt.Successful(bits) => requireByteAligned(bits)
         case Attempt.Failure(cause) =>
           throw new IllegalArgumentException(s"ImmutableCodec encode failed: ${cause.messageWithContext}")
       }
@@ -57,7 +64,7 @@ object ImmutableCodec {
   def fromScodec[T](enc: Encoder[T], dec: Decoder[T]): ImmutableCodec[T] = new ImmutableCodec[T] {
     def immutableBytes(value: T): ByteVector =
       enc.encode(value) match {
-        case Attempt.Successful(bits) => bits.toByteVector
+        case Attempt.Successful(bits) => requireByteAligned(bits)
         case Attempt.Failure(cause) =>
           throw new IllegalArgumentException(s"ImmutableCodec encode failed: ${cause.messageWithContext}")
       }

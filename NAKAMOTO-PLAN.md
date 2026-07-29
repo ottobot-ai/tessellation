@@ -21,22 +21,13 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `17/23` dispositioned. `O-01` through `O-17` are
-ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`; `O-18` transport/DA
-bytes, `O-19` upstream-v4 migration policy, and `O-20` field-34 slash-record schema
-await owner responses in
-`docs/review/O18-TRANSPORT-DA-BYTE-CONTRACT-OWNER-REVIEW.md` and
-`docs/review/O19-V4-SNAPSHOT-MIGRATION-POLICY-OWNER-REVIEW.md`, and
-`docs/review/O20-SLASH-RECORD-SCHEMA-OWNER-REVIEW.md`. `O-21` optimistic decision
-evidence awaits a response in
-`docs/review/O21-OPTIMISTIC-DECISION-EVIDENCE-OWNER-REVIEW.md`. `O-22` fraud-proof
-activation and adjudication awaits a response in
-`docs/review/O22-FRAUD-PROOF-ACTIVATION-OWNER-REVIEW.md`. `O-23` slash liability
-and bond tranches awaits a response in
-`docs/review/O23-SLASH-LIABILITY-OWNER-REVIEW.md`. Dependencies under
-O-01 through O-17 mean implementation of their ratified direction and closure of
-their listed engineering, research, schema, parameter, or proof gates. O-18,
-O-19, O-20, O-21, O-22, and O-23 are the only pending owner responses.
+**Owner-decision status:** `20/23` dispositioned. `O-01` through `O-17`, `O-20`,
+`O-22`, and `O-23` are ratified in
+`docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. `O-18` transport/DA bytes,
+`O-19` upstream-v4 migration policy, and `O-21` optimistic decision evidence
+await owner responses in their focused review packets. Dependencies under every
+ratified decision still require implementation and closure of the listed
+engineering, research, schema, parameter, and proof gates.
 
 ## Active objective
 
@@ -1278,15 +1269,18 @@ delivery, rollback, and recovery.
   asymmetry maps `CannotRederive` to no-slash while another node may uphold, and
   local env-overridable watchtower/slash parameters feed rooted state. Branch-aware
   evidence/adjudication, `FIN-14`, `SHARD-C-012`, `O-16`, and `O-20` remain open.
-  **O-22 stop-the-line correction:** this path is not dark today: a producer peeks
-  the local pool into `GlobalIncrementalSnapshot.fraudProofs`, and GSAM can apply
-  rooted effects while mapping failed adjudication to no slash. Before any further
-  live use, O-22 must select mandatory-empty versus field removal, whole-candidate
-  verdict semantics, and incremental-signer bounty ownership. `WT-000` is the
-  current-era containment gate; its focused RED oracle currently fails all four
-  intended authority/retired-shape/cooldown checks with zero errors (SHA-256
+  **O-22 ratified final-launch correction:** this path is not dark today: a
+  producer peeks the local pool into `GlobalIncrementalSnapshot.fraudProofs`, and
+  GSAM can apply rooted effects while mapping failed adjudication to no slash.
+  Replace the provisional path once with the final bounded InvalidStateProof V1
+  collection in the sole ordinal-zero ScodecV1 launch schema. There is no
+  mandatory-empty or removed target era, later activation, or compatibility
+  decoder. Whole-candidate verdict semantics and per-new-signer actual-debit
+  bounty ownership are fixed. `WT-000` is a temporary source-level development
+  interlock; its focused RED oracle currently fails all four
+  authority/provisional-shape/cooldown checks with zero errors (SHA-256
   `e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`).
-  `WT-001..010` remain future activation gates.
+  `WT-001..010` qualify the final launch implementation.
 - A package-private dark identity-composition model now requires the real
   `CanonicalPhase2Lease` type with a dedicated `CurrencySnapshotReplay` purpose,
   the exact-history session, and matching exact-image, semantic, field-32, and
@@ -1386,12 +1380,13 @@ delivery, rollback, and recovery.
 - An assigned, bonded, rate-limited challenge names exact retained inputs/base,
   checkpoint, signers, and reproduced mismatch. An assertion alone never rolls
   back or slashes.
-- **PRE-ACTIVATION CONTAINMENT:** O-22 recommends removing `fraudProofs` from the
-  current greenfield `GlobalIncrementalSnapshot` schema, disconnecting the local
-  pool/validator/slash fold/field-34 writer from producer and follower consensus,
-  and retaining any transport/replay components as explicitly dark tests only.
-  No current-era nonempty proof may change canonical bytes or state while
-  O-20/O-22/O-23 and the engineering gates remain open. This also contains
+- **FINAL LAUNCH REPLACEMENT:** O-22 requires direct replacement of the
+  provisional `fraudProofs` path with the final bounded InvalidStateProof V1
+  collection in the sole ordinal-zero ScodecV1 schema. Do not remove and later
+  re-add it, add an activation ordinal, or preserve the provisional shape. A
+  temporary source-level interlock disconnects the unsafe local pool,
+  provisional validator/slash fold, and provisional field-34 committee effect
+  while the final implementation is assembled; it is not a protocol era. This also contains
   `SLASH-07`: the current field-34 writer expresses cooldown in `EpochProgress`
   while committee selection compares it to a snapshot-ordinal-derived anchor,
   allowing event-triggered schedules to produce an empty exclusion interval.
@@ -1440,8 +1435,9 @@ delivery, rollback, and recovery.
   `PeerId` scan. InvalidStateProof V1 is full-only unless a later protocol era
   specifies residual-lock semantics. Slash consumes exact active or pending
   backing before maturity/replacement, funds bounty only from actual debit, and
-  deduplicates `(peerId, shardId, checkpointHash)` independently. O-23 owns these
-  pending decisions.
+  deduplicates `(peerId, shardId, checkpointHash)` independently. O-23 ratifies
+  the complete E-2 tranche, full-only, hold/release, same-candidate ordering,
+  debit/tombstone/reward, and portable-revalidation rules.
 - Gates: `WT-001` through `WT-007`, including `WT-002A`/`WT-002B`, `CRYPTO-001`,
   `REC-*`, resource/flood tests.
 
@@ -1498,7 +1494,7 @@ These are consensus dependencies, not optional cleanup:
 
 | Track | Work | Earliest parallel start | Blocks |
 |---|---|---|---|
-| S1 canonical identity/serde/era | Replace live JSON/Kryo hashing/proofs with one hash-bound ScodecV1 ordinal-0 service; freeze composite vectors and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. The unused configurable multi-era registry and invalid bridge scaffold are deleted. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
+| S1 canonical identity/serde/era | Add `Hasher.forScodec` as a typed `ScodecV1Hasher` requiring one audited `ConsensusHashSchema[A]` that binds the exact byte-aligned `ImmutableCodec[A]`, type-specific static domain, and frozen bounded size, then replace live JSON/Kryo hashing/proofs with that one domain-separated ordinal-0 service. Freeze a globally unique schema manifest, composite vectors, and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. The unused configurable multi-era registry and invalid bridge scaffold are deleted. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
 | S2 deterministic framework oracle/kernel | Authorization, checked arithmetic, conservation, semantic replay protection, ordered execution, resource bounds, independent prefix oracle. | After E0 economic grammar | E4/E5/E8-E11/E13 |
 | S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
@@ -1527,10 +1523,11 @@ blockers include accumulator omissions for rooted field 33
 `ConsumedAllowSpends` and field 34 `Slashings`, the unenforced ROOT-008 physical
 MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard
 diff/positive replay-coverage, exact optimistic-tip attestation, and finality/tower
-proof schemas, plus the pending O-18 transport/DA, O-19 migration-policy, O-20
-field-34 slash-record, and O-21 optimistic-decision-evidence decisions. A separate explicit,
-non-implicit MPT commitment codec freezes strict leaf/branch/extension bytes and
-passes 15 focused tests. The atomic-cutover guard now inventories ordinal-selected
+proof schemas. The pending owner decisions are O-18 transport/DA, O-19
+migration policy, and O-21 optimistic-decision evidence. O-20's narrow field-34
+schema direction is owner-ratified; its exact grammar and bytes are not frozen.
+A separate explicit, non-implicit MPT commitment codec freezes strict
+leaf/branch/extension bytes and passes 15 focused tests. The atomic-cutover guard now inventories ordinal-selected
 hash/state-proof authority, direct hash selection, legacy field-erasing snapshot
 projections, live Kryo promotion, and the prior JSON MPT/preimage surfaces. It is
 a syntactic fuse, not semantic non-reachability proof. Live hashing/signing,

@@ -1,26 +1,28 @@
 # O-23 Slash Liability and Bond Tranche Owner Review
 
-**Status:** OWNER RESPONSE REQUIRED. ECO-06 cannot be closed by passing pending
-withdrawal maps and token locks into the existing slash manager. The current
-state does not identify which principal was liable when a checkpoint signer
-committed the offense.
+**Status:** OWNER-RATIFIED DIRECTION; ENGINEERING OPEN. On 2026-07-29 the owner
+accepted `O23-01` through `O23-06`. ECO-06 still cannot be closed by passing
+pending withdrawal maps and token locks into the existing slash manager. The
+current state does not identify which principal was liable when a checkpoint
+signer committed the offense.
 
-**Runtime authority:** None. This packet does not activate fraud proofs,
-slashing, field 34, or any current-era snapshot field.
+**Current runtime authority:** Unsafe and unqualified. This packet does not
+activate or bless the provisional fraud-proof, slashing, field-34, or snapshot
+paths.
 
 **Primary gates:** O-03, O-11, O-20, O-22, ECO-02, ECO-06, WT-002,
 WT-005, SLASH-03..06, ROOT-008-F34, and PARAM-001
 
-**Updated:** 2026-07-16
+**Updated:** 2026-07-29
 
 **Adversarial correction:** the earlier shorthand was not schema-freezeable. A
 single amount-changing replacement lock cannot preserve two exact liability
 tranches; ambient create/reference hashes are not stable identities across hash
 eras; unexplained missing backing is not equivalent to a previously consumed
 bond; and a reorg-surviving verdict needs portable historical Phase-2 evidence.
-The recommendations below incorporate those corrections.
+The selected rules below incorporate those corrections.
 
-## 1. Why another owner decision is required
+## 1. Ratified liability problem
 
 The confirmed ECO-06 exploit has two parts.
 
@@ -54,11 +56,11 @@ identity and a frozen liability interval, or an equally strong rooted construct.
 A current-map-only patch may be retained only as a RED demonstration; it cannot
 be activated.
 
-## 2. Recommended V1 model
+## 2. Ratified V1 model
 
 ### O23-01 - infraction-time bond liability
 
-**Recommendation:** liability attaches to every exact security-bond tranche
+**Selected:** liability attaches to every exact security-bond tranche
 assigned to the signer in the delayed canonical population used for the disputed
 checkpoint. For checkpoint period `E`, the normal source is the exact rooted
 `E-2` eligibility population selected under O-11.
@@ -99,7 +101,7 @@ simpler, but it can seize later innocent delegation and is not recommended.
 
 ### O23-02 - full InvalidStateProof V1 only
 
-**Recommendation:** freeze InvalidStateProof V1 at exactly `1/1`. Any active
+**Selected:** freeze InvalidStateProof V1 at exactly `1/1`. Any active
 policy carrying another fraction is invalid.
 
 Each slashable V1 tranche owns one unique exact-amount backing lock. An
@@ -123,7 +125,7 @@ configuration change.
 
 ### O23-03 - exit and evidence horizon
 
-**Recommendation:** a tranche remains locked and slashable through the last
+**Selected:** a tranche remains locked and slashable through the last
 period in which its N-2 population entry can authorize an artifact, plus the
 complete rooted evidence publication, retrieval, adjudication, inclusion, and
 Phase-2 replacement horizon. The unbond/release delay must be strictly no shorter
@@ -153,7 +155,7 @@ and ordering are protocol law and cannot come from local HOCON.
 
 ### O23-04 - same-candidate order
 
-**Recommendation:** all ordinary events and proof envelopes validate against the
+**Selected:** all ordinary events and proof envelopes validate against the
 same exact proposal parent. Withdrawals may be staged, but no maturity,
 exact-amount successor, or staged release is applied before adjudication. The
 deterministic order is:
@@ -175,7 +177,7 @@ There is no filter-failed-proof-and-continue branch.
 
 ### O23-05 - actual-debit funding and rewards
 
-**Recommendation:** `actualDebit` is the sum of exact backing principal removed
+**Selected:** `actualDebit` is the sum of exact backing principal removed
 without a balance credit after the complete backing join succeeds. Bounty is
 `floor(actualDebit * rootedBountyFraction)` using checked arithmetic; principal
 burn is the remainder. Saturation is forbidden. A culpable signer with no
@@ -201,7 +203,7 @@ accumulator-owned transition.
 
 ### O23-06 - density reorg behavior
 
-**Recommendation:** a signature over an objectively invalid execution result
+**Selected:** a signature over an objectively invalid execution result
 remains culpable when its exact base was authenticated Phase 2 at signing time,
 even if a later density reorg orphans that base. The slash effect itself is
 ordinary branch state: it rolls back when its containing snapshot is orphaned
@@ -231,6 +233,26 @@ density replacement never restarts or extends the clock.
 A signature issued against a base that was never valid Phase 2 is outside this
 InvalidStateProof rule and requires its own typed offense; it cannot be smuggled
 into this tier by treating an unauthenticated state reference as canonical.
+
+### Non-normative Polkadot comparison
+
+The broad security pattern is similar to
+[Polkadot staking](https://paritytech.github.io/polkadot-sdk/master/pallet_staking/index.html),
+not copied from its consensus or dispute protocol. Polkadot records era-specific
+validator/nominator exposure, permits after-the-fact offenses, delays withdrawal,
+and supports reporter rewards. Its
+[slashing-span model](https://paritytech.github.io/substrate/master/pallet_staking/slashing/index.html)
+addresses reused stake and offenses discovered after the fact. Those mechanisms
+preserve historical slashability across unbonding.
+
+This V1 is deliberately different in its accounting identity and consensus
+context: one fixed `BondId` names an exact tranche; full-only
+invalid-state-proof slashing consumes exact backing; a consumed-bond tombstone
+prevents duplicate debit; each signer is adjudicated independently; and evidence
+must survive Phase-2 density replacement through portable revalidation.
+Polkadot's maximum-per-slashing-span accounting and parachain dispute voting are
+not imported. GL0 remains Nakamoto/Taktikos/LDD, and deterministic exceptional
+replay decides an invalid-state proof.
 
 ## 3. Required transition shape
 
@@ -299,10 +321,10 @@ and full maturity refund after the slash record. Its SHA-256 is
 
 ## 5. Implementation sequence after ratification
 
-1. **Contain current authority under O-22.** Remove `fraudProofs` from the
-   current greenfield snapshot schema and disconnect proposal, follower, GSAM,
-   field-34 writer, and cooldown authority. Keep transport/replay only as dark,
-   bounded test components.
+1. **Interlock provisional authority under O-22.** Disconnect provisional pool,
+   proposal, follower, GSAM, field-34, and cooldown authority while building the
+   direct final replacement. This is source-level development containment, not a
+   target wire era or field removal/re-add sequence.
 2. **Freeze schemas under O-20/O-23.** Define the fixed SHA-256 `BondId` preimage,
    bond family, complete E-2 liability set, liability interval/index, bounded
    evidence hold, consumed-bond tombstone, full-only rooted InvalidStateProof
@@ -328,18 +350,16 @@ and full maturity refund after the slash record. Its SHA-256 is
    historical roster/KES/VRF/eta/parameters/liabilities, bounded inputs, and
    signer-specific prior records. Prove restart, catch-up, deep retrieval,
    candidate defer, branch rollback, and density-replacement revalidation.
-7. **Activate in a protocol era only after the RED corpus is green.** The
-   activation parent commits every schema and parameter. Dark pool results are
-   discarded/revalidated and no pre-activation bytes are grandfathered.
+7. **Integrate the final launch path only after the RED corpus is green.** The
+   sole ordinal-zero ScodecV1 launch grammar commits every schema and parameter.
+   Provisional pool results and bytes are never accepted or grandfathered.
 
 The first four stages can be delegated in parallel only at their model/vector
 boundaries. Runtime integration remains ordered because the economic sink cannot
-be wired before the liability and record schemas are frozen, and activation
-cannot precede exact historical/recovery qualification.
+be wired before the liability and record schemas are frozen, and final launch
+integration cannot precede exact historical/recovery qualification.
 
-## 6. Owner response format
-
-Please answer all six:
+## 6. Owner disposition
 
 ```text
 O23-01: accept fixed-hash BondId and complete E-2 operator-tranche liability
@@ -350,6 +370,6 @@ O23-05: accept actual-debit funding, consumed-bond tombstones, and reward burn
 O23-06: accept portable revalidation, exact backing outcomes, and no deadline reset
 ```
 
-An answer selects design only. It does not activate fraud proofs or close O-20,
-O-22, exact historical context, resource, recovery, serde, or adversarial-test
-gates.
+All six directions were accepted on 2026-07-29. The answer selects design only.
+It does not activate fraud proofs or close O-20/O-22 implementation, exact
+historical context, resource, recovery, serde, or adversarial-test gates.
