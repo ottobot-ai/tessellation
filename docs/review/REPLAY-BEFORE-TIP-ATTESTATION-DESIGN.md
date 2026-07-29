@@ -668,7 +668,7 @@ staged landing rules are:
 ### Phase A - RED boundary tests
 
 - Add
-  `modules/dag-l0/src/test/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/GlobalTipAttestationEmitterSuite.scala`.
+  `modules/dag-l0/src/red/scala/io/constellationnetwork/dag/l0/infrastructure/snapshot/nakamoto/GlobalTipAttestationEmitterSuite.scala`.
 - Extend `CatchUpVerificationSuite.scala`, `NakamotoChainStoreSuite.scala`, and
   `TipAttestationWireValidationSuite.scala` with the tests in section 8.
 - Tests must fail before any production API change.

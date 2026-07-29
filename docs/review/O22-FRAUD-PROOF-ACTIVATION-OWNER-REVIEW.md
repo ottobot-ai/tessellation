@@ -268,13 +268,15 @@ offline importer and is not current runtime compatibility.
 Existing W3a component tests use identical stub replay and policy across nodes.
 They remain useful component tests, but do not prove launch safety.
 
-The focused legacy/interlock oracle
-`O22FraudProofPreActivationContainmentRedSuite` compiles and fails all four
-legacy/interlock gates with zero errors: active producer/GSAM authority,
-permissive legacy JSON member handling, acceptance of the provisional Scodec
-shape, and provisional field-34 cooldown influence on committee selection. It
-does not specify the final launch schema. Its SHA-256 is
-`e21fe7bc5f3a98ebd1c97a0ad7d9384fc0397d5b1440be91e0b613a31dfd5cdc`.
+The tracked final-launch oracle
+`O22FinalLaunchWireRedSuite` lives in the isolated `RedTest` source set. It
+compiles and currently reports four failed target gates and one passing byte
+rejection: the JSON digest cutover, bounded canonical V1 evidence, atomic
+five-result field-34 integration, and local-HOCON independence remain RED; the
+known provisional/trailing Scodec fixture already rejects. This replaces the
+stale pre-activation-absence premise rather than retaining it as compatibility.
+The exact file hash and promotion conditions are recorded in
+`CONSENSUS-RED-WITNESS-CATALOG.md`.
 
 ## 10. Owner disposition
 

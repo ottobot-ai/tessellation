@@ -38,19 +38,19 @@ ThisBuild / version := {
     // Priority 2 & 3: Derive from git via sbt-dynver
     val dynverOutput = dynverGitDescribeOutput.value
     val buildId = sys.env.get("GITHUB_RUN_NUMBER").map(n => s"build$n").getOrElse("local")
-    
+
     dynverOutput match {
       case Some(out) if out.hasNoTags =>
         // Repository has no version tags - use fallback
         val sha = out.commitSuffix.sha
         s"0.0.0+notags.$sha.$buildId"
-        
+
       case Some(out) =>
         val baseVersion = out.ref.dropPrefix
         val distance = out.commitSuffix.distance
         val sha = out.commitSuffix.sha
         val isDirty = out.isDirty()
-        
+
         if (distance == 0 && !isDirty) {
           // Exactly on a tag with clean working directory
           baseVersion
@@ -61,7 +61,7 @@ ThisBuild / version := {
           // Commits after tag (most common dev scenario)
           s"$baseVersion+$distance.$sha.$buildId"
         }
-        
+
       case None =>
         // No git info available (shallow clone, no tags, etc.)
         val fallbackBase = "0.0.0"
@@ -76,9 +76,7 @@ ThisBuild / dynverSonatypeSnapshots := false
 // Explicitly derive isSnapshot from git state so ci-release behaves correctly
 // in any context (tag push, branch push, or local invocation)
 ThisBuild / isSnapshot := {
-  dynverGitDescribeOutput.value.forall(out =>
-    out.commitSuffix.distance > 0 || out.isDirty()
-  )
+  dynverGitDescribeOutput.value.forall(out => out.commitSuffix.distance > 0 || out.isDirty())
 }
 
 // Sonatype Central publishing — required by sbt-ci-release (+publishSigned)
@@ -106,6 +104,8 @@ ThisBuild / scalacOptions ++= Seq("-release", "21")
 // sbt-ci-release auto-enables via AutoPlugin
 
 val scalafixCommonSettings = inConfig(IntegrationTest)(scalafixConfigSettings(IntegrationTest))
+lazy val RedTest = config("red").extend(Test)
+lazy val redTestSettings = inConfig(RedTest)(Defaults.testSettings ++ scalafixConfigSettings(RedTest))
 
 bloopExportJarClassifiers in Global := Some(Set("sources"))
 
@@ -129,11 +129,11 @@ lazy val commonTestSettings = Seq(
 )
 
 ThisBuild / assemblyMergeStrategy := {
-  case "logback.xml"                                             => MergeStrategy.first
-  case x if x.contains("io.netty.versions.properties")           => MergeStrategy.discard
-  case x if x.contains("scala.semanticdb")                       => MergeStrategy.discard
-  case PathList("META-INF", "versions", _, "OSGI-INF", _ @_*)    => MergeStrategy.discard
-  case PathList(xs @ _*) if xs.last == "module-info.class"       => MergeStrategy.first
+  case "logback.xml"                                          => MergeStrategy.first
+  case x if x.contains("io.netty.versions.properties")        => MergeStrategy.discard
+  case x if x.contains("scala.semanticdb")                    => MergeStrategy.discard
+  case PathList("META-INF", "versions", _, "OSGI-INF", _ @_*) => MergeStrategy.discard
+  case PathList(xs @ _*) if xs.last == "module-info.class"    => MergeStrategy.first
   case x =>
     val oldStrategy = (assembly / assemblyMergeStrategy).value
     oldStrategy(x)
@@ -373,10 +373,11 @@ lazy val testShared = (project in file("modules/test-shared"))
 
 lazy val nodeShared = (project in file("modules/node-shared"))
   .dependsOn(shared % "compile->compile;test->test", testShared % Test, keytool, kernel)
-  .configs(IntegrationTest)
+  .configs(IntegrationTest, RedTest)
   .settings(
     name := "tessellation-node-shared",
     Defaults.itSettings,
+    redTestSettings,
     scalafixCommonSettings,
     commonSettings,
     commonTestSettings,
@@ -495,7 +496,7 @@ lazy val dagL1 = (project in file("modules/dag-l1"))
       Libraries.monocleCore,
       Libraries.monocleMacro,
       Libraries.newtype,
-      Libraries.refinedCore,
+      Libraries.refinedCore
     )
   )
 
@@ -549,9 +550,11 @@ lazy val dagL0 = (project in file("modules/dag-l0"))
   .enablePlugins(AshScriptPlugin)
   .enablePlugins(JavaAppPackaging)
   .dependsOn(keytool, kernel, shared % "compile->compile;test->test", testShared % Test, nodeShared % "compile->compile;test->test")
+  .configs(RedTest)
   .settings(
     name := "tessellation-dag-l0",
     Defaults.itSettings,
+    redTestSettings,
     scalafixCommonSettings,
     commonSettings,
     commonTestSettings,
@@ -661,7 +664,7 @@ lazy val sdk = (project in file("modules/sdk"))
     libraryDependencies ++= Seq(
       CompilerPlugin.kindProjector,
       CompilerPlugin.betterMonadicFor,
-      CompilerPlugin.semanticDB,
+      CompilerPlugin.semanticDB
     ) ++ Seq(
       (keytool / Compile / libraryDependencies).value,
       (kernel / Compile / libraryDependencies).value,
@@ -672,14 +675,14 @@ lazy val sdk = (project in file("modules/sdk"))
       (dagL1 / Compile / libraryDependencies).value
     ).flatten,
     Compile / packageBin / mappings ++= Seq(
-        (keytool / Compile / packageBin / mappings).value,
-        (kernel / Compile / packageBin / mappings).value,
-        (shared / Compile / packageBin / mappings).value,
-        (nodeShared / Compile / packageBin / mappings).value,
-        (currencyL0 / Compile / packageBin / mappings).value,
-        (currencyL1 / Compile / packageBin / mappings).value,
-        (dagL1 / Compile / packageBin / mappings).value
-      ).flatten.filterNot { case (_, path) => path.endsWith("rally-version.properties")},
+      (keytool / Compile / packageBin / mappings).value,
+      (kernel / Compile / packageBin / mappings).value,
+      (shared / Compile / packageBin / mappings).value,
+      (nodeShared / Compile / packageBin / mappings).value,
+      (currencyL0 / Compile / packageBin / mappings).value,
+      (currencyL1 / Compile / packageBin / mappings).value,
+      (dagL1 / Compile / packageBin / mappings).value
+    ).flatten.filterNot { case (_, path) => path.endsWith("rally-version.properties") },
     Compile / packageSrc / mappings ++= Seq(
       (keytool / Compile / packageSrc / mappings).value,
       (kernel / Compile / packageSrc / mappings).value,
@@ -696,7 +699,9 @@ lazy val sdk = (project in file("modules/sdk"))
     // artifact since there's nothing to ship. The underlying doc-link cleanup is happening
     // separately on the source files.
     Compile / doc / sources := Seq.empty,
-    Compile / packageDoc / publishArtifact := false,
+    Compile / packageDoc / publishArtifact := false
   )
 
 addCommandAlias("runLinter", ";scalafixAll --rules OrganizeImports")
+addCommandAlias("redCompile", ";all nodeShared/RedTest/compile dagL0/RedTest/compile")
+addCommandAlias("redWitnesses", ";all nodeShared/RedTest/test dagL0/RedTest/test")
