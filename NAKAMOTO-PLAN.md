@@ -1509,7 +1509,7 @@ quorum is not yet proved, and GL0 cleanup still precedes complete authenticated
 staging. S4/E11 must stage, objectively authenticate/compare, and atomically
 switch every sink before abandoning the prior generation.
 
-Current S1 evidence is cleanup, identity, and one dark byte contract only. The
+Current S1 evidence is cleanup, identity, and dark byte/signature contracts only. The
 stale configurable Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
 deleted. `ProtocolEraId.ScodecV1` is frozen to strict tag `0x01`; empty,
 trailing, and every other one-byte tag reject, and a source tripwire keeps the
@@ -1518,7 +1518,15 @@ now lands a declaration inventory over 48 grounded artifact families, nine
 authority meanings, and ten typed transcript contracts. Every transcript requires
 the exact eligibility parent, atomic KES/VRF pair, N-2 roster/stake/key view, N-1
 eta evidence, period/slot, purpose, and exact subsystem context. It defines no
-codec, wire tag, preimage bytes, signature, or runtime authority. Confirmed
+codec, wire tag, preimage bytes, signature, or runtime authority. A separate
+omission-detecting schema table now has exactly one `SchemaOpen` row for every
+artifact kind; it does not freeze a source type, codec, domain, bound, or vector.
+The dark `ScodecV1Hasher` binds one reviewed `ConsensusHashSchema[A]` to exact
+byte-aligned immutable bytes, a canonical static domain, a maximum encoded size,
+and fixed SHA-256. Its public content-ID/sign/verify operations sign the raw
+32-byte digest. Raw digest helpers are package-restricted and source-guarded, and
+negative vectors prove the legacy 64-byte ASCII-hex preimage does not verify.
+There is still no production schema or runtime caller. Confirmed
 blockers include accumulator omissions for rooted field 33
 `ConsumedAllowSpends` and field 34 `Slashings`, the unenforced ROOT-008 physical
 MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard

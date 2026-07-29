@@ -246,7 +246,20 @@ bytes, or runtime reachability. Typed transcript contracts require the exact
 branch-historical N-2 atomic KES/VRF pair plus roster/stake view, N-1 eta,
 period/slot, and purpose at every inventoried VRF/sortition use. It records known
 accumulator/change-set, MPT-key, slashing-value, optimistic-attestation, tower,
-genesis, lane, O18, O19, O20, and O21 blockers; it does not close E1.1 or E1.3.
+genesis, lane, O18, O19, O20, and O21 blockers. A separate total
+omission-detecting table gives each of the 48 kinds one `SchemaOpen` row while
+explicitly freezing no source type, codec, domain, maximum, vector, signature, or
+authority. It does not close E1.1 or E1.3.
+
+The dark E1.10A primitive now computes a typed raw 32-byte SHA-256 digest from
+one bundled `ConsensusHashSchema[A]`, and its public content-ID/sign/verify
+operations cannot select bytes, codec, or domain independently. Package-restricted
+signature helpers receive only `ConsensusDigest`; source guards reject their
+expansion or public exposure. Focused vectors prove a signature over the raw
+digest does not verify against the legacy 64-byte ASCII-hex preimage, a wrong
+typed value fails, and an available JSON encoder cannot rescue immutable-codec
+failure. No production `ConsensusHashSchema`, runtime caller, or selector was
+added, so E1.10A, SER-005, and the atomic cutover remain open.
 
 That inventory is now subtype-total over all 14 live finality artifact kinds.
 Only CoreBatch, ReleasedCoreRecord, PathManifest, and PathChunk have concrete
