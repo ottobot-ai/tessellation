@@ -106,9 +106,7 @@ object ConsensusArtifactContextV1CodecSuite extends FunSuite {
     expect(wrongWidths.forall(length => NetworkIdV1.fromByteVector(filled(length, 1)).isLeft)) &&
     expect(wrongWidths.forall(length => GenesisIdV1.fromByteVector(filled(length, 1)).isLeft)) &&
     expect(
-      wrongWidths.forall(length =>
-        ConsensusParametersIdV1.fromByteVector(filled(length, 1)).isLeft
-      )
+      wrongWidths.forall(length => ConsensusParametersIdV1.fromByteVector(filled(length, 1)).isLeft)
     ) &&
     expect(NetworkIdV1.fromByteVector(allZero).isLeft) &&
     expect(GenesisIdV1.fromByteVector(allZero).isLeft) &&
@@ -122,9 +120,7 @@ object ConsensusArtifactContextV1CodecSuite extends FunSuite {
     expect(wrongWidths.forall(length => networkIdCodec.complete.decodeValue(BitVector.low(length.toLong * 8L)).toEither.isLeft)) &&
     expect(wrongWidths.forall(length => genesisIdCodec.complete.decodeValue(BitVector.low(length.toLong * 8L)).toEither.isLeft)) &&
     expect(
-      wrongWidths.forall(length =>
-        consensusParametersIdCodec.complete.decodeValue(BitVector.low(length.toLong * 8L)).toEither.isLeft
-      )
+      wrongWidths.forall(length => consensusParametersIdCodec.complete.decodeValue(BitVector.low(length.toLong * 8L)).toEither.isLeft)
     ) &&
     expect(networkIdCodec.complete.decodeValue(allZero).toEither.isLeft) &&
     expect(genesisIdCodec.complete.decodeValue(allZero).toEither.isLeft) &&
@@ -225,13 +221,12 @@ object ConsensusArtifactContextV1CodecSuite extends FunSuite {
     val _ = implicitly[NotGiven[NetworkIdV1 =:= GenesisIdV1]]
     val _ = implicitly[NotGiven[NetworkIdV1 =:= ConsensusParametersIdV1]]
     val _ = implicitly[NotGiven[GenesisIdV1 =:= ConsensusParametersIdV1]]
-    val typedFactory
-      : (
-          NetworkIdV1,
-          GenesisIdV1,
-          ProtocolEraId,
-          ConsensusParametersIdV1
-        ) => Either[ConsensusArtifactContextV1.ValidationError, ConsensusArtifactContextV1] =
+    val typedFactory: (
+      NetworkIdV1,
+      GenesisIdV1,
+      ProtocolEraId,
+      ConsensusParametersIdV1
+    ) => Either[ConsensusArtifactContextV1.ValidationError, ConsensusArtifactContextV1] =
       ConsensusArtifactContextV1.from
 
     expect(typedFactory(networkId, genesisId, ScodecV1, parametersId) == Right(artifact))
@@ -260,9 +255,7 @@ object ConsensusArtifactContextV1CodecSuite extends FunSuite {
     )
 
     def rejects[A](constructor: Constructor[A]): Boolean =
-      invalid.forall(bytes =>
-        invoke(constructor, bytes).swap.exists(_.isInstanceOf[IllegalArgumentException])
-      )
+      invalid.forall(bytes => invoke(constructor, bytes).swap.exists(_.isInstanceOf[IllegalArgumentException]))
 
     expect(rejects(networkIdConstructor)) &&
     expect(rejects(genesisIdConstructor)) &&

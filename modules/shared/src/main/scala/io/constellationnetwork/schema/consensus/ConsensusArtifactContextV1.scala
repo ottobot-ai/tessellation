@@ -38,8 +38,7 @@ object NetworkIdV1 {
 
   sealed abstract class ValidationError(val message: String) extends Product with Serializable
   case object NullBytes extends ValidationError("network id bytes cannot be null")
-  final case class InvalidLength(actual: Long)
-      extends ValidationError(s"network id must contain exactly $Length bytes, got $actual")
+  final case class InvalidLength(actual: Long) extends ValidationError(s"network id must contain exactly $Length bytes, got $actual")
   case object AllZero extends ValidationError("network id cannot be all zero")
 
   def fromBytes(bytes: Array[Byte]): Either[ValidationError, NetworkIdV1] =
@@ -58,8 +57,8 @@ object NetworkIdV1 {
 
 /** Candidate genesis identity for the dark S1 consensus-artifact grammar.
   *
-  * It is deliberately distinct from network and parameter identities. Its JVM-callable constructor validates and clones its input; the
-  * type has no runtime authority.
+  * It is deliberately distinct from network and parameter identities. Its JVM-callable constructor validates and clones its input; the type
+  * has no runtime authority.
   */
 final class GenesisIdV1 private (sourceBytes: Array[Byte]) {
   private val bytes: Array[Byte] = {
@@ -86,8 +85,7 @@ object GenesisIdV1 {
 
   sealed abstract class ValidationError(val message: String) extends Product with Serializable
   case object NullBytes extends ValidationError("genesis id bytes cannot be null")
-  final case class InvalidLength(actual: Long)
-      extends ValidationError(s"genesis id must contain exactly $Length bytes, got $actual")
+  final case class InvalidLength(actual: Long) extends ValidationError(s"genesis id must contain exactly $Length bytes, got $actual")
   case object AllZero extends ValidationError("genesis id cannot be all zero")
 
   def fromBytes(bytes: Array[Byte]): Either[ValidationError, GenesisIdV1] =
@@ -221,9 +219,9 @@ final class ConsensusArtifactContextV1 private (
     other match {
       case that: ConsensusArtifactContextV1 =>
         networkId == that.networkId &&
-          genesisId == that.genesisId &&
-          protocolEraId == that.protocolEraId &&
-          parametersId == that.parametersId
+        genesisId == that.genesisId &&
+        protocolEraId == that.protocolEraId &&
+        parametersId == that.parametersId
       case _ => false
     }
 
