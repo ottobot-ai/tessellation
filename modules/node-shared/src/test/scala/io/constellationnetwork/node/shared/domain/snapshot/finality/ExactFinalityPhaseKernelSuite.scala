@@ -251,9 +251,7 @@ object ExactFinalityPhaseKernelSuite extends SimpleIOSuite with Checkers {
 
     expect.same(expected, recovery.state.mode) &&
     expect(
-      Vector(genesis, main(1)).forall(ref =>
-        recovery.state.requireOperational(ref) == Left(Error.Halted(expected))
-      )
+      Vector(genesis, main(1)).forall(ref => recovery.state.requireOperational(ref) == Left(Error.Halted(expected)))
     )
   }
 
@@ -691,7 +689,9 @@ object ExactFinalityPhaseKernelSuite extends SimpleIOSuite with Checkers {
     val sourceExtensions = Set(".scala", ".java", ".kt", ".kts")
     val stream = Files.walk(root)
     try
-      stream.iterator().asScala
+      stream
+        .iterator()
+        .asScala
         .filter(path => Files.isRegularFile(path) && sourceExtensions.exists(path.toString.endsWith))
         .toVector
     finally stream.close()

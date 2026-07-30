@@ -9,8 +9,8 @@ import eu.timepit.refined.types.numeric.NonNegLong
 /** Dark, pure lifecycle kernel for exact-reference GL0 finality phases.
   *
   * This kernel deliberately accepts already-verified capabilities. It does not authenticate or execute a snapshot, select a canonical
-  * frontier, evaluate depth, sample peers, define optimistic evidence, publish state, or authorize a consumer. Its only responsibility is to
-  * make the phase/replacement state machine executable without collapsing identity to an ordinal.
+  * frontier, evaluate depth, sample peers, define optimistic evidence, publish state, or authorize a consumer. Its only responsibility is
+  * to make the phase/replacement state machine executable without collapsing identity to an ordinal.
   *
   * No direct production-source caller is permitted until the objective selector, qualification verifiers, durable coordinator, and
   * reversible effect transaction are complete. The package-scoped capability constructors are source-level staging hygiene, not a JVM
@@ -83,8 +83,8 @@ private[finality] object ExactFinalityPhaseKernel {
 
   /** Capability issued only by the future objective canonical-frontier verifier.
     *
-    * The pointed-to fork-choice payload remains opaque until O15 defines the frontier, cutoff, and late-reveal rules. The branch CAS detects
-    * a canonical mutation, but cannot detect a contender observed after verification because `Observe` does not advance it. Before
+    * The pointed-to fork-choice payload remains opaque until O15 defines the frontier, cutoff, and late-reveal rules. The branch CAS
+    * detects a canonical mutation, but cannot detect a contender observed after verification because `Observe` does not advance it. Before
     * activation, one owned coordinator queue/critical section must serialize `Observe`, the final eligible-contender drain/recheck, and
     * application of this capability. The local revision is not a consensus cutoff and receipt of a losing P0 candidate does not dequalify
     * current P2 state.
@@ -310,140 +310,140 @@ private[finality] object ExactFinalityPhaseKernel {
         case Left(LineageFailure.Recover(reason)) => Right(enterRecovery(state, reason))
         case Left(LineageFailure.Reject(error))   => Left(error)
         case Right(nextCanonical) =>
-        state.canonicalOldestFirst.lastOption match {
-          case None =>
-            nextBranchRevision(state.branchRevision) match {
-              case Left(reason) => Right(enterRecovery(state, reason))
-              case Right(nextBranch) =>
-                val phases = nextCanonical.foldLeft(state.phaseByHash) { (acc, ref) =>
-                  acc.updated(ref.hash, Phase.P1Provisional)
-                }
-                Right(
-                  Transition(
-                    state.copy(
-                      phaseByHash = phases,
-                      canonicalOldestFirst = nextCanonical,
-                      orphanedByHash = state.orphanedByHash -- nextCanonical.iterator.map(_.hash),
-                      branchRevision = nextBranch
-                    ),
-                    Vector(
-                      Event.CanonicalAdvanced(
-                        None,
-                        selectedTip,
-                        nextCanonical,
-                        selection.decisionEvidence,
-                        nextBranch
-                      )
-                    )
-                  )
-                )
-            }
-
-          case Some(currentTip) if currentTip == selectedTip =>
-            Right(Transition(state, Vector.empty))
-
-          case Some(currentTip) =>
-            val commonCount = commonPrefixSize(state.canonicalOldestFirst, nextCanonical)
-            if (commonCount == 0)
-              Right(enterRecovery(state, RecoveryReason.DisconnectedCanonicalFrontier(currentTip, selectedTip)))
-            else {
-              val commonAncestor = nextCanonical(commonCount - 1)
-              val orphaned = state.canonicalOldestFirst.drop(commonCount)
-              val adopted = nextCanonical.drop(commonCount)
-              val extension = orphaned.isEmpty
-
-              if (extension) {
-                nextBranchRevision(state.branchRevision) match {
-                  case Left(reason) => Right(enterRecovery(state, reason))
-                  case Right(nextBranch) =>
-                    val nextPhases = adopted.foldLeft(state.phaseByHash) { (acc, ref) =>
-                      acc.updated(ref.hash, Phase.P1Provisional)
-                    }
-                    Right(
-                      Transition(
-                        state.copy(
-                          phaseByHash = nextPhases,
-                          canonicalOldestFirst = nextCanonical,
-                          orphanedByHash = state.orphanedByHash -- adopted.iterator.map(_.hash),
-                          branchRevision = nextBranch
-                        ),
-                        Vector(
-                          Event.CanonicalAdvanced(
-                            Some(currentTip),
-                            selectedTip,
-                            adopted,
-                            selection.decisionEvidence,
-                            nextBranch
-                          )
+          state.canonicalOldestFirst.lastOption match {
+            case None =>
+              nextBranchRevision(state.branchRevision) match {
+                case Left(reason) => Right(enterRecovery(state, reason))
+                case Right(nextBranch) =>
+                  val phases = nextCanonical.foldLeft(state.phaseByHash) { (acc, ref) =>
+                    acc.updated(ref.hash, Phase.P1Provisional)
+                  }
+                  Right(
+                    Transition(
+                      state.copy(
+                        phaseByHash = phases,
+                        canonicalOldestFirst = nextCanonical,
+                        orphanedByHash = state.orphanedByHash -- nextCanonical.iterator.map(_.hash),
+                        branchRevision = nextBranch
+                      ),
+                      Vector(
+                        Event.CanonicalAdvanced(
+                          None,
+                          selectedTip,
+                          nextCanonical,
+                          selection.decisionEvidence,
+                          nextBranch
                         )
                       )
                     )
-                }
-              } else
-                (
-                  nextBranchRevision(state.branchRevision),
-                  nextLineageRevision(state.lineageRevision)
-                ) match {
-                  case (Left(reason), _) => Right(enterRecovery(state, reason))
-                  case (_, Left(reason)) => Right(enterRecovery(state, reason))
-                  case (Right(nextBranch), Right(nextLineage)) =>
-                    val nextOrphaned = orphaned.foldLeft(state.orphanedByHash) { (acc, ref) =>
-                      acc.updated(
-                        ref.hash,
-                        ExactStatus.Orphaned(state.phaseByHash.getOrElse(ref.hash, Phase.P0Pending), selectedTip)
-                      )
-                    } -- adopted.iterator.map(_.hash)
-                    // Re-adoption never restores P2 by identity alone. The retained evidence is audit history;
-                    // a fresh verified qualification capability is required on the new lineage.
-                    val nextPhases = adopted.foldLeft(state.phaseByHash) { (acc, ref) =>
-                      acc.updated(ref.hash, Phase.P1Provisional)
-                    }
-                    val nextOperationalHead =
-                      nextCanonical.reverseIterator.find(ref => nextPhases.get(ref.hash).contains(Phase.P2Operational))
-                    val orphanedOperational =
-                      orphaned.filter(ref => state.phaseByHash.get(ref.hash).contains(Phase.P2Operational))
-                    val adoptedOperational =
-                      adopted.filter(ref => nextPhases.get(ref.hash).contains(Phase.P2Operational))
-                    val replacement = Event.CanonicalReplaced(
-                      currentTip,
-                      selectedTip,
-                      commonAncestor,
-                      orphaned,
-                      adopted,
-                      selection.decisionEvidence,
-                      nextBranch,
-                      nextLineage
-                    )
-                    val operationalReplacement = state.operationalHead.collect {
-                      case old if !nextOperationalHead.contains(old) =>
-                        Event.OperationalReplaced(
-                          old,
-                          nextOperationalHead,
-                          commonAncestor,
-                          orphanedOperational,
-                          adoptedOperational,
-                          nextBranch,
-                          nextLineage
-                        ): Event
-                    }
+                  )
+              }
 
-                    Right(
-                      Transition(
-                        state.copy(
-                          phaseByHash = nextPhases,
-                          canonicalOldestFirst = nextCanonical,
-                          operationalHead = nextOperationalHead,
-                          orphanedByHash = nextOrphaned,
-                          branchRevision = nextBranch,
-                          lineageRevision = nextLineage
-                        ),
-                        replacement +: operationalReplacement.toVector
+            case Some(currentTip) if currentTip == selectedTip =>
+              Right(Transition(state, Vector.empty))
+
+            case Some(currentTip) =>
+              val commonCount = commonPrefixSize(state.canonicalOldestFirst, nextCanonical)
+              if (commonCount == 0)
+                Right(enterRecovery(state, RecoveryReason.DisconnectedCanonicalFrontier(currentTip, selectedTip)))
+              else {
+                val commonAncestor = nextCanonical(commonCount - 1)
+                val orphaned = state.canonicalOldestFirst.drop(commonCount)
+                val adopted = nextCanonical.drop(commonCount)
+                val extension = orphaned.isEmpty
+
+                if (extension) {
+                  nextBranchRevision(state.branchRevision) match {
+                    case Left(reason) => Right(enterRecovery(state, reason))
+                    case Right(nextBranch) =>
+                      val nextPhases = adopted.foldLeft(state.phaseByHash) { (acc, ref) =>
+                        acc.updated(ref.hash, Phase.P1Provisional)
+                      }
+                      Right(
+                        Transition(
+                          state.copy(
+                            phaseByHash = nextPhases,
+                            canonicalOldestFirst = nextCanonical,
+                            orphanedByHash = state.orphanedByHash -- adopted.iterator.map(_.hash),
+                            branchRevision = nextBranch
+                          ),
+                          Vector(
+                            Event.CanonicalAdvanced(
+                              Some(currentTip),
+                              selectedTip,
+                              adopted,
+                              selection.decisionEvidence,
+                              nextBranch
+                            )
+                          )
+                        )
                       )
-                    )
-                }
-            }
-        }
-    }
+                  }
+                } else
+                  (
+                    nextBranchRevision(state.branchRevision),
+                    nextLineageRevision(state.lineageRevision)
+                  ) match {
+                    case (Left(reason), _) => Right(enterRecovery(state, reason))
+                    case (_, Left(reason)) => Right(enterRecovery(state, reason))
+                    case (Right(nextBranch), Right(nextLineage)) =>
+                      val nextOrphaned = orphaned.foldLeft(state.orphanedByHash) { (acc, ref) =>
+                        acc.updated(
+                          ref.hash,
+                          ExactStatus.Orphaned(state.phaseByHash.getOrElse(ref.hash, Phase.P0Pending), selectedTip)
+                        )
+                      } -- adopted.iterator.map(_.hash)
+                      // Re-adoption never restores P2 by identity alone. The retained evidence is audit history;
+                      // a fresh verified qualification capability is required on the new lineage.
+                      val nextPhases = adopted.foldLeft(state.phaseByHash) { (acc, ref) =>
+                        acc.updated(ref.hash, Phase.P1Provisional)
+                      }
+                      val nextOperationalHead =
+                        nextCanonical.reverseIterator.find(ref => nextPhases.get(ref.hash).contains(Phase.P2Operational))
+                      val orphanedOperational =
+                        orphaned.filter(ref => state.phaseByHash.get(ref.hash).contains(Phase.P2Operational))
+                      val adoptedOperational =
+                        adopted.filter(ref => nextPhases.get(ref.hash).contains(Phase.P2Operational))
+                      val replacement = Event.CanonicalReplaced(
+                        currentTip,
+                        selectedTip,
+                        commonAncestor,
+                        orphaned,
+                        adopted,
+                        selection.decisionEvidence,
+                        nextBranch,
+                        nextLineage
+                      )
+                      val operationalReplacement = state.operationalHead.collect {
+                        case old if !nextOperationalHead.contains(old) =>
+                          Event.OperationalReplaced(
+                            old,
+                            nextOperationalHead,
+                            commonAncestor,
+                            orphanedOperational,
+                            adoptedOperational,
+                            nextBranch,
+                            nextLineage
+                          ): Event
+                      }
+
+                      Right(
+                        Transition(
+                          state.copy(
+                            phaseByHash = nextPhases,
+                            canonicalOldestFirst = nextCanonical,
+                            operationalHead = nextOperationalHead,
+                            orphanedByHash = nextOrphaned,
+                            branchRevision = nextBranch,
+                            lineageRevision = nextLineage
+                          ),
+                          replacement +: operationalReplacement.toVector
+                        )
+                      )
+                  }
+              }
+          }
+      }
   }
 
   private def qualify(
@@ -480,7 +480,7 @@ private[finality] object ExactFinalityPhaseKernel {
           (),
           Error.WrongEvidenceKind(expectedKind, evidence.evidence.kind): Error
         )
-    } yield {
+    } yield
       if (state.phaseByHash.get(target.hash).contains(Phase.P2Operational))
         Transition(state, Vector.empty)
       else {
@@ -513,7 +513,6 @@ private[finality] object ExactFinalityPhaseKernel {
           )
         )
       }
-    }
   }
 
   private def markRetentionMature(state: State, ref: GlobalSnapshotStateRef): Either[Error, Transition] =
@@ -628,7 +627,5 @@ private[finality] object ExactFinalityPhaseKernel {
   private def canonicalNonZeroHash(hash: Hash): Boolean =
     hash != Hash.empty &&
       hash.value.length == 64 &&
-      hash.value.forall(character =>
-        character >= '0' && character <= '9' || character >= 'a' && character <= 'f'
-      )
+      hash.value.forall(character => character >= '0' && character <= '9' || character >= 'a' && character <= 'f')
 }
