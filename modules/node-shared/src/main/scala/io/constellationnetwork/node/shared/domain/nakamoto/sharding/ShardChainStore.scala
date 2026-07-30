@@ -334,7 +334,7 @@ object ShardChainStore {
                       // newly-connected entry (the incoming one plus any reconnected descendants) against the current best; an orphan
                       // store leaves the tip untouched.
                       val newBestTipHash: Option[Hash] = {
-                        val candidates = newlyConnected.toList.flatMap(newByHash.get)
+                        val candidates = newlyConnected.toList.sortBy(_.value).flatMap(newByHash.get)
                         val seed = resolvedBest
                         candidates
                           .foldLeft(seed) {
@@ -432,7 +432,7 @@ object ShardChainStore {
 
                 // Re-run fork choice over all connected entries under the new anchor. A node canonical on an un-adopted branch reorgs
                 // here the moment GL0 makes the other exact checkpoint Phase 2.
-                val candidates = newConnected.toList.flatMap(state.byHash.get)
+                val candidates = newConnected.toList.sortBy(_.value).flatMap(state.byHash.get)
                 val newBest = candidates
                   .reduceOption((x, y) => if (compareAnchoredMaxvalid(state.byHash, Some(anchorHash), x, y) >= 0) x else y)
                   .map(_.hash)
@@ -633,9 +633,9 @@ object ShardChainStore {
         private def deriveHash(checkpoint: Signed[ShardCheckpoint]): F[Hash] =
           Hasher[F].hash(checkpoint.value.signingPreimage)
 
-        /** Taktikos `maxvalid-tk`: longer chain wins; ties broken by lower head slot; ties broken by lower VRF output (BigInt unsigned).
+        /** Taktikos `maxvalid-tk`: longer chain wins; ties break by lower head slot, unsigned VRF output, then checkpoint hash.
           *
-          * Returns positive when `a` beats `b`; negative when `b` beats `a`; zero when they're indistinguishable on these criteria.
+          * Returns positive when `a` beats `b`; negative when `b` beats `a`; zero only when their complete fork-choice identity matches.
           *
           * Identical algorithm to `ChainSelection.standardCompare`
           * (`modules/node-shared/src/main/scala/io/constellationnetwork/node/shared/domain/nakamoto/ChainSelection.scala:180-192`). That
@@ -692,11 +692,17 @@ object ShardChainStore {
             // Earlier slot wins (harder lottery)
             if (a.slot < b.slot) 1 else -1
           } else {
-            // Lower VRF output wins (deterministic). Use BigInt-unsigned comparison (signum=1) to mirror
-            // ChainSelection.compareVrfOutputs.
+            // Lower VRF output wins. On an exact tie (same-slot producer equivocation), lower canonical checkpoint hash wins. The hash
+            // tiebreak makes this comparator total and mirrors ChainSelection.deterministicTip; without it Set/arrival order selects the tip.
             val bigA = BigInt(1, a.vrfOutput)
             val bigB = BigInt(1, b.vrfOutput)
-            -bigA.compare(bigB) // negate so the LOWER BigInt wins (returns positive)
+            val vrfComparison = -bigA.compare(bigB) // negate so the LOWER BigInt wins (returns positive)
+
+            if (vrfComparison != 0) vrfComparison
+            else {
+              val hashComparison = a.hash.value.compareTo(b.hash.value)
+              if (hashComparison < 0) 1 else if (hashComparison > 0) -1 else 0
+            }
           }
       }
     }

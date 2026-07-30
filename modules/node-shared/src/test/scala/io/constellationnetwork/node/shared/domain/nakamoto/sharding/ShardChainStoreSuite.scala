@@ -299,6 +299,52 @@ object ShardChainStoreSuite extends MutableIOSuite {
       )
   }
 
+  test("same-slot producer equivocations converge on the lower checkpoint hash independent of orphan arrival order") { ctx =>
+    implicit val h: Hasher[IO] = ctx.hasher
+
+    for {
+      leftStore <- ShardChainStore.make[IO](shardZero)
+      rightStore <- ShardChainStore.make[IO](shardZero)
+      signedA <- mkSignedCheckpoint(ctx, ord = 1L, parent = Hash.empty)
+      hashA <- ctx.hasher.hash(signedA.value.signingPreimage)
+      // Same registered producer, eta, and slot yield the same VRF possession proof. Distinct anchors make distinct checkpoint hashes.
+      signedB <- mkSignedCheckpoint(ctx, ord = 2L, parent = hashA, signerIndex = 1, gl0Anchor = 101L, slotOverride = Some(2L))
+      signedC <- mkSignedCheckpoint(ctx, ord = 2L, parent = hashA, signerIndex = 1, gl0Anchor = 102L, slotOverride = Some(2L))
+      hashB <- ctx.hasher.hash(signedB.value.signingPreimage)
+      hashC <- ctx.hasher.hash(signedC.value.signingPreimage)
+      vrfB <- ctx.checkpointSigner.proofDerivedVrfOutput(signedB.value.producerSignature)
+      vrfC <- ctx.checkpointSigner.proofDerivedVrfOutput(signedC.value.producerSignature)
+      // Both children arrive as orphans in opposite orders. Storing A reconnects a Set containing both tied descendants.
+      _ <- leftStore.store(signedB, hashA, ShardOrdinal(2L), slot = 2L, vrfOutput = vrfB)
+      _ <- leftStore.store(signedC, hashA, ShardOrdinal(2L), slot = 2L, vrfOutput = vrfC)
+      _ <- rightStore.store(signedC, hashA, ShardOrdinal(2L), slot = 2L, vrfOutput = vrfC)
+      _ <- rightStore.store(signedB, hashA, ShardOrdinal(2L), slot = 2L, vrfOutput = vrfB)
+      leftBeforeParent <- leftStore.bestTip
+      rightBeforeParent <- rightStore.bestTip
+      _ <- storeCheckpoint(ctx, leftStore, signedA, Hash.empty, ShardOrdinal(1L), slot = 1L)
+      _ <- storeCheckpoint(ctx, rightStore, signedA, Hash.empty, ShardOrdinal(1L), slot = 1L)
+      leftTip <- leftStore.bestTip
+      rightTip <- rightStore.bestTip
+      expected = if (hashB.value.compareTo(hashC.value) < 0) hashB else hashC
+      _ <- leftStore.noteAnchor(hashA)
+      _ <- rightStore.noteAnchor(hashA)
+      leftAnchoredTip <- leftStore.bestTip
+      rightAnchoredTip <- rightStore.bestTip
+    } yield
+      expect.all(
+        leftBeforeParent.isEmpty,
+        rightBeforeParent.isEmpty,
+        java.util.Arrays.equals(vrfB, vrfC),
+        hashB =!= hashC,
+        leftTip.exists(_.hash === expected),
+        rightTip.exists(_.hash === expected),
+        leftTip.map(_.hash) === rightTip.map(_.hash),
+        leftAnchoredTip.exists(_.hash === expected),
+        rightAnchoredTip.exists(_.hash === expected),
+        leftAnchoredTip.map(_.hash) === rightAnchoredTip.map(_.hash)
+      )
+  }
+
   // ===========================================================================
   // Test 3: idempotent store
   // ===========================================================================
