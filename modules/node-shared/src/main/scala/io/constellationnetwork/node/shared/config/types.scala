@@ -165,22 +165,23 @@ object types {
     // and the depth fallback can lag production by k1 even when optimistic Phase 2 does not ⇒ margin (R/3 - k1) = 0.033*k1.
     // Derived from the per-env k₁, NOT loaded — keeps the eta-rotation period in lockstep with the confirmation depth.
     def etaRotationSnapshots(env: AppEnvironment): PosLong =
-      PosLong.unsafeFrom(math.round(3.1d * confirmationDepthK(env).value))
+      PosLong.unsafeFrom(NakamotoConfig.etaRotationSnapshotsFromK1(confirmationDepthK(env).value))
     // k2 = 100*k1 recommended local retention/proof/recovery capacity. It does not create Phase 3 or an
     // absolute fork-choice floor. Derived from per-environment k1 and threaded through legacy `archivalDepthK`
     // parameter names until those Phase-3-era symbols are removed.
     def keepDepthBehindFinalized(env: AppEnvironment): PosLong =
-      PosLong.unsafeFrom(100L * confirmationDepthK(env).value)
+      PosLong.unsafeFrom(Math.multiplyExact(100L, confirmationDepthK(env).value))
     // Track-3 S3 fork-choice lookback = k₁ + 1. Forks shallower than this are resolved by the tip
     // tiebreak (maxvalid-tk, longest-chain); deeper forks switch to the density rule (maxvalid-bg). At
     // k1 + 1 the density rule engages after the shallow-fork window. Derived from per-environment k1 —
     // replaces the hardcoded `ChainSelection.DefaultKLookback` (50) at the production wiring.
-    def kLookback(env: AppEnvironment): Long = confirmationDepthK(env).value + 1L
+    def kLookback(env: AppEnvironment): Long = Math.addExact(confirmationDepthK(env).value, 1L)
     // Track-3 S3 density window = round(R / 3), R = etaRotationSnapshots (= round(3.1·k₁)), so
     // sWindow ≈ 1.033·k₁ slots. The density comparison counts blocks within this many slots of the true
     // fork point — one confirmation-depth's worth of chain growth, matching maxvalid-bg's s-parameter.
     // Derived from the per-env R, NOT loaded — replaces the hardcoded `ChainSelection.DefaultSWindow` (200).
-    def sWindow(env: AppEnvironment): Long = math.round(etaRotationSnapshots(env).value.toDouble / 3.0d)
+    def sWindow(env: AppEnvironment): Long =
+      NakamotoConfig.sWindowFromEtaRotation(etaRotationSnapshots(env).value)
   }
 
   /** HOCON shape for the gl0 LDD snowplow (see [[NakamotoConfig.ldd]]). `baseline` (fB) and `amplitude` (fA) are EXACT rationals read
@@ -196,6 +197,31 @@ object types {
   object NakamotoConfig {
     // Neutral fallback for `confirmationDepthK(env)` when an environment is missing from the HOCON block — the dev default (32).
     val DefaultConfirmationDepthK: PosLong = PosLong.unsafeFrom(32L)
+
+    /** Exact positive half-up evaluation of `round(31 * k1 / 10)`.
+      *
+      * The eta period is consensus-critical. Computing it through `Double` would make an ambient floating-point conversion part of the
+      * protocol and silently lose integer precision for sufficiently large valid `PosLong` values.
+      */
+    private[config] def etaRotationSnapshotsFromK1(k1: Long): Long =
+      roundedPositiveRatio(k1, numerator = 31L, denominator = 10L, "eta rotation")
+
+    /** Exact positive half-up evaluation of `round(etaRotation / 3)`. */
+    private[config] def sWindowFromEtaRotation(etaRotation: Long): Long =
+      roundedPositiveRatio(etaRotation, numerator = 1L, denominator = 3L, "density window")
+
+    private def roundedPositiveRatio(value: Long, numerator: Long, denominator: Long, label: String): Long = {
+      require(value > 0L, s"$label input must be positive, got $value")
+      require(numerator > 0L, s"$label numerator must be positive, got $numerator")
+      require(denominator > 0L, s"$label denominator must be positive, got $denominator")
+
+      val rounded = (BigInt(value) * BigInt(numerator) * 2 + BigInt(denominator)) / (BigInt(denominator) * 2)
+
+      if (!rounded.isValidLong)
+        throw new ArithmeticException(s"$label exceeds Long range: $rounded")
+
+      rounded.longValue
+    }
 
     // The `confirmationDepthKByEnv` field reads from the HOCON key `confirmation-depth-k` (the per-env block), NOT the
     // default kebab-cased `confirmation-depth-k-by-env`. Use an explicit `ProductHint` field override;

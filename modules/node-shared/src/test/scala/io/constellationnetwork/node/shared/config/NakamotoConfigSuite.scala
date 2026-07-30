@@ -1,5 +1,7 @@
 package io.constellationnetwork.node.shared.config
 
+import scala.util.Try
+
 import io.constellationnetwork.env.AppEnvironment._
 import io.constellationnetwork.node.shared.config.types._
 import io.constellationnetwork.node.shared.ext.pureconfig._
@@ -61,6 +63,24 @@ object NakamotoConfigSuite extends SimpleIOSuite {
       nakamoto.sWindow(Integrationnet) == 265L,
       // CONFIG-FLAG defaults OFF (byte-identical k₁-freeze baseline — the 2026-06-27 storm backstop).
       !nakamoto.bandDensityReorgEnabled
+    )
+  }
+
+  pureTest("eta and density windows use exact half-up integer arithmetic at every remainder boundary") {
+    val etaByK1 = (1L to 10L).map(NakamotoConfig.etaRotationSnapshotsFromK1).toList
+    val densityByEta = (3L to 8L).map(NakamotoConfig.sWindowFromEtaRotation).toList
+
+    expect.all(
+      etaByK1 == List(3L, 6L, 9L, 12L, 16L, 19L, 22L, 25L, 28L, 31L),
+      densityByEta == List(1L, 1L, 2L, 2L, 2L, 3L)
+    )
+  }
+
+  pureTest("exact derived-parameter arithmetic rejects nonpositive input and Long overflow") {
+    expect.all(
+      Try(NakamotoConfig.etaRotationSnapshotsFromK1(0L)).isFailure,
+      Try(NakamotoConfig.sWindowFromEtaRotation(0L)).isFailure,
+      Try(NakamotoConfig.etaRotationSnapshotsFromK1(Long.MaxValue)).failed.toOption.exists(_.isInstanceOf[ArithmeticException])
     )
   }
 
