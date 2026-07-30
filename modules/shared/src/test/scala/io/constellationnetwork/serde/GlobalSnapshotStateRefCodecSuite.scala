@@ -112,13 +112,16 @@ object GlobalSnapshotStateRefCodecSuite extends FunSuite {
       .and(expect(decode(emptyMptRoot).isLeft))
   }
 
-  test("decode rejects an empty parent after ordinal zero and accepts it at ordinal zero") {
+  test("decode requires the empty parent sentinel exactly at ordinal zero") {
     val empty = ByteVector.fill(32L)(0.toByte)
     val emptyParent = replace(golden, 40L, 32L, empty)
     val ordinalZeroWithEmptyParent =
       replace(emptyParent, 0L, 8L, ByteVector.fill(8L)(0.toByte))
+    val ordinalZeroWithNonemptyParent =
+      replace(golden, 0L, 8L, ByteVector.fill(8L)(0.toByte))
 
     expect(decode(emptyParent).isLeft)
+      .and(expect(decode(ordinalZeroWithNonemptyParent).isLeft))
       .and(
         expect(
           decode(ordinalZeroWithEmptyParent) ==
@@ -140,11 +143,12 @@ object GlobalSnapshotStateRefCodecSuite extends FunSuite {
     expect(malformed.forall(ref => GlobalSnapshotStateRefCodec.codec.encode(ref).toEither.isLeft))
   }
 
-  test("encode rejects empty authority sentinels outside the genesis-parent exception") {
+  test("encode requires the empty parent sentinel exactly at ordinal zero") {
     val invalid = List(
       sample.copy(hash = Hash.empty),
       sample.copy(parentHash = Hash.empty),
-      sample.copy(mptRoot = MptRoot(Hash.empty))
+      sample.copy(mptRoot = MptRoot(Hash.empty)),
+      sample.copy(ordinal = SnapshotOrdinal.MinValue)
     )
 
     expect(invalid.forall(ref => GlobalSnapshotStateRefCodec.codec.encode(ref).toEither.isLeft))

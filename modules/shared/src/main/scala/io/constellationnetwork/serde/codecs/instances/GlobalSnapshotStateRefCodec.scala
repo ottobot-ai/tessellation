@@ -12,8 +12,8 @@ import scodec.{Attempt, Codec, Err}
 import shapeless.{::, HNil}
 
 /** Canonical ScodecV1 shape of an exact global snapshot state identity. In addition to the fixed-width representation, this boundary
-  * rejects empty authority sentinels outside the genesis parent exception. Semantic consumers must still authenticate exact branch
-  * membership and Phase-2 status. The finality domain owns a separate codec and semantic validator for its evidence types.
+  * requires the empty parent sentinel exactly at ordinal zero. Semantic consumers must still authenticate exact branch membership and
+  * Phase-2 status. The finality domain owns a separate codec and semantic validator for its evidence types.
   */
 object GlobalSnapshotStateRefCodec {
   private val snapshotOrdinalCodec: Codec[SnapshotOrdinal] = Codec[SnapshotOrdinal]
@@ -35,8 +35,8 @@ object GlobalSnapshotStateRefCodec {
       Attempt.failure(Err("GlobalSnapshotStateRef hashes must be 64-character lowercase hexadecimal"))
     else if (ref.hash == Hash.empty) Attempt.failure(Err("GlobalSnapshotStateRef.hash must not be Hash.empty"))
     else if (ref.mptRoot.value == Hash.empty) Attempt.failure(Err("GlobalSnapshotStateRef.mptRoot must not be Hash.empty"))
-    else if (ref.ordinal != SnapshotOrdinal.MinValue && ref.parentHash == Hash.empty)
-      Attempt.failure(Err("GlobalSnapshotStateRef.parentHash may be Hash.empty only at ordinal zero"))
+    else if ((ref.ordinal == SnapshotOrdinal.MinValue) != (ref.parentHash == Hash.empty))
+      Attempt.failure(Err("GlobalSnapshotStateRef.parentHash must be Hash.empty exactly at ordinal zero"))
     else Attempt.successful(ref)
 
   implicit val codec: Codec[GlobalSnapshotStateRef] = structuralCodec.exmap(validate, validate)
