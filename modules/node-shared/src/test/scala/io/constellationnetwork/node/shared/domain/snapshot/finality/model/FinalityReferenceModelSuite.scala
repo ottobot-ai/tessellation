@@ -1,10 +1,12 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality.model
 
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.node.shared.domain.snapshot.finality.model.FinalityReferenceModel._
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.security.hash.Hash
 import io.constellationnetwork.security.mpt.MptRoot
 
+import eu.timepit.refined.types.numeric.NonNegLong
 import weaver.SimpleIOSuite
 
 object FinalityReferenceModelSuite extends SimpleIOSuite {
@@ -39,6 +41,20 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   private def applyCommand(state: State, command: Command): State =
     FinalityReferenceModel.step(state, command).fold(err => throw new AssertionError(err.toString), _.state)
 
+  private def verifyOrThrow(
+    state: State,
+    ref: SnapshotRef,
+    evidence: Phase2Evidence
+  ): VerifiedPhase2Qualification =
+    verifyPhase2Qualification(state, ref, evidence).fold(err => throw new AssertionError(err.toString), identity)
+
+  private def qualify(
+    state: State,
+    ref: SnapshotRef,
+    evidence: Phase2Evidence
+  ): State =
+    applyCommand(state, Command.QualifyPhase2(verifyOrThrow(state, ref, evidence)))
+
   private def observeAll(initial: State, refs: List[SnapshotRef]): State =
     refs.foldLeft(initial)((state, next) => applyCommand(state, Command.ObserveExecutedCandidate(next)))
 
@@ -58,7 +74,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   pureTest("[FIN-M-001] exact candidate moves P0 -> P1 -> P2 without an ordinal-only status") {
     val observed = observeAll(State.empty(parameters), List(genesis, a1, a2, a3))
     val selected = applyCommand(observed, Command.SelectCanonical(a3, ForkChoiceRule.MaxValidTk))
-    val qualified = applyCommand(selected, Command.QualifyPhase2(a1, Phase2Evidence.Depth))
+    val qualified = qualify(selected, a1, Phase2Evidence.Depth)
 
     expect.all(
       observed.statusOf(a1) == ExactStatus.Observed(Phase.P0Pending),
@@ -72,7 +88,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
     val b1 = ref(1L, '4', genesis.hash, 'e')
     val observed = observeAll(State.empty(parameters), List(genesis, a1, b1))
     val selected = applyCommand(observed, Command.SelectCanonical(a1, ForkChoiceRule.MaxValidTk))
-    val qualified = applyCommand(selected, Command.QualifyPhase2(a1, decided(a1)))
+    val qualified = qualify(selected, a1, decided(a1))
 
     expect.all(
       qualified.refsAtOrdinal(ord(1L)) == Set(a1, b1),
@@ -83,13 +99,10 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
 
   pureTest("[FIN-M-003] decided-attestation OR k1 depth independently qualifies the exact canonical hash") {
     val selected = canonicalA
-    val byOptimistic = applyCommand(selected, Command.QualifyPhase2(a2, decided(a2)))
-    val byDepth = applyCommand(selected, Command.QualifyPhase2(a1, Phase2Evidence.Depth))
-    val belowOptimistic = FinalityReferenceModel.step(
-      selected,
-      Command.QualifyPhase2(a2, decided(a2, Weight(1, 2)))
-    )
-    val belowDepth = FinalityReferenceModel.step(selected, Command.QualifyPhase2(a2, Phase2Evidence.Depth))
+    val byOptimistic = qualify(selected, a2, decided(a2))
+    val byDepth = qualify(selected, a1, Phase2Evidence.Depth)
+    val belowOptimistic = verifyPhase2Qualification(selected, a2, decided(a2, Weight(1, 2)))
+    val belowDepth = verifyPhase2Qualification(selected, a2, Phase2Evidence.Depth)
 
     expect.all(
       byOptimistic.requireOperational(a2) == Right(()),
@@ -111,7 +124,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
     )
 
     expect(
-      FinalityReferenceModel.step(selected, Command.QualifyPhase2(a2, wrongParameterEvidence)) ==
+      verifyPhase2Qualification(selected, a2, wrongParameterEvidence) ==
         Left(ModelError.InsufficientEvidence(wrongParameterEvidence))
     )
   }
@@ -121,7 +134,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
     val wrongTargetEvidence = decided(a1)
 
     expect(
-      FinalityReferenceModel.step(selected, Command.QualifyPhase2(a2, wrongTargetEvidence)) ==
+      verifyPhase2Qualification(selected, a2, wrongTargetEvidence) ==
         Left(ModelError.InsufficientEvidence(wrongTargetEvidence))
     )
   }
@@ -146,7 +159,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   }
 
   pureTest("[FIN-D-002][FIN-S-001A] same-height replacement emits exact Replace and P2 Rollback events") {
-    val oldP2 = applyCommand(canonicalA, Command.QualifyPhase2(a3, decided(a3)))
+    val oldP2 = qualify(canonicalA, a3, decided(a3))
     val b1 = ref(1L, '4', genesis.hash, 'e')
     val b2 = ref(2L, '5', b1.hash, 'f')
     val b3 = ref(3L, '6', b2.hash, '7')
@@ -169,8 +182,92 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
     }
   }
 
+  pureTest("[FIN-M-001][FIN-D-002] exact-hash ABA requires fresh P2 qualification") {
+    val selectedMain = canonicalA
+    val staleOptimistic = verifyOrThrow(selectedMain, a3, decided(a3))
+    val staleDepth = verifyOrThrow(selectedMain, a1, Phase2Evidence.Depth)
+    val oldP2 = applyCommand(selectedMain, Command.QualifyPhase2(staleOptimistic))
+    val b1 = ref(1L, '4', genesis.hash, 'e')
+    val b2 = ref(2L, '5', b1.hash, 'f')
+    val b3 = ref(3L, '6', b2.hash, '7')
+    val withFork = observeAll(oldP2, List(b1, b2, b3))
+    val selectedFork = applyCommand(withFork, Command.SelectCanonical(b3, ForkChoiceRule.MaxValidBg))
+    val returned = applyCommand(selectedFork, Command.SelectCanonical(a3, ForkChoiceRule.MaxValidBg))
+    val staleOptimisticResult = FinalityReferenceModel.step(returned, Command.QualifyPhase2(staleOptimistic))
+    val staleDepthResult = FinalityReferenceModel.step(returned, Command.QualifyPhase2(staleDepth))
+    val freshOptimistic = verifyOrThrow(returned, a3, decided(a3))
+    val freshDepth = verifyOrThrow(returned, a1, Phase2Evidence.Depth)
+    val requalifiedOptimistic = applyCommand(returned, Command.QualifyPhase2(freshOptimistic))
+    val requalifiedDepth = applyCommand(returned, Command.QualifyPhase2(freshDepth))
+    val staleExpected =
+      ModelError.StalePhase2Qualification(staleOptimistic.expectedLineageRevision, returned.lineageRevision)
+
+    expect.all(
+      selectedFork.lineageRevision.value.value == 1L,
+      returned.lineageRevision.value.value == 2L,
+      returned.statusOf(genesis) == ExactStatus.Canonical(Phase.P2Operational),
+      returned.statusOf(a1) == ExactStatus.Canonical(Phase.P1Provisional),
+      returned.statusOf(a2) == ExactStatus.Canonical(Phase.P1Provisional),
+      returned.statusOf(a3) == ExactStatus.Canonical(Phase.P1Provisional),
+      returned.phase2Head.contains(genesis),
+      returned.requireOperational(a3) == Left(ModelError.NotCanonical(a3)),
+      staleOptimisticResult == Left(staleExpected),
+      staleDepthResult == Left(
+        ModelError.StalePhase2Qualification(staleDepth.expectedLineageRevision, returned.lineageRevision)
+      ),
+      requalifiedOptimistic.requireOperational(a3) == Right(()),
+      requalifiedDepth.requireOperational(a1) == Right(())
+    )
+  }
+
+  pureTest("[FIN-M-001] canonical extension preserves the qualification lineage revision") {
+    val selected = canonicalA
+    val captured = verifyOrThrow(selected, a1, Phase2Evidence.Depth)
+    val withExtension = observeAll(selected, List(a4))
+    val extended = applyCommand(withExtension, Command.SelectCanonical(a4, ForkChoiceRule.MaxValidTk))
+    val qualified = applyCommand(extended, Command.QualifyPhase2(captured))
+
+    expect.all(
+      extended.lineageRevision == selected.lineageRevision,
+      qualified.requireOperational(a1) == Right(())
+    )
+  }
+
+  pureTest("[FIN-M-001] lineage revision exhaustion enters RecoveryRequired without partial replacement") {
+    val b1 = ref(1L, '4', genesis.hash, 'e')
+    val b2 = ref(2L, '5', b1.hash, 'f')
+    val b3 = ref(3L, '6', b2.hash, '7')
+    val selected = qualify(canonicalA, a3, decided(a3))
+    val retainedQualification = verifyOrThrow(selected, a3, decided(a3))
+    val withFork = observeAll(selected, List(b1, b2, b3))
+    val maxRevision = CanonicalLineageRevision(NonNegLong.unsafeFrom(Long.MaxValue))
+    val before = withFork.copy(lineageRevision = maxRevision)
+    val result = FinalityReferenceModel.step(before, Command.SelectCanonical(b3, ForkChoiceRule.MaxValidBg))
+
+    result match {
+      case Right(StepResult(recovering, List(Event.EnteredRecovery(reason)))) =>
+        val expectedReason = RecoveryReason.LineageRevisionExhausted(maxRevision, b3)
+        val recovery = Mode.RecoveryRequired(expectedReason)
+        val attemptedMutation =
+          FinalityReferenceModel.step(recovering, Command.QualifyPhase2(retainedQualification))
+
+        expect.all(
+          reason == expectedReason,
+          recovering.mode == recovery,
+          recovering.canonicalTip.contains(a3),
+          recovering.phase2Head.contains(a3),
+          recovering.statusOf(b3) == ExactStatus.Observed(Phase.P0Pending),
+          List(genesis, a1, a2, a3).forall(ref => recovering.requireOperational(ref) == Left(ModelError.Halted(recovery))),
+          verifyPhase2Qualification(recovering, a3, decided(a3)) == Left(ModelError.Halted(recovery)),
+          attemptedMutation == Left(ModelError.Halted(recovery)),
+          recovering.lineageRevision == maxRevision
+        )
+      case other => failure(s"expected absorbing lineage-exhaustion recovery, got $other")
+    }
+  }
+
   pureTest("[FIN-D-003] k2 maturity is retention metadata and cannot block a denser replacement") {
-    val oldP2 = applyCommand(canonicalLong, Command.QualifyPhase2(a3, decided(a3)))
+    val oldP2 = qualify(canonicalLong, a3, decided(a3))
     val mature = applyCommand(oldP2, Command.MarkRetentionMature(a3))
     val b1 = ref(1L, '4', genesis.hash, 'e')
     val b2 = ref(2L, '5', b1.hash, 'f')
@@ -206,11 +303,12 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   }
 
   pureTest("[FIN-M-003][FIN-D-003] P2 qualification and k2 maturity commands are idempotent") {
-    val qualified = FinalityReferenceModel.step(canonicalA, Command.QualifyPhase2(a3, decided(a3)))
+    val qualification = verifyOrThrow(canonicalA, a3, decided(a3))
+    val qualified = FinalityReferenceModel.step(canonicalA, Command.QualifyPhase2(qualification))
 
     qualified match {
       case Right(StepResult(phase2, firstEvents)) =>
-        val repeatedQualification = FinalityReferenceModel.step(phase2, Command.QualifyPhase2(a3, decided(a3)))
+        val repeatedQualification = FinalityReferenceModel.step(phase2, Command.QualifyPhase2(qualification))
         val matured = FinalityReferenceModel.step(canonicalLong, Command.MarkRetentionMature(a3))
         matured match {
           case Right(StepResult(retained, maturityEvents)) =>
@@ -231,24 +329,28 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   }
 
   pureTest("[FIN-D-003][FIN-W-002] missing ancestry enters RecoveryRequired and halts further mutation") {
-    val selected = canonicalA
+    val selected = qualify(canonicalA, a3, decided(a3))
+    val retainedQualification = verifyOrThrow(selected, a3, decided(a3))
     val missing = hash('8')
     val disconnected = ref(8L, '9', missing, 'a')
     val observed = applyCommand(selected, Command.ObserveExecutedCandidate(disconnected))
     val recoveryResult = FinalityReferenceModel.step(observed, Command.SelectCanonical(disconnected, ForkChoiceRule.MaxValidBg))
 
     recoveryResult match {
-      case Right(StepResult(recovering, List(Event.EnteredRecovery(missingHash, competingTip)))) =>
+      case Right(StepResult(recovering, List(Event.EnteredRecovery(reason)))) =>
         val attemptedMutation = FinalityReferenceModel.step(
           recovering,
-          Command.QualifyPhase2(a3, Phase2Evidence.Depth)
+          Command.QualifyPhase2(retainedQualification)
         )
+        val expectedReason = RecoveryReason.MissingAncestor(missing, disconnected)
+        val recovery = Mode.RecoveryRequired(expectedReason)
         expect.all(
-          missingHash == missing,
-          competingTip == disconnected,
+          reason == expectedReason,
           recovering.canonicalTip == selected.canonicalTip,
           recovering.phase2Head == selected.phase2Head,
-          attemptedMutation == Left(ModelError.Halted(Mode.RecoveryRequired(missing, disconnected)))
+          List(genesis, a1, a2, a3).forall(ref => recovering.requireOperational(ref) == Left(ModelError.Halted(recovery))),
+          verifyPhase2Qualification(recovering, a3, decided(a3)) == Left(ModelError.Halted(recovery)),
+          attemptedMutation == Left(ModelError.Halted(recovery))
         )
       case other => failure(s"expected exact RecoveryRequired transition, got $other")
     }

@@ -1,8 +1,11 @@
 package io.constellationnetwork.node.shared.domain.snapshot.finality.model
 
+import io.constellationnetwork.node.shared.domain.snapshot.finality.CanonicalLineageRevision
 import io.constellationnetwork.schema.SnapshotOrdinal
 import io.constellationnetwork.schema.nakamoto.GlobalSnapshotStateRef
 import io.constellationnetwork.security.hash.Hash
+
+import eu.timepit.refined.types.numeric.NonNegLong
 
 /** Pure executable specification for the target hash-bound GL0 finality gadget.
   *
@@ -66,9 +69,19 @@ object FinalityReferenceModel {
   }
 
   sealed trait Mode extends Product with Serializable
+
+  sealed trait RecoveryReason extends Product with Serializable
+  object RecoveryReason {
+    final case class MissingAncestor(missingAncestor: Hash, competingTip: SnapshotRef) extends RecoveryReason
+    final case class LineageRevisionExhausted(
+      current: CanonicalLineageRevision,
+      competingTip: SnapshotRef
+    ) extends RecoveryReason
+  }
+
   object Mode {
     case object Running extends Mode
-    final case class RecoveryRequired(missingAncestor: Hash, competingTip: SnapshotRef) extends Mode
+    final case class RecoveryRequired(reason: RecoveryReason) extends Mode
   }
 
   sealed trait ForkChoiceRule extends Product with Serializable
@@ -90,6 +103,16 @@ object FinalityReferenceModel {
     case object Depth extends Phase2Evidence
   }
 
+  /** Internal capability returned only after the model verifies qualification evidence against one canonical lineage.
+    *
+    * The lineage revision is a local CAS token, not portable evidence and not part of the O21 wire design.
+    */
+  final class VerifiedPhase2Qualification private[model] (
+    val expectedLineageRevision: CanonicalLineageRevision,
+    val ref: SnapshotRef,
+    val evidence: Phase2Evidence
+  )
+
   sealed trait Command extends Product with Serializable
   object Command {
     final case class ObserveExecutedCandidate(ref: SnapshotRef) extends Command
@@ -99,7 +122,7 @@ object FinalityReferenceModel {
       */
     final case class SelectCanonical(selectedTip: SnapshotRef, rule: ForkChoiceRule) extends Command
 
-    final case class QualifyPhase2(ref: SnapshotRef, evidence: Phase2Evidence) extends Command
+    final case class QualifyPhase2(qualification: VerifiedPhase2Qualification) extends Command
     final case class MarkRetentionMature(ref: SnapshotRef) extends Command
   }
 
@@ -121,7 +144,7 @@ object FinalityReferenceModel {
       newHead: Option[SnapshotRef],
       commonAncestor: SnapshotRef
     ) extends Event
-    final case class EnteredRecovery(missingAncestor: Hash, competingTip: SnapshotRef) extends Event
+    final case class EnteredRecovery(reason: RecoveryReason) extends Event
     final case class RetentionMatured(ref: SnapshotRef) extends Event
   }
 
@@ -133,6 +156,10 @@ object FinalityReferenceModel {
     final case class WrongSelectionRule(expected: ForkChoiceRule, supplied: ForkChoiceRule, divergenceDepth: Long) extends ModelError
     final case class InsufficientEvidence(evidence: Phase2Evidence) extends ModelError
     final case class InsufficientRetentionDepth(observed: Long, required: Long) extends ModelError
+    final case class StalePhase2Qualification(
+      expected: CanonicalLineageRevision,
+      actual: CanonicalLineageRevision
+    ) extends ModelError
     final case class Halted(recovery: Mode.RecoveryRequired) extends ModelError
   }
 
@@ -143,6 +170,7 @@ object FinalityReferenceModel {
     canonicalHashes: Set[Hash],
     canonicalTip: Option[SnapshotRef],
     phase2Head: Option[SnapshotRef],
+    lineageRevision: CanonicalLineageRevision,
     orphaned: Map[Hash, ExactStatus.Orphaned],
     retentionMature: Set[Hash],
     mode: Mode
@@ -163,9 +191,13 @@ object FinalityReferenceModel {
       candidates.valuesIterator.filter(_.ordinal == ordinal).toSet
 
     def requireOperational(ref: SnapshotRef): Either[ModelError, Unit] =
-      statusOf(ref) match {
-        case ExactStatus.Canonical(Phase.P2Operational) => Right(())
-        case _                                          => Left(ModelError.NotCanonical(ref))
+      mode match {
+        case recovery: Mode.RecoveryRequired => Left(ModelError.Halted(recovery))
+        case Mode.Running =>
+          statusOf(ref) match {
+            case ExactStatus.Canonical(Phase.P2Operational) => Right(())
+            case _                                          => Left(ModelError.NotCanonical(ref))
+          }
       }
   }
 
@@ -178,6 +210,7 @@ object FinalityReferenceModel {
         canonicalHashes = Set.empty,
         canonicalTip = None,
         phase2Head = None,
+        lineageRevision = CanonicalLineageRevision(NonNegLong.unsafeFrom(0L)),
         orphaned = Map.empty,
         retentionMature = Set.empty,
         mode = Mode.Running
@@ -193,8 +226,23 @@ object FinalityReferenceModel {
         command match {
           case Command.ObserveExecutedCandidate(ref) => observe(state, ref)
           case Command.SelectCanonical(ref, rule)    => selectCanonical(state, ref, rule)
-          case Command.QualifyPhase2(ref, evidence)  => qualifyPhase2(state, ref, evidence)
+          case Command.QualifyPhase2(qualification)  => qualifyPhase2(state, qualification)
           case Command.MarkRetentionMature(ref)      => markRetentionMature(state, ref)
+        }
+    }
+
+  def verifyPhase2Qualification(
+    state: State,
+    ref: SnapshotRef,
+    evidence: Phase2Evidence
+  ): Either[ModelError, VerifiedPhase2Qualification] =
+    state.mode match {
+      case recovery: Mode.RecoveryRequired => Left(ModelError.Halted(recovery))
+      case Mode.Running =>
+        exactCandidate(state, ref).flatMap { _ =>
+          if (!state.canonicalHashes.contains(ref.hash)) Left(ModelError.NotCanonical(ref))
+          else if (!qualifies(state, ref, evidence)) Left(ModelError.InsufficientEvidence(evidence))
+          else Right(new VerifiedPhase2Qualification(state.lineageRevision, ref, evidence))
         }
     }
 
@@ -222,13 +270,7 @@ object FinalityReferenceModel {
     exactCandidate(state, selectedTip).flatMap { _ =>
       ancestry(state, selectedTip) match {
         case Left(missing) =>
-          val recovery = Mode.RecoveryRequired(missing, selectedTip)
-          Right(
-            StepResult(
-              state.copy(mode = recovery),
-              List(Event.EnteredRecovery(missing, selectedTip))
-            )
-          )
+          Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, selectedTip)))
         case Right(newChain) =>
           state.canonicalTip match {
             case None =>
@@ -252,15 +294,13 @@ object FinalityReferenceModel {
             case Some(oldTip) =>
               ancestry(state, oldTip) match {
                 case Left(missing) =>
-                  val recovery = Mode.RecoveryRequired(missing, selectedTip)
-                  Right(StepResult(state.copy(mode = recovery), List(Event.EnteredRecovery(missing, selectedTip))))
+                  Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, selectedTip)))
                 case Right(oldChain) =>
                   val oldByHash = oldChain.iterator.map(r => r.hash -> r).toMap
                   val mrcaIndex = newChain.indexWhere(r => oldByHash.contains(r.hash))
                   if (mrcaIndex < 0) {
                     val missing = newChain.last.parentHash
-                    val recovery = Mode.RecoveryRequired(missing, selectedTip)
-                    Right(StepResult(state.copy(mode = recovery), List(Event.EnteredRecovery(missing, selectedTip))))
+                    Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, selectedTip)))
                   } else {
                     val mrca = newChain(mrcaIndex)
                     val oldMrcaIndex = oldChain.indexWhere(_.hash == mrca.hash)
@@ -271,46 +311,55 @@ object FinalityReferenceModel {
                     if (suppliedRule != expectedRule)
                       Left(ModelError.WrongSelectionRule(expectedRule, suppliedRule, divergenceDepth))
                     else {
-                      val newHashes = newChain.iterator.map(_.hash).toSet
-                      val orphanedRefs = oldChain.take(oldMrcaIndex)
-                      val adoptedRefs = newChain.take(mrcaIndex)
-                      val nextOrphaned = orphanedRefs.foldLeft(state.orphaned) { (acc, ref) =>
-                        acc.updated(ref.hash, ExactStatus.Orphaned(state.phases.getOrElse(ref.hash, Phase.P0Pending), Some(selectedTip)))
-                      } -- adoptedRefs.iterator.map(_.hash)
-                      val nextPhases = adoptedRefs.foldLeft(state.phases) { (acc, ref) =>
-                        val restored = state.orphaned.get(ref.hash).map(_.was).getOrElse(Phase.P1Provisional)
-                        acc.updated(ref.hash, restored)
-                      }
-                      val nextP2 = newChain.find(r => nextPhases.get(r.hash).contains(Phase.P2Operational))
-                      val replacementEvent =
-                        if (mrca.hash == oldTip.hash)
-                          Event.CanonicalAdvanced(Some(oldTip), selectedTip): Event
-                        else
-                          Event.CanonicalReplaced(
-                            oldTip,
-                            selectedTip,
-                            mrca,
-                            orphanedRefs.reverse,
-                            adoptedRefs.reverse,
-                            suppliedRule
-                          ): Event
-                      val phase2Event = state.phase2Head.collect {
-                        case previous if nextP2.forall(_.hash != previous.hash) =>
-                          Event.Phase2Replaced(previous, nextP2, mrca): Event
-                      }.toList
+                      val extension = mrca.hash == oldTip.hash
+                      nextLineageRevision(state.lineageRevision, selectedTip, extension) match {
+                        case Left(reason) => Right(enterRecovery(state, reason))
+                        case Right(nextLineage) =>
+                          val newHashes = newChain.iterator.map(_.hash).toSet
+                          val orphanedRefs = oldChain.take(oldMrcaIndex)
+                          val adoptedRefs = newChain.take(mrcaIndex)
+                          val nextOrphaned = orphanedRefs.foldLeft(state.orphaned) { (acc, ref) =>
+                            acc.updated(
+                              ref.hash,
+                              ExactStatus.Orphaned(state.phases.getOrElse(ref.hash, Phase.P0Pending), Some(selectedTip))
+                            )
+                          } -- adoptedRefs.iterator.map(_.hash)
+                          val nextPhases = adoptedRefs.foldLeft(state.phases) { (acc, ref) =>
+                            // Exact-hash ABA is a new canonical lineage. Historical P2 is audit evidence, not authority.
+                            acc.updated(ref.hash, Phase.P1Provisional)
+                          }
+                          val nextP2 = newChain.find(r => nextPhases.get(r.hash).contains(Phase.P2Operational))
+                          val replacementEvent =
+                            if (extension)
+                              Event.CanonicalAdvanced(Some(oldTip), selectedTip): Event
+                            else
+                              Event.CanonicalReplaced(
+                                oldTip,
+                                selectedTip,
+                                mrca,
+                                orphanedRefs.reverse,
+                                adoptedRefs.reverse,
+                                suppliedRule
+                              ): Event
+                          val phase2Event = state.phase2Head.collect {
+                            case previous if nextP2.forall(_.hash != previous.hash) =>
+                              Event.Phase2Replaced(previous, nextP2, mrca): Event
+                          }.toList
 
-                      Right(
-                        StepResult(
-                          state.copy(
-                            phases = nextPhases,
-                            canonicalHashes = newHashes,
-                            canonicalTip = Some(selectedTip),
-                            phase2Head = nextP2,
-                            orphaned = nextOrphaned
-                          ),
-                          replacementEvent :: phase2Event
-                        )
-                      )
+                          Right(
+                            StepResult(
+                              state.copy(
+                                phases = nextPhases,
+                                canonicalHashes = newHashes,
+                                canonicalTip = Some(selectedTip),
+                                phase2Head = nextP2,
+                                lineageRevision = nextLineage,
+                                orphaned = nextOrphaned
+                              ),
+                              replacementEvent :: phase2Event
+                            )
+                          )
+                      }
                     }
                   }
               }
@@ -320,35 +369,39 @@ object FinalityReferenceModel {
 
   private def qualifyPhase2(
     state: State,
-    ref: SnapshotRef,
-    evidence: Phase2Evidence
-  ): Either[ModelError, StepResult] =
-    exactCandidate(state, ref).flatMap { _ =>
-      if (!state.canonicalHashes.contains(ref.hash)) Left(ModelError.NotCanonical(ref))
-      else if (!qualifies(state, ref, evidence)) Left(ModelError.InsufficientEvidence(evidence))
-      else if (state.phases.get(ref.hash).contains(Phase.P2Operational)) Right(StepResult(state, Nil))
-      else
-        ancestry(state, ref) match {
-          case Left(missing) =>
-            val recovery = Mode.RecoveryRequired(missing, ref)
-            Right(StepResult(state.copy(mode = recovery), List(Event.EnteredRecovery(missing, ref))))
-          case Right(chain) =>
-            val canonicalAncestors = chain.filter(r => state.canonicalHashes.contains(r.hash))
-            val nextPhases = canonicalAncestors.foldLeft(state.phases) { (acc, r) =>
-              acc.updated(r.hash, Phase.P2Operational)
-            }
-            val nextHead = state.phase2Head match {
-              case Some(current) if current.ordinal.value.value > ref.ordinal.value.value => current
-              case _                                                                      => ref
-            }
-            Right(
-              StepResult(
-                state.copy(phases = nextPhases, phase2Head = Some(nextHead)),
-                List(Event.Phase2Advanced(ref, evidence))
+    qualification: VerifiedPhase2Qualification
+  ): Either[ModelError, StepResult] = {
+    val ref = qualification.ref
+    val evidence = qualification.evidence
+
+    if (qualification.expectedLineageRevision != state.lineageRevision)
+      Left(ModelError.StalePhase2Qualification(qualification.expectedLineageRevision, state.lineageRevision))
+    else
+      exactCandidate(state, ref).flatMap { _ =>
+        if (!state.canonicalHashes.contains(ref.hash)) Left(ModelError.NotCanonical(ref))
+        else if (state.phases.get(ref.hash).contains(Phase.P2Operational)) Right(StepResult(state, Nil))
+        else
+          ancestry(state, ref) match {
+            case Left(missing) =>
+              Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, ref)))
+            case Right(chain) =>
+              val canonicalAncestors = chain.filter(r => state.canonicalHashes.contains(r.hash))
+              val nextPhases = canonicalAncestors.foldLeft(state.phases) { (acc, r) =>
+                acc.updated(r.hash, Phase.P2Operational)
+              }
+              val nextHead = state.phase2Head match {
+                case Some(current) if current.ordinal.value.value > ref.ordinal.value.value => current
+                case _                                                                      => ref
+              }
+              Right(
+                StepResult(
+                  state.copy(phases = nextPhases, phase2Head = Some(nextHead)),
+                  List(Event.Phase2Advanced(ref, evidence))
+                )
               )
-            )
-        }
-    }
+          }
+      }
+  }
 
   private def markRetentionMature(
     state: State,
@@ -387,6 +440,27 @@ object FinalityReferenceModel {
 
   private def exactCandidate(state: State, ref: SnapshotRef): Either[ModelError, SnapshotRef] =
     state.candidates.get(ref.hash).filter(_ == ref).toRight(ModelError.UnknownSnapshot(ref))
+
+  private def nextLineageRevision(
+    current: CanonicalLineageRevision,
+    competingTip: SnapshotRef,
+    extension: Boolean
+  ): Either[RecoveryReason.LineageRevisionExhausted, CanonicalLineageRevision] =
+    if (extension) Right(current)
+    else if (current.value.value == Long.MaxValue)
+      Left(RecoveryReason.LineageRevisionExhausted(current, competingTip))
+    else
+      Right(
+        CanonicalLineageRevision(
+          NonNegLong.unsafeFrom(current.value.value + 1L)
+        )
+      )
+
+  private def enterRecovery(state: State, reason: RecoveryReason): StepResult =
+    StepResult(
+      state.copy(mode = Mode.RecoveryRequired(reason)),
+      List(Event.EnteredRecovery(reason))
+    )
 
   /** Tip-first ancestry. Hash.empty is the explicit root-parent sentinel. Missing parent bytes fail closed. */
   private def ancestry(state: State, tip: SnapshotRef): Either[Hash, List[SnapshotRef]] = {
