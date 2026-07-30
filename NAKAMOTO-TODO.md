@@ -55,13 +55,17 @@
 > priority buckets and numbered items below are a component inventory, not the
 > economic-deployment sequence.
 >
-> **Owner-decision status:** `20/23` dispositioned. `O-01` through `O-17`,
-> `O-20`, `O-22`, and `O-23` are ratified in
-> `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. `O-18` transport/DA bytes,
-> `O-19` upstream-v4 migration policy, and `O-21` optimistic decision evidence
-> await owner responses in their focused review packets. Open work under every
-> ratified direction is an engineering, research, schema, parameter, or proof
-> gate, not a request for another owner answer.
+> **Owner-decision status:** within the numbered O-01 through O-23 register,
+> `20/23` are dispositioned. `O-01` through `O-17`, `O-20`, `O-22`, and `O-23`
+> are ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. `O-18`
+> transport/DA bytes and `O-21` optimistic decision evidence await focused owner
+> responses. `O-19` upstream-v4 migration policy is deferred with
+> launch-profile-specific P12 offline migration and does not block the greenfield
+> runtime; migration work may not infer its unresolved choices. Later audit packets also require owner review
+> for `S2-ORDER-01..03`, `O13-A1` through `O13-F` including A3's exact
+> intent/equivocation disposition, `TL-EXP-1..4`, and the reward curve/zero-price/rooted-bound/
+> precision/nonconvergence choices. Other open work under ratified directions is
+> an engineering, research, schema, parameter, or proof gate.
 
 ---
 
@@ -99,6 +103,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
     objective-tie design gates; do not hide any of them in a collection fold.
   - Assign every open CRITICAL/HIGH audit finding one owner, RED test, write set,
     dependency, and closing commit.
+  - Resolve every additional owner stop-line named above, or explicitly defer it
+    outside the launch-enabled operation/migration set. Recommendations and
+    existing manager call order cannot freeze consensus semantics.
   - **Gate:** `ARCH-001..003`, `SIG-001..005`.
 
 - [ ] **STOP-THE-LINE - complete rooted state and key-aware reads**
@@ -736,6 +743,20 @@ criteria are in `NAKAMOTO-PLAN.md`.
     canonical hash-bound protocol-era service.
     Ordinal zero is ScodecV1 for bytes, hashes, signatures, state proofs, MPT
     nodes/values, and recovery records in every environment.
+  - **Current-source configuration authority inventory (2026-07-29):**
+    `docs/review/CONSENSUS-CONFIG-AUTHORITY-INVENTORY.tsv` classifies 102 reviewed
+    GL0/finality/shard/slash, economic, roster, ML0, protocol/build identity,
+    legacy-era, node-local consensus-clock, and sidecar sources as open
+    consensus/root/roster/recovery authority, genesis inputs, dark telemetry,
+    stale inputs, or local QoS. Its ordinary Test guard freezes
+    exact source/consumer anchors, accounts for all 41 typed Nakamoto HOCON
+    overrides, and conservatively rejects an unreviewed production Scala or Go
+    source file that combines a raw environment API with a Nakamoto key. It also
+    freezes the reviewed raw token/version/jar identity overrides and local
+    allowance-list join gate. This lexical tripwire is not a whole-program
+    data-flow or completeness proof and changes no runtime authority.
+    `PARAM-001`, `GOV-001`, rooted policy/roster ownership, and removal of the
+    inventoried local consensus authorities remain open.
   - **Landed nonactivating E1a cleanup (2026-07-16):** deleted the unused
     configurable Kryo/JSON/Scodec range registry and invalid plain-JSON/Kryo
     bridge scaffold. Added only `ProtocolEraId.ScodecV1`, frozen as strict tag
@@ -878,6 +899,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
 - [ ] **S2 PARTIAL - deterministic framework oracle and kernel**
   - Close authorization, conservation/checked arithmetic, replay, ordering,
     backing, and resource-limit findings for every enabled economic operation.
+  - **OWNER REVIEW REQUIRED:** `docs/review/S2-CANONICAL-ECONOMIC-ORDER-OWNER-REVIEW.md`
+    proposes freezing only the first zero-fee
+    transfer/allow-spend-create/token-lock-create slice. `S2-ORDER-01..03`
+    decide family rank, accepted-prefix funding, bounded
+    retry, `Awaiting` reinsertion, and candidate-local rejection. Production
+    wiring remains blocked on the complete grammar and Scodec identities.
   - **ECO-02 remains CRITICAL/PARTIAL:** the focused worktree now enforces the
     counted/pending-record-to-live-native-indefinite-unique-lock join on every
     changed ordinary transition and blocks the reproduced finite replacement.
@@ -1073,6 +1100,12 @@ criteria are in `NAKAMOTO-PLAN.md`.
 - [ ] **E4 PLANNED - replayable checkpoint schema and complete root**
   - Schema work depends on complete-root steps 1-3; ordinary diff adoption
     remains blocked until integrated step 5 closes.
+  - [ ] **E4A acyclic exact-context schema cut:** freeze the shared,
+    authority-free exact-reference and checkpoint-reference value shapes before
+    P4.4. They bind required fields/commitments but prove neither history nor
+    Phase 2. P4.4 then wires branch-historical verification, and E4B's remaining
+    checkpoint/diff integration consumes that verified capability. Full P7 is not
+    a prerequisite of P4.4.
   - Bind exact Phase-2 base, network/genesis/era/parameters, shard/roster/parent/
     duty, and complete ordered signed inputs.
   - Bind per-MG `preRoot/preVersion`, canonical byte diff,
@@ -1136,6 +1169,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
     authenticated state, not a producer claim.
   - Durably store exact bytes, then sign a domain-separated custody receipt that
     cannot count as execution validity.
+  - Dark schemas, RED tests, and local custody primitives may proceed while O-18
+    is open. Live DA framing, chunking, decompression, fetch, receipt, and intake
+    wiring remain blocked until O-18's canonical-byte/resource contract freezes.
   - **Gate:** `ADMIT-001/002`, `SIG-003/004`, `DA-*`, `NET-*`.
 
 - [ ] **E8 SCAFFOLD ONLY - positive watchtower coverage before GL0 inclusion**
@@ -1145,6 +1181,13 @@ criteria are in `NAKAMOTO-PLAN.md`.
     domain; every adopter verifies assignment, distinct signers, signatures, and
     threshold. Any authenticated assigned mismatch quarantines pending objective
     adjudication regardless of positive count.
+  - Positive assigned-watchtower replay is the ordinary gate; noncommittee GL0
+    validators do not replay an unchallenged checkpoint. An authenticated
+    assigned mismatch quarantines immediately and triggers bounded exceptional
+    universal GL0 replay of the exact retained base/inputs. Its match verdict can
+    release quarantine, mismatch preserves it, and unavailable defers. This core
+    has no slash, bounty, rollback, or delivery authority; those effects belong
+    to the later E11 cut after lifecycle S6-S8.
   - No checkpoint-derived economic capability is usable before coverage;
     unrelated GL0 snapshots continue while it waits.
   - **Gate:** `WT-001/002/004/005/006/008/008A`.
@@ -1152,6 +1195,9 @@ criteria are in `NAKAMOTO-PLAN.md`.
 ### Wave 4 - Global adoption and cross-metagraph settlement
 
 - [ ] **E9 PLANNED - verified GL0 diff adoption and global settlement kernel**
+  - **Explicit dependencies:** E6's one-outstanding checkpoint lifecycle, E7's
+    authenticated durable custody, and E8's positive coverage plus objective
+    replay verdict/quarantine core are mandatory before this security cutover.
   - **CONFIRMED blocker:** candidate replay still reads ambient/ordinal-only
     authority at `CurrencySnapshotAcceptanceManager.scala:300-324,362,378-380,594-596`
     and `GlobalSnapshotOpsManager.scala:46-50,122-134`. Replace these
@@ -1160,6 +1206,10 @@ criteria are in `NAKAMOTO-PLAN.md`.
     history enters recovery/defer; it is not artifact invalidity.
   - Verify quorum/base/continuity/pre-root/input/coverage/diff scope, apply the
     canonical diff, and recompute post-roots. Never install a claimed root.
+  - P8 owns the pure certificate/base/CAS/diff/root adoption primitive and its
+    zero-recreation tests. E9 owns the only live GSAM cutover, universal global
+    settlement composition, and removal of temporary ordinary-adopter CL1 replay.
+    Do not create a second adoption implementation in either packet.
   - Require exact canonical Phase-2 origin for every signed historical read,
     nondecreasing per-MG refs, and proposal-parent pre-root/version CAS before
     replay/sign/inclusion. Receiver live head and self-claimed roots never enter.
@@ -1400,6 +1450,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     `GROWTH-001`.
 
 - [ ] **E11 SCAFFOLD ONLY - exceptional replay, adjudication, and slashing**
+  - **Split lifecycle:** E8's objective match/mismatch/unavailable replay verdict
+    and quarantine core gates E9 adoption. E11's portable evidence, economic
+    slash/bounty delivery, rollback, and reorg effects integrate only after
+    lifecycle S6-S8 and may consume the already-dark E9/E10 interfaces without
+    authorizing early adoption.
   - Accept only assigned, bonded, rate/resource-limited exact-data challenges.
   - Bounded exceptional replay by every GL0 validator of the challenged
     sharded-CL1 checkpoint's exact retained base and ordered framework inputs,
@@ -1491,6 +1546,10 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 - [ ] **E14 PLANNED - staged activation and independent qualification**
   - Keep economic sharding fail-closed until every launch dependency closes.
+  - Treat `PARAM-001`, zero consensus-validity/root/phase effect from
+    receiver-local configuration or wall clock, and `SHARD-C-005` as
+    unconditional release gates. `numShards=1` must run the same execution,
+    watchtower, and ordinary-adoption semantics as 2 and K, with no shortcut.
   - Run model/component, multi-process, partition/restart/reorg, Byzantine
     committee/watchtower, cross-shard multi-MG, long-run permissionless, and
     independent candidate-audit stages.
@@ -1504,11 +1563,14 @@ criteria are in `NAKAMOTO-PLAN.md`.
 
 E1, E2, E2K, S1, S2, S3, and S4 can run in parallel after E0 freezes shared
 vocabulary. E3/E4 then proceed in parallel against frozen interfaces. E6/E7 may
-run in parallel after E4; E8 follows replay-capable E5. Inside E9, the delivery,
-data-fee, checkpoint-global-ordering, and exact-branch lanes may build in parallel
-only behind frozen interfaces; they join before any economic activation. E9 is
-the security cutover. E10/E11 integrate after it; E12/E13 follow the global state
-contracts; E14 qualifies the exact integrated candidate.
+run in parallel after E4; E8 follows replay-capable E5 and authenticated E7
+custody. E8's challenge quarantine/exceptional replay verdict core must close before E9 can
+activate, but universal GL0 replay occurs only after an authenticated challenge.
+Inside E9, the delivery, data-fee, checkpoint-global-ordering, and
+exact-branch lanes may build in parallel only behind frozen interfaces; they join
+before any economic activation. E9 is the security cutover. E10 and E11's later
+slash-delivery/rollback effects integrate after it; E12/E13 follow the global
+state contracts; E14 qualifies the exact integrated candidate.
 
 Every delegated packet records `baseline`, `writeSet`, invariant/finding/test
 IDs, dependencies, commands, artifact directory, and integration owner. Shared

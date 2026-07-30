@@ -21,13 +21,20 @@
 
 Companion to `NAKAMOTO-TODO.md`. The older `docs/nakamoto/IMPLEMENTATION-PLAN-POST-VALIDATION.md` is historical and must not be read as the current shard design.
 
-**Owner-decision status:** `20/23` dispositioned. `O-01` through `O-17`, `O-20`,
-`O-22`, and `O-23` are ratified in
-`docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. `O-18` transport/DA bytes,
-`O-19` upstream-v4 migration policy, and `O-21` optimistic decision evidence
-await owner responses in their focused review packets. Dependencies under every
-ratified decision still require implementation and closure of the listed
-engineering, research, schema, parameter, and proof gates.
+**Owner-decision status:** within the numbered O-01 through O-23 register,
+`20/23` are dispositioned. `O-01` through `O-17`, `O-20`, `O-22`, and `O-23`
+are ratified in `docs/review/CONSENSUS-OWNER-DECISIONS-ANSWERS.md`. `O-18`
+transport/DA bytes and `O-21` optimistic decision evidence await focused owner
+responses. `O-19` upstream-v4 migration policy is intentionally deferred with
+the launch-profile-specific P12 offline migration and does not block the
+greenfield runtime;
+no migration implementation may infer its choices before that response.
+Subsequent audit work also opened narrower owner stop-lines outside the numbered
+register: `S2-ORDER-01..03`, `O13-A1` through `O13-F` including A3's exact
+semantic-intent and equivocation disposition, `TL-EXP-1..4`, and the reward curve/zero-price/
+rooted-bound/precision/nonconvergence choices. Dependencies under every ratified
+decision still require implementation and closure of the listed engineering,
+research, schema, parameter, and proof gates.
 
 ## Active objective
 
@@ -134,6 +141,8 @@ to end.
   execution signature, watchtower coverage/evidence, global optimistic
   attestation, and downstream Phase-2 reference. No type may substitute for
   another.
+- Resolve or explicitly defer out of launch scope every owner stop-line named in
+  the status above. A recommendation or existing call order is not protocol law.
 - Create a one-owner/one-RED-test/one-closing-commit ledger for every open
   CRITICAL/HIGH audit finding and a write-set manifest for delegated work.
 - Gate: `ARCH-001` through `ARCH-003`, `SIG-001` through `SIG-005`; repository
@@ -948,6 +957,12 @@ permissionless proof claims.
 **Depends on:** E0, E1 exact Phase-2 refs, E2/E2K identities, S1-S3, and
 complete-root steps 1-3. Diff adoption remains blocked through step 5.
 
+- **E4A shared-schema cut:** first freeze the authority-free exact-context and
+  checkpoint-reference value shapes used by both P7 and P4.4. This cut binds the
+  required exact reference fields and commitments but neither resolves history
+  nor proves Phase 2. P4.4 then makes their branch-historical verification
+  load-bearing. Only the later E4B checkpoint/diff integration may consume that
+  verified capability. Full P7 is therefore not a prerequisite of P4.4.
 - Define one strict Scodec checkpoint preimage binding network/genesis/era/
   parameters, shard/epoch/roster, parent/ordinal/duty, exact Phase-2 base hash and
   root, and one ordered bounded input list per metagraph.
@@ -1038,11 +1053,15 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   through the required execution/challenge/recovery horizon.
 - Sign a domain-separated admission/custody receipt that cannot decode or count
   as execution validity. Specify a deterministic censorship/offline fallback.
+- Schema, RED, and local custody primitives may remain dark while O-18 is open.
+  No live DA framing, chunking, decompression, fetch, receipt, or intake wiring
+  activates until O-18's canonical-byte and resource contract is ratified and
+  frozen.
 - Gates: `ADMIT-001`/`ADMIT-002`, `SIG-003`/`SIG-004`, `DA-*`, `NET-*`.
 
 ### E8 - Positive pre-inclusion watchtower coverage (`SCAFFOLD ONLY`)
 
-**Depends on:** E2/E2K, E4-E6, and S2.
+**Depends on:** E2/E2K, E4-E7, and S2.
 
 - Deterministically select a noncommittee complement/sample with minimum
   coverage from the same branch-bound historical eligibility state.
@@ -1055,6 +1074,14 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   verifies assignment, distinct noncommittee identities, signatures, and minimum
   threshold. An authenticated assigned mismatch quarantines the checkpoint
   pending objective adjudication even if positive count is already sufficient.
+- Positive assigned-watchtower replay is the ordinary pre-inclusion gate and
+  does not make noncommittee GL0 validators replay an unchallenged checkpoint.
+  An authenticated assigned mismatch quarantines immediately and alone triggers
+  bounded exceptional universal GL0 replay of the exact retained base/inputs.
+  That replay returns match, mismatch, or unavailable: match can release the
+  quarantine, mismatch preserves it, and unavailable defers. The verdict core
+  has no slash, bounty, rollback, or delivery authority; those economic/reorg
+  effects remain the later E11 integration cut.
 - No checkpoint-derived transfer, fee, lock, stake/collateral, reward, mint/burn,
   cross-MG effect, withdrawal, bridge effect, or acknowledgement becomes usable
   before coverage.
@@ -1062,7 +1089,9 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
 
 ### E9 - Ordinary GL0 diff adoption and global settlement kernel (`PLANNED`)
 
-**Depends on:** E1, E4, E5, E8, and S2. **Security cutover point.**
+**Depends on:** E1, E4, E5, E6 single-outstanding lifecycle, E7 authenticated
+custody, E8 positive coverage plus its challenge quarantine/exceptional replay
+verdict core, and S2. **Security cutover point.**
 
 **Confirmed replay-authority blocker:** the historical-snapshot callback is not
 the sole input today. Currency replay can prefer ordinal-only `LastN` snapshots,
@@ -1078,6 +1107,11 @@ work; it never makes an older reference invalid or changes fork choice.
   ordinal, pre-root/version, input commitments, the positive-coverage certificate
   and absence of a pending authenticated mismatch, diff namespace/canonicality,
   then apply the diff and recompute every post-root.
+- P8 owns the pure certificate/base/CAS/diff/root adoption primitive and its
+  zero-recreation tests. E9 owns the only live GSAM cutover that calls that
+  primitive, composes its result with the universal global kernel, and removes
+  temporary ordinary-adopter CL1 replay. This ownership split must not create two
+  independently evolving adoption implementations.
 - Resolve every binary's signed origin to exact canonical Phase-2 historical
   state before replay/sign/inclusion, require nondecreasing refs within each MG
   segment, and never use receiver live head, peer-local state, wall clock, or a
@@ -1386,7 +1420,13 @@ delivery, rollback, and recovery.
 
 ### E11 - Exceptional challenge replay and sound slashing (`SCAFFOLD ONLY`)
 
-**Depends on:** E2, E4-E10.
+**Split dependency:** E8 owns ordinary positive replay coverage, immediate
+challenge quarantine, and the challenge-triggered exceptional replay verdict
+core required before E9 activation. Unchallenged ordinary checkpoints do not
+receive universal GL0 replay. E11 owns the later portable evidence,
+slash/bounty delivery, rollback, and reorg integration; that effects cut depends
+on E2, E4-E10 and follows lifecycle S6-S8. Implementing E9 dark APIs does not
+authorize adoption before the E8 gate.
 
 - An assigned, bonded, rate-limited challenge names exact retained inputs/base,
   checkpoint, signers, and reproduced mismatch. An assertion alone never rolls
@@ -1488,6 +1528,10 @@ delivery, rollback, and recovery.
 
 - Keep economic sharding fail-closed until all predecessor gates pass. An unsafe
   development profile must be explicit and cannot share production parameters.
+- Release unconditionally requires `PARAM-001`, zero consensus-validity/root/
+  phase effect from receiver-local configuration or wall clock, and
+  `SHARD-C-005`: `numShards=1` runs the same execution-committee, watchtower, and
+  ordinary-adoption semantics as 2 and K with no direct/unsharded bypass.
 - Activate in stages: model/component; deterministic multi-process; partition/
   restart/reorg; adversarial committee/watchtower; multi-MG cross-shard; long-run
   permissionless testnet; exact-candidate independent audit.
@@ -1507,7 +1551,7 @@ These are consensus dependencies, not optional cleanup:
 |---|---|---|---|
 | S1 canonical identity/serde/era | Add `Hasher.forScodec` as a typed `ScodecV1Hasher` requiring one audited `ConsensusHashSchema[A]` that binds the exact byte-aligned `ImmutableCodec[A]`, type-specific static domain, and frozen bounded size, then replace live JSON/Kryo hashing/proofs with that one domain-separated ordinal-0 service. Freeze a globally unique schema manifest, composite vectors, and MPT node/value bytes; isolate upstream-v4 Brotli/Kryo in a read-only importer. The unused configurable multi-era registry and invalid bridge scaffold are deleted. | After E0 vocabulary | E2, E2K, E3-E5, E7, E13 |
 | S2 deterministic framework oracle/kernel | Authorization, checked arithmetic, conservation, semantic replay protection, ordered execution, resource bounds, independent prefix oracle. | After E0 economic grammar | E4/E5/E8-E11/E13 |
-| S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
+| S3 lane and DA contract | Explicit currency and currency-with-data lanes; isolated custom commitment; exact input/chunk retention; no decoder-based dispatch. Semantic schemas and RED work may remain dark while O-18 is open; no live DA/intake byte path activates before O-18's canonical-byte/resource contract freezes. | After E0 lane decision + S1 primitives | E4/E7/E8/E11 |
 | S4 transport/resource/recovery harness | Finish end-to-end bounds beyond the landed callback/worker containment: downstream sinks, outer-signature resource admission, malformed-message isolation, multi-sink cancellation atomicity, one descriptor/chunk size contract, durable outboxes, exact-hash multi-peer recovery, and fuzz/fault harness. Native admission never replaces universal GL1 execution at GL0. | RED tests can start after E0 | E1/E3/E7/E11/E14 |
 
 The bootstrap selector now returns an exact peer/ordinal/hash tuple, restricts
@@ -1519,6 +1563,21 @@ peer-reported plurality is not consensus evidence, ML0 historical facilitator
 quorum is not yet proved, and GL0 cleanup still precedes complete authenticated
 staging. S4/E11 must stage, objectively authenticate/compare, and atomically
 switch every sink before abandoning the prior generation.
+
+The current configuration-authority source tripwire inventories 102 reviewed
+surfaces across GL0/finality/shards/slashing, framework economics, local rosters,
+ML0 parameters, protocol/build identity, legacy era selection, node-local
+consensus clocks, and the Go sidecar. Its guard freezes exact source/consumer
+anchors, covers all 41
+`application.conf` `NAKAMOTO_*`
+substitutions, and conservatively rejects an unreviewed production Scala or Go
+source file that combines a raw environment API with a `NAKAMOTO_*` key. It also
+freezes the reviewed raw token/version/jar identity overrides and local
+allowance-list join gate. This is a current-source lexical review boundary, not
+a whole-program data-flow or completeness proof and not runtime parameter
+authority. The rooted consensus
+parameter object, rooted economic policies/rosters, recovery replacement, and
+local-authority removal remain open under `PARAM-001`/`GOV-001`.
 
 Current S1 evidence is cleanup, identity, and dark byte/signature contracts only. The
 stale configurable Kryo/JSON/Scodec range registry and unused plain-format legacy bridges are
@@ -1551,8 +1610,9 @@ blockers include accumulator omissions for rooted field 33
 `ConsumedAllowSpends` and field 34 `Slashings`, the unenforced ROOT-008 physical
 MPT-key grammar, the JSON `SlashedRegistryEntry` leaf, missing signed lane/shard
 diff/positive replay-coverage, exact optimistic-tip attestation, and finality/tower
-proof schemas. The pending owner decisions are O-18 transport/DA, O-19
-migration policy, and O-21 optimistic-decision evidence. O-20's narrow field-34
+proof schemas. O-18 transport/DA and O-21 optimistic-decision evidence remain
+runtime owner stop-lines. O-19 migration policy is intentionally deferred to
+launch-profile-specific P12 and does not block the greenfield runtime. O-20's narrow field-34
 schema direction is owner-ratified. A dark candidate now records tag `0x01`,
 canonical-composition 103-byte logical-identity bytes, and 159-byte record bytes
 with private validated constructors and exhaustive tag/refinement negatives.
