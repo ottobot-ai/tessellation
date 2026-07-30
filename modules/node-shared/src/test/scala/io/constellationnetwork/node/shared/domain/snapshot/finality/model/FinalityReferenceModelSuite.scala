@@ -26,7 +26,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   private def ref(value: Long, char: Char, parent: Hash, rootChar: Char): SnapshotRef =
     SnapshotRef(ord(value), hash(char), parent, MptRoot(hash(rootChar)))
 
-  private val genesis = ref(0L, 'a', Hash.empty, '0')
+  private val genesis = ref(0L, 'a', Hash.empty, 'a')
   private val a1 = ref(1L, '1', genesis.hash, 'b')
   private val a2 = ref(2L, '2', a1.hash, 'c')
   private val a3 = ref(3L, '3', a2.hash, 'd')
@@ -36,7 +36,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   // Hash.empty is 64 zeroes and is the ancestry root sentinel, so never use it as a fixture's snapshot hash.
   private val a7 = SnapshotRef(ord(7L), Hash("01" * 32), a6.hash, MptRoot(hash('8')))
   private val a8 = ref(8L, '7', a7.hash, '9')
-  private val a9 = ref(9L, 'f', a8.hash, '0')
+  private val a9 = ref(9L, 'f', a8.hash, '1')
 
   private def applyCommand(state: State, command: Command): State =
     FinalityReferenceModel.step(state, command).fold(err => throw new AssertionError(err.toString), _.state)
@@ -69,6 +69,130 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
   private def canonicalLong: State = {
     val observed = observeAll(State.empty(parameters), List(genesis, a1, a2, a3, a4, a5, a6, a7, a8, a9))
     applyCommand(observed, Command.SelectCanonical(a9, ForkChoiceRule.MaxValidTk))
+  }
+
+  pureTest("[FIN-M-001] malformed exact references reject before P0 observation") {
+    val malformed =
+      List(
+        genesis.copy(hash = Hash("A" * 64)),
+        genesis.copy(parentHash = hash('b')),
+        genesis.copy(mptRoot = MptRoot(Hash.empty)),
+        a1.copy(parentHash = Hash.empty)
+      )
+
+    expect(
+      malformed.forall { candidate =>
+        FinalityReferenceModel.step(State.empty(parameters), Command.ObserveExecutedCandidate(candidate)) match {
+          case Left(ModelError.InvalidReference(rejected, _)) => rejected == candidate
+          case _                                              => false
+        }
+      }
+    )
+  }
+
+  pureTest("[FIN-M-001] same-hash exact-reference collision rejects without replacing P0") {
+    val observed = observeAll(State.empty(parameters), List(genesis))
+    val collision = genesis.copy(mptRoot = MptRoot(hash('f')))
+    val result = FinalityReferenceModel.step(observed, Command.ObserveExecutedCandidate(collision))
+
+    expect.all(
+      result == Left(ModelError.HashCollision(genesis, collision)),
+      observed.statusOf(genesis) == ExactStatus.Observed(Phase.P0Pending),
+      observed.statusOf(collision) == ExactStatus.Unknown
+    )
+  }
+
+  pureTest("[FIN-M-001] known ordinal gap rejects as invalid lineage without entering recovery") {
+    val gap = ref(2L, '4', genesis.hash, 'e')
+    val observed = observeAll(State.empty(parameters), List(genesis, gap))
+    val result = FinalityReferenceModel.step(observed, Command.SelectCanonical(gap, ForkChoiceRule.MaxValidTk))
+
+    result match {
+      case Left(ModelError.InvalidLineage(child, knownParent, detail)) =>
+        expect.all(
+          child == gap,
+          knownParent == genesis,
+          detail.contains("ordinal"),
+          observed.mode == Mode.Running,
+          observed.statusOf(gap) == ExactStatus.Observed(Phase.P0Pending)
+        )
+      case other => failure(s"expected typed invalid-lineage rejection, got $other")
+    }
+  }
+
+  pureTest("[FIN-M-001] Long.MaxValue adjacency reaches the unknown grandparent without signed overflow") {
+    val missingGrandparent = hash('5')
+    val parent = ref(Long.MaxValue - 1L, '6', missingGrandparent, '7')
+    val child = ref(Long.MaxValue, '8', parent.hash, '9')
+    val observed = observeAll(State.empty(parameters), List(parent, child))
+    val result = FinalityReferenceModel.step(observed, Command.SelectCanonical(child, ForkChoiceRule.MaxValidBg))
+
+    result match {
+      case Right(StepResult(recovering, List(Event.EnteredRecovery(reason)))) =>
+        val expectedReason = RecoveryReason.MissingAncestor(missingGrandparent, child)
+        val recovery = Mode.RecoveryRequired(expectedReason)
+        val grandparent = ref(Long.MaxValue - 2L, '5', hash('4'), '6')
+        val attemptedMutation =
+          FinalityReferenceModel.step(recovering, Command.ObserveExecutedCandidate(grandparent))
+
+        expect.all(
+          reason == expectedReason,
+          recovering.mode == recovery,
+          recovering.canonicalTip.isEmpty,
+          recovering.statusOf(child) == ExactStatus.Observed(Phase.P0Pending),
+          recovering.requireOperational(child) == Left(ModelError.Halted(recovery)),
+          verifyPhase2Qualification(recovering, child, Phase2Evidence.Depth) == Left(ModelError.Halted(recovery)),
+          attemptedMutation == Left(ModelError.Halted(recovery))
+        )
+      case other => failure(s"expected missing-grandparent recovery without ordinal overflow, got $other")
+    }
+  }
+
+  pureTest("[FIN-M-001] cyclic known lineage rejects and never becomes RecoveryRequired") {
+    val selfHash = hash('4')
+    val cyclic = SnapshotRef(ord(1L), selfHash, selfHash, MptRoot(hash('e')))
+    val observed = observeAll(State.empty(parameters), List(cyclic))
+    val result = FinalityReferenceModel.step(observed, Command.SelectCanonical(cyclic, ForkChoiceRule.MaxValidTk))
+
+    result match {
+      case Left(ModelError.InvalidLineage(child, knownParent, detail)) =>
+        expect.all(
+          child == cyclic,
+          knownParent == cyclic,
+          detail.contains("ordinal") || detail.contains("cycle"),
+          observed.mode == Mode.Running
+        )
+      case other => failure(s"expected cyclic lineage rejection, got $other")
+    }
+  }
+
+  pureTest("[FIN-M-001] two complete genesis frontiers enter typed disconnected recovery") {
+    val selected = qualify(canonicalA, a3, decided(a3))
+    val retainedQualification = verifyOrThrow(selected, a3, decided(a3))
+    val otherGenesis = ref(0L, 'b', Hash.empty, 'c')
+    val otherTip = ref(1L, 'c', otherGenesis.hash, 'd')
+    val observed = observeAll(selected, List(otherGenesis, otherTip))
+    val result = FinalityReferenceModel.step(observed, Command.SelectCanonical(otherTip, ForkChoiceRule.MaxValidBg))
+
+    result match {
+      case Right(StepResult(recovering, List(Event.EnteredRecovery(reason)))) =>
+        val expectedReason = RecoveryReason.DisconnectedCanonicalFrontier(a3, otherTip)
+        val recovery = Mode.RecoveryRequired(expectedReason)
+        val attemptedMutation =
+          FinalityReferenceModel.step(recovering, Command.QualifyPhase2(retainedQualification))
+
+        expect.all(
+          reason == expectedReason,
+          recovering.mode == recovery,
+          recovering.canonicalTip.contains(a3),
+          recovering.phase2Head.contains(a3),
+          recovering.statusOf(otherTip) == ExactStatus.Observed(Phase.P0Pending),
+          List(genesis, a1, a2, a3).forall(ref => recovering.requireOperational(ref) == Left(ModelError.Halted(recovery))),
+          verifyPhase2Qualification(recovering, a3, decided(a3)) == Left(ModelError.Halted(recovery)),
+          attemptedMutation == Left(ModelError.Halted(recovery))
+        )
+      case other => failure(s"expected typed disconnected-frontier recovery, got $other")
+    }
   }
 
   pureTest("[FIN-M-001] exact candidate moves P0 -> P1 -> P2 without an ordinal-only status") {
@@ -274,7 +398,7 @@ object FinalityReferenceModelSuite extends SimpleIOSuite {
     val b3 = ref(3L, '6', b2.hash, '7')
     val b4 = ref(4L, 'b', b3.hash, '8')
     val b5 = ref(5L, 'c', b4.hash, '9')
-    val b6 = ref(6L, 'd', b5.hash, '0')
+    val b6 = ref(6L, 'd', b5.hash, '1')
     val withFork = observeAll(mature, List(b1, b2, b3, b4, b5, b6))
     val replaced = FinalityReferenceModel.step(withFork, Command.SelectCanonical(b6, ForkChoiceRule.MaxValidBg))
 

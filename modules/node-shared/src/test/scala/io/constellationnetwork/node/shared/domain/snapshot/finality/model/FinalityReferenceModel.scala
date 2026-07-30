@@ -73,6 +73,10 @@ object FinalityReferenceModel {
   sealed trait RecoveryReason extends Product with Serializable
   object RecoveryReason {
     final case class MissingAncestor(missingAncestor: Hash, competingTip: SnapshotRef) extends RecoveryReason
+    final case class DisconnectedCanonicalFrontier(
+      currentTip: SnapshotRef,
+      competingTip: SnapshotRef
+    ) extends RecoveryReason
     final case class LineageRevisionExhausted(
       current: CanonicalLineageRevision,
       competingTip: SnapshotRef
@@ -151,7 +155,13 @@ object FinalityReferenceModel {
   sealed trait ModelError extends Product with Serializable
   object ModelError {
     final case class UnknownSnapshot(ref: SnapshotRef) extends ModelError
+    final case class InvalidReference(ref: SnapshotRef, detail: String) extends ModelError
     final case class HashCollision(existing: SnapshotRef, incoming: SnapshotRef) extends ModelError
+    final case class InvalidLineage(
+      child: SnapshotRef,
+      knownParent: SnapshotRef,
+      detail: String
+    ) extends ModelError
     final case class NotCanonical(ref: SnapshotRef) extends ModelError
     final case class WrongSelectionRule(expected: ForkChoiceRule, supplied: ForkChoiceRule, divergenceDepth: Long) extends ModelError
     final case class InsufficientEvidence(evidence: Phase2Evidence) extends ModelError
@@ -247,19 +257,21 @@ object FinalityReferenceModel {
     }
 
   private def observe(state: State, ref: SnapshotRef): Either[ModelError, StepResult] =
-    state.candidates.get(ref.hash) match {
-      case Some(existing) if existing != ref => Left(ModelError.HashCollision(existing, ref))
-      case Some(_)                           => Right(StepResult(state, Nil))
-      case None =>
-        Right(
-          StepResult(
-            state.copy(
-              candidates = state.candidates.updated(ref.hash, ref),
-              phases = state.phases.updated(ref.hash, Phase.P0Pending)
-            ),
-            List(Event.CandidateObserved(ref))
+    validateReference(ref).flatMap { _ =>
+      state.candidates.get(ref.hash) match {
+        case Some(existing) if existing != ref => Left(ModelError.HashCollision(existing, ref))
+        case Some(_)                           => Right(StepResult(state, Nil))
+        case None =>
+          Right(
+            StepResult(
+              state.copy(
+                candidates = state.candidates.updated(ref.hash, ref),
+                phases = state.phases.updated(ref.hash, Phase.P0Pending)
+              ),
+              List(Event.CandidateObserved(ref))
+            )
           )
-        )
+      }
     }
 
   private def selectCanonical(
@@ -269,8 +281,9 @@ object FinalityReferenceModel {
   ): Either[ModelError, StepResult] =
     exactCandidate(state, selectedTip).flatMap { _ =>
       ancestry(state, selectedTip) match {
-        case Left(missing) =>
+        case Left(AncestryFailure.Recover(missing)) =>
           Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, selectedTip)))
+        case Left(AncestryFailure.Reject(error)) => Left(error)
         case Right(newChain) =>
           state.canonicalTip match {
             case None =>
@@ -293,15 +306,15 @@ object FinalityReferenceModel {
 
             case Some(oldTip) =>
               ancestry(state, oldTip) match {
-                case Left(missing) =>
+                case Left(AncestryFailure.Recover(missing)) =>
                   Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, selectedTip)))
+                case Left(AncestryFailure.Reject(error)) => Left(error)
                 case Right(oldChain) =>
                   val oldByHash = oldChain.iterator.map(r => r.hash -> r).toMap
                   val mrcaIndex = newChain.indexWhere(r => oldByHash.contains(r.hash))
-                  if (mrcaIndex < 0) {
-                    val missing = newChain.last.parentHash
-                    Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, selectedTip)))
-                  } else {
+                  if (mrcaIndex < 0)
+                    Right(enterRecovery(state, RecoveryReason.DisconnectedCanonicalFrontier(oldTip, selectedTip)))
+                  else {
                     val mrca = newChain(mrcaIndex)
                     val oldMrcaIndex = oldChain.indexWhere(_.hash == mrca.hash)
                     val divergenceDepth = math.max(mrcaIndex, oldMrcaIndex).toLong
@@ -382,8 +395,9 @@ object FinalityReferenceModel {
         else if (state.phases.get(ref.hash).contains(Phase.P2Operational)) Right(StepResult(state, Nil))
         else
           ancestry(state, ref) match {
-            case Left(missing) =>
+            case Left(AncestryFailure.Recover(missing)) =>
               Right(enterRecovery(state, RecoveryReason.MissingAncestor(missing, ref)))
+            case Left(AncestryFailure.Reject(error)) => Left(error)
             case Right(chain) =>
               val canonicalAncestors = chain.filter(r => state.canonicalHashes.contains(r.hash))
               val nextPhases = canonicalAncestors.foldLeft(state.phases) { (acc, r) =>
@@ -462,18 +476,61 @@ object FinalityReferenceModel {
       List(Event.EnteredRecovery(reason))
     )
 
-  /** Tip-first ancestry. Hash.empty is the explicit root-parent sentinel. Missing parent bytes fail closed. */
-  private def ancestry(state: State, tip: SnapshotRef): Either[Hash, List[SnapshotRef]] = {
+  private sealed trait AncestryFailure extends Product
+  private object AncestryFailure {
+    final case class Recover(missing: Hash) extends AncestryFailure
+    final case class Reject(error: ModelError.InvalidLineage) extends AncestryFailure
+  }
+
+  /** Tip-first ancestry. Only unavailable parent bytes enter recovery; malformed known lineage rejects. */
+  private def ancestry(state: State, tip: SnapshotRef): Either[AncestryFailure, List[SnapshotRef]] = {
     @annotation.tailrec
-    def loop(current: SnapshotRef, acc: List[SnapshotRef], seen: Set[Hash]): Either[Hash, List[SnapshotRef]] =
-      if (seen.contains(current.hash)) Left(current.hash)
-      else if (current.parentHash == Hash.empty) Right((current :: acc).reverse)
+    def loop(
+      current: SnapshotRef,
+      acc: List[SnapshotRef],
+      seen: Set[Hash]
+    ): Either[AncestryFailure, List[SnapshotRef]] =
+      if (seen.contains(current.hash))
+        Left(AncestryFailure.Reject(ModelError.InvalidLineage(current, current, "cycle in exact parent lineage")))
+      else if (current.ordinal.value.value == 0L)
+        if (current.parentHash == Hash.empty) Right((current :: acc).reverse)
+        else
+          Left(
+            AncestryFailure.Reject(
+              ModelError.InvalidLineage(current, current, "ordinal-zero candidate does not use the genesis parent sentinel")
+            )
+          )
       else
         state.candidates.get(current.parentHash) match {
-          case None         => Left(current.parentHash)
-          case Some(parent) => loop(parent, current :: acc, seen + current.hash)
+          case Some(parent) if BigInt(parent.ordinal.value.value) + 1 == BigInt(current.ordinal.value.value) =>
+            loop(parent, current :: acc, seen + current.hash)
+          case Some(parent) =>
+            Left(
+              AncestryFailure.Reject(
+                ModelError.InvalidLineage(current, parent, "known parent ordinal is not exactly child ordinal minus one")
+              )
+            )
+          case None => Left(AncestryFailure.Recover(current.parentHash))
         }
 
     loop(tip, Nil, Set.empty)
   }
+
+  private def validateReference(ref: SnapshotRef): Either[ModelError, Unit] = {
+    val ordinal = ref.ordinal.value.value
+    val hashValid = canonicalNonZeroHash(ref.hash)
+    val parentValid = if (ordinal == 0L) ref.parentHash == Hash.empty else canonicalNonZeroHash(ref.parentHash)
+    val rootValid = canonicalNonZeroHash(ref.mptRoot.value)
+
+    Either.cond(
+      hashValid && parentValid && rootValid,
+      (),
+      ModelError.InvalidReference(ref, "hash, parent sentinel, or MPT root is not canonical")
+    )
+  }
+
+  private def canonicalNonZeroHash(hash: Hash): Boolean =
+    hash != Hash.empty &&
+      hash.value.length == 64 &&
+      hash.value.forall(character => (character >= '0' && character <= '9') || (character >= 'a' && character <= 'f'))
 }
