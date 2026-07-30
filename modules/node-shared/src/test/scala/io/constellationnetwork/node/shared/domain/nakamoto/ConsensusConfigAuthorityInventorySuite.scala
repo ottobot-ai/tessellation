@@ -363,17 +363,16 @@ object ConsensusConfigAuthorityInventorySuite extends SimpleIOSuite {
     environmentApi: Regex,
     keyLiteral: Regex = nakamotoKeyLiteral
   ): Map[(String, String), Int] =
-    sources
-      .flatMap { source =>
-        val withoutSourceComments = withoutComments(source.contents)
-        if (environmentApi.findFirstIn(withoutSourceComments).isEmpty) List.empty
-        else
-          keyLiteral
-            .findAllMatchIn(withoutSourceComments)
-            .map(matched => (matched.group(1), source.path))
-            .toSet
-            .toList
-      }
+    sources.flatMap { source =>
+      val withoutSourceComments = withoutComments(source.contents)
+      if (environmentApi.findFirstIn(withoutSourceComments).isEmpty) List.empty
+      else
+        keyLiteral
+          .findAllMatchIn(withoutSourceComments)
+          .map(matched => (matched.group(1), source.path))
+          .toSet
+          .toList
+    }
       .groupMapReduce(identity)(_ => 1)(_ + _)
 
   /** Removes line and nested block comments while retaining string contents needed to read the environment key literal. */
@@ -476,7 +475,20 @@ object ConsensusConfigAuthorityInventorySuite extends SimpleIOSuite {
         val id :: family :: authorityKey :: source :: sourceMarker :: sourceCount :: consumer :: consumerMarker :: consumerCount :: effect :: targetAuthority :: status :: Nil =
           fields
         val values =
-          List(id, family, authorityKey, source, sourceMarker, sourceCount, consumer, consumerMarker, consumerCount, effect, targetAuthority, status)
+          List(
+            id,
+            family,
+            authorityKey,
+            source,
+            sourceMarker,
+            sourceCount,
+            consumer,
+            consumerMarker,
+            consumerCount,
+            effect,
+            targetAuthority,
+            status
+          )
         require(values.forall(_.trim.nonEmpty), s"Inventory row contains an empty field: $id")
         ManifestRow(
           id,
