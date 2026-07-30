@@ -540,6 +540,17 @@ path on the current root shape.
 - Implement/validate the real K/alpha/beta Avalanche/Snowball cascade as the
   optimistic Phase-2 rail and `k1` depth as its Nakamoto fallback. Neither rail
   validates economics.
+- **Dark exact-phase kernel only (2026-07-29):**
+  `ExactFinalityPhaseKernel` now models exact-reference P0/P1/P2,
+  branch/lineage-CAS rejection, reversible P2 suffixes, append-only
+  lineage-bound qualification provenance, retention isolation, and absorbing
+  recovery. Generated reorg/ABA tests and a direct-production-JVM-source guard
+  keep it nonactivating. This is not a `FinalityGate` implementation: the
+  fork-choice pointer is only kind-checked and remains opaque/unverified; there
+  is no O-15 selector-input/frontier epoch binding, cutoff or late-reveal rule,
+  atomic eligible-contender drain/recheck, durable coordinator transaction, or
+  runtime caller. Those gates must close before the kernel can authorize
+  canonical selection or Phase 2.
 - **Current containment (2026-07-15):** raw local GL0 attestation emitters,
   receiver-invented producer evidence, periodic best-tip re-attestation, and the
   one-round cumulative-weight finalization sink are removed. Verified remote
@@ -1610,6 +1621,18 @@ ECO-30's focused event-isolation regressions now prove cross-family pending-lock
 reuse, direct collateral successor/predecessor withdrawal, and non-latest
 reused-lock-owner withdrawal reject as attributable events before materialization.
 Preserve them and the terminal defense.
+
+ECO-17 is now a confirmed reachable determinism defect rather than a
+hypothetical cross-platform concern. The isolated
+`GlobalDelegatedRewardsMathDeterminismRedSuite` runs the real Testnet pricing
+validator and two-window updater, then reproduces a one-datum reward difference
+between Java-permitted Math and StrictMath paths from the same canonical state.
+No runtime curve change is included. `ECON-REWARD-003` first freezes the intended
+curve, zero-price behavior, exact rooted bounds, precision/error schedule, and
+bounded nonconvergence rule in S1, then requires an independent proved interval
+oracle and production implementation in S2-F. Because this fork is greenfield,
+the deterministic algorithm replaces fork-only binary64 execution at ordinal
+zero; any later upstream-v4 source verification remains isolated importer logic.
 
 The same packet replaces private-key-bearing public genesis records with fully
 signed event/backing-lock bundles and persists newly generated economic secrets

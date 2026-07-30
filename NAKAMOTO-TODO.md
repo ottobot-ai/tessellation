@@ -468,6 +468,15 @@ criteria are in `NAKAMOTO-PLAN.md`.
     boundary, and models MRCA orphan/adopt plus Phase-2 replacement. It does not
     select the winner or authorize live fork choice
     (`FinalityReferenceModel.scala:7-11,97-100,217-313`).
+  - **Dark exact-phase kernel only (2026-07-29):**
+    `ExactFinalityPhaseKernel` models exact P0/P1/P2 refs, branch/lineage CAS,
+    reversible P2 suffixes, qualification provenance, retention isolation, and
+    absorbing recovery under generated reorg/ABA tests. Its source guard proves
+    only that no other production JVM source directly references it. The
+    fork-choice pointer is kind-checked but opaque/unverified, and there is no
+    selector-input/frontier epoch binding, O-15 cutoff/late-reveal rule, atomic
+    eligible-contender drain/recheck, durable coordinator transaction, or
+    runtime caller. It does not close E1 or authorize `FinalityGate`.
   - **OPEN frontier implementation/proof blocker:** a strict-preference three-cycle
     over structurally connected comparator inputs has `A >tk B`, `B >bg C`, and
     `C >bg A`, so list permutation changes the left-fold winner without relying on
@@ -900,6 +909,21 @@ criteria are in `NAKAMOTO-PLAN.md`.
     delegated pending escape, collateral pending escape, durable dedup before
     debit, and full maturity refund after the slash record). SHA-256:
     `96f568291a4eee8e636debd814b8d8e4a3d5eebc6c3c2e06a5a752f4b3c04ca7`.
+  - **ECO-17/ECON-REWARD-003 CONFIRMED HIGH, runtime fix open:** the isolated
+    `GlobalDelegatedRewardsMathDeterminismRedSuite` passes three real Testnet
+    pricing validations, exercises the two-window `PriceStateUpdater` promotion,
+    and then fails the one-result invariant: the live Math path mints
+    `30031351592`, while a Java-permitted StrictMath reference path mints
+    `30031351591` from the same epoch-`1001274` state. The second case records
+    an admitted fractional-power overflow. The suite is intentionally outside
+    ordinary `Test` and has SHA-256
+    `b375143b716af846ba72f48bf57fd9daea8352451ad16c0138a6781379cb04f6`.
+    Before implementation, owner review must freeze the intended curve,
+    zero-price semantics, exact rooted input bounds, precision/error schedule,
+    and bounded nonconvergence result. S1 owns those parameter/schema choices;
+    S2-F owns the proved rational/fixed-point oracle and production cutover.
+    This greenfield target replaces binary64 from ordinal zero; upstream-v4
+    verification, if later required, remains isolated importer logic.
   - **ECO-29 current tree fixed / history compromised:** public genesis now
     carries signed event/backing-lock bundles and generated economic secrets are
     stored separately with owner-only permissions. Historical fixture private
@@ -976,7 +1000,7 @@ criteria are in `NAKAMOTO-PLAN.md`.
     [`TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md`](docs/review/TOKEN-LOCK-EXPIRY-OWNER-REVIEW.md).
     Allow-spend consume/expiry/refund remain blocked on O-13 terminal ordering;
     all other E2 grammar rows remain open.
-  - **Gate:** `ECON-D/C/A/R/O/B/F/G-*`.
+  - **Gate:** `ECON-D/C/A/R/O/B/F/G-*`, `ECON-REWARD-003`.
 
 - [ ] **S3 PARTIAL - signed payload lanes and data availability**
   - Make currency and currency-with-data explicit; decoder success and custom
