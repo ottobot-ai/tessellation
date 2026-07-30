@@ -61,11 +61,13 @@
 > transport/DA bytes and `O-21` optimistic decision evidence await focused owner
 > responses. `O-19` upstream-v4 migration policy is deferred with
 > launch-profile-specific P12 offline migration and does not block the greenfield
-> runtime; migration work may not infer its unresolved choices. Later audit packets also require owner review
-> for `S2-ORDER-01..03`, `O13-A1` through `O13-F` including A3's exact
-> intent/equivocation disposition, `TL-EXP-1..4`, and the reward curve/zero-price/rooted-bound/
-> precision/nonconvergence choices. Other open work under ratified directions is
-> an engineering, research, schema, parameter, or proof gate.
+> runtime; migration work may not infer its unresolved choices. Later audit
+> packets also require owner review for `S2-ORDER-01..03`,
+> `P7-CPREF-01..06`, `O13-A1` through `O13-F` including A3's exact
+> intent/equivocation disposition, `TL-EXP-1..4`, and the reward
+> curve/zero-price/rooted-bound/precision/nonconvergence choices. Other open
+> work under ratified directions is an engineering, research, schema, parameter,
+> or proof gate.
 
 ---
 
@@ -1106,6 +1108,11 @@ criteria are in `NAKAMOTO-PLAN.md`.
     Phase 2. P4.4 then wires branch-historical verification, and E4B's remaining
     checkpoint/diff integration consumes that verified capability. Full P7 is not
     a prerequisite of P4.4.
+    The 104-byte global state-reference canary is frozen, but the
+    checkpoint-parent lineage shape and `ShardOrdinal` rules remain owner-blocked
+    on `P7-CPREF-01..06` in
+    `docs/review/P7-CHECKPOINT-PARENT-REFERENCE-OWNER-REVIEW.md`; proposed bytes
+    there have no runtime or Phase-2 authority.
   - Bind exact Phase-2 base, network/genesis/era/parameters, shard/roster/parent/
     duty, and complete ordered signed inputs.
   - Bind per-MG `preRoot/preVersion`, canonical byte diff,

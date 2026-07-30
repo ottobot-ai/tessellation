@@ -30,11 +30,12 @@ the launch-profile-specific P12 offline migration and does not block the
 greenfield runtime;
 no migration implementation may infer its choices before that response.
 Subsequent audit work also opened narrower owner stop-lines outside the numbered
-register: `S2-ORDER-01..03`, `O13-A1` through `O13-F` including A3's exact
-semantic-intent and equivocation disposition, `TL-EXP-1..4`, and the reward curve/zero-price/
-rooted-bound/precision/nonconvergence choices. Dependencies under every ratified
-decision still require implementation and closure of the listed engineering,
-research, schema, parameter, and proof gates.
+register: `S2-ORDER-01..03`, `P7-CPREF-01..06`, `O13-A1` through `O13-F`
+including A3's exact semantic-intent and equivocation disposition,
+`TL-EXP-1..4`, and the reward curve/zero-price/rooted-bound/precision/
+nonconvergence choices. Dependencies under every ratified decision still
+require implementation and closure of the listed engineering, research,
+schema, parameter, and proof gates.
 
 ## Active objective
 
@@ -963,6 +964,12 @@ complete-root steps 1-3. Diff adoption remains blocked through step 5.
   nor proves Phase 2. P4.4 then makes their branch-historical verification
   load-bearing. Only the later E4B checkpoint/diff integration may consume that
   verified capability. Full P7 is therefore not a prerequisite of P4.4.
+- The 104-byte `GlobalSnapshotStateRef` structural value is frozen and enforces
+  the global ordinal-zero parent sentinel in both directions. P7.0 remains
+  partial: the checkpoint-parent lineage value and `ShardOrdinal` rules are
+  blocked on `P7-CPREF-01..06` in
+  `docs/review/P7-CHECKPOINT-PARENT-REFERENCE-OWNER-REVIEW.md`. Its candidate
+  bytes are review-only and have no Phase-2, signing, or runtime authority.
 - Define one strict Scodec checkpoint preimage binding network/genesis/era/
   parameters, shard/epoch/roster, parent/ordinal/duty, exact Phase-2 base hash and
   root, and one ordered bounded input list per metagraph.
