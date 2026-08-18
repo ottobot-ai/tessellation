@@ -35,8 +35,7 @@ trait ConsensusStateAdvancer[F[_], Key, Artifact, Context, Status, Outcome, Kind
   )(
     getter: PeerDeclarations => Option[A]
   )(implicit asyncF: Async[F]): F[Option[SortedMap[PeerId, A]]] = {
-
-    def processNonStale =
+    val maybeAllDeclarations =
       state.facilitators.value.traverse { peerId =>
         resources.peerDeclarationsMap
           .get(peerId)
@@ -44,21 +43,16 @@ trait ConsensusStateAdvancer[F[_], Key, Artifact, Context, Status, Outcome, Kind
           .map((peerId, _))
       }.map(SortedMap.from(_))
 
-    def processStale =
-      processNonStale
-
     for {
       now <- Clock[F].monotonic
       elapsed = now - resources.updatedAt
       isStale = elapsed > config.peersDeclarationTimeout
-      result <-
-        if (isStale) {
-          logger.warn(
-            s"The process is stale when getting all declarations. Elapsed: ${elapsed.toSeconds}s, Timeout: ${config.peersDeclarationTimeout.toSeconds}s"
-          ) >> processStale.pure
-        } else {
-          processNonStale.pure
-        }
-    } yield result
+      _ <- logger
+        .warn(
+          s"Still waiting for declarations from all facilitators; consensus does not proceed with partial declarations. " +
+            s"Elapsed since last declaration: ${elapsed.toSeconds}s, staleness threshold: ${config.peersDeclarationTimeout.toSeconds}s"
+        )
+        .whenA(isStale && maybeAllDeclarations.isEmpty)
+    } yield maybeAllDeclarations
   }
 }

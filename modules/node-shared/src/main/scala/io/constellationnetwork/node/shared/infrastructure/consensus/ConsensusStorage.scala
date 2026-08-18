@@ -48,9 +48,7 @@ trait ConsensusStorage[F[_], Event, Key, Artifact, Context, Status, Outcome, Kin
 
   private[consensus] def getTimeTrigger: F[Option[FiniteDuration]]
 
-  private[consensus] def setTimeTrigger(time: FiniteDuration): F[Unit]
-
-  def clearTimeTrigger: F[Unit]
+  def resetTimeTrigger: F[Unit]
 
   private[consensus] def addArtifact(key: Key, artifact: Artifact)(
     implicit hasher: Hasher[F]
@@ -156,11 +154,13 @@ object ConsensusStorage {
         def getTimeTrigger: F[Option[FiniteDuration]] =
           timeTriggerR.get
 
-        def setTimeTrigger(time: FiniteDuration): F[Unit] =
-          timeTriggerR.set(time.some)
-
-        def clearTimeTrigger: F[Unit] =
-          timeTriggerR.set(none)
+        // The time trigger deadline is only ever moved forward, never cleared. A node whose
+        // deadline is unset can never declare TimeTrigger and therefore can never contribute
+        // to epoch progress, so `None` must remain unreachable after startup.
+        def resetTimeTrigger: F[Unit] =
+          Clock[F].monotonic.flatMap { now =>
+            timeTriggerR.set((now + consensusConfig.timeTriggerInterval).some)
+          }
 
         def condModifyState[B](key: Key)(modifyStateFn: ModifyStateFn[F, Key, Status, Outcome, Kind, B]): F[Option[B]] =
           stateUpdateSemaphore.permit.use { _ =>

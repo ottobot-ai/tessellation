@@ -20,7 +20,7 @@ import io.constellationnetwork.node.shared.infrastructure.consensus.ConsensusSta
 import io.constellationnetwork.node.shared.infrastructure.consensus._
 import io.constellationnetwork.node.shared.infrastructure.consensus.declaration._
 import io.constellationnetwork.node.shared.infrastructure.consensus.message._
-import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.TimeTrigger
+import io.constellationnetwork.node.shared.infrastructure.consensus.trigger.{ConsensusTrigger, TimeTrigger}
 import io.constellationnetwork.node.shared.infrastructure.fork.ExitOnFork
 import io.constellationnetwork.node.shared.infrastructure.metrics.Metrics
 import io.constellationnetwork.node.shared.infrastructure.node.RestartService
@@ -65,6 +65,23 @@ object GlobalSnapshotConsensusStateAdvancer {
     val logger: SelfAwareStructuredLogger[F] = Slf4jLogger.getLoggerFromName[F]("GlobalSnapshotConsensusStateAdvancer")
     val facilitatorsObservationName = "facilitators"
 
+    def recordTriggerCensus(
+      declaredTriggers: List[ConsensusTrigger],
+      facilitatorCount: Int,
+      majorityTrigger: ConsensusTrigger
+    ): F[Unit] = {
+      val timeVotes = declaredTriggers.count(_ === TimeTrigger)
+      val eventVotes = declaredTriggers.size - timeVotes
+
+      Metrics[F].updateGauge("dag_consensus_declared_triggers", timeVotes, Seq(("trigger", "time"))) >>
+        Metrics[F].updateGauge("dag_consensus_declared_triggers", eventVotes, Seq(("trigger", "event"))) >>
+        Metrics[F].updateGauge("dag_consensus_declared_triggers", facilitatorCount - declaredTriggers.size, Seq(("trigger", "none"))) >>
+        Metrics[F].incrementCounter(
+          "dag_consensus_majority_trigger_total",
+          Seq(("trigger", if (majorityTrigger === TimeTrigger) "time" else "event"))
+        )
+    }
+
     def getConsensusOutcome(
       state: GlobalSnapshotConsensusState
     ): Option[(Previous[GlobalSnapshotKey], GlobalConsensusOutcome)] =
@@ -101,10 +118,11 @@ object GlobalSnapshotConsensusStateAdvancer {
                   )
                 }.flatMap {
                   _.map(_.foldMap(f => (f.upperBound, f.candidates.value, f.trigger.toList))).flatMap {
-                    case (bound, candidates, triggers) => pickMajority(triggers).map((bound, candidates, _))
+                    case (bound, candidates, triggers) => pickMajority(triggers).map((bound, candidates, triggers, _))
                   }.traverse {
-                    case (bound, candidates, majorityTrigger) =>
-                      Applicative[F].whenA(majorityTrigger === TimeTrigger)(consensusStorage.clearTimeTrigger) >>
+                    case (bound, candidates, declaredTriggers, majorityTrigger) =>
+                      recordTriggerCensus(declaredTriggers, state.facilitators.value.size, majorityTrigger) >>
+                        Applicative[F].whenA(majorityTrigger === TimeTrigger)(consensusStorage.resetTimeTrigger) >>
                         HasherSelector[F].withCurrent { implicit hasher =>
                           state.facilitators.value.hash
                         }.flatMap { facilitatorsHash =>
@@ -298,6 +316,7 @@ object GlobalSnapshotConsensusStateAdvancer {
         val scSnapshotCount = signedGS.stateChannelSnapshots.view.values.map(_.size).sum
 
         Metrics[F].updateGauge("dag_global_snapshot_ordinal", signedGS.ordinal.value) >>
+          Metrics[F].updateGauge("dag_global_snapshot_epoch_progress", signedGS.epochProgress.value.value) >>
           Metrics[F].updateGauge("dag_global_snapshot_height", signedGS.height.value) >>
           Metrics[F].updateGauge("dag_global_snapshot_signature_count", signedGS.proofs.size) >>
           Metrics[F]

@@ -40,6 +40,8 @@ trait ConsensusManager[F[_], Key, Artifact, Context, Status, Outcome, Kind] {
 
   private[consensus] def facilitateOnEvent: F[Unit]
 
+  private[consensus] def startTimeTriggerDaemon: F[Unit]
+
   private[consensus] def checkForStateUpdate(key: Key)(resources: ConsensusResources[Artifact, Kind]): F[Unit]
 }
 
@@ -67,6 +69,7 @@ object ConsensusManager {
 
     val collectRegistrationRetryPolicy = limitRetries(3).join(fullJitter(2.seconds))
     val observationRetryPolicy = limitRetries[F](10).join(constantDelay(3.seconds))
+    val timeTriggerPollInterval = 1.second
 
     def collectRegistration(peer: Peer): F[Unit] =
       for {
@@ -142,6 +145,7 @@ object ConsensusManager {
               .trySetInitialConsensusOutcome(outcome)
               .ifM(
                 nodeStorage.tryModifyState(Observing, WaitingForReady) >>
+                  consensusStorage.resetTimeTrigger >>
                   internalFacilitateWith(none),
                 new Throwable("Error initializing consensus storage").raiseError[F, Unit]
               )
@@ -150,7 +154,11 @@ object ConsensusManager {
 
       def facilitateOnEvent: F[Unit] =
         S.supervise {
-          internalFacilitateWith(EventTrigger.some)
+          isTimeTriggerDue
+            .ifM(
+              internalFacilitateWith(TimeTrigger.some),
+              internalFacilitateWith(EventTrigger.some)
+            )
             .handleErrorWith(logger.error(_)(s"Error facilitating consensus with event trigger"))
         }.void
 
@@ -159,25 +167,32 @@ object ConsensusManager {
           .trySetInitialConsensusOutcome(initialOutcome)
           .ifM(
             consensusStorage.trySetObservationKey(lastKey) >>
-              scheduleFacility,
+              consensusStorage.resetTimeTrigger,
             new Throwable("Error initializing consensus storage").raiseError[F, Unit]
           )
 
-      private def scheduleFacility: F[Unit] =
-        Clock[F].monotonic.map(_ + config.timeTriggerInterval).flatMap { nextTimeValue =>
-          consensusStorage.setTimeTrigger(nextTimeValue) >>
-            S.supervise {
-              val condTriggerWithTime = for {
-                maybeTimeTrigger <- consensusStorage.getTimeTrigger
-                currentTime <- Clock[F].monotonic
-                _ <- Applicative[F]
-                  .whenA(maybeTimeTrigger.exists(currentTime >= _))(internalFacilitateWith(TimeTrigger.some))
-              } yield ()
+      def startTimeTriggerDaemon: F[Unit] =
+        S.supervise {
+          val pollOnce = for {
+            maybeTimeTrigger <- consensusStorage.getTimeTrigger
+            currentTime <- Clock[F].monotonic
+            _ <- Metrics[F].updateGauge("dag_consensus_time_trigger_armed", maybeTimeTrigger.fold(0)(_ => 1))
+            _ <- maybeTimeTrigger.traverse_ { timeTrigger =>
+              Metrics[F].updateGauge("dag_consensus_time_trigger_remaining_seconds", (timeTrigger - currentTime).toMillis / 1000.0)
+            }
+            _ <- Applicative[F]
+              .whenA(maybeTimeTrigger.exists(currentTime >= _))(internalFacilitateWith(TimeTrigger.some))
+          } yield ()
 
-              Temporal[F].sleep(config.timeTriggerInterval) >> condTriggerWithTime
-                .handleErrorWith(logger.error(_)(s"Error triggering consensus with time trigger"))
-            }.void
-        }
+          (Temporal[F].sleep(timeTriggerPollInterval) >>
+            pollOnce.handleErrorWith(logger.error(_)(s"Error triggering consensus with time trigger"))).foreverM
+        }.void
+
+      private def isTimeTriggerDue: F[Boolean] =
+        for {
+          maybeTimeTrigger <- consensusStorage.getTimeTrigger
+          currentTime <- Clock[F].monotonic
+        } yield maybeTimeTrigger.exists(currentTime >= _)
 
       def withdrawFromConsensus: F[Unit] =
         for {
@@ -207,9 +222,11 @@ object ConsensusManager {
                 logger.debug(s"Trying to facilitate consensus {key=${nextKey.show}, trigger=${trigger.show}}") >>
                   consensusStateCreator.tryFacilitateConsensus(nextKey, lastOutcome, trigger, resources).flatMap {
                     case Some(state) =>
-                      stallDetection(nextKey, state) >>
+                      Metrics[F].incrementCounter("dag_consensus_facilitation_total", facilitationTags(trigger, created = true)) >>
+                        stallDetection(nextKey, state) >>
                         internalCheckForStateUpdate(nextKey, resources)
-                    case None => Applicative[F].unit
+                    case None =>
+                      Metrics[F].incrementCounter("dag_consensus_facilitation_total", facilitationTags(trigger, created = false))
                   }
               }
           }.void
@@ -230,7 +247,8 @@ object ConsensusManager {
                     .tryUpdateLastConsensusOutcomeWithCleanup(previousKey, newOutcome)
                     .ifM(
                       afterConsensusFinish(_trigger.get(newOutcome)),
-                      logger.info("Skip triggering another consensus")
+                      logger.error(s"Skip triggering another consensus {key=${key.show}}") >>
+                        Metrics[F].incrementCounter("dag_consensus_outcome_commit_skipped_total")
                     ) >>
                   nodeStorage.tryModifyStateGetResult(WaitingForReady, Ready).void
               case None =>
@@ -241,30 +259,46 @@ object ConsensusManager {
         }
 
       private def afterConsensusFinish(majorityTrigger: ConsensusTrigger): F[Unit] =
-        majorityTrigger match {
+        ensureTimeTriggerArmed >> (majorityTrigger match {
           case EventTrigger => afterEventTrigger
           case TimeTrigger  => afterTimeTrigger
+        })
+
+      // Defensive: no reachable path should leave the time trigger unset, but a node that can
+      // never declare TimeTrigger can never contribute to epoch progress, so re-arm just in case
+      private def ensureTimeTriggerArmed: F[Unit] =
+        consensusStorage.getTimeTrigger.flatMap { maybeTimeTrigger =>
+          consensusStorage.resetTimeTrigger.whenA(maybeTimeTrigger.isEmpty)
         }
 
       private def afterEventTrigger: F[Unit] =
-        for {
-          maybeTimeTrigger <- consensusStorage.getTimeTrigger
-          currentTime <- Clock[F].monotonic
-          containsTriggerEvent <- consensusStorage.containsTriggerEvent
-          _ <-
-            if (maybeTimeTrigger.exists(currentTime >= _))
-              internalFacilitateWith(TimeTrigger.some)
-            else if (containsTriggerEvent)
-              internalFacilitateWith(EventTrigger.some)
-            else if (maybeTimeTrigger.isEmpty)
-              internalFacilitateWith(none) // when there's no time trigger scheduled yet, trigger again with nothing
-            else
-              Applicative[F].unit
-        } yield ()
+        isTimeTriggerDue.flatMap { timeTriggerDue =>
+          if (timeTriggerDue)
+            internalFacilitateWith(TimeTrigger.some)
+          else
+            consensusStorage.containsTriggerEvent
+              .ifM(
+                internalFacilitateWith(EventTrigger.some),
+                Applicative[F].unit // the time trigger daemon facilitates once the deadline passes
+              )
+        }
 
       private def afterTimeTrigger: F[Unit] =
-        scheduleFacility >> consensusStorage.containsTriggerEvent
+        consensusStorage.resetTimeTrigger >> consensusStorage.containsTriggerEvent
           .ifM(internalFacilitateWith(EventTrigger.some), Applicative[F].unit)
+
+      private def facilitationTags(trigger: Option[ConsensusTrigger], created: Boolean): Metrics.TagSeq =
+        Seq(
+          (
+            "trigger",
+            trigger match {
+              case Some(TimeTrigger)  => "time"
+              case Some(EventTrigger) => "event"
+              case None               => "none"
+            }
+          ),
+          ("created", created.toString)
+        )
 
       private def stallDetection(key: Key, state: ConsensusState[Key, Status, Outcome, Kind]): F[Unit] =
         S.supervise {
@@ -284,15 +318,16 @@ object ConsensusManager {
 
     }
 
-    S.supervise(
-      nodeStorage.nodeStates
-        .filter(_ === NodeState.Leaving)
-        .evalTap { _ =>
-          manager.withdrawFromConsensus
-        }
-        .compile
-        .drain
-    ) >>
+    manager.startTimeTriggerDaemon >>
+      S.supervise(
+        nodeStorage.nodeStates
+          .filter(_ === NodeState.Leaving)
+          .evalTap { _ =>
+            manager.withdrawFromConsensus
+          }
+          .compile
+          .drain
+      ) >>
       S.supervise(
         clusterStorage.peerChanges.mapFilter {
           case Both(_, peer) if peer.state === NodeState.Observing =>

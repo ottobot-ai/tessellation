@@ -104,7 +104,7 @@ object CurrencySnapshotConsensusStateAdvancer {
                         case (bound, candidates, triggers) => pickMajority(triggers).map((bound, candidates, _))
                       }.traverse {
                         case (bound, candidates, majorityTrigger) =>
-                          Applicative[F].whenA(majorityTrigger === TimeTrigger)(consensusStorage.clearTimeTrigger) >>
+                          Applicative[F].whenA(majorityTrigger === TimeTrigger)(consensusStorage.resetTimeTrigger) >>
                             state.facilitators.value.hash.flatMap { facilitatorsHash =>
                               for {
                                 peerEvents <- consensusStorage.pullEvents(bound)
